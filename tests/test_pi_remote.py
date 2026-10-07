@@ -529,7 +529,7 @@ def test_the_keys_only_file_is_checked_before_sshd_reloads(tmp_path):
         log.unlink()
         if good:
             assert out.returncode == 0, out.stderr
-            assert calls == ["sshd -t", "systemctl reload ssh", "sshd -T"]
+            assert calls == ["sshd -t", "systemctl reload-or-restart ssh", "sshd -T"]
             assert "PasswordAuthentication no" in conf.read_text(encoding="utf-8")
         else:
             assert out.returncode != 0 and calls == ["sshd -t"]
@@ -610,3 +610,126 @@ def test_the_wifi_and_password_steps_come_last():
     labels = [label for label, _c, _t in remote.provision_steps("192.168.1.50")]
     assert labels[-2].startswith("Keep the Wi-Fi on the Pi")
     assert labels[-1].startswith("Turn SSH password login off")
+
+
+# ── review of 2026-10-07 ──────────────────────────────────────────────────
+def _fake_sshd(tmp_path, log, *, test_ok=True, effective="passwordauthentication no"):
+    sshd = tmp_path / "sshd"
+    sshd.write_text("#!/bin/sh\n"
+                    f"echo \"sshd $1\" >> {_shell_path(log)}\n"
+                    f"if [ \"$1\" = -t ]; then exit {0 if test_ok else 1}; fi\n"
+                    f"echo '{effective}'\n", encoding="utf-8")
+    return sshd
+
+
+@pytest.mark.parametrize("reload_ok, effective", [
+    (False, "passwordauthentication no"),     # ssh.service inactive: reload fails
+    (True, "passwordauthentication yes"),     # another setting still allows passwords
+])
+def test_a_keys_only_step_that_fails_after_the_check_takes_the_drop_in_away(
+        tmp_path, reload_ok, effective):
+    # MEASURED: sshd -t passed, 'systemctl reload' failed, and the drop-in
+    # stayed - the user was told password login is ON, and the next sshd
+    # restart or reboot made the Pi keys-only, unproven.
+    log = tmp_path / "calls.log"
+    conf = tmp_path / "sshd_config.d" / "00-council-keys-only.conf"
+    conf.parent.mkdir()
+    sshd = _fake_sshd(tmp_path, log, effective=effective)
+    fail = "" if reload_ok else "echo 'Job for ssh.service failed' >&2; return 1; "
+    shims = ("sudo() { \"$@\"; }\n"
+             f"systemctl() {{ echo \"systemctl $*\" >> {_shell_path(log)}; {fail}}}\n")
+    cmd = remote.keys_only_cmd(path=_shell_path(conf), sshd=_shell_path(sshd))
+    out = _sh(shims + "eval " + cmd[len("bash -c "):])
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert out.returncode != 0 and "keys-only" not in out.stdout
+    assert not conf.exists() and not conf.with_name(conf.name + ".council-tmp").exists()
+    assert "password login stays on" in out.stderr
+    # ...and sshd is told again, without the file.
+    assert calls[-1].startswith("systemctl reload-or-restart")
+    assert calls.index("sshd -t") < len(calls) - 1
+
+
+def test_password_login_back_on_reloads_or_restarts():
+    assert "reload-or-restart ssh" in remote.password_login_back_cmd()
+
+
+def _logging_sudo(log):
+    return f"sudo() {{ echo \"sudo $*\" >> {_shell_path(log)}; \"$@\"; }}\nsync() {{ :; }}\n"
+
+
+def test_the_wifi_key_is_zeroed_where_it_is_before_the_file_is_replaced(tmp_path):
+    # On the FAT boot partition 'mv -f' over network-config only freed its
+    # clusters: the 64-hex key stayed readable from the raw card.
+    files, boot = _wifi_files(tmp_path)
+    log = tmp_path / "sudo.log"
+    nm = "802-11-wireless:/etc/NetworkManager/system-connections/home.nmconnection"
+    shims = (_logging_sudo(log) + "nmcli() { case \"$*\" in *FILENAME*) echo '" + nm
+             + "';; *) echo 802-11-wireless;; esac; }\n")
+    cmd = remote.wifi_keep_cmd((_shell_path(boot),), cloud_cfg_dir=_shell_path(
+        tmp_path / "cloud"), netplan_dir=_shell_path(tmp_path))
+    out = _sh(shims + "eval " + cmd[len("bash -c "):])
+    assert out.returncode == 0, out.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    nc = _shell_path(boot / "network-config")
+    wipe = calls.index(f"sudo shred -n 0 -z -x -- {nc}")
+    move = next(i for i, c in enumerate(calls) if c.startswith("sudo mv -f") and c.endswith(nc))
+    assert wipe < move
+    # the leftover tmp file (it may be a whole user-data) is zeroed before it goes
+    left = _shell_path(boot / "user-data.council-tmp")
+    assert calls.index(f"sudo shred -n 0 -z -x -- {left}") < next(
+        i for i, c in enumerate(calls) if c.startswith("sudo rm -f") and left in c)
+    assert not (boot / "user-data.council-tmp").exists()
+    assert pi_secrets.wifi_psk("Home", "wifi-pass-123") not in (
+        boot / "network-config").read_text(encoding="utf-8")
+
+
+def test_the_host_key_is_zeroed_where_it_is_before_user_data_is_replaced(tmp_path):
+    pem, pub = pi_secrets.host_keypair()
+    files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
+                                  password="correct-horse-42",
+                                  host_key_private=pem, host_key_public=pub), fb.CLOUDINIT)
+    boot = tmp_path / "boot"
+    boot.mkdir()
+    (boot / "user-data").write_text(files["user-data"], encoding="utf-8", newline="\n")
+    log = tmp_path / "sudo.log"
+    out = _sh(_logging_sudo(log) + remote.scrub_firstboot_cmd((_shell_path(boot),)))
+    assert out.returncode == 0, out.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    ud = _shell_path(boot / "user-data")
+    wipe = calls.index(f"sudo shred -n 0 -z -x -- {ud}")
+    assert wipe < next(i for i, c in enumerate(calls) if c.startswith("sudo mv -f"))
+    assert "PRIVATE KEY" not in (boot / "user-data").read_text(encoding="utf-8")
+
+
+def test_the_legacy_firstrun_script_zeroes_itself_and_still_finishes(tmp_path):
+    # firstrun.sh holds the Wi-Fi key on the FAT boot partition and removed
+    # itself with a plain 'rm -f'. Zeroing a running script under bash would
+    # cut it off mid-way, so its last step is one compound command: here
+    # that step runs, adapted to a temp folder, and must finish.
+    files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
+                                  password="correct-horse-42", wifi_ssid="Home",
+                                  wifi_password="wifi-pass-123"), fb.SYSTEMD)
+    last = [ln for ln in files["firstrun.sh"].splitlines() if "shred" in ln]
+    assert len(last) == 1 and last[0].startswith("{ ") and last[0].endswith("exit 0; }")
+    assert last[0].index("shred") < last[0].index("rm -f")
+    fw = tmp_path / "firmware"
+    fw.mkdir()
+    (fw / "cmdline.txt").write_text("console=tty1" + fb.CMDLINE_HOOK + "\n", encoding="utf-8",
+                                    newline="\n")
+    step = last[0].replace("/boot/firmware", _shell_path(fw)).replace(
+        "/boot/", _shell_path(tmp_path / "none") + "/")
+    script = fw / "firstrun.sh"
+    marks = tmp_path / "marks"
+    script.write_text("#!/bin/bash\n"
+                      f"echo start >> {_shell_path(marks)}\n"
+                      f"psk={pi_secrets.wifi_psk('Home', 'wifi-pass-123')}\n"
+                      + step + "\n"
+                      f"echo AFTER-EXIT >> {_shell_path(marks)}\n", encoding="utf-8",
+                      newline="\n")
+    import subprocess
+    out = subprocess.run([_git_bash(), _shell_path(script)], capture_output=True, text=True,
+                         timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert not script.exists()
+    assert marks.read_text(encoding="utf-8").split() == ["start"]
+    assert "systemd.run" not in (fw / "cmdline.txt").read_text(encoding="utf-8")

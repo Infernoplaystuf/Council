@@ -215,10 +215,16 @@ def _systemd(cfg: FirstBoot, pw_hash: str, psk: str) -> Dict[str, str]:
         ]
     if cfg.timezone:
         lines.append(f"timedatectl set-timezone {q(cfg.timezone)}")
+    # This script holds the Wi-Fi key and lives on the FAT boot partition,
+    # where 'rm' only frees its clusters: the key stayed readable from the
+    # raw card. It is zeroed in place, then removed. ONE compound command,
+    # so bash has read all of it before the script's own bytes are zeroed.
     lines += [
-        "rm -f /boot/firmware/firstrun.sh /boot/firstrun.sh",
-        "sed -i 's| systemd.run.*||g' /boot/firmware/cmdline.txt /boot/cmdline.txt 2>/dev/null",
-        "exit 0",
+        "{ for f in /boot/firmware/firstrun.sh /boot/firstrun.sh; do "
+        "[ -f \"$f\" ] && shred -n 0 -z -x -u -- \"$f\"; done; "
+        "rm -f /boot/firmware/firstrun.sh /boot/firstrun.sh; "
+        "sed -i 's| systemd.run.*||g' /boot/firmware/cmdline.txt /boot/cmdline.txt 2>/dev/null; "
+        "exit 0; }",
     ]
     return {"firstrun.sh": "\n".join(lines) + "\n",
             "userconf.txt": f"{cfg.username}:{pw_hash}\n",

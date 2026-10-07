@@ -241,6 +241,17 @@ def firewall_rules(pc_ip: str, port: int = 11434) -> str:
 
 #: Every first-boot file the Council writes carries this line (firstboot.py).
 FIRSTBOOT_MARKER = "Written by The Council's Pi setup."
+
+
+def wipe_in_place_cmd(path_q: str) -> str:
+    """Overwrite a file's bytes with zeros WHERE THEY ARE (``path_q`` is
+    already shell-quoted), before it is replaced. The boot partition is FAT:
+    a rename over a file, or rm, only frees its clusters, and the old bytes -
+    the 64-hex Wi-Fi key beside 'password:', the host private key - stay on
+    the card for anyone who reads it raw (grep -a on /dev/sdX1). FAT has no
+    copy-on-write, so writing over the file's own range rewrites those same
+    clusters. -x keeps the file's size (no rounding up to a block)."""
+    return f"sudo shred -n 0 -z -x -- {path_q}"
 _SCRUBBED_USER_DATA = (
     "#cloud-config\n"
     "# First boot is done. The Council removed what it had put here (the Pi's\n"
@@ -259,12 +270,14 @@ def scrub_firstboot_cmd(boot_dirs: Tuple[str, ...] = ("/boot/firmware", "/boot")
     (the Wi-Fi key) is NOT touched here: it goes at the end of provisioning
     (`wifi_keep_cmd`), only once NetworkManager is shown to keep the Wi-Fi
     profile on the Pi itself — a Pi that loses its Wi-Fi cannot be reached
-    to fix it."""
+    to fix it. The old bytes are zeroed in place first (wipe_in_place_cmd):
+    replaced on FAT, they stayed on the card."""
     q = shlex.quote
     checks = []
     for d in boot_dirs:
         f = f"{d}/user-data"
         checks.append(f"if [ -f {q(f)} ] && sudo grep -qF {q(FIRSTBOOT_MARKER)} {q(f)}; then "
+                      f"{wipe_in_place_cmd(q(f))} && "
                       f"printf %s {q(_SCRUBBED_USER_DATA)} | sudo tee {q(f + '.council-tmp')} "
                       f">/dev/null && sudo mv -f {q(f + '.council-tmp')} {q(f)} || exit 1; fi")
     return "; ".join(checks) + "; sync"
@@ -415,7 +428,10 @@ _KEYS_ONLY_TEXT = ("# Written by The Council's Pi setup: SSH accepts keys only.\
 
 
 def _reload_ssh() -> str:
-    return "(sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd)"
+    # reload-or-restart: a plain reload fails when ssh.service is not running
+    # (a socket-activated sshd), and that failure used to leave the drop-in.
+    return ("(sudo systemctl reload-or-restart ssh 2>/dev/null"
+            " || sudo systemctl reload-or-restart sshd)")
 
 
 def keys_only_cmd(path: str = KEYS_ONLY_FILE, sshd: str = "/usr/sbin/sshd") -> str:
@@ -423,18 +439,40 @@ def keys_only_cmd(path: str = KEYS_ONLY_FILE, sshd: str = "/usr/sbin/sshd") -> s
     with the Council's key (that is the proof key login works). The drop-in
     is checked by 'sshd -t' BEFORE the reload — a bad file is removed and
     nothing reloads — and the effective setting is read back ('sshd -T').
-    ``path`` / ``sshd`` exist so a test can run the real script."""
+
+    ANY way out before 'keys-only' is printed removes the drop-in again (an
+    EXIT trap), and reloads if a reload was tried. MEASURED (review,
+    2026-10-07): a failed 'systemctl reload' left the file in place; the
+    Council said password login was still ON - true until the next sshd
+    restart or reboot, which made the Pi keys-only with no new key login
+    ever proven. ``path`` / ``sshd`` exist so a test can run the real script."""
     q = shlex.quote
     f = path
     return _bash(
         "set -eu\n"
+        "stage=writing\n"
+        "undo() {\n"
+        "  rc=$?\n"
+        "  if [ \"$stage\" != done ]; then\n"
+        f"    sudo rm -f {q(f)} {q(f + '.council-tmp')} || true\n"
+        "    if [ \"$stage\" = reloading ]; then\n"
+        f"      {_reload_ssh()} || true\n"
+        "      echo \"sshd did not take the keys-only setting; it was removed and"
+        " password login stays on\" >&2\n"
+        "    fi\n"
+        "  fi\n"
+        "  exit $rc\n"
+        "}\n"
+        "trap undo EXIT\n"
         f"printf %s {q(_KEYS_ONLY_TEXT)} | sudo tee {q(f + '.council-tmp')} >/dev/null\n"
         f"sudo mv -f {q(f + '.council-tmp')} {q(f)}\n"
-        f"if ! sudo {q(sshd)} -t; then sudo rm -f {q(f)}; echo \"sshd refused the"
+        f"if ! sudo {q(sshd)} -t; then echo \"sshd refused the"
         " setting; password login was left as it was\" >&2; exit 1; fi\n"
+        "stage=reloading\n"
         f"{_reload_ssh()}\n"
         f"sudo {q(sshd)} -T 2>/dev/null | grep -qix 'passwordauthentication no' || "
         "{ echo \"another sshd setting still allows passwords\" >&2; exit 1; }\n"
+        "stage=done\n"
         "echo keys-only\n")
 
 
@@ -517,13 +555,16 @@ def wifi_keep_cmd(boot_dirs: Tuple[str, ...] = ("/boot/firmware", "/boot"), *,
          of a netplan profile lives in /run and is re-made from it at boot);
       2. cloud-init is told not to render the network again
          (99-disable-network-config.cfg), so the emptied seed cannot wipe it;
-      3. network-config becomes a comment-only file, and the Council's
+      3. network-config's bytes are zeroed where they are on the card
+         (wipe_in_place_cmd - a FAT rename-over left the key in the freed
+         clusters), it becomes a comment-only file, and the Council's
          leftover *.council-tmp files go.
 
     No Wi-Fi profile on the Pi = the card is left alone and the step fails:
     a headless Pi that loses its Wi-Fi cannot be reached to fix it. A card
     whose network-config holds no Wi-Fi (Ethernet) is emptied too."""
     q = shlex.quote
+    wipe_leftover = wipe_in_place_cmd('"$t"')
     lines = ["set -eu", "done_any=no"]
     for d in boot_dirs:
         f = f"{d}/network-config"
@@ -544,10 +585,15 @@ def wifi_keep_cmd(boot_dirs: Tuple[str, ...] = ("/boot/firmware", "/boot"), *,
             f"  sudo mkdir -p {q(cloud_cfg_dir)}",
             f"  printf %s {q(CLOUD_NO_NETWORK)} | sudo tee "
             f"{q(cloud_cfg_dir + '/99-disable-network-config.cfg')} >/dev/null",
+            f"  {wipe_in_place_cmd(q(f))}",
             f"  printf %s {q(_SCRUBBED_NETWORK)} | sudo tee {q(f + '.council-tmp')} >/dev/null",
             f"  sudo mv -f {q(f + '.council-tmp')} {q(f)}",
             "  done_any=yes",
             "fi",
+            # A leftover from an interrupted write on Windows may be a whole
+            # user-data or network-config: zeroed too, then removed.
+            f"for t in {q(d)}/*.council-tmp; do [ -f \"$t\" ] && "
+            f"{wipe_leftover} || true; done",
             f"sudo rm -f {q(d)}/*.council-tmp 2>/dev/null || true",
         ]
     lines += ["sync", 'echo "card network settings removed: $done_any"']
