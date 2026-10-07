@@ -34,6 +34,13 @@ What is in the store (schema version ``SCHEMA_VERSION``, documented in
              PROPOSED until the user confirms them; drifted labels ('POC')
              are suggested by field_search.field_name_candidates, never
              assumed.
+  name_decisions (v2) the user's answers ('D. Whitfield' is Dana — here or
+             everywhere — or neither), keyed by person_key of the name.
+  extraction_done (v2) which passages a model has read, per document
+             version and per model, so a stopped run resumes.
+  extraction_docs (v3) each document's passages and the signature they
+             were worked out from, so a resumed run skips a finished
+             document without reading it.
 
 Seeding reads "records": a table row, a JSON object, or one document's labelled
 header fields. Two values in one row are a strong link (seeded); values that
@@ -59,7 +66,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
@@ -103,6 +110,9 @@ CREATE TABLE IF NOT EXISTS mentions (
     UNIQUE (entity_id, document_id, locator, method)
 );
 CREATE INDEX IF NOT EXISTS mentions_entity ON mentions(entity_id);
+-- v3: the free-text pass asks for one document's mentions at a time; without
+-- this every ask was a full scan (MEASURED: 84 of 118 s for 3,000 documents).
+CREATE INDEX IF NOT EXISTS mentions_document ON mentions(document_id);
 CREATE TABLE IF NOT EXISTS relations (
     id TEXT PRIMARY KEY,               -- sha256(subject|predicate|object)[:20]
     subject_id TEXT NOT NULL, predicate TEXT NOT NULL, object_id TEXT NOT NULL,
@@ -155,6 +165,13 @@ CREATE TABLE IF NOT EXISTS extraction_done (
     model TEXT NOT NULL, ts REAL NOT NULL, links INTEGER NOT NULL,
     error TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (document_id, content_hash, chunk, model)
+);
+-- v3: one row per text document the free-text pass worked out: the
+-- signature of everything its passages depend on (its content, its
+-- mentions, its Collection, the project names) and the passage numbers that
+-- went to a model. Same signature + every passage done = nothing to read.
+CREATE TABLE IF NOT EXISTS extraction_docs (
+    document_id TEXT PRIMARY KEY, sig TEXT NOT NULL, chunks TEXT NOT NULL
 );
 """
 
@@ -247,6 +264,12 @@ def person_display(raw: str) -> str:
 def person_key(raw: str) -> str:
     toks = [t for t in fold(person_display(raw)).split() if t not in _SUFFIXES]
     return " ".join(toks)
+
+
+def _name_key(surface: str) -> str:
+    """How a name answer is filed: 'D. Whitfield' and 'Whitfield, D.' are one
+    question (person_key reads both as 'd whitfield')."""
+    return person_key(surface) or fold(surface)
 
 
 def is_initial_form(key: str) -> bool:
@@ -530,7 +553,8 @@ class KnowledgeGraph:
                 self.db.executescript(SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
                                 "('schema_version', ?)", (str(SCHEMA_VERSION),))
-                # v1 -> v2 only ADDS a table (created above); record it.
+                # v1 -> v2 -> v3 only ADD tables and an index (created
+                # above); record it.
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'"
                                 " AND CAST(value AS INTEGER) < ?",
                                 (str(SCHEMA_VERSION), SCHEMA_VERSION))
@@ -550,8 +574,17 @@ class KnowledgeGraph:
         refused with its bytes untouched. The schema script and the default
         rules used to run first — MEASURED: a 'newer' store got its dropped
         tables recreated and a deleted rule re-inserted, then was refused."""
+        # The whole path percent-encoded after 'file:' (no authority part):
+        # Path.as_uri() gives 'file://%3F/C:/…' for a \\?\ path — the
+        # spelling of a vault deeper than 260 characters — which SQLite
+        # refuses ("invalid uri authority"), and the store was reported
+        # damaged. Encoded like this, both spellings open.
+        uri = "file:" + "".join(
+            ch if ch.isascii() and ch.isalnum() else
+            "".join(f"%{b:02X}" for b in ch.encode("utf-8"))
+            for ch in str(self.path.resolve())) + "?mode=ro"
         try:
-            ro = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+            ro = sqlite3.connect(uri, uri=True)
         except sqlite3.Error as exc:
             raise KnowledgeGraphDamaged(
                 f"the knowledge graph store {self.path} could not be read "
@@ -778,6 +811,10 @@ class KnowledgeGraph:
                 content_hash: str, locator: Dict[str, Any], quote: str,
                 method: str, run_id: str, model: str = "") -> str:
         s, o = self.resolve(s), self.resolve(o)
+        if s == o:
+            # Two merged entries (PN-1234/B with PN-1234/A merged into it):
+            # their row's 'B supersedes A' would make B supersede ITSELF.
+            return ""
         rid = relation_id(s, pred, o)
         now = time.time()
         row = self.db.execute("SELECT status FROM relations WHERE id=?", (rid,)).fetchone()
@@ -874,10 +911,13 @@ class KnowledgeGraph:
                                         (r["id"],))
                 stats["records"] = len(records)
                 # A model's evidence stays across rebuilds (it cost GPU time) -
-                # unless its document changed since; then it is stale and goes.
+                # unless its document changed since, or is gone: then it is
+                # stale and goes. A deleted file kept its last content hash,
+                # so its model links lived on with nothing behind them.
                 self.db.execute(
-                    "DELETE FROM evidence WHERE method='model' AND content_hash !="
-                    " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)")
+                    "DELETE FROM evidence WHERE method='model' AND (content_hash !="
+                    " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)"
+                    " OR document_id IN (SELECT id FROM documents WHERE status='missing'))")
                 self._seed_records(records, run_id)
                 if use_collections:
                     stats["collections"] = self._seed_collections(run_id)
@@ -1195,14 +1235,68 @@ class KnowledgeGraph:
     def decided_name(self, surface: str, document_id: str) -> Optional[str]:
         """What the user said ``surface`` means in this document: an entity
         id, '' for "neither, a different person", or None (not asked yet).
-        An answer for this document beats one for everywhere."""
+        An answer for this document beats one for everywhere.
+
+        Answers are keyed by person_key, so 'Whitfield, D.' is the same
+        question as 'D. Whitfield' (they were keyed by fold() and the
+        'everywhere' answer missed the surname-first spelling); rows an
+        earlier Council wrote under fold() are still found. An answer naming
+        a person a rebuild has since deleted (no document names her any
+        more) counts as NOT answered, so the question comes back: it used to
+        hand out the deleted id, giving links and mentions with no entity."""
         for doc in (document_id or "", ""):
-            row = self.db.execute("SELECT entity_id FROM name_decisions WHERE"
-                                  " surface_norm=? AND document_id=?",
-                                  (fold(surface), doc)).fetchone()
-            if row is not None:
+            for key in dict.fromkeys((_name_key(surface), fold(surface))):
+                row = self.db.execute("SELECT entity_id FROM name_decisions WHERE"
+                                      " surface_norm=? AND document_id=?",
+                                      (key, doc)).fetchone()
+                if row is None:
+                    continue
+                if row[0] and self.entity(self.resolve(row[0])) is None:
+                    return None
                 return row[0]
         return None
+
+    def answers(self) -> List[Dict[str, Any]]:
+        """The user's name answers, newest first, each with what it says
+        ('D. Whitfield' is Dana Whitfield, in which document) — so a wrong
+        one can be found and forgotten."""
+        said: Dict[Tuple[str, str], str] = {}
+        for d in self.decisions():
+            if d["action"] == "name":
+                p = d["payload"]
+                said[(_name_key(p.get("surface", "")), p.get("document_id") or "")] = \
+                    p.get("surface", "")
+        out = []
+        for r in self.db.execute(
+                "SELECT nd.*, d.path FROM name_decisions nd LEFT JOIN documents d ON"
+                " d.id=nd.document_id ORDER BY nd.ts DESC"):
+            ent = self.entity(self.resolve(r["entity_id"])) if r["entity_id"] else None
+            out.append({"key": r["surface_norm"], "document_id": r["document_id"],
+                        "surface": said.get((r["surface_norm"], r["document_id"]),
+                                            r["surface_norm"]),
+                        "entity_id": r["entity_id"],
+                        "name": (ent["name"] if ent else
+                                 "a different person" if not r["entity_id"] else "(gone)"),
+                        "path": r["path"] or "", "everywhere": not r["document_id"]})
+        return out
+
+    def forget_answer(self, key: str, document_id: str = "") -> None:
+        """Undo one name answer: the question is asked again at the next
+        rebuild. Logged as 'name_undo' (the log itself is never edited)."""
+        with self.db:
+            n = self.db.execute("DELETE FROM name_decisions WHERE surface_norm=? AND"
+                                " document_id=?", (key, document_id or "")).rowcount
+            if not n:
+                raise KeyError(key)
+            # The question's own row is 'resolved', and a rebuild re-asks
+            # with INSERT OR IGNORE on the same (kind, surface, document,
+            # spot): it would stay answered. It goes, so it is asked again.
+            for r in self.db.execute("SELECT id, surface, document_id FROM review"
+                                     " WHERE status='resolved'").fetchall():
+                if _name_key(r["surface"]) == key and (
+                        not document_id or r["document_id"] == document_id):
+                    self.db.execute("DELETE FROM review WHERE id=?", (r["id"],))
+            self._decide("name_undo", {"key": key, "document_id": document_id or None})
 
     def answer_review(self, review_id: int, entity_id: Optional[str], *,
                       everywhere: bool = False) -> None:
@@ -1216,8 +1310,13 @@ class KnowledgeGraph:
             raise KeyError(entity_id)
         doc = "" if everywhere else (r["document_id"] or "")
         with self.db:
+            # An older row under the fold() key would shadow nothing (the
+            # person_key row is looked up first) but would come back after
+            # this one is forgotten.
+            self.db.execute("DELETE FROM name_decisions WHERE surface_norm=? AND"
+                            " document_id=?", (fold(r["surface"]), doc))
             self.db.execute("INSERT OR REPLACE INTO name_decisions VALUES (?,?,?,?)",
-                            (fold(r["surface"]), doc, entity_id or "", time.time()))
+                            (_name_key(r["surface"]), doc, entity_id or "", time.time()))
             q = "UPDATE review SET status='resolved' WHERE status='open' AND surface=?"
             args: tuple = (r["surface"],)
             if not everywhere:
@@ -1228,10 +1327,27 @@ class KnowledgeGraph:
             self._decide("name", {"surface": r["surface"], "entity_id": entity_id,
                                   "document_id": doc or None, "review_id": review_id})
 
-    def merge(self, keep_id: str, absorb_id: str) -> None:
+    #: Statuses only the user sets. A merge never copies one over another
+    #: status, and an unmerge gives each back to the entry it belonged to.
+    _USER_STATUSES = ("accepted", "rejected")
+
+    def merge(self, keep_id: str, absorb_id: str) -> List[Dict[str, Any]]:
         """``absorb_id`` is the same thing as ``keep_id`` (two spellings of one
         person, a part listed twice). Its aliases, mentions, links and the
-        user's decisions on them move to ``keep_id``; undo with `unmerge`."""
+        user's decisions on them move to ``keep_id``; undo with `unmerge`.
+
+        Returns the CLASHES: links both entries had where the absorbed one
+        carries a user decision (accepted / rejected) that differs from the
+        survivor's status. The survivor's status is KEPT — the user decided
+        about the other entry's link, not this one — and the caller asks.
+        MEASURED (review, 2026-10-07): a rejected model link on a duplicate
+        'Caroline Lee' made Carol Lee's own labelled link 'rejected', it stayed
+        rejected after unmerge and rebuild, and neighbors() hid it for good.
+
+        Everything the merge changes is recorded in its decision (moved and
+        created links with their old statuses, links that became loops — an
+        accepted 'B supersedes A' once A is B — and their evidence, aliases
+        copied) so `unmerge` can put it back."""
         keep_id, absorb_id = self.resolve(keep_id), self.resolve(absorb_id)
         k, a = self.entity(keep_id), self.entity(absorb_id)
         if k is None or a is None:
@@ -1240,115 +1356,229 @@ class KnowledgeGraph:
             raise ValueError("that is the same entity")
         if k["type"] != a["type"] or k["type"] == "DOCUMENT":
             raise ValueError(f"cannot merge a {a['type']} into a {k['type']}")
-        rank = {"accepted": 3, "rejected": 2, "seeded": 1, "suggested": 0}
+        changes: Dict[str, List[Any]] = {"relations": [], "loops": [], "aliases": []}
+        clashes: List[Dict[str, Any]] = []
         with self.db:
+            # Entries merged into ``absorb`` earlier stay merged into IT
+            # (resolve() follows the chain): splitting ``absorb`` off later
+            # keeps them with it. They used to be re-pointed at ``keep``.
             self.db.execute("UPDATE entities SET merged_into=? WHERE id=?", (keep_id, absorb_id))
-            self.db.execute("UPDATE entities SET merged_into=? WHERE merged_into=?",
-                            (keep_id, absorb_id))
             for al in self.db.execute("SELECT * FROM aliases WHERE entity_id=?",
                                       (absorb_id,)).fetchall():
-                self._alias(keep_id, al["alias"], al["source"])
+                if self.db.execute("SELECT 1 FROM aliases WHERE entity_id=? AND alias=?",
+                                   (keep_id, al["alias"])).fetchone() is None:
+                    self.db.execute("INSERT INTO aliases VALUES (?,?,?,?)",
+                                    (keep_id, al["alias"], al["alias_norm"], al["source"]))
+                    changes["aliases"].append([al["alias"], al["source"]])
+            # Mentions are rebuilt by every seed; no record needed.
             self.db.execute("UPDATE OR IGNORE mentions SET entity_id=? WHERE entity_id=?",
                             (keep_id, absorb_id))
             self.db.execute("DELETE FROM mentions WHERE entity_id=?", (absorb_id,))
             for r in self.db.execute("SELECT * FROM relations WHERE subject_id=? OR object_id=?",
                                      (absorb_id, absorb_id)).fetchall():
+                old = dict(r)
+                ev = [dict(e) for e in self.db.execute(
+                    "SELECT * FROM evidence WHERE relation_id=?", (r["id"],))]
                 s_ = keep_id if r["subject_id"] == absorb_id else r["subject_id"]
                 o_ = keep_id if r["object_id"] == absorb_id else r["object_id"]
-                if s_ != o_:
+                if s_ == o_:
+                    changes["loops"].append({"old": old, "evidence": ev})
+                else:
                     new_id = relation_id(s_, r["predicate"], o_)
                     have = self.db.execute("SELECT status FROM relations WHERE id=?",
                                            (new_id,)).fetchone()
+                    entry = {"old": old, "new_id": new_id, "created": have is None,
+                             "status": r["status"], "evidence": ev, "moved": []}
                     if have is None:
                         self.db.execute("INSERT INTO relations VALUES (?,?,?,?,?,?,?)",
                                         (new_id, s_, r["predicate"], o_, r["status"],
                                          r["created_ts"], time.time()))
-                    elif rank[r["status"]] > rank[have["status"]]:
-                        self.db.execute("UPDATE relations SET status=? WHERE id=?",
-                                        (r["status"], new_id))
-                    self.db.execute("UPDATE OR IGNORE evidence SET relation_id=? WHERE"
-                                    " relation_id=?", (new_id, r["id"]))
+                    elif (r["status"] != have["status"]
+                          and r["status"] in self._USER_STATUSES):
+                        clashes.append({"relation_id": new_id, "predicate": r["predicate"],
+                                        "subject_id": s_, "object_id": o_,
+                                        "kept": have["status"], "theirs": r["status"]})
+                    for e in ev:
+                        if self.db.execute("UPDATE OR IGNORE evidence SET relation_id=?"
+                                           " WHERE id=?", (new_id, e["id"])).rowcount:
+                            entry["moved"].append(e["id"])
+                    changes["relations"].append(entry)
                 self.db.execute("DELETE FROM evidence WHERE relation_id=?", (r["id"],))
                 self.db.execute("DELETE FROM relations WHERE id=?", (r["id"],))
             self._decide("merge", {"keep": keep_id, "absorb": absorb_id,
-                                   "keep_name": k["name"], "absorb_name": a["name"]})
+                                   "keep_name": k["name"], "absorb_name": a["name"],
+                                   "changes": changes})
+        return clashes
+
+    def _merge_record(self, absorb_id: str) -> Optional[Dict[str, Any]]:
+        """The latest merge decision that absorbed ``absorb_id``."""
+        for r in self.db.execute("SELECT payload FROM decisions WHERE action='merge'"
+                                 " ORDER BY id DESC"):
+            p = json.loads(r[0])
+            if p.get("absorb") == absorb_id:
+                return p
+        return None
 
     def unmerge(self, absorb_id: str) -> None:
-        """Undo a merge. Links from labels and Collections come back apart at
-        the next rebuild; links a model suggested while merged stay with the
-        entity they were moved to."""
+        """Undo a merge: the entry is its own again, with the links the merge
+        moved, the links it turned into loops, and the user's decisions on
+        them, as they were; the names the merge copied go back. Links from
+        labels and Collections are worked out again at the next rebuild;
+        links a model suggested WHILE merged stay with the survivor. (A merge
+        an older Council recorded without its changes only comes apart.)"""
         row = self.db.execute("SELECT merged_into FROM entities WHERE id=?",
                               (absorb_id,)).fetchone()
         if row is None or not row["merged_into"]:
             raise ValueError("that entity is not merged into another")
+        keep_id = row["merged_into"]
+        rec = self._merge_record(absorb_id) or {}
         with self.db:
             self.db.execute("UPDATE entities SET merged_into=NULL WHERE id=?", (absorb_id,))
-            self._decide("unmerge", {"entity": absorb_id, "was_in": row["merged_into"]})
+            ch = rec.get("changes") if rec.get("keep") == keep_id else None
+            if ch:
+                self._undo_merge(keep_id, ch)
+            self._decide("unmerge", {"entity": absorb_id, "was_in": keep_id})
+
+    def _undo_merge(self, keep_id: str, ch: Dict[str, Any]) -> None:
+        cols = ("id", "subject_id", "predicate", "object_id", "status", "created_ts",
+                "updated_ts")
+        ecols = ("id", "relation_id", "document_id", "content_hash", "locator", "quote",
+                 "method", "model", "run_id")
+
+        def put_back(rel: Dict[str, Any], evidence: List[Dict[str, Any]]) -> None:
+            self.db.execute("INSERT OR IGNORE INTO relations VALUES (?,?,?,?,?,?,?)",
+                            tuple(rel[c] for c in cols))
+            for e in evidence:
+                # Still there (moved onto the survivor's link): move it back.
+                # Gone (a duplicate the merge dropped, or a rebuild re-made
+                # it): the recorded row; the next rebuild drops it again if
+                # it is stale or derived.
+                if not self.db.execute("UPDATE OR IGNORE evidence SET relation_id=? WHERE"
+                                       " id=?", (rel["id"], e["id"])).rowcount:
+                    self.db.execute(
+                        f"INSERT OR IGNORE INTO evidence ({', '.join(ecols)}) VALUES"
+                        f" ({', '.join('?' * len(ecols))})",
+                        tuple({**e, "relation_id": rel["id"]}[c] for c in ecols))
+
+        for alias, source in ch.get("aliases", []):
+            self.db.execute("DELETE FROM aliases WHERE entity_id=? AND alias=? AND source=?",
+                            (keep_id, alias, source))
+        for loop in ch.get("loops", []):
+            put_back(loop["old"], loop["evidence"])
+        for entry in ch.get("relations", []):
+            put_back(entry["old"], entry["evidence"])
+            if not entry["created"]:
+                continue
+            cur = self.db.execute("SELECT status FROM relations WHERE id=?",
+                                  (entry["new_id"],)).fetchone()
+            if cur is None:
+                continue
+            left = self.db.execute("SELECT COUNT(*) FROM evidence WHERE relation_id=?",
+                                   (entry["new_id"],)).fetchone()[0]
+            carried = cur["status"] == entry["status"]
+            if cur["status"] in self._USER_STATUSES and not carried:
+                continue            # the user decided on the merged link itself
+            if not left:
+                self.db.execute("DELETE FROM relations WHERE id=?", (entry["new_id"],))
+            elif cur["status"] in self._USER_STATUSES:
+                # The decision belonged to the split-off entry's link; what
+                # is left here is the survivor's own evidence: a suggestion
+                # the next rebuild works out again.
+                self.db.execute("UPDATE relations SET status='suggested', updated_ts=?"
+                                " WHERE id=?", (time.time(), entry["new_id"]))
 
     def merged_into_me(self, eid: str) -> List[Dict[str, Any]]:
         return [self.entity(r[0]) for r in self.db.execute(
             "SELECT id FROM entities WHERE merged_into=?", (eid,))]
 
     # ── free-text extraction (KG2) ──
+    def _text_documents(self) -> List[sqlite3.Row]:
+        """The readable documents whose free text may hold links (tables and
+        JSON give theirs through labelled fields)."""
+        return [d for d in self.db.execute(
+                    "SELECT id, path, content_hash FROM documents WHERE status='ok'"
+                    " ORDER BY path").fetchall()
+                if Path(d["path"]).suffix.lower() not in _TABULAR | _JSON]
+
+    def _doc_lines(self, d) -> Optional[List[Tuple[Optional[int], int, str]]]:
+        try:
+            return document_lines(self.root / d["path"])
+        except Exception:
+            return None
+
+    def _doc_context(self, d) -> Tuple[List[Tuple[str, str]], set]:
+        """The document's mentions as (entity id, locator JSON), and every
+        entity tied to it: mentioned anywhere in it, or the project of its
+        Collection."""
+        ments = [(m[0], m[1]) for m in self.db.execute(
+            "SELECT entity_id, locator FROM mentions WHERE document_id=?", (d["id"],))]
+        doc_ents = {e for e, _l in ments}
+        doc_ents |= {r[0] for r in self.db.execute(
+            "SELECT subject_id FROM relations WHERE predicate='DOCUMENTED_IN' AND object_id=?",
+            (d["id"],))}
+        return ments, doc_ents
+
+    @staticmethod
+    def _doc_sig(d, ments, doc_ents, terms_sig: str, max_lines: int, overlap: int) -> str:
+        """Everything a document's passages are worked out from. Unchanged =
+        the same passages, so a finished document need not be read again."""
+        h = hashlib.sha256()
+        for part in ([d["content_hash"], terms_sig, str(max_lines), str(overlap)]
+                     + sorted(f"{e}@{loc}" for e, loc in ments) + sorted(doc_ents)):
+            h.update(part.encode("utf-8"))
+            h.update(b"\0")
+        return h.hexdigest()
+
+    def _doc_chunks(self, d, lines, ments, doc_ents, index, max_lines: int,
+                    overlap: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        by_spot: Dict[Tuple[Optional[int], int], set] = {}
+        for eid, locj in ments:
+            loc = json.loads(locj)
+            if loc.get("line"):
+                by_spot.setdefault((loc.get("page"), int(loc["line"])), set()).add(eid)
+        groups: Dict[Optional[int], List[Tuple[int, str]]] = {}
+        for page, line, text in lines:
+            groups.setdefault(page, []).append((line, text))
+        n = 0
+        for page, plines in groups.items():
+            step = max(1, max_lines - overlap)
+            for start in range(0, max(1, len(plines)), step):
+                window = plines[start:start + max_lines]
+                if not window:
+                    break
+                ents = set()
+                for line, _t in window:
+                    ents |= by_spot.get((page, line), set())
+                wtext = "\n".join(t for _l, t in window)
+                named_projects = self._projects_named(wtext, index)
+                if len(ents) >= 2 or (ents and named_projects - ents):
+                    ents |= named_projects
+                    out.append({"document_id": d["id"], "path": d["path"],
+                                "content_hash": d["content_hash"], "chunk": n,
+                                "page": page, "first_line": window[0][0],
+                                "text": wtext,
+                                # the chunk's own entities first
+                                "entities": (sorted(ents) + sorted(doc_ents - ents))[:60]})
+                n += 1
+                if start + max_lines >= len(plines):
+                    break
+        return out
+
     def text_chunks(self, max_lines: int = 40, overlap: int = 5
                     ) -> List[Dict[str, Any]]:
         """Every text chunk worth a model call: a PDF page, or ~40 lines with
         a small overlap, that mentions at least TWO known entities (the
         gazetteer and labelled-field mentions say which). Tables are skipped
         — their links come from labelled columns."""
+        index = self._project_index()
         out: List[Dict[str, Any]] = []
-        docs = self.db.execute("SELECT id, path, content_hash FROM documents WHERE status='ok'"
-                               " ORDER BY path").fetchall()
-        project_terms = self._project_terms()
-        for d in docs:
-            p = self.root / d["path"]
-            if p.suffix.lower() in _TABULAR or p.suffix.lower() in _JSON:
+        for d in self._text_documents():
+            lines = self._doc_lines(d)
+            if lines is None:
                 continue
-            try:
-                lines = document_lines(p)
-            except Exception:
-                continue
-            ments = self.db.execute(
-                "SELECT entity_id, locator FROM mentions WHERE document_id=?", (d["id"],)).fetchall()
-            by_spot: Dict[Tuple[Optional[int], int], set] = {}
-            for m in ments:
-                loc = json.loads(m["locator"])
-                if loc.get("line"):
-                    by_spot.setdefault((loc.get("page"), int(loc["line"])), set()).add(m["entity_id"])
-            # Everything tied to the document — mentioned anywhere in it, or
-            # the project of its Collection — is offered to the model too: a
-            # one-word name ('the Helios rig') is not searched for (too noisy),
-            # yet it is exactly how prose names a project.
-            doc_ents = {m["entity_id"] for m in ments}
-            doc_ents |= {r["subject_id"] for r in self.db.execute(
-                "SELECT subject_id FROM relations WHERE predicate='DOCUMENTED_IN' AND object_id=?",
-                (d["id"],))}
-            groups: Dict[Optional[int], List[Tuple[int, str]]] = {}
-            for page, line, text in lines:
-                groups.setdefault(page, []).append((line, text))
-            n = 0
-            for page, plines in groups.items():
-                step = max(1, max_lines - overlap)
-                for start in range(0, max(1, len(plines)), step):
-                    window = plines[start:start + max_lines]
-                    if not window:
-                        break
-                    ents = set()
-                    for line, _t in window:
-                        ents |= by_spot.get((page, line), set())
-                    wtext = "\n".join(t for _l, t in window)
-                    named_projects = {pid for rx, pid in project_terms if rx.search(wtext)}
-                    if len(ents) >= 2 or (ents and named_projects - ents):
-                        ents |= named_projects
-                        out.append({"document_id": d["id"], "path": d["path"],
-                                    "content_hash": d["content_hash"], "chunk": n,
-                                    "page": page, "first_line": window[0][0],
-                                    "text": "\n".join(t for _l, t in window),
-                                    # the chunk's own entities first
-                                    "entities": (sorted(ents) + sorted(doc_ents - ents))[:60]})
-                    n += 1
-                    if start + max_lines >= len(plines):
-                        break
+            ments, doc_ents = self._doc_context(d)
+            out += self._doc_chunks(d, lines, ments, doc_ents, index, max_lines, overlap)
         return out
 
     _COMMON_FIRST_WORDS = {"project", "program", "programme", "the", "new", "phase",
@@ -1360,10 +1590,14 @@ class KnowledgeGraph:
         Rig'): prose names projects that way. These only OFFER a project to
         the model — the checks decide what survives; a one-word MENTION
         would be too noisy, so the gazetteer does not do this."""
-        terms, seen = [], set()
+        return [(_term_re(w), pid) for w, pid in self._project_words()]
+
+    def _project_words(self) -> List[Tuple[str, str]]:
+        words_out, seen = [], set()
         for r in self.db.execute(
                 "SELECT a.entity_id, a.alias FROM aliases a JOIN entities e ON"
-                " e.id=a.entity_id WHERE e.type='PROJECT' AND e.merged_into IS NULL"):
+                " e.id=a.entity_id WHERE e.type='PROJECT' AND e.merged_into IS NULL"
+                " ORDER BY a.entity_id, a.alias"):
             words = [r["alias"]]
             first = r["alias"].split()[0] if " " in r["alias"] else ""
             if (len(first) >= 5 and first[:1].isupper()
@@ -1372,8 +1606,34 @@ class KnowledgeGraph:
             for w in words:
                 if len(w) >= 4 and (w.lower(), r["entity_id"]) not in seen:
                     seen.add((w.lower(), r["entity_id"]))
-                    terms.append((_term_re(w), r["entity_id"]))
-        return terms
+                    words_out.append((w, r["entity_id"]))
+        return words_out
+
+    def _project_index(self) -> Dict[str, Any]:
+        """The project terms indexed by their first token, as the gazetteer
+        indexes names: a passage is tested only against the terms whose
+        first word it holds. MEASURED (review, 3,000 documents): one search
+        per term per passage was 348k searches and most of what was left of
+        a 120 s pass. Not one alternation regex: Python takes the FIRST
+        alternative that matches at a spot, so a project called 'Atlas Test'
+        inside another's 'Atlas Test Rig' would no longer be offered."""
+        by_token: Dict[str, List[Tuple["re.Pattern", str]]] = {}
+        always: List[Tuple["re.Pattern", str]] = []
+        words = self._project_words()
+        for w, pid in words:
+            m = _TOKEN_RE.match(w)
+            (by_token.setdefault(m.group(0).lower(), []) if m else always).append(
+                (_term_re(w), pid))
+        sig = hashlib.sha256("\0".join(f"{w.lower()}|{pid}" for w, pid in sorted(words))
+                             .encode("utf-8")).hexdigest()
+        return {"by_token": by_token, "always": always, "sig": sig}
+
+    @staticmethod
+    def _projects_named(text: str, index: Dict[str, Any]) -> set:
+        cands = list(index["always"])
+        for tok in set(t.lower() for t in _TOKEN_RE.findall(text)):
+            cands += index["by_token"].get(tok, [])
+        return {pid for rx, pid in cands if rx.search(text)}
 
     def known_entities(self, ids: Iterable[str]):
         """kg_extract.Known for these entity ids (merged ones resolved)."""
@@ -1387,30 +1647,72 @@ class KnowledgeGraph:
 
     def suggest_from_text(self, workers: Dict[str, Any], *, model: str,
                           on_progress=None, should_stop=lambda: False,
-                          only_new: bool = True) -> Dict[str, Any]:
+                          only_new: bool = True, max_lines: int = 40,
+                          overlap: int = 5) -> Dict[str, Any]:
         """Ask a model for links in the free text; every surviving link lands
         as SUGGESTED (method 'model', the model's name, the quote, the line
         the Council found). ``workers`` maps a worker name ('this PC',
-        'NodePrimus'…) to a kg_extract chat function; chunks are shared out
-        through one queue and the results written here, by one thread.
-        Resumable: chunks done for this document version and model are
-        skipped. ``should_stop()`` pauses after the chunks in flight."""
+        'NodePrimus'…) to a kg_extract chat function — which reads with
+        ``model`` — or to ``(chat, its own model)``: a Pi reads with the
+        smaller model it has. Chunks are shared out through one queue and
+        the results written here, by one thread. ``model`` names the run.
+
+        Resumable: a passage counts as done when a model of THIS run's
+        workers read this version of it without an error. Each passage is
+        recorded under the model that actually read it — a Pi's llama3.2:3b
+        passages were recorded as the PC's gemma3:12b's, so the stronger
+        model never read them — and one that failed (Ollama not running) is
+        read again next time. A document whose passages are all done and
+        whose signature (content, mentions, Collection, project names) is
+        unchanged is not read at all. ``should_stop()`` pauses after the
+        chunks in flight."""
         import queue as _queue
         import threading as _threading
         from council_core import kg_extract as kx
 
-        run_id = str(uuid.uuid4())
-        todo = []
-        for c in self.text_chunks():
-            done = self.db.execute(
+        wk: Dict[str, Tuple[Any, str]] = {
+            name: (w, model) if callable(w) else (w[0], str(w[1]))
+            for name, w in workers.items()}
+        models = sorted({m for _c, m in wk.values()})
+        marks = ",".join("?" * len(models))
+
+        def is_done(doc_id: str, h: str, chunk: int) -> bool:
+            return self.db.execute(
                 "SELECT 1 FROM extraction_done WHERE document_id=? AND content_hash=? AND"
-                " chunk=? AND model=?",
-                (c["document_id"], c["content_hash"], c["chunk"], model)).fetchone()
-            if not (only_new and done):
-                c["known"] = self.known_entities(c["entities"])
-                todo.append(c)
+                f" chunk=? AND error='' AND model IN ({marks})",
+                (doc_id, h, chunk, *models)).fetchone() is not None
+
+        run_id = str(uuid.uuid4())
+        index = self._project_index()
+        todo = []
+        read = skipped = 0
+        with self.db:
+            for d in self._text_documents():
+                ments, doc_ents = self._doc_context(d)
+                sig = self._doc_sig(d, ments, doc_ents, index["sig"], max_lines, overlap)
+                prev = self.db.execute("SELECT sig, chunks FROM extraction_docs WHERE"
+                                       " document_id=?", (d["id"],)).fetchone()
+                if (only_new and prev is not None and prev["sig"] == sig
+                        and all(is_done(d["id"], d["content_hash"], n)
+                                for n in json.loads(prev["chunks"]))):
+                    skipped += 1
+                    continue
+                lines = self._doc_lines(d)
+                if lines is None:
+                    continue
+                read += 1
+                chunks = self._doc_chunks(d, lines, ments, doc_ents, index, max_lines,
+                                          overlap)
+                self.db.execute("INSERT OR REPLACE INTO extraction_docs VALUES (?,?,?)",
+                                (d["id"], sig, json.dumps([c["chunk"] for c in chunks])))
+                for c in chunks:
+                    if only_new and is_done(c["document_id"], c["content_hash"], c["chunk"]):
+                        continue
+                    c["known"] = self.known_entities(c["entities"])
+                    todo.append(c)
         stats = {"chunks": len(todo), "done": 0, "links": 0, "rejected": 0, "errors": 0,
-                 "stopped": False, "by_worker": {}}
+                 "stopped": False, "by_worker": {}, "documents_read": read,
+                 "documents_skipped": skipped}
         with self.db:
             self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
                             (run_id, f"extract:{model}", time.time()))
@@ -1419,22 +1721,22 @@ class KnowledgeGraph:
             jobs.put(c)
         results: "_queue.Queue" = _queue.Queue()
 
-        def work(name, chat):
+        def work(name, chat, wmodel):
             while not should_stop():
                 try:
                     c = jobs.get_nowait()
                 except _queue.Empty:
                     return
                 res = kx.extract(c["text"], c["known"], chat)
-                results.put((name, c, res))
+                results.put((name, wmodel, c, res))
 
-        threads = [_threading.Thread(target=work, args=(n, ch), name=f"kg-extract-{n}",
-                                     daemon=True) for n, ch in workers.items()]
+        threads = [_threading.Thread(target=work, args=(n, ch, m), name=f"kg-extract-{n}",
+                                     daemon=True) for n, (ch, m) in wk.items()]
         for t in threads:
             t.start()
         while any(t.is_alive() for t in threads) or not results.empty():
             try:
-                name, c, res = results.get(timeout=0.2)
+                name, wmodel, c, res = results.get(timeout=0.2)
             except _queue.Empty:
                 continue
             with self.db:
@@ -1447,10 +1749,10 @@ class KnowledgeGraph:
                     self._relate(link.subject, link.predicate, link.object, "suggested",
                                  doc_id=c["document_id"], content_hash=c["content_hash"],
                                  locator=loc, quote=quote, method="model", run_id=run_id,
-                                 model=f"{model} @ {name}")
+                                 model=f"{wmodel} @ {name}")
                 self.db.execute(
                     "INSERT OR REPLACE INTO extraction_done VALUES (?,?,?,?,?,?,?)",
-                    (c["document_id"], c["content_hash"], c["chunk"], model, time.time(),
+                    (c["document_id"], c["content_hash"], c["chunk"], wmodel, time.time(),
                      len(res.links), res.error))
             stats["done"] += 1
             stats["links"] += len(res.links)
@@ -1616,10 +1918,15 @@ class KnowledgeGraph:
         w = csv.writer(buf)
         w.writerow(["subject_type", "subject", "predicate", "object_type", "object",
                     "status", "file", "where", "quote", "method"])
+        # A store an older Council wrote can hold a link whose end is gone
+        # (a name answer once pointed at a deleted person): exported as
+        # '(gone)' instead of failing the whole export.
+        gone = {"type": "", "name": "(gone)"}
         for rel in self.all_relations(include_rejected=True):
+            subj, obj = rel["subject"] or gone, rel["object"] or gone
             for ev in self.evidence(rel["id"]) or [{}]:
-                w.writerow([rel["subject"]["type"], rel["subject"]["name"],
-                            rel["predicate"], rel["object"]["type"], rel["object"]["name"],
+                w.writerow([subj["type"], subj["name"],
+                            rel["predicate"], obj["type"], obj["name"],
                             rel["status"], ev.get("path", ""), ev.get("where", ""),
                             ev.get("quote", ""), ev.get("method", "")])
         return buf.getvalue()

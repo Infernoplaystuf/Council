@@ -620,3 +620,17 @@ def test_csv_rows_are_numbered_as_in_the_file_and_bad_rows_are_reported(tmp_path
         assert kg.coverage()["skipped_rows"] == stats["skipped_rows"]
         ctx = kgm.source_context(v / "data_in", "t.csv", {"row": 5, "column": "Program Lead"})
         assert ("Program Lead", "Dan Smith", True) in ctx
+
+
+# ── review fixes (2026-10-07) ─────────────────────────────────────────────
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Windows path spelling")
+def test_a_store_reached_by_its_long_path_spelling_opens(tmp_path):
+    # The read-only check before writing built its URI with Path.as_uri(),
+    # which gives 'file://%3F/C:/...' for a \\?\ path (a vault past 260
+    # characters): "invalid uri authority", and the store was reported
+    # damaged.
+    v = tmp_path / "v"
+    kgm.KnowledgeGraph(v).close()
+    bs = chr(92)
+    long_v = Path(bs + bs + "?" + bs + str(v.resolve()))
+    kgm.KnowledgeGraph(long_v).close()

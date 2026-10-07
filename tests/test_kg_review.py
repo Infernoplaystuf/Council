@@ -146,3 +146,179 @@ def test_merge_refuses_nonsense(kg, bad):
     other = carol if bad == "same" else kg.search("PN-0088", "PART")[0]["id"]
     with pytest.raises(ValueError):
         kg.merge(carol, other)
+
+
+# ── review fixes (2026-10-07) ─────────────────────────────────────────────
+def _caroline_with_a_rejected_link(kg):
+    """A duplicate 'Caroline Lee' whose model link to PRJ-0915 the user
+    rejected, while Carol Lee's own link to PRJ-0915 comes from labels."""
+    kg._entity("PERSON", "Caroline Lee")
+    kg.db.commit()
+    caroline = person(kg, "Caroline Lee")
+    proj = kg.search("PRJ-0915", "PROJECT")[0]["id"]
+    doc = kg.db.execute("SELECT id, content_hash FROM documents WHERE path LIKE"
+                        " '%helios_status_2026-03.md'").fetchone()
+    kg._relate(caroline, "CONTACT_FOR", proj, "suggested", doc_id=doc[0],
+               content_hash=doc[1], locator={"line": 4}, quote="q", method="model",
+               run_id="r", model="m @ pc")
+    kg.db.commit()
+    rid = next(r["id"] for r in kg.all_relations() if r["subject"]["name"] == "Caroline Lee")
+    kg.set_relation_status(rid, "rejected")
+    return person(kg, "Carol Lee"), caroline
+
+
+def _statuses(kg):
+    return {(r["subject"]["name"], r["predicate"], r["object"]["name"]): r["status"]
+            for r in kg.all_relations(include_rejected=True)}
+
+
+def test_a_link_only_a_model_supports_is_a_suggestion(kg):
+    # Carol Lee CONTACT_FOR PRJ-0915 is seeded from labels; a model says it
+    # too; then the label rules are withdrawn. The desktop's seed() kept it
+    # 'seeded' with only the model's evidence - firm, and never put to the
+    # user. (Fixed by the laptop's re-derived statuses, kept in the merge.)
+    import json as _json
+    note = kg.root / "ironbridge" / "notes" / "helios_contact.txt"
+    sent = "Carol Lee is the point of contact for the Helios Turbine Upgrade and PRJ-0915."
+    note.write_text("Helios contacts\n" + sent + "\n", encoding="utf-8")
+    kg.seed()
+
+    def says_contact(messages, **kw):
+        text = messages[-1]["content"].split('"""')[1]
+        links = ([{"subject": "Carol Lee", "predicate": "CONTACT_FOR", "object": "PRJ-0915",
+                   "quote": sent}] if sent in text else [])
+        return _json.dumps({"links": links})
+    kg.suggest_from_text({"pc": says_contact}, model="m")
+    assert rel_status(kg, "Carol Lee", "CONTACT_FOR", "PRJ-0915") == "seeded"
+    kg.set_rule_status("Point of Contact", "rejected")
+    kg.set_rule_status("POC", "rejected")
+    kg.seed()
+    assert rel_status(kg, "Carol Lee", "CONTACT_FOR", "PRJ-0915") == "suggested"
+
+
+def test_merge_never_overwrites_the_survivors_own_link_and_asks_instead(kg):
+    carol, caroline = _caroline_with_a_rejected_link(kg)
+    assert rel_status(kg, "Carol Lee", "CONTACT_FOR", "PRJ-0915") == "seeded"
+    clashes = kg.merge(carol, caroline)
+    # The user rejected CAROLINE's link, never Carol's: hers stays, and the
+    # clash is handed back for the tab to ask about.
+    assert rel_status(kg, "Carol Lee", "CONTACT_FOR", "PRJ-0915") == "seeded"
+    assert [(c["predicate"], c["kept"], c["theirs"]) for c in clashes] == [
+        ("CONTACT_FOR", "seeded", "rejected")]
+    kg.unmerge(caroline)
+    assert rel_status(kg, "Caroline Lee", "CONTACT_FOR", "PRJ-0915") == "rejected"
+    kg.seed()
+    assert rel_status(kg, "Carol Lee", "CONTACT_FOR", "PRJ-0915") == "seeded"
+    assert rel_status(kg, "Caroline Lee", "CONTACT_FOR", "PRJ-0915") == "rejected"
+
+
+def test_merge_then_unmerge_then_rebuild_restores_every_status(kg):
+    carol, caroline = _caroline_with_a_rejected_link(kg)
+    sup = next(r["id"] for r in kg.all_relations() if r["predicate"] == "SUPERSEDES"
+               and r["subject"]["name"] == "PN-1234/B")
+    kg.set_relation_status(sup, "accepted")
+    kg.seed()
+    before = _statuses(kg)
+    assert before[("PN-1234/B", "SUPERSEDES", "PN-1234/A")] == "accepted"
+    shim_a = kg.search("PN-1234/A", "PART")[0]["id"]
+    shim_b = kg.search("PN-1234/B", "PART")[0]["id"]
+    kg.merge(carol, caroline)
+    kg.merge(shim_b, shim_a)          # their accepted SUPERSEDES becomes a loop
+    kg.seed()                         # a rebuild while merged
+    assert not any(r["subject"]["id"] == r["object"]["id"]
+                   for r in kg.all_relations(include_rejected=True))
+    kg.unmerge(caroline)
+    kg.unmerge(shim_a)
+    kg.seed()
+    assert _statuses(kg) == before
+
+
+def test_unmerge_keeps_an_earlier_merge_into_the_split_entry(kg):
+    for n in ("Alpha Person", "Beta Person", "Gamma Person"):
+        kg._entity("PERSON", n)
+    kg.db.commit()
+    a, b, c = (person(kg, n) for n in ("Alpha Person", "Beta Person", "Gamma Person"))
+    kg.merge(b, a)
+    kg.merge(c, b)
+    assert kg.resolve(a) == c
+    kg.unmerge(b)
+    assert kg.resolve(a) == b and kg.resolve(b) == b
+
+
+def test_unmerge_takes_back_the_names_merge_copied(kg):
+    kg._entity("PERSON", "Caroline Lee")
+    kg.db.commit()
+    caroline, carol = person(kg, "Caroline Lee"), person(kg, "Carol Lee")
+    kg._alias(caroline, "Caz", "user")
+    kg.db.commit()
+    kg.merge(carol, caroline)
+    assert "Caz" in kg.entity(carol)["aliases"]
+    kg.unmerge(caroline)
+    kg.seed()
+    owners = [kg.entity(r[0])["name"] for r in
+              kg.db.execute("SELECT entity_id FROM aliases WHERE alias='Caz'")]
+    assert owners == ["Caroline Lee"]
+
+
+def test_an_answer_about_a_person_who_is_gone_is_asked_again(tmp_path):
+    # 'D. Whitfield' = Dana everywhere; Dana then leaves the documents and a
+    # rebuild deletes her; a new note names 'D. Whitfield' again. The answer
+    # pointed at the deleted id: links and mentions with no entity, and the
+    # CSV export crashed.
+    v = tmp_path / "v"
+    root = v / "data_in"
+    root.mkdir(parents=True)
+    (root / "projects.csv").write_text(
+        "Project ID,Program Lead\nPRJ-0001,Dana Whitfield\nPRJ-0002,Dan Whitfield\n",
+        encoding="utf-8")
+    (root / "note.txt").write_text("Project: PRJ-0003\nProgram Lead: D. Whitfield\n",
+                                   encoding="utf-8")
+    g = kgm.KnowledgeGraph(v)
+    try:
+        g.confirm_all_rules()
+        g.seed()
+        q = review(g, "D. Whitfield")
+        dana = next(c["id"] for c in q["candidates"] if c["name"] == "Dana Whitfield")
+        g.answer_review(q["id"], dana, everywhere=True)
+        g.seed()
+        (root / "projects.csv").write_text("Project ID,Program Lead\nPRJ-0002,Dan Whitfield\n",
+                                           encoding="utf-8")
+        (root / "note.txt").unlink()
+        g.seed()
+        assert g.entity(dana) is None
+        (root / "note2.txt").write_text("Project: PRJ-0004\nProgram Lead: D. Whitfield\n",
+                                        encoding="utf-8")
+        g.seed()
+        ids = {r[0] for r in g.db.execute("SELECT id FROM entities")}
+        assert all(r["subject_id"] in ids and r["object_id"] in ids
+                   for r in g.db.execute("SELECT * FROM relations"))
+        assert all(r[0] in ids for r in g.db.execute("SELECT entity_id FROM mentions"))
+        assert any(r["surface"] == "D. Whitfield" for r in g.reviews())
+        g.export_relations_csv()
+        g.write_exports()
+    finally:
+        g.close()
+
+
+def test_an_answer_can_be_forgotten(kg):
+    q = review(kg, "D. Whitfield")
+    kg.answer_review(q["id"], person(kg, "Dana Whitfield"))
+    kg.seed()
+    assert not [r for r in kg.reviews() if r["surface"] == "D. Whitfield"]
+    ans = kg.answers()
+    assert [(a["surface"], a["name"]) for a in ans] == [("D. Whitfield", "Dana Whitfield")]
+    assert ans[0]["path"].endswith("helios_status_2026-03.md")
+    kg.forget_answer(ans[0]["key"], ans[0]["document_id"])
+    assert kg.answers() == [] and kg.decisions()[-1]["action"] == "name_undo"
+    kg.seed()
+    assert [r for r in kg.reviews() if r["surface"] == "D. Whitfield"]
+
+
+def test_an_everywhere_answer_covers_the_last_first_spelling(kg):
+    q = review(kg, "D. Whitfield")
+    kg.answer_review(q["id"], person(kg, "Dana Whitfield"), everywhere=True)
+    csvp = kg.root / "ironbridge" / "trackers" / "reviewers.csv"
+    csvp.write_text('Project,Owner\nPRJ-0944,"Whitfield, D."\n', encoding="utf-8")
+    kg.seed()
+    assert not [r for r in kg.reviews() if "hitfield" in r["surface"]]
+    assert rel_status(kg, "Dana Whitfield", "LEADS", "PRJ-0944") == "seeded"

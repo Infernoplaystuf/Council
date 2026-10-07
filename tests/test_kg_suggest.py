@@ -161,3 +161,85 @@ def test_rejected_model_link_stays_rejected(kg):
 def test_a_failing_model_is_counted_not_fatal(kg):
     stats = kg.suggest_from_text({"pc": lambda m, **k: "not json"}, model="broken")
     assert stats["errors"] == stats["done"] > 0 and stats["links"] == 0
+
+
+# ── review fixes (2026-10-07) ─────────────────────────────────────────────
+def test_passages_that_failed_are_read_again(kg):
+    # Ollama not running: every passage errored, and was recorded as done, so
+    # a later run with Ollama up read nothing until the documents changed.
+    def down(messages, **kw):
+        raise ConnectionError("Ollama is not running")
+    first = kg.suggest_from_text({"pc": down}, model="gemma3:12b")
+    assert first["chunks"] > 0 and first["errors"] == first["chunks"]
+    again = kg.suggest_from_text({"pc": oracle()}, model="gemma3:12b")
+    assert again["chunks"] == first["chunks"] and again["errors"] == 0
+
+
+def test_each_worker_records_the_model_that_read_the_passage(kg):
+    # A Pi worker reads with its OWN model (llama3.2:3b); its passages were
+    # recorded as read by the PC's model, so gemma3:12b never read them.
+    total = len(kg.text_chunks())
+    s1 = kg.suggest_from_text({"NodePrimus": (oracle(), "llama3.2:3b")}, model="gemma3:12b")
+    assert s1["done"] == total
+    models = {r[0] for r in kg.db.execute("SELECT model FROM extraction_done")}
+    assert models == {"llama3.2:3b"}
+    ev_models = {e["model"] for r in kg.all_relations() for e in kg.evidence(r["id"])
+                 if e["method"] == "model"}
+    assert ev_models == {"llama3.2:3b @ NodePrimus"}
+    kinds = [r[0] for r in kg.db.execute("SELECT kind FROM runs WHERE kind LIKE 'extract%'")]
+    assert kinds == ["extract:gemma3:12b"]
+    # The PC's stronger model has not read them: it does now ...
+    s2 = kg.suggest_from_text({"this PC": (oracle(), "gemma3:12b")}, model="gemma3:12b")
+    assert s2["chunks"] == total
+    # ... and a run with both has nothing left to do.
+    s3 = kg.suggest_from_text({"this PC": (oracle(), "gemma3:12b"),
+                               "NodePrimus": (oracle(), "llama3.2:3b")}, model="gemma3:12b")
+    assert s3["chunks"] == 0
+
+
+def test_a_resumed_run_does_not_read_finished_documents_again(kg):
+    # MEASURED (review, 3,000 documents): a second run with every passage
+    # done took 119 s to return chunks=0 - every document was read and cut
+    # into passages before extraction_done was looked at.
+    first = kg.suggest_from_text({"pc": oracle()}, model="o")
+    assert first["chunks"] > 0 and first["documents_read"] >= 3
+    again = kg.suggest_from_text({"pc": oracle()}, model="o")
+    assert again["chunks"] == 0 and again["documents_read"] == 0
+    assert again["documents_skipped"] == first["documents_read"]
+    # A document whose passages change (a new name in it) is read again.
+    meeting = kg.root / "ironbridge" / "notes" / "meeting_2026-04-02.txt"
+    meeting.write_text(meeting.read_text(encoding="utf-8")
+                       + "\nPriya Raman will join the Atlas Test Rig review.\n",
+                       encoding="utf-8")
+    kg.seed()
+    third = kg.suggest_from_text({"pc": oracle()}, model="o")
+    assert third["chunks"] > 0 and third["documents_read"] == 1
+
+
+def test_mentions_are_found_by_document_through_an_index(kg):
+    plan = " ".join(str(r[-1]) for r in kg.db.execute(
+        "EXPLAIN QUERY PLAN SELECT entity_id, locator FROM mentions WHERE document_id=?",
+        ("x",)))
+    assert "USING INDEX" in plan and "mentions_document" in plan
+
+
+def test_a_shorter_project_name_inside_a_longer_one_is_still_offered(kg):
+    # The project terms are matched through an index of first words; a
+    # project named 'Atlas' must still be offered where the text says
+    # 'Atlas Test Rig' (another project's name could start the same way).
+    pid = kg._entity("PROJECT", "PRJ-0999")
+    kg._alias(pid, "Atlas Test", "user")
+    kg.db.commit()
+    terms = kg._project_index()
+    text = "Hana Kowalski will run the Atlas Test Rig on Monday with Dan Whitfield."
+    hits = kg._projects_named(text, terms)
+    atlas = kg.search("PRJ-0944", "PROJECT")[0]["id"]
+    assert {atlas, pid} <= hits
+
+
+def test_model_evidence_from_a_deleted_file_goes(kg):
+    kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    assert ("Dan Whitfield", "WORKS_ON", "PRJ-0944") in _model_links(kg)
+    (kg.root / "ironbridge" / "notes" / "meeting_2026-04-02.txt").unlink()
+    kg.seed()
+    assert ("Dan Whitfield", "WORKS_ON", "PRJ-0944") not in _model_links(kg)

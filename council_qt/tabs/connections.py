@@ -16,7 +16,9 @@ Accept / Reject on a link. Nothing here deletes or edits a document.
 
 Rebuild and the label harvest run on worker threads with their own SQLite
 connection (a connection belongs to the thread that made it); the view's own
-connection is reopened when they finish.
+connection is reopened when they finish. Listing the installed models asks
+Ollama over HTTP, so it runs on a worker too — building the tab never waits
+on (or, in a test, reaches) a model server.
 """
 from __future__ import annotations
 
@@ -112,28 +114,50 @@ class ConnectionsActions:
         best = kx.DEFAULT_EXTRACTOR
         return ([best] if best in names else []) + [n for n in names if n != best]
 
-    def pi_workers(self) -> List[tuple]:
-        """(name, host url, model) of registered Pi nodes — only when remote
-        nodes are enabled (COUNCIL_REMOTE_NODES=1), the engine's own opt-in."""
+    def pi_nodes(self) -> tuple:
+        """``(usable, skipped)``: usable = (name, host url, model) of the
+        registered Pi nodes whose model is US-origin; skipped = (name, model)
+        of the rest. Only when remote nodes are enabled
+        (COUNCIL_REMOTE_NODES=1), the engine's own opt-in. A node's model
+        was used whatever it was — the real NodePrimus has only qwen2.5:3b,
+        so 'and my Pi nodes' ran extraction on it; local_models() already
+        offered only US-origin models for this PC."""
+        from council_core.pi_setup import pi_models
         try:
             import council_engine as ce
             if not ce._remote_nodes_enabled():
-                return []
+                return [], []
             from council_core import apothecary as apoth
             reg = apoth._ae.NodeRegistry(str(apoth.registry_path(self.vault_dir)))
-            return [(n.name, f"http://{n.host}:{n.ollama_port}", n.model or n.active_model)
-                    for n in reg.list_nodes() if (n.model or n.active_model)]
+            nodes = [(n.name, f"http://{n.host}:{n.ollama_port}", n.model or n.active_model)
+                     for n in reg.list_nodes() if (n.model or n.active_model)]
         except Exception:
-            return []
+            return [], []
+        usable = [x for x in nodes if pi_models.is_us_origin(x[2])]
+        skipped = [(n, m) for n, _u, m in nodes if not pi_models.is_us_origin(m)]
+        return usable, skipped
+
+    def pi_workers(self) -> List[tuple]:
+        """(name, host url, model) of the Pi nodes that may share the work."""
+        return self.pi_nodes()[0]
+
+    def pi_skipped(self) -> List[tuple]:
+        """(name, model) of the Pi nodes left out: not a US-origin model."""
+        return self.pi_nodes()[1]
 
     def suggest(self, model: str, use_pis: bool, on_progress, should_stop):
+        """Each worker reads with its OWN model (a Pi has a smaller one), and
+        the run is named by the bare model: 'extract:' is added once, by the
+        graph (it was added here too: 'extract:extract:gemma3:12b')."""
         from council_core import kg_extract as kx
-        workers = {f"this PC ({model})": kx.ollama_chat(model)}
+        from council_core.pi_setup import pi_models
+        workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
         if use_pis:
             for name, url, pmodel in self.pi_workers():
-                workers[f"{name} ({pmodel})"] = kx.ollama_chat(pmodel, host=url)
+                if pi_models.is_us_origin(pmodel):         # pi_workers filters too
+                    workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
         with self.open_graph() as kg:
-            return kg.suggest_from_text(workers, model=f"extract:{model}",
+            return kg.suggest_from_text(workers, model=model,
                                         on_progress=on_progress, should_stop=should_stop)
 
     def open_file(self, rel_path: str) -> None:
@@ -145,7 +169,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
     """Search, links with evidence, and a source preview."""
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
-                 auto_refresh: bool = True, ask_string=None, ask_yes_no=None):
+                 auto_refresh: bool = True, ask_string=None, ask_yes_no=None,
+                 ask_choice=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -159,6 +184,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         from .. import dialogs as _dialogs
         self.ask_string = ask_string or _dialogs.askstring
         self.ask_yes_no = ask_yes_no or _dialogs.askyesno
+        self.ask_choice = ask_choice or _dialogs.askchoice
         self._build()
         if auto_refresh:
             self._reopen()
@@ -183,6 +209,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.rebuild_btn = self._button(row, "⟳ Rebuild graph", self.on_rebuild)
         self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
+        self.answers_btn = self._button(row, "Your answers", self.on_answers)
         outer.addLayout(row)
 
         srow = QHBoxLayout()
@@ -253,6 +280,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         mrow = QHBoxLayout()
         self.merge_btn = self._button(mrow, "Same as…", self.on_merge)
         self.split_btn = self._button(mrow, "Split off a merged name", self.on_unmerge)
+        self.forget_btn = self._button(mrow, "Forget this answer", self.on_forget_answer)
         mrow.addStretch(1)
         rl.addLayout(mrow)
         split.addWidget(right)
@@ -447,6 +475,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         status = (sel.get("data") or {}).get("status") if is_rel else None
         self.accept_btn.setEnabled(is_rel and status != "accepted")
         self.reject_btn.setEnabled(is_rel and status != "rejected")
+        self.forget_btn.setEnabled(sel.get("kind") == "answer" and not self._busy)
 
     # ------------------------------------------------------------------
     def on_open_file(self) -> None:
@@ -507,16 +536,38 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.show_entity(self._current)
 
     def refresh_models(self) -> None:
+        """List the installed US-origin models and the Pi nodes, on a worker:
+        it asks Ollama over HTTP, which the tab's constructor used to do on
+        the GUI thread (and every test that built the tab reached the real
+        Ollama port)."""
+        self.suggest_btn.setEnabled(False)
+
+        def work() -> None:
+            try:
+                models = self.actions.local_models()
+            except Exception:                             # noqa: BLE001
+                models = []
+            try:
+                pis, skipped = self.actions.pi_workers(), self.actions.pi_skipped()
+            except Exception:                             # noqa: BLE001
+                pis, skipped = [], []
+            self._to_ui(self._models_ready, models, pis, skipped)
+
+        threading.Thread(target=work, name="kg-models", daemon=True).start()
+
+    def _models_ready(self, models, pis, skipped) -> None:
         self.model_box.clear()
-        for m in self.actions.local_models():
+        for m in models:
             self.model_box.addItem(m, m)
-        pis = self.actions.pi_workers()
         self.pis_box.setEnabled(bool(pis))
-        self.pis_box.setToolTip(
-            ", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
-            "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
-            "and enable remote nodes (COUNCIL_REMOTE_NODES=1).")
-        self.suggest_btn.setEnabled(self.model_box.count() > 0)
+        tip = (", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
+               "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
+               "and enable remote nodes (COUNCIL_REMOTE_NODES=1).")
+        if skipped:
+            tip += "\n" + "\n".join(f"{n} skipped: {m} is not a US-origin model"
+                                    for n, m in skipped)
+        self.pis_box.setToolTip(tip)
+        self.suggest_btn.setEnabled(self.model_box.count() > 0 and not self._busy)
 
     def on_suggest(self) -> None:
         """Ask the chosen model (and Pis, if ticked) for links in the free
@@ -611,7 +662,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
     def on_questions(self) -> None:
         """The open questions (an initial that fits two people, an inferred
-        name). Listed for now; answering them is the merge review (KG3)."""
+        name). Select one to answer it (KG3); "Your answers" lists the
+        answers given, each can be forgotten."""
         if self._kg is None:
             return
         self.tree.clear()
@@ -670,7 +722,21 @@ class ConnectionsTab(ViewHelpers, QWidget):
                                f"'{display_name(cur)}'? Its names and links move here; you "
                                "can split it off again.", parent=self):
             return
-        self._kg.merge(self._current, other["id"])
+        clashes = self._kg.merge(self._current, other["id"])
+        # The user's accept/reject on the merged-in entry's link is NOT copied
+        # over this entry's own link (it was: a rejected duplicate link hid a
+        # labelled one for good). Ask, one link at a time.
+        for c in clashes:
+            ent = self._kg.entity(c["object_id"] if c["subject_id"] == self._current
+                                  else c["subject_id"])
+            direction = "out" if c["subject_id"] == self._current else "in"
+            link = f"'{phrase(c['predicate'], direction)} {display_name(ent)}'"
+            if self.ask_yes_no(
+                    "Same decision here?",
+                    f"You {c['theirs']} {display_name(other)}'s link {link}. "
+                    f"{display_name(cur)}'s own link is {c['kept']}. Make it "
+                    f"{c['theirs']} too?", parent=self):
+                self._kg.set_relation_status(c["relation_id"], c["theirs"])
         self.status.setText(f"'{display_name(other)}' merged into '{display_name(cur)}'.")
         self.show_entity(self._current)
         self.on_search()
@@ -678,16 +744,55 @@ class ConnectionsTab(ViewHelpers, QWidget):
     def on_unmerge(self) -> None:
         if self._kg is None or not self._current:
             return
-        merged = self._kg.merged_into_me(self._current)
+        merged = [m for m in self._kg.merged_into_me(self._current) if m]
         if not merged:
             return
         m = merged[0]
+        if len(merged) > 1:
+            # Two or more entries merged in: the user picks which one (the
+            # first was always the one split off).
+            names = [display_name(x) for x in merged]
+            pick = self.ask_choice("Split off which?", "Which merged entry should be "
+                                   "its own again?", names, parent=self)
+            if pick is None:
+                return
+            m = merged[names.index(pick)]
         if not self.ask_yes_no("Split off?", f"Make '{display_name(m)}' its own entry "
-                               "again? Links from labels come back apart at the next "
+                               "again? Its links and your decisions on them go back to "
+                               "it; links from labels are worked out again at the "
                                "rebuild.", parent=self):
             return
         self._kg.unmerge(m["id"])
         self.status.setText(f"'{display_name(m)}' split off. Rebuilding…")
+        self.on_rebuild()
+
+    def on_answers(self) -> None:
+        """The user's own answers about names, so a wrong one can be found and
+        forgotten (an answer had no undo)."""
+        if self._kg is None:
+            return
+        self.tree.clear()
+        self._current = None
+        self._selected = None
+        answers = self._kg.answers()
+        self.status.setText(f"{len(answers)} answer(s) you gave. Select one to forget it.")
+        for a in answers:
+            where = "everywhere" if a["everywhere"] else (a["path"] or "one document")
+            item = QTreeWidgetItem([f"'{a['surface']}' is {a['name']}", "your answer", where])
+            item.setData(0, ROLE_KIND, "answer")
+            item.setData(0, ROLE_DATA, a)
+            self.tree.addTopLevelItem(item)
+        self._enable_actions()
+
+    def on_forget_answer(self) -> None:
+        sel = self._selected or {}
+        if sel.get("kind") != "answer" or self._kg is None or self._busy:
+            return
+        a = sel["data"]
+        self._kg.forget_answer(a["key"], a["document_id"])
+        self._selected = None
+        self.status.setText(f"Forgot that '{a['surface']}' is {a['name']}. Rebuilding — "
+                            "the question will be asked again…")
         self.on_rebuild()
 
     def closeEvent(self, event) -> None:          # noqa: N802 — Qt's name
