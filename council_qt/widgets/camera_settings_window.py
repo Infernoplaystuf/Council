@@ -1116,7 +1116,7 @@ class SettingsCore:
                 self.say(str(out["summary"]))
             return
         late = self.busy and what not in ("capturing", "stopped", "presets",
-                                          "box")
+                                          "box", "streaming")
         if late:
             self.busy = False
             if self._pending and not self._write_timer.isActive():
@@ -1139,6 +1139,15 @@ class SettingsCore:
             # window, a frame-rate limit; Start: exposure and gain). Which
             # rows that moves is the camera's business, so they are read
             # again — once, after the clicks stop.
+            self._refresh_timer.start()
+        elif what == "streaming":
+            # The live view started (or stopped) the stream. WHICH SETTINGS
+            # CHANGE LIVE DEPENDS ON IT: a Basler locks its pixel format,
+            # mirror and binning while it grabs. The rows were described
+            # at Connect, before the live view's first tick started the
+            # stream, so the tabs offered the pixel format as live — no
+            # "restarts the live view", and a binning slider that wrote
+            # (each write a stream restart) at every step of a drag.
             self._refresh_timer.start()
         elif what == "presets":
             self.fill_presets(select=str(out.get("name") or ""))

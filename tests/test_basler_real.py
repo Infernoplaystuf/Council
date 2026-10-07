@@ -533,6 +533,11 @@ def test_the_emulators_node_map_fills_the_tabs(emulator_typhon):
     trigger = tabs.rows["TriggerSource"].editor
     assert "Line1" in {trigger.itemText(i) for i in range(trigger.count())}
     assert tabs.area_edit.text() == fc.current_area()["area"]
+    # The emulator locks its pixel format while it grabs; the tabs, built
+    # at Connect before the live view started the stream, learn it.
+    assert _pump(_app, 2.0, until=lambda: not tabs.rows["PixelFormat"].live)
+    assert "restarts the live view" in tabs.rows["PixelFormat"].note.text()
+    assert tabs.rows["Gain"].live
     # A frame camera honours the boxes beside Start: none greyed.
     for port in ("exposure", "gain", "frame_rate"):
         assert getattr(ui.ports, port).widget.isEnabled(), port

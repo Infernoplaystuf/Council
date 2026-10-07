@@ -589,6 +589,24 @@ def test_the_boxes_beside_start_move_the_same_settings_in_the_tabs(
         ui.on_btn_stop_capture()
 
 
+def test_the_tabs_know_what_the_running_stream_locks(clean, typhon_dir):
+    """The tabs are built at Connect, before the live view's first tick
+    starts the stream — when nothing is locked. A frame camera locks its
+    pixel format while it grabs: the Image tab offered it as live (no
+    "restarts the live view"; a slider of such a setting wrote at every
+    step of a drag). The live view starting the stream is now news to
+    every view, which reads its settings again."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    assert frame_camera._LIVE.previewing
+    assert pump(1.0, until=lambda: not tabs.rows["PixelFormat"].live), \
+        "the tab still says the pixel format changes live"
+    row = tabs.rows["PixelFormat"]
+    assert "restarts the live view" in row.note.text()
+    assert tabs.rows["Gain"].live
+
+
 def test_a_set_is_refused_before_the_camera_is_read_while_it_changes(
         clean, typhon_dir, monkeypatch):
     """A change that restarts the stream owns the camera on the worker. A

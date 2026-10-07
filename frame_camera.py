@@ -939,9 +939,11 @@ def _manage_preview(want: bool) -> None:
         _started_stream(session)
         _LIVE.previewing = True
         _LIVE.idle = ""
+        _announce({"what": "streaming", "streaming": True})
     elif not want and _LIVE.previewing:
         if restartable:
             _stop_preview(session)
+            _announce({"what": "streaming", "streaming": False})
         else:
             # Not stopped — never restart this stream — just not drawn.
             _LIVE.previewing = False
@@ -2163,9 +2165,10 @@ def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
     still "pending" when it returned; and with {"what": "connected"} /
     {"what": "disconnected"}, and {"what": "pending"} when a change goes
     to the worker (its answer follows); {"what": "box", "box": ...} when a
-    box beside Start wrote the camera (_box_written). For the settings
-    window, its tabs and pop-outs, which must show what the camera actually
-    took. Returns a function that removes the listener.
+    box beside Start wrote the camera (_box_written); {"what": "streaming"}
+    when the live view starts or stops the stream (which settings can
+    change live depends on it). For the settings window, its tabs and
+    pop-outs, which must show what the camera actually took. Returns a function that removes the listener.
     Not script-linkable (it takes a function)."""
     if not callable(listener):
         raise RuntimeError("on_camera_change is for the app's own code (it "
