@@ -17,8 +17,11 @@ Accept / Reject on a link. Nothing here deletes or edits a document.
 Rebuild and the label harvest run on worker threads with their own SQLite
 connection (a connection belongs to the thread that made it); the view's own
 connection is reopened when they finish. Listing the installed models asks
-Ollama over HTTP, so it runs on a worker too — building the tab never waits
-on (or, in a test, reaches) a model server.
+Ollama over HTTP (GET /api/tags on this PC), so it runs on a worker too —
+building the tab never waits on a model server. It does still ASK it, as it
+is built: a test that builds the tab stubs ConnectionsActions.local_models
+and pi_nodes (test_connections_tab, and the window fixture of
+test_council_qt_foundation), or it reaches the real Ollama port.
 """
 from __future__ import annotations
 
