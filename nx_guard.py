@@ -24,8 +24,10 @@ script (nx_policy "Two kinds of script"):
     wrapped. Before the real call, each OUTPUT path parameter (path_role:
     found from the installed filter's own signature, not a hand list) is read
     ONCE into a plain string — a PathLike that answers differently the second
-    time gets no second time — resolved (path_contain.canonical: .., 8.3
-    names, junctions, symlinks, \\\\?\\ and UNC spellings) and must:
+    time gets no second time — resolved (path_contain.resolved: .., 8.3
+    names, junctions, symlinks, \\\\?\\ and UNC spellings; compared in its
+    canonical form, and the file system asked about it in a spelling that
+    works past 260 characters) and must:
       - lie under a write root (the vault's data_out, the run's staging and
         working folders),
       - not be an input (read-only roots),
@@ -233,7 +235,11 @@ class Guard:
             self.refuse(what, f"{s} is a network share or a device, not a "
                               f"folder in the output area")
         try:
-            c = path_contain.canonical(s)
+            # c to compare with the roots; q to ask the file system about —
+            # the canonical form of a long path cannot be asked (path_contain
+            # "Comparing is not asking"): under an 8.3 short-name vault an
+            # existing file read as new, and was overwritten.
+            c, q = path_contain.resolved(s)
         except (OSError, ValueError) as exc:
             self.refuse(what, f"{s} cannot be resolved ({exc})")
         if not self._inside(c, self.write_roots):
@@ -242,9 +248,9 @@ class Guard:
                               f"{'; '.join(self.shown_roots) or '(none)'}")
         if self._inside(c, self.read_only):
             self.refuse(what, f"{s} is an input, and inputs are read-only")
-        if os.path.isdir(c):
+        if os.path.isdir(q):
             if not mkdir and not self._own(c):
-                if _has_entries(c):
+                if _has_entries(q):
                     self.refuse(what, f"{s} is a folder that already holds "
                                       f"files this run did not make; a writer "
                                       f"could replace them. Write into a new "
@@ -252,7 +258,7 @@ class Guard:
                 # An empty folder holds nothing to lose: what this run
                 # writes into it is the run's own from here on.
                 self.created.add(c)
-        elif os.path.lexists(c):
+        elif os.path.lexists(q):
             if not self._own(c):
                 self.refuse(what, f"{s} already exists and this run did not "
                                   f"make it; it is never overwritten")
@@ -312,7 +318,7 @@ class Guard:
                    positional: bool) -> Tuple[tuple, dict, list]:
         """Capability, then (MODEL) every output path. Returns the call's
         arguments with each output path replaced by the plain string that
-        was checked, and [(canonical path, existed before)] for after()."""
+        was checked, and those plain strings for after()."""
         name = getattr(cls, "__name__", "?")
         self.check_capability(cls, name)
         if not self.model:
@@ -341,7 +347,7 @@ class Guard:
                         continue
                 what = f"{name}.{pname}"
                 s = self.check_write(value, what)
-                touched.append(path_contain.canonical(s))
+                touched.append(s)
                 if pname in bound:
                     if pname in pos and pos[pname] < len(args) \
                             and pname not in kwargs:
@@ -356,6 +362,9 @@ class Guard:
                 xdmf = next((p.get("default") == "True" for p in params
                              if p["name"] == "write_xdmf_file"), False)
             if xdmf:
+                # Named the way the writer names it: from the path it is
+                # handed, not from the canonical form (which cannot be used
+                # as a path past 260 characters).
                 companion = os.path.splitext(touched[0])[0] + ".xdmf"
                 self.check_write(companion, f"{name} (its .xdmf)")
         return tuple(args), kwargs, touched
@@ -383,8 +392,14 @@ class Guard:
                             f"and it holds a separator, a colon or '..'")
 
     def after(self, touched: list) -> None:
-        for c in touched:
-            if os.path.lexists(c):
+        """What a writer made, from the plain paths it was handed: the run's
+        own from here on."""
+        for s in touched:
+            try:
+                c, q = path_contain.resolved(s)
+            except (OSError, ValueError, TypeError):
+                continue
+            if os.path.lexists(q):
                 self.created.add(c)
 
     def check_pipeline(self, pipeline: Any) -> None:

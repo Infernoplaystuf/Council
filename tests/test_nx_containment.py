@@ -44,6 +44,9 @@ import nx_guard
 import nx_policy
 import path_contain
 import workflow_runner as wr
+# A vault reached by its 8.3 short name whose long name is past 260
+# characters (made with GetShortPathNameW; skips where the volume has none).
+from tests.test_path_contain import short_vault  # noqa: F401  (a fixture)
 
 HELPERS = Path(__file__).resolve().parent / "data" / "dream3d_e2e"
 REAL_CATALOG = json.loads((HELPERS / "nx_catalog.json").read_text(
@@ -579,6 +582,84 @@ def test_a_symlink_out_of_the_output_area_is_outside(tmp_path):
             g.check_write(link / "notes.txt", "test")
     finally:
         os.rmdir(link)
+
+
+def _short_vault_out(short: Path) -> Path:
+    out = short / "data_out"
+    out.mkdir(exist_ok=True)
+    return out
+
+
+@windows_only
+def test_the_overwrite_rule_holds_under_a_short_name_vault(short_vault):
+    """canonical() drops the \\\\?\\ prefix realpath keeps on a long result,
+    so the guard asked lexists/isdir about a 318-character path with
+    LongPathsEnabled=0: an existing data_out file counted as new (measured:
+    a model script overwrote it), and a full folder as empty."""
+    short, long = short_vault
+    out = _short_vault_out(short)
+    earlier = out / "previous_result_from_an_earlier_run.dream3d"
+    earlier.write_text("earlier", encoding="utf-8")
+    full = out / "an_earlier_runs_folder_of_results"
+    full.mkdir()
+    (full / "kept.csv").write_text("kept", encoding="utf-8")
+    # The long spellings really are past what an unprefixed call can use.
+    assert len(path_contain.canonical(earlier)) > 260
+    g = nx_guard.Guard({"trust": "model", "write_roots": [str(out)],
+                        "own_roots": [], "own_files": [], "read_only": []})
+    with pytest.raises(nx_guard.Refused, match="already exists"):
+        g.check_write(str(earlier), "WriteDREAM3DFilter.export_file_path")
+    with pytest.raises(nx_guard.Refused, match="already holds files"):
+        g.check_write(str(full), "WriteASCIIDataFilter.output_dir")
+    # The long spelling the user may see is the same file.
+    with pytest.raises(nx_guard.Refused, match="already exists"):
+        g.check_write("\\\\?\\" + str(long / "data_out" / earlier.name),
+                      "WriteDREAM3DFilter.export_file_path")
+    # A new file is the run's own once checked, and its own to write again.
+    fresh = out / "a_new_result_written_by_this_run.dream3d"
+    assert g.check_write(str(fresh), "first") == str(fresh)
+    fresh.write_text("mine", encoding="utf-8")
+    g.after([str(fresh)])
+    assert g.check_write(str(fresh), "again") == str(fresh)
+    # ...and deleting something the run did not make is still refused.
+    with pytest.raises(nx_guard.Refused):
+        g.check_delete(str(earlier), "deleting")
+    assert earlier.read_text(encoding="utf-8") == "earlier"
+    assert (full / "kept.csv").read_text(encoding="utf-8") == "kept"
+
+
+@needs_nx
+@windows_only
+def test_a_model_script_cannot_overwrite_data_out_under_a_short_name_vault(
+        short_vault):
+    """The reviewer's end-to-end case: the real runner, the real guard, the
+    real nxpython, a vault reached by its short name."""
+    short, _long = short_vault
+    out = _short_vault_out(short)
+    victim = out / "previous_result_from_an_earlier_run.dream3d"
+    victim.write_text("earlier", encoding="utf-8")
+    script = short / "task_model.py"
+    script.write_text(nx_policy.stamp_model_script(
+        "import simplnx as nx\nds = nx.DataStructure()\n"
+        "r = nx.CreateDataArrayFilter.execute(data_structure=ds, "
+        "output_array_path=nx.DataPath('A'), tuple_dimensions=[[3]], "
+        "component_count=1)\n"
+        "r = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+        f"export_file_path={str(victim)!r}, write_xdmf_file=False)\n"
+        "assert not r.errors, r.errors\n", "a test"), encoding="utf-8")
+    res = wr.run_linear([script], vault_dir=short)
+    assert not res.success, res.summary()
+    assert "already exists" in res.step_results[0].error
+    assert victim.read_text(encoding="utf-8") == "earlier"
+    # A NEW output there, with the .xdmf named from the path the writer is
+    # handed, still works.
+    fresh = out / "a_new_result_from_this_run.dream3d"
+    script.write_text(script.read_text(encoding="utf-8").replace(
+        repr(str(victim)), repr(str(fresh))).replace(
+        "write_xdmf_file=False", "write_xdmf_file=True"), encoding="utf-8")
+    res = wr.run_linear([script], vault_dir=short)
+    assert res.success, res.summary()
+    assert fresh.is_file() and fresh.with_suffix(".xdmf").is_file()
 
 
 @needs_nx

@@ -27,29 +27,66 @@ same way or the answer is wrong in one direction or the other:
 
 A string prefix test on the canonical forms is used, not Path.relative_to on
 unresolved paths: "C:\\vault\\data_out_old" is not inside "C:\\vault\\data_out".
+
+Comparing is not asking
+-----------------------
+The canonical form is for COMPARING only. It drops the \\\\?\\ prefix, and a
+long name past 260 characters cannot be used without it (LongPathsEnabled=0,
+the Windows default): os.path.lexists() of the 318-character canonical form
+of an existing file said False (measured), so nx_guard took a data_out file
+the run did not make for a new one and let a model script overwrite it. A
+question for the FILE SYSTEM (exists, is it a folder, what is in it) is asked
+of resolved()'s second spelling, which keeps — or adds — the prefix.
 """
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Tuple
 
 _PREFIX = "\\\\?\\"
 _UNC_PREFIX = "\\\\?\\UNC\\"
+# The longest path a call without \\?\ accepts (MAX_PATH less its NUL).
+_MAX_PLAIN = 259
+
+
+def _compare_form(real: str) -> str:
+    if os.name == "nt":
+        if real.startswith(_UNC_PREFIX):
+            real = "\\\\" + real[len(_UNC_PREFIX):]
+        elif real.startswith(_PREFIX):
+            real = real[len(_PREFIX):]
+    return os.path.normcase(real)
+
+
+def _fs_form(real: str) -> str:
+    """``real`` (a realpath result: absolute, normalised, backslashes) in a
+    spelling every file-system call accepts. The prefix goes on only when the
+    path is too long without it: with \\\\?\\ Windows stops normalising the
+    name, so "x.dream3d." would name a different file from the one the
+    unprefixed spelling a filter is handed opens."""
+    if os.name != "nt" or real.startswith(_PREFIX) or len(real) <= _MAX_PLAIN:
+        return real
+    if real.startswith("\\\\"):
+        return _UNC_PREFIX + real[2:]
+    return _PREFIX + real
 
 
 def canonical(path: Any) -> str:
     """``path`` as one comparable string: absolute, symlinks and junctions
     followed, 8.3 short names expanded (realpath, for every component that
     exists), the \\\\?\\ prefix realpath keeps on a long result dropped, and
-    case folded on Windows. Raises OSError/ValueError/TypeError for what is
-    not a path."""
-    s = os.path.realpath(os.fspath(path))
-    if os.name == "nt":
-        if s.startswith(_UNC_PREFIX):
-            s = "\\\\" + s[len(_UNC_PREFIX):]
-        elif s.startswith(_PREFIX):
-            s = s[len(_PREFIX):]
-    return os.path.normcase(s)
+    case folded on Windows. For comparing only — see "Comparing is not
+    asking". Raises OSError/ValueError/TypeError for what is not a path."""
+    return _compare_form(os.path.realpath(os.fspath(path)))
+
+
+def resolved(path: Any) -> Tuple[str, str]:
+    """(canonical form, file-system spelling) of ``path``, from ONE realpath
+    call: the first to compare with other canonical forms, the second to ask
+    the file system about (lexists, isdir, scandir) — it works whatever the
+    length. Raises like canonical()."""
+    real = os.path.realpath(os.fspath(path))
+    return _compare_form(real), _fs_form(real)
 
 
 def is_under(child: Any, parent: Any) -> bool:

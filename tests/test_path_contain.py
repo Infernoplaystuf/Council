@@ -105,6 +105,28 @@ def test_the_short_name_does_not_weaken_containment(short_vault, tmp_path):
 
 
 @windows_only
+def test_the_file_system_is_asked_in_a_spelling_that_works(short_vault):
+    """canonical() is for comparing: past 260 characters it cannot be asked
+    about (LongPathsEnabled=0) — lexists() of an existing file's canonical
+    form said False. resolved() gives a second spelling that can."""
+    short, long = short_vault
+    (short / "data_out").mkdir(exist_ok=True)
+    f = short / "data_out" / "previous_result_from_an_earlier_run.dream3d"
+    f.write_text("x", encoding="utf-8")
+    c, q = path_contain.resolved(f)
+    assert c == path_contain.canonical(f) and len(c) > 260
+    assert os.path.lexists(q) and os.path.isfile(q)
+    assert os.path.isdir(path_contain.resolved(short / "data_out")[1])
+    assert not os.path.lexists(path_contain.resolved(
+        short / "data_out" / "not_there.dream3d")[1])
+    # A path short enough to use as it is keeps its plain spelling: with
+    # \\?\ Windows stops normalising names ("x." would be another file).
+    plain = long.parent / "x.txt"
+    assert path_contain.resolved(plain)[1] == os.path.realpath(plain)
+    assert not path_contain.resolved(plain)[1].startswith("\\\\?\\")
+
+
+@windows_only
 def test_a_junction_out_of_the_output_area_is_outside_it(tmp_path):
     import _winapi
     vault = tmp_path / "vault"
