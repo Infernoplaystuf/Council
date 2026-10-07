@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+
 def _shipped_script(name: str) -> Path:
     """A script another interpreter runs, so it must exist as a FILE: in a
     frozen build, in the bundle folder (sys._MEIPASS, where council.spec's
