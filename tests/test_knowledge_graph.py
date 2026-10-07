@@ -634,3 +634,107 @@ def test_a_store_reached_by_its_long_path_spelling_opens(tmp_path):
     bs = chr(92)
     long_v = Path(bs + bs + "?" + bs + str(v.resolve()))
     kgm.KnowledgeGraph(long_v).close()
+
+
+# ── faster rebuilds (the user's decision g, 2026-10-07) ──────────────────
+def _full_snapshot(kg):
+    """Everything a rebuild derives from the documents, without run ids and
+    row ids. (Collections live in the vault, not in data_in, so a _fresh
+    copy has none: their rows are left out.)"""
+    q = kg.db.execute
+    return (_snapshot(kg),
+            sorted((r[0], r[1], r[2], r[3]) for r in q(
+                "SELECT e.name, m.locator, m.surface, m.method FROM mentions m"
+                " JOIN entities e ON e.id=m.entity_id WHERE m.method != 'collection'")),
+            sorted((r[0], r[1], r[2]) for r in q(
+                "SELECT relation_id, locator, method FROM evidence"
+                " WHERE method != 'collection'")),
+            sorted((r[0], r[1]) for r in q("SELECT kind, surface FROM review"
+                                           " WHERE status='open'")))
+
+
+def _counting_reads(monkeypatch):
+    import collections
+    calls = collections.Counter()
+    real_records, real_lines = kgm.read_records, kgm.document_lines
+    monkeypatch.setattr(kgm, "read_records",
+                        lambda p, rel, rules: calls.update([Path(p).name]) or
+                        real_records(p, rel, rules))
+    monkeypatch.setattr(kgm, "document_lines",
+                        lambda p: calls.update([Path(p).name]) or real_lines(p))
+    return calls
+
+
+def test_a_rebuild_reads_only_documents_whose_content_changed(tmp_path, monkeypatch):
+    v, _key = _vault(tmp_path)
+    with _graph(v, poc=True) as kg:
+        kg.seed()
+        first = _full_snapshot(kg)
+        calls = _counting_reads(monkeypatch)
+        stats = kg.seed()
+        assert calls == {} and stats["documents_read"] == 0
+        assert stats["documents_unchanged"] > 0
+        assert _full_snapshot(kg) == first
+        memo = v / "data_in" / "ironbridge" / "notes" / "meeting_2026-04-02.txt"
+        memo.write_text(memo.read_text(encoding="utf-8") + "\nPN-0088 is on order.\n",
+                        encoding="utf-8")
+        stats = kg.seed()
+        assert set(calls) == {"meeting_2026-04-02.txt"} and stats["documents_read"] == 1
+        with _fresh(tmp_path, v, "fresh") as fresh:
+            fresh.add_label_synonym("POC", "Point of Contact")
+            fresh.seed()
+            assert _full_snapshot(kg) == _full_snapshot(fresh)
+
+
+def test_changing_the_field_rules_reads_every_document_again(tmp_path, monkeypatch):
+    v = _tiny(tmp_path, {"a.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n",
+                         "b.txt": "Owner: Dan Smith\nPart: PN-1/A\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        calls = _counting_reads(monkeypatch)
+        kg.set_rule_status("Owner", "rejected")
+        kg.seed()
+        assert set(calls) == {"a.md", "b.txt"}
+        assert "Dan Smith" not in _people(kg)
+
+
+def test_a_stopped_rebuild_resumes_where_it_stopped(tmp_path, monkeypatch):
+    v, _key = _vault(tmp_path)
+    with _graph(v, poc=True) as kg:
+        kg.SEED_BATCH = 3
+        n_files = len(kg.document_files())
+
+        def stop_at_seven(n, total):
+            if n == 7:
+                raise KeyboardInterrupt("the app was closed")
+        with pytest.raises(KeyboardInterrupt):
+            kg.seed(on_progress=stop_at_seven)
+        # The batches committed before the stop (two of three documents,
+        # less any this install cannot read) are kept.
+        cached = kg.db.execute("SELECT COUNT(*) FROM doc_cache").fetchone()[0]
+        assert cached >= 3
+        assert kg.db.execute("SELECT COUNT(*) FROM runs WHERE kind='seed' AND"
+                             " finished_ts IS NOT NULL").fetchone()[0] == 0
+        calls = _counting_reads(monkeypatch)
+        stats = kg.seed()
+        assert stats["documents_unchanged"] == cached
+        assert stats["documents_read"] + cached == n_files - len(
+            [u for u in stats["unreadable"] if "needs the" in u])
+        assert len(set(calls)) == stats["documents_read"]
+        with _fresh(tmp_path, v, "fresh") as fresh:
+            fresh.add_label_synonym("POC", "Point of Contact")
+            fresh.seed()
+            assert _full_snapshot(kg) == _full_snapshot(fresh)
+
+
+def test_the_cached_text_of_a_deleted_document_goes(tmp_path):
+    v = _tiny(tmp_path, {"a.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n",
+                         "secret.txt": "Owner: Dan Smith\nThe combination is 1234.\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        assert any("combination" in r[0] for r in kg.db.execute("SELECT lines FROM doc_cache"))
+        (v / "data_in" / "secret.txt").unlink()
+        kg.seed()
+        assert not any("combination" in r[0]
+                       for r in kg.db.execute("SELECT lines || records FROM doc_cache"))
+        assert "doc_cache" not in json.dumps(kg.export_json())

@@ -41,6 +41,10 @@ What is in the store (schema version ``SCHEMA_VERSION``, documented in
   extraction_docs (v3) each document's passages and the signature they
              were worked out from, so a resumed run skips a finished
              document without reading it.
+  doc_cache  (v3) what reading each document gave (labelled records, text
+             lines) at its content hash: a rebuild re-reads only changed
+             documents, and its reading phase commits in batches so a
+             stopped rebuild resumes. Never exported.
 
 Seeding reads "records": a table row, a JSON object, or one document's labelled
 header fields. Two values in one row are a strong link (seeded); values that
@@ -172,6 +176,16 @@ CREATE TABLE IF NOT EXISTS extraction_done (
 -- went to a model. Same signature + every passage done = nothing to read.
 CREATE TABLE IF NOT EXISTS extraction_docs (
     document_id TEXT PRIMARY KEY, sig TEXT NOT NULL, chunks TEXT NOT NULL
+);
+-- v3: what reading a document gave (its labelled records and its text lines),
+-- so a rebuild reads only documents whose content changed and a stopped
+-- rebuild resumes. reader_sig covers the confirmed field rules and the
+-- reading code: either changing reads every document again. A row goes when
+-- its document is deleted or can no longer be read (it holds the text).
+CREATE TABLE IF NOT EXISTS doc_cache (
+    document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+    reader_sig TEXT NOT NULL, records TEXT NOT NULL, lines TEXT NOT NULL,
+    ts REAL NOT NULL
 );
 """
 
@@ -504,6 +518,57 @@ def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     if suf in _JSON:
         return _json_records(p, rel, rules)
     return _text_records(p, rel, rules)
+
+
+#: Part of every doc_cache signature. The reading code's own bytes are in the
+#: signature too (see _reader_sig), so this needs bumping only for a change
+#: elsewhere that alters what a document reads as.
+READER_VERSION = 1
+
+
+def _reader_sig(rules: Sequence[FieldRule]) -> str:
+    """What a cached reading depends on besides the document's bytes: the
+    confirmed rules, the reading code (this module, field_search, vault_rag)
+    and the reader libraries' versions. Any change = read again: a cache
+    that outlived a parser fix would keep the old answers for good."""
+    import importlib.util as iu
+    h = hashlib.sha256(f"reader {READER_VERSION}".encode("utf-8"))
+    for r in sorted(rules, key=lambda r: r.label):
+        h.update(r.to_json().encode("utf-8"))
+    for mod in ("field_search", "vault_rag"):
+        try:
+            spec = iu.find_spec(mod)
+            h.update(Path(spec.origin).read_bytes() if spec and spec.origin else b"-")
+        except Exception:
+            h.update(b"?")
+    h.update(Path(__file__).read_bytes())
+    try:
+        from importlib import metadata as md
+        for lib in ("pandas", "openpyxl", "pypdf", "python-docx", "xlrd"):
+            try:
+                h.update(f"{lib}={md.version(lib)}".encode("utf-8"))
+            except md.PackageNotFoundError:
+                h.update(f"{lib}=-".encode("utf-8"))
+    except Exception:
+        h.update(b"no-metadata")
+    return h.hexdigest()
+
+
+def _records_json(records: Sequence[Record]) -> str:
+    return json.dumps([{"kind": r.kind, "skipped_row": r.skipped_row,
+                        "values": [[v.rule.label, v.raw, v.locator, v.snippet]
+                                   for v in r.values]} for r in records],
+                      ensure_ascii=False)
+
+
+def _records_load(text: str, rel: str, rules_by_label: Dict[str, FieldRule]
+                  ) -> List[Record]:
+    """Records from doc_cache. A label no confirmed rule has raises KeyError
+    (the caller reads the document instead)."""
+    return [Record(rel, d["kind"], [Value(rules_by_label[lab], raw, loc, snip)
+                                    for lab, raw, loc, snip in d["values"]],
+                   skipped_row=int(d.get("skipped_row") or 0))
+            for d in json.loads(text)]
 
 
 def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
@@ -845,23 +910,98 @@ class KnowledgeGraph:
             self._decide(f"relation_{status}", {"relation_id": rid, "note": note})
 
     # ── seeding ──
+    #: The reading phase commits after this many documents (or SEED_BATCH_S
+    #: seconds), so a rebuild stopped part-way — the app closed, the PC
+    #: slept — keeps what it read: the next one starts where it stopped.
+    SEED_BATCH = 50
+    SEED_BATCH_S = 5.0
+
+    def _cached(self, did: str, h: str, sig: str) -> Optional[sqlite3.Row]:
+        row = self.db.execute("SELECT * FROM doc_cache WHERE document_id=?",
+                              (did,)).fetchone()
+        return row if row is not None and row["content_hash"] == h and \
+            row["reader_sig"] == sig else None
+
+    def _cached_lines(self, did: str, h: str, p: Path
+                      ) -> List[Tuple[Optional[int], int, str]]:
+        """A document's text lines: from doc_cache when it holds this
+        version, else read from the file."""
+        row = self.db.execute("SELECT content_hash, lines FROM doc_cache WHERE"
+                              " document_id=?", (did,)).fetchone()
+        if row is not None and row["content_hash"] == h:
+            return [tuple(x) for x in json.loads(row["lines"])]
+        return document_lines(p)
+
     def seed(self, *, use_collections: bool = True, gazetteer: bool = True,
              on_progress=None) -> Dict[str, Any]:
         """Rebuild everything that comes from documents, with no model:
         labelled fields (confirmed rules only), Collections, and a gazetteer
         pass. The user's decisions and accepted/rejected statuses survive.
-        Returns the run's stats (also stored in ``runs``)."""
+        Returns the run's stats (also stored in ``runs``).
+
+        Two phases. READING: each document's records and text lines are kept
+        in doc_cache by content hash, so only documents whose content changed
+        (or every one, when the confirmed rules or the reading code changed)
+        are read and parsed; this phase commits in batches, so a stopped
+        rebuild resumes. MEASURED before (review, 2026-10-06): ~15 minutes
+        for 3,100 files in ONE transaction - stopped, it kept nothing. THE
+        GRAPH: worked out from the cached readings in one transaction, as
+        before - never half-built, and the same as a fresh build."""
         run_id = str(uuid.uuid4())
         t0 = time.time()
         rules = [r for r, _s in self.field_rules("confirmed")]
+        by_label = {r.label: r for r in rules}
+        sig = _reader_sig(rules)
         files = self.document_files()
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
                                  "unreadable": [], "skipped_rows": [],
-                                 "rules": len(rules)}
+                                 "rules": len(rules), "documents_read": 0,
+                                 "documents_unchanged": 0}
+        with self.db:
+            self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
+                            (run_id, "seed", t0))
+        # ── 1. reading (batched commits) ──
+        seen_paths = set()
+        readable: List[Tuple[Path, str, str]] = []
+        last, n_batch = time.time(), 0
+        try:
+            for n, p in enumerate(files):
+                if on_progress:
+                    on_progress(n, len(files))
+                rel = self._rel(p)
+                try:
+                    did, h = self._document(p, run_id)
+                    seen_paths.add(rel)
+                    why = missing_reader(p)
+                    if why:
+                        stats["unreadable"].append(f"{rel}: {why}")
+                        self.db.execute("UPDATE documents SET status='unreadable'"
+                                        " WHERE id=?", (did,))
+                    elif self._cached(did, h, sig) is not None:
+                        stats["documents_unchanged"] += 1
+                        readable.append((p, did, h))
+                    else:
+                        recs = read_records(p, rel, rules)
+                        lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
+                            (did, h, sig, _records_json(recs),
+                             json.dumps(lines, ensure_ascii=False), time.time()))
+                        stats["documents_read"] += 1
+                        readable.append((p, did, h))
+                except Exception as exc:
+                    stats["unreadable"].append(f"{rel}: {exc.__class__.__name__}")
+                n_batch += 1
+                if n_batch >= self.SEED_BATCH or time.time() - last >= self.SEED_BATCH_S:
+                    self.db.commit()
+                    last, n_batch = time.time(), 0
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()          # the batch in progress; earlier ones stay
+            raise
+        # ── 2. the graph (one transaction) ──
         try:
             with self.db:
-                self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
-                                (run_id, "seed", t0))
                 # Derived rows are rebuilt; decisions and user statuses are kept.
                 self.db.execute("DELETE FROM evidence WHERE method != 'model'")
                 self.db.execute("DELETE FROM mentions")
@@ -881,34 +1021,42 @@ class KnowledgeGraph:
                     " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
                     " UNION SELECT subject_id FROM relations WHERE status='accepted'"
                     " UNION SELECT object_id FROM relations WHERE status='accepted'")}
-                seen_paths = set()
                 records: List[Tuple[Record, str, str]] = []
-                for n, p in enumerate(files):
-                    if on_progress:
-                        on_progress(n, len(files))
+                for p, did, h in readable:
+                    row = self._cached(did, h, sig)
                     try:
-                        did, h = self._document(p, run_id)
-                        seen_paths.add(self._rel(p))
-                        why = missing_reader(p)
-                        if why:
-                            stats["unreadable"].append(f"{self._rel(p)}: {why}")
-                            self.db.execute("UPDATE documents SET status='unreadable'"
-                                            " WHERE id=?", (did,))
+                        recs = (_records_load(row["records"], self._rel(p), by_label)
+                                if row is not None else None)
+                    except Exception:
+                        recs = None
+                    if recs is None:            # not expected: read it after all
+                        try:
+                            recs = read_records(p, self._rel(p), rules)
+                        except Exception as exc:
+                            stats["unreadable"].append(
+                                f"{self._rel(p)}: {exc.__class__.__name__}")
                             continue
-                        for rec in read_records(p, self._rel(p), rules):
-                            if rec.kind == "skipped":
-                                stats["skipped_rows"].append(
-                                    f"{rec.path}: row {rec.skipped_row} has more cells "
-                                    "than the header")
-                                continue
-                            records.append((rec, did, h))
-                    except Exception as exc:
-                        stats["unreadable"].append(f"{self._rel(p)}: {exc.__class__.__name__}")
+                    for rec in recs:
+                        if rec.kind == "skipped":
+                            stats["skipped_rows"].append(
+                                f"{rec.path}: row {rec.skipped_row} has more cells "
+                                "than the header")
+                            continue
+                        records.append((rec, did, h))
                 # Gone since the last run: kept (decisions may cite them), marked.
                 for r in self.db.execute("SELECT id, path FROM documents").fetchall():
                     if r["path"] not in seen_paths:
                         self.db.execute("UPDATE documents SET status='missing' WHERE id=?",
                                         (r["id"],))
+                # The cache holds a document's text: none is kept for a file
+                # that was deleted or can no longer be read.
+                keep = [did for _p, did, _h in readable]
+                self.db.execute("CREATE TEMP TABLE IF NOT EXISTS _kg_keep (id TEXT PRIMARY KEY)")
+                self.db.execute("DELETE FROM _kg_keep")
+                self.db.executemany("INSERT OR IGNORE INTO _kg_keep VALUES (?)",
+                                    [(d,) for d in keep])
+                self.db.execute("DELETE FROM doc_cache WHERE document_id NOT IN"
+                                " (SELECT id FROM _kg_keep)")
                 stats["records"] = len(records)
                 # A model's evidence stays across rebuilds (it cost GPU time) -
                 # unless its document changed since, or is gone: then it is
@@ -1194,12 +1342,17 @@ class KnowledgeGraph:
         for p in files:
             if p.suffix.lower() in _TABULAR:
                 continue
-            row = self.db.execute("SELECT id FROM documents WHERE path=?",
-                                  (self._rel(p),)).fetchone()
+            # Not a file this install cannot read (no pypdf): it has no
+            # lines to search, and reading it again only to find that out
+            # was the one read left in an unchanged vault's rebuild.
+            row = self.db.execute("SELECT id, content_hash FROM documents WHERE path=?"
+                                  " AND status='ok'", (self._rel(p),)).fetchone()
             if row is None:
                 continue
             did = row["id"]
-            for page, line, text in document_lines(p):
+            # The lines the reading phase cached: an unchanged document is
+            # not read again for the gazetteer either.
+            for page, line, text in self._cached_lines(did, row["content_hash"], p):
                 loc = {"line": line}
                 if page is not None:
                     loc["page"] = page
@@ -1502,7 +1655,7 @@ class KnowledgeGraph:
 
     def _doc_lines(self, d) -> Optional[List[Tuple[Optional[int], int, str]]]:
         try:
-            return document_lines(self.root / d["path"])
+            return self._cached_lines(d["id"], d["content_hash"], self.root / d["path"])
         except Exception:
             return None
 
