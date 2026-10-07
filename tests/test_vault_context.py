@@ -144,7 +144,7 @@ def test_an_empty_block_changes_nothing():
 
 def test_the_engine_gates_on_the_same_marker():
     import council_engine as ce
-    src = inspect.getsource(ce.PersonalityModel.respond)
+    src = inspect.getsource(ce.PersonalityModel._stitched)   # respond's prompt
     assert repr(vc.MARKER)[1:-1] in src or vc.MARKER in src
     profiles = ce.ROLE_CONTEXT_PROFILES
     assert profiles["writer"]["use_vault"] == "full"
@@ -222,7 +222,7 @@ def test_evidence_is_the_same_passages_under_the_judges_marker(tmp_path):
 
 def test_the_engine_strips_only_the_members_marker_from_the_judge():
     import council_engine as ce
-    src = inspect.getsource(ce.PersonalityModel.respond)
+    src = inspect.getsource(ce.PersonalityModel._stitched)   # respond's prompt
     assert '"VAULT CONTEXT:"' in src
     assert vc.EVIDENCE_MARKER not in src            # never stripped
 

@@ -1021,6 +1021,66 @@ class SharedNotes:
         return len(self._items)
 
 
+def _obj(required=(), **props: Any) -> Dict[str, Any]:
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+_S = {"type": "string"}
+_I = {"type": "integer"}
+_N = {"type": "number"}
+_B = {"type": "boolean"}
+
+#: Each tool's arguments as a JSON schema — what a model with NATIVE tool
+#: calling is given (ModelAgent.act), so it cannot invent an argument.
+PARAMS: Dict[str, Dict[str, Any]] = {
+    "run_python": _obj(["code"], code=_S, filename=_S, timeout_s=_I),
+    "vault_save": _obj(["name", "content"], name=_S, content=_S),
+    "vault_list": _obj(),
+    "vault_read": _obj(["name"], name=_S),
+    "vault_search": _obj(["query"], query=_S),
+    "api_search": _obj(["query"], query=_S, k=_I),
+    "api_signature": _obj(["name"], name=_S),
+    "cached_result": _obj(["query"], query=_S),
+    "recall_decision": _obj(["question"], question=_S, k=_I),
+    "data_digest": _obj(),
+    "table_peek": _obj(["file"], file=_S, rows=_I),
+    "calc": _obj([], expr=_S, convert={"type": "array",
+                                        "items": {"type": ["number", "string"]}},
+                 days_between={"type": "array", "items": _S}, today=_B),
+    "quote_check": _obj(["quote"], quote=_S, file=_S),
+    "field_lookup": _obj(["field"], field=_S, value=_S, file=_S),
+    "column_stats": _obj(["file"], file=_S, column=_S),
+    "data_query": _obj(["code"], code=_S),
+    "read_section": _obj(["name"], name=_S, heading=_S, start=_I, end=_I),
+    "condense_file": _obj(["name"], name=_S, focus=_S, tokens=_I),
+    "semantic_search": _obj(["query"], query=_S, k=_I),
+    "code_outline": _obj(["path"], path=_S),
+    "code_grep": _obj(["pattern"], pattern=_S, path=_S, glob=_S,
+                      ignore_case=_B),
+    "lint_check": _obj([], code=_S, path=_S),
+    "run_tests": _obj(["path"], path=_S, k=_S),
+    "diff_preview": _obj(["path", "content"], path=_S, content=_S),
+    "shared_notes": _obj([], post=_S, read=_B),
+    "make_chart": _obj(["file"], file=_S, kind=_S,
+                       columns={"type": "array", "items": _S}),
+    "node_status": _obj([], probe=_B),
+}
+
+
+def tool_specs(tools: Dict[str, ToolFn]) -> List[Dict[str, Any]]:
+    """[{name, description, parameters}] for native tool calling; [] when
+    any tool lacks a schema (the text path is used then)."""
+    out = []
+    for name, fn in tools.items():
+        params = getattr(fn, "params", None) or PARAMS.get(name)
+        if params is None:
+            return []
+        out.append({"name": name,
+                    "description": getattr(fn, "help", "") or name,
+                    "parameters": params})
+    return out
+
+
 #: Tools whose answer depends only on their arguments and the files, so a
 #: repeat within one question is served from the cache.
 CACHEABLE = frozenset({
@@ -1120,6 +1180,7 @@ class ToolSet(dict):
                     self._cache[key] = res
             return res
         call.help = getattr(fn, "help", "")              # type: ignore[attr-defined]
+        call.params = PARAMS.get(name)                   # type: ignore[attr-defined]
         call.__name__ = name
         return call
 
@@ -1170,5 +1231,5 @@ def judge_checks(tools: Dict[str, ToolFn], candidates: Dict[str, Any],
 
 
 __all__ = ["make_extra_tools", "ToolSet", "SharedNotes", "ROLE_TOOLS",
-           "CACHEABLE", "judge_checks", "calc", "safe_eval", "convert",
+           "CACHEABLE", "PARAMS", "tool_specs", "judge_checks", "calc", "safe_eval", "convert",
            "find_quote", "lint", "resolve_in", "PathError", "tool"]

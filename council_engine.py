@@ -3069,6 +3069,28 @@ def _ollama_num_ctx(slot: str, entry: Optional[Dict[str, Any]]) -> int:
 _THINK_LEVEL_FAMILIES = ("gptoss", "gpt-oss")
 
 
+import contextvars as _contextvars
+from contextlib import contextmanager as _contextmanager
+
+#: The thinking effort the CURRENT call asked for ("low" / "medium" /
+#: "high"), set by PersonalityModel.respond(think=...) for the duration of
+#: one call. None: the default below.
+_THINK_LEVEL: "_contextvars.ContextVar[Optional[str]]" = \
+    _contextvars.ContextVar("council_think_level", default=None)
+THINK_LEVELS = ("low", "medium", "high")
+
+
+@_contextmanager
+def think_level(level: Optional[str]):
+    """Calls made inside this block think at `level` — per step of the
+    council: low for the Peasant and cross-fire, high for the Judge."""
+    token = _THINK_LEVEL.set(level if level in THINK_LEVELS else None)
+    try:
+        yield
+    finally:
+        _THINK_LEVEL.reset(token)
+
+
 def ollama_think(entry: Optional[Dict[str, Any]]) -> Any:
     """The "think" value to send for this model, or None to send nothing.
 
@@ -3084,16 +3106,26 @@ def ollama_think(entry: Optional[Dict[str, Any]]) -> Any:
     if "thinking" not in caps:
         return None
     want = os.environ.get("COUNCIL_OLLAMA_THINK", "").strip().lower()
+    level = _THINK_LEVEL.get()
     who = f"{(entry or {}).get('family', '')} {(entry or {}).get('name', '')}"
     if any(f in who.lower() for f in _THINK_LEVEL_FAMILIES):
-        return want if want in ("low", "medium", "high") else "low"
-    return want in ("1", "true", "on", "yes")
+        # COUNCIL_OLLAMA_THINK, when set, is the user's word and wins;
+        # otherwise the step's level (think_level), else "low".
+        if want in THINK_LEVELS:
+            return want
+        return level if level in THINK_LEVELS else "low"
+    if want:
+        return want in ("1", "true", "on", "yes")
+    return level == "high"
 
 
-def _think_headroom() -> int:
-    """Extra num_predict for a call whose model will think first."""
+def _think_headroom(think: Any = None) -> int:
+    """Extra num_predict for a call whose model will think first: more for
+    a higher thinking level."""
     raw = os.environ.get("COUNCIL_OLLAMA_THINK_HEADROOM", "").strip()
-    return int(raw) if raw.isdigit() else 768
+    base = int(raw) if raw.isdigit() else 768
+    return base * {"medium": 2, "high": 4}.get(think, 1) \
+        if isinstance(think, str) else base
 
 
 class _OllamaHTTPError(RuntimeError):
@@ -3490,7 +3522,7 @@ def _ollama_local_gated(
         # Thinking tokens count against num_predict: without room for them
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
         # tokens thinking on a short warm call, measured).
-        num_predict = int(num_predict) + _think_headroom()
+        num_predict = int(num_predict) + _think_headroom(think)
     model_name = entry["name"]
     wanted_predict = num_predict
     cpt = _ollama_cpt(model_name)
@@ -3890,6 +3922,21 @@ def _native_tool_calls(calls: List[Dict[str, Any]], names: List[str]
     return out
 
 
+def native_tools(role: Optional[str]) -> bool:
+    """Does `role`'s model call tools NATIVELY — an Ollama model whose
+    capabilities include "tools" (llama3.1, gpt-oss)? Never loads a model;
+    False whenever it cannot tell."""
+    try:
+        from council_core import local_models
+        backend, name = _target_for(_slot_for_role(role))
+        if backend != "ollama":
+            return False
+        entry = local_models.ollama_model(name, max_age=60.0) or {}
+        return "tools" in (entry.get("capabilities") or [])
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
 def chat_tools(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
@@ -4163,6 +4210,7 @@ class LocalBackendSpec:
         trace: bool = True,
         token_callback: Optional[Callable[[str], None]] = None,
         role: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> str:
         temp = self.default_temperature if temperature is None else float(temperature)
         mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
@@ -4186,8 +4234,13 @@ class LocalBackendSpec:
         # Ollama fallback when no GGUF can load (_route_chat). With no slot
         # file every role is on "main". `model`, `host`, `allow_remote`
         # retained for trace/registry compatibility.
+        if json_schema is None:
+            return _route_chat(messages, slot=slot, role=role,
+                               temperature=temp, num_predict=mtok,
+                               token_callback=token_callback)
         return _route_chat(messages, slot=slot, role=role, temperature=temp,
-                           num_predict=mtok, token_callback=token_callback)
+                           num_predict=mtok, token_callback=token_callback,
+                           json_schema=json_schema)
 
 
 class BackendRegistry:
@@ -5784,7 +5837,64 @@ class PersonalityModel:
         extra_context: str = "",
         token_callback: Optional[Callable[[str], None]] = None,
         max_tokens: Optional[int] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        think: Optional[str] = None,
     ) -> str:
+        """One call as this personality. ``json_schema`` constrains the
+        reply (structured output; the text is returned either way).
+        ``think`` is this step's thinking effort, "low" / "medium" /
+        "high", for models that think (think_level)."""
+        stitched_user = self._stitched(user_text, extra_context)
+        spec = (
+            self.registry.get(self.backend_key)
+            if self.backend_key
+            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
+        )
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
+        kw: Dict[str, Any] = {}
+        if json_schema is not None:
+            kw["json_schema"] = json_schema
+        with think_level(think):
+            return spec.generate(
+                developer_instructions=self.system_prompt,
+                user_text=stitched_user,
+                temperature=self.temperature,
+                max_tokens=effective_max_tokens,
+                trace=self.trace,
+                token_callback=token_callback,
+                role=self.name,
+                **kw,
+            )
+
+    def respond_with_tools(
+        self,
+        user_text: str,
+        tools: List[Dict[str, Any]],
+        *,
+        extra_context: str = "",
+        max_tokens: Optional[int] = None,
+        think: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One call that may use the model's NATIVE tool calling (Ollama
+        models with the "tools" capability): {"content", "tool_calls"}.
+        Same prompt as respond. Callers check native_tools(role) first —
+        elsewhere chat_tools emulates, which squeezes a free-text
+        answer into JSON."""
+        messages = [{"role": "system", "content": self.system_prompt},
+                    {"role": "user",
+                     "content": self._stitched(user_text, extra_context)}]
+        with think_level(think):
+            return chat_tools(
+                messages, tools, role=self.name, temperature=self.temperature,
+                num_predict=(max_tokens if max_tokens is not None
+                             else self.max_output_tokens))
+
+    def _stitched(self, user_text: str, extra_context: str = "") -> str:
+        """The user message respond sends: memory, profile, project,
+        prior session, history and council context, then the task. The
+        parts that stay the same through a question come first, so the
+        server can reuse its cached prefix (see the Stable prefix test)."""
         # ── Role-aware context profile ─────────────────────────────────
         profile       = ROLE_CONTEXT_PROFILES.get(self.name, _DEFAULT_CONTEXT_PROFILE)
         history_turns = profile["history_turns"]
@@ -5905,23 +6015,7 @@ class PersonalityModel:
             prefix_parts.append("COUNCIL CONTEXT:\n" + filtered_extra.strip())
 
         stitched_user = "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
-
-        spec = (
-            self.registry.get(self.backend_key)
-            if self.backend_key
-            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
-        )
-
-        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
-        return spec.generate(
-            developer_instructions=self.system_prompt,
-            user_text=stitched_user,
-            temperature=self.temperature,
-            max_tokens=effective_max_tokens,
-            trace=self.trace,
-            token_callback=token_callback,
-            role=self.name,
-        )
+        return stitched_user
 
 
 
@@ -6772,7 +6866,15 @@ class JudgeModel(PersonalityModel):
             f"User request:\n{user_text}\n\n"
             f"Candidate response:\n{candidate_text}\n"
         )
-        return self.respond(prompt, extra_context=extra_context)
+        # Structured: the verdict, findings and required changes come back
+        # as JSON (council_schemas) and are rendered into the layout above,
+        # which parse_required_changes and the verdict check read. Thinks
+        # hard — this decides whether the answer ships.
+        from council_core import council_schemas as _cs
+        raw = self.respond(prompt + "\n" + _cs.CRITIQUE_JSON_NOTE,
+                           extra_context=extra_context,
+                           json_schema=_cs.CRITIQUE_SCHEMA, think="high")
+        return _cs.render_critique(raw)
 
     @staticmethod
     def parse_required_changes(critique: str) -> list:
@@ -6865,7 +6967,10 @@ class JudgeModel(PersonalityModel):
                 f"REBUTTAL:\n{rebuttal}\n\n"
                 f"DISCUSSION:\n{discussion}\n"
             )
-        raw = self.respond("\n".join(parts), extra_context=extra_context)
+        from council_core import council_schemas as _cs
+        raw = self.respond("\n".join(parts), extra_context=extra_context,
+                           json_schema=_cs.ranking_schema(list(candidates)),
+                           think="high")
         # Validate and normalise — returns clean JSON string
         parsed = _parse_ranking_json(raw)
         try:

@@ -211,7 +211,32 @@ def peasant_cross_exam(
         "and must not duplicate any question from the prior Q&A list above."
     )
 
-    return peasant_model.respond(prompt, extra_context=extra_context)
+    from .council_schemas import QUESTIONS_SCHEMA, render_questions
+    return render_questions(_ask(
+        peasant_model, prompt, extra_context=extra_context,
+        json_schema=QUESTIONS_SCHEMA, think=THINK["peasant"]))
+
+#: How hard each step thinks, on models that think (council_engine.
+#: think_level): short, frequent steps low; the answer itself and the
+#: Judge high.
+THINK = {"draft": "medium", "rebuttal": "medium", "cross_fire": "low",
+         "peasant": "low", "confidence": "low", "adversarial": "low",
+         "synthesis": "high"}
+
+
+def _ask(model: Any, prompt: str, **kw: Any) -> str:
+    """model.respond(prompt, **kw), dropping json_schema / think for a
+    model that does not take them (stand-ins, older wrappers)."""
+    try:
+        return model.respond(prompt, **kw)
+    except TypeError as exc:
+        if not any(k in str(exc) for k in ("json_schema", "think",
+                                           "unexpected keyword")):
+            raise
+        kw.pop("json_schema", None)
+        kw.pop("think", None)
+        return model.respond(prompt, **kw)
+
 
 def _prior_qa_block(prior_qa: Optional[List[Dict[str, str]]]) -> str:
     if not prior_qa:
@@ -252,8 +277,13 @@ def peasant_turn_questions(peasant_model, *, messages: Dict[str, str],
         "for every member:\n"
         "TO <ROLE>:\nQ1: <question>?\nQ2: <question>?\n"
         "Do not repeat any earlier question.")
-    return peasant_model.respond(prompt, extra_context="\n\n".join(parts),
-                                 max_tokens=160 * max(1, len(messages)))
+    from .council_schemas import render_turn_questions, turn_questions_schema
+    roles_l = [r.lower() for r in messages]
+    return render_turn_questions(_ask(
+        peasant_model, prompt, extra_context="\n\n".join(parts),
+        max_tokens=160 * max(1, len(messages)),
+        json_schema=turn_questions_schema(roles_l),
+        think=THINK["peasant"]), roles_l)
 
 
 _TO_ROLE = re.compile(r"^\s*\**\s*TO\s+([A-Za-z_]+)\s*\**\s*:?\s*\**\s*$",
@@ -532,22 +562,52 @@ class ModelAgent:
         return _cb
 
     def act(self, ctx: AgentContext, *,
-            ask_confidence: bool = False) -> List[AgentEvent]:
+            ask_confidence: bool = False,
+            think: Optional[str] = None) -> List[AgentEvent]:
         """The member's answer as events. `ask_confidence`: a draft, which
-        ends with a CONFIDENCE line (council_core.confidence)."""
+        ends with a CONFIDENCE line (council_core.confidence). `think`: the
+        step's thinking effort (THINK)."""
         events: List[AgentEvent] = []
         prompt = self._compose_prompt(ctx, ask_confidence=ask_confidence)
 
         if not (self.enable_tools and self.tools):
             events.append(AgentEvent(self.display_name, "thought", "Generating response…"))
-            text = self.model.respond(prompt, token_callback=self._make_token_cb())
+            text = _ask(self.model, prompt,
+                        token_callback=self._make_token_cb(), think=think)
             return [AgentEvent(self.display_name, "final", text)]
 
+        # NATIVE tool calling when the member's model has it (an Ollama
+        # model with the "tools" capability): the server returns the calls
+        # as data, with arguments checked against each tool's schema
+        # (tool_kit.PARAMS). Elsewhere the model writes {"tool": …} JSON in
+        # its text and _extract_tool_calls finds it, as before.
+        specs = self._native_specs()
+
+        def ask(text_prompt: str):
+            """(text, calls) for one model call."""
+            nonlocal specs
+            if specs:
+                try:
+                    reply = self.model.respond_with_tools(
+                        text_prompt, specs, think=think)
+                    calls = [{"tool": c.get("name"),
+                              "args": c.get("arguments") or {}}
+                             for c in reply.get("tool_calls") or []]
+                    return str(reply.get("content") or ""), calls
+                except Exception as exc:                  # noqa: BLE001
+                    events.append(AgentEvent(
+                        self.display_name, "thought",
+                        f"Native tool calling failed ({exc}); using text."))
+                    specs = []
+            out = _ask(self.model, text_prompt,
+                       token_callback=self._make_token_cb(), think=think)
+            return out, _extract_tool_calls(out)
+
         events.append(AgentEvent(self.display_name, "thought", "Calling model backend…"))
-        text = self.model.respond(prompt, token_callback=self._make_token_cb())
+        text, calls = ask(prompt)
+        results: List[str] = []
 
         for _ in range(self.max_tool_steps):
-            calls = _extract_tool_calls(text)
             if not calls:
                 events.append(AgentEvent(self.display_name, "final", text))
                 return events
@@ -581,19 +641,40 @@ class ModelAgent:
             ctx.shared.setdefault("tool_payloads", {}).update(payloads)
             obs_text = "\n\n".join(obs_lines).strip() or "(no tool output)"
             events.append(AgentEvent(self.display_name, "observation", obs_text))
+            results.append(obs_text)
 
+            # The follow-up carries the ORIGINAL prompt and every result so
+            # far. It used to send the results alone — each call is
+            # stateless, so the model answered without seeing the question.
             followup = (
-                f"TOOL RESULTS:\n{obs_text}\n\n"
-                "Now produce the best possible answer (no tool JSON unless more tools needed)."
+                f"{prompt}\n\nTOOL RESULTS SO FAR:\n"
+                + "\n\n".join(results) + "\n\n"
+                "Now produce the best possible answer (no tool call unless "
+                "more tools are needed)."
             )
             if ask_confidence:
                 from .confidence import DRAFT_INSTRUCTION
                 followup += "\n\n" + DRAFT_INSTRUCTION
             events.append(AgentEvent(self.display_name, "thought", "Calling model (post-tool)…"))
-            text = self.model.respond(followup, token_callback=self._make_token_cb())
+            text, calls = ask(followup)
 
         events.append(AgentEvent(self.display_name, "final", text))
         return events
+
+    def _native_specs(self) -> List[Dict[str, Any]]:
+        """The tools as native specs when this member's model calls tools
+        natively; [] for the text path."""
+        if not hasattr(self.model, "respond_with_tools"):
+            return []
+        try:
+            import council_engine
+            if not council_engine.native_tools(getattr(self.model, "name",
+                                                       None)):
+                return []
+            from .tool_kit import tool_specs
+            return tool_specs(self.tools)
+        except Exception:                                 # noqa: BLE001
+            return []
 
 class DeliberationOrchestrator:
     """
@@ -640,7 +721,8 @@ class DeliberationOrchestrator:
         (events, answer, confidence). With `emit`, the answer's events go
         out as soon as they exist (the one-at-a-time path)."""
         from . import confidence as _cf
-        evs = self.agents[key].act(ctx, ask_confidence=True)
+        evs = self.agents[key].act(ctx, ask_confidence=True,
+                                   think=THINK["draft"])
         # Self-reported confidence, 0–100%, from the draft's own last line
         # (CONFIDENCE: 85% — reason). The line is cut from the answer the
         # others read. Only when it is missing is the member asked again,
@@ -660,11 +742,12 @@ class DeliberationOrchestrator:
         if conf is None:
             conf = _cf.DEFAULT
             try:
-                raw = self.agents[key].model.respond(
+                raw = _ask(
+                    self.agents[key].model,
                     "How confident are you in this answer, from 0 to 100 "
                     "percent? Reply with ONLY the number.\n\n"
                     f"THE ANSWER:\n{answer[:4000]}",
-                    max_tokens=8,
+                    max_tokens=8, think=THINK["confidence"],
                 )
                 got = _cf.parse_reply(raw)
                 conf = got if got is not None else _cf.DEFAULT
@@ -910,11 +993,13 @@ class DeliberationOrchestrator:
                     return "\n".join(debate_lines)
 
                 def _rebut(key: str) -> str:
-                    return self.agents[key].model.respond(
+                    return _ask(
+                        self.agents[key].model,
                         "Produce your rebuttal now.",
                         extra_context=_rebuttal_context(key),
                         token_callback=self.agents[key]._make_token_cb(),
                         max_tokens=600,  # rebuttals must be concise bullets, not essays
+                        think=THINK["rebuttal"],
                     )
 
                 rebutters = [k for k in panel
@@ -1003,11 +1088,13 @@ class DeliberationOrchestrator:
                         )
 
                     def _post(key: str, turn=turn) -> str:
-                        return self.agents[key].model.respond(
+                        return _ask(
+                            self.agents[key].model,
                             "Post your cross-fire message now.",
                             extra_context=_cf_context(turn),
                             token_callback=self.agents[key]._make_token_cb(),
                             max_tokens=400,  # cross-fire must be tight
+                            think=THINK["cross_fire"],
                         )
 
                     def _record(key: str, msg: str, turn=turn) -> None:
@@ -1162,10 +1249,11 @@ class DeliberationOrchestrator:
                             "Be specific and adversarial. Do NOT offer improvements.\n"
                             "Format: CHALLENGE: <your strongest objection in 3-6 sentences>"
                         )
-                        _adversarial_challenge = self.agents["peasant"].model.respond(
+                        _adversarial_challenge = _ask(
+                            self.agents["peasant"].model,
                             "State your adversarial challenge now.",
                             extra_context=_adv_ctx,
-                            max_tokens=300,
+                            max_tokens=300, think=THINK["adversarial"],
                         )
                         ctx.shared["adversarial_challenge"] = _adversarial_challenge
                         ctx.shared["adversarial_target"] = _winner_role
@@ -1182,7 +1270,8 @@ class DeliberationOrchestrator:
             else:
                 self._phase("Writer — revising the answer" if _revising
                             else "Writer — synthesizing final answer")
-                synth_evs = self.agents[synth].act(ctx)
+                synth_evs = self.agents[synth].act(ctx,
+                                                   think=THINK["synthesis"])
             for ev in synth_evs:
                 if not _quick_answer:
                     emit(ev)
