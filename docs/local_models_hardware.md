@@ -2,8 +2,9 @@
 
 Measured on 2026-10-05 on this laptop; the docs suite was measured again later
 that day on the docs fix that is now merged. **Draft:** the gpt-oss:20b re-run is
-still waiting for enough free memory, so its results are marked
-**GPT-OSS PENDING** until it finishes.
+still waiting for enough free memory (the waits of 2026-10-05 and 2026-10-06 never
+got there; a new wait began on 2026-10-07, see section 7), so its results are
+marked **GPT-OSS PENDING** until it finishes.
 
 <!-- FINALIZER: every "GPT-OSS PENDING" marker (intro, sections 1, 3.1, 3.2, 3.4, 4, 5.2, 5.3, 7)
 gets the re-run's numbers from bench_results/2026-10-05/gpt-oss_20b/gpt-oss_20b_new_run2.json
@@ -13,8 +14,10 @@ with the questions / citations / not-covered / code split, reply tok/s per suite
 over that suite's calls), median and mean seconds per case, placement and load time from
 the log. Then recompute the gpt-oss rows of 5.2 with the method in 5.3, using its own
 per-case token counts and NOT the scaled 2026-10-02 times, and apply the decision rule at
-the end of section 4. If the re-run never happened, say so in each place instead. Delete
-this comment when you are done. -->
+the end of section 4. Add the 2026-10-07 wait (and any later one) to the table of waits in
+section 7 from run2_memory_wait.log, and reword that bullet if the run went ahead. If the
+re-run never happened, say so in each place instead. Delete this comment when you are
+done. -->
 
 **Labels** (the same as in [specialized_nodes.md](specialized_nodes.md)):
 **M\*** = measured on this laptop. **M** = measured by a named source.
@@ -247,7 +250,8 @@ in 9 of 10 questions, phi3.5 in 10 of 10).
 - llama3.1:8b cited the right page, [3], both times. phi3.5 cited [1] (and
   other pages) and failed both.
 - phi3.5 also cites many pages at once: 27 of the 40 pages it cited were right,
-  against 21 of 22 for llama3.1:8b.
+  against 21 of 22 for llama3.1:8b (the harness's own count, over the 12
+  questions and the 5 code tasks).
 
 **The first fix's regression is gone.** Under 85695ce, 2 of 10 code answers were
 scripts without the function the task asks for (llama c05, phi3.5 c02). The
@@ -304,6 +308,9 @@ rests on three facts:
   almost 3 times faster than phi4 (20.1 tokens/s against 7.2).
 - It becomes the first choice for the Coder role only if its time per GUI is
   acceptable to you. That time was about 90 s on 2026-10-02.
+- Either way, memory is tight for it on this laptop. It is 13.8 GB, and in four
+  waits the PC never had the benchmark's safety margin free (the model's size
+  plus 4 GiB; section 7). Close other heavy programs before switching to it.
 
 ---
 
@@ -443,9 +450,27 @@ section 4):
 - **The PC was busy.** Other agents' test suites were running during every run.
   - Free commit memory dipped to 0.6 GB (phi3.5 run) and 1.3 GB (phi4 run).
   - No case was invalid, but the speeds may be slightly low.
-- **gpt-oss:20b has not been measured on the current code yet.** On 2026-10-05
-  the PC never had enough free memory (model size + 4 GB) to load it safely. Its
-  re-run is waiting for that: **GPT-OSS PENDING**.
+- **gpt-oss:20b has not been measured on the current code yet.** The benchmark
+  loads a model only while Windows has more free commit memory than the model's
+  size plus 4 GiB: 16.85 GiB for gpt-oss:20b (13.8 GB on disk). Below that, Windows
+  can run out of commit memory (the 0xC0000142 crash), which would also kill the
+  other programs' tests. The PC never got there:
+
+  | Wait | Readings | Most free commit seen |
+  |---|---|---|
+  | 2026-10-05, 10:02–10:17 | 43 | 15.66 GiB |
+  | 2026-10-05, 19:39–22:03 | 156 | 15.35 GiB |
+  | 2026-10-06, 08:22–11:25 | 183 | 15.02 GiB |
+  | 2026-10-06, 13:37–16:13 | 156 | 14.82 GiB |
+
+  - Other agents' test suites were running during most of these waits. But a new
+    wait on 2026-10-07 began at 15.70 GiB with **no** Python process running, so
+    even without test suites it was about 1.2 GiB short. At the end of the first
+    wait, after a Python test process (1.6 GiB), the largest holders were Claude,
+    Steam's web helper, OneDrive and Discord, at about 0.5–1 GiB each.
+  - The commit limit is 38.96 GiB: 31.7 GiB of RAM plus a page file of about
+    7.3 GiB.
+  - Its re-run is still waiting: **GPT-OSS PENDING**.
 - **Prose roles were not graded.** The writer, judge, skeptic, sage, strategist,
   peasant, intern and artist were not tested. The suites cover only GUIs, code
   behind and documentation answers.
