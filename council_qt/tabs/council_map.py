@@ -101,6 +101,7 @@ class CouncilMapTab(ViewHelpers, QWidget):
             row2, "Refresh models & machines", self.refresh)
         self._button(row2, "Placement review…", self.open_placement)
         self._button(row2, "Machines & roles…", self.open_routing)
+        self._button(row2, "Benchmark…", self.open_bench)
         row2.addStretch(1)
         row2.addWidget(self._legend())
         outer.addLayout(row2)
@@ -359,6 +360,13 @@ class CouncilMapTab(ViewHelpers, QWidget):
         dialog.finished.connect(lambda _r: self._after_placement())
         dialog.open()
         self._routing_dialog = dialog
+
+    def open_bench(self) -> None:
+        """Measure the council on a fixed question set; compare runs."""
+        from ..widgets.bench_dialog import BenchDialog
+        dialog = BenchDialog(self.window or self)
+        dialog.open()
+        self._bench_dialog = dialog
 
     def _after_placement(self) -> None:
         # Applied role changes rewrite model_slots.json: show the new roles,

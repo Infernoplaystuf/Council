@@ -54,6 +54,9 @@ PROTECTED_SUBDIRS: tuple = (
     ".council_usage",
     # How the council decided earlier questions (council_core.past_decisions).
     ".council_memory",
+    # The council benchmark's runs (council_core.council_bench): measurements
+    # of the app, not the user's documents.
+    ".council_bench",
 )
 
 # Lowercased once at import for the per-path membership test in
