@@ -36,8 +36,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 #: Tabs that hold more than one group: (title, its groups in order, what its
 #: tooltip says). A group in none of these has a tab of its own.
 SHARED_TABS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
-    ("Exposure", ("Exposure", "Gain", "Frame rate"),
-     "Exposure, gain and the frame rate, with their auto modes"),
+    ("Exposure", ("Exposure", "Gain", "Frame rate", "Trigger"),
+     "Exposure, gain, the frame rate and the trigger, with their auto "
+     "modes"),
     ("Image", ("Image", "Binning"),
      "Pixel format, mirroring, gamma and binning"),
     ("Filters", ("Event rate controller", "Anti-flicker",
@@ -69,6 +70,7 @@ MOST_USED: Dict[str, Tuple[str, ...]] = {
     "Gain": ("GainAuto", "Gain", "BlackLevel"),
     "Frame rate": ("AcquisitionFrameRateEnable", "AcquisitionFrameRate",
                    "ResultingFrameRate"),
+    "Trigger": ("TriggerMode", "TriggerSource", "TriggerActivation"),
     "Image": ("PixelFormat", "ReverseX", "ReverseY", "GammaEnable", "Gamma"),
     "Binning": ("BinningHorizontal", "BinningVertical"),
     "Biases": ("bias.bias_diff_on", "bias.bias_diff_off", "bias.bias_fo",

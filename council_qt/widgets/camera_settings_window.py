@@ -303,7 +303,17 @@ class SettingRow(QObject):
     from the camera goes through `show_value` with the signals quiet.
 
     `compact` is the main window's tabs: narrower slider and box, and a
-    label that wraps rather than widening a 430 px column."""
+    one-line label, elided, rather than widening a 430 px column.
+
+    A SETTING THE STREAM IS IN THE WAY OF IS WRITTEN ON RELEASE. Each write
+    of one (a Basler's binning) stops the live view, writes and starts it
+    again; a drag wrote one per throttle tick — a stream restarted a dozen
+    times for one gesture. Its slider says nothing while held and writes the
+    value it is let go at. A live setting writes as it moves.
+
+    `explain_read_only`: say under a read-only row why it cannot change —
+    where it sits among settings that can (a group of readings says so once,
+    above them)."""
 
     edited = Signal(str, object)
     reset = Signal(str)
@@ -315,13 +325,15 @@ class SettingRow(QObject):
     COMPACT_LABEL = 150
 
     def __init__(self, setting: Dict[str, Any], grid: QGridLayout, row: int,
-                 parent: QWidget, compact: bool = False):
+                 parent: QWidget, compact: bool = False,
+                 explain_read_only: bool = False):
         super().__init__(parent)
         self.setting = dict(setting)
         self.key = str(setting["key"])
         self.kind = str(setting.get("type") or TEXT)
         self.read_only = bool(setting.get("read_only"))
         self.compact = bool(compact)
+        self.explain_read_only = bool(explain_read_only)
         self._quiet = False
         #: The answer to the last write, said under the row until replaced.
         self.result = ""
@@ -389,6 +401,9 @@ class SettingRow(QObject):
             self.editor = QLabel(parent)
             self.editor.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse)
+            if not self.compact:
+                # Greyed, as a reading is: nothing here can be changed.
+                self.editor.setEnabled(False)
             grid.addWidget(self.editor, row, 1, 1, 2)
             return
         if self.kind == BOOL:
@@ -413,6 +428,7 @@ class SettingRow(QObject):
             slider.setRange(0, self.scale.steps)
             slider.setMinimumWidth(self.WIDTHS[self.compact][0])
             slider.valueChanged.connect(self._from_slider)
+            slider.sliderReleased.connect(self._released)
             self.slider = slider
             grid.addWidget(slider, row, 1)
             grid.addWidget(box, row, 2)
@@ -458,12 +474,27 @@ class SettingRow(QObject):
     def _typed(self, value: float) -> Any:
         return int(round(value)) if self.kind == INT else float(value)
 
+    @property
+    def live(self) -> bool:
+        """Changes while the camera streams (False: the stream must stop)."""
+        return bool(self.setting.get("live", True))
+
     def _from_slider(self, position: int) -> None:
         if self._quiet or self.scale is None:
             return
         value = self._typed(self.scale.value(position))
         self._quietly(lambda: self.editor.setValue(value))
+        if not self.live and self.slider.isSliderDown():
+            return                      # written on release (_released)
         self.edited.emit(self.key, value)
+
+    def _released(self) -> None:
+        """The slider let go: a setting the stream is in the way of is
+        written now, once, at the value it was let go at."""
+        if self._quiet or self.scale is None or self.live:
+            return
+        self.edited.emit(self.key,
+                         self._typed(self.scale.value(self.slider.value())))
 
     def _from_box(self, value: float) -> None:
         if self._quiet:
@@ -599,6 +630,10 @@ class SettingRow(QObject):
         notes: List[Tuple[str, str]] = []
         if self.result:
             notes.append((self.result, self.result_tone))
+        if not writable and self.explain_read_only:
+            why = str(s.get("help") or "").strip() or (
+                "the camera reports it; it cannot be set from here")
+            notes.append((f"Read only — {why}", "dim"))
         if held:
             notes.append((f"Greyed out while {held} — change that first",
                           "dim"))
@@ -649,8 +684,20 @@ def add_group_boxes(layout: QVBoxLayout, parent: QWidget,
         grid = QGridLayout(box)
         grid.setColumnStretch(1, 1)
         grid.setVerticalSpacing(2)
+        readings = all(s.get("read_only") or s.get("type") == TEXT
+                       for s in members)
+        first = 0
+        if readings:
+            # A group of readings says it once, not under every row.
+            note = QLabel("Readings — the camera reports these; they cannot "
+                          "be set.", box)
+            note.setWordWrap(True)
+            note.setEnabled(False)
+            grid.addWidget(note, 0, 0, 1, 4)
+            first = 1
         for index, setting in enumerate(members):
-            keep(SettingRow(setting, grid, index * 2, box))
+            keep(SettingRow(setting, grid, first + index * 2, box,
+                            explain_read_only=not readings))
         layout.addWidget(box)
 
 
@@ -1299,7 +1346,12 @@ class PresetsMixin:
                 return ""
         out = self._call("Import preset", self.api.import_preset, path)
         if out is None:
-            return ""
+            # frame_camera told every listener (this view too) before it
+            # returned: the list is filled and the answer said — `heard`
+            # did it. A refusal leaves last_error.
+            if self.last_error or self._last_heard.get("what") != "presets":
+                return ""
+            out = dict(self._last_heard)
         self.import_folder = os.path.dirname(str(path))
         name = str(out.get("name") or "")
         self.fill_presets(select=name)

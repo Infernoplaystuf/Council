@@ -699,6 +699,25 @@ BASLER_FEATURES: Tuple[_Feature, ...] = (
               "ResultingFrameRateAbs"),
              "Frame rate the camera will run at", "Frame rate", unit="fps",
              read_only=True),
+    # THE TRIGGER, selector first: TriggerMode, Source, Activation and
+    # Delay are the selected trigger's (SFNC), so the selector is written
+    # before them. With a trigger On the camera waits for one before each
+    # frame — the live view shows nothing until one arrives.
+    _Feature("TriggerSelector", ("TriggerSelector",), "Trigger",
+             "Trigger", help="Which trigger the settings below are for — "
+                             "FrameStart starts each frame."),
+    _Feature("TriggerMode", ("TriggerMode",), "Trigger mode", "Trigger",
+             help="On: the camera waits for the trigger below before each "
+                  "frame, and the live view shows nothing until one "
+                  "arrives. Off: it runs free."),
+    _Feature("TriggerSource", ("TriggerSource",), "Trigger source",
+             "Trigger", help="Where the trigger comes from: an input line, "
+                             "software, a timer …"),
+    _Feature("TriggerActivation", ("TriggerActivation",),
+             "Trigger on", "Trigger",
+             help="Which edge or level of the signal triggers."),
+    _Feature("TriggerDelay", ("TriggerDelay", "TriggerDelayAbs"),
+             "Trigger delay", "Trigger", unit="µs"),
     _Feature("DeviceTemperature", ("DeviceTemperature", "TemperatureAbs"),
              "Temperature", "Status", unit="°C", read_only=True),
 )

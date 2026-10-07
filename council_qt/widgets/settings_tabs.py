@@ -301,6 +301,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             page, column = self._new_page(tab.title, tab.tip)
             self.pages[tab.title] = page
             parent = column.parentWidget()
+            before = set(self.rows)
             for section in tab.sections:
                 self._section(parent, column, section, by_key,
                               titled=len(tab.sections) > 1 or
@@ -308,6 +309,14 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             if tab.title == cats.CAMERA_TAB:
                 self._area_section(parent, column)
             column.addStretch(1)
+            # One label column across the tab's sections, so the sliders
+            # line up (each section is a grid of its own).
+            labels = [self.rows[k].label for k in self.rows if k not in before]
+            if labels:
+                width = min(csw.SettingRow.COMPACT_LABEL,
+                            max(lab.sizeHint().width() for lab in labels))
+                for label in labels:
+                    label.setMinimumWidth(width)
         self._restore_title(current)
 
     def _section(self, parent: QWidget, column: QVBoxLayout,
