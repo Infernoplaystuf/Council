@@ -65,8 +65,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+def _shipped_script(name: str) -> Path:
+    """A script another interpreter runs, so it must exist as a FILE: in a
+    frozen build, in the bundle folder (sys._MEIPASS, where council.spec's
+    datas put it); otherwise beside this module. When neither has it, the
+    path beside this module (the caller says it is missing)."""
+    here = Path(__file__).resolve().parent / name
+    base = getattr(sys, "_MEIPASS", None) \
+        if getattr(sys, "frozen", False) else None
+    if base and (Path(base) / name).is_file():
+        return Path(base) / name
+    return here
+
+
 #: Runs a script inside the containment (see nx_guard's docstring).
-GUARD = Path(__file__).resolve().parent / "nx_guard.py"
+GUARD = _shipped_script("nx_guard.py")
 
 
 # ============================================================
@@ -302,6 +315,17 @@ def _run_pipeline_subprocess(
         return base
     model = trust == nx_policy.MODEL
     guarded = model or _imports_simplnx(source)
+    if guarded and not Path(GUARD).is_file():
+        # Never run such a script unguarded. (A bundle built without the
+        # file failed every simplnx step with "can't open file", or "ended
+        # without the containment's report" for a model script.)
+        base.error = (f"the containment script is missing ({GUARD}), and a "
+                      f"simplnx or model-written script is never run without "
+                      f"it. A bundled build must ship nx_guard.py, "
+                      f"nx_policy.py, nx_introspect.py and path_contain.py "
+                      f"beside the app (council.spec datas).")
+        base.duration_s = time.monotonic() - start
+        return base
     tmp: Optional[Path] = None
     report: Optional[Path] = None
     made_cwd: Optional[Path] = None

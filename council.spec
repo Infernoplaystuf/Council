@@ -154,6 +154,18 @@ datas = [
     ("BUILDING.md",               "."),
     ("requirements.txt",          "."),
     ("installs.txt",              "."),
+    # ── Scripts run by ANOTHER interpreter (the DREAM3D-NX env), so they
+    #    must be .py files beside the app, not modules frozen into it:
+    #    workflow_runner launches every simplnx and every model-written
+    #    pipeline script as [nxpython, nx_guard.py, policy, script], and
+    #    nx_bridge runs nx_worker.py; both import the three after them
+    #    from their own folder. tests/test_nx_containment.py checks this
+    #    list against what those two import. ──
+    ("nx_guard.py",               "."),
+    ("nx_worker.py",              "."),
+    ("nx_policy.py",              "."),
+    ("nx_introspect.py",          "."),
+    ("path_contain.py",           "."),
 ] + llama_datas + st_datas + hf_datas + extra_datas
 
 # ---- Modules to deliberately exclude (slim down the bundle) -----------------

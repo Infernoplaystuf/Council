@@ -1303,6 +1303,97 @@ def test_a_model_edited_copy_runs_once_the_user_takes_it_over(
 
 
 # ============================================================
+# 4c. The guard in a bundled build
+# ============================================================
+
+REPO = Path(wr.__file__).resolve().parent
+
+
+def _spec_datas() -> set:
+    """(source, destination) of every literal entry in council.spec's
+    `datas = [...] + ...`."""
+    import ast
+    tree = ast.parse((REPO / "council.spec").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "datas"
+                for t in node.targets):
+            v = node.value
+            while isinstance(v, ast.BinOp):
+                v = v.left
+            return {tuple(e.value for e in el.elts) for el in v.elts
+                    if isinstance(el, ast.Tuple)}
+    raise AssertionError("council.spec has no datas list")
+
+
+def _sibling_modules(*scripts: str) -> set:
+    """Every module of this repo ``scripts`` import (anywhere in them,
+    lazily too), transitively: what must exist as a .py FILE beside a
+    script that runs in another interpreter."""
+    import ast
+    todo, seen = list(scripts), set()
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        tree = ast.parse((REPO / f"{name}.py").read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            mods = [a.name for a in node.names] \
+                if isinstance(node, ast.Import) else (
+                [node.module] if isinstance(node, ast.ImportFrom)
+                and node.module and not node.level else [])
+            todo += [m for m in mods if (REPO / f"{m}.py").is_file()]
+    return seen
+
+
+def test_the_bundle_ships_the_scripts_the_nx_env_runs():
+    """Every simplnx workflow step (the user's too) and every model script
+    runs as [python, nx_guard.py, policy, script], and nx_guard imports its
+    neighbours as files: council.spec shipped none of them, so a frozen
+    build failed every such step ("can't open file ...nx_guard.py")."""
+    need = _sibling_modules("nx_guard", "nx_worker")
+    assert {"nx_guard", "nx_worker", "nx_policy", "nx_introspect",
+            "path_contain"} <= need
+    datas = _spec_datas()
+    missing = sorted(f"{n}.py" for n in need if (f"{n}.py", ".") not in datas)
+    assert not missing, f"council.spec datas lacks {missing}"
+
+
+def test_a_missing_guard_fails_the_step_and_says_so(tmp_path, monkeypatch):
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been launched")
+    monkeypatch.setattr(wr.subprocess, "run", never)
+    monkeypatch.setattr(wr, "GUARD", tmp_path / "gone" / "nx_guard.py")
+    model = tmp_path / "model.py"
+    model.write_text(nx_policy.stamp_model_script("x = 1\n", "a test"),
+                     encoding="utf-8")
+    users_nx = tmp_path / "mine_nx.py"
+    users_nx.write_text("import simplnx as nx\n", encoding="utf-8")
+    monkeypatch.setattr(wr, "interpreter_for",
+                        lambda _s: (sys.executable, None))
+    for script in (model, users_nx):
+        err = wr.run_linear([script]).step_results[0].error
+        assert "nx_guard.py" in err and "missing" in err, err
+        assert "nothing should have been launched" not in err
+    # A plain script of the user's needs no guard: it gets to the launch.
+    plain = tmp_path / "plain.py"
+    plain.write_text("x = 1\n", encoding="utf-8")
+    err = wr.run_linear([plain]).step_results[0].error
+    assert "nothing should have been launched" in err
+
+
+def test_a_frozen_build_finds_the_guard_in_its_bundle_folder(tmp_path,
+                                                            monkeypatch):
+    (tmp_path / "nx_guard.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert wr._shipped_script("nx_guard.py") == tmp_path / "nx_guard.py"
+    monkeypatch.delattr(sys, "frozen")
+    assert wr._shipped_script("nx_guard.py") == REPO / "nx_guard.py"
+
+
+# ============================================================
 # 5. The Tk "Write pipeline" saves MAX_PATH-safe, stamped
 # ============================================================
 
