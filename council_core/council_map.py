@@ -891,8 +891,10 @@ GUIDE: Tuple[GuideStep, ...] = (
         "winner. The Writer then writes the one answer you see, from all of "
         "it: the answers, the arguments, the ranking.\n\n"
         "The Judge checks that answer. PASS — it is shown to you. NEEDS WORK "
-        "— the Judge lists what must change and the council goes round once "
-        "more.",
+        "— the Judge lists what must change, and the Writer revises its "
+        "answer against that list for the Judge to check again (no new "
+        "debate). Only when the Judge rejects the whole approach does the "
+        "full council go round again.",
         ("debate", "judge", "writer", "answer"),
         "council_core/deliberation.py (rank, synthesise, critique)"),
     GuideStep(
