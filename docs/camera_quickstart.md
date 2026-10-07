@@ -151,7 +151,12 @@ adding it to a new one as well is harmless — the second call does nothing.)
 A project built from an example keeps the example as it was **that day**. A
 Typhon built before the FPS box still says **Frame count**, and has no
 **Settings** button; one built before the presets has no preset picker,
-**Save preset** or **Camera settings…** button. To bring it up to date
+**Save preset** or **Camera settings…** button; one built before the
+settings tabs has the exposure, gain and FPS boxes loose under the image
+folder and no tabs. Updating moves those three boxes into the **Basic** tab
+with their names, ports and links, so your own code in their handlers and
+in Start is kept and keeps working (checked on the Typhon example as it
+was just before the tabs, with the FPS and Start handlers edited). To bring it up to date
 without losing your own code:
 
 1. **GUI Designer → Open**, pick your Typhon (`example_typhon` if you used the
@@ -272,10 +277,13 @@ Typhon can connect straight away.
    the camera sees — the **live view** — so you can aim, focus and set the
    camera's area first. **Nothing is saved** while it is only live; the line
    above the picture says `Live · not saving`.
-3. Optionally set the camera up: **Camera settings…** for every setting it
-   has, a box drawn on the picture + **Apply area to camera** for its own
-   ROI — or simply **pick a preset** in the box under the status line. See
-   *Camera settings and presets* and *The bird bath* below.
+3. Optionally set the camera up: the **tabs under the image folder** hold
+   its settings by category (each can **Pop out** into a window of its own),
+   **Camera settings…** has every setting in one window, a box drawn on the
+   picture + **Apply area to camera** sets its own ROI — or simply **pick a
+   preset** in the box under the status line or the **Presets** tab. See
+   *The settings tabs under the image folder*, *Camera settings and presets*
+   and *The bird bath* below.
 4. **Start capture** — frames are written to that folder (and, for an EVK4,
    the `.raw`).
 5. **Stop capture** when done — the picture goes back to live — then copy the
@@ -347,7 +355,9 @@ capture instead of one with gaps.
 
 ### Exposure, gain and FPS
 
-Exposure and gain are applied when **Start capture** starts. **0 means "leave
+These three boxes are in the **Basic** tab under the image folder (see *The
+settings tabs under the image folder* for the rest of the camera's
+settings). Exposure and gain are applied when **Start capture** starts. **0 means "leave
 it as the camera has it"** (a spin box always has a number in it):
 
 - **Exposure µs** — up to 10 s. Basler only; an event camera has no exposure.
@@ -667,6 +677,172 @@ line says so when it had to move. **Full sensor** puts it back.
   **Camera's area** box.
 - **Not while capturing**, on either camera — see *One set-up per run*.
 
+### The settings tabs under the image folder
+
+Under the **Image folder** box is a row of tabs that holds the camera's
+settings in the main window — no window to open for the everyday ones.
+
+- **Basic** is always there: the **Exposure**, **Gain** and **FPS** boxes
+  (they used to sit on their own under the folder; they work exactly as
+  before — see *Exposure, gain and FPS*). Connected to an event camera,
+  Exposure and Gain are greyed (an event camera has neither) and the note
+  under them says so; FPS still sets its picture window.
+- When a camera **connects**, a tab per category of **that camera's own
+  settings** appears beside Basic, built from what the camera describes —
+  so an EVK4, a Basler and the simulated cameras each get their own set, and
+  a model with more features gets more rows, never fewer. **Disconnect**, or
+  connecting another camera, rebuilds them; with no camera the tabs say
+  *Connect a camera to see its settings*.
+  - **EVK4**: **Biases** (`bias_diff_on`, `bias_diff_off`, `bias_fo`,
+    `bias_hpf`, `bias_refr`, each with the sensor's own range, and a green
+    bar under the slider marking the range the sensor **recommends**),
+    **Filters** (the event rate controller, anti-flicker, the event trail /
+    STC filter and the event rate activity filter, each a section of its
+    own), **Display** (below), **Camera** (its area, then the readings —
+    temperature, illumination, pixel dead time — and what it is: serial,
+    sensor, event format).
+  - **Basler**: **Exposure** (exposure and auto exposure, gain and auto gain,
+    black level, the frame-rate limit and the rate the camera will reach,
+    and the trigger: mode, source, edge, delay), **Image** (pixel format,
+    mirror X/Y, gamma, digital shift, binning and its mode), **Camera** (its
+    area, and its temperature where the model reports one) — whichever of
+    these nodes the model has.
+  - **Simulated cameras**: their small set, the same way.
+- Last, **Presets** (below).
+
+A tab is a **glance and a quick change**: each section shows its category's
+most-used settings, compactly, and says how many more there are
+(`+4 more in Pop out: Filter, Duty cycle, Start threshold, …`). Everything in a tab is
+**live**, exactly as in the settings window: a slider writes the newest
+value at most every 60 ms while it moves and always the last one, so the
+live picture follows the drag; what the camera took is what is shown.
+
+**Display — what an event picture looks like.** The live view used only the
+defaults; these are now settings of the event camera (the simulated event
+camera has them too):
+
+- **Picture window** — how long each picture collects events (the same thing
+  the FPS box sets: 50 fps = 20 ms);
+- **Events shown** — `ON and OFF`, `ON only` or `OFF only`;
+- **Colours** — `Grey` (mid-grey ground, white ON, black OFF: the picture
+  every earlier run saved), `Dark` (the events on black — easier to read in a
+  sparse scene) or `Colour` (light ON and blue OFF on dark blue; the PNGs are
+  then saved in colour).
+
+They change the **live view and the PNGs only — never the `.raw`**, which has
+every event whatever they are (the raw view draws it in the standard grey).
+They are saved in presets and in each run's `<run>_camera.json`, so a run
+says how its PNGs were drawn.
+
+### Pop out a category
+
+**Pop out ⧉** beside a section opens **that category** — every one of its
+settings — in a window of its own beside Typhon. Not a dialog: the live view
+and any capture carry on, and **several can be open at once** (Biases on one
+side, Anti-flicker on the other); pressing Pop out again brings the open one
+forward.
+
+- Every setting of the category, with the **camera's own range and unit**
+  beside it (`-85 … 140`, and under it `rec. -25 … 60` for a bias), as the
+  camera reports them.
+- **Live**: drag a bias and the live picture shows it as you drag, through
+  the same 60 ms throttle — the camera is not sent a value per pixel of the
+  drag.
+- **Everything stays in step**: a change in a pop-out moves the same row in
+  the tabs and in any other window showing it, and the FPS box (or Start
+  writing the exposure and gain boxes) moves the rows it sets — the views
+  all hear the one answer the camera gave.
+- A setting **the stream is in the way of** (a Basler's pixel format, mirror,
+  binning) says `Changing this restarts the live view for a moment`; its
+  slider writes **once, when you let go**, not at every step of a drag (each
+  write would stop and restart the stream). While **capturing** it is greyed
+  with `Stop the capture to change this — one run keeps one set-up`, and
+  frame_camera refuses it with the capture's message anyway.
+- A setting **another one owns** is greyed and says why
+  (`Greyed out while ExposureAuto is Continuous — change that first`); a
+  **read-only** one says `Read only — …`; a category of readings (Status)
+  says so once at the top.
+- **Reset <category> (as connected)** puts only this category back as the
+  camera had it when it was connected — the rest are left alone. While
+  capturing it works when everything in the category changes live (it is
+  the same as dragging each back by hand); a category with a setting the
+  stream is in the way of is refused until Stop.
+- A **preset bar** at the bottom: pick a preset and **Apply**, or type a name
+  and **Save** — the **whole camera** (every setting and its area), not only
+  this category; a pop-out is where a set-up gets tuned, so it is where it
+  can be saved.
+
+### Saving a configuration — presets, export and import
+
+A **preset** is the camera's whole set-up: every setting worth saving
+(including an event camera's Display settings) **and the camera's own area**,
+kept per camera **in the app's project folder** (`camera_presets.json`), as
+described under *Camera settings and presets*. Three places save and apply
+them, and they always list the same presets:
+
+- the **Presets** tab: the list; **Apply** (or double-click), **Rename**,
+  **Delete** (click twice); a name + **Save as** (tick *with the camera's
+  area* to include it); **Export…** and **Import…**;
+- each pop-out's preset bar (above);
+- the preset box and **Save preset** under the status line.
+
+**Export…** writes the preset chosen in the list to a file of its own,
+`<name>.camera-preset.json`, in a folder you pick — to take to **another
+project or another PC**. It **never writes over a file**: a name already
+there becomes `<name>_2.camera-preset.json` (the file is created
+exclusively, so not even a file that appears at the same moment is
+replaced).
+
+**Import…** adds the preset in such a file to this camera's presets **in
+this project**. It is checked as strictly as the presets file itself — not
+JSON, not an exported preset (a project's whole `camera_presets.json` is
+refused with a word on what to export instead), bigger than 1 MB, saved by a
+newer version of the app, or a value of the wrong kind: each refused with
+the reason, and nothing is written. It **never replaces a preset**: a name
+already used here gets ` (2)` and the status line says so. A preset saved on
+the **other kind** of camera (an event camera's biases for a Basler) is
+refused — none of it could apply; one from **another model of the same
+kind** is imported, and the status line names the settings this camera does
+not have (they are reported, not applied, when you apply it). Importing does
+not apply it: pick it to apply it.
+
+**Applying a preset says what it took.** It is applied **live** where it can
+be — the status line ends `Applied live.` — and where something in it needs
+the stream stopped, the live view restarts once for all of it and the line
+names what needed that: `The live view restarted for Pixel format (the
+stream must stop to change it).` Applying a preset, like changing the area,
+waits for **Stop** while capturing (one run, one set-up); **saving** one
+works while capturing.
+
+**What the tabs and pop-outs cost the window** — offscreen on this PC, the
+window not on any screen but painted into its offscreen buffer, four runs
+on a simulated frame camera at **5328 x 3040** (the boA5320's size, Mono8,
+30 fps), dragging Gain back and forth for 4 s at 60 positions a second:
+
+| UI thread | Tabs only | Dragging in the tab | Dragging in a pop-out (the tab open too) | 3 pop-outs open, dragging |
+|---|---|---|---|---|
+| live view, per tick (median / worst) | 1.8–2.0 / 2.4–3.1 ms | 1.8–2.0 / 2.8–4.7 ms | 1.8–2.0 / 2.8–3.1 ms | 1.9–2.0 / 2.9–3.3 ms |
+| one setting written, the whole cycle (median / worst) | — | 0.34–0.36 / 0.6–2.1 ms | 0.51–0.53 / 1.0–2.2 ms | 0.53–0.55 / 1.0–1.7 ms |
+| pictures drawn a second | 27.0–28.3 | 28.2 | 26.7–28.2 | 26.9–29.1 |
+| longest the window was busy | 7–15 ms | 9–11 ms | 7–10 ms | 8–10 ms |
+
+About 60 writes reach the camera in the 4 s of dragging (the throttle), and
+each view reads its settings again once, when the drag stops (0.1–0.2 ms
+here). The "longest busy" column is the largest gap seen by a 2 ms timer,
+and the longest one (15 ms) came with nothing being dragged — the live
+view's own 16 MB picture, not the settings. On **pylon's emulator** (a real
+`BaslerDevice`, its largest frame 4096 x 3040): 30.3–30.4 pictures a second
+and 0.26–0.29 ms a tick in every case, 0.6–0.97 ms per written gain; a fake
+EVK4 at 1280 x 720: 0.25–0.27 ms a tick, 0.34–0.59 ms per written bias.
+**Not measured: a real EVK4** — a tab reads every facility of the camera
+once after a drag stops there, which on the real sensor is a USB read per
+setting (a pop-out reads only its own category).
+
+**Smallest window.** At Typhon's smallest size (1400 x 820) the column is
+431 px wide and a tab page 190 px high: every tab title fits (an EVK4's six
+need 419 px), nothing on a page is wider than the page, and a page scrolls
+down to what does not fit (checked with Arial, offscreen, for each camera).
+
 ### Camera settings and presets
 
 **Camera settings…** (under the status line) opens a window beside Typhon —
@@ -680,8 +856,10 @@ with its own ranges, increments and units, so nothing is guessed:
   rate controller** (on/off, rate limit), **anti-flicker** (on/off, band pass /
   band stop, the frequency band, duty cycle, thresholds), the **event trail
   filter** (on/off, TRAIL / STC_CUT_TRAIL / STC_KEEP_TRAIL, threshold), the
-  **event rate activity filter** where the sensor has one, the picture window
-  (ms per picture), and read-only status: temperature, pixel dead time,
+  **event rate activity filter** where the sensor has one, the **display**
+  (the picture window in ms per picture, which events are shown, the
+  colours — see *The settings tabs under the image folder*), and read-only
+  status: temperature, pixel dead time,
   serial, sensor, event format. A `.raw` opened as a device has none of the
   facilities and lists only what it has.
 - **Basler** (from the node map): exposure (and auto), gain (and auto), black
@@ -806,9 +984,12 @@ only the bird bath matters.
    `Camera's area: 512, 300, 160, 120 of 1280x720, sensor px`. Drawn too
    big? Draw a smaller box on the new picture and apply again — it lands
    where you drew it.
-3. **Camera settings…** — set the biases (`bias_diff_on` / `bias_diff_off`
-   for how strong a change must be), the trail filter, anti-flicker for a
-   pump or a lamp. The picture shows each change as you make it.
+3. The **Biases** and **Filters** tabs under the image folder (or **Pop
+   out** a category, or **Camera settings…**) — set the biases
+   (`bias_diff_on` / `bias_diff_off` for how strong a change must be), the
+   trail filter, anti-flicker for a pump or a lamp; **Display** if the
+   events read better on black. The picture shows each change as you make
+   it.
 4. Type `Bird bath` into the preset box and press **Save preset**.
 5. Another day — another run of Typhon, the same project: **Connect**, pick
    **Bird bath** in the preset box. The biases, filters and the camera's ROI
