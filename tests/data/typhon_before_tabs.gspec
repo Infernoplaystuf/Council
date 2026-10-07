@@ -1,0 +1,2422 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 1016,
+    "w": 1504
+  },
+  "clarifications": [],
+  "gspec_version": 3,
+  "mode": "linked",
+  "project": "typhon",
+  "requires": [
+    "numpy",
+    "PIL",
+    "sklearn"
+  ],
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 20 bold",
+      "freeform": false,
+      "h": 40,
+      "id": "s00",
+      "kind": "label",
+      "label": "Typhon",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 416,
+      "x": 24,
+      "y": 16,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s01",
+      "kind": "label",
+      "label": "Image folder",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 304,
+      "x": 24,
+      "y": 72,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s02",
+      "kind": "file_picker",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "capture_folder"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [],
+        "mode": "folder"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 464,
+      "x": 24,
+      "y": 104,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s03",
+      "kind": "label",
+      "label": "Exposure µs (0 = keep)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 224,
+      "x": 24,
+      "y": 168,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s04",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "exposure"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "increment": 100,
+        "to": 10000000
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 224,
+      "x": 24,
+      "y": 200,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s05",
+      "kind": "label",
+      "label": "Gain dB (0 = keep)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 224,
+      "x": 24,
+      "y": 256,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s06",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "gain"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "increment": 1,
+        "to": 48
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 224,
+      "x": 24,
+      "y": 288,
+      "z": 7
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s07",
+      "kind": "label",
+      "label": "FPS (0 = camera default)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 224,
+      "x": 24,
+      "y": 344,
+      "z": 8
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s08",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frame_rate"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "increment": 1,
+        "to": 1000
+      },
+      "resize": "auto",
+      "script": {
+        "function": "apply_frame_rate",
+        "inputs": [
+          "frame_rate"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 224,
+      "x": 24,
+      "y": 376,
+      "z": 9
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s09",
+      "kind": "label",
+      "label": "Live view",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "view_status"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 296,
+      "x": 512,
+      "y": 72,
+      "z": 10
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 440,
+      "id": "s10",
+      "kind": "image_canvas",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "live_view"
+      },
+      "props": {
+        "colormap": "",
+        "overlay": false,
+        "overlay_alpha": 0.5,
+        "roi": true,
+        "zoom_to_fit": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 104,
+      "z": 11
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "s11",
+      "kind": "scrubber",
+      "label": "Frame",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frame"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "show_total": true,
+        "to": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 288,
+      "x": 512,
+      "y": 568,
+      "z": 12
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s12",
+      "kind": "button",
+      "label": "Scan for bad timings",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "scan_report",
+        "inputs": [
+          "capture_folder"
+        ],
+        "module": "frame_timing",
+        "outputs": {
+          "bad_count": "count",
+          "bad_list": "names"
+        }
+      },
+      "w": 256,
+      "x": 24,
+      "y": 440,
+      "z": 13
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s13",
+      "kind": "label",
+      "label": "Frames on a bad timing",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 496,
+      "z": 14
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s14",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "bad_count"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 528,
+      "z": 15
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s15",
+      "kind": "label",
+      "label": "Which frames",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 584,
+      "z": 16
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 120,
+      "id": "s16",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "bad_list"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 616,
+      "z": 17
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s17",
+      "kind": "label",
+      "label": "Crop box (x, y, w, h)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 512,
+      "y": 632,
+      "z": 18
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s18",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "roi"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 512,
+      "y": 664,
+      "z": 19
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s19",
+      "kind": "label",
+      "label": "Save cropped frames to",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 792,
+      "y": 632,
+      "z": 20
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s20",
+      "kind": "file_picker",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "output_folder"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [],
+        "mode": "folder"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 792,
+      "y": 664,
+      "z": 21
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s21",
+      "kind": "button",
+      "label": "Save cropped frames",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "export_roi",
+        "inputs": [
+          "capture_folder",
+          "roi",
+          "output_folder"
+        ],
+        "module": "frame_roi",
+        "outputs": {
+          "save_status": "summary"
+        }
+      },
+      "w": 256,
+      "x": 512,
+      "y": 720,
+      "z": 22
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 48,
+      "id": "s22",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "save_status"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 320
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 792,
+      "y": 720,
+      "z": 23
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 24,
+      "id": "s23",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "current_frame"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 296,
+      "x": 816,
+      "y": 72,
+      "z": 24
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 14 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s24",
+      "kind": "label",
+      "label": "Classifier",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 72,
+      "z": 25
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s25",
+      "kind": "label",
+      "label": "Model — pick one, or type a new name",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 104,
+      "z": 26
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s26",
+      "kind": "combobox",
+      "label": "Model",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "classifier_name"
+      },
+      "props": {
+        "command": "",
+        "readonly": false,
+        "values": []
+      },
+      "resize": "auto",
+      "script": {
+        "function": "open_classifier",
+        "inputs": [
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_name": "name",
+          "classifier_status": "summary"
+        }
+      },
+      "w": 232,
+      "x": 1136,
+      "y": 128,
+      "z": 27
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s27",
+      "kind": "button",
+      "label": "Open",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "open_classifier",
+        "inputs": [
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_name": "name",
+          "classifier_status": "summary"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 128,
+      "z": 28
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s28",
+      "kind": "label",
+      "label": "New class",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 80,
+      "x": 1136,
+      "y": 480,
+      "z": 29
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s29",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "new_class"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 144,
+      "x": 1224,
+      "y": 480,
+      "z": 30
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s30",
+      "kind": "button",
+      "label": "Add class",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "add_class",
+        "inputs": [
+          "classifier_name",
+          "new_class"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_status": "summary",
+          "new_class": "cleared"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 480,
+      "z": 31
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s31",
+      "kind": "label",
+      "label": "Classes (pick one, then mark)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 520,
+      "z": 32
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 88,
+      "id": "s32",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "classes"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 544,
+      "z": 33
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s33",
+      "kind": "button",
+      "label": "Mark this frame",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "mark_frame",
+        "inputs": [
+          "classifier_name",
+          "capture_folder",
+          "current_frame",
+          "classes"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 232,
+      "x": 1136,
+      "y": 640,
+      "z": 34
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s34",
+      "kind": "button",
+      "label": "Remove class",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "remove_class",
+        "inputs": [
+          "classifier_name",
+          "classes"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_status": "summary"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 640,
+      "z": 35
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s35",
+      "kind": "button",
+      "label": "Train",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "train",
+        "inputs": [
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 168,
+      "x": 1136,
+      "y": 680,
+      "z": 36
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s36",
+      "kind": "button",
+      "label": "Predict this frame",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "predict_frame",
+        "inputs": [
+          "classifier_name",
+          "capture_folder",
+          "current_frame"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 168,
+      "x": 1312,
+      "y": 680,
+      "z": 37
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 96,
+      "id": "s37",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "classifier_status"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 336
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 720,
+      "z": 38
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s38",
+      "kind": "button",
+      "label": "Classify all frames",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "classify_folder",
+        "inputs": [
+          "classifier_name",
+          "capture_folder"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classified_with_line": "classified_with",
+          "classifier_status": "summary",
+          "predictions": "rows"
+        }
+      },
+      "w": 344,
+      "x": 1136,
+      "y": 824,
+      "z": 39
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s39",
+      "kind": "label",
+      "label": "Predictions",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 864,
+      "z": 40
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 112,
+      "id": "s40",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "predictions"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 888,
+      "z": 41
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s41",
+      "kind": "label",
+      "label": "Camera",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 232,
+      "x": 24,
+      "y": 784,
+      "z": 42
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 96,
+      "id": "s42",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "cameras"
+      },
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 464,
+      "x": 24,
+      "y": 816,
+      "z": 43
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s43",
+      "kind": "button",
+      "label": "Scan for cameras",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "list_cameras",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "camera_notes": "notes",
+          "cameras": "rows",
+          "capture_status": "summary"
+        }
+      },
+      "w": 224,
+      "x": 24,
+      "y": 920,
+      "z": 44
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s44",
+      "kind": "button",
+      "label": "Connect",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "connect",
+        "inputs": [
+          "cameras"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 112,
+      "x": 264,
+      "y": 920,
+      "z": 45
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s45",
+      "kind": "button",
+      "label": "Disconnect",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "disconnect",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 104,
+      "x": 384,
+      "y": 920,
+      "z": 46
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s46",
+      "kind": "button",
+      "label": "Start capture",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "start",
+        "inputs": [
+          "capture_folder",
+          "exposure",
+          "gain",
+          "frame_rate"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 224,
+      "x": 24,
+      "y": 960,
+      "z": 47
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s47",
+      "kind": "button",
+      "label": "Stop capture",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "stop",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 224,
+      "x": 264,
+      "y": 960,
+      "z": 48
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s48",
+      "kind": "label",
+      "label": "Camera's ROI (its own area) — draw a box on the live view, then Apply",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 784,
+      "z": 49
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s49",
+      "kind": "button",
+      "label": "Apply area to camera",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "set_area",
+        "inputs": [
+          "roi"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary",
+          "roi": "crop"
+        }
+      },
+      "w": 296,
+      "x": 512,
+      "y": 816,
+      "z": 50
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s50",
+      "kind": "button",
+      "label": "Full sensor",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "full_frame",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary",
+          "roi": "crop"
+        }
+      },
+      "w": 296,
+      "x": 816,
+      "y": 816,
+      "z": 51
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "s51",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "capture_status"
+      },
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 888,
+      "z": 52
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s52",
+      "kind": "label",
+      "label": "Backends not searched",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 192,
+      "x": 296,
+      "y": 584,
+      "z": 53
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 120,
+      "id": "s53",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "camera_notes"
+      },
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 192,
+      "x": 296,
+      "y": 616,
+      "z": 54
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s54",
+      "kind": "button",
+      "label": "Camera setup…",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "setup",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "camera_notes": "notes",
+          "cameras": "rows",
+          "capture_status": "summary"
+        }
+      },
+      "w": 224,
+      "x": 264,
+      "y": 780,
+      "z": 55
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s55",
+      "kind": "button",
+      "label": "Play / Pause",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "play_pause",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 808,
+      "y": 572,
+      "z": 56
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s56",
+      "kind": "button",
+      "label": "PNG / Raw",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "toggle_view",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 912,
+      "y": 572,
+      "z": 57
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s57",
+      "kind": "button",
+      "label": "Pop out",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "pop_out",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 1016,
+      "y": 572,
+      "z": 58
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s58",
+      "kind": "button",
+      "label": "Settings ▾",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "settings_menu",
+        "inputs": [],
+        "module": "gui_settings",
+        "outputs": {}
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 16,
+      "z": 59
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 24,
+      "id": "s59",
+      "kind": "label",
+      "label": "Camera's area: — (no camera connected)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "camera_area"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 856,
+      "z": 60
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 24,
+      "id": "s60",
+      "kind": "label",
+      "label": "Presets (settings + area) — pick one to apply, or type a name and Save",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 936,
+      "z": 61
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s61",
+      "kind": "combobox",
+      "label": "Preset",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "preset"
+      },
+      "props": {
+        "command": "",
+        "readonly": false,
+        "values": []
+      },
+      "resize": "auto",
+      "script": {
+        "function": "pick_preset",
+        "inputs": [
+          "preset"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 296,
+      "x": 512,
+      "y": 960,
+      "z": 62
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s62",
+      "kind": "button",
+      "label": "Save preset",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "save_preset",
+        "inputs": [
+          "preset"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 816,
+      "y": 960,
+      "z": 63
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s63",
+      "kind": "button",
+      "label": "Camera settings…",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "camera_settings",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 968,
+      "y": 960,
+      "z": 64
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s64",
+      "kind": "label",
+      "label": "Show",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 56,
+      "x": 1136,
+      "y": 168,
+      "z": 65
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s65",
+      "kind": "combobox",
+      "label": "Filter",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "default": "All classifiers",
+        "dir": "io",
+        "name": "classifier_filter"
+      },
+      "props": {
+        "command": "",
+        "readonly": false,
+        "values": []
+      },
+      "resize": "auto",
+      "script": {
+        "function": "list_classifiers",
+        "inputs": [
+          "classifier_filter"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 280,
+      "x": 1200,
+      "y": 168,
+      "z": 66
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s66",
+      "kind": "entry",
+      "label": "New name",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "new_name"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "New name",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 104,
+      "x": 1136,
+      "y": 208,
+      "z": 67
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s67",
+      "kind": "button",
+      "label": "Save as",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "save_as",
+        "inputs": [
+          "classifier_name",
+          "new_name",
+          "classifier_filter"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_name": "name",
+          "classifier_status": "summary",
+          "new_name": "cleared"
+        }
+      },
+      "w": 72,
+      "x": 1248,
+      "y": 208,
+      "z": 68
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s68",
+      "kind": "button",
+      "label": "Rename",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "rename_classifier",
+        "inputs": [
+          "classifier_name",
+          "new_name",
+          "classifier_name",
+          "classifier_filter"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_name": "name",
+          "classifier_status": "summary",
+          "new_name": "cleared"
+        }
+      },
+      "w": 72,
+      "x": 1328,
+      "y": 208,
+      "z": 69
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s69",
+      "kind": "button",
+      "label": "Delete",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "delete_classifier",
+        "inputs": [
+          "classifier_name",
+          "classifier_name",
+          "classifier_filter"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_name": "name",
+          "classifier_status": "summary"
+        }
+      },
+      "w": 72,
+      "x": 1408,
+      "y": 208,
+      "z": 70
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s70",
+      "kind": "file_picker",
+      "label": "Export folder",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "export_to"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [],
+        "mode": "folder"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 232,
+      "x": 1136,
+      "y": 248,
+      "z": 71
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s71",
+      "kind": "button",
+      "label": "Export",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "export_classifier",
+        "inputs": [
+          "classifier_name",
+          "export_to",
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 248,
+      "z": 72
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s72",
+      "kind": "button",
+      "label": "Export this app's classifiers",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "export_this_app",
+        "inputs": [
+          "export_to"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 344,
+      "x": 1136,
+      "y": 288,
+      "z": 73
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s73",
+      "kind": "file_picker",
+      "label": "Import file",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "import_from"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [
+          "*.zip"
+        ],
+        "mode": "file"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 232,
+      "x": 1136,
+      "y": 328,
+      "z": 74
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s74",
+      "kind": "button",
+      "label": "Import",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "import_classifier",
+        "inputs": [
+          "import_from",
+          "new_name",
+          "classifier_filter",
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classes": "classes",
+          "classifier_name": "name",
+          "classifier_status": "summary",
+          "new_name": "cleared"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 328,
+      "z": 75
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s75",
+      "kind": "entry",
+      "label": "Tag",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "tag"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "Tag",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 120,
+      "x": 1136,
+      "y": 368,
+      "z": 76
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s76",
+      "kind": "button",
+      "label": "Add tag",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "add_tag",
+        "inputs": [
+          "classifier_name",
+          "tag",
+          "classifier_filter",
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary",
+          "tag": "cleared"
+        }
+      },
+      "w": 104,
+      "x": 1264,
+      "y": 368,
+      "z": 77
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s77",
+      "kind": "button",
+      "label": "Remove tag",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "remove_tag",
+        "inputs": [
+          "classifier_name",
+          "tag",
+          "classifier_filter",
+          "classifier_name"
+        ],
+        "module": "frame_classes",
+        "outputs": {
+          "classifier_status": "summary"
+        }
+      },
+      "w": 104,
+      "x": 1376,
+      "y": 368,
+      "z": 78
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 64,
+      "id": "s78",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "classified_with_line"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 336
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 344,
+      "x": 1136,
+      "y": 408,
+      "z": 79
+    }
+  ],
+  "window": {
+    "bg": "#045f80",
+    "fg": "#ffffff",
+    "font": "Arial 11",
+    "min_h": 820,
+    "min_w": 1400,
+    "title": "Typhon"
+  }
+}

@@ -157,9 +157,10 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
     changes = dx.layout_changes(old, new)
     # Pop out, Settings, then the camera's own set-up: the area line, the
     # presets heading, the preset picker, Save preset, Camera settings;
-    # then the classifier library (s64-s78).
+    # then the classifier library (s64-s78); then the camera settings tabs
+    # under the image folder (s79 the notebook, s80 Basic, s81 its note).
     assert [a.rsplit(" (", 1)[-1].rsplit(" ", 1)[-1].rstrip(")")
-            for a in changes.added] == [f"s{i}" for i in range(57, 79)]
+            for a in changes.added] == [f"s{i}" for i in range(57, 82)]
     assert changes.added[:2] == ["Pop out (s57)", "Settings ▾ (s58)"]
     assert {"Preset (s61)", "Save preset (s62)",
             "Camera settings… (s63)"} <= set(changes.added)
@@ -181,7 +182,7 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 22 added, 0 removed, 8 rewired")
+    assert lines[0].startswith("  shapes: 25 added, 0 removed, 8 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
@@ -442,6 +443,102 @@ def test_the_cli_update_needs_a_project_and_refuses_force(tmp_path,
         rex.main(["typhon", "--update", "--no-run"])
     with pytest.raises(SystemExit, match="use one or the other"):
         rex.main(["typhon", "--update", "--force", "--no-run"])
+
+
+# ============================================================
+# The camera settings tabs (2026-10-07) reach an existing Typhon
+# ============================================================
+#: examples/gui/typhon.gspec at 794f8b6, byte for byte: the Typhon the user
+#: has the day the tabs arrived (presets, the classifier library, no tabs).
+BEFORE_TABS = ROOT / "tests" / "data" / "typhon_before_tabs.gspec"
+
+
+def build_before_tabs(vault: Path, monkeypatch,
+                      name: str = "tabs_typhon") -> Path:
+    examples = vault.parent / f"{name}_examples"
+    examples.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(BEFORE_TABS, examples / "typhon.gspec")
+    with monkeypatch.context() as m:
+        m.setattr(gx, "EXAMPLES_DIR", examples)
+        built = dx.build_project("typhon", name, vault, toolkit="qt")
+    return built.project_dir
+
+
+def test_the_fixture_is_typhon_before_the_tabs():
+    shapes = {s["id"]: s for s in json.loads(
+        BEFORE_TABS.read_text(encoding="utf-8"))["shapes"]}
+    assert "s79" not in shapes and len(shapes) == 79
+    assert (shapes["s04"]["x"], shapes["s04"]["y"]) == (24, 200)
+    assert shapes["s08"]["script"]["function"] == "apply_frame_rate"
+
+
+def test_a_typhon_from_before_the_tabs_gets_them_and_keeps_its_code(
+        tmp_path, monkeypatch):
+    """The boxes beside Start move into the Basic tab with their ports,
+    links and widget names: the user's own code in the FPS box's handler
+    and in Start is kept as it is, with no warning (neither link changed),
+    app.py is untouched — and the updated app has the tabs, filled for the
+    camera it connects."""
+    vault = tmp_path / "vault"
+    pdir = build_before_tabs(vault, monkeypatch)
+    names_before = dict(gpj.load_manifest(pdir).widget_names)
+    fps = hand_edit(pdir, "on_spn_spinbox_3")
+    start = hand_edit(pdir, "on_btn_start_capture")
+    app_before = (pdir / "app.py").read_bytes()
+
+    out = dx.update_from_example("tabs_typhon", "typhon", vault,
+                                 stamp="20261007_120000")
+    assert out.ok, out.lines
+    said = "\n".join(out.lines)
+    assert "WARNING" not in said, said
+    assert "(s79)" in said and "(s80)" in said, "the tabs were not added"
+    handlers = (pdir / "handlers.py").read_text(encoding="utf-8")
+    assert method(handlers, "on_spn_spinbox_3") == fps
+    assert method(handlers, "on_btn_start_capture") == start
+    assert (pdir / "app.py").read_bytes() == app_before
+    names = gpj.load_manifest(pdir).widget_names
+    for sid in ("s03", "s04", "s05", "s06", "s07", "s08"):
+        assert names[sid] == names_before[sid], sid
+    ports_py = (pdir / "ui" / "ports.py").read_text(encoding="utf-8")
+    assert "settings_tabs" in ports_py and "settings_note" in ports_py
+
+    code = (
+        "import sys\n"
+        f"sys.path[:0] = [{str(pdir)!r}, {str(ROOT)!r}]\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "app = QApplication([])\n"
+        "import app as generated, frame_camera\n"
+        "ui = generated.App(); ui.resize(1400, 820); ui.grab()\n"
+        "tabs = ui._settings_tabs\n"
+        "page = ui.ports.settings_tabs.widget.widget(0)\n"
+        "print(type(tabs).__name__, tabs.titles())\n"
+        "print(all(page.isAncestorOf(getattr(ui.ports, p).widget)\n"
+        "          for p in ('exposure', 'gain', 'frame_rate')))\n"
+        "ui.on_btn_scan_for_cameras()\n"
+        "rows = ui.ports.cameras.items()\n"
+        "ui.ports.cameras.widget.setCurrentRow(\n"
+        "    next(i for i, r in enumerate(rows) if r.endswith('event')))\n"
+        "ui.on_btn_connect()\n"
+        "print(tabs.titles())\n"
+        # An arrow click to 25: the box's link runs on a step or a
+        # committed number (_SpinBox.committed), not on every setValue.
+        "box = ui.ports.frame_rate.widget\n"
+        "box.setValue(24); box.stepBy(1)\n"
+        "print(frame_camera._LIVE.device.accumulate_ms)\n"
+        "frame_camera.disconnect()\n")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
+               COUNCIL_VAULT_ROOT=str(vault), PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run([sys.executable, "-c", code], cwd=str(pdir), env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    printed = done.stdout.strip().splitlines()
+    assert printed[-4] == "SettingsTabs ['Basic', 'Camera', 'Presets']"
+    assert printed[-3] == "True", "a box beside Start is not in Basic"
+    assert printed[-2] == ("['Basic', 'Biases', 'Filters', 'Display', "
+                           "'Camera', 'Presets']")
+    # The FPS box still applies its rate through its (hand-edited) link:
+    # 25 pictures a second is a 40 ms window on an event camera.
+    assert printed[-1] == "40.0"
 
 
 # ============================================================
