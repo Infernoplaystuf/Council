@@ -6836,17 +6836,31 @@ class JudgeModel(PersonalityModel):
             "Weight high self-confidence answers (≥80%) positively — but verify they earned it.\n\n"
             f"USER REQUEST:\n{user_text}\n\nCANDIDATES:\n"
         ]
+        # Each answer gets a share of this judge's real window (judge_view),
+        # condensed — start, end and the lines about the question kept —
+        # when longer; it used to be cut at 2,000 characters, which ranked
+        # long code answers without their second half.
+        try:
+            from council_core import judge_view as _jv
+            _budget = _jv.answer_budget(_jv.judge_window(self),
+                                        len(candidates))
+            _fit = _jv.fit
+        except Exception:                                 # noqa: BLE001
+            _budget = 2000
+            def _fit(t, n, q=""):
+                return (t or "")[:n]
+        _side = max(600, int(_budget * 0.15))
         for role, data in candidates.items():
-            # Truncate per-field to keep judge context bounded regardless of round count.
-            # Answer is the most important signal — give it the most budget.
-            answer      = data.get("answer",          "")[:2000]
-            peasant_q   = data.get("peasant_q",       "")[:600]
-            rebuttal    = data.get("rebuttal",         "")[:600]
-            discussion  = data.get("discussion",       "")[:400]
+            answer      = _fit(data.get("answer", ""), _budget, user_text)
+            peasant_q   = data.get("peasant_q",       "")[:_side]
+            rebuttal    = data.get("rebuttal",         "")[:_side]
+            discussion  = data.get("discussion",       "")[:max(400, _side // 2)]
             self_conf   = data.get("self_confidence",  50)
+            code_check  = data.get("code_check", "")
             parts.append(
                 f"--- {role} [self-confidence: {self_conf}%] ---\n"
                 f"ANSWER:\n{answer}\n\n"
+                + (f"{code_check}\n\n" if code_check else "") +
                 f"PEASANT QUESTIONS:\n{peasant_q}\n\n"
                 f"REBUTTAL:\n{rebuttal}\n\n"
                 f"DISCUSSION:\n{discussion}\n"

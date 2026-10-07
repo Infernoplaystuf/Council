@@ -886,6 +886,14 @@ class DeliberationOrchestrator:
 
             # 4) Judge ranks
             self._phase("Judge — ranking candidates")
+            # Each candidate's Python, parsed (never run) — judge_view.
+            from . import judge_view as _jv
+            for _ck, _cd in candidates.items():
+                _chk = _jv.code_check(_cd.get("answer", ""))
+                _cd["code_check"] = _chk
+                if _chk and _jv.has_problems(_chk):
+                    emit(AgentEvent("Judge", "observation",
+                                    f"{_ck.capitalize()} — {_chk}"))
             # The vault's evidence, for ranking and critique only (never for
             # routing): ctx.shared["judge_evidence"], set by the front end
             # (council_core.vault_context.evidence). Passed only when there
@@ -1010,6 +1018,12 @@ class DeliberationOrchestrator:
             _crit_ctx = f"Ranking:\n{rank_json}"
             if _evidence:
                 _crit_ctx += f"\n\n{_evidence}"
+            _synth_chk = _jv.code_check(synth_final)
+            if _synth_chk:
+                _crit_ctx += f"\n\nTHE ANSWER'S {_synth_chk}"
+                if _jv.has_problems(_synth_chk):
+                    emit(AgentEvent("Judge", "observation",
+                                    f"Final answer — {_synth_chk}"))
             critique = self.judge.critique(user_text, synth_final, extra_context=_crit_ctx, query_mode=ctx.shared.get("query_mode", ""))
             ctx.shared["judge_critique"] = critique
             ev = AgentEvent("Judge", "observation", critique)
