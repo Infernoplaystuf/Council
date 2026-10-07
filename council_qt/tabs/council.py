@@ -88,6 +88,14 @@ PER_TURN_FIELDS = (
 )
 
 
+def docs_readers(models, docs) -> list:
+    """Who reads the documentation block: the Coder and the Writer."""
+    if not getattr(docs, "text", ""):
+        return []
+    from council_core import docs_brief
+    return docs_brief.readers(models)
+
+
 class CouncilActions:
     """What the Council tab can ask the application to do.
 
@@ -249,12 +257,20 @@ class CouncilActions:
                 x for x in (judge_evidence, past_block) if x)
         writer = getattr(models, "writer", None)
 
+        # Real documentation for a coding question (docs_brief): to the
+        # Coder and the Writer, so they use the documented API.
+        docs = self.docs_brief(typed_text, models)
+        if docs.titles and on_event is not None:
+            from council_core.deliberation import AgentEvent
+            on_event(AgentEvent("Librarian", "observation", docs.note()))
+
         turn_models = vault_context.turn_models(models)
         with vault_context.applied(turn_models, memo), \
                 vault_context.applied(turn_models, block), \
                 vault_context.applied([sage] if sage_kb else [], sage_kb), \
                 vault_context.applied([writer] if past_block else [],
-                                      past_block):
+                                      past_block), \
+                vault_context.applied(docs_readers(models, docs), docs.text):
             result = self._answer(typed_text, models, options, judge_evidence,
                                   on_event=on_event, on_token=on_token)
         # Before the next question can start: this exchange is history, and
@@ -303,6 +319,13 @@ class CouncilActions:
                        if judge_evidence else None),
             on_event=on_event,
             on_token=on_token if getattr(options, "stream", True) else None)
+
+    def docs_brief(self, question: str, models):
+        """The DOCUMENTATION block for a coding question (blocking: a
+        keyword search on the documentation servers, no model)."""
+        from council_core import docs_brief
+        return docs_brief.build(question, docs_brief.route_of(models,
+                                                               question))
 
     def vault_brief(self, question: str):
         """The VAULT CONTEXT for a question (blocking: a search)."""

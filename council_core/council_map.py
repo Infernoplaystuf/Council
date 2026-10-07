@@ -326,10 +326,11 @@ def _edges() -> List[Edge]:
           cite="council_core/after_turn.py (log_sage_gap)"),
         E("mcp_docs", "docs", "documentation pages", "context", "live",
           cite="council_core/docs_qa.py:2034-2052"),
-        E("docs", "coder", "API docs for the code it writes", "context",
-          note="The docs role reads real package documentation but the "
-               "council's coder never asks it; the coder guesses APIs.",
-          cite="council_core/docs_qa.py:262"),
+        E("mcp_docs", "coder", "DOCUMENTATION: the pages for a coding "
+          "question", "context", "live",
+          cite="council_core/docs_brief.py; docs_qa.docs_context"),
+        E("mcp_docs", "writer", "DOCUMENTATION for a coding question",
+          "context", "live", cite="council_core/docs_brief.py"),
         E("web", "intern", "researched pages", "context",
           note="intern_agent.py can research the web before drafting; the "
                "turn does not use it.", cite="intern_agent.py"),
@@ -936,13 +937,13 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
-        "The green dashed lines are the map's suggestions: the Docs role "
-        "helping the Coder, the Analyst computing figures from your data "
-        "files, evidence for the Skeptic and the Intern. A red "
+        "The green dashed lines are the map's suggestions: the Analyst "
+        "computing figures from your data files, web research for the "
+        "Intern, evidence for the Skeptic and the Intern. A red "
         "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",
-        ("docs", "coder", "analyst", "skeptic", "intern", "librarian"),
+        ("analyst", "web", "skeptic", "intern", "librarian"),
         "council_core/council_map.py (the table of links)"),
 )
 

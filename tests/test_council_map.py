@@ -67,7 +67,8 @@ def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
     peers = {e.src if e.dst == "coder" else e.dst
              for e in m.edges_of("coder")}
     assert peers == {"judge", "debate", "librarian", "tools", "role_memory",
-                     "docs", "usage_log", "fanout"}
+                     "mcp_docs", "usage_log", "fanout"}
+    assert _edge(cm.static_map(), "mcp_docs", "coder").status == "live"
 
 
 def test_the_judge_is_the_controller_of_placement():
@@ -243,8 +244,8 @@ def test_tab_draws_and_filters(qapp):
 def test_tab_click_shows_the_node_and_empty_space_shows_the_gaps(qapp):
     tab = _tab(qapp, [])
     try:
-        tab.canvas.node_clicked.emit("coder")
-        assert tab.details.toPlainText().startswith("Coder")
+        tab.canvas.node_clicked.emit("skeptic")
+        assert tab.details.toPlainText().startswith("Skeptic")
         assert "Proposed" in tab.details.toPlainText()
         tab.canvas.node_clicked.emit("")
         assert tab.details.toPlainText().startswith("What is missing")
