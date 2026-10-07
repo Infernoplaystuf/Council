@@ -379,7 +379,8 @@ def test_a_card_with_files_is_not_erased_unless_the_user_agreed(tmp_path):
     files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
                                   password="correct-horse-42"), fb.CLOUDINIT)
     job = fh.write_job(tmp_path / "job2", disk=disk, image=src, init_format=fb.CLOUDINIT,
-                       firstboot_files=files, extract_sha256=sha, files_confirmed=True)
+                       firstboot_files=files, extract_sha256=sha,
+                       files_confirmed=disk.contents())
     assert fh.run(job, FakeOps(tmp_path, [cam]))["ok"]
 
 
@@ -397,3 +398,104 @@ def test_an_image_of_unknown_format_gets_the_format_the_card_shows(tmp_path, clo
     assert final["ok"], final
     assert final["format"] == want
     assert fb.verify(ops.boot, by_format[want], want) == []
+
+
+# ── review of 2026-10-07: the card is judged right before it is erased ────────
+#: What can take the card's number while the image is checked: the user's
+#: (small, so otherwise eligible) USB backup stick, with files.
+BACKUP_STICK = {**SD, "FriendlyName": "SanDisk Ultra", "SerialNumber": "4C530001",
+                "UniqueId": "USBSTOR-SANDISK",
+                "Partitions": [{"Number": 1, "Size": SD["Size"], "DriveLetter": "G",
+                                "FileSystem": "exFAT", "Label": "BACKUPS",
+                                "VolumeSize": SD["Size"], "SizeRemaining": 1024,
+                                "RootCount": 1, "RootNames": ["backup.zip"]}]}
+
+
+class SwappingOps(FakeOps):
+    """list_disks gives ``later`` once the image check has run."""
+
+    def __init__(self, tmp_path, first, later):
+        super().__init__(tmp_path, first)
+        self.later = later
+        self.calls = []
+
+    def list_disks(self):
+        self.calls.append(self.disks_json is self.later)
+        return super().list_disks()
+
+
+def _swap_during_the_check(monkeypatch, ops):
+    real = wr.check_image
+
+    def check_then_swap(*a, **k):
+        out = real(*a, **k)
+        ops.disks_json = ops.later          # minutes in real life
+        return out
+    monkeypatch.setattr(wr, "check_image", check_then_swap)
+
+
+@pytest.mark.parametrize("later", [
+    [{**BACKUP_STICK, "Number": 2}],                          # another device, same number
+    [{**SD, "Size": 300 * 1000 ** 3}],                         # no longer eligible
+    [],                                                        # gone
+])
+def test_a_disk_that_changed_during_the_image_check_is_not_erased(tmp_path, monkeypatch,
+                                                                  later):
+    # The disk was judged once, BEFORE the minutes-long image check, and
+    # Clear-Disk erased whatever held that number afterwards (MEASURED: a
+    # backup stick at #2 with files nobody confirmed, ok=True).
+    src, _data, sha = make_image(tmp_path)
+    job, _ = _job(tmp_path, SD, src, sha)
+    ops = SwappingOps(tmp_path, [SD], later)
+    _swap_during_the_check(monkeypatch, ops)
+    final = fh.run(job, ops)
+    assert not final["ok"] and final["refused"] and "nothing was erased" in final["message"]
+    assert ops.cleared == [] and ops.card.read_bytes() == b"\xff" * SD["Size"]
+    assert ops.calls[-1] is True            # judged on the listing AFTER the check
+
+
+def test_the_image_is_checked_before_the_listing_that_guards_the_erase(tmp_path, monkeypatch):
+    src, data, sha = make_image(tmp_path)
+    job, _ = _job(tmp_path, SD, src, sha)
+    order = []
+    ops = FakeOps(tmp_path, [SD])
+    real_list, real_check, real_clear = ops.list_disks, wr.check_image, ops.clear
+    ops.list_disks = lambda: order.append("list") or real_list()
+    ops.clear = lambda n: order.append("clear") or real_clear(n)
+    monkeypatch.setattr(wr, "check_image",
+                        lambda *a, **k: order.append("check") or real_check(*a, **k))
+    assert fh.run(job, ops)["ok"]
+    assert order == ["list", "check", "list", "clear"]
+
+
+def test_files_agreed_for_one_card_do_not_cover_another_in_the_same_reader(tmp_path):
+    # The reader's number, unique id, serial and size are the same for any
+    # card in it: the yes given for card A erased card B.
+    from tests.test_pi_disks import CAMERA_CARD
+    card_a = {**CAMERA_CARD, "Size": SD["Size"], "Number": 2}
+    card_b = {**card_a, "Partitions": [{**card_a["Partitions"][0], "Label": "THESIS_BACKUP",
+                                        "RootNames": ["thesis"], "RootCount": 1}]}
+    src, _data, sha = make_image(tmp_path)
+    a = dk.parse([card_a])[0]
+    files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
+                                  password="correct-horse-42"), fb.CLOUDINIT)
+    job = fh.write_job(tmp_path / "job", disk=a, image=src, init_format=fb.CLOUDINIT,
+                       firstboot_files=files, extract_sha256=sha,
+                       files_confirmed=a.contents())
+    ops = FakeOps(tmp_path, [card_b])
+    final = fh.run(job, ops)
+    assert not final["ok"] and final["refused"] and "THESIS_BACKUP" in final["message"]
+    assert "not what you agreed to erase" in final["message"] and ops.cleared == []
+
+
+def test_an_older_jobs_bare_yes_agrees_to_nothing(tmp_path):
+    from tests.test_pi_disks import CAMERA_CARD
+    cam = {**CAMERA_CARD, "Size": SD["Size"], "Number": 2}
+    src, _data, sha = make_image(tmp_path)
+    job, _ = _job(tmp_path, cam, src, sha)
+    data = json.loads(job.read_text(encoding="utf-8"))
+    data["files_confirmed"] = True
+    job.write_text(json.dumps(data), encoding="utf-8")
+    ops = FakeOps(tmp_path, [cam])
+    final = fh.run(job, ops)
+    assert not final["ok"] and "did not agree" in final["message"] and ops.cleared == []

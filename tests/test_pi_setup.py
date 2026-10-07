@@ -199,8 +199,14 @@ def test_a_card_that_holds_files_needs_its_own_confirmation(env, tmp_path):
     with pytest.raises(ValueError, match="holds files.*bootfs"):
         su.prepare_new_pi(**kw)
     assert not (env["tmp"] / "state").exists()
-    out = su.prepare_new_pi(**{**kw, "cfg": cfg()}, files_confirmed=True)
-    assert json.loads(out["job"].read_text(encoding="utf-8"))["files_confirmed"] is True
+    # A bare yes - or a yes for what was on it before - is not enough: the
+    # job names what the user agreed to erase, and the helper checks it.
+    for stale in (True, ["F: 'bootfs' (FAT32, used space unknown)"]):
+        with pytest.raises(ValueError, match="holds files"):
+            su.prepare_new_pi(**{**kw, "cfg": cfg()}, files_confirmed=stale)
+    out = su.prepare_new_pi(**{**kw, "cfg": cfg()}, files_confirmed=old.contents())
+    job = json.loads(out["job"].read_text(encoding="utf-8"))
+    assert job["files_confirmed"] == old.contents()
 
 
 def test_an_image_of_unknown_format_carries_both_and_the_card_decides(env, tmp_path):

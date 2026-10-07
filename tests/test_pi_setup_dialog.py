@@ -473,8 +473,57 @@ def test_a_card_whose_files_the_user_agreed_to_erase_is_written(qapp, tmp_path):
     d.s_pass.setText("correct-horse-42")
     d.s_pass2.setText("correct-horse-42")
     d.on_write()
-    assert d.actions.prepared["files_confirmed"] is True
+    assert d.actions.prepared["files_confirmed"] == d._current_disk().contents()
+    assert "'bootfs'" in d.actions.prepared["files_confirmed"][0]
     assert len(asked) == 1                          # asked once, not on every change
+    _close(qapp, d)
+
+
+def test_a_card_swapped_in_the_same_reader_is_asked_about_again(qapp, tmp_path):
+    # The yes was tied to the reader's identity (number, unique id, serial,
+    # size - the reader's, not the card's): card B, swapped in after a yes
+    # for card A, reached prepare() with files_confirmed=True and its own
+    # files were never named.
+    from tests.test_pi_disks import CAMERA_CARD
+    card_a = {**CAMERA_CARD, "Number": 3}
+    card_b = {**card_a, "Partitions": [{**card_a["Partitions"][0], "Label": "THESIS_BACKUP",
+                                        "FileSystem": "exFAT", "RootCount": 1,
+                                        "RootNames": ["thesis"]}]}
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [card_a]
+    asked = []
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda t, m, **k: asked.append(m) or True)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert len(asked) == 1 and "EOS_DIGITAL" in asked[0]
+    acts.disks = REAL + [card_b]                    # same reader, another card
+    d.refresh_disks()
+    d.disk_list.setCurrentRow(2)
+    assert len(asked) == 2 and "THESIS_BACKUP" in asked[1]
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    d.card_next.click()
+    d.s_pass.setText("correct-horse-42")
+    d.s_pass2.setText("correct-horse-42")
+    d.on_write()
+    assert "THESIS_BACKUP" in d.actions.prepared["files_confirmed"][0]
+    _close(qapp, d)
+
+
+def test_a_card_swapped_after_the_yes_and_declined_is_not_chosen(qapp, tmp_path):
+    from tests.test_pi_disks import CAMERA_CARD
+    card_a = {**CAMERA_CARD, "Number": 3}
+    card_b = {**card_a, "Partitions": [{**card_a["Partitions"][0], "Label": "OTHER",
+                                        "RootCount": 1, "RootNames": ["x"]}]}
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [card_a]
+    answers = [True, False]
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda *a, **k: answers.pop(0))
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    acts.disks = REAL + [card_b]
+    d.refresh_disks()
+    d.disk_list.setCurrentRow(2)                    # asked about card B, and declined
+    assert answers == [] and d._current_disk() is None and not d.card_next.isEnabled()
     _close(qapp, d)
 
 

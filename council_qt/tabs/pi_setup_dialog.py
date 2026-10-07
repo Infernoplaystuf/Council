@@ -21,7 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
@@ -116,8 +116,11 @@ class PiSetupDialog(ViewHelpers, QDialog):
         from .. import dialogs as _dialogs
         self.ask_yes_no = ask_yes_no or (
             (lambda *a, **k: False) if _dialogs.disabled() else _dialogs.askyesno)
-        #: The card whose files the user agreed to erase (its identity).
-        self._files_ok: Optional[dk.DiskIdentity] = None
+        #: The card whose files the user agreed to erase: its identity AND
+        #: the contents the question named. For a USB reader the identity
+        #: (number, unique id, serial, size) is the reader's, so a same-size
+        #: card swapped in kept the yes given for the card before it.
+        self._files_ok: Optional[Tuple[dk.DiskIdentity, Tuple[str, ...]]] = None
         #: The Pi set up last, whose model can now be downloaded.
         self._ready: Optional[su.Outcome] = None
         self._busy = False
@@ -481,7 +484,7 @@ class PiSetupDialog(ViewHelpers, QDialog):
 
     def _disk_changed(self) -> None:
         d = self._current_disk()
-        if d is not None and d.holds_files and self._files_ok != d.identity():
+        if d is not None and d.holds_files and self._files_ok != self._files_key(d):
             # The second, explicit confirmation, naming what is on it.
             if self.ask_yes_no(
                     "This card holds files",
@@ -489,7 +492,7 @@ class PiSetupDialog(ViewHelpers, QDialog):
                     "holds files:\n\n" + "\n".join(f"  • {c}" for c in d.contents())
                     + "\n\nEverything on it will be ERASED. Choose this card anyway?",
                     parent=self):
-                self._files_ok = d.identity()
+                self._files_ok = self._files_key(d)
                 self.say(f"You agreed to erase what is on disk {d.number}: "
                          + "; ".join(d.contents()))
             else:
@@ -501,8 +504,12 @@ class PiSetupDialog(ViewHelpers, QDialog):
         self.confirm_edit.clear()
         self._update_card_next()
 
+    @staticmethod
+    def _files_key(d: dk.Disk) -> Tuple[dk.DiskIdentity, Tuple[str, ...]]:
+        return d.identity(), tuple(d.contents())
+
     def _files_confirmed(self, d: Optional[dk.Disk]) -> bool:
-        return bool(d and (not d.holds_files or self._files_ok == d.identity()))
+        return bool(d and (not d.holds_files or self._files_ok == self._files_key(d)))
 
     def _update_card_next(self) -> None:
         d = self._current_disk()
@@ -595,7 +602,9 @@ class PiSetupDialog(ViewHelpers, QDialog):
                 disk=disk, typed_confirm=self.confirm_edit.text(), image=path,
                 init_format=fmt, extract_sha256=sha, extract_size=size, cfg=cfg,
                 model=self.s_model.currentData(),
-                files_confirmed=bool(disk is not None and disk.holds_files))
+                # What the user agreed to erase, named: the helper refuses a
+                # card that holds anything else.
+                files_confirmed=(disk.contents() if disk is not None else []))
         except Exception as exc:                          # noqa: BLE001
             self.say(f"Not written: {exc}")
             return

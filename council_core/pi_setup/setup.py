@@ -45,7 +45,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 from . import disks as dk
 from . import firstboot as fb
@@ -286,7 +286,7 @@ def _save_pending(items: List[Pending]) -> None:
 def prepare_new_pi(*, disk: dk.Disk, typed_confirm: str, image: Path, init_format: str,
                    extract_sha256: str, extract_size: int, cfg: fb.FirstBoot,
                    model: str, key_dir: Optional[Path] = None,
-                   files_confirmed: bool = False) -> Dict[str, object]:
+                   files_confirmed: Sequence[str] = ()) -> Dict[str, object]:
     """Check everything, build the first-boot files and the helper's job.
     Returns {"job": path, "pending": Pending}. Nothing is erased here.
 
@@ -294,12 +294,17 @@ def prepare_new_pi(*, disk: dk.Disk, typed_confirm: str, image: Path, init_forma
     or a list entry without one): the job carries the first-boot files for
     BOTH formats and the helper uses the one it reads off the written card -
     nothing is assumed from a file name. ``files_confirmed``: the user's
-    second confirmation for a card that already holds files (decision f)."""
+    second confirmation for a card that already holds files (decision f) -
+    the contents (Disk.contents) that question named. A bare yes was tied to
+    the reader, not the card: a card swapped in the same reader was erased
+    without its own files ever being named (review, 2026-10-07)."""
     if not disk.eligible:
         raise ValueError(f"that disk cannot be used: {disk.why_not}")
     if typed_confirm.strip() != disk.confirm_code:
         raise ValueError(f"type exactly: {disk.confirm_code}")
-    if disk.holds_files and not files_confirmed:
+    agreed = ([str(x) for x in files_confirmed]
+              if isinstance(files_confirmed, (list, tuple)) else [])
+    if disk.holds_files and agreed != disk.contents():
         raise ValueError("that card holds files (" + "; ".join(disk.contents())
                          + ") - confirm that they may be erased first")
     if init_format not in fb.FORMATS + ("",):
@@ -325,7 +330,7 @@ def prepare_new_pi(*, disk: dk.Disk, typed_confirm: str, image: Path, init_forma
     job = flash_helper.write_job(job_dir, disk=disk, image=image, init_format=init_format,
                                  firstboot_files=files, extract_sha256=extract_sha256,
                                  extract_size=extract_size, firstboot_by_format=by_format,
-                                 files_confirmed=bool(files_confirmed))
+                                 files_confirmed=agreed if disk.holds_files else [])
     item = Pending(id=job_dir.name, hostname=cfg.hostname, username=cfg.username,
                    host_public=host_public, model=model)
     _save_pending([p for p in pending() if p.hostname != cfg.hostname] + [item])

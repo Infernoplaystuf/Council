@@ -11,7 +11,19 @@ disk is present and still passes every rule in disks.judge (removable bus,
 not system/boot, a card present, <= 256 GB, no Council or Windows folders).
 A card swapped, a reader re-enumerated as another number, or a data drive
 plugged in under the same number are all refused. A card that holds files is
-refused unless the user confirmed erasing them (the job says so).
+refused unless the user agreed to erase EXACTLY what it holds now: the job
+carries the contents the second question named (Disk.contents), and a card
+swapped in the same reader - same number, unique id, serial and size, since
+those belong to the reader - holding anything else is refused.
+
+THE DISK IS JUDGED RIGHT BEFORE IT IS ERASED
+The image check below takes minutes. The card used to be judged once, before
+it - and Clear-Disk then erased whatever held that number afterwards: a USB
+drive plugged in while the image was checked can take a freed disk number,
+and was erased with no eligibility check and no files question (review,
+2026-10-07). Now the disks are listed again AFTER the image check and every
+rule runs on that listing, immediately before Clear-Disk; a first look
+before the check only saves a long wait for a card that is already gone.
 
 THE IMAGE IS CHECKED BEFORE THE CARD IS ERASED
 The user's decision e (2026-10-07). The image file is decompressed and hashed
@@ -44,7 +56,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import disks as dk
 from . import firstboot as fb
@@ -111,6 +123,33 @@ def _status(job_dir: Path, **fields) -> None:
     tmp.replace(job_dir / "status.json")
 
 
+def _the_card(ops: WindowsDiskOps, ident: dk.DiskIdentity, job: Dict[str, Any]) -> dk.Disk:
+    """List the disks NOW and return the job's card, or raise Refused: it
+    must still be exactly that disk, still pass every rule in disks.judge,
+    and hold nothing but what the user agreed to erase."""
+    disk = dk.find(ops.list_disks(), ident)
+    if disk is None:
+        raise Refused("the card you chose is no longer there (removed, swapped, or "
+                      "renumbered) — nothing was erased")
+    if not disk.eligible:
+        raise Refused(f"refusing to erase disk {disk.number}: {disk.why_not}")
+    now = disk.contents()
+    if now:
+        agreed = job.get("files_confirmed")
+        # A list: what the user's second question named. Anything else (an
+        # older job's bare 'true') agreed to nothing in particular.
+        agreed = [str(x) for x in agreed] if isinstance(agreed, list) else []
+        if not agreed:
+            raise Refused(f"disk {disk.number} holds files you did not agree to erase ("
+                          + "; ".join(now) + ") — nothing was erased")
+        if agreed != now:
+            raise Refused(f"what is on disk {disk.number} is not what you agreed to erase "
+                          f"(you agreed to: {'; '.join(agreed)}; it now holds: "
+                          f"{'; '.join(now)}) — a different card? Nothing was erased; "
+                          "choose the card again")
+    return disk
+
+
 def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
     """Do the job; always leaves a final status ('done' or 'error')."""
     ops = ops or WindowsDiskOps()
@@ -122,16 +161,10 @@ def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
         ident = dk.DiskIdentity(**job["disk"])
         image = Path(job["image"])
         _status(job_dir, phase="checking", message="Checking the card is the one you chose…")
-
-        disk = dk.find(ops.list_disks(), ident)
-        if disk is None:
-            raise Refused("the card you chose is no longer there (removed, swapped, or "
-                          "renumbered) — nothing was erased")
-        if not disk.eligible:
-            raise Refused(f"refusing to erase disk {disk.number}: {disk.why_not}")
-        if disk.holds_files and not job.get("files_confirmed"):
-            raise Refused(f"disk {disk.number} holds files you did not agree to erase ("
-                          + "; ".join(disk.contents()) + ") — nothing was erased")
+        # A first look, so a card that is already gone is said at once and
+        # not after minutes of checking the image. It guards nothing: the
+        # erase is guarded by the listing after the check.
+        _the_card(ops, ident, job)
 
         def checking(_phase, done, total):
             _status(job_dir, phase="checking-image", done=done, total=total,
@@ -140,11 +173,15 @@ def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
         try:
             writer.check_image(image, expected_sha256=job.get("extract_sha256", ""),
                                expected_size=int(job.get("extract_size") or 0),
-                               capacity=disk.size, on_progress=checking,
+                               capacity=ident.size, on_progress=checking,
                                cancelled=cancel_flag.exists)
         except writer.WriteFailed as exc:
             raise Refused(f"{exc} — nothing was erased") from exc
 
+        # The disk that is at this number NOW - listed after the check, every
+        # rule run again, then erased at once.
+        _status(job_dir, phase="checking", message="Checking the card again before erasing…")
+        disk = _the_card(ops, ident, job)
         _status(job_dir, phase="erasing", message=f"Erasing {disk.summary()}")
         ops.clear(disk.number)
 
@@ -193,10 +230,13 @@ def write_job(job_dir: Path, *, disk: dk.Disk, image: Path, init_format: str,
               firstboot_files: Dict[str, str], extract_sha256: str = "",
               extract_size: int = 0,
               firstboot_by_format: Optional[Dict[str, Dict[str, str]]] = None,
-              files_confirmed: bool = False) -> Path:
+              files_confirmed: Sequence[str] = ()) -> Path:
     """The job file for the helper (called by the non-elevated Council).
     ``firstboot_by_format`` instead of ``firstboot_files`` when the image's
-    format is not known (``init_format`` ''): the helper picks by the card."""
+    format is not known (``init_format`` ''): the helper picks by the card.
+    ``files_confirmed``: the card's contents (Disk.contents) exactly as the
+    user agreed to erase them - the helper refuses a card holding anything
+    else."""
     job_dir.mkdir(parents=True, exist_ok=True)
     p = job_dir / "job.json"
     p.write_text(json.dumps({"disk": disk.identity().to_json(), "image": str(image),
@@ -204,7 +244,11 @@ def write_job(job_dir: Path, *, disk: dk.Disk, image: Path, init_format: str,
                              "extract_size": extract_size,
                              "firstboot_files": firstboot_files,
                              "firstboot_by_format": firstboot_by_format or {},
-                             "files_confirmed": bool(files_confirmed)}), encoding="utf-8")
+                             # A bare True/False names nothing: agreed to nothing.
+                             "files_confirmed": [
+                                 str(x) for x in (files_confirmed if isinstance(
+                                     files_confirmed, (list, tuple)) else ())]}),
+                 encoding="utf-8")
     return p
 
 

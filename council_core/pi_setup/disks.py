@@ -25,10 +25,19 @@ lists every partition with files on it — its letter, label, file system and
 used space — and every partition Windows cannot read (an old Pi card's Linux
 partition may hold anything). Asked for every eligible disk, an SD card in a
 built-in reader as much as a USB one: a camera card's photos are the same
-loss. A freshly formatted card (a few KB of file-system bookkeeping) is not
-asked about.
+loss. A freshly formatted card is not asked about.
 
-Listing is read-only (PowerShell Get-Disk / Get-Partition / Get-Volume).
+"Holds files" is decided by LISTING each volume's top folder (through its
+volume path, so a volume with no drive letter is listed too), not by its used
+space: a threshold of 1 MB used let a stick holding only a 900 KB password
+database or a few SSH keys through with no question (review, 2026-10-07).
+Only Windows' own System Volume Information is ignored. A volume whose top
+folder cannot be listed (locked, damaged) may hold files and is asked about;
+so is a disk with no partition table Windows can read (a whole-device
+VeraCrypt / LUKS stick, a whole-disk Linux file system: PartitionStyle RAW).
+
+Listing is read-only (PowerShell Get-Disk / Get-Partition / Get-Volume, and
+Get-ChildItem of each SD / MMC / USB volume's top folder).
 """
 from __future__ import annotations
 
@@ -45,12 +54,24 @@ CARD_BUSES = ("SD", "MMC", "USB")
 _PS_LIST = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $out = foreach ($d in Get-Disk) {
+  $card = @('SD', 'MMC', 'USB') -contains "$($d.BusType)"
   $parts = foreach ($p in (Get-Partition -DiskNumber $d.Number)) {
     $v = $p | Get-Volume
+    # The top folder of a card's volume: RootCount $null = it could not be listed.
+    $count = $null; $names = @()
+    if ($card -and $v -and $v.Path) {
+      try {
+        $items = @(Get-ChildItem -Force -LiteralPath $v.Path -ErrorAction Stop |
+                   Where-Object { $_.Name -ne 'System Volume Information' })
+        $count = $items.Count
+        $names = @($items | Select-Object -First 3 | ForEach-Object { $_.Name })
+      } catch { $count = $null }
+    }
     [pscustomobject]@{
       Number = $p.PartitionNumber; Size = $p.Size; DriveLetter = "$($p.DriveLetter)";
       Type = "$($p.Type)"; FileSystem = "$($v.FileSystem)"; Label = "$($v.FileSystemLabel)";
-      SizeRemaining = $v.SizeRemaining; VolumeSize = $v.Size }
+      SizeRemaining = $v.SizeRemaining; VolumeSize = $v.Size;
+      RootCount = $count; RootNames = @($names) }
   }
   [pscustomobject]@{
     Number = $d.Number; FriendlyName = $d.FriendlyName; SerialNumber = "$($d.SerialNumber)".Trim();
@@ -63,12 +84,6 @@ $out = foreach ($d in Get-Disk) {
 """
 
 
-#: Used space a freshly formatted volume may show without holding a file
-#: (FAT32 / exFAT bookkeeping and Windows' System Volume Information are a
-#: few KB to a few hundred KB). More than this = it holds files.
-EMPTY_USED_BYTES = 1024 * 1024
-
-
 @dataclass
 class Partition:
     number: int
@@ -79,6 +94,11 @@ class Partition:
     size_remaining: Optional[int] = None
     volume_size: Optional[int] = None
     part_type: str = ""
+    #: Entries in the volume's top folder (System Volume Information not
+    #: counted), or None when it was not or could not be listed.
+    root_entries: Optional[int] = None
+    #: The first few of them, to name in the question.
+    root_names: List[str] = field(default_factory=list)
 
     def used(self) -> Optional[int]:
         if self.volume_size is None or self.size_remaining is None:
@@ -87,7 +107,11 @@ class Partition:
 
     def holding(self) -> str:
         """What this partition holds, in words, or '' when it holds nothing
-        (empty file system, or a Microsoft Reserved partition)."""
+        (a top folder with nothing in it, or a Microsoft Reserved partition).
+
+        A listed top folder decides. Used space did, with a 1 MB allowance
+        for file-system bookkeeping, and a volume holding one 900 KB file
+        counted as empty — erased with no second question."""
         where = f"{self.drive_letter}: " if self.drive_letter else ""
         name = f"'{self.label}'" if self.label else f"partition {self.number}"
         if self.part_type.lower() == "reserved" or self.size <= 0:
@@ -96,12 +120,23 @@ class Partition:
             return (f"{name} ({self.size / 1e9:.1f} GB): a file system Windows cannot "
                     "read (a Linux card?) - it may hold files")
         used = self.used()
-        if used is None:
-            return f"{where}{name} ({self.file_system}, used space unknown)"
-        if used <= EMPTY_USED_BYTES:
+        space = ("used space unknown" if used is None
+                 else f"{_size(used)} used of {_size(self.volume_size)}")
+        if self.root_entries is None:
+            # Not listed: locked (BitLocker), damaged, or listed by a Council
+            # from before roots were listed. Nothing allocated at all is the
+            # one sure sign of nothing to lose.
+            if used == 0:
+                return ""
+            return (f"{where}{name} ({self.file_system}, {space}; its files could not be "
+                    "listed) - it may hold files")
+        if self.root_entries <= 0:
             return ""
-        return (f"{where}{name} ({self.file_system}, {_size(used)} used of "
-                f"{_size(self.volume_size)})")
+        shown = [n[:40] for n in self.root_names[:3]]
+        more = ", ..." if self.root_entries > len(shown) else ""
+        items = "1 item" if self.root_entries == 1 else f"{self.root_entries} items"
+        return (f"{where}{name} ({self.file_system}, {space}; {items} at the top: "
+                + ", ".join(shown) + more + ")")
 
 
 def _size(n: Optional[int]) -> str:
@@ -135,8 +170,16 @@ class Disk:
         return f"DISK {self.number} - {self.size / 1000 ** 3:.1f} GB"
 
     def contents(self) -> List[str]:
-        """Each partition that holds (or may hold) files, in words."""
-        return [h for h in (p.holding() for p in self.partitions) if h]
+        """Each partition that holds (or may hold) files, in words — and the
+        whole disk when Windows reads no partition table on it (RAW): a
+        whole-device VeraCrypt or LUKS stick, or a whole-disk Linux file
+        system, lists no partitions at all and used to count as empty."""
+        out = [h for h in (p.holding() for p in self.partitions) if h]
+        if (not self.partitions and self.size > 0
+                and self.partition_style.upper() == "RAW"):
+            out.append(f"the whole disk ({self.size / 1e9:.1f} GB): no partition table "
+                       "Windows can read (an encrypted or Linux disk?) - it may hold files")
+        return out
 
     @property
     def holds_files(self) -> bool:
@@ -193,9 +236,21 @@ def parse(raw: Any) -> List[Disk]:
                                   label=str(p.get("Label") or ""),
                                   size_remaining=p.get("SizeRemaining"),
                                   volume_size=p.get("VolumeSize"),
-                                  part_type=str(p.get("Type") or ""))
+                                  part_type=str(p.get("Type") or ""),
+                                  root_entries=(None if p.get("RootCount") is None
+                                                else int(p.get("RootCount"))),
+                                  root_names=_names(p.get("RootNames")))
                         for p in parts]))
     return out
+
+
+def _names(raw: Any) -> List[str]:
+    """RootNames as a list (PowerShell may give one name as a bare string)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return [str(n) for n in raw]
 
 
 def protected_roots() -> List[Path]:

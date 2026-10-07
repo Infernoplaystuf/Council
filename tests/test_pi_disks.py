@@ -100,13 +100,15 @@ BLANK_CARD = {**SD_CARD, "Number": 3, "SerialNumber": "000000000921", "UniqueId"
               "Partitions": [{"Number": 1, "Size": 31_910_000_000, "DriveLetter": "G",
                               "FileSystem": "exFAT", "Label": "", "Type": "IFS",
                               "VolumeSize": 31_909_000_000,
-                              "SizeRemaining": 31_908_700_000}]}
+                              "SizeRemaining": 31_908_700_000,
+                              "RootCount": 0, "RootNames": []}]}
 #: A camera card: 4.2 GB of photos on FAT32.
 CAMERA_CARD = {**BLANK_CARD, "Number": 4, "SerialNumber": "CAM", "UniqueId": "USBSTOR-CAM",
                "Partitions": [{"Number": 1, "Size": 31_910_000_000, "DriveLetter": "H",
                                "FileSystem": "FAT32", "Label": "EOS_DIGITAL", "Type": "IFS",
                                "VolumeSize": 31_900_000_000,
-                               "SizeRemaining": 27_700_000_000}]}
+                               "SizeRemaining": 27_700_000_000,
+                               "RootCount": 2, "RootNames": ["DCIM", "MISC"]}]}
 
 
 def test_a_blank_card_holds_nothing_to_confirm():
@@ -117,7 +119,8 @@ def test_a_blank_card_holds_nothing_to_confirm():
 def test_a_card_with_files_says_what_is_on_it():
     cam = by_number([CAMERA_CARD])[4]
     assert cam.eligible and cam.holds_files
-    assert cam.contents() == ["H: 'EOS_DIGITAL' (FAT32, 4.2 GB used of 31.9 GB)"]
+    assert cam.contents() == ["H: 'EOS_DIGITAL' (FAT32, 4.2 GB used of 31.9 GB; "
+                              "2 items at the top: DCIM, MISC)"]
     # An old Pi card: its boot volume, and a Linux partition Windows cannot read.
     old = by_number([SD_CARD])[2]
     assert old.holds_files
@@ -133,3 +136,58 @@ def test_a_microsoft_reserved_partition_is_not_files():
 
 def test_the_listing_asks_windows_for_each_volumes_size():
     assert "VolumeSize = $v.Size" in dk._PS_LIST
+
+
+# ── review of 2026-10-07: what counts as holding files ─────────────────────
+def _vol(used, *, count=None, names=(), letter="G", fs="FAT32"):
+    part = {"Number": 1, "Size": 31_910_000_000, "DriveLetter": letter, "FileSystem": fs,
+            "Label": "KEYS", "Type": "IFS", "VolumeSize": 31_909_000_000,
+            "SizeRemaining": 31_909_000_000 - used}
+    if count is not None:
+        part.update(RootCount=count, RootNames=list(names))
+    return {**BLANK_CARD, "Partitions": [part]}
+
+
+@pytest.mark.parametrize("used", [16_384 + 900_000, 1_048_576])
+def test_one_small_file_is_files(used):
+    # A 1 MB used-space allowance counted a stick holding only a 900 KB
+    # password database as empty: no second question, erased.
+    d = by_number([_vol(used, count=1, names=["passwords.kdbx"])])[3]
+    assert d.holds_files
+    assert d.contents() == [f"G: 'KEYS' (FAT32, {dk._size(used)} used of 31.9 GB; "
+                            "1 item at the top: passwords.kdbx)"]
+
+
+def test_an_empty_top_folder_is_empty_whatever_the_bookkeeping():
+    # A fresh NTFS volume shows tens of MB used by its own metadata.
+    d = by_number([_vol(70_000_000, count=0, fs="NTFS")])[3]
+    assert not d.holds_files
+
+
+def test_a_top_folder_that_could_not_be_listed_may_hold_files():
+    d = by_number([_vol(300_000)])[3]           # no RootCount: not listed
+    assert d.holds_files and "could not be listed" in d.contents()[0]
+    assert not by_number([_vol(0)])[3].holds_files     # nothing allocated at all
+
+
+def test_many_entries_are_counted_and_the_first_named():
+    d = by_number([_vol(5_000_000, count=7, names=["a", "b", "c"])])[3]
+    assert d.contents()[0].endswith("7 items at the top: a, b, c, ...)")
+
+
+def test_a_disk_with_no_partition_table_windows_reads_may_hold_files():
+    # A whole-device VeraCrypt / LUKS stick, or a whole-disk ext4: Windows
+    # shows it 'Not Initialized' (RAW) with no partitions.
+    raw = by_number([{**BLANK_CARD, "PartitionStyle": "RAW", "Partitions": []}])[3]
+    assert raw.eligible and raw.holds_files
+    assert "no partition table Windows can read" in raw.contents()[0]
+    empty_mbr = by_number([{**BLANK_CARD, "PartitionStyle": "MBR", "Partitions": []}])[3]
+    assert not empty_mbr.holds_files
+
+
+def test_the_listing_lists_each_card_volumes_top_folder_by_its_volume_path():
+    assert "Get-ChildItem -Force -LiteralPath $v.Path" in dk._PS_LIST
+    assert "'System Volume Information'" in dk._PS_LIST
+    raw = _vol(10, count=1)
+    raw["Partitions"][0]["RootNames"] = "only.txt"             # PowerShell unwrapped it
+    assert dk.parse([raw])[0].partitions[0].root_names == ["only.txt"]
