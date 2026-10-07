@@ -106,7 +106,9 @@ class Partition:
 
 def _size(n: Optional[int]) -> str:
     n = int(n or 0)
-    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB" if n >= 1e6         else f"{n / 1e3:.0f} KB"
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    return f"{n / 1e6:.0f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
 
 
 @dataclass
