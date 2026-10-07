@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
 
 import nx_policy  # noqa: E402
+import path_contain  # noqa: E402
 from council_core import dream3d  # noqa: E402
 from council_core import pipeline_intent as pi  # noqa: E402
 from council_core import script_takeover as st  # noqa: E402
@@ -392,6 +394,378 @@ def test_the_confirmation_shows_a_models_text_safely(vault):
     assert rows and max(len(row) for row in rows) < 130
     assert "line 19 (the model stamp) is removed" in body
     assert "-   19 | # council: model-edited" in body
+
+
+def test_the_confirmation_says_all_that_a_users_script_may_do():
+    """A taken-over script runs under the USER rules, which hold only two
+    filters — not processes, the network or native code. The confirmation
+    says so, and does not say arbitrary code stays blocked."""
+    for words in ("write and delete files anywhere your account can",
+                  "run any program", "use the network", "load native code",
+                  "the Council stops checking its outputs",
+                  "The Council still refuses only two DREAM3D-NX filters "
+                  "(Execute Process, Create Python Plugin)."):
+        assert words in st.WHAT_CHANGES, words
+    assert "arbitrary code" not in st.WHAT_CHANGES
+    # ...because that is what the USER rules are.
+    code = ("import ctypes, shutil, socket, subprocess\n"
+            "subprocess.run(['tool'])\n"
+            "socket.create_connection(('host', 1))\n"
+            "ctypes.CDLL('native.dll')\n"
+            "shutil.rmtree('anywhere')\n")
+    assert nx_policy.run_reasons(code, trust=nx_policy.USER) == []
+    assert nx_policy.run_reasons(code, trust=nx_policy.MODEL)
+
+
+# ============================================================
+# Only the stamp goes — its lines as Python and an editor read them
+# ============================================================
+
+def defines(data: bytes) -> dict:
+    """What running ``data`` defines. compile() reads a bare CR as a line
+    break, as an editor and the workflow runner (read_text) do."""
+    ns: dict = {}
+    exec(compile(data.decode("utf-8-sig"), "<script>", "exec"), ns)
+    return {k: v for k, v in ns.items()
+            if not k.startswith("__") and not hasattr(v, "__spec__")}
+
+
+def rows(plan) -> list:
+    return [line for line in st.confirmation(plan).splitlines()
+            if " | " in line]
+
+
+def test_a_bare_cr_ends_a_stamp_line_as_it_ends_a_python_line():
+    code = "x = 1\r# council: model-edited\ry = 2\r"
+    assert nx_policy.script_trust(code) == nx_policy.MODEL
+    assert nx_policy.stamp_lines(code) == [2]
+    assert nx_policy.without_stamp(code) == "x = 1\ry = 2\r"
+    assert nx_policy.script_trust(nx_policy.without_stamp(code)) \
+        == nx_policy.USER
+    # A model's own stamp after a bare CR is a stamp: the app adds none,
+    # and the runner gives the MODEL rules either way.
+    assert nx_policy.stamp_model_script(code, "t") == code
+
+
+def test_code_after_a_bare_cr_on_the_stamp_line_stays(vault, dialogs_on):
+    """A model's stamp line can carry code after a bare CR. Python and an
+    editor read that code as a line of its own, so it stays: only the stamp
+    goes, and the script does what it did — the dialog's "nothing else" is
+    true."""
+    code = nx_policy.stamp_model_script(
+        "DRY_RUN = False\n# council: model-edited\rDRY_RUN = True\n"
+        "ACTION = 'would delete' if DRY_RUN else 'DELETING'\n",
+        "the pipeline chat", edited=True)
+    assert code.startswith("DRY_RUN = False")     # the model's stamp, alone
+    p = put(vault, "pipelines/in/dry.py", code)
+    before = p.read_bytes()
+    plan = st.prepare(vault, p)
+    assert plan.ok and plan.stamp_lines == (2,)
+    assert rows(plan)[1:3] == ["-    2 | # council: model-edited",
+                               "     3 | DRY_RUN = True"]
+    assert "line 2 (the model stamp) is removed" in st.confirmation(plan)
+    said = st.run(plan, vault, YES, via="t")
+    assert "Took over" in said and "removed line 2" in said
+    assert p.read_bytes() == (
+        b"DRY_RUN = False\nDRY_RUN = True\n"
+        b"ACTION = 'would delete' if DRY_RUN else 'DELETING'\n")
+    assert defines(before)["ACTION"] == defines(p.read_bytes())["ACTION"] \
+        == "would delete"
+
+
+def test_a_script_of_bare_crs_loses_only_its_stamp_line(vault, dialogs_on):
+    p = put(vault, "pipelines/in/cr.py",
+            "# council: model-written\rimport math\rA = 1\rB = 2\r")
+    plan = st.prepare(vault, p)
+    assert plan.ok and plan.stamp_lines == (1,)
+    assert rows(plan) == ["-    1 | # council: model-written",
+                          "     2 | import math", "     3 | A = 1",
+                          "     4 | B = 2"]
+    st.run(plan, vault, YES, via="t")
+    assert p.read_bytes() == b"import math\rA = 1\rB = 2\r"
+    assert defines(p.read_bytes()) == {"A": 1, "B": 2}
+    [rec] = log_records(vault)
+    assert rec["removed"] == ["# council: model-written"]
+
+
+def test_a_line_separator_in_the_stamp_line_is_shown_spelled_out(
+        vault, dialogs_on):
+    """U+2028 is no line break to Python — the rest of that line is still
+    the comment — but a dialog may draw one: it is spelled out."""
+    p = put(vault, "pipelines/in/ls.py",
+            "# council: model-written DRY_RUN = True\nx = 1\n")
+    before = p.read_bytes()
+    plan = st.prepare(vault, p)
+    assert plan.ok and plan.stamp_lines == (1,)
+    assert rows(plan)[0] == \
+        "-    1 | # council: model-written\\u2028DRY_RUN = True"
+    st.run(plan, vault, YES, via="t")
+    assert p.read_bytes() == b"x = 1\n"
+    assert defines(before) == defines(p.read_bytes()) == {"x": 1}
+
+
+def test_the_take_over_reads_the_stamp_as_the_runner_does(vault,
+                                                          dialogs_on):
+    """The runner reads a script with universal newlines; the take-over
+    reads it the same way, so "it now runs as yours" is true and a stamp
+    the runner sees is one it can take out."""
+    import workflow_runner
+    q = put(vault, "pipelines/in/q.py",
+            "A = 1  \r# council: model-written\nB = 2\n")
+    assert workflow_runner._trust(q, vault) == nx_policy.MODEL
+    assert st.is_stamped(q)
+    plan = st.prepare(vault, q)
+    assert plan.ok and plan.stamp_lines == (2,)
+    assert "now runs as yours" in st.run(plan, vault, YES, via="t")
+    assert q.read_bytes() == b"A = 1  \rB = 2\n"
+    assert workflow_runner._trust(q, vault) == nx_policy.USER
+
+    r = put(vault, "pipelines/in/r.py",
+            "# council: model-written (x).\nA = 1  \r"
+            "# council: model-written\nB = 2\n")
+    plan = st.prepare(vault, r)
+    assert plan.ok and plan.stamp_lines == (1, 3)
+    assert "now runs as yours" in st.run(plan, vault, YES, via="t")
+    assert r.read_bytes() == b"A = 1  \rB = 2\n"
+    assert workflow_runner._trust(r, vault) == nx_policy.USER
+
+
+@pytest.mark.parametrize("data, why", [
+    # The stamp text inside a string: taking it out changes the string.
+    (b"# council: model-written (x).\nMSG = '''\n# council: model-edited\n"
+     b"'''\n", "line 3 is inside a string"),
+    # 'council: model-written' is an annotated name — a statement.
+    (b"#\ncouncil: model-written\nx = 1\n", "line 2 is part of the code"),
+    # The comment ends the line a backslash continued: without it, the
+    # next line joins the statement (DRY = True and False).
+    (b"DRY = True and \\\n# council: model-written\nFalse\n",
+     "line 2 is part of the code"),
+])
+def test_a_stamp_that_is_not_only_a_comment_is_left_for_the_hand(
+        vault, dialogs_on, data, why):
+    p = vault / "pipelines" / "in" / "s.py"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(data)
+    plan = st.decide(vault, "s.py", "take over s.py")
+    assert not plan.ok
+    assert why in plan.refusal, plan.refusal
+    assert "would change what the script does" in plan.refusal
+    assert "by hand" in plan.refusal and "Nothing changed" in plan.refusal
+    assert st.run(plan, vault, never, via="t") == plan.refusal
+    assert untouched(vault, p, data)
+
+
+def test_a_coding_line_moving_up_is_left_for_the_hand(vault, dialogs_on):
+    """Python honours a coding line only in a file's first two lines: taking
+    line 1 out would move one there and change what 'é' is."""
+    data = ("# council: model-written (x).\n#\n# -*- coding: latin-1 -*-\n"
+            "s = 'é'\n").encode("utf-8")
+    p = vault / "pipelines" / "in" / "enc.py"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(data)
+    plan = st.prepare(vault, p)
+    assert not plan.ok and "coding line" in plan.refusal, plan.refusal
+    assert untouched(vault, p, data)
+
+
+def test_the_coding_line_is_read_where_python_reads_it(vault, dialogs_on):
+    """In a file of bare CRs Python's line 2 is no coding line (it starts
+    with code); read with "\\n" as the only break, the whole file is line 1
+    and its "coding: latin-1" would look like one. Nothing about the coding
+    changes, so the take-over goes ahead."""
+    data = b"# council: model-written\rx = 1  # coding: latin-1\r"
+    p = vault / "pipelines" / "in" / "crc.py"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(data)
+    plan = st.prepare(vault, p)
+    assert plan.ok, plan.refusal
+    st.run(plan, vault, YES, via="t")
+    assert p.read_bytes() == b"x = 1  # coding: latin-1\r"
+    assert defines(data) == defines(p.read_bytes()) == {"x": 1}
+
+
+def test_a_stamp_that_carries_the_coding_line_is_left_for_the_hand(
+        vault, dialogs_on):
+    """Python reads the file fine now; without its first line (stamp and
+    coding line both) it could not — the refusal says that, not that the
+    file is unreadable as it stands."""
+    data = (b"# council: model-written -*- coding: latin-1 -*-\n"
+            b"s = '\xe9'\n")
+    p = vault / "pipelines" / "in" / "enc1.py"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(data)
+    plan = st.prepare(vault, p)
+    assert not plan.ok
+    assert "would leave a file Python cannot read" in plan.refusal, \
+        plan.refusal
+    assert "as it stands" not in plan.refusal
+    assert "by hand" in plan.refusal and "Nothing changed" in plan.refusal
+    assert untouched(vault, p, data)
+
+
+def test_a_script_python_cannot_read_is_left_for_the_hand(vault,
+                                                         dialogs_on):
+    p = put(vault, "pipelines/in/open.py", stamped("x = (1,\n"))
+    before = p.read_bytes()
+    plan = st.prepare(vault, p)
+    assert not plan.ok
+    assert "Python cannot read it as it stands" in plan.refusal
+    assert "delete line 1 by hand" in plan.refusal
+    assert untouched(vault, p, before)
+
+
+# ============================================================
+# Files that cannot simply be rewritten
+# ============================================================
+
+def make_read_only(p: Path):
+    os.chmod(p, stat.S_IREAD)
+
+
+def make_writable(folder: Path):
+    for x in [folder, *folder.rglob("*")]:
+        try:
+            os.chmod(x, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            pass
+
+
+def test_a_read_only_script_is_refused_up_front(vault, dialogs_on):
+    p = put(vault, "pipelines/in/ro.py", stamped())
+    before = p.read_bytes()
+    make_read_only(p)
+    try:
+        plan = st.prepare(vault, p)
+        assert not plan.ok and "read-only" in plan.refusal
+        assert "Nothing changed" in plan.refusal
+        assert st.run(plan, vault, never, via="t") == plan.refusal
+        assert untouched(vault, p, before)
+        assert sorted(x.name for x in p.parent.iterdir()) == ["ro.py"]
+    finally:
+        make_writable(p.parent)
+
+
+def test_a_script_made_read_only_after_the_question_is_left(vault,
+                                                            dialogs_on):
+    p = put(vault, "pipelines/in/ro.py", stamped())
+    before = p.read_bytes()
+
+    def read_only_then_yes(title, text):
+        make_read_only(p)
+        return True
+    try:
+        said = st.run(st.prepare(vault, p), vault, read_only_then_yes,
+                      via="t")
+        assert "read-only" in said and "Nothing changed" in said
+        assert untouched(vault, p, before)
+        assert sorted(x.name for x in p.parent.iterdir()) == ["ro.py"]
+    finally:
+        make_writable(p.parent)
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="only Windows refuses to replace a read-only file")
+def test_a_failed_replace_of_a_read_only_file_leaves_no_temp_file(tmp_path):
+    """The temp file takes the script's mode, read-only included; a failed
+    replace must still take it away."""
+    p = tmp_path / "ro.py"
+    p.write_bytes(b"A = 1\n")
+    make_read_only(p)
+    try:
+        with pytest.raises(OSError):
+            st._replace(p, b"B = 2\n")
+        assert sorted(x.name for x in tmp_path.iterdir()) == ["ro.py"]
+        assert p.read_bytes() == b"A = 1\n"
+    finally:
+        make_writable(tmp_path)
+
+
+def path_of_length(root: Path, length: int, name_end: str = ".py") -> Path:
+    """A path under ``root`` whose real path is exactly ``length``
+    characters: folders of d's, then a name of s's ending in ``name_end``."""
+    base = os.path.realpath(root)
+    need = length - len(base)          # each part: a separator and a name
+    parts = []
+    while need > 60:
+        parts.append("d" * 40)
+        need -= 41
+    parts.append("s" * (need - 1 - len(name_end)) + name_end)
+    p = Path(base, *parts)
+    assert len(str(p)) == length
+    return p
+
+
+@pytest.mark.parametrize("length", [240, 250, 259])
+def test_a_script_near_max_path_can_be_taken_over(vault, dialogs_on, length):
+    """Its temp file must be makeable beside it, whatever the length (an
+    8.3 short-name vault's long form is long)."""
+    pin = vault / "pipelines" / "in"
+    pin.mkdir(parents=True)
+    p = path_of_length(pin, length)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(stamped().encode())
+    said = st.run(st.prepare(vault, p), vault, YES, via="t")
+    assert "Took over" in said, said
+    assert p.read_bytes() == USER_CODE.encode()
+    assert [x.name for x in p.parent.iterdir()] == [p.name]
+
+
+def log_records_at(vault: Path):
+    p = path_contain.resolved(takeover_dir(vault) / st.LOG_NAME)[1]
+    with open(p, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh.read().splitlines()]
+
+
+def test_a_deep_vault_keeps_its_copy_and_log(tmp_path, dialogs_on):
+    """A vault deep enough that the dated copy's path passes MAX_PATH while
+    the script's does not."""
+    v = path_of_length(tmp_path, 205, name_end="v")
+    (v / "data_out").mkdir(parents=True)
+    p = put(v, "pipelines/in/x.py", stamped())
+    before = p.read_bytes()
+    said = st.run(st.prepare(v, p), v, YES, via="t")
+    assert "Took over" in said, said
+    assert "could not be written" not in said
+    assert p.read_bytes() == USER_CODE.encode()
+    [copy] = backups(v)
+    assert len(os.path.realpath(copy)) > 259
+    with open(path_contain.resolved(copy)[1], "rb") as fh:
+        assert fh.read() == before
+    assert log_records_at(v)[0]["removed_lines"] == [1]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="UNC paths are Windows paths")
+@pytest.mark.parametrize("ref", [
+    "\\\\tko-nohost-qq7\\share\\x.py",
+    "//tko-nohost-qq7/share/x.py",
+    "\\\\?\\UNC\\tko-nohost-qq7\\share\\x.py",
+])
+def test_a_network_path_is_refused_from_its_spelling_alone(vault, ref,
+                                                           monkeypatch):
+    """Resolving \\\\host\\share asks the network for the host (seconds, and
+    a connection attempt to a host that answers) before it can say no — on
+    the GUI thread. The refusal comes from the spelling."""
+    asked = []
+    real = os.path.realpath
+
+    def no_network(p, *a, **k):
+        if path_contain.network_or_device(p):
+            asked.append(os.fspath(p))
+            raise OSError("the network was asked")
+        return real(p, *a, **k)
+    monkeypatch.setattr(os.path, "realpath", no_network)
+    typed = f"take over {ref}"
+    assert pi.take_over_ref(typed) == ref
+    plan = st.decide(vault, ref, typed)
+    assert not plan.ok
+    assert "not a script in the vault's script folders" in plan.refusal
+    assert "x.py" in plan.refusal
+    # Every route holding text asks decide() too: the pipeline chat.
+    said = []
+    job = chat_for(vault, said).plan(typed)
+    job()
+    assert said == [("Council", st.NOT_HERE, "observation")]
+    assert asked == []
 
 
 # ============================================================

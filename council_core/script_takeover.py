@@ -13,19 +13,29 @@ no more:
 
   * it removes ONLY the stamp line(s) — every line script_trust() reads as
     one (nx_policy.stamp_lines), so a stamp under a comment the user added
-    goes too — and keeps every other byte: line endings, a BOM, the rest;
+    goes too — and keeps every other byte: line endings, a BOM, the rest.
+    A line is what Python, an editor and the runner call one: a bare CR
+    ends it, so code a model puts after a CR on its stamp line stays;
+  * it checks that what goes is comment and nothing else: Python must read
+    the same code before and after (tokenize, comments aside, the source
+    encoding included). A stamp inside a string, a "stamp" line that is a
+    statement, a take-out that would change the file's coding line, or a
+    file Python cannot read (before or after) is refused — the dialog's
+    "nothing else" must be true — and left for the user's own editor;
   * it keeps a dated copy of the file as it was, in data_out/dream3d/takeover/
     (the app's own output area — where a script is the model's whatever its
     first line says, so the copy can never run as the user's);
   * it replaces the file atomically (a temp file beside it, then os.replace):
     a failure leaves the old script, never half of one, and deletes nothing
-    of the user's;
+    of the user's; every file it makes is spelled to work past MAX_PATH;
   * it logs who and when to data_out/dream3d/takeover/takeover_log.jsonl.
 
 It refuses a file with no stamp (it is the user's already), anything outside
 the vault's script folders — pipelines/in and pipelines/out, where the app
 saves the model scripts the user runs — a script in data_out (the location
-rule keeps it a model script, stamp or not), and anything but a .py file.
+rule keeps it a model script, stamp or not), a read-only file, and anything
+but a .py file. A network or device path is refused from its spelling,
+before anything asks the network about it.
 
 ONLY THE USER CAN ASK
 A take-over loosens what a script may do, so the request must be the user's
@@ -56,11 +66,14 @@ from __future__ import annotations
 import datetime
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+import tokenize
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,12 +86,14 @@ SUBFOLDER = "dream3d/takeover"
 LOG_NAME = "takeover_log.jsonl"
 
 TITLE = "Take over this script?"
-#: What a take-over changes, in the words the confirmation uses.
+#: What a take-over changes, in the words the confirmation uses. The USER
+#: rules (nx_policy.run_reasons, nx_guard) hold two filters and nothing
+#: else: no process, socket or native-code refusal is left.
 WHAT_CHANGES = ("This script will run as yours: it will be able to write and "
-                "delete files anywhere your account can, and the Council "
-                "stops checking its outputs. It still refuses Execute Process "
-                "and Create Python Plugin, the two filters that run arbitrary "
-                "code.")
+                "delete files anywhere your account can, run any program, "
+                "use the network and load native code, and the Council stops "
+                "checking its outputs. The Council still refuses only two "
+                "DREAM3D-NX filters (Execute Process, Create Python Plugin).")
 #: The answer to a take-over phrase that did not come through a door.
 NOT_HERE = ("Taking a script over is done only from what you type in the chat "
             "box, or with the Take over button in the Dream3D tab — never "
@@ -93,6 +108,24 @@ _HEAD_WIDTH = 110
 _MAX_BYTES = 8 * 1024 * 1024
 _SCRIPT_SUFFIXES = (".py", ".d3dpipeline", ".dream3d")
 _EXPLICIT = re.compile(r"\b(?:scripts?|pipelines?|marker|stamp)\b", re.I)
+
+# The temp file the new script is written to, beside it: a short name, and
+# room for it in the folder's spelling (mkstemp adds 8 characters).
+_TEMP_PREFIX = ".~takeover-"
+_TEMP_SUFFIX = ".tmp"
+_TEMP_ROOM = 1 + len(_TEMP_PREFIX) + 16 + len(_TEMP_SUFFIX)
+
+# Tokens that are not code: all a comment line may take with it.
+_NOT_CODE = frozenset({tokenize.COMMENT, tokenize.NL})
+# Tokens placed by the lines around them, not by one line's own text.
+_PLACED = frozenset({tokenize.ENCODING, tokenize.INDENT, tokenize.DEDENT,
+                     tokenize.ENDMARKER})
+_STRINGS = frozenset({tokenize.STRING} | {
+    getattr(tokenize, n) for n in ("FSTRING_START", "FSTRING_MIDDLE",
+                                   "FSTRING_END") if hasattr(tokenize, n)})
+# What tokenize raises for a file Python cannot read.
+_CANNOT_READ = (tokenize.TokenError, SyntaxError, UnicodeDecodeError,
+                LookupError, ValueError)
 
 Confirm = Callable[[str, str], bool]
 
@@ -144,6 +177,15 @@ def _shown(path: Path, vault_dir: Path) -> str:
         base = Path(path_contain.resolved(vault_dir)[1])
         return real.relative_to(base).as_posix()
     except (OSError, ValueError, TypeError):
+        return str(path)
+
+
+def _as_spelled(path: Path, vault_dir: Path) -> str:
+    """How to name ``path`` without resolving it — for a path that must
+    not be resolved (a network or device path: resolving asks the network)."""
+    try:
+        return Path(path).relative_to(vault_dir).as_posix()
+    except ValueError:
         return str(path)
 
 
@@ -228,12 +270,15 @@ def prepare(vault_dir: Path, path) -> Plan:
     it will not be done."""
     import path_contain
     path = Path(path)
-    shown = _shown(path, vault_dir)
+    # From the spelling alone, before anything resolves it: resolving
+    # \\host\share asks the network for the host (path_contain).
     if path_contain.network_or_device(path) or \
             path_contain.has_stream_name(path):
+        shown = _as_spelled(path, vault_dir)
         return Plan(shown=shown, refusal=(
             f"{shown} is not a script in the vault's script folders "
             f"(pipelines/in, pipelines/out). Nothing changed."))
+    shown = _shown(path, vault_dir)
     try:
         real = Path(path_contain.resolved(path)[1])
     except (OSError, ValueError, TypeError) as exc:
@@ -267,12 +312,14 @@ def prepare(vault_dir: Path, path) -> Plan:
     except OSError as exc:
         return Plan(shown=shown, refusal=(
             f"{shown} could not be read: {exc}. Nothing changed."))
-    text = _decode(data)[1]
-    numbers = nx_policy.stamp_lines(text)
+    text, numbers, new = _take_out(data)
     if not numbers:
         return Plan(path=real, shown=shown, refusal=(
             f"{shown} carries no model stamp, so it already runs as yours "
             f"— there is nothing to take over. Nothing changed."))
+    why = _changes_code(data, new, numbers, shown) or _read_only(real, shown)
+    if why:
+        return Plan(path=real, shown=shown, refusal=why)
     return Plan(path=real, shown=shown, stamp_lines=tuple(numbers),
                 head=tuple(_head(text, numbers)),
                 digest=hashlib.sha256(data).hexdigest())
@@ -285,20 +332,119 @@ def _decode(data: bytes) -> Tuple[bytes, str]:
     return bom, data[len(bom):].decode("utf-8", "surrogateescape")
 
 
+def _take_out(data: bytes) -> Tuple[str, List[int], bytes]:
+    """(text, stamp line numbers, the file's bytes without those lines) —
+    lines as nx_policy.lines_with_ends counts them, every other byte kept."""
+    bom, text = _decode(data)
+    numbers = nx_policy.stamp_lines(text)
+    new = bom + nx_policy.without_stamp(text).encode("utf-8",
+                                                     "surrogateescape")
+    return text, numbers, new
+
+
+def _python_reads(data: bytes) -> List[tokenize.TokenInfo]:
+    """``data`` as Python reads a file it runs: the BOM and a coding line
+    honoured, a bare CR a line break. Raises what tokenize raises for a
+    file Python cannot read."""
+    flat = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return list(tokenize.tokenize(io.BytesIO(flat).readline))
+
+
+def _code(tokens: List[tokenize.TokenInfo]) -> List[Tuple[int, str]]:
+    """The tokens Python runs: all but comments and blank-line breaks."""
+    return [(t.type, t.string) for t in tokens if t.type not in _NOT_CODE]
+
+
+def _unreadable(exc: Exception) -> str:
+    if isinstance(exc, UnicodeDecodeError):
+        return f"byte {exc.start} is not {exc.encoding} text"
+    if isinstance(exc, SyntaxError):
+        return exc.msg or "a syntax error"
+    if isinstance(exc, tokenize.TokenError) and exc.args:
+        return str(exc.args[0])
+    return str(exc) or type(exc).__name__
+
+
+def _changes_code(data: bytes, new: bytes, numbers: List[int],
+                  shown: str) -> str:
+    """Why taking lines ``numbers`` out of ``data`` (which gives ``new``)
+    would change more than the stamp — '' when they are comments and
+    nothing else, so Python runs the same code before and after: the
+    confirmation's "nothing else" must be true."""
+    lines = _line_list(numbers)
+    try:
+        before = _python_reads(data)
+    except _CANNOT_READ as exc:
+        return (f"{shown} was not taken over: Python cannot read it as it "
+                f"stands ({_unreadable(exc)}), so the Council cannot check "
+                f"that taking out {lines} (the model stamp) would leave its "
+                f"code as it is. If you have read it and want it as yours, "
+                f"delete {lines} by hand. Nothing changed.")
+    gone = set(numbers)
+    found = {}
+    for tok in before:
+        if tok.type in _NOT_CODE or tok.type in _PLACED:
+            continue
+        for n in range(tok.start[0], tok.end[0] + 1):
+            if n in gone and n not in found:
+                found[n] = ("inside a string" if tok.type in _STRINGS
+                            else "part of the code, not a comment")
+    if found:
+        what = "; ".join(f"line {n} is {why}"
+                         for n, why in sorted(found.items()))
+        reads = "reads" if len(numbers) == 1 else "read"
+        it = "it" if len(numbers) == 1 else "them"
+        return (f"{shown} was not taken over: {lines} {reads} as the model "
+                f"stamp, but {what} — taking {it} out would change what "
+                f"the script does, not only whose it is. Read it, and edit "
+                f"the stamp out by hand if you want it as yours. Nothing "
+                f"changed.")
+    try:
+        after = _python_reads(new)
+    except _CANNOT_READ as exc:
+        why = f"would leave a file Python cannot read ({_unreadable(exc)})"
+    else:
+        if before[0].string != after[0].string:
+            # The ENCODING tokens: a coding line counts only in a file's
+            # first two lines, so taking a line out can bring one in or out.
+            why = ("would change the coding line Python reads its "
+                   "characters by (one counts only in a file's first two "
+                   "lines)")
+        elif _code(before) != _code(after):
+            why = "would change the code Python runs"
+        else:
+            return ""
+    return (f"{shown} was not taken over: taking out {lines} (the model "
+            f"stamp) {why} — it would change what the script does, not "
+            f"only whose it is. Read it, and edit the stamp out by hand if "
+            f"you want it as yours. Nothing changed.")
+
+
+def _read_only(real: Path, shown: str) -> str:
+    """Why a read-only ``real`` is left as it is ('' when it is not): the
+    take-over removes the stamp and changes nothing else — not the mark
+    the user (or a tool of theirs) put on the file."""
+    if os.access(real, os.W_OK):
+        return ""
+    return (f"{shown} is marked read-only, so it was not taken over. "
+            f"Nothing changed. To take it over, clear its read-only mark "
+            f"first, then ask again.")
+
+
 def _printable(line: str) -> str:
     """A line of a model's file, safe to show: control and format characters
-    (a bidi override can make a line read as something else) spelled out,
-    and cut to the dialog's width."""
+    (a bidi override can make a line read as something else) and line or
+    paragraph separators (a dialog may break the row there, though Python
+    does not) spelled out, and cut to the dialog's width."""
     line = line.rstrip("\r\n").replace("\t", "    ")
     out = "".join(ch if unicodedata.category(ch)[0] != "C"
+                  and unicodedata.category(ch) not in ("Zl", "Zp")
                   else f"\\u{ord(ch):04x}" for ch in line)
     return out if len(out) <= _HEAD_WIDTH else out[:_HEAD_WIDTH - 1] + "…"
 
 
 def _head(text: str, removed: List[int]) -> List[str]:
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
+    lines = nx_policy.lines_with_ends(text)
     gone = set(removed)
 
     def row(n: int) -> str:
@@ -379,10 +525,13 @@ def apply(plan: Plan, vault_dir: Path, *, via: str) -> Result:
         return Result(False, f"{plan.shown} changed after you were asked, so "
                              f"it was not taken over. Nothing changed — ask "
                              f"again to see it as it is now.")
-    bom, text = _decode(data)
-    numbers = nx_policy.stamp_lines(text)
-    new_text = nx_policy.without_stamp(text)
-    new = bom + new_text.encode("utf-8", "surrogateescape")
+    text, numbers, new = _take_out(data)
+    why = (_changes_code(data, new, numbers, plan.shown)
+           or _read_only(real, plan.shown))
+    if why:
+        return Result(False, why)
+    # As the runner will read it (utf-8-sig; script_trust reads a bare CR
+    # as the line break read_text makes of it).
     after = new.decode("utf-8-sig", errors="replace")
     if nx_policy.script_trust(after, real, [_data_out(vault_dir)]) \
             != nx_policy.USER:
@@ -415,7 +564,7 @@ def apply(plan: Plan, vault_dir: Path, *, via: str) -> Result:
             "via": via,
             "script": str(real),
             "removed_lines": numbers,
-            "removed": [_printable(text.split("\n")[n - 1])
+            "removed": [_printable(nx_policy.lines_with_ends(text)[n - 1])
                         for n in numbers],
             "backup": str(backup),
             "sha256_before": plan.digest,
@@ -444,7 +593,7 @@ def _keep_copy(vault_dir: Path, real: Path, data: bytes,
         name = f"{stem}.before-takeover-{stamp}{tail}.py"
         target = nx_ops.safe_out_path(vault_dir, name, subfolder=SUBFOLDER)
         try:
-            with open(target, "xb") as fh:
+            with open(_fs(target), "xb") as fh:
                 fh.write(data)
             return target
         except FileExistsError:
@@ -452,12 +601,21 @@ def _keep_copy(vault_dir: Path, real: Path, data: bytes,
     raise OSError("no free name for the copy")
 
 
+def _fs(path: Path, room: int = 0) -> str:
+    """``path`` spelled so the file system takes it at any length — the
+    \\\\?\\ form once it (with ``room`` more characters) passes MAX_PATH, as
+    in an 8.3 short-name vault whose long form is long (path_contain,
+    "Comparing is not asking")."""
+    import path_contain
+    return path_contain.resolved(path, room)[1]
+
+
 def _replace(real: Path, new: bytes) -> None:
     """``real`` becomes ``new`` all at once: written beside it, then
-    os.replace. On a failure the temp file (ours) goes; ``real`` is as it
-    was."""
-    fd, tmp = tempfile.mkstemp(prefix=f".{real.name}.", suffix=".takeover",
-                               dir=str(real.parent))
+    os.replace. On a failure the temp file (ours) goes — its read-only mark,
+    copied from ``real``, taken off first; ``real`` is as it was."""
+    fd, tmp = tempfile.mkstemp(prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX,
+                               dir=_fs(real.parent, _TEMP_ROOM))
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(new)
@@ -470,6 +628,10 @@ def _replace(real: Path, new: bytes) -> None:
         os.replace(tmp, real)
     except BaseException:
         try:
+            os.chmod(tmp, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            pass
+        try:
             os.unlink(tmp)
         except OSError:
             pass
@@ -479,6 +641,6 @@ def _replace(real: Path, new: bytes) -> None:
 def _log(vault_dir: Path, record: dict) -> Path:
     from . import nx_ops
     path = nx_ops.safe_out_path(vault_dir, LOG_NAME, subfolder=SUBFOLDER)
-    with open(path, "a", encoding="utf-8") as fh:
+    with open(_fs(path), "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     return path

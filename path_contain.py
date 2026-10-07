@@ -58,13 +58,15 @@ def _compare_form(real: str) -> str:
     return os.path.normcase(real)
 
 
-def _fs_form(real: str) -> str:
+def _fs_form(real: str, room: int = 0) -> str:
     """``real`` (a realpath result: absolute, normalised, backslashes) in a
-    spelling every file-system call accepts. The prefix goes on only when the
-    path is too long without it: with \\\\?\\ Windows stops normalising the
-    name, so "x.dream3d." would name a different file from the one the
-    unprefixed spelling a filter is handed opens."""
-    if os.name != "nt" or real.startswith(_PREFIX) or len(real) <= _MAX_PLAIN:
+    spelling every file-system call accepts — with ``room`` characters more
+    added to it (a folder a file is about to be made in). The prefix goes on
+    only when the path is too long without it: with \\\\?\\ Windows stops
+    normalising the name, so "x.dream3d." would name a different file from
+    the one the unprefixed spelling a filter is handed opens."""
+    if os.name != "nt" or real.startswith(_PREFIX) or \
+            len(real) + room <= _MAX_PLAIN:
         return real
     if real.startswith("\\\\"):
         return _UNC_PREFIX + real[2:]
@@ -80,13 +82,15 @@ def canonical(path: Any) -> str:
     return _compare_form(os.path.realpath(os.fspath(path)))
 
 
-def resolved(path: Any) -> Tuple[str, str]:
+def resolved(path: Any, room: int = 0) -> Tuple[str, str]:
     """(canonical form, file-system spelling) of ``path``, from ONE realpath
     call: the first to compare with other canonical forms, the second to ask
     the file system about (lexists, isdir, scandir) — it works whatever the
-    length. Raises like canonical()."""
+    length, and still does with ``room`` more characters joined to it (a
+    name for a file to be made in the folder ``path``). Raises like
+    canonical()."""
     real = os.path.realpath(os.fspath(path))
-    return _compare_form(real), _fs_form(real)
+    return _compare_form(real), _fs_form(real, room)
 
 
 def is_under(child: Any, parent: Any) -> bool:

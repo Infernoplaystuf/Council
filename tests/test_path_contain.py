@@ -127,6 +127,26 @@ def test_the_file_system_is_asked_in_a_spelling_that_works(short_vault):
 
 
 @windows_only
+def test_a_folder_is_spelled_with_room_for_a_file_to_be_made_in_it(tmp_path):
+    """A folder short enough to use as it is, but not once a file's name is
+    joined to it (mkstemp's dir=): ``room`` puts the prefix on early."""
+    d = Path(os.path.realpath(tmp_path))
+    while len(str(d)) < 230:
+        d = d / ("d" * min(20, max(1, 229 - len(str(d)))))
+    d.mkdir(parents=True)
+    plain = path_contain.resolved(d)[1]
+    assert plain == os.path.realpath(d) and len(plain) < 248
+    roomy = path_contain.resolved(d, room=40)[1]
+    assert roomy == "\\\\?\\" + plain
+    name = os.path.join(roomy, "t" * 35 + ".tmp")
+    with open(name, "xb") as fh:
+        fh.write(b"x")
+    assert os.path.isfile(name)
+    os.unlink(name)
+    assert path_contain.resolved(d, room=259 - len(plain))[1] == plain
+
+
+@windows_only
 def test_a_junction_out_of_the_output_area_is_outside_it(tmp_path):
     import _winapi
     vault = tmp_path / "vault"
