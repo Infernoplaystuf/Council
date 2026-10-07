@@ -651,3 +651,32 @@ def test_a_failed_step_before_the_question_costs_only_that_step(tmp_path):
     assert actions.send("q", council_options.CouncilOptions.defaults(),
                         on_event=events.append).ok
     assert any("docs: skipped (docs server gone)" in e.text for e in events)
+
+
+def test_expanding_a_fast_answer_runs_the_whole_council(qapp, tmp_path):
+    """Expand with council set a flag nothing read; now the re-ask is
+    deliberated at Deep depth, and no earlier answer is offered instead."""
+    seen = {}
+
+    class Actions(CouncilActions):
+        def reusable(self, q):
+            raise AssertionError("an expand must not offer an old answer")
+
+        def send(self, typed, options, **kw):
+            seen.update(typed=typed, deliberate=options.deliberate,
+                        depth=options.depth)
+
+    widget = CouncilTab(actions=Actions(vault_dir=tmp_path))
+    widget._last_fast_question = "which pump?"
+    widget.on_expand_with_council()
+    deadline = time.monotonic() + 5
+    while "typed" not in seen and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert seen == {"typed": "which pump?", "deliberate": True,
+                    "depth": "deep"}
+    while any(t.name == "council-turn" and t.is_alive()
+              for t in threading.enumerate()):
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()

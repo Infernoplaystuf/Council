@@ -877,7 +877,10 @@ class CouncilTab(ViewHelpers, QWidget):
         # keyword here would swallow.
         self._send(reuse=True)
 
-    def _send(self, *, reuse: bool) -> None:
+    def _send(self, *, reuse: bool, full: bool = False) -> None:
+        """`reuse`: offer an earlier passed answer first (answer_reuse).
+        `full`: the whole council at Deep depth, whatever the switches say
+        (Expand with council)."""
         typed = self.input.toPlainText().strip()
         if not typed:
             return
@@ -893,6 +896,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self.input.clear()
 
         options = self.options()          # on the GUI thread, before the worker
+        if full:
+            options.deliberate = True
+            options.depth = "deep"
 
         def work() -> None:
             try:
@@ -1227,9 +1233,11 @@ class CouncilTab(ViewHelpers, QWidget):
             self.append("Council", "There is no fast answer to expand.",
                         "observation")
             return
-        self._force_full_council = True
         self.input.setPlainText(self._last_fast_question)
-        self.on_send()
+        # The whole council, at Deep depth, and no earlier answer offered
+        # instead: _force_full_council was set here and never read (and
+        # reset_turn cleared it before the send could have).
+        self._send(reuse=False, full=True)
 
     def on_clarify(self, skip: bool = False) -> None:
         self.clarif_frame.hide()
