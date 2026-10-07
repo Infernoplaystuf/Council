@@ -858,8 +858,11 @@ def test_the_user_rules_check_a_literal_pipeline_file(tmp_path):
                                  search_dirs=[tmp_path]) == []
     assert nx_policy.run_reasons(run.format("bad.d3dpipeline"), trust=U,
                                  search_dirs=[tmp_path])
+    # A file this check cannot read as a pipeline is not refused here:
+    # Pipeline.from_file fails on it, or — if simplnx reads it after all —
+    # nx_guard checks every step's uuid when it executes.
     assert nx_policy.run_reasons(run.format("junk.d3dpipeline"), trust=U,
-                                 search_dirs=[tmp_path])
+                                 search_dirs=[tmp_path]) == []
     # A user script may still not use get_filters or name the filter.
     assert nx_policy.run_reasons("import simplnx as nx\nnx.get_filters()\n",
                                  trust=U)
@@ -868,6 +871,67 @@ def test_the_user_rules_check_a_literal_pipeline_file(tmp_path):
     # ...and its own imports stay its own.
     assert nx_policy.run_reasons("import os, shutil\nos.getcwd()\n",
                                  trust=U) == []
+
+
+def test_the_pipeline_file_check_reads_only_simplnx_pipelines(tmp_path):
+    """pipeline_file_reasons matched EVERY .from_file(...) call: a user's
+    Settings.from_file('settings.json') was refused as 'not a pipeline'
+    (it ran at 0822b06). Only simplnx's Pipeline has from_file."""
+    U = nx_policy.USER
+    (tmp_path / "settings.json").write_text('{"threshold": 3}',
+                                            encoding="utf-8")
+    bad = tmp_path / "bad.d3dpipeline"
+    bad.write_text(json.dumps({"name": "b", "pipeline": [
+        {"filter": {"name": "x", "uuid": EXECUTE_PROCESS}, "args": {}}]}),
+        encoding="utf-8")
+    others = [
+        "class Settings:\n    @classmethod\n    def from_file(cls, p):\n"
+        "        return p\ncfg = Settings.from_file('settings.json')\n",
+        # The same in a simplnx script: a tokenizer, libmagic, a config.
+        "import simplnx as nx\nfrom tokenizers import Tokenizer\n"
+        "t = Tokenizer.from_file('settings.json')\n",
+        "import simplnx as nx\nimport magic\nmagic.from_file('bad.d3dpipeline')\n",
+        "import simplnx as nx\ncfg = load_cfg().from_file('settings.json')\n",
+        # No simplnx at all: someone else's Pipeline.
+        "from mylib import Pipeline\nPipeline.from_file('bad.d3dpipeline')\n",
+    ]
+    for code in others:
+        assert nx_policy.run_reasons(code, trust=U,
+                                     search_dirs=[tmp_path]) == [], code
+    # simplnx's Pipeline, however it is spelled, is still checked.
+    spellings = [
+        "import simplnx as nx\nnx.Pipeline.from_file('bad.d3dpipeline')\n",
+        "import simplnx\nsimplnx.Pipeline.from_file('bad.d3dpipeline')\n",
+        "from simplnx import Pipeline\nPipeline.from_file('bad.d3dpipeline')\n",
+        "from simplnx import Pipeline as P\nP.from_file('bad.d3dpipeline')\n",
+        "import simplnx as nx\nP = nx.Pipeline\nP.from_file("
+        "path='bad.d3dpipeline')\n",
+        "from simplnx import *\nPipeline.from_file('bad.d3dpipeline')\n",
+    ]
+    for code in spellings:
+        got = nx_policy.run_reasons(code, trust=U, search_dirs=[tmp_path])
+        assert got and "Execute Process" in got[0], code
+
+
+def test_a_users_own_from_file_script_runs_again(tmp_path):
+    """The reviewer's case through the real runner (plain Python)."""
+    (tmp_path / "settings.json").write_text('{"threshold": 3}',
+                                            encoding="utf-8")
+    s = tmp_path / "my_step.py"
+    s.write_text(
+        "import json\n"
+        "class Settings:\n"
+        "    @classmethod\n"
+        "    def from_file(cls, path):\n"
+        "        with open(path, encoding='utf-8') as fh:\n"
+        "            return json.load(fh)\n"
+        "import os\n"
+        "os.chdir(os.path.dirname(os.path.abspath(__file__)))\n"
+        "cfg = Settings.from_file('settings.json')\n"
+        "print('threshold', cfg['threshold'])\n", encoding="utf-8")
+    res = wr.run_linear([s])
+    assert res.success, res.summary()
+    assert res.step_results[0].stdout.strip() == "threshold 3"
 
 
 # ============================================================

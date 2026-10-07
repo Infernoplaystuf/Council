@@ -68,9 +68,11 @@ script_trust() says which:
     run and again by nx_guard when a filter or a pipeline executes. A user
     script MAY run a saved pipeline the way the simplnx tutorials do —
     nx.Pipeline.from_file(...), set_args, execute — when the .d3dpipeline's
-    filters pass this policy: a literal path is read and checked before
-    anything runs (pipeline_file_reasons), and nx_guard checks every step's
-    uuid when Pipeline.execute runs, whatever the path was.
+    filters pass this policy: a literal path given to simplnx's
+    Pipeline.from_file is read and checked before anything runs
+    (pipeline_file_reasons; any other class's from_file is the script's own
+    business), and nx_guard checks every step's uuid when Pipeline.execute
+    runs, whatever the path was.
 
 A model's script never gets the USER rules by being moved or renamed: the
 stamp travels with the text. Deleting the stamp line is the user taking the
@@ -486,20 +488,63 @@ def pipeline_file_uuids(text: str) -> List[str]:
     return found
 
 
+def _pipeline_class_refs(tree: ast.AST):
+    """A test for "this expression is simplnx's Pipeline class", from the
+    script's own imports: nx.Pipeline / simplnx.Pipeline after
+    `import simplnx [as nx]`, the name `from simplnx import Pipeline [as P]`
+    (or `import *`) binds, and a plain name assigned one of those
+    (`P = nx.Pipeline`). A script that never imports simplnx has none."""
+    modules, names = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "simplnx":
+                    modules.add(a.asname or a.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "simplnx" \
+                and not node.level:
+            for a in node.names:
+                if a.name == "Pipeline":
+                    names.add(a.asname or a.name)
+                elif a.name == "*":
+                    names.add("Pipeline")
+
+    def is_ref(e) -> bool:
+        if isinstance(e, ast.Name):
+            return e.id in names
+        return (isinstance(e, ast.Attribute) and e.attr == "Pipeline"
+                and isinstance(e.value, ast.Name) and e.value.id in modules)
+    # A plain name ever assigned one of those is one too (P = nx.Pipeline).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and is_ref(node.value):
+            names.update(t.id for t in node.targets
+                         if isinstance(t, ast.Name))
+    return is_ref
+
+
 def pipeline_file_reasons(tree: ast.AST, search_dirs: Iterable = ()
                           ) -> List[str]:
     """Why a script's Pipeline.from_file(<literal path>) must not run: the
-    pipeline it names holds a denied filter, or is not a pipeline at all.
+    saved pipeline it names holds a denied filter.
+
+    Only simplnx's Pipeline.from_file is read (the only from_file in the
+    installed simplnx): a user's Settings.from_file('settings.json'), a
+    tokenizer's or libmagic's is not a pipeline, and refusing it as "not a
+    pipeline" broke scripts that ran before (the receiver used not to be
+    looked at).
 
     A relative path is looked for in ``search_dirs`` (the script's own
-    folder, then the run's working folder). A path this cannot find, or one
-    computed at run time, is not refused here: nx_guard checks every step's
-    uuid when that pipeline executes, which no path trick gets past."""
+    folder, then the run's working folder). A path this cannot find, one
+    computed at run time, one reached through a spelling the imports above do
+    not show, and a file this cannot read as a pipeline are not refused here:
+    nx_guard checks every step's uuid when that pipeline executes, which no
+    path trick gets past — this check only says so earlier."""
     reasons: List[str] = []
+    is_pipeline = _pipeline_class_refs(tree)
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "from_file"):
+                and node.func.attr == "from_file"
+                and is_pipeline(node.func.value)):
             continue
         arg = node.args[0] if node.args else next(
             (k.value for k in node.keywords if k.arg in ("path", "arg0")),
@@ -515,10 +560,8 @@ def pipeline_file_reasons(tree: ast.AST, search_dirs: Iterable = ()
         try:
             with open(path, encoding="utf-8-sig") as fh:
                 uuids = pipeline_file_uuids(fh.read())
-        except (OSError, ValueError) as exc:
-            reasons.append(f"line {node.lineno}: {raw} could not be checked "
-                           f"as a pipeline ({exc}), so it is not run")
-            continue
+        except (OSError, ValueError):
+            continue                    # nx_guard checks it if it runs
         for u in uuids:
             if is_denied(u):
                 reasons.append(f"line {node.lineno}: the pipeline {raw} "
