@@ -354,6 +354,15 @@ def upgrade_order(assessments: Sequence[Assessment]) -> List[Assessment]:
         a.spec.priority, short.get(a.model_verdict, 6), -a.seconds_7d))
 
 
+def role_tools(role: str) -> Tuple[str, ...]:
+    """The tools `role` may call (tool_kit.ROLE_TOOLS); the Judge's are the
+    checks the app runs for it."""
+    from .tool_kit import JUDGE_CHECKS, ROLE_TOOLS
+    if role == "judge":
+        return tuple(f"{t} (run for it before ranking)" for t in JUDGE_CHECKS)
+    return tuple(ROLE_TOOLS.get(role, ()))
+
+
 def card_text(a: Assessment) -> str:
     """One role's spec card, as the tab shows it."""
     s = a.spec
@@ -373,6 +382,12 @@ def card_text(a: Assessment) -> str:
     L += [f"  → {n}" for n in a.notes]
     if s.tips:
         L += ["", "TIPS"] + [f"  • {t}" for t in s.tips]
+    tools = role_tools(s.role)
+    if tools:
+        L += ["", "TOOLS (with the Council tab's Tools switch on)",
+              "  " + ", ".join(tools),
+              "  Each tool call is one more model call for this role; a "
+              "model with native tool calling uses them best."]
     if s.duplicate:
         L += ["", "A DUPLICATE (a second copy running at the same time)",
               f"  {s.duplicate}",

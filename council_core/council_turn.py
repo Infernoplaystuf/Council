@@ -82,6 +82,21 @@ def panel_for_route(route: str) -> Tuple[List[str], str]:
     return list(panel), synth
 
 
+#: Who gets tools when the tools are a plain dict rather than a ToolSet
+#: (which carries its own split, tool_kit.ROLE_TOOLS).
+PLAIN_TOOL_ROLES = ("coder", "intern")
+
+
+def tools_for_role(tools: Any, role: str) -> Dict[str, Any]:
+    """`role`'s share of `tools`: a ToolSet's role split, or the whole dict
+    for the coder and intern."""
+    if not tools:
+        return {}
+    if hasattr(tools, "for_role"):
+        return tools.for_role(role)
+    return dict(tools) if role in PLAIN_TOOL_ROLES else {}
+
+
 def build_agents(models: Any, *,
                  token_callback: Optional[Callable[[str, str], None]] = None,
                  enable_tools: bool = False,
@@ -96,6 +111,7 @@ def build_agents(models: Any, *,
     """
     agents: Dict[str, ModelAgent] = {}
     for role, display in AGENT_NAMES.items():
+        role_tools = tools_for_role(tools, role) if enable_tools else {}
         model = getattr(models, role, None)
         if model is None and role == "sage":
             # The Sage is reached through a wrapper in some builds.
@@ -105,8 +121,8 @@ def build_agents(models: Any, *,
             continue
         agents[role] = ModelAgent(
             display, model,
-            enable_tools=enable_tools and role in ("coder", "intern"),
-            tools=tools if enable_tools else None,
+            enable_tools=enable_tools and bool(role_tools),
+            tools=role_tools or None,
             token_callback=token_callback)
     return agents
 
@@ -216,8 +232,16 @@ def run_turn(question: str, models: Any, *,
         return TurnResult(False, message="No judge model is loaded.")
 
     try:
+        if enable_tools and tools is not None and hasattr(tools, "new_turn"):
+            tools.new_turn()             # a fresh cache and scratchpad
         agents = build_agents(models, token_callback=on_token,
                               enable_tools=enable_tools, tools=tools)
+        if enable_tools and tools and "quote_check" in tools:
+            from .tool_kit import judge_checks
+            extra_ctx = dict(extra_ctx or {})
+            extra_ctx.setdefault(
+                "judge_checks",
+                lambda cands, _t=tools: judge_checks(_t, cands))
         if not agents:
             return TurnResult(
                 False,

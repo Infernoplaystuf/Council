@@ -50,7 +50,12 @@ class Switch:
 #: alphabetically has moved every one of them.
 SWITCHES: Tuple[Switch, ...] = (
     Switch("deliberate", "Deliberation", True, shown_in_demo=False),
-    Switch("tools", "Tools", False),
+    Switch("tools", "Tools", False,
+           hint="Lets the members look things up while they work — run and "
+                "test code, check a quote against your vault, compute a "
+                "number, read part of a long file, draw a chart. Each member "
+                "has its own short list (see Council Map ▸ Role specs). "
+                "Slower: each tool use is another model call."),
     Switch("fill_ide", "Fill IDE", True),
     Switch("stream", "Stream tokens", True),
     Switch("use_profile", "👤 Profile", True,

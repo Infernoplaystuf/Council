@@ -380,12 +380,21 @@ class ModelAgent:
         parts.append(f"USER REQUEST:\n{ctx.user_text}")
 
         if self.enable_tools and self.tools:
-            tool_list = ", ".join(sorted(self.tools.keys()))
+            # A tool's one-line `help` (args and purpose) when it has one:
+            # a bare name list left a small model guessing the arguments.
+            helps = [f"- {n}: {getattr(fn, 'help', '')}".rstrip(": ")
+                     for n, fn in self.tools.items()]
+            if any(getattr(fn, "help", "") for fn in self.tools.values()):
+                parts += ["", "TOOLS AVAILABLE (args — what it does):",
+                          *helps]
+            else:
+                parts += ["", "TOOLS AVAILABLE: "
+                          + ", ".join(sorted(self.tools.keys()))]
             parts += [
-                "",
-                f"TOOLS AVAILABLE: {tool_list}",
                 "To use a tool, output ONLY JSON: {\"tool\":\"name\",\"args\":{...}}",
-                "Otherwise write a normal answer.",
+                "Use a tool when it replaces a guess (a number, a quote, a "
+                "file's contents, whether code runs); otherwise write a "
+                "normal answer.",
             ]
         return "\n".join(parts)
 
@@ -854,6 +863,21 @@ class DeliberationOrchestrator:
             # (council_core.vault_context.evidence). Passed only when there
             # is some, so a judge without the keyword still works.
             _evidence = str(ctx.shared.get("judge_evidence") or "")
+            # The Judge's own checks (tool_kit.judge_checks): each passage a
+            # candidate quotes, looked up in the vault. Run by the app, not
+            # by the Judge — the Judge ranks, it does not call tools.
+            _checker = ctx.shared.get("judge_checks")
+            if callable(_checker):
+                try:
+                    _checks = str(_checker(candidates) or "")
+                except Exception as _cexc:                # noqa: BLE001
+                    _checks = ""
+                    emit(AgentEvent("Judge", "observation",
+                                    f"Quote checks failed: {_cexc}"))
+                if _checks:
+                    emit(AgentEvent("Judge", "observation", _checks))
+                    _evidence = "\n\n".join(x for x in (_evidence, _checks)
+                                             if x)
             if _evidence:
                 rank_json = self.judge.rank_candidates(
                     user_text, candidates, extra_context=_evidence)

@@ -154,7 +154,8 @@ _NODES: Tuple[Node, ...] = (
          "coder_agent.py has a write → run → fix loop the turn does not use.",
          "council_core/council_turn.py:108; coder_agent.py"),
     Node("skeptic", "Skeptic", "member",
-         "Attacks the question. Given no vault and no history on purpose.",
+         "Attacks the question. Given no vault passages and no history up "
+         "front, on purpose; with Tools on it checks quotes and numbers.",
          "council_engine.py:5591"),
     Node("sage", "Sage", "member",
          "Long-view answers, from its own knowledge base (taught in the "
@@ -204,9 +205,11 @@ _NODES: Tuple[Node, ...] = (
          "data_index / vault search: matching files and folders.",
          "data_index.py; council_core/vault_search.py"),
     Node("tools", "Tools", "supplier",
-         "run_python, vault_save/list/read/search, api_search, api_signature. "
-         "Only the coder and intern may call them, and only with Tools on.",
-         "council_core/council_tools.py; council_core/council_turn.py:108"),
+         "27 tools, only with Tools on; each member gets its own short list "
+         "(tool_kit.ROLE_TOOLS): code checks for the Coder, data lookups for "
+         "the Intern, quote checks for the Skeptic and the Judge, charts for "
+         "the Artist. Repeat calls in one question come from a cache.",
+         "council_core/council_tools.py; council_core/tool_kit.py"),
     Node("web", "Web research", "supplier",
          "crawl4ai page research (intern_agent.py). Not part of the turn.",
          "intern_agent.py"),
@@ -338,12 +341,16 @@ def _edges() -> List[Edge]:
           note="intern_agent.py can research the web before drafting; the "
                "turn does not use it.", cite="intern_agent.py"),
         # -- tools ---------------------------------------------------------
-        E("tools", "coder", "tool results (run_python, vault_*, api_*), "
-          "when Tools is on", "tools", "live",
-          cite="council_core/council_tools.py; "
-               "council_qt/tabs/council.py:162"),
-        E("tools", "intern", "tool results, when Tools is on", "tools",
-          "live", cite="council_core/council_turn.py:108-109"),
+        *[E("tools", role, "tools: " + ", ".join(names), "tools", "live",
+            cite="council_core/tool_kit.py (ROLE_TOOLS); "
+                 "council_core/council_turn.py (tools_for_role)")
+          for role, names in _role_tools().items()],
+        E("tools", "judge", "quote checks on every passage a candidate "
+          "quotes, before ranking", "tools", "live",
+          cite="council_core/tool_kit.py (judge_checks); "
+               "council_core/deliberation.py"),
+        E("tools", "usage_log", "every tool call (who, which, ok)", "tools",
+          "live", cite="council_core/usage_log.py (record_tool)"),
         E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "live",
           cite="council_core/deliberation.py:314-361"),
         # -- memory --------------------------------------------------------
@@ -438,6 +445,13 @@ def _edges() -> List[Edge]:
                      "history, prior session", "memory", "live",
                      cite="council_engine.py:5645-5770"))
     return out
+
+
+def _role_tools() -> Dict[str, Tuple[str, ...]]:
+    """tool_kit.ROLE_TOOLS for the roles the map draws."""
+    from .tool_kit import ROLE_TOOLS
+    return {r: t for r, t in ROLE_TOOLS.items()
+            if r in MEMBERS + ("writer", "peasant")}
 
 
 def static_map() -> CouncilMap:
@@ -851,15 +865,24 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_core/deliberation.py (rebuttal, cross-fire)"),
     GuideStep(
         "Tools, when they are on",
-        "With Tools on, the Coder and the Intern can stop mid-answer and ask "
-        "for a tool: run some Python, read or search a vault file, or look up "
-        "a function's real signature. The result goes back to them, and also "
-        "to the Writer later as 'prior tool outputs'.\n\n"
+        "With Tools on, a member can stop mid-answer and ask for a tool. "
+        "Each has its own short list: the Coder checks, tests and searches "
+        "code; the Intern looks at data files and computes from them; the "
+        "Skeptic checks quotes and numbers; the Sage and Writer read parts "
+        "of long files; the Strategist recalls past decisions and sees "
+        "which machines are busy; the Artist draws charts. The result goes "
+        "back to the member, and to the Writer later as 'prior tool "
+        "outputs'. Members can leave each other notes, and a repeated "
+        "lookup in the same question is answered from a cache.\n\n"
+        "Before ranking, the app checks every passage a member quoted "
+        "against your vault and tells the Judge which ones are not "
+        "there.\n\n"
         "A tool that fails (code that runs too long, a missing file) is "
         "reported back to the model as a failure; it does not stop the "
         "council.",
-        ("tools", "coder", "intern", "writer"),
-        "council_core/council_tools.py; ModelAgent.act in "
+        ("tools", "judge", "writer") + MEMBERS,
+        "council_core/council_tools.py; council_core/tool_kit.py; "
+        "ModelAgent.act in "
         "council_core/deliberation.py"),
     GuideStep(
         "Judge ranks, Writer writes, Judge checks",

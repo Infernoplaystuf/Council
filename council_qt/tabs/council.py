@@ -179,7 +179,8 @@ class CouncilActions:
         return self._models, self._models_problem
 
     def tools(self):
-        """The coder's and intern's tools, built on the first turn that asks.
+        """The members' tools (a tool_kit.ToolSet: each role gets its own
+        short list), built on the first turn that asks.
 
         council_core.council_tools, over this vault. Without it the Tools
         switch reached run_turn as enable_tools with tools=None, and
