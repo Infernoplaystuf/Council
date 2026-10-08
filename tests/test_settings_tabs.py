@@ -339,6 +339,59 @@ def test_an_evk4_fills_the_tabs_with_every_facility(clean, typhon_dir,
     assert tabs.rows == {}
 
 
+def test_a_raw_opened_by_openeb_gets_only_the_tabs_it_has(
+        clean, typhon_dir, monkeypatch, tmp_path):
+    """OpenEB's own file-backed HAL device (a .raw opened as a camera) has
+    none of the sensor's facilities: its tabs are what it has - Display and
+    Camera - with no bias, filter or reading invented, and its Display
+    category pops out and writes live. Needs the OpenEB build on the paths
+    (PATH, MV_HAL_PLUGIN_PATH, PYTHONPATH as in docs/camera_quickstart.md)."""
+    try:
+        import metavision_hal as hal
+        import metavision_sdk_stream as stream_mod
+    except Exception:                                       # noqa: BLE001
+        pytest.skip("the OpenEB bindings are not importable here")
+    dtype = np.dtype([("x", "<u2"), ("y", "<u2"), ("p", "<i2"), ("t", "<i8")])
+    events = np.zeros(20000, dtype)
+    events["x"] = np.arange(20000) % 1280
+    events["y"] = (np.arange(20000) // 1280) % 720
+    events["p"] = np.arange(20000) % 2
+    events["t"] = np.arange(20000) * 50
+    path = tmp_path / "bench_events.raw"
+    writer = stream_mod.RAWEvt2EventFileWriter(1280, 720, str(path))
+    writer.add_cd_events(events)
+    writer.flush()
+    writer.close()
+    del writer
+    found = cameras.CameraInfo("prophesee", str(path), "", "bench",
+                               "Prophesee", "event")
+
+    def open_camera(chosen, known=None):
+        if chosen.backend == "prophesee":
+            return cameras.EvkDevice(
+                chosen, hal.DeviceDiscovery.open_raw_file(str(path)))
+        return cameras.SyntheticBackend().open(chosen)
+
+    monkeypatch.setattr(cameras, "open_camera", open_camera)
+    monkeypatch.setattr(cameras, "discover", lambda known=None:
+                        cameras.Discovery([found], []))
+    ui = construct(typhon_dir)
+    connect(ui, "bench")
+    tabs = tabs_of(ui)
+    assert tabs.titles() == ["Basic", "Display", "Camera", "Presets"]
+    assert not [k for k in tabs.rows if k.split(".")[0] in
+                ("bias", "erc", "afk", "trail", "activity", "status")]
+    assert set(tabs.pop_buttons) == {"Display", "Camera"}
+    window = tabs.pop_out("Display")
+    assert set(window.rows) == {"window_ms", "display.events",
+                                "display.palette"}
+    window.rows["display.palette"].editor.textActivated.emit("Dark")
+    window.flush_now()
+    assert device().display_palette == "Dark"
+    assert tabs.rows["display.palette"].editor.currentText() == "Dark"
+    ui.on_btn_disconnect()
+
+
 def test_a_bias_dragged_in_its_tab_changes_the_camera_and_the_live_view(
         clean, typhon_dir, evk4, monkeypatch):
     """The user's point: the event camera's settings, changed while the
