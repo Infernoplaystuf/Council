@@ -94,6 +94,13 @@ WRITE_MS = 60
 #: drag reads the camera once, when it stops.
 REFRESH_MS = 300
 
+#: How often a view reads the camera's READINGS again while they are on
+#: screen (an EVK4's temperature, illumination, pixel dead time; a Basler's
+#: temperature). Read once at Connect, a temperature was stale a minute
+#: later. Only that group is read — three facility calls on an EVK4 — and
+#: only while a reading is visible (SettingsCore.read_readings).
+READINGS_MS = 2000
+
 #: How long "Delete" waits for its second click.
 CONFIRM_MS = 4000
 
@@ -888,6 +895,10 @@ class SettingsCore:
         self._soon_timer.setSingleShot(True)
         self._soon_timer.setInterval(0)
         self._soon_timer.timeout.connect(self._refresh_all)
+        # The readings, while a connected camera's are shown (READINGS_MS).
+        self._readings_timer = QTimer(self)
+        self._readings_timer.setInterval(READINGS_MS)
+        self._readings_timer.timeout.connect(self.read_readings)
         #: The last answer a listener call brought, so the caller that made
         #: the change does not handle the same answer a second time.
         self._last_heard: Dict[str, Any] = {}
@@ -933,6 +944,7 @@ class SettingsCore:
             # gone; writing it to the next one would be wrong.
             self._pending.clear()
             self._write_timer.stop()
+            self._readings_timer.stop()
             self._clear_form(self.NO_CAMERA)
             self._cleared()
             self.factory, self.as_connected = "", {}
@@ -949,6 +961,7 @@ class SettingsCore:
         self.refresh_area()
         self.fill_presets()
         self.apply_state()
+        self._readings_timer.start()
 
     def _state(self) -> Dict[str, Any]:
         try:
@@ -986,6 +999,44 @@ class SettingsCore:
                 if row is not None and setting["key"] not in self._pending:
                     row.update(setting)
         self.apply_state()
+
+    def reading_rows(self) -> List[SettingRow]:
+        """The rows of this view's READINGS: groups whose every row is read
+        only, with at least one number among them (an EVK4's Status, a
+        Basler's temperature) — not the camera's identity (serial, sensor:
+        text that never changes) and not a reading among settings (a
+        Basler's resulting frame rate, read again after every write)."""
+        groups: Dict[str, List[SettingRow]] = {}
+        for row in self.rows.values():
+            groups.setdefault(str(row.setting.get("group") or ""),
+                              []).append(row)
+        return [row for rows in groups.values()
+                if all(r.read_only or r.kind == TEXT for r in rows)
+                and any(r.kind in (INT, FLOAT) for r in rows)
+                for row in rows]
+
+    def read_readings(self) -> None:
+        """Read the readings again (READINGS_MS) — only their own groups,
+        and only while one of them is on screen: in a pop-out that is open,
+        in the tab that is showing, in the window. A reading nobody can see
+        costs the camera nothing."""
+        if not self.connected or self.busy:
+            return
+        rows = [r for r in self.reading_rows()
+                if alive(r.editor) and r.editor.isVisible()]
+        if not rows:
+            return
+        groups = list(dict.fromkeys(str(r.setting.get("group") or "")
+                                    for r in rows))
+        try:
+            listed = self._timed("read the readings", self.api.settings_list,
+                                 groups)
+        except Exception:                                 # noqa: BLE001
+            return                     # the next tick says it, or Refresh
+        for setting in listed.get("settings") or []:
+            row = self.rows.get(str(setting.get("key")))
+            if row is not None and row.read_only:
+                row.update(setting)
 
     def _keep_row(self, row: SettingRow) -> None:
         """A row made by _build_form: listened to, and known by key."""

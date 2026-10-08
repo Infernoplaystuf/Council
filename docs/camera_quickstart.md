@@ -762,6 +762,11 @@ forward.
   (`Greyed out while ExposureAuto is Continuous — change that first`); a
   **read-only** one says `Read only — …`; a category of readings (Status)
   says so once at the top.
+- **Readings stay current**: the temperature, illumination and pixel dead
+  time (a Basler's temperature) are read again **every 2 s while they are on
+  screen** — the Status pop-out open, the Camera tab showing, the settings
+  window open — and only they are read (three facility calls on an EVK4).
+  Out of sight they are not read at all.
 - **Reset <category> (as connected)** puts only this category back as the
   camera had it when it was connected — the rest are left alone. While
   capturing it works when everything in the category changes live (it is

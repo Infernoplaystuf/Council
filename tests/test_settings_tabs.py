@@ -392,6 +392,64 @@ def test_a_raw_opened_by_openeb_gets_only_the_tabs_it_has(
     ui.on_btn_disconnect()
 
 
+def offscreen_show(widget):
+    """Shown to Qt (isVisible) but never on a screen: the offscreen
+    platform, and WA_DontShowOnScreen as well."""
+    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    widget.show()
+    pump(0.05)
+
+
+def test_the_readings_are_read_again_while_they_are_on_screen(
+        clean, typhon_dir, evk4, monkeypatch):
+    """An EVK4's temperature was read once, at Connect, and shown for as
+    long as the app ran. A view now reads its readings - only that group -
+    every READINGS_MS while one is visible: the Status pop-out, the Camera
+    tab when it is the tab showing. Hidden, it reads nothing."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    window = tabs.pop_out("Status")
+    asked = []
+    listing = frame_camera.settings_list
+
+    def settings_list(groups=None):
+        asked.append(groups)
+        return listing(groups)
+
+    monkeypatch.setattr(frame_camera, "settings_list", settings_list)
+    evk4.monitor.get_temperature = lambda: 51
+    for view in (window, tabs):
+        assert [r.key for r in view.reading_rows()] == [
+            "status.temperature", "status.illumination",
+            "status.pixel_dead_time"]
+        assert view._readings_timer.isActive()
+        assert view._readings_timer.interval() == csw.READINGS_MS
+        view.read_readings()                  # nothing on screen: no read
+    assert asked == []
+    assert tabs.rows["status.temperature"].editor.text() == "34 °C"
+
+    offscreen_show(window)
+    window.read_readings()
+    assert asked == [["Status"]], "it read more than its readings"
+    assert window.rows["status.temperature"].editor.text() == "51 °C"
+    window.close()
+
+    offscreen_show(ui)
+    tabs.book.setCurrentIndex(tabs.titles().index("Biases"))
+    pump(0.05)
+    tabs.read_readings()                      # the Camera tab is not showing
+    assert asked == [["Status"]]
+    tabs.book.setCurrentIndex(tabs.titles().index("Camera"))
+    pump(0.05)
+    tabs.read_readings()
+    assert asked == [["Status"], ["Status"]]
+    assert tabs.rows["status.temperature"].editor.text() == "51 °C"
+    ui.hide()
+    ui.on_btn_disconnect()
+    assert not tabs._readings_timer.isActive()
+
+
 def test_a_bias_dragged_in_its_tab_changes_the_camera_and_the_live_view(
         clean, typhon_dir, evk4, monkeypatch):
     """The user's point: the event camera's settings, changed while the
