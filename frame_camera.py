@@ -216,6 +216,9 @@ class _Live:
         #: after Stop — the live view comes back at once and would otherwise
         #: replace "Stopped. 120 saved" before anyone read it.
         self.run_note_until = 0.0
+        #: That note, as it was when the live view came back (_manage_
+        #: preview) — "" while it is still worked out from the session.
+        self.run_note = ""
         #: The camera area (x, y, w, h) of the newest LIVE frame on screen:
         #: what a box drawn on the picture is relative to.
         self.shown_aoi: Optional[tuple] = None
@@ -280,6 +283,7 @@ class _Live:
         self.rate_note = ""
         self.rate_note_until = 0.0
         self.run_note_until = 0.0
+        self.run_note = ""
         self.shown_aoi = None
         self.job = None
         self.as_connected = {}
@@ -672,6 +676,7 @@ def stop() -> Dict[str, Any]:
                 "status": stats.line()}
     line = _stopped_line(session)
     _LIVE.run_note_until = time.monotonic() + RUN_NOTE_SECONDS
+    _LIVE.run_note = ""            # this run's, read from the session
     _announce({"what": "stopped", "summary": line})
     return {"summary": line, "status": stats.line()}
 
@@ -803,7 +808,7 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     if meta.get("kind") == "event":
         line += f" · {meta.get('events', 0)} events/window"
     if time.monotonic() < _LIVE.run_note_until:
-        line += f" · {_run_note(session)}"
+        line += f" · {_LIVE.run_note or _run_note(session)}"
     return line
 
 
@@ -926,6 +931,13 @@ def _manage_preview(want: bool) -> None:
             # two later instead of the window freezing for them.
             capture.warm_in_background()
             return
+        if now < _LIVE.run_note_until and not _LIVE.run_note:
+            # THE RUN'S NUMBERS BEFORE THE RESET BELOW. The live line says
+            # "last run: N saved" for a while after Stop, and read N from
+            # the session — after the live view had started its counts
+            # afresh: "last run: 0 saved" for a run that saved every frame.
+            # Nothing is landing now (session.saving, above), so it is final.
+            _LIVE.run_note = _run_note(session)
         try:
             session.record_to(None)
             session.reset_stats()

@@ -769,6 +769,31 @@ def test_start_capture_from_the_preview_goes_live_and_saves(ui, tmp_path):
     assert "last run:" in ui.ports.capture_status.get()
 
 
+def test_after_stop_the_live_line_counts_what_the_run_saved(ui, tmp_path):
+    """Before: "last run: 0 saved" after a run that saved every frame. The
+    live view coming back after Stop starts its counts afresh, and the note
+    read the run's numbers from those - after the reset. A frame camera's
+    stream (and a Basler's) is restarted for the live view; an EVK4's is
+    not, which is why only some runs said 0."""
+    import re
+
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(list(tmp_path.rglob("*.png"))) >= 5)
+    frame_camera.stop()
+    assert pump_until(lambda: frame_camera._LIVE.previewing), \
+        "Stop did not come back to the live view"
+    pump(0.3)
+    line = ui.ports.capture_status.get()
+    said = re.search(r"last run: (\d+) saved", line)
+    assert said, line
+    saved = len(list(tmp_path.rglob("*.png")))
+    assert int(said.group(1)) == saved > 0, line
+
+
 def test_disconnecting_during_the_preview_clears_the_picture(ui, tmp_path):
     ui.ports.capture_folder.set(str(tmp_path))
     pump(0.3)
