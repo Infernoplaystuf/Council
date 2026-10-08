@@ -840,6 +840,29 @@ def test_a_configuration_moves_between_projects_and_never_overwrites(
         frame_camera.import_preset(first)
 
 
+def test_export_and_import_ask_over_the_main_window(clean, typhon_dir,
+                                                   monkeypatch):
+    """The Presets tab is a QObject, not a window: its file dialogs were
+    opened with no parent - a window of their own, free to open behind
+    Typhon. They belong to the main window."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    frame_camera.save_preset("Bench")
+    assert tabs.select_preset("Bench")
+    parents = []
+    monkeypatch.setattr(csw, "_dialogs_disabled", lambda: False)
+    monkeypatch.setattr(
+        csw.QFileDialog, "getExistingDirectory",
+        staticmethod(lambda parent, *_a: parents.append(parent) or ""))
+    monkeypatch.setattr(
+        csw.QFileDialog, "getOpenFileName",
+        staticmethod(lambda parent, *_a: parents.append(parent) or ("", "")))
+    assert tabs.export_preset() == ""
+    assert tabs.import_preset() == ""
+    assert parents == [ui, ui]
+
+
 def test_a_damaged_or_newer_export_is_refused_untouched(tmp_path):
     store = camera_presets.PresetStore(tmp_path / "p" / "camera_presets.json")
     camera = camera_presets.Identity("simulated", "Simulated", "1", "frame")

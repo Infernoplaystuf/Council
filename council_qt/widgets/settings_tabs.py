@@ -511,6 +511,13 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         if out is not None:
             self._took_other(out)
 
+    def _dialog_parent(self) -> Optional[QWidget]:
+        """Export's folder dialog and Import's file dialog belong to the
+        main window. This view is a QObject, not a window: with no parent a
+        dialog opens as a window of its own (its own taskbar entry, free to
+        open behind Typhon) rather than over the tabs that asked."""
+        return self.book.window()
+
     # -- for tests and the measurements ------------------------------------
     def titles(self) -> List[str]:
         return [self.book.tabText(i) for i in range(self.book.count())]
