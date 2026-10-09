@@ -2,7 +2,7 @@
 council_qt.tabs.apothecary — the Apothecary, ported. Advanced mode, as in Tk.
 
 A support console for Raspberry Pi inference nodes: a registry of SSH nodes,
-LAN discovery, the Ollama provisioning wizard, static IP / ethernet keepalive
+LAN discovery, "Set up a Pi" (council_core.pi_setup), static IP / ethernet keepalive
 fixes, and a 60-second health poller that badges each node. Written against
 docs/qt_migration/remaining_tabs_requirements.md §apothecary; the dialogs are
 in apothecary_dialogs.py.
@@ -51,8 +51,7 @@ from council_core import paths
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
 from .apothecary_dialogs import (DiscoverDialog, InventoryDialog, LogView,
-                                 NodeDialog, RegisterDialog, StaticIpDialog,
-                                 WizardDialog)
+                                 NodeDialog, StaticIpDialog)
 
 RESTART_OLLAMA = ("sudo systemctl restart ollama 2>/dev/null "
                   "|| (pkill ollama; sleep 1; ollama serve &)")
@@ -73,6 +72,19 @@ class ApothecaryActions:
     @property
     def monitor(self):
         return self.apoth.monitor
+
+    def reload_registry(self) -> None:
+        """Re-read node_registry.json — the Pi setup writes it from its own
+        registry object, so the cached copy here is stale afterwards."""
+        self.apoth.registry.data = apoth_core._ae.safe_read_json(
+            self.apoth.registry.path, {"nodes": []})
+
+    def secure_node(self, name: str, approved_fingerprint=None):
+        """council_core.pi_setup.setup.secure_existing_node — key login, no
+        stored password, firewalled Ollama."""
+        from council_core.pi_setup import setup as pi_setup
+        return pi_setup.secure_existing_node(self.vault_dir, name,
+                                             approved_fingerprint=approved_fingerprint)
 
     # -- the registry (fast; GUI thread is fine) --------------------------
     def list_nodes(self) -> List[apoth_core.NodeEntry]:
@@ -128,12 +140,6 @@ class ApothecaryActions:
 
     def refresh_models(self, node) -> List[str]:
         return self.apoth.refresh_installed_models(node)
-
-    def provision(self, name: str, model: str, desktop_ip: str,
-                  password: Optional[str], progress):
-        return self.apoth.provision_pi(name, model, desktop_ip,
-                                       password_override=password,
-                                       progress_cb=progress)
 
     def static_ip(self, name: str, static_ip: str, gateway: str,
                   progress) -> bool:
@@ -214,7 +220,9 @@ class ApothecaryTab(ViewHelpers, QWidget):
             (("Test SSH", self.on_test_ssh),
              ("Check Ollama", self.on_check_ollama),
              ("Run Command", self.on_run_command)),
-            (("🔧 Setup Pi Wizard", self.on_wizard),
+            (("🍓 Set up a Pi (new or existing)…", self.on_pi_setup),
+             ("🔒 Switch to key login", self.on_secure_node),
+             ("🔧 Set up the selected Pi…", self.on_wizard),
              ("Set Static IP", self.on_static_ip),
              ("Fix Keepalive", self.on_keepalive),
              ("Restart Ollama", self.on_restart_ollama)),
@@ -466,9 +474,10 @@ class ApothecaryTab(ViewHelpers, QWidget):
     def _discovered(self, name: str, ip: str) -> None:
         self.refresh(select=name)
         self.emit(f"✓ Saved '{name}' at {ip}")
-        if self.ask_yes_no("Run Setup Wizard?",
-                           f"Node saved at {ip}.\n\nRun the Pi Setup Wizard "
-                           "now to install Ollama?", parent=self):
+        if self.ask_yes_no("Set up this Pi?",
+                           f"Node saved at {ip}.\n\nSet it up for the Council now "
+                           "(the checked Ollama release, a firewall that lets only "
+                           "this PC in, key login)?", parent=self):
             self.open_wizard(name)             # by name — defect 4
 
     def on_copy_url(self) -> None:
@@ -487,36 +496,72 @@ class ApothecaryTab(ViewHelpers, QWidget):
         if node is not None:
             self._open(InventoryDialog(node, self.actions, self.emit, self))
 
+    # -- the Pi setup (council_core.pi_setup) ---------------------------
+    def _pi_setup_dialog(self):
+        from .pi_setup_dialog import PiSetupDialog
+        dlg = PiSetupDialog(self, vault_dir=self.actions.vault_dir)
+        dlg.finished.connect(lambda _r: (self.actions.reload_registry(), self.refresh()))
+        return dlg
+
+    def on_pi_setup(self) -> None:
+        self._open(self._pi_setup_dialog())
+
+    def on_secure_node(self, approved_fingerprint=None) -> None:
+        """Move the selected node off its stored password to the Council's
+        key, and firewall its Ollama to this PC."""
+        node = self._need_node("switch it to key login")
+        if node is None:
+            return
+        name = node.name
+
+        def work() -> None:
+            from council_core.pi_setup import remote
+            try:
+                out = self.actions.secure_node(name, approved_fingerprint)
+            except remote.HostKeyUnknown as exc:
+                self._to_ui(self._confirm_secure, name, exc.fingerprint)
+                return
+            except Exception as exc:                      # noqa: BLE001
+                self.emit(f"✗ {name}: {exc}", True)
+                return
+            # Not ok = the key is in and the password gone, but SSH still
+            # takes passwords (keys-only was not proven): said, not hidden.
+            self.emit(("✓ " if out.ok else "✗ ") + out.message, not out.ok)
+            self._to_ui(lambda: (self.actions.reload_registry(), self.refresh()))
+
+        self._ssh("Secure node", work)
+
+    def _confirm_secure(self, name: str, fingerprint: str) -> None:
+        if self.ask_yes_no("Is this your Pi?",
+                           f"The Council has not seen {name}'s SSH key before.\n\n"
+                           f"{fingerprint}\n\nContinue only if this is your Pi.",
+                           parent=self):
+            self.on_secure_node(approved_fingerprint=fingerprint)
+
     # -- the wizard ------------------------------------------------------
+    # The old Setup Pi Wizard (a WizardDialog running
+    # ApothecaryEngine.provision_pi) installed Ollama with 'curl | sh', opened
+    # it to the whole LAN and downloaded qwen2.5:3b (not US-origin) on its own
+    # - on a Pi "Set up a Pi" had made too, replacing the pinned, checked
+    # Ollama (review, 2026-10-07; the user's decisions a and b). The button
+    # and Discover's offer now open "Set up a Pi" for that node.
     def on_wizard(self) -> None:
         node = self.selected_node()
         if node is None:
             self.emit("Add a node first (name, host/IP, SSH credentials), "
-                      "select it, then click Setup Pi Wizard.")
+                      "select it, then click Set up the selected Pi.")
             return
         self.open_wizard(node.name)
 
     def open_wizard(self, name: str) -> None:
+        """"Set up a Pi" on its existing-Pi page, filled in for ``name``."""
         node = self.actions.node(name)
         if node is None:
             self.emit(f"✗ No node named '{name}'.", True)
             return
-
-        def finished(ok: bool) -> None:
-            self.refresh()
-            if not ok:
-                return
-            fresh = self.actions.node(name) or node
-            url = apoth_core.ollama_url(fresh)
-            if self.ask_yes_no(
-                    "Register with Council?",
-                    f"✓ Pi setup complete!\n\nAdd {name} to the Council "
-                    f"dispatcher?\nURL: {url}", parent=self):
-                self._open(RegisterDialog(url, self.emit,
-                                          apoth_core.find_launch_bat(),
-                                          self))
-
-        self._open(WizardDialog(node, self.actions, finished, self))
+        dlg = self._pi_setup_dialog()
+        dlg.start_existing(host=node.host, username=node.username, name=node.name)
+        self._open(dlg)
 
 
 def build_apothecary(window) -> QWidget:

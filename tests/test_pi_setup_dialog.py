@@ -1,0 +1,561 @@
+"""The "Set up a Pi" dialog (council_qt/tabs/pi_setup_dialog.py), offscreen,
+with fake actions: no disk is listed for real, nothing is erased, no UAC
+prompt, nothing goes online."""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+pytest.importorskip("PySide6")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from council_core.pi_setup import disks as dk  # noqa: E402
+from council_core.pi_setup import images as im  # noqa: E402
+from council_core.pi_setup import remote  # noqa: E402
+from council_core.pi_setup import setup as su  # noqa: E402
+from council_qt.tabs.pi_setup_dialog import PiSetupDialog  # noqa: E402
+
+from tests.test_pi_disks import BLANK_CARD, REAL, SD_CARD  # noqa: E402
+from tests.test_pi_flash import CATALOG  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+    app.processEvents()
+
+
+def drive(qapp, dlg, seconds=10):
+    end = time.time() + seconds
+    while (dlg._busy or any(t.name.startswith("pi-setup") and t.is_alive()
+                            for t in threading.enumerate())) and time.time() < end:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+
+
+class FakeActions:
+    def __init__(self, tmp_path):
+        self.tmp = tmp_path
+        self.prepared = None
+        self.started = None
+        self.status = None
+        self.existing_calls = []
+        self.finished = []
+        self._pending = []
+        self.image_file = tmp_path / "2026-10-06-raspios-trixie-arm64-lite.img.xz"
+        self.image_file.write_bytes(b"xz")
+
+    #: Row 2 of the list: a blank card (an old Pi card holds files and is
+    #: asked about separately - see the decision f tests).
+    disks = REAL + [BLANK_CARD]
+
+    def list_disks(self):
+        return [dk.judge(d, []) for d in dk.parse(self.disks)]
+
+    def catalog(self):
+        return im.parse_catalog(CATALOG)
+
+    def fetch_catalog(self):
+        return self.catalog()
+
+    def cached_path(self, img):
+        return self.image_file
+
+    def download(self, img, on_progress, cancelled):
+        return self.image_file
+
+    def prepare(self, **kw):
+        self.prepared = kw
+        job_dir = self.tmp / "job"
+        job_dir.mkdir(exist_ok=True)
+        item = su.Pending(id="job", hostname=kw["cfg"].hostname,
+                          username=kw["cfg"].username, host_public="ssh-ed25519 AAAA",
+                          model=kw["model"])
+        self._pending = [item]
+        return {"job": job_dir / "job.json", "pending": item}
+
+    def start_writer(self, job):
+        self.started = job
+
+    def read_status(self, job_dir):
+        return self.status
+
+    def pending(self):
+        return list(self._pending)
+
+    def setup_existing(self, **kw):
+        self.existing_calls.append(kw)
+        if kw.get("approved_fingerprint") is None:
+            raise remote.HostKeyUnknown(kw["host"], "SHA256:abc123")
+        return su.Outcome(True, kw["host"], kw["name"], "llama3.1:8b", "pi-a is ready")
+
+    def finish(self, item, **kw):
+        self.finished.append(item)
+        self._pending = []
+        return su.Outcome(True, "192.168.1.80", item.hostname, item.model, "ready")
+
+    def abandon(self, job, item):
+        self.abandoned = (job, item)
+        self._pending = []
+
+    def sweep(self):
+        return []
+
+
+@pytest.fixture
+def dlg(qapp, tmp_path):
+    d = PiSetupDialog(actions=FakeActions(tmp_path))
+    yield d
+    drive(qapp, d)
+    d.done(0)
+    d.deleteLater()
+    qapp.processEvents()
+
+
+def test_this_pcs_disks_cannot_be_picked(dlg):
+    dlg.on_new()
+    texts = [dlg.disk_list.item(i).text() for i in range(dlg.disk_list.count())]
+    assert any("Seagate Portable" in t and "can't use" in t for t in texts)
+    dlg.disk_list.setCurrentRow(1)                     # the Seagate
+    assert dlg._current_disk() is None and not dlg.card_next.isEnabled()
+
+
+def test_next_needs_the_exact_confirm_code(dlg):
+    dlg.on_new()
+    dlg.disk_list.setCurrentRow(2)
+    code = dlg._current_disk().confirm_code
+    assert code in dlg.confirm_label.text()
+    dlg.confirm_edit.setText("yes erase it")
+    assert not dlg.card_next.isEnabled()
+    dlg.confirm_edit.setText(code)
+    assert dlg.card_next.isEnabled()
+
+
+def _to_settings(dlg):
+    dlg.on_new()
+    dlg.disk_list.setCurrentRow(2)
+    dlg.confirm_edit.setText(dlg._current_disk().confirm_code)
+    dlg.card_next.click()
+    dlg.s_host.setText("council-pi-2")
+    dlg.s_pass.setText("correct-horse-42")
+    dlg.s_pass2.setText("correct-horse-42")
+    dlg.s_ssid.setText("Home")
+    dlg.s_wpass.setText("wifi-pass-123")
+
+
+def test_mismatched_passwords_write_nothing(dlg):
+    _to_settings(dlg)
+    dlg.s_pass2.setText("different-42")
+    dlg.on_write()
+    assert dlg.actions.prepared is None and "differ" in dlg.log.toPlainText()
+
+
+def test_write_then_find_the_pi(qapp, dlg):
+    _to_settings(dlg)
+    dlg.write_btn.click()
+    acts = dlg.actions
+    assert acts.prepared["typed_confirm"] == acts.list_disks()[2].confirm_code
+    assert acts.prepared["init_format"] == "cloudinit-rpi"
+    assert acts.prepared["model"] in ("llama3.1:8b",)
+    assert acts.started is not None
+    assert dlg.s_pass.text() == "" and dlg.s_wpass.text() == ""
+    acts.status = {"phase": "writing", "done": 500, "total": 1000, "message": "Writing"}
+    dlg._poll_writer()
+    assert dlg.w_bar.value() == 500 and not dlg.find_btn.isEnabled()
+    acts.status = {"phase": "done", "message": "The card is ready."}
+    dlg._poll_writer()
+    assert dlg.find_btn.isEnabled()
+    dlg.find_btn.click()
+    drive(qapp, dlg)
+    assert acts.finished and "✓ ready" in dlg.log.toPlainText()
+
+
+def test_writer_error_is_shown_and_find_stays_off(dlg):
+    _to_settings(dlg)
+    dlg.write_btn.click()
+    dlg.actions.status = {"phase": "error", "message": "refusing to erase disk 2: swapped"}
+    dlg._poll_writer()
+    assert not dlg.find_btn.isEnabled() and "✗ refusing" in dlg.log.toPlainText()
+
+
+def test_existing_pi_asks_about_its_key(qapp, dlg):
+    dlg.ex_host.setText("192.168.1.252")
+    dlg.ex_user.setText("pi")
+    dlg.ex_pass.setText("hunter22")
+    dlg.on_setup_existing()
+    drive(qapp, dlg)
+    assert dlg.fp_btn.isVisible() or not dlg.fp_btn.isHidden()
+    assert "SHA256:abc123" in dlg.fp_label.text()
+    dlg.fp_btn.click()
+    drive(qapp, dlg)
+    assert dlg.actions.existing_calls[-1]["approved_fingerprint"] == "SHA256:abc123"
+    assert "✓ pi-a is ready" in dlg.log.toPlainText()
+    assert dlg.ex_pass.text() == ""
+
+
+def test_pending_pi_can_be_finished_later(qapp, tmp_path):
+    acts = FakeActions(tmp_path)
+    acts._pending = [su.Pending(id="j9", hostname="council-pi-9", username="council",
+                                host_public="ssh-ed25519 AAAA", model="llama3.2:3b")]
+    d = PiSetupDialog(actions=acts)
+    assert d.finish_box.count() == 1
+    d.on_finish_pending()
+    assert d.find_btn.isEnabled()
+    d.on_find()
+    drive(qapp, d)
+    assert acts.finished[0].hostname == "council-pi-9"
+    d.done(0)
+    d.deleteLater()
+    qapp.processEvents()
+
+
+# ── review fixes (merge of knowledge-graph into qt-migration) ─────────────
+from council_qt.tabs.pi_setup_dialog import PiSetupActions  # noqa: E402
+
+
+class RealJobs(PiSetupActions):
+    """The REAL prepare / pending / abandon / sweep (temporary state and key
+    folders); fake disks and images; a writer that never starts (UAC
+    declined) or never reports back."""
+
+    def __init__(self, tmp_path, declined=True):
+        super().__init__(tmp_path / "vault")
+        self.fake = FakeActions(tmp_path)
+        self.declined = declined
+
+    def list_disks(self):
+        return self.fake.list_disks()
+
+    def catalog(self):
+        return self.fake.catalog()
+
+    def cached_path(self, img):
+        return self.fake.cached_path(img)
+
+    def start_writer(self, job):
+        if self.declined:
+            raise RuntimeError("This command cannot be run due to the error: "
+                               "The operation was canceled by the user.")
+
+    def read_status(self, job_dir):
+        return None
+
+
+@pytest.fixture
+def state(tmp_path, monkeypatch):
+    monkeypatch.setenv("COUNCIL_PI_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COUNCIL_KEY_DIR", str(tmp_path / "keys"))
+    return tmp_path / "state"
+
+
+def _close(qapp, d):
+    drive(qapp, d)
+    d.done(0)
+    d.deleteLater()
+    qapp.processEvents()
+
+
+def test_a_declined_uac_prompt_leaves_no_secrets_and_nothing_to_finish(qapp, tmp_path, state):
+    # job.json (the Pi's SSH host PRIVATE key, the password hash, the WPA
+    # key) was deleted only by the helper, so a declined prompt left it on
+    # disk for good, and the start page offered to finish that Pi.
+    d = PiSetupDialog(actions=RealJobs(tmp_path))
+    _to_settings(d)
+    d.write_btn.click()
+    assert list(state.rglob("job.json")) == []
+    assert su.pending() == []
+    assert d.finish_btn.isHidden() and d._job is None
+    assert "did not start" in d.log.toPlainText()
+    _close(qapp, d)
+
+
+def test_a_writer_that_never_reports_back_is_given_up_and_cleaned_up(qapp, tmp_path, state):
+    d = PiSetupDialog(actions=RealJobs(tmp_path, declined=False))
+    d.WRITER_START_TIMEOUT_S = 0
+    _to_settings(d)
+    d.write_btn.click()
+    assert d._timer.isActive() and list(state.rglob("job.json"))
+    d._poll_writer()
+    assert not d._timer.isActive()
+    assert list(state.rglob("job.json")) == [] and su.pending() == []
+    assert "never reported back" in d.log.toPlainText()
+    _close(qapp, d)
+
+
+def test_opening_the_dialog_sweeps_jobs_that_never_ran_or_failed(qapp, tmp_path, state):
+    import json
+    import os
+    import time as _t
+    ids = {k: f"00000000-0000-4000-8000-00000000000{n}"
+           for n, k in enumerate(("stale", "failed", "done", "fresh"), start=1)}
+    for k, jid in ids.items():
+        jd = state / "jobs" / jid
+        jd.mkdir(parents=True)
+        if k in ("stale", "fresh"):
+            (jd / "job.json").write_text('{"secret": "ssh host key"}', encoding="utf-8")
+        if k == "stale":
+            old = _t.time() - 2 * 3600
+            os.utime(jd / "job.json", (old, old))
+        if k in ("failed", "done"):
+            (jd / "status.json").write_text(json.dumps(
+                {"phase": "error" if k == "failed" else "done"}), encoding="utf-8")
+    su._save_pending([su.Pending(id=jid, hostname=f"council-pi-{k}", username="council",
+                                 host_public="ssh-ed25519 AAAA", model="llama3.2:3b")
+                      for k, jid in ids.items()])
+    d = PiSetupDialog(actions=RealJobs(tmp_path))
+    assert sorted(p.hostname for p in su.pending()) == ["council-pi-done", "council-pi-fresh"]
+    assert sorted(p.parent.name for p in state.rglob("job.json")) == [ids["fresh"]]
+    assert d.finish_box.count() == 2
+    _close(qapp, d)
+
+
+LEGACY = {"name": "Raspberry Pi OS Lite (Legacy, 64-bit)",
+          "url": "https://downloads.raspberrypi.com/raspios_oldstable_lite_arm64/images/y/"
+                 "2025-05-13-raspios-bookworm-arm64-lite.img.xz",
+          "extract_size": 2_000_000_000, "extract_sha256": "c" * 64,
+          "image_download_size": 400_000_000, "release_date": "2025-05-13",
+          "init_format": "systemd", "devices": ["pi4-64bit"]}
+
+
+def _with_legacy(acts):
+    import copy
+    cat = copy.deepcopy(CATALOG)
+    cat["os_list"][0]["subitems"].append(dict(LEGACY))
+    acts.catalog = lambda: im.parse_catalog(cat)
+    acts.cached_path = lambda img: acts.image_file if "trixie" in img.filename else None
+    return acts
+
+
+def _write_with_file(dlg, name):
+    f = dlg.actions.tmp / name
+    f.write_bytes(b"img")
+    dlg.on_new()
+    dlg.use_file(f)
+    dlg.disk_list.setCurrentRow(2)
+    dlg.confirm_edit.setText(dlg._current_disk().confirm_code)
+    dlg.s_pass.setText("correct-horse-42")
+    dlg.s_pass2.setText("correct-horse-42")
+    dlg.on_write()
+    return f
+
+
+def test_a_file_not_in_the_list_is_not_checked_against_another_images_hash(qapp, tmp_path):
+    d = PiSetupDialog(actions=FakeActions(tmp_path))
+    f = _write_with_file(d, "my-bookworm-custom.img")
+    kw = d.actions.prepared
+    assert kw["image"] == f and kw["extract_sha256"] == "" and kw["extract_size"] == 0
+    # No format assumed from its name: the helper reads it off the card
+    # (the user's decision e, 2026-10-07).
+    assert kw["init_format"] == ""
+    _close(qapp, d)
+
+
+def test_a_file_whose_format_cannot_be_told_from_its_name_is_still_written(qapp, tmp_path):
+    # It was refused ("cannot be told"); the helper now reads the format off
+    # the written card, so a name says nothing either way.
+    d = PiSetupDialog(actions=FakeActions(tmp_path))
+    _write_with_file(d, "my-custom.img")
+    assert d.actions.prepared["init_format"] == "" and d.actions.started is not None
+    _close(qapp, d)
+
+
+def test_without_the_list_a_bookworm_file_gets_no_assumed_settings(qapp, tmp_path):
+    acts = FakeActions(tmp_path)
+    acts.catalog = lambda: []
+    d = PiSetupDialog(actions=acts)
+    _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")
+    assert acts.prepared["init_format"] == "" and acts.prepared["extract_sha256"] == ""
+    _close(qapp, d)
+
+
+def test_choosing_another_list_entry_drops_the_file_chosen_for_the_first(qapp, tmp_path):
+    d = PiSetupDialog(actions=_with_legacy(FakeActions(tmp_path)))
+    d.on_new()
+    trixie = d._image_path
+    assert trixie is not None and "trixie" in trixie.name
+    d.image_box.setCurrentIndex(1)                  # the Legacy entry, not downloaded
+    assert d._image_path is None
+    d.disk_list.setCurrentRow(2)
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    assert not d.card_next.isEnabled()
+    d.image_box.setCurrentIndex(0)
+    assert d._image_path == trixie
+    _close(qapp, d)
+
+
+def test_the_confirm_code_can_be_typed_and_copied(qapp, dlg):
+    from PySide6.QtCore import Qt
+    dlg.on_new()
+    dlg.disk_list.setCurrentRow(2)
+    code = dlg._current_disk().confirm_code
+    assert code.isascii() and code in dlg.confirm_label.text()
+    assert dlg.confirm_label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+
+
+def test_a_listed_file_carries_its_own_entrys_hash_and_format(qapp, tmp_path):
+    d = PiSetupDialog(actions=_with_legacy(FakeActions(tmp_path)))
+    _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")
+    kw = d.actions.prepared
+    assert kw["init_format"] == "systemd" and kw["extract_sha256"] == "c" * 64
+    assert kw["extract_size"] == 2_000_000_000
+    _close(qapp, d)
+
+
+# ── the user's decisions of 2026-10-07 ────────────────────────────────────
+class ModelActions(FakeActions):
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        self.downloads = []
+
+    def setup_existing(self, **kw):
+        self.existing_calls.append(kw)
+        return su.Outcome(True, kw["host"], kw["name"], "llama3.2:3b", "pi-a is set up",
+                          username=kw["username"], model_pending=True)
+
+    def download_model(self, **kw):
+        self.downloads.append(kw)
+        return su.Outcome(True, kw["host"], "", kw["model"], "llama3.2:3b is on the Pi",
+                          username=kw["username"])
+
+
+def test_the_model_is_downloaded_only_when_the_button_is_pressed(qapp, tmp_path):
+    acts = ModelActions(tmp_path)
+    d = PiSetupDialog(actions=acts)
+    assert d.model_row.isHidden()
+    d.ex_host.setText("192.168.1.252")
+    d.ex_user.setText("pi")
+    d.ex_pass.setText("hunter22")
+    d.on_setup_existing()
+    drive(qapp, d)
+    assert not d.model_row.isHidden() and acts.downloads == []     # named, not fetched
+    assert "llama3.2:3b (Meta, US) — about 2.0 GB to download on the Pi" in d.model_label.text()
+    d.download_btn.click()
+    drive(qapp, d)
+    assert [(k["host"], k["username"], k["model"]) for k in acts.downloads] == [
+        ("192.168.1.252", "pi", "llama3.2:3b")]
+    assert "✓ llama3.2:3b is on the Pi" in d.log.toPlainText() and d.model_row.isHidden()
+    _close(qapp, d)
+
+
+def _old_card_dialog(qapp, tmp_path, answer):
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [SD_CARD]                   # an old Pi card: it holds files
+    asked = []
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda title, msg, **k: asked.append(msg)
+                      or answer)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    return d, asked
+
+
+def test_a_card_that_holds_files_is_chosen_only_after_a_second_question(qapp, tmp_path):
+    d, asked = _old_card_dialog(qapp, tmp_path, answer=False)
+    assert len(asked) == 1
+    assert "'bootfs' (FAT32" in asked[0] and "cannot read" in asked[0] and "ERASED" in asked[0]
+    assert d._current_disk() is None and not d.card_next.isEnabled()
+    _close(qapp, d)
+
+
+def test_a_card_whose_files_the_user_agreed_to_erase_is_written(qapp, tmp_path):
+    d, asked = _old_card_dialog(qapp, tmp_path, answer=True)
+    assert len(asked) == 1 and d._current_disk() is not None
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    assert d.card_next.isEnabled()
+    d.card_next.click()
+    d.s_pass.setText("correct-horse-42")
+    d.s_pass2.setText("correct-horse-42")
+    d.on_write()
+    assert d.actions.prepared["files_confirmed"] == d._current_disk().contents()
+    assert "'bootfs'" in d.actions.prepared["files_confirmed"][0]
+    assert len(asked) == 1                          # asked once, not on every change
+    _close(qapp, d)
+
+
+def test_a_card_swapped_in_the_same_reader_is_asked_about_again(qapp, tmp_path):
+    # The yes was tied to the reader's identity (number, unique id, serial,
+    # size - the reader's, not the card's): card B, swapped in after a yes
+    # for card A, reached prepare() with files_confirmed=True and its own
+    # files were never named.
+    from tests.test_pi_disks import CAMERA_CARD
+    card_a = {**CAMERA_CARD, "Number": 3}
+    card_b = {**card_a, "Partitions": [{**card_a["Partitions"][0], "Label": "THESIS_BACKUP",
+                                        "FileSystem": "exFAT", "RootCount": 1,
+                                        "RootNames": ["thesis"]}]}
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [card_a]
+    asked = []
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda t, m, **k: asked.append(m) or True)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert len(asked) == 1 and "EOS_DIGITAL" in asked[0]
+    acts.disks = REAL + [card_b]                    # same reader, another card
+    d.refresh_disks()
+    d.disk_list.setCurrentRow(2)
+    assert len(asked) == 2 and "THESIS_BACKUP" in asked[1]
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    d.card_next.click()
+    d.s_pass.setText("correct-horse-42")
+    d.s_pass2.setText("correct-horse-42")
+    d.on_write()
+    assert "THESIS_BACKUP" in d.actions.prepared["files_confirmed"][0]
+    _close(qapp, d)
+
+
+def test_a_card_swapped_after_the_yes_and_declined_is_not_chosen(qapp, tmp_path):
+    from tests.test_pi_disks import CAMERA_CARD
+    card_a = {**CAMERA_CARD, "Number": 3}
+    card_b = {**card_a, "Partitions": [{**card_a["Partitions"][0], "Label": "OTHER",
+                                        "RootCount": 1, "RootNames": ["x"]}]}
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [card_a]
+    answers = [True, False]
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda *a, **k: answers.pop(0))
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    acts.disks = REAL + [card_b]
+    d.refresh_disks()
+    d.disk_list.setCurrentRow(2)                    # asked about card B, and declined
+    assert answers == [] and d._current_disk() is None and not d.card_next.isEnabled()
+    _close(qapp, d)
+
+
+def test_offscreen_with_nobody_to_ask_a_card_with_files_is_not_chosen(qapp, tmp_path,
+                                                                      monkeypatch):
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [SD_CARD]
+    d = PiSetupDialog(actions=acts)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert d._current_disk() is None
+    _close(qapp, d)
+
+
+def test_a_blank_card_is_not_asked_about(qapp, tmp_path):
+    asked = []
+    d = PiSetupDialog(actions=FakeActions(tmp_path),
+                      ask_yes_no=lambda *a, **k: asked.append(a) or True)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert asked == [] and d._current_disk() is not None
+    _close(qapp, d)
+
+
+def test_the_format_the_writer_used_is_recorded(qapp, tmp_path):
+    acts = FakeActions(tmp_path)
+    noted = []
+    acts.note_written = lambda item, fmt: noted.append((item.id, fmt)) or item
+    d = PiSetupDialog(actions=acts)
+    _write_with_file(d, "my-custom.img")
+    acts.status = {"phase": "done", "message": "The card is ready.", "format": "systemd"}
+    d._poll_writer()
+    assert noted == [("job", "systemd")]
+    _close(qapp, d)

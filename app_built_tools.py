@@ -147,6 +147,52 @@ def _make_header(name: str, description: str, entry: str, author: str) -> str:
     )
 
 
+def check_tool(name: str, code: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
+    """Every check save_tool makes, WITHOUT writing anything. Returns
+    (ok, message, slug, entry). The agent creator drafts tools with this so a
+    draft the user has not approved never lands in the shared library."""
+    slug = sanitize_name(name)
+    if not _NAME_RE.match(slug):
+        return (False, "invalid tool name — use 3-40 chars of a-z, 0-9, _ "
+                "(start with a letter)", None, None)
+    code = (code or "").strip()
+    if not code:
+        return False, "no code provided", None, None
+    if len(code.encode("utf-8", "replace")) > _MAX_CODE_BYTES:
+        return False, f"tool code exceeds {_MAX_CODE_BYTES} bytes", None, None
+    # Same validator the pandas sandbox uses.
+    try:
+        from vault_analyst import validate_generated_code
+    except Exception as exc:
+        return False, f"validator unavailable: {exc!r}", None, None
+    ok, why = validate_generated_code(code)
+    if not ok:
+        return False, f"rejected by sandbox validator: {why}", None, None
+    entry = entry_function(code)
+    if entry is None:
+        return (False, "the tool must define EXACTLY ONE top-level function "
+                "(its entry point)", None, None)
+    return True, "ok", slug, entry
+
+
+def free_name(name: str, vault_dir: Optional[Any] = None) -> str:
+    """``name`` if no tool (and no file) has it yet, else name_2, name_3, …
+    — so saving never overwrites a tool someone else made."""
+    slug = sanitize_name(name)
+    taken = {it.get("name") for it in _load_index(vault_dir)}
+    d = tools_dir(vault_dir)
+
+    def used(s: str) -> bool:
+        return s in taken or (d / f"{s}.py").exists()
+
+    if not used(slug):
+        return slug
+    n = 2
+    while used(f"{slug[:36]}_{n}"):
+        n += 1
+    return f"{slug[:36]}_{n}"
+
+
 def save_tool(name: str, description: str, code: str, *,
               author: str = "model",
               vault_dir: Optional[Any] = None
@@ -156,27 +202,10 @@ def save_tool(name: str, description: str, code: str, *,
     The code must define EXACTLY ONE top-level function (the entry point) and
     must pass the analyst sandbox validator (no delete/write/network/shell).
     """
-    slug = sanitize_name(name)
-    if not _NAME_RE.match(slug):
-        return (False, "invalid tool name — use 3-40 chars of a-z, 0-9, _ "
-                "(start with a letter)", None)
-    code = (code or "").strip()
-    if not code:
-        return False, "no code provided", None
-    if len(code.encode("utf-8", "replace")) > _MAX_CODE_BYTES:
-        return False, f"tool code exceeds {_MAX_CODE_BYTES} bytes", None
-    # Same validator the pandas sandbox uses.
-    try:
-        from vault_analyst import validate_generated_code
-    except Exception as exc:
-        return False, f"validator unavailable: {exc!r}", None
-    ok, why = validate_generated_code(code)
+    ok, why, slug, entry = check_tool(name, code)
     if not ok:
-        return False, f"rejected by sandbox validator: {why}", None
-    entry = entry_function(code)
-    if entry is None:
-        return (False, "the tool must define EXACTLY ONE top-level function "
-                "(its entry point)", None)
+        return False, why, None
+    code = (code or "").strip()
     existing = _load_index(vault_dir)
     if len(existing) >= _MAX_TOOLS and all(it.get("name") != slug for it in existing):
         return False, f"tool limit reached ({_MAX_TOOLS})", None
@@ -243,6 +272,19 @@ def run_tool(name: str, args: Optional[Dict[str, Any]] = None, *,
     entry = it.get("entry") or entry_function(code)
     if not entry:
         return None, f"[app-built tool — UNVERIFIED] tool '{name}' has no entry function"
+    return run_code(code, args, entry=entry, allowed_folders=allowed_folders,
+                    vault_dir=vault_dir)
+
+
+def run_code(code: str, args: Optional[Dict[str, Any]] = None, *,
+             entry: Optional[str] = None,
+             allowed_folders: Optional[List[Any]] = None,
+             vault_dir: Optional[Any] = None) -> Tuple[Any, str]:
+    """Run tool code held in memory (not a saved tool) through the analyst
+    sandbox, exactly as run_tool runs a saved one."""
+    entry = entry or entry_function(code or "")
+    if not entry:
+        return None, "[app-built tool — UNVERIFIED] the code has no single entry function"
     args = args or {}
     if not isinstance(args, dict):
         return None, "[app-built tool — UNVERIFIED] args must be a dict"

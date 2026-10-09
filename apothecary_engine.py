@@ -7,7 +7,8 @@
 # ============================================================
 #
 # New in v2:
-#   - Pi provisioning wizard (install Ollama, pull model, enable service)
+#   - Pi provisioning wizard (OS check, ethernet keepalive; Ollama and models
+#     moved to council_core.pi_setup - see WIZARD_SEQUENCE)
 #   - Connection health monitor (background thread, auto-recovers)
 #   - Static IP assignment helper for ethernet stability
 #   - Auto-register provisioned Pi into council dispatcher
@@ -112,68 +113,6 @@ PROVISION_TASKS: Dict[str, List[TaskStep]] = {
         ),
     ],
 
-    "install_ollama": [
-        TaskStep(
-            "curl -fsSL https://ollama.com/install.sh | sh",
-            "Download and install Ollama",
-            timeout=300,
-        ),
-        TaskStep("ollama --version", "Verify Ollama installed"),
-        TaskStep(
-            "sudo systemctl enable ollama 2>/dev/null || true",
-            "Enable Ollama service on boot",
-            warn_only=True,
-        ),
-        TaskStep(
-            "sudo systemctl start ollama 2>/dev/null || (ollama serve &); sleep 2",
-            "Start Ollama service",
-            warn_only=True,
-        ),
-        TaskStep(
-            "curl -s --connect-timeout 8 http://localhost:11434/api/tags",
-            "Verify Ollama API responding",
-            timeout=20,
-        ),
-    ],
-
-    "configure_ollama_service": [
-        TaskStep(
-            "sudo mkdir -p /etc/systemd/system/ollama.service.d",
-            "Create systemd override dir",
-        ),
-        TaskStep(
-            "printf '[Service]\\nEnvironment=\"OLLAMA_HOST=0.0.0.0:11434\"\\n"
-            "Environment=\"OLLAMA_FLASH_ATTENTION=1\"\\n' | "
-            "sudo tee /etc/systemd/system/ollama.service.d/override.conf",
-            "Bind Ollama to 0.0.0.0 (allow remote connections)",
-        ),
-        TaskStep("sudo systemctl daemon-reload", "Reload systemd"),
-        TaskStep("sudo systemctl restart ollama", "Restart Ollama"),
-        TaskStep(
-            "sleep 3 && curl -s --connect-timeout 8 http://localhost:11434/api/tags",
-            "Verify Ollama API responding after restart",
-            timeout=20,
-        ),
-    ],
-
-    "open_firewall": [
-        TaskStep(
-            "sudo ufw allow 11434/tcp 2>/dev/null && sudo ufw reload 2>/dev/null || true",
-            "Open port 11434 in ufw",
-            warn_only=True,
-        ),
-        TaskStep(
-            "sudo iptables -I INPUT -p tcp --dport 11434 -j ACCEPT 2>/dev/null || true",
-            "Allow port 11434 in iptables",
-            warn_only=True,
-        ),
-    ],
-
-    "pull_model": [
-        TaskStep("ollama pull {model}", "Pull model {model}", timeout=3600),  # 1hr — large models take time
-        TaskStep("ollama list | grep {model_base}", "Verify model present"),
-    ],
-
     "keepalive_setup": [
         TaskStep(
             "(crontab -l 2>/dev/null; echo '*/5 * * * * ping -c 1 {desktop_ip} > /dev/null 2>&1') | crontab -",
@@ -232,12 +171,17 @@ PROVISION_TASKS: Dict[str, List[TaskStep]] = {
     ],
 }
 
+# The old wizard also installed Ollama with 'curl -fsSL https://ollama.com/install.sh | sh'
+# (no checksum), bound it to 0.0.0.0 with port 11434 open to everyone, and
+# pulled a model (qwen2.5:3b, not US-origin) with no click of its own. Those
+# steps are gone (review, 2026-10-07: they broke the user's decisions a and b,
+# and "Run Full Setup" replaced the pinned, checked Ollama on a Pi the new
+# setup had made). Ollama and models: Apothecary -> "Set up a Pi (new or
+# existing)" (council_core.pi_setup) - ONE pinned release checked before it
+# is installed, a firewall that lets only this PC in, and a US-origin model
+# downloaded only on the user's "Download on the Pi" click.
 WIZARD_SEQUENCE = [
     "check_os",
-    "install_ollama",
-    "configure_ollama_service",
-    "open_firewall",
-    "pull_model",
     "keepalive_setup",
 ]
 
@@ -895,20 +839,18 @@ class Apothecary:
         password_override: Optional[str] = None,
         progress_cb: Optional[Callable[[str, bool], None]] = None,
     ) -> Tuple[bool, str]:
+        """Check the Pi's OS and fix its Ethernet link (WIZARD_SEQUENCE).
+        It no longer installs Ollama or downloads a model - ``model`` is
+        kept for older callers and ignored; see WIZARD_SEQUENCE."""
         node = self._get(name)
         pw   = password_override or node.password or None
-        model_base = model.split(":")[0]
-        vars = {
-            "model": model, "model_base": model_base,
-            "host": node.host, "desktop_ip": desktop_ip,
-        }
+        vars = {"host": node.host, "desktop_ip": desktop_ip}
 
         if progress_cb:
             sep = "=" * 50
             progress_cb(f"\n{sep}", False)
-            progress_cb("  Council Pi Setup Wizard", False)
+            progress_cb("  Council Pi Setup Wizard (OS check and Ethernet keepalive)", False)
             progress_cb(f"  Node: {name}  ({node.username}@{node.host})", False)
-            progress_cb(f"  Model: {model}", False)
             progress_cb(sep, False)
 
         all_ok = True
@@ -930,19 +872,19 @@ class Apothecary:
                 break
 
         if all_ok:
-            node.model     = model
             node.last_seen = now_iso()
             node.status    = "online"
             self.upsert_node(node)
             if progress_cb:
                 sep = "=" * 50
                 progress_cb(f"\n{sep}", False)
-                progress_cb("  \u2713 Pi setup complete!", False)
-                progress_cb(f"  Ollama running at http://{node.host}:{node.ollama_port}", False)
-                progress_cb(f"  Model: {model}", False)
-                progress_cb(f"\n  Add to Council: COUNCIL_PI_HOSTS=http://{node.host}:{node.ollama_port}", False)
+                progress_cb("  \u2713 OS checked and Ethernet keepalive set.", False)
+                progress_cb("  Ollama and models are installed by 'Set up a Pi (new or "
+                            "existing)' in the Apothecary: one pinned, checked Ollama "
+                            "release, and a model only when you press 'Download on the Pi'.",
+                            False)
                 progress_cb(sep, False)
-            return True, f"Provisioned {name}. Ollama at http://{node.host}:{node.ollama_port}"
+            return True, f"Checked {name} and set its Ethernet keepalive."
 
         return False, f"Setup failed for {name}. See output."
 
@@ -1289,7 +1231,8 @@ if _TK_OK:
                 win.destroy()
                 if messagebox.askyesno(
                     "Run Setup Wizard?",
-                    f"Node saved at {ip}.\n\nRun the Pi Setup Wizard now to install Ollama?",
+                    f"Node saved at {ip}.\n\nRun the Pi Setup Wizard now (OS check and "
+                    "ethernet keepalive)?",
                     parent=self,
                 ):
                     self._open_wizard()
@@ -1667,8 +1610,8 @@ if _TK_OK:
                 text=f"Setting up:  {node.name}  ({node.username}@{node.host})",
                 foreground="#89b4fa", font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10,2))
             ttk.Label(win,
-                text="This wizard will: check OS, install Ollama, configure it to accept\n"
-                     "remote connections, pull your chosen model, and fix ethernet stability.",
+                text="This wizard checks the OS and fixes ethernet stability. Ollama and\n"
+                     "models: use 'Set up a Pi (new or existing)' in the Qt Apothecary.",
                 foreground="#6c7086", justify="left").pack(anchor="w", padx=12, pady=(0,8))
             ttk.Separator(win, orient="horizontal").pack(fill="x", padx=12, pady=4)
 

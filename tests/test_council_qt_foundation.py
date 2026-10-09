@@ -626,6 +626,14 @@ def window(qapp, tmp_path, monkeypatch):
     """
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
     monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    # The Connections tab lists the installed models on a worker as it is
+    # built - over HTTP, from the REAL Ollama port. Every build, show and
+    # wired-name check of it here asked 127.0.0.1:11434 for its tags (review,
+    # 2026-10-07: 6 attempts in this file). The listing is stubbed; see
+    # test_building_the_connections_tab_reaches_no_model_server.
+    from council_qt.tabs.connections import ConnectionsActions
+    monkeypatch.setattr(ConnectionsActions, "local_models", lambda self: [])
+    monkeypatch.setattr(ConnectionsActions, "pi_nodes", lambda self: ([], []))
     before = _top_level_ids()
     win = CouncilWindow(theme="dark")
     win._harness_built = []                   # see _build_tab
@@ -650,11 +658,11 @@ def window(qapp, tmp_path, monkeypatch):
 # violation roughly one run in three, blamed on whichever test was running.
 # `test_the_drain_list_covers_every_worker_a_tab_starts` keeps it honest.
 TAB_WORKERS = (
-    "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
+    "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
     "council-command", "council-turn", "designer-", "diagnostics",
     "docs-", "dream3d-", "forge", "grapher-", "ide-",
-    "jobs-", "keyword-index", "lens-", "librarian-", "model-",
-    "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
+    "jobs-", "keyword-index", "kg-", "lens-", "librarian-", "model-",
+    "mongo-convert", "nodes-", "pi-setup", "sessions-", "tts-", "vault-",
     # capture.warm_in_background: Pillow's plugins imported off the UI
     # thread before a camera's picture starts. It touches no widget, but it
     # is named in capture.py, which this list must cover.
@@ -836,6 +844,20 @@ def test_every_registered_tab_builds(window, title, factory, eager):
     widget = _build_tab(window, factory)
     assert widget is not None, f"{title} built nothing"
     assert widget.metaObject() is not None
+
+
+def test_building_the_connections_tab_reaches_no_model_server(window, monkeypatch, qapp):
+    """The harness's Connections tab, built and shown, connects nowhere: no
+    real Ollama, nothing off this machine."""
+    from council_qt.tabs import REGISTRY
+    from tests.fake_ollama import refuse_egress
+    refused = refuse_egress(monkeypatch)
+    title, factory = next((t, f) for t, f, _e in REGISTRY if "Connections" in t)
+    widget = _build_tab(window, factory)
+    window.add_tab(title, lambda w=widget: w, eager=True)
+    window.show_tab(title)
+    _drain_tab_workers(qapp)
+    assert refused == []
 
 
 @pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)

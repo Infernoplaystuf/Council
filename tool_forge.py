@@ -149,14 +149,18 @@ def _entry_has_no_required_args(code: str) -> bool:
     return required_pos <= 0 and required_kw == 0
 
 
-def _test_run_error(name: str, code: str, vault_dir: Any) -> str:
-    """Run the saved tool with no args (only if it needs none) and return an
-    error string if it failed, else ''. Used to drive the self-correction loop."""
+def _test_run_error(name: Optional[str], code: str, vault_dir: Any) -> str:
+    """Run the tool with no args (only if it needs none) and return an error
+    string if it failed, else ''. Used to drive the self-correction loop.
+    ``name`` None runs ``code`` from memory (a draft that was not saved)."""
     if not _entry_has_no_required_args(code):
         return ""   # needs arguments — can't auto-test; accept as saved
     try:
         import app_built_tools as abt
-        _df, msg = abt.run_tool(name, {}, vault_dir=vault_dir)
+        if name is None:
+            _df, msg = abt.run_code(code, {}, vault_dir=vault_dir)
+        else:
+            _df, msg = abt.run_tool(name, {}, vault_dir=vault_dir)
     except Exception as exc:
         return repr(exc)[:300]
     m = str(msg)
@@ -174,6 +178,7 @@ def generate_tool(task: str,
                   author: str = "model",
                   vault_dir: Optional[Any] = None,
                   max_attempts: int = 3,
+                  save: bool = True,
                   ) -> Tuple[bool, str, Optional[str], str]:
     """Ask the model to author a tool for ``task``, validate + save it, test-run
     it, and self-correct on error (up to ``max_attempts``).
@@ -182,6 +187,12 @@ def generate_tool(task: str,
     reuses whatever local-model entry point the caller has (council_engine.
     local_chat in the app). Returns ``(ok, message, saved_name, code)`` — the
     code is returned even on failure so the UI can show what the model wrote.
+
+    ``save=False`` makes the same checks and the same sandbox test-run from
+    memory and writes NOTHING: the returned name is the tool's name, not a
+    saved file. The agent creator drafts this way — save_tool overwrites by
+    name, so a draft saved before approval could replace a user's own tool
+    and stay runnable after being rejected.
     """
     task = (task or "").strip()
     if not task:
@@ -217,16 +228,21 @@ def generate_tool(task: str,
             prompt = _retry_prompt(task, code, last_msg)
             continue
 
-        ok, msg, saved = abt.save_tool(
-            entry, (description or task), code, author=author,
-            vault_dir=vault_dir)
+        if save:
+            ok, msg, saved = abt.save_tool(
+                entry, (description or task), code, author=author,
+                vault_dir=vault_dir)
+        else:
+            ok, msg, saved, _entry = abt.check_tool(entry, code)
+            if ok:
+                msg = f"drafted tool '{saved}' (entry: {entry}); not saved"
         if not ok:
             last_msg = msg
             prompt = _retry_prompt(task, code, f"the sandbox rejected it: {msg}")
             continue
 
-        # Validated + saved. Test-run (when it needs no args); on error, fix.
-        err = _test_run_error(saved, code, vault_dir)
+        # Validated (+ saved). Test-run (when it needs no args); on error, fix.
+        err = _test_run_error(saved if save else None, code, vault_dir)
         if err:
             last_msg = f"it saved but errored when run: {err}"
             prompt = _retry_prompt(task, code, err)

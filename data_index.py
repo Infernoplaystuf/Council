@@ -152,6 +152,7 @@ def is_under(child: Path, parent: Path) -> bool:
 # the data-file extensions we look for (.json especially).
 _APP_INTERNAL_FILENAMES = {
     "specialists.json",
+    "agent_profiles.json",
     "license.json",
     "activation.json",
     "node_registry.json",
