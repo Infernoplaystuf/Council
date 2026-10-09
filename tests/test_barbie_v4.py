@@ -158,7 +158,6 @@ def test_a_simulated_camera_reaches_the_generated_canvas(app, tmp_path):
     app.on_btn_connect()
     assert "Connected" in app.ports.capture_status.get()
     frame_camera.start(str(tmp_path))
-    frame_camera.start(str(tmp_path))
     try:
         deadline = time.monotonic() + 5.0
         while not shown and time.monotonic() < deadline:

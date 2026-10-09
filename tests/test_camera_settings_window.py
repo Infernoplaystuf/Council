@@ -84,7 +84,14 @@ def connect(kind="frame", live=True):
     rows = frame_camera.list_cameras()["rows"]
     frame_camera.connect(next(r for r in rows if r.endswith(kind)))
     if live:
+        # The first Connect in a process starts the picture only once
+        # Pillow's plugins have loaded on their own thread
+        # (capture.warm_in_background): longer than 0.2 s when this test
+        # runs alone.
+        deadline = time.monotonic() + 10.0
         ticks(0.2)
+        while not frame_camera._LIVE.previewing and time.monotonic() < deadline:
+            ticks(0.05)
         assert frame_camera._LIVE.previewing
 
 

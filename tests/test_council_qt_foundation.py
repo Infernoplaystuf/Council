@@ -655,6 +655,10 @@ TAB_WORKERS = (
     "docs-", "dream3d-", "forge", "grapher-", "ide-",
     "jobs-", "keyword-index", "lens-", "librarian-", "model-",
     "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
+    # capture.warm_in_background: Pillow's plugins imported off the UI
+    # thread before a camera's picture starts. It touches no widget, but it
+    # is named in capture.py, which this list must cover.
+    "warm-imports",
 )
 
 
