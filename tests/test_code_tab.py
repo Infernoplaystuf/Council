@@ -148,3 +148,20 @@ def test_a_report_agent_needs_no_plan(tab):
     wait(t, app)
     assert t.notes.toPlainText() == "camera.py:2 is fine."
     assert t.plan_table.rowCount() == 0
+
+
+def test_the_history_benchmark_runs_from_the_tab(tab):
+    t, repo, app = tab
+    calls = {}
+
+    def bench(project, count, say, should_stop):
+        say("[1/1] abc Add reset")
+        calls["count"] = count
+        return {"solved": 1, "valid": 1, "tasks": 1, "mean_calls": 4,
+                "mean_seconds": 9.5, "file": "code-history-x.jsonl"}
+    t.actions.bench = bench
+    t.on_bench()
+    wait(t, app)
+    assert calls == {"count": 5}
+    assert "Solved 1 of 1" in t.status.text()
+    assert "[1/1] abc Add reset" in t.log.toPlainText()

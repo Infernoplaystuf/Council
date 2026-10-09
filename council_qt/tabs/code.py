@@ -94,6 +94,13 @@ class CodeActions:
                              chat_tools=self.chat_tools, on_event=on_event,
                              should_stop=should_stop)
 
+    def bench(self, project: pj.Project, count: int, say, should_stop):
+        from council_core import code_bench
+        return code_bench.run(self.vault_dir, project, label="history",
+                              count=count, chat=self.chat,
+                              chat_tools=self.chat_tools, say=say,
+                              should_stop=should_stop)
+
     def jobs(self, project: pj.Project) -> List[ca.JobRecord]:
         return [r for r in ca.list_records(self.vault_dir, project)
                 if r.branch]
@@ -181,6 +188,12 @@ class CodeTab(ViewHelpers, QWidget):
         self.merge_btn = self._button(buttons, "Merge", self.on_merge)
         self.discard_btn = self._button(buttons, "Discard", self.on_discard)
         buttons.addStretch(1)
+        self.bench_btn = self._button(buttons, "Benchmark on history",
+                                      self.on_bench)
+        self.bench_btn.setToolTip(
+            "Takes recent commits that changed code and its tests, undoes "
+            "the code, and measures whether the council can redo it (the "
+            "commit's tests pass). Your folder is not touched.")
         outer.addLayout(buttons)
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -267,7 +280,7 @@ class CodeTab(ViewHelpers, QWidget):
     def _busy_on(self, on: bool, status: str = "") -> None:
         self._busy = on
         for b in (self.plan_btn, self.diff_btn, self.merge_btn,
-                  self.discard_btn):
+                  self.discard_btn, self.bench_btn):
             b.setEnabled(not on)
         self.run_btn.setEnabled(not on and self._plan is not None)
         self.stop_btn.setEnabled(on)
@@ -428,6 +441,24 @@ class CodeTab(ViewHelpers, QWidget):
             p, prof, task, plan,
             on_event=lambda k, t: self._to_ui(lambda: self.say(k, t)),
             should_stop=self._stop.is_set), done)
+
+    def on_bench(self) -> None:
+        p = self.project()
+        if p is None:
+            self.status.setText("Pick a project first.")
+            return
+        self._stop.clear()
+        self.log.clear()
+        self.views.setCurrentWidget(self.log)
+        self._busy_on(True, "Benchmarking on 5 past commits — this runs the "
+                            "council 5 times.")
+        self._work("code-bench", lambda: self.actions.bench(
+            p, 5, lambda line: self._to_ui(lambda: self.say("phase", line)),
+            self._stop.is_set),
+            lambda s: self.status.setText(
+                f"Solved {s['solved']} of {s['valid']} usable task(s) "
+                f"({s['tasks']} tried); {s['mean_calls']} calls and "
+                f"{s['mean_seconds']} s per task. Saved as {s['file']}."))
 
     def on_stop(self) -> None:
         self._stop.set()

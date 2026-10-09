@@ -67,7 +67,7 @@ def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
     peers = {e.src if e.dst == "coder" else e.dst
              for e in m.edges_of("coder")}
     assert peers == {"judge", "debate", "librarian", "tools", "role_memory",
-                     "mcp_docs", "usage_log", "fanout"}
+                     "mcp_docs", "usage_log", "fanout", "code_jobs"}
     assert _edge(cm.static_map(), "mcp_docs", "coder").status == "live"
 
 

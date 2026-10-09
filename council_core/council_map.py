@@ -261,6 +261,13 @@ _NODES: Tuple[Node, ...] = (
          "much of each member's draft reached the answer "
          "(.council_usage/verdicts-*.jsonl). The weekly review reads it.",
          "council_core/verdict_log.py"),
+    Node("code_jobs", "Code jobs", "agent",
+         "The Code tab: a project's brief, code map and references; a plan "
+         "you approve; steps done with read / find / edit-by-replacement / "
+         "test / GUI-check tools on a git branch of its own, each checked "
+         "by the app and committed; then you merge or discard.",
+         "council_core/code_agent.py; council_core/project_tools.py; "
+         "council_qt/tabs/code.py"),
     Node("bench", "Benchmark", "agent",
          "Asks a fixed set of questions through the council and measures "
          "calls, seconds per step, model loads and right answers, to "
@@ -400,6 +407,11 @@ def _edges() -> List[Edge]:
           cite="council_core/placement.py (WHO HELPS)"),
         E("bench", "question", "a fixed question set, measured", "memory",
           "live", cite="council_core/council_bench.py"),
+        E("code_jobs", "judge", "the project and the task, to plan (the "
+          "planner role)", "tools", "live",
+          cite="council_core/code_agent.py (make_plan)"),
+        E("code_jobs", "coder", "one plan step, with the project tools",
+          "tools", "live", cite="council_core/code_agent.py (run_job)"),
     ]
 
     # -- fan-out coding ----------------------------------------------------
@@ -733,7 +745,7 @@ _NODE_ANCHORS = {"usage_log": (0.28, 0.93), "apothecary": (0.95, 0.78),
                  "role_memory": (0.6, 0.06), "docs": (0.25, 0.85),
                  "mcp_docs": (0.08, 0.92), "tools": (0.25, 0.7),
                  "answer_store": (0.97, 0.2), "verdicts": (0.12, 0.97),
-                 "bench": (0.03, 0.2)}
+                 "bench": (0.03, 0.2), "code_jobs": (0.4, 0.85)}
 _RING = (0.52, 0.47, 0.17, 0.36)        # centre x, y and radii, as fractions
 
 

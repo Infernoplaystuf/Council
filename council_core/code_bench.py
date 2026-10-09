@@ -219,5 +219,29 @@ def run(vault_dir: Path, project: pj.Project, *, label: str = "code",
     return summary
 
 
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """python -m council_core.code_bench PROJECT [--count 5] [--label x]"""
+    import argparse
+    ap = argparse.ArgumentParser(prog="code_bench")
+    ap.add_argument("project")
+    ap.add_argument("--count", type=int, default=5)
+    ap.add_argument("--label", default="code")
+    ap.add_argument("--vault", default=None)
+    args = ap.parse_args(argv)
+    from . import paths
+    vault = Path(args.vault) if args.vault else paths.vault_dir()
+    project = pj.load(vault, args.project)
+    if project is None:
+        print(f"No project named {args.project!r} (make it in the Code tab).")
+        return 2
+    print(json.dumps(run(vault, project, label=args.label, count=args.count),
+                     indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = ["Task", "Outcome", "candidates", "prepare", "run_task", "run",
-           "is_test"]
+           "is_test", "main"]
