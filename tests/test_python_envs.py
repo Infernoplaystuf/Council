@@ -195,8 +195,9 @@ def test_run_example_records_the_choice_and_refuses_a_missing_env(
 
 
 # ============================================================
-# preflight / run_checked / the Run-with widget — the logic that used to
-# live inside the designer tab, where nothing could test it
+# preflight / run_checked — the logic that used to live inside the designer
+# tab, where nothing could test it. (The Run-with box is the Qt
+# council_qt/widgets/runwith.py, tested in tests/test_designer_tab.py.)
 # ============================================================
 
 def _built(tmp_path, name="pre"):
@@ -258,31 +259,6 @@ def test_run_checked_launches_through_the_callbacks(tmp_path):
         assert any("preview running" in l for l in log)
     finally:
         run.stop(pdir, grace=3)
-
-
-def test_the_run_with_widget_saves_to_the_open_project(tmp_path, tk_root):
-    import tkinter as tk
-    import gui_runwith as grw
-    py = pe.find_env("council")
-    if not py:
-        pytest.skip("conda env 'council' not on this machine")
-    pdir = _built(tmp_path, "rw")
-    top = tk.Toplevel(tk_root)
-    try:
-        logged = []
-        box = grw.RunWithBox(top, get_dir=lambda: pdir, log=logged.append)
-        box.sync()
-        assert box.var.get() == pe.DEFAULT_LABEL
-        box.fill()
-        assert "conda: council" in box.box.cget("values")
-        box.var.set("conda: council")
-        box._picked()
-        assert gpj.load_manifest(pdir).python == "council"
-        box.var.set("something else")
-        box.sync()
-        assert box.var.get() == "conda: council"
-    finally:
-        top.destroy()
 
 
 def test_project_files_are_everything_the_app_runs(tmp_path):

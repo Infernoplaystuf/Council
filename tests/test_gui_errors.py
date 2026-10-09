@@ -101,7 +101,10 @@ def test_classify_folder_is_still_a_report_that_never_raises(tmp_path):
 
 
 # ============================================================
-# Ports: clear() shows nothing — never a zero
+# Ports: a blank number is None — never a zero
+#
+# What clear() shows on each kind of port, and the panel saying why it is
+# empty, are checked on the Qt runtime in tests/test_gui_qt_widgets.py.
 # ============================================================
 
 @pytest.fixture(scope="module")
@@ -112,66 +115,6 @@ def rt():
     return ns
 
 
-def test_clear_blanks_text_and_never_writes_a_zero(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    try:
-        sv, iv = tk.StringVar(top, "10"), tk.IntVar(top, 7)
-        ent, spin = tk.Entry(top), tk.Spinbox(top)
-        P = rt["_VarPort"]
-        p_str = P("s", ent, var=sv, option="textvariable", type="str",
-                  direction="io")
-        p_int = P("i", spin, var=iv, option="textvariable", type="int",
-                  direction="io")
-        p_str.clear()
-        p_int.clear()
-        assert sv.get() == ""
-        assert iv.get() == 7, "an IntVar has no blank state; clearing must " \
-                              "not write 0 into it"
-
-        lb = tk.Listbox(top)
-        lp = rt["_ListPort"]("l", lb, direction="io", type="list")
-        lp.set(["a", "b"])
-        lp.clear()
-        assert lb.size() == 0
-
-        ic = rt["ImageCanvas"](top)
-        ic.pack()
-        top.update()
-        img = rt["_ProxyPort"]("v", ic, writer="set_image", type="image",
-                               direction="out")
-        img.set(Image.new("RGB", (10, 10)))
-        img.clear()
-        assert ic._base is None
-
-        # A status bar and a progress bar have an honest empty state. Left as
-        # they were, the previous folder's answer sat beside the new folder
-        # after its scan failed (adversarial review, 2026-09).
-        sb = rt["StatusBar"](top)
-        st = rt["_ProxyPort"]("st", sb, writer="set", type="str",
-                              direction="out")
-        st.set("3 of 5 frames captured on a bad timing")
-        st.clear()
-        assert sb.message.cget("text") == ""
-        from tkinter import ttk
-        dv = tk.DoubleVar(top, 0.0)
-        pb = rt["_VarPort"]("pb", ttk.Progressbar(top), var=dv,
-                            option="variable", type="float", direction="out")
-        pb.set(3.0)
-        pb.clear()
-        assert dv.get() == 0.0
-
-        # ...and a cleared number box reads back as None, not 0 — the same
-        # false zero clear() keeps off the screen, handed to its next reader
-        p_str.set("")
-        num = P("n", tk.Entry(top), var=tk.StringVar(top, "7"),
-                option="textvariable", type="int", direction="io")
-        num.clear()
-        assert num.get() is None
-    finally:
-        top.destroy()
-
-
 @pytest.mark.parametrize("raw,t,want", [
     ("", "int", None), ("  ", "float", None), ("abc", "int", None),
     ("7", "int", 7), ("3.0", "int", 3), ("2.5", "float", 2.5),
@@ -179,25 +122,6 @@ def test_clear_blanks_text_and_never_writes_a_zero(rt, tk_root):
 ])
 def test_coerce_never_invents_a_number(rt, raw, t, want):
     assert rt["_coerce"](raw, t) == want
-
-
-def test_the_panel_says_why_it_is_empty(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    top.geometry("300x200")
-    try:
-        ic = rt["ImageCanvas"](top)
-        ic.pack(fill="both", expand=True)
-        top.update()
-        ic.show_message("Pillow is not installed")
-        msg = ic.canvas.find_withtag("message")
-        assert msg and ic.canvas.itemcget(msg[0], "text") == \
-            "Pillow is not installed"
-        ic.set_image(Image.new("RGB", (10, 10)))
-        assert not ic.canvas.find_withtag("message"), \
-            "an image arriving must replace the message"
-    finally:
-        top.destroy()
 
 
 # ============================================================

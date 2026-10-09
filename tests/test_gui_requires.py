@@ -261,28 +261,3 @@ def test_unattended_startup_never_waits_on_a_dialog(tmp_path):
                        capture_output=True, text=True, timeout=60, env=env)
     assert r.returncode == 3
     assert "definitely_missing_pkg_xyz" in r.stderr
-
-
-def test_the_window_panel_keeps_what_was_applied(tk_root):
-    """The panel copied requires once at attach time and re-rendered that
-    copy after any selection change — so the next Apply (a title edit) saved
-    the OLD list back. Measured: a declared pypylon vanished."""
-    import tkinter as tk
-    import gui_canvas as gc
-    saved = []
-    top = tk.Toplevel(tk_root)
-    try:
-        canvas = gc.DesignerCanvas(top)
-        win = gs.Window(title="Cam")
-
-        def on_window(values):
-            saved.append(pol.parse_requires(values.get("requires", "")))
-        canvas.attach_window(win, on_window, requires=[])
-        insp = canvas.inspector
-        insp._win_vars["requires"].set("pypylon")
-        insp._apply_window()
-        insp._empty()                   # what a selection change re-renders
-        insp._apply_window()            # e.g. after editing only the title
-        assert saved == [["pypylon"], ["pypylon"]]
-    finally:
-        top.destroy()

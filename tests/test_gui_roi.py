@@ -4,6 +4,8 @@ Region of interest on the live image, crop-on-save, and multi-word fonts.
 Barbie Capture v2 lets the user box the part of the frame that matters: Draw
 ROI arms a drag, Apply ROI crops and zooms the view to the box (and keeps it
 cropped on every new frame), and Save writes each frame cropped to the box.
+The canvas's half of that — and the box following its entry port both ways —
+is checked on the Qt runtime in tests/test_gui_qt_widgets.py.
 
 The last test builds the v2 example and drives the GENERATED app in its own
 process, pressing its real buttons. That is deliberate: the retrieval layer in
@@ -20,7 +22,6 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from types import SimpleNamespace as Ev
 
 import pytest
 
@@ -55,17 +56,6 @@ def test_tk_font_quotes_multi_word_families(given, want):
     assert gcol.tk_font(given) == want
 
 
-def test_a_multi_word_font_no_longer_kills_the_app(tk_root):
-    """MEASURED FAILURE: TclError: expected integer but got "UI" — raised at
-    widget construction, so the generated app died before its window."""
-    import tkinter as tk
-    from tkinter import ttk
-    with pytest.raises(tk.TclError):
-        ttk.Label(tk_root, text="x", font="Segoe UI 12")
-    lbl = ttk.Label(tk_root, text="x", font=gcol.tk_font("Segoe UI 12"))
-    lbl.destroy()
-
-
 def test_emit_writes_the_quoted_font():
     s = gs.new_shape("label", 0, 0)
     s.id, s.label, s.font = "l1", "Hello", "Segoe UI 11 bold"
@@ -73,178 +63,6 @@ def test_emit_writes_the_quoted_font():
     src = ge.emit_main_ui(spec)
     assert '"{Segoe UI} 11 bold"' in src
     assert '"Segoe UI 11 bold"' not in src
-
-
-# ============================================================
-# The canvas
-# ============================================================
-
-@pytest.fixture(scope="module")
-def rt():
-    ns: dict = {}
-    exec(compile(ge.WIDGETS_PY, "<widgets>", "exec"), ns)
-    exec(compile(ge.PORTS_RUNTIME, "<ports>", "exec"), ns)
-    return ns
-
-
-@pytest.fixture
-def canvas(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    top.geometry("500x400")
-    ic = rt["ImageCanvas"](top, roi=True)
-    ic.pack(fill="both", expand=True)
-    top.update()
-    ic.set_image(Image.new("RGB", (200, 100), "grey"))
-    top.update()
-    try:
-        yield ic
-    finally:
-        top.destroy()
-
-
-def _draw(ic, box):
-    """Draw ``box`` (image pixels) through the canvas's own mouse handlers."""
-    x, y, w, h = box
-    x0, y0 = ic._to_canvas(x, y)
-    x1, y1 = ic._to_canvas(x + w, y + h)
-    ic.arm_roi()
-    ic._press(Ev(x=x0, y=y0))
-    ic._drag(Ev(x=(x0 + x1) / 2, y=(y0 + y1) / 2))
-    ic._drag(Ev(x=x1, y=y1))
-    ic._release(Ev(x=x1, y=y1))
-
-
-def test_a_drag_draws_the_box_in_image_pixels(canvas):
-    _draw(canvas, (20, 10, 60, 40))
-    assert canvas.get_roi() == (20, 10, 60, 40)
-    assert canvas.canvas.find_withtag("roi_box"), "the box is not on screen"
-
-
-def test_apply_crops_the_view_and_zooms_to_it(canvas):
-    _draw(canvas, (20, 10, 60, 40))
-    canvas.apply_roi()
-    assert canvas._view.size == (60, 40)
-    # zoomed to FIT the crop, not left at the whole-frame scale
-    cw = canvas.canvas.winfo_width()
-    assert canvas._view.size[0] * canvas._scale > 0.9 * cw or \
-        canvas._view.size[1] * canvas._scale > 0.9 * canvas.canvas.winfo_height()
-
-
-def test_an_applied_roi_survives_every_new_frame(canvas):
-    """A scrubbed or live sequence must stay zoomed on the region, not snap
-    back to the whole frame each time a new image arrives."""
-    _draw(canvas, (20, 10, 60, 40))
-    canvas.apply_roi()
-    for shade in ("red", "blue", "white"):
-        canvas.set_image(Image.new("RGB", (200, 100), shade))
-        assert canvas._view.size == (60, 40)
-
-
-def test_clear_returns_to_the_whole_frame(canvas):
-    _draw(canvas, (20, 10, 60, 40))
-    canvas.apply_roi()
-    canvas.clear_roi()
-    assert canvas.get_roi() is None
-    assert canvas._view.size == (200, 100)
-
-
-def test_a_click_without_a_drag_keeps_the_existing_box(canvas):
-    _draw(canvas, (20, 10, 60, 40))
-    x, y = canvas._to_canvas(100, 50)
-    canvas.arm_roi()
-    canvas._press(Ev(x=x, y=y))
-    canvas._release(Ev(x=x, y=y))
-    assert canvas.get_roi() == (20, 10, 60, 40)
-
-
-def test_drawing_is_disabled_while_a_crop_is_applied(canvas):
-    """A box drawn on a zoomed crop is ambiguous — Clear first."""
-    _draw(canvas, (20, 10, 60, 40))
-    canvas.apply_roi()
-    assert "disabled" in canvas._btn_draw.state()
-    canvas.arm_roi()
-    assert canvas._roi_armed is False
-
-
-def test_an_oversized_box_is_reported_clamped_not_as_typed(canvas):
-    """A 400x300 box on a 200x100 frame shows 200 x 100 — never a size whose
-    pixels do not exist."""
-    canvas.set_roi((0, 0, 400, 300))
-    canvas.apply_roi()
-    assert canvas._view.size == (200, 100)
-    note = canvas._roi_note.cget("text")
-    assert "200 x 100" in note and "clamped" in note
-
-
-def test_roi_is_off_by_default_so_drag_still_pans(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    try:
-        ic = rt["ImageCanvas"](top)
-        ic.pack(fill="both", expand=True)
-        top.update()
-        ic.set_image(Image.new("RGB", (50, 50)))
-        ox = ic._ox
-        ic._press(Ev(x=10, y=10)); ic._drag(Ev(x=30, y=10)); ic._release(Ev(x=30, y=10))
-        assert ic.roi_enabled is False and ic.get_roi() is None
-        assert ic._ox == pytest.approx(ox + 20)
-    finally:
-        top.destroy()
-
-
-# ============================================================
-# The ROI port, both ways
-# ============================================================
-
-def test_the_box_and_the_entry_stay_in_sync_both_ways(rt, tk_root, tmp_path):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    top.geometry("500x420")
-    try:
-        ic = rt["ImageCanvas"](top, roi=True)
-        scrub = rt["Scrubber"](top, from_=0, to=0)
-        pick = rt["FilePicker"](top, mode="folder")
-        ent = tk.Entry(top)
-        for w in (pick, scrub, ic, ent):
-            w.pack(fill="both", expand=True)
-        top.update()
-        var = tk.StringVar(top)
-        ent.configure(textvariable=var)
-        P = rt["_VarPort"]
-        fb = rt["_FrameBrowser"](
-            P("f", pick, var=pick.var, option="", type="str", direction="io",
-              default=None, deep=False),
-            P("i", scrub, var=scrub.var, option="", type="int", direction="io",
-              default=None, deep=False),
-            rt["_ProxyPort"]("v", ic, writer="set_image", type="image",
-                             direction="out"),
-            roi_port=P("roi", ent, var=var, option="", type="str",
-                       direction="io", default=None, deep=False))
-        # The browser defers its first folder load to idle; with no folder
-        # that load CLEARS the canvas. Let it run before setting the image.
-        top.update()
-        ic.set_image(Image.new("RGB", (200, 100)))
-        top.update()
-
-        _draw(ic, (20, 10, 60, 40))
-        top.update()
-        assert var.get() == "20, 10, 60, 40", "drawing did not reach the entry"
-
-        var.set("5, 6, 70, 30")
-        top.update()
-        assert ic.get_roi() == (5, 6, 70, 30), "typing did not move the box"
-
-        var.set("5, 6, 7")                      # half-typed: leave it alone
-        top.update()
-        assert ic.get_roi() == (5, 6, 70, 30)
-
-        var.set("")
-        top.update()
-        assert ic.get_roi() is None
-        assert fb is not None
-    finally:
-        top.destroy()
 
 
 # ============================================================

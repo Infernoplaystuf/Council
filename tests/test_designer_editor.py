@@ -1,10 +1,11 @@
 """
 The Designer's gestures, tested with no display at all.
 
-That is the headline. `tests/test_gui_canvas_interaction.py` constructs a REAL
-widget to drive press/drag/release, so it cannot run where there is no display
-and cannot run beside the Qt suite. Every test here drives the same decisions
-through `council_core.designer_editor.Scene`, which touches no toolkit.
+That is the headline. The Tk designer's tests
+(tests/test_gui_canvas_interaction.py, removed with the deprecated Tk GUIs)
+constructed a REAL widget to drive press/drag/release, so they could not run
+where there was no display. Every test here drives the same decisions through
+`council_core.designer_editor.Scene`, which touches no toolkit.
 
 The defects each test names were found by the phase-8 reconnaissance and fixed
 in the move.

@@ -17,13 +17,16 @@ hypothetical. The values in the assertions are the values that came back.
   * a deleted image canvas produced a COMMENT in ui/ports.py and a successful
     build, so the app ran and the slider silently did nothing
 
+The browser itself — capture order, the debounces, the empty folder, a 16-bit
+frame, an unreadable one — is driven on the Qt runtime in
+tests/test_gui_qt_widgets.py and tests/test_gui_qt_runtime.py.
+
 Run:  python -m pytest tests/test_gui_sequence.py -q
 """
 from __future__ import annotations
 
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -132,202 +135,6 @@ def test_natural_sort_survives_a_non_ascii_digit(rt):
     key = rt["_natkey"]
     assert key("frame_².png")          # does not raise
     assert sorted(["b²", "a1"], key=key) == ["a1", "b²"]
-
-
-# ============================================================
-# The browser itself, against a live Tk root
-# ============================================================
-
-def _pump(root, ms=260):
-    """Tk fires `after` callbacks only under update(); a debounce cannot be
-    observed without a real event loop turning over."""
-    end = time.time() + ms / 1000.0
-    while time.time() < end:
-        root.update()
-        time.sleep(0.005)
-
-
-@pytest.fixture
-def rig(rt, tk_root, tmp_path):
-    """A window off the SESSION root, never a root of its own.
-
-    ImageTk.PhotoImage binds to tkinter's default root, so a second Tk() makes
-    ImageCanvas render into a different interpreter than the one holding the
-    image — `TclError: image "pyimage25" doesn't exist`, but only when another
-    Tk test ran first. See tests/conftest.py for why there is exactly one root.
-    """
-    tk = pytest.importorskip("tkinter")
-    Image = pytest.importorskip("PIL.Image")
-    root = tk.Toplevel(tk_root)
-    # A Toplevel of the withdrawn session root is NOT withdrawn itself, and
-    # update() maps it: each of these tests put a 640x480 window on screen.
-    root.withdraw()
-    root.geometry("640x480")
-
-    folder = tmp_path / "cap"
-    folder.mkdir()
-    for n in (1, 2, 10):
-        Image.new("RGB", (40, 30), (n, n, n)).save(folder / f"frame_{n}.png")
-
-    pick = rt["FilePicker"](root, mode="folder")
-    scrub = rt["Scrubber"](root, from_=0, to=0, show_total=True)
-    canv = rt["ImageCanvas"](root)
-    for w in (pick, scrub, canv):
-        w.pack(fill="both", expand=True)
-    root.update()
-
-    p_folder = rt["_VarPort"]("capture_folder", pick, var=pick.var, option="",
-                              type="str", direction="io", default=None,
-                              deep=False)
-    p_index = rt["_VarPort"]("frame", scrub, var=scrub.var, option="",
-                             type="int", direction="io", default=None,
-                             deep=False)
-    p_target = rt["_ProxyPort"]("live_view", canv, writer="set_image",
-                                type="image", direction="out")
-    fb = rt["_FrameBrowser"](p_folder, p_index, p_target)
-    _pump(root)
-    try:
-        yield dict(root=root, fb=fb, canvas=canv, folder=folder,
-                   p_folder=p_folder, p_index=p_index, tmp=tmp_path,
-                   Image=Image)
-    finally:
-        try: root.destroy()
-        except Exception: pass
-
-
-def _count_decodes(Image, monkeypatch):
-    seen = []
-    real = Image.open
-
-    def counting(fp, *a, **k):
-        seen.append(str(fp))
-        return real(fp, *a, **k)
-
-    monkeypatch.setattr(Image, "open", counting)
-    return seen
-
-
-def test_a_folder_lists_in_capture_order(rig):
-    rig["p_folder"].set(str(rig["folder"]))
-    _pump(rig["root"])
-    assert [os.path.basename(f) for f in rig["fb"].files] == [
-        "frame_1.png", "frame_2.png", "frame_10.png"]
-
-
-def test_the_index_resizes_itself_to_the_folder(rig):
-    rig["p_folder"].set(str(rig["folder"]))
-    _pump(rig["root"])
-    assert rig["fb"].count() == 3
-    # the scrubber's range now matches, so the slider cannot run past the end
-    assert int(float(rig["fb"].index.widget.scale.cget("to"))) == 2
-
-
-def test_a_drag_decodes_once_not_once_per_step(rig, monkeypatch):
-    """A scale fires once per integer crossed. The `_last` guard cannot help:
-    every intermediate value really is a different frame."""
-    rig["p_folder"].set(str(rig["folder"]))
-    _pump(rig["root"])
-    seen = _count_decodes(rig["Image"], monkeypatch)
-    for i in (0, 1, 2, 1, 2, 0, 2):
-        rig["p_index"].set(i)
-    _pump(rig["root"])
-    assert len(seen) == 1, f"decoded {len(seen)} times during one drag"
-
-
-def test_typing_a_path_scans_once_not_once_per_keystroke(rig, monkeypatch):
-    full = str(rig["folder"])
-    calls = []
-    real = os.scandir
-    monkeypatch.setattr(os, "scandir",
-                        lambda p=".": (calls.append(str(p)), real(p))[1])
-    for i in range(1, len(full) + 1):
-        rig["p_folder"].set(full[:i])
-    _pump(rig["root"])
-    assert len(calls) == 1, f"scanned {len(calls)} times while typing one path"
-
-
-def test_an_empty_folder_clears_the_canvas(rig):
-    """MEASURED FAILURE: canvas items=1, _base=None — the previous folder's
-    frame stayed painted under a message saying the folder was empty."""
-    rig["p_folder"].set(str(rig["folder"]))
-    _pump(rig["root"])
-    assert len(rig["canvas"].canvas.find_all()) == 1
-
-    empty = rig["tmp"] / "empty"
-    empty.mkdir()
-    rig["p_folder"].set(str(empty))
-    _pump(rig["root"])
-    c = rig["canvas"].canvas
-    assert rig["canvas"]._base is None
-    assert not [i for i in c.find_all() if c.type(i) == "image"], (
-        "a stale frame is still on screen")
-    # ...and the panel says WHY it is empty, instead of a blank rectangle
-    msg = c.find_withtag("message")
-    assert msg and "No images in" in c.itemcget(msg[0], "text")
-
-
-def test_a_half_typed_path_does_not_wipe_the_loaded_folder(rig):
-    rig["p_folder"].set(str(rig["folder"]))
-    _pump(rig["root"])
-    rig["p_folder"].set(str(rig["folder"])[:6])     # mid-typing
-    _pump(rig["root"])
-    assert rig["fb"].count() == 3
-
-
-def test_sixteen_bit_frames_are_scaled_not_clamped(rig):
-    """ImageCanvas._render does .convert("RGBA"), which clamps a 16-bit slice
-    to near-white. A CT or layer scan would come out blank."""
-    Image = rig["Image"]
-    d = rig["tmp"] / "ct"
-    d.mkdir()
-    Image.new("I;16", (8, 8), 4096).save(d / "a.tif")
-    rig["p_folder"].set(str(d))
-    _pump(rig["root"])
-    assert rig["canvas"]._base.mode == "L"
-    assert rig["canvas"]._base.getpixel((0, 0)) == 16
-
-
-def test_stepping_back_past_an_unreadable_frame_shows_the_good_one(rig):
-    """MEASURED: frame 1 unreadable, step 0 -> 1 -> 0, and frame 0 never came
-    back — _last still said 0, so show(0) returned early and the 'Cannot
-    read' message stayed up with no image."""
-    Image = rig["Image"]
-    d = rig["tmp"] / "bad"
-    d.mkdir()
-    Image.new("RGB", (40, 30), (9, 9, 9)).save(d / "f_0.png")
-    (d / "f_1.png").write_bytes(b"\x89PNG\r\n\x1a\n truncated")
-    Image.new("RGB", (40, 30), (9, 9, 9)).save(d / "f_2.png")
-    rig["p_folder"].set(str(d))
-    _pump(rig["root"])
-    assert rig["canvas"]._base is not None
-    rig["p_index"].set(1)
-    _pump(rig["root"])
-    assert rig["canvas"]._base is None
-    rig["p_index"].set(0)
-    _pump(rig["root"])
-    c = rig["canvas"].canvas
-    assert rig["canvas"]._base is not None, "frame 0 did not come back"
-    assert not c.find_withtag("message"), "the 'Cannot read' message stayed"
-
-
-def test_zoom_to_fit_clears_when_there_is_no_image(rt, tk_root):
-    tk = pytest.importorskip("tkinter")
-    Image = pytest.importorskip("PIL.Image")
-    root = tk.Toplevel(tk_root)
-    root.withdraw()                       # see rig: never map it on screen
-    try:
-        root.geometry("400x300")
-        ic = rt["ImageCanvas"](root)
-        ic.pack(fill="both", expand=True)
-        root.update()
-        ic.set_image(Image.new("RGB", (50, 50), "red"))
-        root.update()
-        assert len(ic.canvas.find_all()) == 1
-        ic.set_image(None)
-        root.update()
-        assert len(ic.canvas.find_all()) == 0
-    finally:
-        root.destroy()
 
 
 # ============================================================
