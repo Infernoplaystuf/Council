@@ -268,6 +268,11 @@ class _Live:
         #: an app whose box has no hook (`hooked_boxes`, set by attach).
         self.box_seen: Dict[str, str] = {}
         self.hooked_boxes: set = set()
+        #: What the settings tabs last put in each box beside Start as the
+        #: CAMERA's value (box_shows_camera) — not the user's word, so Start
+        #: neither writes it nor says it "kept the camera's own" over it.
+        #: About the connection.
+        self.box_synced: Dict[str, str] = {}
         #: A box beside Start ("exposure", "gain", "frame_rate") changed
         #: while a camera change had the camera on the worker: its latest
         #: value, written by the UI thread once the change is done
@@ -308,6 +313,7 @@ class _Live:
         self.quiet_reason = None
         self.run_waited = ""
         self.camera_set = {}
+        self.box_synced = {}
         self.queued = {}
         self.preset_in_use = None
         self.record_path = None
@@ -575,12 +581,12 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         if _box_given(value):
             if _box_is_newer(box):
                 write(value)
-            else:
+            elif not _box_shows_camera(box, value):
                 kept.append(box)
     if frame_rate is not None and str(frame_rate).strip():
         if _box_is_newer("frame_rate"):
             set_frame_rate(frame_rate)
-        else:
+        elif not _box_shows_camera("frame_rate", frame_rate):
             kept.append("frame rate")
 
     device = session.device
@@ -1155,6 +1161,32 @@ def _box_is_newer(box: str) -> bool:
     """Should Start apply this box? Yes unless the camera was set to the
     same thing by a preset or the settings window after the box changed."""
     return _LIVE.box_changed.get(box, 0) >= _LIVE.camera_set.get(box, -1)
+
+
+def box_shows_camera(box: str, value: Any) -> Dict[str, Any]:
+    """The settings tabs put the camera's own value in the box beside Start
+    called `box` ("exposure", "gain", "frame_rate"), after a tab, a pop-out
+    or a preset set it: the boxes and the tabs show one camera. It is the
+    camera's value, not the user's word — Start leaves it alone and says
+    nothing of it (it said "Kept the camera's own exposure" over a box that
+    held the camera's exposure).
+
+    Keys: box, value"""
+    _LIVE.box_synced[str(box)] = _box_text(value)
+    return {"box": str(box), "value": _box_text(value)}
+
+
+def _box_shows_camera(box: str, value: Any) -> bool:
+    return _LIVE.box_synced.get(box) == _box_text(value)
+
+
+def _box_text(value: Any) -> str:
+    """A box's value as one spelling: 3000, "3000" and 3000.0 alike."""
+    text = str(value if value is not None else "").strip()
+    try:
+        return f"{float(text):g}"
+    except ValueError:
+        return text
 
 
 def _box_given(value: Any) -> bool:

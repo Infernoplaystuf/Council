@@ -788,10 +788,23 @@ def test_start_uses_a_box_only_when_it_was_changed_after_the_preset(
     ui.ports.capture_folder.set(str(tmp_path / "runs"))
     ui.ports.exposure.widget.setValue(5000)              # typed first
     frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    # The settings tabs put the camera's value in the box (it said 5000
+    # over a camera at 12000): that is the camera's, not a word from the
+    # user, so Start keeps it without a word about keeping anything.
+    assert ui.ports.exposure.get() == 12000
     ui.on_btn_start_capture()
     assert state["ExposureTime"] == 12000.0
-    assert "Kept the camera's own exposure" in ui.ports.capture_status.get()
+    assert "Kept" not in ui.ports.capture_status.get()
     ui.on_btn_stop_capture()
+    # A box nothing put the camera's value in (an app without the tabs)
+    # still holds the user's older word: Start keeps the preset's, and
+    # says so.
+    ui.ports.exposure.widget.setValue(5000)              # typed ...
+    frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    run = frame_camera.start(str(tmp_path / "runs"), 5000)  # ... before
+    assert state["ExposureTime"] == 12000.0
+    assert "Kept the camera's own exposure" in run["summary"]
+    frame_camera.stop()
     ui.ports.exposure.widget.setValue(8000)              # typed after
     ui.on_btn_start_capture()
     assert state["ExposureTime"] == 8000.0

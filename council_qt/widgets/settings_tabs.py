@@ -66,6 +66,29 @@ NOTE_NO_CAMERA = ("Connect a camera to see its settings — they fill the tabs "
                   "beside Basic.")
 
 
+def _quietly_set(port: Any, value: Any) -> None:
+    """Put `value` in a generated port's widget without it counting as a
+    change: its signals are held (no on_change, no script link), and the
+    port is told this is its value now — it compares each change with the
+    last value it saw, and would otherwise miss the user's next one."""
+    widget = getattr(port, "widget", None)
+    if widget is None:
+        return
+    held = widget.blockSignals(True)
+    try:
+        port.set(value)
+    except Exception:                                     # noqa: BLE001
+        return
+    finally:
+        widget.blockSignals(held)
+    raw = getattr(port, "_raw", None)
+    if callable(raw):
+        try:
+            port._last = raw()
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
 class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
     """The main window's settings notebook, kept true to the connected
     camera.
@@ -463,6 +486,125 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             widget.setToolTip("" if has else
                               f"This camera has no {name} — an event camera "
                               f"collects events, not light")
+            self._look_off(widget, not has)
+
+    #: What a box beside Start says for its 0 while this camera has no such
+    #: setting.
+    NOT_HERE = "n/a — event camera"
+
+    def _look_off(self, widget: Any, off: bool) -> None:
+        """A box that is off LOOKS off. The generated style sheet gives each
+        spin box the app's colours with no :disabled rule, so the disabled
+        Exposure box was the live FPS box pixel for pixel (review: 0 of
+        5148 pixels differed) — only a click that did nothing, or the
+        tooltip, said it was off. While off it is drawn flat on the window's
+        colour, in a dim dashed outline, and says NOT_HERE for its 0."""
+        if bool(widget.property("council_off")) == off:
+            return                       # apply_state runs often: no repolish
+        if widget.property("council_sheet") is None:
+            widget.setProperty("council_sheet", widget.styleSheet())
+            special = getattr(widget, "specialValueText", None)
+            widget.setProperty("council_special",
+                               special() if callable(special) else "")
+        sheet = str(widget.property("council_sheet") or "")
+        set_special = getattr(widget, "setSpecialValueText", None)
+        if off:
+            # By its name: the generated class is a subclass of QSpinBox
+            # whose own name a type selector would have to spell. An id
+            # with :disabled outranks the generated "QSpinBox#name" rule.
+            name = widget.objectName()
+            selector = f"#{name}" if name else "*"
+            dark = self.bg.lightness() < 128
+            ground = (self.bg.darker(160) if dark
+                      else self.bg.darker(110)).name()
+            dim = "#8fa9b2" if dark else "#8a8a8a"
+            widget.setStyleSheet(
+                f"{sheet}\n{selector}:disabled {{ "
+                f"background-color: {ground}; color: {dim}; "
+                f"border: 1px dashed {dim}; }}")
+            if callable(set_special):
+                set_special(self.NOT_HERE)
+        else:
+            widget.setStyleSheet(sheet)
+            if callable(set_special):
+                set_special(str(widget.property("council_special") or ""))
+        widget.setProperty("council_off", off)
+
+    # ------------------------------------------------------------------
+    # The boxes beside Start show what the camera has
+    # ------------------------------------------------------------------
+    def _took_setting(self, out: Dict[str, Any]) -> None:
+        super()._took_setting(out)
+        change = dict(out.get("change") or {})
+        if change.get("ok", out.get("ok", True)) and not change.get(
+                "skipped"):
+            self._follow_boxes([str(out.get("key") or "")])
+
+    def _took_set(self, out: Dict[str, Any]) -> None:
+        super()._took_set(out)
+        self._follow_boxes(str(c.get("key")) for c in
+                           (out.get("applied") or {}).get("changes") or []
+                           if c.get("ok", True) and not c.get("skipped"))
+
+    def _follow_boxes(self, keys: Any) -> None:
+        """A tab, a pop-out, a preset or a reset set what a box beside Start
+        also sets (frame_camera.START_BOXES): the box shows the camera's
+        value now. Measured before: Exposure 3000 µs set in the Exposure
+        tab, and the Basic box still said 12000 — through a capture and
+        the next Start, which kept the camera's 3000 (rightly) while the
+        box said otherwise; an EVK4's FPS box said 0 over a 100 ms window.
+
+        QUIETLY: the box's change signal is held, so this is not "the user
+        changed the box" (no stamp, so Start does not write it back, and
+        the FPS box's own link does not write the camera again). Shown as
+        the box can show it: whole µs, whole dB, whole fps — and 0, the
+        box's "keep", while an auto mode owns the value."""
+        owned = getattr(self.api, "START_BOXES", {})
+        keys = set(keys)
+        for box, names in owned.items():
+            port = self.boxes.get(box)
+            if port is None or not keys.intersection(names):
+                continue
+            value = self._box_value(box)
+            if value is None:
+                continue
+            _quietly_set(port, value)
+            told = getattr(self.api, "box_shows_camera", None)
+            if callable(told):
+                told(box, value)
+
+    def _box_value(self, box: str) -> Optional[int]:
+        """What the box `box` shows for the camera's setting now (rows), or
+        None when the tabs do not show it."""
+        def value(key: str) -> Any:
+            row = self.rows.get(key)
+            return None if row is None else row.setting.get("value")
+
+        def number(key: str) -> Optional[float]:
+            got = csw._number(value(key))
+            return got
+
+        def auto(key: str) -> bool:
+            mode = value(key)
+            return mode is not None and str(mode).strip().lower() != "off"
+
+        if box == "exposure":
+            if auto("ExposureAuto"):
+                return 0
+            got = number("ExposureTime")
+        elif box == "gain":
+            if auto("GainAuto"):
+                return 0
+            got = number("Gain")
+        else:
+            window = number("window_ms")
+            if window is not None:
+                return int(round(1000.0 / window)) if window > 0 else 0
+            enabled = value("AcquisitionFrameRateEnable")
+            if enabled is not None and not csw._same(enabled, True):
+                return 0                     # free-running: the box's 0
+            got = number("AcquisitionFrameRate")
+        return None if got is None else int(round(got))
 
     def _basic_note(self) -> None:
         port = self.note_port

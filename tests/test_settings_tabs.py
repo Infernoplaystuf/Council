@@ -773,6 +773,88 @@ def test_a_pop_out_shows_each_settings_range_and_a_bias_its_recommended_one(
         assert 0.50 * width < marked[-1] < 0.75 * width, (marked[-1], width)
 
 
+def test_the_tabs_move_the_boxes_beside_start_and_start_keeps_quiet(
+        clean, typhon_dir, evk4, tmp_path):
+    """The other way round (review): Exposure 12000 typed in the Basic box,
+    then 3000 set in the Exposure tab — Start kept the camera's 3000,
+    rightly, but the box said 12000 through the run and after it; an
+    EVK4's picture window set to 100 ms left the FPS box at 0. The box now
+    shows the camera's value, quietly: not the user's word, so Start
+    neither writes it nor says it kept anything over it."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    ui.ports.exposure.widget.setValue(12000)       # the user's word ...
+    tabs.rows["ExposureTime"].editor.setValue(3000)  # ... then the tab's
+    tabs.flush_now()
+    assert device().state["ExposureTime"] == 3000.0
+    assert ui.ports.exposure.get() == 3000
+    ui.ports.capture_folder.set(str(tmp_path / "run"))
+    started = frame_camera.start(str(tmp_path / "run"),
+                                 ui.ports.exposure.get(),
+                                 ui.ports.gain.get(),
+                                 ui.ports.frame_rate.get())
+    try:
+        assert "Kept" not in started["summary"], started["summary"]
+        assert device().state["ExposureTime"] == 3000.0
+    finally:
+        frame_camera.stop()
+    # The user's word after it is the user's again: Start writes it.
+    ui.ports.exposure.widget.setValue(5000)
+    started = frame_camera.start(str(tmp_path / "run"),
+                                 ui.ports.exposure.get(), 0, 0)
+    try:
+        assert device().state["ExposureTime"] == 5000.0
+    finally:
+        frame_camera.stop()
+    # A preset that turns the auto loop on: the box's 0, "keep".
+    frame_camera.apply_camera_settings({"GainAuto": "Continuous"})
+    pump(0.2)
+    assert ui.ports.gain.get() == 0
+
+    ui.on_btn_disconnect()
+    connect(ui, "00051234")
+    window = tabs.pop_out("Display")
+    applied = []
+    real = frame_camera.apply_frame_rate
+    frame_camera.apply_frame_rate = lambda *a, **k: (applied.append(a)
+                                                     or real(*a, **k))
+    try:
+        window.rows["window_ms"].editor.setValue(100.0)
+        window.flush_now()
+        pump(0.2)
+    finally:
+        frame_camera.apply_frame_rate = real
+    assert device().accumulate_ms == 100.0
+    assert ui.ports.frame_rate.get() == 10
+    assert applied == [], "the FPS box's own link wrote the camera again"
+
+
+def test_a_box_an_event_camera_cannot_use_looks_off(clean, typhon_dir,
+                                                     evk4):
+    """Disabled, the Exposure and Gain boxes were drawn exactly as the live
+    FPS box — the generated style sheet has no :disabled rule (review: 0
+    of 5148 pixels differed). They look off now, and come back as they
+    were with a camera that has them."""
+    ui = construct(typhon_dir)
+    exposure = ui.ports.exposure.widget
+    before = exposure.grab().toImage()
+    sheet = exposure.styleSheet()
+    connect(ui, "00051234")
+    assert not exposure.isEnabled()
+    off = exposure.grab().toImage()
+    live = ui.ports.frame_rate.widget.grab().toImage()
+    assert off.size() == live.size()
+    differ = sum(off.pixel(x, y) != live.pixel(x, y)
+                 for x in range(off.width()) for y in range(off.height()))
+    assert differ > off.width() * off.height() // 4, differ
+    assert exposure.specialValueText() == st.SettingsTabs.NOT_HERE
+    ui.on_btn_disconnect()
+    assert exposure.isEnabled() and exposure.styleSheet() == sheet
+    assert exposure.specialValueText() == ""
+    assert exposure.grab().toImage() == before
+
+
 def test_the_boxes_beside_start_move_the_same_settings_in_the_tabs(
         clean, typhon_dir, evk4, tmp_path):
     """The FPS box sets an event camera's picture window — the Display tab's

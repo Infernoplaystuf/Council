@@ -685,8 +685,16 @@ settings in the main window — no window to open for the everyday ones.
 - **Basic** is always there: the **Exposure**, **Gain** and **FPS** boxes
   (they used to sit on their own under the folder; they work exactly as
   before — see *Exposure, gain and FPS*). Connected to an event camera,
-  Exposure and Gain are greyed (an event camera has neither) and the note
-  under them says so; FPS still sets its picture window.
+  Exposure and Gain are **off and look it** — dark, dashed, and saying
+  `n/a — event camera` (an event camera has neither) — and the note under
+  them says so; FPS still sets its picture window.
+- **The boxes follow the tabs.** When a tab, a pop-out, a preset or a reset
+  changes the exposure, the gain or the frame rate (an event camera's
+  picture window), the box beside Start shows the camera's new value — whole
+  µs, dB or fps, and 0 ("keep") while an auto mode owns it. That is the
+  camera's value, not a new word from you: Start leaves the camera as it is
+  and says nothing about it. Type in the box afterwards and Start writes
+  what you typed, as before.
 - When a camera **connects**, a tab per category of **that camera's own
   settings** appears beside Basic, built from what the camera describes —
   so an EVK4, a Basler and the simulated cameras each get their own set, and
