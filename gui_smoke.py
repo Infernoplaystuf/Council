@@ -580,8 +580,8 @@ def raises_at(source: str, lineno: int) -> bool:
                for n in ast.walk(tree))
 
 
-#: What int(), float() and strptime() say of text that is not what they
-#: read: "invalid literal for int() with base 10: 'thirty'".
+#: What int(), float(), strptime() and fromisoformat() say of text that is
+#: not what they read: "invalid literal for int() with base 10: 'thirty'".
 _PARSE_FAILED = re.compile(r"invalid literal for int\(\)|could not convert "
                            r"string to float|does not match format|"
                            r"Invalid isoformat string")
