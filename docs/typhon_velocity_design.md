@@ -5,17 +5,26 @@ built yet. It combines two pieces of research (velocity measurement, and LED
 calibration), each checked by a separate fact-check, with every correction
 from those checks applied. The research read `qt-migration` at 794f8b6. Since
 then the camera settings tabs (`typhon/settings-tabs`) have landed on
-`qt-migration`, and every file and line reference below has been re-checked
-against `qt-migration` at 906bb26.
+`qt-migration`. This doc's branch, `docs/typhon-velocity`, sits on
+`qt-migration` at 906bb26, and every file and line reference below is to that
+commit, so they resolve on the branch the doc lives on.
 
-**Read this first.** There is no EVK4 on this PC and no real recording. Every
-number below is labelled as one of:
+**Read this first.** There is no EVK4 on this PC and no real recording. Each
+result below is labelled where it appears, as one of the kinds listed here. A
+label at the head of a table or list covers everything in it. Settings,
+defaults and code line numbers are choices or places, not results, so they
+carry no label.
 
-- **measured**: run on this laptop (i7-14700HX) on synthetic events;
+- **measured** (or **checked on this PC**): run or looked up on this laptop
+  (i7-14700HX); anything run on events used synthetic events unless it says
+  otherwise;
 - **computed**: arithmetic or a geometry model;
 - **estimate**: judgement, not measured;
-- **vendor docs**: from Prophesee's or Sony's published material, not
-  re-checkable offline.
+- **OpenEB source**: read from OpenEB 5.2.0's source code on this PC;
+- **paper**: from a published paper, named where it is used;
+- **vendor docs**: from a maker's published material (Prophesee, Sony,
+  chip makers) or a published standard (lens mounts), not re-checkable
+  offline.
 
 Real-world accuracy will be worse than the synthetic figures. Nobody can know
 how much worse until a real recording has been analysed.
@@ -43,6 +52,11 @@ how much worse until a real recording has been analysed.
 - **Lens distortion**: straight lines bowing towards the picture edges, so the scale changes across the image.
 - **Thin-lens formula**: 1/u + 1/v = 1/f, linking object distance u, image distance v and focal length f.
 - **Principal plane**: the reference plane inside a lens that the thin-lens distances are measured from.
+- **Principal distance**: the distance from the lens's rear principal plane to the sensor, counted in pixels; it is what OpenCV calls the focal length (fx).
+- **Pinhole camera model**: the simple camera model OpenCV uses, in which every ray passes through one point.
+- **C-mount / CS-mount**: the two standard screw-in lens mounts on machine-vision cameras. They differ only in flange distance, so a 5 mm spacer lets a C-mount lens fit a CS-mount camera.
+- **Flange distance**: the fixed distance from a lens mount's mounting face to the sensor: 17.526 mm for C-mount, 12.526 mm for CS-mount (vendor docs).
+- **Zhang's method**: the standard way to find a camera's intrinsics and lens distortion from pictures of a flat pattern held at several angles (paper: Zhang 2000); OpenCV's `calibrateCamera` uses it.
 - **Normalised DLT**: the standard least-squares recipe for fitting a homography to matched points.
 - **k1**: the main lens-distortion number; the more negative it is, the more straight lines bow outwards (barrel distortion).
 - **Percentile**: the 99th percentile is the value that 99 % of results fall below; it shows the bad cases without the single worst one.
@@ -52,7 +66,7 @@ how much worse until a real recording has been analysed.
 - **Latency**: the delay between a brightness change and its event.
 - **ERC (event rate controller)**: a sensor feature that drops events once the rate passes a limit.
 - **Anti-flicker (AFK)**: a sensor filter that removes events from lights blinking at 50-520 Hz.
-- **Trail / STC filter**: a sensor filter that keeps only some of the events in each burst at a pixel.
+- **Trail / STC filter**: a sensor filter that keeps only some of the events in each burst at a pixel. STC stands for spatio-temporal contrast, Prophesee's name for it (vendor docs); TRAIL, STC_CUT_TRAIL and STC_KEEP_TRAIL are its three modes.
 - **PWM**: a pin switched on and off at a fixed frequency by a microcontroller's hardware timer.
 - **Duty cycle**: the share of each period the LED is on.
 - **HAL**: the low-level part of Prophesee's software that opens cameras and decodes events.
@@ -66,6 +80,14 @@ how much worse until a real recording has been analysed.
 - **AM / DED**: additive manufacturing (metal 3D printing); directed energy deposition, the kind that blows a stream of powder into the melt.
 - **OpenCV (cv2)**: a widely used open-source computer-vision library; not installed in the council env.
 - **numba**: an add-on that compiles Python number-crunching to machine code; not installed.
+- **MSVC**: Microsoft's C and C++ compiler, part of Visual Studio; installed on this PC.
+- **DBSCAN**: a clustering method that groups points that have enough close neighbours and leaves isolated points out as noise.
+- **Contrast maximisation**: finding the motion that, when used to slide a group of events back to one moment, gives the sharpest picture; that motion is the velocity.
+- **8-connected**: pixels count as touching when they share a side or a corner.
+- **SMD LED**: a surface-mount LED; 0603 and 0805 are package size codes (about 1.6 x 0.8 mm and 2.0 x 1.25 mm).
+- **sha256**: a fingerprint of a file's bytes; any change to the content gives a different value.
+- **Canonical JSON**: JSON written one fixed way (keys sorted, fixed spacing), so the same data always gives the same bytes, and so the same sha256.
+- **finally block**: Python code that runs whether or not an error happened; used here to put camera settings back.
 
 ---
 
@@ -85,18 +107,19 @@ Typhon gains a velocity feature for event cameras, in three stages.
    moving thing, over the picture. The arrow points where the thing is going,
    and its length shows how far it moves in a fixed time. The tail shows where
    it has just been.
-3. Once the **whole recording** has been processed, you get:
-   - a **speed histogram** (one count per track);
-   - a **speed colour legend** whose range is the run's own (from the 1st to
-     the 99th percentile of its track speeds).
-
-   The arrows then recolour to match the legend. Until the whole recording is
-   done, colours use a provisional range and the legend says so, because, as
-   you said, the legend is only usable once the whole video is processed.
-4. Speeds are in **mm/s** once the camera set-up has an LED calibration
+3. While the analysis runs, a **speed histogram** (one count per finished
+   track) builds up beside the picture, marked **partial**. Its range can
+   widen as faster tracks turn up.
+4. Once the **whole recording** has been processed, you get the **speed
+   colour legend**, whose range is the run's own (from the 1st to the 99th
+   percentile of its track speeds). The arrows then recolour to match it,
+   and the histogram loses its "partial" mark. Until then, arrow colours use
+   a provisional range and the legend says so, because, as you said, the
+   legend is only usable once the whole video is processed.
+5. Speeds are in **mm/s** once the camera set-up has an LED calibration
    (stage A: one LED, its distance and the lens focal length; stage B: two
    LEDs). Until then they are in px/s.
-5. Results are new files **beside** the run. The `.raw` and the run's other
+6. Results are new files **beside** the run. The `.raw` and the run's other
    files are never touched.
 
 **Stage 2:** the homography (calibration stage C, four or more LEDs) for
@@ -115,20 +138,22 @@ configurations, which are now on `qt-migration` (section 5).
   or away from the camera reads too slow. mm/s is right only for motion in the
   plane that was calibrated. A thing 10 mm further away than that plane, at
   500 mm, is mis-scaled by 2 % (computed).
-- **There is a top speed.** Willert & Klinner (2022) call about 50,000 px/s
-  the upper bound for this class of sensor. The speeds they actually showed
-  working were about ±10,000 px/s (12,000 px/s on a turntable, with no
-  systematic error). The cause is sensor latency. Their table lists 220 µs
-  for an IMX636-class Prophesee kit (EVK2-HD); the EVK4 datasheet also gives
-  220 µs; Sony gives 100 µs or less for the IMX636 at 1000 lux and under
-  1000 µs at 5 lux, so latency rises in dim light (vendor docs). In real
+- **There is a top speed.** Willert & Klinner (2022, paper) call about
+  50,000 px/s the upper bound for this class of sensor. The speeds they
+  actually showed working were about ±10,000 px/s (12,000 px/s on a
+  turntable, with no systematic error). The cause is sensor latency. Their
+  table lists 220 µs for an IMX636-class Prophesee kit (EVK2-HD); the EVK4
+  datasheet also gives 220 µs; Sony gives 100 µs or less for the IMX636 at
+  1000 lux and under 1000 µs at 5 lux, so latency rises in dim light (vendor
+  docs). In real
   units the limit depends on the lens. At 0.086 mm/px, 10,000 px/s is
   0.86 m/s and 50,000 px/s is 4.3 m/s (computed).
 - **Speed and resolution pull against each other.** Staying under
   50,000 px/s needs at least v / 50,000 mm per pixel. That is 0.1 mm/px at
   5 m/s and 0.2 mm/px at 10 m/s, or about 1 mm/px at 10 m/s if you stay at
   the ~10,000 px/s that has been demonstrated (computed). At those scales,
-  20-100 µm spatter is smaller than one pixel, so whether it is seen depends on
+  20-100 µm spatter (a typical size, estimate) is smaller than one pixel, so
+  whether it is seen depends on
   how bright it is. Small, fast particles in dim light can be missed. Turning
   `bias_fo` down to cut noise adds latency, which makes this worse. A blob's
   size in a 1 ms slice is mostly its motion streak, so Typhon will not report
@@ -138,9 +163,13 @@ configurations, which are now on `qt-migration` (section 5).
 - **Crowds merge.** Things that touch or cross within a slice become one blob,
   and their tracks break or swap. The synthetic numbers in section 2.3 show how
   quickly this happens.
-- **Real accuracy is unknown until a real recording is analysed.** The test
-  data is synthetic and EVT2, with no sensor physics: no latency, no
-  refractory period and no bandwidth limit.
+- **Real accuracy is unknown until a real recording is analysed.** All the
+  test data is synthetic and EVT2. The velocity test data (`gen.py`) has no
+  sensor physics: no latency, no refractory period and no bandwidth limit.
+  The LED test data (`synth.py`) does model the sensor, but with assumed
+  values that have not been checked against a real camera: 40 µs (ON) and
+  60 µs (OFF) latency, 12 / 6 µs timing jitter, bursts of up to 4 events
+  25 µs apart, and 3 % of events dropped.
 
 ---
 
@@ -195,15 +224,16 @@ limits can be saved under a name.
 |---|---|---|
 | Meant for | Spatter or powder: small, fast and numerous | Birds, parts, anything larger and slower |
 | Events used | ON only | ON + OFF |
-| Slice | 1 ms (range 0.25-2 ms). Use 0.25 ms above about 20,000 px/s, because 1 ms slices found only 84 % of the fast particles | 10-20 ms |
+| Slice | 1 ms (range 0.25-2 ms). Use 0.25 ms above about 20,000 px/s, because 1 ms slices found only 84 % of the fast particles (measured) | 10-20 ms |
 | Cell size | 4 px (range 2-4) | 16 px when sparse, 8 px when crowded (see 2.3) |
-| Velocity from | Slope of the last ~6 centres, with the in-slice fit as the first estimate | Slope of the last ~6 centres. The in-slice fit is poor for large, slow objects (20-47 % error) |
+| Velocity from | Slope of the last ~6 centres, with the in-slice fit as the first estimate | Slope of the last ~6 centres. The in-slice fit is poor for large, slow objects (20-47 % error, measured) |
 | Speeds tested | 1,000-20,000 px/s (a "fast" set: 20,000-100,000) | 100-3,000 px/s |
 
 The research proposed a **Kalman filter** (which smooths a position estimate
 over time) for Objects, but it was never run on the object test streams. It was
 run only on 3 rigid rings moving at constant speed. Fed positions only, it gave
-0.8-1.5 % median error; fed the in-slice velocity too, it gave 10-12 %. So the
+0.8-1.5 % median error; fed the in-slice velocity too, it gave 10-12 %
+(measured). So the
 Kalman filter stays an option to try on real recordings, not the default.
 
 ### 2.3 Accuracy on synthetic data
@@ -245,7 +275,8 @@ were the main failure seen.
     through the same reader.
   - Two cheaper variants: run the tracker inside RawPlayback's own decode pass
     through an opt-in callback (one read of the file instead of two), or decode
-    with `CameraStreamSlicer` (section 7). Both decoders gave identical events.
+    with `CameraStreamSlicer` (section 7). Both decoders gave identical events
+    (measured).
 - **Live (stage 2).** A hook goes in `EvkDevice.read()` (`cameras.py:1609`).
   - `_poll` (line 1654) already joins each window's events and returns
     their x, y, polarity and time arrays; `read()` throws them away once the
@@ -254,7 +285,7 @@ were the main failure seen.
     thread through a bounded queue. When the queue is full it drops the
     **oldest** window, counts the drop, and records the gap.
   - Two things to avoid: feeding the worker once per HAL callback (that slowed
-    decoding 8-19x) and running on the UI thread.
+    decoding 8-19x, measured) and running on the UI thread.
 - **Gaps.** A dropped 20 ms window removes 20 particle slices, which is more
   than `max_miss`, so every track ends and restarts. That would bias the track
   counts. Gaps are therefore recorded in `velocity.json` and marked in the
@@ -286,15 +317,15 @@ converted back the same way.
 
 ### 2.6 Other approaches considered
 
-| Approach | What you see | Accuracy (synthetic) | Speed (this PC) | Verdict |
+| Approach | What you see | Accuracy (synthetic, measured) | Speed (this PC, measured) | Verdict |
 |---|---|---|---|---|
 | **Grid clusters + tracks** (2.1) | An arrow and tail per thing, a track table, a histogram | Section 2.3 | Section 7 | **Chosen** |
 | Event PIV (cross-correlating short picture pairs) | A grid of arrows (a flow field), not individual particles | Not measured here | 25.1 fields/s at 880 arrows and 7.9 at 3,476 with an unpadded 32 x 32 FFT; 8.2 and 2.2 when zero-padded to 64 x 64, which avoids wrap-around. `workers=-1` did not help | Stage 3 option for dense powder clouds; needs dense, even seeding |
 | Dense normal flow (plane fit on a time surface) | An arrow at every edge pixel | Reads low: 783 against a true 854 px/s | 0.35 Mev/s | Not recommended: arrows follow edge normals, which is poor for round particles and flapping wings |
 | Contrast maximisation (offline refinement) | A sharper speed for a few chosen objects | No better than the chosen method in a quick, rough test | 14-21 ms per object | Stage 3 option |
-| DBSCAN clustering (as in STELLA) | Same as the chosen method | STELLA (Exp Fluids 2026, 67:110) reports a lowest median absolute error of 1.2 % *of the peak velocity* on synthetic data. That is a different measure from ours and not comparable | 0.12-0.17 Mev/s. scikit-learn 1.8.0 is already installed | Offline only; not needed |
-| Two-line time of flight (in the style of Prophesee's PSM) | The speed of things crossing two lines | Not measured | Very cheap | Worth adding for directed streams (a DED powder stream, recoater-driven powder) |
-| Prophesee SDK Pro trackers | Same as the chosen method, from vendor C++ | Untested | Vendor says efficient | See section 6 |
+| DBSCAN clustering (as in STELLA) | Same as the chosen method | STELLA (paper: Exp Fluids 2026, 67:110) reports a lowest median absolute error of 1.2 % *of the peak velocity* on synthetic data. That is a different measure from ours and not comparable | 0.12-0.17 Mev/s. scikit-learn 1.8.0 is already installed | Offline only; not needed |
+| Two-line time of flight (in the style of Prophesee's PSM) | The speed of things crossing two lines | Not measured | Very cheap (estimate) | Worth adding for directed streams (a DED powder stream, recoater-driven powder) |
+| Prophesee SDK Pro trackers | Same as the chosen method, from vendor C++ | Untested | Vendor says efficient (vendor docs) | See section 6 |
 
 ---
 
@@ -353,16 +384,16 @@ event-block reader in 2.4. Nothing usable for this is in OpenEB on this PC
      runs at 976.56 Hz. Searched as "1000 Hz", it was found every time (at
      977.8 Hz) and then rejected 5/5 by a 1 % rule around 1000 Hz (measured).
      The measured value is also biased by about +1.2 Hz when the true period
-     sits off-centre in the band.
+     sits off-centre in the band (measured).
    - Checked against the stored value, the 1 % rule still does its job. A
      1050 Hz decoy beside a 1 kHz target passes the 5 % band but reads
      1040.5 Hz, so it is rejected. 1100 Hz and 1150 Hz decoys were never
-     reported (0/10).
+     reported (0/10) (measured).
 10. **ON-only mode** is for streams whose OFF events are switched off by the
     biases. A burst start is an ON event more than a quarter-period after the
     pixel's previous event. With one event per blink, this mode needs the rate
     gate lowered to at most 0.5 × f × duration (at the default gate the LED was
-    found 0/10 times) and gives about 0.13 px (measured), not the 0.04-0.05 px
+    found 0/10 times) and gives about 0.13 px (measured), not the 0.03-0.05 px
     of the normal mode.
 
 **Synthetic results (measured).**
@@ -376,7 +407,7 @@ event-block reader in 2.4. Nothing usable for this is in OpenEB on this PC
 | LED inside a 100 Hz flicker region | 30/30 | 0 | 0.047 px | 103 ms |
 | 300 Hz / 2 kHz LED | 20/20 each | 0 | 0.042 / 0.037 px | ~0.1 s |
 | 10 % duty cycle | 20/20 | 0 | 0.046 px | ~0.1 s |
-| Unweighted centroid (each pixel counted once), same clips | | | 0.088-0.15 px | |
+| Unweighted centroid (each pixel counted once), same clips | | | about 0.09-0.15 px, against 0.03-0.05 px weighted | |
 | LED absent | 0 spots in 10/10 | 0 | | |
 
 - **Frequency error:** 0.009 Hz at 1 kHz over 1 s; 0.12 Hz inside flicker.
@@ -393,9 +424,9 @@ event-block reader in 2.4. Nothing usable for this is in OpenEB on this PC
   generator assumed about 240 events/s per flicker pixel, which is a guess, not
   a measurement.) The period test still rejects the lamp, but the run time
   moves towards the no-gate case: 6.6 s per second of events at 10 Mev/s,
-  against 124 ms at 1 Mev/s.
+  against 124 ms at 1 Mev/s (measured).
 - A dense, non-periodic 80 x 80 px region (9.6 of 13.6 Mev/s) took 1.54 s,
-  and the LED was still found (0.064 px).
+  and the LED was still found (0.064 px) (measured).
 - **The real protection** is the camera's area, or a box you draw around the
   LEDs, together with a short clip.
 
@@ -404,37 +435,51 @@ event-block reader in 2.4. Nothing usable for this is in OpenEB on this PC
 - **Frequency.** 1 kHz by default; 0.6-2 kHz works. Accuracy was flat from
   300 Hz to 2 kHz (0.037-0.048 px, measured).
   - Stay above about 600 Hz: in Censi et al.'s tests (2013), motion made
-    transitions only below about 600 Hz. That also keeps the LED clear of the
-    anti-flicker band (50-520 Hz).
-  - Avoid 490 Hz (the other Arduino default), which is inside both of those
-    bands.
+    transitions only below about 600 Hz (paper). That also keeps the LED
+    clear of the anti-flicker band (50-520 Hz, OpenEB source).
+  - Avoid 490 Hz (the other Arduino default, vendor docs), which is inside
+    both of those bands.
   - The upper limit is unknown. The synthetic detector broke down at 5 kHz,
     but that came from the assumed burst model, not from a measurement. The
     real limit depends on the IMX636 pixel dead time, which
     `I_Monitoring.get_pixel_dead_time()` reads from the camera; Typhon's
     Camera tab already shows it as "Pixel dead time".
 - **Several LEDs (stages B and C).** Space their frequencies at least 10 %
-  apart, with no 2:1 ratio between any two, so they share no harmonics: for
-  example 900, 1100, 1300, 1500, 1700, 1900 Hz. Mains flicker is not a reason
-  to avoid round numbers: a 1 kHz LED inside a 100 Hz flicker region was found
-  30/30 times, because the detector compares periods. Run the survey to see
-  what else in the room blinks. Each LED needs its own hardware timer. An
-  ATmega328P (Arduino Uno) has 3 timers; an RP2040 has 8 independent PWM
-  slices. Toggling pins from software adds jitter.
+  apart, with no 2:1 ratio between any two, so that one LED's missed-cycle
+  (2T) intervals cannot pass as another LED's period.
+  - A simple rule gives this with room to spare: keep the highest frequency
+    at most 1.8 times the lowest. Then every LED's half-frequency (what a
+    missed cycle looks like) sits at least 10 % below the lowest LED, well
+    outside the detector's 5 % band. For example: 1000, 1100, 1250, 1400,
+    1550 and 1750 Hz, whose half-frequencies (500-875 Hz) are all at least
+    12.5 % below 1000 Hz (computed).
+  - A wider spread is weaker. In 900, 1100, 1300, 1500, 1700 and 1900 Hz,
+    1700/2 = 850 Hz and 1900/2 = 950 Hz sit only about 5.5 % from 900 Hz,
+    just outside the band (computed); the 1 % measured-frequency rule
+    (3.2, step 9) would still reject them.
+  - Mains flicker is not a reason to avoid round numbers: a 1 kHz LED inside
+    a 100 Hz flicker region was found 30/30 times (measured), because the
+    detector compares periods. Run the survey to see what else in the room
+    blinks.
+  - Each LED needs its own hardware timer. An ATmega328P (Arduino Uno) has
+    3 timers; an RP2040 has 8 independent PWM slices (vendor docs). Toggling
+    pins from software adds jitter.
 - **Driver.** A microcontroller's hardware PWM pin (crystal-timed) with a
-  series resistor. RC or 555 timers drift. Typhon measures the frequency
+  series resistor. RC (resistor-capacitor) or 555 timer circuits drift.
+  Typhon measures the frequency
   (3.2, step 9) rather than trusting a typed value.
 - **Duty cycle.** 50 %. The method compares transitions of the same kind, so
   the duty cycle does not matter (10 % measured 0.046 px), and 50 % gives equal
   ON and OFF data.
 - **Spot size.** Aim for **3-8 px** on the sensor. The emitter should be about
   3-8 times the mm/px at the working distance; at 0.15 mm/px that is
-  0.5-1.2 mm, such as an 0603 or 0805 SMD LED, or a diffused 3 mm LED behind a
-  1 mm hole. Slight defocus is fine, because an even blur keeps the centre.
+  0.5-1.2 mm (computed), such as an 0603 or 0805 SMD LED, or a diffused 3 mm
+  LED behind a 1 mm hole. Slight defocus is fine, because an even blur keeps
+  the centre.
 - **Brightness.** Clearly above the background but not blooming. If a halo of
   events surrounds the spot, lower the LED current rather than the biases.
-- **Height.** An LED die sits 1-5 mm above its board. At 500 mm, 3 mm of
-  height is a 0.6 % scale error, the size of the whole stage-B budget
+- **Height.** An LED die sits 1-5 mm above its board (estimate). At 500 mm,
+  3 mm of height is a 0.6 % scale error, the size of the whole stage-B budget
   (computed). Mount LEDs flush with the motion plane, or record the emitter
   height so Typhon can correct for it.
 - **Reflections.** A glint of the LED on a glossy surface, or on shiny
@@ -467,7 +512,9 @@ advice below is a starting point (no physical camera was used).
     marking the recommended one (`camera_settings.py:1402-1415`). So a value
     such as `hpf` 140 can be dialled in Typhon but is refused by the camera.
     (The simulated camera's table, `cameras.py:1773-1779`, uses the
-    recommended ranges.)
+    recommended ranges.) Take ranges from this section, not from the
+    example in `camera_settings_window.py`'s docstrings, which is wrong
+    (5.1).
   - Prophesee's active-marker bias set, meant to give one event per blink
     (`diff_off` 180, `diff_on` 60, `fo` 30, `hpf` 140, `refr` 0; vendor docs),
     is therefore **not used**: its `hpf` 140 is refused by default, and it
@@ -476,25 +523,29 @@ advice below is a starting point (no physical camera was used).
   - In OpenEB's IMX636 driver (`gen41_erc.cpp`) the ERC drops events in
     **time slots**: `t_drop` only, with horizontal and vertical dropping
     written as 0. The reference period is 200 µs, and the default target is
-    4000 events per period (20 Mev/s). (Prophesee's manual says the ERC drops
-    "spatially and temporally"; the open driver uses only the time part.)
+    4000 events per period (20 Mev/s) (OpenEB source). (Prophesee's manual
+    says the ERC drops "spatially and temporally" (vendor docs); the open
+    driver uses only the time part.)
   - What hurts is missed LED edges, not uneven weighting. Losing whole 200 µs
     slots: 20 % loss still found the LED 6/6 (0.036 px); 30 % found it 5/6
     (0.085 px); 50 % found it 0/10 (measured).
   - By contrast, dropping 50 % of events at random still gave 0.064 px, and
-    dropping 50 % on every other column shifted x by only 0.008 px.
+    dropping 50 % on every other column shifted x by only 0.008 px
+    (measured).
 - **Trail / STC filter: off.** (A *burst* is a run of same-polarity events
   at one pixel within the threshold time.)
   - TRAIL keeps the first event of a burst, and STC_CUT_TRAIL keeps the
-    second. Keeping one event per burst turns the weighted centroid into the
-    unweighted one (0.12-0.15 px instead of 0.04-0.05, measured).
+    second (OpenEB source). Keeping one event per burst turns the weighted
+    centroid into the unweighted one: about 0.09-0.15 px instead of
+    0.03-0.05 px (measured). That figure is the unweighted centroid worked
+    out on the same unfiltered clips; no run had the filter switched on.
   - STC_KEEP_TRAIL keeps every trailing event, but both STC modes delete a
     pixel's lone events. With one event per blink, STC would remove the LED
     entirely.
   - The threshold is in whole milliseconds, minimum 1000 µs, which is exactly
-    one period of a 1 kHz LED.
+    one period of a 1 kHz LED (OpenEB source).
 - **Anti-flicker: off.** The detector rejects mains flicker by itself (30/30
-  inside a 100 Hz region).
+  inside a 100 Hz region, measured).
   - The IMX636 filter acts on 50-520 Hz (OpenEB source; Prophesee's docs give
     50-500 Hz). Its period is set in 128 µs steps and its duty cycle in
     sixteenths.
@@ -505,8 +556,8 @@ advice below is a starting point (no physical camera was used).
     a lamp and the LED could lose LED events. That claim is not in the OpenEB
     source and is unverified.
 - **Area:** the camera's area, or a drawn box, around the LEDs.
-- **Clip length:** 0.25-0.5 s (0.1 s already gave 0.043 px). 1 s at 1 Mev/s is
-  about 3.9 MB as EVT2.
+- **Clip length:** 0.25-0.5 s (0.1 s already gave 0.043 px, measured). 1 s at
+  1 Mev/s is about 3.9 MB as EVT2 (measured).
 
 ### 3.5 The four geometry stages
 
@@ -515,8 +566,9 @@ Each stage keeps the earlier stages' data and adds to it.
 **What one LED plus a distance can and cannot give.**
 
 - The scale uses the thin-lens formula with pixel pitch p = 4.86 µm (IMX636;
-  the EVK4 datasheet and Willert & Klinner's table agree). The distance D is measured from the **sensor
-  plane**, so u + v = D, u = (D + √(D² − 4fD)) / 2, and **mm/px = p × u / v**.
+  the EVK4 datasheet and Willert & Klinner's table agree; vendor docs and
+  paper). The distance D is measured from the **sensor plane**, so u + v = D,
+  u = (D + √(D² − 4fD)) / 2, and **mm/px = p × u / v**.
 - The common shortcut p × D / f overestimates the scale (computed): 16 mm lens
   at 500 mm +7.0 %, at 1000 mm +3.3 %; 8 mm at 500 mm +3.3 %; 25 mm at 500 mm
   +11.5 %; 50 mm at 1000 mm +11.5 %. Typhon uses the thin-lens form. A real
@@ -527,7 +579,8 @@ Each stage keeps the earlier stages' data and adds to it.
   10,000 px/s ≈ 0.86 m/s.
 - **To measure to the sensor plane,** measure to the lens mounting face and
   add the flange distance: **17.526 mm for C-mount, 12.526 mm for CS-mount**
-  (the EVK4 takes both, with an adapter). Typhon records which one was used.
+  (the EVK4 takes both, with an adapter; vendor docs). Typhon records which
+  one was used.
 - **The distance must be along the optical axis.** If you measure straight to
   an off-axis LED, Typhon corrects by cos(atan(r_px / f_px)); left
   uncorrected, the error is 2.4 % at the image corner with a 16 mm lens
@@ -540,7 +593,7 @@ Each stage keeps the earlier stages' data and adds to it.
 | Stage | Hardware | You enter | Gives | Speed accuracy | Assumes |
 |---|---|---|---|---|---|
 | **A** | 1 LED | Focal length (lens list or typed), distance, how it was measured (C or CS mount, to the LED or along the axis), emitter height | mm/px at the LED's depth | About ±3-10 % (estimate), mostly from focal-length tolerance, the distance reference and where the principal plane is | Motion in a plane through the LED, **parallel to the sensor**, near the centre of view; lens focused near that distance |
-| **B** | 2 LEDs a known distance L apart, or 1 LED moved L along a ruler or rail (two clips) | L | Direct mm/px = L / pixel distance; the in-plane axis (speeds can be reported along and across it); an A-against-B check; the focal length (see below) | About 0.5-1.5 % (estimate) for motion parallel to the sensor: a ruler good to ±0.5 mm per 100 mm is 0.5 %, and centroids (0.05-0.2 px over a 500 px baseline) add 0.01-0.04 %. Tilt adds an error that depends on direction (below) | One plane, parallel to the sensor; a single scale |
+| **B** | 2 LEDs a known distance L apart, or 1 LED moved L along a ruler or rail (two clips) | L | Direct mm/px = L / pixel distance; the in-plane axis (speeds can be reported along and across it); an A-against-B check; the focal length (see below) | About 0.5-1.5 % (estimate) for motion parallel to the sensor: a ruler good to ±0.5 mm per 100 mm is 0.5 %, and centroids (0.05-0.2 px over a 500 px baseline) add 0.01-0.04 %. Tilt adds an error that depends on where the motion is and which way it goes (below) | One plane, parallel to the sensor; a single scale |
 | **C** | 4 or more LEDs on one flat surface, no 3 in a line (6-9 recommended, so there is a residual to check), each at its own frequency; or 1 LED moved to 4 or more marked spots | Each point's (X, Y) in mm | Homography (normalised DLT): perspective removed for that plane; per-point residuals | 0.02 % mean with no distortion (computed). With radial distortion k1 = -0.1 / -0.3: 16 mm lens 0.12 / 0.37 % mean (99th percentile 0.30 / 0.90 %); 8 mm lens 0.49 / 1.49 % mean (1.2 / 3.5 %) | Motion in **that** plane (points off it are mis-scaled by the depth ratio); distortion not corrected |
 | **D** | A blinking LED grid board (one row at another frequency to fix its orientation), or a blinking checkerboard on a screen; 10-50 views | Grid pitch | Intrinsics and distortion (Zhang's method, as in OpenCV `calibrateCamera`). Points are then undistorted and C is re-fitted from the stored points **without re-recording**. The plane's pose follows, so parallel planes at other heights become possible | 0.016-0.027 % mean, 99th percentile ≤ 0.10 %, with **exact** intrinsics (computed upper bound). A real calibration's residual adds to this: 0.05-0.3 % (estimate) | A rigid, flat pattern and varied poses. Needs cv2 (not in the council env) or a numpy/scipy version of Zhang's method |
 
@@ -550,27 +603,35 @@ Stage C was also run end to end on a synthetic event clip: 6 LEDs at
 0.015 mm mean (0.033 max) with 6 (measured). The numpy fit matches OpenCV's
 `findHomography` to within 1.1e-5 mm with 4 points and 1.3e-3 mm with 9, and
 the numpy undistortion matches `cv2.undistortPoints` to within 5e-10 px
-(checked with cv2 4.5.5 in the `pylon` env).
+(measured, with cv2 4.5.5 in the `pylon` env).
 
 **Tilt, for stages A and B.** A single scale cannot follow a plane seen at an
-angle, and the error depends on the direction of motion, so it is quoted as
-"up to" (computed):
+angle. The error depends on where in the picture the motion is and which way
+it goes, so it is quoted as "up to" (computed):
 
-- Motion along the two-LED baseline is always measured right, because the
-  scale was taken along it. Motion in other directions is not:
+- **The scale is exact only at the LED baseline itself,** and there only for
+  motion along it; motion across it is also foreshortened (below). Away from
+  the baseline, perspective changes the scale across the picture, so motion
+  in every direction picks up an error, including motion along the baseline.
+- On a plane tilted 15° and 10° at 500 mm, with the baseline in the middle
+  of the area:
+  - 16 mm lens over 120 x 70 mm: motion along the baseline is off by up to
+    **6.1 %**, motion in the best direction by up to 4.4 %, and in the worst
+    direction (135° to the baseline) by up to **10.6 %**;
+  - 8 mm lens over 240 x 135 mm: the same three figures are **12.8 %**,
+    8.5 % and **17.0 %**.
+- **Foreshortening only, before perspective.** These two lists are what the
+  tilt alone does at the baseline's own position. They leave perspective
+  out, so over a real field of view the error is larger, as above:
   - with the baseline along the axis the plane tilts about (the axis that is
     not shortened), motion across it reads **low** by 1 − cos(tilt): 2°
     0.06 %, 5° 0.38 %, 10° 1.52 %, 20° 6.0 %;
   - with the baseline on the shortened axis, motion along the other axis
     reads **high** by 1/cos(tilt) − 1: 10° 1.54 %, 15° 3.53 %, 20° 6.42 %.
-- On a plane tilted 15° and 10° at 500 mm, the worst error over all motion
-  directions is **10.6 %** with a 16 mm lens over 120 x 70 mm (4.4-10.6 %
-  depending on direction), and **17.0 %** with an 8 mm lens over 240 x 135 mm
-  (8.5-17.0 %).
 - Distortion alone, on a plane facing the camera, gives a worst single-scale
   error of 0.48 % (k1 = -0.1) to 1.45 % (k1 = -0.3). The stock EVK4 lens has a
-  47.7° diagonal field of view and distorts. AM cameras often look at an angle
-  through a viewport.
+  47.7° diagonal field of view (vendor docs) and distorts. AM cameras often
+  look at an angle through a viewport.
 
 **Focal length from stage B.** Two different "focal" numbers come out of
 stage B, and they must not be mixed up, so both are stored under clear names:
@@ -745,7 +806,9 @@ At stage C, `homography` holds `{"H", "fitted_on": "raw_px" | "undistorted_px",
   refuse.
 - Lens, focus or camera moved: metadata cannot detect this. You confirm, or
   run **Check**, which re-records the LEDs in place and compares positions. A
-  shift above about 0.5 px means the calibration is stale.
+  shift above about 0.5 px means the calibration is stale (estimate: a
+  judgement, set above the 0.1-0.3 px centroid error expected on a real
+  camera; tune it there).
 - An optional **witness LED** can stay in a corner of every recording, so each
   run checks itself; its events are masked out of velocity. Its light still
   makes particles flicker at its frequency, and masking does not undo that, so
@@ -755,7 +818,8 @@ At stage C, `homography` holds `{"H", "fitted_on": "raw_px" | "undistorted_px",
 
 - **At Start.** If the camera has an active calibration, Typhon writes
   `<run>_calibration.json` beside `<run>_camera.json`. It is a frozen copy of
-  the whole entry plus the sha256 (a fingerprint) of its canonical JSON. It is
+  the whole entry plus the sha256 (a fingerprint) of its canonical JSON (both
+  terms are explained at the top). It is
   written once, with the same no-overwrite rename as the camera record. Like
   the camera record, it is **never a reason not to capture**: a failure is
   reported in Start's summary and never raised.
@@ -764,11 +828,15 @@ At stage C, `homography` holds `{"H", "fitted_on": "raw_px" | "undistorted_px",
   `format_version`. `camera_record.read()` returns None for any version above
   the one it knows, so raising it would make older Typhons ignore new records
   entirely.
-- **In the velocity output.** The analysis records the calibration it
-  **actually used** (id, sha256, stage, model numbers). You may apply a later
+- **In the velocity output.** `<run>_velocity.json` embeds the calibration
+  the analysis **actually used**: its id, sha256, stage and accuracy note, and
+  the model numbers (mm/px and axis; the homography H; the intrinsics K and
+  distortion), or simply a full copy of the entry. You may apply a later
   calibration (for example one made after recording) if camera identity and
   sensor match and you confirm, or a Check shows, that camera and lens did not
-  move.
+  move. The run's frozen `<run>_calibration.json` is then not the one used,
+  which is why the velocity file carries the numbers itself: it can be
+  re-checked on its own.
 
 ### 3.10 What calibrating looks like in Typhon
 
@@ -778,10 +846,10 @@ At stage C, `homography` holds `{"H", "fitted_on": "raw_px" | "undistorted_px",
    frequencies found. Use it to pick LED frequencies clear of room lights and
    to store each LED's measured frequency.
 3. **Record calibration clip** (0.5 s) into the project's
-   `calibration/<id>/` folder. ERC, trail and anti-flicker (and the camera's
-   area, if the clip narrowed it) are switched off for the clip only and
-   restored in a `finally` block, so they come back even on an error. Typhon
-   decides `preset_changed` by comparing the camera with the preset in use at
+   `calibration/<id>/` folder. ERC, trail and anti-flicker are switched off,
+   and the area narrowed if asked, for the clip only; all are restored in a
+   `finally` block, so they come back even on an error. Typhon decides
+   `preset_changed` by comparing the camera with the preset in use at
    the next Start (`_preset_still_in_use`, `frame_camera.py:1682`). A clean
    restore therefore leaves the next run's record naming the preset; a
    restore that failed shows up there as a difference, and the Calibrate
@@ -817,11 +885,12 @@ and never writes over anything.
 | `<run>_calibration.json` | At Start, if the camera has an active calibration | The frozen copy and its sha256 (3.9) |
 | `<run>_tracks.csv` | After analysis | **One row per track:** id; first and last time (µs from the capture's origin, the same clock as `raw_t_us` in the frames CSV); slices and events; start and end position (sensor px); mean vx, vy and speed in px/s and, when calibrated, mm/s; direction; a flag when the track touched a gap; a flag when it looked like a merge |
 | `<run>_track_points.npy` | After analysis | The positions that draw the arrows and tails during playback: a structured numpy array, read with `allow_pickle=False`. One row per track per slice is 32 bytes, about 2.6 MB per recorded second at 10 Mev/s (computed from 81,866 rows/s); it can be thinned to one point every few ms |
-| `<run>_velocity.json` | After analysis | The set-up and every limit used; the calibration actually used (id, sha256, stage, accuracy note); coverage (time analysed, each gap's start and end, windows dropped); counts; the histogram bins; the legend range (1st-99th percentile); the decoder used; timings; the software commit |
+| `<run>_velocity.json` | After analysis | The set-up and every limit used; the calibration actually used, embedded so the file can be re-checked on its own (3.9): id, sha256, stage, accuracy note and the model numbers (mm/px and axis, H, K and distortion), or a full copy of the entry; coverage (time analysed, each gap's start and end, windows dropped); counts; the histogram bins; the legend range (1st-99th percentile); the decoder used; timings; the software commit |
 
 - **Why not one row per track per slice in the CSV:** the synthetic particles
-  gave 81,866 such rows per second at 10 Mev/s and 355,000 at 50 Mev/s. That
-  is roughly 8-35 MB/s of CSV, or gigabytes per minute. The per-track summary
+  gave 81,866 such rows per second at 10 Mev/s and 355,000 at 50 Mev/s
+  (measured). That is roughly 8-35 MB/s of CSV, or gigabytes per minute
+  (computed). The per-track summary
   is what you open in a spreadsheet or the Inferno plotting tools; the `.npy`
   holds the detail.
 - **Never over anything.** Each file is written whole to a hidden temporary
@@ -835,9 +904,9 @@ and never writes over anything.
   (`frame_camera.py:1594-1595`) that marks a run name as taken.
 - **Long paths.** Windows' 260-character path limit applies system-wide on
   this PC (`LongPathsEnabled=0`): Python's own `makedirs` failed past it during
-  testing, and so did writing a benchmark result file. Deep capture folders
-  can hit it. The short-name spelling from commit 9b595c2 is the existing way
-  round it.
+  testing, and so did writing a benchmark result file (measured). Deep
+  capture folders can hit it. The short-name spelling from commit 9b595c2 is
+  the existing way round it.
 - **Calibration clips** are not run files. They live in the project folder
   (3.7).
 
@@ -856,14 +925,15 @@ and never writes over anything.
 | `bias_hpf` | High-pass filter. Higher removes slow background changes | Raise against slow drifts in light |
 | `bias_refr` | **Raising it shortens the rest period, which gives more events**; lowering it gives fewer events per crossing | Lower only to thin heavy streams |
 | **Anti-flicker** | Needed under mains lighting (100/120 Hz flicker) | A narrow band such as 90-130 Hz |
-| **ERC** | Caps the rate. Prophesee's manual says it drops "spatially and temporally" and that signal quality degrades once it triggers; OpenEB's IMX636 driver drops whole 200 µs time slots. For tracks that means gaps in time | Off where possible; prefer the area and filters. If used as a safety cap, its state is recorded with the run |
-| **Event-rate activity filter** | Not on the EVK4. OpenEB 5.2 implements it only for Gen3.1 and GenX320 sensors, so `get_i_event_rate` should return None and Typhon's `_activity` (`camera_settings.py:1509-1512`) hides the group | Confirm with a real camera |
+| **ERC** | Caps the rate. Prophesee's manual says it drops "spatially and temporally" and that signal quality degrades once it triggers (vendor docs); OpenEB's IMX636 driver drops whole 200 µs time slots (OpenEB source). For tracks that means gaps in time | Off where possible; prefer the area and filters. If used as a safety cap, its state is recorded with the run |
+| **Event-rate activity filter** | Not on the EVK4. OpenEB 5.2 implements it only for Gen3.1 and GenX320 sensors (OpenEB source), so `get_i_event_rate` should return None and Typhon's `_activity` (`camera_settings.py:1509-1512`) hides the group | Confirm with a real camera |
 | **Picture window vs slice** | Independent: the picture can stay at 20 ms while Particles use 1 ms slices | Leave the picture at 20 ms |
 
 The bias directions above are from Prophesee's bias manual and could not be
 re-checked offline.
 
-**Three help texts in Typhon need fixing to match** (small, separate fixes):
+**Four texts in Typhon need fixing to match** (small, separate fixes; the
+raw view's speed claim in 7.1 is a fifth):
 
 - `bias_refr` (`camera_settings.py:1299-1300`) gives no direction. It should
   say "higher = shorter rest = more events".
@@ -872,6 +942,19 @@ re-checked offline.
 - The trail filter (`camera_settings.py:1487-1489`) says STC "keeps only
   confirmed events". It should also say that STC deletes a pixel's lone
   events, which is what a small, fast particle makes.
+- The example bias ranges in `council_qt/widgets/camera_settings_window.py`
+  are wrong for the IMX636. `range_text`'s docstring (line 223) and
+  `RangeSlider`'s docstring (lines 357-358) say `bias_diff_on` "runs
+  -85 … 140; -25 … 60 is recommended". OpenEB's tables
+  (`imx636_bias_settings.h` and `imx636_bias_settings_iterator.h`) give
+  `diff_on` an **allowed** range of -150..200 and a **recommended** range of
+  -85..140 (OpenEB source). The -25 is the recommended low end of a
+  different bias, `bias_diff`. Anyone building the calibration or velocity
+  presets from these comments would get the ranges wrong. The example seems
+  to come from the test fake, `tests/fake_evk4.py:53-66`, which reports the
+  real recommended ranges as "allowed" and clips each one to at most
+  -25..60 as "recommended", which matches no IMX636 bias's real range.
+  Aligning the fake with the HAL tables belongs in the same fix.
 
 ### 5.2 How the settings tabs and saved configurations serve this
 
@@ -908,7 +991,8 @@ record stores (3.7).
   track count change as you turn a setting.
 - **The velocity window** (histogram, legend, track table, direction view,
   counters) is its own pop-out. The settings column is narrow (432-464 px),
-  and ten tabs were measured at 672 px of tab strip, which is why related
+  and ten tabs were measured at 672 px of tab strip (measured, as recorded in
+  `camera_categories.py`), which is why related
   settings already share tabs (`camera_categories.py:9-16`). So velocity
   opens from the raw view's **Analyse velocity** and from a button, rather
   than adding another tab.
@@ -942,8 +1026,8 @@ velocity work can start from `qt-migration` directly.
     slice. Use it with the hint `index=false`; without the hint it writes
     `<name>.raw.tmp_index` beside the recording. That index is written in the
     background: it appeared within 3 s of opening, but a quick read that closed
-    the camera first left none. Test the "no index" behaviour with a camera
-    kept open.
+    the camera first left none (measured). Test the "no index" behaviour
+    with a camera kept open.
   - `RAWEvt2EventFileWriter`, which writes synthetic `.raw` files that read
     back exactly. These make the test recordings. It writes EVT2 only.
   - The core algorithms (polarity and area filters, time surfaces, picture
@@ -971,7 +1055,7 @@ offline):
 | CV: ModulatedLightDetector + ActiveMarkerTracker | LED markers, each sending an id coded in the gaps between rising edges (2a = 0, 3a = 1, 4a = start, a = 200 µs) | Not needed |
 | Calibration | Blinking frame generator, blinking dot-grid detector (first row 125 Hz, others 166 Hz), blinking chessboard detector, pinhole estimator; shows patterns on a screen from HTML pages and suggests about 50 detections for a 9 x 6 board | Stage D equivalent |
 
-**Licence and practical issues.**
+**Licence and practical issues** (vendor docs, not re-checkable offline).
 
 - **Which version you get depends on the purchase date.** Prophesee USB EVKs
   bought on or after 7 Oct 2024 came with SDK 5 Pro. Earlier ones got
@@ -981,8 +1065,8 @@ offline):
   installer needed an account (a request form plus a company sign-in).
 - **Current terms.** Prophesee's release notes say that from SDK 5.3 onward
   the SDK ships under a development licence by default (5.3.0 released
-  01/04/2026, 5.3.1 on 28/04/2026; the local OpenEB 5.2.0 matches SDK 5.2.0 of
-  12/01/2026). The March 2026 terms:
+  1 April 2026, 5.3.1 on 28 April 2026; the local OpenEB 5.2.0 matches
+  SDK 5.2.0 of 12 January 2026). The March 2026 terms:
   - allow non-commercial internal evaluation, development, testing and
     demonstration only;
   - allow one copy per Developer, where Developers are the employees named in
@@ -1027,10 +1111,10 @@ scipy 1.17.1). Unless stated, the code ran on a single thread on synthetic
 EVT2 recordings.
 
 **Timings swing by up to about 30 % between runs** (the same clustering ran at
-11.5 Mev/s once and 16.4 another time), so ranges are quoted.
+11.5 Mev/s once and 16.4 another time; measured), so ranges are quoted.
 
 **EVT3 is untested.** A real EVK4 records EVT3, which neither decode speed nor
-the 24-bit clock wrap (every 16.78 s) has been tested on.
+the 24-bit clock wrap (every 16.78 s, computed as 2^24 µs) has been tested on.
 
 ### 7.1 Measured numbers
 
@@ -1041,7 +1125,7 @@ the 24-bit clock wrap (every 16.78 s) has been tested on.
 | Tracker, Particles, 1 ms slices (events already loaded) | 1.2x real time at 1 Mev/s; 0.93x at 5; 0.70x at 10; 0.19x at 50 | Above 1x keeps up; below 1x falls behind |
 | Tracker, Particles, 2 ms slices | 2.25x at 1 Mev/s; 1.58x at 5; 0.93-0.98x at 10 | Doubling the slice nearly doubles the speed at low rates. The prototype counts and labels the whole sensor's cell grid in every slice, so much of its cost is per slice, not per event |
 | Tracker, Objects | 11.4x real time at 1 Mev/s | |
-| Whole job: HAL decode + tracker, Particles 1 ms | 0.85x (threaded) to 1.05x (inline) at 1 Mev/s; 0.21-0.26x at 10 Mev/s | A 10 s recording at 10 Mev/s takes about 40-50 s |
+| Whole job: HAL decode + tracker, Particles 1 ms | 0.85x (threaded) to 1.05x (inline) at 1 Mev/s; 0.21-0.26x at 10 Mev/s | A 10 s recording at 10 Mev/s takes about 40-50 s (computed) |
 | Thread pool: slices clustered in parallel, linked in order | 11.5 → 34-35 Mev/s with 4 or more threads (2 ms slices, 50 Mev/s); only about 1.2x at 1 ms slices and 10 Mev/s | numpy releases Python's lock (the GIL) on large arrays |
 | Existing raw view (`RawPlayback`) | 1.8-4.7 Mev/s | Only 1.8 on a 1 Mev/s recording (0.91 with 1 ms windows), because every window pays 5-9 ms of whole-sensor drawing (921,600 pixels). Its docstring's "tens of millions of events a second" (`event_playback.py:29`) is wrong and should be corrected |
 | Live grab loop (`EvkDevice`), before any velocity work | 5.3-5.5 Mev/s | Without .raw logging, the PNG writer, the frames CSV or the display, so a real capture's budget is lower |
@@ -1059,17 +1143,19 @@ long (25 million events), so per recorded second they double.
 
 **About the live bench.** It replayed a `.raw` through `EvkDevice`, whose
 windows run on the wall clock (`cameras.py:1663`). A file replays as fast as
-it decodes, so each "20 ms" window held 0.1-0.7 s of events. Its window counts
-and drop figures are therefore not valid. (It also dropped the newest entry
-when full; the design drops the oldest.) The 5.3-5.5 Mev/s throughput is still
-fair. The same wall-clock rule matters with a real camera: once the grab loop
-falls behind, each window silently covers more than `window_ms` of events.
+it decodes, so each "20 ms" window held 0.1-0.7 s of events (measured). Its
+window counts and drop figures are therefore not valid. (It also dropped the
+newest entry when full; the design drops the oldest.) The 5.3-5.5 Mev/s
+throughput is still fair. The same wall-clock rule matters with a real
+camera: once the grab loop falls behind, each window silently covers more
+than `window_ms` of events.
 
 ### 7.2 What that means
 
 - **Offline (stage 1):** any recorded rate can be analysed; it just takes
   longer. About real time at 1 Mev/s; about 4-5x the recording's length at
-  10 Mev/s. At 50 Mev/s a single thread needs roughly 6 s (slicer decode) to
+  10 Mev/s (both from the measured whole-job rates in 7.1). At 50 Mev/s a
+  single thread needs roughly 6 s (slicer decode) to
   8.5 s (HAL loop) per recorded second (computed from the tracker and decode
   rates above).
 - **Live Objects:** fine at 1 Mev/s (11.4x). Birds are expected at
@@ -1077,7 +1163,8 @@ falls behind, each window silently covers more than `window_ms` of events.
   (2.3).
 - **Live Particles:** with 1 ms slices, up to about 3-4 Mev/s. With 2 ms
   slices the tracker reaches 5-10 Mev/s, but the grab loop's own budget (about
-  5 Mev/s, lower in a real capture) caps it first. Above that, record and
+  5 Mev/s, lower in a real capture) caps it first (all read from the measured
+  rates in 7.1). Above that, record and
   analyse afterwards, which is your plan anyway.
 
 ### 7.3 Getting faster, in order of cost
@@ -1087,16 +1174,17 @@ falls behind, each window silently covers more than `window_ms` of events.
 2. **The thread pool** for clustering (measured about 3x at 2 ms slices and
    high rates; little gain at 1 ms). No install.
 3. **`CameraStreamSlicer`** for analysis decoding (52-73 against
-   15.6-17.7 Mev/s), or riding RawPlayback's decode pass so the file is read
-   once.
+   15.6-17.7 Mev/s, measured), or riding RawPlayback's decode pass so the file
+   is read once.
 4. **Fixing the raw view's per-window cost** and using the flat-index
-   `accumulate_events` (1.83-1.91x).
+   `accumulate_events` (1.83-1.91x, measured).
 5. **A compiled helper,** only if the steps above are not enough: for example,
    if real recordings at your rates take too long to analyse, or live particles
    are needed above about 3-4 Mev/s.
-   - Options: numba (needs your OK to install), or a small C extension. MSVC
-     14.42 (Visual Studio Community 2022, 17.12.4) is already installed, but the
-     Community licence limits use inside larger organisations.
+   - Options: numba (needs your OK to install), or a small C extension
+     (needs your OK for a build step). MSVC 14.42 (Visual Studio Community
+     2022, 17.12.4) is already installed (checked on this PC), but the
+     Community licence limits use inside larger organisations (vendor docs).
    - Expected 5-10x on the per-event step (estimate, not measured);
      3-5 days.
 
@@ -1115,7 +1203,7 @@ codebase, tests included.
 | 2 | `VelocityTracker`: Particles and Objects presets, adjustable limits, field access, gaps and merge flags; synthetic `.raw` test recordings with known speeds written by `RAWEvt2EventFileWriter`; tests | 3-4 days |
 | 3 | The **Analyse velocity** job in the raw view (worker thread, progress, cancel) and the saved files (section 4) | 1.5-2 days |
 | 4 | Vector overlay in `ImageCanvas`: arrows and tails that follow the slider | 1.5-2 days |
-| 5 | Velocity window (pop-out): histogram, colour legend after full processing, track table, direction view, counters; saved tracker set-ups | 2-3 days |
+| 5 | Velocity window (pop-out): a running histogram marked "partial" until the end, the colour legend after full processing, track table, direction view, counters; saved tracker set-ups | 2-3 days |
 | 6 | `led_locate`: detector, survey, measured-frequency rule, ON-only mode, polarity weighting, tests | 2-3 days |
 | 7 | `camera_calibration` store: rules from `camera_presets`, legacy keys, set-ups, revisions, import/copy, coordinate conversions (area, binning, decimation, mirroring) | 2-3 days |
 | 8 | Stages A and B: clip recording with filters off and restored, detect-and-confirm overlay, lens list, distance form (C/CS mount, emitter height), ruler overlay, Check | 4-5 days |
@@ -1124,8 +1212,9 @@ codebase, tests included.
 **What you see:**
 
 - **After steps 1-5 (about 9-13 days):** open a recording, press **Analyse
-  velocity**, watch the progress, then scrub through arrows and tails, with
-  the histogram, legend and track table, in px/s.
+  velocity**, watch the progress and the partial histogram build up, then
+  scrub through arrows and tails, with the finished histogram, legend and
+  track table, in px/s.
 - **After steps 6-9:** the same in mm/s, with each result labelled by its
   calibration stage and accuracy.
 
@@ -1136,7 +1225,7 @@ exists, a typed mm/px can stand in, marked "typed, unchecked".
 
 | # | Work | Estimate |
 |---|---|---|
-| 1 | Stage C: multi-LED or moved-LED points, normalised DLT with residuals (numpy; matches OpenCV's `findHomography` to within 1.1e-5 mm with 4 points and 1.3e-3 mm with 9), plane grid overlay, saved LED-board definitions, rejection of reflections | 3-4 days |
+| 1 | Stage C: multi-LED or moved-LED points, normalised DLT with residuals (numpy; matches OpenCV's `findHomography` to within 1.1e-5 mm with 4 points and 1.3e-3 mm with 9, measured), plane grid overlay, saved LED-board definitions, rejection of reflections | 3-4 days |
 | 2 | Live: the `EvkDevice.read` hook, the VelocityWorker (drop-oldest queue, counted drops, gaps), live arrows, a rolling live histogram, a rate-budget meter | 2-3 days |
 | 3 | A paced, timestamped simulated event camera for testing the live path without an EVK4. File replay is unpaced, and `SyntheticDevice`'s event mode (`cameras.py:1918-1941`) has no per-event timestamps. `tests/fake_evk4.py` (now on `qt-migration`) is a fake EVK4 that hands out one timestamped buffer per 10 ms of wall clock; it could be fed particle events from the test generator | 1 day |
 | 4 | Tracker set-ups linked to camera presets in the settings tabs | 1 day |
@@ -1175,7 +1264,8 @@ wanted.
    many LEDs at once? An RP2040 board can run up to 8 independent frequencies;
    an Arduino Uno has 3 timers. The Uno's default PWM rate on most pins
    (490 Hz) is too low, while its 976.56 Hz pins are usable because Typhon
-   measures the frequency. Can the LEDs be mounted flush on a flat board?
+   measures the frequency (vendor docs). Can the LEDs be mounted flush on a
+   flat board?
 3. **Typical fields of view.** Roughly how many mm across, at what working
    distance? Does the motion stay mostly in one plane facing the camera, or
    does the camera look at an angle (for example through a viewport)? This
@@ -1183,6 +1273,18 @@ wanted.
 4. **Accuracy needed.** Is a speed distribution enough, or must each particle
    be within ±X %? As a guide: stage B gives about 0.5-1.5 % square-on; stage C
    is needed at an angle; stage D matters for wide lenses (estimates).
+5. **OpenCV for stage D.** Is it OK to use cv2 as an optional dependency for
+   stage D, either from the `pylon` env or installed into the council env?
+   Without it, stage D needs our own numpy/scipy version of Zhang's method
+   (about 3-5 more days, estimate).
+6. **A compiled helper.** If the thread pool is not enough, is it OK to
+   install numba, or to add a small C helper built with MSVC?
+7. **The EVK4 and SDK Pro.** When was the EVK4 bought? EVKs bought on or
+   after 7 Oct 2024 came with SDK 5 Pro (vendor docs). Do you have SDK Pro
+   access? It is not needed, but its tools could cross-check ours.
+8. **Real recordings.** Are there any real EVK4 `.raw` recordings to tune on?
+   None were found on this PC, and every accuracy figure in this design waits
+   on one.
 
 ---
 
@@ -1195,7 +1297,11 @@ wanted.
   above. Three of them were refined against the code or the raw results when
   this design was finished: the 50 Mev/s decode times (section 7.1), what
   sets `preset_changed` (3.10), and where Typhon's bias limits come from
-  (3.4).
+  (3.4). A review of the first version of this design then corrected the
+  tilt figures (3.5, re-run with `geom_check.py`: worst error by direction
+  6.13 % / 12.84 % along the baseline, 4.37 % / 8.49 % at best, 10.61 % /
+  16.98 % at worst, for the 16 mm / 8 mm lens), the unweighted-centroid
+  range (3.2, 3.4) and the multi-LED spacing rule (3.3).
 - **Scripts:** `velo/` (`typhon-integration/`: generator `gen.py`, trackers,
   `bench.py`, `rawbench.py`, `livebench.py`, `slicerbench.py`, `threads.py`;
   `algorithms/`: papers and benches; `factcheck/`: `haldecode.py`,
@@ -1206,7 +1312,8 @@ wanted.
   `C:/Users/apkun/AppData/Local/Temp/claude/C--Users-apkun-Downloads-Council-Demo-Council-Demo--claude-worktrees-priceless-vaughan-cc9023/486b5624-72b4-418a-b22e-cbd5562732ac/scratchpad/`.
 - **OpenEB 5.2.0 source** at `C:/ceb/openeb` (9003b54): `antiflicker_filter.cpp`,
   `gen41_erc.cpp`, `event_trail_filter.cpp`, `i_event_trail_filter_module.h`,
-  `imx636_bias_settings.h`, `i_ll_biases.cpp` (`I_LL_Biases::set` refuses a
+  `imx636_bias_settings.h` and `imx636_bias_settings_iterator.h` (recommended
+  and allowed bias ranges), `i_ll_biases.cpp` (`I_LL_Biases::set` refuses a
   value outside `get_bias_range` unless the range check is bypassed).
 - **Papers:** Willert & Klinner 2022 (event-based imaging velocimetry);
   Censi et al., IROS 2013 (active LED markers); STELLA, Exp Fluids 2026,
@@ -1216,11 +1323,15 @@ wanted.
   (4.86 µm pitch, latency, 25 % contrast threshold); EVK4 datasheet and
   1stVision page (220 µs, C/CS mount); Prophesee biases and event-signal-
   processing manuals; SDK module, analytics, CV and calibration API pages;
-  SDK release notes and the March 2026 terms.
+  SDK release notes and the March 2026 terms; ATmega328P, RP2040 and Arduino
+  PWM figures; C-mount and CS-mount flange distances; the Visual Studio
+  Community licence.
 - **Typhon code read** (line numbers are at `qt-migration` 906bb26, which
-  includes the settings tabs): `council_core/cameras.py`, `event_playback.py`,
+  includes the settings tabs and is the base of this doc's branch,
+  `docs/typhon-velocity`): `council_core/cameras.py`, `event_playback.py`,
   `camera_settings.py`, `camera_record.py`, `camera_presets.py`,
   `camera_categories.py`, `frame_camera.py`,
-  `council_qt/widgets/capture_review.py`, `gui_emit_qt.py`,
+  `council_qt/widgets/capture_review.py`,
+  `council_qt/widgets/camera_settings_window.py`, `gui_emit_qt.py`,
   `examples/gui/typhon.gspec`, `tests/fake_evk4.py` and
   `docs/camera_quickstart.md`.
