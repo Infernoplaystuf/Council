@@ -372,7 +372,9 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
             on_event: Optional[Callable[[str, str], None]] = None,
             should_stop: Optional[Callable[[], bool]] = None,
             max_turns: int = MAX_TURNS,
-            window_chars: Optional[int] = None) -> JobRecord:
+            window_chars: Optional[int] = None,
+            job: Optional[wt.Job] = None,
+            must_pass: Sequence[str] = ()) -> JobRecord:
     """Carry out an approved plan. Blocking — run it on a worker.
     `on_event(kind, text)` narrates: phase / tool / result / check / note."""
     chat_tools = chat_tools or _default_chat_tools()
@@ -382,7 +384,8 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
     plan = plan_of(rec)
     pdir = pj.project_dir(vault_dir, project)
 
-    job = wt.create(project.root, pdir / "worktrees", rec.id)
+    if job is None:            # a prepared worktree (the benchmark) or a new one
+        job = wt.create(project.root, pdir / "worktrees", rec.id)
     rec.branch, rec.base, rec.worktree = job.branch, job.base, str(job.path)
     rec.status, rec.started = "running", time.time()
     save_record(vault_dir, project, rec)
@@ -398,6 +401,10 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
         say("phase", "Running the tests once before any change (baseline)")
         passed, out = ws.run_tests()
         baseline = set() if passed else failing_ids(out)
+        # Tests the job exists to make pass (the benchmark's target tests)
+        # are never excused as "already failing".
+        baseline = {t for t in baseline
+                    if not any(t.startswith(f) for f in must_pass)}
         rec.baseline = sorted(baseline)
         if not passed:
             say("check", f"{len(baseline)} test(s) already fail before the "
