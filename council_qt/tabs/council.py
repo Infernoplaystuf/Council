@@ -66,7 +66,7 @@ from council_core import council_turn
 from council_core import paths
 from council_core import transcript as transcript_core
 
-from .. import theme
+from .. import dialogs, theme
 from ..view import ViewHelpers, amp
 from ..widgets.transcript import (MirroredTranscript, StreamView,
                                   TranscriptView)
@@ -283,6 +283,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self.pipelines_changed: List[Callable[[], None]] = []
         self._pipeline_chat = None
         self._model_chat = None
+        # Asks before a script take-over (_take_over). Yes only on a click;
+        # COUNCIL_NO_DIALOGS answers No.
+        self.confirm = dialogs.confirm
 
         self._build()
         self.refresh_specialists()
@@ -645,6 +648,11 @@ class CouncilTab(ViewHelpers, QWidget):
         typed = self.input.toPlainText().strip()
         if not typed:
             return
+        # "Expand with council" re-sends an earlier QUESTION through here
+        # (_force_full_council); only words typed for this send can ask for a
+        # take-over.
+        if not self._force_full_council and self._take_over(typed):
+            return
         if self._send_command(typed):
             return
         if not self.begin_turn():
@@ -709,6 +717,36 @@ class CouncilTab(ViewHelpers, QWidget):
                 say=lambda who, text, kind: self._to_ui(
                     self.append, who, text, kind))
         return self._model_chat
+
+    def _take_over(self, typed: str) -> bool:
+        """A take-over ("take over <script>") TYPED in this box, or in the
+        Dream3D chat, which sends through it — the chat's one door to it
+        (council_core.script_takeover, "ONLY THE USER CAN ASK"). Read here,
+        before any other command, from the text the user typed; the pipeline
+        chat behind _send_command answers the same words from anywhere else
+        without acting on them. Asks first, on the GUI thread; True if
+        handled."""
+        from council_core import pipeline_intent, script_takeover
+        ref = pipeline_intent.take_over_ref(typed)
+        if ref is None:
+            return False
+        try:
+            plan = script_takeover.decide(self.actions.vault_dir, ref, typed)
+        except Exception as exc:                          # noqa: BLE001
+            plan = script_takeover.Plan(
+                shown=ref, refusal=f"The take-over failed: {exc!r}. Nothing "
+                                   f"changed.")
+        if plan is None:
+            return False
+        self.append("User", typed)
+        self.input.clear()
+        said = script_takeover.run(
+            plan, self.actions.vault_dir,
+            confirm=lambda title, text: self.confirm(title, text, parent=self),
+            via=f"typed in the chat: {typed.splitlines()[0][:200]!r}")
+        self.append("Council", said, "observation")
+        self._pipelines_changed()
+        return True
 
     def _send_command(self, typed: str) -> bool:
         """Answer app commands — pipelines, then models — without the council,

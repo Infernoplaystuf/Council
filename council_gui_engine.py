@@ -5142,6 +5142,23 @@ class CouncilConsole(tk.Tk):
             return False
         single_line = user_text.split("\n", 1)[0]
 
+        # "take over <script>" that did not come through _send_typed — a
+        # re-ask, a re-run, a transcription: answered, never acted on
+        # (council_core.script_takeover, "ONLY THE USER CAN ASK"). One that
+        # names no script is left for the Council, as _send_typed leaves it.
+        try:
+            from council_core import pipeline_intent as _pi
+            from council_core import script_takeover as _st
+            _ref = _pi.take_over_ref(single_line)
+            if _ref is not None and \
+                    _st.decide(VAULT_DIR, _ref, single_line) is not None:
+                self._append_transcript("Council", _st.NOT_HERE,
+                                        "observation")
+                self._set_status("● idle")
+                return True
+        except Exception:
+            pass
+
         # List
         if self._PIPELINE_LIST_RE.match(single_line):
             self._pipeline_list_response()
@@ -9092,12 +9109,14 @@ class CouncilConsole(tk.Tk):
         ttk.Label(bottom, text="Input").pack(anchor="w")
         self.input = self._make_text(bottom, wrap="word", height=4)
         self.input.pack(fill="x")
-        self.input.bind("<Control-Return>", lambda e: self._send())
+        # What the user TYPES goes through _send_typed: the one chat door to
+        # a script take-over. Every other route into _send skips it.
+        self.input.bind("<Control-Return>", lambda e: self._send_typed())
 
         btns = ttk.Frame(bottom)
         btns.pack(fill="x", pady=(4, 0))
 
-        ttk.Button(btns, text="Send  [Ctrl+Enter]", command=self._send).pack(side="left")
+        ttk.Button(btns, text="Send  [Ctrl+Enter]", command=self._send_typed).pack(side="left")
         ttk.Button(btns, text="\U0001f4ca Find & Chart",
                    command=self._council_find_and_chart_button
                    ).pack(side="left", padx=6)
@@ -9370,6 +9389,8 @@ class CouncilConsole(tk.Tk):
                    command=self._dream3d_open_in_folder).pack(side="left", padx=4)
         ttk.Button(list_btns, text="Open out/ folder",
                    command=self._dream3d_open_out_folder).pack(side="left", padx=4)
+        ttk.Button(list_btns, text="Take over…",
+                   command=self._dream3d_take_over_selected).pack(side="left", padx=4)
 
         # Geometry sidekick — interactive 3D cube that reads out the
         # equivalent 4×4 transformation matrix. Standalone HTML, opens
@@ -9711,8 +9732,15 @@ class CouncilConsole(tk.Tk):
                 "Then click ↻ Refresh."
             )
             return
+        try:
+            from council_core import script_takeover as _st
+            _stamped = _st.is_stamped
+        except Exception:
+            _stamped = lambda _p: False                  # noqa: E731
         for pl in pipelines:
             note = f"  ({pl.format}, {len(pl.steps)} step{'s' if len(pl.steps)!=1 else ''})"
+            if _stamped(pl.path):
+                note += "  · model-written"
             self.dream3d_pipeline_list.insert("end", pl.name + note)
 
     def _dream3d_show_selected(self):
@@ -9744,6 +9772,26 @@ class CouncilConsole(tk.Tk):
     def _dream3d_open_out_folder(self):
         import pipeline_scanner as _ps
         self._open_in_explorer(_ps.vault_pipelines_out_dir(VAULT_DIR))
+
+    def _dream3d_take_over_selected(self):
+        """The Take over button: the selected model-written script becomes
+        the user's — after the confirmation, and only on its Yes
+        (council_core.script_takeover)."""
+        pl = self._nx_selected_pipeline()
+        if pl is None:
+            self._dream3d_set_view(
+                "Select a model-written script in the list first.")
+            return
+        from council_core import script_takeover as _st
+        plan = _st.prepare(VAULT_DIR, Path(pl.path))
+        said = _st.run(plan, VAULT_DIR, confirm=self._take_over_confirm,
+                       via="the Take over button (Tk Dream3D tab)")
+        self._dream3d_set_view(said)
+        self._append_transcript("Council", said, "observation")
+        try:
+            self._dream3d_refresh_pipelines()
+        except Exception:
+            pass
 
     def _open_transformation_cube_tool(self):
         """Open the bundled interactive 3D cube → 4×4 transformation matrix
@@ -9809,10 +9857,10 @@ class CouncilConsole(tk.Tk):
             return
         # Push into the Council input widget and trigger _send so all the
         # existing intent handlers (show / modify / run workflow / chat)
-        # apply uniformly.
+        # apply uniformly — through _send_typed, since the user typed it.
         self._set_text(self.input, text)
         self._set_text(self.dream3d_input, "")
-        self._send()
+        self._send_typed()
         # Refresh the pipeline list after — modifying a pipeline produces
         # a new file in out/, but in/ is unchanged. Keep refresh available
         # via the button.
@@ -18006,6 +18054,54 @@ class CouncilConsole(tk.Tk):
         ttk.Button(btns, text="Save", command=_save).pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right", padx=6)
+
+    def _send_typed(self):
+        """The Send button and Ctrl+Enter (and the Dream3D box): what the
+        user TYPED. The one chat door to a script take-over
+        (council_core.script_takeover, "ONLY THE USER CAN ASK"), read before
+        anything else. Every other route into _send — a re-ask from the
+        history, the disagree re-run, the CPU retry, Expand, a speech
+        transcription (a model's output) — calls _send directly and never
+        reaches it; _handle_pipeline_intent answers the words without acting
+        on them."""
+        text = self.input.get("1.0", "end").strip()
+        if text and self._take_over_typed(text):
+            return
+        self._send()
+
+    def _take_over_typed(self, user_text: str) -> bool:
+        """A take-over ("take over <script>") the user typed: ask, act on
+        Yes. True if handled. Only _send_typed calls this."""
+        from council_core import pipeline_intent as _pi
+        from council_core import script_takeover as _st
+        ref = _pi.take_over_ref(user_text)
+        if ref is None:
+            return False
+        try:
+            plan = _st.decide(VAULT_DIR, ref, user_text)
+        except Exception as exc:
+            plan = _st.Plan(shown=ref, refusal=f"The take-over failed: "
+                                               f"{exc!r}. Nothing changed.")
+        if plan is None:
+            return False
+        self._set_text(self.input, "")
+        self._append_transcript("User", user_text)
+        said = _st.run(plan, VAULT_DIR, confirm=self._take_over_confirm,
+                       via="typed in the Tk chat: "
+                           f"{user_text.splitlines()[0][:200]!r}")
+        self._append_transcript("Council", said, "observation")
+        try:
+            self._dream3d_refresh_pipelines()
+        except Exception:
+            pass
+        return True
+
+    def _take_over_confirm(self, title: str, text: str) -> bool:
+        """Yes only on a click; No is the default. (script_takeover.run has
+        already said no under COUNCIL_NO_DIALOGS.)"""
+        from tkinter import messagebox
+        return messagebox.askyesno(title, text, icon="warning",
+                                   default="no", parent=self) is True
 
     def _send(self):
         # Licensing gate — skipped entirely in DEMO_MODE. In product

@@ -596,7 +596,8 @@ def _literal_outputs(source: str) -> List[Tuple[int, str, str]]:
 
 
 def _model_rules_warnings(before: str, before_path: Path, after: str,
-                          vault_dir: Path) -> List[str]:
+                          vault_dir: Path,
+                          new_path: Optional[Path] = None) -> List[str]:
     """What the user must know before running a model-edited copy of THEIR
     OWN script: the stamp puts the whole copy under the model-script rules
     (nx_policy "Two kinds of script"), so what their script always did —
@@ -635,7 +636,10 @@ def _model_rules_warnings(before: str, before_path: Path, after: str,
                    "will be refused when they run:")
         out.extend(f"  line {ln}: {p} = {v}" for ln, p, v in outside[:6])
     out.append("Read the change; to run the copy as your own script, with "
-               "your own rules, delete its first line (the model stamp).")
+               "your own rules, delete its first line (the model stamp)"
+               + (f" — or type 'take over {Path(new_path).name}' in the "
+                  f"chat, which asks you first and keeps a copy"
+                  if new_path is not None else "") + ".")
     return out
 
 
@@ -741,5 +745,5 @@ def modify_pipeline_by_request(
         success=True, pipeline=pipeline, source_path=pipeline_path,
         new_path=new_path, edits=edits, log=result.log,
         warnings=_model_rules_warnings(source, pipeline_path, stamped,
-                                       vault_dir),
+                                       vault_dir, new_path),
     )

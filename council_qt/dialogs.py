@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 from typing import Any, List, Optional, Sequence, Tuple
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 _Btn = QMessageBox.StandardButton
@@ -73,6 +74,28 @@ def askyesno(title: str = "", message: str = "", parent=None, **_kw) -> bool:
     box = _box(QMessageBox.Icon.Question, title, message, parent)
     box.setStandardButtons(_Btn.Yes | _Btn.No)
     return box.exec() == _Btn.Yes
+
+
+def confirm(title: str = "", message: str = "", parent=None) -> bool:
+    """True only on a click of Yes — for an action that loosens what the app
+    enforces (taking a model's script over: council_core.script_takeover).
+
+    Not askyesno: under COUNCIL_NO_DIALOGS it answers No without building a
+    box (an unattended run cannot say yes, and must not be taken to); No is
+    the default button, so Enter does not agree; Escape and closing the box
+    are No; and the text is PLAIN — it quotes a file a model wrote, which a
+    QMessageBox would otherwise render as rich text if it looked like
+    HTML."""
+    if disabled():
+        return False
+    box = _box(QMessageBox.Icon.Warning, title, message, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setStandardButtons(_Btn.Yes | _Btn.No)
+    box.setDefaultButton(_Btn.No)
+    box.setEscapeButton(_Btn.No)
+    box.exec()
+    clicked = box.clickedButton()
+    return clicked is not None and clicked is box.button(_Btn.Yes)
 
 
 def askokcancel(title: str = "", message: str = "", parent=None, **_kw) -> bool:

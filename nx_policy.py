@@ -76,7 +76,11 @@ script_trust() says which:
 
 A model's script never gets the USER rules by being moved or renamed: the
 stamp travels with the text. Deleting the stamp line is the user taking the
-script over, which is theirs to do — and the app says so where it matters:
+script over, which is theirs to do — by hand, or by typing "take over
+<script>" in the chat or clicking Take over in the Dream3D tab
+(council_core.script_takeover: it asks first, removes only the stamp lines
+— stamp_lines / without_stamp — and keeps a copy; no model output can ask
+for it). And the app says so where it matters:
 every refusal of a MODEL script opens with why it got those rules and how
 to hand it back (model_rules_note), and a model "modify" of the user's own
 script says, when it saves the copy, what the rule change means for it
@@ -195,6 +199,17 @@ MODEL = "model"
 USER = "user"
 _STAMP_RE = re.compile(r"^\s*#\s*council:\s*model-(written|edited)\b",
                        re.MULTILINE)
+# A line ends at "\r\n", "\r" or "\n": where Python (compile, and a file it
+# runs), every editor and the workflow runner (read_text, universal
+# newlines) end one. A bare "\r" is a line break to all of them, so the
+# stamp is read the same way — the code a model puts after "\r" on its
+# stamp line is a line of its own, never part of the stamp.
+_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def _universal(code: str) -> str:
+    """``code`` with every line break "\\n" — the text the runner reads."""
+    return code.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def stamp_model_script(code: str, origin: str, *, edited: bool = False) -> str:
@@ -204,7 +219,7 @@ def stamp_model_script(code: str, origin: str, *, edited: bool = False) -> str:
     pipeline chat", ...). Every save of model-written or model-edited code
     goes through this, so the workflow runner gives it the MODEL rules."""
     code = code or ""
-    if _STAMP_RE.search(code):
+    if _STAMP_RE.search(_universal(code)):
         return code
     kind = "edited" if edited else "written"
     return (f"{MODEL_STAMP}{kind} ({origin}). The Council runs this under "
@@ -215,7 +230,7 @@ def script_trust(code: str, path=None, app_roots: Iterable = ()) -> str:
     """MODEL or USER for a script about to be run — see "Two kinds of
     script". MODEL when the text carries the stamp, or ``path`` lies in one
     of ``app_roots`` (the vault's data_out: what is there, the app wrote)."""
-    if _STAMP_RE.search(code or ""):
+    if _STAMP_RE.search(_universal(code or "")):
         return MODEL
     if path is not None:
         try:
@@ -227,6 +242,51 @@ def script_trust(code: str, path=None, app_roots: Iterable = ()) -> str:
     return USER
 
 
+def lines_with_ends(code: str) -> List[str]:
+    """``code`` split after every line break ("\\r\\n", "\\r" or "\\n" — see
+    _LINE_RE), each line keeping its own ending; "".join() of the result is
+    ``code``. Line n here is line n to Python, to an editor and to the
+    runner, which reads ``_universal(code)`` — the same lines, each ending
+    "\\n"."""
+    return _LINE_RE.findall(code)
+
+
+def stamp_lines(code: str) -> List[int]:
+    """The 1-based numbers of the lines that make ``code`` a MODEL script by
+    its text: every line a stamp match touches. Removing exactly these lines
+    (without_stamp) leaves text script_trust() reads as USER. [] for text
+    with no stamp. Lines are counted as lines_with_ends counts them.
+
+    Read as script_trust reads, which is not always one line: its \\s may
+    cross a line break ("#" on one line, "council: model-written" on the
+    next is a stamp), and taking one stamp out can join two lines that are
+    one — so this repeats until no match is left."""
+    lines = lines_with_ends(_universal(code or ""))
+    keep = list(range(len(lines)))          # original numbers still present
+    gone: List[int] = []
+    for _ in range(len(lines) + 1):
+        text = "".join(lines[i] for i in keep)
+        m = _STAMP_RE.search(text)
+        if not m:
+            break
+        # The match may begin on blank lines above the "#"; they are not
+        # the stamp.
+        first = text.count("\n", 0, text.index("#", m.start()))
+        last = text.count("\n", 0, m.end())
+        gone.extend(keep[first:last + 1])
+        keep = keep[:first] + keep[last + 1:]
+    return sorted(i + 1 for i in gone)
+
+
+def without_stamp(code: str) -> str:
+    """``code`` with its stamp lines (stamp_lines) removed and every other
+    character as it was — the user taking the script over."""
+    drop = set(stamp_lines(code or ""))
+    return "".join(line for n, line in
+                   enumerate(lines_with_ends(code or ""), 1)
+                   if n not in drop)
+
+
 def model_rules_note(code: str, path=None, app_roots: Iterable = ()) -> str:
     """Why ``code`` gets the MODEL rules, and how the user hands it back to
     their own — the first thing a refusal says, since a model-edited copy of
@@ -234,14 +294,17 @@ def model_rules_note(code: str, path=None, app_roots: Iterable = ()) -> str:
     ("import 'os' is not allowed") with nothing saying why. '' for a USER
     script."""
     code = code or ""
-    m = _STAMP_RE.search(code)
+    text = _universal(code)
+    m = _STAMP_RE.search(text)
     if m:
-        at = code.index("#", m.start())
-        line = code.count("\n", 0, at) + 1
+        at = text.index("#", m.start())
+        line = text.count("\n", 0, at) + 1
         return (f"line {line} carries the model stamp ('{MODEL_STAMP}"
                 f"{m.group(1)}'), so the model-script rules apply; if you "
                 f"have read the script and want it run as your own, delete "
-                f"that line")
+                f"that line — or, for a script in the vault's pipelines/in "
+                f"or pipelines/out, type 'take over <its file name>' in the "
+                f"chat, which asks you first")
     if path is not None and script_trust(code, path, app_roots) == MODEL:
         return ("the script is in the vault's data_out, where the app saves "
                 "what a model writes, so the model-script rules apply; to run "

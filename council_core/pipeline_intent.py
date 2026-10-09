@@ -14,12 +14,20 @@ with pasted context, not a command.
 NOT HERE: "download <repo> <file>.gguf" and "peek <file>". Tk routes them
 through this function only because it is the chat entry point; neither touches
 a pipeline (see the requirements doc). They are not ported with Dream3D.
+
+ONE THAT IS NOT LIKE THE OTHERS: "take over <script>" (TAKE_OVER_RE). It
+loosens the rules a model's script runs under, so it is acted on only from
+text the user TYPED: the GUI's send handler asks take_over_ref() of the input
+box before anything else (council_core.script_takeover, "ONLY THE USER CAN
+ASK"). candidates() still yields it — first — so that the same words arriving
+any other way are answered with how to do it, never acted on and never sent to
+the Council as a question.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 _I = re.IGNORECASE
 
@@ -73,6 +81,22 @@ EXPORT_RE = re.compile(
 COMPARE_RE = re.compile(
     r"^\s*(?:compare|diff)\s+pipelines?\s+(.+?)\s+(?:and|vs\.?|versus|to|with)"
     r"\s+(.+?)\s*[.!?]?\s*$", _I)
+# The user taking a model's script over: "take over seg_five.py", "take
+# seg_five.py over", "make seg_five.py mine", "remove the model marker from
+# seg_five.py", "delete the first line of seg_five.py" (the stamp is the first
+# line the app writes; the confirmation names the lines that really go). See
+# take_over_ref — this is never acted on from candidates().
+TAKE_OVER_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"take\s+over\s+(?P<a>.+?)"
+    r"|take\s+(?P<b>.+?)\s+over"
+    r"|make\s+(?P<c>.+?)\s+(?:mine|my\s+own)"
+    r"|(?:remove|delete|drop|strip)\s+(?:the\s+)?(?:model[\s-]*)?"
+    r"(?:marker|stamp)(?:\s+line)?"
+    r"(?:\s+(?:from|of|in|on)\s+(?P<d>.+?))?"
+    r"|(?:remove|delete|drop|strip)\s+(?:the\s+)?(?:first|top)\s+line\s+"
+    r"(?:from|of|in|on)\s+(?P<e>.+?)"
+    r")\s*[.!?]?\s*$", _I)
 
 #: Words that describe a pipeline rather than name one.
 GENERIC_TOKENS = frozenset({
@@ -81,9 +105,10 @@ GENERIC_TOKENS = frozenset({
     "script", "file", "saved", "existing", "example",
 })
 
-#: Actions, in the order Tk tries them.
-ACTIONS = ("list", "show", "modify", "explain", "validate", "graph",
-           "to_python", "create", "export", "compare")
+#: Actions, in the order they are tried: the take-over first (see the module
+#: note), then Tk's order.
+ACTIONS = ("take_over", "list", "show", "modify", "explain", "validate",
+           "graph", "to_python", "create", "export", "compare")
 
 
 @dataclass(frozen=True)
@@ -105,11 +130,32 @@ def clean_ref(name: str) -> str:
                     if t.lower().strip(".") not in GENERIC_TOKENS).strip()
 
 
+def take_over_ref(text: str) -> Optional[str]:
+    """The script a take-over names, if the first line of ``text`` asks for
+    one: None when it does not, '' when it names none ("take it over").
+
+    Call it ONLY on what the user typed into a chat box, from the box's send
+    handler — council_core.script_takeover, "ONLY THE USER CAN ASK". Never on
+    a model's reply, a re-sent message, a transcription or a file's text."""
+    if not text:
+        return None
+    m = TAKE_OVER_RE.match(text.split("\n", 1)[0])
+    if not m:
+        return None
+    raw = next((g for g in m.group("a", "b", "c", "d", "e") if g), "")
+    return clean_ref(_q(raw))
+
+
 def candidates(text: str) -> Iterator[Intent]:
-    """Every intent the first line could be, in Tk's precedence order."""
+    """Every intent the first line could be: a take-over phrase first (only
+    ever answered from here — see the module note), then Tk's precedence
+    order."""
     if not text:
         return
     line = text.split("\n", 1)[0]
+    ref = take_over_ref(line)
+    if ref is not None:
+        yield Intent("take_over", (ref,), text)
     if LIST_RE.match(line):
         yield Intent("list", (), text)
     m = SHOW_RE.match(line)
