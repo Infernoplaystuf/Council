@@ -4,8 +4,9 @@ Measured on 2026-10-05 on this laptop; the docs suite was measured again later
 that day on the docs fix that is now merged.
 - **gpt-oss:20b was not re-measured** (decided 2026-10-07). Its figures here are
   from 2026-10-02, before the October fixes; section 7 says why it could not run.
-- **The bugs these runs exposed are now fixed** on branch `llm/bench-findings`
-  (section 3.3). Every number in this report was measured **before** those fixes.
+- **The bugs these runs exposed are now fixed** (branch `llm/bench-findings`,
+  merged into `qt-migration` on 2026-10-09; section 3.3). Every number in this
+  report was measured **before** those fixes.
 
 **Labels** (the same as in [specialized_nodes.md](specialized_nodes.md)):
 **M\*** = measured on this laptop. **M** = measured by a named source.
@@ -180,9 +181,9 @@ How to read this table:
 - **q05**, a docs question, failed for 4 of 5 models, again all but phi4:14b.
 
 **Council issues these runs exposed.** None of them changed whether the
-recommendations hold. All are fixed now: the first is merged; the others are on
-branch `llm/bench-findings` (2026-10-09; not yet merged into `qt-migration` when
-this was written). Every number in this report was measured **before** them.
+recommendations hold. All are fixed and merged into `qt-migration`: the first
+earlier, the others from branch `llm/bench-findings` on 2026-10-09. Every number
+in this report was measured **before** them.
 
 1. **Docs citations.** The search ranked a page without the fact first, and
    small models nearly always cite page [1], so q05 (and q03 for two models)
