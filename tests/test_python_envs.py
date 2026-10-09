@@ -205,6 +205,20 @@ def _built(tmp_path, name="pre"):
     return rex.build("barbie_capture", project=name, vault_dir=tmp_path)
 
 
+def _built_qt(tmp_path, name):
+    """The same example built for Qt — for every test that may LAUNCH it.
+
+    The Tk GUIs are deprecated and no test may open a Tk window
+    (tests/README.md). run_checked reads the toolkit off the project
+    (gui_projects.toolkit_for), so it gates and launches this one as Qt, and
+    the preview inherits QT_QPA_PLATFORM=offscreen. _built stays Tk for the
+    preflight tests, which call pe.preflight(pdir, "") with its default
+    toolkit — a Qt build is (rightly) refused by the Tk gate there."""
+    import run_example_gui as rex
+    return rex.build("barbie_capture", project=name, vault_dir=tmp_path,
+                     target="qt")
+
+
 def test_preflight_passes_a_clean_project(tmp_path):
     pf = pe.preflight(_built(tmp_path), "")
     assert pf.ok and pf.python == sys.executable
@@ -243,7 +257,7 @@ def test_run_checked_launches_through_the_callbacks(tmp_path):
     """The designer's Run, with Tk's after() replaced by a plain queue: every
     UI touch must go through call_soon, so the worker never touches Tk."""
     import queue
-    pdir = _built(tmp_path, "rc")
+    pdir = _built_qt(tmp_path, "rc")
     log, q = [], queue.Queue()
     t = run.run_checked(pdir, log=log.append, call_soon=q.put)
     t.join(timeout=90)
@@ -395,7 +409,7 @@ def test_stop_during_the_check_cancels_the_run(tmp_path):
     opened when the check finished — a camera app opening its device after
     the last thing the user pressed was Stop."""
     import queue
-    pdir = _built(tmp_path, "cancel")
+    pdir = _built_qt(tmp_path, "cancel")
     log, q = [], queue.Queue()
     t = run.run_checked(pdir, log=log.append, call_soon=q.put)
     assert run.stop(pdir) is True
@@ -411,7 +425,7 @@ def test_stop_during_the_check_cancels_the_run(tmp_path):
 
 def test_a_newer_run_replaces_one_still_being_checked(tmp_path):
     import queue
-    pdir = _built(tmp_path, "twice")
+    pdir = _built_qt(tmp_path, "twice")
     log, q = [], queue.Queue()
     t1 = run.run_checked(pdir, log=log.append, call_soon=q.put)
     t2 = run.run_checked(pdir, log=log.append, call_soon=q.put)

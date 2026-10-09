@@ -12,6 +12,13 @@ Now Stop sends "stop" on the child's stdin, the generated app closes itself
 through on_close, and kill() is only the fallback. Every test below runs real
 processes; on_close writes a marker file standing in for a camera release.
 
+The apps that run are built for the Qt target: the Tk GUIs are deprecated and
+no test may open a Tk window (tests/README.md). The stop protocol is the same
+on both — handlers.py is shared, and the Qt main_ui carries the same
+`_watch_for_stop(self)` gui_runner looks for — and the children are offscreen
+because they inherit QT_QPA_PLATFORM=offscreen (tests/desktop_guard.py). The
+two checks of the Tk target's generated TEXT below still build for Tk.
+
 Run:  python -m pytest tests/test_gui_stop.py -q
 """
 from __future__ import annotations
@@ -37,8 +44,9 @@ STUB_TAIL = ('        after this returns, and closes anyway if this raises."""\n
 
 
 def _project(tmp_path, name, on_close_body):
-    """A real generated project whose on_close runs ``on_close_body``."""
-    pdir = rex.build("barbie_capture", project=name, vault_dir=tmp_path / "v")
+    """A real generated Qt project whose on_close runs ``on_close_body``."""
+    pdir = rex.build("barbie_capture", project=name, vault_dir=tmp_path / "v",
+                     target="qt")
     h = pdir / "handlers.py"
     src = h.read_text(encoding="utf-8")
     assert STUB_TAIL in src, "the generated on_close stub changed shape"
@@ -146,13 +154,16 @@ def test_closing_the_window_with_the_listener_live_is_clean(tmp_path):
         "main_py = Path.cwd() / 'main.py'\n"
         "boot = main_py.read_text(encoding='utf-8').split('from app import main')[0]\n"
         "exec(compile(boot, str(main_py), 'exec'), {'__file__': str(main_py)})\n"
-        "import tkinter as tk\n"
+        "from PySide6.QtCore import QTimer\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "qt = QApplication.instance() or QApplication([])\n"
         "from app import App\n"
-        "root = tk.Tk(); app = App(root); app.pack()\n"
-        "root.after(1200, app.request_close)\n"
-        "root.mainloop()\n", encoding="utf-8")
+        "ui = App(); ui.show()\n"
+        "QTimer.singleShot(1200, ui.request_close)\n"
+        "raise SystemExit(qt.exec())\n", encoding="utf-8")
     r = subprocess.run([sys.executable, str(drv)], cwd=str(pdir),
-                       env=dict(os.environ, COUNCIL_PREVIEW_CONTROL="stdin"),
+                       env=dict(os.environ, COUNCIL_PREVIEW_CONTROL="stdin",
+                                QT_QPA_PLATFORM="offscreen"),
                        stdin=subprocess.PIPE, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stderr[-500:]

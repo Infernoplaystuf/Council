@@ -131,11 +131,15 @@ def test_validate_rejects_a_bad_declaration():
 # The generated startup check
 # ============================================================
 
-def _emit(tmp_path, requires):
+def _emit(tmp_path, requires, target="tk"):
+    """Generate the project. A test that RUNS main.py builds it for Qt: the
+    Tk GUIs are deprecated and no test may open a Tk window
+    (tests/README.md). The startup check is the same text on both targets;
+    only Tk's has a messagebox fallback, which those tests never reached."""
     proj = _project(requires)
     spec = gsp.build(proj.shapes, gl.infer(proj.shapes, 400, 300),
                      project="cam", requires=proj.requires)
-    ge.emit(spec, tmp_path)
+    ge.emit(spec, tmp_path, target=target)
     return tmp_path
 
 
@@ -157,7 +161,8 @@ def test_main_py_with_nothing_declared_is_unchanged(tmp_path):
 def test_the_wrong_python_fails_at_startup_with_a_list(tmp_path):
     """Launched under a Python that lacks a declared package, the app says
     so and exits — before any widget exists."""
-    pdir = _emit(tmp_path, ["json", "definitely_missing_pkg_xyz"])
+    pdir = _emit(tmp_path, ["json", "definitely_missing_pkg_xyz"], target="qt")
+    assert "tkinter" not in (pdir / "main.py").read_text(encoding="utf-8")
     r = subprocess.run([sys.executable, "main.py"], cwd=str(pdir),
                        capture_output=True, text=True, timeout=60,
                        env=dict(os.environ, COUNCIL_PREVIEW_CONTROL="stdin"))
@@ -253,7 +258,7 @@ def test_a_string_requires_is_the_list_it_means(tmp_path, raw, want):
 def test_unattended_startup_never_waits_on_a_dialog(tmp_path):
     """COUNCIL_NO_DIALOGS=1 is the switch for unattended runs. The startup
     check ignored it and opened a modal nobody would click."""
-    pdir = _emit(tmp_path, ["definitely_missing_pkg_xyz"])
+    pdir = _emit(tmp_path, ["definitely_missing_pkg_xyz"], target="qt")
     env = {k: v for k, v in os.environ.items()
            if k != "COUNCIL_PREVIEW_CONTROL"}
     env["COUNCIL_NO_DIALOGS"] = "1"

@@ -17,6 +17,7 @@ Run:  python -m pytest tests/test_gui_roi.py -q
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -217,52 +218,60 @@ def test_a_broken_roi_link_blocks_generation(kw, fragment):
 
 # ============================================================
 # The whole thing, as a user would run it
+#
+# Built for the Qt target and driven offscreen in its own process: the Tk
+# GUIs are deprecated and no test may open a Tk window (tests/README.md).
 # ============================================================
 
 DRIVER = textwrap.dedent('''
     import json, sys, time
     from pathlib import Path
-    from types import SimpleNamespace as Ev
     FOLDER, OUT = sys.argv[1], sys.argv[2]
     main_py = Path.cwd() / "main.py"
     boot = main_py.read_text(encoding="utf-8").split("from app import main")[0]
     exec(compile(boot, str(main_py), "exec"), {"__file__": str(main_py)})
-    import tkinter as tk
+    from PySide6.QtCore import QPointF
+    from PySide6.QtWidgets import QApplication
+    qt = QApplication.instance() or QApplication([])
     from app import App
-    root = tk.Tk(); root.geometry("1280x820")
-    app = App(root); app.pack(fill="both", expand=True)
+    app = App(); app.resize(1280, 820)            # never shown
     def pump(ms):
         end = time.time() + ms / 1000
         while time.time() < end:
-            root.update(); time.sleep(0.005)
+            qt.processEvents(); time.sleep(0.005)
     pump(300)
     p, cv = app.ports, app.img_image_canvas
     p.capture_folder.set(FOLDER); pump(700)
     cv.arm_roi()
-    x0, y0 = cv._to_canvas(10, 5); x1, y1 = cv._to_canvas(60, 35)
-    cv._press(Ev(x=x0, y=y0)); cv._drag(Ev(x=x1, y=y1)); cv._release(Ev(x=x1, y=y1))
+    x0, y0 = cv._to_widget(10, 5); x1, y1 = cv._to_widget(60, 35)
+    cv._press(QPointF(x0, y0)); cv._drag(QPointF(x1, y1))
+    cv._release(QPointF(x1, y1))
     cv.apply_roi(); pump(200)
     p.output_folder.set(OUT)
-    app.btn_save_cropped_frames.invoke(); pump(800)
-    print(json.dumps({"roi": cv.get_roi(), "entry": p.roi.get(),
-                      "view": list(cv._view.size), "status": p.save_status.get()}))
-    root.destroy()
+    app.btn_save_cropped_frames.click(); pump(800)
+    print("__OUT__" + json.dumps({
+        "roi": cv.get_roi(), "entry": p.roi.get(),
+        "view": [cv._view.width(), cv._view.height()],
+        "status": p.save_status.get()}))
+    app.close()
 ''')
 
 
 def test_the_generated_v2_app_crops_and_saves_end_to_end(tmp_path, frames):
     import run_example_gui as rex
     src, out = frames
-    pdir = rex.build("barbie_capture_v2", project="t_v2", vault_dir=tmp_path / "v")
+    pdir = rex.build("barbie_capture_v2", project="t_v2", vault_dir=tmp_path / "v",
+                     target="qt")
     drv = tmp_path / "drive.py"
     drv.write_text(DRIVER, encoding="utf-8")
     proc = subprocess.run([sys.executable, str(drv), str(src), str(out)],
                           cwd=str(pdir), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=120)
-    if proc.returncode != 0 and "display" in proc.stderr.lower():
-        pytest.skip("no display")
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env=dict(os.environ, COUNCIL_NO_DIALOGS="1",
+                                   QT_QPA_PLATFORM="offscreen"))
     assert proc.returncode == 0, proc.stderr[-2000:]
-    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    got = json.loads(next(l for l in proc.stdout.splitlines()
+                          if l.startswith("__OUT__"))[len("__OUT__"):])
     assert got["roi"] == [10, 5, 50, 30]
     assert got["entry"] == "10, 5, 50, 30"
     assert got["view"] == [50, 30]
