@@ -19,9 +19,11 @@ no more:
   * it checks that what goes is comment and nothing else: Python must read
     the same code before and after (tokenize, comments aside, the source
     encoding included). A stamp inside a string, a "stamp" line that is a
-    statement, a take-out that would change the file's coding line, or a
-    file Python cannot read (before or after) is refused — the dialog's
-    "nothing else" must be true — and left for the user's own editor;
+    statement, a take-out that would change the file's coding line or
+    join a bare CR above it and an empty line below it into one line break
+    (a line the dialog does not mark would go too), or a file Python cannot
+    read (before or after) is refused — the dialog's "nothing else" must be
+    true — and left for the user's own editor;
   * it keeps a dated copy of the file as it was, in data_out/dream3d/takeover/
     (the app's own output area — where a script is the model's whatever its
     first line says, so the copy can never run as the user's);
@@ -170,12 +172,21 @@ def _data_out(vault_dir: Path) -> Path:
     return nx_ops.out_dir(vault_dir)
 
 
-def _shown(path: Path, vault_dir: Path) -> str:
+def _named(path) -> Path:
+    """``path`` resolved, to NAME it (never to open it): without the \\\\?\\
+    realpath keeps on a long one, so a file deep in a vault is still named
+    from the vault (a dated copy's path passes MAX_PATH sooner than the
+    vault's does)."""
     import path_contain
+    real = path_contain.resolved(path)[1]
+    if real.startswith("\\\\?\\") and not real.startswith("\\\\?\\UNC\\"):
+        real = real[4:]
+    return Path(real)
+
+
+def _shown(path: Path, vault_dir: Path) -> str:
     try:
-        real = Path(path_contain.resolved(path)[1])
-        base = Path(path_contain.resolved(vault_dir)[1])
-        return real.relative_to(base).as_posix()
+        return _named(path).relative_to(_named(vault_dir)).as_posix()
     except (OSError, ValueError, TypeError):
         return str(path)
 
@@ -413,11 +424,34 @@ def _changes_code(data: bytes, new: bytes, numbers: List[int],
         elif _code(before) != _code(after):
             why = "would change the code Python runs"
         else:
-            return ""
+            joined = _joined(_decode(data)[1], gone)
+            if not joined:
+                return ""
+            a, b = joined
+            return (f"{shown} was not taken over: taking out {lines} (the "
+                    f"model stamp) would join the bare CR that ends line {a} "
+                    f"and the empty line {b} into one line break, so line "
+                    f"{b} would go as well — more than the stamp. Edit the "
+                    f"stamp out by hand if you want it as yours. Nothing "
+                    f"changed.")
     return (f"{shown} was not taken over: taking out {lines} (the model "
             f"stamp) {why} — it would change what the script does, not "
             f"only whose it is. Read it, and edit the stamp out by hand if "
             f"you want it as yours. Nothing changed.")
+
+
+def _joined(text: str, gone) -> Optional[Tuple[int, int]]:
+    """(a, b) when taking lines ``gone`` out of ``text`` would put line a's
+    bare CR next to line b, which is only a line feed: "\\r" + "\\n" is one
+    line break, so line b would go too. None when every line kept stays a
+    line of its own — then the file loses exactly the lines taken out."""
+    lines = nx_policy.lines_with_ends(text)
+    kept = [n for n in range(1, len(lines) + 1) if n not in gone]
+    for a, b in zip(kept, kept[1:]):
+        if b - a > 1 and lines[a - 1].endswith("\r") \
+                and lines[b - 1].startswith("\n"):
+            return a, b
+    return None
 
 
 def _read_only(real: Path, shown: str) -> str:

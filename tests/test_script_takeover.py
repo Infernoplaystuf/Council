@@ -488,6 +488,27 @@ def test_a_script_of_bare_crs_loses_only_its_stamp_line(vault, dialogs_on):
     assert rec["removed"] == ["# council: model-written"]
 
 
+@pytest.mark.parametrize("data", [
+    b"A = 1\r# council: model-written\n\nB = 2\n",
+    b"A = 1\r# council: model-written\r\n# council: model-edited\n\nB = 2\n",
+])
+def test_a_take_out_that_would_join_two_line_breaks_is_left_for_the_hand(
+        vault, dialogs_on, data):
+    """A bare CR ending the line above the stamp and a line that is only a
+    line feed below it would meet as one CRLF: a line the dialog does not
+    mark would go too, so "nothing else" would not be true. Found by a
+    fuzz of mixed line endings; the code is the same, the lines are not."""
+    p = vault / "pipelines" / "in" / "j.py"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(data)
+    plan = st.prepare(vault, p)
+    assert not plan.ok
+    assert "join" in plan.refusal and "by hand" in plan.refusal, plan.refusal
+    assert "Nothing changed" in plan.refusal
+    assert st.run(plan, vault, YES, via="t") == plan.refusal
+    assert p.read_bytes() == data and not backups(vault)
+
+
 def test_a_line_separator_in_the_stamp_line_is_shown_spelled_out(
         vault, dialogs_on):
     """U+2028 is no line break to Python — the rest of that line is still
@@ -732,6 +753,9 @@ def test_a_deep_vault_keeps_its_copy_and_log(tmp_path, dialogs_on):
     with open(path_contain.resolved(copy)[1], "rb") as fh:
         assert fh.read() == before
     assert log_records_at(v)[0]["removed_lines"] == [1]
+    # Named from the vault, as the script is — not by a 260-character
+    # spelling of the whole path (realpath keeps \\?\ on a long one).
+    assert f"is kept at data_out/{st.SUBFOLDER}/{copy.name}." in said, said
 
 
 @pytest.mark.skipif(os.name != "nt", reason="UNC paths are Windows paths")
