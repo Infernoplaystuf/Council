@@ -333,10 +333,11 @@ def test_saves_leave_no_temp_files_behind(vault, capture):
 # The framework pieces it needed
 # ============================================================
 
-def test_generated_listboxes_keep_their_own_selection(tk_root):
+def test_generated_listboxes_keep_their_own_selection():
     """Tk's default exportselection makes selecting in one listbox CLEAR the
-    others — a picked class vanished when the user clicked elsewhere."""
-    import tkinter as tk
+    others — a picked class vanished when the user clicked elsewhere. The
+    Tk emitter turns it off on every listbox. (Checked as generated text: a
+    test may not open a Tk window. A QListWidget has no such coupling.)"""
     import gui_emit as ge
     import gui_layout as gl
     import gui_shapes as gs
@@ -346,19 +347,6 @@ def test_generated_listboxes_keep_their_own_selection(tk_root):
     spec = gsp.build([a, b], gl.infer([a, b], 400, 400), project="lb")
     src = ge.emit_main_ui(spec)
     assert src.count("exportselection=False") == 2
-    top = tk.Toplevel(tk_root)
-    try:
-        l1 = tk.Listbox(top, exportselection=False)
-        l2 = tk.Listbox(top, exportselection=False)
-        for lb in (l1, l2):
-            lb.insert("end", "x", "y")
-            lb.pack()
-        l1.selection_set(1)
-        l2.selection_set(0)
-        top.update()
-        assert l1.curselection() == (1,)
-    finally:
-        top.destroy()
 
 
 @pytest.mark.parametrize("label", ["Remove", "Load", "Kill"])

@@ -267,6 +267,19 @@ def test_escape_does_not_push_an_undo_entry(scene):
     assert len(scene.undo) == depth
 
 
+def test_escape_during_a_draw_commits_no_shape():
+    """Escape while dragging out a NEW shape abandons it: the release that
+    follows must not place it after all. (The other Escape tests are about a
+    move or a resize; this one was only ever checked on the Tk canvas.)"""
+    scene = Scene()
+    scene.active_kind = "button"
+    scene.press(20, 20)
+    scene.drag(120, 60)
+    scene.escape()
+    scene.release(120, 60)
+    assert scene.shapes == [], "an abandoned draw must not commit a shape"
+
+
 # ============================================================
 # Duplicate — two defects in one command
 # ============================================================
@@ -469,3 +482,36 @@ def test_replacing_does_not_alias_the_callers_shapes(scene):
     scene.replace_all(given)
     scene.shapes[0].x = 400
     assert given[0].x == 16
+
+
+# ============================================================
+# Adding shapes to a drawing (the wizard's handoff)
+# ============================================================
+
+def test_adding_shapes_keeps_existing_work_and_is_one_undo_step():
+    """load() replaces the scene and resets undo. Using it to drop a wizard
+    layout onto a canvas someone had already drawn on would destroy that work
+    with no way back, so the additive path exists and must be additive."""
+    import gui_templates as gt
+    scene = Scene()
+    scene.load(gt.form(1))
+    before = len(scene.shapes)
+    ids_before = {s.id for s in scene.shapes}
+
+    scene.add_shapes(gt.reserved(2))
+    assert len(scene.shapes) == before + 2
+    assert ids_before <= {s.id for s in scene.shapes}, "existing work vanished"
+    assert len({s.z for s in scene.shapes}) == len(scene.shapes), \
+        "z must stay unique"
+
+    scene.undo_once()
+    assert len(scene.shapes) == before, "one add must undo in exactly one step"
+
+
+def test_adding_no_shapes_costs_no_undo_step():
+    import gui_templates as gt
+    scene = Scene()
+    scene.load(gt.form(1))
+    depth = len(scene.undo)
+    scene.add_shapes([])
+    assert len(scene.undo) == depth, "nothing added must not cost an undo step"
