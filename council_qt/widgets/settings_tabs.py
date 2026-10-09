@@ -128,8 +128,15 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self.has_gain = True
         #: The text of the last say(), for tests and a page made after it.
         self.said = ""
+        #: The camera tab the USER last chose ("Biases"), kept across a
+        #: Disconnect and the next Connect; "" for none yet.
+        self.chosen = ""
+        #: Tabs are being removed and added: the selection that moves with
+        #: them is not the user's choice.
+        self._rebuilding = False
         self._dress()
         self.presets_page = self._presets_page()
+        book.currentChanged.connect(self._tab_chosen)
         self._listen()
         # The listener goes with the window: a closed window must not keep
         # being told about a camera it no longer shows.
@@ -308,24 +315,37 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
 
     def _clear_form(self, message: str = "") -> None:
         current = self._current_title()
-        self.rows = {}
-        self._shape = None
-        self.plan = []
-        self._remove_pages()
-        if message:
-            page, column = self._new_page(cats.CAMERA_TAB,
-                                          "The connected camera's settings")
-            self.pages[cats.CAMERA_TAB] = page
-            note = QLabel(NO_CAMERA if message == self.NO_CAMERA else message,
-                          page)
-            note.setWordWrap(True)
-            column.addWidget(note)
-            column.addStretch(1)
-        self._restore_title(current)
+        self._rebuilding = True
+        try:
+            self.rows = {}
+            self._shape = None
+            self.plan = []
+            self._remove_pages()
+            if message:
+                page, column = self._new_page(
+                    cats.CAMERA_TAB, "The connected camera's settings")
+                self.pages[cats.CAMERA_TAB] = page
+                note = QLabel(NO_CAMERA if message == self.NO_CAMERA
+                              else message, page)
+                note.setWordWrap(True)
+                column.addWidget(note)
+                column.addStretch(1)
+            self._settle_tab(current)
+        finally:
+            self._rebuilding = False
 
     def _build_form(self, settings: Sequence[Dict[str, Any]],
                     groups: Sequence[str]) -> None:
         current = self._current_title()
+        self._rebuilding = True
+        try:
+            self._build_pages(settings, groups)
+            self._settle_tab(current)
+        finally:
+            self._rebuilding = False
+
+    def _build_pages(self, settings: Sequence[Dict[str, Any]],
+                     groups: Sequence[str]) -> None:
         self.rows = {}
         self._remove_pages()
         self.plan = cats.plan(settings, groups)
@@ -353,7 +373,6 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
                             max(lab.sizeHint().width() for lab in labels))
                 for label in labels:
                     label.setMinimumWidth(width)
-        self._restore_title(current)
 
     def _section(self, parent: QWidget, column: QVBoxLayout,
                  section: cats.Section, by_key: Dict[str, Dict[str, Any]],
@@ -417,17 +436,55 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         index = self.book.currentIndex()
         return self.book.tabText(index) if index >= self.fixed else ""
 
-    def _restore_title(self, title: str) -> None:
+    def _restore_title(self, title: str) -> bool:
         if not title:
-            return
+            return False
         for index in range(self.fixed, self.book.count()):
             if self.book.tabText(index) == title:
                 self.book.setCurrentIndex(index)
-                return
+                return True
+        return False
+
+    def _tab_chosen(self, index: int) -> None:
+        """The user picked a tab: a camera tab is remembered (`chosen`)."""
+        if self._rebuilding:
+            return
+        title = self.book.tabText(index) if index >= self.fixed else ""
+        if title in self.pages:
+            self.chosen = title
+
+    def _settle_tab(self, before: str) -> None:
+        """Which tab shows after the camera tabs were rebuilt; `before` is
+        the one that showed ("" for the wireframe's own, Basic).
+
+        MEASURED (review): with Biases showing, Disconnect removed the
+        camera tabs one by one, the selection walked right onto Presets —
+        greyed, its "connect a camera" line below the fold — and stayed
+        there through the next Connect. Now: with no camera, the Camera
+        tab, which says to connect one; with one, the camera tab the user
+        last chose if this camera has it, else its first. Basic and
+        Presets, when they were showing, stay."""
+        if not before:
+            return                      # Basic: never removed, still shown
+        if before == PRESETS_TAB:
+            self._restore_title(PRESETS_TAB)
+            return
+        if not self.plan:
+            self._restore_title(cats.CAMERA_TAB)
+            return
+        if self.chosen and self._restore_title(self.chosen):
+            return
+        # The Camera tab was showing because there was no camera: not a
+        # choice to keep once there is one.
+        if before != cats.CAMERA_TAB and self._restore_title(before):
+            return
+        self._restore_title(self.plan[0].title)
 
     def _cleared(self) -> None:
         self._clear_presets()
         self.presets_file.setText("Connect a camera to see its presets.")
+        # Its area went with it: the tick box named the old camera's.
+        self.preset_with_area.setText("with the camera's area")
 
     def refresh_area(self) -> None:
         if not self.connected or self.area_edit is None:

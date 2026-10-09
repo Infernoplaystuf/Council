@@ -1095,6 +1095,12 @@ def test_a_capture_takes_live_resets_and_refuses_what_needs_a_stop(
         pixel = image.rows["PixelFormat"]
         assert not pixel.editor.isEnabled()
         assert "Stop the capture to change this" in pixel.note.text()
+        # Greyed, saying why — it was clickable for a refusal (review);
+        # Gain's, whose settings all change live, is not.
+        assert not image.reset_group_button.isEnabled()
+        assert image.reset_group_button.toolTip().startswith(
+            "Stop the capture first")
+        assert gain.reset_group_button.isEnabled()
         image.reset_group()
         assert device().state["PixelFormat"] == "Mono12"
         assert "stop the capture before" in image.status.text()
@@ -1308,6 +1314,83 @@ def test_a_preset_says_what_needed_the_stream_stopped(clean, typhon_dir):
     assert out["restarted"] == ["Pixel format"]
     assert "The live view restarted for Pixel format" in out["summary"]
     assert device().state["PixelFormat"] == "Mono12"
+
+
+def test_an_imported_preset_is_chosen_with_its_own_name(clean, typhon_dir,
+                                                        tmp_path):
+    """After an Import selected "Bright (2)" the name box still said
+    "Bright" (the list was filled with its signals held), and Save as would
+    have replaced "Bright" — not the preset shown chosen (review)."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    tabs.preset_name.setText("Bright")
+    tabs.save_preset()
+    assert tabs.selected_preset() == "Bright"
+    exported = tabs.export_preset(str(tmp_path / "carry"))
+    assert tabs.import_preset(exported) == "Bright (2)"
+    assert tabs.selected_preset() == "Bright (2)"
+    assert tabs.preset_name.text() == "Bright (2)"
+    # A fill that keeps the selection leaves a name being typed alone.
+    tabs.preset_name.setText("Dusk")
+    tabs.fill_presets()
+    assert tabs.preset_name.text() == "Dusk"
+
+
+def test_disconnect_and_connect_keep_the_tab_the_user_chose(clean,
+                                                             typhon_dir,
+                                                             evk4):
+    """With Biases showing, Disconnect removed the camera tabs one by one
+    and the selection walked onto Presets — greyed, its "connect a camera"
+    line below the fold — and stayed there through the next Connect; the
+    Presets tick box still named the old camera's area (review)."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    book = tabs.book
+    book.setCurrentIndex(tabs.titles().index("Biases"))     # the user
+    assert "1280, 720" in tabs.preset_with_area.text()
+    ui.on_btn_disconnect()
+    assert book.tabText(book.currentIndex()) == "Camera"
+    assert tabs.preset_with_area.text() == "with the camera's area"
+    connect(ui, "00051234")
+    assert book.tabText(book.currentIndex()) == "Biases"
+    ui.on_btn_disconnect()
+    connect(ui, "frame")                       # no Biases: its first tab
+    assert book.tabText(book.currentIndex()) == "Exposure"
+    book.setCurrentIndex(0)                    # Basic stays Basic
+    ui.on_btn_disconnect()
+    assert book.currentIndex() == 0
+    connect(ui, "00051234")
+    assert book.currentIndex() == 0
+    book.setCurrentIndex(tabs.titles().index("Presets"))
+    ui.on_btn_disconnect()
+    assert book.tabText(book.currentIndex()) == "Presets"
+
+
+def test_a_pop_out_is_as_wide_as_its_rows(clean, typhon_dir, evk4):
+    """At the 440 px minimum (and a Basler's Frame rate at the 600 px
+    default) a pop-out's rows were wider than its view: a sideways scroll
+    bar, the ranges and reset buttons cut off (review, Arial 11). The
+    window's least width is what its rows need."""
+    from PySide6.QtWidgets import QScrollArea
+
+    ui = construct(typhon_dir)
+    for which in ("00051234", "frame"):
+        connect(ui, which)
+        tabs = tabs_of(ui)
+        for group in list(tabs.pop_buttons):
+            window = tabs.pop_out(group)
+            offscreen_show(window)
+            window.resize(window.minimumSize())
+            pump(0.05)
+            area = window.findChild(QScrollArea)
+            need = area.widget().minimumSizeHint().width()
+            assert need <= area.viewport().width(), (
+                which, group, need, area.viewport().width())
+            assert not area.horizontalScrollBar().isVisible(), group
+            window.close()
+        ui.on_btn_disconnect()
 
 
 def test_a_configuration_moves_between_projects_and_never_overwrites(

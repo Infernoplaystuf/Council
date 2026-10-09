@@ -700,7 +700,10 @@ settings in the main window — no window to open for the everyday ones.
   so an EVK4, a Basler and the simulated cameras each get their own set, and
   a model with more features gets more rows, never fewer. **Disconnect**, or
   connecting another camera, rebuilds them; with no camera the tabs say
-  *Connect a camera to see its settings*.
+  *Connect a camera to see its settings* (the Camera tab is shown then, if a
+  camera tab was). Connecting again brings back the camera tab you last
+  chose — Biases stays Biases across a reconnect — or, on a camera without
+  it, that camera's first tab; Basic and Presets stay where they are.
   - **EVK4**: **Biases** (`bias_diff_on`, `bias_diff_off`, `bias_fo`,
     `bias_hpf`, `bias_refr`, each with the sensor's own range, and a green
     bar under the slider marking the range the sensor **recommends**),
@@ -756,7 +759,8 @@ says how its PNGs were drawn.
 settings — in a window of its own beside Typhon. Not a dialog: the live view
 and any capture carry on, and **several can be open at once** (Biases on one
 side, Anti-flicker on the other); pressing Pop out again brings the open one
-forward.
+forward. A pop-out opens **as wide as its rows** (the range and the ↺ beside
+each never need a sideways scroll), and cannot be made narrower than that.
 
 - Every setting of the category, with the **camera's own range and unit**
   beside it (`-85 … 140`, and under it `rec. -25 … 60` for a bias), as the
@@ -787,8 +791,9 @@ forward.
 - **Reset <category> (as connected)** puts only this category back as the
   camera had it when it was connected — the rest are left alone. While
   capturing it works when everything in the category changes live (it is
-  the same as dragging each back by hand); a category with a setting the
-  stream is in the way of is refused until Stop.
+  the same as dragging each back by hand); in a category with a setting the
+  stream is in the way of that is not as connected, it is **greyed until
+  Stop**, its tooltip saying why.
 - A **preset bar** at the bottom: pick a preset and **Apply**, or type a name
   and **Save** — the **whole camera** (every setting and its area), not only
   this category; a pop-out is where a set-up gets tuned, so it is where it
@@ -826,7 +831,8 @@ the **other kind** of camera (an event camera's biases for a Basler) is
 refused — none of it could apply; one from **another model of the same
 kind** is imported, and the status line names the settings this camera does
 not have (they are reported, not applied, when you apply it). Importing does
-not apply it: pick it to apply it.
+not apply it: it is chosen in the list, with its name (`Bright (2)`) in the
+name box — apply it from there.
 
 **Applying a preset says what it took.** It is applied **live** where it can
 be — the status line ends `Applied live.` — and where something in it needs

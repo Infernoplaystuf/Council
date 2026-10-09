@@ -134,6 +134,11 @@ OBJECT_NAME = "council_camera_settings"
 #: A category pop-out's object name: this, ":", and the category.
 CATEGORY_OBJECT = "council_camera_category"
 
+#: A pop-out's size when it opens, and the least it can be made — wider
+#: when its rows need more (CategoryWindow._fit_width).
+POPOUT_SIZE = (600, 460)
+POPOUT_MIN = (440, 280)
+
 #: What an exported preset file is called (camera_presets.EXPORT_SUFFIX),
 #: for Import's file filter — said here so this module imports no core.
 EXPORT_PATTERN = "*.camera-preset.json"
@@ -1540,7 +1545,8 @@ class PresetsMixin:
         except Exception as exc:                          # noqa: BLE001
             self.presets_file.setText(f"Presets: {exc}")
             return
-        keep = select or self.selected_preset()
+        was = self.selected_preset()
+        keep = select or was
         self.preset_list.blockSignals(True)
         try:
             self.preset_list.clear()
@@ -1557,6 +1563,13 @@ class PresetsMixin:
                     self.preset_list.setCurrentItem(item)
         finally:
             self.preset_list.blockSignals(False)
+        now = self.selected_preset()
+        if now and now.casefold() != was.casefold():
+            # Chosen with the list's signals held, so _preset_chosen did
+            # not run: after an Import selected "Bright (2)" the name box
+            # still said "Bright", and Save as would have replaced that.
+            self.preset_name.setText(now)
+            self._cancel_delete()
         where = listed.get("file") or ""
         said = listed.get("summary") or ""
         if where and getattr(self, "_presets_compact", False):
@@ -2058,8 +2071,8 @@ class CategoryWindow(SettingsCore, QWidget):
         self._preset_names: List[str] = []
         self._build()
         self._listen()
-        self.resize(600, 460)
-        self.setMinimumSize(440, 280)
+        self.resize(*POPOUT_SIZE)
+        self.setMinimumSize(*POPOUT_MIN)
         self.reload()
 
     @property
@@ -2168,6 +2181,41 @@ class CategoryWindow(SettingsCore, QWidget):
             layout.addWidget(QLabel(f"This camera has no {self.group} "
                                     f"settings.", self.form))
         layout.addStretch(1)
+        self._fit_width()
+
+    def _fit_width(self) -> None:
+        """AS WIDE AS ITS ROWS, at its default size and at its smallest.
+        Measured (review, Arial 11): a Basler's Frame rate needed 611 px of
+        form in a 576 px view at the default 600 px — a sideways scroll bar,
+        the reset buttons and its read-only note cut off — and at the 440 px
+        minimum every Basler category and six of an EVK4's scrolled
+        sideways (Biases showed "-85 … 140 / rec. -25 …" cut off). The
+        minimum is now what the rows need; the window grows to it, never
+        shrinks from a size the user chose.
+
+        Measured after polishing: the app's font comes as a style sheet,
+        and before it reached the rows they asked for 47 px less."""
+        self.ensurePolished()
+        layout = self.form.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        need = self.form.minimumSizeHint().width()
+        bar = self.scroll.verticalScrollBar().sizeHint().width()
+        margins = self.layout().contentsMargins()
+        width = (need + bar + 2 * self.scroll.frameWidth()
+                 + margins.left() + margins.right())
+        least = max(POPOUT_MIN[0], width)
+        self.setMinimumWidth(least)
+        if self.width() < least:
+            self.resize(least, self.height())
+
+    def showEvent(self, event: Any) -> None:             # noqa: N802
+        super().showEvent(event)
+        # Measured: the rows asked for 47 px more once shown (the style
+        # sheet's font reaches each of them as it is first shown), so the
+        # width is fitted again then.
+        self._fit_width()
 
     def fill_presets(self, select: str = "") -> None:
         try:
@@ -2217,7 +2265,21 @@ class CategoryWindow(SettingsCore, QWidget):
         for widget in (self.preset_name, self.preset_save,
                        self.preset_combo):
             widget.setEnabled(on)
-        self.reset_group_button.setEnabled(on and bool(mine))
+        # While capturing, a reset that would have to stop the stream (a
+        # setting the stream is in the way of, not as connected) is refused
+        # by frame_camera: greyed here, saying why, rather than clickable
+        # for a refusal (review).
+        stopped_for = self.capturing and any(
+            not row.live and key in mine
+            and not _same(mine[key], row.setting.get("value"))
+            for key, row in self.rows.items())
+        self.reset_group_button.setEnabled(on and bool(mine)
+                                           and not stopped_for)
+        self.reset_group_button.setToolTip(
+            "Stop the capture first — one run keeps one camera set-up."
+            if stopped_for else
+            f"Every {self.group} setting back as the camera had it when it "
+            f"was connected; the rest are left as they are.")
 
     def say(self, text: str, tone: str = "") -> None:
         _colour(self.status, _tone(self.status, tone) if tone else "")
