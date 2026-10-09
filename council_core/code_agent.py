@@ -374,7 +374,9 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
             max_turns: int = MAX_TURNS,
             window_chars: Optional[int] = None,
             job: Optional[wt.Job] = None,
-            must_pass: Sequence[str] = ()) -> JobRecord:
+            must_pass: Sequence[str] = (),
+            tool_names: Optional[Sequence[str]] = None,
+            extra_system: str = "") -> JobRecord:
     """Carry out an approved plan. Blocking — run it on a worker.
     `on_event(kind, text)` narrates: phase / tool / result / check / note."""
     chat_tools = chat_tools or _default_chat_tools()
@@ -411,6 +413,9 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
                          "job; only NEW failures will count.")
 
     tools = ws.tools()
+    if tool_names:              # an agent profile's own tool list
+        keep = set(tool_names) | {"step_done"}
+        tools = {n: f for n, f in tools.items() if n in keep}
     specs = [{"name": n, "description": f.help, "parameters": f.params}
              for n, f in tools.items()]
     budget = window_chars or _window_chars(role)
@@ -433,7 +438,9 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
         if done_summaries:
             user.append("STEPS ALREADY DONE:\n" + "\n".join(done_summaries))
         messages = [
-            {"role": "system", "content": CODER_SYSTEM + "\n\n" + context(
+            {"role": "system", "content": CODER_SYSTEM
+             + (f"\n\nYOUR ROLE ON THIS PROJECT:\n{extra_system}"
+                if extra_system else "") + "\n\n" + context(
                 vault_dir, project, focus, root=job.path,
                 map_chars=min(6000, budget // 6))},
             {"role": "user", "content": "\n\n".join(user)}]

@@ -60,6 +60,8 @@ PROTECTED_SUBDIRS: tuple = (
     # Code projects the council works on (council_core.project): briefs,
     # job notes and git worktrees — whole copies of code, not documents.
     ".council_projects",
+    # The user's coding-agent profiles (council_core.agent_profiles).
+    ".council_agents",
 )
 
 # Lowercased once at import for the per-path membership test in
