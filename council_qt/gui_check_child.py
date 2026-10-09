@@ -1,7 +1,7 @@
 """
-council_core.gui_check_child — build one widget offscreen and report it.
+council_qt.gui_check_child — build one widget offscreen and report it.
 
-    python -m council_core.gui_check_child ROOT MODULE CLASS KWARGS_JSON OUT_DIR
+    python -m council_qt.gui_check_child ROOT MODULE CLASS KWARGS_JSON OUT_DIR
 
 Run by council_core.gui_check in a child process with a time limit, from
 the project's folder (a job's worktree). It:

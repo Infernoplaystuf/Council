@@ -3,7 +3,7 @@ council_core.gui_check — does the widget a coding job changed still build,
 and what does it show?
 
 Tests can pass while a tab fails the moment it opens. This builds the
-widget offscreen in a child process (council_core.gui_check_child, under
+widget offscreen in a child process (council_qt.gui_check_child, under
 council_core.child_proc's time limit and memory cap) from the job's
 worktree and returns:
 
@@ -81,7 +81,7 @@ def check(root: Path, module: str, cls: str,
                                 "COUNCIL_NO_DIALOGS": "1",
                                 "PYTHONDONTWRITEBYTECODE": "1",
                                 "PYTHONPATH": str(APP_ROOT)})
-    run = runner([sys.executable, "-m", "council_core.gui_check_child",
+    run = runner([sys.executable, "-m", "council_qt.gui_check_child",
                   str(root), module, cls, json.dumps(kwargs or {}), str(out)],
                  cwd=str(APP_ROOT), env=env, timeout=timeout,
                  memory_limit_mb=MEMORY_MB)
