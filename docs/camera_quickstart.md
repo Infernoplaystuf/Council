@@ -1073,9 +1073,10 @@ An event camera reports events per window and the event rate instead of frames
 per second: it has no frames.
 
 **When the camera sends nothing**, the line says so instead of a rate:
-`Live view — not saving · NO PICTURE for 6 s — the camera waits for a
-trigger: its FrameStart trigger is On (source Software) — nothing here sends
-a software trigger: set Trigger mode Off (Exposure tab, Trigger)`. (The rate
+`NO PICTURE for 6 s — waiting for a software trigger: set Trigger mode Off ·
+live view, not saving` — the silence and its reason first, as the line is
+one row, cut off at the window's edge (a trigger other than FrameStart is
+named: `a trigger on Line1 (FrameBurstStart)`). (The rate
 is measured from frames that arrive, so with none arriving it used to keep
 showing the last one — `62.5 fps` for a camera that had stopped.) A camera
 running slowly is not called silent until several of its own frame intervals
@@ -1095,8 +1096,8 @@ source is `Software`). So:
 - **Start capture is refused** while a trigger waits for **Software** —
   nothing in Typhon sends one, so the run would save nothing; with a
   trigger on an **input line** the run starts, says which trigger it waits
-  for, and after Stop says `the camera waited for a trigger the whole run`
-  if none came;
+  for, and after Stop says `Stopped — the camera waited for a trigger on
+  Line1 all run.` if none came;
 - a Basler has **one trigger per TriggerSelector entry** (nine on the
   emulator: FrameStart, FrameBurstStart, …), and the rows show the
   **selected** one only. Every trigger counts above — a FrameBurstStart

@@ -665,7 +665,9 @@ def test_trigger_mode_on_says_why_the_picture_stopped(emulator_typhon,
                  row.note.text()), row.note.text()
     line = ui.ports.capture_status.get
     assert _pump(app, 6.0, until=lambda: "NO PICTURE" in line()), line()
-    assert "its FrameStart trigger is On (source Software)" in line()
+    assert line().startswith("NO PICTURE for "), line()
+    assert "— waiting for a software trigger: set Trigger mode Off" in \
+        line()
     with pytest.raises(RuntimeError, match="nothing here sends a software"):
         fc.start(str(tmp_path / "run"))
     assert not fc._LIVE.capturing

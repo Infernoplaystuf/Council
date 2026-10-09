@@ -247,9 +247,10 @@ class _Live:
         #: The camera's description read by Connect, while Connect is being
         #: announced to the views (settings_list answers from it); else None.
         self.connect_listing: Optional[List[Any]] = None
-        #: Why the camera is sending nothing — "its FrameStart trigger is On
-        #: (source Software)" — read once when it goes quiet (_quiet_note),
-        #: or None until then; forgotten when a setting changes.
+        #: Why the camera is sending nothing — "a software trigger
+        #: (FrameStart)", what it waits for — read once when it goes quiet
+        #: (_quiet_note): "" for no trigger, None until asked; forgotten
+        #: when a setting changes.
         self.quiet_reason: Optional[str] = None
         #: Said with the last run's result when it saved nothing because
         #: of that ("the camera waited for a trigger the whole run ..."),
@@ -645,6 +646,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         _started_stream(session)
     _LIVE.capturing = True
     _LIVE.previewing = False
+    # The run's own silence, if any, is asked about afresh: a reason left
+    # from the live view's was said after a Stop that came within a tick.
+    _LIVE.quiet_reason = None
+    _LIVE.run_waited = ""
     record = None
     if content is not None:
         record, record_note = _save_camera_record(out, run, content)
@@ -664,8 +669,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "folder and copy the run afterwards, or frames will be "
                  "skipped.")
     if waits_for:
-        said += (f" The camera waits for a trigger before each frame: "
-                 f"{waits_for}.")
+        said += f" The camera waits for {waits_for} before each frame."
     # A settings window greys out what a capture refuses (the area, a
     # preset, a setting the stream is in the way of) from this.
     _announce({"what": "capturing", "summary": said})
@@ -711,8 +715,8 @@ def stop() -> Dict[str, Any]:
     stats = session.run_stats()
     # A run that saved nothing because the camera waited for a trigger says
     # so after Stop: "0 saved" alone read as a fault of the app.
-    _LIVE.run_waited = (f"the camera waited for a trigger the whole run "
-                        f"({_LIVE.quiet_reason})"
+    _LIVE.run_waited = (f"the camera waited for {_LIVE.quiet_reason} all "
+                        f"run"
                         if _LIVE.quiet_reason and not stats.grabbed else "")
     if not ended:
         # The truth, not a hopeful message. Something is still holding the
@@ -756,7 +760,8 @@ def _stopped_line(session: Any) -> str:
     if stats.waiting:
         line = f"Stopped — still saving. {stats.line()}"
     if _LIVE.run_waited:
-        line += f" — {_LIVE.run_waited}"
+        # First: the line is one row, and the reason is what matters.
+        line = f"Stopped — {_LIVE.run_waited}. {stats.line()}"
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -854,7 +859,7 @@ def _waits_for_trigger(device: Any) -> str:
     software trigger — nothing here sends one, so the run would save
     nothing (measured on the emulator: a 4 s run wrote only its .csv and
     camera record). A hardware trigger is the user's to fire: the run
-    starts, and this says which ones it waits for ("" for none)."""
+    starts, and this says what it waits for ("" for nothing)."""
     on = _triggers_on(device)
     software = [t for t in on if t.software]
     if software:
@@ -864,13 +869,30 @@ def _waits_for_trigger(device: Any) -> str:
             f"{software[0].source}, and nothing here sends a software "
             f"trigger — this run would save no frames. Set Trigger mode "
             f"Off (Exposure tab, Trigger), then Start")
-    return "; ".join(t.said() for t in on)
+    return _trigger_words(on)
+
+
+def _trigger_words(on: List[Any]) -> str:
+    """What a camera waits for, short: "a software trigger", "a trigger on
+    Line1", "a trigger on Line1 (FrameBurstStart)" — the first of `on`, a
+    software one first (that is the one nothing here can fire). The usual
+    trigger, FrameStart, goes unnamed: the line is one row."""
+    if not on:
+        return ""
+    first = sorted(on, key=lambda t: not t.software)[0]
+    what = ("a software trigger" if first.software
+            else f"a trigger on {first.source or 'its input'}")
+    if first.selector and first.selector != "FrameStart":
+        what += f" ({first.selector})"
+    return what
 
 
 def _quiet_note(session: Any) -> str:
-    """"NO PICTURE for 6 s — the camera waits for a trigger: its FrameStart
-    trigger is On (source Software) ..." while the camera sends nothing
-    (CaptureSession.quiet), else "".
+    """"NO PICTURE for 6 s — waiting for a software trigger: set Trigger
+    mode Off" while the camera sends nothing
+    (CaptureSession.quiet), else "". SHORT: the status line is one row,
+    and with the camera's own words for the trigger the reason was cut off
+    at the window's edge (rendered at 1400 x 820).
 
     The camera is asked why ONCE per silence (it writes the trigger
     selector to look at each trigger, and puts it back), and again when a
@@ -880,15 +902,13 @@ def _quiet_note(session: Any) -> str:
         _LIVE.quiet_reason = None
         return ""
     if _LIVE.quiet_reason is None:
-        on = _triggers_on(session.device)
-        reason = "; ".join(t.said() for t in on)
-        if any(t.software for t in on):
-            reason += (" — nothing here sends a software trigger: set "
-                       "Trigger mode Off (Exposure tab, Trigger)")
-        _LIVE.quiet_reason = reason
+        _LIVE.quiet_reason = _trigger_words(_triggers_on(session.device))
     said = f"NO PICTURE for {gone:.0f} s"
-    if _LIVE.quiet_reason:
-        said += f" — the camera waits for a trigger: {_LIVE.quiet_reason}"
+    reason = _LIVE.quiet_reason
+    if reason:
+        said += f" — waiting for {reason}"
+        if reason.startswith("a software"):
+            said += ": set Trigger mode Off"
     return said
 
 
@@ -927,7 +947,9 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     waiting for a trigger that never came (_quiet_note)."""
     quiet = _quiet_note(session)
     if quiet:
-        line = f"Live view — not saving · {quiet}"
+        # The silence first, and why: "not saving" can wait at the end of
+        # a line that is cut off at the window's edge.
+        line = f"{quiet} · live view, not saving"
     else:
         line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}

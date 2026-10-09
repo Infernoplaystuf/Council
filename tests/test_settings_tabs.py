@@ -1029,9 +1029,13 @@ def test_a_camera_waiting_for_a_trigger_says_so_and_start_refuses_a_run_nobody_c
     monkeypatch.setattr(type(dev), "read", nothing)
     line = ui.ports.capture_status.get
     assert pump(5.0, until=lambda: "NO PICTURE" in line()), line()
-    assert line().startswith("Live view — not saving · NO PICTURE for ")
-    assert "its FrameStart trigger is On (source Software)" in line()
-    assert "nothing here sends a software trigger" in line()
+    # The silence and its reason FIRST, short: the line is one row, cut off
+    # at the window's edge (rendered: the reason was cut off).
+    assert line().startswith("NO PICTURE for "), line()
+    assert line().split(" · ")[0].endswith(
+        " — waiting for a software trigger: set Trigger mode Off"), line()
+    assert len(line().split(" · ")[0]) <= 80, line()
+    assert line().endswith("live view, not saving")
     assert " fps" not in line(), "a rate for a camera sending nothing"
 
     # Start is refused BEFORE anything stops: the live view carries on.
@@ -1046,13 +1050,15 @@ def test_a_camera_waiting_for_a_trigger_says_so_and_start_refuses_a_run_nobody_c
     # says what it waits for, and says why it saved nothing.
     waiting[:] = [camera_settings.Trigger("FrameStart", "Line1")]
     started = frame_camera.start(str(tmp_path / "run"))
-    assert ("waits for a trigger before each frame: its FrameStart trigger "
-            "is On (source Line1)") in started["summary"]
-    assert pump(5.0, until=lambda: line().startswith("NO PICTURE")), line()
+    assert ("The camera waits for a trigger on Line1 before each "
+            "frame.") in started["summary"]
+    assert pump(5.0, until=lambda: line().startswith("NO PICTURE")
+                and "a trigger on Line1" in line()), line()
     stopped = frame_camera.stop()
     assert "0 grabbed" in stopped["summary"]
-    assert ("the camera waited for a trigger the whole run (its FrameStart "
-            "trigger is On (source Line1))") in stopped["summary"]
+    assert stopped["summary"].startswith(
+        "Stopped — the camera waited for a trigger on Line1 all run. "), \
+        stopped["summary"]
 
 
 def test_reset_this_category_puts_only_it_back(clean, typhon_dir, evk4):
