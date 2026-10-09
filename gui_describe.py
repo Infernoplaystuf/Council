@@ -980,6 +980,19 @@ class Wanted:
                                                repr=False)
 
 
+#: What a description is OF, before it says what that holds: "An image
+#: viewer: ...", "A table editor with ...". It names the app, not one more
+#: widget — "An image viewer: a large image area" asks for ONE image area,
+#: and counting both would send a right design back for a second.
+_SUBJECT = re.compile(r"^[^.:\n]{0,60}?(?=:|\s+with\s)", re.IGNORECASE)
+
+
+def _subject_end(text: str) -> int:
+    """Where the subject phrase heading ``text`` ends; 0 when it has none."""
+    m = _SUBJECT.match(text)
+    return m.end() if m else 0
+
+
 def _mentions(prefix: str) -> int:
     """How many widgets one match stands for, from the text before it."""
     num = _NUMBER_BEFORE.search(prefix)
@@ -1019,6 +1032,7 @@ def requested_widgets(text: Any) -> List[Wanted]:
     of-N then preferred it to the candidate that had both (2026-10-05)."""
     s = str(text or "")
     out: List[Wanted] = []
+    head = _subject_end(s)
     for what, rx, kinds in _REQUEST_RES:
         if what == "a button":
             s = _named_buttons(s, out)
@@ -1030,7 +1044,8 @@ def requested_widgets(text: Any) -> List[Wanted]:
             before = s[max(0, m.start() - 40):m.start()]
             if not _NEGATED.search(before[-16:]):
                 found = True
-                count += _mentions(before)
+                if m.end() > head:
+                    count += _mentions(before)
             return " " * len(m.group(0))
 
         s = rx.sub(blank, s)
@@ -1133,9 +1148,35 @@ def _gap(w: Wanted, have: int, shapes: Sequence[Shape]) -> str:
         for s in shapes:
             cap = _caption(s)
             if s.kind not in w.kinds and cap and w.words.search(cap):
-                text += f" — '{cap}' is a {s.kind}, not {w.what}"
+                inner = _held_kinds(s, shapes)
+                text += (f" — '{cap}' is a {s.kind}"
+                         + (f" holding {_a(inner)}" if inner else "")
+                         + f", not {w.what}")
                 break
     return text
+
+
+def _a(kinds: Sequence[str]) -> str:
+    """"a spinbox", "an entry and a label"."""
+    return " and ".join(("an " if k[:1] in "aeiou" else "a ") + k
+                        for k in kinds)
+
+
+def _held_kinds(box: Shape, shapes: Sequence[Shape]) -> List[str]:
+    """The widget kinds inside a container, top first, at most two: what a
+    caption that says "slider" really holds. llama3.1:8b's C3 drew a
+    labelframe "Frame slider" around a spin box four rounds running, told
+    only that a slider was missing (2026-10-05)."""
+    if box.kind not in CONTAINER_KINDS:
+        return []
+    out: List[str] = []
+    for s in sorted(shapes, key=lambda s: (s.y, s.x)):
+        if s is box or s.kind in CONTAINER_KINDS or s.kind in out:
+            continue
+        if (box.x <= s.x and s.x + s.w <= box.x + box.w
+                and box.y <= s.y and s.y + s.h <= box.y + box.h):
+            out.append(s.kind)
+    return out[:2]
 
 
 def missing_widgets(shapes: Sequence[Shape], wanted: Sequence[Wanted]

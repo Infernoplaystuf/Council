@@ -516,8 +516,11 @@ def _shown(value: Any) -> str:
     return re.sub(r" at 0x[0-9A-Fa-f]+", "", text)[:300]
 
 
-def _inputs_text(inputs: Dict[str, Any]) -> str:
-    return ", ".join(f"{k}={v!r}" for k, v in inputs.items()) or "the same"
+def _inputs_text(inputs: Dict[str, Any], picked: Any = ()) -> str:
+    """"search='', fruits selected=[]": a list port's input is what the
+    user SELECTED in it, which is not the items it shows."""
+    return ", ".join(f"{k}{' selected' if k in picked else ''}={v!r}"
+                     for k, v in inputs.items()) or "the same"
 
 
 _BROAD = ("Exception", "BaseException")
@@ -537,7 +540,8 @@ def broad_handler_at(source: str, lineno: int) -> str:
     test read an empty file. A handler that names what it catches (except
     ValueError: around int(text)) still refuses deliberately — and so does
     a catch-all around the code's OWN `raise ValueError(...)` (the child
-    checks that with raises_at)."""
+    checks that with raises_at), or around int(text) failing on what the
+    user typed (parse_failed)."""
     try:
         tree = ast.parse(source or "")
     except (SyntaxError, ValueError):
@@ -574,6 +578,24 @@ def raises_at(source: str, lineno: int) -> bool:
     return any(isinstance(n, ast.Raise)
                and n.lineno <= lineno <= (n.end_lineno or n.lineno)
                for n in ast.walk(tree))
+
+
+#: What int(), float() and strptime() say of text that is not what they
+#: read: "invalid literal for int() with base 10: 'thirty'".
+_PARSE_FAILED = re.compile(r"invalid literal for int\(\)|could not convert "
+                           r"string to float|does not match format|"
+                           r"Invalid isoformat string")
+
+
+def parse_failed(exc: BaseException) -> bool:
+    """Whether ``exc`` is a parse of the user's text failing — a bad INPUT,
+    which a catch-all may honestly turn into the message the user sees
+    (`try: n = int(text)` / `except Exception: raise ValueError("Age must
+    be a whole number")`). "Invalid format specifier" (qwen2.5's K7) is a
+    ValueError too, but of the code: it fails whatever the user typed."""
+    return isinstance(exc, ValueError) and (
+        type(exc).__name__ == "JSONDecodeError"
+        or bool(_PARSE_FAILED.search(str(exc))))
 
 
 def _check_value(value: Any, check: str, what: str) -> str:
@@ -908,7 +930,7 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             return None, ""
         spelled = broad_handler_at(source_of(own[-1].filename),
                                    own[-1].lineno)
-        if not spelled:
+        if not spelled or parse_failed(crash):
             return None, ""
         if isinstance(crash, ValueError):
             # `raise ValueError(result["error"])` inside the try, relabelled
@@ -957,6 +979,12 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             record["problems"].append("it closes the window")
 
     # ---- repeated presses (handler mode, a port with a "sample2") -------
+    picked = {s["name"] for s in job.get("ports") or []
+              if s.get("binder") == "list"}
+
+    def said_with(inputs):
+        return _inputs_text(inputs, picked)
+
     def press(app, inputs):
         """One press with ``inputs`` typed in: (what it wrote, port by
         port; why it failed, or "")."""
@@ -965,7 +993,7 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         record["press"] = {}
         errors, problems = len(record["errors"]), len(record["problems"])
         getattr(app, job["handler"])()
-        said = f"pressed with {_inputs_text(inputs)}"
+        said = f"pressed with {said_with(inputs)}"
         record["problems"][problems:] = [
             f"{said}: {p}" for p in record["problems"][problems:] if p]
         bad = [e for e in record["errors"][errors:] if not e["deliberate"]]
@@ -996,9 +1024,9 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             if seen[2] != seen[0]:
                 port = next(k for k in list(seen[0]) + list(seen[2])
                             if seen[0].get(k) != seen[2].get(k))
-                return (f"pressed with {_inputs_text(one)}, then with "
-                        f"{_inputs_text(two)}, then with "
-                        f"{_inputs_text(one)} again, it set {port} to "
+                return (f"pressed with {said_with(one)}, then with "
+                        f"{said_with(two)}, then with "
+                        f"{said_with(one)} again, it set {port} to "
                         f"{seen[2].get(port, '(nothing)')} the third time "
                         f"but to {seen[0].get(port, '(nothing)')} the first "
                         f"— each press must start from the ORIGINAL data, "

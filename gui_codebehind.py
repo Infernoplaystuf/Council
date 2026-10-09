@@ -798,7 +798,61 @@ def hints_for(faults: Sequence[str], target: Target) -> List[str]:
     if "broad except" in text:
         add("let errors raise (or raise ValueError with a plain sentence); "
             "do not catch Exception and carry on")
+    for h in _value_hints(text):
+        add(h)
+    syntax = _SYNTAX.search(text)
+    if syntax:
+        add(f"line {syntax.group(1)} is not valid Python: "
+            + ("close every (, [ and { on the line that opens it — write a "
+               "long dict one key per line, ending with its }"
+               if _BRACKETS.search(syntax.group(2)) else
+               "a name is one word with no spaces, arguments are separated "
+               "by commas, and a line that opens a block ends with ':'"))
+    if not out and faults:
+        # Every fault goes back with a HOW TO FIX: 9 of the 22 repair
+        # prompts of the 2026-10-05 run had none (replayed offline).
+        add("fix exactly what WHAT IS WRONG names, on the line it names, "
+            "and keep everything else as it is")
     return out[:6]
+
+
+#: A syntax fault as gate 1 words it: "line 7: '{' was never closed: ...".
+_SYNTAX = re.compile(r"^line (\d+): (invalid (?:syntax|character|decimal "
+                     r"literal).*|.*was never closed|unmatched .*|"
+                     r".*does not match opening .*|unterminated .*|"
+                     r"expected .*|unexpected indent|unindent .*|"
+                     r"cannot assign to .*|f-string.*)", re.MULTILINE)
+_BRACKETS = re.compile(r"never closed|unmatched|does not match opening")
+
+#: What a value of a built-in type is called in a hint.
+_TYPE_WORDS = {"int": "an int", "float": "a float", "str": "a string",
+               "bool": "a bool", "list": "a list", "dict": "a dict",
+               "tuple": "a tuple", "set": "a set", "bytes": "bytes"}
+
+
+def _value_hints(text: str) -> List[str]:
+    """An attribute a built-in value does not have, said about the name on
+    the failing line: phi3.5's K7 called age.is_integer() on the int a
+    number box gives (no int has it on Python 3.11) and got the bare
+    AttributeError back, three repairs running (2026-10-05)."""
+    out = []
+    for typ, attr, line in re.findall(
+            r"'(\w+)' object has no attribute '(\w+)'"
+            r"(?: \(at [^:\s]+:\d+: ([^\n]*))?", text):
+        word = _TYPE_WORDS.get(typ)
+        if word is None and typ != "NoneType":
+            continue
+        used = re.search(r"([A-Za-z_][\w.]*(?:\[[^\]]*\])?)\s*\.\s*"
+                         + re.escape(attr) + r"\b", line or "")
+        name = used.group(1) if used else "the value"
+        if typ == "NoneType":
+            out.append(f"{name} is None there (a blank input, or a call "
+                       f"that returned nothing): test `if {name} is None:` "
+                       f"before using it")
+        else:
+            out.append(f"{name} is {word} there, and {word} has no "
+                       f".{attr} — use only what {word} has")
+    return out
 
 
 def repair_prompt(target: Target, cand: Candidate, budget: Optional[int] = None

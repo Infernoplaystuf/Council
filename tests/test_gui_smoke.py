@@ -221,6 +221,45 @@ def f(age):
     assert "whole number" in r.soft
 
 
+@pytest.mark.parametrize("parse", ["int(age)", "float(age)",
+                                   "json.loads(age)",
+                                   "datetime.strptime(age, '%Y')"])
+def test_a_catch_all_around_reading_the_users_text_is_still_a_refusal(parse):
+    """The commonest shape of an honest refusal small models write: a
+    catch-all around int(text). What it caught is the user's text failing
+    to parse, not the code failing — so it stays the refusal it means."""
+    r = function(f"""
+import json
+from datetime import datetime
+
+
+def f(age):
+    try:
+        n = {parse}
+    except Exception as e:
+        raise ValueError(f"Age must be a whole number: {{e}}")
+    return {{"count": str(n)}}
+""", ["thirty"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "whole number" in r.soft
+
+
+def test_parse_failed_tells_bad_input_from_bad_code():
+    assert gui_smoke.parse_failed(ValueError(
+        "invalid literal for int() with base 10: 'x'"))
+    assert gui_smoke.parse_failed(ValueError(
+        "could not convert string to float: 'x'"))
+    import json as _json
+    try:
+        _json.loads("x")
+    except ValueError as exc:
+        assert gui_smoke.parse_failed(exc)
+    assert not gui_smoke.parse_failed(ValueError(
+        "Invalid format specifier ' \"age\": {age}, \"subscribed\": "
+        "{subscribed}' for object of type 'str'"))
+    assert not gui_smoke.parse_failed(KeyError("width"))
+
+
 def test_in_a_handler_a_crash_raised_again_as_value_error_is_a_fault():
     """The same, through the failure envelope handler mode wraps a body in
     (report_error decides it there)."""
@@ -268,6 +307,9 @@ def test_a_handler_that_filters_what_the_last_press_left_is_caught(key):
     assert not r.ok, r.summary()
     assert any("each press must start from the ORIGINAL data" in p
                for p in r.problems), r.problems
+    # what was SELECTED in the list is said as that, never as its items
+    said = next(p for p in r.problems if "ORIGINAL" in p)
+    assert "fruits selected=[]" in said and "fruits=" not in said, said
 
 
 def test_one_press_still_cannot_tell():

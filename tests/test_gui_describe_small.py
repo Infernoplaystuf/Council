@@ -863,6 +863,11 @@ def test_the_buttons_a_description_names_are_read_with_their_captions(
      "to convert to", 2),
     ("a theme dropdown (Light, Dark)", 1),
     ("a 'Start at login' checkbox ... a 'Debug logging' checkbox", 2),
+    # what the description is OF names the app, not one more widget
+    ("An image viewer: a large image area with a frame slider under it", 1),
+    ("A table editor with a table of parts and an Add button", 1),
+    ("A window with two dropdowns", 2),
+    ("A dropdown with three choices", 1),
 ])
 def test_how_many_the_text_asks_for_is_read(text, count):
     first = gd.requested_widgets(text)[0]
@@ -954,10 +959,28 @@ def test_recorded_designs_the_grader_passed_have_no_gaps(key):
 def test_a_caption_never_stands_in_for_the_widget():
     """llama3.1:8b's C3, four rounds running: a labelframe titled "Frame
     slider" holding a spin box. A check that read captions as widgets
-    would have passed it; the gap now also says what the caption is."""
+    would have passed it; the gap now also says what the caption is, and
+    what it holds."""
     assert recorded_gaps("llama3.1:8b C3 2") == [
-        "a slider (scale or scrubber) — 'Frame slider' is a labelframe, "
-        "not a slider"]
+        "a slider (scale or scrubber) — 'Frame slider' is a labelframe "
+        "holding a spinbox, not a slider"]
+
+
+def test_the_repair_round_is_told_what_the_captioned_box_holds():
+    """The C3 shape, small: the repair prompt names the spin box the
+    'Frame slider' group holds, not only the missing slider."""
+    text = "An image viewer: a large image area with a frame slider under it."
+    boxed = col(leaf("image_canvas", "Image"),
+                leaf("labelframe", "Frame slider",
+                     children=[leaf("spinbox", "")]))
+    fixed = col(leaf("image_canvas", "Image"), leaf("scale", "Frame"))
+    model = Model(*[tree_reply(boxed)] * SMALL.n_best, tree_reply(fixed))
+    res = gd.describe(text, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert ("missing a slider (scale or scrubber) — 'Frame slider' is a "
+            "labelframe holding a spinbox, not a slider") in \
+        model.calls[-1]["prompt"]
+    assert "scale" in {s.kind for s in res.shapes}
 
 
 @pytest.mark.parametrize("key", ["qwen2.5 C4 1", "phi3.5 C4 4"])

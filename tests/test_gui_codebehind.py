@@ -1255,3 +1255,56 @@ def test_a_repeated_press_fault_is_repaired_with_the_recipe():
     hints = gcb.hints_for([fault], k2_target())
     assert any("self._ai_original = self.ports.fruits.items()" in h
                for h in hints), hints
+
+
+#: The faults the 2026-10-05 run sent back with no HOW TO FIX, verbatim
+#: (the recorded replies replayed through the writer offline): 9 of its 22
+#: repair prompts.
+BARE_FAULTS = {
+    "phi3.5 K1": "line 4: invalid syntax. Perhaps you forgot a comma?: if "
+                 "second_number is None or not isinstance(second extramount, "
+                 "(int, float)):",
+    "phi3.5 K7": "smoke run raised AttributeError: 'int' object has no "
+                 "attribute 'is_integer' (at logic.py:15: if age is None or "
+                 "not age.is_integer():)",
+    "phi3.5 K8": "line 7: '{' was never closed: conversion_factors = {\"mm\": "
+                 "{\"cm\": 0.1, \"m\": 0.001, \"in\": 0.0393700787401575},",
+    "phi4:14b K6": "line 11: start_stop is a button — it has no value to "
+                   "set(); use .enable(True/False)",
+    "qwen2.5 K2": "smoke run raised AttributeError: 'SmokeApp' object has no "
+                  "attribute '_ai_original_fruits' (at handlers.py:26: "
+                  "filtered_items = [item for item in "
+                  "self._ai_original_fruits if search_text in item.lower()])",
+}
+
+
+@pytest.mark.parametrize("key", sorted(BARE_FAULTS))
+def test_no_fault_goes_back_without_a_hint(key):
+    target = k2_target() if "K2" in key or "K6" in key else fn_target()
+    assert gcb.hints_for([BARE_FAULTS[key]], target), key
+
+
+def test_an_attribute_a_plain_value_lacks_is_said_about_the_name():
+    """phi3.5's K7, three repairs running: age.is_integer() on the int a
+    number box gives (no int has it on Python 3.11)."""
+    hints = gcb.hints_for([BARE_FAULTS["phi3.5 K7"]], fn_target())
+    assert hints[0] == ("age is an int there, and an int has no .is_integer "
+                        "— use only what an int has")
+    none = gcb.hints_for(["smoke run raised AttributeError: 'NoneType' object "
+                          "has no attribute 'strip' (at logic.py:3: "
+                          "name = text.strip())"], fn_target())
+    assert none[0].startswith("text is None there")
+
+
+def test_a_syntax_fault_gets_the_rule_it_broke():
+    comma = gcb.hints_for([BARE_FAULTS["phi3.5 K1"]], fn_target())
+    assert comma[0].startswith("line 4 is not valid Python: a name is one "
+                               "word with no spaces")
+    brace = gcb.hints_for([BARE_FAULTS["phi3.5 K8"]], fn_target())
+    assert brace[0].startswith("line 7 is not valid Python: close every (, "
+                               "[ and {")
+
+
+def test_a_fault_with_a_hint_of_its_own_gets_no_generic_one():
+    hints = gcb.hints_for(["line 3: undefined name 'np'"], fn_target())
+    assert hints == ["add `import numpy as np` inside the function"]

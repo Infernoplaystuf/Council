@@ -362,6 +362,13 @@ SCHEDULE_PAGES = [
      "write `from glimmerquay import Cadence`"),
     ("import glimmerquay.next_window\n",
      "`import` takes modules only"),
+    # a method read out of its class as if the class were a module
+    ("from glimmerquay.Cadence import windows\n",
+     "glimmerquay.Cadence is a class, not a module, and `from ... import` "
+     "reads names out of modules only: write `from glimmerquay import "
+     "Cadence` and call .windows() on a Cadence"),
+    ("from glimmerquay.Cadence.windows import start\n",
+     "glimmerquay.Cadence is a class"),
 ])
 def test_importing_what_is_not_a_module_or_a_module_name_is_caught(code,
                                                                     says):
@@ -411,6 +418,24 @@ def test_a_dotted_name_in_a_from_import_is_answered_with_the_fix():
                           "glimmerquay.CHECKSUMS\n", [], PKG)
     assert ("`from glimmerquay.codec import encode_frame`; `from "
             "glimmerquay import CHECKSUMS`") in check.issues[0]
+
+
+@pytest.mark.parametrize("line, fixed", [
+    # phi3.5's docs-fix review run, c02 reply 4, verbatim: the comment's
+    # own words were read as names and garbled the fix
+    ("from glimmerquay.codec import encode_frame, glimmerquay.CHECKSUMS  "
+     "# Assuming glimmerquay.codec is a module that contains these elements",
+     "`from glimmerquay.codec import encode_frame`; `from glimmerquay "
+     "import CHECKSUMS`"),
+    # phi3.5's c05 reply 2: the same class named twice
+    ("from glimmerquay import Cadence, glimmerquay.Cadence",
+     "`from glimmerquay import Cadence`"),
+    ("from glimmerquay import (Ledger, glimmerquay.LedgerFullError as Full)",
+     "`from glimmerquay import Ledger, LedgerFullError as Full`"),
+])
+def test_the_dotted_name_fix_reads_only_the_names(line, fixed):
+    issue = qa.check_code(line + "\n", [], PKG).issues[0]
+    assert issue.endswith("never dotted ones: " + fixed), issue
 
 
 def test_check_code_leaves_other_libraries_alone():
