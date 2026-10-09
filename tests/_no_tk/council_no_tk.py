@@ -35,8 +35,14 @@ MESSAGE = ("Tk GUIs are deprecated - tests must not open a Tk window "
 LOG_ENV = "COUNCIL_NO_TK_LOG"
 
 
-class TkWindowRefused(RuntimeError):
-    """A test (or a program a test started) tried to open a Tk window."""
+class TkWindowRefused(BaseException):
+    """A test (or a program a test started) tried to open a Tk window.
+
+    A BaseException, like KeyboardInterrupt, ON PURPOSE. Tk tests guarded
+    their root with `except Exception: skip` ("no display") — the old tk_root
+    fixture did, the Tk agent-panel test did, smoke_test's grapher check
+    printed "skipped" and returned — so an ordinary exception here would
+    have become a quiet skip or a passing check instead of a failure."""
 
 
 def _record(what):

@@ -55,6 +55,17 @@ def test_a_subclass_of_tk_is_refused_too():
         Console()
 
 
+def test_except_exception_cannot_turn_the_refusal_into_a_skip():
+    """The pattern Tk tests used around their root: `try: tk.Tk()` /
+    `except Exception: skip("no display")`. The refusal must get past it."""
+    assert getattr(tkinter, "_council_no_tk", False), "the guard is not in place"
+    with pytest.raises(guard.TkWindowRefused):
+        try:
+            tkinter.Tk()
+        except Exception:                            # noqa: BLE001
+            pytest.fail("the refusal was swallowed as an ordinary Exception")
+
+
 def test_the_message_names_where_to_read_why():
     assert guard.MESSAGE.startswith(
         "Tk GUIs are deprecated - tests must not open a Tk window")
