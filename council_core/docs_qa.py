@@ -1450,6 +1450,48 @@ def documented_paths(pages: Sequence[Source], roots: Iterable[str]
         for m in _PAGE_KIND.finditer(p.text or ""):
             if m.group(1).split(".")[0] in roots:
                 out[m.group(1)] = m.group(2).lower()
+    out.update(_owner_kinds(pages, roots))
+    return out
+
+
+#: What a headed page says of the name it sits under: a function, a class,
+#: a constant or a submodule lives in a module; a method, a property or an
+#: attribute in a class.
+_OWNER_KIND = {"function": "module", "class": "module", "module": "module",
+               "package": "module", "constant": "module", "data": "module",
+               "method": "class", "property": "class", "attribute": "class"}
+
+
+def _owner_kinds(pages: Sequence[Source], roots: Sequence[str]
+                 ) -> Dict[str, str]:
+    """The kind of each name with no heading of its own, read from the
+    headed pages under it — deepest first, so "PySide6.QtWidgets.QLabel
+    .setText (method)" makes QLabel a class and QtWidgets a module.
+
+    REVIEW (2026-10-09): with no page of its own, a Capitalised last part
+    was read as a class, so `import PIL.Image` (pages "PIL.Image.open
+    (function)", "PIL.Image.OPEN (constant)") and `from PySide6.QtWidgets
+    import QApplication` were flagged as importing a class. A name the
+    pages disagree about is left to that guess."""
+    headed: Dict[str, str] = {}
+    for p in pages:
+        for m in _PAGE_KIND.finditer(p.text or ""):
+            if m.group(1).split(".")[0] in roots:
+                headed[m.group(1)] = m.group(2).lower()
+    known = dict(headed)
+    out: Dict[str, str] = {}
+    depth = max((k.count(".") for k in headed), default=0)
+    for level in range(depth, 0, -1):
+        votes: Dict[str, Set[str]] = {}
+        for path, kind in known.items():
+            owner = path.rpartition(".")[0]
+            said = _OWNER_KIND.get(kind)
+            if path.count(".") == level and "." in owner and said and \
+                    owner not in headed:
+                votes.setdefault(owner, set()).add(said)
+        for owner, said in votes.items():
+            if len(said) == 1:
+                out[owner] = known[owner] = next(iter(said))
     return out
 
 

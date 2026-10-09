@@ -1234,6 +1234,27 @@ def test_a_task_that_starts_from_the_original_data_is_told_so():
     assert "ORIGINAL data" not in plain
 
 
+@pytest.mark.parametrize("task", [
+    "Each press of Filter removes the first item from the fruits list, and "
+    "the count label shows how many of the original items are left, e.g. "
+    "'1 of 2 left'.",
+    "When Filter is pressed, show the items of the original list in a random "
+    "order in the fruits list, and how many there are in the count label.",
+    "Shuffle the original list on every press.",
+    "Every click adds the search text to the original items.",
+    "Each press shows the next item of the original list in the label.",
+])
+def test_a_task_that_changes_on_every_press_is_not_told_to_restart(task):
+    """REVIEW (2026-10-09): any "original <noun>" turned the rule on, and
+    the prompt then said "Repeated presses start from the ORIGINAL data"
+    to a task whose presses each remove, add, shuffle or step on."""
+    assert not gcb.restarts_from_original(task)
+    prompt, _shed = gcb.build_prompt(h_target(
+        name="on_btn_filter", label="Filter", instruction=task,
+        ports=list(K2_ROWS), handlers=["on_btn_filter", "on_close"]))
+    assert "ORIGINAL data" not in prompt
+
+
 def test_a_model_that_stops_answering_leaves_the_best_gate_report():
     """A replay that runs out of recorded replies said only "the model call
     failed" — not how far the best candidate got."""
@@ -1308,3 +1329,146 @@ def test_a_syntax_fault_gets_the_rule_it_broke():
 def test_a_fault_with_a_hint_of_its_own_gets_no_generic_one():
     hints = gcb.hints_for(["line 3: undefined name 'np'"], fn_target())
     assert hints == ["add `import numpy as np` inside the function"]
+
+
+# ============================================================
+# Review of the 2026-10-05 fixes (2026-10-09)
+# ============================================================
+
+@pytest.mark.parametrize("body, name, close", [
+    # never assigned, read as result.get(...)
+    ('''
+    import os
+    names = sorted(os.listdir(folder))
+    return {"status": str(result.get("n")), "files": names}''',
+     "result", None),
+    # the DataFrame it never built
+    ('''
+    import pandas as pd
+    return {"status": str(df.shape[0]), "files": list(df.columns)}''',
+     "df", None),
+    # a typo of a name it did define
+    ('''
+    import os
+    result = {"n": len(os.listdir(folder))}
+    return {"status": str(reslt.get("n")), "files": []}''',
+     "reslt", "result"),
+])
+def test_an_undefined_variable_read_as_name_attr_is_told_to_define_it(
+        body, name, close):
+    """REVIEW: every undefined name read only as `name.attr` was called "a
+    module never imported", and the hint said to import it - for a typo
+    whose own fault said "did you mean 'result'?" too."""
+    cand = gcb.check(fence("def count_images(folder):" + body), fn_target(),
+                     catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert f"undefined name '{name}'" in cand.faults[0]
+    assert "used as a module" not in cand.faults[0], cand.faults
+    if close:
+        assert f"did you mean '{close}'?" in cand.faults[0]
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert hints[0] == (f"define {name} before using it, or use one of the "
+                        f"parameters (folder)"), hints
+    assert not any("import it" in h for h in hints), hints
+
+
+def test_self_in_a_function_is_told_it_is_not_a_handler():
+    """A small model's common slip in FUNCTION mode: self.ports.x.set()."""
+    cand = gcb.check(fence('''
+def count_images(folder):
+    import os
+    names = sorted(os.listdir(folder))
+    self.ports.status.set(str(len(names)))
+    return {"status": str(len(names)), "files": names}'''), fn_target(),
+        catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert "used as a module" not in cand.faults[0], cand.faults
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert hints[0].startswith("there is no self here: this is a function, "
+                               "not a handler"), hints
+    assert "(folder)" in hints[0] and "'status', 'files'" in hints[0]
+    assert not any("import" in h for h in hints), hints
+
+
+@pytest.mark.parametrize("module", ["shutil", "cv2"])
+def test_a_real_module_read_as_name_attr_is_still_a_module(module):
+    cand = gcb.check(fence(f'''
+def count_images(folder):
+    x = {module}.thing(folder)
+    return {{"status": str(x), "files": []}}'''), fn_target(), catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert "it is used as a module but never imported" in cand.faults[0]
+
+
+TWO_LISTS = [gcb.PortRow("search", "entry", "str", "var", "", "Search"),
+             gcb.PortRow("matches", "listbox", "str", "list", "", "Matches"),
+             gcb.PortRow("names", "listbox", "str", "list", "", "Names"),
+             gcb.PortRow("find", "button", "event", "event", "", "Find")]
+
+
+def two_list_target(instruction):
+    return h_target(name="on_btn_find", label="Find", instruction=instruction,
+                    ports=list(TWO_LISTS),
+                    handlers=["on_btn_find", "on_close"])
+
+
+def test_the_recipe_keeps_the_list_the_task_calls_original():
+    """REVIEW (2026-10-09): the recipe took the FIRST list port - here the
+    output list - so a model that followed it filtered the wrong list, and
+    the repeated presses could not see it (the output is the same on every
+    press)."""
+    target = two_list_target(
+        "show in the matches list those items of the original list of names "
+        "(the names list) that contain the search text")
+    assert gcb.restarts_from_original(target.instruction)
+    prompt, _shed = gcb.build_prompt(target)
+    assert "self._ai_original = self.ports.names.items()" in prompt
+    assert "self._ai_original = self.ports.matches.items()" not in prompt
+    fault = ("smoke run: pressed ... — each press must start from the "
+             "ORIGINAL data, not from what the last press left")
+    hints = gcb.hints_for([fault], target)
+    assert any("self._ai_original = self.ports.names.items()" in h
+               for h in hints), hints
+
+
+def test_when_the_task_does_not_say_which_list_every_one_is_named():
+    target = two_list_target(
+        "show the items of the original list that contain the search text, "
+        "and how many in the matches list")
+    prompt, _shed = gcb.build_prompt(target)
+    recipe = prompt[prompt.index("Repeated presses"):].splitlines()[0]
+    assert "self.ports.matches.items(), self.ports.names.items()" in recipe
+    assert "self._ai_original = <that list>" in recipe
+
+
+@pytest.mark.parametrize("fault, hint", [
+    # the LAST .get on the line is the one that failed, on what the first
+    # returned - not the port
+    ("smoke run raised AttributeError: 'str' object has no attribute 'get' "
+     "(at handlers.py:5: mode = self.ports.settings.get().get('mode'))",
+     "the value self.ports.settings.get() returns is a string there, and a "
+     "string has no .get — use only what a string has"),
+    ("smoke run raised AttributeError: 'list' object has no attribute 'get' "
+     "(at handlers.py:7: first = self.ports.files.items().get(0))",
+     "the value self.ports.files.items() returns is a list there, and a list "
+     "has no .get — use only what a list has"),
+    ("smoke run raised AttributeError: 'dict' object has no attribute 'name' "
+     "(at logic.py:4: label = rows[0].name)",
+     "rows[0] is a dict there, and a dict has no .name — use only what a "
+     "dict has"),
+    ("smoke run raised AttributeError: 'NoneType' object has no attribute "
+     "'strip' (at handlers.py:5: name = self.ports.name.get().strip())",
+     "the value self.ports.name.get() returns is None there (a blank input, "
+     "or a call that returned nothing): keep it in a variable and test that "
+     "variable for None before using it"),
+    ("smoke run raised AttributeError: 'NoneType' object has no attribute "
+     "'strip'",
+     "the value is None there (a blank input, or a call that returned "
+     "nothing): keep it in a variable and test that variable for None "
+     "before using it"),
+])
+def test_the_attribute_hint_names_the_receiver_that_failed(fault, hint):
+    """REVIEW (2026-10-09): the hint took the FIRST `<name>.attr` on the
+    line, so it called the settings port a string; and with no name found
+    it put "the value" inside a code snippet."""
+    assert gcb.hints_for([fault], fn_target())[0] == hint

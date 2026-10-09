@@ -438,6 +438,69 @@ def test_the_dotted_name_fix_reads_only_the_names(line, fixed):
     assert issue.endswith("never dotted ones: " + fixed), issue
 
 
+def pydocs_page(n, name, kind, body=""):
+    """A page shaped like the bundled pydocs server's: headed with the
+    name and its kind."""
+    return qa.Source(n, "pydocs", name, name,
+                     f"# {name}  ({kind})\n\n{body or name}")
+
+
+#: What the bundled server handed back for "open an image with Pillow"
+#: (2026-10-09): function and constant pages under PIL.Image, and no page
+#: for the module PIL.Image itself.
+PIL_PAGES = [
+    pydocs_page(1, "PIL.GdImageFile.open", "function",
+                "PIL.GdImageFile.open(fp, mode='r')"),
+    pydocs_page(2, "PIL.Image.OPEN", "constant", "PIL.Image.OPEN = {}"),
+    pydocs_page(3, "PIL.WmfImagePlugin.WmfHandler.open", "method",
+                "PIL.WmfImagePlugin.WmfHandler.open(im)"),
+    pydocs_page(4, "PIL.Image.open", "function",
+                "PIL.Image.open(fp, mode='r', formats=None) -> Image"),
+]
+#: ... and for "show a QLabel" with PySide6.
+QT_PAGES = [
+    pydocs_page(1, "PySide6.QtWidgets.QLabel.setText", "method",
+                "PySide6.QtWidgets.QLabel.setText(arg__1: str)"),
+    pydocs_page(2, "PySide6.QtWidgets.QApplication", "class",
+                "class PySide6.QtWidgets.QApplication(arg__1: list)"),
+]
+
+
+@pytest.mark.parametrize("pages, roots, code", [
+    (PIL_PAGES, ["PIL"], "import PIL.Image\n\n\ndef image_size(path):\n"
+                         "    with PIL.Image.open(path) as im:\n"
+                         "        return im.size\n"),
+    (PIL_PAGES, ["PIL"], "from PIL.Image import open as open_image\n"),
+    (PIL_PAGES, ["PIL"], "from PIL import Image\n"),
+    (QT_PAGES, ["PySide6"], "from PySide6.QtWidgets import QApplication, "
+                            "QLabel\n"),
+    (QT_PAGES, ["PySide6"], "import PySide6.QtWidgets\n"),
+])
+def test_a_capitalised_module_with_pages_under_it_is_a_module(pages, roots,
+                                                              code):
+    """REVIEW (2026-10-09): a Capitalised last part with no page of its own
+    was read as a class, so right `import PIL.Image` and `from
+    PySide6.QtWidgets import QApplication` were flagged ("PIL.Image is a
+    class, not a module"). A function, class or constant page under a name
+    says that name is a module."""
+    check = qa.check_code(code, pages, roots)
+    assert not [i for i in check.issues if "not a module" in i], check.issues
+
+
+@pytest.mark.parametrize("code, says", [
+    # a method page under it still says QLabel is a class
+    ("from PySide6.QtWidgets.QLabel import setText\n",
+     "PySide6.QtWidgets.QLabel is a class, not a module"),
+    ("import PySide6.QtWidgets.QLabel\n",
+     "PySide6.QtWidgets.QLabel is a class, not a module"),
+    ("import PySide6.QtWidgets.QApplication\n",
+     "PySide6.QtWidgets.QApplication is a class, not a module"),
+])
+def test_a_class_with_pages_under_it_is_still_a_class(code, says):
+    check = qa.check_code(code, QT_PAGES, ["PySide6"])
+    assert any(says in i for i in check.issues), check.issues
+
+
 def test_check_code_leaves_other_libraries_alone():
     pages = [qa.Source(1, "s", "glimmerquay.Ledger", "glimmerquay.Ledger",
                        "class glimmerquay.Ledger(capacity: int = 64)")]

@@ -71,8 +71,10 @@ import builtins
 import dataclasses
 import difflib
 import hashlib
+import importlib.util
 import math
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -562,25 +564,72 @@ _FROM_ORIGINAL = re.compile(
     r"|\bfrom\s+the\s+(?:original|full)\s", re.IGNORECASE)
 
 
+#: A task whose presses each change what the next one sees, or are random
+#: by design: "each press removes the first item ... of the original items
+#: left", "the original list in a random order", "every click shows the
+#: next item". Its "original" is not where every press starts.
+_EACH_PRESS_CHANGES = re.compile(
+    r"\b(?:random\w*|shuffl\w*)\b"
+    r"|\b(?:each|every|another|a\s+later|the\s+next)\s+(?:press|click|time)"
+    r"\b[^.]*?\b(?:next|previous|removes?|deletes?|drops?|adds?|appends?"
+    r"|inserts?|pops?|moves?|advances?|steps?|increments?|decrements?"
+    r"|toggles?|cycles?|rotates?|one\s+more)\b", re.IGNORECASE)
+
+
 def restarts_from_original(instruction: str) -> bool:
-    """Whether every press of the task starts from the ORIGINAL data."""
-    return bool(_FROM_ORIGINAL.search(instruction or ""))
+    """Whether every press of the task starts from the ORIGINAL data — and
+    not a task that keeps state or is random by design, which also says
+    "original" (review, 2026-10-09: right code for both was failed by the
+    repeated presses, and told to start from the original)."""
+    text = instruction or ""
+    return bool(_FROM_ORIGINAL.search(text)) and \
+        not _EACH_PRESS_CHANGES.search(text)
+
+
+def _original_ports(target: Target) -> List[PortRow]:
+    """The list or table ports the task's "original" may mean: the one it
+    names right after the word ("the original list of names", "the
+    original fruits"), else every one of them.
+
+    REVIEW (2026-10-09): it was the FIRST list port, which for "show in
+    the matches list those items of the original list of names" is the
+    output — a model following the recipe filtered the wrong list, and the
+    repeated presses could not see it (that output is the same on every
+    press)."""
+    held = [p for p in target.ports if p.binder in ("list", "table")]
+    if len(held) <= 1:
+        return held
+    text = " ".join((target.instruction or "").split())
+    named = []
+    for p in held:
+        words = sorted({w for w in (p.name, p.name.replace("_", " "),
+                                    p.label) if w}, key=len, reverse=True)
+        if re.search(r"\b(?:original|unfiltered|full)\b[^.;:]{0,30}?\b(?:"
+                     + "|".join(re.escape(w) for w in words) + r")\b",
+                     text, re.IGNORECASE):
+            named.append(p)
+    return named if len(named) == 1 else held
 
 
 def _original_recipe(target: Target) -> str:
     """How to keep the original, on this window's own list or table."""
-    held = [p for p in target.ports if p.binder in ("list", "table")]
+    held = _original_ports(target)
+    keep = (f"`if getattr(self, \"{PRIVATE_PREFIX}original\", None) is None: "
+            f"self.{PRIVATE_PREFIX}original = ")
     if not held:
         return (f"keep the data as it is on the first press in "
                 f"self.{PRIVATE_PREFIX}original (when getattr(self, "
                 f"\"{PRIVATE_PREFIX}original\", None) is None), and work "
                 f"from that copy on every press")
-    p = held[0]
-    read = "items()" if p.binder == "list" else "rows()"
-    return (f"on the first press keep the original — `if getattr(self, "
-            f"\"{PRIVATE_PREFIX}original\", None) is None: "
-            f"self.{PRIVATE_PREFIX}original = self.ports.{p.name}.{read}` — "
-            f"and work from self.{PRIVATE_PREFIX}original on every press")
+    reads = [f"self.ports.{p.name}."
+             + ("items()" if p.binder == "list" else "rows()") for p in held]
+    if len(reads) == 1:
+        return (f"on the first press keep the original — {keep}{reads[0]}` "
+                f"— and work from self.{PRIVATE_PREFIX}original on every "
+                f"press")
+    return (f"on the first press keep the original of the list the task "
+            f"starts from (one of {', '.join(reads)}) — {keep}<that list>` "
+            f"— and work from self.{PRIVATE_PREFIX}original on every press")
 
 
 def _private_ok(attr: str) -> bool:
@@ -735,7 +784,15 @@ def hints_for(faults: Sequence[str], target: Target) -> List[str]:
                            r"|undefined name '([A-Za-z_][A-Za-z0-9_]*)'",
                            text):
         n = name[0] or name[1]
-        if n in AUTO_IMPORTS:
+        if n == "self" and target.mode == "function":
+            # self.ports.status.set(...) in a function: a handler's habit
+            add("there is no self here: this is a function, not a handler — "
+                "take the inputs from its parameters ("
+                + (", ".join(p.name for p in target.params) or "none")
+                + ") and RETURN the outputs in the dict ("
+                + ", ".join(repr(k) for k in target.keys)
+                + "), never self.ports")
+        elif n in AUTO_IMPORTS:
             add(f"add `{AUTO_IMPORTS[n]}` inside the function")
         elif n in modules:
             # "define image_stats, or use a parameter" was the hint for
@@ -842,17 +899,51 @@ def _value_hints(text: str) -> List[str]:
         word = _TYPE_WORDS.get(typ)
         if word is None and typ != "NoneType":
             continue
-        used = re.search(r"([A-Za-z_][\w.]*(?:\[[^\]]*\])?)\s*\.\s*"
-                         + re.escape(attr) + r"\b", line or "")
-        name = used.group(1) if used else "the value"
-        if typ == "NoneType":
-            out.append(f"{name} is None there (a blank input, or a call "
-                       f"that returned nothing): test `if {name} is None:` "
-                       f"before using it")
+        name = _receiver(line or "", attr)
+        if not name:
+            subject = "the value"
+        elif name.endswith(")"):
+            subject = f"the value {name} returns"
         else:
-            out.append(f"{name} is {word} there, and {word} has no "
+            subject = name
+        if typ == "NoneType":
+            out.append(f"{subject} is None there (a blank input, or a call "
+                       f"that returned nothing): "
+                       + (f"test `if {name} is None:`" if subject == name
+                          else "keep it in a variable and test that "
+                               "variable for None")
+                       + " before using it")
+        else:
+            out.append(f"{subject} is {word} there, and {word} has no "
                        f".{attr} — use only what {word} has")
     return out
+
+
+def _receiver(line: str, attr: str) -> str:
+    """The expression ``.attr`` is read from on ``line`` — at its LAST
+    use, which is where a chain fails: in
+    `self.ports.settings.get().get('mode')` the str with no .get is what
+    `self.ports.settings.get()` returned, not the port (review,
+    2026-10-09: the first use was named). "" when there is none."""
+    hits = [m.start() for m in re.finditer(r"\.\s*" + re.escape(attr)
+                                           + r"\b", line)]
+    if not hits:
+        return ""
+    end = j = hits[-1]
+    depth = 0
+    while j > 0:
+        c = line[j - 1]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and not (c.isalnum() or c in "_."):
+            break
+        j -= 1
+    name = line[j:end].strip()
+    return name if re.match(r"[A-Za-z_]", name) else ""
 
 
 def repair_prompt(target: Target, cand: Candidate, budget: Optional[int] = None
@@ -1839,6 +1930,38 @@ def _used_as_module(tree: ast.AST) -> set:
     return dotted - bare
 
 
+#: Modules a model reaches for that this machine may not have installed —
+#: still modules, so "never imported" is the right thing to say of them.
+KNOWN_MODULES = frozenset({
+    "cv2", "scipy", "skimage", "sklearn", "torch", "tifffile", "imageio",
+    "h5py", "yaml", "requests", "serial", "pypylon", "openpyxl", "xlrd",
+    "plotly", "seaborn", "numba", "pydicom", "nibabel", "SimpleITK"})
+
+
+def _is_module(name: str, modules: set) -> bool:
+    """Whether an undefined ``name`` read only as `name.attr` could really
+    be a module the code forgot to import.
+
+    REVIEW (2026-10-09): reading every such name as a module turned the
+    "define it" hint into "import it" for result.get(...) never assigned,
+    df.shape with no DataFrame built, self.ports in a function, and the
+    typo reslt.get(...) — whose fault itself said "did you mean 'result'?".
+    A variable is far likelier than a module nobody can find."""
+    if name == "self" or not name.isidentifier():
+        return False
+    if name in modules or name in AUTO_IMPORTS or name in KNOWN_MODULES \
+            or name in getattr(sys, "stdlib_module_names", ()) \
+            or name in gui_policy.LINKED_MODULES \
+            or name in gui_policy.THIRD_PARTY \
+            or name in gui_policy.PROJECT_MODULES or name in TOOLKIT_ROOTS:
+        return True
+    try:
+        # a top-level name: found on sys.path, never imported or run
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def name_fixes(code: str, target: Target) -> Tuple[str, List[str], List[str]]:
     """Gate 4: (code with safe imports added, faults, notes).
 
@@ -1881,9 +2004,11 @@ def name_fixes(code: str, target: Target) -> Tuple[str, List[str], List[str]]:
         else:
             close = difflib.get_close_matches(name, all_bound, n=1,
                                               cutoff=0.8)
+            module = name in as_module and not close and \
+                _is_module(name, modules)
             faults.append(f"line {line}: undefined name '{name}'"
                           + (" — it is used as a module but never imported"
-                             if name in as_module else "")
+                             if module else "")
                           + (f" — did you mean '{close[0]}'?" if close
                              else ""))
     if imports and fn is not None and isinstance(fn, ast.FunctionDef):

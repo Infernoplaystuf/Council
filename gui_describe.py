@@ -880,6 +880,13 @@ def select_examples(text: str, *, mode: str = "pixel",
 #: read-only, auto-scrolling log whose port APPENDS one line — the widget
 #: the code behind a log monitor is written against. A design with a text
 #: box there now gets the repair round that names the log_pane.
+#:
+#: The same reason holds the other way: "a multi-line text box that shows
+#: the selected file's details" (M1) is a text box, which the grader wants
+#: and a log_pane (one appended line per .set()) is not. It accepted a
+#: log_pane until the 2026-10-09 review found M1 passing Describe with one
+#: and failing the grade ("no text"). Only log wording ("a multi-line log
+#: view") wants a log_pane, and that is read as a log view first.
 _REQUEST_WORDS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("radio buttons", r"radio\s?-?(?:buttons?|options?)", ("radiobutton",)),
     ("a checkbox", r"check\s?-?(?:box(?:es)?|buttons?)|tick\s?-?box(?:es)?",
@@ -901,14 +908,15 @@ _REQUEST_WORDS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
      r"image\s+(?:area|view|viewer|preview|panel|display|canvas)s?"
      r"|live\s+view|camera\s+view|video\s+(?:view|feed|preview)",
      ("image_canvas",)),
-    ("a log view", r"log\s+(?:view|pane|panel|window|area|output)s?",
+    ("a log view", r"(?:multi\s?-?\s?line\s+)?log\s+(?:view|pane|panel"
+                   r"|window|area|output)s?|multi\s?-?\s?line\s+logs?",
      ("log_pane",)),
     ("a file or folder picker",
      r"(?:file|folder|directory)\s+(?:picker|chooser|selector)s?",
      ("file_picker",)),
     ("a multi-line text box",
      r"multi\s?-?\s?line(?:\s+\w+)?(?:\s+(?:box|area|field|text\s?box))?",
-     ("text", "log_pane")),
+     ("text",)),
     # "a box to type a number" (S2) is a text box too: phi3.5 drew no
     # entry there and Describe saw no gap.
     ("a text box",
@@ -942,20 +950,41 @@ _ARTICLE_BEFORE = re.compile(r"\b(?:a|an|one|another)\s+(?:(?:'[^'\n]*'|"
 
 #: A button's caption as a description gives it: a Capitalised word and up
 #: to two lower-case ones ("Scan for cameras", "Clear all", "OK"), or a
-#: quoted caption. Articles and number words are never captions ("Two
-#: buttons" asks for two buttons, not one called Two).
+#: quoted caption. Articles, numbers and the words that point or count are
+#: never its first word ("Two buttons" asks for two buttons, not one called
+#: Two) — and never one of its lower-case words either: those say the
+#: phrase is a sentence ("Add two", "At the bottom", "Also add a", "There
+#: are two", "Use the arrow"), not a caption. A preposition can be in one
+#: ("Scan for cameras", "Sign in").
+_NOT_FIRST = (r"A|An|The|One|Two|Three|Four|Five|Six|Some|Several|Both|Each"
+              r"|All|More|Other|Another|Any|Every|No|This|That|These|Those"
+              r"|Its|Their|Your|Our|My")
+_NOT_INNER = (r"a|an|the|one|two|three|four|five|six|seven|eight|nine|ten"
+              r"|it|its|this|that|these|those|them|their|and|or|buttons?")
 _CAPTION = (r"(?:'[^'\n]{1,40}'|\"[^\"\n]{1,40}\""
-            r"|(?!(?:A|An|The|One|Two|Three|Four|Five|Six|Some|Several|Both"
-            r"|Each|All|More|Other)\b)[A-Z][\w/&+-]*"
-            r"(?:\s+(?!(?:and|or|buttons?)\b)[a-z][\w-]*){0,2})")
+            r"|(?!(?:" + _NOT_FIRST + r")\b)[A-Z][\w/&+-]*"
+            r"(?:\s+(?!(?:" + _NOT_INNER + r")\b)[a-z][\w-]*){0,2})")
 #: "Scan for cameras and Connect buttons", "Start, Pause and Reset buttons",
 #: "a Plot button". Case-sensitive on purpose: only a Capitalised word or a
 #: quoted one is a caption. It runs after "radio buttons", "Check Button"
-#: and "toolbar" are blanked, so those never read as captions.
+#: and "toolbar" are blanked, so those never read as captions. What it
+#: matches is checked again by _named_buttons, which knows where the
+#: sentence starts.
 _NAMED_BUTTONS = re.compile(
     r"(?<![\w'\"])(" + _CAPTION + r"(?:\s*,\s*" + _CAPTION + r")*"
-    r"(?:\s*,?\s+(?:and|or)\s+" + _CAPTION + r")?)\s+[Bb]uttons?\b")
+    r"(?:\s*,?\s+(?:and|or)\s+" + _CAPTION + r")?)\s+([Bb]uttons?)\b")
 _CAPTION_SPLIT = re.compile(r"\s*,?\s+(?:and|or)\s+|\s*,\s*")
+#: Where a sentence or a clause starts: a word there is Capitalised by the
+#: grammar, so its capital says nothing about a caption.
+_CLAUSE_END = ".!?:;(\n—–•*-"
+#: The words that open a sentence before a comma — "At bottom, Start and
+#: Stop buttons", "Finally, Start and Stop buttons" — which the caption
+#: list would otherwise read as its first item.
+_OPENERS = frozenset(
+    "At On In Under Below Above Beside Beneath Behind Underneath Over Across"
+    " Along Around Inside Outside Within Without Near Between Beyond To From"
+    " For With By After Before Then Also Finally Lastly Additionally"
+    " Meanwhile Otherwise Optionally Ideally Plus Here There".split())
 
 _ORDINALS = ("", "first", "second", "third", "fourth", "fifth", "sixth")
 
@@ -1002,17 +1031,54 @@ def _mentions(prefix: str) -> int:
     return 1 if _ARTICLE_BEFORE.search(prefix) else 0
 
 
+def _opens_clause(before: str) -> bool:
+    """Whether the text after ``before`` starts a sentence or a clause."""
+    before = before.rstrip(" \t")
+    return not before or before[-1] in _CLAUSE_END
+
+
+def _captions(phrase: str, plural: bool, opens: bool) -> List[str]:
+    """The captions a matched "X, Y and Z button(s)" phrase really names;
+    [] when it names none.
+
+    A Capitalised word is a caption because it is Capitalised where a
+    sentence would not be — so at the start of a sentence it says nothing:
+    "Control buttons", "Navigation buttons" and "Add buttons to ..." name a
+    sort of button there. A sentence may still open with a LIST of
+    captions ("OK and Cancel buttons below the tabs"). One caption before
+    "buttons" names a sort anywhere ("the Zoom buttons"), never a caption.
+    REVIEW (2026-10-09): reading every opening word as a caption sent right
+    designs back to add a button labelled 'Add two' or 'At the bottom'."""
+    caps = [c.strip().strip("'\"").strip()
+            for c in _CAPTION_SPLIT.split(phrase)]
+    sep = _CAPTION_SPLIT.search(phrase)
+    if phrase.lstrip()[:1] in ("'", '"'):
+        opens = False             # a quoted caption is one wherever it is
+    if opens and len(caps) > 1 and sep and "," in sep.group(0) and \
+            not re.search(r"\b(?:and|or)\b", sep.group(0)) and \
+            caps[0].split()[0] in _OPENERS:
+        # "Finally, Start and Stop buttons": the opener is not one of them,
+        # and what follows its comma is mid-sentence
+        caps, opens = caps[1:], False
+    caps = [c for c in caps if c]
+    return caps if len(caps) >= (2 if plural or opens else 1) else []
+
+
 def _named_buttons(s: str, out: List[Wanted]) -> str:
     """Append a Wanted per button caption ``s`` names; ``s`` with those
-    phrases blanked, so the bare "button" in them is not read again."""
+    phrases blanked, so the bare "button" in them is not read again. A
+    phrase that names no caption is left for the plain "a button" read."""
     def blank(m: "re.Match[str]") -> str:
-        if not _NEGATED.search(s[max(0, m.start() - 16):m.start()]):
-            for cap in _CAPTION_SPLIT.split(m.group(1)):
-                cap = cap.strip().strip("'\"").strip()
-                if cap and not any(w.name.lower() == cap.lower()
-                                   for w in out if w.name):
-                    out.append(Wanted(f"a button labelled '{cap}'",
-                                      ("button", "toolbar"), 1, cap))
+        if _NEGATED.search(s[max(0, m.start() - 16):m.start()]):
+            return " " * len(m.group(0))
+        caps = _captions(m.group(1), plural=m.group(2).lower() == "buttons",
+                         opens=_opens_clause(s[:m.start()]))
+        if not caps:
+            return m.group(0)
+        for cap in caps:
+            if not any(w.name.lower() == cap.lower() for w in out if w.name):
+                out.append(Wanted(f"a button labelled '{cap}'",
+                                  ("button", "toolbar"), 1, cap))
         return " " * len(m.group(0))
     return _NAMED_BUTTONS.sub(blank, s)
 
@@ -1096,11 +1162,19 @@ def _button_captions(shapes: Sequence[Shape]) -> List[str]:
 
 def _says(caption: str, name: str) -> bool:
     """Whether ``caption`` carries the first word of ``name``: "Clear" is a
-    "Clear all" button, "Scan" a "Scan for cameras" one."""
-    first = re.findall(r"\w+", name.lower())
-    return bool(first) and re.search(
-        rf"(?<![a-z0-9]){re.escape(first[0])}(?![a-z0-9])", caption) \
-        is not None
+    "Clear all" button, "Scan" a "Scan for cameras" one — and a word one
+    shortens to the other ("Prev" and "Previous") is the same word.
+    Matching too loosely only loses a repair round; too strictly sends a
+    right design back for one."""
+    first = re.findall(r"[a-z0-9]+", name.lower())
+    if not first:
+        return False
+    want = first[0]
+    for word in re.findall(r"[a-z0-9]+", caption.lower()):
+        if word == want or (min(len(word), len(want)) >= 3 and (
+                word.startswith(want) or want.startswith(word))):
+            return True
+    return False
 
 
 def _unanswered(names: Sequence[str], captions: Sequence[str]) -> List[int]:
