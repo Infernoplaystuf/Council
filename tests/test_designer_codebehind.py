@@ -597,6 +597,29 @@ def test_a_handler_defined_twice_is_not_treated_as_new(demo):
     assert not plan.ok and "more than once" in plan.problems[0]
 
 
+def test_a_task_from_the_original_data_gets_a_second_sample_per_input(
+        tmp_path):
+    """K2's "filter the ORIGINAL list": each input gets a second value, so
+    the smoke run presses with both, in both orders (gui_smoke)."""
+    import json
+    from council_core import bench_codebehind as bc
+    case = next(c for c in json.loads(
+        (ROOT / "tests" / "data" / "llm_bench" / "code_cases.json")
+        .read_text(encoding="utf-8"))["cases"] if c["id"] == "K2")
+    _name, pdir, shapes, button = bc.make_project(case, tmp_path / "vault")
+    req = dc.Request(project_dir=pdir, shapes=shapes, shape_id=button.id,
+                     instruction=case["task"], mode="handler")
+    plan = dc.plan(req)
+    assert plan.ok, plan.problems
+    rows = {r["name"]: r for r in plan.port_rows}
+    assert rows["search"]["sample"] == "sample"
+    assert rows["search"]["sample2"] == ""
+    assert rows["fruits"]["sample2"] == []
+    assert "sample2" not in rows["count"] and "sample2" not in rows["filter"]
+    req.instruction = "show in the count label how many fruits are listed"
+    assert not any("sample2" in r for r in dc.plan(req).port_rows)
+
+
 def test_the_handler_smoke_run_presses_the_wrapped_method(demo):
     bad = BODY.replace("self.ports.status", "self.ports.result_box")
     good = BODY

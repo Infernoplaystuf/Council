@@ -68,6 +68,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import secrets
 import struct
 import subprocess
@@ -502,6 +503,158 @@ def _expand(value: Any, tokens: Dict[str, str]) -> Any:
     return value
 
 
+def _shown(value: Any) -> str:
+    """A value as two presses are compared on: its repr with object
+    addresses dropped, and an image by its size, not its identity."""
+    if type(value).__module__.split(".")[0] in ("PIL", "numpy"):
+        shape = getattr(value, "shape", None) or getattr(value, "size", "")
+        return f"<{type(value).__name__} {shape}>"
+    try:
+        text = repr(value)
+    except Exception:                                    # noqa: BLE001
+        text = f"<{type(value).__name__}>"
+    return re.sub(r" at 0x[0-9A-Fa-f]+", "", text)[:300]
+
+
+def _inputs_text(inputs: Dict[str, Any], picked: Any = ()) -> str:
+    """"search='', fruits selected=[]": a list port's input is what the
+    user SELECTED in it, which is not the items it shows."""
+    return ", ".join(f"{k}{' selected' if k in picked else ''}={v!r}"
+                     for k, v in inputs.items()) or "the same"
+
+
+_BROAD = ("Exception", "BaseException")
+
+
+def broad_handler_at(source: str, lineno: int) -> str:
+    """How the except clause is spelled ("except Exception", "except:")
+    when line ``lineno`` of ``source`` is a ``raise`` whose innermost
+    handler catches everything; "" otherwise.
+
+    raise ValueError("why") is the documented refusal, and the smoke run
+    lets it pass on the sample data. Raised from a catch-all, it is not a
+    refusal but a relabelled crash: qwen2.5's K7 (2026-10-05) wrote
+    `except Exception as e: raise ValueError(f"Failed to save: {e}")`
+    around an f-string that itself raised ("Invalid format specifier"),
+    the run called that deliberate, the writer accepted it, and the hidden
+    test read an empty file. A handler that names what it catches (except
+    ValueError: around int(text)) still refuses deliberately — and so does
+    a catch-all over anything but a fault of the code (code_fault): the
+    user's input failing to be read is what a refusal is for."""
+    try:
+        tree = ast.parse(source or "")
+    except (SyntaxError, ValueError):
+        return ""
+    inner = None                  # the innermost handler raising there
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and any(
+                isinstance(sub, ast.Raise)
+                and sub.lineno <= lineno <= (sub.end_lineno or sub.lineno)
+                for stmt in node.body for sub in ast.walk(stmt)):
+            if inner is None or node.lineno > inner.lineno:
+                inner = node
+    if inner is None:
+        return ""
+    if inner.type is None:
+        return "except:"
+    caught = inner.type.elts if isinstance(inner.type, ast.Tuple) \
+        else [inner.type]
+    for n in caught:
+        name = n.id if isinstance(n, ast.Name) else \
+            n.attr if isinstance(n, ast.Attribute) else ""
+        if name in _BROAD:
+            return f"except {name}"
+    return ""
+
+
+def raises_at(source: str, lineno: int) -> bool:
+    """Whether line ``lineno`` of ``source`` is a ``raise`` statement — the
+    code refusing on purpose, not a call on that line failing."""
+    try:
+        tree = ast.parse(source or "")
+    except (SyntaxError, ValueError):
+        return False
+    return any(isinstance(n, ast.Raise)
+               and n.lineno <= lineno <= (n.end_lineno or n.lineno)
+               for n in ast.walk(tree))
+
+
+#: What int(), float(), complex(), bytes.fromhex(), strptime() and
+#: fromisoformat() say of text that is not what they read: "invalid literal
+#: for int() with base 10: 'thirty'".
+_PARSE_FAILED = re.compile(r"invalid literal for int\(\)|could not convert "
+                           r"string to float|does not match format|"
+                           r"Invalid isoformat string|complex\(\) arg is a "
+                           r"malformed string|non-hexadecimal number found "
+                           r"in fromhex")
+
+
+def parse_failed(exc: BaseException) -> bool:
+    """Whether ``exc`` is a parse of the user's text failing — a bad INPUT:
+    `n = int(text)` on "thirty" raises the ValueError the user is meant to
+    see, with no `raise` of the code's own. "Invalid format specifier"
+    (qwen2.5's K7) is a ValueError too, but of the code: it fails whatever
+    the user typed."""
+    return isinstance(exc, ValueError) and (
+        type(exc).__name__ == "JSONDecodeError"
+        or bool(_PARSE_FAILED.search(str(exc))))
+
+
+#: Errors no input can cause: the code is wrong whatever the user typed.
+_CODE_FAULT_TYPES = (NameError, AttributeError, ImportError, SyntaxError,
+                     AssertionError, RecursionError, NotImplementedError)
+#: The ValueError a bad format spec raises (qwen2.5's K7): "Invalid format
+#: specifier ...", "Unknown format code 'd' ...", "Space not allowed in
+#: string format specifier", "Single '}' encountered in format string".
+_FORMAT_FAILED = re.compile(r"format (?:specifier|string|code)|Single '[{}]' "
+                            r"encountered|Cannot specify ',' with")
+_UNPACK_FAILED = re.compile(r"(?:not enough|too many) values to unpack")
+#: Typed text is unpacked by splitting it: `first, last = text.split()`.
+_SPLITS = re.compile(r"\.(?:r?split|splitlines|r?partition)\(")
+#: A blank box read as a value: int(None), float(None), Decimal(None).
+_BLANK_READ = re.compile(r"(?:int|float|complex)\(\) argument must be .*"
+                         r"not 'NoneType'|conversion from NoneType|"
+                         r"must be str, not None")
+
+
+def code_fault(exc: BaseException, line: str = "",
+               blank: bool = False) -> bool:
+    """Whether ``exc`` — caught by a catch-all and raised again as
+    ValueError — is a fault of the CODE, which no input fixes, rather than
+    the user's input failing to be read, which the catch-all's message
+    honestly refuses. ``line`` is the source line that raised it, and
+    ``blank`` whether an input was left blank (None).
+
+    A fault: a NameError, AttributeError, ImportError and the like; a
+    TypeError (but int(None) of a blank box, which the repeated press
+    types); a format spec (K7); unpacking what the code did not split; a
+    key written in the code itself (`row["widht"]`). Everything else — an
+    IP address, a Decimal, a UUID, a date out of range, a key or an index
+    the user chose, a typed zero — is input the user can fix.
+
+    REVIEW (2026-10-09): the rule was the other way round — only an
+    int()/float()/json/strptime message was input — so an honest `except
+    Exception: raise ValueError("Enter a valid IP address")` was failed,
+    and so was a catch-all refusing the blank box the double press sends."""
+    if isinstance(exc, _CODE_FAULT_TYPES):
+        return True
+    text = str(exc)
+    if isinstance(exc, TypeError):
+        return not (blank and _BLANK_READ.search(text))
+    if isinstance(exc, KeyError):
+        # "'widht'" or "{name}" (a str.format field) written on the line
+        key = exc.args[0] if exc.args else None
+        return isinstance(key, str) and any(
+            f"{a}{key}{b}" in (line or "")
+            for a, b in (("'", "'"), ('"', '"'), ("{", "}")))
+    if isinstance(exc, ValueError):
+        if _FORMAT_FAILED.search(text):
+            return True
+        if _UNPACK_FAILED.search(text):
+            return not _SPLITS.search(line or "")
+    return False
+
+
 def _check_value(value: Any, check: str, what: str) -> str:
     """Why ``value`` cannot be shown where ``what`` is, or ""."""
     tname = type(value).__name__
@@ -539,6 +692,7 @@ def _check_value(value: Any, check: str, what: str) -> str:
 
 def _child_main(job_path: str) -> None:            # pragma: no cover - child
     import io
+    import random
     import traceback
 
     # The parent's nonce, before anything else runs (see the module
@@ -564,7 +718,9 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         sys.path.insert(1, job["app_root"])
     tokens = _seed_samples(sandbox)
     record: Dict[str, Any] = {"blocked": [], "problems": [], "sets": {},
-                              "errors": [], "notes": []}
+                              "errors": [], "notes": [],
+                              # what the current press wrote, port by port
+                              "press": {}}
 
     # ---- stand-ins for hardware modules -------------------------------
     import types
@@ -718,6 +874,10 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             record["sets"].setdefault("__chart__", "redrawn")
 
     class FakePort:
+        """A port with the real binder's behaviour — and its STATE: what a
+        press set is what the next press reads (a listbox's items, a
+        label's text), as in the window."""
+
         def __init__(self, spec):
             self.name, self.kind = spec["name"], spec.get("kind", "")
             self.type = spec.get("type", "str")
@@ -726,29 +886,34 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             self.sample = _expand(spec.get("sample"), tokens)
             self.widget = FakeChartWidget() \
                 if self.writer == "figure_for_drawing" else None
+            self.value = self.sample if self.sample is not None else {
+                "path": tokens["<FOLDER>"], "int": 3, "float": 0.5,
+                "bool": True, "rows": [("a", "1")],
+                "str": ["a"] if self.binder == "list" else "sample"
+            }.get(self.type, "sample")
+            #: A listbox's items or a table's rows, as the last press left
+            #: them.
+            self.held = (["alpha", "beta"] if self.binder == "list" else
+                         [("a", "1"), ("b", "2")] if self.binder == "table"
+                         else None)
 
         def get(self):
             if self.binder in ("proxy", "event"):
                 raise TypeError(f"port {self.name!r} is write-only "
                                 f"({self.kind} has no value to read)")
-            if self.sample is not None:
-                return self.sample
-            return {"path": tokens["<FOLDER>"], "int": 3, "float": 0.5,
-                    "bool": True, "rows": [("a", "1")],
-                    "str": ["a"] if self.binder == "list" else "sample"
-                    }.get(self.type, "sample")
+            return self.value
 
         def items(self):
             if self.binder != "list":
                 raise AttributeError(f"port {self.name!r} is a {self.kind}; "
                                      f"only a listbox has items()")
-            return ["alpha", "beta"]
+            return list(self.held)
 
         def rows(self):
             if self.binder != "table":
                 raise AttributeError(f"port {self.name!r} is a {self.kind}; "
                                      f"only a table has rows()")
-            return [("a", "1"), ("b", "2")]
+            return list(self.held)
 
         def set(self, value):
             if self.binder == "event":
@@ -771,6 +936,15 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                 record["problems"].append(_check_value(
                     value, "text", f"port {self.name!r} ({self.kind})"))
             record["sets"][self.name] = type(value).__name__
+            if self.binder in ("list", "table"):
+                self.held = list(value)
+            elif self.binder != "proxy":
+                self.value = value
+            shown = _shown(value)
+            if self.writer == "append":
+                record["press"].setdefault(self.name, []).append(shown)
+            else:
+                record["press"][self.name] = shown
 
         def clear(self):
             pass
@@ -791,26 +965,191 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         def __getitem__(self, name):
             return getattr(self, name)
 
+    def own_frames(exc):
+        """(the whole traceback, its frames in the candidate's files)."""
+        tb = traceback.extract_tb(getattr(exc, "__traceback__", None))
+        return tb, [f for f in tb if os.path.basename(f.filename) in
+                    ("handlers.py", "logic.py")]
+
+    def source_of(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:                                # noqa: BLE001
+            return ""
+
+    def meant(exc, tb, own):
+        """Whether ``exc`` is a refusal the candidate raised on purpose: a
+        ValueError from a `raise` line of its own, or the user's text
+        failing to parse on its line (`n = int(text)`). A ValueError a
+        built-in raises on a line of the code is a crash: an unpack, a
+        format spec (qwen2.5's K7 without its catch-all), max([]) all
+        passed softly as "deliberate", then failed the hidden test
+        (review, 2026-10-09)."""
+        if not (isinstance(exc, ValueError) and own and tb
+                and own[-1] is tb[-1]):
+            return False
+        return parse_failed(exc) or raises_at(source_of(own[-1].filename),
+                                              own[-1].lineno)
+
+    def blank_input(app):
+        """Whether a box the press reads was left blank (None) — what the
+        repeated press types into an empty number box."""
+        ports = getattr(app, "ports", None)
+        return any(getattr(getattr(ports, n, None), "value", "") is None
+                   for n in getattr(ports, "_names", ()))
+
+    def relabelled(exc, own, blank=False):
+        """(the crash, how the catch-all is spelled) when the candidate's
+        ValueError was raised from a handler that catches everything over
+        a fault of the code (code_fault); (None, "") for a refusal it
+        meant — of input the user can fix, or its own raise inside the
+        try."""
+        crash = getattr(exc, "__context__", None)
+        if crash is None or not own:
+            return None, ""
+        spelled = broad_handler_at(source_of(own[-1].filename),
+                                   own[-1].lineno)
+        if not spelled:
+            return None, ""
+        ctb, cown = own_frames(crash)
+        if isinstance(crash, ValueError) and cown and ctb and \
+                cown[-1] is ctb[-1] and raises_at(
+                    source_of(cown[-1].filename), cown[-1].lineno):
+            # `raise ValueError(result["error"])` inside the try, relabelled
+            # by the catch-all (qwen2.5-coder's K4 does exactly that): still
+            # the refusal the code meant.
+            return None, ""
+        if not code_fault(crash, (cown[-1].line or "") if cown else "",
+                          blank):
+            return None, ""
+        return crash, spelled
+
+    def crash_report(crash, spelled):
+        """(the error line, the crash's own frames): the error that was
+        relabelled, at the line that raised it."""
+        return (f"{type(crash).__name__}: {crash} — caught by `{spelled}` "
+                f"and raised again as ValueError; a refusal is for input the "
+                f"user can fix, not for a crash in the code"), \
+            own_frames(crash)[1]
+
     class Host:
         def report_error(self, what, exc):
-            tb = traceback.extract_tb(getattr(exc, "__traceback__", None))
-            own = [f for f in tb if os.path.basename(f.filename) in
-                   ("handlers.py", "logic.py")]
+            tb, own = own_frames(exc)
+            # raise ValueError("why") in the body itself: the message the
+            # user is meant to see, not a fault — unless a catch-all raised
+            # it over a crash.
+            deliberate = meant(exc, tb, own)
+            error = f"{type(exc).__name__}: {exc}"
+            if deliberate:
+                crash, spelled = relabelled(exc, own, blank_input(self))
+                if crash is not None:
+                    deliberate = False
+                    error, crash_own = crash_report(crash, spelled)
+                    own = crash_own or own
             record["errors"].append({
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": error,
                 "where": (f"{os.path.basename(own[-1].filename)}:"
                           f"{own[-1].lineno}" if own else ""),
                 "line_text": own[-1].line if own else "",
-                # raise ValueError("why") in the body itself: the message
-                # the user is meant to see, not a fault.
-                "deliberate": bool(isinstance(exc, ValueError) and own
-                                   and tb and own[-1] is tb[-1])})
+                "deliberate": deliberate})
 
         def clear_ports(self, *names):
             pass
 
         def request_close(self):
             record["problems"].append("it closes the window")
+
+    # ---- repeated presses (handler mode, a port with a "sample2") -------
+    picked = {s["name"] for s in job.get("ports") or []
+              if s.get("binder") == "list"}
+
+    def said_with(inputs):
+        return _inputs_text(inputs, picked)
+
+    def reseed():
+        """The random modules seeded alike before every press: a handler
+        random by design ("the original list in a random order") answers
+        the same inputs the same way, as the check below needs."""
+        random.seed(0)
+        numpy = sys.modules.get("numpy")
+        if numpy is not None:
+            try:
+                numpy.random.seed(0)
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def press(app, inputs):
+        """One press with ``inputs`` typed in: (what it wrote, port by
+        port; why it failed, or "")."""
+        for name, value in inputs.items():
+            getattr(app.ports, name).value = value
+        record["press"] = {}
+        reseed()
+        errors, problems = len(record["errors"]), len(record["problems"])
+        getattr(app, job["handler"])()
+        said = f"pressed with {said_with(inputs)}"
+        record["problems"][problems:] = [
+            f"{said}: {p}" for p in record["problems"][problems:] if p]
+        bad = [e for e in record["errors"][errors:] if not e["deliberate"]]
+        if bad:
+            return {}, (f"{said}, it raised {bad[0]['error'][:300]}"
+                        + (f" (at {bad[0]['where']})" if bad[0]["where"]
+                           else ""))
+        return dict(record["press"]), ""
+
+    def repeat_problem(app_cls, again):
+        """Press with the samples, then with other inputs, then with the
+        samples again — and the other way round, on a fresh window. A task
+        that starts every press from the ORIGINAL data shows the same for
+        the same inputs whatever came before. One press cannot tell: K2's
+        "filter the ORIGINAL list" passed it for 4 of 5 models that each
+        filtered what the LAST press had left (2026-10-05).
+
+        First each set of inputs is pressed twice on a fresh window: when
+        those two already differ, the handler keeps state, or steps on, by
+        design ("each press removes the first item ... of the original
+        items left"), and the check cannot tell that from filtering what
+        the last press left — so it says nothing. Filtering the filtered
+        list with the same search gives the same list twice, so K2's fault
+        still reaches the check (review, 2026-10-09)."""
+        first = {s["name"]: FakePort(s).value for s in again}
+        other = {s["name"]: _expand(s["sample2"], tokens) for s in again}
+
+        def fresh():
+            app = app_cls.__new__(app_cls)
+            app.ports = FakePorts(job.get("ports") or [])
+            return app
+
+        for inputs in (first, other):
+            app = fresh()
+            twice = []
+            for _ in range(2):
+                writes, error = press(app, inputs)
+                if error:
+                    return error
+                twice.append(writes)
+            if twice[0] != twice[1]:
+                return ""
+        for one, two in ((first, other), (other, first)):
+            app = fresh()
+            seen = []
+            for inputs in (one, two, one):
+                writes, error = press(app, inputs)
+                if error:
+                    return error
+                seen.append(writes)
+            if seen[2] != seen[0]:
+                port = next(k for k in list(seen[0]) + list(seen[2])
+                            if seen[0].get(k) != seen[2].get(k))
+                return (f"pressed with {said_with(one)}, then with "
+                        f"{said_with(two)}, then with "
+                        f"{said_with(one)} again, it set {port} to "
+                        f"{seen[2].get(port, '(nothing)')} the third time "
+                        f"but to {seen[0].get(port, '(nothing)')} the first "
+                        f"— each press must start from the ORIGINAL data, "
+                        f"not from what the last press left")
+        return ""
 
     # ---- run -----------------------------------------------------------
     real_stdout, real_stderr = sys.stdout, sys.stderr
@@ -874,20 +1213,29 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                                        f"the sample data")
                 else:
                     verdict["error"] = first["error"][:600]
+            again = [s for s in job.get("ports") or [] if "sample2" in s]
+            if again and not verdict.get("error") and not record["blocked"]:
+                why = repeat_problem(app_cls, again)
+                if why:
+                    record["problems"].append(why)
         verdict["ok"] = not (record["problems"] or record["blocked"]
                              or verdict.get("error"))
     except BaseException as exc:                         # noqa: BLE001
         verdict["call_seconds"] = time.perf_counter() - t0
-        tb = traceback.extract_tb(exc.__traceback__)
-        own = [f for f in tb if os.path.basename(f.filename) in
-               ("handlers.py", "logic.py")]
+        tb, own = own_frames(exc)
         name = type(exc).__name__
         if isinstance(exc, SystemExit):
             msg = "SystemExit — it calls sys.exit()/exit(), which closes the app"
         else:
             msg = f"{name}: {exc}"
-        deliberate = (isinstance(exc, ValueError) and own
-                      and own[-1] is tb[-1] and not record["blocked"])
+        deliberate = meant(exc, tb, own) and not record["blocked"]
+        if deliberate:
+            crash, spelled = relabelled(
+                exc, own, any(a is None for a in job.get("args") or []))
+            if crash is not None:
+                deliberate = False
+                msg, crash_own = crash_report(crash, spelled)
+                own = crash_own or own
         if deliberate:
             # The documented failure path: raise ValueError("why"). On three
             # sample frames that may be the honest answer — said, not failed.

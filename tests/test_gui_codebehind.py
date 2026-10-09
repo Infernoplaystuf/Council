@@ -10,6 +10,7 @@ test_designer_codebehind.py proves the whole thing on a real project.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import time
 from pathlib import Path
@@ -1120,3 +1121,354 @@ def test_the_same_failure_twice_stops_the_retries():
     model = Script(RuntimeError("boom"), RuntimeError("boom"), GOOD)
     res = gcb.write(fn_target(), model, n_best=3)
     assert not res.ok and len(model.calls) == 2 and "boom" in res.errors[0]
+
+
+# ============================================================
+# The 2026-10-05 benchmark, replayed: recorded replies, no model
+# ============================================================
+
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+CASES = {c["id"]: c for c in json.loads(
+    (ROOT / "tests" / "data" / "llm_bench" / "code_cases.json").read_text(
+        encoding="utf-8"))["cases"]}
+K2_ROWS = [gcb.PortRow("search", "entry", "str", "var", "", "Search"),
+           gcb.PortRow("fruits", "listbox", "str", "list", "", "Fruits"),
+           gcb.PortRow("count", "label", "str", "var", "", "Count"),
+           gcb.PortRow("filter", "button", "event", "event", "", "Filter")]
+
+
+def k2_target(**kw) -> gcb.Target:
+    return h_target(name="on_btn_filter", label="Filter",
+                    instruction=CASES["K2"]["task"], ports=list(K2_ROWS),
+                    handlers=["on_btn_filter", "on_close"], **kw)
+
+
+def k4_target(**kw) -> gcb.Target:
+    return fn_target(
+        name="analyze", label="Analyze",
+        instruction=CASES["K4"]["codebehind"]["instruction"],
+        params=[gcb.Param("image_path", "str", "image_path", "file_picker",
+                          'a file path the user picked in "Image"', "<PNG>")],
+        outputs=[gcb.Output("brightness", "brightness", "label", "text"),
+                 gcb.Output("size", "size", "label", "text")],
+        shortlist=[gcb.Ref("image_stats", "image_pixel_stats",
+                           "image_pixel_stats(path)", params=("path",),
+                           required=1)], **kw)
+
+
+def test_an_app_module_called_as_module_dot_function_gets_its_import():
+    """qwen2.5-coder's K4: all five replies called
+    image_stats.image_pixel_stats(image_path) — the task's own wording —
+    without importing image_stats, and gate 4 sent each one back."""
+    cand = gcb.check(RECORDED["code"]["qwen2.5-coder K4 1"], k4_target(),
+                     catalogue)
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+    assert "added `import image_stats`" in cand.notes
+    assert "    import image_stats" in cand.code
+    ast.parse(cand.code)
+
+
+def test_the_hint_for_an_unimported_app_module_is_to_import_it():
+    """The old hint — "define image_stats before using it, or use one of
+    the parameters (image_path)" — pointed away from the fix."""
+    hints = gcb.hints_for(["line 7: undefined name 'image_stats'"],
+                          k4_target())
+    assert hints[0].startswith("add `import image_stats` inside the "
+                               "function")
+    assert not any("define image_stats" in h for h in hints)
+
+
+def test_a_module_the_app_may_not_import_is_named_as_a_module():
+    reply = fence('''
+def count_images(folder):
+    img = cv2.imread(folder)
+    return {"status": str(img), "files": []}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_NAMES
+    assert "it is used as a module but never imported" in cand.faults[0]
+    assert "import cv2" not in cand.code
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert any(h.startswith("cv2 is used as a module but never imported")
+               for h in hints), hints
+
+
+def test_handler_state_read_before_any_press_set_it_gets_a_hint():
+    """qwen2.5's K2: self._ai_original_fruits read on the FIRST press. The
+    bare AttributeError went back with no HOW TO FIX, and the model
+    returned the same code three times."""
+    fault = ("smoke run raised AttributeError: 'SmokeApp' object has no "
+             "attribute '_ai_original_fruits' (at handlers.py:26: "
+             "filtered_items = [item for item in self._ai_original_fruits]")
+    model = Script(RECORDED["code"]["qwen2.5 K2 2"],
+                   RECORDED["code"]["phi4:14b K2 1"])
+    res = gcb.write(k2_target(), model, smoke=Smoke(fault, None),
+                    max_repairs=1)
+    assert res.ok and len(model.calls) == 2, res.errors
+    repair = model.calls[1]["prompt"]
+    assert "HOW TO FIX" in repair
+    assert 'getattr(self, "_ai_original_fruits", None)' in repair
+
+
+def test_a_crash_relabelled_as_a_value_error_gets_its_own_hint():
+    fault = ("smoke run raised ValueError: Invalid format specifier — caught "
+             "by `except Exception` and raised again as ValueError; a refusal "
+             "is for input the user can fix, not for a crash in the code "
+             "(at logic.py:8: file.write(...))")
+    hints = gcb.hints_for([fault], fn_target())
+    assert any("never turn a crash into ValueError" in h for h in hints)
+    assert not any("do not catch Exception and carry on" in h
+                   for h in hints), "the policy hint invites the wrapper"
+
+
+def test_a_task_that_starts_from_the_original_data_is_told_so():
+    """K2 says "the ORIGINAL list"; 4 of 5 models filtered what the last
+    press left. The prompt now says how to keep the original."""
+    assert gcb.restarts_from_original(CASES["K2"]["task"])
+    for cid in ("K1", "K3", "K5", "K6", "K7", "K8"):
+        assert not gcb.restarts_from_original(CASES[cid]["task"]), cid
+    prompt, _shed = gcb.build_prompt(k2_target())
+    assert "Repeated presses start from the ORIGINAL data" in prompt
+    assert "self._ai_original = self.ports.fruits.items()" in prompt
+    plain, _shed = gcb.build_prompt(h_target())
+    assert "ORIGINAL data" not in plain
+
+
+@pytest.mark.parametrize("task", [
+    "Each press of Filter removes the first item from the fruits list, and "
+    "the count label shows how many of the original items are left, e.g. "
+    "'1 of 2 left'.",
+    "When Filter is pressed, show the items of the original list in a random "
+    "order in the fruits list, and how many there are in the count label.",
+    "Shuffle the original list on every press.",
+    "Every click adds the search text to the original items.",
+    "Each press shows the next item of the original list in the label.",
+])
+def test_a_task_that_changes_on_every_press_is_not_told_to_restart(task):
+    """REVIEW (2026-10-09): any "original <noun>" turned the rule on, and
+    the prompt then said "Repeated presses start from the ORIGINAL data"
+    to a task whose presses each remove, add, shuffle or step on."""
+    assert not gcb.restarts_from_original(task)
+    prompt, _shed = gcb.build_prompt(h_target(
+        name="on_btn_filter", label="Filter", instruction=task,
+        ports=list(K2_ROWS), handlers=["on_btn_filter", "on_close"]))
+    assert "ORIGINAL data" not in prompt
+
+
+def test_a_model_that_stops_answering_leaves_the_best_gate_report():
+    """A replay that runs out of recorded replies said only "the model call
+    failed" — not how far the best candidate got."""
+    bad = fence('''
+def count_images(folder):
+    return {"status": str(len(os.listdir(folder)))}''')
+    res = gcb.write(fn_target(), Script(bad, RuntimeError("ran out")),
+                    smoke=Smoke(None))
+    assert not res.ok and "the model call failed" in res.errors[0]
+    assert any(g.startswith("references: FAILED") for g in res.gates), \
+        res.gates
+
+
+def test_a_repeated_press_fault_is_repaired_with_the_recipe():
+    fault = ("smoke run: pressed with search='', then with search='sample', "
+             "then with search='' again, it set fruits to [] the third time "
+             "but to ['alpha', 'beta'] the first — each press must start "
+             "from the ORIGINAL data, not from what the last press left")
+    hints = gcb.hints_for([fault], k2_target())
+    assert any("self._ai_original = self.ports.fruits.items()" in h
+               for h in hints), hints
+
+
+#: The faults the 2026-10-05 run sent back with no HOW TO FIX, verbatim
+#: (the recorded replies replayed through the writer offline): 9 of its 22
+#: repair prompts.
+BARE_FAULTS = {
+    "phi3.5 K1": "line 4: invalid syntax. Perhaps you forgot a comma?: if "
+                 "second_number is None or not isinstance(second extramount, "
+                 "(int, float)):",
+    "phi3.5 K7": "smoke run raised AttributeError: 'int' object has no "
+                 "attribute 'is_integer' (at logic.py:15: if age is None or "
+                 "not age.is_integer():)",
+    "phi3.5 K8": "line 7: '{' was never closed: conversion_factors = {\"mm\": "
+                 "{\"cm\": 0.1, \"m\": 0.001, \"in\": 0.0393700787401575},",
+    "phi4:14b K6": "line 11: start_stop is a button — it has no value to "
+                   "set(); use .enable(True/False)",
+    "qwen2.5 K2": "smoke run raised AttributeError: 'SmokeApp' object has no "
+                  "attribute '_ai_original_fruits' (at handlers.py:26: "
+                  "filtered_items = [item for item in "
+                  "self._ai_original_fruits if search_text in item.lower()])",
+}
+
+
+@pytest.mark.parametrize("key", sorted(BARE_FAULTS))
+def test_no_fault_goes_back_without_a_hint(key):
+    target = k2_target() if "K2" in key or "K6" in key else fn_target()
+    assert gcb.hints_for([BARE_FAULTS[key]], target), key
+
+
+def test_an_attribute_a_plain_value_lacks_is_said_about_the_name():
+    """phi3.5's K7, three repairs running: age.is_integer() on the int a
+    number box gives (no int has it on Python 3.11)."""
+    hints = gcb.hints_for([BARE_FAULTS["phi3.5 K7"]], fn_target())
+    assert hints[0] == ("age is an int there, and an int has no .is_integer "
+                        "— use only what an int has")
+    none = gcb.hints_for(["smoke run raised AttributeError: 'NoneType' object "
+                          "has no attribute 'strip' (at logic.py:3: "
+                          "name = text.strip())"], fn_target())
+    assert none[0].startswith("text is None there")
+
+
+def test_a_syntax_fault_gets_the_rule_it_broke():
+    comma = gcb.hints_for([BARE_FAULTS["phi3.5 K1"]], fn_target())
+    assert comma[0].startswith("line 4 is not valid Python: a name is one "
+                               "word with no spaces")
+    brace = gcb.hints_for([BARE_FAULTS["phi3.5 K8"]], fn_target())
+    assert brace[0].startswith("line 7 is not valid Python: close every (, "
+                               "[ and {")
+
+
+def test_a_fault_with_a_hint_of_its_own_gets_no_generic_one():
+    hints = gcb.hints_for(["line 3: undefined name 'np'"], fn_target())
+    assert hints == ["add `import numpy as np` inside the function"]
+
+
+# ============================================================
+# Review of the 2026-10-05 fixes (2026-10-09)
+# ============================================================
+
+@pytest.mark.parametrize("body, name, close", [
+    # never assigned, read as result.get(...)
+    ('''
+    import os
+    names = sorted(os.listdir(folder))
+    return {"status": str(result.get("n")), "files": names}''',
+     "result", None),
+    # the DataFrame it never built
+    ('''
+    import pandas as pd
+    return {"status": str(df.shape[0]), "files": list(df.columns)}''',
+     "df", None),
+    # a typo of a name it did define
+    ('''
+    import os
+    result = {"n": len(os.listdir(folder))}
+    return {"status": str(reslt.get("n")), "files": []}''',
+     "reslt", "result"),
+])
+def test_an_undefined_variable_read_as_name_attr_is_told_to_define_it(
+        body, name, close):
+    """REVIEW: every undefined name read only as `name.attr` was called "a
+    module never imported", and the hint said to import it - for a typo
+    whose own fault said "did you mean 'result'?" too."""
+    cand = gcb.check(fence("def count_images(folder):" + body), fn_target(),
+                     catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert f"undefined name '{name}'" in cand.faults[0]
+    assert "used as a module" not in cand.faults[0], cand.faults
+    if close:
+        assert f"did you mean '{close}'?" in cand.faults[0]
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert hints[0] == (f"define {name} before using it, or use one of the "
+                        f"parameters (folder)"), hints
+    assert not any("import it" in h for h in hints), hints
+
+
+def test_self_in_a_function_is_told_it_is_not_a_handler():
+    """A small model's common slip in FUNCTION mode: self.ports.x.set()."""
+    cand = gcb.check(fence('''
+def count_images(folder):
+    import os
+    names = sorted(os.listdir(folder))
+    self.ports.status.set(str(len(names)))
+    return {"status": str(len(names)), "files": names}'''), fn_target(),
+        catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert "used as a module" not in cand.faults[0], cand.faults
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert hints[0].startswith("there is no self here: this is a function, "
+                               "not a handler"), hints
+    assert "(folder)" in hints[0] and "'status', 'files'" in hints[0]
+    assert not any("import" in h for h in hints), hints
+
+
+@pytest.mark.parametrize("module", ["shutil", "cv2"])
+def test_a_real_module_read_as_name_attr_is_still_a_module(module):
+    cand = gcb.check(fence(f'''
+def count_images(folder):
+    x = {module}.thing(folder)
+    return {{"status": str(x), "files": []}}'''), fn_target(), catalogue)
+    assert cand.stage == gcb.STAGE_NAMES, cand.faults
+    assert "it is used as a module but never imported" in cand.faults[0]
+
+
+TWO_LISTS = [gcb.PortRow("search", "entry", "str", "var", "", "Search"),
+             gcb.PortRow("matches", "listbox", "str", "list", "", "Matches"),
+             gcb.PortRow("names", "listbox", "str", "list", "", "Names"),
+             gcb.PortRow("find", "button", "event", "event", "", "Find")]
+
+
+def two_list_target(instruction):
+    return h_target(name="on_btn_find", label="Find", instruction=instruction,
+                    ports=list(TWO_LISTS),
+                    handlers=["on_btn_find", "on_close"])
+
+
+def test_the_recipe_keeps_the_list_the_task_calls_original():
+    """REVIEW (2026-10-09): the recipe took the FIRST list port - here the
+    output list - so a model that followed it filtered the wrong list, and
+    the repeated presses could not see it (the output is the same on every
+    press)."""
+    target = two_list_target(
+        "show in the matches list those items of the original list of names "
+        "(the names list) that contain the search text")
+    assert gcb.restarts_from_original(target.instruction)
+    prompt, _shed = gcb.build_prompt(target)
+    assert "self._ai_original = self.ports.names.items()" in prompt
+    assert "self._ai_original = self.ports.matches.items()" not in prompt
+    fault = ("smoke run: pressed ... — each press must start from the "
+             "ORIGINAL data, not from what the last press left")
+    hints = gcb.hints_for([fault], target)
+    assert any("self._ai_original = self.ports.names.items()" in h
+               for h in hints), hints
+
+
+def test_when_the_task_does_not_say_which_list_every_one_is_named():
+    target = two_list_target(
+        "show the items of the original list that contain the search text, "
+        "and how many in the matches list")
+    prompt, _shed = gcb.build_prompt(target)
+    recipe = prompt[prompt.index("Repeated presses"):].splitlines()[0]
+    assert "self.ports.matches.items(), self.ports.names.items()" in recipe
+    assert "self._ai_original = <that list>" in recipe
+
+
+@pytest.mark.parametrize("fault, hint", [
+    # the LAST .get on the line is the one that failed, on what the first
+    # returned - not the port
+    ("smoke run raised AttributeError: 'str' object has no attribute 'get' "
+     "(at handlers.py:5: mode = self.ports.settings.get().get('mode'))",
+     "the value self.ports.settings.get() returns is a string there, and a "
+     "string has no .get — use only what a string has"),
+    ("smoke run raised AttributeError: 'list' object has no attribute 'get' "
+     "(at handlers.py:7: first = self.ports.files.items().get(0))",
+     "the value self.ports.files.items() returns is a list there, and a list "
+     "has no .get — use only what a list has"),
+    ("smoke run raised AttributeError: 'dict' object has no attribute 'name' "
+     "(at logic.py:4: label = rows[0].name)",
+     "rows[0] is a dict there, and a dict has no .name — use only what a "
+     "dict has"),
+    ("smoke run raised AttributeError: 'NoneType' object has no attribute "
+     "'strip' (at handlers.py:5: name = self.ports.name.get().strip())",
+     "the value self.ports.name.get() returns is None there (a blank input, "
+     "or a call that returned nothing): keep it in a variable and test that "
+     "variable for None before using it"),
+    ("smoke run raised AttributeError: 'NoneType' object has no attribute "
+     "'strip'",
+     "the value is None there (a blank input, or a call that returned "
+     "nothing): keep it in a variable and test that variable for None "
+     "before using it"),
+])
+def test_the_attribute_hint_names_the_receiver_that_failed(fault, hint):
+    """REVIEW (2026-10-09): the hint took the FIRST `<name>.attr` on the
+    line, so it called the settings port a string; and with no name found
+    it put "the value" inside a code snippet."""
+    assert gcb.hints_for([fault], fn_target())[0] == hint

@@ -455,6 +455,48 @@ def _sample_for(port: Any, widget: Any, instruction: str) -> Any:
     return "sample"
 
 
+#: The kinds a person types or picks into, and so the ones a second press
+#: changes; a path stays the same file (the sample folder is the sample).
+_PRESSED_INPUTS = frozenset({"entry", "text", "combobox", "spinbox", "scale",
+                             "checkbutton", "radiobutton", "listbox"})
+
+
+#: _second_sample's "this port keeps its value on the second press".
+UNCHANGED = object()
+
+
+def _second_sample(port: Any, widget: Any, first: Any) -> Any:
+    """What the smoke run types for a SECOND press with other inputs (see
+    gui_smoke's repeated presses) — a blank text box, the other choice, the
+    other tick, no selection — or UNCHANGED for a port a person does not
+    type into, or a path (the sample folder is the sample)."""
+    if port.kind not in _PRESSED_INPUTS or port.type == "path" or (
+            isinstance(first, str) and first.startswith("<")):
+        return UNCHANGED
+    props = dict(getattr(widget, "props", None) or {}) if widget else {}
+    if port.binder == "list":
+        return []
+    if port.kind == "combobox":
+        other = [str(v) for v in props.get("values") or [] if str(v) != first]
+        return other[0] if other else ""
+    if port.kind == "radiobutton":
+        other = [c for c in (getattr(port, "choices", None) or [])
+                 if c != first]
+        return other[0] if other else UNCHANGED
+    if port.kind in ("spinbox", "scale"):
+        try:
+            ends = [float(props.get("from_", 0)), float(props.get("to", 100))]
+        except (TypeError, ValueError):
+            ends = [0.0, 100.0]
+        pick = next((e for e in ends if e != first), ends[0])
+        return int(pick) if isinstance(first, int) else pick
+    if port.type == "bool" or port.kind == "checkbutton":
+        return not first
+    # A typed box left blank reads as None (gui_emit_qt._coerce); a text
+    # box as "".
+    return None if port.type in ("int", "float") else ""
+
+
 def _param_type(port: Any) -> str:
     import gui_codebehind as gcb
     if port.binder in ("list", "table"):
@@ -623,6 +665,14 @@ def _plan(out: Plan, req: Request) -> None:
     out.port_rows = [dict(name=r.name, kind=r.kind, type=r.type,
                           binder=r.binder, writer=r.writer, sample=r.sample)
                      for r in rows]
+    if req.mode == "handler" and gcb.restarts_from_original(req.instruction):
+        # Every press must start from the ORIGINAL data, which one press
+        # cannot show: each input gets a second sample, and the smoke run
+        # presses with both, in both orders (gui_smoke).
+        for row, p in zip(out.port_rows, spec.ports):
+            second = _second_sample(p, widget_of(p), row["sample"])
+            if second is not UNCHANGED and second != row["sample"]:
+                row["sample2"] = second
     target = gcb.Target(mode=req.mode, instruction=req.instruction.strip(),
                         label=out.label, kind=w.kind,
                         project_mode=out.project_mode, toolkit=out.toolkit,

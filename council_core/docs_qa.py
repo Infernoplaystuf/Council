@@ -1417,6 +1417,195 @@ def documented_api(pages: Sequence[Source]) -> Tuple[Set[str],
     return idents, sigs
 
 
+#: The bundled server heads each page "# glimmerquay.Cadence.windows
+#: (method)"; other servers may not, and then a Capitalised last part is
+#: read as a class (the Python convention) and anything else as unknown.
+_PAGE_KIND = re.compile(r"^#\s*([A-Za-z_][\w.]*)\s+\((\w+)\)", re.MULTILINE)
+
+
+def documented_paths(pages: Sequence[Source], roots: Iterable[str]
+                     ) -> Dict[str, str]:
+    """Every dotted name under ``roots`` the pages write out — with each
+    prefix: "glimmerquay.Cadence.windows" gives "glimmerquay.Cadence" too —
+    mapped to what a page heading says it is ("class", "method", "module",
+    ...); else "class" or "function" when the text calls it (`name(`), and
+    "" when nothing says."""
+    roots = [r for r in roots if r]
+    out: Dict[str, str] = {}
+    if not roots:
+        return out
+    dotted = re.compile(r"\b(?:" + "|".join(map(re.escape, roots))
+                        + r")(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+    for p in pages:
+        text = f"{p.title}\n{p.ref}\n{p.text}"
+        for m in dotted.finditer(text):
+            parts = m.group(0).split(".")
+            for i in range(2, len(parts) + 1):
+                out.setdefault(".".join(parts[:i]), "")
+            if text[m.end():m.end() + 1] == "(" and not out[m.group(0)]:
+                out[m.group(0)] = (
+                    "class" if text[:m.start()].endswith("class ")
+                    or parts[-1][:1].isupper() else
+                    "method" if parts[-2][:1].isupper() else "function")
+        for m in _PAGE_KIND.finditer(p.text or ""):
+            if m.group(1).split(".")[0] in roots:
+                out[m.group(1)] = m.group(2).lower()
+    out.update(_owner_kinds(pages, roots))
+    return out
+
+
+#: What a headed page says of the name it sits under: a function, a class,
+#: a constant or a submodule lives in a module; a method, a property or an
+#: attribute in a class.
+_OWNER_KIND = {"function": "module", "class": "module", "module": "module",
+               "package": "module", "constant": "module", "data": "module",
+               "method": "class", "property": "class", "attribute": "class"}
+
+
+def _owner_kinds(pages: Sequence[Source], roots: Sequence[str]
+                 ) -> Dict[str, str]:
+    """The kind of each name with no heading of its own, read from the
+    headed pages under it — deepest first, so "PySide6.QtWidgets.QLabel
+    .setText (method)" makes QLabel a class and QtWidgets a module.
+
+    REVIEW (2026-10-09): with no page of its own, a Capitalised last part
+    was read as a class, so `import PIL.Image` (pages "PIL.Image.open
+    (function)", "PIL.Image.OPEN (constant)") and `from PySide6.QtWidgets
+    import QApplication` were flagged as importing a class. A name the
+    pages disagree about is left to that guess."""
+    headed: Dict[str, str] = {}
+    for p in pages:
+        for m in _PAGE_KIND.finditer(p.text or ""):
+            if m.group(1).split(".")[0] in roots:
+                headed[m.group(1)] = m.group(2).lower()
+    known = dict(headed)
+    out: Dict[str, str] = {}
+    depth = max((k.count(".") for k in headed), default=0)
+    for level in range(depth, 0, -1):
+        votes: Dict[str, Set[str]] = {}
+        for path, kind in known.items():
+            owner = path.rpartition(".")[0]
+            said = _OWNER_KIND.get(kind)
+            if path.count(".") == level and "." in owner and said and \
+                    owner not in headed:
+                votes.setdefault(owner, set()).add(said)
+        for owner, said in votes.items():
+            if len(said) == 1:
+                out[owner] = known[owner] = next(iter(said))
+    return out
+
+
+def _kind_of(path: str, paths: Dict[str, str]) -> str:
+    kind = paths.get(path, "")
+    if not kind and "." in path and path.rsplit(".", 1)[1][:1].isupper():
+        kind = "class"
+    return kind
+
+
+def _import_issues(node: ast.AST, roots: Set[str], paths: Dict[str, str]
+                   ) -> List[str]:
+    """What is wrong with one import of the documented package that the
+    names alone do not show: a method imported as if it were a name of the
+    module (qwen2.5's c05, 2026-10-05: `from glimmerquay import Cadence,
+    windows` — windows is Cadence.windows), or `import` given a class, a
+    function or a method instead of a module (`import pkg.Class.method`).
+    Both passed this check — every identifier on the pages counted — went
+    out with no repair round, and failed at the import. So did reading a
+    method out of its class as if the class were a module (`from
+    pkg.Class import method`)."""
+    out: List[str] = []
+    if isinstance(node, ast.ImportFrom) and node.module and not node.level \
+            and node.module.split(".")[0] in roots:
+        held = _not_a_module(node.module, paths)
+        if held:
+            path, kind = held
+            home, name = path.rsplit(".", 1)
+            rest = node.module[len(path) + 1:]
+            calls = ", ".join(
+                f".{rest + '.' if rest else ''}{a.name}()"
+                for a in node.names if a.name != "*")
+            out.append(f"line {node.lineno}: `from {node.module} import "
+                       f"...` — {path} is a {kind}, not a module, and "
+                       f"`from ... import` reads names out of modules only: "
+                       f"write `from {home} import {name}`"
+                       + (f" and call {calls} on a {name}"
+                          if calls and kind == "class" else ""))
+            return out
+        for a in node.names:
+            if a.name == "*" or f"{node.module}.{a.name}" in paths:
+                continue
+            owners = sorted({p.rsplit(".", 1)[0] for p in paths
+                             if p.endswith("." + a.name)})
+            if owners and all(_kind_of(o, paths) == "class" for o in owners):
+                owner = owners[0]
+                home, cls = owner.rsplit(".", 1)
+                what = paths.get(f"{owner}.{a.name}") or "member"
+                out.append(f"line {node.lineno}: {a.name} is a {what} of "
+                           f"{owner}, not a name in {node.module} — import "
+                           f"the class (`from {home} import {cls}`) and "
+                           f"call .{a.name}() on a {cls}")
+    elif isinstance(node, ast.Import):
+        for a in node.names:
+            if a.name.split(".")[0] not in roots:
+                continue
+            held = _not_a_module(a.name, paths)
+            if held:
+                path, kind = held
+                home, name = path.rsplit(".", 1)
+                rest = (f" and call .{a.name[len(path) + 1:]}() on it"
+                        if len(a.name) > len(path) else "")
+                out.append(f"line {node.lineno}: `import {a.name}` — "
+                           f"{path} is a {kind}, not a module, and "
+                           f"`import` takes modules only: write `from "
+                           f"{home} import {name}`{rest}")
+    return out
+
+
+def _not_a_module(dotted: str, paths: Dict[str, str]
+                  ) -> Optional[Tuple[str, str]]:
+    """(the first part of ``dotted`` the pages say is not a module, what it
+    is): "glimmerquay.Cadence.windows" -> ("glimmerquay.Cadence", "class");
+    None when every part may be a module."""
+    parts = dotted.split(".")
+    for i in range(2, len(parts) + 1):
+        path = ".".join(parts[:i])
+        kind = _kind_of(path, paths)
+        if kind and kind not in ("module", "package"):
+            return path, kind
+    return None
+
+
+#: `from pkg import A, pkg.B` — a dotted name where only plain names go.
+_DOTTED_FROM = re.compile(r"^\s*from\s+([A-Za-z_][\w.]*)\s+import\s+(.+)$")
+
+
+def _dotted_from_hint(line: str) -> str:
+    """The repair for a from-import that names a dotted name, which Python
+    refuses as plain "invalid syntax": phi3.5 wrote `from glimmerquay
+    import Ledger, glimmerquay.LedgerFullError` in its c01, c02 and c03 and
+    kept it through every repair round (2026-10-05). A comment after the
+    names is left out, and a name said twice is said once."""
+    m = _DOTTED_FROM.match((line or "").split("#", 1)[0])
+    if not m:
+        return ""
+    names = [n.strip() for n in m.group(2).strip("() \t").split(",")
+             if n.strip()]
+    if not any("." in n.split(" as ")[0] for n in names):
+        return ""
+    groups: Dict[str, List[str]] = {}
+    for n in names:
+        head, _as, alias = (p.strip() for p in n.partition(" as "))
+        home, _dot, name = head.rpartition(".")
+        plain = f"{name} as {alias}" if alias else name
+        group = groups.setdefault(home or m.group(1), [])
+        if plain not in group:
+            group.append(plain)
+    fixed = "; ".join(f"`from {home} import {', '.join(ns)}`"
+                      for home, ns in groups.items())
+    return (f" — after `import` come plain names, never dotted ones: "
+            f"{fixed}")
+
+
 class _Names(ast.NodeVisitor):
     """Names bound anywhere (flat — scope is ignored on purpose: the check is
     for 'used but never defined', and a flat view never cries wolf about a
@@ -1575,7 +1764,8 @@ def _check_code(code: str, pages: Sequence[Source],
             line = lines[exc.lineno - 1].strip() if exc.lineno <= len(
                 lines) else ""
         return CodeCheck(False, [f"line {exc.lineno}: SyntaxError: {exc.msg}"
-                                 + (f" — `{line}`" if line else "")])
+                                 + (f" — `{line}`" if line else "")
+                                 + _dotted_from_hint(line)])
     except ValueError as exc:               # a NUL byte, on 3.11
         return CodeCheck(False, [f"The code cannot be parsed: {exc}"])
     issues: List[str] = []
@@ -1602,6 +1792,7 @@ def _check_code(code: str, pages: Sequence[Source],
         return CodeCheck(not issues, issues, True, 0)
 
     idents, sigs = documented_api(pages)
+    paths = documented_paths(pages, roots)
     aliases: Dict[str, List[str]] = {}       # local name -> dotted path
     var_types: Dict[str, List[str]] = {}     # variable -> what made it
     flagged: Set[str] = set()
@@ -1615,6 +1806,8 @@ def _check_code(code: str, pages: Sequence[Source],
                       f"you were given{_suggest(missing, idents)}")
 
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            issues.extend(_import_issues(node, roots, paths))
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.name.split(".")[0] in roots:

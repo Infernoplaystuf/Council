@@ -14,6 +14,7 @@ Pillow or matplotlib must load first).
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -131,6 +132,405 @@ def f(folder):
 """, ["<FOLDER>"], {"count": "text"})
     assert r.ok
     assert "ValueError" in r.soft
+
+
+# ---- a crash relabelled as a refusal -------------------------------------
+
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+
+
+def recorded_code(key: str) -> str:
+    """The code inside one recorded reply's ```python fence."""
+    reply = RECORDED["code"][key]
+    return reply.split("```python", 1)[-1].split("```", 1)[0].strip("\n")
+
+
+def test_broad_handler_at_reads_the_innermost_handler():
+    src = """def f(x):
+    try:
+        return int(x)
+    except Exception as e:
+        raise ValueError(f"bad: {e}")
+
+
+def g(x):
+    try:
+        return int(x)
+    except ValueError:
+        raise ValueError("Age must be a whole number")
+
+
+def h(x):
+    try:
+        try:
+            return int(x)
+        except ValueError:
+            raise ValueError("inner")
+    except:
+        raise ValueError("outer")
+"""
+    assert gui_smoke.broad_handler_at(src, 5) == "except Exception"
+    assert gui_smoke.broad_handler_at(src, 12) == ""
+    assert gui_smoke.broad_handler_at(src, 20) == ""
+    assert gui_smoke.broad_handler_at(src, 22) == "except:"
+    assert gui_smoke.broad_handler_at(src, 3) == ""
+    assert gui_smoke.raises_at(src, 5) and not gui_smoke.raises_at(src, 3)
+
+
+def test_a_crash_a_catch_all_raises_again_as_value_error_is_a_fault():
+    """qwen2.5's K7 (2026-10-05), as recorded: `except Exception as e:
+    raise ValueError(f"Failed to save: {e}")` around an f-string that
+    itself raised. The run called it a deliberate refusal, the writer
+    accepted it, and the hidden test read an empty file."""
+    r = function(recorded_code("qwen2.5 K7 4"),
+                 ["sample", 3, True, "<SAVE>"], {"status": "text"},
+                 name="save")
+    assert not r.ok and not r.soft
+    assert "Invalid format specifier" in r.error
+    assert "raised again as ValueError" in r.error
+    assert r.where == "logic.py:8" and "file.write" in r.line_text
+
+
+def test_a_refusal_the_code_raised_itself_stays_one_under_a_catch_all():
+    """qwen2.5-coder's K4 shape: `raise ValueError(result["error"])` inside
+    the try, relabelled by `except Exception: raise ValueError(str(e))`."""
+    r = function("""
+def f(folder):
+    try:
+        result = {"error": "no frames in " + folder}
+        if "error" in result:
+            raise ValueError(result["error"])
+        return {"count": "1"}
+    except Exception as e:
+        raise ValueError(str(e))
+""", ["<FOLDER>"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "no frames" in r.soft
+
+
+def test_a_refusal_from_a_handler_that_names_its_error_stays_one():
+    r = function("""
+def f(age):
+    try:
+        return {"count": str(int(age))}
+    except ValueError:
+        raise ValueError("Age must be a whole number")
+""", ["thirty"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "whole number" in r.soft
+
+
+@pytest.mark.parametrize("parse", ["int(age)", "float(age)",
+                                   "json.loads(age)",
+                                   "datetime.strptime(age, '%Y')"])
+def test_a_catch_all_around_reading_the_users_text_is_still_a_refusal(parse):
+    """The commonest shape of an honest refusal small models write: a
+    catch-all around int(text). What it caught is the user's text failing
+    to parse, not the code failing — so it stays the refusal it means."""
+    r = function(f"""
+import json
+from datetime import datetime
+
+
+def f(age):
+    try:
+        n = {parse}
+    except Exception as e:
+        raise ValueError(f"Age must be a whole number: {{e}}")
+    return {{"count": str(n)}}
+""", ["thirty"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "whole number" in r.soft
+
+
+def test_parse_failed_tells_bad_input_from_bad_code():
+    assert gui_smoke.parse_failed(ValueError(
+        "invalid literal for int() with base 10: 'x'"))
+    assert gui_smoke.parse_failed(ValueError(
+        "could not convert string to float: 'x'"))
+    import json as _json
+    try:
+        _json.loads("x")
+    except ValueError as exc:
+        assert gui_smoke.parse_failed(exc)
+    assert not gui_smoke.parse_failed(ValueError(
+        "Invalid format specifier ' \"age\": {age}, \"subscribed\": "
+        "{subscribed}' for object of type 'str'"))
+    assert not gui_smoke.parse_failed(KeyError("width"))
+
+
+def test_in_a_handler_a_crash_raised_again_as_value_error_is_a_fault():
+    """The same, through the failure envelope handler mode wraps a body in
+    (report_error decides it there)."""
+    r = handler("""
+    def on_btn_go(self, *args) -> None:
+        try:
+            try:
+                self.ports.status.set(f'{"n": 1}')
+            except Exception as e:
+                raise ValueError(f"Failed: {e}")
+        except Exception as exc:
+            self.report_error("Go", exc)
+""")
+    assert not r.ok and not r.soft
+    assert "raised again as ValueError" in r.error
+    assert r.where == "handlers.py:8" and "status.set" in r.line_text
+
+
+#: Honest refusals: a catch-all around reading what the user typed, which
+#: the user can fix. REVIEW (2026-10-09): only int()/float()/json/strptime
+#: messages were allowed, so each of these was failed as a relabelled crash.
+HONEST_CATCH_ALLS = {
+    "ipaddress": ("import ipaddress", "ipaddress.ip_address(text.strip())"),
+    "decimal": ("from decimal import Decimal", "Decimal(text)"),
+    "date range": ("import datetime",
+                   "datetime.date(*(int(p) for p in '2026-13-40'.split("
+                   "'-')))"),
+    "uuid": ("import uuid", "uuid.UUID(text)"),
+    "hex": ("", "bytes.fromhex(text)"),
+    "base64": ("import base64", "base64.b64decode(text, validate=True)"),
+    "a key the user chose": ("", "{'mm': 1, 'cm': 10}[text]"),
+    "an index the user chose": ("", "text.split()[1]"),
+    "unpacking what was typed": ("", "[a for a, _b in [text.split(' ')]]"),
+    "a typed zero": ("", "10 / len(text.strip('sample'))"),
+}
+
+
+@pytest.mark.parametrize("label", sorted(HONEST_CATCH_ALLS))
+def test_a_catch_all_around_reading_the_input_is_a_refusal(label):
+    imp, expr = HONEST_CATCH_ALLS[label]
+    r = function(f"""
+{imp}
+
+
+def f(text):
+    try:
+        value = {expr}
+    except Exception:
+        raise ValueError("Enter a valid value, e.g. 12.5")
+    return {{"status": str(value)}}
+""", ["sample"], {"status": "text"})
+    assert r.ok, (label, r.summary())
+    assert "Enter a valid value" in r.soft
+
+
+#: Crashes of the code itself, which no input fixes: a catch-all raising
+#: them again as ValueError is a relabelled crash (qwen2.5's K7).
+CODE_FAULTS_CAUGHT = {
+    "NameError": "str(lenght)",
+    "AttributeError": "text.strip().lenght",
+    "a key written in the code": "{'width': 3}['widht']",
+    "TypeError": "'n=' + len(text)",
+    "format spec": "f'{\"name\": 1}'",
+    "unpacking the code's own value": "[a for a, _b in [(1, 2, 3)]]",
+}
+
+
+@pytest.mark.parametrize("label", sorted(CODE_FAULTS_CAUGHT))
+def test_a_code_fault_a_catch_all_raises_again_is_still_a_fault(label):
+    r = function(f"""
+def f(text):
+    try:
+        value = {CODE_FAULTS_CAUGHT[label]}
+    except Exception as e:
+        raise ValueError(f"Could not do it: {{e}}")
+    return {{"status": str(value)}}
+""", ["sample"], {"status": "text"})
+    assert not r.ok and not r.soft, (label, r.summary())
+    assert "raised again as ValueError" in r.error
+    assert r.where == "logic.py:4", r.where
+
+
+def test_a_blank_number_box_refused_by_a_catch_all_is_a_refusal():
+    """REVIEW: the repeated press types None into a blank int box; `try:
+    n = int(self.ports.n.get()) except Exception: raise ValueError("Enter
+    how many items to show")` was failed for the int(None) TypeError."""
+    ports = [{"name": "n", "kind": "entry", "type": "int", "binder": "var",
+              "sample": 3, "sample2": None},
+             {"name": "fruits", "kind": "listbox", "type": "str",
+              "binder": "list", "sample": ["alpha"], "sample2": []},
+             {"name": "count", "kind": "label", "type": "str",
+              "binder": "var"},
+             {"name": "go", "kind": "button", "type": "event",
+              "binder": "event"}]
+    r = gui_smoke.smoke_handler(HEAD + """
+    def on_btn_go(self, *args) -> None:
+        try:
+            try:
+                n = int(self.ports.n.get())
+            except Exception:
+                raise ValueError("Enter how many items to show")
+            if getattr(self, "_ai_original", None) is None:
+                self._ai_original = self.ports.fruits.items()
+            shown = self._ai_original[:n]
+            self.ports.fruits.set(shown)
+            self.ports.count.set(f"{len(shown)} items")
+        except Exception as exc:
+            self.clear_ports("fruits", "count")
+            self.report_error("Go", exc)
+""", "on_btn_go", ports, app_root=ROOT, timeout=8)
+    assert r.ok, r.summary()
+
+
+def test_int_of_none_is_a_blank_box_only_when_an_input_is_blank():
+    src = """
+def f(text):
+    try:
+        n = int({arg})
+    except Exception:
+        raise ValueError("Enter a whole number")
+    return {{"status": str(n)}}
+"""
+    blank = function(src.format(arg="text"), [None], {"status": "text"})
+    assert blank.ok and "whole number" in blank.soft, blank.summary()
+    # None the code made itself, with every input filled in: its own fault
+    made = function(src.format(arg="{}.get('n')"), ["sample"],
+                    {"status": "text"})
+    assert not made.ok and "raised again as ValueError" in made.error
+
+
+@pytest.mark.parametrize("line, said", [
+    ("first, last = text.split(' ')", "not enough values to unpack"),
+    ("value = f'{\"name\": 1}'", "format specifier"),
+    ("value = max([n for n in [] if n])", "empty sequence"),
+])
+def test_a_value_error_a_builtin_raises_on_the_code_line_is_a_crash(line,
+                                                                   said):
+    """REVIEW: a ValueError with the candidate's frame last was taken as a
+    deliberate refusal whatever raised it - qwen2.5's K7 crash without its
+    catch-all, an unpack, max([]) all passed softly, then failed the hidden
+    test. Only a `raise` on that line, or the user's text failing to parse
+    there, is a refusal."""
+    r = function(f"""
+def f(text):
+    {line}
+    return {{"status": "done"}}
+""", ["sample"], {"status": "text"})
+    assert not r.ok and not r.soft, r.summary()
+    assert said in r.error and r.where == "logic.py:3"
+
+
+def test_int_of_the_typed_text_on_the_code_line_is_still_a_refusal():
+    r = function("""
+def f(text):
+    n = int(text)
+    return {"status": str(n)}
+""", ["thirty"], {"status": "text"})
+    assert r.ok and "invalid literal" in r.soft, r.summary()
+
+
+def test_in_a_handler_a_builtins_value_error_is_a_crash_too():
+    r = handler("""
+    def on_btn_go(self, *args) -> None:
+        try:
+            first, last = str(self.ports.folder.get()).split("|")
+            self.ports.status.set(last)
+        except Exception as exc:
+            self.report_error("Go", exc)
+""")
+    assert not r.ok and not r.soft, r.summary()
+    assert "not enough values to unpack" in r.error
+
+
+# ---- repeated presses: every press from the ORIGINAL data ----------------
+
+K2_PORTS = [
+    {"name": "search", "kind": "entry", "type": "str", "binder": "var",
+     "sample": "sample", "sample2": ""},
+    {"name": "fruits", "kind": "listbox", "type": "str", "binder": "list",
+     "sample": ["alpha", "beta"], "sample2": []},
+    {"name": "count", "kind": "label", "type": "str", "binder": "var"},
+    {"name": "filter", "kind": "button", "type": "event", "binder": "event"},
+]
+
+
+def k2_press(key: str, ports=None) -> gui_smoke.SmokeResult:
+    body = "\n".join("    " + ln if ln.strip() else ""
+                     for ln in recorded_code(key).split("\n"))
+    return gui_smoke.smoke_handler(HEAD + body + "\n", "on_btn_filter",
+                                   ports or K2_PORTS, app_root=ROOT,
+                                   timeout=8)
+
+
+@pytest.mark.parametrize("key", ["llama3.1:8b K2 1", "qwen2.5-coder K2 1"])
+def test_a_handler_that_filters_what_the_last_press_left_is_caught(key):
+    """K2 (2026-10-05): one press passed the smoke run for both; each
+    filtered the list the previous press had left, and failed the hidden
+    test ("'AN' must search the ORIGINAL list")."""
+    r = k2_press(key)
+    assert not r.ok, r.summary()
+    assert any("each press must start from the ORIGINAL data" in p
+               for p in r.problems), r.problems
+    # what was SELECTED in the list is said as that, never as its items
+    said = next(p for p in r.problems if "ORIGINAL" in p)
+    assert "fruits selected=[]" in said and "fruits=" not in said, said
+
+
+def test_one_press_still_cannot_tell():
+    """Without a second sample (a task that never says ORIGINAL) the run is
+    the single press it always was."""
+    plain = [{k: v for k, v in p.items() if k != "sample2"} for p in K2_PORTS]
+    assert k2_press("llama3.1:8b K2 1", plain).ok
+
+
+def test_a_handler_that_keeps_the_original_passes_the_repeated_presses():
+    """phi4:14b's K2 — the one model that passed the hidden test."""
+    r = k2_press("phi4:14b K2 1")
+    assert r.ok, r.summary()
+
+
+#: Right handlers for tasks that keep state, or are random, by design —
+#: each one's own task said "original", so it got the repeated presses.
+BY_DESIGN = {
+    # "Each press removes the first item, and the count shows how many of
+    # the original items are left"
+    "keeps state": """
+    def on_btn_filter(self, *args) -> None:
+        items = self.ports.fruits.items()
+        if getattr(self, "_ai_total", None) is None:
+            self._ai_total = len(items)
+        rest = items[1:]
+        self.ports.fruits.set(rest)
+        self.ports.count.set(f"{len(rest)} of {self._ai_total} left")
+""",
+    # "show the items of the original list in a random order"
+    "random": """
+    def on_btn_filter(self, *args) -> None:
+        import random
+        if getattr(self, "_ai_original", None) is None:
+            self._ai_original = self.ports.fruits.items()
+        items = list(self._ai_original)
+        random.shuffle(items)
+        self.ports.fruits.set(items)
+        self.ports.count.set(f"{len(items)} items")
+""",
+}
+
+
+@pytest.mark.parametrize("label", sorted(BY_DESIGN))
+def test_a_handler_that_changes_on_every_press_by_design_is_not_failed(label):
+    """REVIEW (2026-10-09): the A, B, A presses failed a right handler for
+    a task that keeps state (4 of 4 runs) or is random (3 of 4). Two
+    presses with the same inputs that already differ say it is by design;
+    and the random module is seeded alike before every press."""
+    for _ in range(3):
+        r = gui_smoke.smoke_handler(HEAD + BY_DESIGN[label], "on_btn_filter",
+                                    K2_PORTS, app_root=ROOT, timeout=8)
+        assert r.ok, (label, r.summary())
+
+
+def test_ports_keep_what_a_press_set():
+    """The fake window has state now: a listbox's items are what the last
+    press set, as in the real one."""
+    r = handler("""
+    def on_btn_go(self, *args) -> None:
+        self.ports.names.set(["one"])
+        self.ports.status.set(",".join(self.ports.names.items()))
+        if self.ports.status.get() != "one":
+            raise RuntimeError("the label did not keep its text")
+""")
+    assert r.ok, r.summary()
 
 
 # ============================================================

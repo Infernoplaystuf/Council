@@ -314,6 +314,193 @@ def test_problems_left_after_the_repairs_are_shown_not_hidden(server):
     assert r.model_calls == 1 + 1 + qa.MAX_REPAIRS
 
 
+C05 = next(t for t in docs_bench.load_bench()["code_tasks"]
+           if t["id"] == "c05")
+#: qwen2.5's c05 answer, recorded on 2026-10-05: windows is a METHOD
+#: (Cadence.windows), imported as if glimmerquay had a function by that name.
+RECORDED_C05 = json.loads(
+    (ROOT / "tests" / "data" / "llm_bench" / "recorded_2026-10-05.json")
+    .read_text(encoding="utf-8"))["docs"]["qwen2.5 c05 2"]
+
+
+def test_a_method_imported_as_a_module_name_goes_back_for_repair(server):
+    """It passed the check — `windows` is on a page, as Cadence.windows —
+    went out with no repair round, and failed at the import."""
+    model = Stub(q("glimmerquay window times", "first three windows",
+                   "Cadence start times"),
+                 RECORDED_C05,
+                 ans("x [1]", code=C05["reference"]))
+    r = ask(C05["task"], model, server, write_code=True)
+    assert len(model.calls) == 3, "no repair round was asked for"
+    repair = model.calls[2]["messages"][-1]["content"]
+    assert "windows is a method of glimmerquay.Cadence, not a name in " \
+           "glimmerquay" in repair, repair
+    assert "`from glimmerquay import Cadence`" in repair
+    assert r.code_ok
+
+
+SCHEDULE_PAGES = [
+    qa.Source(1, "s", "glimmerquay.Cadence.windows",
+              "glimmerquay.Cadence.windows",
+              "# glimmerquay.Cadence.windows  (method)\n\n"
+              "glimmerquay.Cadence.windows(start: float, count: int)"),
+    qa.Source(2, "s", "glimmerquay.Cadence", "glimmerquay.Cadence",
+              "# glimmerquay.Cadence  (class)\n\n"
+              "class glimmerquay.Cadence(period_s: float)"),
+    qa.Source(3, "s", "glimmerquay.schedule", "glimmerquay.schedule",
+              "# glimmerquay.schedule  (module)\n\nMembers:\n"
+              "- glimmerquay.next_window(cadence, now) -> float"),
+]
+
+
+@pytest.mark.parametrize("code, says", [
+    ("from glimmerquay import Cadence, windows\n",
+     "windows is a method of glimmerquay.Cadence"),
+    ("import glimmerquay.Cadence.windows\n",
+     "glimmerquay.Cadence is a class, not a module"),
+    ("import glimmerquay.Cadence\n",
+     "write `from glimmerquay import Cadence`"),
+    ("import glimmerquay.next_window\n",
+     "`import` takes modules only"),
+    # a method read out of its class as if the class were a module
+    ("from glimmerquay.Cadence import windows\n",
+     "glimmerquay.Cadence is a class, not a module, and `from ... import` "
+     "reads names out of modules only: write `from glimmerquay import "
+     "Cadence` and call .windows() on a Cadence"),
+    ("from glimmerquay.Cadence.windows import start\n",
+     "glimmerquay.Cadence is a class"),
+])
+def test_importing_what_is_not_a_module_or_a_module_name_is_caught(code,
+                                                                    says):
+    check = qa.check_code(code, SCHEDULE_PAGES, PKG)
+    assert not check.ok
+    assert any(says in i for i in check.issues), check.issues
+
+
+@pytest.mark.parametrize("code", [
+    "from glimmerquay import Cadence, next_window\n",
+    "import glimmerquay\nimport glimmerquay.schedule\n",
+    "from glimmerquay.schedule import Cadence\n",
+    C05["reference"],
+])
+def test_imports_the_documentation_supports_still_pass(code):
+    check = qa.check_code(code, SCHEDULE_PAGES, PKG)
+    assert check.ok, check.issues
+
+
+def test_every_reference_answer_passes_against_the_pages_it_is_served(
+        server):
+    """Precision: the import rules never flag a right answer, on the pages
+    the bundled server really hands each code task."""
+    for task in docs_bench.load_bench()["code_tasks"]:
+        pages = qa.retrieve(task["task"], [task["task"]], servers=[server],
+                            packages=PKG).pages
+        check = qa.check_code(task["reference"], pages, PKG)
+        assert check.ok, (task["id"], check.issues)
+
+
+def test_without_page_headings_a_capitalised_owner_is_read_as_a_class():
+    pages = [qa.Source(1, "s", "pkg.Ledger.append", "Ledger.append",
+                       "pkg.Ledger.append(entry) appends one entry")]
+    check = qa.check_code("from pkg import append\n", pages, ["pkg"])
+    assert not check.ok
+    assert "append is a method of pkg.Ledger" in check.issues[0]
+
+
+def test_a_dotted_name_in_a_from_import_is_answered_with_the_fix():
+    """phi3.5's c01-c03 (2026-10-05): Python says only "invalid syntax",
+    and the model kept the line through every repair round."""
+    check = qa.check_code("from glimmerquay import Ledger, "
+                          "glimmerquay.LedgerFullError\n", [], PKG)
+    assert "`from glimmerquay import Ledger, LedgerFullError`" in \
+        check.issues[0]
+    check = qa.check_code("from glimmerquay.codec import encode_frame, "
+                          "glimmerquay.CHECKSUMS\n", [], PKG)
+    assert ("`from glimmerquay.codec import encode_frame`; `from "
+            "glimmerquay import CHECKSUMS`") in check.issues[0]
+
+
+@pytest.mark.parametrize("line, fixed", [
+    # phi3.5's docs-fix review run, c02 reply 4, verbatim: the comment's
+    # own words were read as names and garbled the fix
+    ("from glimmerquay.codec import encode_frame, glimmerquay.CHECKSUMS  "
+     "# Assuming glimmerquay.codec is a module that contains these elements",
+     "`from glimmerquay.codec import encode_frame`; `from glimmerquay "
+     "import CHECKSUMS`"),
+    # phi3.5's c05 reply 2: the same class named twice
+    ("from glimmerquay import Cadence, glimmerquay.Cadence",
+     "`from glimmerquay import Cadence`"),
+    ("from glimmerquay import (Ledger, glimmerquay.LedgerFullError as Full)",
+     "`from glimmerquay import Ledger, LedgerFullError as Full`"),
+])
+def test_the_dotted_name_fix_reads_only_the_names(line, fixed):
+    issue = qa.check_code(line + "\n", [], PKG).issues[0]
+    assert issue.endswith("never dotted ones: " + fixed), issue
+
+
+def pydocs_page(n, name, kind, body=""):
+    """A page shaped like the bundled pydocs server's: headed with the
+    name and its kind."""
+    return qa.Source(n, "pydocs", name, name,
+                     f"# {name}  ({kind})\n\n{body or name}")
+
+
+#: What the bundled server handed back for "open an image with Pillow"
+#: (2026-10-09): function and constant pages under PIL.Image, and no page
+#: for the module PIL.Image itself.
+PIL_PAGES = [
+    pydocs_page(1, "PIL.GdImageFile.open", "function",
+                "PIL.GdImageFile.open(fp, mode='r')"),
+    pydocs_page(2, "PIL.Image.OPEN", "constant", "PIL.Image.OPEN = {}"),
+    pydocs_page(3, "PIL.WmfImagePlugin.WmfHandler.open", "method",
+                "PIL.WmfImagePlugin.WmfHandler.open(im)"),
+    pydocs_page(4, "PIL.Image.open", "function",
+                "PIL.Image.open(fp, mode='r', formats=None) -> Image"),
+]
+#: ... and for "show a QLabel" with PySide6.
+QT_PAGES = [
+    pydocs_page(1, "PySide6.QtWidgets.QLabel.setText", "method",
+                "PySide6.QtWidgets.QLabel.setText(arg__1: str)"),
+    pydocs_page(2, "PySide6.QtWidgets.QApplication", "class",
+                "class PySide6.QtWidgets.QApplication(arg__1: list)"),
+]
+
+
+@pytest.mark.parametrize("pages, roots, code", [
+    (PIL_PAGES, ["PIL"], "import PIL.Image\n\n\ndef image_size(path):\n"
+                         "    with PIL.Image.open(path) as im:\n"
+                         "        return im.size\n"),
+    (PIL_PAGES, ["PIL"], "from PIL.Image import open as open_image\n"),
+    (PIL_PAGES, ["PIL"], "from PIL import Image\n"),
+    (QT_PAGES, ["PySide6"], "from PySide6.QtWidgets import QApplication, "
+                            "QLabel\n"),
+    (QT_PAGES, ["PySide6"], "import PySide6.QtWidgets\n"),
+])
+def test_a_capitalised_module_with_pages_under_it_is_a_module(pages, roots,
+                                                              code):
+    """REVIEW (2026-10-09): a Capitalised last part with no page of its own
+    was read as a class, so right `import PIL.Image` and `from
+    PySide6.QtWidgets import QApplication` were flagged ("PIL.Image is a
+    class, not a module"). A function, class or constant page under a name
+    says that name is a module."""
+    check = qa.check_code(code, pages, roots)
+    assert not [i for i in check.issues if "not a module" in i], check.issues
+
+
+@pytest.mark.parametrize("code, says", [
+    # a method page under it still says QLabel is a class
+    ("from PySide6.QtWidgets.QLabel import setText\n",
+     "PySide6.QtWidgets.QLabel is a class, not a module"),
+    ("import PySide6.QtWidgets.QLabel\n",
+     "PySide6.QtWidgets.QLabel is a class, not a module"),
+    ("import PySide6.QtWidgets.QApplication\n",
+     "PySide6.QtWidgets.QApplication is a class, not a module"),
+])
+def test_a_class_with_pages_under_it_is_still_a_class(code, says):
+    check = qa.check_code(code, QT_PAGES, ["PySide6"])
+    assert any(says in i for i in check.issues), check.issues
+
+
 def test_check_code_leaves_other_libraries_alone():
     pages = [qa.Source(1, "s", "glimmerquay.Ledger", "glimmerquay.Ledger",
                        "class glimmerquay.Ledger(capacity: int = 64)")]

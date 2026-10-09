@@ -772,7 +772,7 @@ TIMER_FULL = col(row(leaf("label", "Minutes"), leaf("spinbox", "Minutes")),
 
 
 def wanted_kinds(text):
-    return [kinds for _what, kinds in gd.requested_widgets(text)]
+    return [w.kinds for w in gd.requested_widgets(text)]
 
 
 @pytest.mark.parametrize("text, kinds", [
@@ -780,28 +780,349 @@ def wanted_kinds(text):
     # the specific phrase is used up, so it does not also demand a button
     ("three radio buttons", [("radiobutton",)]),
     ("a 'Debug' Check Button", [("checkbutton",)]),
-    # a multi-line box is not also a single-line entry
-    ("a multi-line Message box", [("text", "log_pane")]),
+    # a multi-line box is not also a single-line entry - and it is a text
+    # box: a log_pane is for log wording (see _REQUEST_WORDS)
+    ("a multi-line Message box", [("text",)]),
+    ("a multi-line text box that shows the details", [("text",)]),
+    ("a multi-line log view", [("log_pane",)]),
+    ("a multi-line log", [("log_pane",)]),
     ("a status bar but no menu bar", [("status_bar",)]),
     ("a form without a status bar", []),
     ("a login form", []),
+    # a log view is a log_pane, never a text box (see _REQUEST_WORDS)
+    ("a large log view below", [("log_pane",)]),
+    ("a box to type a number", [("entry", "text", "combobox", "spinbox")]),
 ])
 def test_requested_widgets_reads_only_what_is_named(text, kinds):
     assert wanted_kinds(text) == kinds
 
 
+BENCH_CASES = {c["id"]: c for c in json.loads(
+    (ROOT / "tests" / "data" / "llm_bench" / "gui_cases.json").read_text(
+        encoding="utf-8"))["cases"]}
+#: Model replies the benchmark recorded on 2026-10-05, verbatim.
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+
+
+def recorded_gaps(key):
+    """Describe's verdict on one recorded reply to its benchmark case."""
+    case = BENCH_CASES[key.split()[1]]
+    checked = gd.check_reply(RECORDED["gui"][key], canvas_w=gd.CANVAS_W,
+                             canvas_h=gd.CANVAS_H)
+    assert checked.ok, (key, checked.faults)
+    return gd.missing_widgets(checked.shapes,
+                              gd.requested_widgets(case["text"]))
+
+
+#: Counts a description gives that its grader does not check, each read by
+#: hand: C1 names "a Gain slider" AND "a frame slider", and every C1 design
+#: the grader passed on 2026-10-05 drew both.
+UNGRADED_COUNTS = {("C1", "a slider"): 2}
+
+
 def test_the_benchmark_descriptions_never_demand_a_widget_they_do_not_want():
     """Precision over recall: a requirement read wrongly ranks a right
     design below a wrong one and spends a repair round. Every widget read
-    from a benchmark description must be one its expectations allow."""
-    data = json.loads((ROOT / "tests" / "data" / "llm_bench" /
-                       "gui_cases.json").read_text(encoding="utf-8"))
-    for case in data["cases"]:
+    from a benchmark description must be one its expectations allow, and
+    no more of a kind than the grader counts."""
+    for case in BENCH_CASES.values():
         allowed = set(case["expect"].get("kinds_all", []))
         for group in case["expect"].get("kinds_any", []):
             allowed |= set(group)
-        for what, kinds in gd.requested_widgets(case["text"]):
-            assert allowed.intersection(kinds), (case["id"], what)
+        counts = case["expect"].get("count_at_least", {})
+        for w in gd.requested_widgets(case["text"]):
+            assert allowed.intersection(w.kinds), (case["id"], w.what)
+            if w.count > 1 and not w.name:
+                assert any(counts.get(k, 0) >= w.count for k in w.kinds) \
+                    or UNGRADED_COUNTS.get((case["id"], w.what)) == w.count, \
+                    (case["id"], w.what, w.count)
+
+
+@pytest.mark.parametrize("cid, captions", [
+    ("S1", ["Send", "Clear"]),
+    ("S2", ["Convert"]),
+    ("S3", ["Start", "Pause", "Reset"]),
+    ("S4", ["Add", "Remove", "Clear all"]),
+    ("M1", ["Open"]),
+    ("M2", ["OK", "Cancel"]),
+    ("M3", ["Add", "Delete"]),
+    ("M4", ["Plot"]),
+    ("C1", ["Scan for cameras", "Connect", "Start capture", "Stop capture"]),
+    ("C2", ["Export", "Clear log"]),
+    # the toolbar's "Open, Save, Previous and Next" are not called buttons
+    ("C3", ["Add box", "Delete annotation"]),
+    ("C4", ["Apply", "Clear"]),
+])
+def test_the_buttons_a_description_names_are_read_with_their_captions(
+        cid, captions):
+    named = [w.name for w in gd.requested_widgets(BENCH_CASES[cid]["text"])
+             if w.name]
+    assert named == captions
+
+
+@pytest.mark.parametrize("text, count", [
+    ("two dropdowns to choose the X column and the Y column", 2),
+    ("a dropdown for the unit to convert from and a dropdown for the unit "
+     "to convert to", 2),
+    ("a theme dropdown (Light, Dark)", 1),
+    ("a 'Start at login' checkbox ... a 'Debug logging' checkbox", 2),
+    # what the description is OF names the app, not one more widget
+    ("An image viewer: a large image area with a frame slider under it", 1),
+    ("A table editor with a table of parts and an Add button", 1),
+    ("A window with two dropdowns", 2),
+    ("A dropdown with three choices", 1),
+])
+def test_how_many_the_text_asks_for_is_read(text, count):
+    first = gd.requested_widgets(text)[0]
+    assert first.count == count, first
+
+
+@pytest.mark.parametrize("text", ["Two buttons side by side",
+                                  "no OK button", "three radio buttons"])
+def test_articles_numbers_and_negations_are_never_captions(text):
+    assert not [w for w in gd.requested_widgets(text) if w.name]
+
+
+def named(text):
+    return [w.name for w in gd.requested_widgets(text) if w.name]
+
+
+@pytest.mark.parametrize("text, captions", [
+    # the words a sentence opens with are not a caption
+    ("Add two buttons: Start and Stop.", []),
+    ("Add buttons to start and stop the capture.", []),
+    ("There are two buttons along the bottom, Start and Stop.", []),
+    ("Put three buttons in a row: Load, Save, Quit.", []),
+    ("Use the arrow buttons to step through frames.", []),
+    ("Also add a button called Delete.", []),
+    # one Capitalised word before "buttons" names a sort, not a caption
+    ("Control buttons along the bottom: Start, Stop and Reset.", []),
+    ("Navigation buttons under the image step frames.", []),
+    ("Big buttons for start and stop.", []),
+    # the phrase before the comma is where, not a caption
+    ("At the bottom, Start and Stop buttons.", ["Start", "Stop"]),
+    ("On the right, Add and Remove buttons.", ["Add", "Remove"]),
+    ("In the toolbar, Open and Save buttons.", ["Open", "Save"]),
+    ("Below the list, Add and Remove buttons.", ["Add", "Remove"]),
+    ("Under the list, Scan and Connect buttons.", ["Scan", "Connect"]),
+    ("On top, Start and Stop buttons.", ["Start", "Stop"]),
+    ("Finally, Start and Stop buttons.", ["Start", "Stop"]),
+    # a list of captions may open a sentence; one caption may follow a verb
+    ("A timer. Start and Stop buttons.", ["Start", "Stop"]),
+    ("Prev and Next buttons under the image.", ["Prev", "Next"]),
+    ("Play, Pause and Stop buttons", ["Play", "Pause", "Stop"]),
+    ("Put Apply and Close buttons below the tabs.", ["Apply", "Close"]),
+    ("Add and Remove buttons under the list.", ["Add", "Remove"]),
+    # a quoted caption is one wherever it stands
+    ("'Go' button below the box.", ["Go"]),
+])
+def test_a_caption_is_never_the_opening_words_of_a_sentence(text, captions):
+    """REVIEW (2026-10-09): any Capitalised word and up to two lower-case
+    ones before "buttons" was read as a caption, so a right design for "Add
+    two buttons: Start and Stop" was sent back to add a button labelled
+    'Add two' - four repair calls, and a note telling the user to draw it."""
+    assert named(text) == captions
+
+
+def test_the_describe_prompts_name_only_real_captions():
+    """The Designer's own graded prompts: A2 ("Also add a button called
+    Delete") was read as a button labelled 'Also add a'."""
+    data = json.loads((ROOT / "examples" / "gui" / "describe_prompts" /
+                       "prompts.json").read_text(encoding="utf-8"))
+    got = {p["id"]: named(p["text"]) for p in data["prompts"]
+           if named(p["text"])}
+    assert got == {"E1": ["Sign in", "Cancel"], "E2": ["Reset"],
+                   "E3": ["Convert"], "E4": ["Save"], "M2": ["Refresh"],
+                   "M3": ["OK", "Cancel"], "M4": ["Submit"], "M5": ["Start"],
+                   "H1": ["Apply", "Close"], "H4": ["Add"], "A5": ["OK"]}
+
+
+@pytest.mark.parametrize("text, buttons", [
+    ("Add two buttons: Start and Stop.", ["Start", "Stop"]),
+    ("Use the arrow buttons to step through frames.", ["<", ">"]),
+    ("Prev and Next buttons under the image.", ["Previous", "Next"]),
+    ("Previous and Next buttons under the image.", ["Prev", "Next"]),
+    ("Below the list, Add and Remove buttons.", ["Add", "Remove"]),
+])
+def test_a_right_design_for_these_phrasings_has_no_gap(text, buttons):
+    shapes = gd.check_reply(tree_reply(col(
+        leaf("listbox", "Items"),
+        row(*[leaf("button", b) for b in buttons])))).shapes
+    assert gd.missing_widgets(shapes, gd.requested_widgets(text)) == []
+
+
+def test_a_right_design_is_not_sent_back_for_the_words_a_sentence_opens_with():
+    """End to end on the small-model path: one call, and no note telling
+    the user to draw an 'Add two' button."""
+    text = ("A capture window: a live view on top. "
+            "Add two buttons: Start and Stop.")
+    good = col(leaf("image_canvas", "Live view"),
+               row(leaf("button", "Start"), leaf("button", "Stop")))
+    model = Model(tree_reply(good))
+    res = gd.describe(text, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert len(model.calls) == 1
+    assert not any("leaves out" in n for n in res.notes)
+
+
+def test_a_button_with_another_caption_does_not_answer_a_named_one():
+    """Kinds alone were not enough: any two buttons answered "Start and
+    Reset buttons"."""
+    other = col(row(leaf("label", "Minutes"), leaf("spinbox", "Minutes")),
+                leaf("progressbar", "Time left"),
+                row(leaf("button", "Go"), leaf("button", "Stop")))
+    checked = gd.check_reply(tree_reply(other))
+    gaps = gd.missing_widgets(checked.shapes, gd.requested_widgets(TIMER_TEXT))
+    assert gaps == ["a button labelled 'Start' (button or toolbar)",
+                    "a button labelled 'Reset' (button or toolbar)"]
+
+
+def test_each_named_button_needs_its_own_button():
+    """"Clear" answers "Clear all" — but one button is not two."""
+    text = "Apply and Clear buttons, and a Clear log button"
+    one = gd.check_reply(tree_reply(col(row(leaf("button", "Apply"),
+                                            leaf("button", "Clear")))))
+    assert gd.missing_widgets(one.shapes, gd.requested_widgets(text)) == [
+        "a button labelled 'Clear log' (button or toolbar)"]
+    two = gd.check_reply(tree_reply(col(row(
+        leaf("button", "Clear log"), leaf("button", "Apply"),
+        leaf("button", "Clear")))))
+    assert gd.missing_widgets(two.shapes, gd.requested_widgets(text)) == []
+
+
+def test_toolbar_buttons_and_a_pickers_browse_button_answer_by_caption():
+    text = "a toolbar with Open and Save buttons, and a Browse button"
+    shapes = gd.check_reply(tree_reply(col(
+        leaf("toolbar", "Main", props={"buttons": ["Open", "Save"]}),
+        leaf("file_picker", "Folder"), leaf("text", "Notes")))).shapes
+    assert gd.missing_widgets(shapes, gd.requested_widgets(text)) == []
+
+
+def test_best_of_n_prefers_the_candidate_with_the_named_buttons():
+    wrong = col(row(leaf("label", "Minutes"), leaf("spinbox", "Minutes")),
+                leaf("progressbar", "Time left"),
+                row(leaf("button", "Go"), leaf("button", "Halt")))
+    model = Model(tree_reply(wrong), tree_reply(TIMER_FULL))
+    res = gd.describe(TIMER_TEXT, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert {s.label for s in res.shapes if s.kind == "button"} == {
+        "Start", "Reset"}
+    assert any("candidate 2 of 3 passed" in n for n in res.notes)
+
+
+def test_the_benchmark_repair_that_dropped_named_buttons_is_seen():
+    """qwen2.5's C1 (2026-10-05): candidate 2 had "Scan for cameras" and
+    "Connect" but no list or status bar; the repair added those and DROPPED
+    both buttons — and was accepted as complete, then failed the grade
+    ("2 button, wanted at least 4; no label mentioning scan / connect")."""
+    assert recorded_gaps("qwen2.5 C1 3") == [
+        "a button labelled 'Scan for cameras' (button or toolbar)",
+        "a button labelled 'Connect' (button or toolbar)"]
+    assert recorded_gaps("qwen2.5 C1 2") == [
+        "a status bar (status_bar)",
+        "a list (listbox or treeview or combobox)"]
+
+
+def test_the_benchmark_count_gap_is_seen():
+    """phi3.5's S2 reply 3 (label + ONE dropdown + Convert) was accepted
+    as complete: "a dropdown for ... and a dropdown for ..." was not read
+    as two. (Its missing entry stays unseen: each requested widget is
+    answered on its own, and a dropdown is a box one can type in — reading
+    the kinds jointly would turn "a dropdown list of cameras" into two.)"""
+    assert recorded_gaps("phi3.5 S2 3") == ["a second dropdown (combobox)"]
+
+
+@pytest.mark.parametrize("key", ["llama3.1:8b C1 1", "phi4:14b C1 1",
+                                 "qwen2.5-coder C1 1", "qwen2.5-coder C4 1",
+                                 "phi4:14b C4 1", "llama3.1:8b S2 1"])
+def test_recorded_designs_the_grader_passed_have_no_gaps(key):
+    """The precision side, on real replies: every one of these passed the
+    benchmark's grade, and none may now be sent back for a repair."""
+    assert recorded_gaps(key) == []
+
+
+def test_a_caption_never_stands_in_for_the_widget():
+    """llama3.1:8b's C3, four rounds running: a labelframe titled "Frame
+    slider" holding a spin box. A check that read captions as widgets
+    would have passed it; the gap now also says what the caption is, and
+    what it holds."""
+    assert recorded_gaps("llama3.1:8b C3 2") == [
+        "a slider (scale or scrubber) — 'Frame slider' is a labelframe "
+        "holding a spinbox, not a slider"]
+
+
+def test_the_repair_round_is_told_what_the_captioned_box_holds():
+    """The C3 shape, small: the repair prompt names the spin box the
+    'Frame slider' group holds, not only the missing slider."""
+    text = "An image viewer: a large image area with a frame slider under it."
+    boxed = col(leaf("image_canvas", "Image"),
+                leaf("labelframe", "Frame slider",
+                     children=[leaf("spinbox", "")]))
+    fixed = col(leaf("image_canvas", "Image"), leaf("scale", "Frame"))
+    model = Model(*[tree_reply(boxed)] * SMALL.n_best, tree_reply(fixed))
+    res = gd.describe(text, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert ("missing a slider (scale or scrubber) — 'Frame slider' is a "
+            "labelframe holding a spinbox, not a slider") in \
+        model.calls[-1]["prompt"]
+    assert "scale" in {s.kind for s in res.shapes}
+
+
+@pytest.mark.parametrize("key", ["qwen2.5 C4 1", "phi3.5 C4 4"])
+def test_a_text_box_is_not_the_log_view_the_benchmark_asks_for(key):
+    """C4 (2026-10-05): both drew a text box for "a large log view", which
+    Describe accepted and the grader failed ("no log_pane")."""
+    assert recorded_gaps(key) == ["a log view (log_pane)"]
+
+
+def _m1_design(details):
+    return col(leaf("file_picker", "Folder"),
+               row(col(leaf("listbox", "Files"), leaf("button", "Open")),
+                   col(leaf("image_canvas", "Preview"),
+                       leaf(details, "Details"))))
+
+
+def _c4_design(log):
+    return col(leaf("file_picker", "Log file"),
+               row(leaf("combobox", "Level",
+                        props={"values": ["DEBUG", "INFO", "WARNING",
+                                          "ERROR"]}),
+                   leaf("entry", "Search"), leaf("checkbutton", "Auto-scroll"),
+                   leaf("button", "Apply"), leaf("button", "Clear")),
+               leaf(log, "Log"), leaf("status_bar", "Lines: 0"))
+
+
+@pytest.mark.parametrize("cid, kind, right", [
+    ("M1", "text", True), ("M1", "log_pane", False),
+    ("C4", "log_pane", True), ("C4", "text", False)])
+def test_describe_and_the_grader_agree_on_a_text_box_and_a_log_pane(
+        cid, kind, right):
+    """REVIEW (2026-10-09): the log view was made to agree one way only.
+    M1's "a multi-line text box that shows the selected file's details"
+    still took a log_pane, which the grader fails ("no text") - a design
+    Describe calls complete must be one the grader passes, and back."""
+    from council_core import llm_bench as lb
+    design = (_m1_design if cid == "M1" else _c4_design)(kind)
+    checked = gd.check_reply(tree_reply(design), canvas_w=gd.CANVAS_W,
+                             canvas_h=gd.CANVAS_H)
+    assert checked.ok, checked.faults
+    gaps = gd.missing_widgets(checked.shapes,
+                              gd.requested_widgets(BENCH_CASES[cid]["text"]))
+    misses = lb.acceptance_misses(BENCH_CASES[cid]["expect"], checked.shapes)
+    assert (gaps == []) is right, gaps
+    assert (misses == []) is right, misses
+
+
+def test_a_repair_round_is_told_the_log_view_is_a_log_pane():
+    text = "A log monitor: a log file picker at the top and a large log view."
+    as_text = col(leaf("file_picker", "Log file"), leaf("text", "Log"))
+    as_log = col(leaf("file_picker", "Log file"), leaf("log_pane", "Log"))
+    model = Model(*[tree_reply(as_text)] * SMALL.n_best, tree_reply(as_log))
+    res = gd.describe(text, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert "missing a log view (log_pane)" in model.calls[-1]["prompt"]
+    assert "log_pane" in {s.kind for s in res.shapes}
 
 
 def test_best_of_n_prefers_the_candidate_with_the_named_widgets():
