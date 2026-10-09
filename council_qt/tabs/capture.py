@@ -68,6 +68,10 @@ class CaptureTab(ViewHelpers, QWidget):
         self._found = cameras.Discovery()
         self.device: Optional[cameras.Device] = None
         self.session: Optional[capture.CaptureSession] = None
+        # The frame on screen. The status line describes it on every tick,
+        # not only on the ticks that found a new one: an event camera's
+        # "events/window" vanished whenever a tick came between two frames.
+        self._shown: Optional[cameras.Frame] = None
         self._busy = False
 
         self._build()
@@ -258,6 +262,7 @@ class CaptureTab(ViewHelpers, QWidget):
     def _opened(self, device: cameras.Device) -> None:
         self.device = device
         self.session = capture.CaptureSession(device)
+        self._shown = None
         limits = device.limits()
         roi = device.roi()
         self.view.origin = (roi.x, roi.y)
@@ -341,8 +346,9 @@ class CaptureTab(ViewHelpers, QWidget):
         frame = self.session.mailbox.take()
         if frame is not None:
             self.view.show_frame(frame)
+            self._shown = frame
         stats = self.session.stats()
-        self.status.setText(self._status_line(stats, frame))
+        self.status.setText(self._status_line(stats, self._shown))
         if stats.recording_failed:
             self._sync()
 
@@ -442,6 +448,7 @@ class CaptureTab(ViewHelpers, QWidget):
         if session is not None:
             session.close()
         self.device = None
+        self._shown = None
         self._sync()
 
     # ==================================================================

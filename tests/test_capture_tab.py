@@ -278,6 +278,29 @@ def test_an_event_camera_reports_events_not_just_frames(tab):
         tab.on_stop()
 
 
+def test_the_event_line_stays_between_frames(tab):
+    """A tick that finds no new frame still describes the one on screen.
+
+    The line used to drop "events/window" on every such tick, so it flickered
+    in the app, and the test above failed whenever its last tick fell
+    between two frames."""
+    connect_to(tab, kind="event")
+    tab.on_start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while ("events/window" not in tab.status.text()
+               and time.monotonic() < deadline):
+            QApplication.processEvents()
+            time.sleep(0.01)
+            tab._draw()
+        assert "events/window" in tab.status.text(), "no event frame arrived"
+    finally:
+        tab.on_stop()
+    tab.session.mailbox.take()          # nothing new from here on
+    tab._draw()
+    assert "events/window" in tab.status.text()
+
+
 def test_stopping_ends_the_thread_and_the_timer(tab):
     connect_to(tab)
     tab.on_start()
