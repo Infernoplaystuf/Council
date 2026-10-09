@@ -22,10 +22,8 @@ So every test here builds a small wireframe IN CODE, emits it with
 target="qt", imports it, and constructs App offscreen — the same class main()
 builds. The assertions are about the running window, not the emitted text.
 
-The fixture pattern is test_gui_qt_runtime.py's, including WHY the platform is
-forced before PySide6 is imported: a "windows"-platform QApplication flips the
-process to per-monitor DPI awareness and shrinks an already-open Tk window
-~20%, which would corrupt the session-scoped Tk fixture.
+The fixture pattern is test_gui_qt_runtime.py's, including forcing the
+offscreen platform before PySide6 is imported (see that file for why).
 """
 from __future__ import annotations
 
@@ -70,7 +68,7 @@ def _forget() -> None:
 
 @pytest.fixture(scope="session")
 def qapp():
-    """The one QApplication. Offscreen, so it cannot disturb the Tk fixture."""
+    """The one QApplication. Offscreen, so nothing is drawn on screen."""
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     yield app

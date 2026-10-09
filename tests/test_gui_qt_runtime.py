@@ -7,20 +7,18 @@ its widgets, which is the only way to find out whether the ports really read
 back what was written, whether a change signal really fires, and whether the
 frame browser really decodes an image.
 
-WHY OFFSCREEN, AND WHY THAT IS SAFE HERE
-----------------------------------------
-Measured on this machine: creating a QApplication on the "windows" platform
+WHY OFFSCREEN
+-------------
+Nothing a test builds is drawn on the real screen. It was first forced for a
+Tk reason: measured on this machine, a QApplication on the "windows" platform
 flips the whole process to per-monitor DPI awareness, and an already-open Tk
-window shrinks ~20% on the spot (a 400 px window goes 520 -> 416 physical px).
-The Tk fixture in conftest.py is session-scoped and may already be live, so that
-would corrupt every Tk test in the same run. Under QT_QPA_PLATFORM=offscreen the
-awareness stays 0 and nothing moves — verified again on this env at install
-time. So the platform is forced BEFORE the first PySide6 import, and Tk and Qt
-share one pytest session safely.
+window shrank ~20% on the spot (a 400 px window went 520 -> 416 physical px),
+which corrupted the Tk tests sharing the session. There are no Tk windows in
+the run any more (tests/no_tk_guard.py), but the platform is still forced
+BEFORE the first PySide6 import.
 
-The QApplication is session-scoped for the same reason tk_root is: Qt supports
-exactly one per process and does not reliably tolerate being torn down and
-rebuilt.
+The QApplication is session-scoped: Qt supports exactly one per process and
+does not reliably tolerate being torn down and rebuilt.
 """
 from __future__ import annotations
 
@@ -62,7 +60,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture(scope="session")
 def qapp():
-    """The one QApplication. Offscreen, so it cannot disturb the Tk fixture."""
+    """The one QApplication. Offscreen, so nothing is drawn on screen."""
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     yield app

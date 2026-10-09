@@ -64,9 +64,12 @@ if str(REPO) not in sys.path:
 # Run as a script (`python tests/smoke_test.py`, as installs.txt says), no
 # conftest is loaded — so the throwaway app folder and vault are set up here,
 # before any import below can find the user's real ~/.council. Measured: a run
-# of this file rewrote three index files in the real vault.
+# of this file rewrote three index files in the real vault. The Tk guard is
+# installed here for the same reason: no check may open a Tk window (the Tk
+# GUIs are deprecated — tests/no_tk_guard.py).
 if __name__ == "__main__":
     import tests.sandbox_vault  # noqa: E402,F401
+    import tests.no_tk_guard  # noqa: E402,F401
 
 
 # ─── Test runner ────────────────────────────────────────────────────
