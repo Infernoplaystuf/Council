@@ -101,7 +101,10 @@ def test_classify_folder_is_still_a_report_that_never_raises(tmp_path):
 
 
 # ============================================================
-# Ports: clear() shows nothing — never a zero
+# Ports: a blank number is None — never a zero
+#
+# What clear() shows on each kind of port, and the panel saying why it is
+# empty, are checked on the Qt runtime in tests/test_gui_qt_widgets.py.
 # ============================================================
 
 @pytest.fixture(scope="module")
@@ -110,66 +113,6 @@ def rt():
     exec(compile(ge.WIDGETS_PY, "<widgets>", "exec"), ns)
     exec(compile(ge.PORTS_RUNTIME, "<ports>", "exec"), ns)
     return ns
-
-
-def test_clear_blanks_text_and_never_writes_a_zero(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    try:
-        sv, iv = tk.StringVar(top, "10"), tk.IntVar(top, 7)
-        ent, spin = tk.Entry(top), tk.Spinbox(top)
-        P = rt["_VarPort"]
-        p_str = P("s", ent, var=sv, option="textvariable", type="str",
-                  direction="io")
-        p_int = P("i", spin, var=iv, option="textvariable", type="int",
-                  direction="io")
-        p_str.clear()
-        p_int.clear()
-        assert sv.get() == ""
-        assert iv.get() == 7, "an IntVar has no blank state; clearing must " \
-                              "not write 0 into it"
-
-        lb = tk.Listbox(top)
-        lp = rt["_ListPort"]("l", lb, direction="io", type="list")
-        lp.set(["a", "b"])
-        lp.clear()
-        assert lb.size() == 0
-
-        ic = rt["ImageCanvas"](top)
-        ic.pack()
-        top.update()
-        img = rt["_ProxyPort"]("v", ic, writer="set_image", type="image",
-                               direction="out")
-        img.set(Image.new("RGB", (10, 10)))
-        img.clear()
-        assert ic._base is None
-
-        # A status bar and a progress bar have an honest empty state. Left as
-        # they were, the previous folder's answer sat beside the new folder
-        # after its scan failed (adversarial review, 2026-09).
-        sb = rt["StatusBar"](top)
-        st = rt["_ProxyPort"]("st", sb, writer="set", type="str",
-                              direction="out")
-        st.set("3 of 5 frames captured on a bad timing")
-        st.clear()
-        assert sb.message.cget("text") == ""
-        from tkinter import ttk
-        dv = tk.DoubleVar(top, 0.0)
-        pb = rt["_VarPort"]("pb", ttk.Progressbar(top), var=dv,
-                            option="variable", type="float", direction="out")
-        pb.set(3.0)
-        pb.clear()
-        assert dv.get() == 0.0
-
-        # ...and a cleared number box reads back as None, not 0 — the same
-        # false zero clear() keeps off the screen, handed to its next reader
-        p_str.set("")
-        num = P("n", tk.Entry(top), var=tk.StringVar(top, "7"),
-                option="textvariable", type="int", direction="io")
-        num.clear()
-        assert num.get() is None
-    finally:
-        top.destroy()
 
 
 @pytest.mark.parametrize("raw,t,want", [
@@ -181,27 +124,13 @@ def test_coerce_never_invents_a_number(rt, raw, t, want):
     assert rt["_coerce"](raw, t) == want
 
 
-def test_the_panel_says_why_it_is_empty(rt, tk_root):
-    import tkinter as tk
-    top = tk.Toplevel(tk_root)
-    top.geometry("300x200")
-    try:
-        ic = rt["ImageCanvas"](top)
-        ic.pack(fill="both", expand=True)
-        top.update()
-        ic.show_message("Pillow is not installed")
-        msg = ic.canvas.find_withtag("message")
-        assert msg and ic.canvas.itemcget(msg[0], "text") == \
-            "Pillow is not installed"
-        ic.set_image(Image.new("RGB", (10, 10)))
-        assert not ic.canvas.find_withtag("message"), \
-            "an image arriving must replace the message"
-    finally:
-        top.destroy()
-
-
 # ============================================================
 # The generated app, pressed like a user would
+#
+# Built for the Qt target and driven offscreen in its own process: the Tk
+# GUIs are deprecated and no test may open a Tk window (tests/README.md).
+# handlers.py — the stub that clears its ports and reports — is the same
+# file on both targets.
 # ============================================================
 
 DRIVER = textwrap.dedent('''
@@ -211,25 +140,26 @@ DRIVER = textwrap.dedent('''
     main_py = Path.cwd() / "main.py"
     boot = main_py.read_text(encoding="utf-8").split("from app import main")[0]
     exec(compile(boot, str(main_py), "exec"), {"__file__": str(main_py)})
-    import tkinter as tk
+    from PySide6.QtWidgets import QApplication
+    qt = QApplication.instance() or QApplication([])
     from app import App
-    root = tk.Tk(); app = App(root); app.pack()
+    app = App()                                   # never shown
     def pump(ms):
         end = time.time() + ms / 1000
         while time.time() < end:
-            root.update(); time.sleep(0.005)
+            qt.processEvents(); time.sleep(0.005)
     pump(300)
     p, out = app.ports, {}
     def scan(key):
-        app.btn_scan_for_bad_timings.invoke(); pump(1200)
-        out[key] = [p.bad_count.get(), app.lst_listbox.size()]
+        app.btn_scan_for_bad_timings.click(); pump(1200)
+        out[key] = [p.bad_count.get(), app.lst_listbox.count()]
     scan("no_folder")
     p.capture_folder.set(FRAMES); pump(800); scan("frames")
     p.capture_folder.set(EMPTY); pump(800); scan("empty_after")
-    app.btn_save_cropped_frames.invoke(); pump(500)
+    app.btn_save_cropped_frames.click(); pump(500)
     out["save_status"] = p.save_status.get()
     print("__OUT__" + json.dumps(out))
-    root.destroy()
+    app.close()
 ''')
 
 
@@ -237,13 +167,15 @@ def test_the_scan_never_shows_a_false_zero(tmp_path, frames):
     import run_example_gui as rex
     empty = tmp_path / "empty"
     empty.mkdir()
-    pdir = rex.build("barbie_capture_v2", project="err", vault_dir=tmp_path / "v")
+    pdir = rex.build("barbie_capture_v2", project="err", vault_dir=tmp_path / "v",
+                     target="qt")
     drv = tmp_path / "drive.py"
     drv.write_text(DRIVER, encoding="utf-8")
     r = subprocess.run([sys.executable, str(drv), str(frames), str(empty)],
                        cwd=str(pdir), capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=120,
-                       env=dict(os.environ, COUNCIL_NO_DIALOGS="1"))
+                       env=dict(os.environ, COUNCIL_NO_DIALOGS="1",
+                                QT_QPA_PLATFORM="offscreen"))
     assert r.returncode == 0, r.stderr[-1500:]
     out = json.loads(next(l for l in r.stdout.splitlines()
                           if l.startswith("__OUT__"))[len("__OUT__"):])
@@ -392,10 +324,13 @@ def test_a_function_offered_inside_try_or_if_counts(tmp_path):
 # Stubs an older Council wrote are upgraded — unedited ones only
 # ============================================================
 
-def _built(tmp_path, name):
+def _built(tmp_path, name, target="tk"):
+    """barbie_capture_v2, generated. Tk for the stub-upgrade tests, which only
+    read and regenerate it; Qt for the ones that RUN it (no test may open a
+    Tk window — tests/README.md)."""
     import run_example_gui as rex
     return rex.build("barbie_capture_v2", project=name,
-                     vault_dir=tmp_path / "v")
+                     vault_dir=tmp_path / "v", target=target)
 
 
 def _regenerate(pdir):
@@ -491,6 +426,9 @@ def test_a_label_with_a_newline_still_generates_valid_python(tmp_path):
 
 # ============================================================
 # The error still reaches the user when something else is wrong too
+#
+# Driven on the Qt target, with QMessageBox.critical recorded instead of
+# shown; COUNCIL_NO_DIALOGS is removed so the dialog path is taken.
 # ============================================================
 
 PRESS = textwrap.dedent('''
@@ -499,23 +437,24 @@ PRESS = textwrap.dedent('''
     main_py = Path.cwd() / "main.py"
     boot = main_py.read_text(encoding="utf-8").split("from app import main")[0]
     exec(compile(boot, str(main_py), "exec"), {"__file__": str(main_py)})
-    import tkinter as tk
-    from tkinter import messagebox
+    from PySide6.QtWidgets import QApplication, QMessageBox
     shown = []
-    messagebox.showerror = lambda title, msg, **k: shown.append([title, msg])
+    QMessageBox.critical = staticmethod(
+        lambda parent, title, msg, *a, **k: shown.append([title, msg]))
+    qt = QApplication.instance() or QApplication([])
     from app import App
-    root = tk.Tk(); app = App(root); app.pack()
+    app = App()                                   # never shown
     for _ in range(30):
-        root.update(); time.sleep(0.01)
+        qt.processEvents(); time.sleep(0.01)
     real_err = sys.stderr
     if os.environ.get("NO_STDERR"):
         sys.stderr = None              # what pythonw gives a GUI app
-    app.btn_scan_for_bad_timings.invoke()
+    app.btn_scan_for_bad_timings.click()
     for _ in range(60):
-        root.update(); time.sleep(0.01)
+        qt.processEvents(); time.sleep(0.01)
     sys.stderr = real_err
     print("__OUT__" + json.dumps(shown))
-    root.destroy()
+    app.close()
 ''')
 
 
@@ -523,6 +462,7 @@ def _press(pdir, tmp_path, **env):
     drv = tmp_path / "press.py"
     drv.write_text(PRESS, encoding="utf-8")
     e = {k: v for k, v in os.environ.items() if k != "COUNCIL_NO_DIALOGS"}
+    e["QT_QPA_PLATFORM"] = "offscreen"
     e.update(env)
     r = subprocess.run([sys.executable, str(drv)], cwd=str(pdir),
                        capture_output=True, text=True, encoding="utf-8",
@@ -535,7 +475,7 @@ def _press(pdir, tmp_path, **env):
 def test_the_dialog_still_appears_under_pythonw(tmp_path):
     """MEASURED under pythonw.exe: sys.stderr is None, report_error raised
     on its first line, and no dialog appeared at all."""
-    pdir = _built(tmp_path, "pyw")
+    pdir = _built(tmp_path, "pyw", target="qt")
     shown = _press(pdir, tmp_path, NO_STDERR="1")
     assert shown and "no folder chosen" in shown[0][1]
 
@@ -544,7 +484,7 @@ def test_a_port_renamed_under_the_handler_cannot_hide_the_error(tmp_path):
     """After a rename, handlers.py still names the old port. The old stub's
     clear() raised AttributeError inside the except, so report_error never
     ran and the failure vanished."""
-    pdir = _built(tmp_path, "renamed")
+    pdir = _built(tmp_path, "renamed", target="qt")
     hp = pdir / "handlers.py"
     src = hp.read_text(encoding="utf-8")
     assert 'self.clear_ports("bad_count", "bad_list")' in src

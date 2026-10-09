@@ -8,17 +8,16 @@ verify cheaply:
     to-end against a ScriptedRunner.
   • Approve/Dismiss flips status only — no registry mutation.
 
-(The Tk widget itself is sketched as best-effort under a hidden root in
-a separate test that auto-skips when Tk is unavailable, e.g. on CI.)
+The Tk panel itself is no longer built here: the Tk GUIs are deprecated and
+no test may open a Tk window (tests/README.md). The Qt Agents tab is tested
+in tests/test_agents_tab.py.
 """
 from __future__ import annotations
 
-import gc
 import queue
 import tempfile
 import threading
 import unittest
-import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -138,82 +137,6 @@ class TestPanelOps(unittest.TestCase):
             statuses = q.current_status()
             self.assertEqual(statuses[0]["status"], "approved")
             self.assertNotIn("send_email", registry.names())
-        finally:
-            td.cleanup()
-
-
-class TestPanelInstantiates(unittest.TestCase):
-    """Sketch test: build the panel under a hidden Tk root, schedule its
-    drain once, then destroy. Skips when Tk can't open (CI / SSH)."""
-
-    def test_construct_destroy(self):
-        """THE TCL INTERPRETER MUST DIE HERE, ON THIS THREAD.
-
-        This test is the source of the full-suite abort at ~94%: "Windows
-        fatal exception: code 0x80000003" with the faulthandler showing a
-        garbage collection on a ThreadPoolExecutor worker inside safe_agent's
-        tool dispatch — the files that run straight after this one. It was
-        taken for a Qt crash for a long time; 0x80000003 is a breakpoint, and
-        Tcl_Panic on Win64 IS a __debugbreak().
-
-        destroy() tears down the Tk widgets but not the Python objects: the
-        root and the panel still reference each other (root.children <->
-        panel.master, the panel's StringVars), so the root and its `tkapp`
-        — a whole second Tcl interpreter — waited for the cyclic collector.
-        That collector runs on whichever thread trips its threshold, and a
-        Tcl interpreter freed off the thread that created it panics ("async
-        handler deleted by the wrong thread"). Measured with a per-module
-        probe over the whole suite: this was the ONLY module that left a Tk
-        root for the collector, and collecting on the main thread at module
-        boundaries made the abort go away.
-
-        So the panel is built in a helper whose frame is gone by the time we
-        collect, and the collection happens here — and is asserted, so a
-        future reference that keeps the interpreter alive fails this test
-        instead of aborting some unrelated file later.
-        """
-        try:
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-        except Exception:
-            self.skipTest("Tk not available in this environment")
-            return
-        try:
-            self._build_and_destroy_panel(root)
-        finally:
-            try:
-                root.destroy()
-            except Exception:
-                pass
-            interpreter = weakref.ref(root)
-            del root
-            gc.collect()
-        self.assertIsNone(
-            interpreter(),
-            "the Tk root outlived its test, so the cyclic collector will free "
-            "its Tcl interpreter on whatever thread it next runs on — a "
-            "Tcl_Panic (0x80000003) if that is not this one")
-
-    def _build_and_destroy_panel(self, root):
-        import agent_panel
-
-        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        try:
-            agent, *_ = _build_agent_and_logs(td, [
-                '{"action":"final","answer":"x"}',
-            ])
-            # Provide a factory that returns the prebuilt agent
-            panel = agent_panel.AgentPanel(
-                root, agent_factory=lambda: agent,
-            )
-            # The panel is a Toplevel: withdrawing the ROOT does not hide
-            # it, and update_idletasks maps it — a 980x680 window flashed
-            # on the desktop every run.
-            panel.withdraw()
-            # Drain once so any scheduled callbacks fire harmlessly
-            root.update_idletasks()
-            panel.destroy()
         finally:
             td.cleanup()
 

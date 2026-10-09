@@ -333,10 +333,11 @@ def test_saves_leave_no_temp_files_behind(vault, capture):
 # The framework pieces it needed
 # ============================================================
 
-def test_generated_listboxes_keep_their_own_selection(tk_root):
+def test_generated_listboxes_keep_their_own_selection():
     """Tk's default exportselection makes selecting in one listbox CLEAR the
-    others — a picked class vanished when the user clicked elsewhere."""
-    import tkinter as tk
+    others — a picked class vanished when the user clicked elsewhere. The
+    Tk emitter turns it off on every listbox. (Checked as generated text: a
+    test may not open a Tk window. A QListWidget has no such coupling.)"""
     import gui_emit as ge
     import gui_layout as gl
     import gui_shapes as gs
@@ -346,19 +347,6 @@ def test_generated_listboxes_keep_their_own_selection(tk_root):
     spec = gsp.build([a, b], gl.infer([a, b], 400, 400), project="lb")
     src = ge.emit_main_ui(spec)
     assert src.count("exportselection=False") == 2
-    top = tk.Toplevel(tk_root)
-    try:
-        l1 = tk.Listbox(top, exportselection=False)
-        l2 = tk.Listbox(top, exportselection=False)
-        for lb in (l1, l2):
-            lb.insert("end", "x", "y")
-            lb.pack()
-        l1.selection_set(1)
-        l2.selection_set(0)
-        top.update()
-        assert l1.curselection() == (1,)
-    finally:
-        top.destroy()
 
 
 @pytest.mark.parametrize("label", ["Remove", "Load", "Kill"])
@@ -394,49 +382,56 @@ DRIVER = textwrap.dedent('''
     main_py = Path.cwd() / "main.py"
     boot = main_py.read_text(encoding="utf-8").split("from app import main")[0]
     exec(compile(boot, str(main_py), "exec"), {"__file__": str(main_py)})
-    import tkinter as tk
+    from PySide6.QtWidgets import QApplication
+    qt = QApplication.instance() or QApplication([])
     from app import App
-    root = tk.Tk(); app = App(root); app.pack()
+    app = App()                                   # never shown
     def pump(ms):
         end = time.time() + ms / 1000
         while time.time() < end:
-            root.update(); time.sleep(0.005)
+            qt.processEvents(); time.sleep(0.005)
     pump(300)
     p = app.ports
     p.capture_folder.set(FRAMES); pump(800)
     cl = p.classes.widget
     for c in ("good", "bad timing"):
-        p.new_class.set(c); app.btn_add_class.invoke(); pump(200)
+        p.new_class.set(c); app.btn_add_class.click(); pump(200)
     def mark(i, cls):
         p.frame.set(i); pump(200)
-        cl.selection_clear(0, "end")
-        cl.selection_set(list(cl.get(0, "end")).index(cls))
-        app.btn_mark_this_frame.invoke(); pump(150)
+        cl.clearSelection()
+        cl.item(p.classes.items().index(cls)).setSelected(True)
+        app.btn_mark_this_frame.click(); pump(150)
     for i in (3, 17): mark(i, "bad timing")
     for i in (0, 8, 20): mark(i, "good")
-    app.btn_train.invoke(); pump(300)
+    app.btn_train.click(); pump(300)
     trained = p.classifier_status.get()
-    app.btn_classify_all_frames.invoke(); pump(800)
-    rows = list(p.predictions.widget.get(0, "end"))
+    app.btn_classify_all_frames.click(); pump(800)
+    rows = p.predictions.items()
     print("__OUT__" + json.dumps({"trained": trained, "rows": rows,
                                   "current": p.current_frame.get()}))
-    root.destroy()
+    app.close()
 ''')
 
 
 def test_the_generated_app_marks_trains_and_classifies(tmp_path, capture,
                                                       monkeypatch):
+    """Barbie Capture v3, built for Qt and pressed like a user would — Add
+    class, Mark this frame, Train, Classify all frames — in its own process,
+    offscreen. (The Tk GUIs are deprecated: no test may open a Tk window.)"""
     import run_example_gui as rex
     folder, truth = capture
     vault = tmp_path / "v"
-    pdir = rex.build("barbie_capture_v3", project="e2e", vault_dir=vault)
+    pdir = rex.build("barbie_capture_v3", project="e2e", vault_dir=vault,
+                     target="qt")
     drv = tmp_path / "drive.py"
     drv.write_text(DRIVER, encoding="utf-8")
-    env = dict(os.environ, COUNCIL_NO_DIALOGS="1", COUNCIL_VAULT_ROOT=str(vault))
+    env = dict(os.environ, COUNCIL_NO_DIALOGS="1", COUNCIL_VAULT_ROOT=str(vault),
+               QT_QPA_PLATFORM="offscreen")
     r = subprocess.run([sys.executable, str(drv), str(folder)], cwd=str(pdir),
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=180, env=env)
     assert r.returncode == 0, r.stderr[-1500:]
+    assert " failed: " not in r.stderr, r.stderr[-1500:]
     out = json.loads(next(l for l in r.stdout.splitlines()
                           if l.startswith("__OUT__"))[len("__OUT__"):])
     assert "Leave-one-out accuracy 100%" in out["trained"], out["trained"]

@@ -45,7 +45,8 @@ NOT COVERED (none of these is reached by a test today):
   the guard is per test;
 - ctypes ShellExecute, QProcess.start / startDetached;
 - python CHILD processes: the guard is in-process only;
-- Tk windows: a Toplevel must be withdraw()n by the test that makes it.
+- Tk windows: those are refused outright, in this process and in python
+  children, by tests/no_tk_guard.py (the Tk GUIs are deprecated).
 """
 from __future__ import annotations
 

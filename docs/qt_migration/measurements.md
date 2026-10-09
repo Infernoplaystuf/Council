@@ -167,6 +167,16 @@ assigned (CouncilConsole IS the root) -- those paths raise AttributeError.
 
 ## 4. Tests
 
+UPDATE 2026-10-09 -- the Tk GUIs are deprecated, and NO TEST MAY OPEN A TK
+WINDOW. All 72 tests that made a Tk root or Toplevel (57 in the pytest
+process, 15 only in a child process) were removed, ported to Qt or
+toolkit-free tests, or pointed at the Qt target; the tk_root fixture below is
+gone. tests/no_tk_guard.py makes tkinter.Tk() and Toplevel() raise
+"Tk GUIs are deprecated - tests must not open a Tk window" for the whole run,
+in the pytest process and in every python child (via tests/_no_tk/ first on
+PYTHONPATH). tests/README.md says what to do with a test that trips it. The
+rest of this section is the state as measured before that.
+
 tests/conftest.py has a SESSION-scoped tk_root fixture (one root per session,
 withdrawn). Its docstring records why: on Python 3.11 / Tcl 8.6.15, creating a
 root after destroying one fails with "Can't find a usable init.tcl", and with one
