@@ -53,5 +53,12 @@ When a test you are writing, or one merging from another branch, trips it:
   `tests/test_frame_classes.py`. Note that `run_example_gui.py` still builds
   for `tk` when no target is given.
 
+A test may still RUN Tk-target code whose correct behaviour is to open no
+window — there the guard is the tripwire. The startup-check tests in
+`tests/test_gui_requires.py` run a Tk `main.py` that must exit 3 without
+its messagebox under `COUNCIL_PREVIEW_CONTROL` or `COUNCIL_NO_DIALOGS`; if
+either switch stops working, the child's `tkinter.Tk()` is refused and the
+test fails (exit 1, not 3) instead of a modal opening.
+
 On 2026-10-09 this was applied to all 72 tests that made a Tk window: the
 ports and Qt retargets are in the commits that removed them.

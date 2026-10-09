@@ -132,15 +132,51 @@ def test_validate_rejects_a_bad_declaration():
 # ============================================================
 
 def _emit(tmp_path, requires, target="tk"):
-    """Generate the project. A test that RUNS main.py builds it for Qt: the
-    Tk GUIs are deprecated and no test may open a Tk window
-    (tests/README.md). The startup check is the same text on both targets;
-    only Tk's has a messagebox fallback, which those tests never reached."""
+    """Generate the project for `target` — Tk, the generator's default,
+    unless the test says otherwise."""
     proj = _project(requires)
     spec = gsp.build(proj.shapes, gl.infer(proj.shapes, 400, 300),
                      project="cam", requires=proj.requires)
     ge.emit(spec, tmp_path, target=target)
     return tmp_path
+
+
+# THE STARTUP CHECK IS RUN ON BOTH TARGETS, and running the Tk one opens no
+# window when the check is right: its main.py exits 3 before any widget
+# exists. Launched by hand it would ALSO show the list in a messagebox; the
+# designer's launch marker (COUNCIL_PREVIEW_CONTROL) and the unattended
+# switch (COUNCIL_NO_DIALOGS) each keep that dialog shut, and each test below
+# leaves only its own switch in the child's environment. If that switch
+# stops working, the child's tkinter.Tk() is refused by the no-Tk guard
+# (tests/no_tk_guard.py — TkWindowRefused is a BaseException, which the
+# dialog's `except Exception` does not swallow), so the regression fails
+# here with exit 1, not 3, instead of hanging on a modal nobody clicks.
+# Tk stays covered because it is still the generator's default target
+# (gui_emit.DEFAULT_TARGET) and run_example_gui's.
+#
+# The Qt main.py has no dialog at all, and must not reach for tkinter to say
+# that PySide6 is missing.
+STARTUP_TARGETS = ["tk", "qt"]
+_SWITCHES = ("COUNCIL_PREVIEW_CONTROL", "COUNCIL_NO_DIALOGS")
+
+
+def _start(pdir, target, switch, value):
+    """Run the generated main.py with `switch` set and the other unset."""
+    src = (pdir / "main.py").read_text(encoding="utf-8")
+    if target == "qt":
+        assert "tkinter" not in src
+    else:
+        # The dialog the switches keep shut is really there. If the Tk target
+        # ever loses it, its case here has nothing left to check.
+        assert "showerror" in src
+    env = {k: v for k, v in os.environ.items() if k not in _SWITCHES}
+    env[switch] = value
+    r = subprocess.run([sys.executable, "main.py"], cwd=str(pdir),
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert "TkWindowRefused" not in r.stderr, (
+        f"the startup check reached for its dialog under {switch}:\n"
+        + r.stderr[-1500:])
+    return r
 
 
 def test_main_py_checks_every_declared_package(tmp_path):
@@ -158,14 +194,14 @@ def test_main_py_with_nothing_declared_is_unchanged(tmp_path):
     assert "_MISSING" not in (pdir / "main.py").read_text(encoding="utf-8")
 
 
-def test_the_wrong_python_fails_at_startup_with_a_list(tmp_path):
+@pytest.mark.parametrize("target", STARTUP_TARGETS)
+def test_the_wrong_python_fails_at_startup_with_a_list(tmp_path, target):
     """Launched under a Python that lacks a declared package, the app says
-    so and exits — before any widget exists."""
-    pdir = _emit(tmp_path, ["json", "definitely_missing_pkg_xyz"], target="qt")
-    assert "tkinter" not in (pdir / "main.py").read_text(encoding="utf-8")
-    r = subprocess.run([sys.executable, "main.py"], cwd=str(pdir),
-                       capture_output=True, text=True, timeout=60,
-                       env=dict(os.environ, COUNCIL_PREVIEW_CONTROL="stdin"))
+    so and exits — before any widget exists. Launched from the designer
+    (COUNCIL_PREVIEW_CONTROL), the list goes to its log and no dialog opens."""
+    pdir = _emit(tmp_path, ["json", "definitely_missing_pkg_xyz"],
+                 target=target)
+    r = _start(pdir, target, "COUNCIL_PREVIEW_CONTROL", "stdin")
     assert r.returncode == 3
     assert "definitely_missing_pkg_xyz" in r.stderr
     assert "Run with" in r.stderr
@@ -255,14 +291,11 @@ def test_a_string_requires_is_the_list_it_means(tmp_path, raw, want):
     assert spec.requires == want
 
 
-def test_unattended_startup_never_waits_on_a_dialog(tmp_path):
+@pytest.mark.parametrize("target", STARTUP_TARGETS)
+def test_unattended_startup_never_waits_on_a_dialog(tmp_path, target):
     """COUNCIL_NO_DIALOGS=1 is the switch for unattended runs. The startup
     check ignored it and opened a modal nobody would click."""
-    pdir = _emit(tmp_path, ["definitely_missing_pkg_xyz"], target="qt")
-    env = {k: v for k, v in os.environ.items()
-           if k != "COUNCIL_PREVIEW_CONTROL"}
-    env["COUNCIL_NO_DIALOGS"] = "1"
-    r = subprocess.run([sys.executable, "main.py"], cwd=str(pdir),
-                       capture_output=True, text=True, timeout=60, env=env)
+    pdir = _emit(tmp_path, ["definitely_missing_pkg_xyz"], target=target)
+    r = _start(pdir, target, "COUNCIL_NO_DIALOGS", "1")
     assert r.returncode == 3
     assert "definitely_missing_pkg_xyz" in r.stderr
