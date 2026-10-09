@@ -163,7 +163,7 @@ def test_every_setting_gets_a_control_of_its_kind_with_the_cameras_range():
     # Owned by its enable flag: greyed out, and saying why.
     rate = w.rows["AcquisitionFrameRate"]
     assert not rate.editor.isEnabled()
-    assert "AcquisitionFrameRateEnable is off" in rate.note.text()
+    assert '"Limit the frame rate" is off' in rate.note.text()
     assert w.area_edit.text() == "0, 0, 640, 480"
     assert "Live view" in w.state_label.text()
 
@@ -229,7 +229,7 @@ def test_typing_a_number_is_one_write_when_committed():
     w.flush_now()
     assert api.writes == [("ExposureTime", 1234.5)]
     assert device().state["ExposureTime"] == 1234.5
-    assert w.status.text() == "ExposureTime: 1234.5"
+    assert w.status.text() == "Exposure time: 1234.5 µs"
 
 
 def test_what_the_camera_made_of_a_value_is_what_the_control_shows():

@@ -2381,9 +2381,12 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
     def finish(change: Any) -> Dict[str, Any]:
         if change.ok and not change.skipped:
             _camera_set([key])
+        # SAID AS THE ROW SAYS IT: its label and unit ("Picture window:
+        # 99.9 ms", not "window_ms: 99.901") — and, like a preset or a
+        # reset, that the live view restarted when the write needed it.
         out = {"change": change.as_dict(), "key": key, "value": change.value,
                "ok": change.ok, "what": "setting", "pending": False,
-               "summary": change.line()}
+               "summary": change.line(setting.label, setting.unit)}
         now = _roi_or_none(device) if moves_area else None
         if now is not None and now != before:
             # The picture's pixels changed under the crop box: cleared, as
@@ -2392,6 +2395,9 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
             out.update(area=_area_text(now), crop="", area_moved=True)
             out["summary"] += (f" — the camera's area is now "
                                f"{_area_text(now)} (in its new pixels)")
+        if stop and change.ok and not change.skipped:
+            out["summary"] += (". The live view restarted for it (the "
+                               "stream must stop to change it).")
         return out
 
     return _run_change(f"Changing {setting.label}", work, finish, stop)
@@ -2478,7 +2484,7 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                 "reset": (f"{name} as connected" if name else
                           "Settings as connected")}.get(what,
                                                         "Camera settings")
-        said = f"{head}: {applied.summary()}"
+        said = f"{head}: {applied.summary(labels)}"
         if restarted:
             said += (f" The live view restarted for {', '.join(restarted)} "
                      f"(the stream must stop to change "

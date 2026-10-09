@@ -327,7 +327,7 @@ def test_the_window_shows_the_emulators_nodes_and_writes_them(
     gain.editor.setValue(6.5)
     window.flush_now()
     assert cam.Gain.GetValue() == pytest.approx(6.5, abs=1e-3)
-    assert window.status.text() == "Gain: 6.5"
+    assert window.status.text() == "Gain: 6.5 dB"
 
 
 def test_a_preset_saved_in_the_window_puts_the_emulator_back(

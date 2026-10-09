@@ -99,8 +99,9 @@ class Setting:
     answer from a settings window:
       * `read_only` — never writable here (a temperature, a serial number).
       * `held` — writable, but another setting owns it at the moment
-        ("ExposureAuto is Continuous"): grey it out and say why. A preset
-        that turns the auto loop off in the same set still writes it.
+        ('"Auto exposure" is Continuous', by the owner's label): grey it
+        out and say why. A preset that turns the auto loop off in the same
+        set still writes it.
       * `live` False — writable only with the stream stopped (a Basler's
         pixel format): the caller stops it, writes, and starts it again.
     """
@@ -160,17 +161,29 @@ class Change:
         """Took, but not exactly as asked (clamped or snapped)."""
         return self.ok and not self.skipped and not same(self.asked, self.value)
 
-    def line(self) -> str:
-        """One line for a status bar or a list."""
+    def line(self, label: str = "", unit: str = "") -> str:
+        """One line for a status bar or a list — said by `label`, the name
+        on the setting's row, with its `unit`, when given. The key alone
+        ("window_ms: 99.901", "PixelFormat: Mono12") was what every tab's
+        and pop-out's status line said under a row called "Picture window"
+        or "Pixel format"."""
+        name = label or self.key
+
+        def said(value: Any) -> str:
+            text = show(value)
+            numeric = isinstance(value, (int, float)) and not isinstance(
+                value, bool)
+            return f"{text} {unit}" if unit and numeric else text
+
         if not self.ok:
-            return f"{self.key}: NOT changed — {self.note}"
+            return f"{name}: NOT changed — {self.note}"
         if self.skipped:
-            return f"{self.key}: left at {show(self.value)} — {self.note}"
+            return f"{name}: left at {said(self.value)} — {self.note}"
         if self.adjusted:
             why = f" ({self.note})" if self.note else ""
-            return (f"{self.key}: {show(self.value)}, asked "
+            return (f"{name}: {said(self.value)}, asked "
                     f"{show(self.asked)}{why}")
-        return f"{self.key}: {show(self.value)}"
+        return f"{name}: {said(self.value)}"
 
     def as_dict(self) -> Dict[str, Any]:
         return {"key": self.key, "asked": self.asked, "value": self.value,
@@ -199,8 +212,9 @@ class Applied:
     def ok(self) -> bool:
         return not self.refused and not self.roi_error
 
-    def summary(self) -> str:
-        """One sentence: how many took, and the first thing that did not."""
+    def summary(self, labels: Optional[Mapping[str, str]] = None) -> str:
+        """One sentence: how many took, and the first thing that did not —
+        named by its label when `labels` (key: label) has it."""
         took = sum(1 for c in self.changes if c.ok and not c.skipped)
         bits = [f"{took} setting{'s' if took != 1 else ''} applied"]
         if self.roi_asked is not None:
@@ -215,7 +229,8 @@ class Applied:
             bits.append(f"{len(self.adjusted)} adjusted by the camera")
         if self.refused:
             first = self.refused[0]
-            bits.append(f"{len(self.refused)} refused ({first.key}: "
+            name = (labels or {}).get(first.key) or first.key
+            bits.append(f"{len(self.refused)} refused ({name}: "
                         f"{first.note})")
         return "; ".join(bits) + "."
 
@@ -258,7 +273,10 @@ def same(a: Any, b: Any) -> bool:
 
 def show(value: Any) -> str:
     """A value for a person. Floats lose their read-back noise (a gain of 3
-    reads back 2.999994 on the emulator — said as 3, not 2.99999)."""
+    reads back 2.999994 on the emulator — said as 3, not 2.99999); on and
+    off are words, as the settings window says them, not True and False."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
     if isinstance(value, float):
         return f"{round(value, 4):g}"
     return str(value)
@@ -307,6 +325,13 @@ def coerce(setting: Setting, value: Any) -> Tuple[Any, str]:
         except (TypeError, ValueError):
             raise SettingError(f"{setting.label} must be a number, not "
                                f"{value!r}") from None
+        except OverflowError:
+            # A whole number no float holds (10**400 read from a file):
+            # refused as this setting's, so a set reports it by name and
+            # writes the rest — it stopped a preset half way, unnamed.
+            raise SettingError(f"{setting.label} must be a number a camera "
+                               f"can hold, not one of {len(str(value))} "
+                               f"digits") from None
         if math.isnan(number) or math.isinf(number):
             raise SettingError(f"{setting.label} must be a finite number")
         note = ""
@@ -831,11 +856,15 @@ class BaslerSettings(Provider):
             if found is None:
                 return ""              # no auto loop on this model: write it
             state = _plain(found[1].GetValue())
+        # Said by the label on the row that owns it: the node name
+        # ("ExposureAuto is Continuous") under a row called "Auto exposure"
+        # sent the user looking for a setting the window does not show.
+        owner = f'"{self._feature(other).label}"'
         if isinstance(needed, bool):
             met = str(state).strip().lower() in _TRUE if not isinstance(
                 state, bool) else state
-            return "" if met == needed else f"{other} is off"
-        return "" if str(state) == str(needed) else f"{other} is {state}"
+            return "" if met == needed else f"{owner} is off"
+        return "" if str(state) == str(needed) else f"{owner} is {state}"
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:
@@ -1639,7 +1668,7 @@ class SyntheticSettings(Provider):
         on = batch.get("AcquisitionFrameRateEnable",
                        self.device.state["AcquisitionFrameRateEnable"])
         on = on if isinstance(on, bool) else str(on).lower() in _TRUE
-        return "" if on else "AcquisitionFrameRateEnable is off"
+        return "" if on else '"Limit the frame rate" is off'
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:

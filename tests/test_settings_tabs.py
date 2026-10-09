@@ -718,6 +718,54 @@ def test_the_tabs_know_what_the_running_stream_locks(clean, typhon_dir):
     assert tabs.rows["Gain"].live
 
 
+def test_a_status_line_says_the_rows_label_and_a_restart(clean, typhon_dir,
+                                                         evk4):
+    """Every tab's and pop-out's status line said the KEY ("window_ms:
+    99.901", "PixelFormat: Mono12") under rows called "Picture window" and
+    "Pixel format"; and one write that restarted the live view did not say
+    so, where a preset or a reset that did the same did."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    tabs.rows["ExposureTime"].editor.setValue(3000)
+    tabs.flush_now()
+    assert tabs.said == "Exposure time: 3000 µs", tabs.said
+    assert pump(1.0, until=lambda: not tabs.rows["PixelFormat"].live)
+    tabs.rows["PixelFormat"].editor.textActivated.emit("Mono12")
+    tabs.flush_now()
+    assert pump(2.0, until=lambda: "restarted" in tabs.said), tabs.said
+    assert tabs.said.startswith("Pixel format: Mono12"), tabs.said
+    assert "The live view restarted for it" in tabs.said
+    ui.on_btn_disconnect()
+    connect(ui, "00051234")
+    window = tabs.pop_out("Display")
+    window.rows["window_ms"].editor.setValue(99.9)
+    window.flush_now()
+    assert window.status.text() == "Picture window: 99.9 ms", \
+        window.status.text()
+
+
+def test_a_pop_out_says_only_its_own_categorys_news(clean, typhon_dir, evk4):
+    """A pop-out hears every change (on_camera_change) but its status line
+    is about its own category: an anti-flicker write said in the Biases
+    window was the answer to a question nobody asked there."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    biases = tabs.pop_out("Biases")
+    biases.rows["bias.bias_fo"].editor.setValue(-20)
+    biases.flush_now()
+    said = biases.status.text()
+    assert said == "bias_fo: -20", said
+    afk = tabs.pop_out("Anti-flicker")
+    afk.rows["afk.low_hz"].editor.setValue(140)
+    afk.flush_now()
+    assert "140" in afk.status.text(), afk.status.text()
+    assert biases.status.text() == said, "another category's news"
+    # The tabs show every category: they say it.
+    assert "140" in tabs.said, tabs.said
+
+
 def test_a_set_is_refused_before_the_camera_is_read_while_it_changes(
         clean, typhon_dir, monkeypatch):
     """A change that restarts the stream owns the camera on the worker. A
@@ -754,7 +802,7 @@ def test_held_and_read_only_rows_are_greyed_and_say_why(clean, typhon_dir,
     tabs = tabs_of(ui)
     rate = tabs.pop_out("Frame rate").rows["AcquisitionFrameRate"]
     assert not rate.editor.isEnabled() and not rate.slider.isEnabled()
-    assert "Greyed out while AcquisitionFrameRateEnable is off" in \
+    assert 'Greyed out while "Limit the frame rate" is off' in \
         rate.note.text()
     status = tabs.pop_out("Status")
     temperature = status.rows["DeviceTemperature"]

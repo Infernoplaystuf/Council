@@ -68,6 +68,41 @@ def test_text_that_is_not_a_number_is_a_mistake_not_a_zero():
             cs.coerce(setting(cs.FLOAT), bad)
 
 
+def test_a_whole_number_too_big_for_any_camera_is_a_mistake_not_a_crash():
+    """float(10**400) raises OverflowError, which coerce let through: a
+    preset holding such a number stopped half way, the setting at fault
+    unnamed. It is refused like any other value the setting cannot take."""
+    with pytest.raises(cs.SettingError, match="Thing"):
+        cs.coerce(setting(cs.FLOAT), 10 ** 400)
+    with pytest.raises(cs.SettingError, match="Thing"):
+        cs.coerce(setting(cs.INT, minimum=0, maximum=10), -10 ** 400)
+    dev = simulated("frame")
+    done = cs.apply(dev, {"ExposureTime": 1234.0, "Gain": 10 ** 400,
+                          "BlackLevel": 7})
+    refused = {c.key: c.note for c in done.refused}
+    assert list(refused) == ["Gain"] and "Gain" in refused["Gain"]
+    assert dev.state["ExposureTime"] == 1234.0 and dev.state["BlackLevel"] == 7
+
+
+def test_a_change_is_said_by_its_label_with_its_unit():
+    """The status line under every tab and pop-out said "window_ms: 99.901"
+    and "PixelFormat: Mono12" — keys, not what the rows are called."""
+    took = cs.Change("window_ms", 99.901, 99.901)
+    assert took.line() == "window_ms: 99.901"
+    assert took.line("Picture window", "ms") == "Picture window: 99.901 ms"
+    assert cs.Change("Gain", 30, 24.0, note="clamped to the maximum, 24"
+                     ).line("Gain", "dB") == \
+        "Gain: 24 dB, asked 30 (clamped to the maximum, 24)"
+    assert cs.Change("PixelFormat", "X", "Mono8", ok=False, note="no"
+                     ).line("Pixel format") == "Pixel format: NOT changed — no"
+    assert cs.Change("ReverseX", True, True).line("Mirror left-right") == \
+        "Mirror left-right: on"
+    applied = cs.Applied([cs.Change("PixelFormat", "X", "Mono8", ok=False,
+                                    note="not an entry")])
+    assert "(Pixel format: not an entry)" in applied.summary(
+        {"PixelFormat": "Pixel format"})
+
+
 def test_typed_values_are_not_adjustments_when_they_took_as_typed():
     assert not cs.Change("k", "5000", 5000.0).adjusted
     assert not cs.Change("k", "on", True).adjusted
@@ -213,8 +248,36 @@ def test_basler_ranges_types_and_entries_come_from_the_nodes():
 
 def test_a_value_the_auto_loop_owns_is_held_not_read_only():
     exposure = by_key(basler()[0])["ExposureTime"]
-    assert exposure.held == "ExposureAuto is Continuous"
+    # Said by the label on the row that owns it, not by its node name
+    # ("ExposureAuto is Continuous" under a row labelled "Auto exposure").
+    assert exposure.held == '"Auto exposure" is Continuous'
     assert not exposure.read_only
+    dev, cam = basler()
+    cam.AcquisitionFrameRateEnable.value = False
+    assert by_key(dev)["AcquisitionFrameRate"].held == \
+        '"Limit the frame rate" is off'
+    assert by_key(simulated("frame"))["AcquisitionFrameRate"].held == \
+        '"Limit the frame rate" is off'
+
+
+def test_a_basler_category_is_read_from_its_own_nodes_only():
+    """A pop-out reads its category again after every drag (describe_
+    groups). On a Basler that is the category's own nodes: with the group
+    filter removed, a pop-out read the whole node map after each drag and
+    every test stayed green (a mutation the review ran)."""
+    dev, cam = basler(
+        TriggerSelector=Node("FrameStart", choices=("FrameStart",
+                                                    "FrameBurstStart")),
+        TriggerMode=Node("Off", choices=("Off", "On")),
+        GammaEnable=Node(False), Gamma=Node(1.0, 0.0, 4.0))
+    asked = []
+    original = dev._node
+    dev._node = lambda name: asked.append(name) or original(name)
+    got = dev.settings_provider().describe_groups(["Gain"])
+    assert [s.key for s in got] == ["GainAuto", "Gain", "BlackLevel"]
+    own = {n for f in cs.BASLER_FEATURES if f.group == "Gain"
+           for n in f.names}
+    assert asked and set(asked) <= own, sorted(set(asked) - own)
 
 
 def test_a_set_turns_the_auto_loop_off_before_the_value_it_owns():

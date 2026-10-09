@@ -759,7 +759,8 @@ forward.
   with `Stop the capture to change this — one run keeps one set-up`, and
   frame_camera refuses it with the capture's message anyway.
 - A setting **another one owns** is greyed and says why
-  (`Greyed out while ExposureAuto is Continuous — change that first`); a
+  (`Greyed out while "Auto exposure" is Continuous — change that
+  first`, by the label of the row that owns it); a
   **read-only** one says `Read only — …`; a category of readings (Status)
   says so once at the top.
 - **Readings stay current**: the temperature, illumination and pixel dead
@@ -891,7 +892,7 @@ area** in sensor pixels, the **presets**, and **What the last change did**.
   `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
 - A bias outside its **recommended** range says so under its row.
 - A setting another one owns is **greyed out and says why** (`Greyed out
-  while ExposureAuto is Continuous — change that first`). One the stream is
+  while "Auto exposure" is Continuous — change that first`). One the stream is
   in the way of (a Basler's pixel format, mirror, binning) says `Changing
   this restarts the live view for a moment`, and does exactly that.
 - **↺** on a row puts that setting back **as the camera had it when it was

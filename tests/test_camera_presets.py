@@ -436,3 +436,27 @@ def test_repairing_a_damaged_file_still_moves_it_aside(store):
     store.path.write_text("{not json", encoding="utf-8")
     store.save(EVK_A, "Bird bath", BIRD_BATH, None, repair=True)
     assert store.repaired == "file"
+
+
+def test_a_number_no_camera_setting_can_hold_is_refused_untouched(store,
+                                                                  tmp_path):
+    """JSON and Python take an integer of any length as "a plain number".
+    An exported file holding Gain 10**400 was imported, and applying it
+    wrote the exposure, then stopped at the gain with "int too large to
+    convert to float" — part of the preset on the camera, the rest not,
+    and the setting at fault not named. Refused where the file is read."""
+    with pytest.raises(cp.PresetError, match="cannot be saved"):
+        store.save(EVK_A, "Huge", {"bias.bias_fo": 10 ** 400}, None)
+    camera = cp.Identity("simulated", "Simulated", "1", "frame")
+    bad = tmp_path / "huge.camera-preset.json"
+    bad.write_text(json.dumps({
+        "kind": cp.EXPORT_KIND, "format": cp.FORMAT,
+        "camera": camera.as_dict(),
+        "preset": {"name": "bad", "settings": {
+            "ExposureTime": 1234.0, "Gain": 10 ** 400, "BlackLevel": 7},
+            "roi": [8, 8, 320, 240]}}), encoding="utf-8")
+    with pytest.raises(cp.PresetFileError, match="cannot be used"):
+        cp.import_preset(store, camera, bad)
+    assert not store.path.exists(), "a refused import wrote the store"
+    # The widest whole number a camera node holds still passes.
+    store.save(EVK_A, "Wide", {"erc.rate": 2 ** 63 - 1}, None)

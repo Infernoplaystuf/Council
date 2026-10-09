@@ -239,11 +239,17 @@ def _now() -> str:
 # ======================================================================
 # Validation — what a read accepts
 # ======================================================================
+#: The widest whole number a preset holds: a 64-bit node's. JSON and Python
+#: read an integer of any length, and one of 400 digits passed as "a plain
+#: number" — applying it then failed half way through the preset.
+WIDEST_INT = 2 ** 63
+
+
 def _scalar(value: Any) -> bool:
     if isinstance(value, bool) or isinstance(value, str):
         return True
     if isinstance(value, int):
-        return True
+        return -WIDEST_INT <= value < WIDEST_INT
     return isinstance(value, float) and math.isfinite(value)
 
 
