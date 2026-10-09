@@ -182,6 +182,17 @@ def save_tool(name: str, description: str, code: str, *,
         return False, f"tool limit reached ({_MAX_TOOLS})", None
     d = _ensure_dir(vault_dir)
     path = d / f"{slug}.py"
+    if path.exists():
+        # Every replaced version is kept (council_core.tool_review): an
+        # approved tool that is changed can be compared and restored.
+        try:
+            vdir = d / "versions"
+            vdir.mkdir(exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            (vdir / f"{slug}-{stamp}.py").write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
     try:
         path.write_text(
             _make_header(slug, description, entry, author) + "\n" + code + "\n",

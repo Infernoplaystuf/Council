@@ -196,4 +196,17 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
         "vault_search": vault_search,
         "api_search": api_search, "api_signature": api_signature}
     tools.update(make_extra_tools(vault_dir, notes=notes, roots=roots or ()))
-    return ToolSet(tools, notes=notes, vault_dir=vault_dir)
+    # Tools Forge built and the USER approved (council_core.tool_review),
+    # for the roles they were approved for.
+    from council_core.tool_kit import ROLE_TOOLS
+    role_tools = {r: tuple(t) for r, t in ROLE_TOOLS.items()}
+    try:
+        from council_core import tool_review
+        for name, fn, roles in tool_review.approved_tools(vault_dir):
+            tools[name] = fn
+            for r in roles:
+                role_tools[r] = role_tools.get(r, ()) + (name,)
+    except Exception:                                     # noqa: BLE001
+        pass
+    return ToolSet(tools, notes=notes, vault_dir=vault_dir,
+                   role_tools=role_tools)

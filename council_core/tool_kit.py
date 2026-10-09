@@ -1180,7 +1180,7 @@ class ToolSet(dict):
                     self._cache[key] = res
             return res
         call.help = getattr(fn, "help", "")              # type: ignore[attr-defined]
-        call.params = PARAMS.get(name)                   # type: ignore[attr-defined]
+        call.params = PARAMS.get(name) or getattr(fn, "params", None)  # type: ignore[attr-defined]
         call.__name__ = name
         return call
 
