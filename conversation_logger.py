@@ -57,6 +57,9 @@ PROTECTED_SUBDIRS: tuple = (
     # The council benchmark's runs (council_core.council_bench): measurements
     # of the app, not the user's documents.
     ".council_bench",
+    # Code projects the council works on (council_core.project): briefs,
+    # job notes and git worktrees — whole copies of code, not documents.
+    ".council_projects",
 )
 
 # Lowercased once at import for the per-path membership test in
