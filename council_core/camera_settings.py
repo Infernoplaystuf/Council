@@ -62,14 +62,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
                       EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
                       Roi, _ask, _interface, fit_roi, off_sensor, on_sensor)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
-           "area_unchanged",
+           "Trigger", "trigger_warning", "area_unchanged",
            "coerce", "apply", "snapshot", "needs_stop", "stops_needed"]
 
 #: What a setting holds.
@@ -122,6 +123,10 @@ class Setting:
     recommended: Optional[Tuple[float, float]] = None
     #: Why another setting owns this one right now, or "".
     held: str = ""
+    #: What this value does to the picture that a person must be told, or
+    #: "": a Basler's TriggerMode On means no frame until a trigger arrives,
+    #: which froze the live view with no word said (trigger_warning).
+    warning: str = ""
 
     @property
     def savable(self) -> bool:
@@ -135,7 +140,8 @@ class Setting:
                 "min": self.minimum, "max": self.maximum, "step": self.step,
                 "choices": list(self.choices), "unit": self.unit,
                 "read_only": self.read_only, "live": self.live,
-                "held": self.held, "help": self.help,
+                "held": self.held, "warning": self.warning,
+                "help": self.help,
                 "recommended": (list(self.recommended)
                                 if self.recommended else None)}
 
@@ -283,6 +289,40 @@ def show(value: Any) -> str:
 
 
 # ======================================================================
+# A camera that waits for a trigger
+# ======================================================================
+@dataclass(frozen=True)
+class Trigger:
+    """One of the camera's triggers that is ON: the camera waits for a
+    signal from `source` before what `selector` names (a frame, a burst, an
+    exposure) — so, until one arrives, it sends nothing.
+
+    MEASURED on pylon's emulator: TriggerMode On (its source is Software by
+    default) stopped the frames at once; the live line kept its last
+    "62.5 fps", and a 4 s capture saved nothing, with no word on why.
+    Nothing in this app sends a software trigger."""
+    selector: str
+    source: str
+
+    @property
+    def software(self) -> bool:
+        """Only a program can fire it — and nothing here does."""
+        return self.source.strip().lower().startswith("software")
+
+    def said(self) -> str:
+        which = f"{self.selector} trigger" if self.selector else "trigger"
+        return f"its {which} is On (source {self.source or 'unknown'})"
+
+
+def trigger_warning(source: str) -> str:
+    """Under a TriggerMode row that is On: what that does to the picture."""
+    if Trigger("", source).software:
+        return ("No picture: it waits for a software trigger, and nothing "
+                "here sends one — set it Off")
+    return (f"No picture until a trigger arrives on {source or 'its source'}")
+
+
+# ======================================================================
 # Turning what was typed or saved into what the setting takes
 # ======================================================================
 _TRUE = {"1", "true", "yes", "on", "enabled"}
@@ -367,6 +407,10 @@ class Provider:
     #: settings, or None for last.
     roi_after_group: Optional[str] = None
 
+    #: The keys whose value may carry a `warning` (Setting.warning): after a
+    #: write of one, the caller reads it again to say it.
+    warns: frozenset = frozenset()
+
     def describe(self) -> List[Setting]:
         raise NotImplementedError
 
@@ -410,6 +454,23 @@ class Provider:
         """Load the factory settings. Raises NeedsStop, before anything is
         written, while the stream is in the way."""
         raise SettingError("this camera has no defaults of its own to load")
+
+    # -- triggers: what makes a camera send nothing ------------------------
+    def triggers_on(self) -> List[Trigger]:
+        """Every trigger the camera waits for now — all of them, not only
+        the one its selector shows. [] for a camera with no trigger (an
+        EVK4 here, the simulated cameras): it runs free."""
+        return []
+
+    def trigger_modes(self) -> Dict[str, str]:
+        """Each trigger's mode by its selector entry ({"FrameStart": "Off",
+        "FrameBurstStart": "On", ...}); {} with none to report."""
+        return {}
+
+    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
+        """Put each trigger's mode back as `modes` has it (trigger_modes, as
+        connected); what was changed, one line each."""
+        return []
 
     # ------------------------------------------------------------------
     def find(self, key: str) -> Setting:
@@ -647,10 +708,14 @@ def apply(device: Any, values: Mapping[str, Any],
     return done
 
 
-def snapshot(device: Any) -> Dict[str, Any]:
+def snapshot(device: Any,
+             described: Optional[Sequence[Setting]] = None) -> Dict[str, Any]:
     """The values worth saving in a preset: every writable setting, as the
-    camera has it now. Readings (a temperature) and labels are left out."""
-    return {s.key: s.value for s in device.settings_provider().describe()
+    camera has it now. Readings (a temperature) and labels are left out.
+    `described`: the camera's description, when it was just read."""
+    if described is None:
+        described = device.settings_provider().describe()
+    return {s.key: s.value for s in described
             if s.savable and s.value is not None}
 
 
@@ -730,11 +795,14 @@ BASLER_FEATURES: Tuple[_Feature, ...] = (
     # frame — the live view shows nothing until one arrives.
     _Feature("TriggerSelector", ("TriggerSelector",), "Trigger",
              "Trigger", help="Which trigger the settings below are for — "
-                             "FrameStart starts each frame."),
+                             "FrameStart starts each frame. Each trigger "
+                             "has its own mode, source and edge: these "
+                             "rows show the selected one only."),
     _Feature("TriggerMode", ("TriggerMode",), "Trigger mode", "Trigger",
-             help="On: the camera waits for the trigger below before each "
-                  "frame, and the live view shows nothing until one "
-                  "arrives. Off: it runs free."),
+             help="On: the camera waits for the trigger selected above "
+                  "before each frame, and the live view shows nothing until "
+                  "one arrives. Off: it runs free. For the selected trigger "
+                  "only — Reset puts every trigger back as connected."),
     _Feature("TriggerSource", ("TriggerSource",), "Trigger source",
              "Trigger", help="Where the trigger comes from: an input line, "
                              "software, a timer …"),
@@ -760,6 +828,7 @@ class BaslerSettings(Provider):
     """
 
     roi_after_group = "Binning"
+    warns = frozenset({"TriggerMode"})
 
     def __init__(self, device: Any):
         self.device = device
@@ -836,6 +905,12 @@ class BaslerSettings(Provider):
                 setting = replace(setting, live=False)
             else:
                 setting = replace(setting, read_only=True)
+        if feature.key == "TriggerMode" and str(setting.value) == "On":
+            # The row says what On does to the picture, where it was
+            # clicked: the tooltip alone said it, and the live view froze.
+            source = self._resolve(self._feature("TriggerSource"))
+            setting = replace(setting, warning=trigger_warning(
+                str(_plain(source[1].GetValue())) if source else ""))
         return setting
 
     def read(self, key: str) -> Any:
@@ -843,6 +918,93 @@ class BaslerSettings(Provider):
         if found is None:
             raise SettingError(f"this camera has no {key}")
         return _plain(found[1].GetValue())
+
+    # -- triggers ------------------------------------------------------------
+    def _each_trigger(self, visit: Callable[[str, Any, Any], None]) -> None:
+        """Call visit(selector entry, TriggerMode node, TriggerSource node)
+        with each of the camera's triggers selected in turn, then select
+        the one that was selected before.
+
+        EVERY TRIGGER, NOT THE SELECTED ONE. TriggerMode and its source are
+        the SELECTED trigger's (SFNC), and the rows show that one: measured
+        on the emulator, FrameBurstStart left On while the selector showed
+        FrameStart was invisible to the rows, to a preset and to "Reset
+        Trigger" — on a real camera a burst trigger left On stops the
+        frames. Only the selector is written here, and put back."""
+        mode = self.device._node("TriggerMode")
+        if mode is None or not _readable(mode):
+            return
+        source = self.device._node("TriggerSource")
+        selector = self.device._node("TriggerSelector")
+        entries: List[str] = []
+        was = ""
+        if selector is not None and _readable(selector):
+            try:
+                was = str(_plain(selector.GetValue()))
+                entries = [str(s) for s in selector.GetSymbolics()]
+            except Exception:                               # noqa: BLE001
+                entries = []
+        if len(entries) < 2 or not _writable(selector):
+            visit(was, mode, source)
+            return
+        try:
+            for entry in entries:
+                try:
+                    if entry != str(_plain(selector.GetValue())):
+                        selector.SetValue(entry)
+                except Exception:                           # noqa: BLE001
+                    continue            # an entry this model cannot select
+                visit(entry, mode, source)
+        finally:
+            try:
+                if str(_plain(selector.GetValue())) != was:
+                    selector.SetValue(was)
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def triggers_on(self) -> List[Trigger]:
+        found: List[Trigger] = []
+
+        def visit(entry: str, mode: Any, source: Any) -> None:
+            try:
+                if str(_plain(mode.GetValue())) != "On":
+                    return
+                said = (str(_plain(source.GetValue()))
+                        if source is not None and _readable(source) else "")
+            except Exception:                               # noqa: BLE001
+                return
+            found.append(Trigger(entry, said))
+        self._each_trigger(visit)
+        return found
+
+    def trigger_modes(self) -> Dict[str, str]:
+        modes: Dict[str, str] = {}
+
+        def visit(entry: str, mode: Any, _source: Any) -> None:
+            try:
+                modes[entry] = str(_plain(mode.GetValue()))
+            except Exception:                               # noqa: BLE001
+                pass
+        self._each_trigger(visit)
+        return modes
+
+    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
+        done: List[str] = []
+
+        def visit(entry: str, mode: Any, _source: Any) -> None:
+            wanted = modes.get(entry)
+            if wanted is None:
+                return
+            try:
+                if str(_plain(mode.GetValue())) == wanted:
+                    return
+                mode.SetValue(wanted)
+                done.append(f"the {entry or 'camera'} trigger {wanted} again")
+            except Exception as exc:                        # noqa: BLE001
+                done.append(f"the {entry or 'camera'} trigger NOT put back "
+                            f"to {wanted} — {_why(exc)}")
+        self._each_trigger(visit)
+        return done
 
     def held_by(self, setting: Setting, batch: Mapping[str, Any]) -> str:
         feature = self._feature(setting.key)

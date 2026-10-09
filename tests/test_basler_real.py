@@ -631,3 +631,73 @@ def test_a_configuration_made_on_the_emulator_is_exported_and_imported(
     assert cam.Gain.GetValue() == pytest.approx(7.0, abs=0.01)
     _pump(app, 0.5)
     assert tabs.rows["Gain"].editor.value() == pytest.approx(7.0, abs=0.01)
+
+
+def _trigger_modes(cam):
+    keep = cam.TriggerSelector.GetValue()
+    modes = {}
+    for entry in cam.TriggerSelector.GetSymbolics():
+        cam.TriggerSelector.SetValue(entry)
+        modes[entry] = cam.TriggerMode.GetValue()
+    cam.TriggerSelector.SetValue(keep)
+    return modes
+
+
+def test_trigger_mode_on_says_why_the_picture_stopped(emulator_typhon,
+                                                      tmp_path):
+    """MEASURED (review, 2026-10-08): one click on Trigger mode On in the
+    Exposure tab - the emulator's source is Software - stopped the frames;
+    the row said nothing, the live line kept "62.5 fps", a 4 s capture
+    saved nothing and said nothing. Now the row and the status line say it,
+    the live line says how long there has been no picture and why, and
+    Start refuses a run nothing can trigger."""
+    fc, ui, app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    tabs = ui._settings_tabs
+    assert cam.TriggerSource.GetValue() == "Software"
+    row = tabs.rows["TriggerMode"]
+    row._from_choice("On")
+    tabs.flush_now()
+    assert cam.TriggerMode.GetValue() == "On"
+    assert tabs.said.startswith("Trigger mode: On — No picture: it waits "
+                                "for a software trigger"), tabs.said
+    assert _pump(app, 2.0, until=lambda: "software trigger" in
+                 row.note.text()), row.note.text()
+    line = ui.ports.capture_status.get
+    assert _pump(app, 6.0, until=lambda: "NO PICTURE" in line()), line()
+    assert "its FrameStart trigger is On (source Software)" in line()
+    with pytest.raises(RuntimeError, match="nothing here sends a software"):
+        fc.start(str(tmp_path / "run"))
+    assert not fc._LIVE.capturing
+    row._from_choice("Off")
+    tabs.flush_now()
+    assert _pump(app, 4.0, until=lambda: "NO PICTURE" not in line()
+                 and " fps" in line()), line()
+    assert _pump(app, 2.0, until=lambda: row.note.text() == ""), \
+        row.note.text()
+
+
+def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
+        emulator_typhon):
+    """The emulator has nine triggers (TriggerSelector); TriggerMode is the
+    selected one's. A FrameBurstStart trigger left On while the selector
+    showed FrameStart survived "Reset Trigger", which said it had applied
+    (review). Every trigger is put back as connected now, and said."""
+    fc, ui, app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    connected = _trigger_modes(cam)
+    assert set(connected.values()) == {"Off"}
+    window = ui._settings_tabs.pop_out("Trigger")
+    window.rows["TriggerSelector"]._from_choice("FrameBurstStart")
+    window.flush_now()
+    window.rows["TriggerMode"]._from_choice("On")
+    window.flush_now()
+    window.rows["TriggerSelector"]._from_choice("FrameStart")
+    window.flush_now()
+    assert _trigger_modes(cam)["FrameBurstStart"] == "On"
+    assert fc._triggers_on(fc._LIVE.device)[0].selector == "FrameBurstStart"
+    window.reset_group()
+    assert _pump(app, 4.0, until=lambda: fc._LIVE.job is None)
+    assert _trigger_modes(cam) == connected
+    assert cam.TriggerSelector.GetValue() == "FrameStart"
+    assert "the FrameBurstStart trigger Off again" in window.status.text()

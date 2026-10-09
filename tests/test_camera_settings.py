@@ -280,6 +280,83 @@ def test_a_basler_category_is_read_from_its_own_nodes_only():
     assert asked and set(asked) <= own, sorted(set(asked) - own)
 
 
+class Selected(Node):
+    """A node of the SELECTED trigger (SFNC): TriggerMode and TriggerSource
+    hold one value per TriggerSelector entry, as a Basler's do."""
+
+    def __init__(self, values, choices):
+        super().__init__(next(iter(values.values())), choices=choices)
+        self.values = dict(values)
+
+    def GetValue(self):
+        return self.values[self.cam.TriggerSelector.value]
+
+    def SetValue(self, value):
+        super().SetValue(value)
+        self.values[self.cam.TriggerSelector.value] = value
+
+
+def trigger_basler():
+    entries = ("FrameBurstStart", "FrameStart", "ExposureStart")
+    return basler(
+        TriggerSelector=Node("FrameStart", choices=entries),
+        TriggerMode=Selected({e: "Off" for e in entries}, ("Off", "On")),
+        TriggerSource=Selected({e: "Software" for e in entries},
+                               ("Software", "Line1")))
+
+
+def test_every_trigger_is_seen_not_only_the_selected_one():
+    """TriggerMode is the SELECTED trigger's. Measured on the emulator: a
+    FrameBurstStart trigger left On while the selector showed FrameStart
+    was invisible to the rows and to Reset; and the selected one On (its
+    source Software by default) froze the live view with no word said."""
+    dev, cam = trigger_basler()
+    provider = dev.settings_provider()
+    assert provider.triggers_on() == []
+    cam.TriggerSelector.value = "FrameBurstStart"
+    cam.TriggerMode.SetValue("On")
+    cam.TriggerSelector.value = "FrameStart"
+    on = provider.triggers_on()
+    assert on == [cs.Trigger("FrameBurstStart", "Software")]
+    assert on[0].software
+    assert on[0].said() == "its FrameBurstStart trigger is On (source Software)"
+    assert cam.TriggerSelector.value == "FrameStart", "not put back"
+    shown = by_key(dev)["TriggerMode"]
+    assert shown.value == "Off" and shown.warning == "", "the selected one"
+    # The selected trigger On: its row says what that does to the picture.
+    cam.TriggerMode.SetValue("On")
+    warning = by_key(dev)["TriggerMode"].warning
+    assert "software trigger" in warning and "nothing here sends" in warning
+    assert by_key(dev)["TriggerMode"].as_dict()["warning"] == warning
+    cam.TriggerSource.SetValue("Line1")
+    assert by_key(dev)["TriggerMode"].warning == \
+        "No picture until a trigger arrives on Line1"
+    assert not provider.triggers_on()[-1].software
+    # Put back as connected: every trigger's mode, the selector as it was.
+    connected = {"FrameBurstStart": "Off", "FrameStart": "Off",
+                 "ExposureStart": "Off"}
+    said = provider.restore_trigger_modes(connected)
+    assert said == ["the FrameBurstStart trigger Off again",
+                    "the FrameStart trigger Off again"]
+    assert provider.trigger_modes() == connected
+    assert cam.TriggerSelector.value == "FrameStart"
+    assert provider.restore_trigger_modes(connected) == [], "nothing to do"
+
+
+def test_a_model_with_one_trigger_and_no_selector_is_read_too():
+    dev, cam = basler(TriggerMode=Node("On", choices=("Off", "On")),
+                      TriggerSource=Node("Line1", choices=("Software",
+                                                           "Line1")))
+    provider = dev.settings_provider()
+    assert provider.triggers_on() == [cs.Trigger("", "Line1")]
+    assert provider.trigger_modes() == {"": "On"}
+    assert provider.restore_trigger_modes({"": "Off"}) == [
+        "the camera trigger Off again"]
+    assert cam.TriggerMode.value == "Off"
+    # Cameras with no trigger at all say none.
+    assert simulated("frame").settings_provider().triggers_on() == []
+
+
 def test_a_set_turns_the_auto_loop_off_before_the_value_it_owns():
     dev, cam = basler()
     done = dev.apply_settings({"ExposureTime": 2000, "ExposureAuto": "Off"})

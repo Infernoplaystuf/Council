@@ -239,6 +239,22 @@ class _Live:
         #: keeps what it was last given until it is powered off, so it also
         #: offers its own factory set (load_camera_defaults).
         self.as_connected: Dict[str, Any] = {}
+        #: Each trigger's mode by its selector entry as connected (camera_
+        #: settings Provider.trigger_modes): a Basler's TriggerMode is the
+        #: SELECTED trigger's, so as_connected holds one of nine; Reset puts
+        #: the others back from here.
+        self.as_connected_triggers: Dict[str, str] = {}
+        #: The camera's description read by Connect, while Connect is being
+        #: announced to the views (settings_list answers from it); else None.
+        self.connect_listing: Optional[List[Any]] = None
+        #: Why the camera is sending nothing — "its FrameStart trigger is On
+        #: (source Software)" — read once when it goes quiet (_quiet_note),
+        #: or None until then; forgotten when a setting changes.
+        self.quiet_reason: Optional[str] = None
+        #: Said with the last run's result when it saved nothing because
+        #: of that ("the camera waited for a trigger the whole run ..."),
+        #: or "".
+        self.run_waited = ""
         #: When each box beside Start ("exposure", "gain", "frame_rate")
         #: was last changed, and when a preset or the settings window last
         #: set the same thing on the camera — as a running count, not a
@@ -287,6 +303,10 @@ class _Live:
         self.shown_aoi = None
         self.job = None
         self.as_connected = {}
+        self.as_connected_triggers = {}
+        self.connect_listing = None
+        self.quiet_reason = None
+        self.run_waited = ""
         self.camera_set = {}
         self.queued = {}
         self.preset_in_use = None
@@ -418,8 +438,20 @@ def connect(which: Any) -> Dict[str, Any]:
 
     limits = device.limits()
     area = device.roi()
-    _LIVE.as_connected = _snapshot_or_nothing(device)
-    _announce({"what": "connected", "summary": f"Connected to {info.label}."})
+    # DESCRIBED ONCE. The as-connected snapshot and every view told of the
+    # Connect (the tabs build themselves from it, an open pop-out reads its
+    # category) take the same description, read a moment apart: on an EVK4
+    # each is every facility again, a USB round trip each (review: 132
+    # facility calls for a Connect that made 46 before the tabs).
+    described = _describe_or_none(device)
+    _LIVE.as_connected = _snapshot_or_nothing(device, described)
+    _LIVE.as_connected_triggers = _trigger_modes_or_nothing(device)
+    _LIVE.connect_listing = described
+    try:
+        _announce({"what": "connected",
+                   "summary": f"Connected to {info.label}."})
+    finally:
+        _LIVE.connect_listing = None
     return {
         "summary": (f"Connected to {info.label}. "
                     f"Sensor {limits.width}x{limits.height}."),
@@ -524,6 +556,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     out = Path(where)
     if out.exists() and not out.is_dir():
         raise RuntimeError(f"{out} is a file, not a folder")
+    waits_for = _waits_for_trigger(session.device)
 
     for box, value in (("exposure", exposure), ("gain", gain),
                        ("frame_rate", frame_rate)):
@@ -624,6 +657,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         said += (" This folder is on a network share — save to a local "
                  "folder and copy the run afterwards, or frames will be "
                  "skipped.")
+    if waits_for:
+        said += (f" The camera waits for a trigger before each frame: "
+                 f"{waits_for}.")
     # A settings window greys out what a capture refuses (the area, a
     # preset, a setting the stream is in the way of) from this.
     _announce({"what": "capturing", "summary": said})
@@ -667,6 +703,11 @@ def stop() -> Dict[str, Any]:
                 _LIVE.idle = (f"Stopped, but the raw file did not close "
                               f"cleanly: {exc}")
     stats = session.run_stats()
+    # A run that saved nothing because the camera waited for a trigger says
+    # so after Stop: "0 saved" alone read as a fault of the app.
+    _LIVE.run_waited = (f"the camera waited for a trigger the whole run "
+                        f"({_LIVE.quiet_reason})"
+                        if _LIVE.quiet_reason and not stats.grabbed else "")
     if not ended:
         # The truth, not a hopeful message. Something is still holding the
         # camera, and the next start would be racing it.
@@ -689,6 +730,8 @@ def _run_note(session: Any) -> str:
     """The last run, short: what was saved, what was not, the .raw."""
     stats = session.run_stats()
     bits = [f"{stats.recorded} saved"]
+    if _LIVE.run_waited:
+        bits[0] += f" — {_LIVE.run_waited}"
     if stats.skipped:
         bits.append(f"{stats.skipped} NOT saved")
     raw = _LIVE.raw_path
@@ -706,6 +749,8 @@ def _stopped_line(session: Any) -> str:
     line = f"Stopped. {stats.line()}"
     if stats.waiting:
         line = f"Stopped — still saving. {stats.line()}"
+    if _LIVE.run_waited:
+        line += f" — {_LIVE.run_waited}"
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -776,6 +821,71 @@ def pump(show: Callable[[Any], Any],
     return frame is not None
 
 
+#: How long the camera may send nothing before the live line says so and
+#: asks it why — or longer, for a camera that was running slowly
+#: (capture.QUIET_INTERVALS of its own frame intervals).
+QUIET_SECONDS = 2.0
+
+
+def _triggers_on(device: Any) -> List[Any]:
+    """The camera's triggers that are On (camera_settings.Trigger), or []
+    when it has none or cannot say."""
+    try:
+        return list(device.settings_provider().triggers_on())
+    except Exception:                                     # noqa: BLE001
+        return []
+
+
+def _trigger_modes_or_nothing(device: Any) -> Dict[str, str]:
+    try:
+        return dict(device.settings_provider().trigger_modes())
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+
+def _waits_for_trigger(device: Any) -> str:
+    """At Start, before anything stops: REFUSED when the camera waits for a
+    software trigger — nothing here sends one, so the run would save
+    nothing (measured on the emulator: a 4 s run wrote only its .csv and
+    camera record). A hardware trigger is the user's to fire: the run
+    starts, and this says which ones it waits for ("" for none)."""
+    on = _triggers_on(device)
+    software = [t for t in on if t.software]
+    if software:
+        which = software[0].selector or "camera's"
+        raise RuntimeError(
+            f"the camera's {which} trigger is On with its source "
+            f"{software[0].source}, and nothing here sends a software "
+            f"trigger — this run would save no frames. Set Trigger mode "
+            f"Off (Exposure tab, Trigger), then Start")
+    return "; ".join(t.said() for t in on)
+
+
+def _quiet_note(session: Any) -> str:
+    """"NO PICTURE for 6 s — the camera waits for a trigger: its FrameStart
+    trigger is On (source Software) ..." while the camera sends nothing
+    (CaptureSession.quiet), else "".
+
+    The camera is asked why ONCE per silence (it writes the trigger
+    selector to look at each trigger, and puts it back), and again when a
+    setting changes (_camera_set) or pictures came and went."""
+    gone = session.quiet(QUIET_SECONDS)
+    if not gone:
+        _LIVE.quiet_reason = None
+        return ""
+    if _LIVE.quiet_reason is None:
+        on = _triggers_on(session.device)
+        reason = "; ".join(t.said() for t in on)
+        if any(t.software for t in on):
+            reason += (" — nothing here sends a software trigger: set "
+                       "Trigger mode Off (Exposure tab, Trigger)")
+        _LIVE.quiet_reason = reason
+    said = f"NO PICTURE for {gone:.0f} s"
+    if _LIVE.quiet_reason:
+        said += f" — the camera waits for a trigger: {_LIVE.quiet_reason}"
+    return said
+
+
 def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     """The status line: live numbers while capturing or saving, then one
     final line, then silence — so "Connected to ..." and every other message
@@ -784,7 +894,9 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     if say is None or session is None:
         return
     if _LIVE.capturing or session.saving:
-        say(_status_line(session.stats(), frame))
+        line = _status_line(session.stats(), frame)
+        quiet = _quiet_note(session) if _LIVE.capturing else ""
+        say(f"{quiet} · {line}" if quiet else line)
         _LIVE.reported = False
     elif _LIVE.job is not None:
         # The stream is stopped ON PURPOSE for a moment; not "quiet".
@@ -802,10 +914,18 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     """Said while the live view runs: that NOTHING is being saved comes
     first. Short: the line is one row, and Connect already said which camera
     it is. For a while after Stop it also carries the run's result, which
-    the live view coming back would otherwise have replaced unread."""
-    line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
+    the live view coming back would otherwise have replaced unread.
+
+    A CAMERA SENDING NOTHING IS SAID, NOT A RATE: the measured rate only
+    moves when frames arrive, and the line said "62.5 fps" for a Basler
+    waiting for a trigger that never came (_quiet_note)."""
+    quiet = _quiet_note(session)
+    if quiet:
+        line = f"Live view — not saving · {quiet}"
+    else:
+        line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}
-    if meta.get("kind") == "event":
+    if meta.get("kind") == "event" and not quiet:
         line += f" · {meta.get('events', 0)} events/window"
     if time.monotonic() < _LIVE.run_note_until:
         line += f" · {_LIVE.run_note or _run_note(session)}"
@@ -951,11 +1071,15 @@ def _manage_preview(want: bool) -> None:
         _started_stream(session)
         _LIVE.previewing = True
         _LIVE.idle = ""
-        _announce({"what": "streaming", "streaming": True})
+        # `restartable`: a stream that is never restarted (an EVK4's) locks
+        # no setting by running — the views need not read the camera again.
+        _announce({"what": "streaming", "streaming": True,
+                   "restartable": restartable})
     elif not want and _LIVE.previewing:
         if restartable:
             _stop_preview(session)
-            _announce({"what": "streaming", "streaming": False})
+            _announce({"what": "streaming", "streaming": False,
+                       "restartable": restartable})
         else:
             # Not stopped — never restart this stream — just not drawn.
             _LIVE.previewing = False
@@ -1017,8 +1141,11 @@ def _box_changed(box: str) -> None:
 
 def _camera_set(keys: Any) -> None:
     """A preset, a reset or the settings window set these keys on the
-    camera: the latest word on whichever boxes they belong to."""
+    camera: the latest word on whichever boxes they belong to. Why the
+    camera was quiet is asked again (a trigger may have been turned Off)."""
     keys = set(keys)
+    if keys:
+        _LIVE.quiet_reason = None
     for box, owned in START_BOXES.items():
         if keys.intersection(owned):
             _LIVE.camera_set[box] = next(_STAMPS)
@@ -2317,8 +2444,12 @@ def settings_list(groups: Any = None) -> Dict[str, Any]:
     """
     device = _require_device()
     wanted = _group_names(groups)
+    cached = _LIVE.connect_listing
     try:
-        if wanted:
+        if cached is not None:
+            # Read by Connect a moment ago (connect: DESCRIBED ONCE).
+            described = [s for s in cached if not wanted or s.group in wanted]
+        elif wanted:
             described = device.settings_provider().describe_groups(wanted)
         else:
             described = device.settings()
@@ -2398,6 +2529,17 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
         if stop and change.ok and not change.skipped:
             out["summary"] += (". The live view restarted for it (the "
                                "stream must stop to change it).")
+        if change.ok and not change.skipped and key in getattr(
+                provider, "warns", ()):
+            # A mode can stop the picture (TriggerMode On): said with the
+            # answer, in the status line of the view that made it — one
+            # feature read again, not the camera.
+            try:
+                warning = provider.find(key).warning
+            except Exception:                             # noqa: BLE001
+                warning = ""
+            if warning:
+                out["summary"] += f" — {warning}"
         return out
 
     return _run_change(f"Changing {setting.label}", work, finish, stop)
@@ -2426,7 +2568,9 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
-               name: str, live_ok: bool = False) -> Dict[str, Any]:
+               name: str, live_ok: bool = False,
+               after: Optional[Callable[[], List[str]]] = None
+               ) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
     put back as connected are then the same as changing each live, which
@@ -2435,6 +2579,10 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     THE ANSWER SAYS WHAT NEEDED THE STREAM STOPPED ("restarted"), so a
     preset that applied live reads differently from one that blanked the
     live view for a moment, and the user knows which settings did it.
+
+    `after`, when given, runs right after the set (on the worker with it,
+    when the stream is stopped for it) and says what else it put back, one
+    line each — a reset's triggers other than the selected one.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -2464,11 +2612,20 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                  for k in blocked]
     before = _roi_or_none(device)
 
+    also: List[str] = []
+
     def work() -> Any:
-        return camera_settings.apply(device, values, roi)
+        applied = camera_settings.apply(device, values, roi)
+        if after is not None:
+            try:
+                also.extend(after())
+            except Exception as exc:                      # noqa: BLE001
+                also.append(f"the rest NOT put back — {_said(exc)}")
+        return applied
 
     def finish(applied: Any) -> Dict[str, Any]:
-        _camera_set(_changed_keys(applied))
+        _camera_set(_changed_keys(applied) + (["TriggerMode"] if also
+                                              else []))
         if what == "preset":
             # What the camera TOOK, so a value it snapped is not "changed
             # since" at Start; a preset only partly applied is not in use.
@@ -2485,6 +2642,8 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                           "Settings as connected")}.get(what,
                                                         "Camera settings")
         said = f"{head}: {applied.summary(labels)}"
+        if also:
+            said = said[:-1] + f"; {', '.join(also)}."
         if restarted:
             said += (f" The live view restarted for {', '.join(restarted)} "
                      f"(the stream must stop to change "
@@ -2503,15 +2662,25 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
 # ======================================================================
 # Back to a known state: as connected, or the camera's own factory set
 # ======================================================================
-def _snapshot_or_nothing(device: Any) -> Dict[str, Any]:
+def _snapshot_or_nothing(device: Any,
+                         described: Any = None) -> Dict[str, Any]:
     """Every savable setting now, or {} when the camera cannot say — a
-    camera that cannot describe itself still connects."""
+    camera that cannot describe itself still connects. `described`: its
+    description, just read (_describe_or_none)."""
     from council_core import camera_settings
 
     try:
-        return camera_settings.snapshot(device)
+        return camera_settings.snapshot(device, described)
     except Exception:                                     # noqa: BLE001
         return {}
+
+
+def _describe_or_none(device: Any) -> Any:
+    """Every setting the camera describes, or None when it cannot."""
+    try:
+        return list(device.settings_provider().describe())
+    except Exception:                                     # noqa: BLE001
+        return None
 
 
 def camera_defaults() -> Dict[str, Any]:
@@ -2566,10 +2735,18 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         raise RuntimeError("the camera's settings were not read when it was "
                            "connected — there is nothing to put back")
     wanted = _group_names(group)
+    triggers = dict(_LIVE.as_connected_triggers)
+
+    def every_trigger() -> List[str]:
+        # The SELECTED trigger is in the set; a Basler has a mode for each
+        # of its triggers (nine on the emulator), and one left On stops
+        # the frames — Reset said "applied" over a burst trigger still On.
+        return device.settings_provider().restore_trigger_modes(triggers)
+
     if not wanted:
         return _apply_set(dict(_LIVE.as_connected), None,
                           "Putting the settings back as connected", "reset",
-                          "")
+                          "", after=every_trigger if triggers else None)
     # Before the group is read: a change on the worker owns the camera.
     _refuse_while_busy("put it back")
     try:
@@ -2584,7 +2761,9 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         raise RuntimeError(f"{what}: nothing here was read when the camera "
                            f"was connected — there is nothing to put back")
     return _apply_set(values, None, f"Putting {what} back as connected",
-                      "reset", what, live_ok=True)
+                      "reset", what, live_ok=True,
+                      after=(every_trigger if triggers
+                             and "TriggerMode" in values else None))
 
 
 def load_camera_defaults() -> Dict[str, Any]:
@@ -2972,7 +3151,7 @@ def _box_written(box: str, out: Dict[str, Any]) -> Dict[str, Any]:
     showed the value from before the box until something else made them
     read the camera again. Told, each view reads its settings once, a
     moment later (its refresh timer), however many arrow clicks came."""
-    _announce(dict(out, what="box", box=box))
+    _announce(dict(out, what="box", box=box, keys=list(START_BOXES[box])))
     return out
 
 

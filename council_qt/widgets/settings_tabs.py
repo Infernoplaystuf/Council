@@ -260,6 +260,16 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self.has_gain = bool(state.get("has_gain", True)) \
             if state.get("connected") else True
 
+    def _related(self, groups: set) -> Optional[set]:
+        """A change in a group can move the rest of its TAB (a Basler's
+        frame-rate limit and the rate it reaches follow its exposure, all in
+        Exposure) — not the camera: the other tabs are not read for it."""
+        out = set(groups)
+        for tab in self.plan:
+            if out.intersection(tab.groups):
+                out.update(tab.groups)
+        return out
+
     def _remove_pages(self) -> None:
         for page in list(self.pages.values()):
             index = self.book.indexOf(page)

@@ -848,9 +848,19 @@ view's own 16 MB picture, not the settings. On **pylon's emulator** (a real
 `BaslerDevice`, its largest frame 4096 x 3040): 30.3–30.4 pictures a second
 and 0.26–0.29 ms a tick in every case, 0.6–0.97 ms per written gain; a fake
 EVK4 at 1280 x 720: 0.25–0.27 ms a tick, 0.34–0.59 ms per written bias.
-**Not measured: a real EVK4** — a tab reads every facility of the camera
-once after a drag stops there, which on the real sensor is a USB read per
-setting (a pop-out reads only its own category).
+
+**What is read from the camera, and when.** On an EVK4 every facility read
+is a USB round trip, so each view reads only what a change can have moved:
+after a drag stops, a tab reads **its own tab's** categories and a pop-out
+**its own category**; the FPS box (and Start writing the boxes) makes the
+views read only the rows of what it wrote — an EVK4's picture window, which
+is the app's own setting, costs the camera nothing. Connect describes the
+camera **once**, for its as-connected values and for every view. Counted on
+the fake EVK4 (every facility call): Connect **46** calls (it was 132 with
+the tabs before this, 46 before the tabs); one FPS arrow click **0** (it was
+43); a bias written in its tab reads the Biases facility only. A **closed**
+pop-out (or settings window) reads nothing at all until it is opened again,
+when it reads its category afresh. **Not measured: a real EVK4.**
 
 **Smallest window.** At Typhon's smallest size (1400 x 820) the column is
 431 px wide and a tab page 190 px high: every tab title fits (an EVK4's six
@@ -1047,6 +1057,39 @@ works while capturing too.
 
 An event camera reports events per window and the event rate instead of frames
 per second: it has no frames.
+
+**When the camera sends nothing**, the line says so instead of a rate:
+`Live view — not saving · NO PICTURE for 6 s — the camera waits for a
+trigger: its FrameStart trigger is On (source Software) — nothing here sends
+a software trigger: set Trigger mode Off (Exposure tab, Trigger)`. (The rate
+is measured from frames that arrive, so with none arriving it used to keep
+showing the last one — `62.5 fps` for a camera that had stopped.) A camera
+running slowly is not called silent until several of its own frame intervals
+have passed with nothing.
+
+**A Basler's trigger.** With **Trigger mode On** the camera waits for a
+trigger before each frame, and the picture stops until one arrives — one
+click in the Exposure tab does it (measured on pylon's emulator, whose
+source is `Software`). So:
+
+- the **Trigger mode** row says it in orange under itself — `No picture: it
+  waits for a software trigger, and nothing here sends one — set it Off`, or
+  `No picture until a trigger arrives on Line1` — and the status line says
+  it with the change;
+- the live line says how long there has been no picture and which trigger
+  it waits for (above);
+- **Start capture is refused** while a trigger waits for **Software** —
+  nothing in Typhon sends one, so the run would save nothing; with a
+  trigger on an **input line** the run starts, says which trigger it waits
+  for, and after Stop says `the camera waited for a trigger the whole run`
+  if none came;
+- a Basler has **one trigger per TriggerSelector entry** (nine on the
+  emulator: FrameStart, FrameBurstStart, …), and the rows show the
+  **selected** one only. Every trigger counts above — a FrameBurstStart
+  left On while the selector shows FrameStart is named — and **Reset Trigger
+  (as connected)** / **Reset all** put **every** trigger's mode back as
+  connected, saying which (`the FrameBurstStart trigger Off again`). A preset
+  keeps the selected trigger only.
 
 Each run writes under its own timestamped stem, so a second run into the same
 folder can never overwrite the first. Unplugging the camera mid-capture ends

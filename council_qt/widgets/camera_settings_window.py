@@ -37,7 +37,17 @@ one is always written — so the live picture follows the drag and the camera
 is not sent hundreds of values it would only overwrite. The settings shown
 are read again only REFRESH_MS after the writes stop (a frame-rate limit's
 range follows the exposure on a Basler; an auto mode greys out what it
-owns) — a pop-out reads only its own category then.
+owns) — and only what the change can have moved: a pop-out its own
+category, the tabs the tab it is in (SettingsCore._want_refresh). On an
+EVK4 every facility read is a USB round trip: an FPS arrow click made the
+tabs read all 43 of them (review, measured); it reads the Display group,
+which costs the camera nothing.
+
+A CLOSED WINDOW READS NOTHING
+A pop-out or the whole window, closed, is kept (to open again quickly) but
+hears nothing and reads nothing until it is opened again, when it reads
+everything (`open`). Measured before: eight closed pop-outs each read
+their category again on every FPS click, connect and stream start.
 
 EVERY VIEW HEARS EVERY CHANGE
 Each view listens to frame_camera.on_camera_change, so a bias dragged in a
@@ -70,8 +80,8 @@ import math
 import os
 import time
 from collections import deque
-from typing import (Any, Callable, Deque, Dict, List, Optional, Sequence,
-                    Tuple)
+from typing import (Any, Callable, Deque, Dict, Iterable, List, Optional,
+                    Sequence, Tuple)
 
 from PySide6.QtCore import (QEvent, QObject, QRectF, QSize, Qt, QTimer,
                             Signal)
@@ -800,6 +810,10 @@ class SettingRow(QObject):
             f"was connected" if connected_value is not None else "")
 
         notes: List[Tuple[str, str]] = []
+        if s.get("warning"):
+            # What this value does to the picture (a trigger On: no frame
+            # until one arrives) — first, where the change was made.
+            notes.append((str(s["warning"]), "warn"))
         if self.result:
             notes.append((self.result, self.result_tone))
         if not writable and self.explain_read_only:
@@ -833,6 +847,9 @@ class SettingRow(QObject):
             self.note.setText(text)
             self.note.setVisible(True)
         else:
+            # Emptied, not only hidden: a note read later (a test, a grab)
+            # said a warning that no longer held.
+            self.note.clear()
             self.note.setVisible(False)
 
 
@@ -927,7 +944,14 @@ class SettingsCore:
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(REFRESH_MS)
-        self._refresh_timer.timeout.connect(self.refresh_values)
+        self._refresh_timer.timeout.connect(self._refresh_due)
+        #: The groups the pending refresh reads (_want_refresh): a set, or
+        #: None for every group this view shows.
+        self._refresh_wanted: Optional[set] = set()
+        #: False while the view's window is closed: it hears and reads
+        #: nothing until it is opened again (open_category / open_settings
+        #: read it all then). The tabs are never closed.
+        self.open = True
         # After a preset or a reset: everything read again once control is
         # back in the event loop, not inside the call that applied it.
         self._soon_timer = QTimer(self)
@@ -1014,13 +1038,24 @@ class SettingsCore:
             return self.api.settings_list(list(self.groups))
         return self.api.settings_list()
 
-    def refresh_values(self) -> None:
-        """Every setting shown read again; rows updated in place, or the
-        form rebuilt when the camera now describes a different set."""
-        if not self.connected:
+    def refresh_values(self, groups: Optional[Sequence[str]] = None) -> None:
+        """The settings shown read again — every one, or only those of
+        `groups` — and the rows updated in place; the form is rebuilt when
+        the camera now describes a different set (then everything is read:
+        a part cannot be rebuilt alone)."""
+        if not self.connected or not self.open:
             return
+        wanted: Optional[List[str]] = None
+        if groups is not None and self._shape is not None:
+            wanted = [g for g in dict.fromkeys(groups)
+                      if not self.groups or g in self.groups]
+            if not wanted:
+                return                      # none of them is shown here
         try:
-            listed = self._timed("read the settings", self._read_settings)
+            listed = self._timed(
+                "read the settings",
+                self._read_settings if wanted is None
+                else lambda: self.api.settings_list(wanted))
         except Exception as exc:                          # noqa: BLE001
             self.say(f"Could not read the camera's settings: {exc}",
                      tone="bad")
@@ -1029,15 +1064,51 @@ class SettingsCore:
         settings = list(listed.get("settings") or [])
         shape = tuple((s["key"], s.get("type"), bool(s.get("read_only")),
                        s.get("group")) for s in settings)
-        if shape != self._shape:
+        if wanted is not None:
+            had = tuple(s for s in self._shape or () if s[3] in wanted)
+            if shape != had:
+                self.refresh_values()
+                return
+        elif shape != self._shape:
             self._build_form(settings, list(listed.get("groups") or []))
             self._shape = shape
-        else:
-            for setting in settings:
-                row = self.rows.get(setting["key"])
-                if row is not None and setting["key"] not in self._pending:
-                    row.update(setting)
+            self.apply_state()
+            return
+        for setting in settings:
+            row = self.rows.get(setting["key"])
+            if row is not None and setting["key"] not in self._pending:
+                row.update(setting)
         self.apply_state()
+
+    def _want_refresh(self, groups: Optional[Iterable[str]] = None) -> None:
+        """Read `groups` again REFRESH_MS from now — with what they can move
+        (_related) — or, with None, everything this view shows. Restarted by
+        every ask, so a drag reads the camera once, when it stops."""
+        if groups is not None:
+            groups = set(groups)
+            if not groups:
+                return
+        if self._refresh_wanted is not None:
+            related = None if groups is None else self._related(groups)
+            self._refresh_wanted = (None if related is None
+                                    else self._refresh_wanted | related)
+        self._refresh_timer.start()
+
+    def _related(self, groups: set) -> Optional[set]:
+        """The groups a change in `groups` can move. The whole window reads
+        everything (None) — what it shows is the whole camera, and it is
+        open only when asked for; a pop-out reads its own category anyway;
+        the tabs read the tab each group is in (SettingsTabs)."""
+        return None
+
+    def _refresh_due(self) -> None:
+        wanted, self._refresh_wanted = self._refresh_wanted, set()
+        self.refresh_values(None if wanted is None else sorted(wanted))
+
+    def _groups_of(self, keys: Iterable[str]) -> set:
+        """The groups of the rows shown here for `keys`."""
+        return {str(self.rows[k].setting.get("group") or "")
+                for k in keys if k in self.rows}
 
     def reading_rows(self) -> List[SettingRow]:
         """The rows of this view's READINGS: groups whose every row is read
@@ -1131,6 +1202,21 @@ class SettingsCore:
     def _soon(self) -> None:
         self._soon_timer.start()
 
+    def _closed(self) -> None:
+        """The view's window was closed: it stops hearing and reading the
+        camera (`open`) until it is opened again."""
+        self.open = False
+        for timer in (self._refresh_timer, self._soon_timer,
+                      self._readings_timer):
+            timer.stop()
+        self._refresh_wanted = set()
+
+    def reopen(self) -> None:
+        """Opened again (open_category / open_settings): everything read,
+        the camera may have changed in every way while it was closed."""
+        self.open = True
+        self.reload()
+
     def _refresh_all(self) -> None:
         self.refresh_values()
         self.refresh_area()
@@ -1169,7 +1255,7 @@ class SettingsCore:
                 row.restore()
         if self._pending and not self._write_timer.isActive():
             self._write_timer.start()
-        self._refresh_timer.start()
+        self._want_refresh(self._groups_of(key for key, _v in items))
         # The whole cycle on the UI thread: the call, and the view's own
         # handling of its answer (measured in docs/camera_quickstart.md).
         self.timings.append(("write cycle",
@@ -1187,12 +1273,16 @@ class SettingsCore:
         out = self._call(f"Reset {label}", self.api.reset_setting, key)
         if out is not None:
             self._took_setting(out)
-        self._refresh_timer.start()
+        self._want_refresh(self._groups_of([key]))
 
     # ------------------------------------------------------------------
     # What the camera says — frame_camera.on_camera_change, UI thread
     # ------------------------------------------------------------------
     def heard(self, out: Dict[str, Any]) -> None:
+        if not self.open:
+            # Closed: nothing is read for a window nobody sees; opening it
+            # again reads everything (open_category / open_settings).
+            return
         self._last_heard = dict(out)
         what = str(out.get("what") or "")
         if what in ("connected", "disconnected"):
@@ -1230,10 +1320,16 @@ class SettingsCore:
             self.capturing = what == "capturing"
         elif what == "box":
             # A box beside Start wrote the camera (the FPS box: a picture
-            # window, a frame-rate limit; Start: exposure and gain). Which
-            # rows that moves is the camera's business, so they are read
-            # again — once, after the clicks stop.
-            self._refresh_timer.start()
+            # window, a frame-rate limit; Start: exposure and gain). The
+            # rows of what it wrote (`keys`) are read again — once, after
+            # the clicks stop — with what they move (_related); not the
+            # camera: an FPS click made the tabs read every facility of an
+            # EVK4 (43 USB round trips) for its picture window.
+            keys = out.get("keys")
+            if keys is None:
+                self._want_refresh()
+            else:
+                self._want_refresh(self._groups_of(keys))
         elif what == "streaming":
             # The live view started (or stopped) the stream. WHICH SETTINGS
             # CHANGE LIVE DEPENDS ON IT: a Basler locks its pixel format,
@@ -1241,8 +1337,11 @@ class SettingsCore:
             # at Connect, before the live view's first tick started the
             # stream, so the tabs offered the pixel format as live — no
             # "restarts the live view", and a binning slider that wrote
-            # (each write a stream restart) at every step of a drag.
-            self._refresh_timer.start()
+            # (each write a stream restart) at every step of a drag. A
+            # stream that is never restarted (an EVK4's) locks nothing:
+            # not read again for it.
+            if out.get("restartable", True):
+                self._want_refresh()
         elif what == "presets":
             self.fill_presets(select=str(out.get("name") or ""))
             if out.get("summary"):
@@ -1280,7 +1379,7 @@ class SettingsCore:
                           self.as_connected.get(key))
             if row.kind in (BOOL, CHOICE):
                 # An auto mode or an enable flag: what it owns changes now.
-                self._refresh_timer.start()
+                self._want_refresh(self._groups_of([key]))
         if out.get("area_moved"):
             # Binning changed the area's own numbers: the area box too.
             self.refresh_area()
@@ -1300,6 +1399,13 @@ class SettingsCore:
         self._show_took(head, lines)
         for row in self.rows.values():
             row.result, row.result_tone = "", ""
+        for change in applied.get("changes") or []:
+            # What the camera took, shown now — the read after it (_soon)
+            # brings ranges and held states.
+            row = self.rows.get(str(change.get("key")))
+            if row is not None and change.get("ok", True) \
+                    and not row.busy_editing():
+                row.show_value(change.get("value"))
         self.say(head, tone="" if out.get("ok", True) else "warn")
         if out.get("what") == "preset" and out.get("name"):
             self.select_preset(str(out["name"]))
@@ -1913,6 +2019,7 @@ class CameraSettingsWindow(PresetsMixin, SettingsCore, QWidget):
         # A value still in the throttle is written, not lost.
         if self._pending:
             self.flush_now()
+        self._closed()
         super().closeEvent(event)
 
 
@@ -2145,6 +2252,7 @@ class CategoryWindow(SettingsCore, QWidget):
     def closeEvent(self, event: Any) -> None:            # noqa: N802
         if self._pending:
             self.flush_now()
+        self._closed()
         super().closeEvent(event)
 
 
@@ -2206,7 +2314,7 @@ def open_settings(parent: Optional[QWidget] = None, show: bool = True,
         window = CameraSettingsWindow(api, parent)
         _HELD["window"] = window
     else:
-        window.reload()
+        window.reopen()
     _raise(window, show)
     return window
 
@@ -2229,7 +2337,7 @@ def open_category(group: str, parent: Optional[QWidget] = None,
         window = CategoryWindow(api, group, parent, font=font)
         _HELD[key] = window
     else:
-        window.reload()
+        window.reopen()
     _raise(window, show)
     return window
 

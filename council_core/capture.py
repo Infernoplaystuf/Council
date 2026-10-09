@@ -48,6 +48,11 @@ STOP_TIMEOUT = 3.0
 #: The window the measured rate is averaged over, in seconds.
 RATE_WINDOW = 1.0
 
+#: A camera that has sent nothing for this many of its own frame intervals
+#: (the last one measured; and at least RATE_WINDOW) is not running at its
+#: last measured rate.
+QUIET_INTERVALS = 3.0
+
 #: How many consecutive failed reads end a capture. A backstop for any fault
 #: that repeats every time rather than clearing.
 MAX_CONSECUTIVE_ERRORS = 50
@@ -666,6 +671,15 @@ class CaptureSession:
         self._lock = threading.RLock()   # re-entrant: _took holds it across _record
         self._stats = Stats()
         self._marks: List[float] = []
+        #: When the last frame arrived (the clock's time) — or the stream
+        #: started, before the first; None before any start.
+        self._last_frame_at: Optional[float] = None
+        #: Seconds between the last two frames of this stream, or None.
+        #: The measured RATE cannot say how often a slow camera sends: under
+        #: one frame a RATE_WINDOW it reads 0.
+        self._interval: Optional[float] = None
+        #: The last frame time is the stream's start, not a frame's.
+        self._from_start = False
 
     # ------------------------------------------------------------------
     @property
@@ -689,11 +703,41 @@ class CaptureSession:
         self._counted_from = len(self._writers)
         self._ended_stats = None
 
+    def quiet_for(self) -> float:
+        """Seconds since the camera last sent a frame (since the stream
+        started, before the first one); 0 when it is not running.
+
+        A camera that stops sending raises nothing — a Basler waiting for a
+        trigger just times out its reads — so this is how the live line
+        knows (measured on the emulator: TriggerMode On, no frame for 6 s,
+        and the line still said "62.5 fps")."""
+        last = self._last_frame_at
+        if last is None or not self.running:
+            return 0.0
+        return max(0.0, self._clock() - last)
+
+    def quiet(self, least: float = RATE_WINDOW) -> float:
+        """quiet_for() once it is longer than `least` AND than
+        QUIET_INTERVALS of the camera's own last measured frame intervals
+        (a camera running at 0.2 fps is not quiet 2 s after a frame);
+        else 0."""
+        gone = self.quiet_for()
+        step = self._interval
+        enough = max(least, QUIET_INTERVALS * step) if step else least
+        return gone if gone > enough else 0.0
+
     def stats(self) -> Stats:
         writers = list(self._writers)[self._counted_from:]
         failed = next((w.failed for w in writers if w.failed), "")
+        quiet = self.quiet()
         with self._lock:
             base = self._stats
+        if base.rate > 0 and quiet:
+            # THE RATE IS MEASURED FROM FRAMES THAT ARRIVE: with none
+            # arriving the sliding window is never updated, and the last
+            # rate stood for a camera that had stopped. Several of its own
+            # intervals with nothing is not that rate any more.
+            base = replace(base, rate=0.0)
         return replace(
             base, dropped=self.mailbox.dropped,
             recorded=sum(w.written for w in writers),
@@ -782,6 +826,9 @@ class CaptureSession:
         # Before the thread, not inside it: see warm_imports.
         warm_imports()
         self.device.start()
+        self._last_frame_at = self._clock()
+        self._interval = None
+        self._from_start = True
         self._thread = threading.Thread(target=self._loop, name="capture",
                                         daemon=True)
         self._thread.start()
@@ -854,6 +901,10 @@ class CaptureSession:
             self._took(frame)
 
     def _took(self, frame: cameras.Frame) -> None:
+        now, last = self._clock(), self._last_frame_at
+        if last is not None and not self._from_start:
+            self._interval = max(0.0, now - last)
+        self._last_frame_at, self._from_start = now, False
         with self._lock:
             # Recorded and counted as one step (see record_to's `reset`).
             # submit() only queues, so the lock is held for microseconds.

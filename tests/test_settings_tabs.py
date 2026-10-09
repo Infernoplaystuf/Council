@@ -450,6 +450,116 @@ def test_the_readings_are_read_again_while_they_are_on_screen(
     assert not tabs._readings_timer.isActive()
 
 
+FACILITIES = ("biases", "erc", "afk", "trail", "activity", "monitor", "hw",
+              "roi")
+
+
+def count_hal_calls(hal):
+    """Count every facility method call on the fake EVK4, by facility — on
+    the sensor each is a USB round trip."""
+    calls = {name: 0 for name in FACILITIES}
+    for name in FACILITIES:
+        facility = getattr(hal, name)
+        for attr in dir(facility):
+            method = getattr(facility, attr)
+            if attr.startswith("_") or not callable(method) or \
+                    isinstance(method, type):
+                continue
+
+            def counted(*a, _m=method, _n=name, **k):
+                calls[_n] += 1
+                return _m(*a, **k)
+            setattr(facility, attr, counted)
+    return calls
+
+
+def test_connect_an_fps_click_and_a_tab_write_read_only_what_they_change(
+        clean, typhon_dir, evk4):
+    """MEASURED in review on the fake EVK4: Connect made 132 facility calls
+    (46 before the tabs: the snapshot as connected); the tabs described
+    the camera again, and again when the live view started its stream. One
+    FPS arrow click made 43 (0 before) — the tabs read every facility for
+    a picture window that is not a facility at all."""
+    calls = count_hal_calls(evk4)
+    ui = construct(typhon_dir)
+    ui.on_btn_scan_for_cameras()
+    rows = ui.ports.cameras.items()
+    ui.ports.cameras.widget.setCurrentRow(
+        next(i for i, r in enumerate(rows) if "00051234" in r))
+    ui.on_btn_connect()
+    assert pump(1.5, until=lambda: frame_camera._LIVE.previewing)
+    pump(0.6)                              # past every refresh timer
+    connected = sum(calls.values())
+    for name in calls:
+        calls[name] = 0
+    device().settings_provider().describe()
+    once = sum(calls.values())
+    assert once > 30, "the fake has stopped counting"
+    assert connected < once + 10, (
+        f"Connect made {connected} facility calls; one description is "
+        f"{once}")
+
+    for name in calls:
+        calls[name] = 0
+    box = ui.ports.frame_rate.widget
+    box.setValue(24)
+    box.stepBy(1)
+    tabs = tabs_of(ui)
+    assert pump(1.0, until=lambda: tabs.rows["window_ms"].editor.value()
+                == 40.0)
+    pump(0.5)
+    assert sum(calls.values()) == 0, calls
+
+    # A bias written in its tab reads its own tab again, not the filters
+    # and the readings.
+    tabs.rows["bias.bias_fo"].editor.setValue(-20)
+    tabs.flush_now()
+    pump(0.6)
+    assert calls["biases"] > 0
+    assert {n: c for n, c in calls.items() if n != "biases" and c} == {}
+
+
+def test_a_closed_pop_out_hears_nothing_and_reads_it_all_when_reopened(
+        clean, typhon_dir, evk4, monkeypatch):
+    """Closed pop-outs stayed listening (kept to open again quickly): with
+    all eight opened and closed, one FPS click made eight category reads
+    — one per closed window — and a reconnect two each (review)."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    windows = [tabs.pop_out(group) for group in list(tabs.pop_buttons)]
+    assert len(windows) == 8
+    for window in windows:
+        offscreen_show(window)
+        window.close()
+        assert not window.open
+    asked = []
+    listing = frame_camera.settings_list
+
+    def settings_list(groups=None):
+        asked.append(groups)
+        return listing(groups)
+    monkeypatch.setattr(frame_camera, "settings_list", settings_list)
+    box = ui.ports.frame_rate.widget
+    box.setValue(24)
+    box.stepBy(1)
+    frame_camera.set_camera_setting("bias.bias_fo", 25)
+    frame_camera.set_camera_setting("afk.enabled", True)
+    pump(0.7)
+    # ONE read: the tabs', of the two tabs those changes are in, once the
+    # changes stop — none for a closed window, none of the whole camera.
+    assert len(asked) == 1 and asked[0] is not None, asked
+    assert set(asked[0]) == {"Display", "Anti-flicker",
+                             "Event rate activity filter",
+                             "Event rate controller",
+                             "Event trail filter"}, asked
+    # Opened again: it reads everything, and shows the camera as it is.
+    biases = tabs.pop_out("Biases")
+    assert biases is windows[[w.group for w in windows].index("Biases")]
+    assert biases.open
+    assert biases.rows["bias.bias_fo"].editor.value() == 25
+
+
 def test_a_bias_dragged_in_its_tab_changes_the_camera_and_the_live_view(
         clean, typhon_dir, evk4, monkeypatch):
     """The user's point: the event camera's settings, changed while the
@@ -815,6 +925,52 @@ def test_held_and_read_only_rows_are_greyed_and_say_why(clean, typhon_dir,
     period = tabs.pop_out("Event rate controller").rows["erc.period"]
     assert not period.editor.isEnabled()
     assert period.note.text().startswith("Read only — ")
+
+
+def test_a_camera_waiting_for_a_trigger_says_so_and_start_refuses_a_run_nobody_can_trigger(
+        clean, typhon_dir, monkeypatch, tmp_path):
+    """MEASURED on pylon's emulator (review, 2026-10-08): one click on
+    Trigger mode On (its source Software) stopped the frames; the live line
+    kept saying "62.5 fps", and a 4 s capture saved nothing with no word
+    on why. The camera's triggers are a Basler's (tests/test_basler_real.py
+    clicks the real node); here the simulated camera is made to wait."""
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    dev = device()
+    waiting = [camera_settings.Trigger("FrameStart", "Software")]
+    monkeypatch.setattr(type(dev.settings_provider()), "triggers_on",
+                        lambda self: list(waiting))
+
+    def nothing(self, timeout_ms=1000):
+        time.sleep(0.01)
+        return None                     # what a Basler's timed-out read is
+    monkeypatch.setattr(type(dev), "read", nothing)
+    line = ui.ports.capture_status.get
+    assert pump(5.0, until=lambda: "NO PICTURE" in line()), line()
+    assert line().startswith("Live view — not saving · NO PICTURE for ")
+    assert "its FrameStart trigger is On (source Software)" in line()
+    assert "nothing here sends a software trigger" in line()
+    assert " fps" not in line(), "a rate for a camera sending nothing"
+
+    # Start is refused BEFORE anything stops: the live view carries on.
+    with pytest.raises(RuntimeError, match="nothing here sends a software "
+                                           "trigger — this run would save "
+                                           "no frames"):
+        frame_camera.start(str(tmp_path / "run"))
+    assert not frame_camera._LIVE.capturing and frame_camera._LIVE.previewing
+    assert not (tmp_path / "run").exists()
+
+    # A trigger on an input line is the user's to fire: the run starts,
+    # says what it waits for, and says why it saved nothing.
+    waiting[:] = [camera_settings.Trigger("FrameStart", "Line1")]
+    started = frame_camera.start(str(tmp_path / "run"))
+    assert ("waits for a trigger before each frame: its FrameStart trigger "
+            "is On (source Line1)") in started["summary"]
+    assert pump(5.0, until=lambda: line().startswith("NO PICTURE")), line()
+    stopped = frame_camera.stop()
+    assert "0 grabbed" in stopped["summary"]
+    assert ("the camera waited for a trigger the whole run (its FrameStart "
+            "trigger is On (source Line1))") in stopped["summary"]
 
 
 def test_reset_this_category_puts_only_it_back(clean, typhon_dir, evk4):

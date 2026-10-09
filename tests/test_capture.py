@@ -214,6 +214,47 @@ def test_the_rate_falls_when_frames_stop_arriving():
         f"a silent camera still reads as {session.stats().rate:.1f} fps")
 
 
+def test_a_camera_that_sends_nothing_has_no_rate_and_says_how_long():
+    """MEASURED on pylon's emulator: TriggerMode On stopped the frames, and
+    the live line said "62.5 fps" for as long as it lasted — the sliding
+    window moves only when a frame arrives. Silence is now measured too."""
+    now = [0.0]
+    session = CaptureSession(FakeDevice(total=0), clock=lambda: now[0])
+    assert session.quiet_for() == 0.0, "not started: not quiet"
+    session.start()
+    try:
+        for i in range(10):
+            now[0] = i * 0.01                  # 100 fps
+            session._took(frame(i))
+        assert session.stats().rate > 50 and session.quiet() == 0.0
+        now[0] += 0.5
+        assert session.stats().rate > 50, "half a second is a gap"
+        now[0] += 2.0
+        assert session.quiet() == pytest.approx(2.5, abs=0.01)
+        assert session.stats().rate == 0.0, "a silent camera has no rate"
+        assert session.quiet(5.0) == 0.0, "not yet as long as asked"
+    finally:
+        session.stop()
+    assert session.quiet_for() == 0.0, "stopped: not quiet"
+
+    # A camera running slowly is quiet only after several of its frames
+    # failed to come (capture.QUIET_INTERVALS), not after one interval —
+    # from the time between its frames: its measured RATE is 0, under one
+    # frame per RATE_WINDOW.
+    slow = CaptureSession(FakeDevice(total=0), clock=lambda: now[0])
+    slow.start()
+    try:
+        for i in range(3):
+            now[0] = 100.0 + 2.0 * i           # 0.5 fps
+            slow._took(frame(i))
+        now[0] += 3.0
+        assert slow.quiet(1.0) == 0.0
+        now[0] += 4.0
+        assert slow.quiet(1.0) == pytest.approx(7.0)
+    finally:
+        slow.stop()
+
+
 def test_a_single_frame_has_no_rate_yet():
     session = CaptureSession(FakeDevice(), clock=lambda: 0.0)
     session._took(frame(1))
