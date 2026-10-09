@@ -1,0 +1,533 @@
+# Local models in the Council: which one does which job, and what better hardware buys
+
+Measured on 2026-10-05 on this laptop; the docs suite was measured again later
+that day on the docs fix that is now merged.
+- **gpt-oss:20b was not re-measured** (decided 2026-10-07). Its figures here are
+  from 2026-10-02, before the October fixes; section 7 says why it could not run.
+- **The bugs these runs exposed are now fixed** on branch `llm/bench-findings`
+  (section 3.3). Every number in this report was measured **before** those fixes.
+
+**Labels** (the same as in [specialized_nodes.md](specialized_nodes.md)):
+**M\*** = measured on this laptop. **M** = measured by a named source.
+**P** = measured on that hardware with a non-US model of the same size (timing
+only; that model is never recommended). **V** = vendor claim. **E** = estimate.
+
+---
+
+## 1. The short answer
+
+- **On this laptop, use llama3.1:8b (Meta) for every Council job.** It is the
+  Coder (decided 2026-10-07). It passed 11 of 12 GUIs, 6 of 8 code tasks and 16
+  of 17 documentation items. It fits entirely on the 8 GB GPU, so it is fast:
+  about 7 s per GUI, 4 s per code task and 2 s per docs answer (medians, **M\***).
+- **phi4:14b (Microsoft) is the most accurate US model measured on the current
+  code**: GUI 11/12, code 7/8, docs 17/17. But it does not fit in 8 GB. 44% of it
+  runs on the CPU, which makes it 5 to 12 times slower: about 81 s per GUI, 21 s
+  per code task and 12 s per docs answer. Use it when getting the code right
+  matters more than waiting.
+- **phi3.5 (Microsoft) is fast but unreliable** for these jobs (GUI 3/12, code
+  2/8, docs 12/17). Do not give it the Coder or Docs role.
+- **gpt-oss:20b (OpenAI) was not re-measured.** On 2026-10-02, before the
+  October fixes, it scored code 8/8 and docs 16/17, and it passed all 7 of the
+  GUI cases it reached (M4 and C1–C4 never ran). It ran at about 20.1 tokens/s
+  with 43% of it in VRAM, and each GUI took about 90 s. It could not be loaded
+  safely again: it needs 16.85 GiB of free commit memory, and with this laptop's
+  everyday apps running the best seen was 15.7 GiB.
+- **The best GUI score came from a model we cannot recommend.** qwen2.5-coder 7B
+  (Alibaba, non-US) passed 12/12. It was measured for comparison only.
+- **The docs fix is merged and works.** On the merged code llama3.1:8b answers
+  every documentation question with the right page cited, including two new
+  trap questions that catch a model that always cites the first page (18 of 19
+  items in all). phi3.5 still falls into both traps.
+- **Better hardware buys speed, not correctness.** The pass rate depends on the
+  model. The speed depends on whether the whole model fits in GPU memory.
+  - A **12 GB** card holds phi4:14b completely. A GUI drops from about 1¾ min
+    (106 s on average) to about 19–27 s (**E**).
+  - A **16 GB** card holds gpt-oss:20b completely. It generates 63–172 tokens/s,
+    depending on the card (**M**), against 20.1 on this laptop: 3 to 8.6 times
+    faster.
+  - llama3.1:8b already fits on this laptop's GPU, so a bigger card gains it
+    little. A 12 GB card generates about 12–54% faster (**P**), which takes
+    roughly 8–33% off each job (**E**).
+
+---
+
+## 2. What was measured and how
+
+**The harness.** Each model was run with this command:
+
+```
+python -m council_core.llm_bench --model ollama:<name> --suites gui,code,docs --pipeline new
+```
+
+- It puts every Council role on the one model under test.
+- Each call goes through the app's own engine route (`council_engine.local_chat`)
+  to the local Ollama.
+- It works in a throwaway scratch vault, never in your vault.
+- It records every reply, every token count and every second.
+- It ran one pass per model, and only one model was loaded at a time.
+
+| Suite | What the model must do | How it is graded | Cases |
+|---|---|---|---|
+| **GUI** | Describe draws a window from a plain-English description. The descriptions range from a contact form and a length converter to a camera capture panel and a log monitor. | The harness grades the drawing itself, independently of Describe. The widgets must come from the palette, stay inside the window, not overlap and form a valid spec. The case's own required widgets, counts and labels must all be present. Then **Generate** must produce code that passes its policy gate. Finally a **probe** builds the generated Qt app offscreen and clicks every control. | 12 (4 simple, 4 medium, 4 complex) |
+| **Code** | The code-behind writer ("Write it with the model…") writes what one button does in a small app. Examples: sum two numbers, filter a list, load a CSV, run a stopwatch, convert units. The writer runs with its own checks, smoke run, repair rounds and best-of-N. | A **hidden test** runs the handler in a fresh Python. | 8 (3 simple, 4 medium, 1 complex) |
+| **Docs** | Answer from the documentation of an invented package, *glimmerquay*, so no model can know it beforehand. The answers come through `docs_qa` and the bundled MCP documentation server (`tools/pydocs_mcp_server.py`). | 10 questions need the right answer **and** a citation of a page that holds it. 2 questions must get "not covered", because the docs do not answer them. 5 code tasks have hidden tests. | 17 (19 since the docs fix: two "trap" re-askings of q03 and q05 put the pages without the answer first, and every page cited must hold the answer) |
+
+**The code under test.** A frozen copy of `qt-migration` at commit **87dc535**. It
+includes both fixes from 2026-10-05:
+- 62e37a0: Describe's best-of-N now checks that the widgets the description
+  names are drawn.
+- 87dc535: Ollama now refuses a prompt that is too long, and the engine re-fits
+  it, instead of the front being silently lost.
+
+The docs suite was then run twice more on llama3.1:8b and phi3.5 (section 3.5):
+on the first docs-retrieval fix (85695ce, branch `llm/docs-retrieval`) and on its
+reviewed version (641b292), which is the one merged into `qt-migration` (7dd77dc).
+Nothing merged since 87dc535 changes Describe, the code-behind writer or its
+smoke run. The other merges changed docs Q&A, the engine's network handling (the
+localhost guard; local calls never go through a proxy) and Typhon's camera code.
+The fixes on `llm/bench-findings` (section 3.3) do change Describe, the writer,
+its smoke run and the docs code check. They came after every run in this report.
+
+**This PC.**
+- Intel i7-14700HX, 32 GB DDR5-5600, NVIDIA RTX 4070 Laptop GPU with 8 GB.
+- Ollama 0.35.0, context window 8,192 tokens, Q4_K_M weights (gpt-oss: MXFP4),
+  Python 3.11.14.
+- The full runs took place between 09:21 and 10:50; the docs re-runs between
+  14:44 and 14:46 and between 19:43 and 19:51.
+- Other test suites were running on the PC at the same time.
+
+**Where the numbers come from.** The raw results are in
+`Downloads/Council-Demo/bench_results/2026-10-05/<model>/`: a JSON report, a
+console log and notes for each model; the docs re-runs are in `docsfix/` and
+`docsfix_review/`.
+- **Every 2026-10-05 number** in sections 3 to 5 was re-counted from the
+  individual cases, calls and replies in the JSON reports, not from their
+  summaries, most recently on 2026-10-09. All the pass counts agree with the
+  summaries and the notes.
+- **Two details differ from the notes:** phi3.5's garbled names (3.3) are in 11
+  of 34 code replies, not 12; and 3 of llama3.1:8b's 4 C3 attempts drew the
+  spinbox, not all 4 (its first drew no slider at all).
+- **The earlier numbers** in 3.4, and gpt-oss:20b's, come from logs or from
+  earlier reports, as marked there.
+
+---
+
+## 3. Results
+
+### 3.1 Pass counts (2026-10-05, commit 87dc535)
+
+| Model | Maker | Origin | GUI | GUI by tier (simple / medium / complex) | Code | Code by tier (simple 3 / medium 4 / complex 1) | Docs | Docs split: questions / right citation / "not covered" / code |
+|---|---|---|---|---|---|---|---|---|
+| **llama3.1:8b** | Meta | US | **11/12** | 4/4, 4/4, 3/4 | **6/8** | 2/3, 3/4, 1/1 | **16/17** | 9/10, 9/10, 2/2, 5/5 |
+| **phi3.5** (3.8B) | Microsoft | US | **3/12** | 2/4, 1/4, 0/4 | **2/8** | 1/3, 0/4, 1/1 | **12/17** | 8/10, 8/10, 2/2, 2/5 |
+| **phi4:14b** | Microsoft | US | **11/12** | 4/4, 4/4, 3/4 | **7/8** | 2/3, 4/4, 1/1 | **17/17** | 10/10, 10/10, 2/2, 5/5 |
+| **gpt-oss:20b** | OpenAI | US | not re-measured; 7/7 of the 7 reached on 2026-10-02 | 4/4, 3/3 reached (M4 not run), not run | not re-measured; 8/8 on 2026-10-02 | – | not re-measured; 16/17 on 2026-10-02 | – |
+| qwen2.5 7B | Alibaba | **non-US**, comparison only | 10/12 | 4/4, 4/4, 2/4 | 4/8 | 3/3, 0/4, 1/1 | 14/17 | 8/10, 8/10, 2/2, 4/5 |
+| qwen2.5-coder 7B | Alibaba | **non-US**, comparison only | 12/12 | 4/4, 4/4, 4/4 | 6/8 | 3/3, 3/4, 0/1 | 16/17 | 9/10, 9/10, 2/2, 5/5 |
+
+- Every GUI that passed was also Generated, and its app built and ran offscreen
+  with no errors.
+- No case was thrown out as a harness or PC fault.
+- No reply hit its token limit, and no reply broke its JSON schema.
+- gpt-oss:20b's 2026-10-02 scores are from the code before the October fixes
+  (stage 3 in 3.4); its code and docs splits were not kept.
+
+### 3.2 Speed and time per job on this PC
+
+| Model | Where Ollama put it | Reply tokens/s (GUI / code / docs) | Prompt tokens/s | Median s per case (GUI / code / docs) | Mean s per case (GUI / code / docs) | Whole run, wall clock | Load at start |
+|---|---|---|---|---|---|---|---|
+| llama3.1:8b | all on the GPU (2026-10-01 check) | 46 / 48 / 49 | ~2,700 | 7.0 / 4.4 / 2.0 | 9.1 / 4.9 / 2.5 | 3 min 20 s | 5.4 s |
+| phi3.5 | all on the GPU (2026-10-01 check) | 71 / 85 / 89 | ~4,700 (2026-10-01 speed test; in these suites hidden by the prompt cache) | 17.7 / 12.2 / 1.8 | 20.3 / 17.3 / 2.8 | 7 min 18 s | 3.2 s |
+| phi4:14b | 56% GPU, 44% CPU (11.0 GB) | 7.2 / 8.4 / 9.9 | ~700 (earlier speed test) | 80.9 / 21.0 / 12.2 | 105.8 / 24.7 / 15.6 | 29 min 17 s | 17.7 s |
+| gpt-oss:20b | 43% in VRAM (2026-10-02 check) | 20.1 (2026-10-02 check); not re-measured | 711 (2026-10-02) | not re-measured | about 90 / 13 / 7 on 2026-10-02 (GUI: the 7 cases reached); not re-measured | not re-measured | cold load 35–83 s, earlier runs |
+| qwen2.5 7B *(non-US)* | all on the GPU (4.99 GB) | 49 / 51 / 52 | ~2,900 | 6.8 / 5.7 / 1.7 | 11.1 / 7.3 / 2.0 | ~4 min | 8.4 s |
+| qwen2.5-coder 7B *(non-US)* | all on the GPU (4.99 GB) | 50 / 51 / 52 | ~2,900 | 6.2 / 3.6 / 1.9 | 6.6 / 5.0 / 2.3 | 2 min 50 s | 9.3 s |
+
+How to read this table:
+- **A "case" covers the whole job**, not just the model call.
+  - GUI: Describe, Generate and the offscreen probe.
+  - Code: the writer with its checks, the smoke run and the hidden test.
+  - Docs: the search query plus the answer.
+- **Reply speed is the median over that suite's calls.** The prompt speeds of
+  phi3.5, phi4:14b and gpt-oss:20b come from separate speed tests. The others are
+  medians over the calls, which can include Ollama's prompt cache. Prompts in
+  these suites were never longer than 2,748 tokens.
+- **Writing the reply takes most of the time.** It is 82–98% of the model's time
+  in every suite. For example, a llama3.1:8b GUI case spends 7.8 of its 8.5 model
+  seconds on the reply, and a phi4:14b GUI case spends 102.6 of 104.9.
+- **phi4:14b's GUI mean is higher than its median because of one case.** C2 took
+  374 s across 3 calls. With a longer prompt it also slows down: 7.2 tokens/s with
+  a 2k-token prompt, 4.7 with a 6k one (**M\***, the same speed test).
+- **Loading a model when switching between models takes longer.** A cold swap
+  was measured at 45 s for llama3.1:8b and 83 s for gpt-oss:20b
+  ([specialized_nodes.md](specialized_nodes.md)).
+
+### 3.3 What went wrong
+
+| Model | Failed | What happened |
+|---|---|---|
+| llama3.1:8b | GUI C3; code K2, K8; docs q05 | **C3:** none of its 4 attempts drew the slider the description asks for. The last 3 drew a number box (spinbox) in a box titled "Frame slider". **K2:** it filtered the already-filtered list. **K8:** it inverted the unit factor, so 1 in came out as 0.394 cm. **q05:** the answer was right, but it cited the wrong page (see the Council issues below). |
+| phi3.5 | GUI: 9 of 12; code K2, K3, K5, K6, K7, K8; docs q03, q05, c01, c04, c05 | **GUI:** every failure was a valid layout with a requested widget left out; 7 of the 9 still lacked it after two repair rounds. **Code:** logic errors, a crash in the smoke run, and an `except Exception` that the policy refused. In 11 of 34 code replies it garbled names, writing "…dict" where a name should be (`filtereddict`, `csvdict`). |
+| phi4:14b | GUI C2; code K5 | **C2:** it stacked the three tab pages on top of each other, so they overlap. Its profile (pixel mode, best-of-1) means the new named-widget check never ran for it. **K5:** it invented a blank-input message by stitching together phrases from the writer's own prompt. |
+| qwen2.5 7B *(non-US)* | GUI C1, C4; code K2, K3, K6, K7; docs q03, q05, c05 | Mostly logic errors. C1 and C4 show the two Describe weaknesses below. |
+| qwen2.5-coder 7B *(non-US)* | code K2, K4; docs q05 | **K4:** it used a module it never imported. The code writer's repair hint pointed the wrong way, so all 5 replies repeated the mistake. |
+
+**Two cases most models failed:**
+- **K2, "filter the original list"**, failed for 4 of 5 models. Only phi4:14b got
+  it right. The smoke run pressed the button only once, so it could not catch
+  this (fixed since; item 6 below).
+- **q05**, a docs question, failed for 4 of 5 models, again all but phi4:14b.
+
+**Council issues these runs exposed.** None of them changed whether the
+recommendations hold. All are fixed now: the first is merged; the others are on
+branch `llm/bench-findings` (2026-10-09; not yet merged into `qt-migration` when
+this was written). Every number in this report was measured **before** them.
+
+1. **Docs citations.** The search ranked a page without the fact first, and
+   small models nearly always cite page [1], so q05 (and q03 for two models)
+   failed. **Fixed and merged** (7dd77dc; 3.5): a page that holds the answer
+   now comes first.
+2. **Describe's named-widget check looked only at widget kinds.** qwen2.5's C1
+   drew 2 buttons where 4 named ones were asked, and phi3.5's S2 one dropdown
+   where two were asked; Describe saw no gap in either. **Fixed**
+   (`gui_describe.py`): named buttons must be drawn with those captions, one to
+   one, "a dropdown for X and a dropdown for Y" needs two, and a gap says what
+   the shape really is ("'Frame slider' is a labelframe holding a spinbox, not a
+   slider", llama3.1:8b C3).
+3. **Describe and the grader disagreed about "a log view"** (phi3.5 C4, qwen2.5
+   C4). **Fixed**: Describe was wrong and now wants a log pane, like the grader;
+   a text box is editable and replaces its whole text on each update, while a
+   log pane appends a line.
+4. **Code-writer gaps** (`gui_codebehind.py`, `gui_smoke.py`), each **fixed**:
+   - the wrong repair hint for `module.function()` (qwen2.5-coder K4): the writer
+     now adds `import image_stats` for an app module used that way, and the hint
+     says to import it; K4's first recorded reply now passes;
+   - a re-raised `ValueError` counted as a deliberate refusal (qwen2.5 K7): a
+     catch-all that re-raises over a fault of the code, such as K7's bad format
+     specifier, now fails as a crash; a `ValueError` the code raises itself, or
+     one from parsing what the user typed, still counts as a refusal;
+   - an error sent back for repair with no hint (qwen2.5 K2): a replay found 9 of
+     22 repair prompts without one, and every fault now gets a hint, a general one
+     when no rule matches.
+5. **`docs_qa`'s code check accepted a method imported as a module name**
+   (qwen2.5 c05). The merged docs fix already compiles the code and requires the
+   function the task names. **Fixed**: `check_code` now also catches
+   `from glimmerquay import Cadence, windows`, `import pkg.Class.method` and
+   `from pkg.Class import method`, and gives a dotted name in a from-import its
+   corrected line.
+6. **The smoke run pressed the button only once** (K2). **Fixed**: when the task
+   says each press starts from the original data, the writer's prompt says so,
+   and the smoke run presses three times (the samples, other inputs, the samples
+   again), in both orders, and fails code whose third press differs from its
+   first. A task that changes its data on purpose (a shuffle, a step) is not
+   held to this.
+
+### 3.4 Before and after the October fixes
+
+| Stage (code version) | llama3.1:8b GUI / code / docs | phi3.5 GUI / code / docs | gpt-oss:20b GUI / code / docs | Raw data |
+|---|---|---|---|---|
+| 1. Old pipeline (2026-10-01) | 4/12, 5/8, not run | 1/12 and 0/12 (two passes), 1/8 (both passes), not run | not run | phi3.5: log kept (that run used the built-in GGUF engine, not Ollama). llama: raw report lost; numbers from the 2026-10-01 report. |
+| 2. New pipeline, before the code-writer fixes (2026-10-01) | 11/12, 2/8, not run | 1/12, 1/8, not run | not run | Logs kept. Two passes each, with the same result both times. |
+| 3. + code-writer fixes, 080c274 (2026-10-02) | 11/12 (GUI unchanged), 6/8, 16/17 | 1/12, 2/8, 12/17 | 7/7 of the 7 GUIs reached (time cap), 8/8, 16/17 | Raw reports lost (they were in a temp folder); numbers from the reports of that day. |
+| **4. + Describe and Ollama fixes, 62e37a0 and 87dc535 (2026-10-05, this report)** | **11/12, 6/8, 16/17** | **3/12, 2/8, 12/17** | **not re-measured** (section 7) | Raw kept and re-counted. phi4:14b's first full run (11/12, 7/8, 17/17) is also in this stage. |
+| 5. + first docs-retrieval fix, 85695ce (docs only) | –, –, 16/17 | –, –, 14/17 | not run | Raw kept. |
+| **6. + its review fixes, 641b292, merged as 7dd77dc (docs only, 19 items)** | **–, –, 18/19** | **–, –, 13/19** | not run | Raw kept. |
+
+No model has been measured on the `llm/bench-findings` fixes (3.3).
+
+**What each change did:**
+- **The new pipeline** (a layout tree, a JSON schema and best-of-N for small
+  models) took llama3.1:8b's GUIs from **4/12 to 11/12**.
+- **The code-writer fixes** of 2026-10-02 took llama3.1:8b's code from **2/8 to
+  6/8**, and phi3.5's from 1/8 to 2/8. The fixes:
+  - a blank number box arrives as None;
+  - errors use the task's own wording;
+  - private state is allowed;
+  - failed model calls are retried.
+- **The Describe fix** (62e37a0) took phi3.5's GUIs from **1/12 to 3/12**.
+  - Best-of-N now prefers a complete design, which rescued S1 and M1.
+  - llama3.1:8b stayed at 11/12, because none of its four C3 attempts drew a
+    slider (the last three drew the same spinbox).
+- **The Ollama fix** (87dc535) never triggered. The largest prompt was 2,748
+  tokens against a window of 8,192, so these suites cannot show its effect.
+- **The docs fix** (stages 5 and 6) fixed every citation failure on the original
+  questions; see 3.5.
+
+### 3.5 After the docs fix (now merged)
+
+| Model | Docs code | Score | Questions | Right citation | "Not covered" | Code tasks | Trap questions (r01, r02) |
+|---|---|---|---|---|---|---|---|
+| llama3.1:8b | 87dc535 (section 3.1) | 16/17 | 9/10 | 9/10 | 2/2 | 5/5 | – |
+| | 85695ce, first fix | 16/17 | **10/10** | **10/10** | 2/2 | 4/5 | – |
+| | **641b292, merged** | **18/19** | **10/10** | **10/10** | 2/2 | 4/5 | **2/2** |
+| phi3.5 | 87dc535 (section 3.1) | 12/17 | 8/10 | 8/10 | 2/2 | 2/5 | – |
+| | 85695ce, first fix | 14/17 | **10/10** | **10/10** | 2/2 | 2/5 | – |
+| | **641b292, merged** | **13/19** | **10/10** | **10/10** | 2/2 | 1/5 | **0/2** |
+
+**What it fixed:** the citation failures (q03, q05) are gone for both models,
+because a page that holds the fact is now ranked first.
+
+**What it did not fix:** small models still cite page [1] by habit (llama3.1:8b
+in 9 of 10 questions, phi3.5 in 10 of 10).
+- The two trap questions put pages without the answer first.
+- llama3.1:8b cited the right page, [3], both times. phi3.5 cited [1] (and
+  other pages) and failed both.
+- phi3.5 also cites many pages at once: 27 of the 40 pages it cited were right,
+  against 21 of 22 for llama3.1:8b (the harness's own count, over the 12
+  questions and the 5 code tasks).
+
+**The first fix's regression is gone.** Under 85695ce, 2 of 10 code answers were
+scripts without the function the task asks for (llama c05, phi3.5 c02). The
+merged check compiles the code and asks for that function, so llama's c05 now
+passes after one repair round.
+
+**Each model still lost one code task against the morning run, for other
+reasons:**
+- llama3.1:8b c04 failed with a stray "}" at the end of a line, which two repair
+  rounds did not remove. It passed in the two earlier runs.
+- phi3.5 failed c01, c02 and c03 on import lines that are not valid Python
+  (`from glimmerquay.codec import encode_frame, glimmerquay.CHECKSUMS`), the same
+  habit as in its morning run. Its c05 logic was also wrong.
+
+**Speed:** a median of 2.5 s per docs item for llama3.1:8b (2.0 s before; the
+answers now read more pages, 1,102 prompt tokens per item on average instead of
+685) and 1.8 s for phi3.5 (unchanged). In the llama run, 7 calls waited 24–93 s
+while Ollama loaded the model again (most likely another program used Ollama in
+between), so that run's mean of 20.5 s is not a speed measurement.
+
+phi4:14b, gpt-oss:20b and the qwen models were not re-run on the merged docs
+code.
+
+---
+
+## 4. Recommended model per Council role on this PC (US models only)
+
+| Council role | Use | Why | If you can wait |
+|---|---|---|---|
+| **Coder: GUIs** (Describe, then Generate) | **llama3.1:8b** | 11/12 GUIs, about 7 s each | phi4:14b has the same 11/12 but takes about 81 s each, with no gain. |
+| **Coder: code behind** ("Write it with the model…") | **llama3.1:8b** | 6/8, about 4 s per task | **phi4:14b**: 7/8, about 21 s per task. |
+| **Docs** (answers from documentation) | **llama3.1:8b** | 16/17, about 2 s per answer; 18/19 on the merged docs fix, including both trap questions | **phi4:14b**: 17/17, about 12 s per answer (not yet run on the merged docs fix). |
+| **Council members**: writer, judge, skeptic, sage, strategist, peasant, intern, artist | **llama3.1:8b** | These roles were **not graded** here; see the note below. | – |
+| Do **not** use for Coder or Docs | phi3.5 | 3/12 GUIs, 2/8 code, 12/17 docs (13/19 on the merged docs fix) | – |
+
+**Note on the Council-member roles.** The suites do not test prose, so this pick
+rests on three facts:
+- llama3.1:8b is the most capable US model that fits completely on this GPU.
+  phi3.5 fits too, but fails most of the structured jobs.
+- It handles the JSON-heavy jobs well.
+- With every role on one model, nothing has to swap in or out (45–83 s per cold
+  swap on this PC).
+
+**Why one model for everything on this laptop.**
+- GUIs and the code behind them share **one Coder role**, so they always use the
+  same model. On this laptop that model is llama3.1:8b (decided 2026-10-07).
+- The 8 GB card holds only one of these models at a time. Giving roles different
+  models therefore means a cold load at every switch.
+- llama3.1:8b is the only US model here that is both reliable and fast.
+
+**Why gpt-oss:20b is not in this table.**
+- It was not re-measured on the current code (decided 2026-10-07). Its 2026-10-02
+  scores were code 8/8, docs 16/17 and GUI 7/7 of the 7 cases it reached, before
+  the October fixes, at about 90 / 13 / 7 s per GUI / code task / docs answer.
+- It does not fit on the 8 GB GPU (43% in VRAM, 20.1 tokens/s), and it cannot
+  be loaded safely while this laptop's everyday apps run: it needs 16.85 GiB of
+  free commit memory, and five waits never saw more than 15.7 GiB (section 7).
+- On a 16 GB or larger card it fits completely and is the likely pick for Coder
+  and Docs (section 5). Check it on that machine first (section 6).
+
+---
+
+## 5. Hardware tiers: what each one gives you
+
+### 5.1 Why: pass rates follow the model, speed follows the hardware
+
+- **The model decides the pass rate.**
+  - Describe picks its profile from the model's size and the 8,192-token window
+    the engine gives every Ollama model, never from the graphics card. So the
+    same model gets the same prompts, retries and checks on any machine. This was
+    not tested on other hardware; it follows from how the code chooses.
+  - So a better card does not make llama3.1:8b pass C3, and it does not make
+    phi3.5 reliable.
+- **The hardware decides the speed.**
+  - Writing the reply is 82–98% of the model's time, and its speed is set by
+    memory bandwidth.
+  - A model that fits completely in the GPU's memory runs at GPU speed. A model
+    that spills part of itself to the CPU slows down several times over: phi4:14b
+    runs at 7.2 tokens/s here and at 31–42.5 on a 12 GB card.
+- **So the question for each tier is: which models fit completely in GPU memory?**
+
+### 5.2 The tiers
+
+Each time is per GUI / per code task / per docs answer, as a mean in seconds
+unless marked "min". "Fits" means the model is completely in GPU memory at an
+8k-token context. The speeds come from [specialized_nodes.md](specialized_nodes.md)
+and its sources; the times are worked out from them as described in 5.3.
+gpt-oss:20b's scores and times are its 2026-10-02 ones (not re-measured).
+
+| Tier | Fits | llama3.1:8b | phi4:14b | gpt-oss:20b | Best pick |
+|---|---|---|---|---|---|
+| **8 GB GPU: this laptop** (RTX 4070 Laptop; desktop RTX 4060 / 4060 Ti 8 GB are the same class) | llama3.1:8b, phi3.5. phi4 and gpt-oss spill to the CPU. | 46–49 tokens/s. **9.1 / 4.9 / 2.5** (**M\***) | 7.2–9.9 tokens/s, 44% on the CPU. **106 / 25 / 16** (**M\***) | 20.1 tokens/s, 43% in VRAM (**M\***, 2026-10-02). About 90 / 13 / 7 on 2026-10-02; not re-measured, and too big to load safely with everyday apps running | **llama3.1:8b** for everything, the Coder included. phi4:14b when accuracy matters. |
+| **12 GB GPU** (RTX 3060 12 GB, 4070, 5070) | Adds **phi4:14b** at 8k context. 16k needs `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0`. gpt-oss still spills. | 55 tokens/s on a 3060 and 71 on a 4070 (**P**). **8.4 / 4.6 / 2.3** and **6.3 / 3.7 / 1.6** (**E**) | 31 tokens/s on a 3060 and 42.5 on a 4070 (**P**). **27 / 8 / 5** and **19 / 6 / 3.4** (**E**). That is about 3 to 5½ times faster than this laptop. | spills; not measured | **phi4:14b** for Coder and Docs: the most accurate US model measured on the current code, now at a usable speed. llama3.1:8b (4.9 GB on disk) and phi4 (11 GB loaded) do not fit together. |
+| **16 GB GPU** (4060 Ti 16 GB, 5060 Ti, 4070 Ti Super, 5070 Ti, 5080) | Adds **gpt-oss:20b**. | fits; speed depends on the card's memory bandwidth (a 4060 Ti 16 GB has less than a 3060 12 GB); not tabulated | fits; same caveat | **63 / 92 / 156 / 172** tokens/s by card (**M**), against 20.1 here. About **29 / 5 / 2.2** on a 4060 Ti 16 GB and **11 / 3 / 0.8** on a 5080 (**E**, rough) | **gpt-oss:20b** for Coder and Docs, if a check on that machine bears out its 2026-10-02 scores. **phi4:14b** is the fully measured alternative. |
+| **24 GB GPU** (RTX 3090, 4090; RX 7900 XTX) | gpt-oss:20b **and** llama3.1:8b loaded together (~21 GB), so no swapping. Or bigger models (Gemma 3 27B, OLMo 3 32B), which were not measured on these suites. | fits, alongside gpt-oss | fits | **147.5** tokens/s (3090) and **191** (4090) (**M**). About **13 / 3 / 1** and **10 / 2.7 / 0.7** (**E**, rough) | gpt-oss:20b for Coder and Docs (same check first), llama3.1:8b for the Council members, both loaded at once. A 7900 XTX reads prompts at about 30% of a 4090's speed. |
+| **32 GB GPU** (RTX 5090) | All of the above, with longer context | fits | fits | **298** tokens/s (**M**). About **7 / 2.3 / 0.5** (**E**, rough) | As for 24 GB, with room to spare. |
+| **CPU only** (8-core desktop, dual-channel DDR5, 32 GB) | Models up to about 30B fit in RAM. MoE models such as gpt-oss run relatively well here. | ~11 tokens/s (**E**; a 16-core 7950X measured 11.2, **M**). Prompts at ~60–75 tokens/s (**E**). **~60–67 / ~24–26 / ~18–21** (**E**) | not tabulated; slower than llama | ~10–15 tokens/s, prompts at ~80 (**E**). About **2.4–3.3 min / 24–31 / 17–21** (**E**, rough) | Usable but slow: about a minute per GUI with llama3.1:8b. gpt-oss:20b if a check there bears out its 2026-10-02 scores. |
+| **Pi 5, 8 or 16 GB, CPU** | 1B–4B models, and llama3.1:8b (tight on 8 GB). gpt-oss:20b just fits on 16 GB. | 1.99 tokens/s (**M**); prompts at ~7 (**E**). **~7.8 min / ~2.9 min / ~2.5 min** (**E**). The longest GUI prompt (1,952 tokens) takes ~280 s to read, right at the engine's **300 s first-reply limit**. | 16 GB only: ~1.2 tokens/s (**P**). **~19 min per GUI**, and its GUI prompts exceed the 300 s limit, so it **fails today**. | 16 GB only: ~2.5–4 tokens/s, prompts at ~12–15 (**E**). About **9½–14 min / ~2 min / ~1.5 min** (**E**, rough) | **Not for Coder or Docs.** The small models that run well on a Pi (1B–3B, 4.6–11 tokens/s, **M**) were not tested on these suites, and the smallest model that was (phi3.5, 3.8B) passed only 3/12 GUIs. |
+| **Pi 5 + AI HAT+ 2** | Llama 3.2 1B only, with a 2,048-token window (**V**) | – | – | – | **Cannot run Coder or Docs at all.** The HAT supports no JSON schema and no tools. Background summaries only. |
+| **Pi 4, 8 GB** | 1B–3B models | – | – | – | Not for these roles. A 3B model runs at 1.84 tokens/s (**M**). |
+
+### 5.3 How the times were worked out
+
+- **The formula.** Time per case = fixed overhead + prompt tokens ÷ prompt speed
+  + reply tokens ÷ reply speed.
+  - The fixed overhead covers Generate, the probe, the smoke run and the tests:
+    0.7–1.6 s per GUI or code case, measured here.
+  - The token counts are each model's own means per case, from the 2026-10-05
+    runs. llama3.1:8b uses 2,002 prompt and 358 reply tokens per GUI. phi4:14b
+    uses 2,221 and 724.
+- **A check of the formula on this laptop.** With the reply speeds of 3.2, it
+  predicts 9.2 / 4.8 / 2.3 s for llama3.1:8b, which measured 9.1 / 4.9 / 2.5, and
+  104.7 / 24.0 / 14.1 s for phi4:14b, which measured 105.8 / 24.7 / 15.6. So it
+  is within about 10%.
+- **gpt-oss:20b's times are rougher.** Its token counts were never kept: its
+  2026-10-02 reports are lost, and it was not re-measured. So its 2026-10-02 times
+  on this laptop (about 90 / 13 / 7 s) were scaled by 20.1 ÷ the tier's reply
+  speed, keeping the fixed overhead.
+  - The 90 s per GUI covers only the 7 simple and medium cases it reached, so
+    the full-suite figure would likely be higher.
+  - On GPUs prompt reading improves about as much as generation does, or more,
+    so these times are about right or on the slow side.
+  - The CPU and Pi rows replace this laptop's prompt reading (711 tokens/s) with
+    the tier's slower one, assuming about 2,000 prompt tokens per GUI and 700 per
+    code task or docs answer.
+- **gpt-oss "thinks" before it answers.** The Council sends it `think: "low"`.
+  Those hidden reasoning tokens are part of its reply time.
+
+---
+
+## 6. How to check your own PC
+
+**The Models tab's "Check this PC" button** measures every installed US-made
+model on the machine it runs on.
+- Non-US models are skipped unless you name them; then they are measured but
+  never ranked.
+- It never downloads a model. Install models in Ollama yourself, for example
+  `ollama pull llama3.1:8b`.
+- Press the button again to stop the check.
+
+**What it does for each model:**
+1. Unloads everything, so each model starts on an empty card.
+2. Makes one cold call. Its time is shown as "first answer after switching".
+3. Makes two warm calls, each with a prompt of about 1,200 tokens and a reply of
+   up to 192 tokens. These give the **reply** and **prompt** tokens/s.
+4. Reads where Ollama put the model: "GPU", "N% on GPU" or "CPU".
+5. Runs a **quick probe**: 1 GUI (S2, the length converter, including Generate
+   and the offscreen run), 1 code task (K1) and 2 docs questions (q01, q04).
+6. Estimates the model's seconds per GUI, per function and per docs answer, and
+   predicts a reply speed from the hardware alone ("hardware predicts ~N").
+
+**What you get:**
+- One line per model.
+- A "Best —" line for GUIs and code, for docs, and for the fastest replies.
+- A saved report, `model_bench.json`, in your vault.
+
+It takes a few minutes per model, and longer for models that spill to the CPU. The
+packaged (frozen) build measures speed and placement only.
+
+**How to read the result:**
+- **If the measured reply speed is far below the prediction,** the model is
+  probably spilling to the CPU, or something else is using the GPU.
+- **The time estimates are model time only.** Generate, the smoke run and the
+  tests add a second or two per job.
+- **The quick probe is a smoke test** (4 items), not a pass rate. For pass rates,
+  run the full benchmark from section 2. It took 3 to 29 minutes per model on this
+  PC.
+  - Run it when the PC is otherwise idle.
+  - Free commit memory should stay above the model's size plus 4 GB. Below that,
+    Windows can run out of it (the 0xC0000142 crash).
+- **"Fastest replies" ranks by speed alone.** phi3.5 would top it, even though it
+  fails most Coder and Docs jobs.
+
+**Known limits of its speed prediction** (see [specialized_nodes.md](specialized_nodes.md),
+section 4):
+- **It overpredicts MoE models such as gpt-oss.** On this laptop it predicts 28.4
+  tokens/s for gpt-oss:20b, which measured 20.1: **41% too high**.
+  - The same formula would predict ~97 tokens/s on a 4060 Ti 16 GB, where 63 was
+    measured, and ~339 on a 4090, where 191 was.
+  - For gpt-oss, trust the measured number, not the prediction.
+- **It is close for ordinary (dense) models:**
+  - llama3.1:8b: 41.6 predicted, 46–49 measured;
+  - phi4:14b: 8.8 predicted, 7.2–9.9 measured;
+  - an RTX 3060: 75.3 predicted, 75.6 measured.
+  - It overpredicts an RTX 3090 by 24%.
+- **Some hardware gets no prediction at all.** Its table has no RTX 50-series, AMD
+  or Intel GPUs. It also assumes dual-channel RAM, which is wrong for a Pi.
+
+---
+
+## 7. Caveats, and what was not measured
+
+- **Small samples.** Each model ran once: 12 GUIs, 8 code tasks and 17 docs
+  items. A difference of one case can be chance.
+  - phi3.5's GUI rise from 1/12 to 3/12 has a traced cause: the new check
+    rescued S1 and M1 (see 3.4). It is still a small number.
+  - Single code answers flip between runs: llama3.1:8b's docs task c04 passed
+    twice and failed once with a stray "}" (3.5).
+- **The PC was busy.** Other agents' test suites were running during every run.
+  - Free commit memory dipped to 0.6 GB (phi3.5 run) and 1.3 GB (phi4 run).
+  - No case was invalid, but the speeds may be slightly low.
+- **The numbers predate the bug fixes.** Describe, the code-behind writer, its
+  smoke run and the docs code check were all changed on `llm/bench-findings`
+  after these runs (3.3), so a run on that code could score some cases
+  differently.
+- **gpt-oss:20b was not re-measured on the current code** (decided 2026-10-07).
+  The benchmark loads a model only while Windows has more free commit memory than
+  the model's size plus 4 GiB: 16.85 GiB for gpt-oss:20b (13.8 GB on disk). Below
+  that, Windows can run out of commit memory (the 0xC0000142 crash), which would
+  also kill the other programs' tests. The PC never got there:
+
+  | Wait | Readings | Most free commit seen |
+  |---|---|---|
+  | 2026-10-05, 10:02–10:17 | 43 | 15.66 GiB |
+  | 2026-10-05, 19:39–22:03 | 156 | 15.35 GiB |
+  | 2026-10-06, 08:22–11:25 | 183 | 15.02 GiB |
+  | 2026-10-06, 13:37–16:13 | 156 | 14.82 GiB |
+  | 2026-10-07, 09:41–12:05 | 144 | 15.70 GiB |
+
+  - Other agents' test suites were running during most of these waits. But the
+    2026-10-07 wait began at its best, 15.70 GiB, with **no** Python process
+    running, so even with only the everyday apps it was about 1.2 GiB short. At
+    the end of the first wait, after a Python test process (1.6 GiB), the largest
+    holders were Claude, Steam's web helper, OneDrive and Discord, at about
+    0.5–1 GiB each.
+  - The commit limit is 38.96 GiB: 31.7 GiB of RAM plus a page file of about
+    7.3 GiB.
+  - So its figures here are the 2026-10-02 ones, from before the October fixes:
+    code 8/8, docs 16/17, GUI 7/7 of the 7 cases reached (M4 and C1–C4 never
+    ran), about 20.1 tokens/s with 43% in VRAM.
+- **Prose roles were not graded.** The writer, judge, skeptic, sage, strategist,
+  peasant, intern and artist were not tested. The suites cover only GUIs, code
+  behind and documentation answers.
+- **Other hardware was not measured with these suites.**
+  - The tier speeds come from the sources in
+    [specialized_nodes.md](specialized_nodes.md). Some are **P**: timed with a
+    non-US model of the same size.
+  - The tier times are **E**.
+  - The pass rates are assumed to carry over unchanged (see 5.1).
+- **Prompts were short.** No prompt in these suites exceeded 2,748 tokens, and
+  the window was 8,192 tokens.
+  - Long documents were not tested.
+  - The over-long-prompt fix (87dc535) never triggered.
+  - Speed drops as prompts grow: phi4:14b runs at 7.2 tokens/s with a 2k-token
+    prompt and 4.7 with a 6k one.
+- **Some earlier figures cannot be re-checked.** Stage 1 for llama3.1:8b and all
+  of stage 3 in 3.4, including gpt-oss's 2026-10-02 scores and speed, come from
+  that day's reports. Those raw reports were in a temp folder and are gone. Only
+  the phi3.5 old-pipeline log and the stage-2 logs survive.
+- **The docs fix was re-measured on two models only** (llama3.1:8b and phi3.5).
+  The other models' docs scores are from before it.
+- **Only US-origin models are recommended** (Llama: Meta; Phi: Microsoft; Gemma:
+  Google; Granite: IBM; OLMo: AI2; gpt-oss: OpenAI). qwen2.5 and qwen2.5-coder
+  (Alibaba) were measured for comparison only. Gemma, Granite and OLMo were not
+  installed, so they were not measured.
