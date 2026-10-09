@@ -16,6 +16,10 @@ and the default root a widget or variable made with no master would create —
 and tkinter.Toplevel(). Importing tkinter, or a module built on it, and
 reading Tk code as text are untouched: plenty of tests still do that.
 
+With COUNCIL_NO_TK_LOG set to a file, every refusal is also appended to it
+(pid, the test that was running, what was called) — how a run shows the
+guard never fired outside the tests of the guard itself.
+
 Standard library only, and syntax an old Python still parses: a child may be
 another interpreter (a camera SDK's conda env, a 3.9 probe), and a
 sitecustomize that fails would break every child, not just Tk ones.
@@ -27,12 +31,29 @@ MESSAGE = ("Tk GUIs are deprecated - tests must not open a Tk window "
            "(see docs/qt_migration/measurements.md section 4 and "
            "tests/README.md)")
 
+#: The environment variable naming a file to record refusals in.
+LOG_ENV = "COUNCIL_NO_TK_LOG"
+
 
 class TkWindowRefused(RuntimeError):
     """A test (or a program a test started) tried to open a Tk window."""
 
 
+def _record(what):
+    import os
+    log = os.environ.get(LOG_ENV)
+    if not log:
+        return
+    try:
+        with open(log, "a", encoding="utf-8") as f:
+            f.write("%s\t%s\t%s\n" % (
+                os.getpid(), os.environ.get("PYTEST_CURRENT_TEST", "-"), what))
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 def _refuse(what):
+    _record(what)
     raise TkWindowRefused("%s [%s was called]" % (MESSAGE, what))
 
 
@@ -60,13 +81,27 @@ def patch(tkinter_module):
 
 
 class _Finder(object):
-    """Patches tkinter as it is imported. Finds nothing else."""
+    """Patches tkinter as it is imported. Finds nothing itself.
+
+    The spec comes from the finders AFTER this one on sys.meta_path, so
+    another import hook that also wraps tkinter (a coverage or tracing tool)
+    still gets to; this one patches last, so the refusal is what stays."""
 
     def find_spec(self, name, path=None, target=None):
         if name != "tkinter":
             return None
-        import importlib.machinery
-        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        finders = list(sys.meta_path)
+        later = finders[finders.index(self) + 1:] if self in finders else []
+        spec = None
+        for finder in later:
+            find = getattr(finder, "find_spec", None)
+            if find is not None:
+                spec = find(name, path, target)
+                if spec is not None:
+                    break
+        if spec is None:
+            import importlib.machinery
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
         if spec is None or spec.loader is None:
             return spec
         exec_module = spec.loader.exec_module
@@ -85,8 +120,10 @@ def install():
     if loaded is not None:
         patch(loaded)
         return
-    if not any(isinstance(f, _Finder) for f in sys.meta_path):
-        sys.meta_path.insert(0, _Finder())
+    for finder in list(sys.meta_path):
+        if isinstance(finder, _Finder):
+            sys.meta_path.remove(finder)
+    sys.meta_path.insert(0, _Finder())       # first, ahead of later hooks
 
 
 def installed():
@@ -94,7 +131,7 @@ def installed():
     loaded = sys.modules.get("tkinter")
     if loaded is not None:
         return bool(getattr(loaded, "_council_no_tk", False))
-    return any(isinstance(f, _Finder) for f in sys.meta_path)
+    return bool(sys.meta_path) and isinstance(sys.meta_path[0], _Finder)
 
 
 def run_next_sitecustomize(here):

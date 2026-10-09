@@ -31,7 +31,9 @@ For the whole run, `tkinter.Tk()` (and so `Tcl()` and a default root) and
 in the pytest process and in every python child a test starts: the guard puts
 `tests/_no_tk/` first on `PYTHONPATH`, and its `sitecustomize.py` refuses Tk
 in the child at startup. Importing `tkinter` or a Tk module, and checking the
-code the Tk target generates as text, are still fine.
+code the Tk target generates as text, are still fine. Set
+`COUNCIL_NO_TK_LOG=<file>` to have every refusal recorded there (pid, test,
+call); in a clean run only `tests/test_no_tk_guard.py` appears in it.
 
 When a test you are writing, or one merging from another branch, trips it:
 

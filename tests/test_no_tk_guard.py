@@ -102,20 +102,54 @@ def test_a_child_may_still_import_tkinter(tmp_path):
     assert "IMPORTED" in r.stdout
 
 
-def test_the_child_hook_runs_a_sitecustomize_it_shadows(tmp_path):
+OTHER_SITE = textwrap.dedent('''
+    import importlib.machinery, os, sys
+    os.environ["OTHER_SITE_RAN"] = "1"
+
+    class OtherHook:                  # another tool wrapping tkinter's import
+        def find_spec(self, name, path=None, target=None):
+            if name != "tkinter":
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            run = spec.loader.exec_module
+            def wrapped(module):
+                run(module)
+                module._other_hook = True
+            spec.loader.exec_module = wrapped
+            return spec
+
+    sys.meta_path.insert(0, OtherHook())
+''')
+
+
+def test_the_child_hook_composes_with_a_sitecustomize_it_shadows(tmp_path):
     """Being first on PYTHONPATH hides any other sitecustomize (coverage's,
-    say); the hook runs the next one too."""
+    say), so the hook runs the next one — and that one's own tkinter import
+    hook still runs, while the refusal is applied last and stays."""
     other = tmp_path / "other_site"
     other.mkdir()
-    (other / "sitecustomize.py").write_text(
-        "import os\nos.environ['OTHER_SITE_RAN'] = '1'\n", encoding="utf-8")
+    (other / "sitecustomize.py").write_text(OTHER_SITE, encoding="utf-8")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(guard.HOOK_DIR), str(other)])
     r = subprocess.run(
         [sys.executable, "-c",
-         "import os, sys, tkinter; "
+         "import os, tkinter; "
          "print(os.environ.get('OTHER_SITE_RAN'), "
+         "getattr(tkinter, '_other_hook', False), "
          "getattr(tkinter, '_council_no_tk', False))"],
         capture_output=True, text=True, timeout=60, env=env)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["1", "True"]
+    assert r.stdout.split() == ["1", "True", "True"]
+
+
+def test_a_refusal_is_recorded_when_asked(tmp_path, monkeypatch):
+    """COUNCIL_NO_TK_LOG is how a whole run shows the guard never fired."""
+    assert getattr(tkinter, "_council_no_tk", False), "the guard is not in place"
+    log = tmp_path / "no_tk.log"
+    monkeypatch.setenv("COUNCIL_NO_TK_LOG", str(log))
+    with pytest.raises(guard.TkWindowRefused):
+        tkinter.Tk()
+    pid, test, what = log.read_text(encoding="utf-8").strip().split("\t")
+    assert pid == str(os.getpid())
+    assert "test_a_refusal_is_recorded_when_asked" in test
+    assert what == "tkinter.Tk()"

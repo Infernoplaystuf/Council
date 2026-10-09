@@ -23,6 +23,10 @@ probe that measured the run before this found 15 of the 72 tests that made
 Tk windows doing it only in a child, where a guard in this process alone
 would never have seen them.
 
+COUNCIL_NO_TK_LOG=<file> records every refusal there too — pid, the test
+that was running (a child inherits PYTEST_CURRENT_TEST), and what was called
+— so a whole run can show the guard fired nowhere but in its own tests.
+
 NOT COVERED: a child started with -I or -E, or with an environment that
 drops PYTHONPATH (none of those makes a Tk window today); a different
 interpreter that cannot import the hook (it is plain stdlib Python, so any
