@@ -505,6 +505,8 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
                              "THE CHECK FAILED:\n" + verdict.text[-4000:]
                              + "\n\nFix it, check again, then call "
                                "step_done."})
+        _transcript(pdir / "jobs" / f"{rec.id}.transcript.jsonl", i,
+                    step.title, messages)
         if ws.done is not None and verdict is not None and verdict.ok:
             sha = job.commit(f"Step {i}: {step.title}\n\n{ws.done}")
             step.status, step.summary, step.commit = "done", ws.done, sha or ""
@@ -534,6 +536,25 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
         say("note", f"The handoff note could not be written: {exc}")
     save_record(vault_dir, project, rec)
     return rec
+
+
+def _transcript(path: Path, step: int, title: str,
+                messages: List[Dict[str, Any]]) -> None:
+    """Every message of a step, appended to the job's transcript — what the
+    coder was told, what it called, what came back — to read after a job
+    that went wrong. Never raises."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for n, m in enumerate(messages):
+                fh.write(json.dumps({
+                    "step": step, "title": title, "n": n,
+                    "role": m.get("role"), "tool": m.get("tool_name", ""),
+                    "calls": m.get("tool_calls") or [],
+                    "content": str(m.get("content") or "")[:8000]},
+                    ensure_ascii=False) + "\n")
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 def _args_line(args: Dict[str, Any]) -> str:

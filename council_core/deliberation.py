@@ -211,10 +211,11 @@ def peasant_cross_exam(
         "and must not duplicate any question from the prior Q&A list above."
     )
 
-    from .council_schemas import QUESTIONS_SCHEMA, render_questions
+    from .council_schemas import QUESTIONS_SCHEMA, enabled, render_questions
     return render_questions(_ask(
         peasant_model, prompt, extra_context=extra_context,
-        json_schema=QUESTIONS_SCHEMA, think=THINK["peasant"]))
+        json_schema=QUESTIONS_SCHEMA if enabled() else None,
+        think=THINK["peasant"]))
 
 #: How hard each step thinks, on models that think (council_engine.
 #: think_level): short, frequent steps low; the answer itself and the
@@ -277,12 +278,13 @@ def peasant_turn_questions(peasant_model, *, messages: Dict[str, str],
         "for every member:\n"
         "TO <ROLE>:\nQ1: <question>?\nQ2: <question>?\n"
         "Do not repeat any earlier question.")
-    from .council_schemas import render_turn_questions, turn_questions_schema
+    from .council_schemas import (enabled, render_turn_questions,
+                                  turn_questions_schema)
     roles_l = [r.lower() for r in messages]
     return render_turn_questions(_ask(
         peasant_model, prompt, extra_context="\n\n".join(parts),
         max_tokens=160 * max(1, len(messages)),
-        json_schema=turn_questions_schema(roles_l),
+        json_schema=turn_questions_schema(roles_l) if enabled() else None,
         think=THINK["peasant"]), roles_l)
 
 

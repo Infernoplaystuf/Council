@@ -22,7 +22,15 @@ fails and the reply is used as it came, as before.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, Iterable, List, Optional
+
+
+def enabled() -> bool:
+    """COUNCIL_STRUCTURED=0 sends no schemas (the free-text replies and
+    their repair, as before) — for a model that answers worse under one."""
+    return os.environ.get("COUNCIL_STRUCTURED", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
 
 
 def _parse(text: str) -> Optional[Any]:

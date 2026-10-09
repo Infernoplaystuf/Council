@@ -3984,10 +3984,19 @@ def _native_tool_calls(calls: List[Dict[str, Any]], names: List[str]
     return out
 
 
+def _native_tools_allowed() -> bool:
+    """COUNCIL_NATIVE_TOOLS=0: every tool call goes through the emulated,
+    schema-constrained form — for a model whose native tool calls misfire."""
+    return os.environ.get("COUNCIL_NATIVE_TOOLS", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 def native_tools(role: Optional[str]) -> bool:
     """Does `role`'s model call tools NATIVELY — an Ollama model whose
     capabilities include "tools" (llama3.1, gpt-oss)? Never loads a model;
     False whenever it cannot tell."""
+    if not _native_tools_allowed():
+        return False
     try:
         from council_core import local_models
         backend, name = _target_for(_slot_for_role(role))
@@ -4050,7 +4059,7 @@ def chat_tools(
                 backend = "ollama"
             except BackendUnavailable:
                 pass
-    if backend == "ollama" and plain:
+    if backend == "ollama" and plain and _native_tools_allowed():
         entry = local_models.ollama_model(name, max_age=60.0) or {}
         caps = entry.get("capabilities")
         if caps is None or "tools" in caps:
@@ -6933,9 +6942,13 @@ class JudgeModel(PersonalityModel):
         # which parse_required_changes and the verdict check read. Thinks
         # hard — this decides whether the answer ships.
         from council_core import council_schemas as _cs
-        raw = self.respond(prompt + "\n" + _cs.CRITIQUE_JSON_NOTE,
-                           extra_context=extra_context,
-                           json_schema=_cs.CRITIQUE_SCHEMA, think="high")
+        if _cs.enabled():
+            raw = self.respond(prompt + "\n" + _cs.CRITIQUE_JSON_NOTE,
+                               extra_context=extra_context,
+                               json_schema=_cs.CRITIQUE_SCHEMA, think="high")
+        else:
+            raw = self.respond(prompt, extra_context=extra_context,
+                               think="high")
         return _cs.render_critique(raw)
 
     @staticmethod
@@ -7031,7 +7044,8 @@ class JudgeModel(PersonalityModel):
             )
         from council_core import council_schemas as _cs
         raw = self.respond("\n".join(parts), extra_context=extra_context,
-                           json_schema=_cs.ranking_schema(list(candidates)),
+                           json_schema=(_cs.ranking_schema(list(candidates))
+                                        if _cs.enabled() else None),
                            think="high")
         # Validate and normalise — returns clean JSON string
         parsed = _parse_ranking_json(raw)

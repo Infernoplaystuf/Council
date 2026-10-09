@@ -298,7 +298,9 @@ class CodeTab(ViewHelpers, QWidget):
                 self._to_ui(lambda: self.status.setText(msg))
             finally:
                 self._to_ui(lambda: self._busy_on(False))
-        threading.Thread(target=work, name=name, daemon=True).start()
+        # One literal name, so the window drains it on close
+        # (TAB_WORKERS in tests/test_council_qt_foundation.py).
+        threading.Thread(target=work, name="code-job", daemon=True).start()
 
     # -- plan -------------------------------------------------------------
     def show_plan(self, plan: ca.Plan) -> None:
