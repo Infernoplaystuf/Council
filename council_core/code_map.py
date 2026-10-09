@@ -22,7 +22,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 CODE_SUFFIXES = {".py", ".js", ".ts", ".java", ".cs", ".cpp", ".cc", ".c",
                  ".h", ".hpp", ".go", ".rs", ".m", ".qss", ".ui"}

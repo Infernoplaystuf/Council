@@ -19,7 +19,8 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from council_core import project as pj  # noqa: E402
-from council_qt.tabs.code import CodeActions, CodeTab, ProjectDialog  # noqa: E402
+from council_qt.tabs.code import CodeActions, CodeTab  # noqa: E402
+from council_qt.widgets.code_dialogs import ProjectDialog  # noqa: E402
 
 
 @pytest.fixture(scope="module")
