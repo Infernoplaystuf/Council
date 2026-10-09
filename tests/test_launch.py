@@ -246,6 +246,51 @@ def test_a_configured_vault_says_nothing(qapp, no_model, monkeypatch,
         window.request_close()
 
 
+def test_an_ollama_that_is_not_running_is_told_to_start(qapp, no_model,
+                                                        monkeypatch):
+    """Found re-checking the review's fix: with the Ollama fallback on and
+    nothing listening, the status bar read "… is Ollama running?. Set a
+    model in the Models tab." — a doubled stop after the question, and only
+    the advice for a missing model, when the model is named and the server
+    is what is missing."""
+    import socket
+
+    from council_qt.window import CouncilWindow
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        host = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    monkeypatch.setenv("COUNCIL_OLLAMA_HOST", host)
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+    monkeypatch.setenv("COUNCIL_OLLAMA_MODEL", "llama3.1:8b")
+    no_model.mkdir(parents=True, exist_ok=True)
+    app, window, plan = build(window_factory=CouncilWindow)
+    try:
+        assert plan.onboarding
+        assert _pump_until(app, lambda: bool(_status_of(window)))
+        said = _status_of(window)
+        assert "?." not in said, said
+        assert f"no Ollama server answers at {host}" in said, said
+        assert "Start Ollama, or set a model in the Models tab." in said, said
+    finally:
+        window.request_close()
+
+
+@pytest.mark.parametrize("reason, sentence", [
+    ("no model is configured yet", "no model is configured yet."),
+    ("the model file C:\\m\\x.gguf is not on disk.",
+     "the model file C:\\m\\x.gguf is not on disk."),
+    ("", "no model is configured yet."),
+])
+def test_the_notice_ends_each_reason_once(reason, sentence):
+    """A reason gets one full stop, never a second; and one that is not
+    about a server gets the Models-tab advice alone."""
+    said = startup.setup_notice(reason)
+    assert said.startswith(f"Setup needed — {sentence} "), said
+    assert ".." not in said and "?." not in said, said
+    assert "Set a model in the Models tab." in said, said
+    assert "Start Ollama" not in said, said
+
+
 def test_a_host_with_a_wizard_gets_to_use_it(qapp, no_model):
     """The seam for the moment a Qt wizard exists: give the window an
     `open_onboarding` and it is called instead of the notice."""
@@ -284,6 +329,128 @@ def test_a_failing_wizard_is_reported_and_survived(qapp, no_model, capsys):
 
 
 # ============================================================
+# Nothing slow before the first pixel
+# ============================================================
+# Found in review: the readiness check (an Ollama probe: 0.9 s on a closed
+# 127.0.0.1 port, 2.5-3.2 s on "localhost", which tries ::1 and 127.0.0.1)
+# and the vault setup (a first-launch copy of loose data: 4.6 s with an
+# 800 MB CSV) both ran BEFORE show_splash — the batch-0 report said "during
+# the splash". Measured to the splash: 1.1 s on the base, 2.0 s on the branch.
+
+class _CountingSplash:
+    """NoSplash's surface, counting the frames it is pumped."""
+
+    def __init__(self):
+        self.pumps = 0
+        self.dismissed = False
+
+    def pump(self):
+        self.pumps += 1
+
+    def dismiss(self, on_done=None):
+        self.dismissed = True
+        if on_done:
+            on_done()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    """The splash, the readiness check and the vault setup, recording when
+    each ran and on which thread. The real check and setup still run.
+    perf_counter, not monotonic: on Windows monotonic ticks every ~16 ms,
+    and two events in one tick cannot be ordered."""
+    import threading
+
+    from council_core import model_ready, vault_setup
+
+    events = []
+    splash = _CountingSplash()
+
+    def show_splash(**_kw):
+        events.append(("splash", time.perf_counter(), True))
+        return splash
+
+    def wrap(name, real, delay=0.0):
+        def recorded_call(*args, **kwargs):
+            on_main = threading.current_thread() is threading.main_thread()
+            events.append((name, time.perf_counter(), on_main))
+            time.sleep(delay)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                events.append((name + " done", time.perf_counter(), on_main))
+        return recorded_call
+
+    monkeypatch.setattr(qt_launch, "show_splash", show_splash)
+    monkeypatch.setattr(model_ready, "check",
+                        wrap("check", model_ready.check, delay=0.5))
+    monkeypatch.setattr(vault_setup, "prepare",
+                        wrap("prepare", vault_setup.prepare, delay=0.3))
+    return events, splash
+
+
+def _when(events, name):
+    return next(at for what, at, _main in events if what == name)
+
+
+def test_the_splash_is_up_before_the_slow_startup_steps(qapp, recorded,
+                                                         no_model):
+    events, _splash = recorded
+    _app, window, plan = build()
+    names = [what for what, _at, _main in events]
+    assert names[0] == "splash", names
+    assert plan.onboarding, "the check's answer did not reach the plan"
+    window.request_close()
+
+
+def test_the_check_runs_beside_the_window_build_not_before_it(
+        qapp, recorded, no_model):
+    events, _splash = recorded
+    built = []
+
+    class Timed(FakeWindow):
+        def __init__(self):
+            built.append(time.perf_counter())
+            super().__init__()
+
+    _app, window, plan = build(window_factory=Timed)
+    started, finished = _when(events, "check"), _when(events, "check done")
+    assert started < built[0] < finished, (
+        "the window waited for the readiness check")
+    on_main = next(main for what, _at, main in events if what == "check")
+    assert not on_main, "the readiness check ran on the GUI thread"
+    assert plan.onboarding
+    window.request_close()
+
+
+def test_the_vault_setup_keeps_the_splash_turning(qapp, recorded):
+    events, splash = recorded
+    pumps_during = []
+    real_pump = splash.pump
+
+    def pump():
+        if _when_or_none(events, "prepare") and not _when_or_none(
+                events, "prepare done"):
+            pumps_during.append(1)
+        real_pump()
+
+    splash.pump = pump
+    _app, window, _plan = build()
+    on_main = next(main for what, _at, main in events if what == "prepare")
+    assert not on_main, "the vault setup blocked the GUI thread"
+    assert pumps_during, "the splash froze while the vault was set up"
+    assert _when(events, "prepare done") < _when(events, "splash") + 5
+    window.request_close()
+
+
+def _when_or_none(events, name):
+    return next((at for what, at, _main in events if what == name), None)
+
+
+# ============================================================
 # Tabs
 # ============================================================
 
@@ -311,6 +478,25 @@ def test_the_tabs_are_registered_before_the_reveal(qapp, monkeypatch):
     assert window.isVisible()
     assert seen and seen[0] == "registered", (
         f"the window was revealed before its tabs existed: {seen}")
+
+
+def test_a_second_launch_in_one_process_leaves_the_app_dressed(qapp,
+                                                               monkeypatch):
+    """Every build() used to dress the app again (theme.apply), re-polishing
+    every widget in the process. One launch per process never noticed; this
+    file builds ~30 times inside the suite's one process, where that was
+    ~20 s a build and a queue of ~197,000 layout calls that its last
+    processEvents spent 390 s draining — the full run was killed there."""
+    build()
+    styles = []
+    real_set_style = qapp.setStyle
+    monkeypatch.setattr(qapp, "setStyle",
+                        lambda *args: (styles.append(args),
+                                       real_set_style(*args))[1])
+    assert QApplication.instance() is qapp
+    build()
+    build()
+    assert styles == [], f"the app was dressed again: {styles}"
 
 
 def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
@@ -366,6 +552,35 @@ def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
     assert (vault / "data_in" / "orders.csv").is_file()
     for folder in ("logs", "workspace", "tmp"):
         assert (vault / folder).is_dir(), folder
+
+
+def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
+                                                          monkeypatch):
+    """The review's probe, as a test: a model saved the way the app saves one
+    (onboarding.save_gguf_path, model_slots.save), then a Qt launch. On the
+    base there was no data_in/ at all; with batch 0 both files were copied
+    into it and the data index offered them as datasets."""
+    import onboarding
+    from council_core import model_slots
+
+    # save_gguf_path also exports the choice; recorded so it is put back.
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", "placeholder")
+    monkeypatch.delenv("COUNCIL_GGUF_PATH")
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    model = tmp_path / "models" / "granite.gguf"
+    model.parent.mkdir()
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    assert onboarding.save_gguf_path(vault, str(model)) is None
+    model_slots.save(vault, model_slots.SlotConfig(slots={
+        "main": model_slots.Slot("main", str(model)),
+        "coding": model_slots.Slot("coding", "ollama:llama3.1:8b")}))
+    assert (vault / "backend_settings.json").is_file()
+    assert (vault / "model_slots.json").is_file()
+    build()
+    build()
+    landed = sorted(p.name for p in (vault / "data_in").iterdir())
+    assert landed == ["README.txt"], landed
 
 
 def test_a_launch_respects_the_skip_switch(qapp, tmp_path, upgrader,
@@ -434,6 +649,30 @@ def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):
     build()
     for var in ENGINE_VARS:
         assert var not in os.environ, var
+
+
+def test_the_tk_console_applies_them(tmp_path, engine_env, monkeypatch):
+    """Run, not read (found in review: the check below passed with Tk's
+    call disabled). _load_backend_settings is the console's own method; it
+    is called unbound, with only the settings path it asks its console for,
+    so no Tk window is built."""
+    import council_gui_engine as cge
+
+    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "placeholder")
+    monkeypatch.delenv("COUNCIL_GGUF_N_CTX")
+    _engine_settings(tmp_path, n_ctx="12288", gpu_layers="7",
+                     embed_device="cuda")
+    monkeypatch.setenv("COUNCIL_EMBED_DEVICE", "cpu")     # an export wins
+
+    class Console:
+        def _backend_settings_path(self):
+            return tmp_path / "vault" / "backend_settings.json"
+
+    data = cge.CouncilConsole._load_backend_settings(Console())
+    assert data["n_ctx"] == "12288"
+    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "12288"
+    assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "7"
+    assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cpu"
 
 
 def test_the_tk_console_applies_them_through_the_same_function():

@@ -151,10 +151,13 @@ class VaultActions:
 
     # -- not yet extracted ------------------------------------------------
     def _later(self, what: str):
+        # Said to the USER, so it says what they can act on. It used to name
+        # the porter's to-do ("still lives on the Tk shell (a _vmgr_* method
+        # bound to CouncilConsole). Extracting it is phase 3 — …"), the kind
+        # of text batch 0 took out of the Council tab. The button that would
+        # reach this is disabled with the same words (VaultTab._stats_box).
         raise self.NotYetExtracted(
-            f"{what} still lives on the Tk shell (a _vmgr_* method bound to "
-            f"CouncilConsole). Extracting it is phase 3 — see "
-            f"docs/qt_full_port_scope.md.")
+            f"{what} — not available in this build yet (the Tk app has it).")
 
     def import_zip(self, path, subfolder, log=None):
         from council_core import vault_import
@@ -602,7 +605,15 @@ class VaultTab(ViewHelpers, QWidget):
     def _stats_box(self) -> QGroupBox:
         box = QGroupBox("📊 Data stats (precomputed)")
         row = QHBoxLayout(box)
-        self._button(row, "🧮 Build / update stats", self.on_build_stats)
+        self.stats_btn = self._button(row, "🧮 Build / update stats",
+                                      self.on_build_stats)
+        # Shown, disabled and saying so, like the Council tab's unwired
+        # controls: VaultActions.build_stats is still behind the line, and a
+        # live button that answers every click with a refusal reads as broken.
+        self.stats_btn.setEnabled(False)
+        self.stats_btn.setToolTip(
+            "Data stats — not available in this build yet (the Tk app has "
+            "it).")
         note = QLabel("min/max/mean/… per column, cached")
         note.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         row.addWidget(note)

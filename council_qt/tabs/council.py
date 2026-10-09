@@ -43,10 +43,11 @@ WHAT IS AND IS NOT HERE
 The VIEW is complete and the turn is real: `CouncilActions.send` runs
 council_core.council_turn (or one Writer, on the fast path). What is not wired
 yet — Look Up, Find & Chart, Defer to Vault, instructions, content style, the
-per-role override, verdict responses, Expand, two of the switches — is shown
-DISABLED with a "not available in this build yet" tooltip (_label_unavailable)
-rather than looking live; docs/qt_migration/remaining_scope_2026-10-06.md says
-which batch wires each.
+per-role override, the specialist pin, History, verdict responses, Expand, and
+every switch but Deliberation and Stream tokens — is shown DISABLED with a
+"not available in this build yet" tooltip (_label_unavailable) rather than
+looking live; docs/qt_migration/remaining_scope_2026-10-06.md says which batch
+wires each.
 """
 from __future__ import annotations
 
@@ -148,14 +149,22 @@ class CouncilActions:
             return f"Could not save: {exc}"
         return f"Saved to {path}"
 
-    def question_history(self, limit: int = 40) -> List[str]:
+    def question_history(self, limit: int = 40) -> Optional[List[str]]:
+        """The recent questions, or None when there is no store to read.
+
+        None is not []: "no questions asked yet" is a claim about the
+        session, and with no store it is false. convo_store is not in this
+        build, and nothing in Qt writes questions yet (saving is Batch 1), so
+        this is None today and History is disabled (_label_unavailable).
+        Measured in review: History straight after a question said "No
+        questions asked yet this session."."""
         try:
             import convo_store
             store = convo_store.ConvoStore(self.vault_dir)
             return [turn.get("text", "") for turn in store.recent(limit)
                     if turn.get("who") == "User"]
         except Exception:                                 # noqa: BLE001
-            return []
+            return None
 
     # -- the turn --------------------------------------------------------
     def models(self):
@@ -270,8 +279,11 @@ class CouncilTab(ViewHelpers, QWidget):
         #: what -> the widgets labelled "not available in this build yet".
         self.unavailable = {}
         self._specialists = None
+        # The Profile box shows what the engine will do (it cannot be
+        # changed here yet — see council_options.SWITCHES).
         self._opts = council_options.CouncilOptions.defaults(
-            demo_mode=self.demo_mode)
+            demo_mode=self.demo_mode,
+            profile_enabled=council_options.profile_applied())
         for field in PER_TURN_FIELDS:
             setattr(self, field, None)
 
@@ -340,6 +352,10 @@ class CouncilTab(ViewHelpers, QWidget):
         label("Content style", self.content_style_btn)
         label("The per-role model override", self.backend_box,
               why="Every role answers from the model set in the Models tab.")
+        label("Asking a specialist", self.specialist_box,
+              why="Every question is answered without a specialist.")
+        label("History", self.history_btn,
+              why="Questions are not saved in this build yet.")
         label("Responding to a verdict", self.vfb_agree, self.vfb_disagree,
               self.redeliberate_btn,
               why="Verdicts are not recorded yet, so there is nothing for "
@@ -347,7 +363,7 @@ class CouncilTab(ViewHelpers, QWidget):
         for switch in council_options.SWITCHES:
             box = self._checkboxes.get(switch.key)
             if box is not None and not switch.available:
-                label(switch.label.replace("✦", "").strip(), box)
+                label(switch.name, box, why=switch.unavailable_why)
 
     def _transcript_side(self) -> QWidget:
         panel = QWidget()
@@ -437,7 +453,9 @@ class CouncilTab(ViewHelpers, QWidget):
     def _action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.send_btn = self._button(row, "Send  [Ctrl+Enter]", self.on_send)
-        self.find_chart_btn = self._button(row, amp("📊 Find & Chart"),
+        # The bare caption: _button escapes it. Wrapped in amp() here too it
+        # rendered as "Find && Chart" (found in review).
+        self.find_chart_btn = self._button(row, "📊 Find & Chart",
                                            self.on_find_and_chart)
         self.look_up_btn = self._button(row, amp("🔍 Look Up"),
                                         self.on_look_up)
@@ -453,7 +471,8 @@ class CouncilTab(ViewHelpers, QWidget):
         self.expand_btn.setEnabled(False)
         self.save_btn = self._button(row, amp("💾 Save answer"),
                                      self.on_save_answer)
-        self._button(row, amp("🕘 History"), self.on_history)
+        self.history_btn = self._button(row, amp("🕘 History"),
+                                        self.on_history)
         self._button(row, amp("💡 What can I ask?"), self.on_examples)
         row.addStretch(1)
 
@@ -658,8 +677,12 @@ class CouncilTab(ViewHelpers, QWidget):
         if not self.begin_turn():
             return
         self.reset_turn()
-        # Only calls made from here on describe THIS turn's speed.
+        # Only calls made from here on describe THIS turn's speed, and the
+        # label is cleared with the rates it shows: kept, the previous turn's
+        # "Writer 40 tok/s" stood all through a turn that then failed — and
+        # after it — under a tooltip that says "this turn" (found in review).
         self._turn_stats_floor = self.actions.last_call_stats().get("seq") or 0
+        self.tps_label.setText("")
         self._last_query = typed
         self.append("User", typed)
         self.input.clear()
@@ -1052,6 +1075,9 @@ class CouncilTab(ViewHelpers, QWidget):
 
     def on_history(self) -> None:
         questions = self.actions.question_history()
+        if questions is None:
+            self._not_yet("History")
+            return
         if not questions:
             self.append("Council", "No questions asked yet this session.",
                         "observation")

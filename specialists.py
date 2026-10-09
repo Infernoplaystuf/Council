@@ -101,6 +101,9 @@ class SpecialistRegistry:
         self.vault_dir = vault_dir
         self.path = vault_dir / "specialists.json"
         self._items: List[Specialist] = []
+        #: Why specialists.json could not be read, while that file is still
+        #: the one on disk; None otherwise.
+        self.unreadable: Optional[str] = None
         self._load_or_seed()
 
     # ---- Load / save -------------------------------------------------------
@@ -112,21 +115,46 @@ class SpecialistRegistry:
                 self._items = [Specialist.from_dict(d) for d in raw]
                 return
             except Exception as e:
-                print(f"[Specialists] Failed to parse {self.path}: {e}")
-                # Fall through to seed defaults
+                # THE USER'S FILE IS LEFT ALONE. This used to fall through to
+                # the seeding below, whose save() wrote the three defaults
+                # over it — on every launch, since both shells load the
+                # registry at startup (found in review: a '{"specs": []}'
+                # file was replaced). The defaults are used in memory, and
+                # save() sets the file aside before anything is written.
+                print(f"[Specialists] Failed to parse {self.path}: {e} — "
+                      f"using the defaults; the file is left as it is.")
+                self.unreadable = repr(e)
+                self._items = list(default_specialists())
+                return
 
-        # No file or unreadable — seed with sensible defaults
+        # No file — seed with sensible defaults
         self._items = list(default_specialists())
         self.save()
+
+    def _set_aside_unreadable(self) -> None:
+        """Move the file that would not parse to specialists.json.unreadable
+        (…unreadable1, 2, … if that name is taken), so a save cannot destroy
+        its text. Raises if it cannot be moved — and then nothing is written."""
+        target = self.path.with_name(self.path.name + ".unreadable")
+        n = 1
+        while target.exists():
+            target = self.path.with_name(f"{self.path.name}.unreadable{n}")
+            n += 1
+        self.path.replace(target)
+        print(f"[Specialists] The unreadable {self.path.name} was kept as "
+              f"{target.name}.")
 
     def save(self) -> None:
         try:
             self.vault_dir.mkdir(parents=True, exist_ok=True)
+            if self.unreadable is not None and self.path.exists():
+                self._set_aside_unreadable()
             self.path.write_text(
                 json.dumps([s.to_dict() for s in self._items],
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self.unreadable = None
         except Exception as e:
             print(f"[Specialists] Save failed: {e}")
 

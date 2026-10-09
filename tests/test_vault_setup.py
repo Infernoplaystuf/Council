@@ -133,6 +133,62 @@ def test_loose_data_at_the_vault_root_is_copied_into_data_in(places):
     assert [p.name for p in done.copied] == ["orders.csv"]
 
 
+#: App state the app keeps at the vault ROOT, beside the user's loose data.
+#: data_index's own skip list predates all of these.
+_STATE = ("backend_settings.json", "model_slots.json", "model_bench.json",
+          "vault_index.json", "vault_embeddings.json", "semantic_cache.json",
+          "question_history.json", "graph_presets.json")
+
+
+def test_the_apps_own_settings_are_not_copied_in_as_data(places):
+    """Found in review: one Qt launch over a vault holding the app's settings
+    copied backend_settings.json (with the GGUF path in it), model_slots.json,
+    vault_index.json and vault_embeddings.json into data_in/, where the data
+    index listed them as the user's datasets — every Qt user who configures
+    a model. Tk did the same through the same function."""
+    import data_index
+
+    _app, _repo, vault = places
+    for name in _STATE:
+        (vault / name).write_text('{"app": "state"}', encoding="utf-8")
+    (vault / "orders.csv").write_text("id\n1\n", encoding="utf-8")
+    (vault / "customers.json").write_text('[{"id": 1}]', encoding="utf-8")
+
+    done = vault_setup.prepare_data_dirs(vault, log=lambda m: None)
+
+    landed = sorted(p.name for p in (vault / "data_in").iterdir())
+    assert landed == ["README.txt", "customers.json", "orders.csv"], landed
+    assert sorted(p.name for p in done.copied) == ["customers.json",
+                                                   "orders.csv"]
+    for name in _STATE:
+        assert (vault / name).is_file(), f"{name} was moved"
+    found = data_index.DataIndex(
+        search_roots=[data_index.input_dir(vault)]).discover()
+    names = sorted(Path(getattr(entry, "path", entry)).name for entry in found)
+    assert names == ["customers.json", "orders.csv"], names
+
+
+def test_a_copy_an_earlier_run_made_is_removed_only_when_identical(places):
+    """The copies already made (the real vault here has data_in/
+    vault_index.json and semantic_cache.json from Tk runs) go when they are
+    byte-identical to the app's file at the root — data_index's own proof
+    for its stray-config sweep. A different file of that name is the user's,
+    and is kept."""
+    _app, _repo, vault = places
+    (vault / "data_in").mkdir()
+    (vault / "model_slots.json").write_text('{"main": "a"}', encoding="utf-8")
+    (vault / "data_in" / "model_slots.json").write_text('{"main": "a"}',
+                                                        encoding="utf-8")
+    (vault / "vault_index.json").write_text('{"v": 2}', encoding="utf-8")
+    (vault / "data_in" / "vault_index.json").write_text('{"v": 1}',
+                                                        encoding="utf-8")
+    done = vault_setup.prepare_data_dirs(vault, log=lambda m: None)
+    assert not (vault / "data_in" / "model_slots.json").exists()
+    assert (vault / "data_in" / "vault_index.json").read_text() == '{"v": 1}'
+    assert (vault / "model_slots.json").is_file()
+    assert [p.name for p in done.cleaned] == ["model_slots.json"]
+
+
 def test_the_skip_switch_is_honoured(places, monkeypatch):
     app, repo, vault = places
     (app / "node_registry.json").write_text("{}", encoding="utf-8")
@@ -164,14 +220,66 @@ def test_the_tk_engine_calls_the_same_functions():
     body = code_of(source, "_migrate_old_paths_to_vault")
     assert "vault_setup.migrate_legacy_paths(" in body
     assert "shutil.move" not in body, "Tk still has its own copy of the moves"
+    assert "vault_setup.prepare_data_dirs(" in code_of(source,
+                                                      "_prepare_data_dirs")
     console = next(node for node in ast.parse(source).body
                    if isinstance(node, ast.ClassDef)
                    and node.name == "CouncilConsole")
-    init = ast.unparse(next(node for node in console.body
-                            if isinstance(node, ast.FunctionDef)
-                            and node.name == "__init__"))
-    assert "vault_setup.prepare_data_dirs(" in init
-    assert "data_index.init_data_dirs(" not in init
+    init = next(node for node in console.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "__init__")
+    assert "data_index.init_data_dirs(" not in ast.unparse(init)
+    # A STATEMENT of __init__'s own body, not merely text somewhere in it:
+    # review wrapped the call in `if False:` and every test still passed.
+    direct = [ast.unparse(stmt) for stmt in init.body
+              if isinstance(stmt, ast.Expr)]
+    assert "_prepare_data_dirs()" in direct, (
+        "CouncilConsole.__init__ no longer runs the data-folder step "
+        "unconditionally")
+
+
+# ---- the Tk side, run (found in review: only its TEXT was checked) --------
+
+@pytest.fixture
+def tk_engine(tmp_path, monkeypatch):
+    """council_gui_engine, imported in the test sandbox (no migration at
+    import — tests/sandbox_vault.py), with every folder it moves between
+    pointed at THIS test's: APP_DIR, VAULT_DIR, and __file__, whose folder is
+    the repo root the Dream3D docs are moved out of — the real one is this
+    checkout, and a move out of it into a temp vault is a move into the bin."""
+    import council_gui_engine as cge
+
+    app, vault, repo = (tmp_path / "app", tmp_path / "vault",
+                        tmp_path / "repo")
+    for folder in (app, vault, repo):
+        folder.mkdir()
+    monkeypatch.setattr(cge, "APP_DIR", app)
+    monkeypatch.setattr(cge, "VAULT_DIR", vault)
+    monkeypatch.setattr(cge, "__file__", str(repo / "council_gui_engine.py"))
+    return cge, app, vault, repo
+
+
+def test_tk_moves_an_upgraders_files(tk_engine):
+    cge, app, vault, repo = tk_engine
+    (app / "node_registry.json").write_text('{"nodes": ["pi"]}',
+                                            encoding="utf-8")
+    (repo / "vault" / "dream3d_docs").mkdir(parents=True)
+    (repo / "vault" / "dream3d_docs" / "filters.md").write_text("docs")
+    cge._migrate_old_paths_to_vault()
+    assert (vault / "node_registry.json").read_text() == '{"nodes": ["pi"]}'
+    assert (vault / "dream3d_docs" / "filters.md").is_file()
+    assert not (app / "node_registry.json").exists()
+
+
+def test_tk_sets_up_the_data_folders(tk_engine):
+    cge, _app, vault, _repo = tk_engine
+    (vault / "orders.csv").write_text("id\n1\n", encoding="utf-8")
+    (vault / "model_slots.json").write_text("{}", encoding="utf-8")
+    cge._prepare_data_dirs()
+    assert (vault / "data_in" / "README.txt").is_file()
+    assert (vault / "data_out" / "README.txt").is_file()
+    assert (vault / "data_in" / "orders.csv").is_file()
+    assert not (vault / "data_in" / "model_slots.json").exists()
 
 
 def test_the_module_imports_no_toolkit():

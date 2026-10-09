@@ -112,6 +112,64 @@ def test_bat_check_still_launches_nothing_wherever_it_is(tmp_path):
     assert not out.exists(), "--check started the app"
 
 
+def _run_bat_line(tmp_path, line: str):
+    """The launcher run from a RAW command line, as a user types it in cmd.
+    The list form above lets subprocess quote each argument, which hides
+    how cmd itself splits the line."""
+    _argv, kwargs, out = _prepare_bat(tmp_path, entry_src=_ARGV_ENTRY)
+    bat = Path(kwargs["cwd"]) / "run-windows.bat"
+    proc = subprocess.run(f'cmd.exe /d /s /c ""{bat}" {line}"',
+                          capture_output=True, timeout=180, **kwargs)
+    return proc, out
+
+
+@win_only
+@pytest.mark.parametrize("line, args", [
+    # Found in review: cmd's %1 / shift treats = , ; as separators, so the
+    # app got ['--advanced', '--x', '1', '2', '3', '-style', 'fusion'].
+    ("--advanced --x=1,2;3 -style=fusion",
+     ["--advanced", "--x=1,2;3", "-style=fusion"]),
+    ('--advanced --vault="C:\\My Vault"',
+     ["--advanced", "--vault=C:\\My Vault"]),
+])
+def test_bat_passes_the_line_on_as_typed(tmp_path, line, args):
+    proc, out = _run_bat_line(tmp_path, line)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _started(out) == {"entry": "council_qt.py", "args": args}
+
+
+@win_only
+def test_bat_finds_its_own_flags_past_an_empty_argument(tmp_path):
+    """The old scan stopped at "" (cmd cannot tell it from the end of the
+    line), so a --tk after one was handed to the app as nothing at all."""
+    proc, out = _run_bat_line(tmp_path, '--advanced "" --TK')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    got = _started(out)
+    assert got["entry"] == "council_gui_engine.py", got
+    assert "--TK" not in got["args"] and "--tk" not in got["args"], got
+    assert got["args"][0] == "--advanced", got
+
+
+@win_only
+def test_bat_check_anywhere_on_a_raw_line_launches_nothing(tmp_path):
+    proc, out = _run_bat_line(tmp_path, "--x=1 --check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not out.exists(), "--check started the app"
+
+
+@win_only
+def test_bat_does_not_take_its_flags_out_of_another_argument(tmp_path):
+    """Only a whole --tk / --check is the launcher's. (Known limit, in the
+    script's comment: the words are found in the TEXT of the line, so a
+    quoted argument holding " --tk " as a word of its own loses it.)"""
+    proc, out = _run_bat_line(tmp_path,
+                              '--tkinter "R&D --tk2" x=--tk --checkpoint')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _started(out) == {"entry": "council_qt.py",
+                             "args": ["--tkinter", "R&D --tk2", "x=--tk",
+                                      "--checkpoint"]}
+
+
 @win_only
 def test_the_legacy_launcher_passes_them_through_too(tmp_path):
     """launch_council.bat forwards %* to run-windows.bat; the arguments were

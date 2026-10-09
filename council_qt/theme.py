@@ -125,8 +125,25 @@ QPlainTextEdit, QTextEdit, QLineEdit, QListWidget, QTreeWidget {{
 """
 
 
+#: Set by apply() on the style object it leaves the app with: which theme it
+#: put on — see _wears.
+_WORN = "council_theme"
+
+
 def apply(app, name: str = "dark") -> None:
-    """Dress a QApplication. The only call the rest of the app needs."""
+    """Dress a QApplication. The only call the rest of the app needs.
+
+    A no-op when the app already wears exactly this theme. Dressing is not
+    free: every widget alive in the process is re-polished, and each combo
+    box's list gets six layout calls queued (9,000 for 1,500 combo boxes,
+    measured). One launch per process never noticed. The test suite runs in
+    ONE process and launch.build — which dresses the app — runs ~30 times in
+    it: with the ~50,000 widgets alive by then, each build took ~20 s, and
+    test_launch's last processEvents spent 390 s on ~197,000 queued calls
+    before the run was killed (found re-running the suites for batch 0).
+    """
+    if _wears(app, name):
+        return
     app.setStyle("Fusion")
     # Fusion, not the native Windows 11 style: the native style ignores the
     # palette for most surfaces, so a dark app under it comes out half light.
@@ -134,3 +151,22 @@ def apply(app, name: str = "dark") -> None:
     # to the "clam" ttk theme for exactly this reason.
     app.setPalette(palette(name))
     app.setStyleSheet(stylesheet(name))
+    # Marked on the STYLE OBJECT, not the app: a setStyle by anyone else
+    # replaces that object, and the mark goes with it. (The style cannot just
+    # be asked its name — under a stylesheet app.style() is Qt's stylesheet
+    # proxy, whose name() is "".)
+    app.style().setProperty(_WORN, name)
+
+
+def _wears(app, name: str) -> bool:
+    """Whether the app still wears exactly ``name`` as apply() left it: the
+    same style object, palette and stylesheet. Anything changed underneath —
+    another theme, a stylesheet or palette set elsewhere, another style — and
+    the theme is put on in full. Never raises: a check that cannot be made
+    means "dress it"."""
+    try:
+        return (app.style().property(_WORN) == name
+                and app.styleSheet() == stylesheet(name)
+                and app.palette() == palette(name))
+    except Exception:                                     # noqa: BLE001
+        return False

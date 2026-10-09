@@ -31,27 +31,39 @@ setlocal enableextensions disabledelayedexpansion
 REM --check and --tk are the launcher's own, wherever they are on the line.
 REM `run-windows.bat --check` resolves the env + reports GPU readiness, then
 REM exits WITHOUT launching - a quick "did my setup work?" command; --tk starts
-REM the classic Tk UI. Every OTHER argument is the app's (--advanced, ...) and
-REM is passed on, in order, as typed. They used to be dropped: only the first
+REM the classic Tk UI. EVERYTHING ELSE on the line is the app's (--advanced,
+REM ...) and goes on exactly as typed. It used to be dropped: only the first
 REM argument was looked at and the app was started with none, so
 REM `run-windows.bat --advanced` opened the default build.
-REM APP_ARGS is built WITHOUT quotes round the set, so a quoted argument keeps
-REM its quotes and a & or space inside them stays inside them. An empty ""
-REM argument ends the scan (cmd cannot tell it from the end of the line).
-REM shift /1 leaves %0 alone: %~dp0 below must still be this script's folder.
-set "CHECK_ONLY="
-set "APP_ARGS="
-:scan_args
-if "%~1"=="" goto :args_scanned
-if /i "%~1"=="--check" set "CHECK_ONLY=1" & goto :next_arg
-if /i "%~1"=="--tk" set "COUNCIL_UI=tk" & goto :next_arg
-set APP_ARGS=%APP_ARGS% %1
-:next_arg
-shift /1
-goto :scan_args
-:args_scanned
-
+REM It is the WHOLE line, %*, with the two flags taken out as whole words
+REM (either case, wherever they are) - not rebuilt from %1 and shift, which
+REM split at = , and ; as well as spaces (--x=1,2 reached the app as --x 1 2)
+REM and stopped at an empty "" argument (found in review). `set APP_ARGS=%*`
+REM is unquoted on purpose, so a quoted argument keeps its quotes and a & or
+REM space inside them stays inside them; from here on APP_ARGS is only read
+REM with !...!, which cmd never parses again. Padded with a space each side
+REM so a flag at either end is a whole word too, and the padding comes off
+REM after. Twice each, because " --tk --tk " loses only one per pass.
+REM Known limit: the words are found in the line's TEXT, so a quoted argument
+REM with " --tk " or " --check " as a word inside it loses that word. And a
+REM caret-escaped & typed unquoted (a^&b) reaches `set` as a bare & - quote
+REM an argument with & in it, as cmd needs anyway.
+set APP_ARGS=%*
 setlocal enabledelayedexpansion
+set "CHECK_ONLY="
+if defined APP_ARGS (
+    set "APP_ARGS= !APP_ARGS! "
+    set "BEFORE=!APP_ARGS!"
+    set "APP_ARGS=!APP_ARGS: --check = !"
+    set "APP_ARGS=!APP_ARGS: --check = !"
+    if not "!APP_ARGS!"=="!BEFORE!" set "CHECK_ONLY=1"
+    set "BEFORE=!APP_ARGS!"
+    set "APP_ARGS=!APP_ARGS: --tk = !"
+    set "APP_ARGS=!APP_ARGS: --tk = !"
+    if not "!APP_ARGS!"=="!BEFORE!" set "COUNCIL_UI=tk"
+    set "APP_ARGS=!APP_ARGS:~1,-1!"
+    set "BEFORE="
+)
 
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
@@ -168,7 +180,7 @@ if "!COUNCIL_ENTRY!"=="council_qt.py" (
         set "COUNCIL_ENTRY=council_gui_engine.py"
     )
 )
-echo [run-windows] launching !COUNCIL_ENTRY!!APP_ARGS! ...
+echo [run-windows] launching !COUNCIL_ENTRY! !APP_ARGS! ...
 
 REM !APP_ARGS! is expanded LAST, after cmd has parsed the line, so what it
 REM holds - quotes, &, ^ - goes to the app as text, never as cmd syntax.

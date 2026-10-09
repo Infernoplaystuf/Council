@@ -4011,6 +4011,16 @@ def _migrate_old_paths_to_vault() -> None:
                                      repo_root=Path(__file__).parent)
 
 
+def _prepare_data_dirs():
+    """data_in/ and data_out/ with their READMEs, the stray-config sweep and
+    the copy of loose root data — through council_core.vault_setup, which the
+    Qt launch calls too. CouncilConsole.__init__ calls this; it is a function
+    of its own so a test can run Tk's step without building the console (a
+    check of the call's TEXT alone survived the call being disabled)."""
+    from council_core import vault_setup
+    return vault_setup.prepare_data_dirs(VAULT_DIR)
+
+
 # Run migration silently on startup — unless told not to. The test suite
 # points the vault at a throwaway folder deleted when the session ends; a
 # migration into it MOVED the user's legacy files there and they were gone
@@ -4248,8 +4258,7 @@ class CouncilConsole(tk.Tk):
         # data_in/ (byte-identical copies only); and copy any loose user
         # CSV/TSV/JSON at the vault root into data_in/ so they are
         # discoverable — originals stay put, we never silently move user data.
-        from council_core import vault_setup as _vault_setup
-        _vault_setup.prepare_data_dirs(VAULT_DIR)
+        _prepare_data_dirs()
 
         self.data_index = data_index.DataIndex(
             search_roots=[

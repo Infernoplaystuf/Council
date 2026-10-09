@@ -222,6 +222,86 @@ def test_disabled_text_is_distinct(qapp):
     assert normal != disabled
 
 
+def test_the_theme_the_app_already_wears_is_not_put_on_again(qapp):
+    """Dressing the app re-polishes EVERY widget in the process and queues six
+    layout calls for each combo box's list. Found running the whole suite in
+    one process: launch.build dresses the app on every call, and with the
+    ~50,000 widgets the suite leaves alive each build took ~20 s, and the
+    calls queued by test_launch's builds (~197,000) took 390 s to drain in
+    its last processEvents — the run was killed there. Measured on its own:
+    one apply over 1,500 combo boxes queues 9,000 calls."""
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import QComboBox
+
+    theme.apply(qapp, "dark")
+    combos = []
+    for _ in range(10):
+        combo = QComboBox()
+        combo.addItems(["a", "b", "c"])
+        combos.append(combo)
+    views = [combo.view() for combo in combos]
+    qapp.processEvents()
+    queued = []
+
+    class Spy(QObject):
+        def eventFilter(self, obj, event):
+            if (event.type() == QEvent.Type.MetaCall
+                    and any(obj is view for view in views)):
+                queued.append(obj)
+            return False
+
+    spy = Spy()
+    qapp.installEventFilter(spy)
+    try:
+        theme.apply(qapp, "dark")
+        qapp.processEvents()
+    finally:
+        qapp.removeEventFilter(spy)
+        for combo in combos:
+            combo.deleteLater()
+        qapp.processEvents()
+    assert not queued, (
+        f"the same theme was put on again: {len(queued)} layout calls queued "
+        f"for 10 combo boxes")
+
+
+def test_a_theme_that_changed_underneath_is_put_back(qapp, monkeypatch):
+    """Skipping is only for an app that still wears exactly this theme: a
+    different theme, a stylesheet or palette changed by someone else, or
+    another style set underneath, and it is applied in full."""
+    from PySide6.QtGui import QPalette
+
+    def window_lightness():
+        return qapp.palette().color(QPalette.ColorRole.Window).lightness()
+
+    try:
+        theme.apply(qapp, "dark")
+        theme.apply(qapp, "light")
+        assert window_lightness() > 127, "the light theme was not applied"
+        theme.apply(qapp, "dark")
+        assert window_lightness() < 128, "dark was not put back"
+
+        qapp.setStyleSheet("")
+        theme.apply(qapp, "dark")
+        assert qapp.styleSheet() == theme.stylesheet("dark")
+
+        qapp.setPalette(theme.palette("light"))
+        theme.apply(qapp, "dark")
+        assert qapp.palette() == theme.palette("dark")
+
+        qapp.setStyle("Windows")
+        styles = []
+        real_set_style = qapp.setStyle
+        monkeypatch.setattr(qapp, "setStyle",
+                            lambda style: (styles.append(style),
+                                           real_set_style(style))[1])
+        theme.apply(qapp, "dark")
+        assert styles == ["Fusion"], "a style set underneath was kept"
+    finally:
+        monkeypatch.undo()
+        theme.apply(qapp, "dark")             # leave the session as we found it
+
+
 # ------------------------------------------------------------- the tab host
 
 def test_tabs_are_built_lazily_and_only_once(qapp):
@@ -455,7 +535,15 @@ def test_an_unextracted_action_says_so_instead_of_doing_nothing(
     for name in unextracted:
         with pytest.raises(VaultActions.NotYetExtracted) as exc:
             getattr(tab.actions, name)()
-        assert "phase 3" in str(exc.value), name
+        # Said to the user: what is missing, not the porter's to-do list
+        # (it used to read "… a _vmgr_* method bound to CouncilConsole.
+        # Extracting it is phase 3 — see docs/qt_full_port_scope.md.").
+        assert "not available in this build yet" in str(exc.value), name
+        assert "phase 3" not in str(exc.value), name
+        assert "_vmgr_" not in str(exc.value), name
+    # And the button that would reach it says so before it is clicked.
+    assert not tab.stats_btn.isEnabled()
+    assert "not available in this build yet" in tab.stats_btn.toolTip()
     window.request_close()
 
 
@@ -871,6 +959,31 @@ def test_every_registered_tab_survives_being_shown(window, title, factory,
     qapp = QApplication.instance()
     qapp.processEvents()
     assert widget.isVisible() or widget.isVisibleTo(window)
+
+
+#: The default tabs and the --advanced ones (Nodes is one of those).
+EVERY_TAB = REGISTERED + [(title, factory, eager) for title, factory, eager
+                          in tab_registry.ADVANCED_REGISTRY]
+
+
+@pytest.mark.parametrize("title,factory,eager", EVERY_TAB,
+                         ids=[title for title, _, _ in EVERY_TAB])
+def test_no_caption_on_a_tab_is_escaped_twice(window, title, factory, eager):
+    """ViewHelpers._button applies amp() itself, so a caller that ALSO wraps
+    the text shows a doubled ampersand: measured in review, the Council tab's
+    "📊 Find & Chart" rendered as "Find && Chart" (text() was "Find &&&&
+    Chart"), and Nodes' "Apply && Rebuild" went through the same path. Qt
+    shows "&&" as "&", so a caption holding "&&&&" is on screen as "&&"."""
+    from PySide6.QtWidgets import QAbstractButton, QGroupBox, QLabel
+
+    widget = _build_tab(window, factory)
+    doubled = [(type(w).__name__, w.text())
+               for kind in (QAbstractButton, QLabel)
+               for w in widget.findChildren(kind) if "&&&&" in w.text()]
+    doubled += [("QGroupBox", box.title())
+                for box in widget.findChildren(QGroupBox)
+                if "&&&&" in box.title()]
+    assert not doubled, f"{title}: captions escaped twice: {doubled}"
 
 
 @pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
