@@ -1,0 +1,3 @@
+# Node A — the only differences from B are these two lines.
+node_id: A
+news_enabled: true

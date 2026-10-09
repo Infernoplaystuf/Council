@@ -1,0 +1,3 @@
+# Node B — identical to A except it never sees news.
+node_id: B
+news_enabled: false

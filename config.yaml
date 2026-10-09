@@ -1,0 +1,59 @@
+# Shared settings — identical for both nodes. Only nodes/<id>.yaml may differ,
+# and only in node_id / news (quant_duel.config.check_identical enforces it).
+
+seed: 20261009
+
+universe:
+  benchmark: SPY
+  context: [SPY, QQQ]
+  tickers: [AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, BRK-B, JPM,
+            V, UNH, XOM, LLY, JNJ, MA, PG, HD, COST, MRK,
+            ABBV, CVX, PEP, KO, WMT, BAC, ADBE, CRM, CSCO, ORCL,
+            MCD, TMO, ABT, ACN, LIN, DIS, NKE, INTC, QCOM, TXN,
+            SPY, QQQ]
+
+data:
+  source: yfinance          # yfinance | synthetic
+  history_start: "2015-01-01"
+  dir: data
+
+features:
+  return_lookbacks: [1, 5, 10, 20, 60]
+  ma_windows: [10, 50, 200]
+  vol_windows: [10, 20, 60]
+  rsi_window: 14
+  volume_z_window: 20
+  enabled:                  # feature-group on/off flags (the tuner may toggle)
+    returns: true
+    ma_ratio: true
+    volatility: true
+    rsi: true
+    volume_z: true
+    day_of_week: true
+    spy_context: true
+
+model:
+  kind: logistic            # always_up | persistence | logistic | boosting
+  params:
+    logistic: {C: 0.1, max_iter: 500}
+    boosting: {max_depth: 3, learning_rate: 0.05, max_iter: 200,
+               min_samples_leaf: 200, l2_regularization: 1.0}
+
+backtest:
+  train_days: 756           # ~3 years of trading days
+  test_days: 21             # refit every ~month (walk-forward step)
+  min_train_days: 252
+  cost_bps: 5
+  threshold: 0.52           # long when P(up) >= threshold, else flat
+  validation_years: 3
+
+llm:                        # phase 4 — any OpenAI-compatible server
+  url: http://localhost:11434/v1
+  model: llama3.2:3b
+  temperature: 0.0
+  timeout_s: 180
+
+schedule:                   # phase 7 — America/New_York
+  timezone: America/New_York
+  daily_at: "16:45"
+  tune_weekday: 5           # Saturday

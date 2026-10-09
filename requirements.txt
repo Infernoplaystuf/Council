@@ -1,0 +1,10 @@
+# Python 3.11+. All of these have aarch64 (Raspberry Pi) wheels.
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+pyarrow>=14
+PyYAML>=6
+yfinance>=0.2.40
+# Optional: lightgbm (gradient boosting falls back to scikit-learn's
+# HistGradientBoostingClassifier when it is missing).
+pytest>=8
