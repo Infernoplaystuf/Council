@@ -68,6 +68,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import secrets
 import struct
 import subprocess
@@ -502,6 +503,79 @@ def _expand(value: Any, tokens: Dict[str, str]) -> Any:
     return value
 
 
+def _shown(value: Any) -> str:
+    """A value as two presses are compared on: its repr with object
+    addresses dropped, and an image by its size, not its identity."""
+    if type(value).__module__.split(".")[0] in ("PIL", "numpy"):
+        shape = getattr(value, "shape", None) or getattr(value, "size", "")
+        return f"<{type(value).__name__} {shape}>"
+    try:
+        text = repr(value)
+    except Exception:                                    # noqa: BLE001
+        text = f"<{type(value).__name__}>"
+    return re.sub(r" at 0x[0-9A-Fa-f]+", "", text)[:300]
+
+
+def _inputs_text(inputs: Dict[str, Any]) -> str:
+    return ", ".join(f"{k}={v!r}" for k, v in inputs.items()) or "the same"
+
+
+_BROAD = ("Exception", "BaseException")
+
+
+def broad_handler_at(source: str, lineno: int) -> str:
+    """How the except clause is spelled ("except Exception", "except:")
+    when line ``lineno`` of ``source`` is a ``raise`` whose innermost
+    handler catches everything; "" otherwise.
+
+    raise ValueError("why") is the documented refusal, and the smoke run
+    lets it pass on the sample data. Raised from a catch-all, it is not a
+    refusal but a relabelled crash: qwen2.5's K7 (2026-10-05) wrote
+    `except Exception as e: raise ValueError(f"Failed to save: {e}")`
+    around an f-string that itself raised ("Invalid format specifier"),
+    the run called that deliberate, the writer accepted it, and the hidden
+    test read an empty file. A handler that names what it catches (except
+    ValueError: around int(text)) still refuses deliberately — and so does
+    a catch-all around the code's OWN `raise ValueError(...)` (the child
+    checks that with raises_at)."""
+    try:
+        tree = ast.parse(source or "")
+    except (SyntaxError, ValueError):
+        return ""
+    inner = None                  # the innermost handler raising there
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and any(
+                isinstance(sub, ast.Raise)
+                and sub.lineno <= lineno <= (sub.end_lineno or sub.lineno)
+                for stmt in node.body for sub in ast.walk(stmt)):
+            if inner is None or node.lineno > inner.lineno:
+                inner = node
+    if inner is None:
+        return ""
+    if inner.type is None:
+        return "except:"
+    caught = inner.type.elts if isinstance(inner.type, ast.Tuple) \
+        else [inner.type]
+    for n in caught:
+        name = n.id if isinstance(n, ast.Name) else \
+            n.attr if isinstance(n, ast.Attribute) else ""
+        if name in _BROAD:
+            return f"except {name}"
+    return ""
+
+
+def raises_at(source: str, lineno: int) -> bool:
+    """Whether line ``lineno`` of ``source`` is a ``raise`` statement — the
+    code refusing on purpose, not a call on that line failing."""
+    try:
+        tree = ast.parse(source or "")
+    except (SyntaxError, ValueError):
+        return False
+    return any(isinstance(n, ast.Raise)
+               and n.lineno <= lineno <= (n.end_lineno or n.lineno)
+               for n in ast.walk(tree))
+
+
 def _check_value(value: Any, check: str, what: str) -> str:
     """Why ``value`` cannot be shown where ``what`` is, or ""."""
     tname = type(value).__name__
@@ -564,7 +638,9 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         sys.path.insert(1, job["app_root"])
     tokens = _seed_samples(sandbox)
     record: Dict[str, Any] = {"blocked": [], "problems": [], "sets": {},
-                              "errors": [], "notes": []}
+                              "errors": [], "notes": [],
+                              # what the current press wrote, port by port
+                              "press": {}}
 
     # ---- stand-ins for hardware modules -------------------------------
     import types
@@ -718,6 +794,10 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             record["sets"].setdefault("__chart__", "redrawn")
 
     class FakePort:
+        """A port with the real binder's behaviour — and its STATE: what a
+        press set is what the next press reads (a listbox's items, a
+        label's text), as in the window."""
+
         def __init__(self, spec):
             self.name, self.kind = spec["name"], spec.get("kind", "")
             self.type = spec.get("type", "str")
@@ -726,29 +806,34 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             self.sample = _expand(spec.get("sample"), tokens)
             self.widget = FakeChartWidget() \
                 if self.writer == "figure_for_drawing" else None
+            self.value = self.sample if self.sample is not None else {
+                "path": tokens["<FOLDER>"], "int": 3, "float": 0.5,
+                "bool": True, "rows": [("a", "1")],
+                "str": ["a"] if self.binder == "list" else "sample"
+            }.get(self.type, "sample")
+            #: A listbox's items or a table's rows, as the last press left
+            #: them.
+            self.held = (["alpha", "beta"] if self.binder == "list" else
+                         [("a", "1"), ("b", "2")] if self.binder == "table"
+                         else None)
 
         def get(self):
             if self.binder in ("proxy", "event"):
                 raise TypeError(f"port {self.name!r} is write-only "
                                 f"({self.kind} has no value to read)")
-            if self.sample is not None:
-                return self.sample
-            return {"path": tokens["<FOLDER>"], "int": 3, "float": 0.5,
-                    "bool": True, "rows": [("a", "1")],
-                    "str": ["a"] if self.binder == "list" else "sample"
-                    }.get(self.type, "sample")
+            return self.value
 
         def items(self):
             if self.binder != "list":
                 raise AttributeError(f"port {self.name!r} is a {self.kind}; "
                                      f"only a listbox has items()")
-            return ["alpha", "beta"]
+            return list(self.held)
 
         def rows(self):
             if self.binder != "table":
                 raise AttributeError(f"port {self.name!r} is a {self.kind}; "
                                      f"only a table has rows()")
-            return [("a", "1"), ("b", "2")]
+            return list(self.held)
 
         def set(self, value):
             if self.binder == "event":
@@ -771,6 +856,15 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                 record["problems"].append(_check_value(
                     value, "text", f"port {self.name!r} ({self.kind})"))
             record["sets"][self.name] = type(value).__name__
+            if self.binder in ("list", "table"):
+                self.held = list(value)
+            elif self.binder != "proxy":
+                self.value = value
+            shown = _shown(value)
+            if self.writer == "append":
+                record["press"].setdefault(self.name, []).append(shown)
+            else:
+                record["press"][self.name] = shown
 
         def clear(self):
             pass
@@ -791,26 +885,125 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         def __getitem__(self, name):
             return getattr(self, name)
 
+    def own_frames(exc):
+        """(the whole traceback, its frames in the candidate's files)."""
+        tb = traceback.extract_tb(getattr(exc, "__traceback__", None))
+        return tb, [f for f in tb if os.path.basename(f.filename) in
+                    ("handlers.py", "logic.py")]
+
+    def source_of(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:                                # noqa: BLE001
+            return ""
+
+    def relabelled(exc, own):
+        """(the crash, how the catch-all is spelled) when the candidate's
+        ValueError was raised from a handler that catches everything over
+        something that was NOT its own refusal — see broad_handler_at;
+        (None, "") for a refusal it meant."""
+        crash = getattr(exc, "__context__", None)
+        if crash is None or not own:
+            return None, ""
+        spelled = broad_handler_at(source_of(own[-1].filename),
+                                   own[-1].lineno)
+        if not spelled:
+            return None, ""
+        if isinstance(crash, ValueError):
+            # `raise ValueError(result["error"])` inside the try, relabelled
+            # by the catch-all (qwen2.5-coder's K4 does exactly that): still
+            # the refusal the code meant.
+            ctb, cown = own_frames(crash)
+            if cown and ctb and cown[-1] is ctb[-1] and raises_at(
+                    source_of(cown[-1].filename), cown[-1].lineno):
+                return None, ""
+        return crash, spelled
+
+    def crash_report(crash, spelled):
+        """(the error line, the crash's own frames): the error that was
+        relabelled, at the line that raised it."""
+        return (f"{type(crash).__name__}: {crash} — caught by `{spelled}` "
+                f"and raised again as ValueError; a refusal is for input the "
+                f"user can fix, not for a crash in the code"), \
+            own_frames(crash)[1]
+
     class Host:
         def report_error(self, what, exc):
-            tb = traceback.extract_tb(getattr(exc, "__traceback__", None))
-            own = [f for f in tb if os.path.basename(f.filename) in
-                   ("handlers.py", "logic.py")]
+            tb, own = own_frames(exc)
+            # raise ValueError("why") in the body itself: the message the
+            # user is meant to see, not a fault — unless a catch-all raised
+            # it over a crash.
+            deliberate = bool(isinstance(exc, ValueError) and own and tb
+                              and own[-1] is tb[-1])
+            error = f"{type(exc).__name__}: {exc}"
+            if deliberate:
+                crash, spelled = relabelled(exc, own)
+                if crash is not None:
+                    deliberate = False
+                    error, crash_own = crash_report(crash, spelled)
+                    own = crash_own or own
             record["errors"].append({
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": error,
                 "where": (f"{os.path.basename(own[-1].filename)}:"
                           f"{own[-1].lineno}" if own else ""),
                 "line_text": own[-1].line if own else "",
-                # raise ValueError("why") in the body itself: the message
-                # the user is meant to see, not a fault.
-                "deliberate": bool(isinstance(exc, ValueError) and own
-                                   and tb and own[-1] is tb[-1])})
+                "deliberate": deliberate})
 
         def clear_ports(self, *names):
             pass
 
         def request_close(self):
             record["problems"].append("it closes the window")
+
+    # ---- repeated presses (handler mode, a port with a "sample2") -------
+    def press(app, inputs):
+        """One press with ``inputs`` typed in: (what it wrote, port by
+        port; why it failed, or "")."""
+        for name, value in inputs.items():
+            getattr(app.ports, name).value = value
+        record["press"] = {}
+        errors, problems = len(record["errors"]), len(record["problems"])
+        getattr(app, job["handler"])()
+        said = f"pressed with {_inputs_text(inputs)}"
+        record["problems"][problems:] = [
+            f"{said}: {p}" for p in record["problems"][problems:] if p]
+        bad = [e for e in record["errors"][errors:] if not e["deliberate"]]
+        if bad:
+            return {}, (f"{said}, it raised {bad[0]['error'][:300]}"
+                        + (f" (at {bad[0]['where']})" if bad[0]["where"]
+                           else ""))
+        return dict(record["press"]), ""
+
+    def repeat_problem(app_cls, again):
+        """Press with the samples, then with other inputs, then with the
+        samples again — and the other way round, on a fresh window. A task
+        that starts every press from the ORIGINAL data shows the same for
+        the same inputs whatever came before. One press cannot tell: K2's
+        "filter the ORIGINAL list" passed it for 4 of 5 models that each
+        filtered what the LAST press had left (2026-10-05)."""
+        first = {s["name"]: FakePort(s).value for s in again}
+        other = {s["name"]: _expand(s["sample2"], tokens) for s in again}
+        for one, two in ((first, other), (other, first)):
+            app = app_cls.__new__(app_cls)
+            app.ports = FakePorts(job.get("ports") or [])
+            seen = []
+            for inputs in (one, two, one):
+                writes, error = press(app, inputs)
+                if error:
+                    return error
+                seen.append(writes)
+            if seen[2] != seen[0]:
+                port = next(k for k in list(seen[0]) + list(seen[2])
+                            if seen[0].get(k) != seen[2].get(k))
+                return (f"pressed with {_inputs_text(one)}, then with "
+                        f"{_inputs_text(two)}, then with "
+                        f"{_inputs_text(one)} again, it set {port} to "
+                        f"{seen[2].get(port, '(nothing)')} the third time "
+                        f"but to {seen[0].get(port, '(nothing)')} the first "
+                        f"— each press must start from the ORIGINAL data, "
+                        f"not from what the last press left")
+        return ""
 
     # ---- run -----------------------------------------------------------
     real_stdout, real_stderr = sys.stdout, sys.stderr
@@ -874,13 +1067,16 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                                        f"the sample data")
                 else:
                     verdict["error"] = first["error"][:600]
+            again = [s for s in job.get("ports") or [] if "sample2" in s]
+            if again and not verdict.get("error") and not record["blocked"]:
+                why = repeat_problem(app_cls, again)
+                if why:
+                    record["problems"].append(why)
         verdict["ok"] = not (record["problems"] or record["blocked"]
                              or verdict.get("error"))
     except BaseException as exc:                         # noqa: BLE001
         verdict["call_seconds"] = time.perf_counter() - t0
-        tb = traceback.extract_tb(exc.__traceback__)
-        own = [f for f in tb if os.path.basename(f.filename) in
-               ("handlers.py", "logic.py")]
+        tb, own = own_frames(exc)
         name = type(exc).__name__
         if isinstance(exc, SystemExit):
             msg = "SystemExit — it calls sys.exit()/exit(), which closes the app"
@@ -888,6 +1084,12 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             msg = f"{name}: {exc}"
         deliberate = (isinstance(exc, ValueError) and own
                       and own[-1] is tb[-1] and not record["blocked"])
+        if deliberate:
+            crash, spelled = relabelled(exc, own)
+            if crash is not None:
+                deliberate = False
+                msg, crash_own = crash_report(crash, spelled)
+                own = crash_own or own
         if deliberate:
             # The documented failure path: raise ValueError("why"). On three
             # sample frames that may be the honest answer — said, not failed.

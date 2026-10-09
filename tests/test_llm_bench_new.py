@@ -333,6 +333,61 @@ def test_state_kept_on_self_is_refused_by_the_handler_mode_writer(fake):
     assert "self._started" in r["detail"]
 
 
+# ---- 2026-10-05 replies, replayed through the real writer ----------------
+
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+
+
+def replay_code(cid, vault, *keys):
+    """One code case through the real writer, project, smoke run and hidden
+    test, the engine answering with these recorded replies in order."""
+    tap = lb.EngineTap([RECORDED["code"][k] for k in keys])
+    with tap:
+        row = lb.run_code_case(CODE[cid], tap, strategy="codebehind",
+                               vault=vault, n_best=1)
+    return row, tap
+
+
+def test_k2_filtering_what_the_last_press_left_is_sent_back(short_vault):
+    """llama3.1:8b's K2 passed every gate and the ONE-press smoke run, then
+    failed the hidden test. Now the smoke run presses again and the repair
+    is told to keep the original — replayed here with phi4's reply, the
+    one that kept it."""
+    row, tap = replay_code("K2", short_vault, "llama3.1:8b K2 1",
+                           "phi4:14b K2 1")
+    assert row["passed"], row
+    assert row["attempts"] == 2 and row["repair_rounds"] == 1
+    repair = tap.prompts[1]
+    assert "each press must start from the ORIGINAL data" in repair
+    assert "self._ai_original = self.ports.fruits.items()" in repair
+    assert "Repeated presses start from the ORIGINAL data" in tap.prompts[0]
+
+
+def test_k2_qwen_coder_is_caught_by_the_repeated_presses(short_vault):
+    row, _tap = replay_code("K2", short_vault, "qwen2.5-coder K2 1")
+    assert not row["passed"] and row["category"] != "test_failure", row
+    assert any("ORIGINAL data" in g for g in row["gates"]), row["gates"]
+
+
+def test_k4_module_dot_function_now_reaches_the_hidden_test_and_passes(
+        short_vault):
+    """qwen2.5-coder's K4: recorded undefined_name after 5 calls."""
+    row, _tap = replay_code("K4", short_vault, "qwen2.5-coder K4 1")
+    assert row["passed"], row
+    assert row["attempts"] == 1
+    assert "added `import image_stats`" in row["notes"]
+
+
+def test_k7_a_crash_relabelled_as_a_refusal_is_not_accepted(short_vault):
+    """qwen2.5's K7: the smoke run called the relabelled crash deliberate,
+    the writer accepted it, and the hidden test read an empty file."""
+    row, _tap = replay_code("K7", short_vault, "qwen2.5 K7 4")
+    assert not row["passed"] and row["category"] != "test_failure", row
+    assert any("raised again as ValueError" in g for g in row["gates"]), \
+        row["gates"]
+
+
 def test_the_docs_suite_answers_through_the_docs_role(fake):
     with lb.EngineTap() as tap:
         got = lb.run_docs(tap, items=("q01", "q04"))

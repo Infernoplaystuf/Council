@@ -415,6 +415,22 @@ def _q(text: str, cap: int = 60) -> str:
     return text if len(text) <= cap else text[:cap - 1] + "…"
 
 
+def importable_modules(target: Target) -> List[str]:
+    """The modules YOU MAY IMPORT names one by one — the app modules (a
+    linked project), this project's own, its declared packages — and every
+    module a shortlisted function comes from. A name among them that the
+    code reads as `name.function(...)` and never imports is safe to import:
+    gate 4 adds the import, and the policy gate reads it again."""
+    out = sorted(gui_policy.LINKED_MODULES) \
+        if target.project_mode == "linked" else []
+    out += [r for r in gui_policy.as_requires(target.requires)
+            if r not in gui_policy.THIRD_PARTY and r.isidentifier()]
+    out += [m for m in target.local_modules
+            if m not in gui_policy.PROJECT_MODULES and m != MODULE]
+    out += [r.module for r in target.shortlist if r.module.isidentifier()]
+    return _dedupe(out)
+
+
 def _allowed_text(target: Target) -> str:
     third = "numpy, PIL (Pillow), pandas, matplotlib.figure"
     linked = sorted(gui_policy.LINKED_MODULES) \
@@ -535,6 +551,38 @@ def port_line(p: PortRow) -> str:
     return f"{base}.get() -> {typ}, .set(value)  {p.kind}{lab}"
 
 
+#: A task whose every press works from the data as it was at the start:
+#: "the items of the ORIGINAL list", "every original item again". K2 says
+#: exactly that, and four of five models filtered whatever the LAST press
+#: had left instead (2026-10-05) — which one press cannot show, so the
+#: smoke run presses again (gui_smoke, handler mode) and the prompt says it.
+_FROM_ORIGINAL = re.compile(
+    r"\b(?:original|unfiltered)\s+(?:list|items?|data|rows?|table|values?"
+    r"|entries|text|order)\b|\b(?:every|each|all)\s+(?:the\s+)?original\b"
+    r"|\bfrom\s+the\s+(?:original|full)\s", re.IGNORECASE)
+
+
+def restarts_from_original(instruction: str) -> bool:
+    """Whether every press of the task starts from the ORIGINAL data."""
+    return bool(_FROM_ORIGINAL.search(instruction or ""))
+
+
+def _original_recipe(target: Target) -> str:
+    """How to keep the original, on this window's own list or table."""
+    held = [p for p in target.ports if p.binder in ("list", "table")]
+    if not held:
+        return (f"keep the data as it is on the first press in "
+                f"self.{PRIVATE_PREFIX}original (when getattr(self, "
+                f"\"{PRIVATE_PREFIX}original\", None) is None), and work "
+                f"from that copy on every press")
+    p = held[0]
+    read = "items()" if p.binder == "list" else "rows()"
+    return (f"on the first press keep the original — `if getattr(self, "
+            f"\"{PRIVATE_PREFIX}original\", None) is None: "
+            f"self.{PRIVATE_PREFIX}original = self.ports.{p.name}.{read}` — "
+            f"and work from self.{PRIVATE_PREFIX}original on every press")
+
+
 def _private_ok(attr: str) -> bool:
     """self._ai_<name>: the handler's own state between clicks."""
     rest = attr[len(PRIVATE_PREFIX):] if attr.startswith(PRIVATE_PREFIX) \
@@ -559,6 +607,10 @@ def _ports_block(target: Target, mention: Sequence[str] = ()) -> str:
                  f"start = time.monotonic()) and read it with getattr(self, "
                  f"\"{PRIVATE_PREFIX}start\", None) — never any other "
                  f"self.<name>.")
+    if restarts_from_original(target.instruction):
+        lines.append("Repeated presses start from the ORIGINAL data, never "
+                     "from what the last press left in the window: "
+                     + _original_recipe(target) + ".")
     return "\n".join(lines)
 
 
@@ -678,15 +730,42 @@ def hints_for(faults: Sequence[str], target: Target) -> List[str]:
         if h not in out:
             out.append(h)
 
+    modules = importable_modules(target)
     for name in re.findall(r"name '([A-Za-z_][A-Za-z0-9_]*)' is not defined"
                            r"|undefined name '([A-Za-z_][A-Za-z0-9_]*)'",
                            text):
         n = name[0] or name[1]
         if n in AUTO_IMPORTS:
             add(f"add `{AUTO_IMPORTS[n]}` inside the function")
+        elif n in modules:
+            # "define image_stats, or use a parameter" was the hint for
+            # `image_stats.image_pixel_stats(path)` — the very form K4's task
+            # words it in; all five of qwen2.5-coder's replies kept the call
+            # and never imported (2026-10-05).
+            add(f"add `import {n}` inside the function — {n} is one of the "
+                f"modules under YOU MAY IMPORT")
+        elif f"'{n}' — it is used as a module" in text:
+            add(f"{n} is used as a module but never imported: import it "
+                f"inside the function if it is under YOU MAY IMPORT, or use "
+                f"a module that is")
         else:
             add(f"define {n} before using it, or use one of the parameters "
                 f"({', '.join(p.name for p in target.params) or 'self.ports'})")
+    for attr in re.findall(r"has no attribute '(" + PRIVATE_PREFIX
+                           + r"[A-Za-z0-9_]+)'", text):
+        # The handler's own state, read on a press before any press set it:
+        # qwen2.5's K2 read self._ai_original_fruits on the FIRST press and
+        # got the bare AttributeError back with no hint, three repairs
+        # running — each returned the same code (2026-10-05).
+        add(f"self.{attr} does not exist until a press sets it: read it with "
+            f"getattr(self, \"{attr}\", None), and when that gives None, set "
+            f"it first (on the first press)")
+    if "start from the ORIGINAL data" in text:
+        add(_original_recipe(target))
+    if "raised again as ValueError" in text:
+        add("fix the line that failed; never turn a crash into ValueError — "
+            "catch only the error a bad input causes (e.g. `except "
+            "ValueError:` around int(text)), and let any other error raise")
     if "no port" in text and target.ports:
         add("the ports are exactly: "
             + ", ".join(p.name for p in target.ports))
@@ -1694,8 +1773,26 @@ def undefined_names(code: str, extra: Sequence[str] = ()) -> List[Tuple[str,
     return out
 
 
+def _used_as_module(tree: ast.AST) -> set:
+    """Names every read of which is `name.attr` — the way a module is
+    used (`image_stats.image_pixel_stats(path)`)."""
+    bases = {id(n.value) for n in ast.walk(tree)
+             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+    dotted, bare = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            (dotted if id(n) in bases else bare).add(n.id)
+    return dotted - bare
+
+
 def name_fixes(code: str, target: Target) -> Tuple[str, List[str], List[str]]:
-    """Gate 4: (code with safe imports added, faults, notes)."""
+    """Gate 4: (code with safe imports added, faults, notes).
+
+    A name that is a module the app may import, read as `name.function()`,
+    gets its import like `np` does — the form a task usually words it in
+    ("call image_stats.image_pixel_stats(path)"). Before, only the bare
+    `image_pixel_stats(path)` was fixed, and qwen2.5-coder's K4 spent all
+    five calls on the dotted one (2026-10-05)."""
     faults: List[str] = []
     notes: List[str] = []
     extra = list(target.module_names) + list(target.handlers)
@@ -1713,6 +1810,8 @@ def name_fixes(code: str, target: Target) -> Tuple[str, List[str], List[str]]:
                         and isinstance(n.ctx, ast.Store)}
                        | {a.arg for a in ast.walk(tree)
                           if isinstance(a, ast.arg)})
+    as_module = _used_as_module(tree)
+    modules = set(importable_modules(target))
     for name, line in missing:
         if name in AUTO_IMPORTS:
             imports.append(AUTO_IMPORTS[name])
@@ -1721,10 +1820,16 @@ def name_fixes(code: str, target: Target) -> Tuple[str, List[str], List[str]]:
             stmt = f"from {by_func[name][0]} import {name}"
             imports.append(stmt)
             notes.append(f"added `{stmt}`")
+        elif name in modules and name in as_module:
+            stmt = f"import {name}"
+            imports.append(stmt)
+            notes.append(f"added `{stmt}`")
         else:
             close = difflib.get_close_matches(name, all_bound, n=1,
                                               cutoff=0.8)
             faults.append(f"line {line}: undefined name '{name}'"
+                          + (" — it is used as a module but never imported"
+                             if name in as_module else "")
                           + (f" — did you mean '{close[0]}'?" if close
                              else ""))
     if imports and fn is not None and isinstance(fn, ast.FunctionDef):
@@ -2078,8 +2183,13 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
             else:
                 res.errors = [f"the model call failed: {exc!r}"]
             if best is not None:
+                # The best candidate's gate report, as when the rounds run
+                # out: a replay that runs out of recorded replies (or a
+                # model that stops answering) still says how far it got.
                 res.errors += best.faults
                 res.raw = best.raw
+                res.gates = [g.line() for g in best.gates]
+                res.smoke = best.smoke
                 res.best = best
             return
         res.attempts += 1

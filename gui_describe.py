@@ -870,6 +870,16 @@ def select_examples(text: str, *, mode: str = "pixel",
 #: would rank a right design below a wrong one and spend a repair round on
 #: it. Vague words — "area", "field", "panel", "display" on their own —
 #: are deliberately left out.
+#:
+#: "A log view" is a log_pane and nothing else. It used to accept a "text"
+#: too, while the benchmark's grader wants a log_pane — so phi3.5's and
+#: qwen2.5's C4 (a text box for "a large log view") passed Describe's check
+#: and failed the grade (2026-10-05). The grader is the one that is right:
+#: a text box is the user's to type in (readonly is off by default) and its
+#: port replaces the whole text on every .set(), while a log_pane is the
+#: read-only, auto-scrolling log whose port APPENDS one line — the widget
+#: the code behind a log monitor is written against. A design with a text
+#: box there now gets the repair round that names the log_pane.
 _REQUEST_WORDS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("radio buttons", r"radio\s?-?(?:buttons?|options?)", ("radiobutton",)),
     ("a checkbox", r"check\s?-?(?:box(?:es)?|buttons?)|tick\s?-?box(?:es)?",
@@ -892,16 +902,18 @@ _REQUEST_WORDS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
      r"|live\s+view|camera\s+view|video\s+(?:view|feed|preview)",
      ("image_canvas",)),
     ("a log view", r"log\s+(?:view|pane|panel|window|area|output)s?",
-     ("log_pane", "text")),
+     ("log_pane",)),
     ("a file or folder picker",
      r"(?:file|folder|directory)\s+(?:picker|chooser|selector)s?",
      ("file_picker",)),
     ("a multi-line text box",
      r"multi\s?-?\s?line(?:\s+\w+)?(?:\s+(?:box|area|field|text\s?box))?",
      ("text", "log_pane")),
+    # "a box to type a number" (S2) is a text box too: phi3.5 drew no
+    # entry there and Describe saw no gap.
     ("a text box",
      r"text\s?-?box(?:es)?|text\s+fields?|input\s+(?:box|field)s?"
-     r"|search\s+box(?:es)?",
+     r"|search\s+box(?:es)?|box(?:es)?\s+(?:to|for)\s+(?:typ|enter)\w*",
      ("entry", "text", "combobox", "spinbox")),
     ("a button", r"buttons?", ("button", "toolbar")),
 )
@@ -914,39 +926,236 @@ _REQUEST_RES = tuple((what, re.compile(r"\b(?:" + words + r")\b",
 _NEGATED = re.compile(r"\b(?:no|not|without)(?:\s+(?:a|an|any|the))?\s*$",
                       re.IGNORECASE)
 
+#: Named once per window however often the text mentions them — and "three
+#: tabs" is ONE notebook. Every other kind is counted.
+_UNCOUNTED = frozenset({"a status bar", "a menu bar", "a toolbar", "tabs"})
+_NUMBERS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+#: "two dropdowns", "three radio buttons", "2 large charts".
+_NUMBER_BEFORE = re.compile(r"\b(two|three|four|five|six|[2-6])\s+"
+                            r"(?:[a-z-]+\s+)?$", re.IGNORECASE)
+#: "a dropdown for X and a dropdown for Y": each "a"/"an" is one more —
+#: up to two words between, a quoted caption counting as one ("a 'Debug
+#: logging' checkbox", "a font size spin box").
+_ARTICLE_BEFORE = re.compile(r"\b(?:a|an|one|another)\s+(?:(?:'[^'\n]*'|"
+                             r"\"[^\"\n]*\"|[a-z-]+)\s+){0,2}$",
+                             re.IGNORECASE)
 
-def requested_widgets(text: Any) -> List[Tuple[str, Tuple[str, ...]]]:
-    """The widgets ``text`` names outright, as (what, kinds that count),
-    in the order of _REQUEST_WORDS, each at most once.
+#: A button's caption as a description gives it: a Capitalised word and up
+#: to two lower-case ones ("Scan for cameras", "Clear all", "OK"), or a
+#: quoted caption. Articles and number words are never captions ("Two
+#: buttons" asks for two buttons, not one called Two).
+_CAPTION = (r"(?:'[^'\n]{1,40}'|\"[^\"\n]{1,40}\""
+            r"|(?!(?:A|An|The|One|Two|Three|Four|Five|Six|Some|Several|Both"
+            r"|Each|All|More|Other)\b)[A-Z][\w/&+-]*"
+            r"(?:\s+(?!(?:and|or|buttons?)\b)[a-z][\w-]*){0,2})")
+#: "Scan for cameras and Connect buttons", "Start, Pause and Reset buttons",
+#: "a Plot button". Case-sensitive on purpose: only a Capitalised word or a
+#: quoted one is a caption. It runs after "radio buttons", "Check Button"
+#: and "toolbar" are blanked, so those never read as captions.
+_NAMED_BUTTONS = re.compile(
+    r"(?<![\w'\"])(" + _CAPTION + r"(?:\s*,\s*" + _CAPTION + r")*"
+    r"(?:\s*,?\s+(?:and|or)\s+" + _CAPTION + r")?)\s+[Bb]uttons?\b")
+_CAPTION_SPLIT = re.compile(r"\s*,?\s+(?:and|or)\s+|\s*,\s*")
+
+_ORDINALS = ("", "first", "second", "third", "fourth", "fifth", "sixth")
+
+
+@dataclass(frozen=True)
+class Wanted:
+    """One widget the description names outright.
+
+    ``what`` is said to a person and a model alike ("a dropdown"),
+    ``kinds`` are the kinds that answer it, ``count`` how many the text
+    asks for ("two dropdowns"; "a dropdown for X and a dropdown for Y"),
+    and ``name`` the caption a button must carry ("Scan for cameras" in
+    "Scan for cameras and Connect buttons")."""
+    what: str
+    kinds: Tuple[str, ...]
+    count: int = 1
+    name: str = ""
+    #: The words that named it — a shape whose caption says them but whose
+    #: kind does not answer is pointed out (llama3.1:8b's C3: a labelframe
+    #: titled "Frame slider" holding a spin box, four rounds running).
+    words: Optional["re.Pattern[str]"] = field(default=None, compare=False,
+                                               repr=False)
+
+
+def _mentions(prefix: str) -> int:
+    """How many widgets one match stands for, from the text before it."""
+    num = _NUMBER_BEFORE.search(prefix)
+    if num:
+        word = num.group(1).lower()
+        return _NUMBERS.get(word) or int(word)
+    return 1 if _ARTICLE_BEFORE.search(prefix) else 0
+
+
+def _named_buttons(s: str, out: List[Wanted]) -> str:
+    """Append a Wanted per button caption ``s`` names; ``s`` with those
+    phrases blanked, so the bare "button" in them is not read again."""
+    def blank(m: "re.Match[str]") -> str:
+        if not _NEGATED.search(s[max(0, m.start() - 16):m.start()]):
+            for cap in _CAPTION_SPLIT.split(m.group(1)):
+                cap = cap.strip().strip("'\"").strip()
+                if cap and not any(w.name.lower() == cap.lower()
+                                   for w in out if w.name):
+                    out.append(Wanted(f"a button labelled '{cap}'",
+                                      ("button", "toolbar"), 1, cap))
+        return " " * len(m.group(0))
+    return _NAMED_BUTTONS.sub(blank, s)
+
+
+def requested_widgets(text: Any) -> List[Wanted]:
+    """The widgets ``text`` names outright, in the order of _REQUEST_WORDS,
+    each kind at most once — with how many it asks for, and one Wanted per
+    button it names by its caption.
 
     A word match, like select_examples: dumb, predictable, testable. It is
     used only to RANK valid designs and to say what a repair round should
-    add — a design is never refused because of it (see _describe)."""
+    add — a design is never refused because of it (see _describe).
+
+    Kinds alone were not enough: qwen2.5's C1 repair dropped the "Scan for
+    cameras" and "Connect" buttons the description names, kept Start/Stop
+    capture, and was accepted as complete because A button was there; best-
+    of-N then preferred it to the candidate that had both (2026-10-05)."""
     s = str(text or "")
-    out: List[Tuple[str, Tuple[str, ...]]] = []
+    out: List[Wanted] = []
     for what, rx, kinds in _REQUEST_RES:
+        if what == "a button":
+            s = _named_buttons(s, out)
         found = False
+        count = 0
 
         def blank(m: "re.Match[str]") -> str:
-            nonlocal found
-            if not _NEGATED.search(s[max(0, m.start() - 16):m.start()]):
+            nonlocal found, count
+            before = s[max(0, m.start() - 40):m.start()]
+            if not _NEGATED.search(before[-16:]):
                 found = True
+                count += _mentions(before)
             return " " * len(m.group(0))
 
         s = rx.sub(blank, s)
         if found:
-            out.append((what, kinds))
+            n = 1 if what in _UNCOUNTED else max(1, count)
+            out.append(Wanted(what, kinds, n, words=rx))
     return out
 
 
-def missing_widgets(shapes: Sequence[Shape],
-                    wanted: Sequence[Tuple[str, Tuple[str, ...]]]
+def _caption(shape: Any) -> str:
+    props = getattr(shape, "props", {}) or {}
+    return " ".join(str(t) for t in (getattr(shape, "label", "") or "",
+                                     props.get("text") or "") if t).strip()
+
+
+def _answering(shapes: Sequence[Shape], kinds: Sequence[str]) -> int:
+    """How many widgets of ``kinds`` the design has; a toolbar answering
+    "a button" counts each of its buttons."""
+    n = 0
+    for s in shapes:
+        if s.kind not in kinds:
+            continue
+        buttons = (getattr(s, "props", {}) or {}).get("buttons")
+        if s.kind == "toolbar" and "button" in kinds and \
+                isinstance(buttons, list):
+            n += max(1, len(buttons))
+        else:
+            n += 1
+    return n
+
+
+def _button_captions(shapes: Sequence[Shape]) -> List[str]:
+    """Every caption a person could press, lower-cased: each button, each
+    toolbar button, and a file picker's built-in "Browse"."""
+    out: List[str] = []
+    for s in shapes:
+        if s.kind == "button":
+            out.append(_caption(s).lower())
+        elif s.kind == "toolbar":
+            for b in (getattr(s, "props", {}) or {}).get("buttons") or []:
+                if isinstance(b, dict):
+                    b = b.get("text") or b.get("label") or ""
+                out.append(str(b).lower())
+        elif s.kind == "file_picker":
+            out.append("browse")
+    return out
+
+
+def _says(caption: str, name: str) -> bool:
+    """Whether ``caption`` carries the first word of ``name``: "Clear" is a
+    "Clear all" button, "Scan" a "Scan for cameras" one."""
+    first = re.findall(r"\w+", name.lower())
+    return bool(first) and re.search(
+        rf"(?<![a-z0-9]){re.escape(first[0])}(?![a-z0-9])", caption) \
+        is not None
+
+
+def _unanswered(names: Sequence[str], captions: Sequence[str]) -> List[int]:
+    """Indexes of ``names`` no caption answers, each caption answering at
+    most one name — "Clear" and "Clear log" are two buttons. A matching by
+    augmenting paths, so the order the names come in cannot lose one."""
+    owner: Dict[int, int] = {}
+
+    def take(i: int, seen: set) -> bool:
+        for j, cap in enumerate(captions):
+            if j in seen or not _says(cap, names[i]):
+                continue
+            seen.add(j)
+            if j not in owner or take(owner[j], seen):
+                owner[j] = i
+                return True
+        return False
+
+    return [i for i in range(len(names)) if not take(i, set())]
+
+
+def _plural(noun: str) -> str:
+    return noun + ("es" if noun.endswith(("x", "s", "sh", "ch")) else "s")
+
+
+def _gap(w: Wanted, have: int, shapes: Sequence[Shape]) -> str:
+    """One requested widget the design lacks, phrased for a person and a
+    model alike: "a progress bar (progressbar)", "a second dropdown
+    (combobox)"."""
+    kinds = " or ".join(w.kinds)
+    article, _sp, noun = w.what.partition(" ")
+    if article not in ("a", "an"):
+        noun = ""
+    missing = w.count - have
+    if have == 0 and w.count == 1:
+        text = f"{w.what} ({kinds})"
+    elif have == 0:
+        text = f"{w.count} {_plural(noun) if noun else w.what} ({kinds})"
+    elif missing == 1 and noun and have + 1 < len(_ORDINALS):
+        text = f"a {_ORDINALS[have + 1]} {noun} ({kinds})"
+    else:
+        text = (f"{missing} more {_plural(noun) if noun else w.what} "
+                f"({kinds})")
+    if have == 0 and w.words is not None:
+        for s in shapes:
+            cap = _caption(s)
+            if s.kind not in w.kinds and cap and w.words.search(cap):
+                text += f" — '{cap}' is a {s.kind}, not {w.what}"
+                break
+    return text
+
+
+def missing_widgets(shapes: Sequence[Shape], wanted: Sequence[Wanted]
                     ) -> List[str]:
-    """Each requested widget no shape answers, phrased for a person and a
-    model alike: "a progress bar (progressbar)"."""
-    have = {getattr(s, "kind", "") for s in shapes}
-    return [f"{what} ({' or '.join(kinds)})" for what, kinds in wanted
-            if not have.intersection(kinds)]
+    """Each requested widget the design does not answer, in the order the
+    description names them: a kind with no shape, fewer shapes than the
+    text counts, a button caption no button carries."""
+    named = [w for w in wanted if w.name]
+    lost = {id(named[i]) for i in _unanswered(
+        [w.name for w in named], _button_captions(shapes))} if named else set()
+    out: List[str] = []
+    for w in wanted:
+        if w.name:
+            if id(w) in lost:
+                out.append(f"{w.what} ({' or '.join(w.kinds)})")
+            continue
+        have = _answering(shapes, w.kinds)
+        if have < w.count:
+            out.append(_gap(w, have, shapes))
+    return out
 
 
 def example_wireframe(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H

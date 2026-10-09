@@ -10,6 +10,7 @@ test_designer_codebehind.py proves the whole thing on a real project.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import time
 from pathlib import Path
@@ -1120,3 +1121,137 @@ def test_the_same_failure_twice_stops_the_retries():
     model = Script(RuntimeError("boom"), RuntimeError("boom"), GOOD)
     res = gcb.write(fn_target(), model, n_best=3)
     assert not res.ok and len(model.calls) == 2 and "boom" in res.errors[0]
+
+
+# ============================================================
+# The 2026-10-05 benchmark, replayed: recorded replies, no model
+# ============================================================
+
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+CASES = {c["id"]: c for c in json.loads(
+    (ROOT / "tests" / "data" / "llm_bench" / "code_cases.json").read_text(
+        encoding="utf-8"))["cases"]}
+K2_ROWS = [gcb.PortRow("search", "entry", "str", "var", "", "Search"),
+           gcb.PortRow("fruits", "listbox", "str", "list", "", "Fruits"),
+           gcb.PortRow("count", "label", "str", "var", "", "Count"),
+           gcb.PortRow("filter", "button", "event", "event", "", "Filter")]
+
+
+def k2_target(**kw) -> gcb.Target:
+    return h_target(name="on_btn_filter", label="Filter",
+                    instruction=CASES["K2"]["task"], ports=list(K2_ROWS),
+                    handlers=["on_btn_filter", "on_close"], **kw)
+
+
+def k4_target(**kw) -> gcb.Target:
+    return fn_target(
+        name="analyze", label="Analyze",
+        instruction=CASES["K4"]["codebehind"]["instruction"],
+        params=[gcb.Param("image_path", "str", "image_path", "file_picker",
+                          'a file path the user picked in "Image"', "<PNG>")],
+        outputs=[gcb.Output("brightness", "brightness", "label", "text"),
+                 gcb.Output("size", "size", "label", "text")],
+        shortlist=[gcb.Ref("image_stats", "image_pixel_stats",
+                           "image_pixel_stats(path)", params=("path",),
+                           required=1)], **kw)
+
+
+def test_an_app_module_called_as_module_dot_function_gets_its_import():
+    """qwen2.5-coder's K4: all five replies called
+    image_stats.image_pixel_stats(image_path) — the task's own wording —
+    without importing image_stats, and gate 4 sent each one back."""
+    cand = gcb.check(RECORDED["code"]["qwen2.5-coder K4 1"], k4_target(),
+                     catalogue)
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+    assert "added `import image_stats`" in cand.notes
+    assert "    import image_stats" in cand.code
+    ast.parse(cand.code)
+
+
+def test_the_hint_for_an_unimported_app_module_is_to_import_it():
+    """The old hint — "define image_stats before using it, or use one of
+    the parameters (image_path)" — pointed away from the fix."""
+    hints = gcb.hints_for(["line 7: undefined name 'image_stats'"],
+                          k4_target())
+    assert hints[0].startswith("add `import image_stats` inside the "
+                               "function")
+    assert not any("define image_stats" in h for h in hints)
+
+
+def test_a_module_the_app_may_not_import_is_named_as_a_module():
+    reply = fence('''
+def count_images(folder):
+    img = cv2.imread(folder)
+    return {"status": str(img), "files": []}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_NAMES
+    assert "it is used as a module but never imported" in cand.faults[0]
+    assert "import cv2" not in cand.code
+    hints = gcb.hints_for(cand.faults, fn_target())
+    assert any(h.startswith("cv2 is used as a module but never imported")
+               for h in hints), hints
+
+
+def test_handler_state_read_before_any_press_set_it_gets_a_hint():
+    """qwen2.5's K2: self._ai_original_fruits read on the FIRST press. The
+    bare AttributeError went back with no HOW TO FIX, and the model
+    returned the same code three times."""
+    fault = ("smoke run raised AttributeError: 'SmokeApp' object has no "
+             "attribute '_ai_original_fruits' (at handlers.py:26: "
+             "filtered_items = [item for item in self._ai_original_fruits]")
+    model = Script(RECORDED["code"]["qwen2.5 K2 2"],
+                   RECORDED["code"]["phi4:14b K2 1"])
+    res = gcb.write(k2_target(), model, smoke=Smoke(fault, None),
+                    max_repairs=1)
+    assert res.ok and len(model.calls) == 2, res.errors
+    repair = model.calls[1]["prompt"]
+    assert "HOW TO FIX" in repair
+    assert 'getattr(self, "_ai_original_fruits", None)' in repair
+
+
+def test_a_crash_relabelled_as_a_value_error_gets_its_own_hint():
+    fault = ("smoke run raised ValueError: Invalid format specifier — caught "
+             "by `except Exception` and raised again as ValueError; a refusal "
+             "is for input the user can fix, not for a crash in the code "
+             "(at logic.py:8: file.write(...))")
+    hints = gcb.hints_for([fault], fn_target())
+    assert any("never turn a crash into ValueError" in h for h in hints)
+    assert not any("do not catch Exception and carry on" in h
+                   for h in hints), "the policy hint invites the wrapper"
+
+
+def test_a_task_that_starts_from_the_original_data_is_told_so():
+    """K2 says "the ORIGINAL list"; 4 of 5 models filtered what the last
+    press left. The prompt now says how to keep the original."""
+    assert gcb.restarts_from_original(CASES["K2"]["task"])
+    for cid in ("K1", "K3", "K5", "K6", "K7", "K8"):
+        assert not gcb.restarts_from_original(CASES[cid]["task"]), cid
+    prompt, _shed = gcb.build_prompt(k2_target())
+    assert "Repeated presses start from the ORIGINAL data" in prompt
+    assert "self._ai_original = self.ports.fruits.items()" in prompt
+    plain, _shed = gcb.build_prompt(h_target())
+    assert "ORIGINAL data" not in plain
+
+
+def test_a_model_that_stops_answering_leaves_the_best_gate_report():
+    """A replay that runs out of recorded replies said only "the model call
+    failed" — not how far the best candidate got."""
+    bad = fence('''
+def count_images(folder):
+    return {"status": str(len(os.listdir(folder)))}''')
+    res = gcb.write(fn_target(), Script(bad, RuntimeError("ran out")),
+                    smoke=Smoke(None))
+    assert not res.ok and "the model call failed" in res.errors[0]
+    assert any(g.startswith("references: FAILED") for g in res.gates), \
+        res.gates
+
+
+def test_a_repeated_press_fault_is_repaired_with_the_recipe():
+    fault = ("smoke run: pressed with search='', then with search='sample', "
+             "then with search='' again, it set fruits to [] the third time "
+             "but to ['alpha', 'beta'] the first — each press must start "
+             "from the ORIGINAL data, not from what the last press left")
+    hints = gcb.hints_for([fault], k2_target())
+    assert any("self._ai_original = self.ports.fruits.items()" in h
+               for h in hints), hints

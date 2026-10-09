@@ -14,6 +14,7 @@ Pillow or matplotlib must load first).
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -131,6 +132,168 @@ def f(folder):
 """, ["<FOLDER>"], {"count": "text"})
     assert r.ok
     assert "ValueError" in r.soft
+
+
+# ---- a crash relabelled as a refusal -------------------------------------
+
+RECORDED = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "recorded_2026-10-05.json").read_text(encoding="utf-8"))
+
+
+def recorded_code(key: str) -> str:
+    """The code inside one recorded reply's ```python fence."""
+    reply = RECORDED["code"][key]
+    return reply.split("```python", 1)[-1].split("```", 1)[0].strip("\n")
+
+
+def test_broad_handler_at_reads_the_innermost_handler():
+    src = """def f(x):
+    try:
+        return int(x)
+    except Exception as e:
+        raise ValueError(f"bad: {e}")
+
+
+def g(x):
+    try:
+        return int(x)
+    except ValueError:
+        raise ValueError("Age must be a whole number")
+
+
+def h(x):
+    try:
+        try:
+            return int(x)
+        except ValueError:
+            raise ValueError("inner")
+    except:
+        raise ValueError("outer")
+"""
+    assert gui_smoke.broad_handler_at(src, 5) == "except Exception"
+    assert gui_smoke.broad_handler_at(src, 12) == ""
+    assert gui_smoke.broad_handler_at(src, 20) == ""
+    assert gui_smoke.broad_handler_at(src, 22) == "except:"
+    assert gui_smoke.broad_handler_at(src, 3) == ""
+    assert gui_smoke.raises_at(src, 5) and not gui_smoke.raises_at(src, 3)
+
+
+def test_a_crash_a_catch_all_raises_again_as_value_error_is_a_fault():
+    """qwen2.5's K7 (2026-10-05), as recorded: `except Exception as e:
+    raise ValueError(f"Failed to save: {e}")` around an f-string that
+    itself raised. The run called it a deliberate refusal, the writer
+    accepted it, and the hidden test read an empty file."""
+    r = function(recorded_code("qwen2.5 K7 4"),
+                 ["sample", 3, True, "<SAVE>"], {"status": "text"},
+                 name="save")
+    assert not r.ok and not r.soft
+    assert "Invalid format specifier" in r.error
+    assert "raised again as ValueError" in r.error
+    assert r.where == "logic.py:8" and "file.write" in r.line_text
+
+
+def test_a_refusal_the_code_raised_itself_stays_one_under_a_catch_all():
+    """qwen2.5-coder's K4 shape: `raise ValueError(result["error"])` inside
+    the try, relabelled by `except Exception: raise ValueError(str(e))`."""
+    r = function("""
+def f(folder):
+    try:
+        result = {"error": "no frames in " + folder}
+        if "error" in result:
+            raise ValueError(result["error"])
+        return {"count": "1"}
+    except Exception as e:
+        raise ValueError(str(e))
+""", ["<FOLDER>"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "no frames" in r.soft
+
+
+def test_a_refusal_from_a_handler_that_names_its_error_stays_one():
+    r = function("""
+def f(age):
+    try:
+        return {"count": str(int(age))}
+    except ValueError:
+        raise ValueError("Age must be a whole number")
+""", ["thirty"], {"count": "text"})
+    assert r.ok, r.summary()
+    assert "whole number" in r.soft
+
+
+def test_in_a_handler_a_crash_raised_again_as_value_error_is_a_fault():
+    """The same, through the failure envelope handler mode wraps a body in
+    (report_error decides it there)."""
+    r = handler("""
+    def on_btn_go(self, *args) -> None:
+        try:
+            try:
+                self.ports.status.set(f'{"n": 1}')
+            except Exception as e:
+                raise ValueError(f"Failed: {e}")
+        except Exception as exc:
+            self.report_error("Go", exc)
+""")
+    assert not r.ok and not r.soft
+    assert "raised again as ValueError" in r.error
+    assert r.where == "handlers.py:8" and "status.set" in r.line_text
+
+
+# ---- repeated presses: every press from the ORIGINAL data ----------------
+
+K2_PORTS = [
+    {"name": "search", "kind": "entry", "type": "str", "binder": "var",
+     "sample": "sample", "sample2": ""},
+    {"name": "fruits", "kind": "listbox", "type": "str", "binder": "list",
+     "sample": ["alpha", "beta"], "sample2": []},
+    {"name": "count", "kind": "label", "type": "str", "binder": "var"},
+    {"name": "filter", "kind": "button", "type": "event", "binder": "event"},
+]
+
+
+def k2_press(key: str, ports=None) -> gui_smoke.SmokeResult:
+    body = "\n".join("    " + ln if ln.strip() else ""
+                     for ln in recorded_code(key).split("\n"))
+    return gui_smoke.smoke_handler(HEAD + body + "\n", "on_btn_filter",
+                                   ports or K2_PORTS, app_root=ROOT,
+                                   timeout=8)
+
+
+@pytest.mark.parametrize("key", ["llama3.1:8b K2 1", "qwen2.5-coder K2 1"])
+def test_a_handler_that_filters_what_the_last_press_left_is_caught(key):
+    """K2 (2026-10-05): one press passed the smoke run for both; each
+    filtered the list the previous press had left, and failed the hidden
+    test ("'AN' must search the ORIGINAL list")."""
+    r = k2_press(key)
+    assert not r.ok, r.summary()
+    assert any("each press must start from the ORIGINAL data" in p
+               for p in r.problems), r.problems
+
+
+def test_one_press_still_cannot_tell():
+    """Without a second sample (a task that never says ORIGINAL) the run is
+    the single press it always was."""
+    plain = [{k: v for k, v in p.items() if k != "sample2"} for p in K2_PORTS]
+    assert k2_press("llama3.1:8b K2 1", plain).ok
+
+
+def test_a_handler_that_keeps_the_original_passes_the_repeated_presses():
+    """phi4:14b's K2 — the one model that passed the hidden test."""
+    r = k2_press("phi4:14b K2 1")
+    assert r.ok, r.summary()
+
+
+def test_ports_keep_what_a_press_set():
+    """The fake window has state now: a listbox's items are what the last
+    press set, as in the real one."""
+    r = handler("""
+    def on_btn_go(self, *args) -> None:
+        self.ports.names.set(["one"])
+        self.ports.status.set(",".join(self.ports.names.items()))
+        if self.ports.status.get() != "one":
+            raise RuntimeError("the label did not keep its text")
+""")
+    assert r.ok, r.summary()
 
 
 # ============================================================
