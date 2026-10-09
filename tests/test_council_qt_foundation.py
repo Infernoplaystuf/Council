@@ -222,6 +222,86 @@ def test_disabled_text_is_distinct(qapp):
     assert normal != disabled
 
 
+def test_the_theme_the_app_already_wears_is_not_put_on_again(qapp):
+    """Dressing the app re-polishes EVERY widget in the process and queues six
+    layout calls for each combo box's list. Found running the whole suite in
+    one process: launch.build dresses the app on every call, and with the
+    ~50,000 widgets the suite leaves alive each build took ~20 s, and the
+    calls queued by test_launch's builds (~197,000) took 390 s to drain in
+    its last processEvents — the run was killed there. Measured on its own:
+    one apply over 1,500 combo boxes queues 9,000 calls."""
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import QComboBox
+
+    theme.apply(qapp, "dark")
+    combos = []
+    for _ in range(10):
+        combo = QComboBox()
+        combo.addItems(["a", "b", "c"])
+        combos.append(combo)
+    views = [combo.view() for combo in combos]
+    qapp.processEvents()
+    queued = []
+
+    class Spy(QObject):
+        def eventFilter(self, obj, event):
+            if (event.type() == QEvent.Type.MetaCall
+                    and any(obj is view for view in views)):
+                queued.append(obj)
+            return False
+
+    spy = Spy()
+    qapp.installEventFilter(spy)
+    try:
+        theme.apply(qapp, "dark")
+        qapp.processEvents()
+    finally:
+        qapp.removeEventFilter(spy)
+        for combo in combos:
+            combo.deleteLater()
+        qapp.processEvents()
+    assert not queued, (
+        f"the same theme was put on again: {len(queued)} layout calls queued "
+        f"for 10 combo boxes")
+
+
+def test_a_theme_that_changed_underneath_is_put_back(qapp, monkeypatch):
+    """Skipping is only for an app that still wears exactly this theme: a
+    different theme, a stylesheet or palette changed by someone else, or
+    another style set underneath, and it is applied in full."""
+    from PySide6.QtGui import QPalette
+
+    def window_lightness():
+        return qapp.palette().color(QPalette.ColorRole.Window).lightness()
+
+    try:
+        theme.apply(qapp, "dark")
+        theme.apply(qapp, "light")
+        assert window_lightness() > 127, "the light theme was not applied"
+        theme.apply(qapp, "dark")
+        assert window_lightness() < 128, "dark was not put back"
+
+        qapp.setStyleSheet("")
+        theme.apply(qapp, "dark")
+        assert qapp.styleSheet() == theme.stylesheet("dark")
+
+        qapp.setPalette(theme.palette("light"))
+        theme.apply(qapp, "dark")
+        assert qapp.palette() == theme.palette("dark")
+
+        qapp.setStyle("Windows")
+        styles = []
+        real_set_style = qapp.setStyle
+        monkeypatch.setattr(qapp, "setStyle",
+                            lambda style: (styles.append(style),
+                                           real_set_style(style))[1])
+        theme.apply(qapp, "dark")
+        assert styles == ["Fusion"], "a style set underneath was kept"
+    finally:
+        monkeypatch.undo()
+        theme.apply(qapp, "dark")             # leave the session as we found it
+
+
 # ------------------------------------------------------------- the tab host
 
 def test_tabs_are_built_lazily_and_only_once(qapp):

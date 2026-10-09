@@ -480,6 +480,25 @@ def test_the_tabs_are_registered_before_the_reveal(qapp, monkeypatch):
         f"the window was revealed before its tabs existed: {seen}")
 
 
+def test_a_second_launch_in_one_process_leaves_the_app_dressed(qapp,
+                                                               monkeypatch):
+    """Every build() used to dress the app again (theme.apply), re-polishing
+    every widget in the process. One launch per process never noticed; this
+    file builds ~30 times inside the suite's one process, where that was
+    ~20 s a build and a queue of ~197,000 layout calls that its last
+    processEvents spent 390 s draining — the full run was killed there."""
+    build()
+    styles = []
+    real_set_style = qapp.setStyle
+    monkeypatch.setattr(qapp, "setStyle",
+                        lambda *args: (styles.append(args),
+                                       real_set_style(*args))[1])
+    assert QApplication.instance() is qapp
+    build()
+    build()
+    assert styles == [], f"the app was dressed again: {styles}"
+
+
 def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
     """A launch that resolves a vault path and then fails on every read because
     nothing made the directory is a worse first run than no vault at all."""
