@@ -73,10 +73,12 @@ from collections import deque
 from typing import (Any, Callable, Deque, Dict, List, Optional, Sequence,
                     Tuple)
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (QEvent, QObject, QRectF, QSize, Qt, QTimer,
+                            Signal)
 from PySide6.QtGui import (QColor, QKeySequence, QPainter, QPalette,
                            QShortcut)
-from PySide6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QCheckBox,
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractSlider,
+                               QAbstractSpinBox, QCheckBox,
                                QComboBox, QDoubleSpinBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
@@ -378,6 +380,35 @@ class RangeSlider(QSlider):
         painter.end()
 
 
+class WheelGuard(QObject):
+    """THE WHEEL SCROLLS THE PAGE, NOT THE CONTROL IT PASSES OVER.
+
+    A tab and a pop-out are scrolling columns of sliders, boxes and lists,
+    and Qt gives a wheel turn to the control under the pointer: measured at
+    1400 x 820, wheeling down the Filters tab moved the trail filter's
+    threshold 10000 -> 8706 µs on the camera and the page never moved; one
+    notch over the pixel format changed it (on a Basler, a stream restart).
+
+    So a control takes the wheel only once it has been clicked or tabbed to
+    (focus) — otherwise the turn is ignored, and Qt hands it to the parents,
+    the scroll area among them. A setting the stream is in the way of is
+    never written from the wheel at all: each notch would restart the live
+    view. One guard per row, for its slider and its editor."""
+
+    def __init__(self, row: "SettingRow"):
+        super().__init__(row)
+        self.row = row
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and (
+                not self.row.live or not watched.hasFocus()):
+            # Ignored, not swallowed: QApplication.notify passes an
+            # ignored wheel event on to the parent widget.
+            event.ignore()
+            return True
+        return False
+
+
 class SettingRow(QObject):
     """The widgets of one setting in its group's grid: label, slider, editor
     (with the unit), a reset button, and a note under them.
@@ -451,6 +482,14 @@ class SettingRow(QObject):
         self.label.setToolTip(self._tooltip())
         grid.addWidget(self.label, row, 0)
         self._build(grid, row, parent)
+        self._wheel = WheelGuard(self)
+        for widget in (self.slider, self.editor):
+            if isinstance(widget, (QAbstractSlider, QAbstractSpinBox,
+                                   QComboBox)):
+                # Click or Tab gives it the wheel; a wheel turn never does
+                # (a spin box and a list take focus from the wheel itself).
+                widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                widget.installEventFilter(self._wheel)
         last = 3
         if show_range:
             last = 4

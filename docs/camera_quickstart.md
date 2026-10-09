@@ -717,6 +717,14 @@ most-used settings, compactly, and says how many more there are
 value at most every 60 ms while it moves and always the last one, so the
 live picture follows the drag; what the camera took is what is shown.
 
+**The mouse wheel scrolls the tab** (and a pop-out), whatever is under the
+pointer: a slider, box or list takes the wheel only **once you have clicked
+it** (or reached it with Tab). Before, wheeling down the Filters tab moved
+the trail filter's threshold on the camera instead of the page, and one
+notch over the pixel format changed it. A setting that restarts the live
+view (pixel format, mirror, binning) never changes from the wheel at all —
+pick it from its list.
+
 **Display — what an event picture looks like.** The live view used only the
 defaults; these are now settings of the event camera (the simulated event
 camera has them too):

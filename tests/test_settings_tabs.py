@@ -897,6 +897,124 @@ def test_a_setting_the_stream_is_in_the_way_of_is_written_on_release(qapp):
     host.deleteLater()
 
 
+def wheel(widget, at, notches=-1):
+    """`notches` of the mouse wheel on `widget` at `at` (its own pixels),
+    delivered as a real one is: QApplication.notify gives a turn of the
+    wheel to the widget under the pointer, then to each parent in turn
+    while it is ignored. It does that walk only for the system's own
+    (spontaneous) events — one sent from code stops at the first widget —
+    so the walk is done here. Returns the widget that took it, or None."""
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    point = QPointF(at)
+    while widget is not None:
+        event = QWheelEvent(point, QPointF(widget.mapToGlobal(point)),
+                            QPoint(0, 0), QPoint(0, 120 * notches),
+                            Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier,
+                            Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(widget, event)
+        if event.isAccepted():
+            return widget
+        if widget.isWindow():
+            return None
+        point += QPointF(widget.pos())
+        widget = widget.parentWidget()
+    return None
+
+
+def focus(widget):
+    """Click focus, offscreen: a window drawn with WA_DontShowOnScreen is
+    never made active by activateWindow, and an inactive window gives no
+    widget focus."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        QApplication.setActiveWindow(widget.window())
+    widget.setFocus(Qt.FocusReason.MouseFocusReason)
+    pump(0.05)
+    assert widget.hasFocus()
+
+
+def test_the_wheel_scrolls_a_tab_and_never_changes_what_it_passes_over(
+        clean, typhon_dir, evk4):
+    """MEASURED (review, 2026-10-08): at 1400 x 820 the Filters tab has to
+    be scrolled, and wheeling over the middle of it moved a slider instead —
+    the trail filter's threshold went 10000 -> 8706 µs on the camera and
+    the page did not move. A slider, a box or a list under the pointer now
+    takes the wheel only once it has been clicked (focus)."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QScrollArea
+
+    ui = construct(typhon_dir)
+    ui.resize(1400, 820)
+    offscreen_show(ui)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    page = tabs.page("Filters")
+    tabs.book.setCurrentWidget(page)
+    pump(0.1)
+    area = page.findChild(QScrollArea)
+    bar = area.verticalScrollBar()
+    assert bar.maximum() > 0, "nothing to scroll: this proves nothing"
+    shown = {k: r.setting.get("value") for k, r in tabs.rows.items()}
+    camera = (evk4.trail.get_threshold(), evk4.afk.get_band_low_frequency(),
+              evk4.erc.get_cd_event_rate(), dict(evk4.biases.values))
+    viewport = area.viewport()
+    under = set()
+    for x in (60, 200, 330):
+        bar.setValue(0)
+        for _ in range(4):
+            point = QPoint(x, viewport.height() // 2)
+            target = viewport.childAt(point) or viewport
+            under.add(type(target).__name__)
+            wheel(target, target.mapFrom(viewport, point))
+            pump(0.02)
+        assert bar.value() > 0, f"the page did not scroll (x={x})"
+    tabs.flush_now()
+    pump(0.1)
+    assert under & {"RangeSlider", "QSpinBox", "QDoubleSpinBox",
+                    "QComboBox"}, f"never over a control: {under}"
+    assert (evk4.trail.get_threshold(), evk4.afk.get_band_low_frequency(),
+            evk4.erc.get_cd_event_rate(), dict(evk4.biases.values)) == camera
+    assert {k: r.setting.get("value") for k, r in tabs.rows.items()} == shown
+
+    # Clicked first (focus), a live setting's slider still takes the wheel.
+    row = tabs.rows["trail.threshold"]
+    focus(row.slider)
+    assert wheel(row.slider, row.slider.rect().center()) is row.slider
+    tabs.flush_now()
+    assert evk4.trail.get_threshold() != camera[0]
+    ui.hide()
+
+
+def test_the_wheel_never_writes_a_setting_that_restarts_the_live_view(
+        clean, typhon_dir):
+    """One notch over the Image tab's pixel format changed it Mono8 ->
+    Mono12 (review) — on a Basler a stream restart, for a scroll. A setting
+    the stream is in the way of is never written from the wheel, clicked
+    or not."""
+    ui = construct(typhon_dir)
+    ui.resize(1400, 820)
+    offscreen_show(ui)
+    connect(ui, "frame")
+    tabs = tabs_of(ui)
+    tabs.book.setCurrentWidget(tabs.page("Image"))
+    assert pump(1.0, until=lambda: not tabs.rows["PixelFormat"].live)
+    combo = tabs.rows["PixelFormat"].editor
+    for focused in (False, True):
+        if focused:
+            focus(combo)
+        assert wheel(combo, combo.rect().center()) is not combo
+        tabs.flush_now()
+        pump(0.2)
+        assert combo.currentText() == "Mono8"
+        assert device().state["PixelFormat"] == "Mono8"
+    ui.hide()
+
+
 # ======================================================================
 # Saving a configuration
 # ======================================================================
