@@ -18,7 +18,7 @@ from quant_duel import config as cfgmod
 from quant_duel.check import run_checks
 from quant_duel.llm.client import LLMError
 from quant_duel.llm.server import is_up, llm_server
-from quant_duel.scheduler import plan, run_due
+from quant_duel.scheduler import due, plan, run_due
 
 from .conftest import ROOT
 
@@ -134,12 +134,20 @@ def test_run_due_runs_jobs_in_order_and_logs(root):
     assert calls[0][-3:] == ["--node", "A", "daily"]
     log = (root / "logs" / "A.log").read_text()
     assert "run daily" in log and "daily | ok daily" in log
-    # news-poll time is remembered
-    done = run_due(cfg, now=at(TUE, 10, 5), runner=runner)
+    # the last poll is read from the news store, whoever ran it
+    from quant_duel.news.store import NewsStore
+
+    def polling_runner(cmd, timeout):
+        s = NewsStore(root / "data" / "A" / "news.sqlite")
+        s.conn.execute("INSERT INTO polls VALUES (?,?,?,?,?)",
+                       (at(TUE, 10, 5).astimezone(dt.timezone.utc)
+                        .isoformat(), "ticker:AAPL", 3, 3, None))
+        s.close()
+        return 0, "polled"
+    done = run_due(cfg, now=at(TUE, 10, 5), runner=polling_runner)
     assert [d["job"] for d in done] == ["news-poll"]
-    state = json.loads((root / "data" / "A" / "schedule.json").read_text())
-    assert state["news-poll"].startswith("2026-10-06T10:05")
     assert run_due(cfg, now=at(TUE, 10, 20), runner=runner) == []
+    assert [j["job"] for j in due(cfg, at(TUE, 11, 10))] == ["news-poll"]
 
 
 def test_a_failed_daily_stops_the_report(root):
@@ -312,3 +320,57 @@ def test_deployment_files():
     for must in ("SSD", "llama-server", "enable-linger", "Warm-up",
                  "start checklist", "experiment-init", "sync-exports"):
         assert must in doc, must
+
+
+# ============================================================
+# Hooks for a host (the Council)
+# ============================================================
+
+def test_env_overrides_point_the_llm_elsewhere(root, monkeypatch):
+    monkeypatch.setenv("QUANT_DUEL_LLM_URL", "http://192.168.1.50:11434/v1")
+    monkeypatch.setenv("QUANT_DUEL_LLM_ALLOW_REMOTE", "1")
+    a, b = cfgmod.load("A", root=root), cfgmod.load("B", root=root)
+    assert a["llm"]["url"] == "http://192.168.1.50:11434/v1"
+    assert a["llm"]["allow_remote"] is True
+    assert a["llm"]["server"]["command"] is None
+    cfgmod.check_identical(a, b)               # still identical
+    from quant_duel.llm.client import OpenAIClient
+    OpenAIClient.from_config(a["llm"])         # remote allowed now
+    monkeypatch.delenv("QUANT_DUEL_LLM_ALLOW_REMOTE")
+    with pytest.raises(LLMError, match="not on this machine"):
+        OpenAIClient.from_config(cfgmod.load("A", root=root)["llm"])
+
+
+def test_the_cli_reports_llm_use_in_one_line(root, capsys):
+    text = (root / "config.yaml").read_text().replace(
+        "url: http://localhost:11434/v1",
+        f"url: http://127.0.0.1:{_free_port()}/v1").replace(
+        "retries: 2", "retries: 0")
+    (root / "config.yaml").write_text(text)
+    from quant_duel.news.feeds import Item
+    from quant_duel.news.store import NewsStore
+    s = NewsStore(root / "data" / "A" / "news.sqlite")
+    now = dt.datetime.now(dt.timezone.utc)
+    s.add("feed", [Item("Apple soars", "x", now.strftime(
+        "%a, %d %b %Y %H:%M:%S +0000"))], {"Apple soars": ["AAPL"]}, now)
+    s.close()
+    cli.main(["--root", str(root), "--node", "A", "news-score"])
+    out = capsys.readouterr().out
+    assert out.strip().splitlines()[-1].startswith("QD-LLM: failed")
+    cli.main(["--root", str(root), "--node", "B", "status"])
+    assert "QD-LLM" not in capsys.readouterr().out    # no LLM use, no line
+
+
+def test_plan_json_and_status_json(root, capsys):
+    assert cli.main(["--root", str(root), "--node", "A", "run-due",
+                     "--plan-json"]) == 0
+    jobs = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+    assert isinstance(jobs, list)
+    for j in jobs:
+        assert set(j) == {"job", "args", "llm"}
+    assert cli.main(["--root", str(root), "--node", "A", "status",
+                     "--json"]) == 0
+    st = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+    assert st["node"] == "A" and st["news_enabled"] is True
+    assert st["last_run"] is None and st["books"] == {}
+    assert st["llm"]["model"]

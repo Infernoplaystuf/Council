@@ -27,9 +27,7 @@ directly; ``run_due`` does the I/O.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
-import os
 import subprocess
 import sys
 from logging.handlers import RotatingFileHandler
@@ -131,48 +129,67 @@ def _logger(root: Path, node: str) -> logging.Logger:
     return log
 
 
-def _state_path(cfg) -> Path:
-    return cfg.node_dir / "schedule.json"
-
-
-def load_state(cfg) -> Dict[str, Any]:
-    try:
-        return json.loads(_state_path(cfg).read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
-
-
-def save_state(cfg, state: Dict[str, Any]) -> None:
-    path = _state_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
-    os.replace(tmp, path)
-
-
 def facts(cfg) -> Dict[str, Any]:
-    """What the plan needs from the node's files."""
+    """What the plan needs, read from the node's own data — so a job run
+    by anything (this scheduler, a host like the Council, a person) counts:
+    the ledger's last day and tuning rounds, the news store's last poll,
+    the experiment window."""
     from . import experiment as ex
     from .paper.ledger import Ledger
     out: Dict[str, Any] = {"last_run": None, "tuned_for": None,
-                           "window": None}
+                           "window": None, "state": {}}
     path = cfg.node_dir / "paper.sqlite"
     if path.exists():
         led = Ledger(path)
         try:
             out["last_run"] = led.last_run()
             t = led.frame("tuner_log")
-            # a round the LLM missed (or that errored) is retried next call
-            t = t[~t["status"].isin(["llm_failed", "error"])]
-            if len(t):
-                out["tuned_for"] = dt.date.fromisoformat(max(t["day"]))
+            # a round the LLM missed (or that errored) is retried later
+            missed = t[t["status"].isin(["llm_failed", "error"])]
+            done = t[~t["status"].isin(["llm_failed", "error"])]
+            if len(done):
+                out["tuned_for"] = dt.date.fromisoformat(max(done["day"]))
+            if len(missed):
+                last = missed.iloc[-1]
+                out["state"]["tune"] = {"day": last["day"],
+                                        "at": last["logged_at"]}
         finally:
             led.close()
+    news = cfg.node_dir / "news.sqlite"
+    if cfg.news_enabled and news.exists():
+        import sqlite3
+        con = sqlite3.connect(news)
+        try:
+            row = con.execute("SELECT MAX(at) FROM polls").fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            con.close()
+        if row and row[0]:
+            out["state"]["news-poll"] = row[0]
     exp_path = cfg.root / "experiment.yaml"
     if exp_path.exists():
         e = ex.load(exp_path)
         out["window"] = (e.start, e.end)
     return out
+
+
+def due(cfg, now: Optional[dt.datetime] = None) -> List[Dict[str, Any]]:
+    """The jobs due now for ``cfg``'s node, with their CLI arguments."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    f = facts(cfg)
+    day = now.astimezone(NY).date()
+    report = cfg.root / "reports" / cfg.node_id / f"{day}.md"
+    jobs = plan(now, news=cfg.news_enabled, schedule=cfg["schedule"],
+                state=f["state"], last_run=f["last_run"],
+                report_done=report.exists(), tuned_for=f["tuned_for"],
+                window=f["window"], cutoff=cfg["news"]["cutoff"])
+    return [{"job": j, "args": job_args(j, f["window"]),
+             "llm": j in LLM_JOBS} for j in jobs]
+
+
+#: Jobs that call the LLM (a host routes and gates these).
+LLM_JOBS = ("news-poll", "tune", "report")
 
 
 def job_args(job: str, window: Optional[tuple]) -> List[str]:
@@ -195,19 +212,12 @@ def run_due(cfg, now: Optional[dt.datetime] = None,
         log.info("run-due already running; skipped")
         return []
     try:
-        state = load_state(cfg)
-        f = facts(cfg)
-        day = now.astimezone(NY).date()
-        report = cfg.root / "reports" / cfg.node_id / f"{day}.md"
-        jobs = plan(now, news=cfg.news_enabled, schedule=cfg["schedule"],
-                    state=state, last_run=f["last_run"],
-                    report_done=report.exists(), tuned_for=f["tuned_for"],
-                    window=f["window"], cutoff=cfg["news"]["cutoff"])
+        jobs = due(cfg, now)
         if not jobs:
             log.info("nothing due")
         done = []
-        for job in jobs:
-            args = job_args(job, f["window"])
+        for j in jobs:
+            job, args = j["job"], j["args"]
             if dry_run:
                 done.append({"job": job, "args": args, "rc": None})
                 continue
@@ -219,13 +229,6 @@ def run_due(cfg, now: Optional[dt.datetime] = None,
                 log.info("  %s | %s", job, line)
             (log.info if rc == 0 else log.error)("%s finished rc=%s", job, rc)
             done.append({"job": job, "args": args, "rc": rc})
-            if job == "news-poll":
-                state["news-poll"] = now.isoformat(timespec="seconds")
-                save_state(cfg, state)
-            if job == "tune":            # retried at most every 3 hours
-                state["tune"] = {"day": last_completed_day(now).isoformat(),
-                                 "at": now.isoformat(timespec="seconds")}
-                save_state(cfg, state)
             if job == "daily" and rc != 0:
                 break                      # no report on a failed day
         return done

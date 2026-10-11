@@ -81,7 +81,33 @@ def load(node: Optional[str] = None, *, root: Path = ROOT,
         if node_id != node:
             raise ConfigError(f"nodes/{node}.yaml says node_id {node_id!r}")
         news = bool(node_raw.get("news_enabled", False))
-    return Config(copy.deepcopy(raw), node_id, news, root)
+    raw = copy.deepcopy(raw)
+    apply_env(raw)
+    return Config(raw, node_id, news, root)
+
+
+#: Environment overrides for the LLM endpoint, set by a host such as the
+#: Council when it routes the duel's LLM calls to one of its machines. Only
+#: WHERE the model runs changes; the model and every other setting stay in
+#: config.yaml (and its hash), identical for both nodes.
+ENV_URL = "QUANT_DUEL_LLM_URL"
+ENV_MODEL = "QUANT_DUEL_LLM_MODEL"
+ENV_ALLOW_REMOTE = "QUANT_DUEL_LLM_ALLOW_REMOTE"
+
+
+def apply_env(raw: Dict[str, Any]) -> None:
+    import os
+    llm = raw.setdefault("llm", {})
+    url = os.environ.get(ENV_URL, "").strip()
+    if url:
+        llm["url"] = url
+        # a host-provided server is used as is: never start a local one
+        llm["server"] = dict(llm.get("server") or {}, command=None)
+    model = os.environ.get(ENV_MODEL, "").strip()
+    if model:
+        llm["model"] = model
+    if os.environ.get(ENV_ALLOW_REMOTE, "").strip() == "1":
+        llm["allow_remote"] = True
 
 
 def check_identical(a: Config, b: Config) -> None:

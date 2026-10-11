@@ -22,6 +22,32 @@ class LLMError(RuntimeError):
     """The LLM could not give a usable answer (down, slow, or malformed)."""
 
 
+#: What this process's LLM calls did, for the one-line ``QD-LLM:`` summary
+#: the CLI prints at exit (a host reads it to rest a failing machine).
+USAGE: Dict[str, Any] = {"ok": 0, "failed": 0, "last_error": ""}
+
+
+def reset_usage() -> None:
+    USAGE.update(ok=0, failed=0, last_error="")
+
+
+def record(ok: bool, error: str = "") -> None:
+    USAGE["ok" if ok else "failed"] += 1
+    if not ok:
+        USAGE["last_error"] = str(error)[:300]
+
+
+def usage_line() -> Optional[str]:
+    """``QD-LLM: ok n=3 failed=0`` (or ``failed ...``), None if unused."""
+    if not USAGE["ok"] and not USAGE["failed"]:
+        return None
+    state = "failed" if USAGE["failed"] and not USAGE["ok"] else "ok"
+    line = f"QD-LLM: {state} ok={USAGE['ok']} failed={USAGE['failed']}"
+    if USAGE["failed"]:
+        line += f" last_error={USAGE['last_error']!r}"
+    return line
+
+
 class ChatModel(Protocol):
     def chat(self, messages: List[Dict[str, str]], *, json_mode: bool = False,
              max_tokens: Optional[int] = None) -> str: ...
@@ -104,6 +130,7 @@ class OpenAIClient:
                 content = reply["choices"][0]["message"]["content"]
                 if not isinstance(content, str):
                     raise LLMError("reply has no text content")
+                record(True)
                 return content
             except urllib.error.HTTPError as exc:
                 last = exc
@@ -113,6 +140,7 @@ class OpenAIClient:
                     json.JSONDecodeError, KeyError, IndexError, TypeError,
                     LLMError) as exc:
                 last = exc
+        record(False, f"LLM request failed: {last}")
         raise LLMError(f"LLM request failed: {last}")
 
 

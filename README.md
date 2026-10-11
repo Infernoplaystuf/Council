@@ -192,6 +192,24 @@ the nodes must come out identical: the run ends with `replay check: PASS`
 or `FAIL`. A full September 2026 replay (42 tickers, 3-year gate, five
 tuning rounds per node) took ~8 minutes and 390 MB here.
 
+## Inside the Council
+
+The Council can run the duel for you (its **📈 Quant Duel** tab): it plans
+with `run-due --plan-json`, runs each job as its own process, reads
+`status --json`, and routes the LLM work (news scoring, tuning, report
+summaries) to the machine its *Machines & roles* binds to the `quant` role,
+through the same per-machine limit, cooldown and fallback as its own roles.
+The hooks it uses:
+
+- `QUANT_DUEL_LLM_URL`, `QUANT_DUEL_LLM_MODEL`, `QUANT_DUEL_LLM_ALLOW_REMOTE`
+  — environment overrides for where the model runs (no local server is
+  started when the URL is overridden). config.yaml and its hash are
+  untouched, so the experiment's freeze check still holds.
+- Every CLI run that used the LLM ends with one line,
+  `QD-LLM: ok|failed ok=N failed=M [last_error=...]`.
+- The schedule reads its state from the data (ledger, tuner log, news
+  polls), so a job counts whoever ran it — Council, timer or you.
+
 ## Reading a backtest
 
 `ll_edge` is how much lower a learned model's log loss is than the best

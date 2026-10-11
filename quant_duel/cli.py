@@ -15,6 +15,8 @@
     python -m quant_duel.cli replay --start 2026-09-01 --end 2026-09-30
     python -m quant_duel.cli --node A run-due   [--dry-run]  (timer, every 15 min)
     python -m quant_duel.cli --node A check     (pre-flight list)
+    python -m quant_duel.cli --node A status    [--json]
+    python -m quant_duel.cli --node A run-due --plan-json   (for a host)
     python -m quant_duel.cli sync-exports       (pull both nodes' exports)
 
 Prices and features are shared by both nodes (data/shared/); each node keeps
@@ -346,8 +348,12 @@ def cmd_replay(cfg: cfgmod.Config, args) -> int:
 
 
 def cmd_run_due(cfg: cfgmod.Config, args) -> int:
-    from .scheduler import run_due
+    import json as _json
+    from .scheduler import due, run_due
     _need_node(cfg)
+    if args.plan_json:
+        print(_json.dumps(due(cfg)))
+        return 0
     done = run_due(cfg, dry_run=args.dry_run)
     if not done:
         print("nothing due")
@@ -356,6 +362,87 @@ def cmd_run_due(cfg: cfgmod.Config, args) -> int:
         print(f"{'would run' if args.dry_run else 'ran'} "
               f"{' '.join(d['args'])}{rc}")
     return 0 if all(d["rc"] in (0, None) for d in done) else 1
+
+
+def node_status(cfg: cfgmod.Config) -> dict:
+    """A plain summary of the node for a host (the Council) to show."""
+    import json as _json
+    from .scheduler import due, facts
+    from .paper.ledger import Ledger
+    f = facts(cfg)
+    out = {"node": cfg.node_id, "news_enabled": cfg.news_enabled,
+           "root": str(cfg.root),
+           "last_run": f["last_run"].isoformat() if f["last_run"] else None,
+           "window": [d.isoformat() for d in f["window"]]
+           if f["window"] else None,
+           "llm": {"url": cfg["llm"]["url"], "model": cfg["llm"]["model"]},
+           "books": {}, "tuner_last": None, "news": None,
+           "due": [j["job"] for j in due(cfg)], "last_report": None}
+    path = cfg.node_dir / "paper.sqlite"
+    if path.exists():
+        led = Ledger(path)
+        try:
+            eq = led.frame("equity").sort_values("date")
+            start = led.frame("books").set_index("book")["start_cash"]
+            for book, g in eq.groupby("book"):
+                last = float(g["equity"].iloc[-1])
+                prev = float(g["equity"].iloc[-2]) if len(g) > 1 else \
+                    float(start[book])
+                out["books"][book] = {
+                    "equity": round(last, 2),
+                    "day_pct": round(100 * (last / prev - 1), 3),
+                    "total_pct": round(100 * (last / start[book] - 1), 3)}
+            t = led.frame("tuner_log")
+            if len(t):
+                r = t.iloc[-1]
+                out["tuner_last"] = {
+                    "day": r["day"], "status": r["status"],
+                    "changes": r["changes_json"] if isinstance(
+                        r["changes_json"], str) else None,
+                    "improvement": None if r["improvement"] != r["improvement"]
+                    else float(r["improvement"])}
+        finally:
+            led.close()
+    if cfg.news_enabled and _news_path(cfg).exists():
+        from .news.store import NewsStore
+        store = NewsStore(_news_path(cfg))
+        try:
+            pairs = store.pairs()
+            out["news"] = {
+                "headlines": int(len(store.frame("headlines"))),
+                "scored": int((pairs["status"] == "scored").sum()),
+                "pending": int((pairs["status"] == "pending").sum()),
+                "last_poll": f["state"].get("news-poll")}
+        finally:
+            store.close()
+    reports = sorted((cfg.root / "reports" / cfg.node_id).glob("*.md"))
+    if reports:
+        out["last_report"] = str(reports[-1])
+    _json.dumps(out)                     # must be plain JSON
+    return out
+
+
+def cmd_status(cfg: cfgmod.Config, args) -> int:
+    import json as _json
+    _need_node(cfg)
+    st = node_status(cfg)
+    if args.json:
+        print(_json.dumps(st))
+        return 0
+    print(f"node {st['node']} (news {'on' if st['news_enabled'] else 'off'})"
+          f" — last day {st['last_run'] or 'none yet'}; due now: "
+          f"{', '.join(st['due']) or 'nothing'}")
+    for book, b in st["books"].items():
+        print(f"  {book:8s} {b['equity']:>12,.2f}  day {b['day_pct']:+.3f}%  "
+              f"total {b['total_pct']:+.3f}%")
+    if st["tuner_last"]:
+        print(f"  last tuning round {st['tuner_last']['day']}: "
+              f"{st['tuner_last']['status']}")
+    if st["news"]:
+        n = st["news"]
+        print(f"  news: {n['headlines']} headlines, {n['scored']} scored, "
+              f"{n['pending']} pending")
+    return 0
 
 
 def cmd_check(cfg: cfgmod.Config, args) -> int:
@@ -454,10 +541,11 @@ def _news_for_export(cfg: cfgmod.Config):
 
 def _llm(cfg: cfgmod.Config):
     """The configured LLM client, or None (with the reason printed)."""
-    from .llm.client import LLMError, OpenAIClient
+    from .llm.client import LLMError, OpenAIClient, record
     try:
         return OpenAIClient.from_config(cfg["llm"])
     except LLMError as exc:
+        record(False, str(exc))
         print(f"LLM unavailable: {exc}")
         return None
 
@@ -480,6 +568,8 @@ def llm_session(cfg: cfgmod.Config):
             stack.enter_context(llm_server(cfg["llm"], log))
             client = _llm(cfg)
         except LLMError as exc:
+            from .llm.client import record
+            record(False, str(exc))
             print(f"LLM unavailable: {exc}")
         yield client
 
@@ -633,6 +723,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="write daily reports (uses the LLM if up)")
     p = sub.add_parser("run-due")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--plan-json", action="store_true",
+                   help="print the due jobs as JSON and run nothing")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("check")
     p.add_argument("--offline", action="store_true",
                    help="skip the network checks")
@@ -640,6 +734,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
                       else cfgmod.ROOT)
+    from .llm.client import reset_usage
+    reset_usage()
+    try:
+        return _dispatch(cfg, args)
+    finally:
+        from .llm.client import usage_line
+        line = usage_line()
+        if line:
+            print(line)
+
+
+def _dispatch(cfg: cfgmod.Config, args) -> int:
     return {"ingest": cmd_ingest, "build-features": cmd_build_features,
             "backtest": cmd_backtest, "daily": cmd_daily,
             "export": cmd_export, "tune": cmd_tune,
@@ -648,6 +754,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "news-status": cmd_news_status,
             "experiment-init": cmd_experiment_init, "compare": cmd_compare,
             "replay": cmd_replay, "run-due": cmd_run_due,
+            "status": cmd_status,
             "check": cmd_check,
             "sync-exports": cmd_sync_exports}[args.cmd](cfg, args)
 
