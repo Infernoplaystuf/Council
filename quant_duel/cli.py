@@ -10,6 +10,9 @@
     python -m quant_duel.cli --node A news-poll  [--no-score]   (node A only)
     python -m quant_duel.cli --node A news-score
     python -m quant_duel.cli --node A news-status
+    python -m quant_duel.cli experiment-init --start 2026-11-02 --end 2026-12-01
+    python -m quant_duel.cli compare [--a exports/A] [--b exports/B]
+    python -m quant_duel.cli replay --start 2026-09-01 --end 2026-09-30
 
 Prices and features are shared by both nodes (data/shared/); each node keeps
 its own paper ledger (data/<node>/paper.sqlite) and exports (exports/<node>/).
@@ -252,6 +255,90 @@ def cmd_news_status(cfg: cfgmod.Config, args) -> int:
     return 0
 
 
+def cmd_experiment_init(cfg: cfgmod.Config, args) -> int:
+    from . import experiment as ex
+    try:
+        e = ex.init(cfg.root / "experiment.yaml", cfg.root, cfg,
+                    dt.date.fromisoformat(args.start),
+                    dt.date.fromisoformat(args.end), name=args.name,
+                    allow_past=args.allow_past)
+    except ex.ExperimentError as exc:
+        raise SystemExit(str(exc))
+    print(f"wrote and froze {cfg.root / 'experiment.yaml'}: {e.name}, "
+          f"{e.start} → {e.end} ({e.raw['trading_days']} trading days)")
+    return 0
+
+
+def cmd_compare(cfg: cfgmod.Config, args) -> int:
+    from . import experiment as ex
+    from .compare.report import CompareError, compare
+    path = Path(args.experiment) if args.experiment else \
+        cfg.root / "experiment.yaml"
+    try:
+        exp = ex.load(path)
+    except ex.ExperimentError as exc:
+        raise SystemExit(str(exc))
+    exports = cfg.root / cfg["paper"]["exports_dir"]
+    a = Path(args.a) if args.a else exports / "A"
+    b = Path(args.b) if args.b else exports / "B"
+    out = Path(args.out) if args.out else cfg.root / "reports" / \
+        "compare" / exp.name
+    try:
+        res = compare(a, b, exp, out, exp.changed_files(path.parent))
+    except (CompareError, ValueError) as exc:
+        raise SystemExit(f"compare failed: {exc}")
+    for w in res["warnings"]:
+        print("WARNING:", w)
+    print(res["verdict"])
+    print(res["verdict_returns"])
+    print(f"report: {res['out_dir'] / 'compare.md'}")
+    return 0
+
+
+def cmd_replay(cfg: cfgmod.Config, args) -> int:
+    from . import experiment as ex
+    from . import replay as rp
+    from .compare.report import compare
+    start, end = (dt.date.fromisoformat(args.start),
+                  dt.date.fromisoformat(args.end))
+    cfg_a = cfgmod.load("A", root=cfg.root)
+    cfg_b = cfgmod.load("B", root=cfg.root)
+    prices, table = build_features(cfg_a)
+    hashes = PriceStore(cfg.shared_dir / "prices").day_hashes(
+        _price_tickers(cfg))
+    hashes = dict(zip(hashes["date"], hashes["hash"]))
+    proposer, llm = None, None
+    if args.proposer == "random":
+        proposer = rp.random_proposer(cfg["tuner"]["bounds"], cfg["seed"])
+    elif args.proposer == "llm":
+        llm = _llm(cfg)
+    out = rp.new_folder(cfg.data_dir / "replay", start, end)
+    print(f"replay {start} → {end} into {out} (news disabled, proposer: "
+          f"{args.proposer})")
+    res = rp.run(cfg_a, cfg_b, table, prices, hashes, start, end, out,
+                 proposer=proposer, llm=llm,
+                 report_llm=_llm(cfg) if args.report else None,
+                 write_reports=args.report)
+    for node, rows in res["tunes"].items():
+        if rows:
+            print(f"  {node} tuner: " + ", ".join(f"{d} {s}"
+                                                   for d, s in rows))
+    e = ex.init(out / "experiment.yaml", cfg.root, cfg, start, end,
+                name=f"replay-{out.name}", allow_past=True)
+    r = compare(out / "exports" / "A", out / "exports" / "B", e,
+                out / "compare")
+    for w in r["warnings"]:
+        print("WARNING:", w)
+    print(r["verdict"])
+    same = r["log_loss"]["identical"] and not any(
+        "differ" in w for w in r["warnings"])
+    print("replay check: " + ("PASS — both nodes identical with news "
+                              "disabled" if same else
+                              "FAIL — the nodes diverged without news"))
+    print(f"report: {r['out_dir'] / 'compare.md'}")
+    return 0 if same else 1
+
+
 def cmd_daily(cfg: cfgmod.Config, args) -> int:
     from .export.csv import export_node
     from .paper.books import BookConfig
@@ -439,6 +526,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--no-score", action="store_true")
     sub.add_parser("news-score")
     sub.add_parser("news-status")
+    p = sub.add_parser("experiment-init")
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--name", default=None)
+    p.add_argument("--allow-past", action="store_true",
+                   help=argparse.SUPPRESS)
+    p = sub.add_parser("compare")
+    p.add_argument("--experiment", default=None)
+    p.add_argument("--a", default=None, help="node A exports folder")
+    p.add_argument("--b", default=None, help="node B exports folder")
+    p.add_argument("--out", default=None)
+    p = sub.add_parser("replay")
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--proposer", choices=["random", "llm", "none"],
+                   default="random")
+    p.add_argument("--report", action="store_true",
+                   help="write daily reports (uses the LLM if up)")
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
                       else cfgmod.ROOT)
@@ -447,7 +552,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "export": cmd_export, "tune": cmd_tune,
             "report": cmd_report, "news-poll": cmd_news_poll,
             "news-score": cmd_news_score,
-            "news-status": cmd_news_status}[args.cmd](cfg, args)
+            "news-status": cmd_news_status,
+            "experiment-init": cmd_experiment_init, "compare": cmd_compare,
+            "replay": cmd_replay}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

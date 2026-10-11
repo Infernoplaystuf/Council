@@ -1,5 +1,6 @@
 """Tidy CSVs, one file per table, every row tagged with its node:
 
+    exports/<node>/books.csv         books, start cash, current settings
     exports/<node>/predictions.csv   book, date, ticker, p, signal, target...
     exports/<node>/fills.csv         every paper fill with its cost
     exports/<node>/equity.csv        cash, holdings, equity per book per day
@@ -79,8 +80,8 @@ def export_node(ledger: Ledger, out_dir: Path, news=None) -> List[Path]:
         return df
 
     written = []
-    for name in ("predictions", "fills", "equity", "holdings", "events",
-                 "tuner_log"):
+    for name in ("books", "predictions", "fills", "equity", "holdings",
+                 "events", "tuner_log"):
         written.append(write_csv(tag(ledger.frame(name)),
                                  out_dir / f"{name}.csv"))
     models = ledger.frame("models")
