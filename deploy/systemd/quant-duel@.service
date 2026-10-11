@@ -1,0 +1,18 @@
+# Quant Duel — run whatever is due for node %i (A or B). Paper trading only.
+# A *user* unit: install into ~/.config/systemd/user/ and run
+#   loginctl enable-linger $USER
+# so it keeps running without a login. Expects the checkout in ~/quant-duel
+# with its venv in ~/quant-duel/.venv (see deploy/README_PI.md).
+[Unit]
+Description=Quant Duel node %i: run due jobs (paper trading only)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-duel
+ExecStart=%h/quant-duel/.venv/bin/python -m quant_duel.cli --node %i run-due
+Nice=10
+TimeoutStartSec=4h
+# the LLM server is started as a child and counts here too
+MemoryMax=6G

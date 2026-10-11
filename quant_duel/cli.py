@@ -13,6 +13,9 @@
     python -m quant_duel.cli experiment-init --start 2026-11-02 --end 2026-12-01
     python -m quant_duel.cli compare [--a exports/A] [--b exports/B]
     python -m quant_duel.cli replay --start 2026-09-01 --end 2026-09-30
+    python -m quant_duel.cli --node A run-due   [--dry-run]  (timer, every 15 min)
+    python -m quant_duel.cli --node A check     (pre-flight list)
+    python -m quant_duel.cli sync-exports       (pull both nodes' exports)
 
 Prices and features are shared by both nodes (data/shared/); each node keeps
 its own paper ledger (data/<node>/paper.sqlite) and exports (exports/<node>/).
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -201,16 +205,16 @@ def cmd_news_poll(cfg: cfgmod.Config, args) -> int:
 
 
 def cmd_news_score(cfg: cfgmod.Config, args) -> int:
-    from .locks import LockBusy, file_lock
+    from .locks import LockBusy
     from .news.score import score_pending
     from .news.store import NewsStore
     _need_news(cfg)
-    llm = _llm(cfg)
-    if llm is None:
-        return 0
     store = NewsStore(_news_path(cfg))
     try:
-        with file_lock(cfg.data_dir / "llm.lock"):
+        with llm_session(cfg) as llm:
+            if llm is None:
+                print("news-score skipped: LLM unavailable")
+                return 0
             rep = score_pending(store, llm, cfg["news"],
                                 model_name=cfg["llm"]["model"])
     except LockBusy as exc:
@@ -307,18 +311,20 @@ def cmd_replay(cfg: cfgmod.Config, args) -> int:
     hashes = PriceStore(cfg.shared_dir / "prices").day_hashes(
         _price_tickers(cfg))
     hashes = dict(zip(hashes["date"], hashes["hash"]))
-    proposer, llm = None, None
+    proposer = None
     if args.proposer == "random":
         proposer = rp.random_proposer(cfg["tuner"]["bounds"], cfg["seed"])
-    elif args.proposer == "llm":
-        llm = _llm(cfg)
     out = rp.new_folder(cfg.data_dir / "replay", start, end)
     print(f"replay {start} → {end} into {out} (news disabled, proposer: "
           f"{args.proposer})")
-    res = rp.run(cfg_a, cfg_b, table, prices, hashes, start, end, out,
-                 proposer=proposer, llm=llm,
-                 report_llm=_llm(cfg) if args.report else None,
-                 write_reports=args.report)
+    from contextlib import nullcontext
+    session = llm_session(cfg) if (args.proposer == "llm" or args.report) \
+        else nullcontext(None)
+    with session as client:
+        res = rp.run(cfg_a, cfg_b, table, prices, hashes, start, end, out,
+                     proposer=proposer,
+                     llm=client if args.proposer == "llm" else None,
+                     report_llm=client, write_reports=args.report)
     for node, rows in res["tunes"].items():
         if rows:
             print(f"  {node} tuner: " + ", ".join(f"{d} {s}"
@@ -337,6 +343,62 @@ def cmd_replay(cfg: cfgmod.Config, args) -> int:
                               "FAIL — the nodes diverged without news"))
     print(f"report: {r['out_dir'] / 'compare.md'}")
     return 0 if same else 1
+
+
+def cmd_run_due(cfg: cfgmod.Config, args) -> int:
+    from .scheduler import run_due
+    _need_node(cfg)
+    done = run_due(cfg, dry_run=args.dry_run)
+    if not done:
+        print("nothing due")
+    for d in done:
+        rc = "" if d["rc"] is None else f" rc={d['rc']}"
+        print(f"{'would run' if args.dry_run else 'ran'} "
+              f"{' '.join(d['args'])}{rc}")
+    return 0 if all(d["rc"] in (0, None) for d in done) else 1
+
+
+def cmd_check(cfg: cfgmod.Config, args) -> int:
+    from .check import run_checks
+    _need_node(cfg)
+    lines = run_checks(cfg, network=not args.offline)
+    for status, item, detail in lines:
+        print(f"[{status}] {item}" + (f" — {detail}" if detail else ""))
+    fails = sum(s == "FAIL" for s, _, _ in lines)
+    warns = sum(s == "WARN" for s, _, _ in lines)
+    print(f"{fails} FAIL, {warns} WARN")
+    return 1 if fails else 0
+
+
+def cmd_sync_exports(cfg: cfgmod.Config, args, runner=None) -> int:
+    """rsync each node's exports from ``compare.remote`` into exports/<node>/
+    (copies only; never deletes)."""
+    import subprocess
+    remote = (cfg.get("compare") or {}).get("remote") or {}
+    if not remote:
+        print("compare.remote is empty — nothing to pull (both nodes on this "
+              "machine already write exports/A and exports/B)")
+        return 0
+    bad = 0
+    for node in ("A", "B"):
+        src = remote.get(node)
+        if not src:
+            continue
+        dest = cfg.root / cfg["paper"]["exports_dir"] / node
+        dest.mkdir(parents=True, exist_ok=True)
+        cmd = ["rsync", "-az", "--timeout=60", str(src).rstrip("/") + "/",
+               str(dest) + "/"]
+        if runner:
+            rc = runner(cmd)
+        else:
+            try:
+                rc = subprocess.run(cmd).returncode
+            except OSError as exc:
+                print(f"{node}: {exc}")
+                rc = 1
+        print(f"{node}: {' '.join(cmd)} → rc={rc}")
+        bad += rc != 0
+    return 1 if bad else 0
 
 
 def cmd_daily(cfg: cfgmod.Config, args) -> int:
@@ -400,6 +462,28 @@ def _llm(cfg: cfgmod.Config):
         return None
 
 
+@contextmanager
+def llm_session(cfg: cfgmod.Config):
+    """Hold the machine-wide LLM lock, start the LLM server if configured
+    (stopped again on exit), and yield a client — or None if the LLM is
+    unavailable, so the caller skips its LLM part. Raises LockBusy if
+    another LLM job is running."""
+    from contextlib import ExitStack
+    from .llm.client import LLMError
+    from .llm.server import llm_server
+    from .locks import file_lock
+    with file_lock(cfg.data_dir / "llm.lock"), ExitStack() as stack:
+        client = None
+        try:
+            log = cfg.root / "logs" / "llm-server.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            stack.enter_context(llm_server(cfg["llm"], log))
+            client = _llm(cfg)
+        except LLMError as exc:
+            print(f"LLM unavailable: {exc}")
+        yield client
+
+
 def _open_ledger(cfg: cfgmod.Config):
     from .paper.ledger import Ledger
     path = cfg.node_dir / "paper.sqlite"
@@ -410,7 +494,7 @@ def _open_ledger(cfg: cfgmod.Config):
 
 def cmd_tune(cfg: cfgmod.Config, args) -> int:
     import json as _json
-    from .locks import LockBusy, file_lock
+    from .locks import LockBusy
     from .tuner.run import tune
     _need_node(cfg)
     ledger = _open_ledger(cfg)
@@ -424,12 +508,15 @@ def cmd_tune(cfg: cfgmod.Config, args) -> int:
             proposal = _json.loads(Path(args.proposal).read_text())
         _, table = build_features(cfg)
         try:
-            with file_lock(cfg.data_dir / "llm.lock"):
+            if proposal is not None:
                 row = tune(ledger, cfg.raw, table, day,
-                           news=cfg.news_enabled,
-                           llm=None if proposal else _llm(cfg),
-                           proposal=proposal,
+                           news=cfg.news_enabled, proposal=proposal,
                            sentiment=load_sentiment(cfg))
+            else:
+                with llm_session(cfg) as llm:
+                    row = tune(ledger, cfg.raw, table, day,
+                               news=cfg.news_enabled, llm=llm,
+                               sentiment=load_sentiment(cfg))
         except LockBusy as exc:
             print(f"tune skipped: {exc}")
             return 0
@@ -452,7 +539,7 @@ def cmd_tune(cfg: cfgmod.Config, args) -> int:
 
 
 def cmd_report(cfg: cfgmod.Config, args) -> int:
-    from .locks import LockBusy, file_lock
+    from .locks import LockBusy
     from .report.daily import write_report
     _need_node(cfg)
     ledger = _open_ledger(cfg)
@@ -463,8 +550,8 @@ def cmd_report(cfg: cfgmod.Config, args) -> int:
             raise SystemExit("the ledger has no processed day yet")
         out = cfg.root / "reports" / cfg.node_id
         try:
-            with file_lock(cfg.data_dir / "llm.lock"):
-                path = write_report(ledger, day, out, _llm(cfg),
+            with llm_session(cfg) as llm:
+                path = write_report(ledger, day, out, llm,
                                     words=cfg["report"]["words"])
         except LockBusy:
             path = write_report(ledger, day, out, None,
@@ -544,6 +631,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    default="random")
     p.add_argument("--report", action="store_true",
                    help="write daily reports (uses the LLM if up)")
+    p = sub.add_parser("run-due")
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("check")
+    p.add_argument("--offline", action="store_true",
+                   help="skip the network checks")
+    sub.add_parser("sync-exports")
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
                       else cfgmod.ROOT)
@@ -554,7 +647,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "news-score": cmd_news_score,
             "news-status": cmd_news_status,
             "experiment-init": cmd_experiment_init, "compare": cmd_compare,
-            "replay": cmd_replay}[args.cmd](cfg, args)
+            "replay": cmd_replay, "run-due": cmd_run_due,
+            "check": cmd_check,
+            "sync-exports": cmd_sync_exports}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ scikit-learn>=1.4
 scipy>=1.11
 pyarrow>=14
 PyYAML>=6
+tzdata; sys_platform == "win32"   # time zones on Windows
 yfinance>=0.2.40
 # Optional: lightgbm>=4 (gradient boosting falls back to scikit-learn's
 # HistGradientBoostingClassifier when it is missing; pip install lightgbm).

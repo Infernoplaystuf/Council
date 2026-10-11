@@ -6,6 +6,8 @@ for a month, then a paired comparison says whether A predicted better.
 
 **Paper trading only. Nothing here can place an order.**
 
+**Deploying on Raspberry Pis: see [`deploy/README_PI.md`](deploy/README_PI.md).**
+
 It runs on whatever machines you already have (your Council PCs or Pis):
 both nodes are configurations (`nodes/A.yaml`, `nodes/B.yaml`), not
 dedicated computers. Prices are fetched once into `data/shared/` and both
@@ -53,6 +55,9 @@ quant_duel/
   experiment.py       experiment.yaml: the frozen protocol (window, metrics, hashes)
   compare/            paired A-vs-B statistics and the compare report
   replay.py           both nodes over a past window, news off, as a dry run
+  scheduler.py        run-due: which jobs are due now (NY time, market calendar)
+  check.py            the pre-flight list for a node
+deploy/               systemd units, cron/Task Scheduler lines, README_PI.md
   cli.py
 tests/                timing, folds, costs, ledger maths, leakage canaries
 ```
@@ -72,7 +77,10 @@ tests/                timing, folds, costs, ledger maths, leakage canaries
 5. **Done** — news pipeline and the sentiment overlay for node A, with
    cutoff tests.
 6. **Done** — `compare`, `replay`, full replay dry run of both nodes.
-7. Scheduling with `run-due` (Task Scheduler or cron), deployment notes.
+7. **Done** — Pi deployment: `run-due` every 15 minutes (systemd user
+   timer, cron or Task Scheduler), on-demand `llama-server`, rotated logs,
+   `check`, `sync-exports`, and `deploy/README_PI.md` (setup, warm-up,
+   start checklist).
 
 ## Paper trading (`daily`)
 

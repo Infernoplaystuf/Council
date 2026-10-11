@@ -61,6 +61,14 @@ llm:                        # any OpenAI-compatible server on this machine
   retries: 2
   max_tokens: 400
   allow_remote: false       # a non-local URL is refused unless true
+  model_file: null          # path to the GGUF (check prints its hash; must
+                            # be identical on both nodes)
+  server:                   # start the server per LLM job, stop it after
+    command: null           # e.g. [~/llama.cpp/build/bin/llama-server, -m,
+                            #   ~/models/llama-3.2-3b-instruct-q4_k_m.gguf,
+                            #   --host, 127.0.0.1, --port, "8080", -c, "4096",
+                            #   -t, "4"]  — null: use whatever runs at url
+    start_timeout_s: 180
 
 tuner:                      # weekly; only the live book can change
   min_improvement: 0.0005   # mean log loss must drop by MORE than this
@@ -134,7 +142,12 @@ news:                       # used by the news node (A) only; B never reads it
     QCOM: [Qualcomm]
     TXN: [Texas Instruments]
 
-schedule:                   # phase 7 — America/New_York
+schedule:                   # run-due, New York time (calendar skips holidays)
   timezone: America/New_York
+  news_from: "09:00"        # node A polls hourly from here to news.cutoff
   daily_at: "16:45"
-  tune_weekday: 5           # Saturday
+  tune_weekday: 5           # Saturday (Sunday catches up)
+
+compare:
+  remote: {}                # Pis: {A: "pi@quant-a.local:quant-duel/exports/A",
+                            #       B: "pi@quant-b.local:quant-duel/exports/B"}

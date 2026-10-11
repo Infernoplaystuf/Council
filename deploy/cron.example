@@ -1,0 +1,9 @@
+# Cron instead of systemd (or both nodes on one Linux/macOS machine):
+#   crontab -e   and add (adjust the path):
+*/15 * * * * cd $HOME/quant-duel && .venv/bin/python -m quant_duel.cli --node A run-due >/dev/null 2>&1
+*/15 * * * * cd $HOME/quant-duel && .venv/bin/python -m quant_duel.cli --node B run-due >/dev/null 2>&1
+# Output goes to logs/A.log and logs/B.log (rotated) either way.
+#
+# Windows (both nodes on one PC), from a terminal in the checkout:
+#   schtasks /create /sc minute /mo 15 /tn QuantDuelA /tr "C:\path\quant-duel\.venv\Scripts\python.exe -m quant_duel.cli --root C:\path\quant-duel --node A run-due"
+#   schtasks /create /sc minute /mo 15 /tn QuantDuelB /tr "C:\path\quant-duel\.venv\Scripts\python.exe -m quant_duel.cli --root C:\path\quant-duel --node B run-due"

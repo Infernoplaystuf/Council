@@ -1,0 +1,13 @@
+# Every 15 minutes; run-due decides what is due (New York time, market
+# calendar), so the Pi's own time zone does not matter. Persistent=true
+# runs a missed call after a reboot.
+[Unit]
+Description=Quant Duel node %i every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target
