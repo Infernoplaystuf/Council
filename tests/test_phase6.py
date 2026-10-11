@@ -170,7 +170,10 @@ def test_compare_finds_news_that_really_helps(tmp_path, cfg, table, prices):
     dirs = _run_nodes(tmp_path, table, prices, oracle)
     res = compare(dirs["A"], dirs["B"], _exp(tmp_path, cfg),
                   tmp_path / "out")
-    assert res["warnings"] == []
+    # the data checks pass; the only warning is that an oracle's accuracy
+    # is too good to be real
+    assert len(res["warnings"]) == 1
+    assert "far too good" in res["warnings"][0]
     assert res["log_loss"]["ci_low"] > 0
     assert res["verdict"].startswith("Node A (news) predicted better")
     out = tmp_path / "out"
@@ -178,7 +181,7 @@ def test_compare_finds_news_that_really_helps(tmp_path, cfg, table, prices):
               "tuner_timeline.csv", "equity_curves.csv", "equity.svg"):
         assert (out / f).exists(), f
     md = (out / "compare.md").read_text()
-    assert "Checks passed" in md and "## Verdict" in md
+    assert "investigate leakage" in md and "## Verdict" in md
     m = pd.read_csv(out / "metrics.csv")
     assert set(m["book"]) == {"live", "control", "spy"}
 
@@ -204,7 +207,7 @@ def test_compare_flags_different_prices_and_controls(tmp_path, cfg, table,
                   tmp_path / "out")
     text = " ".join(res["warnings"])
     assert "PRICE DATA DIFFERS on 1" in text and "CONTROL books differ" in text
-    assert "Checks that failed" in (tmp_path / "out" / "compare.md").read_text()
+    assert "## ⚠ Warnings" in (tmp_path / "out" / "compare.md").read_text()
 
 
 def test_compare_refuses_swapped_folders(tmp_path, cfg, table, prices):

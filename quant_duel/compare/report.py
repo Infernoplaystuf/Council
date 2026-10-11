@@ -279,15 +279,20 @@ def compare(a_dir: Path, b_dir: Path, exp: Experiment, out_dir: Path,
                           "Node A (news) earned less per day than node B.")
     metrics = pd.DataFrame(node_metrics(a, "A", exp) +
                            node_metrics(b, "B", exp))
-    hot = metrics[(metrics["book"] != "spy") &
-                  (metrics.get("accuracy", pd.Series(dtype=float)) > 0.55)]
+    acc = metrics.get("accuracy", pd.Series(np.nan, index=metrics.index))
+    learned = metrics["book"] != "spy"
+    for r in metrics[learned & (acc > 0.60)].itertuples():
+        warnings.append(f"{r.node} {r.book} accuracy {r.accuracy:.1%} is far "
+                        "too good for daily stock direction — investigate "
+                        "leakage before believing anything in this report.")
+    hot = metrics[learned & (acc > 0.55) & (acc <= 0.60)]
     if len(hot):
         warnings.append(
             "Accuracy above 55% (" + ", ".join(
                 f"{r.node} {r.book} {r.accuracy:.1%}"
                 for r in hot.itertuples()) + f") over {ll['n_days']:.0f} "
             "days. Tickers move together, so a short window swings widely "
-            "and this is most likely luck — but rule out leakage before "
+            "and this is probably luck — but rule out leakage before "
             "believing it.")
     tl = timeline(a, b, exp)
     cv = curves(a, b, exp)
@@ -316,7 +321,7 @@ def _markdown(exp, warnings, ll, ret, v_ll, v_ret, metrics, prices, ctrl,
          f"{ll['n_days']:.0f} scored days · {ll['n_rows']:.0f} paired "
          "predictions", ""]
     if warnings:
-        L += ["## ⚠ Checks that failed", ""] + [f"- {w}" for w in warnings]
+        L += ["## ⚠ Warnings", ""] + [f"- {w}" for w in warnings]
         L += [""]
     else:
         L += ["Checks passed: identical prices on every day, identical "
