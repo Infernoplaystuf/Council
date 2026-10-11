@@ -48,6 +48,11 @@ backtest:
   threshold: 0.52           # long when P(up) >= threshold, else flat
   validation_years: 3
 
+paper:                      # forward paper trading (no orders, ever)
+  start_cash: 100000
+  fill: open                # orders placed at a close fill at the next open | close
+  exports_dir: exports
+
 llm:                        # phase 4 — any OpenAI-compatible server
   url: http://localhost:11434/v1
   model: llama3.2:3b

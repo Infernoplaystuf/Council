@@ -1,11 +1,15 @@
-"""Command line. Phase 1-2: ingest, build-features, backtest.
+"""Command line.
 
     python -m quant_duel.cli ingest          [--source synthetic] [--end 2026-10-08]
     python -m quant_duel.cli build-features  [--end ...]
     python -m quant_duel.cli backtest        [--models always_up,persistence,logistic,boosting]
+    python -m quant_duel.cli --node A daily  [--start 2026-09-01] [--end ...] [--no-ingest]
+    python -m quant_duel.cli --node A export
 
-Prices and features are shared by both nodes (data/shared/); --node only
-matters from phase 3 on, where each node keeps its own ledger.
+Prices and features are shared by both nodes (data/shared/); each node keeps
+its own paper ledger (data/<node>/paper.sqlite) and exports (exports/<node>/).
+``daily`` = ingest + build-features + one paper step per unprocessed trading
+day + export. Paper trading only: nothing here can place an order.
 """
 from __future__ import annotations
 
@@ -59,18 +63,33 @@ def cmd_ingest(cfg: cfgmod.Config, args) -> int:
     return 1 if bad == len(reports) else 0
 
 
-def cmd_build_features(cfg: cfgmod.Config, args) -> int:
+def _price_tickers(cfg: cfgmod.Config) -> list:
+    return list(dict.fromkeys(cfg.tickers + cfg["universe"]["context"]))
+
+
+def build_features(cfg: cfgmod.Config, end: Optional[dt.date] = None):
+    """(prices, feature table) from the shared price cache; the table is
+    also saved to data/shared/features.parquet."""
     store = PriceStore(cfg.shared_dir / "prices")
-    prices = store.load_all(cfg.tickers + cfg["universe"]["context"])
+    prices = store.load_all(_price_tickers(cfg))
     table = build(prices, cfg["features"], cfg.tickers,
                   context=cfg["universe"]["benchmark"])
-    if args.end:
-        table = table[table["date"] <= dt.date.fromisoformat(args.end)]
+    if end:
+        table = table[table["date"] <= end]
     path = _features_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     out = table.copy()
     out["date"] = pd.to_datetime(out["date"])
-    out.to_parquet(path)
+    tmp = path.with_suffix(".tmp")
+    out.to_parquet(tmp)
+    tmp.replace(path)
+    return prices, table
+
+
+def cmd_build_features(cfg: cfgmod.Config, args) -> int:
+    end = dt.date.fromisoformat(args.end) if args.end else None
+    _, table = build_features(cfg, end)
+    path = _features_path(cfg)
     print(f"features: {len(table)} rows, {table['ticker'].nunique()} tickers, "
           f"{table['date'].min()} → {table['date'].max()} ({path})")
     return 0
@@ -119,9 +138,76 @@ def _print_importances(table: pd.DataFrame, cfg: cfgmod.Config) -> None:
           ", ".join(f"{k} {v:.0f}" for k, v in top.items()))
 
 
+def _need_node(cfg: cfgmod.Config) -> None:
+    if cfg.node_id not in ("A", "B"):
+        raise SystemExit("this command belongs to a node: pass --node A or "
+                         "--node B")
+
+
+def cmd_daily(cfg: cfgmod.Config, args) -> int:
+    from .export.csv import export_node
+    from .paper.books import BookConfig
+    from .paper.daily import node_lock, run_through
+    from .paper.ledger import Ledger
+    _need_node(cfg)
+    end = dt.date.fromisoformat(args.end) if args.end else last_completed_day()
+    with node_lock(cfg.node_dir / "daily.lock"):
+        if not args.no_ingest:
+            if cmd_ingest(cfg, argparse.Namespace(source=args.source,
+                                                  end=end.isoformat())):
+                print("ingest failed for every ticker — nothing to do")
+                return 1
+        prices, table = build_features(cfg)
+        hashes = PriceStore(cfg.shared_dir / "prices").day_hashes(
+            _price_tickers(cfg))
+        hashes = dict(zip(hashes["date"], hashes["hash"]))
+        ledger = Ledger(cfg.node_dir / "paper.sqlite")
+        try:
+            if not ledger.initialized:
+                ledger.init(cfg.node_id, float(cfg["paper"]["start_cash"]),
+                            BookConfig.from_config(cfg),
+                            cfg["universe"]["benchmark"])
+                print(f"new ledger for node {cfg.node_id} "
+                      f"({ledger.path})")
+            start = dt.date.fromisoformat(args.start) if args.start else end
+            results = run_through(ledger, cfg, table, prices, start, end,
+                                  hashes)
+            for r in results:
+                eq = ", ".join(f"{b} {v:,.0f}" for b, v in
+                               sorted(r["equity"].items()))
+                print(f"  {r['day']}: {eq}")
+            if not results:
+                print(f"nothing new to process up to {end} "
+                      f"(last run {ledger.last_run()})")
+            export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
+                        cfg.node_id)
+        finally:
+            ledger.close()
+    return 0
+
+
+def cmd_export(cfg: cfgmod.Config, args) -> int:
+    from .export.csv import export_node
+    from .paper.ledger import Ledger
+    _need_node(cfg)
+    path = cfg.node_dir / "paper.sqlite"
+    if not path.exists():
+        print(f"no ledger yet at {path} — run daily first")
+        return 1
+    ledger = Ledger(path)
+    try:
+        out = export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
+                          cfg.node_id)
+    finally:
+        ledger.close()
+    print(f"exported {len(out)} files to {out[0].parent}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="quant_duel")
-    ap.add_argument("--node", default=None, help="A or B (from phase 3)")
+    ap.add_argument("--node", default=None, help="A or B")
+    ap.add_argument("--root", default=None, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("ingest")
     p.add_argument("--source", default=None)
@@ -131,10 +217,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("backtest")
     p.add_argument("--models",
                    default="always_up,persistence,logistic,boosting")
+    p = sub.add_parser("daily")
+    p.add_argument("--start", default=None,
+                   help="first day for a new ledger (default: --end)")
+    p.add_argument("--end", default=None,
+                   help="last day to process (default: last completed day)")
+    p.add_argument("--source", default=None)
+    p.add_argument("--no-ingest", action="store_true")
+    sub.add_parser("export")
     args = ap.parse_args(argv)
-    cfg = cfgmod.load(args.node)
+    cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
+                      else cfgmod.ROOT)
     return {"ingest": cmd_ingest, "build-features": cmd_build_features,
-            "backtest": cmd_backtest}[args.cmd](cfg, args)
+            "backtest": cmd_backtest, "daily": cmd_daily,
+            "export": cmd_export}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

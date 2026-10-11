@@ -20,6 +20,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 python -m quant_duel.cli ingest            # yfinance; --source synthetic offline
 python -m quant_duel.cli build-features
 python -m quant_duel.cli backtest          # baselines, logistic, boosting vs buy-and-hold
+python -m quant_duel.cli --node B daily    # after each close: ingest, features, paper step, export
 python -m pytest -q
 ```
 
@@ -36,6 +37,8 @@ quant_duel/
   models/             fit / predict_proba: always-up, persistence, logistic,
                       boosting (LightGBM if installed, else scikit-learn)
   backtest/           walk-forward folds (1-day embargo), long/flat with costs, metrics
+  paper/              books (live, frozen control, SPY), model specs, SQLite ledger, daily step
+  export/             tidy CSVs per node for Power BI / Tableau / compare
   cli.py
 tests/                timing, folds, costs, ledger maths, leakage canaries
 ```
@@ -48,12 +51,41 @@ tests/                timing, folds, costs, ledger maths, leakage canaries
    HistGradientBoostingClassifier; `model.params.boosting.backend`) and the
    comparison: every model on the same folds and rows, with a paired
    log-loss edge over the best baseline (`ll_edge`, t-stat across days).
-3. Paper ledger with the frozen control and SPY, `daily`, exports.
+3. **Done** — paper ledger with the frozen control and SPY, `daily`,
+   `export`.
 4. LLM tuner (schema, bounds, validation gate, change log) and daily report.
 5. News and the sentiment overlay for node A (collect hourly, score in one
    batch before the cutoff).
 6. `compare`, `replay`, full dry run.
 7. Scheduling with `run-due` (Task Scheduler or cron), deployment notes.
+
+## Paper trading (`daily`)
+
+Run after each close (`--node A` or `--node B`). For every trading day not
+yet processed it: fills the previous close's orders at this day's open
+(`paper.fill: open|close`) with `cost_bps` on each traded dollar, marks to
+the close, scores yesterday's predictions, then predicts every ticker and
+places tomorrow's orders (equal weight, long where P(up) clears the
+threshold). `--start` sets the first day of a new ledger; missed days are
+caught up in order, each seeing only the data it would have seen live.
+
+Three books per node, in `data/<node>/paper.sqlite`:
+
+- **live** — what the tuner may change (phase 4); starts equal to control;
+- **control** — the starting settings, frozen when the ledger is created;
+- **spy** — buys the benchmark once and holds it.
+
+Holdings are tracked as market value moved by adjusted returns, so splits
+and dividend re-adjustments cannot corrupt the books; cash + holdings =
+equity is tested. Models are not pickled: each is a JSON spec (settings,
+training window, data hash, prediction fingerprint) that refits
+deterministically and is verified on every reuse; both nodes get
+byte-identical specs from the same prices. Models refit every
+`backtest.test_days` trading days, the same cadence as the backtest.
+
+`export` (also run by `daily`) writes `exports/<node>/`: predictions,
+fills, equity, equity_curves, holdings, models, price_hashes, events,
+metrics.
 
 ## Reading a backtest
 
