@@ -54,7 +54,9 @@ class BookConfig:
                    features_enabled=dict(cfg["features"]["enabled"]),
                    threshold=float(bt["threshold"]),
                    train_days=int(bt["train_days"]),
-                   refit_days=int(bt["test_days"]))
+                   refit_days=int(bt["test_days"]),
+                   sentiment_weight=float((cfg.get("news") or {}).get(
+                       "sentiment_weight", 0.0)))
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -9,7 +9,10 @@
    ``d``'s close — is now known).
 3. **Predict** every ticker from features dated ``d`` or earlier, for the
    live and the control book, and place orders: equal weight over the
-   tickers predicted, long where P(up) clears the book's threshold.
+   tickers predicted, long where P(up) clears the book's threshold. On the
+   news node only, the LIVE book's P(up) gets the sentiment overlay
+   (``p + w * sentiment``, clipped) from headlines published before ``d``'s
+   cutoff; the control book never sees news.
    The SPY book buys the benchmark once and holds it.
 
 Everything for day ``d`` is one transaction. ``run_through`` steps through
@@ -28,6 +31,7 @@ import pandas as pd
 
 from ..locks import file_lock
 from ..market_calendar import trading_days
+from ..news.sentiment import lookup, overlay
 from . import artifact
 from .books import MODEL_BOOKS, BookConfig
 from .ledger import Ledger
@@ -144,12 +148,18 @@ def _model_for(ledger: Ledger, book: str, conf: BookConfig,
 
 
 def _predict(ledger: Ledger, book: str, table: pd.DataFrame, day: dt.date,
-             seed: int, cache: Dict[str, tuple]) -> None:
+             seed: int, cache: Dict[str, tuple],
+             sentiment: Optional[pd.DataFrame] = None) -> None:
     conf = ledger.book_config(book)
     model, spec = _model_for(ledger, book, conf, table, day, seed, cache)
     rows = table[table["date"] == day]
     p = model.predict_proba(rows[spec.data["features"]])
     out = pd.DataFrame({"ticker": rows["ticker"].to_numpy(), "p": p})
+    if sentiment is not None:
+        s = lookup(sentiment, [day] * len(out), out["ticker"])
+        out["p_base"] = p
+        out["sentiment"] = s
+        out["p"] = overlay(p, s, conf.sentiment_weight)
     if conf.model_kind == "always_up":
         out["signal"] = 1
     else:
@@ -163,8 +173,11 @@ def _predict(ledger: Ledger, book: str, table: pd.DataFrame, day: dt.date,
 def step(ledger: Ledger, cfg, table: pd.DataFrame,
          prices: Mapping[str, pd.DataFrame], day: dt.date,
          price_hash: Optional[str] = None,
-         cache: Optional[Dict[str, tuple]] = None) -> Dict[str, object]:
-    """Process trading day ``day`` once (see the module docstring)."""
+         cache: Optional[Dict[str, tuple]] = None,
+         sentiment: Optional[pd.DataFrame] = None) -> Dict[str, object]:
+    """Process trading day ``day`` once (see the module docstring).
+    ``sentiment`` (date, ticker, sentiment) is given on the news node only;
+    only its rows for ``day`` are read."""
     if ledger.has_run(day):
         return {"day": day, "skipped": True}
     last = ledger.last_run()
@@ -184,8 +197,12 @@ def step(ledger: Ledger, cfg, table: pd.DataFrame,
         if last is not None:
             done = cut[cut["date"] == last].dropna(subset=["target"])
             scored = ledger.score(last, done)
+        today = None
+        if sentiment is not None:
+            today = sentiment[sentiment["date"] == day]
         for book in MODEL_BOOKS:
-            _predict(ledger, book, cut, day, cfg["seed"], cache)
+            _predict(ledger, book, cut, day, cfg["seed"], cache,
+                     today if book == "live" else None)
         if not ledger.holdings("spy") and ledger.pending_orders("spy") is None:
             ledger.add_orders("spy", day, {bench: 1.0})
         ledger.mark_run(day, price_hash)
@@ -196,7 +213,8 @@ def step(ledger: Ledger, cfg, table: pd.DataFrame,
 
 def run_through(ledger: Ledger, cfg, table: pd.DataFrame,
                 prices: Mapping[str, pd.DataFrame], start: dt.date,
-                end: dt.date, hashes: Optional[Mapping[dt.date, str]] = None
+                end: dt.date, hashes: Optional[Mapping[dt.date, str]] = None,
+                sentiment: Optional[pd.DataFrame] = None
                 ) -> List[Dict[str, object]]:
     """Every unprocessed trading day from ``start`` (or the day after the
     last run) to ``end``, in order."""
@@ -207,7 +225,7 @@ def run_through(ledger: Ledger, cfg, table: pd.DataFrame,
     out = []
     for d in days:
         out.append(step(ledger, cfg, table, prices, d,
-                        (hashes or {}).get(d), cache))
+                        (hashes or {}).get(d), cache, sentiment))
         # Only the models of the newest day can be reused.
         keep = {k: v for k, v in cache.items() if not k.startswith("new:")}
         cache.clear()

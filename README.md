@@ -22,6 +22,7 @@ python -m quant_duel.cli build-features
 python -m quant_duel.cli backtest          # baselines, logistic, boosting vs buy-and-hold
 python -m quant_duel.cli --node B daily --report  # after each close: ingest, features, paper step, export, report
 python -m quant_duel.cli --node B tune     # weekly: LLM proposes, the gate decides
+python -m quant_duel.cli --node A news-poll  # node A, hourly in market hours: fetch + score
 python -m pytest -q
 ```
 
@@ -43,6 +44,8 @@ quant_duel/
   llm/                local OpenAI-compatible client, strict JSON, retries
   tuner/              schema + bounds, validation gate, tuning round + change log
   report/             daily report: ledger numbers + a short LLM summary
+  news/               node A only: RSS/Atom poll, ticker mapping, cutoff timing,
+                      LLM scoring in capped batches, daily sentiment + overlay
   locks.py            one daily run per node, one LLM job per machine
   cli.py
 tests/                timing, folds, costs, ledger maths, leakage canaries
@@ -60,8 +63,8 @@ tests/                timing, folds, costs, ledger maths, leakage canaries
    `export`.
 4. **Done** — LLM tuner (schema, bounds, validation gate, change log) and
    the daily report.
-5. News and the sentiment overlay for node A (collect hourly, score in one
-   batch before the cutoff).
+5. **Done** — news pipeline and the sentiment overlay for node A, with
+   cutoff tests.
 6. `compare`, `replay`, full dry run.
 7. Scheduling with `run-due` (Task Scheduler or cron), deployment notes.
 
@@ -117,6 +120,34 @@ The LLM URL must be on this machine unless `llm.allow_remote` is set. If
 the LLM is down the round is logged as `llm_failed` and nothing changes;
 the daily report (`reports/<node>/YYYY-MM-DD.md`) is still written with the
 ledger's numbers, without the summary.
+
+## News (node A only)
+
+`news-poll` fetches every ticker's feed (`news.ticker_feed`, Yahoo Finance
+RSS by default) plus any `news.feeds`, stores each headline once (same
+title from several feeds = one story) with its source, publish time and
+tickers (its feed's ticker, plus any cashtag, `(SYM)` or alias from
+`news.aliases` in the title), then scores what is pending with the LLM in
+batches of `batch_size` — only the `max_per_ticker_day` most recent per
+ticker-day, the rest are kept but never scored. A score is a number in
+[-1, 1] per (headline, ticker); malformed replies leave items for the next
+poll. Everything is kept in `data/A/news.sqlite`.
+
+**Cutoff:** a headline counts for the first trading day whose 16:00 New
+York cutoff is strictly after its publish time (15:59 → today, 16:00 →
+tomorrow, weekend → Monday). No usable timestamp → never counts; a publish
+time later than the fetch is pulled back to the fetch. Day t's sentiment
+is the mean score of the ticker's headlines counting for t.
+
+**Overlay:** only node A's live book: `p_adj = clip(p + w * sentiment)`,
+`w` starting at `news.sentiment_weight` (0.02). The ledger records both
+`p_base` and `sentiment`. The tuner may change `w` on node A; the gate
+judges it only on days with sentiment history and needs at least
+`news.min_validation_days` of them. Node B never reads news: the CLI
+refuses news commands there and its daily step is never given sentiment.
+
+**Warm-up:** run `news-poll` hourly for 2–3 weeks before the start;
+`news-status` shows headlines, scoring progress and per-day coverage.
 
 ## Reading a backtest
 

@@ -15,6 +15,12 @@ Recent live results play no part.
 
 Note: the threshold only decides long/flat, so it cannot change log loss —
 a threshold-only proposal can never pass this gate.
+
+Sentiment (news node): each setting's predictions get its own overlay
+``p + w * sentiment`` from the sentiment history. A proposal that changes
+``w`` is judged only on the days that HAVE sentiment history (elsewhere the
+overlay adds nothing, which would just dilute the difference), and needs at
+least ``news.min_validation_days`` of them.
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import pandas as pd
 from ..backtest.metrics import prediction_metrics
 from ..backtest.run import evaluate, paired_edge, predict
 from ..features.build import feature_columns
+from ..news.sentiment import lookup, overlay
 from ..paper.books import BookConfig
 from ..paper.daily import as_of
 
@@ -71,7 +78,8 @@ def _book_cfg(cfg: Dict, book: BookConfig) -> Dict:
 
 
 def walk_forward(table: pd.DataFrame, book: BookConfig, cfg: Dict,
-                 seed: int, cutoff: dt.date) -> Run:
+                 seed: int, cutoff: dt.date,
+                 sentiment: Optional[pd.DataFrame] = None) -> Run:
     cut = as_of(table, cutoff)
     labelled = sorted(cut.dropna(subset=["target"])["date"].unique())
     years = cfg["backtest"]["validation_years"]
@@ -86,19 +94,35 @@ def walk_forward(table: pd.DataFrame, book: BookConfig, cfg: Dict,
     feats = book.features(feature_columns(cut))
     pred = predict(cut, book.model_kind, raw, seed, features=feats,
                    start_after=start_after)
+    if sentiment is not None:
+        pred["p_base"] = pred["p"]
+        pred["p"] = overlay(pred["p"].to_numpy(),
+                            lookup(sentiment, pred["date"], pred["ticker"]),
+                            book.sentiment_weight)
     return Run(pred, evaluate(pred, raw), min(pred["date"]),
                max(pred["date"]))
 
 
 def gate(table: pd.DataFrame, current: BookConfig, proposed: BookConfig,
          cfg: Dict, seed: int, cutoff: dt.date,
-         baseline: Optional[Run] = None) -> Verdict:
-    base = baseline or walk_forward(table, current, cfg, seed, cutoff)
-    prop = walk_forward(table, proposed, cfg, seed, cutoff)
+         baseline: Optional[Run] = None,
+         sentiment: Optional[pd.DataFrame] = None) -> Verdict:
+    base = baseline or walk_forward(table, current, cfg, seed, cutoff,
+                                    sentiment)
+    prop = walk_forward(table, proposed, cfg, seed, cutoff, sentiment)
     # Compare on the rows both predicted (all of them, unless one setting's
     # first fold starts later for lack of history).
     key = ["date", "ticker"]
     common = base.pred[key].merge(prop.pred[key], on=key)
+    if proposed.sentiment_weight != current.sentiment_weight:
+        need = int(cfg.get("news", {}).get("min_validation_days", 10))
+        days = set() if sentiment is None else set(
+            sentiment.loc[sentiment["date"] <= cutoff, "date"])
+        common = common[common["date"].isin(days)]
+        have = common["date"].nunique()
+        if have < need:
+            raise ValueError(f"only {have} days of sentiment history to "
+                             f"validate a sentiment weight; need {need}")
     b = base.pred.merge(common, on=key)
     p = prop.pred.merge(common, on=key)
     edge = paired_edge(p, b)

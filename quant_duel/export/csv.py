@@ -10,6 +10,9 @@
     exports/<node>/events.csv        refits, missing bars, tuner adoptions
     exports/<node>/tuner_log.csv     every proposal, its gate result, verdict
     exports/<node>/metrics.csv       prediction + strategy metrics per book
+    exports/A/headlines.csv          news node: every headline-ticker pair,
+                                     publish time, the day it counts for, score
+    exports/A/sentiment_daily.csv    news node: date, ticker, sentiment, n
 
 Long format throughout (Power BI and Tableau like it best); files are
 written atomically so a reader never sees half a file.
@@ -65,7 +68,8 @@ def metrics(ledger: Ledger) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def export_node(ledger: Ledger, out_dir: Path) -> List[Path]:
+def export_node(ledger: Ledger, out_dir: Path, news=None) -> List[Path]:
+    """``news``: (news.sqlite path, news settings) on the news node."""
     node = ledger.meta("node_id") or "?"
     out_dir = Path(out_dir)
 
@@ -100,4 +104,24 @@ def export_node(ledger: Ledger, out_dir: Path) -> List[Path]:
     m = metrics(ledger) if len(eq) else pd.DataFrame()
     written.append(write_csv(tag(m.replace([np.inf, -np.inf], np.nan)),
                              out_dir / "metrics.csv"))
+    if news is not None:
+        written += _export_news(news[0], news[1], out_dir, tag)
     return written
+
+
+def _export_news(path: Path, news_cfg, out_dir: Path, tag) -> List[Path]:
+    from ..news.sentiment import assign_days, daily_sentiment
+    from ..news.store import NewsStore
+    store = NewsStore(path)
+    try:
+        pairs = store.pairs()
+    finally:
+        store.close()
+    cutoff, cap = news_cfg["cutoff"], int(news_cfg["max_per_ticker_day"])
+    days = assign_days(pairs, cutoff, cap)
+    undated = pairs[pairs["published"].isna()].assign(day=None, rank=None)
+    allp = pd.concat([days, undated], ignore_index=True)
+    allp["published"] = allp["published"].astype(str)
+    return [write_csv(tag(allp), out_dir / "headlines.csv"),
+            write_csv(tag(daily_sentiment(pairs, cutoff, cap)),
+                      out_dir / "sentiment_daily.csv")]

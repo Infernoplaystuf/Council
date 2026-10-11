@@ -7,6 +7,9 @@
     python -m quant_duel.cli --node A export
     python -m quant_duel.cli --node A tune   [--day ...] [--proposal file.json]
     python -m quant_duel.cli --node A report [--day ...]
+    python -m quant_duel.cli --node A news-poll  [--no-score]   (node A only)
+    python -m quant_duel.cli --node A news-score
+    python -m quant_duel.cli --node A news-status
 
 Prices and features are shared by both nodes (data/shared/); each node keeps
 its own paper ledger (data/<node>/paper.sqlite) and exports (exports/<node>/).
@@ -146,6 +149,109 @@ def _need_node(cfg: cfgmod.Config) -> None:
                          "--node B")
 
 
+def _news_path(cfg: cfgmod.Config) -> Path:
+    return cfg.node_dir / "news.sqlite"
+
+
+def load_sentiment(cfg: cfgmod.Config):
+    """Daily sentiment on the news node; None on the other (never read)."""
+    if not cfg.news_enabled:
+        return None
+    from .news.sentiment import daily_sentiment
+    from .news.store import NewsStore
+    path = _news_path(cfg)
+    if not path.exists():
+        return pd.DataFrame(columns=["date", "ticker", "sentiment", "n"])
+    store = NewsStore(path)
+    try:
+        n = cfg["news"]
+        return daily_sentiment(store.pairs(), n["cutoff"],
+                               int(n["max_per_ticker_day"]))
+    finally:
+        store.close()
+
+
+def _need_news(cfg: cfgmod.Config) -> None:
+    _need_node(cfg)
+    if not cfg.news_enabled:
+        raise SystemExit(f"node {cfg.node_id} never sees news "
+                         "(news_enabled: false)")
+
+
+def cmd_news_poll(cfg: cfgmod.Config, args) -> int:
+    from .news.poll import poll
+    from .news.store import NewsStore
+    _need_news(cfg)
+    store = NewsStore(_news_path(cfg))
+    try:
+        rep = poll(store, cfg["news"], cfg.tickers)
+        print(f"news-poll: {rep['sources']} feeds, {rep['items']} items, "
+              f"{rep['new']} new" + (f", {len(rep['errors'])} feeds failed"
+                                     if rep["errors"] else ""))
+        for e in rep["errors"][:5]:
+            print("  " + e)
+    finally:
+        store.close()
+    if not args.no_score:
+        return cmd_news_score(cfg, args)
+    return 0
+
+
+def cmd_news_score(cfg: cfgmod.Config, args) -> int:
+    from .locks import LockBusy, file_lock
+    from .news.score import score_pending
+    from .news.store import NewsStore
+    _need_news(cfg)
+    llm = _llm(cfg)
+    if llm is None:
+        return 0
+    store = NewsStore(_news_path(cfg))
+    try:
+        with file_lock(cfg.data_dir / "llm.lock"):
+            rep = score_pending(store, llm, cfg["news"],
+                                model_name=cfg["llm"]["model"])
+    except LockBusy as exc:
+        print(f"news-score skipped: {exc}")
+        return 0
+    finally:
+        store.close()
+    print(f"news-score: {rep['scored']} scored, {rep['unscored']} left for "
+          f"later, {rep['capped']} over the per-day cap" +
+          (" — LLM unavailable" if rep["llm_failed"] else ""))
+    return 0
+
+
+def cmd_news_status(cfg: cfgmod.Config, args) -> int:
+    from .news.sentiment import assign_days
+    from .news.store import NewsStore
+    _need_news(cfg)
+    if not _news_path(cfg).exists():
+        print("no headlines yet — run news-poll (warm-up: 2–3 weeks before "
+              "the start)")
+        return 0
+    store = NewsStore(_news_path(cfg))
+    try:
+        pairs = store.pairs()
+        days = assign_days(pairs, cfg["news"]["cutoff"],
+                           int(cfg["news"]["max_per_ticker_day"]))
+        heads = store.frame("headlines")
+    finally:
+        store.close()
+    print(f"{len(heads)} headlines, {len(pairs)} headline-ticker pairs; "
+          f"{(pairs['status'] == 'scored').sum()} scored, "
+          f"{(pairs['status'] == 'pending').sum()} pending, "
+          f"{(pairs['status'] == 'capped').sum()} capped, "
+          f"{(pairs['status'] == 'failed').sum()} failed; "
+          f"{heads['published'].isna().sum()} without a usable time")
+    if len(days):
+        per = days.groupby("day").agg(pairs=("ticker", "size"),
+                                      tickers=("ticker", "nunique"),
+                                      scored=("status",
+                                              lambda x: (x == "scored").sum()))
+        print(per.tail(15).to_string())
+    return 0
+
+
 def cmd_daily(cfg: cfgmod.Config, args) -> int:
     from .export.csv import export_node
     from .paper.books import BookConfig
@@ -173,7 +279,7 @@ def cmd_daily(cfg: cfgmod.Config, args) -> int:
                       f"({ledger.path})")
             start = dt.date.fromisoformat(args.start) if args.start else end
             results = run_through(ledger, cfg, table, prices, start, end,
-                                  hashes)
+                                  hashes, sentiment=load_sentiment(cfg))
             for r in results:
                 eq = ", ".join(f"{b} {v:,.0f}" for b, v in
                                sorted(r["equity"].items()))
@@ -182,12 +288,19 @@ def cmd_daily(cfg: cfgmod.Config, args) -> int:
                 print(f"nothing new to process up to {end} "
                       f"(last run {ledger.last_run()})")
             export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
-                        cfg.node_id)
+                        cfg.node_id, news=_news_for_export(cfg))
         finally:
             ledger.close()
     if args.report:
         return cmd_report(cfg, argparse.Namespace(day=None))
     return 0
+
+
+def _news_for_export(cfg: cfgmod.Config):
+    """(news db path, news settings) on the news node, else None."""
+    if cfg.news_enabled and _news_path(cfg).exists():
+        return _news_path(cfg), cfg["news"]
+    return None
 
 
 def _llm(cfg: cfgmod.Config):
@@ -228,7 +341,8 @@ def cmd_tune(cfg: cfgmod.Config, args) -> int:
                 row = tune(ledger, cfg.raw, table, day,
                            news=cfg.news_enabled,
                            llm=None if proposal else _llm(cfg),
-                           proposal=proposal)
+                           proposal=proposal,
+                           sentiment=load_sentiment(cfg))
         except LockBusy as exc:
             print(f"tune skipped: {exc}")
             return 0
@@ -244,7 +358,7 @@ def cmd_tune(cfg: cfgmod.Config, args) -> int:
                   f"{row['edge_t']:+.2f})")
         from .export.csv import export_node
         export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
-                    cfg.node_id)
+                    cfg.node_id, news=_news_for_export(cfg))
     finally:
         ledger.close()
     return 0
@@ -285,7 +399,7 @@ def cmd_export(cfg: cfgmod.Config, args) -> int:
     ledger = Ledger(path)
     try:
         out = export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
-                          cfg.node_id)
+                          cfg.node_id, news=_news_for_export(cfg))
     finally:
         ledger.close()
     print(f"exported {len(out)} files to {out[0].parent}")
@@ -321,13 +435,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="a JSON proposal file instead of asking the LLM")
     p = sub.add_parser("report")
     p.add_argument("--day", default=None)
+    p = sub.add_parser("news-poll")
+    p.add_argument("--no-score", action="store_true")
+    sub.add_parser("news-score")
+    sub.add_parser("news-status")
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
                       else cfgmod.ROOT)
     return {"ingest": cmd_ingest, "build-features": cmd_build_features,
             "backtest": cmd_backtest, "daily": cmd_daily,
             "export": cmd_export, "tune": cmd_tune,
-            "report": cmd_report}[args.cmd](cfg, args)
+            "report": cmd_report, "news-poll": cmd_news_poll,
+            "news-score": cmd_news_score,
+            "news-status": cmd_news_status}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

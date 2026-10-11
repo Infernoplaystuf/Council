@@ -80,6 +80,60 @@ tuner:                      # weekly; only the live book can change
 report:
   words: 150
 
+news:                       # used by the news node (A) only; B never reads it
+  cutoff: "16:00"           # New York; a headline counts for the first trading
+                            # day whose cutoff is strictly after it was published
+  sentiment_weight: 0.02    # starting w in p_adj = clip(p + w * sentiment)
+  max_per_ticker_day: 10    # headlines scored and used per ticker per day
+  batch_size: 8             # headlines per LLM call
+  max_score_attempts: 3
+  min_validation_days: 10   # sentiment history needed to validate a new w
+  timeout_s: 20
+  ticker_feed: "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+  skip_ticker_feeds: [SPY, QQQ]
+  feeds: []                 # extra general feeds: [{name: ..., url: ...}]
+  aliases:                  # names that map a headline to a ticker (whole words)
+    AAPL: [Apple, iPhone]
+    MSFT: [Microsoft]
+    NVDA: [Nvidia]
+    AMZN: [Amazon]
+    GOOGL: [Alphabet, Google]
+    META: [Meta Platforms, Facebook, Instagram]
+    AVGO: [Broadcom]
+    TSLA: [Tesla]
+    BRK-B: [Berkshire Hathaway, Berkshire]
+    JPM: [JPMorgan, JP Morgan]
+    V: [Visa]
+    UNH: [UnitedHealth]
+    XOM: [Exxon, ExxonMobil]
+    LLY: [Eli Lilly]
+    JNJ: [Johnson & Johnson, J&J]
+    MA: [Mastercard]
+    PG: [Procter & Gamble, P&G]
+    HD: [Home Depot]
+    COST: [Costco]
+    MRK: [Merck]
+    ABBV: [AbbVie]
+    CVX: [Chevron]
+    PEP: [PepsiCo, Pepsi]
+    KO: [Coca-Cola, Coke]
+    WMT: [Walmart]
+    BAC: [Bank of America]
+    ADBE: [Adobe]
+    CRM: [Salesforce]
+    CSCO: [Cisco]
+    ORCL: [Oracle]
+    MCD: [McDonald's, McDonalds]
+    TMO: [Thermo Fisher]
+    ABT: [Abbott]
+    ACN: [Accenture]
+    LIN: [Linde]
+    DIS: [Disney]
+    NKE: [Nike]
+    INTC: [Intel]
+    QCOM: [Qualcomm]
+    TXN: [Texas Instruments]
+
 schedule:                   # phase 7 — America/New_York
   timezone: America/New_York
   daily_at: "16:45"

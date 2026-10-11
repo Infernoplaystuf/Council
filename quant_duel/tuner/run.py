@@ -84,8 +84,21 @@ def history(ledger: Ledger, n: int = 3) -> List[Dict[str, Any]]:
     return rows
 
 
+def sentiment_summary(sent: Optional[pd.DataFrame],
+                      day: dt.date) -> Dict[str, Any]:
+    if sent is None or sent.empty:
+        return {"days": 0}
+    s = sent[sent["date"] <= day]
+    return {"days": int(s["date"].nunique()),
+            "ticker_days": int(len(s)),
+            "mean_abs": round(float(s["sentiment"].abs().mean()), 3)
+            if len(s) else 0.0}
+
+
 def prompt(cfg: Dict, current: BookConfig, news: bool, live: Dict,
-           backtest: Dict[str, float], past: List[Dict]) -> List[Dict[str, str]]:
+           backtest: Dict[str, float], past: List[Dict],
+           sentiment: Optional[Dict[str, Any]] = None
+           ) -> List[Dict[str, str]]:
     t = cfg["tuner"]
     system = SYSTEM.format(years=cfg["backtest"]["validation_years"],
                            margin=t["min_improvement"],
@@ -93,7 +106,7 @@ def prompt(cfg: Dict, current: BookConfig, news: bool, live: Dict,
     shown = {k: v for k, v in current.to_dict().items()
              if k not in ("extra", "refit_days")
              and (news or k != "sentiment_weight")}
-    user = canonical({
+    body = {
         "CURRENT": shown,
         "SCHEMA": describe(current, t["bounds"], news),
         "BACKTEST_OF_CURRENT": _round({k: backtest[k] for k in (
@@ -101,16 +114,23 @@ def prompt(cfg: Dict, current: BookConfig, news: bool, live: Dict,
             if k in backtest}),
         "LIVE_RECENT": live,
         "RECENT_PROPOSALS": past,
-    })
+    }
+    if news and sentiment is not None:
+        body["SENTIMENT_HISTORY"] = sentiment
+    user = canonical(body)
     return [{"role": "system", "content": system},
             {"role": "user", "content": user}]
 
 
 def tune(ledger: Ledger, cfg: Dict, table: pd.DataFrame, day: dt.date, *,
          news: bool, llm: Optional[ChatModel] = None,
-         proposal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+         proposal: Optional[Dict[str, Any]] = None,
+         sentiment: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """Run one round; returns the logged row (plus ``id``). Either ``llm``
-    asks the model for a proposal, or ``proposal`` is given directly."""
+    asks the model for a proposal, or ``proposal`` is given directly.
+    ``sentiment`` (news node only) feeds the overlay in the gate."""
+    if not news:
+        sentiment = None
     current = ledger.book_config("live")
     t = cfg["tuner"]
     row: Dict[str, Any] = {"day": day.isoformat(),
@@ -134,14 +154,16 @@ def tune(ledger: Ledger, cfg: Dict, table: pd.DataFrame, day: dt.date, *,
         return log(status="skipped",
                    errors=f"a change was already adopted this week ({week})")
     try:
-        baseline = gatemod.walk_forward(table, current, cfg, cfg["seed"], day)
+        baseline = gatemod.walk_forward(table, current, cfg, cfg["seed"], day,
+                                        sentiment)
     except ValueError as exc:
         return log(status="error", errors=str(exc))
     if proposal is None:
         if llm is None:
             return log(status="llm_failed", errors="no LLM configured")
         messages = prompt(cfg, current, news, live_summary(ledger),
-                          baseline.metrics, history(ledger))
+                          baseline.metrics, history(ledger),
+                          sentiment_summary(sentiment, day))
         try:
             proposal, raw = chat_json(llm, messages,
                                       max_tokens=t.get("max_tokens", 300))
@@ -162,7 +184,7 @@ def tune(ledger: Ledger, cfg: Dict, table: pd.DataFrame, day: dt.date, *,
                proposed_json=checked.book.to_json())
     try:
         v = gatemod.gate(table, current, checked.book, cfg, cfg["seed"], day,
-                         baseline=baseline)
+                         baseline=baseline, sentiment=sentiment)
     except ValueError as exc:
         return log(status="error", errors=str(exc))
     return log(status="adopted" if v.adopt else "rejected",

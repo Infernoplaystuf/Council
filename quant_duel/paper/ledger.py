@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS models (
 CREATE TABLE IF NOT EXISTS predictions (
     book TEXT NOT NULL, date TEXT NOT NULL, ticker TEXT NOT NULL,
     p REAL NOT NULL, signal INTEGER NOT NULL, model_id TEXT,
-    target REAL, fwd_return REAL, PRIMARY KEY (book, date, ticker));
+    target REAL, fwd_return REAL, p_base REAL, sentiment REAL,
+    PRIMARY KEY (book, date, ticker));
 CREATE TABLE IF NOT EXISTS orders (
     book TEXT NOT NULL, signal_date TEXT NOT NULL, ticker TEXT NOT NULL,
     weight REAL NOT NULL, filled_on TEXT,
@@ -78,6 +79,16 @@ class Ledger:
         self.conn.execute("PRAGMA journal_mode=DELETE")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Columns added after a ledger may have been created."""
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(predictions)")}
+        for name in ("p_base", "sentiment"):
+            if name not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE predictions ADD COLUMN {name} REAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -185,9 +196,16 @@ class Ledger:
     # -- predictions and orders --------------------------------------------
     def add_predictions(self, book: str, day: dt.date, rows: pd.DataFrame,
                         model_id: Optional[str]) -> None:
+        """``rows``: ticker, p, signal, and optionally p_base (before the
+        sentiment overlay) and sentiment (NaN = none that day)."""
+        def opt(r, name):
+            v = getattr(r, name, None)
+            return None if v is None or v != v else float(v)
         self.conn.executemany(
-            "INSERT INTO predictions VALUES (?,?,?,?,?,?,NULL,NULL)",
-            [(book, _d(day), r.ticker, float(r.p), int(r.signal), model_id)
+            "INSERT INTO predictions (book, date, ticker, p, signal, "
+            "model_id, p_base, sentiment) VALUES (?,?,?,?,?,?,?,?)",
+            [(book, _d(day), r.ticker, float(r.p), int(r.signal), model_id,
+              opt(r, "p_base"), opt(r, "sentiment"))
              for r in rows.itertuples()])
 
     def score(self, day: dt.date, outcomes: pd.DataFrame) -> int:

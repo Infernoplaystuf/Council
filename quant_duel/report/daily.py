@@ -45,6 +45,14 @@ def facts(ledger: Ledger, day: dt.date) -> Dict[str, Any]:
             "long": int(p["signal"].sum()), "of": int(len(p)),
             "top": [{"ticker": r.ticker, "p_up": round(r.p, 3)}
                     for r in top.itertuples()]}
+        if p["p_base"].notna().any():                     # the news node
+            s = p.dropna(subset=["sentiment"])
+            out["news"] = {
+                "tickers_with_sentiment": int(len(s)),
+                "mean_sentiment": round(float(s["sentiment"].mean()), 3)
+                if len(s) else None,
+                "signals_changed_by_news": int(
+                    ((p["p"] >= 0.5) != (p["p_base"] >= 0.5)).sum())}
     scored = ledger.frame("predictions").dropna(subset=["target"])
     if len(scored):
         last = scored["date"].max()
@@ -66,6 +74,7 @@ PROMPT = (
     "Write a plain-text summary of about {words} words of today's paper "
     "trading for node {node}. Cover the signals, the live strategy's P&L "
     "versus the frozen control and buy-and-hold SPY, and any tuner changes. "
+    "Mention news sentiment only if FACTS has a news entry. "
     "Use ONLY the numbers in FACTS; do not invent numbers, do not give "
     "investment advice, no headings or lists.")
 
@@ -93,6 +102,11 @@ def _table(f: Dict[str, Any]) -> List[str]:
         lines += ["", f"Signals for the next session: long {sig['long']} of "
                   f"{sig['of']}. Highest P(up): " + ", ".join(
                       f"{t['ticker']} {t['p_up']:.3f}" for t in sig["top"])]
+    if f.get("news"):
+        n = f["news"]
+        lines += ["", f"News: sentiment for {n['tickers_with_sentiment']} "
+                  f"tickers (mean {n['mean_sentiment']}); it flipped "
+                  f"{n['signals_changed_by_news']} up/down calls."]
     if f.get("yesterday_accuracy"):
         lines += ["", "Accuracy of the last scored day: " + ", ".join(
             f"{b} {a:.1%}" for b, a in sorted(f["yesterday_accuracy"].items()))]
