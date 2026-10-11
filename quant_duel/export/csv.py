@@ -7,7 +7,8 @@
     exports/<node>/holdings.csv      current holdings
     exports/<node>/models.csv        every model spec (window, hashes)
     exports/<node>/price_hashes.csv  the price-data hash of each run day
-    exports/<node>/events.csv        refits, missing bars, ...
+    exports/<node>/events.csv        refits, missing bars, tuner adoptions
+    exports/<node>/tuner_log.csv     every proposal, its gate result, verdict
     exports/<node>/metrics.csv       prediction + strategy metrics per book
 
 Long format throughout (Power BI and Tableau like it best); files are
@@ -74,7 +75,8 @@ def export_node(ledger: Ledger, out_dir: Path) -> List[Path]:
         return df
 
     written = []
-    for name in ("predictions", "fills", "equity", "holdings", "events"):
+    for name in ("predictions", "fills", "equity", "holdings", "events",
+                 "tuner_log"):
         written.append(write_csv(tag(ledger.frame(name)),
                                  out_dir / f"{name}.csv"))
     models = ledger.frame("models")

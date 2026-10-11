@@ -21,20 +21,16 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
-import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
 import pandas as pd
 
+from ..locks import file_lock
 from ..market_calendar import trading_days
 from . import artifact
 from .books import MODEL_BOOKS, BookConfig
 from .ledger import Ledger
-
-STALE_LOCK_S = 6 * 3600
 
 
 def as_of(table: pd.DataFrame, day: dt.date) -> pd.DataFrame:
@@ -219,25 +215,6 @@ def run_through(ledger: Ledger, cfg, table: pd.DataFrame,
     return out
 
 
-@contextmanager
-def node_lock(path: Path) -> Iterator[None]:
+def node_lock(path: Path):
     """One daily run per node at a time (a stale lock is broken)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            if time.time() - path.stat().st_mtime > STALE_LOCK_S:
-                path.unlink(missing_ok=True)
-                continue
-            raise RuntimeError(f"another run holds {path}") from None
-    else:
-        raise RuntimeError(f"could not take {path}")
-    try:
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        yield
-    finally:
-        path.unlink(missing_ok=True)
+    return file_lock(path)

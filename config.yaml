@@ -53,11 +53,32 @@ paper:                      # forward paper trading (no orders, ever)
   fill: open                # orders placed at a close fill at the next open | close
   exports_dir: exports
 
-llm:                        # phase 4 — any OpenAI-compatible server
-  url: http://localhost:11434/v1
+llm:                        # any OpenAI-compatible server on this machine
+  url: http://localhost:11434/v1   # Ollama; llama-server: http://127.0.0.1:8080/v1
   model: llama3.2:3b
   temperature: 0.0
   timeout_s: 180
+  retries: 2
+  max_tokens: 400
+  allow_remote: false       # a non-local URL is refused unless true
+
+tuner:                      # weekly; only the live book can change
+  min_improvement: 0.0005   # mean log loss must drop by MORE than this
+  min_edge_t: 2.0           # ...and consistently: paired t across days >= this
+  max_changes: 3            # settings changed per proposal
+  max_tokens: 300
+  bounds:
+    threshold: [0.50, 0.60]
+    train_days: [252, 1260]
+    sentiment_weight: [0.0, 0.10]   # node A only (news)
+    min_features_on: 2
+    logistic: {C: [0.001, 10.0]}
+    boosting: {max_depth: [2, 6], learning_rate: [0.01, 0.2],
+               max_iter: [50, 500], min_samples_leaf: [50, 1000],
+               l2_regularization: [0.0, 10.0]}
+
+report:
+  words: 150
 
 schedule:                   # phase 7 — America/New_York
   timezone: America/New_York

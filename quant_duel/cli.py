@@ -5,6 +5,8 @@
     python -m quant_duel.cli backtest        [--models always_up,persistence,logistic,boosting]
     python -m quant_duel.cli --node A daily  [--start 2026-09-01] [--end ...] [--no-ingest]
     python -m quant_duel.cli --node A export
+    python -m quant_duel.cli --node A tune   [--day ...] [--proposal file.json]
+    python -m quant_duel.cli --node A report [--day ...]
 
 Prices and features are shared by both nodes (data/shared/); each node keeps
 its own paper ledger (data/<node>/paper.sqlite) and exports (exports/<node>/).
@@ -183,6 +185,92 @@ def cmd_daily(cfg: cfgmod.Config, args) -> int:
                         cfg.node_id)
         finally:
             ledger.close()
+    if args.report:
+        return cmd_report(cfg, argparse.Namespace(day=None))
+    return 0
+
+
+def _llm(cfg: cfgmod.Config):
+    """The configured LLM client, or None (with the reason printed)."""
+    from .llm.client import LLMError, OpenAIClient
+    try:
+        return OpenAIClient.from_config(cfg["llm"])
+    except LLMError as exc:
+        print(f"LLM unavailable: {exc}")
+        return None
+
+
+def _open_ledger(cfg: cfgmod.Config):
+    from .paper.ledger import Ledger
+    path = cfg.node_dir / "paper.sqlite"
+    if not path.exists():
+        raise SystemExit(f"no ledger yet at {path} — run daily first")
+    return Ledger(path)
+
+
+def cmd_tune(cfg: cfgmod.Config, args) -> int:
+    import json as _json
+    from .locks import LockBusy, file_lock
+    from .tuner.run import tune
+    _need_node(cfg)
+    ledger = _open_ledger(cfg)
+    try:
+        day = dt.date.fromisoformat(args.day) if args.day else \
+            ledger.last_run()
+        if day is None:
+            raise SystemExit("the ledger has no processed day yet")
+        proposal = None
+        if args.proposal:
+            proposal = _json.loads(Path(args.proposal).read_text())
+        _, table = build_features(cfg)
+        try:
+            with file_lock(cfg.data_dir / "llm.lock"):
+                row = tune(ledger, cfg.raw, table, day,
+                           news=cfg.news_enabled,
+                           llm=None if proposal else _llm(cfg),
+                           proposal=proposal)
+        except LockBusy as exc:
+            print(f"tune skipped: {exc}")
+            return 0
+        print(f"tune {day} ({row['source']}): {row['status'].upper()}")
+        for k in ("errors", "reason", "changes_json"):
+            if row.get(k):
+                print(f"  {k}: {row[k]}")
+        if row.get("ll_current") is not None:
+            print(f"  log loss {row['ll_current']:.5f} → "
+                  f"{row['ll_proposed']:.5f} (improvement "
+                  f"{row['improvement']:+.5f}, needs > {row['margin']} with t >= "
+                  f"{cfg['tuner'].get('min_edge_t', 2.0)}; t "
+                  f"{row['edge_t']:+.2f})")
+        from .export.csv import export_node
+        export_node(ledger, cfg.root / cfg["paper"]["exports_dir"] /
+                    cfg.node_id)
+    finally:
+        ledger.close()
+    return 0
+
+
+def cmd_report(cfg: cfgmod.Config, args) -> int:
+    from .locks import LockBusy, file_lock
+    from .report.daily import write_report
+    _need_node(cfg)
+    ledger = _open_ledger(cfg)
+    try:
+        day = dt.date.fromisoformat(args.day) if args.day else \
+            ledger.last_run()
+        if day is None:
+            raise SystemExit("the ledger has no processed day yet")
+        out = cfg.root / "reports" / cfg.node_id
+        try:
+            with file_lock(cfg.data_dir / "llm.lock"):
+                path = write_report(ledger, day, out, _llm(cfg),
+                                    words=cfg["report"]["words"])
+        except LockBusy:
+            path = write_report(ledger, day, out, None,
+                                words=cfg["report"]["words"])
+    finally:
+        ledger.close()
+    print(f"report: {path}")
     return 0
 
 
@@ -224,13 +312,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="last day to process (default: last completed day)")
     p.add_argument("--source", default=None)
     p.add_argument("--no-ingest", action="store_true")
+    p.add_argument("--report", action="store_true",
+                   help="write the daily report afterwards")
     sub.add_parser("export")
+    p = sub.add_parser("tune")
+    p.add_argument("--day", default=None, help="cutoff (default: last run)")
+    p.add_argument("--proposal", default=None,
+                   help="a JSON proposal file instead of asking the LLM")
+    p = sub.add_parser("report")
+    p.add_argument("--day", default=None)
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node, root=Path(args.root) if args.root
                       else cfgmod.ROOT)
     return {"ingest": cmd_ingest, "build-features": cmd_build_features,
             "backtest": cmd_backtest, "daily": cmd_daily,
-            "export": cmd_export}[args.cmd](cfg, args)
+            "export": cmd_export, "tune": cmd_tune,
+            "report": cmd_report}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

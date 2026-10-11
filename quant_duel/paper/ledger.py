@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS equity (
     PRIMARY KEY (book, date));
 CREATE TABLE IF NOT EXISTS runs (
     date TEXT PRIMARY KEY, price_hash TEXT, finished_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tuner_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, logged_at TEXT NOT NULL,
+    day TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+    reason TEXT, changes_json TEXT, errors TEXT, raw_reply TEXT,
+    current_json TEXT, proposed_json TEXT, ll_current REAL,
+    ll_proposed REAL, improvement REAL, margin REAL, edge_t REAL,
+    detail_json TEXT);
 CREATE TABLE IF NOT EXISTS events (
     date TEXT NOT NULL, book TEXT, kind TEXT NOT NULL, message TEXT NOT NULL);
 """
@@ -224,11 +231,37 @@ class Ledger:
                           (book, _d(day), cash, holdings, cash + holdings,
                            traded))
 
+    # -- tuner log ------------------------------------------------------------
+    TUNER_COLUMNS = ("day", "source", "status", "reason", "changes_json",
+                     "errors", "raw_reply", "current_json", "proposed_json",
+                     "ll_current", "ll_proposed", "improvement", "margin",
+                     "edge_t", "detail_json")
+
+    def log_tuning(self, row: Dict[str, object]) -> int:
+        unknown = set(row) - set(self.TUNER_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown tuner_log columns {sorted(unknown)}")
+        cols = ["logged_at"] + list(self.TUNER_COLUMNS)
+        vals = [dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")]
+        vals += [row.get(c) for c in self.TUNER_COLUMNS]
+        cur = self.conn.execute(
+            f"INSERT INTO tuner_log ({','.join(cols)}) VALUES "
+            f"({','.join('?' * len(cols))})", vals)
+        return int(cur.lastrowid)
+
+    def adopted_in_week(self, day: dt.date) -> Optional[str]:
+        """The day of an adoption in ``day``'s ISO week, if any."""
+        monday = day - dt.timedelta(days=day.weekday())
+        return self._one(
+            "SELECT day FROM tuner_log WHERE status='adopted' AND day>=? "
+            "AND day<? ORDER BY day LIMIT 1",
+            (_d(monday), _d(monday + dt.timedelta(days=7))))
+
     # -- reading ------------------------------------------------------------
     def frame(self, table: str, where: str = "", args=()) -> pd.DataFrame:
         if table not in {"books", "holdings", "models", "predictions",
                          "orders", "fills", "equity", "runs", "events",
-                         "meta"}:
+                         "meta", "tuner_log"}:
             raise ValueError(table)
         sql = f"SELECT * FROM {table}" + (f" WHERE {where}" if where else "")
         return pd.read_sql_query(sql, self.conn, params=args)

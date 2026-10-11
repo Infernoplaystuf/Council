@@ -22,7 +22,8 @@ from .walkforward import folds
 
 
 def predict(table: pd.DataFrame, kind: str, cfg: Dict, seed: int = 0,
-            features: Sequence[str] | None = None) -> pd.DataFrame:
+            features: Sequence[str] | None = None,
+            start_after=None) -> pd.DataFrame:
     """Out-of-sample predictions: date, ticker, p, target, fwd_return, fold."""
     bt = cfg["backtest"]
     labelled = table.dropna(subset=["target"])
@@ -32,7 +33,8 @@ def predict(table: pd.DataFrame, kind: str, cfg: Dict, seed: int = 0,
     by_date = {d: g for d, g in labelled.groupby("date")}
     for f in folds(list(by_date), train_days=bt["train_days"],
                    test_days=bt["test_days"],
-                   min_train_days=bt["min_train_days"]):
+                   min_train_days=bt["min_train_days"],
+                   start_after=start_after):
         train = pd.concat([by_date[d] for d in f.train])
         test = pd.concat([by_date[d] for d in f.test])
         model = make_model(kind, cfg["model"]["params"], seed=seed)
