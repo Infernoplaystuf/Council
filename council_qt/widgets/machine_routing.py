@@ -34,6 +34,11 @@ from ..view import ViewHelpers
 
 HERE = "(this PC)"
 
+#: Every role the dialog binds: the council's, then the service roles
+#: (node_routing.SERVICE_ROLES, e.g. the Quant Duel). Saving rebuilds the
+#: bindings from this list, so a role missing here would be dropped.
+ROUTABLE_ROLES = tuple(model_slots.COUNCIL_ROLES) + tuple(nr.SERVICE_ROLES)
+
 
 def apothecary_nodes(vault_dir: Path) -> List[nr.Node]:
     """Names and Ollama addresses from node_registry.json — only those two
@@ -97,7 +102,7 @@ class MachineRoutingDialog(ViewHelpers, QDialog):
         v.addLayout(row)
 
         v.addWidget(QLabel("Roles"))
-        self.roles = QTableWidget(len(model_slots.COUNCIL_ROLES), 3)
+        self.roles = QTableWidget(len(ROUTABLE_ROLES), 3)
         self.roles.setHorizontalHeaderLabels(
             ["Role", "Answers on", "If it does not answer"])
         self.roles.horizontalHeader().setSectionResizeMode(
@@ -164,8 +169,11 @@ class MachineRoutingDialog(ViewHelpers, QDialog):
                 chosen[role_item.text()] = (combo.currentText(),
                                             fb.currentText() if fb else "here")
         names = self.machine_names()
-        for r, role in enumerate(model_slots.COUNCIL_ROLES):
-            self.roles.setItem(r, 0, QTableWidgetItem(role))
+        for r, role in enumerate(ROUTABLE_ROLES):
+            item = QTableWidgetItem(role)
+            if role in nr.SERVICE_ROLES:
+                item.setToolTip(nr.SERVICE_ROLES[role])
+            self.roles.setItem(r, 0, item)
             binding = self.routing.roles.get(role)
             node, fallback = chosen.get(role, (
                 binding.node if binding else HERE,
@@ -203,7 +211,7 @@ class MachineRoutingDialog(ViewHelpers, QDialog):
                 self.machines.cellWidget(r, 2).isChecked(),
                 self.machines.cellWidget(r, 3).value())
         roles = {}
-        for r, role in enumerate(model_slots.COUNCIL_ROLES):
+        for r, role in enumerate(ROUTABLE_ROLES):
             node = self.roles.cellWidget(r, 1).currentText()
             if node != HERE and node in nodes:
                 roles[role] = nr.Binding(

@@ -30,6 +30,7 @@ from .docs import build_docs
 from .dream3d import build_dream3d
 from .librarian import build_librarian
 from .nodes import build_nodes
+from .quant_duel import build_quant_duel
 from .ide import build_ide
 from .vault_health import build_vault_health
 from .changelog import build_changelog
@@ -59,6 +60,9 @@ REGISTRY = [
     ("🕸 Council Map", build_council_map, False),
     ("💻 Code", build_code, False),
     ("🧩 Fan-out", build_fanout, False),
+    # Eager: its 15-minute timer runs due jobs without the tab being opened
+    # (only when the user turned the duel and its schedule on).
+    ("📈 Quant Duel", build_quant_duel, True),
     ("📖 Docs", build_docs, False),
     ("📊 Grapher", build_grapher, False),
     ("🧊 Dream3D", build_dream3d, False),
@@ -92,6 +96,6 @@ __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_agents",
            "build_capture",
            "build_changelog", "build_code", "build_council", "build_council_map", "build_fanout", "build_librarian", "build_ide", "build_nodes", "build_vault_health",
            "build_designer", "build_diagnostics", "build_docs", "build_dream3d", "build_forge", "build_grapher",
-           "build_jobs",
+           "build_jobs", "build_quant_duel",
            "build_lens", "build_models", "build_sessions",
            "build_specialists", "build_speech", "build_vault"]

@@ -64,6 +64,15 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _URL = re.compile(r"^https?://[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?/?$")
 
 
+#: Roles that are not council members but whose LLM work is routed the
+#: same way (a binding, the machine's call slots, cooldown, fallback). The
+#: Machines & roles dialog lists them after the council's roles.
+SERVICE_ROLES = {
+    "quant": "Quant Duel — paper trading: news scoring, tuning, reports "
+             "(council_core/quant_duel.py)",
+}
+
+
 class RoutingError(ValueError):
     pass
 
@@ -370,7 +379,7 @@ def run_parallel(calls: Sequence[Callable[[], Any]],
         return list(pool.map(one, calls))
 
 
-__all__ = ["FILE_NAME", "Node", "Binding", "Routing", "RoutingError",
+__all__ = ["FILE_NAME", "SERVICE_ROLES", "Node", "Binding", "Routing", "RoutingError",
            "Target", "parse", "load", "save", "problem", "current",
            "invalidate", "set_current", "route", "is_allowed_host",
            "enabled_nodes", "mark_failed", "mark_ok", "cooling",

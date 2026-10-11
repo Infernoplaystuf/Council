@@ -228,6 +228,39 @@ Useful for hands-free brainstorming.
 
 ---
 
+## The Quant Duel tab
+
+A paper-trading experiment the Council can run for you: node **A** reads
+news, node **B** never does, and after about a month `compare` says whether
+news helped. Paper trading only — it has no way to place an order. The duel
+lives in its own folder (a checkout of the `quant-duel` branch, with its own
+`.venv`); the Council runs its commands as separate processes.
+
+1. **Folder** — the checkout; **Python** blank uses its `.venv`.
+2. Tick the nodes this PC runs (both, or one if the other node is a Pi
+   running the duel itself), tick **On**, and **Save**. Nothing runs before
+   that. Once on, the duel fetches daily prices from Yahoo Finance and
+   (node A) headlines from RSS feeds — nothing else leaves this PC.
+3. **Where its LLM runs** — by default the model in the duel's own
+   `config.yaml` on this PC. To use a Raspberry Pi (or any machine with
+   Ollama): **Machines & roles…**, add the machine, enable it, and bind the
+   **quant** role to it. The duel's LLM jobs (news scoring, the weekly
+   tuning round, report summaries) then run there, using one of the
+   machine's call slots so they never pile up on it. A machine that fails
+   rests (30 s, doubling to 5 min); meanwhile the job runs here (fallback
+   *here*) or waits (fallback *fail*). The Council Map shows the link.
+4. **Run due jobs while the Council is open** runs whatever is due every
+   15 minutes (news hourly on A in market hours, the daily step after 16:45
+   New York time, the report, Saturday's tuning). Use this OR a systemd
+   timer / Task Scheduler for a folder, not both: the duel's locks keep two
+   daily steps or two LLM jobs from overlapping, but two news polls could
+   (harmless — a headline is stored once — just wasted work).
+5. **Check** runs the duel's pre-flight list, **Replay last month** runs
+   both nodes over last month with news off (it must end PASS), **Compare**
+   writes the A-vs-B report after the experiment.
+
+The duel's own `deploy/README_PI.md` covers running a node directly on a Pi.
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |

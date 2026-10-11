@@ -543,7 +543,8 @@ def _is_local_host(host: str) -> bool:
 
 def live_overlay(m: CouncilMap, slots: Any = None,
                  statuses: Sequence[Any] = (),
-                 main_path: str = "", routing: Any = None) -> CouncilMap:
+                 main_path: str = "", routing: Any = None,
+                 quant: Optional[bool] = None) -> CouncilMap:
     """Add model and machine nodes to `m` (in place) and return it.
 
     `slots` is a model_slots.SlotConfig (or anything with .slots, .roles and
@@ -555,6 +556,10 @@ def live_overlay(m: CouncilMap, slots: Any = None,
     (routing on, the machine enabled): then its model → that machine is
     live. A machine that has a slot's model but no role bound to it is drawn
     as a PROPOSED link — it could share the load.
+
+    The Quant Duel (`quant`, a service role) is drawn when it is turned on
+    or bound: its LLM work → the machine it is bound to, or this PC.
+    `quant=None` reads quant_duel.json from the vault.
     """
     if routing is None:
         try:
@@ -679,6 +684,14 @@ def live_overlay(m: CouncilMap, slots: Any = None,
             f"{url}" + (f"\n{probed.summary}" if probed else ""),
             "council_core/node_routing.py")
         for role in roles:
+            if role == QUANT_ROLE:
+                _quant_node(m)
+                m.link(Edge(QUANT, nid, "LLM work (news scoring, tuning, "
+                            f"reports) runs on {name}, holding one of its "
+                            "call slots", "network", "live",
+                            cite="council_core/quant_duel.py (run, "
+                                 "endpoint)"))
+                continue
             slot_name = slots.slot_for(role) if slots is not None else ""
             src = f"model:{slot_name}" if f"model:{slot_name}" in m.nodes \
                 else role
@@ -686,7 +699,39 @@ def live_overlay(m: CouncilMap, slots: Any = None,
                         "network", "live",
                         cite="council_core/node_routing.py; "
                              "council_engine.py (_route_to_node)"))
+    if quant is None:
+        quant = _quant_enabled()
+    quant_routed = any(QUANT_ROLE in r for r in routed.values())
+    if quant and not quant_routed:
+        _quant_node(m)
+        m.link(Edge(QUANT, THIS_PC, "LLM work (news scoring, tuning, "
+                    "reports) with the model in the duel's config",
+                    "network", "live",
+                    note="Bind the 'quant' role in Machines & roles to send "
+                         "it to another machine.",
+                    cite="council_core/quant_duel.py (endpoint)"))
     return m
+
+
+QUANT = "quant-duel"
+QUANT_ROLE = "quant"
+
+
+def _quant_node(m: CouncilMap) -> None:
+    if QUANT not in m.nodes:
+        m.add(Node(QUANT, "Quant Duel", "agent",
+                   "Paper-trading experiment (node A reads news, node B "
+                   "never does) run by the Council as its own processes; "
+                   "its LLM jobs follow the 'quant' role's machine binding.",
+                   "council_core/quant_duel.py"))
+
+
+def _quant_enabled() -> bool:
+    try:
+        from . import paths, quant_duel
+        return quant_duel.load(paths.vault_dir()).enabled
+    except Exception:                                     # noqa: BLE001
+        return False
 
 
 def _url_key(url: str) -> str:

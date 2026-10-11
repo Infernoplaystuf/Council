@@ -643,7 +643,7 @@ TAB_WORKERS = (
     "council-command", "council-map-", "council-turn", "designer-", "diagnostics",
     "docs-", "dream3d-", "fanout-", "forge", "grapher-", "ide-",
     "jobs-", "keyword-index", "lens-", "librarian-", "model-",
-    "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
+    "mongo-convert", "nodes-", "quant-", "sessions-", "tts-", "vault-",
 )
 
 
