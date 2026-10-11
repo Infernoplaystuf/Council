@@ -1,8 +1,8 @@
-"""Command line. Phase 1: ingest, build-features, backtest.
+"""Command line. Phase 1-2: ingest, build-features, backtest.
 
     python -m quant_duel.cli ingest          [--source synthetic] [--end 2026-10-08]
     python -m quant_duel.cli build-features  [--end ...]
-    python -m quant_duel.cli backtest        [--models always_up,persistence,logistic]
+    python -m quant_duel.cli backtest        [--models always_up,persistence,logistic,boosting]
 
 Prices and features are shared by both nodes (data/shared/); --node only
 matters from phase 3 on, where each node keeps its own ledger.
@@ -19,10 +19,11 @@ import pandas as pd
 
 from . import config as cfgmod
 from .backtest.run import compare_models, suspicious
-from .features.build import build
+from .features.build import build, feature_columns
 from .ingest.sources import make_source
 from .ingest.store import PriceStore, ingest
 from .market_calendar import is_trading_day, previous_trading_day
+from .models.base import Boosting, make_model
 
 
 def last_completed_day(now: Optional[dt.datetime] = None) -> dt.date:
@@ -88,6 +89,11 @@ def cmd_backtest(cfg: cfgmod.Config, args) -> int:
     with pd.option_context("display.width", 160, "display.max_columns", 20,
                            "display.float_format", "{:.4f}".format):
         print(results)
+    if results.attrs.get("best_baseline") and "ll_edge" in results:
+        print(f"ll_edge: log-loss gain per day over the best baseline "
+              f"({results.attrs['best_baseline']}); |t| < 2 is noise")
+    if "boosting" in kinds:
+        _print_importances(table, cfg)
     for warning in suspicious(results):
         print("WARNING:", warning)
     out = cfg.root / "reports" / "backtest_latest.csv"
@@ -95,6 +101,22 @@ def cmd_backtest(cfg: cfgmod.Config, args) -> int:
     results.to_csv(out)
     print(f"saved {out}")
     return 0
+
+
+def _print_importances(table: pd.DataFrame, cfg: cfgmod.Config) -> None:
+    """Which features the boosted model leans on, fit on the most recent
+    training window (for reading, not for trading)."""
+    bt = cfg["backtest"]
+    labelled = table.dropna(subset=["target"])
+    dates = sorted(labelled["date"].unique())[-bt["train_days"]:]
+    train = labelled[labelled["date"].isin(set(dates))]
+    feats = feature_columns(table)
+    model = make_model("boosting", cfg["model"]["params"], seed=cfg["seed"])
+    assert isinstance(model, Boosting)
+    model.fit(train[feats], train["target"].to_numpy())
+    top = model.importances().head(10)
+    print(f"boosting ({model.backend}) top features, latest window: " +
+          ", ".join(f"{k} {v:.0f}" for k, v in top.items()))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -107,7 +129,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("build-features")
     p.add_argument("--end", default=None)
     p = sub.add_parser("backtest")
-    p.add_argument("--models", default="always_up,persistence,logistic")
+    p.add_argument("--models",
+                   default="always_up,persistence,logistic,boosting")
     args = ap.parse_args(argv)
     cfg = cfgmod.load(args.node)
     return {"ingest": cmd_ingest, "build-features": cmd_build_features,

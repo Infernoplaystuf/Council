@@ -124,8 +124,12 @@ def guard(table: pd.DataFrame, features: Sequence[str],
         x = labelled[f].to_numpy(dtype=float)
         if np.nanstd(x) == 0:
             continue
-        hi = x > np.nanmedian(x)
-        agree = max((hi == y).mean(), (hi != y).mean())
+        med = np.nanmedian(x)
+        # Both > and >= the median: a 0/1 feature has median 0 or 1, and
+        # only one of the two splits separates its values.
+        agree = 0.0
+        for hi in (x > med, x >= med):
+            agree = max(agree, (hi == y).mean(), (hi != y).mean())
         if agree > max_agreement:
             raise LeakageError(
                 f"feature {f!r} agrees with tomorrow's direction on "

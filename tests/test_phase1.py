@@ -207,6 +207,17 @@ def test_canary_a_feature_equal_to_the_future_target_is_caught(table, cfg):
         guard(leaky, ["target"])
 
 
+def test_canary_a_binary_copy_of_the_target_is_caught(table):
+    """A 0/1 feature has its median at 0 or 1, so a split strictly above
+    the median separates nothing — the guard must still see it."""
+    leaky = table.copy()
+    leaky["up_tomorrow"] = (leaky["fwd_return"] > 0).astype(float)
+    leaky["down_tomorrow"] = 1.0 - leaky["up_tomorrow"]
+    for col in ("up_tomorrow", "down_tomorrow"):
+        with pytest.raises(LeakageError, match=col):
+            guard(leaky, [col])
+
+
 def test_canary_a_shuffled_target_scores_about_half(table, cfg):
     rng = np.random.default_rng(0)
     shuffled = table.copy()

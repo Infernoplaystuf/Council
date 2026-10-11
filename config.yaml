@@ -37,7 +37,8 @@ model:
   params:
     logistic: {C: 0.1, max_iter: 500}
     boosting: {max_depth: 3, learning_rate: 0.05, max_iter: 200,
-               min_samples_leaf: 200, l2_regularization: 1.0}
+               min_samples_leaf: 200, l2_regularization: 1.0,
+               backend: auto}       # auto (LightGBM if installed) | lightgbm | sklearn
 
 backtest:
   train_days: 756           # ~3 years of trading days
