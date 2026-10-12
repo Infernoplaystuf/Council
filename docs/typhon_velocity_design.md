@@ -956,6 +956,13 @@ raw view's speed claim in 7.1 is a fifth):
   -25..60 as "recommended", which matches no IMX636 bias's real range.
   Aligning the fake with the HAL tables belongs in the same fix.
 
+All five are fixed on `typhon/text-fixes` (2026-10-12). Aligning the fake
+showed one more thing that matters for presets: Typhon opens an EVK4
+without OpenEB's range-check bypass, and then `I_LL_Biases::set` refuses
+any value outside the **recommended** range (OpenEB source). So the range a
+bias can actually be set to is -85..140 for `bias_diff_on`, not -150..200;
+the settings rows now run over that range (`get_bias_range()`).
+
 ### 5.2 How the settings tabs and saved configurations serve this
 
 The prelude (`typhon/settings-tabs`, now on `qt-migration` at 906bb26) gives
@@ -1127,7 +1134,7 @@ the 24-bit clock wrap (every 16.78 s, computed as 2^24 µs) has been tested on.
 | Tracker, Objects | 11.4x real time at 1 Mev/s | |
 | Whole job: HAL decode + tracker, Particles 1 ms | 0.85x (threaded) to 1.05x (inline) at 1 Mev/s; 0.21-0.26x at 10 Mev/s | A 10 s recording at 10 Mev/s takes about 40-50 s (computed) |
 | Thread pool: slices clustered in parallel, linked in order | 11.5 → 34-35 Mev/s with 4 or more threads (2 ms slices, 50 Mev/s); only about 1.2x at 1 ms slices and 10 Mev/s | numpy releases Python's lock (the GIL) on large arrays |
-| Existing raw view (`RawPlayback`) | 1.8-4.7 Mev/s | Only 1.8 on a 1 Mev/s recording (0.91 with 1 ms windows), because every window pays 5-9 ms of whole-sensor drawing (921,600 pixels). Its docstring's "tens of millions of events a second" (`event_playback.py:29`) is wrong and should be corrected |
+| Existing raw view (`RawPlayback`) | 1.8-4.7 Mev/s | Only 1.8 on a 1 Mev/s recording (0.91 with 1 ms windows), because every window pays 5-9 ms of whole-sensor drawing (921,600 pixels). Its docstring's "tens of millions of events a second" (`event_playback.py:29`) was wrong; corrected on `typhon/text-fixes` |
 | Live grab loop (`EvkDevice`), before any velocity work | 5.3-5.5 Mev/s | Without .raw logging, the PNG writer, the frames CSV or the display, so a real capture's budget is lower |
 | Live worker, Particles 1 ms, at 1 Mev/s | 88 % busy (1.77 s of work per 2 s) | |
 | Flat-index `accumulate_events` | 1.83-1.91x faster, identical pixels | Headroom for the live picture |
