@@ -235,6 +235,40 @@ Writer; launchers unchanged (Qt).
 - Not done: KG4's neighbourhood block (not built on `knowledge-graph` either — it becomes
   one more block in `prepare_turn`); Expand with council (Batch 3); the per-role carrier.
 
+**Batch 2, finished (2026-10-12, same branch).**
+- A source chip shows the file READ-ONLY in the app (its first rows and columns, no model —
+  Tk's `_preview_data_file`) with a "Show in folder" button that selects it in Explorer /
+  Finder; a file that has gone since is said. It used to open the folder only. Nothing
+  writes to the file; an offscreen run never starts the file manager.
+- Context-window notices in plain words in both shells ("too long for what the model can
+  read at once", "fills 85% of …", "Left out 2 parts of what was found …"), naming the
+  setting that sizes THIS model's window — `COUNCIL_OLLAMA_NUM_CTX` when Ollama serves it,
+  else `COUNCIL_GGUF_N_CTX` (Tk always said the GGUF one). The "nearly full" notice comes at
+  the engine's answer reserve (75% of the window; earlier on windows under 1,024 tokens)
+  and never later than 80%.
+- `council_core.vault_setup.VAULT_ROOT_STATE` is in `data_index._APP_INTERNAL_FILENAMES` and
+  `conversation_logger.PROTECTED_STATE_FILES` (measured before: `model_slots.json` and
+  `model_bench.json` reached the prompt on "search the vault for X"; the data index's own
+  migration copied all eight into `data_in/`).
+- The seam names its three blocks (`turn_context`, above `prepare_turn`): the vault (in
+  front of the question), this conversation (Batch 1, per role inside `respond()`), and
+  the knowledge graph's cited neighbourhood — `turn_context.knowledge_graph_block`, a hook
+  that returns None until KG4. What it returns is assembled with the vault blocks
+  (`_inject_file_contents(extra_blocks=…)`, priority band PRIO_EXTRA: below named files,
+  above the vault search) and cites its files under the answer when it is kept.
+- `tests/test_planted_fact_both_shells.py`: one FakeOllama, a question that names no file —
+  Qt as the app builds it (default build; the panel with `DI_DEMO_MODE=0`) and Tk (real
+  `_send`/`_poll_ui_queue` on a stand-in, no window): the fact is in every Writer prompt,
+  the answer, the chips and the saved sources; both shells give the Writer the same vault
+  text; a follow-up gets turn 1 and the file, and not an older session. On 21f7e18 the Qt
+  Writer was sent the bare question and 0 of 12 panel Writer prompts had the file.
+- Open, found while doing this: (1) RECENT CONVERSATION includes the question being
+  answered (it is saved when asked, and `respond()` reads the session file), so it appears
+  twice in each Qt prompt — Tk with SILO off does the same; (2) the injection is sized with
+  `get_n_ctx()` (4,096 when unset) while the notices measure against the real window
+  (`effective_n_ctx`, 8,192 for Ollama by default) — Tk's behaviour, kept; (3) the Tk stand-in
+  tests share the Tk console's process-wide indexes unless reset (fixed in the tests).
+
 **Review fixes (2026-10-12, same branch).** Each was reproduced by a test first.
 - Every Qt tab's personalities get the Qt scope (`council_turn.load_personalities(scope=…)`,
   default `memory_scope.for_qt()`; `sessions.rebuild_with_prior` too). The Lens and the
