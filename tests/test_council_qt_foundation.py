@@ -845,18 +845,72 @@ def test_every_drain_prefix_matches_a_real_worker():
     assert not dead, f"TAB_WORKERS prefixes that match nothing: {dead}"
 
 
+def _tab_workers_alive() -> list:
+    return [t for t in threading.enumerate()
+            if t.is_alive() and any(t.name.startswith(prefix)
+                                    for prefix in TAB_WORKERS)]
+
+
 def _drain_tab_workers(qapp, seconds: float = 10.0) -> None:
-    """Wait for any tab worker to finish, pumping so its callback lands."""
+    """Wait for every tab worker to finish, pumping so its callback lands -
+    and for the workers THOSE callbacks start.
+
+    IT USED TO STOP ONE CALLBACK SHORT. Once no worker was alive it pumped a
+    last time and returned - and that last pump is where the Models tab's
+    hardware probe delivers its result, which starts two more workers
+    (model-find, model-assess). Nobody waited for them. They ran on into
+    the next test, after the `window` fixture had put
+    local_models.list_local_models back, and asked the REAL Ollama
+    (127.0.0.1:11434) for its tags: the offline guard failed
+    test_every_registered_tab_builds[Docs], the test after [Models], once
+    in a whole-suite run (review, 2026-10-12), and every time when
+    ModelsActions.find was made to wait for the stub to go.
+
+    So it returns only after two pumps in a row with no worker alive before
+    or after either: everything a finished worker posted has been delivered,
+    and what was delivered started nothing - not even a worker quick enough
+    to be born and gone inside one pump."""
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        alive = [t for t in threading.enumerate()
-                 if t.is_alive() and any(t.name.startswith(prefix)
-                                         for prefix in TAB_WORKERS)]
-        if not alive:
-            break
+    quiet = 0
+    while quiet < 2 and time.monotonic() < deadline:
+        busy = bool(_tab_workers_alive())
         qapp.processEvents()
-        time.sleep(0.01)
-    qapp.processEvents()
+        busy = busy or bool(_tab_workers_alive())
+        quiet = 0 if busy else quiet + 1
+        if busy:
+            time.sleep(0.01)
+
+
+def test_the_drain_waits_for_a_worker_that_a_callback_starts(qapp):
+    """The Models tab's shape, without the Models tab: a worker hands its
+    result to the UI thread and is gone; the result starts the next worker.
+    The first worker has already finished when the drain begins - so the
+    only pump that can deliver its result is one the drain makes after
+    seeing nothing alive, and the second worker is born after that."""
+    bridge = UiBridge()
+    finished = []
+
+    def second():
+        time.sleep(0.3)
+        finished.append("second")
+
+    def first_result():
+        threading.Thread(target=second, name="model-second-for-the-test",
+                         daemon=True).start()
+
+    first = threading.Thread(
+        target=lambda: bridge.call_on_ui(first_result),
+        name="model-first-for-the-test", daemon=True)
+    first.start()
+    first.join()
+    try:
+        _drain_tab_workers(qapp)
+        assert finished == ["second"], (
+            "the drain returned while a worker started by a callback it "
+            "delivered was still running")
+    finally:
+        _pump(qapp, lambda: bool(finished))
+        bridge.stop()
 
 
 def _build_tab(window, factory):
