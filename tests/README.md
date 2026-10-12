@@ -87,8 +87,9 @@ test that reached out: every refusal, in this process or a child, is written
 to a report, and the autouse `offline_test` fixture **fails the test** it
 happened in, naming what was refused and the line that asked. Set
 `COUNCIL_OFFLINE_LOG=<file>` to have every refusal recorded there too (pid,
-test, what, where); in a clean run only `tests/test_offline_guard.py`
-appears in it. `python tests/smoke_test.py` installs the same guard, and its
+test, what, where); in a clean run only `tests/test_offline_guard.py` (and
+the `test_inner.py` of the small pytest it runs) appears in it - 24 lines on
+2026-10-12. `python tests/smoke_test.py` installs the same guard, and its
 runner fails a check that tried.
 
 A fake server on loopback works as before - `tests/fake_ollama.py`'s

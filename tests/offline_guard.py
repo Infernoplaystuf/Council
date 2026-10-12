@@ -44,7 +44,7 @@ leave the machine.
 
 COUNCIL_OFFLINE_LOG=<file> records every refusal there too (pid, test, what,
 where), so a whole run can show the guard fired nowhere but in its own tests
-(tests/test_offline_guard.py).
+(tests/test_offline_guard.py, and the test_inner.py of the pytest it runs).
 
 Imported by tests/conftest.py and inferno_local/tests/conftest.py, and by
 tests/smoke_test.py when it runs as a script (which loads no conftest).
