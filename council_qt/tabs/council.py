@@ -129,6 +129,20 @@ NOT_AVAILABLE = "{what} — not available in this build yet."
 _SPEAKERS = frozenset(council_turn.AGENT_NAMES.values()) | {"Judge"}
 
 
+def _notice_sink(on_event, on_notice):
+    """``notice(who, text, kind)`` for the app's own lines in a turn: to
+    ``on_notice`` when the caller takes them apart from the turn's events,
+    else to ``on_event`` as an observation."""
+    def notice(who: str, text: str, kind: str = "observation") -> None:
+        who, kind = who or "Council", kind or "observation"
+        if on_notice is not None:
+            on_notice(who, text, kind)
+        elif on_event is not None:
+            from council_core.deliberation import AgentEvent
+            on_event(AgentEvent(who, kind, text))
+    return notice
+
+
 class CouncilActions:
     """What the Council tab can ask the application to do.
 
@@ -221,12 +235,20 @@ class CouncilActions:
         return self._models, self._models_problem
 
     def send(self, typed_text: str, options, *, on_event=None,
-             on_token=None):
+             on_token=None, on_notice=None):
         """Run one turn through council_core.council_turn.
 
         Takes the TYPED text and a frozen options snapshot — never a widget and
         never the augmented text (A1, A5). Reports progress by calling
         ``on_event``; the caller decides which thread that lands on.
+
+        ``on_notice(who, text, kind)`` takes the app's OWN lines for this turn
+        — prepare_turn's notices ("Tracking → goal", "Reading: …", the
+        context-window warnings, "Your files could not be read …") and the
+        note under an answer from the data. They are not the models' turn
+        events: the Tk shell keeps them in the conversation, and so does the
+        tab (found in review — they went to the debug log only). Without
+        ``on_notice`` they arrive through ``on_event`` as observations.
         """
         from council_core import council_turn
 
@@ -244,14 +266,16 @@ class CouncilActions:
         # runs (council_core.turn_context.prepare_turn). The models are sent
         # `prepared.text`; everything that decides WHAT to do reads the
         # typed text (A5).
-        prepared = self.prepare(typed_text, on_event=on_event)
+        prepared = self.prepare(typed_text, on_event=on_event,
+                                on_notice=on_notice)
         sent = prepared.text if prepared is not None else typed_text
 
         if prepared is not None and prepared.answerable_from_data and \
                 self._fast_answers():
             # Answered from the data — a count, a summary, a fresh derived
             # result. No model is asked, so none has to be loaded.
-            result = self._from_data(prepared, on_event=on_event)
+            result = self._from_data(prepared, on_event=on_event,
+                                     on_notice=on_notice)
             models = None
         else:
             models, problem = self.models()
@@ -294,17 +318,13 @@ class CouncilActions:
             self._turn_state = turn_context.TurnState(self.vault_dir)
         return self._turn_state
 
-    def prepare(self, typed_text: str, *, on_event=None):
+    def prepare(self, typed_text: str, *, on_event=None, on_notice=None):
         """council_core.turn_context.prepare_turn for this conversation, its
-        notices reported as the turn's own events. None if it could not run
-        at all — the question is then asked without the vault, and the
-        transcript says so (a turn must not die because a file would not
+        notices reported through ``on_notice`` (see send). None if it could
+        not run at all — the question is then asked without the vault, and
+        the transcript says so (a turn must not die because a file would not
         open)."""
-        from council_core.deliberation import AgentEvent
-
-        def notice(who: str, text: str, kind: str = "observation") -> None:
-            if on_event is not None:
-                on_event(AgentEvent(who or "Council", "observation", text))
+        notice = _notice_sink(on_event, on_notice)
 
         try:
             from council_core import turn_context
@@ -322,16 +342,18 @@ class CouncilActions:
         from council_core import turn_context
         return turn_context.fast_answers_enabled(self.vault_dir)
 
-    def _from_data(self, prepared, *, on_event=None):
-        """The answer the analyst computed, given as the answer."""
+    def _from_data(self, prepared, *, on_event=None, on_notice=None):
+        """The answer the analyst computed, given as the answer, and the
+        app's note under it (a notice — see send)."""
         from council_core import council_turn, turn_context
         from council_core.deliberation import AgentEvent
         events = [AgentEvent("Writer", "final", prepared.fast_answer),
                   AgentEvent("Council", "observation",
                              turn_context.FAST_ANSWER_NOTE)]
         if on_event is not None:
-            for event in events:
-                on_event(event)
+            on_event(events[0])
+        _notice_sink(on_event, on_notice)("Council",
+                                          turn_context.FAST_ANSWER_NOTE)
         return council_turn.TurnResult(True, answer=prepared.fast_answer,
                                        route="data", events=events)
 
@@ -956,7 +978,11 @@ class CouncilTab(ViewHelpers, QWidget):
                     on_event=lambda ev: self._to_ui(
                         lambda ev=ev: self.on_event(ev)),
                     on_token=lambda who, tok: self._to_ui(
-                        lambda who=who, tok=tok: self.on_token(who, tok)))
+                        lambda who=who, tok=tok: self.on_token(who, tok)),
+                    # The app's own lines: kept in the conversation, as Tk
+                    # keeps them (not turn events — see _save_pending).
+                    on_notice=lambda who, text, kind: self._to_ui(
+                        self.append, who, text, kind))
                 if result is not None:
                     self._to_ui(lambda: self.finish_turn(result))
             # THE MESSAGE IS BOUND HERE, NOT READ LATER. Python deletes the
@@ -1227,6 +1253,12 @@ class CouncilTab(ViewHelpers, QWidget):
         if not keep:
             self.conversation.log(who, text, kind)
         elif self._pending is not None:
+            # The logs take it NOW, under the id it was said under, as the Tk
+            # shell's do; only whether it joins the conversation file waits
+            # for the turn's end (_save_pending). It waited whole before, so
+            # a turn's entries were logged at its end under the renamed id,
+            # and a crash mid-turn lost a deliberation's drafts from both.
+            self.conversation.log(who, text, kind)
             self._pending.append((who, text, kind, turn_event))
         else:
             self.conversation.record(who, text, kind)
@@ -1236,10 +1268,13 @@ class CouncilTab(ViewHelpers, QWidget):
     # ==================================================================
     def _save_pending(self) -> None:
         """Save what the turn said: the answer, with its provenance, and the
-        app's own lines (errors, notices, the session's name).
+        app's own lines (errors, the context notices — "Tracking → goal",
+        "Reading: …", the context-window warnings — the note under an answer
+        from the data, the session's name), in the order they were said, as
+        the Tk shell keeps them. Everything was logged when it was said.
 
         The turn's OTHER events — a full council's drafts, cross-examination,
-        rankings and critiques — go to the debug log only. The Tk shell
+        rankings and critiques — are in the debug log only. The Tk shell
         stores them all, and one full-council turn is forty-odd entries: the
         twelve-entry RECENT CONVERSATION a follow-up sees was then one turn's
         debate, and the question before it had already dropped out (found by
@@ -1257,13 +1292,13 @@ class CouncilTab(ViewHelpers, QWidget):
                               if transcript_core.is_final_answer(who, kind)
                               and text == answer), default=None)
         for i, (who, text, kind, turn_event) in enumerate(pending):
+            # Every one was logged when it was said (append).
             if i == last_answer_at:
                 extra = {"provenance": provenance} if provenance else {}
-                self.conversation.record(who, text, kind, **extra)
-            elif turn_event:
-                self.conversation.log(who, text, kind)
-            else:
-                self.conversation.record(who, text, kind)
+                self.conversation.record(who, text, kind, logged=True,
+                                         **extra)
+            elif not turn_event:
+                self.conversation.record(who, text, kind, logged=True)
         self._turn_provenance = None
         self.conversation.flush()
 

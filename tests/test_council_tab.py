@@ -139,7 +139,8 @@ def test_the_turn_worker_is_handed_the_snapshot_and_the_typed_text(tab, qapp):
     seen = {}
 
     class Recording(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             seen["text"] = typed_text
             seen["options"] = options
             seen["thread"] = threading.current_thread().name
@@ -199,7 +200,8 @@ def test_a_second_send_is_refused_while_one_is_running(tab, qapp):
     release = threading.Event()
 
     class Slow(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             release.wait(2.0)
 
     tab.actions = Slow()
@@ -223,7 +225,8 @@ def test_the_send_button_is_disabled_for_the_duration(tab, qapp):
     release = threading.Event()
 
     class Slow(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             release.wait(2.0)
 
     tab.actions = Slow()
@@ -238,7 +241,8 @@ def test_a_failing_turn_still_releases_the_lock(tab, qapp):
     """Otherwise one exception makes the tab permanently unusable, and the
     only cue is a button that never comes back."""
     class Boom(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             raise RuntimeError("model gone")
 
     tab.actions = Boom()
@@ -392,7 +396,8 @@ def test_a_new_turn_resets_the_previous_one(tab, qapp):
     # while the main thread pumped Qt events — which is what it was actually
     # asserting on, and it is not what this test is about.
     class Recording(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             from council_core import council_turn
             return council_turn.TurnResult(True, message="done")
 

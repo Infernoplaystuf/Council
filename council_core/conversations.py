@@ -677,15 +677,17 @@ class Conversation:
                 model.memory_scope = snap.scope
 
     # -- writing --------------------------------------------------------
-    def record(self, who: str, text: str, kind: str = "final",
-               **extra: Any) -> bool:
+    def record(self, who: str, text: str, kind: str = "final", *,
+               logged: bool = False, **extra: Any) -> bool:
         """One transcript entry, kept the way the Tk shell keeps it
-        (_append_transcript): the debug log takes everything but tokens; the
-        conversation takes everything but tokens, phases and thoughts; a
-        question also goes into History. ``extra`` keys are added to the
-        conversation record (provenance, for instance). True if stored."""
+        (_append_transcript): the logs take it (see `log`) unless ``logged``
+        says they already have; the conversation takes everything but
+        tokens, phases and thoughts; a question also goes into History.
+        ``extra`` keys are added to the conversation record (provenance, for
+        instance). True if stored."""
         from . import transcript as transcript_core
-        self.log(who, text, kind)
+        if not logged:
+            self.log(who, text, kind)
         if not transcript_core.stores_in_history(kind):
             return False
         if who == "User":
@@ -705,10 +707,21 @@ class Conversation:
         return True
 
     def log(self, who: str, text: str, kind: str = "final") -> None:
-        """The debug log only (conversation_logs/, never read by a model) —
-        for what is worth keeping for the user's own debugging but is not
-        part of the conversation: a deliberation's drafts, cross-examination
-        and rankings."""
+        """The logs only, as an entry is said — never read by a model:
+
+          conversation_logs/session_<id>.jsonl  the debug log (everything but
+                                                tokens), under the id current
+                                                when it was said
+          logs/council.log                      the Librarian's line log of
+                                                every entry the conversation
+                                                would keep, as the Tk shell
+                                                writes it (Qt wrote none —
+                                                found in review)
+
+        Alone, for what is worth keeping for the user's own debugging but is
+        not part of the conversation: a deliberation's drafts,
+        cross-examination and rankings, and lines that quote other
+        sessions."""
         from . import transcript as transcript_core
         try:
             if self.logger is not None and transcript_core.logs_to_session(kind):
@@ -716,6 +729,22 @@ class Conversation:
                                       meta={"session": self.session_id})
         except Exception as exc:                          # noqa: BLE001
             self._problem(f"the debug log did not take an entry: {exc!r}")
+        if transcript_core.stores_in_history(kind):
+            self._line_log(who, text)
+
+    def _line_log(self, who: str, text: str) -> None:
+        """One line in logs/council.log — council_engine.Librarian.log_event's
+        format ("[ts] who: text") and bytes: it appends in text mode, so on
+        Windows every newline is written CRLF. One atomic append."""
+        try:
+            path = self.vault_dir / "logs" / "council.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = f"[{now_iso()}] {who}: {text}".rstrip() + "\n"
+            if os.linesep != "\n":
+                line = line.replace("\n", os.linesep)
+            append_line(path, line.encode("utf-8"))
+        except Exception as exc:                          # noqa: BLE001
+            self._problem(f"council.log did not take an entry: {exc!r}")
 
     def note_question(self, text: str) -> None:
         """question_history.json, which History reads — Tk's too."""
