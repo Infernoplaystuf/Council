@@ -40,6 +40,7 @@ from .models import build_models
 from .sessions import build_sessions
 from .specialists import build_specialists
 from .speech import build_speech
+from .var_graph import build_var_graph
 from .vault import build_vault
 
 #: (title, factory, eager). Factories take the CouncilWindow.
@@ -61,6 +62,7 @@ REGISTRY = [
     ("📊 Grapher", build_grapher, False),
     ("🧊 Dream3D", build_dream3d, False),
     ("🎨 GUI Designer", build_designer, False),
+    ("🔗 Variable Map", build_var_graph, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 

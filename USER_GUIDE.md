@@ -228,6 +228,27 @@ Useful for hands-free brainstorming.
 
 ---
 
+## Variable Map
+
+For tracking down a bug in a Python script: open the script, pick the variable whose value is wrong, and the map shows **what fed it** (left) and **what it feeds** (right), each link labelled with the line that makes it. The script is only read, never run.
+
+- **Click a node** to make it the centre; **click a link** or a row in **Trace** to jump to that line in **Source**.
+- **Depth** is how many hops out to show. **Include if/while conditions** also links the variables an `if`/`while` tests to what it guards — useful for "why did this branch run?", but busier.
+- **Worth a look** lists the usual suspects: names read but never assigned (typos), values assigned and never read, and parameters overwritten before they're used.
+- Calls into functions and classes in the same file are followed (arguments → parameters, `return` → the caller, `obj.attr` → the class's `self.attr`). Calls into libraries just link their arguments to the result.
+
+The same analysis runs from a shell, no GUI needed:
+
+```
+python -m council_core.var_graph script.py              # summary + findings
+python -m council_core.var_graph script.py --up total   # what feeds `total`
+python -m council_core.var_graph script.py --down main.prices
+python -m council_core.var_graph script.py --path RATE main.total
+python -m council_core.var_graph script.py --dot --up total > total.dot   # Graphviz
+```
+
+---
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
