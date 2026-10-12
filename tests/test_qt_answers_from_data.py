@@ -195,13 +195,13 @@ def test_a_chip_for_a_file_that_has_gone_says_so(qapp, engine):
 def test_show_in_folder_selects_the_file(tmp_path):
     """The command "Show in folder" runs on each platform (never run here):
     the file selected in Explorer and Finder, its folder elsewhere."""
-    from council_qt.tabs import council
+    from council_qt.widgets import source_preview
     path = tmp_path / "a folder" / "pumps.csv"
-    assert council.reveal_command(path, "win32") == (
+    assert source_preview.reveal_command(path, "win32") == (
         f'explorer /select,"{path}"')
-    assert council.reveal_command(path, "darwin") == ["open", "-R",
+    assert source_preview.reveal_command(path, "darwin") == ["open", "-R",
                                                       str(path)]
-    assert council.reveal_command(path, "linux") == ["xdg-open",
+    assert source_preview.reveal_command(path, "linux") == ["xdg-open",
                                                      str(path.parent)]
 
 
