@@ -355,12 +355,18 @@ def _patch_socket():
             return real_gni(sockaddr, flags)
         lookups["getnameinfo"] = getnameinfo
 
+    # Only where the guard is not already outermost: something that wrapped
+    # these after it (a usercustomize, a tracing tool) is wrapped in turn, so
+    # the refusal comes first again; a function still the guard's own is
+    # left alone rather than checked twice.
     for name, fn in wrappers.items():
-        setattr(fn, _MARK, True)
-        setattr(cls, name, fn)
+        if not getattr(getattr(cls, name), _MARK, False):
+            setattr(fn, _MARK, True)
+            setattr(cls, name, fn)
     for name, fn in lookups.items():
-        setattr(fn, _MARK, True)
-        setattr(socket, name, fn)
+        if not getattr(getattr(socket, name), _MARK, False):
+            setattr(fn, _MARK, True)
+            setattr(socket, name, fn)
     setattr(cls, _MARK, True)
 
 
@@ -420,8 +426,9 @@ class _Finder(object):
 
 def install():
     """Refuse egress, and the real Ollama's port, in THIS process from now
-    on. Idempotent."""
-    if not socket.socket.__dict__.get(_MARK):
+    on. Idempotent; called again, it puts the guard back in front of
+    anything that has wrapped the socket functions since."""
+    if not installed():
         _patch_socket()
     loaded = sys.modules.get(_Finder.NAME)
     if loaded is not None:
@@ -438,16 +445,18 @@ def install():
 
 
 def installed():
-    """Whether this process refuses egress right now: the guard's wrappers
-    are the ones in place (a test may wrap one for a while - inferno_local's
-    own socket guard does - and must put it back)."""
+    """Whether the guard's wrappers are the outermost ones right now. (A
+    test may wrap one for a while - inferno_local's own socket guard does -
+    and puts it back; install() puts the guard in front again.)"""
     if not socket.socket.__dict__.get(_MARK):
         return False
-    for name in ("connect", "connect_ex", "sendto"):
+    for name in ("connect", "connect_ex", "sendto", "send", "sendall"):
         if not getattr(getattr(socket.socket, name), _MARK, False):
             return False
-    for name in ("getaddrinfo", "gethostbyname", "gethostbyaddr"):
-        if not getattr(getattr(socket, name), _MARK, False):
+    for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex",
+                 "gethostbyaddr", "getnameinfo"):
+        if hasattr(socket, name) and \
+                not getattr(getattr(socket, name), _MARK, False):
             return False
     return True
 

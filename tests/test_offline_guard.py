@@ -264,6 +264,32 @@ def test_a_refusal_is_recorded_when_asked(tmp_path, monkeypatch):
     _taken(1)
 
 
+def test_install_puts_the_guard_back_in_front_of_a_later_wrapper(monkeypatch):
+    """Something that wraps socket.connect after the guard (a usercustomize
+    run after the hook's sitecustomize, a tracing tool) would see an
+    off-loopback address first; install() puts the refusal in front again."""
+    _require_guard()
+    seen = []
+    inner = socket.socket.connect
+
+    def later(self, address):
+        seen.append(address)
+        return inner(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", later)
+    assert not guard._CORE.installed()
+    guard._CORE.install()
+    assert guard._CORE.installed()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(guard.EgressRefused):
+            s.connect(NOWHERE)
+    finally:
+        s.close()
+    assert seen == [], "the later wrapper ran before the refusal"
+    _taken(1)
+
+
 def test_a_refusal_is_reported_even_with_the_variable_gone(monkeypatch):
     """A test that clears the environment cannot hide its own refusals."""
     _require_guard()
