@@ -189,3 +189,19 @@ def test_tk_sends_through_prepare_turn():
     assert "_turn_context.prepare_turn(" in send
     assert "_inject_file_contents(" not in send
     assert "_run_analyst_step(" not in send
+
+
+def test_tk_forget_says_when_the_list_could_not_be_read(tk_engine):
+    """Found in review (cfd61f8): with a list file that cannot be read, the
+    vault index keeps the file and reports why (denylist_problem), but Tk's
+    "forget" branch only looked at what was added and said the words were
+    already on the list."""
+    cge, vault = tk_engine
+    damaged = b'["kiwi", "walnut"'                # cut off mid-write
+    (vault / "fuzzy_denylist.json").write_bytes(damaged)
+    console, _events = _send(cge, "forget zebrafin", worker=False)
+    said = [text for _who, text, _kind in console.said]
+    assert not any("already" in text for text in said), said
+    assert any(text.startswith("Nothing was forgotten:") for text in said), (
+        said)
+    assert (vault / "fuzzy_denylist.json").read_bytes() == damaged

@@ -15061,7 +15061,15 @@ class CouncilConsole(tk.Tk):
             idx = _get_vault_index()
             if idx is not None and tokens:
                 added = idx.add_to_fuzzy_denylist(tokens)
-                if added:
+                # A list file that cannot be read is kept, and why is said
+                # (denylist_problem) — not "already on the list" (found in
+                # review: the words were not added at all).
+                _problem = getattr(idx, "denylist_problem", "")
+                if _problem:
+                    self._append_transcript(
+                        "Council", f"Nothing was forgotten: {_problem}.",
+                        "observation")
+                elif added:
                     self._append_transcript(
                         "Council",
                         "OK — these will no longer be used as fuzzy matches: "
