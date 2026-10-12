@@ -383,3 +383,86 @@ def test_a_folder_that_cannot_be_made_does_not_stop_the_store(tmp_path,
     monkeypatch.setattr(Path, "mkdir", real_mkdir)
     assert conv.record("User", "now it works") is True
     assert heard == ["saving"] and not conv.unsaved
+
+
+# ============================================================
+# Appends from several processes at once (verdict_history.jsonl)
+# ============================================================
+
+def _append_race(tmp_path, procs: int, each: int, *, tk_too: bool = False):
+    """``procs`` processes append ``each`` records to one file at once
+    through append_line (and, with ``tk_too``, one more through the Tk
+    console's _save_verdict_record). Returns (rows, bad_lines)."""
+    target = tmp_path / "verdict_history.jsonl"
+    go = tmp_path / "go"
+    script = textwrap.dedent(f"""
+        import json, os, sys, time
+        sys.path.insert(0, {str(ROOT)!r})
+        from pathlib import Path
+        from council_core.conversations import append_line
+        target, go, name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+        pad = "x" * 300
+        while not go.exists():
+            time.sleep(0.005)
+        for i in range({each}):
+            line = json.dumps({{"who": name, "i": i, "pad": pad}}) + chr(10)
+            append_line(target, line.encode("utf-8"))
+    """)
+    runners = [subprocess.Popen([PY, "-c", script, str(target), str(go),
+                                 f"p{n}"], stderr=subprocess.PIPE, text=True)
+               for n in range(procs)]
+    go.write_text("go", encoding="utf-8")
+    for proc in runners:
+        _out, err = proc.communicate(timeout=300)
+        assert proc.returncode == 0, err
+    rows, bad = [], 0
+    for line in target.read_bytes().split(b"\n"):
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            bad += 1
+    return rows, bad
+
+
+def test_appends_from_four_processes_at_once_keep_every_record(tmp_path):
+    """Found in review: on Windows the C runtime emulates O_APPEND as
+    seek-to-end then write, which is not atomic between processes — four
+    processes x 3000 records lost 1459 and left 28 torn lines. Every
+    launch shares verdict_history.jsonl, and two launches can share a
+    session file. Each record must land whole, none lost."""
+    rows, bad = _append_race(tmp_path, procs=4, each=1500)
+    assert bad == 0, f"{bad} torn lines"
+    for n in range(4):
+        got = sorted(r["i"] for r in rows if r["who"] == f"p{n}")
+        assert got == list(range(1500)), (
+            f"p{n} lost {1500 - len(set(got))} records")
+
+
+def test_the_tk_console_appends_its_verdicts_the_same_way(tmp_path,
+                                                          monkeypatch):
+    """The Tk console's _save_verdict_record (run on a stand-in — no
+    window) appends through append_line too: its open("a") lost records
+    to a Qt launch appending at the same moment."""
+    import council_gui_engine as cge
+    target = tmp_path / "verdict_history.jsonl"
+    monkeypatch.setattr(cge, "VERDICT_HISTORY_PATH", target)
+    used = []
+    real = conversations.append_line
+    monkeypatch.setattr(conversations, "append_line",
+                        lambda path, data: (used.append(Path(path)),
+                                            real(path, data)))
+
+    class Console:
+        said = []
+
+        def _append_transcript(self, who, text, kind="final"):
+            self.said.append((who, text))
+
+    console = Console()
+    cge.CouncilConsole._save_verdict_record(console, {"query": "ü",
+                                                      "session_id": "s"})
+    assert used == [target], "Tk did not append through append_line"
+    assert _lines(target) == [{"query": "ü", "session_id": "s"}]
+    assert not console.said

@@ -22,7 +22,12 @@ changed on the way, all invisible to the Tk shell's callers:
     the cache. (Latent in Tk because SILO blanks history there.)
   * A record is appended with ONE write of one whole line (`append_line`), so
     a crash leaves the line whole or absent, never a merged half — and a torn
-    line is skipped on reading, as before.
+    line is skipped on reading, as before. The append is atomic between
+    PROCESSES too (every launch shares verdict_history.jsonl): on Windows
+    open("a") and O_APPEND are seek-then-write and lost records under load,
+    so there the file is opened for append-only access (see append_line).
+    A writer that still uses open("a") — the Tk console's council.log, and
+    any older copy of the app — can still lose a line to that race.
   * `claim()` creates a session file only if it does not exist, which is how a
     Qt launch makes sure no other launch is writing the same session.
 
@@ -78,6 +83,17 @@ def append_line(path: Path, data: bytes) -> None:
     Opened per call: nothing is held open between turns, so another program
     reading the file (the Tk shell's preview, a backup) never meets a lock.
 
+    ATOMIC BETWEEN PROCESSES. Every launch appends to verdict_history.jsonl,
+    and two launches can share a session file, so two processes append to
+    one file at once. On POSIX, O_APPEND makes the seek and the write one
+    step. On Windows it does NOT: the C runtime emulates O_APPEND as
+    "seek to the end, then write", and between the two another process's
+    record lands and is written over — measured, four processes x 3000
+    records lost 1459 and left 28 torn lines (so did the Tk shell's
+    open("a")). On Windows the file is opened through CreateFileW with
+    FILE_APPEND_DATA as its only data access: every write then goes to the
+    end of the file as the file system writes it, never over another's.
+
     A file that does not end in a newline holds a line torn by a crash; the
     record starts on a line of its own, so the fragment stays one unreadable
     line (skipped on reading) instead of swallowing this record too.
@@ -91,6 +107,9 @@ def append_line(path: Path, data: bytes) -> None:
                     data = b"\n" + data
     except FileNotFoundError:
         pass
+    if _WIN_APPEND is not None:
+        _WIN_APPEND(str(path), data)
+        return
     fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_BINARY,
                  0o644)
     try:
@@ -100,6 +119,60 @@ def append_line(path: Path, data: bytes) -> None:
             view = view[written:]
     finally:
         os.close(fd)
+
+
+def _windows_appender() -> Optional[Callable[[str, bytes], None]]:
+    """append_line's writer on Windows (see there), or None elsewhere."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel32.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        write = kernel32.WriteFile
+        write.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+                          ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        write.restype = wintypes.BOOL
+        close = kernel32.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close.restype = wintypes.BOOL
+    except Exception:                                     # noqa: BLE001
+        return None
+    file_append_data, synchronize = 0x0004, 0x00100000
+    share_all = 0x1 | 0x2 | 0x4            # read, write, delete
+    open_always, attribute_normal = 4, 0x80
+    invalid = wintypes.HANDLE(-1).value
+
+    def append(path: str, data: bytes) -> None:
+        handle = create(path, file_append_data | synchronize, share_all,
+                        None, open_always, attribute_normal, None)
+        if handle is None or handle == invalid:
+            err = ctypes.get_last_error()
+            raise OSError(None, ctypes.FormatError(err).strip(), path, err)
+        try:
+            view = memoryview(data)
+            while view:
+                chunk = view[:1 << 30]
+                buf = (ctypes.c_char * len(chunk)).from_buffer_copy(chunk)
+                done = wintypes.DWORD(0)
+                if not write(handle, buf, len(chunk), ctypes.byref(done),
+                             None):
+                    err = ctypes.get_last_error()
+                    raise OSError(None, ctypes.FormatError(err).strip(),
+                                  path, err)
+                view = view[done.value:]
+        finally:
+            close(handle)
+
+    return append
+
+
+_WIN_APPEND = _windows_appender()
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

@@ -16243,10 +16243,16 @@ class CouncilConsole(tk.Tk):
     def _save_verdict_record(self, record: dict):
         """Append one verdict record to the persistent history file."""
         import json as _j
+        from council_core import conversations as _conversations
         try:
             VERDICT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(VERDICT_HISTORY_PATH, "a", encoding="utf-8") as _f:
-                _f.write(_j.dumps(record, ensure_ascii=False) + "\n")
+            # One atomic append (council_core.conversations.append_line): a
+            # Qt launch appends to the same file, and on Windows open("a")
+            # is seek-then-write, so two launches wrote over each other's
+            # records.
+            _conversations.append_line(
+                VERDICT_HISTORY_PATH,
+                (_j.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
         except Exception as e:
             self._append_transcript("Librarian", "Verdict history write failed: " + str(e), "final")
 
