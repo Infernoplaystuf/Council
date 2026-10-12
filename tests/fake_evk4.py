@@ -10,6 +10,12 @@ refuse out of range, enums are IntEnums with the bindings' member names, the
 activity thresholds are one object with four fields. No physical EVK4 has
 been on the machine this was written on; this stands in for one.
 
+THE BIASES ARE AN IMX636'S, FROM OPENEB'S OWN TABLES (Biases.RANGES; tests/
+test_camera_settings.py checks them against the source where it is on the
+machine). It used to report each bias's RECOMMENDED range as "allowed" and an
+invented -25 … 60 slice of it as "recommended" — which matched no IMX636
+bias, and hid that the HAL refuses a value outside the recommended range.
+
 THE STREAM HONOURS THE SETTINGS, ROUGHLY: a higher bias_diff_on fires
 fewer pixels on the moving edge, the trail filter drops its trailing OFF
 events, and the ERC caps the count — so a drag in a pop-out shows in the
@@ -48,14 +54,22 @@ def openeb_source(relative: str) -> Optional[str]:
 
 
 class BiasInfo:
-    def __init__(self, allowed, recommended):
+    """LL_Bias_Info: both ranges, and get_bias_range() — the one set()
+    checks, which is the RECOMMENDED range unless the device was opened with
+    the range-check bypass (LL_Bias_Info::get_bias_range, OpenEB 5.2)."""
+
+    def __init__(self, allowed, recommended, bypass=False):
         self.allowed, self.recommended = allowed, recommended
+        self.bypass = bypass
 
     def get_bias_allowed_range(self):
         return self.allowed
 
     def get_bias_recommended_range(self):
         return self.recommended
+
+    def get_bias_range(self):
+        return self.allowed if self.bypass else self.recommended
 
     def is_modifiable(self):
         return True
@@ -65,30 +79,49 @@ class BiasInfo:
 
 
 class Biases:
-    """I_LL_Biases with an IMX636's five biases and their ranges."""
-    RANGES = {"bias_diff_on": (-85, 140), "bias_diff_off": (-35, 190),
-              "bias_fo": (-35, 55), "bias_hpf": (0, 120),
-              "bias_refr": (-20, 235)}
+    """I_LL_Biases of an IMX636: its six biases and OpenEB's ranges.
 
-    def __init__(self):
+    RANGES is name: (allowed, recommended), from hal_psee_plugins/include/
+    devices/imx636/imx636_bias_settings_iterator.h (allowed) and
+    imx636_bias_settings.h (recommended), in the order the real
+    get_all_biases lists them (a std::map: by name).
+
+    set() CHECKS LIKE THE HAL: against get_bias_range() — the recommended
+    range, unless `bypass` (DeviceConfig's ll_biases_range_check_bypass,
+    which Typhon never sets) — and outside it RAISES, as I_LL_Biases::set
+    does (HalException ValueOutOfRange, a RuntimeError in Python), with the
+    HAL's own words."""
+    RANGES = {
+        "bias_diff": ((-150, 200), (-25, 23)),
+        "bias_diff_off": ((-150, 200), (-35, 190)),
+        "bias_diff_on": ((-150, 200), (-85, 140)),
+        "bias_fo": ((-150, 200), (-35, 55)),
+        "bias_hpf": ((0, 255), (0, 120)),
+        "bias_refr": ((-50, 255), (-20, 235)),
+    }
+
+    def __init__(self, bypass: bool = False):
         self.values = {name: 0 for name in self.RANGES}
         self.writes: List[Any] = []
+        self.bypass = bypass
 
     def get_all_biases(self):
         return dict(self.values)
 
     def get_bias_info(self, name):
-        low, high = self.RANGES[name]
-        return BiasInfo((low, high), (max(low, -25), min(high, 60)))
+        allowed, recommended = self.RANGES[name]
+        return BiasInfo(allowed, recommended, self.bypass)
 
     def get(self, name):
         return self.values[name]
 
     def set(self, name, value):
-        low, high = self.RANGES[name]
         self.writes.append((name, value))
+        low, high = self.get_bias_info(name).get_bias_range()
         if not low <= value <= high:
-            return False
+            raise RuntimeError(f'Invalid value {value} for bias "{name}". '
+                               f"Value should be within range [{low}, "
+                               f"{high}].")
         self.values[name] = int(value)
         return True
 

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from council_core import camera_settings as cs
 from council_core import cameras
 from council_core.cameras import CameraInfo, Roi
+from tests import fake_evk4
 
 
 # ======================================================================
@@ -471,51 +472,20 @@ def test_a_snapshot_holds_what_a_user_chose_not_readings():
 # ======================================================================
 # A fake Metavision HAL, shaped like the real facilities
 # ======================================================================
-class BiasInfo:
-    def __init__(self, allowed, recommended, modifiable=True):
-        self.allowed, self.recommended = allowed, recommended
-        self.modifiable = modifiable
-
-    def get_bias_allowed_range(self):
-        return self.allowed
-
-    def get_bias_recommended_range(self):
-        return self.recommended
-
-    def is_modifiable(self):
-        return self.modifiable
-
-    def get_description(self):
-        return "from the HAL"
-
-
-class Biases:
-    RANGES = {"bias_diff_on": (-85, 140), "bias_diff_off": (-35, 190),
-              "bias_fo": (-35, 55), "bias_hpf": (0, 120),
-              "bias_refr": (-20, 235)}
+class Biases(fake_evk4.Biases):
+    """The fake EVK4's IMX636 biases — OpenEB's own tables, checked by the
+    HAL's rule (fake_evk4.Biases) — with each write logged, and a sensor
+    that quantises: an odd bias_hpf lands on the even below."""
 
     def __init__(self):
-        self.values = {name: 0 for name in self.RANGES}
-        self.log = []
-
-    def get_all_biases(self):
-        return dict(self.values)
-
-    def get_bias_info(self, name):
-        low, high = self.RANGES[name]
-        return BiasInfo((low, high), (max(low, -25), min(high, 60)))
-
-    def get(self, name):
-        return self.values[name]
+        super().__init__()
+        self.log = self.writes
 
     def set(self, name, value):
-        low, high = self.RANGES[name]
-        self.log.append((name, value))
-        if not low <= value <= high:
-            return False                 # the HAL's answer: a bool
-        # The sensor quantises: an odd bias_hpf lands on the even below.
-        self.values[name] = value - (value % 2 if name == "bias_hpf" else 0)
-        return True
+        took = super().set(name, value)
+        if name == "bias_hpf":
+            self.values[name] = value - value % 2
+        return took
 
 
 class Module:
@@ -697,11 +667,72 @@ def evk(**kw):
 def test_every_bias_the_hal_lists_is_offered_with_its_ranges():
     found = by_key(evk()[0])
     on = found["bias.bias_diff_on"]
+    # The range the HAL accepts — the recommended one, without the bypass.
     assert (on.minimum, on.maximum) == (-85, 140)
-    assert on.recommended == (-25, 60)
+    assert on.recommended == (-85, 140)
     assert on.group == cs.G_BIASES and on.kind == cs.INT
     assert {k for k in found if k.startswith("bias.")} == {
         f"bias.{n}" for n in Biases.RANGES}
+
+
+def test_the_fake_evk4s_biases_are_openebs_imx636_tables():
+    """tests/fake_evk4 reported each bias's RECOMMENDED range as "allowed"
+    and an invented -25 … 60 slice as "recommended", and it had five
+    biases, not six (bias_diff was missing). Its table is now OpenEB's,
+    read here from the source where it is on the machine."""
+    import re
+
+    recommended = fake_evk4.openeb_source(
+        "hal_psee_plugins/include/devices/imx636/imx636_bias_settings.h")
+    allowed = fake_evk4.openeb_source(
+        "hal_psee_plugins/include/devices/imx636/"
+        "imx636_bias_settings_iterator.h")
+    ll_biases = fake_evk4.openeb_source(
+        "hal_psee_plugins/psee_hw_layer_headers/include/metavision/"
+        "psee_hw_layer/devices/imx636/imx636_ll_biases.h")
+    if None in (recommended, allowed, ll_biases):
+        pytest.skip("the OpenEB source is not on this machine")
+    # The table's fields are in this order (struct imx636_bias_setting).
+    assert re.search(r"std::string name;\s*int min_allowed_offset;\s*"
+                     r"int max_allowed_offset;\s*int min_recommended_offset;"
+                     r"\s*int max_recommended_offset;", ll_biases)
+    offsets = {k: int(v) for k, v in re.findall(
+        r"static constexpr int (\w+)\s*=\s*(-?\d+);", recommended)}
+    rows = re.findall(r'\{"(\w+)",\s*(-?\d+),\s*(-?\d+),\s*(\w+),\s*(\w+),'
+                      r'\s*(true|false)\}', allowed)
+    table = {name: ((int(lo), int(hi)), (offsets[rlo], offsets[rhi]))
+             for name, lo, hi, rlo, rhi, _mod in rows}
+    assert table == fake_evk4.Biases.RANGES
+    assert table["bias_diff_on"] == ((-150, 200), (-85, 140))
+    assert sorted(fake_evk4.Biases.RANGES) == list(fake_evk4.Biases.RANGES), \
+        "get_all_biases is a std::map: by name"
+
+
+def test_a_bias_runs_over_the_range_the_hal_accepts_not_the_allowed_one():
+    """I_LL_Biases::set refuses (raises) a value outside get_bias_range(),
+    which is the RECOMMENDED range unless the device was opened with the
+    range-check bypass — and Typhon opens an EVK4 without it
+    (DeviceDiscovery.open(serial)). The slider and a preset were bounded by
+    the ALLOWED range: bias_diff_on 180 was offered and always refused.
+    The fake had hidden it by calling the recommended range "allowed"."""
+    hal = fake_evk4.FakeEvk4()
+    dev = cameras.EvkDevice(fake_evk4.info(), hal)
+    on = by_key(dev)["bias.bias_diff_on"]
+    assert (on.minimum, on.maximum) == (-85, 140)
+    assert on.recommended == (-85, 140)
+    change = dev.set_setting("bias.bias_diff_on", 180)
+    assert change.ok, change.note
+    assert change.value == 140 and change.note == "clamped to the maximum, 140"
+    done = dev.apply_settings({"bias.bias_refr": 250, "bias.bias_diff": -40})
+    assert done.ok, done.summary()
+    assert hal.biases.values["bias_refr"] == 235
+    assert hal.biases.values["bias_diff"] == -25
+    # Opened with the bypass, the HAL checks the allowed range instead.
+    hal.biases.bypass = True
+    on = by_key(dev)["bias.bias_diff_on"]
+    assert (on.minimum, on.maximum) == (-150, 200)
+    assert on.recommended == (-85, 140)
+    assert dev.set_setting("bias.bias_diff_on", 180).value == 180
 
 
 def test_the_filters_and_the_readings_are_described():
@@ -777,18 +808,22 @@ def test_the_numbers_the_help_quotes_are_openebs():
 
 
 def test_a_bias_the_sensor_refuses_is_a_refusal_not_a_success():
-    """set() returns False rather than raising."""
+    """Outside its range I_LL_Biases::set RAISES (HalException
+    ValueOutOfRange, OpenEB source) — it does not return False, as this
+    test used to say; the fake it ran on returned False. A False from the
+    sensor is a refusal too. Either way the camera keeps what it had."""
     dev, hal = evk()
-    change = dev.settings_provider().set(
-        "bias.bias_fo", 50, setting=cs.Setting(
-            "bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0))  # no clamp
-    assert change.ok
-    hal.biases.RANGES = dict(hal.biases.RANGES, bias_fo=(-35, 10))
-    refused = dev.settings_provider().set(
-        "bias.bias_fo", 40, setting=cs.Setting(
-            "bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0))
-    assert not refused.ok and "refused" in refused.note
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    provider = dev.settings_provider()
+    assert provider.set("bias.bias_fo", 50, setting=unclamped).ok
+    refused = provider.set("bias.bias_fo", 60, setting=unclamped)
+    assert not refused.ok
+    assert "Value should be within range [-35, 55]" in refused.note
     assert refused.value == 50, "the camera kept what it had"
+    hal.biases.set = lambda name, value: False
+    refused = provider.set("bias.bias_fo", 40, setting=unclamped)
+    assert not refused.ok and "refused" in refused.note
+    assert refused.value == 50
 
 
 def test_a_quantised_bias_reports_what_the_sensor_holds():
@@ -1056,8 +1091,9 @@ def test_every_facility_method_used_exists_in_the_real_bindings():
         "BandPass", "BandStop"}
     assert {"TRAIL", "STC_CUT_TRAIL", "STC_KEEP_TRAIL"} <= set(
         hal.I_EventTrailFilterModule.Type.__members__)
-    for name in ("get_bias_allowed_range", "get_bias_recommended_range",
-                 "is_modifiable", "get_description"):
+    for name in ("get_bias_range", "get_bias_allowed_range",
+                 "get_bias_recommended_range", "is_modifiable",
+                 "get_description"):
         assert hasattr(hal.LL_Bias_Info, name), name
     assert hasattr(hal.I_ROI, "Window") and hasattr(hal.I_ROI, "Mode")
 

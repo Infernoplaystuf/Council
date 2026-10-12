@@ -12,9 +12,10 @@ whether it can change while the camera streams. That is `Setting`.
 
 RANGES COME FROM THE CAMERA, NEVER FROM THIS FILE
 A Basler node reports its own minimum, maximum and increment, and an
-enumeration only the entries this model offers. An EVK4 bias reports its
-allowed and recommended range through LL_Bias_Info; the ERC, anti-flicker and
-trail filter report their supported bounds. The tables here say only WHICH
+enumeration only the entries this model offers. An EVK4 bias reports the
+range its HAL accepts and the recommended one through LL_Bias_Info
+(EvkSettings says why that is not the "allowed" range); the ERC,
+anti-flicker and trail filter report their supported bounds. The tables here say only WHICH
 features to look for, what to call them, and in what order to write them.
 (The one bound written here is the EVK4's picture window, which is this app's
 own display setting, not the camera's.)
@@ -1342,10 +1343,21 @@ class EvkSettings(Provider):
     get_i_erc_module, get_i_roi and the rest all return None — so each
     facility is optional here and a missing one is simply not listed.
 
-    THE HAL REPORTS SUCCESS AS A BOOL. set(), enable() and the set_* calls
-    return False rather than raising when the sensor refuses, so a False is
-    turned into a refusal here; ignoring it would report a bias the camera
-    never took.
+    THE HAL REPORTS SUCCESS AS A BOOL — OR RAISES. set(), enable() and the
+    set_* calls return False for some refusals, so a False is turned into a
+    refusal here; ignoring it would report a bias the camera never took.
+    Others raise (OpenEB source: a bias outside its range, an IMX636 trail
+    threshold outside 1-100 ms), which Provider.set reports as a refusal too.
+
+    A BIAS RUNS OVER THE RANGE set() ACCEPTS: LL_Bias_Info.get_bias_range(),
+    which is the RECOMMENDED range unless the device was opened with the
+    range-check bypass (DeviceConfig ll_biases_range_check_bypass) — and
+    DeviceDiscovery.open(serial), as cameras.EvkBackend opens one, does not
+    set it. An IMX636's allowed bias_diff_on is -150..200, but only
+    -85..140 is accepted (OpenEB's imx636_bias_settings*.h); bounded by the
+    allowed range, a slider or a preset asked for values the HAL always
+    refused. The recommended range is still reported, for a camera opened
+    with the bypass.
     """
 
     roi_after_group = None          # the area last: nothing depends on it
@@ -1429,8 +1441,9 @@ class EvkSettings(Provider):
 
     def _bias(self, name: Any, value: Any) -> Setting:
         info = _ask(self.biases, "get_bias_info", name)
-        allowed = _pair(_ask(info, "get_bias_allowed_range")) or _pair(
-            _ask(info, "get_bias_range"))
+        # What set() checks (see the class notes), not the allowed range.
+        allowed = _pair(_ask(info, "get_bias_range")) or _pair(
+            _ask(info, "get_bias_allowed_range"))
         recommended = _pair(_ask(info, "get_bias_recommended_range"))
         modifiable = _ask(info, "is_modifiable")
         described = _ask(info, "get_description") or ""

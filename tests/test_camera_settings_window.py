@@ -175,6 +175,29 @@ def test_every_setting_gets_a_control_of_its_kind_with_the_cameras_range():
     assert "Live view" in w.state_label.text()
 
 
+def test_the_example_bias_ranges_are_the_imx636s_own():
+    """range_text and RangeSlider said bias_diff_on "runs -85 … 140;
+    -25 … 60 is recommended" — the recommended range taken for the allowed
+    one, and -25 is bias_diff's recommended low end. Anyone building the
+    calibration or velocity presets from these comments got the ranges
+    wrong (docs/typhon_velocity_design.md 5.1). OpenEB's IMX636 table
+    (tests/fake_evk4.Biases.RANGES, checked against the source in
+    test_camera_settings) allows -150 … 200 and recommends -85 … 140."""
+    from tests import fake_evk4
+
+    allowed, recommended = fake_evk4.Biases.RANGES["bias_diff_on"]
+    assert (allowed, recommended) == ((-150, 200), (-85, 140))
+    for doc in (csw.range_text.__doc__, csw.RangeSlider.__doc__):
+        said = " ".join(doc.split())
+        assert "-25 … 60" not in said
+        assert "-150 … 200" in said and "-85 … 140" in said
+        assert "range-check bypass" in said
+    # And the function does what its docstring says it does.
+    assert csw.range_text({"min": -150, "max": 200,
+                           "recommended": [-85, 140]}) == \
+        "-150 … 200\nrec. -85 … 140"
+
+
 def test_an_event_cameras_biases_say_when_they_leave_the_recommended_range():
     connect("event")
     w = window()
