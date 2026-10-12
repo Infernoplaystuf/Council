@@ -158,9 +158,16 @@ def _own_names():
     return (name.lower(),) if name else ()
 
 
+#: The tests' own wrappers of what a test calls (tests/desktop_guard.py wraps
+#: subprocess.Popen.__init__): looked through, like this file, so "where"
+#: names the code that asked rather than the wrapper it went through.
+_WRAPPERS = ("desktop_guard.py", "no_tk_guard.py", "offline_guard.py")
+
+
 def _where():
     """The first frame, from the refusal outward, outside this file, the
-    standard library and site-packages: the code that asked."""
+    tests' own wrappers, the standard library and site-packages: the code
+    that asked."""
     try:
         import sysconfig
         skip = []
@@ -169,12 +176,15 @@ def _where():
             p = paths.get(key)
             if p:
                 skip.append(os.path.normcase(os.path.abspath(p)) + os.sep)
-        me = os.path.normcase(os.path.abspath(__file__))
+        here = os.path.dirname(os.path.abspath(__file__))
+        mine = set([os.path.normcase(os.path.abspath(__file__))] + [
+            os.path.normcase(os.path.join(os.path.dirname(here), name))
+            for name in _WRAPPERS])
         f = sys._getframe(1)
         first = None
         while f is not None:
             fn = os.path.normcase(os.path.abspath(f.f_code.co_filename))
-            if fn != me:
+            if fn not in mine:
                 if first is None:
                     first = f
                 if not any(fn.startswith(s) for s in skip):

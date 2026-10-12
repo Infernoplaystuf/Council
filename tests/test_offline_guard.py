@@ -494,17 +494,17 @@ def test_a_python_child_still_reaches_a_fake_server(tmp_path):
     _taken(0)
 
 
-STARTS_CHILDREN = textwrap.dedent('''
-    import os, socket, subprocess, sys
-    if not getattr(socket.socket, "_council_offline", False):
-        print("UNGUARDED")
-        sys.exit(2)
-    bare = dict(os.environ)
-    bare.pop("PYTHONPATH")
-    for flags, env in [(["-I"], None), (["-E"], None), (["-S"], None),
-                       ([], bare), ([], None), (["-u", "-X", "utf8"], None)]:
-        subprocess.run([sys.executable] + flags + ["-c", "pass"], env=env,
-                       check=True, timeout=60)
+INNER_CHILDREN_TESTS = textwrap.dedent('''
+    import os, subprocess, sys
+
+    def test_starts_children():
+        bare = dict(os.environ)
+        bare.pop("PYTHONPATH")
+        for flags, env in [(["-I"], None), (["-E"], None), (["-S"], None),
+                           ([], bare), ([], None),
+                           (["-u", "-X", "utf8"], None)]:
+            subprocess.run([sys.executable] + flags + ["-c", "pass"],
+                           env=env, check=True, timeout=60)
 ''')
 
 
@@ -512,31 +512,32 @@ def test_a_python_child_out_of_the_guards_reach_is_listed(tmp_path):
     """A child started with -I, -E or -S, or without PYTHONPATH, runs with
     no guard - and nothing said so; a probe that rides on PYTHONPATH cannot
     see it either (review, 2026-10-12). With COUNCIL_OFFLINE_LOG set, each
-    one is listed there: not a refusal, so it fails nothing. The children
-    here only run `pass`."""
+    one is listed there - not a refusal, so it fails nothing - naming the
+    line that started it, through tests/desktop_guard.py's wrapper of
+    Popen, as in the suite. Run in a pytest of its own, which sets the log
+    from the start; the children only run `pass`."""
     _require_guard()
     log = tmp_path / "offline.log"
-    script = tmp_path / "starts_children.py"
-    script.write_text(STARTS_CHILDREN, encoding="utf-8")
-    env = dict(os.environ, **{guard.LOG_ENV: str(log)})
-    r = subprocess.run([sys.executable, str(script)], capture_output=True,
-                       text=True, timeout=300, cwd=str(tmp_path), env=env)
-    assert "UNGUARDED" not in r.stdout, "the child has no guard"
-    assert r.returncode == 0, r.stderr
+    code, out = _inner_pytest(
+        tmp_path, "test_inner_children.py", INNER_CHILDREN_TESTS,
+        "from tests.desktop_guard import desktop_openers  # noqa\n",
+        {guard.LOG_ENV: str(log)})
+    assert code == 0, out
+    assert "1 passed" in out, out
     lines = [line.split("\t") for line in
              log.read_text(encoding="utf-8").splitlines()]
-    whats = [what for _pid, _test, what, _where in lines]
-    assert [w.split(":")[0] for w in whats] == [
+    whats = [what.split(":")[0] for _pid, _test, what, _where in lines]
+    assert whats == [
         "a python child without the guard (started with -I)",
         "a python child without the guard (started with -E)",
         "a python child without the guard (started with -S)",
         "a python child without the guard (its PYTHONPATH does not have "
-        "tests/_offline)"], whats
+        "tests/_offline)"], lines
     pids = {pid for pid, _test, _what, _where in lines}
-    assert len(pids) == 1 and str(os.getpid()) not in pids  # the child's
+    assert len(pids) == 1 and str(os.getpid()) not in pids  # the inner pytest
     for _pid, test, _what, where in lines:
-        assert "test_a_python_child_out_of_the_guards_reach_is_listed" in test
-        assert "starts_children.py" in where        # the line that started it
+        assert "test_inner_children.py::test_starts_children" in test
+        assert "test_inner_children.py" in where, where   # not the wrapper
     _taken(0)                                       # nothing was refused
 
 
@@ -623,7 +624,8 @@ INNER_TESTS = textwrap.dedent('''
 ''')
 
 
-def _inner_pytest(tmp_path, name, tests, conftest_extra=""):
+def _inner_pytest(tmp_path, name, tests, conftest_extra="",
+                  env_extra=None):
     """Run `tests` in a pytest of its own, with this guard as its conftest
     (and its own report, not ours)."""
     (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
@@ -636,6 +638,7 @@ def _inner_pytest(tmp_path, name, tests, conftest_extra=""):
     env.pop(guard.REPORT_ENV, None)            # its own report, not ours
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("COUNCIL_OLLAMA_HOST", None)
+    env.update(env_extra or {})
     r = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          str(tmp_path / name)],
