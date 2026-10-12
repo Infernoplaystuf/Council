@@ -562,6 +562,35 @@ def test_the_full_council_keeps_every_role_to_this_conversation(qapp,
         _close(qapp, window, view)
 
 
+def test_the_first_verdict_is_kept_under_the_session_s_name(qapp, engine):
+    """Found in review: finish_turn recorded the verdict under the launch's
+    raw id and THEN renamed the session, so the first verdict of every
+    judged session belonged to an id nobody has, and the Sessions list
+    never showed a badge for a one-deliberation session."""
+    from council_qt.tabs.sessions import SessionsTab
+    window, view = _council(qapp, engine.vault, demo_mode=False)
+    try:
+        view._checkboxes["deliberate"].setChecked(True)
+        started = view.conversation.session_id
+        _ask(qapp, view, "Note: the pump is quiet.", timeout=180)
+        assert view._last_route not in (None, "direct", "data"), (
+            view._last_route)
+        session = view.conversation.session_id
+        assert session != started, "the session was not named"
+        rows = [json.loads(line) for line in
+                (engine.vault / "verdict_history.jsonl").read_text(
+                    encoding="utf-8").splitlines()]
+        assert [r["session_id"] for r in rows] == [session], rows
+        sessions = SessionsTab(window)
+        assert _pump(qapp, lambda: any(r.id == session
+                                       for r in sessions._shown))
+        label = next(r.label for r in sessions._shown if r.id == session)
+        assert "/10" in label and label.endswith("(this conversation)"), label
+        sessions.deleteLater()
+    finally:
+        _close(qapp, window, view)
+
+
 def test_a_full_council_turn_keeps_the_question_and_the_answer(qapp, engine):
     """Its drafts, cross-examination and rankings go to the debug log: kept in
     the conversation (as Tk keeps them) they filled the twelve entries a

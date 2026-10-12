@@ -1170,15 +1170,19 @@ class CouncilTab(ViewHelpers, QWidget):
             self.append("Council", "Sources: " + ", ".join(
                 Path(p).name for p in source_paths[:self.MAX_CHIPS]),
                 "phase", keep=False)
+        # The name FIRST, then the verdict under it. The other way round (as
+        # the Tk shell does it) the first verdict of every judged session was
+        # recorded under the launch's raw id, which this rename retires — so
+        # a one-deliberation session never had its badge (found in review).
+        if getattr(result, "session_name", ""):
+            named = self.conversation.rename(result.session_name)
+            if named.ok:
+                self.append("Council", named.message, "observation")
         if getattr(result, "verdict_id", ""):
             # Recorded where the Tk shell records it, with this turn's id. The
             # bar that would let the user answer it stays as Batch 0 left it.
             self.conversation.record_verdict(conversations.verdict_record(
                 result, self.conversation.session_id, self._last_query or ""))
-        if getattr(result, "session_name", ""):
-            named = self.conversation.rename(result.session_name)
-            if named.ok:
-                self.append("Council", named.message, "observation")
         if result.route == "direct" and result.answer:
             # Only a fast answer can be expanded, and only until the next turn
             # resets it (A4). The question is kept; the BUTTON stays disabled
