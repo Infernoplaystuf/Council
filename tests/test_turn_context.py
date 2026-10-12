@@ -166,6 +166,7 @@ APP_FILES = {
     "librarian_wishlist.md": "- [ ] zebrafin gasket PLANTWISH",
     "vault_rag_misses.txt": "2026\tzebrafin gasket PLANTMISS",
     "sage_knowledge/notes.md": "zebrafin gasket PLANTSAGE",
+    "specialists.json": '{"name": "zebrafin gasket PLANTSPEC"}',
 }
 
 
@@ -202,7 +203,8 @@ def test_the_protected_names_are_where_the_index_looks():
                 "conversation_logs"):
         assert sub in cl.PROTECTED_SUBDIRS
     for name in ("verdict_history.jsonl", "vault_rag_misses.txt",
-                 "librarian_wishlist.md"):
+                 "librarian_wishlist.md", "specialists.json",
+                 "council_instructions.json", "content_style.json"):
         assert name in cl.PROTECTED_STATE_FILES
     assert "trends.md" in cl.PROTECTED_ROOT_FILES
 

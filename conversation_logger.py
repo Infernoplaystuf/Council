@@ -102,6 +102,13 @@ PROTECTED_STATE_FILES: tuple = (
     # (measured) — an older session's question, past "This conversation
     # only" (council_core.memory_scope).
     "verdict_history.jsonl", "vault_rag_misses.txt", "librarian_wishlist.md",
+    # The app's own settings at the vault root: the Personal Specialists, the
+    # council instructions and content style, the model pins, the node list
+    # and the Grapher presets. A vault search returned specialists.json as a
+    # "source" for questions about sales (docs/qt_migration/
+    # remaining_scope_2026-10-06.md, the source-chips row).
+    "specialists.json", "council_instructions.json", "content_style.json",
+    "personality_backends.json", "node_registry.json", "graph_presets.json",
 )
 
 #: App files protected only at the vault ROOT — a name too ordinary to
