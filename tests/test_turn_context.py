@@ -1006,3 +1006,72 @@ def test_a_knowledge_graph_block_cites_only_vault_files(vault_env, tmp_path,
     names = {p.resolve() for p in prepared.source_paths}
     assert pumps.resolve() in names
     assert outside.resolve() not in names and memory.resolve() not in names
+
+
+# ============================================================
+# A folder linked into the vault (decided 2026-10-12, review)
+# ============================================================
+# Found in review: a junction inside the vault that points outside it is
+# searched, and the outside file's content reaches the prompt. DECIDED: a
+# folder the user links into the vault is part of the vault — that is how a
+# folder is put in without copying it — and it stays on this PC. What keeps
+# it safe is that protection is decided on the RESOLVED path: a link to the
+# app's own memory/ is still the app's memory. Both are pinned here.
+
+def _junction(link, target):
+    import subprocess
+    done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link),
+                           str(target)], capture_output=True, text=True)
+    if done.returncode:
+        pytest.skip(f"no junction: {done.stderr.strip()}")
+
+
+def _unlink_junction(link):
+    import subprocess
+    # rmdir removes the junction itself, never what it points at.
+    subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions")
+def test_a_folder_linked_into_the_vault_is_searched(vault_env, tmp_path):
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    outside = tmp_path / "linked_project"
+    outside.mkdir()
+    (outside / "gasket_notes.txt").write_text(
+        "The zebrafin gasket was replaced in June.\n" * 3, encoding="utf-8")
+    link = vault / "data_in" / "linked"
+    _junction(link, outside)
+    try:
+        state = tc.TurnState(vault)
+        state.get_vault_index().rebuild()
+        prepared, _said, _ = _prepare(vault, "search the vault for zebrafin",
+                                      state=state, n_ctx=16384)
+    finally:
+        _unlink_junction(link)
+    assert "zebrafin gasket was replaced" in prepared.text
+    assert (outside / "gasket_notes.txt").is_file(), "the target was touched"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions")
+def test_a_link_to_the_app_s_memory_is_still_the_app_s(vault_env):
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    memory = vault / "memory"
+    memory.mkdir()
+    (memory / "memory_writer.md").write_text(
+        "- the zebrafin merger with ACME is PLANTMEMORY\n", encoding="utf-8")
+    link = vault / "data_in" / "archive"
+    _junction(link, memory)
+    try:
+        state = tc.TurnState(vault)
+        state.get_vault_index().rebuild()
+        prepared, _said, _ = _prepare(vault, "search the vault for zebrafin",
+                                      state=state, n_ctx=16384)
+        named, _said, _ = _prepare(
+            vault, f"summarize {link / 'memory_writer.md'}", n_ctx=16384)
+    finally:
+        _unlink_junction(link)
+    assert "PLANTMEMORY" not in prepared.text
+    assert "PLANTMEMORY" not in named.text
+    assert (memory / "memory_writer.md").is_file(), "the target was touched"

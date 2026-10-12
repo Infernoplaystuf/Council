@@ -2134,6 +2134,13 @@ the vocabulary list. Lowercase only. Single line only.
         # in parallel. This lets the progress callback emit an accurate
         # total at the start instead of counting up forever.
         #
+        # A folder LINKED into the vault (a junction or a symlink) is walked
+        # like any other: linking is how a folder is put in the vault
+        # without copying it, and it stays on this PC. Protection is decided
+        # on the RESOLVED path (_is_protected_fast, is_protected_path), so a
+        # link to the app's own memory/ is still the app's memory (decided
+        # 2026-10-12; tests/test_turn_context.py pins both).
+        #
         # Hidden + cache dirs we deliberately skip: .git, .chromadb,
         # .git_clones, __pycache__, node_modules, .venv. Without this
         # the walk descended into vault/.chromadb (which can hold
