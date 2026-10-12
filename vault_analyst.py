@@ -250,6 +250,16 @@ def _is_index_file(name: str) -> bool:
         return False
 
 
+def _is_app_state_name(name: str) -> bool:
+    """Named like the app's own state (data_index.is_app_state_file) — the
+    vault search and the data index never take it as data."""
+    try:
+        import data_index
+        return data_index.is_app_state_file(name)
+    except Exception:
+        return False
+
+
 def folder_file_counts(data_folder: Any, recursive: bool = True
                        ) -> Dict[str, Any]:
     """Cheap file census — total count + breakdown by extension — WITHOUT
@@ -1733,8 +1743,8 @@ def folder_data_summary(
                     continue
                 if p.suffix.lower() not in _EXTRA_EXT:
                     continue
-                if _is_index_file(p.name):
-                    continue      # the data index's own column index
+                if _is_index_file(p.name) or _is_app_state_name(p.name):
+                    continue      # the app's own files, never a dataset
                 key = str(p.resolve()).lower()
                 if key not in seen:
                     seen.add(key)

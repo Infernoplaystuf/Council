@@ -207,6 +207,28 @@ _APP_INTERNAL_FILENAMES = {
 }
 
 
+def is_app_state_file(path: Any) -> bool:
+    """True for a file NAMED like the app's own state or settings
+    (_APP_INTERNAL_FILENAMES, conversation_logger.PROTECTED_STATE_FILES).
+    The vault search already treats every file of those names as the app's,
+    wherever it is; the data index and the dataset overview do too (found in
+    review: copies an earlier launch put in data_in/, since changed at the
+    root so the byte-identity sweep keeps them, came back as value
+    matches). Such a file is never deleted (cleanup_misplaced_internals
+    takes only a byte-identical copy) — only not searched as data."""
+    try:
+        name = Path(path).name.lower()
+    except Exception:
+        return False
+    if name in {n.lower() for n in _APP_INTERNAL_FILENAMES}:
+        return True
+    try:
+        from conversation_logger import _PROTECTED_STATE_FILES_LC
+        return name in _PROTECTED_STATE_FILES_LC
+    except Exception:
+        return False
+
+
 def migrate_loose_vault_files(vault_dir: Path,
                                extensions: Iterable[str] = (".csv", ".tsv", ".json"),
                                *, copy_only: bool = True) -> List[Path]:
@@ -524,8 +546,9 @@ class DataIndex:
                     continue
                 if p.suffix.lower() not in self.LOADABLE_EXTS:
                     continue
-                # The index's own files (an older build kept them here)
-                if is_app_sidecar(p):
+                # The index's own files (an older build kept them here),
+                # and files named like the app's state (is_app_state_file)
+                if is_app_sidecar(p) or is_app_state_file(p):
                     continue
                 # Skip vault internals
                 s = str(p).replace("\\", "/")

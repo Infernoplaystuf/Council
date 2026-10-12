@@ -822,3 +822,187 @@ def test_a_small_json_file_is_still_a_table(tmp_path):
                     encoding="utf-8")
     schema, rows = tc._data_preview_text(path)
     assert "pump" in schema and "ORCHID" in rows
+
+
+# ============================================================
+# Which files reach the prompt and the chips (review, 2026-10-12)
+# ============================================================
+
+def _app_readmes(vault):
+    from council_core import vault_setup
+    vault_setup.prepare_data_dirs(vault)        # writes the two READMEs
+    assert (vault / "data_in" / "README.txt").is_file()
+    assert (vault / "data_out" / "README.txt").is_file()
+
+
+@pytest.mark.parametrize("question", ["tell me about the zebrafin",
+                                      "search the vault for zebrafin"])
+def test_the_app_s_own_readmes_are_not_vault_matches(vault_env, question):
+    """Found in review: after prepare_data_dirs the app's own
+    data_in/README.txt and data_out/README.txt came back as [VAULT MATCH]
+    blocks and source chips beside the user's real match."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    _app_readmes(vault)
+    (vault / "data_in" / "real.txt").write_text(
+        "the zebrafin gasket datasheet\n", encoding="utf-8")
+    state = tc.TurnState(vault)
+    state.get_vault_index().rebuild()
+    prepared, _said, _ = _prepare(vault, question, state=state, n_ctx=16384)
+    assert "read-only by Data's Inferno" not in prepared.text
+    assert "app-managed output folder" not in prepared.text
+    assert "README.txt" not in [p.name for p in prepared.source_paths]
+
+
+def test_a_readme_the_user_rewrote_is_theirs(vault_env):
+    """Only the app's own text is protected — not every README.txt, and
+    not one the user has made their own."""
+    import conversation_logger as cl
+    vault, _fake = vault_env
+    _app_readmes(vault)
+    readme = vault / "data_in" / "README.txt"
+    assert cl.is_protected_path(readme, vault)
+    assert cl.is_protected_path(vault / "data_out" / "README.txt", vault)
+    assert not cl.is_protected_path(vault / "data_in" / "jobs" / "README.txt",
+                                    vault)
+    readme.write_text("zebrafin gasket notes of my own\n", encoding="utf-8")
+    assert not cl.is_protected_path(readme, vault)
+
+
+def test_a_file_outside_the_vault_named_like_app_state_is_read(vault_env,
+                                                              tmp_path):
+    """Found in review (895976c): "summarize <somewhere>/model_bench.json"
+    read nothing and said nothing — the app-state names are protected by
+    basename, a rule for the vault's content, before the path was checked
+    to be in the vault at all."""
+    vault, _fake = vault_env
+    other = tmp_path / "my_project"
+    other.mkdir()
+    named = other / "model_bench.json"
+    named.write_text('[{"run": 1, "note": "QUOKKA"}]', encoding="utf-8")
+    prepared, _said, _ = _prepare(vault, f"summarize {named}")
+    assert prepared.explicit_paths == [str(named)]
+    assert "QUOKKA" in prepared.text
+
+
+def test_naming_one_of_the_app_s_files_is_said_and_not_read(vault_env):
+    """A named file in the vault that is the app's own (older conversations,
+    memory) is still not read — and the transcript says so, instead of the
+    question going on as if the file had not been named."""
+    vault, _fake = vault_env
+    (vault / "memory").mkdir()
+    named = vault / "memory" / "memory_writer.md"
+    named.write_text("- the user likes WALNUTMEMORY\n", encoding="utf-8")
+    prepared, said, _ = _prepare(vault, f"summarize {named}")
+    assert "WALNUTMEMORY" not in prepared.text
+    assert not prepared.source_paths
+    assert any("memory_writer.md" in text and "app's own" in text
+               for _w, text, _k in said), said
+
+
+def test_a_url_is_not_a_missing_file(vault_env):
+    """Found in review: "summarize https://example.invalid/reports/data.csv"
+    became the explicit path 's://example.invalid/…' (the drive-letter
+    branch of the path pattern) and the Writer was told the file does not
+    exist on this machine."""
+    vault, _fake = vault_env
+    for question in ("summarize https://example.invalid/reports/data.csv",
+                     "see http://intranet/x/y.csv and ftp://host/z.txt"):
+        prepared, _said, _ = _prepare(vault, question)
+        assert prepared.explicit_paths == [], prepared.explicit_paths
+        assert "[NO DATA AVAILABLE" not in prepared.text
+
+
+def test_a_file_url_is_the_file(vault_env):
+    vault, _fake = vault_env
+    named = vault / "data_in" / "pumps.csv"
+    prepared, _said, _ = _prepare(vault, f"summarize {named.as_uri()}")
+    assert [Path(p).resolve() for p in prepared.explicit_paths] == [
+        named.resolve()]
+    assert "ORCHID" in prepared.text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows share lock")
+def test_a_named_file_that_cannot_be_read_is_not_called_missing(vault_env):
+    """Found in review: a file held open by another program (no sharing)
+    was reported to the model as "does NOT exist on this machine", beside a
+    chip for it."""
+    import ctypes
+    from ctypes import wintypes
+    vault, _fake = vault_env
+    named = vault / "data_in" / "locked.csv"
+    named.write_text("a,b\n1,ZEBRA\n", encoding="utf-8")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+    handle = k32.CreateFileW(str(named), 0x80000000, 0, None, 3, 0x80, None)
+    assert handle and handle != wintypes.HANDLE(-1).value
+    try:
+        prepared, said, _ = _prepare(vault, f"summarize {named}")
+    finally:
+        k32.CloseHandle(handle)
+    assert "do NOT exist on this machine" not in prepared.text
+    assert "could not be read" in prepared.text
+    assert not prepared.source_paths, "a chip for a file nobody read"
+    notes = [text for _w, text, _k in said if "locked.csv" in text
+             and "could not be read" in text]
+    assert notes, said
+
+
+def test_a_missing_named_file_is_still_said_to_be_missing(vault_env):
+    vault, _fake = vault_env
+    named = vault / "data_in" / "gone.csv"
+    prepared, _said, _ = _prepare(vault, f"summarize {named}")
+    assert "do NOT exist on this machine" in prepared.text
+
+
+def test_stale_app_state_copies_in_data_in_are_not_value_matches(
+        vault_env):
+    """Found in review: copies of the app's state files an earlier launch
+    put in data_in/, since changed at the root (so the byte-identity sweep
+    keeps them), came back as [VALUE MATCHES] rows — the vault search
+    already treats every file of those names as the app's."""
+    import json as _json
+    from council_core import vault_setup
+    vault, _fake = vault_env
+    for name in sorted(vault_setup.VAULT_ROOT_STATE):
+        (vault / name).write_text(_json.dumps({"now": 1}), encoding="utf-8")
+        (vault / "data_in" / name).write_text(_json.dumps(
+            [{"note": f"zebrafin stale copy of {name}", "k": 1}]),
+            encoding="utf-8")
+    (vault / "data_in" / "real.json").write_text(_json.dumps(
+        [{"note": "zebrafin real record", "k": 2}]), encoding="utf-8")
+    vault_setup.prepare_data_dirs(vault)
+    prepared, _said, _ = _prepare(vault, "which rows mention zebrafin",
+                                  n_ctx=16384)
+    assert "zebrafin real record" in prepared.text
+    assert "stale copy of" not in prepared.text, prepared.text
+
+
+def test_a_knowledge_graph_block_cites_only_vault_files(vault_env, tmp_path,
+                                                       monkeypatch):
+    """KG4's hook: a citation outside the vault, or of one of the app's own
+    files, must not become a chip (a click previews it)."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    outside = tmp_path / "private" / "diary.txt"
+    outside.parent.mkdir()
+    outside.write_text("private\n", encoding="utf-8")
+    (vault / "memory").mkdir()
+    memory = vault / "memory" / "memory_writer.md"
+    memory.write_text("- remembered\n", encoding="utf-8")
+    pumps = vault / "data_in" / "pumps.csv"
+    monkeypatch.setattr(tc, "knowledge_graph_block",
+                        lambda q, s: tc.ContextBlock(
+                            text="Pump P1 KGMARKER [pumps.csv, row 2]",
+                            sources=[str(outside), str(memory), str(pumps),
+                                     "../memory/memory_writer.md"]))
+    prepared, _said, _ = _prepare(vault, "who services pump P1?",
+                                  n_ctx=16384)
+    assert "KGMARKER" in prepared.text
+    names = {p.resolve() for p in prepared.source_paths}
+    assert pumps.resolve() in names
+    assert outside.resolve() not in names and memory.resolve() not in names

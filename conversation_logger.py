@@ -124,6 +124,27 @@ PROTECTED_ROOT_FILES: tuple = ("trends.md",)
 _PROTECTED_ROOT_FILES_LC = frozenset(s.lower() for s in PROTECTED_ROOT_FILES)
 _PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
 
+#: The README the app writes in data_in/ and data_out/
+#: (data_index.init_data_dirs) — protected while it IS the app's text: a
+#: vault search returned both as matches and chips (found in review). Not
+#: every README.txt (a user's data_in/jobs/README.txt is theirs), and not one
+#: the user has rewritten (then it is theirs too).
+APP_README_FOLDERS: tuple = ("data_in", "data_out")
+APP_README_NAME = "readme.txt"
+
+
+def _is_app_readme(path: Path) -> bool:
+    """True when ``path`` holds the app's own README text, word for word."""
+    try:
+        import data_index
+        with open(path, "rb") as fh:
+            data = fh.read(8192)
+        text = data.decode("utf-8").replace("\r\n", "\n").strip()
+    except Exception:
+        return False
+    return text in (data_index._README_INPUT.strip(),
+                    data_index._README_OUTPUT.strip())
+
 
 def is_protected_path(path: Any, vault_dir: Any) -> bool:
     """True if `path` is a protected vault subdir member OR an app-state file.
@@ -155,6 +176,9 @@ def is_protected_path(path: Any, vault_dir: Any) -> bool:
         return False
     parts = rel.parts
     if len(parts) == 1 and parts[0].lower() in _PROTECTED_ROOT_FILES_LC:
+        return True
+    if (len(parts) == 2 and parts[0].lower() in APP_README_FOLDERS
+            and parts[1].lower() == APP_README_NAME and _is_app_readme(p)):
         return True
     return bool(parts) and parts[0].lower() in _PROTECTED_SUBDIRS_LC
 

@@ -2117,6 +2117,15 @@ the vocabulary list. Lowercase only. Single line only.
                 return False
             if sp in _protected_root_files:
                 return True
+            if p.name.lower() == "readme.txt":
+                # The app's own README in data_in/ or data_out/, while it
+                # holds the app's text (conversation_logger._is_app_readme).
+                try:
+                    from conversation_logger import is_protected_path
+                    if is_protected_path(p, self.vault_dir):
+                        return True
+                except Exception:
+                    pass
             return any(sp.startswith(prefix) for prefix in _protected_prefixes)
 
         # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────

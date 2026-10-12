@@ -1368,13 +1368,11 @@ def _read_file_for_injection_uncached(path_str):
         if not p.exists() or not p.is_file():
             return None
         # Defense-in-depth: even if the user pastes a path inside
-        # conversation_logs/, we refuse to inject it.
-        try:
-            import conversation_logger as _cl
-            if _cl.is_protected_path(p, _vault()):
-                return None
-        except Exception:
-            pass
+        # conversation_logs/, we refuse to inject it. [turn_context] Inside
+        # the vault: a file elsewhere that shares an app-state name is the
+        # user's (_named_path_is_app_file).
+        if _named_path_is_app_file(p):
+            return None
         suffix = p.suffix.lower()
         if suffix == '.csv':
             # Bound the read: previously this did `list(reader)` of the
@@ -1499,10 +1497,53 @@ def _read_file_for_injection_uncached(path_str):
         return None
 
 
-def _extract_file_paths(text):
-    """Find file paths in the user message. Protected paths (conversation
-    logs) are filtered before they reach injection — see PROTECTED_SUBDIRS."""
+#: A URL in a question ("https://host/x.csv"): not a file on this machine.
+#: [turn_context] Found in review: the drive-letter branch of _FILE_PATH_RE
+#: matched "s://host/…" inside it, and the Writer was told the "file" did
+#: not exist on this machine. A scheme is two characters or more, so "C://x"
+#: is still a drive path.
+_URL_RE = _re.compile(r"(?<![\w.+-])([a-zA-Z][a-zA-Z0-9+.-]+)://\S*")
+
+
+def _strip_urls(text: str) -> str:
+    """``text`` with every URL blanked out, except a file:// URL on this
+    machine, which becomes its path."""
+    def _one(m):
+        if m.group(1).lower() == "file":
+            try:
+                from urllib.parse import unquote, urlsplit
+                from urllib.request import url2pathname
+                parts = urlsplit(m.group(0))
+                if parts.netloc in ("", "localhost"):
+                    return " " + url2pathname(unquote(parts.path)) + " "
+            except Exception:
+                pass
+        return " "
+    return _URL_RE.sub(_one, text or "")
+
+
+def _named_path_is_app_file(path) -> bool:
+    """[turn_context] A path the user NAMED is one of the app's own files
+    (older conversations, learned memory, settings —
+    conversation_logger.is_protected_path) only inside the vault. Those
+    names are protected by basename for the vault's content; a file
+    elsewhere that shares one (a project's own model_bench.json) is the
+    user's, and was silently not read (found in review of 895976c)."""
+    try:
+        import conversation_logger as _cl
+        import path_contain as _pc
+        vault = _vault()
+        return bool(_pc.is_under(path, vault)
+                    and _cl.is_protected_path(path, vault))
+    except Exception:
+        return False
+
+
+def _file_path_candidates(text):
+    """Every file path written in ``text`` (URLs are not paths; a file://
+    URL is its path), before the app's own files are taken out."""
     import unicodedata as _ud
+    text = _strip_urls(text)
     clean_chars = []
     for ch in text:
         if ch in ('\\', '/', '.', '~', ':'):
@@ -1530,15 +1571,28 @@ def _extract_file_paths(text):
         if candidate and candidate not in seen:
             seen.add(candidate)
             paths.append(candidate)
+    return paths
+
+
+def _extract_file_paths(text):
+    """Find file paths in the user message. Protected paths (conversation
+    logs) are filtered before they reach injection — see PROTECTED_SUBDIRS.
+
+    [turn_context] Protected only inside the vault (_named_path_is_app_file);
+    prepare_turn says which named files were not read for being the app's
+    own (_named_app_files)."""
     # HARD GUARD — drop any path under a protected vault subdir before
     # it can reach the injection layer. The model must never see files
     # under conversation_logs/.
-    try:
-        import conversation_logger as _cl
-        paths = [p for p in paths if not _cl.is_protected_path(p, _vault())]
-    except Exception:
-        pass
-    return paths
+    return [p for p in _file_path_candidates(text)
+            if not _named_path_is_app_file(p)]
+
+
+def _named_app_files(text):
+    """The paths written in ``text`` that are the app's own files, so not
+    read (see _extract_file_paths)."""
+    return [p for p in _file_path_candidates(text)
+            if _named_path_is_app_file(p)]
 
 
 # ── Session "recently referenced files" registry ────────────────────────────
@@ -1554,6 +1608,30 @@ _REFERENCED_FILES_MAP = None
 def _register_referenced_files(m) -> None:
     global _REFERENCED_FILES_MAP
     _REFERENCED_FILES_MAP = m
+
+
+def _why_not_read(path) -> Optional[str]:
+    """[turn_context] Why a named file gave no block: None when it is not
+    there at all (missing), else why it could not be read, in plain words."""
+    p = Path(path)
+    try:
+        if not p.exists():
+            return None
+    except OSError:
+        return None
+    if p.is_dir():
+        return "it is a folder that could not be listed"
+    try:
+        with open(p, "rb") as fh:
+            first = fh.read(1)
+    except PermissionError:
+        return ("it is open in another program, or you do not have "
+                "permission to read it")
+    except OSError as exc:
+        return f"it could not be opened: {exc.strerror or exc}"
+    if not first:
+        return "it is empty"
+    return "nothing in it could be read as text or a table"
 
 
 def _extract_bare_filenames(text):
@@ -1861,6 +1939,10 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
     missing_paths = []
+    # [turn_context] Named files that are on this machine but could not be
+    # read — (path, why). They were reported as missing ("do NOT exist on
+    # this machine"), a file held open by another program included.
+    unreadable_paths = []
     # [turn_context] label -> the files or folders its block was read from, so
     # the answer's sources name THAT file and not whichever file of the same
     # name is found first in data_in/ (breakdown["paths"]).
@@ -1915,7 +1997,11 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             block_paths.setdefault(f"[FILE: {p_check.name or path_str}]",
                                    []).append(path_str)
         else:
-            missing_paths.append(path_str)
+            why = _why_not_read(p_check)
+            if why is None:
+                missing_paths.append(path_str)
+            else:
+                unreadable_paths.append((path_str, why))
 
     # -- Vault folder context (priority 4) ----------------------------------
     # When the user mentions "the vault", "my vault", "vault folder", etc.
@@ -2317,6 +2403,19 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             "invent column names, row counts, or values from memory.]"
         )
         candidates.append((PRIO_NODATA, "[NO DATA AVAILABLE]", miss_block))
+    if unreadable_paths:
+        # [turn_context] On this machine, but not readable: said as such.
+        bad_block = ("[NO DATA AVAILABLE — the user's message named these "
+                     "files; they are on this machine but could not be "
+                     "read:]")
+        for bad, why in unreadable_paths:
+            bad_block += f"\n  - {bad} ({why})"
+        bad_block += (
+            "\n[Tell the user each file could not be read, and why. Do NOT "
+            "invent its contents, column names, row counts or values.]")
+        candidates.append((PRIO_NODATA,
+                           "[NO DATA AVAILABLE: could not be read]",
+                           bad_block))
 
     # -- Assemble: priority sort, per-block cap, cumulative cap, tag --------
     candidates.sort(key=lambda t: t[0])
@@ -2462,6 +2561,7 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         "running":  running,
         "user_text_tokens": user_cost,
         "paths": block_paths,
+        "unreadable": list(unreadable_paths),
     }
 
     if not final_blocks:
@@ -3698,6 +3798,23 @@ def fast_answers_enabled(vault_dir: Any) -> bool:
     return bool(data.get("fast_answers", True))
 
 
+def _vault_sources(raw_sources: Any, vault_dir: Any) -> List[Path]:
+    """resolve_source_paths, kept to files in the vault that are not the
+    app's own (conversation_logger.is_protected_path) — for citations the
+    app did not get from the user (the knowledge graph's, KG4)."""
+    import conversation_logger as _cl
+    import path_contain as _pc
+    out = []
+    for path in resolve_source_paths(raw_sources, vault_dir):
+        try:
+            if (_pc.is_under(path, vault_dir)
+                    and not _cl.is_protected_path(path, vault_dir)):
+                out.append(path)
+        except Exception:                                 # noqa: BLE001
+            continue
+    return out
+
+
 def resolve_source_paths(raw_sources: Any, vault_dir: Any) -> List[Path]:
     """Existing absolute files for a mixed list of absolute paths,
     vault-relative paths, bare names and name patterns — de-duplicated, in
@@ -4074,19 +4191,15 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         if match:
             sources.extend(block_paths.get(label)
                            or [match.group(1).strip()])
-    # A file the user named that was left out to fit is not behind the
-    # answer: no chip for it (the left-out notice names it).
-    left_out = {_re.sub(r"\s*\(budget overflow\)\s*$", "", str(lb))
-                for lb, _cost in (prepared.breakdown.get("dropped") or [])}
-    left_out -= set(labels)
-    for path in prepared.explicit_paths:
-        name = Path(path).name or path
-        if not any(f"{kind}{name}]" in left_out for kind in
-                   ("[FILE: ", "[FOLDER: ", "[FOLDER SUMMARY: ")):
-            sources.append(path)
+    # A file the user named is a source only through its kept block (above):
+    # one left out to fit, missing or unreadable is not behind the answer,
+    # and gets no chip.
     if has_graph and graph is not None:
-        # Only when it was kept: a block left out to fit cited nothing.
-        sources.extend(str(src) for src in (graph.sources or []) if src)
+        # Only when it was kept: a block left out to fit cited nothing. And
+        # only files in the vault that are not the app's own — a chip is
+        # previewed on a click.
+        sources.extend(str(src) for src in _vault_sources(
+            graph.sources or [], state.vault_dir))
     prepared.sources = sources
     try:
         prepared.source_paths = resolve_source_paths(sources,
@@ -4100,6 +4213,17 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
             say("Council", "Reading: " + ", ".join(names))
         elif has_vault:
             say("Council", "Reviewing matching vault files...")
+    try:
+        app_files = _named_app_files(question)
+    except Exception:                                     # noqa: BLE001
+        app_files = []
+    for path in app_files:
+        say("Council", f"{Path(path).name} is one of the app's own files "
+                       f"(older conversations, learned memory or settings), "
+                       f"so it is not read for a question.")
+    for path, why in (prepared.breakdown.get("unreadable") or []):
+        say("Council", f"{Path(path).name} could not be read: {why}. The "
+                       f"answer has nothing from it.")
     if prepared.fuzzy_matches:
         lines = ["Fuzzy matches used (treated as your spelling):"]
         for orig, suggestions in prepared.fuzzy_matches.items():
