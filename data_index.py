@@ -162,6 +162,19 @@ _APP_INTERNAL_FILENAMES = {
     "idea_settings.json",
     "idea_model_config.json",
     "verdict_history.jsonl",
+    # The app's state at the vault root (council_core.vault_setup
+    # .VAULT_ROOT_STATE): engine settings, model slots, the PC check's
+    # benchmark, the vault index and its embeddings, caches and the Grapher
+    # presets. Not named here, a launch copied them into data_in/ and the data
+    # index offered them as the user's datasets (measured, both shells).
+    "backend_settings.json",
+    "model_slots.json",
+    "model_bench.json",
+    "vault_index.json",
+    "vault_embeddings.json",
+    "semantic_cache.json",
+    "fuzzy_denylist.json",
+    "graph_presets.json",
 }
 
 

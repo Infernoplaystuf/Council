@@ -218,6 +218,103 @@ def test_trends_md_is_protected_only_at_the_vault_root(tmp_path):
                                     vault)
 
 
+# ============================================================
+# The app's vault-root state is never a vault match or a dataset
+# ============================================================
+
+def test_the_vault_root_state_is_app_state_in_both_lists():
+    """council_core.vault_setup.VAULT_ROOT_STATE names the files the app
+    writes at the vault root. Before: data_index's skip list named none of
+    them, and the vault search's list missed model_slots.json and
+    model_bench.json."""
+    import conversation_logger as cl
+    import data_index
+    from council_core import vault_setup
+    missing_skip = sorted(vault_setup.VAULT_ROOT_STATE
+                          - set(data_index._APP_INTERNAL_FILENAMES))
+    missing_protected = sorted(vault_setup.VAULT_ROOT_STATE
+                               - set(cl.PROTECTED_STATE_FILES))
+    assert not missing_skip, f"not in data_index's skip list: {missing_skip}"
+    assert not missing_protected, (
+        f"not protected from the vault search: {missing_protected}")
+
+
+#: The app's own vault-root settings that the vault index does not write
+#: itself, each with a marker (the index files are its own and are
+#: rewritten by a rebuild).
+ROOT_STATE_FILES = {
+    "backend_settings.json": "PLANTBACKEND",
+    "model_slots.json": "PLANTSLOTS",
+    "model_bench.json": "PLANTBENCH",
+    "graph_presets.json": "PLANTPRESETS",
+}
+
+
+@pytest.mark.parametrize("question", [
+    "search the vault for zebrafin",
+    "what do we know about the zebrafin gasket?"])
+def test_the_app_s_settings_files_never_come_back_as_vault_matches(
+        vault_env, question):
+    """A vault search must not offer the app's settings as a source: the
+    marker must not reach the prompt and the file must not be a chip."""
+    import json as _json
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    for name, marker in ROOT_STATE_FILES.items():
+        (vault / name).write_text(
+            _json.dumps({"note": f"zebrafin gasket {marker}"}) + "\n",
+            encoding="utf-8")
+    (vault / "data_in" / "real.txt").write_text(
+        "the zebrafin gasket datasheet PLANTDATA\n", encoding="utf-8")
+    state = tc.TurnState(vault)
+    state.get_vault_index().rebuild()
+    prepared, _said, _ = _prepare(vault, question, state=state)
+    leaked = [m for m in ROOT_STATE_FILES.values() if m in prepared.text]
+    assert not leaked, f"{leaked} reached the prompt:\n{prepared.text}"
+    cited = {Path(s).name for s in prepared.sources} | {
+        p.name for p in prepared.source_paths}
+    assert not cited & set(ROOT_STATE_FILES), cited
+    assert "PLANTDATA" in prepared.text, (
+        "the user's own file is no longer found:\n" + prepared.text)
+
+
+def test_the_loose_file_copy_leaves_the_app_s_state_at_the_root(tmp_path):
+    """data_index.migrate_loose_vault_files copies the user's loose root
+    data into data_in/. Before: it filed backend_settings.json,
+    model_slots.json and the vault indexes there as the user's datasets."""
+    import data_index
+    from council_core import vault_setup
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    for name in vault_setup.VAULT_ROOT_STATE:
+        (vault / name).write_text('{"app": true}\n', encoding="utf-8")
+    (vault / "orders.json").write_text('[{"order": 1}]\n', encoding="utf-8")
+    copied = {p.name for p in data_index.migrate_loose_vault_files(vault)}
+    assert copied == {"orders.json"}, copied
+    assert sorted(p.name for p in (vault / "data_in").iterdir()) == [
+        "orders.json"]
+    for name in vault_setup.VAULT_ROOT_STATE:
+        assert (vault / name).read_text(encoding="utf-8") == '{"app": true}\n'
+
+
+def test_a_user_s_file_named_like_app_state_is_kept(tmp_path):
+    """cleanup_misplaced_internals knows the root-state names too; it still
+    takes out only a byte-identical copy of the root file. A data_in/ file
+    of that name with other content is the user's, and is kept."""
+    import data_index
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "model_slots.json").write_text('{"app": 1}\n', encoding="utf-8")
+    (vault / "data_in" / "model_slots.json").write_text(
+        '{"mine": 1}\n', encoding="utf-8")
+    removed = [p.name for p in data_index.cleanup_misplaced_internals(vault)]
+    assert removed == []
+    assert (vault / "data_in" / "model_slots.json").read_text(
+        encoding="utf-8") == '{"mine": 1}\n'
+    assert (vault / "model_slots.json").read_text(
+        encoding="utf-8") == '{"app": 1}\n'
+
+
 #: Older sessions and learned memory, planted where the app keeps them, each
 #: with a marker that must not reach the prompt when the user names the vault
 #: folder itself in a question.

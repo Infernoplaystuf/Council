@@ -109,6 +109,11 @@ PROTECTED_STATE_FILES: tuple = (
     # remaining_scope_2026-10-06.md, the source-chips row).
     "specialists.json", "council_instructions.json", "content_style.json",
     "personality_backends.json", "node_registry.json", "graph_presets.json",
+    # The model slots and the PC check's benchmark (council_core.model_slots,
+    # council_core.pc_check) — the last two of council_core.vault_setup
+    # .VAULT_ROOT_STATE this list did not name. "search the vault for X"
+    # put both into the prompt when they held the word (measured).
+    "model_slots.json", "model_bench.json",
 )
 
 #: App files protected only at the vault ROOT — a name too ordinary to
