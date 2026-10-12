@@ -58,6 +58,14 @@ earlier turns and nothing older ("This conversation only",
 council_core.memory_scope); an older session gets in only when the user loads
 it from the Sessions tab, and the transcript says so. History lists the
 questions both shells were asked.
+
+THE VAULT IS IN FRONT OF THE QUESTION (Batch 2)
+Each turn goes through council_core.turn_context.prepare_turn — the function
+the Tk shell calls too: the files the user names, vault and value matches, the
+analyst's computed answer (given straight back when it is a direct one, with
+no model asked), all in front of the question for the Writer on the default
+build and for every role in the full council. The judge routes on what was
+typed. The files behind an answer are chips under the transcript.
 """
 from __future__ import annotations
 
