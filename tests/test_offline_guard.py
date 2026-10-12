@@ -494,6 +494,76 @@ def test_a_python_child_still_reaches_a_fake_server(tmp_path):
     _taken(0)
 
 
+STARTS_CHILDREN = textwrap.dedent('''
+    import os, socket, subprocess, sys
+    if not getattr(socket.socket, "_council_offline", False):
+        print("UNGUARDED")
+        sys.exit(2)
+    bare = dict(os.environ)
+    bare.pop("PYTHONPATH")
+    for flags, env in [(["-I"], None), (["-E"], None), (["-S"], None),
+                       ([], bare), ([], None), (["-u", "-X", "utf8"], None)]:
+        subprocess.run([sys.executable] + flags + ["-c", "pass"], env=env,
+                       check=True, timeout=60)
+''')
+
+
+def test_a_python_child_out_of_the_guards_reach_is_listed(tmp_path):
+    """A child started with -I, -E or -S, or without PYTHONPATH, runs with
+    no guard - and nothing said so; a probe that rides on PYTHONPATH cannot
+    see it either (review, 2026-10-12). With COUNCIL_OFFLINE_LOG set, each
+    one is listed there: not a refusal, so it fails nothing. The children
+    here only run `pass`."""
+    _require_guard()
+    log = tmp_path / "offline.log"
+    script = tmp_path / "starts_children.py"
+    script.write_text(STARTS_CHILDREN, encoding="utf-8")
+    env = dict(os.environ, **{guard.LOG_ENV: str(log)})
+    r = subprocess.run([sys.executable, str(script)], capture_output=True,
+                       text=True, timeout=300, cwd=str(tmp_path), env=env)
+    assert "UNGUARDED" not in r.stdout, "the child has no guard"
+    assert r.returncode == 0, r.stderr
+    lines = [line.split("\t") for line in
+             log.read_text(encoding="utf-8").splitlines()]
+    whats = [what for _pid, _test, what, _where in lines]
+    assert [w.split(":")[0] for w in whats] == [
+        "a python child without the guard (started with -I)",
+        "a python child without the guard (started with -E)",
+        "a python child without the guard (started with -S)",
+        "a python child without the guard (its PYTHONPATH does not have "
+        "tests/_offline)"], whats
+    pids = {pid for pid, _test, _what, _where in lines}
+    assert len(pids) == 1 and str(os.getpid()) not in pids  # the child's
+    for _pid, test, _what, where in lines:
+        assert "test_a_python_child_out_of_the_guards_reach_is_listed" in test
+        assert "starts_children.py" in where        # the line that started it
+    _taken(0)                                       # nothing was refused
+
+
+@pytest.mark.parametrize("argv,why", [
+    (["python", "-I", "x.py"], "started with -I"),
+    (["python", "-W", "ignore", "-sE", "-m", "x"], "started with -E"),
+    (["pythonw.exe", "-Xutf8", "-S", "x.py"], "started with -S"),
+    (["python", "-c", "print('-I -E -S')"], None),     # the code, not flags
+    (["python", "x.py", "-I"], None),                  # the script's own
+    (["git", "status"], None),                         # not python
+    ([r"C:\Program Files\Python 3\python.exe", "-I", "x.py"],
+     "started with -I"),
+])
+def test_how_a_child_is_told_unguarded(argv, why):
+    """Popen's audit event carries the command LINE on Windows; it is split
+    back the way the C runtime splits it."""
+    core = guard._CORE
+    env = {"PYTHONPATH": str(guard.HOOK_DIR)}
+    assert core.unguarded_python_child(None, argv, env) == why
+    line = subprocess.list2cmdline(argv)
+    assert core._split_command_line(line) == argv
+    assert core.unguarded_python_child(None, line, env) == why
+    if why is None and core._is_python(argv[0]):
+        assert core.unguarded_python_child(None, line, {}) == \
+            "its PYTHONPATH does not have tests/_offline"
+
+
 OTHER_SITE = textwrap.dedent('''
     import os
     os.environ["OTHER_SITE_RAN"] = str(int(os.environ.get("OTHER_SITE_RAN", "0")) + 1)

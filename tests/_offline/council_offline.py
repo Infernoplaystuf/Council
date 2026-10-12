@@ -52,18 +52,28 @@ NOT COVERED: a child started with -I, -E or -S, or with an environment that
 drops PYTHONPATH; a program that is not Python (curl, ssh, git, ollama) - no
 test starts one that goes online today; a socket made from _socket directly;
 Qt's own networking (gui_policy keeps QtNetwork out of generated apps, and
-the Council does not use it).
+the Council does not use it). The python children are not silent, though:
+with $COUNCIL_OFFLINE_LOG set, every one that subprocess.Popen starts out of
+the guard's reach is LISTED there ("a python child without the guard",
+why, its command line, and the line that started it) - a note, not a
+refusal: it fails no test. A whole run then shows which children only code
+review vouches for (one review counted about 186 launches: gui_smoke, the
+benches, the docs runner), instead of a probe that cannot see them either.
 
 Standard library only, and syntax an old Python still parses: a child may be
 another interpreter (a camera SDK's conda env), and a sitecustomize that fails
 would break every child, not only those that go online.
 """
 import os
+import re
 import socket
 import sys
 
 #: How every refusal starts.
 MESSAGE = "tests must stay offline"
+
+#: How the log lists a python child started out of the guard's reach.
+UNGUARDED = "a python child without the guard"
 
 #: Where every refusal is also recorded, for a whole run (optional).
 LOG_ENV = "COUNCIL_OFFLINE_LOG"
@@ -179,12 +189,31 @@ def _where():
     return "?"
 
 
+def _line(rec):
+    return "\t".join(str(x).replace("\t", " ").replace("\r", " ")
+                     .replace("\n", " ") for x in rec) + "\n"
+
+
+def _note(what):
+    """Write `what` to $COUNCIL_OFFLINE_LOG only: not a refusal, so not in
+    the report, and no test fails for it."""
+    path = os.environ.get(LOG_ENV)
+    if not path:
+        return
+    rec = (os.getpid(), os.environ.get("PYTEST_CURRENT_TEST", "-"), what,
+           _where())
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_line(rec))
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 def _record(what):
     rec = (os.getpid(), os.environ.get("PYTEST_CURRENT_TEST", "-"), what,
            _where())
     REFUSALS.append(rec)
-    line = "\t".join(str(x).replace("\t", " ").replace("\r", " ")
-                     .replace("\n", " ") for x in rec) + "\n"
+    line = _line(rec)
     for env in (REPORT_ENV, LOG_ENV):
         path = os.environ.get(env)
         if not path and env == REPORT_ENV:
@@ -459,10 +488,152 @@ class _Finder(object):
         return spec
 
 
+_PYTHON = re.compile(r"^pythonw?(\d+(\.\d+)*)?(\.exe)?$", re.IGNORECASE)
+
+
+def _split_command_line(line):
+    """A Windows command line as the C runtime splits it into argv - the
+    inverse of subprocess.list2cmdline, which is what Popen's audit event
+    carries on Windows."""
+    argv, cur, quoted, have, i, n = [], [], False, False, 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == "\\":
+            j = i
+            while j < n and line[j] == "\\":
+                j += 1
+            if j < n and line[j] == '"':
+                cur.append("\\" * ((j - i) // 2))
+                if (j - i) % 2:
+                    cur.append('"')
+                else:
+                    quoted = not quoted
+                i, have = j + 1, True
+                continue
+            cur.append(line[i:j])
+            i, have = j, True
+            continue
+        if c == '"':
+            quoted, have = not quoted, True
+        elif c in " \t" and not quoted:
+            if have:
+                argv.append("".join(cur))
+            cur, have = [], False
+        else:
+            cur.append(c)
+            have = True
+        i += 1
+    if have:
+        argv.append("".join(cur))
+    return argv
+
+
+def _is_python(program):
+    if not program:
+        return False
+    if _PYTHON.match(os.path.basename(program)):
+        return True
+    try:
+        return (os.path.normcase(os.path.abspath(program))
+                == os.path.normcase(os.path.abspath(sys.executable)))
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def _interpreter_flags(args):
+    """The one-letter interpreter options before the script, -c or -m."""
+    flags = set()
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--" or not arg.startswith("-") or arg == "-":
+            break
+        if arg.startswith("--"):
+            if arg == "--check-hash-based-pycs":
+                i += 1
+            i += 1
+            continue
+        letters = arg[1:]
+        for k, ch in enumerate(letters):
+            if ch in "cm":
+                return flags                        # the rest is the program's
+            if ch in "WX":
+                if k == len(letters) - 1:
+                    i += 1                          # its value is the next arg
+                break
+            flags.add(ch)
+        i += 1
+    return flags
+
+
+def _pythonpath(env):
+    if env is None:
+        return os.environ.get("PYTHONPATH", "")
+    for key, value in env.items():
+        if os.fsdecode(key).upper() == "PYTHONPATH":
+            return os.fsdecode(value)
+    return ""
+
+
+def unguarded_python_child(executable, args, env):
+    """Why the program subprocess.Popen is about to start - (executable,
+    args, env) as its audit event gives them - is a python that will run
+    WITHOUT this guard; None when it is guarded, or not python."""
+    if isinstance(args, (str, bytes)):
+        argv = _split_command_line(os.fsdecode(args))
+    else:
+        argv = [os.fsdecode(a) for a in args]
+    program = os.fsdecode(executable) if executable is not None else (
+        argv[0] if argv else "")
+    if not _is_python(program):
+        return None
+    off = sorted(_interpreter_flags(argv[1:]) & set("IES"))
+    if off:
+        return "started with " + " ".join("-" + f for f in off)
+    here = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+    on_path = [os.path.normcase(os.path.abspath(p))
+               for p in _pythonpath(env).split(os.pathsep) if p]
+    if here not in on_path:
+        return "its PYTHONPATH does not have tests/_offline"
+    return None
+
+
+_WATCHING = []
+
+
+def _watch_children():
+    """With $COUNCIL_OFFLINE_LOG set, list there every python child that
+    subprocess.Popen starts without this guard. An audit hook: it cannot be
+    removed again, so it is added only when the log is asked for, once per
+    process, and it returns at once for every other event. It never raises
+    - an exception from an audit hook would stop the Popen."""
+    if _WATCHING or not os.environ.get(LOG_ENV) \
+            or not hasattr(sys, "addaudithook"):
+        return
+
+    def hook(event, args):
+        if event != "subprocess.Popen":
+            return
+        try:
+            why = unguarded_python_child(args[0], args[1], args[3])
+            if why:
+                shown = args[1] if isinstance(args[1], str) else " ".join(
+                    os.fsdecode(a) for a in args[1])
+                if len(shown) > 300:
+                    shown = shown[:300] + "..."
+                _note("%s (%s): %s" % (UNGUARDED, why, shown))
+        except Exception:                            # noqa: BLE001
+            pass
+
+    sys.addaudithook(hook)
+    _WATCHING.append(hook)
+
+
 def install():
     """Refuse egress, and the real Ollama's port, in THIS process from now
     on. Idempotent; called again, it puts the guard back in front of
     anything that has wrapped the socket functions since."""
+    _watch_children()
     if not installed():
         _patch_socket()
     loaded = sys.modules.get(_Finder.NAME)
