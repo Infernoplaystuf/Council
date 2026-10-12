@@ -234,3 +234,47 @@ Writer; launchers unchanged (Qt).
   history and the miss log).
 - Not done: KG4's neighbourhood block (not built on `knowledge-graph` either — it becomes
   one more block in `prepare_turn`); Expand with council (Batch 3); the per-role carrier.
+
+**Review fixes (2026-10-12, same branch).** Each was reproduced by a test first.
+- Every Qt tab's personalities get the Qt scope (`council_turn.load_personalities(scope=…)`,
+  default `memory_scope.for_qt()`; `sessions.rebuild_with_prior` too). The Lens and the
+  Designer's Review — default tabs — sent role/project memory and the profile before; the
+  default session id of a non-conversation tab is "" (no RECENT CONVERSATION), not "qt".
+- Naming the vault folder in a question ("What is in <vault>?") no longer lists
+  `conversations/`, `conversation_logs/`, `logs/` or `memory/` (both folder renderers also
+  check the protection against the vault, not only the named folder's parent).
+- A vault that cannot keep conversations (read-only, permission denied) no longer stops the
+  Qt app from starting; the transcript says the conversation is not being saved and the
+  toolbar says "Memory: not saved".
+- Appends are atomic between processes on Windows (`append_line` opens with
+  `FILE_APPEND_DATA` only; `open("a")` lost records under load). Tk's verdict append uses it.
+- Load as Prior loads the listed file (a stem `safe_name` would change — "pump notes",
+  "older - Copy" — is reached by its own name); a prior another launch renamed away is
+  dropped and said at the next turn; a session line that is not a record no longer fails
+  every turn; a non-ASCII judge name becomes the stored file stem.
+- The first verdict of a judged session is recorded under the session's name (rename
+  first).
+- The turn's own notices ("Tracking → goal", "Reading: …", context-window warnings, the
+  note under an answer from the data) are kept in the conversation file as Tk keeps them;
+  Qt writes `logs/council.log`; each entry is logged when it is said, under the id it was
+  said under (tests/test_shell_parity.py compares one turn in both shells).
+- Importing the Tk module no longer turns Qt's memory off: Tk sets SILO through
+  `memory_scope.set_tk_default()`, which marks it `COUNCIL_DEMO_SILO_SOURCE=tk-default`,
+  and `for_qt` ignores a SILO so marked (a user's SILO still counts).
+- The Tk console claims its session id on disk at start (`conversations.claim_session_id`,
+  the Qt rule), so Tk and Qt in the same second never share a session, whichever starts
+  first. Tk's rename accepts a claimed `_2` id and keeps the stored stem.
+
+Still open after the review (not fixed on this branch):
+- Tk records its first verdict before naming the session (its record carries the id at
+  queue time), so Tk's one-deliberation sessions still have no badge.
+- Tk's Agree/Disagree (A3) stamps `user_agreed` on the LAST line of
+  `verdict_history.jsonl` — now possibly a Qt verdict — and rewrites the whole file with
+  `write_text` (not atomic; on Windows CRLF; `ensure_ascii` escapes). Fix with the verdict
+  bar in Batch 4: stamp by `verdict_id`, append a response record instead of rewriting.
+- Tk's council.log is still appended with `open("a")` (can lose a line to a concurrent
+  append on Windows); Tk's "New session" menu action does not claim its id.
+- Qt writes no crash-recovery sentinel (`conversations/<id>.active`) around a turn, as Tk
+  does — Batch 6 (crash recovery).
+- The notices Qt now keeps take slots in the Writer's 12-entry RECENT CONVERSATION (about
+  three entries per default-build turn instead of two), as they would in Tk with SILO off.
