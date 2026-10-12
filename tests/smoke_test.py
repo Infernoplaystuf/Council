@@ -6163,8 +6163,11 @@ def test_standing_primer_reaches_the_model() -> None:
            "extra_context" in getattr(PM, "__dataclass_fields__", {}))
     _check("it defaults to empty, so an unset model is unchanged",
            PM.__dataclass_fields__["extra_context"].default == "")
+    # respond() sends the user message stitch() builds (split out so a
+    # caller can size a text around it: PersonalityModel.prompt_frame).
     _check("respond() folds the standing primer in",
-           "self.extra_context" in inspect.getsource(PM.respond))
+           "self.stitch(" in inspect.getsource(PM.respond)
+           and "self.extra_context" in inspect.getsource(PM.stitch))
 
     # The fold's contract, exactly as respond() computes it.
     def fold(standing, per_call):
