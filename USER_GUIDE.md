@@ -235,6 +235,7 @@ For tracking down a bug in a Python script — or in a GUI and the scripts it ca
 - **Click a node** to make it the centre; **click a link** or a row in **Trace** to jump to that line in **Source** (it switches file when the line is in another one). Orange links cross from one file to another.
 - **➕ Add** puts more scripts alongside the ones already open — e.g. a script the GUI calls that lives in another folder. The file box at the top of the list shows one file's variables at a time.
 - **🖼 Export image…** saves the graph as a PNG (sharp, 2× resolution) or an SVG — the whole graph, not just the part on screen, with a caption naming the variable traced.
+- **📋 Copy trace** / **📝 Save trace…** (next to the Trace tab) give the trace as text — what feeds the variable, what it feeds, and any "worth a look" findings on that path — to paste into a bug report or keep as notes (.txt, or .md).
 - **Depth** is how many hops out to show. **Include if/while conditions** also links the variables an `if`/`while` tests to what it guards — useful for "why did this branch run?", but busier.
 - **Worth a look** lists the usual suspects: names read but never assigned (typos), values assigned and never read, parameters replaced before they're used, and scripts that don't parse.
 
@@ -256,6 +257,7 @@ python -m council_core.var_graph my_gui_folder/          # a GUI and its scripts
 python -m council_core.var_graph script.py --up total   # what feeds `total`
 python -m council_core.var_graph my_gui_folder/ --up worker.folder
 python -m council_core.var_graph my_gui_folder/ --path ports.capture_folder ports.bad_count
+python -m council_core.var_graph script.py --trace total --out total_trace.txt   # the text report
 python -m council_core.var_graph script.py --dot --up total > total.dot   # Graphviz
 ```
 

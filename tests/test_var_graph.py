@@ -448,3 +448,50 @@ def test_command_line_on_a_folder(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "handlers.py:" in out and "ports.capture_folder" in out
     assert vg.main([str(tmp_path / "nope")]) == 2
+
+
+# ----------------------------------------------------------------------
+# the trace as text
+# ----------------------------------------------------------------------
+def test_trace_report_has_both_directions_and_findings(cart):
+    text = vg.trace_report(cart, cart.resolve("taxed.amount"), max_depth=3)
+    assert text.startswith("Variable Map trace")
+    assert "Variable    : amount  (taxed)" in text
+    feeds = text.index("WHAT FEEDS IT")
+    fed = text.index("WHAT IT FEEDS")
+    assert feeds < fed
+    assert "subtotal  (Cart.total)" in text[feeds:fed]        # upstream
+    assert "taxed() return" in text[fed:]                       # downstream
+    assert "WORTH A LOOK ON THIS PATH" in text
+    assert "overwritten on line 15" in text
+    assert "Depth       : 3 hops; if/while conditions off" in text
+
+
+def test_trace_report_says_nothing_when_nothing(cart):
+    text = vg.trace_report(cart, cart.resolve("main.total"))
+    assert "WHAT IT FEEDS (where its value goes)\n  (nothing)" in text
+    assert "Depth       : all" in text
+
+
+def test_trace_report_across_files_names_them(gui):
+    text = vg.trace_report(gui, gui.resolve("worker.folder"))
+    assert "10 files under" in text
+    assert "handlers.py:" in text and "ports.capture_folder" in text
+
+
+def test_write_text_replaces_whole(tmp_path):
+    out = tmp_path / "t" / "trace.txt"
+    vg.write_text(out, "first")
+    vg.write_text(out, "├─ second")
+    assert out.read_text(encoding="utf-8") == "├─ second\n"
+    assert [p.name for p in out.parent.iterdir()] == ["trace.txt"]
+
+
+def test_command_line_trace(tmp_path, capsys):
+    script = tmp_path / "cart.py"
+    script.write_text(CART, encoding="utf-8")
+    assert vg.main([str(script), "--trace", "main.total"]) == 0
+    assert "WHAT FEEDS IT" in capsys.readouterr().out
+    out = tmp_path / "trace.txt"
+    assert vg.main([str(script), "--trace", "main.total", "--out", str(out)]) == 0
+    assert "WHAT FEEDS IT" in out.read_text(encoding="utf-8")

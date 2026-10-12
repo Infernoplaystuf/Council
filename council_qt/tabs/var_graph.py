@@ -29,7 +29,8 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
                            QPainterPathStroker, QPen, QTextCursor, QTextFormat)
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QGraphicsPathItem,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
+                               QGraphicsPathItem,
                                QGraphicsRectItem, QGraphicsScene,
                                QGraphicsSimpleTextItem, QGraphicsView,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -80,6 +81,12 @@ class VarGraphActions:
             "Export the graph", initialfile=suggested, defaultextension=".png",
             filetypes=[("PNG image", "*.png"), ("SVG drawing", "*.svg")],
             parent=parent)
+
+    def pick_trace_export(self, parent, suggested: str) -> str:
+        from .. import dialogs
+        return dialogs.asksaveasfilename(
+            "Save the trace", initialfile=suggested, defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("Markdown", "*.md")], parent=parent)
 
     def pick_folder(self, parent) -> str:
         from .. import dialogs
@@ -328,11 +335,12 @@ def export_graph(view: "GraphView", path: str, caption: str = "") -> Path:
     return out
 
 
-def suggested_name(var: vgm.Var) -> str:
-    """'total_variable_map.png', from the traced variable's name."""
+def suggested_name(var: vgm.Var, ending: str = "_variable_map.png") -> str:
+    """'total_variable_map.png' (or 'total_trace.txt'), from the traced
+    variable's name."""
     base = var.name if var.kind != "return" else f"{var.local_scope}_return"
     base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._") or "graph"
-    return f"{base}_variable_map.png"
+    return f"{base}{ending}"
 
 
 def fill_trace(tree: QTreeWidget, g: vgm.VarGraph, focus: str, depth: int,
@@ -467,6 +475,20 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     code.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
     code.setFont(QFont("Consolas", 10))
     tabs.addTab(code, "Source")
+    corner = QWidget(tabs)
+    cl = QHBoxLayout(corner)
+    cl.setContentsMargins(0, 0, 4, 0)
+    copy_trace = QPushButton(amp("📋 Copy trace"), corner)
+    copy_trace.setObjectName("copy_trace")
+    copy_trace.setToolTip("Copy the whole trace as text - both directions and "
+                          "the findings on the way - for a bug report or notes")
+    save_trace = QPushButton(amp("📝 Save trace…"), corner)
+    save_trace.setObjectName("save_trace")
+    save_trace.setToolTip("Save the same text to a .txt or .md file")
+    for b in (copy_trace, save_trace):
+        b.setEnabled(False)
+        cl.addWidget(b)
+    tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
     mid.setStretchFactor(0, 3)
     mid.setStretchFactor(1, 2)
     mid.setSizes([520, 340])
@@ -479,6 +501,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     page.path_edit, page.conditions, page.depth = path_edit, conds, depth
     page.file_filter, page.search = file_filter, search
     page.export_button = export
+    page.copy_trace_button, page.save_trace_button = copy_trace, save_trace
 
     # -- behaviour -------------------------------------------------------
     def open_file(file: Optional[str]) -> None:
@@ -514,7 +537,8 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         state["focus"] = vid
         c = conds.isChecked()
         view.show_graph(g, vid, depth.value(), c)
-        export.setEnabled(True)
+        for b in (export, copy_trace, save_trace):
+            b.setEnabled(True)
         fill_trace(trace, g, vid, depth.value(), c)
         tabs.setCurrentWidget(trace)
         v = g.vars[vid]
@@ -602,7 +626,8 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
             view.scene().clear()
             view.nodes = {}
             trace.clear()
-            export.setEnabled(False)
+            for b in (export, copy_trace, save_trace):
+                b.setEnabled(False)
 
     def chosen_paths() -> List[str]:
         return [p.strip().strip('"') for p in path_edit.text().split(SEP.strip())
@@ -693,6 +718,43 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         status.setText(f"Saved the graph to {out}")
         window.set_status(f"Exported {out.name}")
 
+    def current_report() -> Optional[tuple]:
+        """(variable, report text) for what is traced now, or None."""
+        g, vid = state["graph"], state["focus"]
+        if g is None or not isinstance(vid, str) or vid not in g.vars:
+            return None
+        v = g.vars[vid]
+        return v, vgm.trace_report(g, v, depth.value(), conds.isChecked())
+
+    def on_copy_trace() -> None:
+        got = current_report()
+        if got is None:
+            return
+        QApplication.clipboard().setText(got[1])
+        status.setText(f"✓ Copied the trace of {got[0].label} to the clipboard")
+
+    def on_save_trace() -> None:
+        got = current_report()
+        if got is None:
+            return
+        v, report = got
+        path = actions.pick_trace_export(page, suggested_name(v, "_trace.txt"))
+        if not path:
+            return
+        out = Path(path)
+        if not out.suffix:
+            out = out.with_suffix(".txt")
+        if out.suffix.lower() == ".md":
+            report = f"```\n{report}\n```"     # keep the tree's alignment
+        try:
+            vgm.write_text(out, report)
+        except OSError as exc:
+            status.setText(f"Could not save the trace: {exc}")
+            window.set_status("Save failed")
+            return
+        status.setText(f"Saved the trace to {out}")
+        window.set_status(f"Saved {out.name}")
+
     def on_conditions() -> None:
         # Condition edges are only recorded when asked for: re-read.
         if state["graph"] is not None:
@@ -706,6 +768,8 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     add_more.clicked.connect(lambda: set_paths(actions.pick_files(page), add=True))
     run.clicked.connect(analyze)
     export.clicked.connect(on_export)
+    copy_trace.clicked.connect(on_copy_trace)
+    save_trace.clicked.connect(on_save_trace)
     path_edit.returnPressed.connect(analyze)
     search.textChanged.connect(lambda _t: fill_list())
     file_filter.currentIndexChanged.connect(lambda _i: fill_list())
@@ -720,6 +784,8 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     page.set_paths = set_paths
     page.focus_on = focus_on
     page.export = on_export
+    page.copy_trace = on_copy_trace
+    page.save_trace = on_save_trace
     page.show_line = show_line
     page.state = state
     return page

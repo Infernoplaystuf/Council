@@ -53,6 +53,7 @@ import builtins
 import json
 import os
 import sys
+import tempfile
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1403,6 +1404,63 @@ def format_trace(g: VarGraph, var: Var, direction: str = "up",
     return "\n".join(lines)
 
 
+def trace_report(g: VarGraph, var: Var, max_depth: Optional[int] = None,
+                 conditions: Optional[bool] = None) -> str:
+    """The whole trace of `var` as plain text, for a bug report or notes:
+    what it is, what feeds it, what it feeds, and the findings on that path.
+    The two trees are format_trace's, so they read the same as --up/--down."""
+    want = g.conditions if conditions is None else conditions
+    up = g.upstream(var.id, max_depth, want)
+    down = g.downstream(var.id, max_depth, want)
+    where = f" in {Path(var.file).name}" if var.file else ""
+    seen = [f"written on {_lines(var.defined)}", f"read on {_lines(var.used)}"]
+    if var.elsewhere:
+        seen.append("also " + ", ".join(dict.fromkeys(var.elsewhere)))
+    if g.modules:
+        scripts = f"{len(g.modules)} files under {g.filename}"
+    else:
+        scripts = g.filename
+    hops = "all" if max_depth is None else f"{max_depth} hop{'s' if max_depth != 1 else ''}"
+    out = ["Variable Map trace",
+           "",
+           f"Variable    : {var.label}",
+           f"Kind        : {var.kind}{where}; " + "; ".join(seen),
+           f"Scripts     : {scripts}",
+           f"Depth       : {hops}; if/while conditions {'on' if want else 'off'}",
+           f"Reach       : {len(up)} variables can affect it; it can affect "
+           f"{len(down)}",
+           ""]
+    for title, direction in (("WHAT FEEDS IT (where its value comes from)", "up"),
+                             ("WHAT IT FEEDS (where its value goes)", "down")):
+        body = format_trace(g, var, direction, max_depth, want).splitlines()[1:]
+        out += [title, *(body or ["  (nothing)"]), ""]
+    on_path = {var.id} | {s.var.id for s in up + down}
+    found = [f for f in g.findings if f"{f.scope}::{f.name}" in on_path]
+    if found:
+        out.append("WORTH A LOOK ON THIS PATH")
+        for f in found:
+            at = f"{Path(f.file).name}:{f.line}" if g.modules else f"L{f.line}"
+            out.append(f"  {at:<22s} {f.message}")
+        out.append("")
+    return "\n".join(out)
+
+
+def write_text(path, text: str) -> Path:
+    """Write `text` as UTF-8 via a temp file in the same folder, then swap it
+    in: a failed write leaves the old file, never half of a new one."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(out.parent), prefix=out.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+        os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return out
+
+
 def _at(g: VarGraph, e: Edge) -> str:
     """'L12', or 'handlers.py:12' when the graph spans several files."""
     return f"{Path(e.file).name}:{e.line}" if g.modules else f"L{e.line}"
@@ -1438,6 +1496,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--down", metavar="VAR", help="what VAR feeds (where a bad value goes)")
     ap.add_argument("--path", nargs=2, metavar=("FROM", "TO"),
                     help="the shortest chain from FROM to TO")
+    ap.add_argument("--trace", metavar="VAR",
+                    help="both directions plus the findings on the way, as a "
+                         "report to save or paste")
+    ap.add_argument("--out", metavar="FILE",
+                    help="with --trace: write the report to FILE instead of printing it")
     ap.add_argument("--find", metavar="TEXT", help="list variables matching TEXT")
     ap.add_argument("--depth", type=int, default=None)
     ap.add_argument("--conditions", action="store_true",
@@ -1465,6 +1528,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 steps = g.upstream(v.id, args.depth) if args.up else g.downstream(v.id, args.depth)
                 focus = {v.id} | {s.var.id for s in steps}
             print(g.to_dot(focus))
+        elif args.trace:
+            report = trace_report(g, g.resolve(args.trace), args.depth)
+            if args.out:
+                print(f"wrote {write_text(args.out, report)}")
+            else:
+                print(report)
         elif args.up or args.down:
             v = g.resolve(args.up or args.down)
             print(format_trace(g, v, "up" if args.up else "down", args.depth))
@@ -1488,7 +1557,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             for f in g.findings:
                 at = f"{Path(f.file).name}:{f.line}" if g.modules else f"L{f.line}"
                 print(f"  {at:<22s} {f.kind:15s} {f.message}")
-            print("\nTry --up NAME, --down NAME, --path A B, --find TEXT, --dot")
+            print("\nTry --up NAME, --down NAME, --trace NAME, --path A B, "
+                  "--find TEXT, --dot")
     except KeyError as exc:
         print(exc.args[0], file=sys.stderr)
         return 1

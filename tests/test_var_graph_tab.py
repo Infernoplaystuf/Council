@@ -64,6 +64,10 @@ class _Actions(VarGraphActions):
     def pick_folder(self, parent):
         return self.folder
 
+    def pick_trace_export(self, parent, suggested):
+        self.suggested = suggested
+        return self.export_to
+
     def pick_export(self, parent, suggested):
         self.suggested = suggested
         return self.export_to
@@ -272,3 +276,49 @@ def test_export_without_a_suffix_is_png(tab, tmp_path):
     page.actions.export_to = str(tmp_path / "prices")
     page.export()
     assert (tmp_path / "prices.png").is_file()
+
+
+def test_trace_buttons_follow_the_selection(tab):
+    app, page, script = tab
+    _load(app, page, script)
+    assert not page.copy_trace_button.isEnabled()
+    assert not page.save_trace_button.isEnabled()
+    page.focus_on("main::total")
+    assert page.copy_trace_button.isEnabled() and page.save_trace_button.isEnabled()
+
+
+def test_copy_trace_puts_the_report_on_the_clipboard(tab):
+    app, page, script = tab
+    _load(app, page, script)
+    page.depth.setValue(2)
+    page.focus_on("main::total")
+    page.copy_trace_button.click()
+    text = QApplication.clipboard().text()
+    assert text.startswith("Variable Map trace")
+    assert "Variable    : total  (main)" in text
+    assert "Depth       : 2 hops" in text            # the tab's own depth
+    assert "Copied the trace" in page.status.text()
+
+
+def test_save_trace_txt_and_md(tab, tmp_path):
+    app, page, script = tab
+    _load(app, page, script)
+    page.focus_on("taxed::amount")
+    out = tmp_path / "out" / "amount.txt"
+    page.actions.export_to = str(out)
+    page.save_trace_button.click()
+    assert page.actions.suggested == "amount_trace.txt"
+    text = out.read_text(encoding="utf-8")
+    assert "WHAT FEEDS IT" in text and "WORTH A LOOK ON THIS PATH" in text
+    assert str(out) in page.status.text()
+    md = tmp_path / "out" / "amount.md"
+    page.actions.export_to = str(md)
+    page.save_trace()
+    body = md.read_text(encoding="utf-8")
+    assert body.startswith("```\nVariable Map trace") and body.rstrip().endswith("```")
+    page.actions.export_to = str(tmp_path / "out" / "plain")
+    page.save_trace()
+    assert (tmp_path / "out" / "plain.txt").is_file()
+    page.actions.export_to = ""                     # cancelled: nothing new
+    page.save_trace()
+    assert sorted(p.name for p in out.parent.iterdir()) == ["amount.md", "amount.txt", "plain.txt"]
