@@ -3733,8 +3733,9 @@ def left_out_notice(dropped, n_ctx: int) -> str:
     list)."""
     count = len(dropped)
     lines = [f"⚠ Left out {count} part{'s' if count != 1 else ''} of what "
-             f"was found, so the question fits in the {int(n_ctx or 0):,} "
-             f"tokens the model reads at a time:"]
+             f"was found, so the question fits in what the model reads at "
+             f"a time ({int(n_ctx or 0):,} tokens, with room kept for the "
+             f"answer):"]
     for label, cost in dropped:
         lines.append(f"  • {_plain_label(label)}  (about {int(cost):,} "
                      f"tokens)")
@@ -3826,11 +3827,20 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
             f"try rephrasing or check the file/column name.")
 
     # 3. The injection ------------------------------------------------------
+    # Sized for the window the main model really has (effective_n_ctx: the
+    # num_ctx Ollama is sent, or the loaded GGUF's), the one the notices in
+    # step 5 measure against. The Tk _send used get_n_ctx(), the CONFIGURED
+    # size — 4,096 with COUNCIL_GGUF_N_CTX unset — so the vault blocks were
+    # cut to a quarter of a 16 K window and "left out to fit 4,096" sat
+    # beside "fills 30% of 16,384".
     if n_ctx is None:
         try:
-            n_ctx = ce.get_n_ctx()
+            n_ctx = int(ce.effective_n_ctx("main"))
         except Exception:                                 # noqa: BLE001
-            n_ctx = 4096
+            try:
+                n_ctx = ce.get_n_ctx()
+            except Exception:                             # noqa: BLE001
+                n_ctx = 4096
     pins = state.current_pins() if pinned_files is None else pinned_files
     # The knowledge graph's block (KG4; None until it is built) goes into
     # the same assembly as the vault blocks.

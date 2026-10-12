@@ -271,9 +271,11 @@ Writer; launchers unchanged (Qt).
   Writer was sent the bare question and 0 of 12 panel Writer prompts had the file.
 - Open, found while doing this: (1) RECENT CONVERSATION includes the question being
   answered (it is saved when asked, and `respond()` reads the session file), so it appears
-  twice in each Qt prompt — Tk with SILO off does the same; (2) the injection is sized with
-  `get_n_ctx()` (4,096 when unset) while the notices measure against the real window
-  (`effective_n_ctx`, 8,192 for Ollama by default) — Tk's behaviour, kept; (3) the Tk stand-in
+  twice in each Qt prompt — Tk with SILO off does the same; (2) FIXED: the injection was
+  sized with `get_n_ctx()` (the configured 4,096 when unset) while the notices measured the
+  real window (`effective_n_ctx`: 8,192 for Ollama by default, 16,384 for a GGUF the ladder
+  loaded so) — `prepare_turn` now sizes it with `effective_n_ctx`, in both shells, as the
+  engine's own note on `get_n_ctx` asks; (3) the Tk stand-in
   tests share the Tk console's process-wide indexes unless reset (fixed in the tests);
   (4) the analyst's own notices ("Analyst direct-routed to folder_data_summary …", "Context
   retrieval failed with an unexpected error …") are still Tk's technical wording, now in

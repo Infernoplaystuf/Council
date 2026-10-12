@@ -227,6 +227,27 @@ def test_a_prompt_well_inside_the_window_says_nothing_about_it(vault_env,
     assert not _window_notices(said), said
 
 
+def test_the_context_is_sized_for_the_window_the_model_really_has(
+        vault_env, monkeypatch):
+    """council_engine.get_n_ctx() is the CONFIGURED size (4,096 with
+    COUNCIL_GGUF_N_CTX unset — the launchers leave it unset); the window the
+    model really has is effective_n_ctx() (Ollama's num_ctx, 8,192 by
+    default; a GGUF loaded at 16,384 on a big card). Its docstring: "Code
+    that SIZES a prompt should ask effective_n_ctx() instead." prepare_turn
+    sized the vault blocks with get_n_ctx(), so they were cut to fit a
+    quarter of a 16 K window, while the notices measured the real one."""
+    import council_engine as ce
+    vault, _fake = vault_env
+    monkeypatch.delenv("COUNCIL_GGUF_N_CTX", raising=False)
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 16384)
+    assert ce.get_n_ctx() == 4096
+    prepared, _said, _ = _prepare(vault, f"What is in {vault / 'data_in'} ?")
+    assert prepared.breakdown["n_ctx"] == 16384, prepared.breakdown
+    labels = [label for label, _ in prepared.breakdown["costs"]]
+    # A window of 16 K or more gets the folder's rich listing.
+    assert any(label.startswith("[FOLDER: ") for label in labels), labels
+
+
 @pytest.mark.parametrize("ollama,slot_n_ctx,named", [
     (False, None, "COUNCIL_GGUF_N_CTX"),
     (True, None, "COUNCIL_OLLAMA_NUM_CTX"),
