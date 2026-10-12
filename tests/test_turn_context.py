@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -224,6 +225,31 @@ def test_a_prompt_well_inside_the_window_says_nothing_about_it(vault_env,
     monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: window)
     _prepared, said, _ = _prepare(vault, question, n_ctx=32768)
     assert not _window_notices(said), said
+
+
+@pytest.mark.parametrize("ollama,slot_n_ctx,named", [
+    (False, None, "COUNCIL_GGUF_N_CTX"),
+    (True, None, "COUNCIL_OLLAMA_NUM_CTX"),
+    # The main slot's own window wins over the variable
+    # (council_engine._ollama_num_ctx): naming the variable would be advice
+    # that changes nothing.
+    (True, 4096, "model_slots.json"),
+])
+def test_the_notice_names_the_setting_that_sizes_the_window(
+        monkeypatch, ollama, slot_n_ctx, named):
+    import council_engine as ce
+    from council_core import turn_context as tc
+    main = SimpleNamespace(name="main", path="ollama:phi3.5",
+                           n_ctx=slot_n_ctx)
+    monkeypatch.setattr(ce, "_ollama_will_serve", lambda _slot: ollama)
+    monkeypatch.setattr(ce, "_slot_config",
+                        lambda: SimpleNamespace(slots={"main": main}))
+    assert named in tc.window_setting()
+    text = tc.context_window_notice({"input_tokens": 5000, "n_ctx": 4096,
+                                     "over_window": True,
+                                     "safe_input": 3072,
+                                     "pct_of_window": 122.0})
+    assert named in text, text
 
 
 def test_blocks_left_out_to_fit_are_said_in_plain_words(vault_env):

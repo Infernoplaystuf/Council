@@ -242,8 +242,9 @@ Writer; launchers unchanged (Qt).
   writes to the file; an offscreen run never starts the file manager.
 - Context-window notices in plain words in both shells ("too long for what the model can
   read at once", "fills 85% of …", "Left out 2 parts of what was found …"), naming the
-  setting that sizes THIS model's window — `COUNCIL_OLLAMA_NUM_CTX` when Ollama serves it,
-  else `COUNCIL_GGUF_N_CTX` (Tk always said the GGUF one). The "nearly full" notice comes at
+  setting that sizes THIS model's window — when Ollama serves it, the main slot's `n_ctx`
+  in `model_slots.json` if set, else `COUNCIL_OLLAMA_NUM_CTX`; otherwise
+  `COUNCIL_GGUF_N_CTX` (Tk always said the GGUF one). The "nearly full" notice comes at
   the engine's answer reserve (75% of the window; earlier on windows under 1,024 tokens)
   and never later than 80%.
 - `council_core.vault_setup.VAULT_ROOT_STATE` is in `data_index._APP_INTERNAL_FILENAMES` and

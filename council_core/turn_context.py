@@ -3615,10 +3615,19 @@ NEARLY_FULL = 0.8
 
 
 def window_setting() -> str:
-    """The setting that sizes the main model's window: Ollama's num_ctx when
-    Ollama serves it, else the GGUF context size. Never loads a model."""
+    """The setting that sizes the main model's window, as the engine reads
+    it (council_engine._ollama_num_ctx / effective_n_ctx): when Ollama serves
+    the main model, the main slot's own "n_ctx" in model_slots.json if it has
+    one, else COUNCIL_OLLAMA_NUM_CTX; otherwise COUNCIL_GGUF_N_CTX. Never
+    loads a model."""
     try:
         if ce._ollama_will_serve("main"):
+            try:
+                main = ce._slot_config().slots.get("main")
+            except Exception:                             # noqa: BLE001
+                main = None
+            if main is not None and getattr(main, "n_ctx", None):
+                return 'the main model\'s "n_ctx" in model_slots.json'
             return "COUNCIL_OLLAMA_NUM_CTX"
     except Exception:                                     # noqa: BLE001
         pass
