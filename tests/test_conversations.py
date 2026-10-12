@@ -338,3 +338,17 @@ def test_the_module_imports_no_toolkit():
         encoding="utf-8")
     for toolkit in ("tkinter", "PySide6", "import council_engine"):
         assert toolkit not in source
+
+
+def test_a_history_that_cannot_be_read_is_never_written_over(tmp_path):
+    """add() took any read failure for "no history yet" and wrote a one-item
+    list over the file: a moment's refusal (another process swapping it in)
+    or a damaged file cost every earlier question."""
+    import question_history
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    path = vault / "question_history.json"
+    path.write_text('[{"q": "kept", "ts": 1}, {"q": "half', encoding="utf-8")
+    before = path.read_bytes()
+    question_history.QuestionHistory(vault).add("new question")
+    assert path.read_bytes() == before
