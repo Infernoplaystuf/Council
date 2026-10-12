@@ -311,6 +311,64 @@ def test_a_prompt_too_long_for_the_model_is_said_and_kept(qapp, engine,
                for r in rows), rows
 
 
+#: The marker council_engine._clamp_messages_to_ctx leaves where it cut a
+#: prompt that did not fit the window.
+CLAMP_MARK = "trimmed to fit the model's context window"
+
+
+def _writer_requests(fake):
+    """(system, the rest) of every request the Writer made."""
+    out = []
+    for body in fake.state.chats:
+        msgs = body.get("messages") or []
+        system = "\n".join(m.get("content") or "" for m in msgs
+                           if m.get("role") == "system")
+        rest = "\n".join(m.get("content") or "" for m in msgs
+                         if m.get("role") != "system")
+        if "WRITER of the Council" in system:
+            out.append((system, rest))
+    return out
+
+
+def test_named_files_reach_the_writer_whole_or_are_said_left_out(qapp,
+                                                                  engine):
+    """Found in review of 217f2d4: the vault blocks were sized for 75% of
+    Ollama's 8,192-token window, as if they were the whole prompt. The
+    Writer's call adds its own instructions (about 5,000 characters) and
+    this conversation's earlier turns, and keeps 2,400 tokens for the
+    answer, so the engine cut the middle out of the Writer's prompt — a
+    named file and the fact in it — while the transcript said only "Left
+    out 1 part" and the chips still named the file. What the Writer is sent
+    now fits as it is sent, and whatever had to go is said."""
+    serial = "ZEBRAFIN-7731"
+    filler = "Routine inspection text for the line, nothing unusual. " * 140
+    names = ("alpha", "bravo", "charlie", "delta")
+    for name in names:
+        fact = (f"The serial of the spare is {serial}.\n" if name == "bravo"
+                else "")
+        (engine.vault / "data_in" / f"{name}.txt").write_text(
+            fact + filler + "\n" + filler, encoding="utf-8")
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Compare alpha.txt, bravo.txt, charlie.txt and "
+                         "delta.txt")
+        text = view.transcript.toPlainText()
+        chips = [c.text() for c in view.source_chips]
+    finally:
+        _close(qapp, window, view)
+    writer = _writer_requests(engine.fake)
+    assert writer, "the Writer was not asked"
+    _system, prompt = writer[-1]
+    assert CLAMP_MARK not in prompt, (
+        "the engine cut the Writer's prompt to fit, and nothing said so")
+    for name in names:
+        if f"[FILE: {name}.txt" not in prompt:
+            assert f"{name}.txt (a file you named)" in text, (name, text)
+            assert f"📄 {name}.txt" not in chips, (name, chips)
+    assert "[FILE: bravo.txt" in prompt and serial in prompt
+    assert not engine.refused
+
+
 def test_a_failing_context_step_still_answers_and_says_so(qapp, engine,
                                                          monkeypatch):
     from council_core import turn_context

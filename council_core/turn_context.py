@@ -528,17 +528,37 @@ def _coach_for_error(msg: str):
     return None
 
 
-def _smart_truncate_block_to_tokens(block_text: str, max_tokens: int) -> str:
+def _smart_truncate_block_to_tokens(block_text: str, max_tokens: int,
+                                    count: Optional[Callable[[str], int]]
+                                    = None) -> str:
     """Truncate a rendered injection block to fit a per-block token cap.
 
-    Uses `estimate_tokens` and falls back to char-budget trimming. Always
-    leaves a visible marker so the model knows content was elided.
+    Uses `estimate_tokens` (or ``count``, the counter the caller's budget
+    is kept in) and falls back to char-budget trimming. Always leaves a
+    visible marker so the model knows content was elided.
     """
-    cur = _estimate_block_tokens(block_text)
+    cur = (count or _estimate_block_tokens)(block_text)
     if cur <= max_tokens:
         return block_text
-    # ~4 chars/token works for English; over-estimate a touch by using 4.
-    target_chars = max(800, max_tokens * 4)
+    if count is not None:
+        # [turn_context] The counter's own characters per token, measured
+        # on this block, so the cap holds in the caller's units — checked
+        # after the cut (the marker it adds counts too), so blocks sized to
+        # share a budget do not each run a few tokens over it.
+        target_chars = max(800, int(max_tokens * len(block_text)
+                                    / max(1, cur)))
+        trimmed = block_text
+        for _ in range(4):
+            trimmed, _ = _smart_truncate_text(block_text, target_chars)
+            got = count(trimmed)
+            if got <= max_tokens or target_chars <= 800:
+                break
+            target_chars = max(800, target_chars - int(
+                (got - max_tokens) * len(trimmed) / max(1, got)) - 8)
+        return trimmed
+    else:
+        # ~4 chars/token works for English; over-estimate a touch by using 4.
+        target_chars = max(800, max_tokens * 4)
     trimmed, _ = _smart_truncate_text(block_text, target_chars)
     return trimmed
 
@@ -1630,7 +1650,8 @@ def _build_search_header_block(rec, score=None) -> str:
 
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
                            task_memo_block=None, pinned_files=None,
-                           extra_blocks=None):
+                           extra_blocks=None, room_tokens=None,
+                           count_tokens=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1641,6 +1662,14 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
     [turn_context] ``extra_blocks``: (label, text) pairs prepare_turn hands
     in — the knowledge graph's cited neighbourhood (KG4) — placed at
     PRIO_EXTRA. None (every caller before it) changes nothing.
+
+    [turn_context] ``room_tokens`` / ``count_tokens``: what the model's call
+    leaves for the augmented text and how it counts it
+    (council_engine.prompt_room — prepare_turn passes both). The blocks are
+    then sized to fit THAT, counted with that counter, instead of 75% of
+    ``n_ctx`` less a guessed 500-token allowance for the Writer's own prompt
+    (which, on an 8,192 window, let the engine cut the middle out of a named
+    file). None (every other caller) keeps the old sizing.
     """
     try:
         return _inject_file_contents_impl(
@@ -1648,6 +1677,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
             task_memo_block=task_memo_block,
             pinned_files=pinned_files,
             extra_blocks=extra_blocks,
+            room_tokens=room_tokens,
+            count_tokens=count_tokens,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1687,7 +1718,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                                 task_memo_block=None, pinned_files=None,
-                                extra_blocks=None):
+                                extra_blocks=None, room_tokens=None,
+                                count_tokens=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1743,11 +1775,22 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # above). Scale linearly with n_ctx so a 4K-ctx model gets ~512-token
     # blocks while a 32K-ctx model still gets 5K-token blocks.
     per_block_cap = max(512, n_ctx // 6)
-    reply_reserve = max(256, int(n_ctx * 0.25))
-    safe_input = max(1, n_ctx - reply_reserve)
-    user_cost = _estimate_block_tokens(user_text)
-    writer_overhead = 500   # rough Writer system prompt allowance
-    remaining = max(256, safe_input - user_cost - writer_overhead)
+    # [turn_context] The counter the budget below is kept in: the one the
+    # model's call is fitted with when prepare_turn says so (count_tokens),
+    # else this module's estimate.
+    _est = count_tokens or _estimate_block_tokens
+    user_cost = _est(user_text)
+    if room_tokens is not None:
+        # [turn_context] What the call really leaves for this text (the
+        # window less the reply, the role's own prompt and the blocks in
+        # front of the text — council_engine.prompt_room), less a little for
+        # the "~N tokens" tags and the blank lines between blocks.
+        remaining = max(256, int(room_tokens) - user_cost - 64)
+    else:
+        reply_reserve = max(256, int(n_ctx * 0.25))
+        safe_input = max(1, n_ctx - reply_reserve)
+        writer_overhead = 500   # rough Writer system prompt allowance
+        remaining = max(256, safe_input - user_cost - writer_overhead)
 
     # Priority bands — lower = higher priority
     # VAULT_SUMMARY lists EVERY matching file by name (with brief
@@ -1789,6 +1832,10 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
     missing_paths = []
+    # [turn_context] label -> the files or folders its block was read from, so
+    # the answer's sources name THAT file and not whichever file of the same
+    # name is found first in data_in/ (breakdown["paths"]).
+    block_paths = {}
 
     # -- Task memo (priority 1) ----------------------------------------------
     # A short RAM-resident sticky note carrying the user's original goal +
@@ -1827,12 +1874,17 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     PRIO_FOLDER, f"{lbl_prefix}{p_check.name or path_str}]",
                     folder_block,
                 ))
+                block_paths.setdefault(
+                    f"{lbl_prefix}{p_check.name or path_str}]", []).append(
+                    path_str)
             continue
         snippet = _read_file_for_injection(path_str)
         if snippet:
             candidates.append((
                 PRIO_EXPLICIT, f"[FILE: {p_check.name or path_str}]", snippet,
             ))
+            block_paths.setdefault(f"[FILE: {p_check.name or path_str}]",
+                                   []).append(path_str)
         else:
             missing_paths.append(path_str)
 
@@ -2075,6 +2127,10 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                                         if str(name).lower() in pinned_set
                                         else "[VAULT MATCH: ")
                         candidates.append((PRIO_VAULT, f"{label_prefix}{name}]", block))
+                        if rec.get("path"):
+                            block_paths.setdefault(
+                                f"{label_prefix}{name}]", []).append(
+                                str(rec["path"]))
 
                 # Summary block — emitted ONLY when not in headers mode,
                 # because the headers block already covers the same
@@ -2254,12 +2310,28 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # cumulative budget gets blown by stacked non-droppable blocks (the
     # old assembly let those overflow the window unconditionally).
     HARD_KEEP = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
+    # [turn_context] Several files or folders the user named share the room
+    # the call leaves (room_tokens): each gets an equal part of it, head and
+    # tail with a visible marker, rather than the first one or two whole and
+    # the rest left out — "compare a, b, c and d" needs some of each.
+    named_cap = per_block_cap
+    if room_tokens is not None:
+        named = [c for c in candidates if c[0] in (PRIO_EXPLICIT,
+                                                   PRIO_FOLDER)]
+        if len(named) > 1:
+            fixed = sum(_est(c[2]) for c in candidates if c[0] in HARD_KEEP)
+            share = (remaining - fixed) // len(named)
+            named_cap = max(256, min(per_block_cap, share))
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
         else:
-            capped = _smart_truncate_block_to_tokens(content, per_block_cap)
-        cost = _estimate_block_tokens(capped)
+            capped = _smart_truncate_block_to_tokens(
+                content,
+                named_cap if prio in (PRIO_EXPLICIT, PRIO_FOLDER)
+                else per_block_cap,
+                count=count_tokens)
+        cost = _est(capped)
         # First-pass cumulative gate — only droppable blocks are filtered
         # here. Non-droppable ones go into `placed` unconditionally and
         # the rescue pass below handles overflow.
@@ -2322,14 +2394,14 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 try:
                     condensed = _cond.condense_to_fit(
                         _capped_i, headroom, task=_task_src,
-                        estimate_tokens=_estimate_block_tokens,
+                        estimate_tokens=_est,
                         llm_call=_cond_llm)
                 except Exception as _cx:
                     print('[inject] condense failed: ' + repr(_cx),
                           file=_sys_dbg.stderr)
                     condensed = None
                 if condensed:
-                    new_cost = _estimate_block_tokens(condensed)
+                    new_cost = _est(condensed)
                     if new_cost < cost_i and new_cost <= headroom:
                         placed[i] = (prio_i, label_i, condensed, new_cost)
                         running -= (cost_i - new_cost)
@@ -2360,6 +2432,7 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         "per_block_cap": per_block_cap,
         "running":  running,
         "user_text_tokens": user_cost,
+        "paths": block_paths,
     }
 
     if not final_blocks:
@@ -3646,12 +3719,60 @@ def resolve_source_paths(raw_sources: Any, vault_dir: Any) -> List[Path]:
 # wrong setting whenever Ollama serves the model (its window is
 # COUNCIL_OLLAMA_NUM_CTX; council_engine.effective_n_ctx).
 
-#: The share of the window past which a turn always says the prompt is
-#: nearly full. The engine keeps a quarter of the window for the answer
-#: (context_budget_report's safe_input; at least 256 tokens), so the notice
-#: comes from about 75% — the point where the answer starts to lose its
-#: room — and never later than this.
-NEARLY_FULL = 0.8
+#: The share of the room a question has — what the window leaves beside the
+#: answer's reserve (council_engine.prompt_room) — past which a turn says it
+#: is nearly full. Below it the Writer's call fits as it is sent; above it
+#: the estimate (council_engine.prompt_count) is close enough to the limit
+#: that the model's own count may pass it, and the engine then cuts the
+#: middle out of the prompt.
+NEARLY_FULL = 0.9
+
+
+def writer_frame(writer: Any = None) -> Tuple[str, int]:
+    """(what the Writer's call sends besides the question it is given, the
+    reply it asks for): ``writer``'s own (PersonalityModel.prompt_frame —
+    its system prompt, this conversation's earlier turns and whatever else
+    the memory scope lets in), else the Writer role's system prompt and
+    reply budget from the engine, with nothing remembered."""
+    frame = getattr(writer, "prompt_frame", None)
+    if callable(frame):
+        try:
+            text, predict = frame()
+            return str(text or ""), int(predict or 0)
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[prepare_turn] the Writer's prompt could not be "
+                  f"measured: {exc!r}")
+    return (str(getattr(ce, "ROLE_PROMPTS", {}).get("writer", ""))
+            + "\nUSER TASK:\n",
+            int(getattr(ce, "ROLE_TOKEN_BUDGETS", {}).get("writer", 2400)))
+
+
+def _writer_slot() -> str:
+    try:
+        return ce._slot_for_role("writer")
+    except Exception:                                     # noqa: BLE001
+        return "main"
+
+
+def writer_budget(augmented: str, room: Dict[str, Any]) -> Dict[str, Any]:
+    """How the Writer's call for ``augmented`` fits the window, in the shape
+    council_engine.context_budget_report gives (so the Tk "context info"
+    reads it too): ``input_tokens`` is everything the call sends — the
+    Writer's own prompt and earlier turns (``room["frame_tokens"]``) and the
+    question with the vault in front of it — and ``safe_input`` what the
+    window leaves for that beside the answer (``reply_reserve``). ``room``
+    is council_engine.prompt_room's."""
+    used = int(room["frame_tokens"]) + int(room["count"](augmented or ""))
+    window, budget = int(room["n_ctx"]), int(room["budget"])
+    try:
+        most = ce.get_model_max_context()
+    except Exception:                                     # noqa: BLE001
+        most = None
+    return {"input_tokens": used, "n_ctx": window,
+            "reply_reserve": int(room["reply"]), "safe_input": budget,
+            "pct_of_window": used / max(1, window) * 100.0,
+            "over_safe": used > budget, "over_window": used > budget,
+            "model_max_ctx": most, "tokenizer": "estimate"}
 
 
 def window_setting() -> str:
@@ -3675,12 +3796,21 @@ def window_setting() -> str:
 
 
 def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
-    """What the transcript says when the prompt does not fit, or nearly
-    fills, what the model can read at once (``budget`` is
-    council_engine.context_budget_report's); None when it fits easily."""
+    """What the transcript says when the Writer's prompt does not fit, or
+    nearly fills, the room the model has for it (``budget`` is
+    writer_budget's: ``input_tokens`` is everything the call sends,
+    ``safe_input`` what the window leaves for it beside the answer's
+    ``reply_reserve``); None when it fits easily.
+
+    Over the room, the engine cuts the middle out of the prompt to fit
+    (council_engine._clamp_messages_to_ctx) — it keeps the answer's room —
+    so the notice says part of the question will be cut, not the answer."""
     used, ctx = int(budget["input_tokens"]), int(budget["n_ctx"])
+    room = int(budget.get("safe_input") or ctx)
+    answer = int(budget.get("reply_reserve") or 0)
     setting = window_setting()
-    if budget.get("over_window") or used > ctx:
+    kept = f", and keeps {answer:,} of them for the answer" if answer else ""
+    if budget.get("over_window") or used > room:
         most = int(budget.get("model_max_ctx") or 0)
         if most and most > ctx:
             hint = (f" This model can read up to {most:,}: start the app "
@@ -3692,18 +3822,17 @@ def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
                     f"about fewer files at once.")
         return (f"⚠ This question, with what was found in your files, is too "
                 f"long for what the model can read at once: about {used:,} "
-                f"tokens, and it reads {ctx:,}. The end will be cut off, so "
-                f"the answer may miss some of your data.{hint}")
-    threshold = min(float(budget.get("safe_input") or ctx),
-                    NEARLY_FULL * ctx)
-    if used > threshold:
-        pct = budget.get("pct_of_window")
-        pct = float(pct) if pct is not None else used / max(1, ctx) * 100
-        return (f"⚠ This question, with what was found in your files, fills "
-                f"{pct:.0f}% of what the model can read at once ({used:,} of "
-                f"{ctx:,} tokens). That leaves little room for the answer, "
-                f"so it may be cut short. Starting the app with {setting} "
-                f"set higher gives it more room.")
+                f"tokens, and it reads {ctx:,}{kept}. Part of it will be cut "
+                f"out, so the answer may miss some of your data.{hint}")
+    if used > NEARLY_FULL * room:
+        pct = used / max(1, room) * 100
+        return (f"⚠ This question, with what was found in your files, nearly "
+                f"fills what the model can read at once: about {used:,} "
+                f"tokens, {pct:.0f}% of the {room:,} it has for a question "
+                f"(it reads {ctx:,}{kept}). If the model counts a little "
+                f"more than this estimate, part of it will be cut out. "
+                f"Starting the app with {setting} set higher gives it more "
+                f"room.")
     return None
 
 
@@ -3750,8 +3879,8 @@ def prepare_turn(question: str, state: TurnState, *,
                  n_ctx: Optional[int] = None,
                  condense: Optional[Callable[[str], str]] = None,
                  pinned_files: Optional[List[str]] = None,
-                 on_notice: Optional[Callable[[str, str, str], None]] = None
-                 ) -> PreparedTurn:
+                 on_notice: Optional[Callable[[str, str, str], None]] = None,
+                 writer: Any = None) -> PreparedTurn:
     """Build what the models are sent for ``question``: the Tk console's
     sequence, once, for both shells.
 
@@ -3762,8 +3891,15 @@ def prepare_turn(question: str, state: TurnState, *,
          dataset overview, the analyst block, the memo — capped to the
          context window, the droppable blocks dropped
       4. the sources behind the turn (for the chips under the answer)
-      5. a warning when the prompt will not fit (context_budget_report)
+      5. a warning when the prompt will not fit (writer_budget)
       6. provenance: what the model was shown, for "where did X come from?"
+
+    The vault blocks are sized for the call the text goes to: ``writer``
+    (the personality that answers — its system prompt, the earlier turns it
+    is given and its reply budget, writer_frame), in the window its slot
+    has (``n_ctx``, else council_engine.effective_n_ctx), counted the way
+    the engine will fit the call (council_engine.prompt_room). Without a
+    ``writer`` the Writer role's own prompt and reply budget are assumed.
 
     Every line the user should see goes to ``on_notice(who, text, kind)`` as
     it happens, in the Tk console's order and wording, and is also kept in
@@ -3781,14 +3917,15 @@ def prepare_turn(question: str, state: TurnState, *,
     token = _ACTIVE.set(state)
     try:
         _prepare(question, state, prepared, say, n_ctx=n_ctx,
-                 condense=condense, pinned_files=pinned_files)
+                 condense=condense, pinned_files=pinned_files,
+                 writer=writer)
     finally:
         _ACTIVE.reset(token)
     return prepared
 
 
 def _prepare(question, state, prepared, say, *, n_ctx, condense,
-             pinned_files) -> None:
+             pinned_files, writer=None) -> None:
     # 1. The task memo ------------------------------------------------------
     try:
         memo = state.task_memory.update(question, llm_call=condense)
@@ -3827,20 +3964,36 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
             f"try rephrasing or check the file/column name.")
 
     # 3. The injection ------------------------------------------------------
-    # Sized for the window the main model really has (effective_n_ctx: the
-    # num_ctx Ollama is sent, or the loaded GGUF's), the one the notices in
-    # step 5 measure against. The Tk _send used get_n_ctx(), the CONFIGURED
-    # size — 4,096 with COUNCIL_GGUF_N_CTX unset — so the vault blocks were
-    # cut to a quarter of a 16 K window and "left out to fit 4,096" sat
-    # beside "fills 30% of 16,384".
+    # Sized for the window the Writer's model really has (effective_n_ctx:
+    # the num_ctx Ollama is sent, or the loaded GGUF's), the one the notices
+    # in step 5 measure against. The Tk _send used get_n_ctx(), the
+    # CONFIGURED size — 4,096 with COUNCIL_GGUF_N_CTX unset — so the vault
+    # blocks were cut to a quarter of a 16 K window and "left out to fit
+    # 4,096" sat beside "fills 30% of 16,384".
+    #
+    # And sized for what the Writer's CALL leaves in that window: its own
+    # instructions (about 5,000 characters), the earlier turns it is given,
+    # the 2,400 tokens kept for its answer. Sized as 75% of the window less
+    # a guessed 500 tokens, the blocks filled more than the call had, and on
+    # Ollama's 8,192 the engine cut the middle out of a named file — with
+    # no notice (found in review of 217f2d4).
+    slot = _writer_slot()
     if n_ctx is None:
         try:
-            n_ctx = int(ce.effective_n_ctx("main"))
+            n_ctx = int(ce.effective_n_ctx(slot))
         except Exception:                                 # noqa: BLE001
             try:
                 n_ctx = ce.get_n_ctx()
             except Exception:                             # noqa: BLE001
                 n_ctx = 4096
+    frame_text, predict = writer_frame(writer)
+    try:
+        room = ce.prompt_room(slot, frame=frame_text, num_predict=predict,
+                              n_ctx=n_ctx)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[prepare_turn] the Writer's room could not be measured: "
+              f"{exc!r}")
+        room = None
     pins = state.current_pins() if pinned_files is None else pinned_files
     # The knowledge graph's block (KG4; None until it is built) goes into
     # the same assembly as the vault blocks.
@@ -3853,7 +4006,9 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
              if graph is not None and (graph.text or "").strip() else None)
     augmented, fuzzy, breakdown = _inject_file_contents(
         question, analyst_block=block, n_ctx=n_ctx,
-        task_memo_block=memo_block, pinned_files=pins, extra_blocks=extra)
+        task_memo_block=memo_block, pinned_files=pins, extra_blocks=extra,
+        room_tokens=room["room"] if room else None,
+        count_tokens=room["count"] if room else None)
     prepared.text = augmented
     prepared.fuzzy_matches = dict(fuzzy or {})
     prepared.breakdown = breakdown if isinstance(breakdown, dict) else {}
@@ -3880,11 +4035,26 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
     except Exception:                                     # noqa: BLE001
         prepared.explicit_paths = []
     sources: List[str] = list(analyst_sources)
+    # The file each kept block was read from (breakdown["paths"]), so a
+    # chip names THAT file — not whichever file of the same name is found
+    # first in data_in/ (found in review: a match in projects/notes.txt got
+    # the chip and the preview of data_in/old/notes.txt).
+    block_paths = prepared.breakdown.get("paths") or {}
     for label in labels:
         match = _SOURCE_LABEL_RE.match(label)
         if match:
-            sources.append(match.group(1).strip())
-    sources.extend(prepared.explicit_paths)
+            sources.extend(block_paths.get(label)
+                           or [match.group(1).strip()])
+    # A file the user named that was left out to fit is not behind the
+    # answer: no chip for it (the left-out notice names it).
+    left_out = {_re.sub(r"\s*\(budget overflow\)\s*$", "", str(lb))
+                for lb, _cost in (prepared.breakdown.get("dropped") or [])}
+    left_out -= set(labels)
+    for path in prepared.explicit_paths:
+        name = Path(path).name or path
+        if not any(f"{kind}{name}]" in left_out for kind in
+                   ("[FILE: ", "[FOLDER: ", "[FOLDER SUMMARY: ")):
+            sources.append(path)
     if has_graph and graph is not None:
         # Only when it was kept: a block left out to fit cited nothing.
         sources.extend(str(src) for src in (graph.sources or []) if src)
@@ -3918,11 +4088,17 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
             dropped, prepared.breakdown.get("n_ctx", 0)))
 
     # 5. Will it fit? -------------------------------------------------------
+    # Measured on what the Writer's call sends — its own prompt and earlier
+    # turns as well as this text — not on this text alone, which put a
+    # prompt the engine was about to cut at 43% of the window.
     try:
-        budget = ce.context_budget_report(augmented)
+        budget = (writer_budget(augmented, room) if room is not None
+                  else ce.context_budget_report(augmented))
         prepared.budget = budget
         notice = context_window_notice(budget)
-        if notice:
+        # Parts were left out so the rest fits: that notice says so, and
+        # a "nearly full" one beside it would only repeat it.
+        if notice and (not dropped or budget.get("over_window")):
             say("Council", notice)
     except Exception as exc:                              # noqa: BLE001
         print(f"[ContextBudget] check failed: {exc!r}")

@@ -265,27 +265,35 @@ class CouncilActions:
         snapshot = (self.conversation.snapshot()
                     if self.conversation is not None else None)
 
+        # The personalities, pointed at this session BEFORE the context is
+        # built: the vault blocks are sized around the Writer's real call —
+        # its instructions, the earlier turns it is given, its answer's room
+        # (turn_context.prepare_turn(writer=…)). Building them loads no
+        # model; that happens at a model's first call, so an answer from
+        # the data still asks none.
+        models, problem = self.models()
+        if models is not None and self.conversation is not None:
+            self.conversation.apply_to(models, snapshot)
+
         # The vault, in front of the question — the same code the Tk shell
         # runs (council_core.turn_context.prepare_turn). The models are sent
         # `prepared.text`; everything that decides WHAT to do reads the
         # typed text (A5).
         prepared = self.prepare(typed_text, on_event=on_event,
-                                on_notice=on_notice)
+                                on_notice=on_notice,
+                                writer=getattr(models, "writer", None))
         sent = prepared.text if prepared is not None else typed_text
 
         if prepared is not None and prepared.answerable_from_data and \
                 self._fast_answers():
             # Answered from the data — a count, a summary, a fresh derived
-            # result. No model is asked, so none has to be loaded.
+            # result. No model is asked.
             result = self._from_data(prepared, on_event=on_event,
                                      on_notice=on_notice)
             models = None
         else:
-            models, problem = self.models()
             if models is None:
                 return council_turn.TurnResult(False, message=problem)
-            if self.conversation is not None:
-                self.conversation.apply_to(models, snapshot)
             if not getattr(options, "deliberate", True):
                 # The fast path: one personality, no panel, no verdict. It is
                 # a real answer and it is NOT a deliberation, so it produces
@@ -321,12 +329,13 @@ class CouncilActions:
             self._turn_state = turn_context.TurnState(self.vault_dir)
         return self._turn_state
 
-    def prepare(self, typed_text: str, *, on_event=None, on_notice=None):
+    def prepare(self, typed_text: str, *, on_event=None, on_notice=None,
+                writer=None):
         """council_core.turn_context.prepare_turn for this conversation, its
-        notices reported through ``on_notice`` (see send). None if it could
-        not run at all — the question is then asked without the vault, and
-        the transcript says so (a turn must not die because a file would not
-        open)."""
+        notices reported through ``on_notice`` (see send), its vault blocks
+        sized around ``writer``'s call. None if it could not run at all —
+        the question is then asked without the vault, and the transcript
+        says so (a turn must not die because a file would not open)."""
         notice = _notice_sink(on_event, on_notice)
 
         try:
@@ -334,7 +343,7 @@ class CouncilActions:
             return turn_context.prepare_turn(
                 typed_text, self.turn_state(),
                 condense=turn_context.condense_with_local_model,
-                on_notice=notice)
+                on_notice=notice, writer=writer)
         except Exception as exc:                          # noqa: BLE001
             notice("Council", f"Your files could not be read for this "
                               f"question ({exc!r}), so it is answered "

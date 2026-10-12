@@ -452,3 +452,92 @@ def test_the_dream3d_writer_sizes_its_shortlist_to_the_loaded_window(engine):
     finally:
         nx_ops.invalidate_catalog(engine.vault)
     assert gen.n_ctx == 16384
+
+
+# ============================================================
+# prompt_room — sizing a text before its call, as the clamp will fit it
+# ============================================================
+# Found in review of 217f2d4: council_core.turn_context sized the vault
+# blocks for 75% of the window less a guessed 500 tokens, while the Writer's
+# call adds a 4,953-character system prompt and keeps 2,400 tokens for its
+# answer — so on Ollama's 8,192 the clamp cut the middle out of a named file.
+
+
+def _two_messages(system, user):
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": user}]
+
+
+def test_a_text_sized_to_the_room_is_not_cut(monkeypatch):
+    import council_engine as ce
+    monkeypatch.setattr(ce, "_OLLAMA_CPT", {})
+    system, head = "S" * 4953, "RECENT CONVERSATION:\nUser: hi\n\nUSER TASK:\n"
+    room = ce.prompt_room("main", frame=system + "\n" + head,
+                          num_predict=2400, n_ctx=8192)
+    assert room["reply"] == 2400 and room["budget"] == 8192 - 2400 - margin(2)
+    count = room["count"]
+    text = "y" * int(room["room"] * ce._budget_cpt())
+    assert count(text) <= room["room"]
+    counter = ce._ollama_counter(ce._OLLAMA_CPT_DEFAULT)
+    sent = _two_messages(system, head + text)
+    kept, reply = ce._clamp_messages_to_ctx(sent, 2400, 8192,
+                                            count_tokens=counter)
+    assert kept == sent and reply == 2400
+    # The room is the real limit, not a guess with slack: a little more and
+    # the clamp cuts.
+    over = _two_messages(system, head + text + "y" * 30)
+    cut, _reply = ce._clamp_messages_to_ctx(over, 2400, 8192,
+                                            count_tokens=counter)
+    assert MARKER in cut[1]["content"]
+
+
+def test_a_denser_measured_ratio_shrinks_the_room(monkeypatch):
+    """The clamp counts an Ollama model at the densest ratio measured for
+    it; the room is counted at the densest any model was measured at."""
+    import council_engine as ce
+    monkeypatch.setattr(ce, "_OLLAMA_CPT", {})
+    plain = ce.prompt_room("main", frame="", num_predict=0, n_ctx=8192)
+    monkeypatch.setattr(ce, "_OLLAMA_CPT", {"phi3.5:latest": [2.44, 3.3]})
+    dense = ce.prompt_room("main", frame="", num_predict=0, n_ctx=8192)
+    text = "z" * 3000
+    assert dense["count"](text) > plain["count"](text)
+    # A model that has only been measured LESS dense never widens it.
+    monkeypatch.setattr(ce, "_OLLAMA_CPT", {"llama3.1:8b": [3.9]})
+    assert ce.prompt_room("main", n_ctx=8192)["count"](text) == \
+        plain["count"](text)
+
+
+def test_a_thinking_model_keeps_its_thinking_room(monkeypatch):
+    import council_engine as ce
+    monkeypatch.setattr(ce, "_OLLAMA_THINKS", {"main": True})
+    room = ce.prompt_room("main", num_predict=2400, n_ctx=16384)
+    assert room["reply"] == 2400 + ce._think_headroom()
+
+
+def test_the_frame_is_what_respond_sends_besides_the_text(tmp_path):
+    """PersonalityModel.prompt_frame is the system prompt and the blocks
+    respond() puts in front of the text — the same stitch respond() sends —
+    and the reply it asks for."""
+    import council_engine as ce
+    models = ce.build_personalities(pins={}, vault_dir=tmp_path,
+                                    session_id="s1", trace=False)
+    writer = models["writer"]
+    writer.memory_scope = "conversation"
+    writer.conversation_store.append("s1", {"who": "User",
+                                            "text": "the pump in bay 4?"})
+    sent = {}
+
+    class Spec:
+        def generate(self, **kwargs):
+            sent.update(kwargs)
+            return "ok"
+
+    writer.registry = SimpleNamespace(get=lambda _k: Spec(),
+                                      best_for=lambda **_k: Spec())
+    writer.respond("QUESTION")
+    frame, predict = writer.prompt_frame()
+    assert predict == 2400 == sent["max_tokens"]
+    assert sent["user_text"] == writer.stitch("QUESTION")
+    assert frame == sent["developer_instructions"] + "\n" + writer.stitch("")
+    assert "the pump in bay 4?" in frame and "RECENT CONVERSATION" in frame
+    assert sent["user_text"].endswith("USER TASK:\nQUESTION")

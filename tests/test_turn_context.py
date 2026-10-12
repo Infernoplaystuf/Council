@@ -194,37 +194,95 @@ def test_a_prompt_that_will_not_fit_says_so(vault_env, monkeypatch):
         assert word not in text, f"{word!r} in {text!r}"
 
 
-def test_a_prompt_over_80_percent_of_the_window_says_so(vault_env,
-                                                        monkeypatch):
+class _Writer:
+    """A stand-in for the personality that answers: prepare_turn sizes the
+    vault blocks around what its call sends besides the question
+    (PersonalityModel.prompt_frame) and the reply it asks for."""
+
+    def __init__(self, frame="", predict=100):
+        self.frame, self.predict = frame, predict
+
+    def prompt_frame(self):
+        return self.frame, self.predict
+
+
+def _filling(vault, share, question="summarize pumps.csv", window=4096):
+    """Prepare ``question`` for a Writer whose own prompt makes its call
+    fill ``share`` of the room a 4,096 window leaves beside its answer."""
     import council_engine as ce
+    base, _s, _ = _prepare(vault, question, n_ctx=window,
+                           writer=_Writer("", 100))
+    room, text = base.budget["safe_input"], base.budget["input_tokens"]
+    frame = "x" * int((share * room - text) * ce._budget_cpt())
+    return _prepare(vault, question, n_ctx=window, writer=_Writer(frame, 100))
+
+
+def test_a_prompt_that_nearly_fills_the_room_says_so(vault_env):
+    """Measured on everything the Writer's call sends (its own prompt and
+    the earlier turns as well as the question and the vault) against what
+    the window leaves beside its answer. It was measured on the question
+    and the vault alone, which put a prompt the engine was about to cut at
+    43% of the window (found in review of 217f2d4)."""
     vault, _fake = vault_env
-    question = _big_file(vault)
-    used = _prompt_tokens(vault, question)
-    window = int(used / 0.85)                 # the prompt fills ~85% of it
-    assert window >= 2048, window
-    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: window)
-    _prepared, said, _ = _prepare(vault, question, n_ctx=32768)
+    prepared, said, _ = _filling(vault, 0.95)
     notices = _window_notices(said)
     assert len(notices) == 1, said
     text = notices[0]
-    assert f"{used / window * 100:.0f}%" in text, text
-    assert f"{window:,}" in text, text
-    assert "too long" not in text and "room" in text, text
+    budget = prepared.budget
+    pct = budget["input_tokens"] / budget["safe_input"] * 100
+    assert f"{pct:.0f}%" in text and "4,096" in text, text
+    assert "keeps 100 of them for the answer" in text, text
+    assert "too long" not in text and "nearly fills" in text, text
     for word in JARGON:
         assert word not in text, f"{word!r} in {text!r}"
 
 
-def test_a_prompt_well_inside_the_window_says_nothing_about_it(vault_env,
-                                                              monkeypatch):
+def test_a_prompt_well_inside_the_room_says_nothing_about_it(vault_env):
+    vault, _fake = vault_env
+    _prepared, said, _ = _filling(vault, 0.5)
+    assert not _window_notices(said), said
+
+
+def test_the_writers_own_prompt_counts_toward_the_fit(vault_env):
+    """The question and the vault blocks alone fill a few per cent of the
+    room; with the Writer's own prompt the call does not fit, and the
+    engine will cut it: that is said."""
+    vault, _fake = vault_env
+    prepared, said, _ = _filling(vault, 1.2)
+    assert prepared.budget["over_window"], prepared.budget
+    notices = _window_notices(said)
+    assert len(notices) == 1 and "too long" in notices[0], said
+    assert "Part of it will be cut out" in notices[0], notices[0]
+    assert "ORCHID" in prepared.text, "the file itself still goes in"
+
+
+def test_named_files_share_the_room_and_none_is_cut_silently(vault_env):
+    """Four large files named at the default 8,192 window, sized around the
+    real Writer's prompt (its 4,953-character instructions, 2,400 tokens
+    kept for the answer): each gets a part of the room — head and tail —
+    and the whole call fits as it will be sent, so the engine cuts
+    nothing. Before, the first ones took the room whole and the call was
+    larger than the window could take beside the answer."""
     import council_engine as ce
     vault, _fake = vault_env
-    question = _big_file(vault)
-    used = _prompt_tokens(vault, question)
-    window = used * 2                         # the prompt fills half of it
-    assert window >= 2048, window
-    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: window)
-    _prepared, said, _ = _prepare(vault, question, n_ctx=32768)
-    assert not _window_notices(said), said
+    filler = "Routine inspection text for the line, nothing unusual. " * 280
+    for name in ("alpha", "bravo", "charlie", "delta"):
+        (vault / "data_in" / f"{name}.txt").write_text(
+            f"{name.upper()}-FIRST-LINE\n" + filler, encoding="utf-8")
+    prepared, said, _ = _prepare(
+        vault, "Compare alpha.txt, bravo.txt, charlie.txt and delta.txt",
+        n_ctx=8192)
+    for name in ("alpha", "bravo", "charlie", "delta"):
+        assert f"{name.upper()}-FIRST-LINE" in prepared.text, name
+    budget = prepared.budget
+    assert budget["n_ctx"] == 8192 and budget["reply_reserve"] == 2400
+    assert not budget["over_window"], budget
+    frame = ce.ROLE_PROMPTS["writer"] + "\nUSER TASK:\n"
+    messages = [{"role": "system", "content": frame},
+                {"role": "user", "content": prepared.text}]
+    kept, reply = ce._clamp_messages_to_ctx(
+        messages, 2400, 8192, count_tokens=ce._ollama_counter(3.0))
+    assert kept == messages and reply == 2400, "the engine would cut it"
 
 
 def test_the_context_is_sized_for_the_window_the_model_really_has(
@@ -329,6 +387,45 @@ def test_a_vault_search_never_brings_back_older_conversations(vault_env,
     leaked = [m for m in (t.split()[-1] for t in APP_FILES.values())
               if m.strip('"}') in prepared.text]
     assert not leaked, f"{leaked} reached the prompt"
+
+
+def test_a_chip_names_the_file_the_match_was_read_from(vault_env):
+    """Found in review: the chip was resolved from the block's label — a
+    bare name — searched for in data_in/, so a match read from
+    projects/notes.txt got the chip (and the read-only preview) of
+    data_in/old/notes.txt, another file with nothing of the answer in it."""
+    vault, _fake = vault_env
+    (vault / "projects").mkdir()
+    real = vault / "projects" / "notes.txt"
+    real.write_text("The zebrafin valve was replaced on line 3.\n" * 5,
+                    encoding="utf-8")
+    (vault / "data_in" / "old").mkdir()
+    (vault / "data_in" / "old" / "notes.txt").write_text(
+        "Unrelated shopping list: eggs, milk.\n", encoding="utf-8")
+    from council_core import turn_context as tc
+    state = tc.TurnState(vault)
+    state.get_vault_index().rebuild()
+    prepared, _said, _ = _prepare(vault, "search the vault for zebrafin",
+                                  state=state, n_ctx=16384)
+    assert "zebrafin valve" in prepared.text
+    assert [p.resolve() for p in prepared.source_paths] == [real.resolve()]
+
+
+def test_a_match_outside_data_in_gets_its_chip(vault_env):
+    """A match in the vault but outside data_in/ reached the prompt with no
+    chip: its bare name was looked for in data_in/ only."""
+    vault, _fake = vault_env
+    (vault / "projects").mkdir()
+    log = vault / "projects" / "valve_log.txt"
+    log.write_text("The zebrafin valve was replaced on line 3.\n" * 5,
+                   encoding="utf-8")
+    from council_core import turn_context as tc
+    state = tc.TurnState(vault)
+    state.get_vault_index().rebuild()
+    prepared, _said, _ = _prepare(vault, "search the vault for zebrafin",
+                                  state=state, n_ctx=16384)
+    assert "zebrafin valve" in prepared.text
+    assert [p.resolve() for p in prepared.source_paths] == [log.resolve()]
 
 
 def test_the_protected_names_are_where_the_index_looks():
@@ -463,7 +560,10 @@ VAULT_ROOT_APP_FILES = {
 }
 
 
-@pytest.mark.parametrize("n_ctx", [4096, 32768])
+# 8,192 gets the compact folder listing, 32,768 the rich one. (A 4,096
+# window leaves the listing no room beside the Writer's own prompt and its
+# answer: it is left out, and said — test_named_files_share_the_room…)
+@pytest.mark.parametrize("n_ctx", [8192, 32768])
 def test_naming_the_vault_folder_never_lists_older_sessions_or_memory(
         vault_env, n_ctx):
     """Found in review: "What is in <vault> ?" listed conversations/,

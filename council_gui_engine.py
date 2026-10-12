@@ -15104,7 +15104,10 @@ class CouncilConsole(tk.Tk):
                 condense=_turn_context.condense_with_local_model,
                 pinned_files=self._current_pinned_filenames(),
                 on_notice=lambda _who, _text, _kind: self._append_transcript(
-                    _who, _text, _kind))
+                    _who, _text, _kind),
+                # The vault blocks are sized around the Writer's real call
+                # (its prompt, what it remembers, its answer's room).
+                writer=self.__dict__.get("writer"))
         except Exception as _prep_exc:
             # A turn must not die because a file would not open.
             print(f"[prepare_turn] failed: {_prep_exc!r}")

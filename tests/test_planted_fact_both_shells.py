@@ -357,7 +357,10 @@ def test_tk_gives_the_writer_the_fact_and_cites_it(engine, monkeypatch):
     finals = [text for who, text, kind in console.said
               if who == "Writer" and kind == "final"]
     assert finals and FACT in finals[-1], console.said
-    assert console._last_turn_sources == ["pumps.csv"]
+    # The file the block was read from (a full path since the review:
+    # a bare name was resolved to the first file of that name).
+    assert [Path(s).name for s in console._last_turn_sources] == [
+        "pumps.csv"]
     assert console.chips == [["pumps.csv"]]
     assert not engine.refused
 

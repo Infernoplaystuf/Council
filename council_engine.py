@@ -1927,6 +1927,7 @@ def _release_slots() -> None:
     with _ROUTE_LOCK:
         _AUTO_OLLAMA.clear()
         _OLLAMA_WINDOWS.clear()
+        _OLLAMA_THINKS.clear()
         _AUTO_PICK = None
     try:
         from council_core import local_models, model_slots
@@ -2290,6 +2291,70 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
     }
 
 
+#: The template margin _clamp_messages_to_ctx keeps for a call of ``n``
+#: messages (see the comment there): what a prompt builder must leave free.
+def _template_margin(n_messages: int) -> int:
+    return 64 + 8 * int(n_messages)
+
+
+def _budget_cpt() -> float:
+    """Chars per token to budget a prompt with BEFORE its call, when the
+    model that will count it is not known yet: the clamp's starting ratio
+    for an unmeasured Ollama model (_OLLAMA_CPT_DEFAULT, 3.0), or the
+    densest ratio any model in this process has been measured at, if that
+    is denser. A GGUF's own tokenizer is not asked (it may be busy in a
+    call); 3.0 is under what the Llama and Phi tokenizers count for prose,
+    code and JSON (measured 3.05-4.09, _OLLAMA_CPT_DEFAULT's note), so an
+    estimate made with it errs on the side of fitting."""
+    with _OLLAMA_CPT_LOCK:
+        seen = [r for ratios in _OLLAMA_CPT.values() for r in ratios]
+    return max(1.0, min([_OLLAMA_CPT_DEFAULT] + seen))
+
+
+def prompt_count(slot: str = "main") -> Callable[[str], int]:
+    """How a prompt for ``slot`` is counted when it is SIZED before the call
+    (prompt_room): chars / _budget_cpt(), rounded up — never fewer tokens
+    than the clamp will count for an Ollama model at the ratios it has
+    measured. Never loads a model, never asks the network."""
+    return _ollama_counter(_budget_cpt())
+
+
+def prompt_room(slot: str = "main", *, frame: str = "",
+                num_predict: int = 0,
+                n_ctx: Optional[int] = None) -> Dict[str, Any]:
+    """What a call on ``slot`` leaves for the text a caller is about to put
+    in it — counted the way _clamp_messages_to_ctx will fit the call, so a
+    text sized to ``room`` is not cut by it.
+
+    The call is the two messages LocalBackendSpec.generate sends: the
+    role's system prompt and a user message. ``frame`` is everything the
+    call sends besides the caller's text (PersonalityModel.prompt_frame:
+    the system prompt, this conversation's earlier turns, …);
+    ``num_predict`` the reply it asks for. ``n_ctx``: the window, else
+    effective_n_ctx(slot).
+
+    Returns a dict: ``n_ctx``; ``reply`` (the reply the clamp keeps room
+    for — num_predict, plus the thinking headroom when the slot's Ollama
+    model thinks, at most half the window); ``budget`` (what the messages
+    may take: the window less the reply and the template margin);
+    ``frame_tokens``; ``room`` (budget - frame_tokens, at least 0); and
+    ``count``, the counter all of these were counted with (prompt_count)."""
+    window = int(n_ctx) if n_ctx else int(effective_n_ctx(slot))
+    margin = _template_margin(2)
+    want = int(num_predict or 0)
+    with _ROUTE_LOCK:
+        thinks = bool(_OLLAMA_THINKS.get(slot or "main"))
+    if thinks and want:
+        want += _think_headroom()
+    reply = max(16, min(want, max(16, (window - margin) // 2)))
+    budget = max(64, window - reply - margin)
+    count = prompt_count(slot)
+    frame_tokens = count(frame) if frame else 0
+    return {"n_ctx": window, "reply": reply, "budget": budget,
+            "frame_tokens": frame_tokens,
+            "room": max(0, budget - frame_tokens), "count": count}
+
+
 def _clamp_messages_to_ctx(
     messages: List[Dict[str, str]], num_predict: int,
     model_n_ctx: Optional[int] = None,
@@ -2360,7 +2425,7 @@ def _clamp_messages_to_ctx(
     # 69-message prompt at the content budget then passed n_ctx by 299
     # tokens and llama-cpp cut the 2400-token reply to 2101. 64 + 8 per
     # message keeps a 2-message call within 16 tokens of the old budget.
-    margin = 64 + 8 * len(messages)
+    margin = _template_margin(len(messages))
     reply = max(16, min(int(num_predict), max(16, (n_ctx - margin) // 2)))
     prompt_budget = max(64, n_ctx - reply - margin)
 
@@ -2829,6 +2894,9 @@ _AUTO_OLLAMA: Dict[str, str] = {}
 #: slot -> the num_ctx sent for it. effective_n_ctx reads this, so a prompt
 #: builder budgets for the window Ollama really has, without a config read.
 _OLLAMA_WINDOWS: Dict[str, int] = {}
+#: slot -> whether the model serving it thinks (its calls get
+#: _think_headroom() more num_predict); prompt_room reads it.
+_OLLAMA_THINKS: Dict[str, bool] = {}
 #: The installed model picked when nothing names one (cached per refresh).
 _AUTO_PICK: Optional[str] = None
 _ROUTE_LOCK = threading.Lock()
@@ -3475,9 +3543,10 @@ def _ollama_local(
             f"(`ollama pull {name}` — the council never downloads), or pick "
             "another model for this role in the Models tab.")
     num_ctx = _ollama_num_ctx(slot, entry)
+    think = ollama_think(entry)
     with _ROUTE_LOCK:
         _OLLAMA_WINDOWS[slot] = num_ctx
-    think = ollama_think(entry)
+        _OLLAMA_THINKS[slot] = think not in (None, False)
     if think not in (None, False):
         # Thinking tokens count against num_predict: without room for them
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
@@ -5561,6 +5630,45 @@ class PersonalityModel:
         token_callback: Optional[Callable[[str], None]] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
+        stitched_user = self.stitch(user_text, extra_context=extra_context)
+
+        spec = (
+            self.registry.get(self.backend_key)
+            if self.backend_key
+            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
+        )
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
+        return spec.generate(
+            developer_instructions=self.system_prompt,
+            user_text=stitched_user,
+            temperature=self.temperature,
+            max_tokens=effective_max_tokens,
+            trace=self.trace,
+            token_callback=token_callback,
+            role=self.name,
+        )
+
+    def prompt_frame(self, *, extra_context: str = "") -> Tuple[str, int]:
+        """(what a respond() call sends besides the text it is given, the
+        reply it asks for in tokens): its system prompt and the blocks
+        stitch() puts in front of the text — this conversation's earlier
+        turns, what the memory scope allows, the standing primer — read now,
+        as respond() would read them. Calls no model.
+
+        For a caller that SIZES the text before respond() is called
+        (council_core.turn_context.prepare_turn sizes the vault blocks around
+        it): the engine's clamp fits the whole call — system prompt, these
+        blocks, the text and the reply — into the window, and cuts the
+        middle out of the largest message when it does not fit."""
+        return (self.system_prompt + "\n"
+                + self.stitch("", extra_context=extra_context),
+                int(self.max_output_tokens))
+
+    def stitch(self, user_text: str, *, extra_context: str = "") -> str:
+        """The user message respond() sends for ``user_text``: the remembered
+        blocks the role and the memory scope allow, then "USER TASK:" and the
+        text. Reads the conversation and memory files; calls no model."""
         # ── Role-aware context profile ─────────────────────────────────
         profile       = ROLE_CONTEXT_PROFILES.get(self.name, _DEFAULT_CONTEXT_PROFILE)
         history_turns = profile["history_turns"]
@@ -5693,24 +5801,7 @@ class PersonalityModel:
         if filtered_extra.strip():
             prefix_parts.append("COUNCIL CONTEXT:\n" + filtered_extra.strip())
 
-        stitched_user = "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
-
-        spec = (
-            self.registry.get(self.backend_key)
-            if self.backend_key
-            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
-        )
-
-        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
-        return spec.generate(
-            developer_instructions=self.system_prompt,
-            user_text=stitched_user,
-            temperature=self.temperature,
-            max_tokens=effective_max_tokens,
-            trace=self.trace,
-            token_callback=token_callback,
-            role=self.name,
-        )
+        return "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
 
 
 
@@ -7337,6 +7428,24 @@ def get_model_size_label(model: "PersonalityModel") -> str:
     return BACKEND_SIZE_LABELS.get(bk, bk or "?")
 
 
+#: The reply budget (num_predict) of the roles that produce long output; the
+#: others keep PersonalityModel's default. build_personalities applies it,
+#: and a caller sizing a prompt for a role before its personality exists
+#: (council_core.turn_context) reads it here.
+ROLE_TOKEN_BUDGETS: Dict[str, int] = {
+    "pitcher":   3200,   # full pitch: title, hook, premise, 6-8 outline sections,
+                         # thumbnail, audience, why-it-works, variants, tags, notes
+    "ideator":   1000,   # raw idea only — 5 short fields, no bloat needed
+    "writer":    2400,   # long-form synthesis and essays
+    "sage":      2400,   # detailed knowledge responses
+    "director":  2000,   # script outlines and style breakdowns
+    "content":   1800,   # packaging writeups
+    "strategist":1600,   # strategic plans
+    "coach":     1800,   # delivery breakdowns with drill sections
+    "algorithm": 1600,   # retention analysis
+}
+
+
 def build_personalities(
     *,
     pins: Dict[str, str],
@@ -7467,22 +7576,8 @@ def build_personalities(
         if role not in pins:
             models[role].backend_key = default_key
 
-    # ── Token budget overrides ────────────────────────────────────────
-    # Roles that produce long structured output get a larger budget.
-    # The default 1400 is fine for most roles; pitcher/sage/writer need more.
-    token_budgets = {
-        "pitcher":   3200,   # full pitch: title, hook, premise, 6-8 outline sections,
-                             # thumbnail, audience, why-it-works, variants, tags, notes
-        "ideator":   1000,   # raw idea only — 5 short fields, no bloat needed
-        "writer":    2400,   # long-form synthesis and essays
-        "sage":      2400,   # detailed knowledge responses
-        "director":  2000,   # script outlines and style breakdowns
-        "content":   1800,   # packaging writeups
-        "strategist":1600,   # strategic plans
-        "coach":     1800,   # delivery breakdowns with drill sections
-        "algorithm": 1600,   # retention analysis
-    }
-    for role, budget in token_budgets.items():
+    # ── Token budget overrides (ROLE_TOKEN_BUDGETS) ───────────────────
+    for role, budget in ROLE_TOKEN_BUDGETS.items():
         if role in models:
             models[role].max_output_tokens = budget
 

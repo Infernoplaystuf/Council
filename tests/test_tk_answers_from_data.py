@@ -163,7 +163,10 @@ def test_the_tk_writer_is_given_the_planted_file(tk_engine):
     assert console.writer.asked, "the Writer was never asked"
     assert FACT in console.writer.asked[-1]
     assert console.writer.asked[-1].rstrip().endswith("Summarize pumps.csv")
-    assert console._last_turn_sources == ["pumps.csv"]
+    # The file the block was read from (a full path since the review:
+    # a bare name was resolved to the first file of that name).
+    assert [Path(s).name for s in console._last_turn_sources] == [
+        "pumps.csv"]
     said = [text for _who, text, _kind in console.said]
     assert any(text.startswith("Tracking → goal:") for text in said), said
 
