@@ -43,6 +43,19 @@ REAL_ENTRY = {
 }
 
 
+@pytest.fixture(autouse=True)
+def no_models_on_this_pc(monkeypatch):
+    """mj.find marks the rows already on this PC, by asking
+    local_models.list_local_models - which scans the PC's model folders and
+    asks the localhost Ollama for its tags: the REAL one on a developer PC
+    (probe, 2026-10-12: test_a_mixed_result_says_how_many_were_verified
+    reached 127.0.0.1:11434; the answer is cached for 5 s, so it is whichever
+    test finds first). Every test here starts with nothing installed."""
+    from council_core import local_models
+    monkeypatch.setattr(local_models, "list_local_models",
+                        lambda *a, **k: [])
+
+
 def test_the_module_imports_no_toolkit():
     source = (ROOT / "council_core" / "model_jobs.py").read_text(
         encoding="utf-8")

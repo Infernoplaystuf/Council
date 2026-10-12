@@ -66,10 +66,16 @@ if str(REPO) not in sys.path:
 # before any import below can find the user's real ~/.council. Measured: a run
 # of this file rewrote three index files in the real vault. The Tk guard is
 # installed here for the same reason: no check may open a Tk window (the Tk
-# GUIs are deprecated — tests/no_tk_guard.py).
+# GUIs are deprecated — tests/no_tk_guard.py). So is the offline guard: no
+# check may connect off loopback or to the real Ollama's port, or look up a
+# name (tests/offline_guard.py), and _run fails a check that tried even when
+# the code under test swallowed the refusal. Measured 2026-10-12: as a
+# script, the model-downloader check made real HTTPS connections to
+# huggingface.co, just as it did under pytest.
 if __name__ == "__main__":
     import tests.sandbox_vault  # noqa: E402,F401
     import tests.no_tk_guard  # noqa: E402,F401
+    import tests.offline_guard  # noqa: E402,F401
 
 
 # ─── Test runner ────────────────────────────────────────────────────
@@ -121,12 +127,26 @@ if _pytest is not None:
 
 def _run(label: str, fn) -> None:
     print(f"\n── {label} ──")
+    # Each check starts with no cached Ollama answer, as each pytest test
+    # does: a cached refusal would let a later check that reaches for the
+    # real Ollama pass without asking (tests/offline_guard.py).
+    guard = sys.modules.get("tests.offline_guard")
+    if guard is not None:
+        guard.forget_cached_answers()
     try:
         fn()
     except Exception as exc:
         _FAILS.append((label, repr(exc)))
         print(f"  ✗ {label} raised: {exc!r}")
         traceback.print_exc()
+    # Script mode loads no conftest, so there is no offline_test fixture: a
+    # check that tried to go online fails here (tests/offline_guard.py).
+    guard = sys.modules.get("tests.offline_guard")
+    refused = guard.take_refusals() if guard is not None else []
+    if refused:
+        detail = f"{guard.MESSAGE} - refused:\n{guard.describe(refused)}"
+        _FAILS.append((label, detail))
+        print(f"  ✗ {label}: {detail}")
 
 
 _ABSENT_OPTIONAL = "isn't installed"
@@ -8145,6 +8165,16 @@ def test_model_downloader() -> None:
 
         prev_urlopen = _ureq.urlopen
         prev_host = md._HF_HOST
+        # download_gguf tries huggingface_hub FIRST when it is installed (it
+        # is, in the council env) - and hf_hub_download ignores `url`: it
+        # asked the REAL huggingface.co for repo/m.gguf (HTTPS to CloudFront,
+        # measured 2026-10-09 and 2026-10-12, under pytest and as a script)
+        # and only fell back to the urlopen below when that failed. Hidden
+        # here, so the stdlib streaming path this check is about is the one
+        # that runs, and nothing leaves the PC.
+        missing = object()
+        prev_hub = sys.modules.get("huggingface_hub", missing)
+        sys.modules["huggingface_hub"] = None      # import -> ImportError
         md._HF_HOST = "127.0.0.1"
         _ureq.urlopen = _fake_urlopen
         try:
@@ -8161,9 +8191,39 @@ def test_model_downloader() -> None:
                                   url="http://127.0.0.1/m.gguf")
             _check("re-download skips an already-present valid file",
                    r2["skipped"] is True)
+
+            # huggingface_hub installed but FAILING (offline, auth, a bad
+            # repo) must fall back to the direct URL. Before the hub was
+            # hidden above, the real hf_hub_download failing against
+            # huggingface.co was what ran this branch - online. Now a fake
+            # hub fails instead; no other check reaches it.
+            import types
+            asked = []
+
+            def _failing_hub_download(**kw):
+                asked.append(kw)
+                raise OSError("offline")
+
+            sys.modules["huggingface_hub"] = types.SimpleNamespace(
+                hf_hub_download=_failing_hub_download)
+            seen.clear()
+            r3 = md.download_gguf("repo", "m.gguf", d / "fallback",
+                                  url="http://127.0.0.1/m.gguf",
+                                  progress=lambda done, total: seen.append(done))
+            _check("a failing huggingface_hub was asked first",
+                   [(k.get("repo_id"), k.get("filename")) for k in asked]
+                   == [("repo", "m.gguf")], repr(asked))
+            _check("hub failed -> the direct URL is streamed instead",
+                   md.looks_like_gguf(r3["path"]) and r3["bytes"] > 0
+                   and r3.get("via") != "huggingface_hub" and len(seen) >= 1,
+                   repr(r3))
         finally:
             _ureq.urlopen = prev_urlopen
             md._HF_HOST = prev_host
+            if prev_hub is missing:
+                sys.modules.pop("huggingface_hub", None)
+            else:
+                sys.modules["huggingface_hub"] = prev_hub
 
 
 def test_stats_cache_per_folder_csv_shards() -> None:

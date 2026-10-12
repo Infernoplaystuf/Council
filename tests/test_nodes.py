@@ -314,9 +314,19 @@ def make_tab(qapp):
     qapp.processEvents()
 
 
-def test_the_factory_takes_a_window(qapp):
+def test_the_factory_takes_a_window(qapp, monkeypatch):
+    # The factory's tab probes at once, on a worker, with the dispatcher
+    # council_engine builds - whose first host is the REAL Ollama
+    # (127.0.0.1:11434, and ::1). That worker ran on into the next test, and
+    # asked it for /api/ps and /api/tags there (probe, 2026-10-12: logged
+    # against test_the_table_fills_from_a_probe). Here it gets this file's
+    # stand-in, and the probe is waited for.
+    import council_engine
+    monkeypatch.setattr(council_engine, "build_dispatcher",
+                        lambda *a, **k: Dispatcher())
     tab = build_nodes(None)
     assert isinstance(tab, NodesTab)
+    drive(qapp, tab)
     tab._timer.stop()
     tab.deleteLater()
 
