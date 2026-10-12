@@ -239,7 +239,13 @@ Writer; launchers unchanged (Qt).
 - A source chip shows the file READ-ONLY in the app (its first rows and columns, no model —
   Tk's `_preview_data_file`) with a "Show in folder" button that selects it in Explorer /
   Finder; a file that has gone since is said. It used to open the folder only. Nothing
-  writes to the file; an offscreen run never starts the file manager.
+  writes to the file; an offscreen run never starts the file manager
+  (`council_qt.widgets.source_preview`).
+- "forget WORD", which the close-match notice under a vault search offers in both shells,
+  works in Qt (`turn_context.forget_command`; before, Qt sent it to the Writer as a
+  question). It takes only words the notice offered in this conversation — Tk takes any
+  "forget …" and put "what", "said" … on the list; Tk's handling is unchanged. The list
+  (`fuzzy_denylist.json`) is written atomically and never over a file that cannot be read.
 - Context-window notices in plain words in both shells ("too long for what the model can
   read at once", "fills 85% of …", "Left out 2 parts of what was found …"), naming the
   setting that sizes THIS model's window — when Ollama serves it, the main slot's `n_ctx`
@@ -268,7 +274,10 @@ Writer; launchers unchanged (Qt).
   twice in each Qt prompt — Tk with SILO off does the same; (2) the injection is sized with
   `get_n_ctx()` (4,096 when unset) while the notices measure against the real window
   (`effective_n_ctx`, 8,192 for Ollama by default) — Tk's behaviour, kept; (3) the Tk stand-in
-  tests share the Tk console's process-wide indexes unless reset (fixed in the tests).
+  tests share the Tk console's process-wide indexes unless reset (fixed in the tests);
+  (4) the analyst's own notices ("Analyst direct-routed to folder_data_summary …", "Context
+  retrieval failed with an unexpected error …") are still Tk's technical wording, now in
+  both shells.
 
 **Review fixes (2026-10-12, same branch).** Each was reproduced by a test first.
 - Every Qt tab's personalities get the Qt scope (`council_turn.load_personalities(scope=…)`,
