@@ -208,9 +208,16 @@ def write_png(image: np.ndarray, path: Any, compress: Any = "auto") -> int:
     raised BEFORE the file is opened, so the caller can fall back to a
     general encoder. Writes `path` directly: a caller that must never leave a
     partial file writes to a temporary name and renames.
+
+    NEVER OVER ANYTHING: `path` is created with exclusive creation ("xb"),
+    so a file already there raises FileExistsError and is left exactly as it
+    was. Opened "wb", two cameras saving under one run name replaced each
+    other's frames silently (measured: half the frames reported saved were
+    on disk; docs/typhon_multicamera_design.md 2.6). A clash from any cause
+    now fails loudly, as a frame not saved.
     """
     data = encode_into(image, compress)
-    with open(Path(path), "wb", buffering=0) as f:
+    with open(Path(path), "xb", buffering=0) as f:
         written = 0
         while written < len(data):
             written += f.write(data[written:])

@@ -336,9 +336,63 @@ def test_recording_writes_frames(tab, tmp_path):
         for _ in range(30):
             QApplication.processEvents()
             time.sleep(0.01)
-        assert list(tmp_path.glob("frame_*.png")), "nothing was written"
+        # "<run>_frame_NNNNNN.png": every recording is a run of its own.
+        assert list(tmp_path.glob("*_frame_*.png")), "nothing was written"
     finally:
         tab.on_stop()
+
+
+def record_for(tab, folder, seconds=0.5):
+    """Start, record into `folder` for a while, stop recording and stop.
+    How many frames the recording saved."""
+    tab.ask_dir = lambda *a, **k: str(folder)
+    tab.on_start()
+    try:
+        tab.on_record()
+        assert tab.session.recorder is not None
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        tab.on_record()                     # stop recording: drains the queue
+        assert tab.session.recorder is None
+        return tab.session.stats().recorded
+    finally:
+        tab.on_stop()
+
+
+def test_a_reconnect_never_overwrites_an_earlier_recording(tab, tmp_path):
+    """Frame numbers restart at every Connect (a new device numbers from 1),
+    and the tab used to save every recording as frame_NNNNNN.png — so the
+    second recording replaced the first one's frames (design 2.6, M0)."""
+    connect_to(tab)
+    first = record_for(tab, tmp_path)
+    kept = {p.name: p.stat().st_mtime_ns for p in tmp_path.glob("*.png")}
+    assert first >= 3 and len(kept) == first
+    tab.on_disconnect()
+    connect_to(tab)
+    second = record_for(tab, tmp_path)
+    assert second >= 3
+    pngs = list(tmp_path.glob("*.png"))
+    assert len(pngs) == first + second, (
+        f"{first} + {second} saved, {len(pngs)} on disk")
+    for name, stamp in kept.items():
+        assert (tmp_path / name).stat().st_mtime_ns == stamp, (
+            f"{name} was written over")
+
+
+def test_each_recording_is_a_run_of_its_own(tab, tmp_path):
+    """Named as Typhon names a run, with its frames CSV, so the slider and
+    the rest of the toolchain read it the same way."""
+    from council_qt.widgets import capture_review
+
+    connect_to(tab)
+    record_for(tab, tmp_path, seconds=0.3)
+    record_for(tab, tmp_path, seconds=0.3)
+    runs = {capture_review.run_of(p) for p in tmp_path.glob("*.png")}
+    assert len(runs) == 2 and "" not in runs, runs
+    for run in runs:
+        assert (tmp_path / f"{run}_frames.csv").exists()
 
 
 def test_declining_the_folder_does_not_start_recording(tab):

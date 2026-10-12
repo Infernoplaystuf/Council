@@ -76,9 +76,25 @@ class Stats:
     skipped: int = 0
     #: Frames grabbed and queued, not yet on disk.
     waiting: int = 0
-    #: Frames the camera or its driver dropped before the app ever saw them
-    #: (pylon's skipped-image count). Real loss, unlike `dropped`.
+    #: pylon's skipped-image count (Frame.meta["skipped_by_camera"]): frames
+    #: pylon threw away before the app saw them. It counts ONLY in pylon's
+    #: "latest image" grab strategies, which a live view uses. A recording
+    #: grabs "one by one", where it stays 0 (vendor docs; measured on the
+    #: emulator: 0, against 161 under LatestImageOnly with a slow reader —
+    #: docs/typhon_multicamera_design.md 3.7). So it does NOT count frames
+    #: lost while recording; a failed grab is counted in `grab_failures`.
     camera_skipped: int = 0
+    #: Grabs that came back FAILED (cameras.GrabFailed): exposures the camera
+    #: made and could not deliver, such as an incomplete frame on the link.
+    #: Each one used up a frame number, so it is a gap in the saved files'
+    #: numbers, and the frames CSV's `grab_failures` column says where.
+    grab_failures: int = 0
+
+    @property
+    def grab_attempts(self) -> int:
+        """Grabs that came back, good or failed. A timed-out read is not a
+        grab: nothing came back."""
+        return self.grabbed + self.grab_failures
 
     def line(self, dropped_label: str = "dropped") -> str:
         """The one line a status bar shows.
@@ -99,6 +115,9 @@ class Stats:
             bits.append(f"{self.skipped} NOT saved (storage too slow)")
         if self.camera_skipped:
             bits.append(f"{self.camera_skipped} lost by the camera/driver")
+        if self.grab_failures:
+            bits.append(f"{self.grab_failures} failed grab"
+                        f"{'' if self.grab_failures == 1 else 's'}")
         if self.errors:
             bits.append(f"{self.errors} error(s)")
         return " · ".join(bits)
@@ -165,6 +184,14 @@ def write_image(image: Any, path: Path) -> None:
     scales 16-bit input by 1/256 on the assumption it fills the full range, so
     a 12-bit frame reads dark to the classifier. That is a conversion bug in
     the reader, not a reason for the writer to alter the user's pixels.)
+
+    NEVER OVER ANYTHING. Both writers create the file with exclusive
+    creation ("xb"): a file already at `path` raises FileExistsError and is
+    left exactly as it was. A frame's name is its run's and its number, so a
+    clash means something else went wrong — two cameras given one run name
+    lost half their frames this way, silently, when frames were written
+    "wb" (docs/typhon_multicamera_design.md 2.6) — and a clash from any
+    cause must fail loudly, as an unsaved frame, not replace one on disk.
     """
     import numpy as np
 
@@ -183,7 +210,31 @@ def write_image(image: Any, path: Path) -> None:
     # NO mode= argument. Pillow infers "I;16" from a uint16 dtype, and passing
     # the mode explicitly is deprecated for removal in Pillow 13 (2026-10-15)
     # -- which would break capture outright, not warn.
-    Image.fromarray(data).save(str(path), compress_level=PNG_COMPRESS_LEVEL)
+    picture = Image.fromarray(data)
+    # Pillow is handed a file opened "xb" here (see NEVER OVER ANYTHING); it
+    # still takes the format from the name's extension, through the handle.
+    made = False
+    try:
+        with open(path, "xb") as handle:
+            made = True
+            picture.save(handle, compress_level=PNG_COMPRESS_LEVEL)
+    except BaseException:
+        if made:
+            # Given a PATH, Pillow removes a file it made and failed to
+            # finish; given our handle it cannot. This file is the one this
+            # call created a moment ago — nobody else's — so it goes, rather
+            # than lie in the run as a frame that cannot be opened.
+            _discard_unfinished(path)
+        raise
+
+
+def _discard_unfinished(path: Any) -> None:
+    """Remove a frame file THIS process just created exclusively and failed
+    to finish. Never called for a file that was already there."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def warm_imports() -> None:
@@ -261,8 +312,94 @@ def imports_warm() -> bool:
 #: The columns of a run's frame index (Recorder `index_name`). window_us is
 #: how long each event-camera picture collected events — the raw view uses
 #: the same window, whatever frame rate the run was captured at.
+#:
+#: timestamp_us IS THE CAMERA'S OWN CLOCK, AS IT GAVE IT. For an event camera
+#: it is microseconds. For a Basler it is the grab result's tick count
+#: (GetTimeStamp), NOT microseconds: the tick's length depends on the model,
+#: and a boost CXP camera (the boA5320) has no timestamp at all, so it is 0
+#: there. The name is kept so that older runs read the same.
+#:
+#: grab_failures is a running count of the grabs that came back failed so
+#: far in this recording (cameras.GrabFailed), on each saved frame's row —
+#: blank for a camera that does not report failed grabs (an event camera has
+#: no grabs to fail). A failed grab uses up a frame number, so it is also a
+#: gap in `index`.
+#:
+#: NEW COLUMNS GO AT THE END ONLY: every reader takes the CSV by column name
+#: (event_playback.raw_origin, run_window_us, frame_times), and a reader of
+#: an older run finds the columns it knows where they always were.
 INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
-                 "window_us")
+                 "window_us", "grab_failures")
+
+#: A run's frame index is "<run>_frames.csv" — and creating it is what
+#: reserves the run's name (reserve_run).
+INDEX_SUFFIX = "_frames.csv"
+
+#: The endings that put a run's name on a file in a capture folder. A run
+#: with any file of these there is taken, and so is a FOLDER of the run's
+#: name (a run of several cameras is a folder; the multi-camera design 2.6).
+RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json")
+
+#: How many names reserve_run tries (base, base_2, ...) before giving up.
+RESERVE_TRIES = 1000
+
+
+def taken_runs(folder: Any) -> set:
+    """The run names already used in `folder`: every name a file of a run
+    starts with (RUN_MARKERS), and every sub-folder's name. Empty for a
+    folder that does not exist or cannot be listed."""
+    names: set = set()
+    try:
+        with os.scandir(str(folder)) as found:
+            for entry in found:
+                try:
+                    if entry.is_dir():
+                        names.add(entry.name)
+                except OSError:
+                    pass
+                for marker in RUN_MARKERS:
+                    head, hit, _ = entry.name.partition(marker)
+                    if hit:
+                        names.add(head)
+    except OSError:
+        pass
+    return names
+
+
+def reserve_run(folder: Any, base: str) -> str:
+    """RESERVE a run's name in `folder` and return it: `base`, or `base_2`,
+    `base_3`, ... when that one is taken.
+
+    Reserved, not just looked for. Looking at the folder was not enough:
+    two Starts in one second — two windows saving into one folder — both
+    looked before either had written a thing, got the same name, and
+    silently overwrote each other's frames (measured: 184-185 frames
+    reported saved, 92-93 PNGs on disk, duplicated CSV rows, the header not
+    on line 1; docs/typhon_multicamera_design.md 2.6). So the run's frames
+    CSV is created here with EXCLUSIVE CREATION ("x": the file system
+    refuses a name that exists, whoever made it and however close in time)
+    and its header is written at once. A name whose file someone else
+    created first is taken, and the next one is tried.
+
+    The Recorder then appends to that CSV and, finding it there, writes no
+    second header. Raises OSError when the folder cannot be made or written,
+    or no name is free after RESERVE_TRIES."""
+    where = Path(str(folder))
+    where.mkdir(parents=True, exist_ok=True)
+    taken = taken_runs(where)
+    run = str(base)
+    for n in range(2, RESERVE_TRIES + 2):
+        if run not in taken:
+            try:
+                with open(where / f"{run}{INDEX_SUFFIX}", "x", newline="",
+                          encoding="utf-8") as handle:
+                    csv.writer(handle).writerow(INDEX_COLUMNS)
+                return run
+            except FileExistsError:
+                pass                       # another window was first
+        run = f"{base}_{n}"
+    raise OSError(f"no free run name in {where} after {RESERVE_TRIES} "
+                  f"tries from {base}")
 
 
 class Recorder:
@@ -272,7 +409,8 @@ class Recorder:
     numbers its own output 0,1,2 produces a tidy sequence that silently hides
     any frame the camera never delivered; naming files after the frame index
     means a gap in the filenames is a gap in the capture, visible in a
-    directory listing.
+    directory listing. A grab that came back failed uses up its number too
+    (cameras.GrabFailed), so it is a gap like any other.
     """
 
     def __init__(self, out_dir: Any, stem: str = "frame",
@@ -299,14 +437,25 @@ class Recorder:
         self.dir.mkdir(parents=True, exist_ok=True)
         warm_imports()
         if self.index_path is not None and self._index_file is None:
-            fresh = not self.index_path.exists()
-            # APPEND, never truncate: the name is per run, but a file that is
-            # somehow already there is the user's data.
-            self._index_file = open(self.index_path, "a", newline="",
-                                    encoding="utf-8")
-            self._index_rows = csv.writer(self._index_file)
+            # A RESERVED run's index is already there, header and all
+            # (reserve_run): it is appended to, with no second header. One
+            # that is not there yet is created EXCLUSIVELY, so two recorders
+            # can never both decide it is new and both write a header — a
+            # look first ("does it exist?") let them. APPEND, never
+            # truncate: a file already there is the user's data.
+            try:
+                handle = open(self.index_path, "x", newline="",
+                              encoding="utf-8")
+                fresh = True
+            except FileExistsError:
+                handle = open(self.index_path, "a", newline="",
+                              encoding="utf-8")
+                fresh = False
+            self._index_file = handle
+            self._index_rows = csv.writer(handle)
             if fresh:
                 self._index_rows.writerow(INDEX_COLUMNS)
+                handle.flush()             # line 1, before anything else
 
     def path_for(self, frame: cameras.Frame) -> Path:
         return self.dir / f"{self.stem}_{frame.index:06d}{self._suffix}"
@@ -326,7 +475,8 @@ class Recorder:
             self._index_rows.writerow((
                 path.name, frame.index, frame.timestamp_us,
                 meta.get("raw_t_us", ""), meta.get("events", ""),
-                int(round(float(window) * 1000)) if window else ""))
+                int(round(float(window) * 1000)) if window else "",
+                meta.get("grab_failures", "")))
 
     def write(self, frame: cameras.Frame) -> Path:
         path = self.path_for(frame)
@@ -680,6 +830,12 @@ class CaptureSession:
         self._interval: Optional[float] = None
         #: The last frame time is the stream's start, not a frame's.
         self._from_start = False
+        #: Failed grabs since this session began (never reset), and how many
+        #: there were when the recording in progress began: the frames CSV's
+        #: grab_failures is the difference, so it counts that recording's
+        #: own — a recording can begin in a stream already running.
+        self._failed_grabs = 0
+        self._failed_grabs_before = 0
 
     # ------------------------------------------------------------------
     @property
@@ -775,6 +931,7 @@ class CaptureSession:
                 self._writers.append(writer)
                 self.writer = writer
                 self._ended_stats = None
+                self._failed_grabs_before = self._failed_grabs
             else:
                 self.writer = None
                 if old is not None:
@@ -883,6 +1040,11 @@ class CaptureSession:
                 # allows, which is how a finished stream logged 737,070
                 # errors in six seconds.
                 misses += 1
+                if isinstance(exc, cameras.GrabFailed):
+                    # An exposure that never arrived: counted on its own,
+                    # with its place in the run (Stats.grab_failures, and the
+                    # frames CSV), not only among errors of every kind.
+                    self._count_failed_grab()
                 self._note_error(str(exc))
                 if misses >= MAX_CONSECUTIVE_ERRORS:
                     self._note_error(
@@ -941,7 +1103,21 @@ class CaptureSession:
                 # every later frame as grabbed-and-not-saved.
                 self._ended_stats = self.stats()
             return False
+        if getattr(self.device, "counts_grab_failures", False):
+            # The running count goes on the frame's CSV row. Only for a
+            # camera that reports failed grabs: a 0 from one that cannot
+            # would claim a count nobody made.
+            meta = frame.meta if frame.meta is not None else {}
+            meta["grab_failures"] = (self._failed_grabs
+                                     - self._failed_grabs_before)
+            frame.meta = meta
         return writer.submit(frame)
+
+    def _count_failed_grab(self) -> None:
+        with self._lock:
+            self._failed_grabs += 1
+            self._stats = replace(
+                self._stats, grab_failures=self._stats.grab_failures + 1)
 
     def _rate(self) -> float:
         """Frames per second over the last `RATE_WINDOW` seconds.

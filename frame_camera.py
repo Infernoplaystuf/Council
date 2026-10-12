@@ -119,7 +119,10 @@ A generated app is forbidden from even SPELLING remove/unlink/rmtree (the gate
 checks attribute names whether or not they are called), and a capture app that
 could silently drop a run would be wrong regardless. Each run writes under its
 own stamped stem, so a second run never overwrites the first and no cleanup is
-required to make one safe.
+required to make one safe. The stem is reserved before the run writes
+anything (its frames CSV is created exclusively, `_unique_run`), and frames
+are created exclusively too, so not even two windows sharing a folder can
+write one file over another.
 """
 from __future__ import annotations
 
@@ -518,7 +521,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
 
     Each run writes under its own stamped name, so starting a second run into
     the same folder adds to it and can never overwrite the first — this module
-    has no way to delete anything and should not have one.
+    has no way to delete anything and should not have one. The name is
+    RESERVED before anything else is written (_unique_run), so two windows
+    starting in the same second into one folder cannot share it either, and
+    every frame is created exclusively: a clash from any other cause stops
+    the recording loudly, as a frame not saved, instead of replacing one.
 
     AN EVENT CAMERA ALSO RECORDS ITS .raw, started BEFORE the stream so the
     file holds the whole run (see EvkDevice.start_raw).
@@ -594,12 +601,17 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     restartable = getattr(device, "restartable", True)
     if _stream_dead(session):
         raise RuntimeError(_DEAD_STREAM)
+    # RESERVED before anything stops: a folder that cannot be written is
+    # refused with the picture still running, like every other refusal.
+    try:
+        run = _unique_run(out)
+    except OSError as exc:
+        raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
     if session.running and restartable:
         _stop_preview(session)
     elif restartable:
         _release_dead_stream(session)
 
-    run = _unique_run(out)
     # READ after the boxes beside Start were applied and before the run's
     # recording begins — the camera as every picture of this run will have
     # it — and WRITTEN only once the capture has started, so a Start that
@@ -1579,28 +1591,24 @@ def _require_reviewer() -> Any:
 
 
 def _unique_run(out: Path) -> str:
-    """The run's name: the time it started, made unique if a run started in
-    the same second is already in the folder. The raw log would otherwise
-    truncate the first run's .raw, silently."""
-    import os
+    """The run's name, RESERVED in `out`: the time it started, with _2, _3
+    added when a run of that name is already there (any of its files, or a
+    folder of its name — a run of several cameras is a folder).
 
-    base = time.strftime("%Y%m%d_%H%M%S")
-    try:
-        names = [e.name for e in os.scandir(out)] if out.is_dir() else []
-    except OSError:
-        names = []
-    taken = set()
-    for name in names:
-        for marker in ("_frame_", "_events.raw", "_frames.csv",
-                       "_camera.json"):
-            head, found, _ = name.partition(marker)
-            if found:
-                taken.add(head)
-    run, n = base, 1
-    while run in taken:
-        n += 1
-        run = f"{base}_{n}"
-    return run
+    Reserved, not just looked for (council_core.capture.reserve_run): its
+    `<run>_frames.csv` is created with exclusive creation and its header
+    written at once, and the recorder appends to it. Looking was not
+    enough: two Typhon windows pressing Start in the same second into one
+    folder both looked before either wrote anything, got the same name, and
+    overwrote each other's frames silently (measured: 184-185 frames
+    reported saved, 92-93 on disk — docs/typhon_multicamera_design.md 2.6).
+    A shared name would also truncate the first run's .raw.
+
+    Creates `out` if it is not there. Raises OSError when it cannot be
+    written."""
+    from council_core import capture
+
+    return capture.reserve_run(out, time.strftime("%Y%m%d_%H%M%S"))
 
 
 def _on_network_share(path: Path) -> bool:

@@ -31,6 +31,7 @@ quitting mid-capture is as safe as pressing Stop.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -332,8 +333,16 @@ class CaptureTab(ViewHelpers, QWidget):
         where = self.ask_dir("Save frames to", str(paths.vault_dir()))
         if not where:
             return
+        folder = Path(where)
         try:
-            self.session.record_to(capture.Recorder(Path(where)))
+            # A RUN OF ITS OWN for every recording, named and reserved as
+            # Typhon reserves one (capture.reserve_run): frame numbers start
+            # again at every Connect, so the fixed "frame" name this used
+            # had a reconnect write over the earlier recording's frames.
+            run = capture.reserve_run(folder, time.strftime("%Y%m%d_%H%M%S"))
+            self.session.record_to(capture.Recorder(
+                folder, stem=f"{run}_frame",
+                index_name=f"{run}{capture.INDEX_SUFFIX}"))
         except OSError as exc:
             self.status.setText(f"Could not record there: {exc}")
             return
