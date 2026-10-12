@@ -398,6 +398,90 @@ def test_every_tab_s_personalities_get_the_qt_scope(engine):
     assert off.writer.memory_scope == "none"
 
 
+# ============================================================
+# A vault that cannot keep the conversation
+# ============================================================
+
+def _refuse_conversation_folders(monkeypatch):
+    """Path.mkdir refuses conversations/ and conversation_logs/, as a
+    read-only or permission-denied vault does."""
+    real_mkdir = Path.mkdir
+
+    def refuse(self, *args, **kwargs):
+        if self.name in ("conversations", "conversation_logs"):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+
+
+def test_a_vault_that_cannot_keep_conversations_still_opens(qapp, tmp_path,
+                                                            monkeypatch):
+    """Found in review (a regression of Batch 1): the Council tab could not
+    be built — so the Qt app could not start — when <vault>/conversations
+    could not be created. It opens, answers, and says plainly that this
+    conversation is not being saved; the toolbar stops claiming a memory it
+    does not have."""
+    from council_core import council_turn
+    from council_qt.tabs import REGISTRY
+    from tests.test_council_turn import FakeModel, Models
+    from council_qt.window import CouncilWindow
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    monkeypatch.setattr(council_turn, "load_personalities",
+                        lambda *_a, **_k: (Models(writer=FakeModel(
+                            "an answer")), ""))
+    _refuse_conversation_folders(monkeypatch)
+
+    # The window's own path: the Council is the one eager tab.
+    shell = CouncilWindow()
+    try:
+        title, factory, eager = REGISTRY[0]
+        shell.add_tab(title, lambda: factory(shell), eager=eager)
+    finally:
+        shell.request_close()
+        qapp.processEvents()
+
+    window, view = _council(qapp, vault)
+    try:
+        assert _pump(qapp, lambda: "not being saved"
+                     in view.transcript.toPlainText()), (
+            view.transcript.toPlainText())
+        assert "not saved" in view.memory_label.text().lower()
+        _ask(qapp, view, "Is this kept?")
+        assert "an answer" in view.transcript.toPlainText()
+        assert not (vault / "conversations").exists()
+    finally:
+        _close(qapp, window, view)
+
+
+def test_a_save_that_fails_later_is_said(qapp, tmp_path, monkeypatch):
+    """The folder was there at start and a save fails mid-session: the
+    transcript says so once and the toolbar follows."""
+    from council_core import council_turn
+    from council_core.conversations import ConversationStore
+    from tests.test_council_turn import FakeModel, Models
+    monkeypatch.setattr(council_turn, "load_personalities",
+                        lambda *_a, **_k: (Models(writer=FakeModel(
+                            "an answer")), ""))
+    window, view = _council(qapp, tmp_path / "vault")
+    try:
+        assert view.memory_label.text() == "Memory: this conversation only"
+
+        def refuse(*_a, **_k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(ConversationStore, "append", refuse)
+        _ask(qapp, view, "First question.")
+        _ask(qapp, view, "Second question.")
+        said = view.transcript.toPlainText()
+        assert said.count("not being saved") == 1, said
+        assert "not saved" in view.memory_label.text().lower()
+    finally:
+        _close(qapp, window, view)
+
+
 def test_the_memory_scope_is_shown(qapp, tmp_path, monkeypatch):
     from council_qt.tabs.council import CouncilActions, CouncilTab
     monkeypatch.delenv("COUNCIL_MEMORY_SCOPE", raising=False)

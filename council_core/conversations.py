@@ -124,7 +124,18 @@ def _atomic_write_text(path: Path, text: str) -> None:
 class ConversationStore:
     def __init__(self, base_dir: Path):
         self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        #: Why the folder could not be created, or "". Not raised: a vault
+        #: that cannot keep conversations (read-only, permission denied)
+        #: must still open — the Qt Council tab is built eagerly, and this
+        #: raising in its constructor stopped the whole app from starting
+        #: (found in review). A write raises then, to a caller that says so.
+        self.problem = ""
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.problem = (f"the folder {self.base_dir} could not be "
+                            f"created ({exc.__class__.__name__}: "
+                            f"{exc.strerror or exc})")
         # (session_id, n) -> (the file's (size, mtime) when read, the turns).
         # Keyed on the FILE: a store whose cache only its own append() could
         # invalidate served stale history to every other store on the folder
@@ -132,12 +143,19 @@ class ConversationStore:
         self._cache: Dict[tuple, Tuple[tuple, List[Dict[str, Any]]]] = {}
         self._lock = threading.Lock()
 
+    def _ensure_dir(self) -> None:
+        """Before a write: the folder, made now if it could not be at start
+        (raises when it still cannot)."""
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.problem = ""
+
     def session_path(self, session_id: str) -> Path:
         return self.base_dir / f"{safe_name(session_id, 64)}.jsonl"
 
     def claim(self, session_id: str) -> bool:
         """Create the session's file if no one has. True when this call made
         it — then no other launch is writing that session."""
+        self._ensure_dir()
         try:
             fd = os.open(str(self.session_path(session_id)),
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY,
@@ -149,6 +167,7 @@ class ConversationStore:
 
     def append(self, session_id: str, record: Dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False) + "\n"
+        self._ensure_dir()
         with self._lock:
             append_line(self.session_path(session_id), line.encode("utf-8"))
             for key in [k for k in self._cache if k[0] == session_id]:
@@ -396,6 +415,11 @@ class Conversation:
         self.session_id = session_id
         self.prior_session_id: Optional[str] = None
         self.problems: List[str] = []
+        #: Why this conversation is not being saved, or "" while it is. A
+        #: conversation that is not saved is one a follow-up cannot see (the
+        #: personalities read the file), so the shell must say so — not only
+        #: print it (see `not_saved_message`).
+        self.unsaved = ""
         self.store = ConversationStore(self.vault_dir / "conversations")
         self._lock = threading.RLock()
         self._listeners: List[Callable[..., None]] = []
@@ -403,6 +427,10 @@ class Conversation:
         self._closed = False
         self.named = False
         self.logger = None
+        if self.store.problem:
+            self._problem(f"this conversation is not being saved: "
+                          f"{self.store.problem}")
+            self._not_saved(self.store.problem)
         try:
             import conversation_logger
             self.logger = conversation_logger.ConversationLogger(
@@ -466,7 +494,8 @@ class Conversation:
     # -- listeners ------------------------------------------------------
     def subscribe(self, listener: Callable[..., None]) -> None:
         """``listener(event, **details)`` after a change: "prior_loaded",
-        "prior_cleared", "renamed". Called on the caller's thread."""
+        "prior_cleared", "renamed", "not_saved" (a save failed — once),
+        "saving" (a save worked again). Called on the caller's thread."""
         self._listeners.append(listener)
 
     def _emit(self, event: str, **details: Any) -> None:
@@ -479,6 +508,26 @@ class Conversation:
     def _problem(self, text: str) -> None:
         self.problems.append(text)
         print(f"[conversation] {text}", flush=True)
+
+    def not_saved_message(self) -> str:
+        """What the user is told while this conversation is not saved."""
+        return (f"This conversation is not being saved ({self.unsaved}), so "
+                f"follow-up questions will not see your earlier questions "
+                f"and it will not be in the Sessions list.")
+
+    def _not_saved(self, reason: str) -> None:
+        """A save failed. Listeners hear it once ("not_saved"), not on every
+        entry; "saving" when a later save works again."""
+        first = not self.unsaved
+        self.unsaved = reason or "the save failed"
+        if first:
+            self._emit("not_saved", message=self.not_saved_message())
+
+    def _saved(self) -> None:
+        if self.unsaved:
+            self.unsaved = ""
+            self._emit("saving", message="This conversation is being saved "
+                                         "again from here on.")
 
     # -- reading --------------------------------------------------------
     def snapshot(self) -> Snapshot:
@@ -527,7 +576,10 @@ class Conversation:
                 self.store.append(self.session_id, record)
         except Exception as exc:                          # noqa: BLE001
             self._problem(f"a turn was not saved: {exc!r}")
+            self._not_saved(f"{exc.__class__.__name__}: "
+                            f"{getattr(exc, 'strerror', None) or exc}")
             return False
+        self._saved()
         return True
 
     def log(self, who: str, text: str, kind: str = "final") -> None:

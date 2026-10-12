@@ -487,6 +487,12 @@ class CouncilTab(ViewHelpers, QWidget):
 
         self._build()
         self.refresh_specialists()
+        if self.conversation.unsaved:
+            # The vault cannot keep conversations (read-only, permission
+            # denied): the tab still opens and answers, and says so.
+            self._on_conversation("not_saved",
+                                  message=self.conversation
+                                  .not_saved_message())
 
     # ==================================================================
     # Layout
@@ -727,12 +733,10 @@ class CouncilTab(ViewHelpers, QWidget):
         # What the council remembers between questions, said plainly — the
         # user's decision, and the first thing to check when a follow-up
         # "forgot" or "knew" something.
-        self.memory_label = QLabel(memory_scope.describe(
-            self.conversation.scope))
+        self.memory_label = QLabel("")
         self.memory_label.setStyleSheet(
             f"color: {self._tokens['muted_fg']};")
-        self.memory_label.setToolTip(memory_scope.explain(
-            self.conversation.scope))
+        self._show_memory()
         row.addWidget(self.memory_label)
         self.status = QLabel("● idle")
         self.status.setStyleSheet(f"color: {self._tokens['success']};")
@@ -1261,15 +1265,33 @@ class CouncilTab(ViewHelpers, QWidget):
         self._save_pending()
         self.conversation.close()
 
+    def _show_memory(self) -> None:
+        """The toolbar's memory line: the scope — or, while this
+        conversation is not being saved, that follow-ups see nothing (the
+        personalities read earlier turns from the saved file)."""
+        if self.conversation.unsaved:
+            self.memory_label.setText("Memory: not saved — follow-ups will "
+                                      "not see earlier questions")
+            self.memory_label.setToolTip(
+                self.conversation.not_saved_message())
+            return
+        self.memory_label.setText(memory_scope.describe(
+            self.conversation.scope))
+        self.memory_label.setToolTip(memory_scope.explain(
+            self.conversation.scope))
+
     def _on_conversation(self, event: str, **details) -> None:
         """Say in the transcript when an older session is brought into this
         conversation, or taken out of it — the user should never have to
-        guess what the council can see."""
-        if event in ("prior_loaded", "prior_cleared"):
+        guess what the council can see — and when this conversation stops
+        (or starts again) being saved."""
+        if event in ("prior_loaded", "prior_cleared", "not_saved", "saving"):
             # Shown, not kept: the line names the other session, and the
             # PRIOR SESSION CONTEXT block is how a loaded one gets in.
             self._to_ui(self.append, "Council", details.get("message", ""),
                         "observation", keep=False)
+        if event in ("not_saved", "saving"):
+            self._to_ui(self._show_memory)
 
     def receive_notice(self, who: str, text: str, kind: str = "final", *,
                        source: str = "") -> None:

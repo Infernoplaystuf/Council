@@ -352,3 +352,34 @@ def test_a_history_that_cannot_be_read_is_never_written_over(tmp_path):
     before = path.read_bytes()
     question_history.QuestionHistory(vault).add("new question")
     assert path.read_bytes() == before
+
+
+def test_a_folder_that_cannot_be_made_does_not_stop_the_store(tmp_path,
+                                                              monkeypatch):
+    """A read-only vault: building the store (and a Conversation) must not
+    raise — the Qt Council tab is built eagerly and this stopped the app
+    from starting. A write still fails, and the Conversation says why."""
+    real_mkdir = Path.mkdir
+
+    def refuse(self, *args, **kwargs):
+        if self.name in ("conversations", "conversation_logs"):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    store = ConversationStore(tmp_path / "conversations")
+    assert "could not be created" in store.problem
+    assert store.list_sessions() == [] and store.load_last("x") == []
+    with pytest.raises(PermissionError):
+        store.append("x", {"who": "User", "text": "hi"})
+
+    heard = []
+    conv = Conversation(tmp_path, scope="conversation")
+    conv.subscribe(lambda event, **d: heard.append(event))
+    assert conv.unsaved and "not being saved" in conv.not_saved_message()
+    assert conv.record("User", "hi") is False
+    assert conv.record("User", "again") is False
+    assert heard == [], "said once, at the start (the tab reads `unsaved`)"
+    monkeypatch.setattr(Path, "mkdir", real_mkdir)
+    assert conv.record("User", "now it works") is True
+    assert heard == ["saving"] and not conv.unsaved
