@@ -19,12 +19,15 @@ bridge. Nothing here writes to disk.
 """
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import (QBrush, QColor, QFont, QPainter, QPainterPath,
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
                            QPainterPathStroker, QPen, QTextCursor, QTextFormat)
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QGraphicsPathItem,
                                QGraphicsRectItem, QGraphicsScene,
@@ -70,6 +73,13 @@ class VarGraphActions:
         return dialogs.askopenfilenames("Open Python scripts",
                                         filetypes=[("Python", "*.py *.pyw")],
                                         parent=parent)
+
+    def pick_export(self, parent, suggested: str) -> str:
+        from .. import dialogs
+        return dialogs.asksaveasfilename(
+            "Export the graph", initialfile=suggested, defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("SVG drawing", "*.svg")],
+            parent=parent)
 
     def pick_folder(self, parent) -> str:
         from .. import dialogs
@@ -244,6 +254,87 @@ class GraphView(QGraphicsView):
         self.centerOn(self.nodes[focus])
 
 
+#: Pixels per scene unit in an exported PNG: sharp on a high-DPI screen or
+#: pasted into a document, without a huge file.
+EXPORT_SCALE = 2.0
+#: Room above the graph for its caption, and around everything.
+CAPTION_H, EXPORT_MARGIN = 34, 24
+
+
+def export_graph(view: "GraphView", path: str, caption: str = "") -> Path:
+    """Write what the graph shows to `path`: PNG, or SVG when the name ends
+    in .svg. The whole graph, not just the part scrolled into view, on the
+    tab's own background, with `caption` (what was traced) above it. Written
+    to a temp file in the same folder and swapped in, so a failed export
+    never leaves half an image where a good one was."""
+    scene = view.scene()
+    if not view.nodes:
+        raise ValueError("there is no graph to export yet")
+    out = Path(path)
+    svg = out.suffix.lower() == ".svg"
+    if not svg and out.suffix.lower() != ".png":
+        out = out.with_suffix(out.suffix + ".png") if out.suffix else out.with_suffix(".png")
+    source = scene.itemsBoundingRect()
+    top = CAPTION_H if caption else 0
+    w = source.width() + 2 * EXPORT_MARGIN
+    h = source.height() + 2 * EXPORT_MARGIN + top
+    tokens = theme.tokens("dark")
+
+    def paint(painter: QPainter, scale: float) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.fillRect(QRectF(0, 0, w * scale, h * scale), QColor(tokens["bg"]))
+        if caption:
+            f = QFont()
+            f.setPixelSize(int(15 * scale))
+            painter.setFont(f)
+            painter.setPen(QColor(tokens["fg"]))
+            painter.drawText(QRectF(EXPORT_MARGIN * scale, EXPORT_MARGIN * scale / 2,
+                                    (w - 2 * EXPORT_MARGIN) * scale, top * scale),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             caption)
+        target = QRectF(EXPORT_MARGIN * scale, (EXPORT_MARGIN + top) * scale,
+                        source.width() * scale, source.height() * scale)
+        scene.render(painter, target, source)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(out.parent), prefix=out.name + ".")
+    os.close(fd)
+    try:
+        if svg:
+            from PySide6.QtSvg import QSvgGenerator
+            gen = QSvgGenerator()
+            gen.setFileName(tmp)
+            gen.setSize(QSize(int(w), int(h)))
+            gen.setViewBox(QRectF(0, 0, w, h))
+            gen.setTitle(caption or "Variable Map")
+            gen.setDescription("Exported from the Council's Variable Map")
+            painter = QPainter(gen)
+            paint(painter, 1.0)
+            painter.end()
+        else:
+            image = QImage(int(w * EXPORT_SCALE), int(h * EXPORT_SCALE),
+                           QImage.Format.Format_ARGB32)
+            image.fill(QColor(tokens["bg"]))
+            painter = QPainter(image)
+            paint(painter, EXPORT_SCALE)
+            painter.end()
+            if not image.save(tmp, "PNG"):
+                raise OSError(f"could not write {out}")
+        os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return out
+
+
+def suggested_name(var: vgm.Var) -> str:
+    """'total_variable_map.png', from the traced variable's name."""
+    base = var.name if var.kind != "return" else f"{var.local_scope}_return"
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._") or "graph"
+    return f"{base}_variable_map.png"
+
+
 def fill_trace(tree: QTreeWidget, g: vgm.VarGraph, focus: str, depth: int,
                conditions: bool) -> None:
     """Two branches, 'Fed by' and 'Feeds', each a tree of edges. A node is
@@ -309,6 +400,12 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     run = QPushButton(amp("🔗 Map variables"), page)
     run.setObjectName("analyze")
     row.addWidget(run)
+    export = QPushButton(amp("🖼 Export image…"), page)
+    export.setObjectName("export")
+    export.setToolTip("Save the graph as a PNG or SVG image - all of it, not "
+                      "only the part on screen")
+    export.setEnabled(False)
+    row.addWidget(export)
     conds = QCheckBox("Include if/while conditions", page)
     conds.setToolTip("Also link the variables an if/while tests to everything "
                      "assigned inside it. Answers 'why did this branch run?', "
@@ -381,6 +478,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     page.var_list, page.findings, page.status = var_list, findings, status
     page.path_edit, page.conditions, page.depth = path_edit, conds, depth
     page.file_filter, page.search = file_filter, search
+    page.export_button = export
 
     # -- behaviour -------------------------------------------------------
     def open_file(file: Optional[str]) -> None:
@@ -416,6 +514,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         state["focus"] = vid
         c = conds.isChecked()
         view.show_graph(g, vid, depth.value(), c)
+        export.setEnabled(True)
         fill_trace(trace, g, vid, depth.value(), c)
         tabs.setCurrentWidget(trace)
         v = g.vars[vid]
@@ -501,7 +600,9 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
             focus_on(prev)
         else:
             view.scene().clear()
+            view.nodes = {}
             trace.clear()
+            export.setEnabled(False)
 
     def chosen_paths() -> List[str]:
         return [p.strip().strip('"') for p in path_edit.text().split(SEP.strip())
@@ -570,6 +671,28 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         if isinstance(state["focus"], str):
             focus_on(state["focus"])
 
+    def on_export() -> None:
+        g, vid = state["graph"], state["focus"]
+        if g is None or not isinstance(vid, str) or vid not in g.vars:
+            return
+        v = g.vars[vid]
+        path = actions.pick_export(page, suggested_name(v))
+        if not path:
+            return
+        where = (f" in {Path(v.file).name}" if g.modules and v.file else
+                 f" in {Path(g.filename).name}" if not g.modules else "")
+        caption = (f"{v.label}{where} — what feeds it (left) and what it "
+                   f"feeds (right), {depth.value()} "
+                   f"hop{'s' if depth.value() != 1 else ''}")
+        try:
+            out = export_graph(view, path, caption)
+        except Exception as exc:                           # noqa: BLE001
+            status.setText(f"Could not export the graph: {exc}")
+            window.set_status("Export failed")
+            return
+        status.setText(f"Saved the graph to {out}")
+        window.set_status(f"Exported {out.name}")
+
     def on_conditions() -> None:
         # Condition edges are only recorded when asked for: re-read.
         if state["graph"] is not None:
@@ -582,6 +705,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         lambda: set_paths([p] if (p := actions.pick_folder(page)) else []))
     add_more.clicked.connect(lambda: set_paths(actions.pick_files(page), add=True))
     run.clicked.connect(analyze)
+    export.clicked.connect(on_export)
     path_edit.returnPressed.connect(analyze)
     search.textChanged.connect(lambda _t: fill_list())
     file_filter.currentIndexChanged.connect(lambda _i: fill_list())
@@ -595,6 +719,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     page.analyze = analyze
     page.set_paths = set_paths
     page.focus_on = focus_on
+    page.export = on_export
     page.show_line = show_line
     page.state = state
     return page
