@@ -737,12 +737,36 @@ def test_a_bias_runs_over_the_range_the_hal_accepts_not_the_allowed_one():
     assert done.ok, done.summary()
     assert hal.biases.values["bias_refr"] == 235
     assert hal.biases.values["bias_diff"] == -25
-    # Opened with the bypass, the HAL checks the allowed range instead.
+    # Opened with the bypass, set() checks no range at all, and
+    # get_bias_range() REPORTS the allowed one — which the slider then uses.
     hal.biases.bypass = True
     on = by_key(dev)["bias.bias_diff_on"]
     assert (on.minimum, on.maximum) == (-150, 200)
     assert on.recommended == (-85, 140)
     assert dev.set_setting("bias.bias_diff_on", 180).value == 180
+
+
+def test_with_the_bypass_the_hal_checks_no_range_and_neither_does_the_fake():
+    """With biases_range_check_bypass, I_LL_Biases::set skips the range
+    check ENTIRELY (OpenEB i_ll_biases.cpp); get_bias_info only makes
+    get_bias_range() report the allowed range. The fake raised outside the
+    allowed range instead, so it modelled a HAL that does not exist."""
+    biases = fake_evk4.Biases(bypass=True)
+    assert biases.get_bias_info("bias_diff_on").get_bias_range() == (-150, 200)
+    assert biases.set("bias_diff_on", 230) is True
+    assert biases.get("bias_diff_on") == 230
+    assert biases.set("bias_hpf", -10) is True
+    # Without the bypass the recommended range is checked, as before.
+    with pytest.raises(RuntimeError, match=r"within range \[-85, 140\]"):
+        fake_evk4.Biases().set("bias_diff_on", 141)
+    source = fake_evk4.openeb_source("hal/cpp/src/facilities/i_ll_biases.cpp")
+    if source is not None:
+        check = source.index(
+            "if (!device_config_.biases_range_check_bypass())")
+        assert source.index("get_bias_range()", check) < source.index(
+            "return set_impl(bias_name, bias_value);", check), \
+            "the range is checked only without the bypass"
+        assert "bias_info.disable_recommended_range();" in source
 
 
 def test_the_filters_and_the_readings_are_described():

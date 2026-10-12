@@ -893,9 +893,11 @@ with its own ranges, increments and units, so nothing is guessed:
 
 - **EVK4** (through the Metavision HAL, as Metavision Studio shows them): every
   bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`,
-  `bias_diff` on an IMX636, with the range the HAL accepts — the
-  recommended one, unless the camera was opened with the range-check
-  bypass — and the recommended range the sensor reports), the **event
+  `bias_diff` on an IMX636, with the range the HAL reports for it — the
+  recommended one, the only range the HAL accepts as Typhon opens the
+  camera; on a camera opened with the range-check bypass, the allowed one,
+  and the HAL then checks none — and the recommended range the sensor
+  reports), the **event
   rate controller** (on/off, rate limit), **anti-flicker** (on/off, band pass /
   band stop, the frequency band, duty cycle, thresholds), the **event trail
   filter** (on/off, TRAIL / STC_CUT_TRAIL / STC_KEEP_TRAIL, threshold), the

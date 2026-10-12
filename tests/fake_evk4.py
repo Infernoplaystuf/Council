@@ -14,7 +14,9 @@ THE BIASES ARE AN IMX636'S, FROM OPENEB'S OWN TABLES (Biases.RANGES; tests/
 test_camera_settings.py checks them against the source where it is on the
 machine). It used to report each bias's RECOMMENDED range as "allowed" and an
 invented -25 … 60 slice of it as "recommended" — which matched no IMX636
-bias, and hid that the HAL refuses a value outside the recommended range.
+bias, and hid that the HAL refuses a value outside the recommended range
+(unless the device is opened with the range-check bypass: then it checks
+none).
 
 THE STREAM HONOURS THE SETTINGS, ROUGHLY: a higher bias_diff_on fires
 fewer pixels on the moving edge, the trail filter drops its trailing OFF
@@ -54,9 +56,10 @@ def openeb_source(relative: str) -> Optional[str]:
 
 
 class BiasInfo:
-    """LL_Bias_Info: both ranges, and get_bias_range() — the one set()
-    checks, which is the RECOMMENDED range unless the device was opened with
-    the range-check bypass (LL_Bias_Info::get_bias_range, OpenEB 5.2)."""
+    """LL_Bias_Info: both ranges, and get_bias_range() — the RECOMMENDED
+    range, which set() checks, unless the device was opened with the
+    range-check bypass: then it reports the ALLOWED range and set() checks
+    none (LL_Bias_Info::get_bias_range, I_LL_Biases::set, OpenEB 5.2)."""
 
     def __init__(self, allowed, recommended, bypass=False):
         self.allowed, self.recommended = allowed, recommended
@@ -86,11 +89,15 @@ class Biases:
     imx636_bias_settings.h (recommended), in the order the real
     get_all_biases lists them (a std::map: by name).
 
-    set() CHECKS LIKE THE HAL: against get_bias_range() — the recommended
-    range, unless `bypass` (DeviceConfig's ll_biases_range_check_bypass,
-    which Typhon never sets) — and outside it RAISES, as I_LL_Biases::set
-    does (HalException ValueOutOfRange, a RuntimeError in Python), with the
-    HAL's own words."""
+    set() CHECKS LIKE THE HAL (I_LL_Biases::set, i_ll_biases.cpp). Without
+    `bypass` (DeviceConfig's ll_biases_range_check_bypass, which Typhon
+    never sets) it checks get_bias_range() — the recommended range — and
+    outside it RAISES (HalException ValueOutOfRange, a RuntimeError in
+    Python), with the HAL's own words. With `bypass` it checks NOTHING:
+    get_bias_info then only makes get_bias_range() report the allowed
+    range. (The IMX636 driver then clamps the register — its factory
+    default plus the offset — to 0..255, imx636_ll_biases.cpp; the fake has
+    no factory default, so it keeps the offset as asked.)"""
     RANGES = {
         "bias_diff": ((-150, 200), (-25, 23)),
         "bias_diff_off": ((-150, 200), (-35, 190)),
@@ -118,7 +125,7 @@ class Biases:
     def set(self, name, value):
         self.writes.append((name, value))
         low, high = self.get_bias_info(name).get_bias_range()
-        if not low <= value <= high:
+        if not self.bypass and not low <= value <= high:
             raise RuntimeError(f'Invalid value {value} for bias "{name}". '
                                f"Value should be within range [{low}, "
                                f"{high}].")
