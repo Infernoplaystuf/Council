@@ -464,6 +464,64 @@ def test_reset_all_puts_every_setting_back_and_leaves_the_area():
     assert frame_camera._LIVE.session.running
 
 
+def every_trigger(cam):
+    """Each trigger's (mode, source, edge, delay), the selector put back."""
+    keep = cam.TriggerSelector.value
+    out = {}
+    for entry in cam.TriggerSelector.choices:
+        cam.TriggerSelector.value = entry
+        out[entry] = (cam.TriggerMode.GetValue(), cam.TriggerSource.GetValue(),
+                      cam.TriggerActivation.GetValue(),
+                      cam.TriggerDelay.GetValue())
+    cam.TriggerSelector.value = keep
+    return out
+
+
+def test_reset_puts_every_trigger_back_with_its_source_edge_and_delay(
+        monkeypatch):
+    """"Reset as connected" put back only each trigger's MODE (frame_camera
+    kept as_connected_triggers as modes). A Basler holds a source, an edge
+    and a delay per TriggerSelector entry too, so a burst trigger moved to
+    Line1, falling edge, 250 µs late, kept all three. A fake Basler with
+    three triggers, through frame_camera as Typhon calls it."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    monkeypatch.setattr(cameras, "discover", lambda known=None:
+                        cameras.Discovery([dev.info], []))
+    monkeypatch.setattr(cameras, "open_camera",
+                        lambda chosen, known=None: dev)
+    frame_camera.connect(frame_camera.list_cameras()["rows"][0])
+    connected = every_trigger(cam)
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerActivation.SetValue("FallingEdge")
+    cam.TriggerDelay.SetValue(250.0)
+    cam.TriggerMode.SetValue("On")
+    sel.value = "ExposureStart"
+    cam.TriggerDelay.SetValue(40.0)
+    sel.value = "FrameStart"
+    assert every_trigger(cam) != connected
+    out = frame_camera.reset_camera_settings()
+    assert out["ok"], out["summary"]
+    assert every_trigger(cam) == connected
+    assert sel.value == "FrameStart", "the selector is where it was"
+    assert ("the FrameBurstStart trigger Off again (its source Software, "
+            "edge RisingEdge and delay 0 µs too)") in out["summary"], \
+        out["summary"]
+    assert "the ExposureStart trigger's delay 0 µs again" in out["summary"]
+    # The Trigger category's own Reset puts the others back too.
+    sel.value = "ExposureStart"
+    cam.TriggerSource.SetValue("Line1")
+    sel.value = "FrameStart"
+    out = frame_camera.reset_camera_settings("Trigger")
+    assert out["ok"], out["summary"]
+    assert every_trigger(cam) == connected
+    assert "the ExposureStart trigger's source Software again" in \
+        out["summary"], out["summary"]
+
+
 def test_reset_all_is_refused_while_capturing(tmp_path):
     connected("frame")
     frame_camera.start(str(tmp_path / "run"))

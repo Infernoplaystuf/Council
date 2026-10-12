@@ -324,6 +324,7 @@ def test_every_trigger_is_seen_not_only_the_selected_one():
     dev, cam = trigger_basler()
     provider = dev.settings_provider()
     assert provider.triggers_on() == []
+    connected = provider.trigger_settings(selected=True)
     cam.TriggerSelector.value = "FrameBurstStart"
     cam.TriggerMode.SetValue("On")
     cam.TriggerSelector.value = "FrameStart"
@@ -343,15 +344,55 @@ def test_every_trigger_is_seen_not_only_the_selected_one():
     assert by_key(dev)["TriggerMode"].warning == \
         "No picture until a trigger arrives on Line1"
     assert not provider.triggers_on()[-1].software
-    # Put back as connected: every trigger's mode, the selector as it was.
-    connected = {"FrameBurstStart": "Off", "FrameStart": "Off",
-                 "ExposureStart": "Off"}
-    said = provider.restore_trigger_modes(connected)
+    # Put back as connected: every trigger, the selector as it was.
+    said = provider.restore_triggers(connected)
     assert said == ["the FrameBurstStart trigger Off again",
-                    "the FrameStart trigger Off again"]
-    assert provider.trigger_modes() == connected
+                    "the FrameStart trigger Off again (its source Software "
+                    "too)"]
+    assert provider.trigger_settings(selected=True) == connected
     assert cam.TriggerSelector.value == "FrameStart"
-    assert provider.restore_trigger_modes(connected) == [], "nothing to do"
+    assert provider.restore_triggers(connected) == [], "nothing to do"
+
+
+def test_putting_every_trigger_back_puts_its_source_edge_and_delay_too():
+    """"Reset as connected" put back each trigger's MODE only. A Basler
+    holds a source, an edge and a delay per TriggerSelector entry too
+    (measured on the emulator), so a FrameBurstStart trigger moved to
+    Line1 on the falling edge, 250 µs late, stayed so after a reset. Every
+    one goes back now — each trigger's mode after its source, edge and
+    delay — the selector left where it was, and what changed is said."""
+    dev, cam = trigger_basler(full=True)
+    provider = dev.settings_provider()
+    connected = provider.trigger_settings(selected=True)
+    assert connected["TriggerSource[FrameBurstStart]"] == "Software"
+    assert connected["TriggerActivation[FrameBurstStart]"] == "RisingEdge"
+    assert connected["TriggerDelay[ExposureStart]"] == 0.0
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerActivation.SetValue("FallingEdge")
+    cam.TriggerDelay.SetValue(250.0)
+    sel.value = "ExposureStart"
+    cam.TriggerDelay.SetValue(40.0)
+    cam.TriggerMode.SetValue("On")
+    sel.value = "FrameStart"
+    cam.log.clear()
+    said = provider.restore_triggers(connected)
+    assert provider.trigger_settings(selected=True) == connected
+    assert sel.value == "FrameStart", "the selector left where it was"
+    assert said == [
+        "the FrameBurstStart trigger's source Software, edge RisingEdge and "
+        "delay 0 µs again",
+        "the ExposureStart trigger Off again (its delay 0 µs too)"], said
+    written = [w for w in cam.log if w[0] != "TriggerSelector"]
+    assert written == [("TriggerSource", "Software"),
+                       ("TriggerActivation", "RisingEdge"),
+                       ("TriggerDelay", 0.0),
+                       ("TriggerDelay", 0.0), ("TriggerMode", "Off")], written
+    # A trigger this camera does not have is said, not dropped.
+    said = provider.restore_triggers({"TriggerMode[AcquisitionStart]": "Off"})
+    assert said == ["the AcquisitionStart trigger's mode NOT put back to "
+                    "Off — this camera has no AcquisitionStart trigger"], said
 
 
 def test_a_model_with_one_trigger_and_no_selector_is_read_too():
@@ -360,12 +401,14 @@ def test_a_model_with_one_trigger_and_no_selector_is_read_too():
                                                            "Line1")))
     provider = dev.settings_provider()
     assert provider.triggers_on() == [cs.Trigger("", "Line1")]
-    assert provider.trigger_modes() == {"": "On"}
-    assert provider.restore_trigger_modes({"": "Off"}) == [
-        "the camera trigger Off again"]
-    assert cam.TriggerMode.value == "Off"
+    # Its one trigger's settings are the rows' own (the snapshot holds
+    # them): none listed apart, nothing to put back apart.
+    assert provider.trigger_settings(selected=True) == {}
+    assert provider.restore_triggers({}) == []
     # Cameras with no trigger at all say none.
     assert simulated("frame").settings_provider().triggers_on() == []
+    assert simulated("frame").settings_provider().restore_triggers(
+        {"TriggerMode[FrameStart]": "Off"}) == []
 
 
 def test_the_selected_triggers_mode_is_written_after_its_source_edge_and_delay():

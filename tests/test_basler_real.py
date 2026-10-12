@@ -849,17 +849,29 @@ def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
     cam = fc._LIVE.device._cam
     connected = _trigger_modes(cam)
     assert set(connected.values()) == {"Off"}
+    every = _every_trigger(cam)
     window = ui._settings_tabs.pop_out("Trigger")
     window.rows["TriggerSelector"]._from_choice("FrameBurstStart")
+    window.flush_now()
+    # Its source, edge and delay too: "Reset" put back only the MODE of a
+    # trigger the selector was not on, and these stayed as changed.
+    window.rows["TriggerSource"]._from_choice("Line1")
+    window.flush_now()
+    window.rows["TriggerActivation"]._from_choice("FallingEdge")
+    window.flush_now()
+    window.rows["TriggerDelay"].editor.setValue(250.0)
     window.flush_now()
     window.rows["TriggerMode"]._from_choice("On")
     window.flush_now()
     window.rows["TriggerSelector"]._from_choice("FrameStart")
     window.flush_now()
     assert _trigger_modes(cam)["FrameBurstStart"] == "On"
+    assert _every_trigger(cam)["FrameBurstStart"][1:] == (
+        "Line1", "FallingEdge", 250.0)
     assert fc._triggers_on(fc._LIVE.device)[0].selector == "FrameBurstStart"
     window.reset_group()
     assert _pump(app, 4.0, until=lambda: fc._LIVE.job is None)
     assert _trigger_modes(cam) == connected
+    assert _every_trigger(cam) == every
     assert cam.TriggerSelector.GetValue() == "FrameStart"
     assert "the FrameBurstStart trigger Off again" in window.status.text()

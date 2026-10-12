@@ -520,14 +520,12 @@ class Provider:
         EVK4 here, the simulated cameras): it runs free."""
         return []
 
-    def trigger_modes(self) -> Dict[str, str]:
-        """Each trigger's mode by its selector entry ({"FrameStart": "Off",
-        "FrameBurstStart": "On", ...}); {} with none to report."""
-        return {}
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
-        """Put each trigger's mode back as `modes` has it (trigger_modes, as
-        connected); what was changed, one line each."""
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """Put EVERY trigger back as `values` has it — trigger_settings(
+        selected=True), read when the camera was connected: each one's
+        source, edge and delay, then its mode, the selector left where it
+        was. What changed or could not be put back, one line per trigger.
+        [] for a camera with no triggers."""
         return []
 
     def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
@@ -1178,34 +1176,59 @@ class BaslerSettings(Provider):
         self._each_trigger(visit)
         return found
 
-    def trigger_modes(self) -> Dict[str, str]:
-        modes: Dict[str, str] = {}
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """EVERY TRIGGER BACK AS CONNECTED, NOT ONLY ITS MODE. A Basler
+        holds a source, an edge and a delay per TriggerSelector entry as
+        well as a mode (measured on the emulator: each changed alone), and
+        "Reset as connected" put back the modes only — a FrameBurstStart
+        trigger moved to Line1 on the falling edge stayed there.
 
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            try:
-                modes[entry] = str(_plain(mode.GetValue()))
-            except Exception:                               # noqa: BLE001
-                pass
-        self._each_trigger(visit)
-        return modes
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
+        Written by apply_triggers: each trigger selected in turn, its
+        source, edge and delay before its mode, a value it already has not
+        written again, and the selector put back where it was. Read first
+        (trigger_settings), so what CHANGED is said: "the FrameBurstStart
+        trigger Off again (its source Software and edge RisingEdge too)"."""
+        if not values:
+            return []
+        try:
+            before = self.trigger_settings(selected=True)
+        except Exception:                                   # noqa: BLE001
+            before = {}
+        words = {"TriggerMode": "mode", "TriggerSource": "source",
+                 "TriggerActivation": "edge", "TriggerDelay": "delay"}
+        changed: Dict[str, Dict[str, Any]] = {}
+        refused: List[str] = []
+        for change in self.apply_triggers(values):
+            split = split_trigger_key(change.key)
+            if split is None:
+                continue
+            base, entry = split
+            if not change.ok:
+                refused.append(f"the {entry} trigger's {words[base]} NOT put "
+                               f"back to {show(change.asked)} — "
+                               f"{change.note}")
+            elif change.key not in before or not same(before[change.key],
+                                                      change.value):
+                changed.setdefault(entry, {})[base] = change.value
         done: List[str] = []
-
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            wanted = modes.get(entry)
-            if wanted is None:
-                return
-            try:
-                if str(_plain(mode.GetValue())) == wanted:
-                    return
-                mode.SetValue(wanted)
-                done.append(f"the {entry or 'camera'} trigger {wanted} again")
-            except Exception as exc:                        # noqa: BLE001
-                done.append(f"the {entry or 'camera'} trigger NOT put back "
-                            f"to {wanted} — {_why(exc)}")
-        self._each_trigger(visit)
-        return done
+        for entry, now in changed.items():
+            parts = []
+            for base in ("TriggerSource", "TriggerActivation",
+                         "TriggerDelay"):
+                word = words[base]
+                if base in now:
+                    unit = " µs" if base == "TriggerDelay" else ""
+                    parts.append(f"{word} {show(now[base])}{unit}")
+            said = (", ".join(parts[:-1]) + " and " + parts[-1]
+                    if len(parts) > 1 else "".join(parts))
+            if "TriggerMode" in now:
+                line = f"the {entry} trigger {show(now['TriggerMode'])} again"
+                if said:
+                    line += f" (its {said} too)"
+            else:
+                line = f"the {entry} trigger's {said} again"
+            done.append(line)
+        return done + refused
 
     def _selected_trigger(self) -> str:
         selector = self.device._node("TriggerSelector")

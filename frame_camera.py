@@ -246,11 +246,13 @@ class _Live:
         #: keeps what it was last given until it is powered off, so it also
         #: offers its own factory set (load_camera_defaults).
         self.as_connected: Dict[str, Any] = {}
-        #: Each trigger's mode by its selector entry as connected (camera_
-        #: settings Provider.trigger_modes): a Basler's TriggerMode is the
-        #: SELECTED trigger's, so as_connected holds one of nine; Reset puts
-        #: the others back from here.
-        self.as_connected_triggers: Dict[str, str] = {}
+        #: Every trigger's settings by selector entry as connected — mode,
+        #: source, edge and delay, by camera_settings.trigger_key ("Trigger
+        #: Source[FrameBurstStart]"; Provider.trigger_settings(selected=
+        #: True)): a Basler's trigger rows are the SELECTED trigger's, so
+        #: as_connected holds one of nine; Reset puts them all back from
+        #: here (Provider.restore_triggers), the selector left where it is.
+        self.as_connected_triggers: Dict[str, Any] = {}
         #: The camera's description read by Connect, while Connect is being
         #: announced to the views (settings_list answers from it); else None.
         self.connect_listing: Optional[List[Any]] = None
@@ -459,7 +461,7 @@ def connect(which: Any) -> Dict[str, Any]:
     # facility calls for a Connect that made 46 before the tabs).
     described = _describe_or_none(device)
     _LIVE.as_connected = _snapshot_or_nothing(device, described)
-    _LIVE.as_connected_triggers = _trigger_modes_or_nothing(device)
+    _LIVE.as_connected_triggers = _every_trigger_or_nothing(device)
     _LIVE.connect_listing = described
     try:
         _announce({"what": "connected",
@@ -882,9 +884,12 @@ def _triggers_on(device: Any) -> List[Any]:
         return []
 
 
-def _trigger_modes_or_nothing(device: Any) -> Dict[str, str]:
+def _every_trigger_or_nothing(device: Any) -> Dict[str, Any]:
+    """Every trigger's mode, source, edge and delay (trigger_settings with
+    the selected one's too), or {} when the camera has none or cannot say."""
     try:
-        return dict(device.settings_provider().trigger_modes())
+        return dict(device.settings_provider().trigger_settings(
+            selected=True))
     except Exception:                                     # noqa: BLE001
         return {}
 
@@ -2722,7 +2727,7 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                name: str, live_ok: bool = False,
-               after: Optional[Callable[[], List[str]]] = None
+               triggers: Optional[Dict[str, Any]] = None
                ) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
@@ -2733,9 +2738,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     preset that applied live reads differently from one that blanked the
     live view for a moment, and the user knows which settings did it.
 
-    `after`, when given, runs right after the set (on the worker with it,
-    when the stream is stopped for it) and says what else it put back, one
-    line each — a reset's triggers other than the selected one.
+    `triggers`, when given, is every trigger as connected (trigger_key:
+    value, _LIVE.as_connected_triggers): put back right after the set (on
+    the worker with it, when the stream is stopped for it — a change among
+    them that the stream is in the way of stops it too), and what that
+    changed is said one line per trigger — a reset's.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -2754,15 +2761,16 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         described = device.settings_provider().describe()
     except Exception:                                     # noqa: BLE001
         described = None
-    blocked = (camera_settings.stops_needed(device, values, roi, described)
+    checked = dict(values, **(triggers or {}))
+    blocked = (camera_settings.stops_needed(device, checked, roi, described)
                if described is not None else
-               camera_settings.stops_needed(device, values, roi))
+               camera_settings.stops_needed(device, checked, roi))
     if live_ok and (roi is not None or blocked):
         _refuse_while_capturing(doing)
     stop = bool(blocked)
     # Another trigger's key in words ("Trigger mode (FrameBurstStart
     # trigger)"), not the preset's raw "TriggerMode[FrameBurstStart]".
-    labels = camera_settings.labels_of(described or [], values)
+    labels = camera_settings.labels_of(described or [], checked)
     restarted = [labels.get(k, "the area" if k == "area" else k)
                  for k in blocked]
     before = _roi_or_none(device)
@@ -2771,11 +2779,13 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
 
     def work() -> Any:
         applied = camera_settings.apply(device, values, roi)
-        if after is not None:
+        if triggers:
             try:
-                also.extend(after())
+                also.extend(device.settings_provider().restore_triggers(
+                    triggers))
             except Exception as exc:                      # noqa: BLE001
-                also.append(f"the rest NOT put back — {_said(exc)}")
+                also.append(f"the other triggers NOT put back — "
+                            f"{_said(exc)}")
         return applied
 
     def finish(applied: Any) -> Dict[str, Any]:
@@ -2890,18 +2900,17 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         raise RuntimeError("the camera's settings were not read when it was "
                            "connected — there is nothing to put back")
     wanted = _group_names(group)
+    # The SELECTED trigger is in the set; a Basler has a mode, a source, an
+    # edge and a delay for each of its triggers (nine on the emulator): one
+    # left On stops the frames — Reset said "applied" over a burst trigger
+    # still On — and one put back On from another line or edge waits for
+    # the wrong signal. Every one goes back as connected.
     triggers = dict(_LIVE.as_connected_triggers)
-
-    def every_trigger() -> List[str]:
-        # The SELECTED trigger is in the set; a Basler has a mode for each
-        # of its triggers (nine on the emulator), and one left On stops
-        # the frames — Reset said "applied" over a burst trigger still On.
-        return device.settings_provider().restore_trigger_modes(triggers)
 
     if not wanted:
         return _apply_set(dict(_LIVE.as_connected), None,
                           "Putting the settings back as connected", "reset",
-                          "", after=every_trigger if triggers else None)
+                          "", triggers=triggers or None)
     # Before the group is read: a change on the worker owns the camera.
     _refuse_while_busy("put it back")
     try:
@@ -2917,8 +2926,8 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
                            f"was connected — there is nothing to put back")
     return _apply_set(values, None, f"Putting {what} back as connected",
                       "reset", what, live_ok=True,
-                      after=(every_trigger if triggers
-                             and "TriggerMode" in values else None))
+                      triggers=(triggers if triggers
+                                and "TriggerMode" in values else None))
 
 
 def load_camera_defaults() -> Dict[str, Any]:
