@@ -1078,6 +1078,10 @@ class CouncilConsole(tk.Tk):
         # an exact row reference (or flag it as hallucinated).
         import provenance as _prov
         self.provenance = _prov.ProvenanceTracker(max_turns=20)
+        # The id is CLAIMED on disk, as the Qt shell claims its own: a Qt
+        # launch in the same second used to take the same id and the two
+        # wrote into one session file.
+        self.session_id = self._claim_session_id()
         try:
             self.conv_logger.start_session(self.session_id)
         except Exception as _e:
@@ -16484,14 +16488,32 @@ class CouncilConsole(tk.Tk):
             "final"
         )
 
+    def _claim_session_id(self, now=None) -> str:
+        """This launch's session id, claimed on disk by creating its debug
+        log exclusively (council_core.conversations.claim_session_id — the
+        Qt shell's rule): unique among sessions and logs, "_2" when another
+        launch took the second first."""
+        from council_core import conversations as _conversations
+        log_dir = getattr(getattr(self, "conv_logger", None), "log_dir", None)
+        sid, problem = _conversations.claim_session_id(
+            self.convo_store, log_dir, now=now)
+        if problem:
+            print(f"[session] {problem}")
+        return sid
+
     def _rename_session(self, new_name: str):
-        """Rename the current session if it still has a raw timestamp ID."""
-        import re as _re
-        if not _re.match(r"^\d{8}_\d{6}$", self.session_id):
+        """Rename the current session if it still has a raw timestamp ID
+        (a claimed one may end "_2")."""
+        from council_core import conversations as _conversations
+        if not _conversations.RAW_SESSION_ID.match(self.session_id):
             return
         ok = self.convo_store.rename_session(self.session_id, new_name)
         if ok:
             old = self.session_id
+            # The id the file is stored under ('größe' is stored 'gr_e'):
+            # otherwise the id and the file disagree, as in the Qt shell
+            # before (council_core.conversations.Conversation.rename).
+            new_name = self.convo_store.stored_id(new_name)
             self.session_id = new_name
             for model in self.personalities.values():
                 if hasattr(model, "session_id") and model.session_id == old:

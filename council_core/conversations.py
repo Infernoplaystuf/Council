@@ -422,6 +422,46 @@ class ConversationStore:
         return "\n".join(lines)
 
 
+def claim_session_id(store: "ConversationStore", log_dir: Optional[Path],
+                     now: Optional[datetime] = None) -> Tuple[str, str]:
+    """(session id, problem) — a launch's id in the Tk format, CLAIMED.
+
+    Unique among sessions AND debug logs on disk: the debug log's file
+    (conversation_logs/session_<id>.jsonl) is created here, exclusively, so
+    two launches in the same second do not share an id — the second gets
+    "_2". (The session's own file is claimed on its first record, so a
+    launch nobody asks anything leaves no empty session in the list.)
+
+    BOTH shells call this. Only the Qt shell did: the Tk console took
+    datetime.now() and its logger buffers, so nothing of a Tk launch was on
+    disk yet, and a Qt launch in the same second took the same id — the two
+    wrote into one session file, and a Tk question reached the Qt Writer's
+    RECENT CONVERSATION under "This conversation only" (found in review).
+
+    ``problem`` is "" or why the log file could not be made (the id is
+    still returned, unclaimed)."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    for n in range(1, 1000):
+        candidate = stamp if n == 1 else f"{stamp}_{n}"
+        if store.session_path(candidate).exists():
+            continue
+        if log_dir is None:
+            return candidate, ""
+        log_path = Path(log_dir) / f"session_{candidate}.jsonl"
+        try:
+            fd = os.open(str(log_path),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY,
+                         0o644)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            return candidate, (f"the conversation log could not be "
+                               f"started: {exc!r}")
+        os.close(fd)
+        return candidate, ""
+    return f"{stamp}_{os.getpid()}", ""
+
+
 # ============================================================
 # Session names
 # ============================================================
@@ -546,35 +586,15 @@ class Conversation:
 
     # -- the id ---------------------------------------------------------
     def _new_session_id(self, now: Optional[datetime] = None) -> str:
-        """The Tk format, unique among sessions AND logs on disk.
-
-        The debug log's file is created here, exclusively: it is the launch's
-        claim on the id, so two launches in the same second do not share a
-        log, and the second gets "_2". (The session's own file is claimed on
-        its first record, so a launch nobody asks anything leaves no empty
-        session in the list.)"""
-        stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
-        for n in range(1, 1000):
-            candidate = stamp if n == 1 else f"{stamp}_{n}"
-            if self.store.session_path(candidate).exists():
-                continue
-            if self.logger is None:
-                return candidate
-            log_path = self.logger.log_dir / f"session_{candidate}.jsonl"
-            try:
-                fd = os.open(str(log_path),
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY,
-                             0o644)
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                self._problem(f"the conversation log could not be "
-                              f"started: {exc!r}")
-                return candidate
-            os.close(fd)
+        """The Tk format, unique among sessions AND logs on disk — see
+        claim_session_id. The debug log is started under the claimed id."""
+        log_dir = self.logger.log_dir if self.logger is not None else None
+        candidate, problem = claim_session_id(self.store, log_dir, now=now)
+        if problem:
+            self._problem(problem)
+        elif self.logger is not None:
             self.logger.start_session(candidate)
-            return candidate
-        return f"{stamp}_{os.getpid()}"
+        return candidate
 
     def _claim(self) -> None:
         """Make the session's file ours before the first record.
