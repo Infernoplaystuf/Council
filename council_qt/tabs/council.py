@@ -233,7 +233,10 @@ class CouncilActions:
         # What this turn may remember, taken once: the session, the prior the
         # user loaded, the memory scope. Applied to every personality before
         # any model call, so a Load as Prior made while a turn runs counts
-        # from the NEXT turn, never halfway through this one.
+        # from the NEXT turn, never halfway through this one. A loaded prior
+        # another launch has since renamed is dropped first, and said.
+        if self.conversation is not None:
+            self.conversation.check_prior()
         snapshot = (self.conversation.snapshot()
                     if self.conversation is not None else None)
 

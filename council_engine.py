@@ -5591,7 +5591,9 @@ class PersonalityModel:
                 chunks = []
                 for t in turns:
                     who  = t.get("who", "unknown")
-                    text = t.get("text", "")
+                    # null or a number on a hand-edited line: as text, not
+                    # a TypeError that fails the whole answer.
+                    text = str(t.get("text") or "")
                     if len(text) > 600:
                         text = text[:600] + "…"
                     chunks.append(f"{who}: {text}")

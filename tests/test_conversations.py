@@ -466,3 +466,142 @@ def test_the_tk_console_appends_its_verdicts_the_same_way(tmp_path,
     assert used == [target], "Tk did not append through append_line"
     assert _lines(target) == [{"query": "ü", "session_id": "s"}]
     assert not console.said
+
+
+# ============================================================
+# Load as Prior loads the session the list showed
+# ============================================================
+
+def _write_session(folder: Path, stem: str, text: str) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{stem}.jsonl").write_text(
+        json.dumps({"ts": "2026-10-01T09:00:00", "who": "User",
+                    "text": text}) + "\n", encoding="utf-8")
+
+
+def test_load_prior_loads_the_listed_file_whatever_its_name(tmp_path):
+    """Found in review: the list shows every *.jsonl by its stem, but the
+    store reached a session through safe_name(). 'pump notes' (a file
+    renamed in Explorer) loaded 'pump_notes' — another session — and said it
+    had loaded 'pump notes'; 'older - Copy' (an Explorer copy) was listed
+    and then 'There is no saved session called ...'."""
+    vault = tmp_path / "vault"
+    folder = vault / "conversations"
+    _write_session(folder, "pump notes", "TANGERINE")
+    _write_session(folder, "pump_notes", "KIWI")
+    _write_session(folder, "older - Copy", "MANGO")
+    store = ConversationStore(folder)
+    assert set(store.list_sessions()) == {"pump notes", "pump_notes",
+                                          "older - Copy"}
+    conv = Conversation(vault)
+    assert conv.load_prior("pump notes").ok
+    prior = conv.store.load_session_summary("pump notes")
+    assert "TANGERINE" in prior and "KIWI" not in prior, prior
+    assert conv.load_prior("older - Copy").ok
+    assert "MANGO" in conv.store.load_session_summary("older - Copy")
+    assert "KIWI" in conv.store.load_session_summary("pump_notes")
+    # A name with a path in it is never followed out of the folder.
+    _write_session(vault, "outside", "SECRET")
+    assert not conv.load_prior("../outside").ok
+    assert "SECRET" not in store.load_session_summary("../outside")
+
+
+def test_a_prior_that_was_renamed_away_is_said_and_dropped(tmp_path):
+    """Found in review: launch B loads launch A's session by its raw id;
+    A then names it after its first answer. B kept the old id, the prior
+    came back empty, and nothing told the user. The next turn now says so
+    and clears it (the Sessions tab's Prior: line follows)."""
+    vault = tmp_path / "vault"
+    a = Conversation(vault)
+    a.record("User", "A's question")
+    b = Conversation(vault)
+    heard = []
+    b.subscribe(lambda event, **d: heard.append((event, d.get("message"))))
+    assert b.load_prior(a.session_id).ok
+    old = a.session_id
+    assert a.rename("pump talk").ok
+    assert b.check_prior() is False
+    assert b.snapshot().prior_session_id is None
+    event, message = heard[-1]
+    assert event == "prior_cleared"
+    assert old in message and "Sessions tab" in message
+    assert b.check_prior() is True          # nothing loaded: nothing to say
+
+
+# ============================================================
+# A session file with lines that are not records
+# ============================================================
+
+def test_lines_that_are_not_records_are_skipped(tmp_path):
+    """Found in review: a hand-edited or foreign file with null, [1, 2],
+    {"text": null}, "str" or 42 on a line made load_session_summary raise
+    AttributeError — and every turn with it loaded as prior failed until
+    Clear Prior."""
+    folder = tmp_path / "conversations"
+    folder.mkdir()
+    (folder / "odd.jsonl").write_text(
+        "\n".join(['null', '[1, 2]', '{"who": "User", "text": null}',
+                   '"str"', '42', '{"who": "Writer", "text": "kept"}',
+                   '{"who": "User", "text": 7}']) + "\n", encoding="utf-8")
+    store = ConversationStore(folder)
+    rows = store.load_last("odd")
+    assert all(isinstance(r, dict) for r in rows)
+    summary = store.load_session_summary("odd")
+    assert "Writer: kept" in summary and "User: 7" in summary
+
+
+def test_a_prior_with_odd_lines_does_not_stop_the_answer(tmp_path):
+    """The engine side: respond() with that file as the prior AND as this
+    session's RECENT CONVERSATION still builds its prompt."""
+    import council_engine as ce
+    folder = tmp_path / "conversations"
+    folder.mkdir()
+    for stem in ("odd", "now"):
+        (folder / f"{stem}.jsonl").write_text(
+            "\n".join(['null', '{"who": "User", "text": null}', '[1]',
+                       '{"who": "Writer", "text": 5}']) + "\n",
+            encoding="utf-8")
+
+    class Spec:
+        prompts = []
+
+        def generate(self, **kwargs):
+            self.prompts.append(kwargs["user_text"])
+            return "fine"
+
+    class Registry:
+        spec = Spec()
+
+        def get(self, _key):
+            return self.spec
+
+    writer = ce.PersonalityModel(
+        name="writer", system_prompt="", weights={}, registry=Registry(),
+        backend_key="x", conversation_store=ConversationStore(folder),
+        session_id="now", prior_session_id="odd", memory_scope="all",
+        trace=False)
+    assert writer.respond("?") == "fine"
+    assert "Writer: 5" in Registry.spec.prompts[-1]
+
+
+# ============================================================
+# A session named with letters the file name cannot hold
+# ============================================================
+
+def test_a_non_ascii_name_is_the_name_of_the_file(tmp_path):
+    """Found in review: the judge's name keeps Unicode letters; the file
+    name does not (safe_name). session_id said 'pumpengröße_halle', the file
+    was pumpengr_e_halle.jsonl, so the Sessions list had no '(this
+    conversation)' mark and this conversation could be loaded as its own
+    prior."""
+    vault = tmp_path / "vault"
+    conv = Conversation(vault)
+    conv.record("User", "Wie groß ist die Pumpe?")
+    named = conv.rename(conversations.clean_name("Pumpengröße Halle"))
+    assert named.ok
+    assert (vault / "conversations" / f"{conv.session_id}.jsonl").is_file()
+    assert conv.session_id in ConversationStore(
+        vault / "conversations").list_sessions()
+    assert conv.session_id in named.message
+    assert not conv.load_prior(conv.session_id).ok
+    assert not conv.load_prior("pumpengröße_halle").ok

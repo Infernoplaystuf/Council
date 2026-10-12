@@ -222,8 +222,31 @@ class ConversationStore:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.problem = ""
 
+    def _stem(self, session_id: str) -> str:
+        """The file stem a session id names.
+
+        A session the list shows is reached by its OWN stem when that file
+        exists: list_sessions() lists every *.jsonl by its stem, and the
+        store used to reach one through safe_name() only — so 'pump notes'
+        (renamed in Explorer) loaded the different session 'pump_notes',
+        and 'older - Copy' was listed and then "not found" (found in
+        review). Anything else — every id the app makes, and a new name —
+        is safe_name()'d as always, so writes are unchanged. A stem with a
+        path in it is never followed out of the folder."""
+        sid = session_id or ""
+        if (sid and sid not in (".", "..") and not sid.startswith(".")
+                and not any(ch in sid for ch in "/\\:")
+                and (self.base_dir / f"{sid}.jsonl").is_file()):
+            return sid
+        return safe_name(sid, 64)
+
     def session_path(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.jsonl"
+        return self.base_dir / f"{self._stem(session_id)}.jsonl"
+
+    def stored_id(self, session_id: str) -> str:
+        """The id the session is listed under — its file's stem (a judge's
+        name with letters a file name cannot hold is stored safe_name()'d)."""
+        return self._stem(session_id)
 
     def claim(self, session_id: str) -> bool:
         """Create the session's file if no one has. True when this call made
@@ -268,9 +291,15 @@ class ConversationStore:
         out: List[Dict[str, Any]] = []
         for ln in lines[-n:]:
             try:
-                out.append(json.loads(ln))
+                record = json.loads(ln)
             except Exception:
-                pass
+                continue
+            # Only records: a line holding null, a list, a string or a
+            # number (a hand-edited or foreign file) made every reader's
+            # t.get() raise, and with it every turn that had the file
+            # loaded as prior (found in review).
+            if isinstance(record, dict):
+                out.append(record)
         with self._lock:
             self._cache[cache_key] = (signature, out)
         return out
@@ -297,7 +326,7 @@ class ConversationStore:
 
     def summary_path(self, session_id: str) -> Path:
         """Path for the generated prose summary of a completed session."""
-        return self.base_dir / f"{safe_name(session_id, 64)}.summary.md"
+        return self.base_dir / f"{self._stem(session_id)}.summary.md"
 
     def save_session_summary(self, session_id: str, summary_text: str) -> None:
         """Persist a generated prose summary for a completed session."""
@@ -318,7 +347,7 @@ class ConversationStore:
     # offered for resume.
 
     def _active_sentinel(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.active"
+        return self.base_dir / f"{self._stem(session_id)}.active"
 
     def mark_session_active(self, session_id: str, query: str = "") -> None:
         """Mark the session as in-flight. Safe to call repeatedly."""
@@ -384,8 +413,8 @@ class ConversationStore:
             return ""
         lines = [f"[Past session: {session_id}]"]
         for t in turns:
-            who = t.get("who", "?")
-            text = t.get("text", "")
+            who = t.get("who") or "?"
+            text = str(t.get("text") or "")       # null or a number: as text
             # Truncate very long turns
             if len(text) > 400:
                 text = text[:400] + "…"
@@ -720,10 +749,13 @@ class Conversation:
         if not session_id:
             return Outcome(False, "Select a session to load.")
         with self._lock:
-            if session_id == self.session_id:
+            # By FILE, not by spelling: two ids can name one file (see
+            # ConversationStore._stem), and this conversation must never be
+            # loaded as its own prior (its turns would go in twice).
+            if self._same_file(session_id, self.session_id):
                 return Outcome(False, "That is this conversation — it is "
                                       "already part of every answer.")
-            if not self.store.session_path(session_id).exists():
+            if not self.store.session_path(session_id).is_file():
                 return Outcome(False, f"There is no saved session called "
                                       f"'{session_id}'.")
             self.prior_session_id = session_id
@@ -738,6 +770,31 @@ class Conversation:
                        f"question on, the council uses it as background.")
         self._emit("prior_loaded", session_id=session_id, message=message)
         return Outcome(True, message, session_id)
+
+    def _same_file(self, a: str, b: str) -> bool:
+        return (os.path.normcase(str(self.store.session_path(a)))
+                == os.path.normcase(str(self.store.session_path(b))))
+
+    def check_prior(self) -> bool:
+        """Before a turn: is the loaded prior still saved? False when it
+        was not — then it is dropped and listeners are told why.
+
+        Another launch can rename the session after it was loaded here (a
+        session is named after its first answer), and the prior then came
+        back empty with nothing said (found in review). True when nothing
+        is loaded or the file is there."""
+        with self._lock:
+            old = self.prior_session_id
+            if not old or self.store.session_path(old).is_file():
+                return True
+            self.prior_session_id = None
+        message = (f"The earlier conversation '{old}' is no longer saved "
+                   f"under that name (it was renamed or removed), so it is "
+                   f"not used. Load it again from the Sessions tab if you "
+                   f"want it.")
+        self._problem(f"the loaded prior {old} is gone")
+        self._emit("prior_cleared", session_id=old, message=message)
+        return False
 
     def clear_prior(self) -> Outcome:
         with self._lock:
@@ -770,7 +827,13 @@ class Conversation:
                     continue          # a name that looks like an id is not one
                 try:
                     if self.store.rename_session(old, candidate):
-                        self.session_id = candidate
+                        # The id the file is stored under: a judge's name
+                        # keeps letters a file name does not ('größe' is
+                        # stored 'gr_e'), and an id that is not the file's
+                        # stem lost the Sessions list's "(this
+                        # conversation)" mark and could be loaded as its
+                        # own prior (found in review).
+                        self.session_id = self.store.stored_id(candidate)
                         self.named = True
                         break
                 except OSError as exc:

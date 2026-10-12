@@ -239,6 +239,39 @@ def test_load_as_prior_is_the_one_way_an_older_session_gets_in(qapp, engine):
         _close(qapp, window, view)
 
 
+def test_a_prior_renamed_by_another_launch_is_said_and_dropped(
+        qapp, tmp_path, monkeypatch):
+    """Launch B loads launch A's session (still a raw id); A names it after
+    its first answer. B's next question says the prior is gone, and the
+    Sessions tab's Prior: line clears — it used to go empty silently."""
+    from council_core import conversations, council_turn
+    from council_qt.tabs.sessions import SessionsTab
+    from tests.test_council_turn import FakeModel, Models
+    writer = FakeModel("an answer")
+    monkeypatch.setattr(council_turn, "load_personalities",
+                        lambda *_a, **_k: (Models(writer=writer), ""))
+    vault = tmp_path / "vault"
+    a = conversations.Conversation(vault)
+    a.record("User", "A's question about the pump")
+    window, view = _council(qapp, vault)
+    sessions = SessionsTab(window)
+    try:
+        assert view.conversation.load_prior(a.session_id).ok
+        assert _pump(qapp, lambda: a.session_id in sessions.prior.text())
+        old = a.session_id
+        assert a.rename("pump question").ok
+        _ask(qapp, view, "And the follow-up?")
+        assert _pump(qapp, lambda: "no longer saved under that name"
+                     in view.transcript.toPlainText()), (
+            view.transcript.toPlainText())
+        assert old in view.transcript.toPlainText()
+        assert _pump(qapp, lambda: sessions.prior.text() == "Prior: none")
+        assert view.conversation.snapshot().prior_session_id is None
+    finally:
+        sessions.deleteLater()
+        _close(qapp, window, view)
+
+
 def test_the_conversation_is_saved_as_tk_saves_it(qapp, engine):
     """The same files, the same place, the same format — and a Tk reader
     (vault_tools.recent_queries) finds the Qt question."""
