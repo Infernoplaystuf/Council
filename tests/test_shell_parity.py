@@ -135,8 +135,15 @@ def _tk_turn(monkeypatch, vault: Path, question: str):
     import task_memory
     from council_core import conversations
 
+    from council_core import turn_context
     monkeypatch.setattr(cge, "VAULT_DIR", vault)
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    # The console's process-wide indexes (module_indexes=True) start empty
+    # for this vault, as they do in a new Tk process — not as an earlier
+    # test left them for its own vault.
+    for name in ("_VAULT_INDEX_INSTANCE", "_DATA_INDEX_INSTANCE",
+                 "_REFERENCED_FILES_MAP"):
+        monkeypatch.setattr(turn_context, name, None)
     C = cge.CouncilConsole
 
     class Console:

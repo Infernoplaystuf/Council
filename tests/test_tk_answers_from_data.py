@@ -98,6 +98,18 @@ def _console(cge, question):
     return Console()
 
 
+def _fresh_module_indexes(monkeypatch):
+    """The Tk console keeps ONE vault index and data index for the process
+    (module_indexes=True), built for the first vault it reads. A test's own
+    vault needs its own: without this, the index a test before built for
+    ITS vault was searched (found when test_shell_parity ran after this
+    file: its empty Tk vault "matched" the previous test's pumps.csv)."""
+    from council_core import turn_context
+    for name in ("_VAULT_INDEX_INSTANCE", "_DATA_INDEX_INSTANCE",
+                 "_REFERENCED_FILES_MAP"):
+        monkeypatch.setattr(turn_context, name, None)
+
+
 @pytest.fixture
 def tk_engine(tmp_path, monkeypatch):
     import council_engine as ce
@@ -111,6 +123,7 @@ def tk_engine(tmp_path, monkeypatch):
         encoding="utf-8")
     with FakeOllama() as fake:
         monkeypatch.setattr(cge, "VAULT_DIR", vault)
+        _fresh_module_indexes(monkeypatch)
         monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
         monkeypatch.setenv("COUNCIL_OLLAMA_HOST", fake.url)
         monkeypatch.setenv("COUNCIL_BACKEND", "ollama")
