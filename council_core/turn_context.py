@@ -215,13 +215,32 @@ def _smart_truncate_text(text: str, max_chars: int) -> tuple:
     return head + marker + tail, True
 
 
+#: Above this a preview does not PARSE a JSON or parquet file as a table
+#: (pandas reads the whole file to give its first rows): it shows the start
+#: of the file as text instead. [turn_context]
+PREVIEW_PARSE_MAX_BYTES = 8 * 1024 * 1024
+
+
 def _text_peek(path, max_bytes: int = 4096) -> str:
-    """First ~max_bytes of a file decoded as text, or a binary note. Bounded."""
+    """First ~max_bytes of a file decoded as text, or a binary note. Bounded.
+
+    [turn_context] Reads ``max_bytes`` and no more: it read the whole file
+    and kept the first 4 KB (read_bytes()[:max_bytes]) — 300 MB held, and
+    seconds on the GUI thread, to preview a CT stack (found in review). A
+    file with NUL bytes in its start is binary: said, with its size, rather
+    than shown as mojibake."""
     p = Path(path)
     try:
-        data = p.read_bytes()[:max_bytes]
+        with open(p, "rb") as fh:
+            data = fh.read(max(0, int(max_bytes)))
     except Exception as e:
         return f"(could not read: {e})"
+    if b"\x00" in data:
+        try:
+            return (f"(binary file, {p.stat().st_size:,} bytes — no text "
+                    f"to show)")
+        except Exception:
+            return "(binary file — no text to show)"
     try:
         txt = data.decode("utf-8")
     except Exception:
@@ -246,6 +265,16 @@ def _data_preview_text(path, max_rows: int = 50):
         import pandas as pd
     except Exception:
         return ("(pandas unavailable — showing a raw text peek.)", _text_peek(p))
+    # [turn_context] JSON and parquet are parsed whole by pandas to give
+    # their first rows (a 53 MB JSON: 512 MB and 4 s on the GUI thread):
+    # past PREVIEW_PARSE_MAX_BYTES the start of the file is shown instead.
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    if suf in (".json", ".parquet", ".pq") and size > PREVIEW_PARSE_MAX_BYTES:
+        return (f"{p.name} is too large ({size:,} bytes) to read as a table "
+                f"here — showing the start of the file.", _text_peek(p))
     df = None
     try:
         if suf in (".csv", ".tsv", ".txt"):

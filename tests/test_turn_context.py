@@ -754,3 +754,71 @@ def test_forget_never_writes_over_a_list_it_cannot_read(vault_env):
     reply = tc.forget_command("forget zebrafin", state)
     assert reply and "could not" in reply.lower(), reply
     assert (vault / "fuzzy_denylist.json").read_bytes() == damaged
+
+
+# ============================================================
+# The source preview's reads are bounded
+# ============================================================
+# Found in review: SourcePreview.show_file (a chip click) read the WHOLE file
+# to show 4,096 characters — _text_peek did read_bytes()[:max_bytes], JSON
+# and parquet were parsed whole — 300-512 MB allocated and up to 4.8 s on the
+# GUI thread for a CT stack, a PDF or a 53 MB JSON.
+
+def _peak_bytes(fn):
+    import tracemalloc
+    import pandas  # noqa: F401 — imported first: its import is not the read
+    tracemalloc.start()
+    try:
+        result = fn()
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+def _big(path, size):
+    with open(path, "wb") as fh:
+        fh.truncate(size)              # zeros: a binary file, written fast
+    return path
+
+
+@pytest.mark.parametrize("name", ["scan_0001.tif", "part.dream3d",
+                                  "report.pdf", "blob.bin"])
+def test_a_large_binary_file_is_previewed_from_its_start(tmp_path, name):
+    from council_core import turn_context as tc
+    path = _big(tmp_path / name, 40 * 1024 * 1024)
+    (schema, rows), peak = _peak_bytes(lambda: tc._data_preview_text(path))
+    assert peak < 4 * 1024 * 1024, f"{peak:,} bytes held to preview it"
+    assert "binary" in rows.lower() and "41,943,040" in rows, rows
+
+
+def test_a_text_peek_reads_only_what_it_shows(tmp_path):
+    from council_core import turn_context as tc
+    path = tmp_path / "log.txt"
+    path.write_text("line of the log\n" * 2_000_000, encoding="utf-8")
+    peek, peak = _peak_bytes(lambda: tc._text_peek(path, max_bytes=4096))
+    assert peek.startswith("line of the log") and len(peek) <= 4096
+    assert peak < 1024 * 1024, f"{peak:,} bytes held for a 4 KB peek"
+
+
+def test_a_large_json_file_is_not_parsed_whole(tmp_path):
+    import json as _json
+    from council_core import turn_context as tc
+    path = tmp_path / "big.json"
+    path.write_text(_json.dumps([{"id": i, "name": f"part {i}"}
+                                 for i in range(400_000)]), encoding="utf-8")
+    assert path.stat().st_size > tc.PREVIEW_PARSE_MAX_BYTES
+    (schema, rows), peak = _peak_bytes(lambda: tc._data_preview_text(path))
+    assert peak < 8 * 1024 * 1024, f"{peak:,} bytes held to preview it"
+    assert rows.startswith('[{"id": 0'), rows[:80]
+    assert "too large" in schema.lower(), schema
+
+
+def test_a_small_json_file_is_still_a_table(tmp_path):
+    import json as _json
+    from council_core import turn_context as tc
+    path = tmp_path / "small.json"
+    path.write_text(_json.dumps([{"pump": "P1", "name": "ORCHID"}]),
+                    encoding="utf-8")
+    schema, rows = tc._data_preview_text(path)
+    assert "pump" in schema and "ORCHID" in rows
