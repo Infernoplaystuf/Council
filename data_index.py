@@ -111,6 +111,35 @@ def bundled_samples_dir() -> Path:
     return Path(__file__).parent / "assets" / "sample_data"
 
 
+#: Where the data index keeps its own files (its column index and its
+#: warm-start cache): a hidden folder in the WRITE root, data_out/.index/.
+#: They were kept in data_in/, the folder the app promises never to write.
+INDEX_SUBFOLDER = ".index"
+
+#: The data index's own files, by name — the column index
+#: (vault_col_index.INDEX_FILENAME), the warm-start cache
+#: (data_index_cache.CACHE_FILENAME) and their temp files, and the pickle
+#: cache older builds wrote. Every existing vault still has the older
+#: builds' copies in data_in/: they are never the user's data — not
+#: discovered, not counted, not listed, not a change to the data (found in
+#: review: discover() returned the column index, so every refresh profiled
+#: it and rewrote it and the cache, and the dataset overview was rebuilt on
+#: every turn — 35 s of a 39 s warm turn on a 279-file vault).
+APP_SIDECAR_NAMES = frozenset({
+    ".vault_col_index.json", ".vault_col_index.json.tmp",
+    "data_index_cache.json.gz", "data_index_cache.json.gz.tmp",
+    "data_index_cache.pickle", "data_index_cache.pickle.tmp",
+})
+
+
+def is_app_sidecar(path: Any) -> bool:
+    """True for a file the data index wrote for itself (APP_SIDECAR_NAMES)."""
+    try:
+        return Path(path).name.lower() in APP_SIDECAR_NAMES
+    except Exception:
+        return False
+
+
 def init_data_dirs(vault_dir: Path) -> None:
     """
     Create vault/data_in/ and vault/data_out/ on first launch and drop
@@ -286,6 +315,43 @@ class FileProfile:
     rows:        List[Dict[str, str]] = field(default_factory=list)
 
 
+def _profile_to_dict(profile: "FileProfile") -> Dict[str, Any]:
+    """A FileProfile as plain JSON-able data, for the warm-start cache."""
+    return {
+        "path": str(profile.path), "name": profile.name,
+        "extension": profile.extension, "row_count": profile.row_count,
+        "columns": [{"name": c.name, "sample_values": list(c.sample_values),
+                     "distinct_count": c.distinct_count,
+                     "null_count": c.null_count,
+                     "inferred_type": c.inferred_type}
+                    for c in profile.columns],
+        "error": profile.error, "indexed_at": profile.indexed_at,
+        "rows": list(profile.rows),
+    }
+
+
+def _profile_from_dict(data: Any) -> Optional["FileProfile"]:
+    """The FileProfile _profile_to_dict made, or None for anything else."""
+    try:
+        return FileProfile(
+            path=Path(data["path"]), name=str(data["name"]),
+            extension=str(data["extension"]),
+            row_count=int(data.get("row_count") or 0),
+            columns=[ColumnInfo(
+                name=str(c["name"]),
+                sample_values=[str(v) for v in c.get("sample_values") or []],
+                distinct_count=int(c.get("distinct_count") or 0),
+                null_count=int(c.get("null_count") or 0),
+                inferred_type=str(c.get("inferred_type") or "text"))
+                for c in data.get("columns") or []],
+            error=str(data.get("error") or ""),
+            indexed_at=float(data.get("indexed_at") or 0.0),
+            rows=[dict(r) for r in data.get("rows") or []
+                  if isinstance(r, dict)])
+    except Exception:
+        return None
+
+
 # ============================================================
 # Index
 # ============================================================
@@ -341,22 +407,31 @@ class DataIndex:
 
         self._profiles: Dict[Path, FileProfile] = {}
 
-        # ── Warm-start: try to restore the pickle sidecar so the
+        # Where this index keeps its own files: data_out/.index/ (never
+        # data_in/, which the app does not write); an index with no write
+        # root keeps them in its first search root, as before.
+        self.cache_dir: Optional[Path] = (
+            self.write_root / INDEX_SUBFOLDER if self.write_root is not None
+            else (self.search_roots[0] if self.search_roots else None))
+
+        # ── Warm-start: try to restore the cache sidecar so the
         # first all_profiles() / find_files_with_column call doesn't
         # have to re-profile every file from cold.  The mtime-delta
         # check inside refresh() still re-profiles anything that
         # actually changed since the cache was written.
         try:
             import data_index_cache as _dic
-            if self.search_roots:
-                cached = _dic.try_load(self.search_roots[0])
+            if self.cache_dir is not None:
+                cached = _dic.try_load(self.cache_dir)
                 if cached:
                     # Only adopt entries whose paths are inside our
                     # search roots — defensive against a cache file
                     # left over from a different vault configuration.
-                    for path, profile in cached.items():
+                    for path, data in cached.items():
                         if any(is_under(path, r) for r in self.search_roots):
-                            self._profiles[path] = profile
+                            profile = _profile_from_dict(data)
+                            if profile is not None:
+                                self._profiles[Path(path)] = profile
         except Exception as exc:
             print(f"[DataIndex] warm-start cache load failed: {exc!r}")
 
@@ -378,9 +453,9 @@ class DataIndex:
         # falls back to the linear scan path).
         self._col_index = None
         try:
-            if self.search_roots:
+            if self.cache_dir is not None:
                 import vault_col_index as _vci
-                self._col_index = _vci.ColumnIndex(self.search_roots[0])
+                self._col_index = _vci.ColumnIndex(self.cache_dir)
         except Exception as exc:
             print(f"[DataIndex] could not init column index: {exc!r}")
             self._col_index = None
@@ -449,6 +524,9 @@ class DataIndex:
                     continue
                 if p.suffix.lower() not in self.LOADABLE_EXTS:
                     continue
+                # The index's own files (an older build kept them here)
+                if is_app_sidecar(p):
+                    continue
                 # Skip vault internals
                 s = str(p).replace("\\", "/")
                 if any(skip in s for skip in
@@ -506,13 +584,15 @@ class DataIndex:
                 self._col_index.save()
             except Exception as exc:
                 print(f"[DataIndex] col_index save failed: {exc!r}")
-        # Persist profiles to the warm-start pickle. Sized so even a
-        # 500-file vault fits in <50 MB on disk; the next launch
-        # restores in <100 ms vs the 2-5 s cold-walk.
-        if changed and self.search_roots:
+        # Persist profiles to the warm-start cache (gzip JSON, in
+        # data_out/.index/) — only when a user's file really changed, so
+        # a turn that changes nothing writes nothing.
+        if changed and self.cache_dir is not None:
             try:
                 import data_index_cache as _dic
-                _dic.save(self.search_roots[0], self._profiles)
+                _dic.save(self.cache_dir,
+                          {str(k): _profile_to_dict(v)
+                           for k, v in self._profiles.items()})
             except Exception as exc:
                 print(f"[DataIndex] warm-start cache save failed: {exc!r}")
         # Any change invalidates find_relationships' memoised result.

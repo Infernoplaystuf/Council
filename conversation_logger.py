@@ -89,6 +89,7 @@ PROTECTED_STATE_FILES: tuple = (
     "fuzzy_denylist.json", "semantic_cache.json", "backend_settings.json",
     "sql_connections.json", "mongo_connections.json",
     "data_index_cache.pickle", ".vault_col_index.json",
+    "data_index_cache.json.gz",
     ".agent_runs.jsonl", ".tool_gaps.jsonl", ".failures.jsonl",
     ".user_quirks.jsonl", ".tool_proposals.jsonl",
     ".onboarded", ".council_python",

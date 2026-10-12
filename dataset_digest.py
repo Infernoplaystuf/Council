@@ -26,13 +26,27 @@ def _data_root(vault_dir: Any) -> Path:
         return Path(vault_dir) / "data_in"
 
 
-def _signature(root: Path) -> Tuple[int, float]:
-    """Cheap change-detector: (file count, latest mtime) under root."""
+def _is_app_file(p: Path) -> bool:
+    """The data index's own files (data_index.APP_SIDECAR_NAMES) — older
+    builds kept them in data_in/ and rewrote them on every refresh, which
+    changed this signature and rebuilt the overview on every turn."""
+    try:
+        import data_index
+        return data_index.is_app_sidecar(p)
+    except Exception:
+        return False
+
+
+def _signature(root: Path) -> Tuple[str, int, float]:
+    """Cheap change-detector: (the folder, file count, latest mtime) under
+    root — the user's files only. The folder is part of it: one process
+    serves more than one vault (a Qt window per conversation, a test after a
+    test), and two vaults' counts and times can agree."""
     n = 0
     latest = 0.0
     try:
         for p in root.rglob("*"):
-            if p.is_file():
+            if p.is_file() and not _is_app_file(p):
                 n += 1
                 try:
                     latest = max(latest, p.stat().st_mtime)
@@ -40,7 +54,7 @@ def _signature(root: Path) -> Tuple[int, float]:
                     pass
     except Exception:
         pass
-    return (n, latest)
+    return (str(root), n, latest)
 
 
 def build_digest(vault_dir: Any, *, max_files: int = 200,
