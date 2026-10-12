@@ -87,10 +87,14 @@ test that reached out: every refusal, in this process or a child, is written
 to a report, and the autouse `offline_test` fixture **fails the test** it
 happened in, naming what was refused and the line that asked. Set
 `COUNCIL_OFFLINE_LOG=<file>` to have every refusal recorded there too (pid,
-test, what, where); in a clean run only `tests/test_offline_guard.py` (and
-the `test_inner.py` of the small pytest it runs) appears in it - 24 lines on
-2026-10-12. `python tests/smoke_test.py` installs the same guard, and its
-runner fails a check that tried.
+test, what, where); in a clean run the only refusals in it are
+`tests/test_offline_guard.py`'s own (and those of the `test_inner*.py` of
+the small pytests it runs) - 34 lines on 2026-10-12 - beside the python
+children listed as out of the guard's reach (see "Not covered" below): 199
+lines that day, 191 of them started through `council_core/child_proc.py`
+(gui_smoke, the LLM and docs benches, the code-behind checks).
+`python tests/smoke_test.py` installs the same guard, and its runner fails
+a check that tried.
 
 A fake server on loopback works as before - `tests/fake_ollama.py`'s
 `FakeOllama` (127.0.0.1, 127.0.0.2 or ::1, on a port of its own), or any
@@ -106,11 +110,23 @@ When a test trips it:
 - **It builds a tab whose worker probes Ollama hosts** (Nodes,
   Connections): give it a stand-in dispatcher or stub its actions - see the
   `window` fixture in `tests/test_council_qt_foundation.py`. Wait for the
-  worker before the test ends, or it asks during the next test.
+  worker before the test ends, or it asks during the next test - and for
+  the workers its result starts: the Models tab's hardware probe, once
+  delivered, starts the model search (`_drain_tab_workers` there).
 - **It would download something**: stub the download (`urlopen`, and
   `huggingface_hub` - `model_downloader` tries it first when it is installed;
   see `test_model_downloader` in `smoke_test.py`).
 
+Each test starts with `council_core.local_models`' cache of Ollama's
+answers emptied: it caches a refused call too, as "not running" (5 to
+60 s), and a test that reached for the real Ollama inside that window asked
+nothing, was refused nothing, and passed.
+
 Not covered: children started with `-I`, `-E` or `-S`, or with an
 environment without `PYTHONPATH`, and programs that are not Python (`git`,
-`ssh`, `curl`, `ollama`) - no test starts one that goes online today.
+`ssh`, `curl`, `ollama`) - no test starts one that goes online today. The
+python ones are listed, though: with `COUNCIL_OFFLINE_LOG` set, every
+python child `subprocess.Popen` starts out of the guard's reach gets a line
+there - `a python child without the guard (started with -I): <command
+line>`, and the line that started it - which fails nothing, but shows which
+children only their own fences and code review vouch for.

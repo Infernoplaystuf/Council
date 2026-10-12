@@ -44,7 +44,14 @@ leave the machine.
 
 COUNCIL_OFFLINE_LOG=<file> records every refusal there too (pid, test, what,
 where), so a whole run can show the guard fired nowhere but in its own tests
-(tests/test_offline_guard.py, and the test_inner.py of the pytest it runs).
+(tests/test_offline_guard.py, and the test_inner*.py of the pytests it runs)
+- and it lists every python child started out of the guard's reach (-I, -E,
+-S, no tests/_offline on its PYTHONPATH), as a note that fails nothing.
+
+Each test starts with council_core.local_models' cache of Ollama's answers
+emptied (forget_cached_answers): a refusal cached as "Ollama is not
+running" would otherwise let the next test that reaches for it pass
+without asking.
 
 Imported by tests/conftest.py and inferno_local/tests/conftest.py, and by
 tests/smoke_test.py when it runs as a script (which loads no conftest).
