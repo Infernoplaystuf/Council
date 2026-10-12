@@ -18,6 +18,20 @@ from council_core import model_slots as ms
 LAPTOP = {"vram_gb": 8.0, "ram_gb": 31.7, "gpu_name": "RTX 4070 Laptop"}
 
 
+@pytest.fixture(autouse=True)
+def no_models_on_this_pc(monkeypatch):
+    """model_jobs.find marks the rows already on this PC, by asking
+    local_models.list_local_models - which scans the PC's model folders and
+    asks the localhost Ollama for its tags: the REAL one on a developer PC
+    (probe, 2026-10-12: test_find_passes_the_role_from_the_task reached
+    127.0.0.1:11434; the answer is cached for 5 s, so it is whichever test
+    finds first). Every test here starts with nothing installed; one that
+    needs installed models stubs its own (test_rows_already_on_this_pc_say_so)."""
+    from council_core import local_models
+    monkeypatch.setattr(local_models, "list_local_models",
+                        lambda *a, **k: [])
+
+
 # ============================================================
 # The catalog
 # ============================================================

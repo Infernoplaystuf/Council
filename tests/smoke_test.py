@@ -8145,6 +8145,16 @@ def test_model_downloader() -> None:
 
         prev_urlopen = _ureq.urlopen
         prev_host = md._HF_HOST
+        # download_gguf tries huggingface_hub FIRST when it is installed (it
+        # is, in the council env) - and hf_hub_download ignores `url`: it
+        # asked the REAL huggingface.co for repo/m.gguf (HTTPS to CloudFront,
+        # measured 2026-10-09 and 2026-10-12, under pytest and as a script)
+        # and only fell back to the urlopen below when that failed. Hidden
+        # here, so the stdlib streaming path this check is about is the one
+        # that runs, and nothing leaves the PC.
+        missing = object()
+        prev_hub = sys.modules.get("huggingface_hub", missing)
+        sys.modules["huggingface_hub"] = None      # import -> ImportError
         md._HF_HOST = "127.0.0.1"
         _ureq.urlopen = _fake_urlopen
         try:
@@ -8164,6 +8174,10 @@ def test_model_downloader() -> None:
         finally:
             _ureq.urlopen = prev_urlopen
             md._HF_HOST = prev_host
+            if prev_hub is missing:
+                sys.modules.pop("huggingface_hub", None)
+            else:
+                sys.modules["huggingface_hub"] = prev_hub
 
 
 def test_stats_cache_per_folder_csv_shards() -> None:

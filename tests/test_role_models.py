@@ -65,6 +65,17 @@ class Actions(RoleActions):
     def files(self):
         return ms.known_files([self.dir])
 
+    def models(self):
+        """This folder's GGUF files. RoleActions.models also scans the PC's
+        model folders and asks the localhost Ollama for its models - the
+        REAL one on a developer PC (probe, 2026-10-12: two tests here reached
+        127.0.0.1:11434 from the panel's scan worker)."""
+        from council_core import local_models
+        also = [self.main_path()] + [s.path for s in
+                                     self.config().slots.values()]
+        return local_models.list_local_models(dirs=[self.dir], also=also,
+                                              include_ollama=False)
+
     def free_vram(self):
         return self.free
 

@@ -678,6 +678,19 @@ def _worker_ui_violations(source: str):
     return offenders
 
 
+class _NoNodes:
+    """What council_engine.build_dispatcher hands the Nodes tab here: a
+    dispatcher with no hosts, so its probe asks no Ollama at all."""
+
+    hosts = ()
+
+    def invalidate(self, host=None):
+        pass
+
+    def probe_all(self):
+        return []
+
+
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
     """A window whose tabs build against a scratch vault, not the real one.
@@ -722,6 +735,21 @@ def window(qapp, tmp_path, monkeypatch):
     from council_qt.tabs.connections import ConnectionsActions
     monkeypatch.setattr(ConnectionsActions, "local_models", lambda self: [])
     monkeypatch.setattr(ConnectionsActions, "pi_nodes", lambda self: ([], []))
+    # The Models and Nodes tabs did the same, on workers, as they were built:
+    # the Models tab's hardware probe warms the installed-model list and its
+    # roles section lists the models (local_models.list_local_models, GET
+    # /api/tags), and the Nodes tab probes every host council_engine's
+    # dispatcher knows (GET /api/ps and /api/tags on 127.0.0.1:11434 and
+    # ::1). Probe of 2026-10-12: the Models tab's build, show and wired-name
+    # tests and the Nodes tab's caption test reached the real Ollama - which
+    # ones varied, as the answers are cached for 5-10 s. Both are stubbed: no
+    # models on this PC, and a dispatcher with no hosts. tests/offline_guard.py
+    # fails a test that reaches port 11434 again.
+    from council_core import local_models
+    monkeypatch.setattr(local_models, "list_local_models",
+                        lambda *a, **k: [])
+    monkeypatch.setattr("council_engine.build_dispatcher",
+                        lambda *a, **k: _NoNodes())
     before = _top_level_ids()
     win = CouncilWindow(theme="dark")
     win._harness_built = []                   # see _build_tab
