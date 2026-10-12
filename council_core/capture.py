@@ -38,7 +38,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import cameras
 
@@ -89,6 +89,12 @@ class Stats:
     #: Each one used up a frame number, so it is a gap in the saved files'
     #: numbers, and the frames CSV's `grab_failures` column says where.
     grab_failures: int = 0
+    #: Frames of a recording that STOPPED ON A FAILED WRITE (recording_
+    #: failed) and so were grabbed and NOT saved: the frame whose write
+    #: failed, those queued behind it, and every frame grabbed after it
+    #: until the app ended the recording (record_to). Not frozen at the
+    #: failure: a run that went on for a minute after it lost a minute.
+    unsaved: int = 0
 
     @property
     def grab_attempts(self) -> int:
@@ -113,12 +119,16 @@ class Stats:
             bits.append(f"{self.waiting} waiting to save")
         if self.skipped:
             bits.append(f"{self.skipped} NOT saved (storage too slow)")
+        if self.unsaved:
+            bits.append(f"{self.unsaved} NOT saved (recording stopped)")
         if self.camera_skipped:
             bits.append(f"{self.camera_skipped} lost by the camera/driver")
         if self.grab_failures:
             bits.append(f"{self.grab_failures} failed grab"
                         f"{'' if self.grab_failures == 1 else 's'}")
         if self.errors:
+            # Failed grabs are NOT among these (CaptureSession._loop): one
+            # failed grab once read "1 failed grab · 1 error(s)", as if two.
             bits.append(f"{self.errors} error(s)")
         return " · ".join(bits)
 
@@ -192,6 +202,9 @@ def write_image(image: Any, path: Path) -> None:
     lost half their frames this way, silently, when frames were written
     "wb" (docs/typhon_multicamera_design.md 2.6) — and a clash from any
     cause must fail loudly, as an unsaved frame, not replace one on disk.
+    And neither leaves HALF a frame: a write that fails part-way (a full
+    disk) removes the file that call created, so no PNG that cannot be
+    opened is left in the run for the slider to list.
     """
     import numpy as np
 
@@ -224,17 +237,8 @@ def write_image(image: Any, path: Path) -> None:
             # finish; given our handle it cannot. This file is the one this
             # call created a moment ago — nobody else's — so it goes, rather
             # than lie in the run as a frame that cannot be opened.
-            _discard_unfinished(path)
+            fast_png.discard_unfinished(path)
         raise
-
-
-def _discard_unfinished(path: Any) -> None:
-    """Remove a frame file THIS process just created exclusively and failed
-    to finish. Never called for a file that was already there."""
-    try:
-        os.remove(path)
-    except OSError:
-        pass
 
 
 def warm_imports() -> None:
@@ -335,10 +339,19 @@ INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
 #: reserves the run's name (reserve_run).
 INDEX_SUFFIX = "_frames.csv"
 
+#: A run's end record, "<run>_run_end.json": what only the end of a
+#: recording knows (Recorder.finish) — above all the failed grabs, which
+#: leave no row of their own, so those after the last saved frame were
+#: nowhere on disk.
+RUN_END_SUFFIX = "_run_end.json"
+RUN_END_FORMAT = "typhon-run-end"
+RUN_END_VERSION = 1
+
 #: The endings that put a run's name on a file in a capture folder. A run
 #: with any file of these there is taken, and so is a FOLDER of the run's
 #: name (a run of several cameras is a folder; the multi-camera design 2.6).
-RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json")
+RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json",
+               RUN_END_SUFFIX)
 
 #: How many names reserve_run tries (base, base_2, ...) before giving up.
 RESERVE_TRIES = 1000
@@ -366,9 +379,11 @@ def taken_runs(folder: Any) -> set:
     return names
 
 
-def reserve_run(folder: Any, base: str) -> str:
-    """RESERVE a run's name in `folder` and return it: `base`, or `base_2`,
-    `base_3`, ... when that one is taken.
+def claim_run(folder: Any, base: str) -> Tuple[str, Any]:
+    """RESERVE a run's name in `folder`: `base`, or `base_2`, `base_3`, ...
+    when that one is taken. Returns (the name, its frames CSV still OPEN for
+    appending, header written) — hand the handle to the run's Recorder
+    (run_recorder), which writes through it and closes it.
 
     Reserved, not just looked for. Looking at the folder was not enough:
     two Starts in one second — two windows saving into one folder — both
@@ -381,9 +396,15 @@ def reserve_run(folder: Any, base: str) -> str:
     and its header is written at once. A name whose file someone else
     created first is taken, and the next one is tried.
 
-    The Recorder then appends to that CSV and, finding it there, writes no
-    second header. Raises OSError when the folder cannot be made or written,
-    or no name is free after RESERVE_TRIES."""
+    KEPT OPEN, NOT CLOSED AND OPENED AGAIN. Closed here and reopened by the
+    recorder, the CSV was free in between for any program that opens a new
+    file without sharing for a moment (some antivirus, sync and indexing
+    programs do) — measured: Start then failed with "Permission denied"
+    after the live view had stopped. Held from creation to the run's end,
+    such a program cannot take it.
+
+    Raises OSError when the folder cannot be made or written, or no name is
+    free after RESERVE_TRIES."""
     where = Path(str(folder))
     where.mkdir(parents=True, exist_ok=True)
     taken = taken_runs(where)
@@ -391,15 +412,40 @@ def reserve_run(folder: Any, base: str) -> str:
     for n in range(2, RESERVE_TRIES + 2):
         if run not in taken:
             try:
-                with open(where / f"{run}{INDEX_SUFFIX}", "x", newline="",
-                          encoding="utf-8") as handle:
-                    csv.writer(handle).writerow(INDEX_COLUMNS)
-                return run
+                handle = open(where / f"{run}{INDEX_SUFFIX}", "x",
+                              newline="", encoding="utf-8")
             except FileExistsError:
-                pass                       # another window was first
+                handle = None              # another window was first
+            if handle is not None:
+                try:
+                    csv.writer(handle).writerow(INDEX_COLUMNS)
+                    handle.flush()         # line 1, before anything else
+                except BaseException:
+                    handle.close()
+                    raise
+                return run, handle
         run = f"{base}_{n}"
     raise OSError(f"no free run name in {where} after {RESERVE_TRIES} "
                   f"tries from {base}")
+
+
+def reserve_run(folder: Any, base: str) -> str:
+    """claim_run, with the CSV closed: the reserved name alone. A Recorder
+    for it appends to the CSV and writes no second header. Prefer claim_run
+    for a run about to be recorded (see KEPT OPEN there)."""
+    run, handle = claim_run(folder, base)
+    handle.close()
+    return run
+
+
+def run_recorder(folder: Any, run: str, claim: Any = None) -> "Recorder":
+    """The Recorder for the run `run` in `folder`: <run>_frame_NNNNNN.png,
+    one row each in <run>_frames.csv — through `claim`, the handle
+    claim_run kept open, when given — and <run>_run_end.json when the
+    recording ends (Recorder.finish)."""
+    return Recorder(folder, stem=f"{run}_frame",
+                    index_name=f"{run}{INDEX_SUFFIX}", index_handle=claim,
+                    end_name=f"{run}{RUN_END_SUFFIX}")
 
 
 class Recorder:
@@ -416,7 +462,9 @@ class Recorder:
     def __init__(self, out_dir: Any, stem: str = "frame",
                  writer: Optional[Callable[[Any, Path], None]] = None,
                  suffix: Optional[str] = None,
-                 index_name: Optional[str] = None):
+                 index_name: Optional[str] = None,
+                 index_handle: Any = None,
+                 end_name: Optional[str] = None):
         self.dir = Path(out_dir)
         self.stem = str(stem) or "frame"
         self.written = 0
@@ -432,10 +480,24 @@ class Recorder:
             self.dir / index_name if index_name else None)
         self._index_file: Any = None
         self._index_rows: Any = None
+        #: The index as claim_run left it, open with its header written:
+        #: written through, never closed and opened again (see claim_run).
+        self._claimed: Any = index_handle
+        #: The run's end record (finish), or None for none.
+        self.end_path: Optional[Path] = (
+            self.dir / end_name if end_name else None)
+        #: Why the end record was not written, or "".
+        self.end_note = ""
+        self._finished = False
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         warm_imports()
+        if self._claimed is not None and self._index_file is None:
+            # RESERVED AND STILL OPEN (claim_run): header and all, written
+            # through the handle that created it.
+            self._index_file, self._claimed = self._claimed, None
+            self._index_rows = csv.writer(self._index_file)
         if self.index_path is not None and self._index_file is None:
             # A RESERVED run's index is already there, header and all
             # (reserve_run): it is appended to, with no second header. One
@@ -495,14 +557,88 @@ class Recorder:
             except (OSError, ValueError):
                 pass
 
+    def finish(self, totals: Mapping[str, Any]) -> Optional[Path]:
+        """Write the run's END RECORD (`end_name`, format "typhon-run-end"),
+        once: FrameWriter calls it when the recording's last frame is on
+        disk — or its first failed write ended it — with its own counts
+        (FrameWriter.totals). Returns its path, or None for none.
+
+        WHY: a failed grab has no row of its own. The frames CSV's running
+        grab_failures shows one only on a LATER saved frame's row, so
+        failed grabs after the last saved frame — and the totals of grab
+        attempts and failures (docs/typhon_multicamera_design.md 3.7) — were
+        nowhere on disk once the window closed (measured: [ok, ok, ok, FAIL,
+        FAIL, FAIL] left a CSV reading 0, 0, 0).
+
+        WHAT IT SAYS (format "typhon-run-end", version 1)
+            run, index        the run's name and its frames CSV
+            written, at       when (local time, and seconds since 1970)
+            frames_saved      PNGs written, each with its row in `index`
+            frames_not_saved  storage_too_slow: skipped by the save queue;
+                              write_failed: the frame whose write failed
+                              and those queued behind it
+            grab_failures     failed grabs while recording (null for a
+                              camera that does not report them: an event
+                              camera, the simulated one)
+            grab_attempts     frames the recording was offered plus
+                              grab_failures (null likewise)
+            first_index, last_index   the first and last frame number the
+                              recording was offered or failed to grab
+            recording_failed  "" — or the write that ended the recording,
+                              naming its frame. The record is written when
+                              the recording ENDS, which for a failed write
+                              is that moment: frames the camera sent after
+                              it were not offered to the recording and are
+                              not counted here (the app's Stop line counts
+                              them "NOT saved (recording stopped)").
+
+        NEVER OVER ANYTHING: written whole to a temporary name and renamed
+        into a name that must not exist (camera_record.write_once). A record
+        that cannot be written is kept in `end_note`; the frames come first.
+        """
+        if self.end_path is None or self._finished:
+            return None
+        self._finished = True
+        name = self.end_path.name
+        run = (name[:-len(RUN_END_SUFFIX)] if name.endswith(RUN_END_SUFFIX)
+               else self.stem)
+        counted = totals.get("grab_failures")
+        doc = {
+            "format": RUN_END_FORMAT, "format_version": RUN_END_VERSION,
+            "run": run,
+            "written": time.strftime("%Y-%m-%d %H:%M:%S"), "at": time.time(),
+            "index": self.index_path.name if self.index_path else "",
+            "frames_saved": int(totals.get("frames_saved", 0) or 0),
+            "frames_not_saved": {
+                "storage_too_slow": int(totals.get("storage_too_slow", 0)
+                                        or 0),
+                "write_failed": int(totals.get("write_failed", 0) or 0)},
+            "grab_failures": None if counted is None else int(counted),
+            "grab_attempts": (None if counted is None else
+                              int(totals.get("offered", 0) or 0)
+                              + int(counted)),
+            "first_index": totals.get("first_index"),
+            "last_index": totals.get("last_index"),
+            "recording_failed": str(totals.get("recording_failed") or ""),
+        }
+        from . import camera_record
+        try:
+            return camera_record.write_once(self.end_path, doc)
+        except Exception as exc:                            # noqa: BLE001
+            self.end_note = f"{type(exc).__name__}: {exc}"
+            return None
+
     def close(self) -> None:
-        """Finish the index. Safe to call twice."""
+        """Finish the index. Safe to call twice — and for a run that never
+        recorded (a refused Start), which still holds claim_run's handle."""
         handle, self._index_file, self._index_rows = self._index_file, None, None
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
+        claimed, self._claimed = self._claimed, None
+        for each in (handle, claimed):
+            if each is not None:
+                try:
+                    each.close()
+                except OSError:
+                    pass
 
 
 def _physical_memory() -> int:
@@ -592,6 +728,14 @@ class FrameWriter:
     THE FIRST WRITE FAILURE STOPS IT, as before: a capture with holes that
     nothing reports is worse than one that ended. Frames already being written
     by the other writers still land and are counted; nothing new starts.
+    `failed` names the frame ("frame 20 not saved — FileExistsError: ..."),
+    and `lost` counts what the failure cost: that frame and those queued
+    behind it.
+
+    THE RECORDING'S OWN TOTALS. The session tells it of every failed grab
+    while it is the recording (note_failed_grab), and it counts every frame
+    it is offered; when the last frame is on disk it hands them to the
+    recorder's end record (Recorder.finish).
     """
 
     def __init__(self, recorder: Recorder,
@@ -602,6 +746,20 @@ class FrameWriter:
         self.written = 0
         self.skipped = 0
         self.failed = ""
+        #: Frames accepted and then NOT saved because a write failed: the
+        #: one whose write failed, those queued behind it, and any offered
+        #: after it. Stats.unsaved.
+        self.lost = 0
+        #: Failed grabs while this was the recording (note_failed_grab) —
+        #: the frames CSV's running grab_failures. Counted only for a
+        #: camera that reports them (set by CaptureSession.record_to).
+        self.grab_failures = 0
+        self.counts_grab_failures = False
+        #: Frames offered (submit), and the first and last frame number
+        #: offered or failed, for the end record.
+        self.offered = 0
+        self.first_index: Optional[int] = None
+        self.last_index: Optional[int] = None
         #: Every file written, in GRAB order — append-only, so a viewer can
         #: pick up new frames without rescanning a folder of thousands.
         self.paths: List[Path] = []
@@ -644,7 +802,13 @@ class FrameWriter:
         """Queue `frame` for saving. False if it will not be saved."""
         size = int(getattr(frame.image, "nbytes", 0) or 0)
         with self._cond:
-            if self.failed or self._closing:
+            if self._closing:
+                return False
+            self.offered += 1
+            self._saw_index(frame.index)
+            if self.failed:
+                # Offered between the failure and the session noticing it.
+                self.lost += 1
                 return False
             # One frame bigger than the whole budget is still accepted when
             # nothing is waiting — otherwise a large enough camera could never
@@ -657,6 +821,38 @@ class FrameWriter:
             self._queued_bytes += size
             self._cond.notify()
         return True
+
+    def note_failed_grab(self, index: Any = None) -> None:
+        """A grab came back failed while this was the recording
+        (cameras.GrabFailed; `index` the frame number it used up)."""
+        with self._cond:
+            self.grab_failures += 1
+            self._saw_index(index)
+
+    def _saw_index(self, index: Any) -> None:
+        """Called with the lock held."""
+        try:
+            number = int(index)
+        except (TypeError, ValueError):
+            return
+        if self.first_index is None:
+            self.first_index = number
+        self.last_index = number
+
+    def totals(self) -> Dict[str, Any]:
+        """This recording's counts, for its end record (Recorder.finish)."""
+        with self._cond:
+            return {
+                "frames_saved": self.written,
+                "storage_too_slow": self.skipped,
+                "write_failed": self.lost,
+                "offered": self.offered,
+                "grab_failures": (self.grab_failures
+                                  if self.counts_grab_failures else None),
+                "first_index": self.first_index,
+                "last_index": self.last_index,
+                "recording_failed": self.failed,
+            }
 
     def _run(self) -> None:
         while True:
@@ -680,12 +876,14 @@ class FrameWriter:
                 self.recorder.save(frame, path)
             except Exception as exc:                        # noqa: BLE001
                 path = None
-                error = f"{type(exc).__name__}: {exc}"
+                error = f"frame {frame.index} not saved — {_failure(exc)}"
             with self._cond:
                 self._inflight -= 1
                 self._finished[seq] = (_without_image(frame), path)
-                if error and not self.failed:
-                    self._fail(error)
+                if error:
+                    self.lost += 1
+                    if not self.failed:
+                        self._fail(error)
                 self._cond.notify_all()
             del frame                   # the image is saved; let it go
             self._publish()
@@ -696,7 +894,9 @@ class FrameWriter:
         """Stop taking frames. Called with the lock held."""
         self.failed = error
         # Frames still queued will never be written; mark them so the ones
-        # finished after them can still be published in order.
+        # finished after them can still be published in order — and count
+        # them, as grabbed and NOT saved.
+        self.lost += len(self._queue)
         for seq, frame in self._queue:
             self._finished[seq] = (None, None)
         self._queue.clear()
@@ -732,7 +932,9 @@ class FrameWriter:
                     # The PNG is on disk but its row could not be written:
                     # the index would have a hole nobody sees. Same rule as
                     # a failed write.
-                    error = error or f"{type(exc).__name__}: {exc}"
+                    error = error or (f"frame {stub.index}'s row in the "
+                                      f"frames CSV not written — "
+                                      f"{_failure(exc)}")
             flush = getattr(self.recorder, "flush_index", None)
             if callable(flush):
                 flush()
@@ -750,6 +952,14 @@ class FrameWriter:
             # were left for us, since only one writer publishes at a time.
 
     def _close_recorder(self) -> None:
+        """The last writer out: every frame is published (or the first
+        failed write ended the recording). The end record, then the index."""
+        finish = getattr(self.recorder, "finish", None)
+        if callable(finish):
+            try:
+                finish(self.totals())
+            except Exception:                               # noqa: BLE001
+                pass
         closer = getattr(self.recorder, "close", None)
         if callable(closer):
             try:
@@ -784,6 +994,18 @@ class FrameWriter:
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(left)
         return not self.alive
+
+
+def _failure(exc: BaseException) -> str:
+    """A failed write, short enough for a status line that is one row:
+    "FileExistsError: File exists (20261012_120000_frame_000020.png)" — the
+    file's NAME, not its whole path (the run's folder is known)."""
+    name = type(exc).__name__
+    if isinstance(exc, OSError) and exc.strerror:
+        where = (f" ({Path(str(exc.filename)).name})"
+                 if exc.filename else "")
+        return f"{name}: {exc.strerror}{where}"
+    return f"{name}: {exc}"
 
 
 def _without_image(frame: cameras.Frame) -> cameras.Frame:
@@ -830,12 +1052,10 @@ class CaptureSession:
         self._interval: Optional[float] = None
         #: The last frame time is the stream's start, not a frame's.
         self._from_start = False
-        #: Failed grabs since this session began (never reset), and how many
-        #: there were when the recording in progress began: the frames CSV's
-        #: grab_failures is the difference, so it counts that recording's
-        #: own — a recording can begin in a stream already running.
-        self._failed_grabs = 0
-        self._failed_grabs_before = 0
+        #: A recording that STOPPED ON A FAILED WRITE and that the app has
+        #: not ended yet (record_to): every frame grabbed meanwhile is a
+        #: frame of that run NOT saved (Stats.unsaved), not a preview frame.
+        self._broken: Optional[FrameWriter] = None
 
     # ------------------------------------------------------------------
     @property
@@ -899,6 +1119,7 @@ class CaptureSession:
             recorded=sum(w.written for w in writers),
             skipped=sum(w.skipped for w in writers),
             waiting=sum(w.pending for w in writers),
+            unsaved=base.unsaved + sum(w.lost for w in writers),
             recording_failed=base.recording_failed or failed)
 
     def record_to(self, recorder: Optional[Recorder],
@@ -921,27 +1142,39 @@ class CaptureSession:
         if recorder is not None:
             recorder.open()
             writer = FrameWriter(recorder)
+            # A 0 from a camera that cannot report failed grabs would claim
+            # a count nobody made: its CSV column and end record say nothing.
+            writer.counts_grab_failures = bool(
+                getattr(self.device, "counts_grab_failures", False))
         with self._lock:
             # The grab loop records and counts each frame under this lock,
             # so it sees either the old writer and old counts or the new.
             if reset:
                 self._reset_locked()
             old = self.writer
+            broken, self._broken = self._broken, None
             if writer is not None:
                 self._writers.append(writer)
                 self.writer = writer
                 self._ended_stats = None
-                self._failed_grabs_before = self._failed_grabs
             else:
                 self.writer = None
-                if old is not None:
+                if old is not None or broken is not None:
                     # Frozen HERE: a camera that keeps streaming after the
                     # recording (an EVK4) would otherwise count frames
-                    # grabbed after Stop as grabbed-and-not-saved.
+                    # grabbed after Stop as grabbed-and-not-saved. A
+                    # recording that stopped on a failed write is frozen
+                    # here too, NOT at the failure: the frames grabbed in
+                    # between are the run's, and were not saved.
                     self._ended_stats = self.stats()
             self.recorder = recorder
         if old is not None:
             finished = old.close(drain_timeout)
+        if broken is not None and broken is not old:
+            # Its failed write already stopped its threads; wait for the
+            # last one to write the end record and close the CSV, so the
+            # run is whole on disk when the app's Stop returns.
+            finished = broken.close(drain_timeout) and finished
         return finished
 
     def run_stats(self) -> Stats:
@@ -954,6 +1187,7 @@ class CaptureSession:
             return live
         return replace(frozen, recorded=live.recorded, skipped=live.skipped,
                        waiting=live.waiting,
+                       unsaved=max(frozen.unsaved, live.unsaved),
                        recording_failed=live.recording_failed)
 
     def flush(self, timeout: Optional[float] = None) -> bool:
@@ -1042,10 +1276,14 @@ class CaptureSession:
                 misses += 1
                 if isinstance(exc, cameras.GrabFailed):
                     # An exposure that never arrived: counted on its own,
-                    # with its place in the run (Stats.grab_failures, and the
-                    # frames CSV), not only among errors of every kind.
-                    self._count_failed_grab()
-                self._note_error(str(exc))
+                    # with its place in the run (Stats.grab_failures, the
+                    # frames CSV, the end record) — and ONLY there, not
+                    # among errors too: "3 failed grabs · 3 error(s)" read
+                    # as six faults (measured). Still the last error said.
+                    self._count_failed_grab(exc)
+                    self._note_error(str(exc), count=False)
+                else:
+                    self._note_error(str(exc))
                 if misses >= MAX_CONSECUTIVE_ERRORS:
                     self._note_error(
                         f"giving up after {misses} failed reads in a row: "
@@ -1086,6 +1324,12 @@ class CaptureSession:
         """Hand `frame` to the writer. Never touches the disk itself."""
         writer = self.writer
         if writer is None:
+            if self._broken is not None:
+                # A frame of a run whose recording stopped on a failed write
+                # and that the app has not ended: grabbed, NOT saved.
+                with self._lock:
+                    self._stats = replace(self._stats,
+                                          unsaved=self._stats.unsaved + 1)
             return False
         if writer.failed:
             # Recording STOPS on the first failure. Carrying on would leave a
@@ -1094,30 +1338,36 @@ class CaptureSession:
             said = writer.failed
             self.writer = None
             self.recorder = None
+            # NOT frozen here (record_to freezes it when the app ends the
+            # recording): until then every frame grabbed is the run's and
+            # is counted NOT saved — this one first. Frozen here, a Stop a
+            # minute later said "20 grabbed" for a run that grabbed 1,800
+            # (measured: 20 for 62), and nothing said the rest were lost.
+            self._broken = writer
             with self._lock:
                 self._stats = replace(self._stats, recording_failed=said,
                                       last_error=f"recording stopped: {said}",
-                                      errors=self._stats.errors + 1)
-                # The recording ended here, not at Stop: freeze its counts,
-                # or a camera that keeps streaming (an EVK4) would count
-                # every later frame as grabbed-and-not-saved.
-                self._ended_stats = self.stats()
+                                      errors=self._stats.errors + 1,
+                                      unsaved=self._stats.unsaved + 1)
             return False
-        if getattr(self.device, "counts_grab_failures", False):
-            # The running count goes on the frame's CSV row. Only for a
-            # camera that reports failed grabs: a 0 from one that cannot
-            # would claim a count nobody made.
+        if writer.counts_grab_failures:
+            # The running count goes on the frame's CSV row: this
+            # recording's own failed grabs so far (a recording can begin in
+            # a stream already running). Only for a camera that reports
+            # failed grabs: a 0 from one that cannot would claim a count
+            # nobody made.
             meta = frame.meta if frame.meta is not None else {}
-            meta["grab_failures"] = (self._failed_grabs
-                                     - self._failed_grabs_before)
+            meta["grab_failures"] = writer.grab_failures
             frame.meta = meta
         return writer.submit(frame)
 
-    def _count_failed_grab(self) -> None:
+    def _count_failed_grab(self, exc: Any = None) -> None:
         with self._lock:
-            self._failed_grabs += 1
             self._stats = replace(
                 self._stats, grab_failures=self._stats.grab_failures + 1)
+            writer = self.writer
+            if writer is not None and not writer.failed:
+                writer.note_failed_grab(getattr(exc, "index", None))
 
     def _rate(self) -> float:
         """Frames per second over the last `RATE_WINDOW` seconds.
@@ -1136,9 +1386,12 @@ class CaptureSession:
         span = self._marks[-1] - self._marks[0]
         return (len(self._marks) - 1) / span if span > 0 else 0.0
 
-    def _note_error(self, said: str) -> None:
+    def _note_error(self, said: str, count: bool = True) -> None:
+        """`said` is the last error; `count` adds it to `errors` (not for a
+        failed grab, which is counted in grab_failures alone)."""
         with self._lock:
-            self._stats = replace(self._stats, errors=self._stats.errors + 1,
-                                  last_error=said)
+            self._stats = replace(
+                self._stats, errors=self._stats.errors + (1 if count else 0),
+                last_error=said)
         if self.on_stats is not None:
             self.on_stats(self.stats())

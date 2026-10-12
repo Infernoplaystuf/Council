@@ -517,3 +517,284 @@ def test_the_readers_take_the_new_column_and_the_gaps(tmp_path):
     assert [capture_review.run_of(p) for p in listed] == [SAME_SECOND] * 4
     assert [n[-10:-4] for n in listed] == [
         "000001", "000002", "000004", "000005"]
+
+
+# ======================================================================
+# The M0 review: a stopped recording is said, totals are kept, no window
+# between reserving a run and writing it, no half PNG
+# ======================================================================
+def clash_ahead(folder, run, session, ahead=8):
+    """Put a file where frame `grabbed + ahead` of `run` will be saved —
+    created exclusively, so it can never replace a frame already saved —
+    and return (its frame number, its path)."""
+    index = session.stats().grabbed + ahead
+    clash = Path(folder) / f"{run}_frame_{index:06d}.png"
+    with open(clash, "xb") as handle:
+        handle.write(PRECIOUS)
+    return index, clash
+
+
+def test_frames_after_a_failed_write_are_counted_not_saved(tmp_path):
+    """The first failed write stops the recording (FrameWriter). The frame
+    that failed and every frame grabbed after it, until the recording is
+    ended, were grabbed and NOT saved — and the numbers say so, instead of
+    freezing at the failure and leaving those frames out of the count."""
+    (tmp_path / "run_frame_000002.png").write_bytes(PRECIOUS)
+    session = capture.CaptureSession(cameras.Device())
+    session.record_to(capture.Recorder(tmp_path, stem="run_frame",
+                                       index_name="run_frames.csv"))
+    for i in range(1, 6):
+        session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8),
+                                    index=i))
+        session.flush(5)
+    live = session.stats()
+    assert (live.grabbed, live.recorded) == (5, 1), live
+    assert "4 NOT saved (recording stopped)" in live.line(), live.line()
+    assert "frame 2" in live.recording_failed, live.recording_failed
+    session.record_to(None)                  # the app ends the recording
+    session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=6))
+    ended = session.run_stats()              # frame 6 is not the run's
+    assert (ended.grabbed, ended.recorded) == (5, 1), ended
+    assert "4 NOT saved (recording stopped)" in ended.line(), ended.line()
+
+
+def test_typhon_says_a_stopped_recording_until_stop_and_at_stop(
+        tmp_path, typhon):
+    """Measured on the build: after a clash at frame 20 the live line said
+    only '1 error(s)', the run still said it was capturing, and the Stop
+    line said '20 grabbed' for a run that grabbed 62 — every frame after
+    the failure dropped from the count."""
+    typhon.connect(simulated_row())
+    out = typhon.start(str(tmp_path))
+    session = typhon._LIVE.session
+    at, clash = clash_ahead(tmp_path, out["run"], session)
+    wait_for(lambda: session.stats().grabbed > at + 4, 15)
+    said = []
+    typhon.pump(lambda image: None, said.append)
+    live = said[-1]
+    assert live.startswith("RECORDING STOPPED"), live
+    assert f"frame {at}" in live and "FileExistsError" in live, live
+    assert "press Stop" in live, live
+    stopped = typhon.stop()["summary"]
+    stats = session.run_stats()
+    assert stopped.startswith("Stopped — RECORDING HAD STOPPED"), stopped
+    assert f"frame {at}" in stopped and "FileExistsError" in stopped, stopped
+    not_saved = stats.grabbed - stats.recorded
+    assert not_saved > 4, stats
+    assert f"{not_saved} NOT saved (recording stopped)" in stopped, stopped
+    typhon.disconnect()
+    assert clash.read_bytes() == PRECIOUS, "a frame on disk was replaced"
+
+
+def test_a_failed_grab_is_counted_once_not_also_as_an_error():
+    """Measured on the build: 3 failed grabs and nothing else printed
+    '3 failed grabs · 3 error(s)' — one fault read as six."""
+    capture.warm_imports()
+    device = basler_with([True, False, False, False, True])
+    session = capture.CaptureSession(device, timeout_ms=5)
+    session.start()
+    wait_for(lambda: session.stats().grabbed == 2)
+    session.stop()
+    stats = session.stats()
+    assert stats.grab_failures == 3, stats
+    assert stats.errors == 0, stats
+    assert "failed" in stats.last_error, stats    # still said
+    assert stats.line().endswith("· 3 failed grabs"), stats.line()
+
+
+def read_end(folder, run):
+    path = Path(folder) / f"{run}_run_end.json"
+    assert path.exists(), f"no end record: {sorted(os.listdir(folder))}"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_failed_grabs_after_the_last_saved_frame_are_in_the_end_record(
+        tmp_path):
+    """Measured on the build: [ok, ok, ok, FAIL, FAIL, FAIL] left 3 PNGs
+    and a CSV whose grab_failures read 0, 0, 0 — the three failed exposures
+    were nowhere on disk once the window closed."""
+    capture.warm_imports()
+    device = basler_with([True, True, True, False, False, False])
+    device.prepare(recording=True)
+    run, claim = capture.claim_run(tmp_path, SAME_SECOND)
+    session = capture.CaptureSession(device, timeout_ms=5)
+    session.record_to(capture.run_recorder(tmp_path, run, claim), reset=True)
+    session.start()
+    wait_for(lambda: session.stats().grab_failures == 3)
+    session.stop()
+    session.record_to(None)
+    end = read_end(tmp_path, run)
+    assert end["format"] == "typhon-run-end" and end["run"] == run, end
+    assert (end["frames_saved"], end["grab_failures"],
+            end["grab_attempts"]) == (3, 3, 6), end
+    assert (end["first_index"], end["last_index"]) == (1, 6), end
+    assert end["frames_not_saved"] == {"storage_too_slow": 0,
+                                       "write_failed": 0}, end
+    assert end["recording_failed"] == "", end
+
+
+def test_a_recording_ended_by_a_failed_write_says_so_in_its_end_record(
+        tmp_path):
+    run = capture.reserve_run(tmp_path, SAME_SECOND)
+    (tmp_path / f"{run}_frame_000002.png").write_bytes(PRECIOUS)
+    session = capture.CaptureSession(cameras.Device())
+    session.record_to(capture.run_recorder(tmp_path, run))
+    for i in (1, 2, 3):
+        session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8),
+                                    index=i))
+        session.flush(5)
+    session.record_to(None)
+    end = read_end(tmp_path, run)
+    assert end["frames_saved"] == 1, end
+    assert end["frames_not_saved"]["write_failed"] == 1, end
+    assert end["recording_failed"].startswith("frame 2 not saved"), end
+    assert "FileExistsError" in end["recording_failed"], end
+    assert (tmp_path / f"{run}_frame_000002.png").read_bytes() == PRECIOUS
+
+
+def test_typhon_writes_the_end_record_once_the_run_is_saved(tmp_path, typhon):
+    typhon.connect(simulated_row())
+    out = typhon.start(str(tmp_path))
+    session = typhon._LIVE.session
+    wait_for(lambda: session.stats().grabbed >= 5)
+    typhon.stop()
+    typhon.disconnect()                     # waits for every queued frame
+    end = read_end(tmp_path, out["run"])
+    pngs = list(tmp_path.glob(f"{out['run']}_frame_*.png"))
+    assert end["frames_saved"] == len(pngs) == session.stats().recorded
+    # The simulated camera reports no failed grabs: not a claimed 0.
+    assert end["grab_failures"] is None and end["grab_attempts"] is None
+
+
+def test_the_end_record_is_never_written_over(tmp_path):
+    run = capture.reserve_run(tmp_path, SAME_SECOND)
+    earlier = tmp_path / f"{run}_run_end.json"
+    earlier.write_bytes(PRECIOUS)
+    session = capture.CaptureSession(cameras.Device())
+    session.record_to(capture.run_recorder(tmp_path, run))
+    session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=1))
+    session.record_to(None)
+    assert earlier.read_bytes() == PRECIOUS
+    assert len(list(tmp_path.glob("*.png"))) == 1
+
+
+def test_a_refused_recording_leaves_the_live_view_running(
+        tmp_path, typhon, monkeypatch):
+    """Everything that can refuse is checked BEFORE the live view stops —
+    the recorder too. On the build it opened after the preview had
+    stopped, so a refusal there left the picture dead."""
+    typhon.connect(simulated_row())
+    session = typhon._LIVE.session
+    session.start()
+    typhon._LIVE.previewing = True
+    wait_for(lambda: session.stats().grabbed >= 2)
+
+    def refuses(self):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(capture.Recorder, "open", refuses)
+    with pytest.raises(RuntimeError, match="cannot save frames"):
+        typhon.start(str(tmp_path))
+    assert session.running, "the refused Start stopped the live view"
+    assert not typhon._LIVE.capturing
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing")
+def test_a_program_that_takes_the_new_csv_cannot_refuse_start(
+        tmp_path, typhon, monkeypatch):
+    """Some antivirus, sync and indexing programs open a new file without
+    sharing for a moment. On the build the run's CSV was created, CLOSED,
+    and opened again by the recorder — and a program that took it in
+    between made Start fail with 'Permission denied' after the live view
+    had stopped. The reservation's own handle is now the recorder's."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = wintypes.HANDLE(-1).value
+    took = []
+    real_open = capture.Recorder.open
+
+    def open_after_a_scanner(self):
+        held = []
+        path = self.index_path
+        if path is not None and path.exists():
+            # GENERIC_READ, share nothing, OPEN_EXISTING
+            handle = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0,
+                                     None)
+            if handle and handle != invalid:
+                held.append(handle)
+                took.append(path.name)
+        try:
+            return real_open(self)
+        finally:
+            for handle in held:
+                k32.CloseHandle(handle)
+
+    monkeypatch.setattr(capture.Recorder, "open", open_after_a_scanner)
+    typhon.connect(simulated_row())
+    out = typhon.start(str(tmp_path))
+    session = typhon._LIVE.session
+    wait_for(lambda: session.stats().recorded >= 3)
+    typhon.stop()
+    typhon.disconnect()
+    assert not took, f"another program took the reserved CSV: {took}"
+    assert_run_is_whole(tmp_path, out["run"], session.stats().recorded)
+
+
+class FullDisk:
+    """A file that takes `room` bytes and then reports a full disk."""
+
+    def __init__(self, real, room):
+        self.real, self.room = real, room
+
+    def write(self, data):
+        data = bytes(data)
+        if self.room <= 0:
+            raise OSError(28, "There is not enough space on the disk")
+        n = min(len(data), self.room)
+        self.real.write(data[:n])
+        self.room -= n
+        return n
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.real.close()
+        return False
+
+
+def test_a_failed_fast_png_write_leaves_no_half_file(tmp_path, monkeypatch):
+    """Measured on the build: a full disk part-way through a frame left a
+    100-byte PNG nobody can open (the slider lists it), on the path nearly
+    every frame takes; the Pillow fallback already removed its own."""
+    import builtins
+
+    def full_open(path, mode="r", *args, **kwargs):
+        real = builtins.open(path, mode, *args, **kwargs)
+        return FullDisk(real, 100) if "b" in mode else real
+
+    monkeypatch.setattr(fast_png, "open", full_open, raising=False)
+    image = (np.arange(64 * 64, dtype=np.uint16).reshape(64, 64) % 4096)
+    path = tmp_path / "f.png"
+    with pytest.raises(OSError) as raised:
+        fast_png.write_png(image, path)
+    assert raised.value.errno == 28
+    assert not path.exists(), "a cut-short PNG was left in the run"
+
+
+def test_a_clash_never_removes_the_file_that_was_there(tmp_path):
+    """The clean-up is for a file THIS call created: a frame already on
+    disk is left exactly as it was."""
+    path = tmp_path / "f.png"
+    path.write_bytes(PRECIOUS)
+    for write in (fast_png.write_png, capture.write_image):
+        with pytest.raises(FileExistsError):
+            write(np.zeros((4, 4), np.uint8), path)
+        assert path.read_bytes() == PRECIOUS

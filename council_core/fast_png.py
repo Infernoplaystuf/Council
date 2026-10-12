@@ -43,6 +43,7 @@ TypeError, so a caller can fall back to a general encoder.
 """
 from __future__ import annotations
 
+import os
 import struct
 import threading
 import zlib
@@ -206,8 +207,8 @@ def write_png(image: np.ndarray, path: Any, compress: Any = "auto") -> int:
 
     TypeError for an image this writer does not take (see the module notes),
     raised BEFORE the file is opened, so the caller can fall back to a
-    general encoder. Writes `path` directly: a caller that must never leave a
-    partial file writes to a temporary name and renames.
+    general encoder. Writes `path` directly, not by renaming a temporary
+    file: one frame is one write.
 
     NEVER OVER ANYTHING: `path` is created with exclusive creation ("xb"),
     so a file already there raises FileExistsError and is left exactly as it
@@ -215,10 +216,32 @@ def write_png(image: np.ndarray, path: Any, compress: Any = "auto") -> int:
     other's frames silently (measured: half the frames reported saved were
     on disk; docs/typhon_multicamera_design.md 2.6). A clash from any cause
     now fails loudly, as a frame not saved.
+
+    NO HALF FRAME LEFT BEHIND: a write that fails part-way (a full disk)
+    removes the file THIS call created a moment before — never one that was
+    already there, which the exclusive creation refused to open — rather
+    than leave a PNG that cannot be opened in the run, where the slider
+    lists it (measured before: a 100-byte file of an 8 KB frame). The
+    Pillow fallback (capture.write_image) does the same.
     """
     data = encode_into(image, compress)
-    with open(Path(path), "xb", buffering=0) as f:
-        written = 0
-        while written < len(data):
-            written += f.write(data[written:])
+    target = Path(path)
+    handle = open(target, "xb", buffering=0)
+    try:
+        with handle as f:
+            written = 0
+            while written < len(data):
+                written += f.write(data[written:])
+    except BaseException:
+        discard_unfinished(target)
+        raise
     return written
+
+
+def discard_unfinished(path: Any) -> None:
+    """Remove a frame file THIS process just created exclusively and failed
+    to finish. Never called for a file that was already there."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass

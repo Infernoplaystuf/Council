@@ -5,6 +5,7 @@ Everything here runs offscreen. No window is ever shown.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -393,6 +394,11 @@ def test_each_recording_is_a_run_of_its_own(tab, tmp_path):
     assert len(runs) == 2 and "" not in runs, runs
     for run in runs:
         assert (tmp_path / f"{run}_frames.csv").exists()
+        # ... and its end record, as a Typhon run has (capture.run_recorder)
+        end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+            encoding="utf-8"))
+        pngs = list(tmp_path.glob(f"{run}_frame_*.png"))
+        assert end["run"] == run and end["frames_saved"] == len(pngs), end
 
 
 def test_declining_the_folder_does_not_start_recording(tab):

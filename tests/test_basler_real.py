@@ -232,6 +232,44 @@ def test_two_emulated_baslers_in_one_folder_in_one_second_lose_nothing(
         assert {r["grab_failures"] for r in rows} == {"0"}
 
 
+def test_an_emulated_basler_run_ends_with_its_grab_totals(tmp_path):
+    """The M0 review: a run's grab attempts and failures are written when
+    it ends (<run>_run_end.json), with real pypylon — through the reserved
+    CSV kept open from Start (capture.claim_run), as Typhon records."""
+    import json
+
+    backend = cameras.BaslerBackend()
+    found = [c for c in backend.discover() if "Emulation" in (c.model or "")]
+    if not found:
+        pytest.skip("needs an emulated camera (PYLON_CAMEMU)")
+    capture.warm_imports()
+    dev = backend.open(found[0])
+    try:
+        dev._cam.PixelFormat.SetValue("Mono8")
+        dev.prepare(True)
+        run, claim = capture.claim_run(tmp_path, "20261012_120000")
+        session = capture.CaptureSession(dev)
+        session.record_to(capture.run_recorder(tmp_path, run, claim),
+                          reset=True)
+        session.start()
+        time.sleep(0.8)
+        session.stop()
+        session.record_to(None)
+        stats = session.run_stats()
+    finally:
+        dev.close()
+    end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+    pngs = list(tmp_path.glob(f"{run}_frame_*.png"))
+    assert stats.recorded >= 5 and end["frames_saved"] == len(pngs) \
+        == stats.recorded, (end, stats)
+    assert end["grab_failures"] == stats.grab_failures == 0, end
+    assert end["grab_attempts"] == (stats.recorded
+                                    + end["frames_not_saved"]
+                                    ["storage_too_slow"]), end
+    assert end["first_index"] == 1 and end["recording_failed"] == "", end
+
+
 # ======================================================================
 # Settings (council_core.camera_settings) on the emulator's node map
 # ======================================================================
