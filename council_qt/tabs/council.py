@@ -65,20 +65,26 @@ the Tk shell calls too: the files the user names, vault and value matches, the
 analyst's computed answer (given straight back when it is a direct one, with
 no model asked), all in front of the question for the Writer on the default
 build and for every role in the full council. The judge routes on what was
-typed. The files behind an answer are chips under the transcript.
+typed. The files behind an answer are chips under the transcript; a click
+shows the file read-only in the app, with a button to show it in the file
+manager.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QPlainTextEdit, QPushButton, QSplitter,
-                               QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
+                               QFrame, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QPushButton,
+                               QSplitter, QTabWidget, QTextEdit, QVBoxLayout,
+                               QWidget)
 
 from council_core import council_options
 from council_core import council_turn
@@ -127,6 +133,89 @@ NOT_AVAILABLE = "{what} — not available in this build yet."
 #: markers name a role ("▶ Writer — drafting answer") or a stage ("▶ Round
 #: 1/2 — …"); only the first kind is an active personality.
 _SPEAKERS = frozenset(council_turn.AGENT_NAMES.values()) | {"Judge"}
+
+
+def reveal_command(path, platform: str = sys.platform
+                   ) -> Union[str, List[str]]:
+    """The command that shows ``path`` in the file manager: selected in
+    Explorer and Finder, its folder elsewhere (the Tk console's
+    _reveal_file). Explorer reads its /select argument itself, so on
+    Windows it is one string, as Tk runs it."""
+    path = Path(path)
+    if platform == "win32":
+        return f'explorer /select,"{path}"'
+    if platform == "darwin":
+        return ["open", "-R", str(path)]
+    return ["xdg-open", str(path.parent)]
+
+
+def reveal_in_file_manager(path) -> None:
+    """Show ``path`` in the file manager. Opens nothing, writes nothing.
+    Not on an offscreen run: there is no screen there for it, and the file
+    manager would open on the desktop of whoever runs it."""
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+        print(f"[reveal] offscreen: not opening the file manager for {path}")
+        return
+    subprocess.Popen(reveal_command(path))      # noqa: S603 — a file path
+
+
+class SourcePreview(QDialog):
+    """A file behind an answer, shown READ-ONLY inside the app: its first
+    rows and its columns, read with no model (turn_context._data_preview_text
+    — the Tk console's _preview_data_file), and a button that shows it in
+    the file manager. Nothing here writes to the file."""
+
+    def __init__(self, parent=None, reveal: Optional[Callable] = None):
+        super().__init__(parent)
+        self.path: Optional[Path] = None
+        self._reveal = reveal
+        self.resize(900, 600)
+        layout = QVBoxLayout(self)
+        self.info = QLabel("")
+        self.info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.info)
+        tabs = QTabWidget()
+        self.rows = QPlainTextEdit()
+        self.schema = QPlainTextEdit()
+        for label, view in (("First rows", self.rows),
+                            ("Columns", self.schema)):
+            view.setReadOnly(True)
+            view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            tabs.addTab(view, label)
+        layout.addWidget(tabs, 1)
+        buttons = QHBoxLayout()
+        self.reveal_button = QPushButton("Show in folder")
+        self.reveal_button.setToolTip("Show this file in the file manager.")
+        self.reveal_button.clicked.connect(self.on_reveal)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons.addWidget(self.reveal_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+    def show_file(self, path: Path) -> None:
+        from council_core import turn_context
+        self.path = Path(path)
+        try:
+            schema, rows = turn_context._data_preview_text(self.path)
+        except Exception as exc:                          # noqa: BLE001
+            schema, rows = (f"The preview failed: {exc}", "")
+        try:
+            size = f"{self.path.stat().st_size:,} bytes"
+        except OSError:
+            size = "size unknown"
+        self.setWindowTitle(f"Preview: {self.path.name} (read-only)")
+        self.info.setText(f"{self.path}  ·  {size}")
+        self.rows.setPlainText(rows or "(empty)")
+        self.schema.setPlainText(schema or "(empty)")
+        self.show()
+        self.raise_()
+
+    def on_reveal(self) -> None:
+        if self.path is not None and self._reveal is not None:
+            self._reveal(self.path)
 
 
 def _notice_sink(on_event, on_notice):
@@ -594,19 +683,37 @@ class CouncilTab(ViewHelpers, QWidget):
     MAX_CHIPS = 12
 
     def _sources_bar(self) -> QWidget:
-        """The files behind the last answer, one chip each — click to open
-        the folder that holds it. Hidden while there are none, so an answer
-        that used no file looks like one."""
+        """The files behind the last answer, one chip each — click to see
+        the file, read-only, in the app (preview_source), with a button that
+        shows it in the file manager. Hidden while there are none, so an
+        answer that used no file looks like one."""
         self.sources_frame = QFrame()
         self._sources_row = QHBoxLayout(self.sources_frame)
         self._sources_row.setContentsMargins(0, 2, 0, 2)
         self.sources_frame.hide()
         self.source_chips: List[QPushButton] = []
-        #: Opens a chip's folder. Replaced in tests (the desktop is not
-        #: theirs to open).
-        self.open_source = lambda path: QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(Path(path).parent)))
+        #: What a chip click does with its path.
+        self.open_source = self.preview_source
+        #: Shows a file in the file manager ("Show in folder"). Replaced in
+        #: tests: the desktop is not theirs to open.
+        self.reveal_source = reveal_in_file_manager
+        #: The one preview window, reused (built on the first click).
+        self.source_preview: Optional[SourcePreview] = None
         return self.sources_frame
+
+    def preview_source(self, path) -> None:
+        """Show a file behind the answer, read-only, in the app. A file that
+        has moved or gone since is said in the transcript instead."""
+        path = Path(path)
+        if not path.is_file():
+            self.append("Council", f"{path.name} is no longer there "
+                                   f"({path.parent}).", "observation",
+                        keep=False)
+            return
+        if self.source_preview is None:
+            self.source_preview = SourcePreview(
+                self, reveal=lambda p: self.reveal_source(p))
+        self.source_preview.show_file(path)
 
     def show_sources(self, paths) -> None:
         """Chips for ``paths`` under the transcript, replacing the last
@@ -622,7 +729,7 @@ class CouncilTab(ViewHelpers, QWidget):
             chip = QPushButton(f"📄 {path.name}")
             chip.setFlat(True)
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            chip.setToolTip(f"{path}\nClick to open the folder it is in.")
+            chip.setToolTip(f"{path}\nClick to preview it here (read-only).")
             chip.clicked.connect(lambda _=False, p=path: self.open_source(p))
             self._sources_row.addWidget(chip)
             self.source_chips.append(chip)

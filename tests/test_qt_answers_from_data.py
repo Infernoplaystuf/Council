@@ -80,7 +80,9 @@ def engine(tmp_path, monkeypatch):
     local_models.invalidate_cache()
 
 
-def _council(vault, *, demo_mode=True):
+def _council(vault, *, demo_mode=True, stub_open=True):
+    """The real tab. ``stub_open``: a chip click is recorded instead of
+    shown (most tests only need to know which file a chip names)."""
     from council_qt.tabs.council import CouncilActions, CouncilTab
     from council_qt.window import CouncilWindow
     window = CouncilWindow()
@@ -88,7 +90,10 @@ def _council(vault, *, demo_mode=True):
                                                      demo_mode=demo_mode),
                       demo_mode=demo_mode)
     opened = []
-    view.open_source = opened.append
+    if stub_open:
+        view.open_source = opened.append
+    # Never the real file manager: the desktop is not the test's to open.
+    view.reveal_source = opened.append
     return window, view, opened
 
 
@@ -142,6 +147,62 @@ def test_the_default_build_answers_with_the_file_in_front_of_it(qapp,
         "pumps.csv"]
     assert rows[0]["text"] == "Summarize pumps.csv", (
         "the conversation keeps what was TYPED, not the vault context")
+
+
+def test_a_chip_opens_the_file_read_only_in_the_app(qapp, engine):
+    """A click shows the file in a preview inside the app — its first rows
+    and its columns, read-only (Tk's _preview_data_file) — with a "Show in
+    folder" button. Before, a click opened the folder in the file manager
+    and nothing was shown in the app. Nothing is written to the file."""
+    window, view, revealed = _council(engine.vault, stub_open=False)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        source = engine.vault / "data_in" / "pumps.csv"
+        before = (source.read_bytes(), source.stat().st_mtime_ns)
+        assert "preview" in view.source_chips[0].toolTip().lower()
+        view.source_chips[0].click()
+        qapp.processEvents()
+        preview = view.source_preview
+        assert preview is not None and preview.isVisible()
+        assert "pumps.csv" in preview.windowTitle()
+        assert FACT in preview.rows.toPlainText()
+        assert "pressure_bar" in preview.schema.toPlainText()
+        assert preview.rows.isReadOnly() and preview.schema.isReadOnly()
+        assert not revealed, "the file manager was opened without a click"
+        preview.reveal_button.click()
+        assert [Path(p).name for p in revealed] == ["pumps.csv"]
+        preview.close()
+        assert (source.read_bytes(), source.stat().st_mtime_ns) == before
+    finally:
+        _close(qapp, window, view)
+
+
+def test_a_chip_for_a_file_that_has_gone_says_so(qapp, engine):
+    window, view, _revealed = _council(engine.vault, stub_open=False)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        source = engine.vault / "data_in" / "pumps.csv"
+        source.rename(source.with_name("pumps_moved.csv"))
+        view.source_chips[0].click()
+        qapp.processEvents()
+        assert "pumps.csv is no longer there" in view.transcript.toPlainText()
+        preview = view.source_preview
+        assert preview is None or not preview.isVisible()
+    finally:
+        _close(qapp, window, view)
+
+
+def test_show_in_folder_selects_the_file(tmp_path):
+    """The command "Show in folder" runs on each platform (never run here):
+    the file selected in Explorer and Finder, its folder elsewhere."""
+    from council_qt.tabs import council
+    path = tmp_path / "a folder" / "pumps.csv"
+    assert council.reveal_command(path, "win32") == (
+        f'explorer /select,"{path}"')
+    assert council.reveal_command(path, "darwin") == ["open", "-R",
+                                                      str(path)]
+    assert council.reveal_command(path, "linux") == ["xdg-open",
+                                                     str(path.parent)]
 
 
 def test_a_value_question_finds_the_file_without_being_told(qapp, engine):
