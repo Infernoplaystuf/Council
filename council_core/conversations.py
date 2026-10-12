@@ -514,12 +514,7 @@ class Conversation:
         question also goes into History. ``extra`` keys are added to the
         conversation record (provenance, for instance). True if stored."""
         from . import transcript as transcript_core
-        try:
-            if self.logger is not None and transcript_core.logs_to_session(kind):
-                self.logger.log_event(kind=kind, who=who, text=text,
-                                      meta={"session": self.session_id})
-        except Exception as exc:                          # noqa: BLE001
-            self._problem(f"the debug log did not take an entry: {exc!r}")
+        self.log(who, text, kind)
         if not transcript_core.stores_in_history(kind):
             return False
         if who == "User":
@@ -534,6 +529,19 @@ class Conversation:
             self._problem(f"a turn was not saved: {exc!r}")
             return False
         return True
+
+    def log(self, who: str, text: str, kind: str = "final") -> None:
+        """The debug log only (conversation_logs/, never read by a model) —
+        for what is worth keeping for the user's own debugging but is not
+        part of the conversation: a deliberation's drafts, cross-examination
+        and rankings."""
+        from . import transcript as transcript_core
+        try:
+            if self.logger is not None and transcript_core.logs_to_session(kind):
+                self.logger.log_event(kind=kind, who=who, text=text,
+                                      meta={"session": self.session_id})
+        except Exception as exc:                          # noqa: BLE001
+            self._problem(f"the debug log did not take an entry: {exc!r}")
 
     def note_question(self, text: str) -> None:
         """question_history.json, which History reads — Tk's too."""

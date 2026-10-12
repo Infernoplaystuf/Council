@@ -290,7 +290,9 @@ def test_an_unreadable_store_is_reported(tmp_path):
 def test_an_empty_store_says_when_sessions_appear(tmp_path):
     result = sessions_core.list_sessions(FakeStore([]), _verdicts(tmp_path, []))
     assert result.ok
-    assert "after you close one" in result.message
+    # Not "after you close one": a session is saved as it happens, in both
+    # shells, so it is listed as soon as something is asked.
+    assert "once you ask" in result.message
 
 
 def test_the_prior_label_reads_naturally():
@@ -308,22 +310,42 @@ def test_a_preview_shows_who_said_what():
     assert "User:" in text and "why is Q3 short" in text
 
 
-def test_the_rebuild_happens_on_a_worker_in_the_qt_tab():
-    """The Tk version rebuilds every personality on the GUI thread, which is a
-    freeze of however long the weights take to load."""
-    import ast
+def test_loading_a_prior_rebuilds_nothing():
+    """The Tk version rebuilds every personality — on the GUI thread — to
+    change one field; this tab did it on a worker and handed the result to a
+    callback nobody connected, so the load changed nothing. The prior is now
+    handed to the conversation, which sets the field at the next turn."""
     source = (ROOT / "council_qt" / "tabs" / "sessions.py").read_text(
         encoding="utf-8")
-    tree = ast.parse(source)
-    method = next(node for node in ast.walk(tree)
-                  if isinstance(node, ast.FunctionDef) and node.name == "_rebuild")
-    body = ast.get_source_segment(source, method) or ""
-    assert "threading.Thread" in body
-    assert "_to_ui" in body
+    assert "rebuild_with_prior" not in source
+    assert "build_personalities" not in source
 
 
-def test_the_tab_hands_the_models_over_rather_than_reaching_across():
-    """The prior session is global state and this tab does not own it."""
-    source = (ROOT / "council_qt" / "tabs" / "sessions.py").read_text(
-        encoding="utf-8")
-    assert "on_models_changed" in source
+def test_the_tab_hands_the_prior_to_the_conversation_it_does_not_own(
+        tmp_path):
+    from council_core.conversations import Conversation, ConversationStore
+    from council_qt.tabs.sessions import SessionsActions
+    vault = tmp_path / "vault"
+    ConversationStore(vault / "conversations").append(
+        "older", {"who": "User", "text": "hello"})
+    conversation = Conversation(vault)
+    actions = SessionsActions(vault_dir=vault, conversation=conversation)
+    assert actions.load_prior("older").ok
+    assert conversation.snapshot().prior_session_id == "older"
+    assert actions.prior() == "older"
+
+
+def test_without_a_conversation_loading_says_why(tmp_path):
+    from council_qt.tabs.sessions import SessionsActions
+    outcome = SessionsActions(vault_dir=tmp_path).load_prior("anything")
+    assert not outcome.ok and "Council tab" in outcome.message
+
+
+def test_the_list_marks_this_conversation_and_the_loaded_one(tmp_path):
+    result = sessions_core.list_sessions(
+        FakeStore(["now", "older", "other"]), _verdicts(tmp_path, []),
+        current="now", prior="older")
+    labels = {row.id: row.label for row in result.rows}
+    assert labels["now"].endswith("(this conversation)")
+    assert labels["older"].endswith("(loaded into this conversation)")
+    assert labels["other"] == "other"

@@ -28,6 +28,7 @@ it likes, and renders what comes back.
 from __future__ import annotations
 
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -148,6 +149,16 @@ class TurnResult:
     #: say so, and an empty string is how it says it.
     verdict_id: str = ""
 
+    #: The name this turn gives its session, or "" — set by the front end's
+    #: send when the session has no name yet (the Tk shell asks the judge
+    #: after a deliberation; see council_core.conversations).
+    session_name: str = ""
+
+    #: Where the answer came from, saved with it in the conversation record:
+    #: route, panel, memory scope, the prior session it could see, the models,
+    #: and the vault sources it was given. Filled by the front end's send.
+    provenance: Dict[str, Any] = field(default_factory=dict)
+
 
 def final_answer(events: List[AgentEvent], synth: str = "writer") -> str:
     """The synthesised answer, last one wins."""
@@ -248,8 +259,11 @@ def run_turn(question: str, models: Any, *,
             confidence=judge_confidence(events), route=route, panel=panel,
             events=list(events))
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
+        # Unique, because it is how a response finds ITS line in
+        # verdict_history.jsonl (route, size and verdict repeat).
         if critique:
-            result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"
+            result.verdict_id = (f"{route or 'turn'}:{len(events)}:{verdict}:"
+                                 f"{uuid.uuid4().hex[:12]}")
         return result
     except Exception as exc:                              # noqa: BLE001
         return TurnResult(False, message=f"The turn failed: {exc!r}", error=exc)

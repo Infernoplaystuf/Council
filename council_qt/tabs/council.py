@@ -43,11 +43,21 @@ WHAT IS AND IS NOT HERE
 The VIEW is complete and the turn is real: `CouncilActions.send` runs
 council_core.council_turn (or one Writer, on the fast path). What is not wired
 yet — Look Up, Find & Chart, Defer to Vault, instructions, content style, the
-per-role override, the specialist pin, History, verdict responses, Expand, and
-every switch but Deliberation and Stream tokens — is shown DISABLED with a
-"not available in this build yet" tooltip (_label_unavailable) rather than
-looking live; docs/qt_migration/remaining_scope_2026-10-06.md says which batch
-wires each.
+per-role override, the specialist pin, verdict responses, Expand, and every
+switch but Deliberation and Stream tokens — is shown DISABLED with a "not
+available in this build yet" tooltip (_label_unavailable) rather than looking
+live; docs/qt_migration/remaining_scope_2026-10-06.md says which batch wires
+each.
+
+THE CONVERSATION IS KEPT (Batch 1)
+Every entry the transcript shows is kept the way the Tk shell keeps it, in the
+same files (council_core.conversations): the question the moment it is asked,
+everything the turn says when the turn ends — the answer with its provenance —
+and anything unsaved when the window closes. Follow-ups see this session's
+earlier turns and nothing older ("This conversation only",
+council_core.memory_scope); an older session gets in only when the user loads
+it from the Sessions tab, and the transcript says so. History lists the
+questions both shells were asked.
 """
 from __future__ import annotations
 
@@ -64,6 +74,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
 
 from council_core import council_options
 from council_core import council_turn
+from council_core import conversations
+from council_core import memory_scope
 from council_core import paths
 from council_core import transcript as transcript_core
 
@@ -120,9 +132,13 @@ class CouncilActions:
     class NotYetExtracted(RuntimeError):
         pass
 
-    def __init__(self, vault_dir: Optional[Path] = None, demo_mode: bool = False):
+    def __init__(self, vault_dir: Optional[Path] = None, demo_mode: bool = False,
+                 conversation=None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self.demo_mode = bool(demo_mode)
+        #: This launch's conversation (council_core.conversations). The tab
+        #: sets it when it is not given; a turn reads it on its worker.
+        self.conversation = conversation
         self._models = None
         self._models_problem = ""
 
@@ -150,21 +166,20 @@ class CouncilActions:
         return f"Saved to {path}"
 
     def question_history(self, limit: int = 40) -> Optional[List[str]]:
-        """The recent questions, or None when there is no store to read.
+        """The recent questions, newest first — from question_history.json,
+        which both shells write (the Tk History reads the same file) — or
+        None when it cannot be read.
 
-        None is not []: "no questions asked yet" is a claim about the
-        session, and with no store it is false. convo_store is not in this
-        build, and nothing in Qt writes questions yet (saving is Batch 1), so
-        this is None today and History is disabled (_label_unavailable).
-        Measured in review: History straight after a question said "No
-        questions asked yet this session."."""
+        None is not []: "no questions asked yet" is a claim, and with no store
+        it is false. This used to import `convo_store`, a module that does not
+        exist, so it was always None."""
         try:
-            import convo_store
-            store = convo_store.ConvoStore(self.vault_dir)
-            return [turn.get("text", "") for turn in store.recent(limit)
-                    if turn.get("who") == "User"]
+            import question_history
+            items = question_history.QuestionHistory(self.vault_dir).recent(
+                limit)
         except Exception:                                 # noqa: BLE001
             return None
+        return [str(item.get("q", "")) for item in items if item.get("q")]
 
     # -- the turn --------------------------------------------------------
     def models(self):
@@ -183,8 +198,14 @@ class CouncilActions:
         from council_core import council_turn
 
         if self._models is None and not self._models_problem:
+            # Built for THIS launch's session: the personalities read the
+            # conversation's earlier turns under its id (it was "qt" for
+            # every launch). apply_to() keeps it current after a rename.
+            session = (self.conversation.snapshot().session_id
+                       if self.conversation is not None else "qt")
             self._models, self._models_problem = (
-                council_turn.load_personalities(self.vault_dir))
+                council_turn.load_personalities(self.vault_dir,
+                                                session_id=session))
         return self._models, self._models_problem
 
     def send(self, typed_text: str, options, *, on_event=None,
@@ -197,21 +218,78 @@ class CouncilActions:
         """
         from council_core import council_turn
 
+        # What this turn may remember, taken once: the session, the prior the
+        # user loaded, the memory scope. Applied to every personality before
+        # any model call, so a Load as Prior made while a turn runs counts
+        # from the NEXT turn, never halfway through this one.
+        snapshot = (self.conversation.snapshot()
+                    if self.conversation is not None else None)
         models, problem = self.models()
         if models is None:
             return council_turn.TurnResult(False, message=problem)
+        if self.conversation is not None:
+            self.conversation.apply_to(models, snapshot)
 
         if not getattr(options, "deliberate", True):
             # The fast path: one personality, no panel, no verdict. It is a
             # real answer and it is NOT a deliberation, so it produces no
             # verdict id — which is what keeps the verdict bar honest (A3).
-            return self._direct(typed_text, models, on_event=on_event)
+            result = self._direct(typed_text, models, on_event=on_event)
+        else:
+            result = council_turn.run_turn(
+                typed_text, models,
+                enable_tools=bool(getattr(options, "tools", False)),
+                on_event=on_event,
+                on_token=on_token if getattr(options, "stream", True)
+                else None)
+        if result.ok:
+            result.provenance = self._provenance(result, models, snapshot)
+            result.session_name = self._session_name(typed_text, result,
+                                                     models)
+        return result
 
-        return council_turn.run_turn(
-            typed_text, models,
-            enable_tools=bool(getattr(options, "tools", False)),
-            on_event=on_event,
-            on_token=on_token if getattr(options, "stream", True) else None)
+    def _provenance(self, result, models, snapshot) -> dict:
+        """Where this answer came from, saved with it (see TurnResult)."""
+        roles = (["writer"] if result.route == "direct"
+                 else list(result.panel or []))
+        backends = {}
+        for role in roles + (["judge"] if result.route != "direct" else []):
+            key = getattr(getattr(models, role, None), "backend_key", None)
+            if isinstance(key, str):
+                backends[role] = key
+        return {
+            "shell": "qt",
+            "route": result.route,
+            "panel": list(result.panel or []),
+            "backends": backends,
+            "memory": snapshot.scope if snapshot else memory_scope.for_qt(),
+            "prior_session": snapshot.prior_session_id if snapshot else None,
+            "sources": [],
+            "verdict_id": result.verdict_id or None,
+        }
+
+    def _session_name(self, typed_text: str, result, models) -> str:
+        """The name for a session that has none yet, or "".
+
+        After a deliberation the judge names it, as in the Tk shell
+        (JudgeModel.name_session — the judge is loaded and has just ruled).
+        On the fast path — the default build, one Writer — the name is made
+        from the question's words: Tk names nothing there, and asking a
+        model would cost a second call or a second model loaded for a file
+        name."""
+        conversation = self.conversation
+        if conversation is None or conversation.named:
+            return ""
+        judge = getattr(models, "judge", None)
+        if result.route != "direct" and hasattr(judge, "name_session"):
+            try:
+                name = conversations.clean_name(
+                    judge.name_session(typed_text, result.critique or ""))
+                if name:
+                    return name
+            except Exception:                             # noqa: BLE001
+                pass
+        return conversations.name_from_question(typed_text)
 
     def _direct(self, typed_text: str, models, *, on_event=None):
         """One personality answering directly, with no council."""
@@ -279,11 +357,32 @@ class CouncilTab(ViewHelpers, QWidget):
         #: what -> the widgets labelled "not available in this build yet".
         self.unavailable = {}
         self._specialists = None
+
+        # This launch's conversation: the one the actions were given, else a
+        # new one in their vault. Shared through the window so the Sessions
+        # tab can load an older session into it, and closed with the window.
+        self.conversation = (self.actions.conversation
+                             or conversations.Conversation(
+                                 self.actions.vault_dir))
+        self.actions.conversation = self.conversation
+        if window is not None and getattr(window, "conversation", None) is None:
+            window.conversation = self.conversation
+        hooks = getattr(window, "close_hooks", None)
+        if isinstance(hooks, list):
+            hooks.append(self.close_conversation)
+        self.conversation.subscribe(self._on_conversation)
+        #: What the running turn has said, saved when the turn ends (None
+        #: when no turn is running: entries are saved as they come).
+        self._pending: Optional[list] = None
+        self._turn_provenance: Optional[dict] = None
+
         # The Profile box shows what the engine will do (it cannot be
-        # changed here yet — see council_options.SWITCHES).
+        # changed here yet — see council_options.SWITCHES): in "This
+        # conversation only" no profile reaches a prompt.
         self._opts = council_options.CouncilOptions.defaults(
             demo_mode=self.demo_mode,
-            profile_enabled=council_options.profile_applied())
+            profile_enabled=council_options.profile_reaches_prompt(
+                self.conversation.scope))
         for field in PER_TURN_FIELDS:
             setattr(self, field, None)
 
@@ -354,12 +453,10 @@ class CouncilTab(ViewHelpers, QWidget):
               why="Every role answers from the model set in the Models tab.")
         label("Asking a specialist", self.specialist_box,
               why="Every question is answered without a specialist.")
-        label("History", self.history_btn,
-              why="Questions are not saved in this build yet.")
         label("Responding to a verdict", self.vfb_agree, self.vfb_disagree,
               self.redeliberate_btn,
-              why="Verdicts are not recorded yet, so there is nothing for "
-                  "an answer to attach to.")
+              why="Each verdict is recorded in the verdict history, but "
+                  "agreeing or disagreeing with one is not wired up yet.")
         for switch in council_options.SWITCHES:
             box = self._checkboxes.get(switch.key)
             if box is not None and not switch.available:
@@ -487,6 +584,16 @@ class CouncilTab(ViewHelpers, QWidget):
         self.tps_label.setToolTip("Generation speed this turn, from the "
                                   "engine's own measurement of each call.")
         row.addWidget(self.tps_label)
+        # What the council remembers between questions, said plainly — the
+        # user's decision, and the first thing to check when a follow-up
+        # "forgot" or "knew" something.
+        self.memory_label = QLabel(memory_scope.describe(
+            self.conversation.scope))
+        self.memory_label.setStyleSheet(
+            f"color: {self._tokens['muted_fg']};")
+        self.memory_label.setToolTip(memory_scope.explain(
+            self.conversation.scope))
+        row.addWidget(self.memory_label)
         self.status = QLabel("● idle")
         self.status.setStyleSheet(f"color: {self._tokens['success']};")
         row.addWidget(self.status)
@@ -643,6 +750,8 @@ class CouncilTab(ViewHelpers, QWidget):
 
     def end_turn(self) -> None:
         self._turn_active = False
+        # The turn is over, whatever became of it: what it said is saved now.
+        self._save_pending()
         self.send_btn.setEnabled(True)
         self.set_status("● idle", self._tokens["success"])
         # Nobody is answering any more. The speed stays: it describes the
@@ -684,7 +793,10 @@ class CouncilTab(ViewHelpers, QWidget):
         self._turn_stats_floor = self.actions.last_call_stats().get("seq") or 0
         self.tps_label.setText("")
         self._last_query = typed
+        # The question is saved the moment it is asked (a crash mid-turn
+        # keeps it); what the turn says is saved when it ends (end_turn).
         self.append("User", typed)
+        self._pending = []
         self.input.clear()
 
         options = self.options()          # on the GUI thread, before the worker
@@ -813,7 +925,8 @@ class CouncilTab(ViewHelpers, QWidget):
         self._note_speaker(event, kind)
         self._refresh_tps()
         if kind == "phase":
-            self.append("", getattr(event, "text", ""), "phase")
+            self.append("", getattr(event, "text", ""), "phase",
+                        turn_event=True)
             return
         if kind == "thought":
             # Progress ("Generating response…"), not conversation: it moves
@@ -830,11 +943,13 @@ class CouncilTab(ViewHelpers, QWidget):
             # save panel). Remembered, because the TurnResult carries the
             # same text again at the end — see finish_turn.
             text = getattr(event, "text", "")
-            self.append(getattr(event, "who", "Council"), text, "final")
+            self.append(getattr(event, "who", "Council"), text, "final",
+                        turn_event=True)
             self._shown_finals = (self._shown_finals or set()) | {text}
             return
         self.append(getattr(event, "who", "Council"),
-                    getattr(event, "text", str(event)), "observation")
+                    getattr(event, "text", str(event)), "observation",
+                    turn_event=True)
 
     def _note_speaker(self, event, kind: str) -> None:
         """"▶ Writer" while the Writer is the one being waited on.
@@ -896,6 +1011,16 @@ class CouncilTab(ViewHelpers, QWidget):
             self.append("Writer", result.answer, "final")
         if result.critique:
             self.set_judge(result.critique)
+        self._turn_provenance = dict(getattr(result, "provenance", None) or {})
+        if getattr(result, "verdict_id", ""):
+            # Recorded where the Tk shell records it, with this turn's id. The
+            # bar that would let the user answer it stays as Batch 0 left it.
+            self.conversation.record_verdict(conversations.verdict_record(
+                result, self.conversation.session_id, self._last_query or ""))
+        if getattr(result, "session_name", ""):
+            named = self.conversation.rename(result.session_name)
+            if named.ok:
+                self.append("Council", named.message, "observation")
         if result.route == "direct" and result.answer:
             # Only a fast answer can be expanded, and only until the next turn
             # resets it (A4). The question is kept; the BUTTON stays disabled
@@ -917,17 +1042,83 @@ class CouncilTab(ViewHelpers, QWidget):
     # ==================================================================
     # The transcript
     # ==================================================================
-    def append(self, who: str, text: str, kind: str = "final") -> None:
-        """One entry, formatted by the shared policy.
+    def append(self, who: str, text: str, kind: str = "final", *,
+               turn_event: bool = False, keep: bool = True) -> None:
+        """One entry, formatted by the shared policy, and kept.
 
         Goes through council_core.transcript, so the Council transcript, the
-        Dream3D mirror and the Tk shell all say the same thing.
+        Dream3D mirror and the Tk shell all say the same thing — and through
+        the conversation, so it is saved where the Tk shell saves its own.
+        ``turn_event``: it came from the running turn's own events (a draft,
+        a cross-examination, a ranking — or the answer); see _save_pending.
+        ``keep=False``: shown, and in the debug log, but NOT part of the
+        conversation — for lines that quote OTHER sessions (History's list
+        of past questions, the name of a loaded session). Kept, they would
+        be in the next prompt's RECENT CONVERSATION, which is exactly how an
+        older session must not get in.
         """
         self.transcript.append_entry(who, text, kind)
         self.mirror.append_entry(who, text, kind)
         if transcript_core.is_final_answer(who, kind):
             self._last_answer = text
             self.save_frame.show()
+        if not keep:
+            self.conversation.log(who, text, kind)
+        elif self._pending is not None:
+            self._pending.append((who, text, kind, turn_event))
+        else:
+            self.conversation.record(who, text, kind)
+
+    # ==================================================================
+    # The conversation
+    # ==================================================================
+    def _save_pending(self) -> None:
+        """Save what the turn said: the answer, with its provenance, and the
+        app's own lines (errors, notices, the session's name).
+
+        The turn's OTHER events — a full council's drafts, cross-examination,
+        rankings and critiques — go to the debug log only. The Tk shell
+        stores them all, and one full-council turn is forty-odd entries: the
+        twelve-entry RECENT CONVERSATION a follow-up sees was then one turn's
+        debate, and the question before it had already dropped out (found by
+        the planted-fact test, tests/test_qt_remembers.py). The default build
+        has one Writer, whose one event IS the answer, so nothing changes
+        there."""
+        pending, self._pending = self._pending, None
+        if not pending:
+            self.conversation.flush()
+            return
+        provenance = self._turn_provenance or None
+        answer = self._last_answer
+        last_answer_at = max((i for i, (who, text, kind, _turn)
+                              in enumerate(pending)
+                              if transcript_core.is_final_answer(who, kind)
+                              and text == answer), default=None)
+        for i, (who, text, kind, turn_event) in enumerate(pending):
+            if i == last_answer_at:
+                extra = {"provenance": provenance} if provenance else {}
+                self.conversation.record(who, text, kind, **extra)
+            elif turn_event:
+                self.conversation.log(who, text, kind)
+            else:
+                self.conversation.record(who, text, kind)
+        self._turn_provenance = None
+        self.conversation.flush()
+
+    def close_conversation(self) -> None:
+        """On close: save anything a running turn has said, end the log."""
+        self._save_pending()
+        self.conversation.close()
+
+    def _on_conversation(self, event: str, **details) -> None:
+        """Say in the transcript when an older session is brought into this
+        conversation, or taken out of it — the user should never have to
+        guess what the council can see."""
+        if event in ("prior_loaded", "prior_cleared"):
+            # Shown, not kept: the line names the other session, and the
+            # PRIOR SESSION CONTEXT block is how a loaded one gets in.
+            self._to_ui(self.append, "Council", details.get("message", ""),
+                        "observation", keep=False)
 
     def receive_notice(self, who: str, text: str, kind: str = "final", *,
                        source: str = "") -> None:
@@ -1079,16 +1270,18 @@ class CouncilTab(ViewHelpers, QWidget):
             self._not_yet("History")
             return
         if not questions:
-            self.append("Council", "No questions asked yet this session.",
-                        "observation")
+            self.append("Council", "No questions asked yet.", "observation",
+                        keep=False)
             return
+        # Shown, never kept: these are other sessions' questions too, and a
+        # kept line would put them in the next prompt (see append).
         self.append("Council",
                     "Recent questions:\n" + "\n".join(f"  • {q}"
                                                       for q in questions[:20]),
-                    "observation")
+                    "observation", keep=False)
 
     def on_examples(self) -> None:
-        self.append("Council", EXAMPLES, "observation")
+        self.append("Council", EXAMPLES, "observation", keep=False)
 
     def on_expand_with_council(self) -> None:
         """Re-ask the last fast question through the full council.
