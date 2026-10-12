@@ -91,9 +91,7 @@ from council_core import transcript as transcript_core
 
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
-from ..widgets.source_preview import (SourcePreview,  # noqa: F401
-                                     reveal_command,
-                                     reveal_in_file_manager)
+from ..widgets.source_preview import SourcePreview, reveal_in_file_manager
 from ..widgets.transcript import (MirroredTranscript, StreamView,
                                   TranscriptView)
 
