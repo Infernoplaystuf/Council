@@ -161,9 +161,9 @@ def test_a_chip_opens_the_file_read_only_in_the_app(qapp, engine):
         before = (source.read_bytes(), source.stat().st_mtime_ns)
         assert "preview" in view.source_chips[0].toolTip().lower()
         view.source_chips[0].click()
-        qapp.processEvents()
         preview = view.source_preview
         assert preview is not None and preview.isVisible()
+        assert _pump(qapp, lambda: not preview.loading, timeout=30)
         assert "pumps.csv" in preview.windowTitle()
         assert FACT in preview.rows.toPlainText()
         assert "pressure_bar" in preview.schema.toPlainText()
@@ -188,6 +188,62 @@ def test_a_chip_for_a_file_that_has_gone_says_so(qapp, engine):
         assert "pumps.csv is no longer there" in view.transcript.toPlainText()
         preview = view.source_preview
         assert preview is None or not preview.isVisible()
+    finally:
+        _close(qapp, window, view)
+
+
+def test_a_chip_click_reads_the_file_off_the_gui_thread(qapp, engine,
+                                                       monkeypatch):
+    """Found in review: the click read the file on the GUI thread (a 53 MB
+    JSON froze the window for 4 s). The dialog opens at once, says it is
+    reading, and is filled when the read — on a worker — is done."""
+    import threading
+    from council_core import turn_context
+    window, view, _revealed = _council(engine.vault, stub_open=False)
+    release, readers = threading.Event(), []
+    real = turn_context._data_preview_text
+
+    def slow(path, *a, **k):
+        readers.append(threading.current_thread())
+        release.wait(30)
+        return real(path, *a, **k)
+
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        monkeypatch.setattr(turn_context, "_data_preview_text", slow)
+        started = time.monotonic()
+        view.source_chips[0].click()
+        assert time.monotonic() - started < 1.0, "the click waited for it"
+        preview = view.source_preview
+        assert preview.isVisible() and preview.loading
+        assert "Reading" in preview.rows.toPlainText()
+        assert _pump(qapp, lambda: bool(readers), timeout=10)
+        assert readers[0] is not threading.main_thread()
+        release.set()
+        assert _pump(qapp, lambda: not preview.loading, timeout=30)
+        assert FACT in preview.rows.toPlainText()
+    finally:
+        release.set()
+        _close(qapp, window, view)
+
+
+def test_a_folder_chip_shows_the_folder(qapp, engine):
+    """Found in review: a chip for a folder (a question naming one) said
+    "<name> is no longer there" although the folder was there — the click
+    took only files. It lists the folder now, read-only."""
+    window, view, _revealed = _council(engine.vault, stub_open=False)
+    try:
+        folder = engine.vault / "data_in"
+        view.show_sources([folder])
+        assert [c.text() for c in view.source_chips] == ["📁 data_in"]
+        view.source_chips[0].click()
+        preview = view.source_preview
+        assert preview is not None and preview.isVisible()
+        assert _pump(qapp, lambda: not preview.loading, timeout=30)
+        assert "pumps.csv" in preview.rows.toPlainText()
+        assert "no longer there" not in view.transcript.toPlainText()
+        preview.reveal_button.click()
+        assert _revealed == [folder]
     finally:
         _close(qapp, window, view)
 

@@ -635,10 +635,13 @@ class CouncilTab(ViewHelpers, QWidget):
         return self.sources_frame
 
     def preview_source(self, path) -> None:
-        """Show a file behind the answer, read-only, in the app. A file that
-        has moved or gone since is said in the transcript instead."""
+        """Show a file behind the answer, read-only, in the app (read on a
+        worker — the click returns at once); a folder is listed. One that
+        has moved or gone since is said in the transcript instead. (A folder
+        chip said "is no longer there": only files were taken — found in
+        review.)"""
         path = Path(path)
-        if not path.is_file():
+        if not path.exists():
             self.append("Council", f"{path.name} is no longer there "
                                    f"({path.parent}).", "observation",
                         keep=False)
@@ -646,7 +649,10 @@ class CouncilTab(ViewHelpers, QWidget):
         if self.source_preview is None:
             self.source_preview = SourcePreview(
                 self, reveal=lambda p: self.reveal_source(p))
-        self.source_preview.show_file(path)
+        if path.is_dir():
+            self.source_preview.show_folder(path)
+        else:
+            self.source_preview.show_file(path)
 
     def show_sources(self, paths) -> None:
         """Chips for ``paths`` under the transcript, replacing the last
@@ -659,7 +665,8 @@ class CouncilTab(ViewHelpers, QWidget):
         title.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         self._sources_row.addWidget(title)
         for path in paths[:self.MAX_CHIPS]:
-            chip = QPushButton(f"📄 {path.name}")
+            chip = QPushButton(f"{'📁' if path.is_dir() else '📄'} "
+                               f"{path.name or path}")
             chip.setFlat(True)
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
             chip.setToolTip(f"{path}\nClick to preview it here (read-only).")

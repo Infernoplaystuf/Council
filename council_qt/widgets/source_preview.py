@@ -5,17 +5,23 @@ The Council tab's source chips open this: the file's first rows and its
 columns, read with no model (council_core.turn_context._data_preview_text —
 the Tk console's _preview_data_file), in read-only boxes, and a "Show in
 folder" button that shows the file in the file manager (the Tk console's
-_reveal_file). Nothing here writes to the file.
+_reveal_file). A folder behind an answer is listed. Nothing here writes to
+the file.
+
+The file is read on a worker thread, never the GUI thread (A1): the dialog
+opens at once, says it is reading, and is filled when the read is done (found
+in review: a 53 MB JSON held the window for 4 s).
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Tuple, Union
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
                                QPushButton, QTabWidget, QVBoxLayout)
 
@@ -44,16 +50,73 @@ def reveal_in_file_manager(path) -> None:
     subprocess.Popen(reveal_command(path))      # noqa: S603 — a file path
 
 
+#: How many entries a folder's listing shows.
+FOLDER_LISTING_MAX = 500
+
+
+def file_preview(path: Path) -> Tuple[str, str, str]:
+    """(columns, first rows, a line about the file) — read with no model.
+    Blocking: run it off the GUI thread."""
+    from council_core import turn_context
+    try:
+        schema, rows = turn_context._data_preview_text(path)
+    except Exception as exc:                              # noqa: BLE001
+        schema, rows = (f"The preview failed: {exc}", "")
+    try:
+        size = f"{path.stat().st_size:,} bytes"
+    except OSError:
+        size = "size unknown"
+    return schema, rows, f"{path}  ·  {size}"
+
+
+def folder_preview(path: Path) -> Tuple[str, str, str]:
+    """(a count, the folder's entries, a line about it): names and sizes
+    only, nothing opened; at most FOLDER_LISTING_MAX entries. Blocking."""
+    names: List[str] = []
+    files = folders = 0
+    more = False
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if len(names) >= FOLDER_LISTING_MAX:
+                    more = True
+                    break
+                try:
+                    if entry.is_dir():
+                        folders += 1
+                        names.append(f"{entry.name}{os.sep}")
+                    else:
+                        files += 1
+                        names.append(f"{entry.name}  "
+                                     f"({entry.stat().st_size:,} bytes)")
+                except OSError:
+                    names.append(entry.name)
+    except OSError as exc:
+        return (f"The folder could not be listed: {exc}", "", str(path))
+    names.sort(key=str.lower)
+    count = (f"{files} file(s) and {folders} folder(s)"
+             + (f" — the first {FOLDER_LISTING_MAX} shown" if more else ""))
+    return count, "\n".join(names), f"{path}  ·  folder"
+
+
 class SourcePreview(QDialog):
     """A file behind an answer, shown READ-ONLY inside the app: its first
     rows and its columns, read with no model (turn_context._data_preview_text
     — the Tk console's _preview_data_file), and a button that shows it in
-    the file manager. Nothing here writes to the file."""
+    the file manager; a folder is listed. Read on a worker thread. Nothing
+    here writes to the file."""
+
+    #: (request, columns, rows, info) — a read finished, on its worker.
+    _read = Signal(int, str, str, str)
 
     def __init__(self, parent=None, reveal: Optional[Callable] = None):
         super().__init__(parent)
         self.path: Optional[Path] = None
         self._reveal = reveal
+        #: True from a click until its read is shown.
+        self.loading = False
+        self._request = 0
+        self._read.connect(self._fill)
         self.resize(900, 600)
         layout = QVBoxLayout(self)
         self.info = QLabel("")
@@ -81,22 +144,46 @@ class SourcePreview(QDialog):
         layout.addLayout(buttons)
 
     def show_file(self, path: Path) -> None:
-        from council_core import turn_context
-        self.path = Path(path)
-        try:
-            schema, rows = turn_context._data_preview_text(self.path)
-        except Exception as exc:                          # noqa: BLE001
-            schema, rows = (f"The preview failed: {exc}", "")
-        try:
-            size = f"{self.path.stat().st_size:,} bytes"
-        except OSError:
-            size = "size unknown"
-        self.setWindowTitle(f"Preview: {self.path.name} (read-only)")
-        self.info.setText(f"{self.path}  ·  {size}")
-        self.rows.setPlainText(rows or "(empty)")
-        self.schema.setPlainText(schema or "(empty)")
+        """Open on ``path``, read on a worker (file_preview)."""
+        self._open(Path(path), file_preview)
+
+    def show_folder(self, path: Path) -> None:
+        """Open on the folder ``path``, listed on a worker."""
+        self._open(Path(path), folder_preview)
+
+    def _open(self, path: Path, reader: Callable) -> None:
+        self.path = path
+        self._request += 1
+        request = self._request
+        self.loading = True
+        self.setWindowTitle(f"Preview: {path.name or path} (read-only)")
+        self.info.setText(f"{path}  ·  reading…")
+        self.rows.setPlainText("Reading…")
+        self.schema.setPlainText("")
         self.show()
         self.raise_()
+
+        def work() -> None:
+            try:
+                schema, rows, info = reader(path)
+            except Exception as exc:                      # noqa: BLE001
+                schema, rows, info = (f"The preview failed: {exc}", "",
+                                      str(path))
+            try:
+                self._read.emit(request, schema, rows, info)
+            except RuntimeError:
+                pass                     # the window was closed first
+
+        threading.Thread(target=work, name="source-preview",
+                         daemon=True).start()
+
+    def _fill(self, request: int, schema: str, rows: str, info: str) -> None:
+        if request != self._request:
+            return                       # an earlier click's read
+        self.loading = False
+        self.info.setText(info)
+        self.rows.setPlainText(rows or "(empty)")
+        self.schema.setPlainText(schema or "(empty)")
 
     def on_reveal(self) -> None:
         if self.path is not None and self._reveal is not None:
