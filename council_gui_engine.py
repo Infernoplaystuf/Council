@@ -16,7 +16,10 @@ import json as _json
 import os
 # Demo siloing: prevent the council from pulling cross-session memory into prompts.
 # Memory files stay on disk; they just are not injected during the demo.
-os.environ.setdefault('COUNCIL_DEMO_SILO', '1')
+# Set as the TK SHELL's default (marked as such), so that importing this
+# module never turns the Qt shell's memory off (council_core.memory_scope).
+from council_core import memory_scope as _memory_scope  # noqa: E402
+_memory_scope.set_tk_default()
 # Single-voice mode: only the Writer speaks. No specialists, no multi-role
 # panel deliberation surfaced to the user. The Writer still gets every piece
 # of injected context (files, vault matches, analyst results).

@@ -197,3 +197,66 @@ def test_conversation_files_are_still_jsonl_lines(planted, tmp_path):
     lines = (tmp_path / "vault" / "conversations" / "now.jsonl").read_text(
         encoding="utf-8").splitlines()
     assert [json.loads(line)["who"] for line in lines] == ["User", "Writer"]
+
+
+# ============================================================
+# The Tk module's SILO default is the Tk shell's, not the user's
+# ============================================================
+
+_IMPORT_ORDER = """
+import os, sys, tempfile
+sys.path.insert(0, {root!r})
+import council_gui_engine                     # sets the Tk shell's default
+from council_core import memory_scope
+from council_core.conversations import Conversation
+conv = Conversation(tempfile.mkdtemp(), session_id="probe")
+print(conv.scope, memory_scope.resolve(), os.environ.get("COUNCIL_DEMO_SILO"))
+"""
+
+
+def _run_after_tk_import(extra_env):
+    import os
+    import subprocess
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("COUNCIL_MEMORY_SCOPE", "COUNCIL_DEMO_SILO",
+                        getattr(memory_scope, "TK_DEFAULT_MARK",
+                                "COUNCIL_DEMO_SILO_SOURCE"))}
+    env.update(extra_env)
+    done = subprocess.run([sys.executable, "-c",
+                           _IMPORT_ORDER.format(root=str(ROOT))],
+                          env=env, capture_output=True, text=True,
+                          timeout=300)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip().splitlines()[-1].split()
+
+
+def test_importing_the_tk_module_first_does_not_turn_qt_memory_off():
+    """Found in review: the Tk module sets COUNCIL_DEMO_SILO=1 by setdefault
+    when it is imported, and the Qt conversation read the environment when
+    it was built — so any import of the Tk module before the Council tab
+    silently switched Qt to "Memory: off". (It showed up in this suite: a
+    test file that imports the Tk module made a later Qt test read "off".)
+    The Tk shell's own default stays exactly as it was."""
+    qt_scope, engine_scope, silo = _run_after_tk_import({})
+    assert qt_scope == "conversation"
+    assert engine_scope == "none", "the Tk shell's default changed"
+    assert silo == "1"
+
+
+def test_a_silo_the_user_set_still_turns_qt_memory_off():
+    qt_scope, engine_scope, _silo = _run_after_tk_import(
+        {"COUNCIL_DEMO_SILO": "1"})
+    assert (qt_scope, engine_scope) == ("none", "none")
+
+
+def test_the_tk_default_is_marked_only_when_tk_sets_it():
+    env = {}
+    memory_scope.set_tk_default(env)
+    assert env == {"COUNCIL_DEMO_SILO": "1",
+                   memory_scope.TK_DEFAULT_MARK: "tk-default"}
+    assert memory_scope.for_qt(env) == "conversation"
+    assert memory_scope.resolve(env) == "none"
+    users = {"COUNCIL_DEMO_SILO": "1"}
+    memory_scope.set_tk_default(users)
+    assert users == {"COUNCIL_DEMO_SILO": "1"}
+    assert memory_scope.for_qt(users) == "none"
