@@ -2163,6 +2163,33 @@ and widened the estimates marked "(review)" below.
 **What you see:** nothing new, except that no frame can be lost this way,
 and a failed grab shows as a counted gap instead of vanishing.
 
+**Status: built** (branch `typhon/data-safety`, then `typhon/data-safety-fixed`
+after its review; not yet merged into `qt-migration`). What it added beyond
+the rows above, from the review:
+
+- A one-camera run also gets an end record, `<run>_run_end.json`
+  (format "typhon-run-end", written once at the end of the recording,
+  never over anything): frames saved and not saved, grab failures and grab
+  attempts, the first and last frame number, and the write that stopped
+  the recording, if one did. Without it, failed grabs after the last saved
+  frame were nowhere on disk. A rig run will still have `<run>_rig_end.json`
+  (M1); the per-camera end record does not replace it.
+- A clash or any other failed write is said in Typhon's own status line:
+  every live line starts `RECORDING STOPPED — frame N not saved — …` until
+  Stop, frames grabbed after it are counted "NOT saved (recording stopped)",
+  and the Stop line starts with it. The first failed write still ends the
+  recording (the FrameWriter's rule); skipping one frame and carrying on
+  instead is a choice not made here.
+- A failed grab is counted once (`grab_failures`), not also among errors.
+- The reserved CSV stays open from its creation to the recorder (no window
+  in which another program can take it), and Start opens the recorder
+  before the live view stops.
+- Not fixable in code: a Typhon from before M0 still picks its run name by
+  looking at the folder, so an old and a new Typhon starting in the same
+  second into one folder can still pick one name. Nothing is overwritten;
+  the new one's recording stops at its first frame, and says so. Every copy
+  sharing a folder should be on M0 or later.
+
 ### Stage M1: MODE 1, several cameras with their own settings (about 24-37 days, estimate)
 
 | # | Work | Estimate |

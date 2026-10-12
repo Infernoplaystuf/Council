@@ -452,15 +452,51 @@ side by side in the capture folder:
 | File | What it is |
 |---|---|
 | `<run>_frame_000001.png` … | What the camera looked like, one per frame (an event camera: one per 20 ms window). |
-| `<run>_frames.csv` | One row per saved PNG: file, frame index, camera timestamp, and for an event camera the event count and where that PNG falls in the `.raw`. |
+| `<run>_frames.csv` | One row per saved PNG (below). Created at **Start**, header first: creating it is what reserves the run's name. |
 | `<run>_events.raw` | **EVK4 only.** Every event the sensor sent, in Prophesee's own format — opens in Metavision Studio and Prophesee's tools. |
 | `<run>_camera.json` | **The run's camera record**: which camera, where on its sensor the pictures are, and how it was set at Start (below). |
+| `<run>_run_end.json` | **The run's end record**, written once when the recording ends (below). |
+
+The frames CSV's columns, read by name (new ones are only ever added at the
+end, so older runs read the same):
+
+| Column | What it holds |
+|---|---|
+| `file`, `index` | the PNG, and the frame number it was saved under |
+| `timestamp_us` | **the camera's own clock, as it gave it.** Microseconds for an event camera; for a Basler it is the grab's **tick count**, not microseconds (the tick's length depends on the model), and **0 on a boA5320**, which has no timestamp |
+| `raw_t_us`, `events`, `window_us` | event camera only: where the PNG falls in the `.raw`, how many events it holds, how long it collected them |
+| `grab_failures` | Basler only: a running count of the grabs that came back **failed** so far in this run (for example an incomplete frame on the CoaXPress link). Blank for an event camera or the simulated one, which report no failed grabs |
+
+**A gap in the frame numbers is a frame not saved**, and there are two
+kinds: a frame the save queue had to skip because storage fell behind
+(`NOT saved (storage too slow)`), and a **failed grab** — an exposure the
+camera made and could not deliver. A failed grab uses up its frame number,
+so it shows as a gap, and `grab_failures` steps up on the next saved row.
+
+**The end record** (`"format": "typhon-run-end"`) holds what only the end of
+a recording knows: `frames_saved`, `frames_not_saved` (`storage_too_slow`,
+and `write_failed`: a frame whose write failed and those queued behind it),
+`grab_failures` and `grab_attempts` (frames the recording was given plus
+failed grabs; `null` for a camera that reports no failed grabs),
+`first_index` and `last_index`, and `recording_failed` (empty, or the write
+that stopped the recording). Failed grabs **after the last saved frame**
+have no CSV row to show them: they are counted only here. Like the camera
+record it is written whole and never over anything; a run from before it
+simply has none. (The Council's own Capture tab writes the same run files —
+frames, CSV, end record — into the folder you pick.)
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
 It grows with how much is changing in the scene, so check free space before a
 long run. A second run never overwrites the first — two runs started in the
-same second get `_2`, `_3` on the name.
+same second get `_2`, `_3` on the name, even from two Typhon windows saving
+into one folder, and a PNG is never written over a file already there (a
+clash stops the recording and says so; see *Reading the status line*).
+**Every Typhon that saves into a shared folder must be this version or
+later:** an older Typhon still picks its run name only by looking at the
+folder, so an older and a newer window pressing Start in the same second
+can still pick one name — the newer one then refuses to write over the
+older one's frames and stops its recording at its first frame, saying so.
 
 **The camera record.** A bird-bath run's PNGs are 160 x 120 — but which 160 x
 120 of the sensor? `<run>_camera.json` says, written once at **Start** (after
@@ -1053,18 +1089,36 @@ works while capturing too.
 `60.0 fps · 242 grabbed · 157 not drawn (screen only) · 242 saved`
 
 - **lost by the camera/driver** (Basler) counts frames pylon itself threw away
-  before the app saw them — invisible before this. While **recording**, pylon
-  queues frames (about 1 GB of them) instead of keeping only the newest, so
-  this should stay at zero; it can appear in the live view, which only ever
-  wants the newest frame. If it grows while recording, the link or the PC
-  cannot keep up — the Basler scan's link checks say which.
+  before the app saw them. pylon counts these **only in the live view**,
+  which keeps just the newest frame. While **recording**, pylon queues
+  frames (about 1 GB of them) one by one, and in that mode its count stays
+  at zero even if frames are lost (vendor docs; measured on the emulator) —
+  so zero here while recording does not prove nothing was lost. What a
+  recording does count is a **failed grab** (below). A frame lost on the
+  link with no failed grab at all is not seen by Typhon today; only a check
+  against the camera's own count (a trigger cable, a frame counter) could
+  find it.
 - **not drawn (screen only)** counts frames the *screen* did not redraw — the
   display shows about 30 a second, whatever the camera does. Normal and
   deliberate; **every one of them is still saved.** Only **NOT saved** means
   frames missing from disk.
 - **saved** is frames on disk. **waiting to save** appears when the disk is
   behind; **NOT saved (storage too slow)** counts frames it could not take at
-  all. If a write *fails* (disk full, folder gone), recording stops and says so.
+  all.
+- **If a write *fails*** (disk full, folder gone, or a file of that frame's
+  name already there — a frame is never written over), the recording stops
+  at that frame, and every live line starts with it until you press
+  **Stop**: `RECORDING STOPPED — frame 20 not saved — FileExistsError: File
+  exists (…_frame_000020.png) — nothing more is saved; press Stop · … · 19
+  saved · 41 NOT saved (recording stopped)`. The picture keeps running (an
+  event camera's `.raw` is written apart from the PNGs and goes on); every
+  frame grabbed after the failure is counted **NOT saved (recording
+  stopped)**, and the Stop line starts `Stopped — RECORDING HAD STOPPED:`
+  with the same reason.
+- **failed grabs** (Basler) counts grabs that came back failed — exposures
+  the camera made and could not deliver. Each leaves a gap in the frame
+  numbers (see *What a run writes*). They are not counted again among
+  **error(s)**, which are other faults.
 - **Stop** gives the disk a second to catch up and then hands the window back.
   Anything still waiting keeps saving and the status line counts it down
   (`Stopped — still saving`); closing the app waits for it.
@@ -1141,7 +1195,7 @@ so a 12-bit frame reads dark *to the classifier*.
 | What you see | What it means |
 |---|---|
 | Basler: empty camera list | Rerun **Camera setup…** and read the **Basler scan** at the top: missing CoaXPress support, a driver problem, a card in the wrong slot or without power, a GigE camera on another subnet. |
-| Basler: `lost by the camera/driver` in the status line | pylon dropped frames before the app got them. Zero while recording is normal; if not, run the Basler scan and read the link checks (CXP cables and applet, USB port, GigE packet size and driver). |
+| Basler: `lost by the camera/driver` in the status line | pylon dropped frames before the app got them — in the live view, which keeps only the newest frame (normal there). pylon does not count this while recording; watch `failed grabs` instead, and if either keeps rising run the Basler scan and read the link checks (CXP cables and applet, USB port, GigE packet size and driver). |
 | "could not open … something else is holding the frame grabber" | The pylon Viewer, or a previous run, still owns the card. Close it. |
 | EVK4: empty list with the camera plugged in | The USB driver, almost always (Prophesee step 3). The SDK cannot tell "no driver" from "no camera" — both are an empty list. Other causes that look identical: Metavision Studio or another program has the camera open (close it); on an OpenEB build, `MV_HAL_PLUGIN_PATH` not set or `libusb-1.0.dll` not on `PATH` (run the build's `utils\scripts\setup_env.bat` first); camera firmware older than 3.8. |
 | EVK4: finding out *why* it was skipped | Start the app with `MV_LOG_LEVEL=TRACE` set and read the console — the SDK only explains a skipped camera there. |
@@ -1162,6 +1216,8 @@ so a 12-bit frame reads dark *to the classifier*.
 | Saving a preset says the path is past 260 characters | The project folder is nested too deep for Windows. Move the project somewhere shorter (or enable long paths in Windows). |
 | Which file does what, or which Python is this? | **Settings → Python Scripts**. |
 | `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
+| `RECORDING STOPPED — frame N not saved — …` | A frame could not be written, and nothing after it is saved: a full disk, a folder that went away, or (`FileExistsError`) a file of that frame's name already there — usually another window, an older Typhon, saving into the same folder under the same run name in the same second. Nothing was written over. Press **Stop**, free space or update every Typhon that shares the folder, and Start again. |
+| `N failed grabs` in the status line | Basler: grabs that came back failed (often an incomplete frame on the link). Each is a gap in the frame numbers; the end record counts them. If it keeps rising, run the Basler scan's link checks. |
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
 | **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |
 | **PNG / Raw** says the raw view needs the Metavision SDK | Viewing a `.raw` uses Prophesee's SDK; install it on this computer (Camera setup…, EVK4). |
