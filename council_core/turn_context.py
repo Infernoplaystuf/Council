@@ -32,6 +32,12 @@ THE EDITS THE MOVE MADE (everything else is byte-for-byte):
     `_DATA_INDEX_INSTANCE`, `_REFERENCED_FILES_MAP`) are NOT re-exported
     by the Tk engine: a copy of a name that is rebound later would go stale
     silently. Set them here (`council_core.turn_context`).
+  * `_inject_file_contents` takes `extra_blocks` (default None: no change),
+    placed at a new priority band PRIO_EXTRA between the folder listings
+    and the vault search — where prepare_turn hands in the knowledge graph's
+    block (KG4; `knowledge_graph_block`, not built yet).
+These edits are marked "[turn_context]" in the code, apart from the
+`_vault()` reads (search for `_vault()`).
 """
 from __future__ import annotations
 
@@ -1623,19 +1629,25 @@ def _build_search_header_block(rec, score=None) -> str:
 
 
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
-                           task_memo_block=None, pinned_files=None):
+                           task_memo_block=None, pinned_files=None,
+                           extra_blocks=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
     broken pdf parser, etc.) degrade to "no injection" rather than
     crashing `_send` and leaving the transcript hung on the user's
     last typed line.
+
+    [turn_context] ``extra_blocks``: (label, text) pairs prepare_turn hands
+    in — the knowledge graph's cited neighbourhood (KG4) — placed at
+    PRIO_EXTRA. None (every caller before it) changes nothing.
     """
     try:
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
             task_memo_block=task_memo_block,
             pinned_files=pinned_files,
+            extra_blocks=extra_blocks,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1674,7 +1686,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
-                                task_memo_block=None, pinned_files=None):
+                                task_memo_block=None, pinned_files=None,
+                                extra_blocks=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1694,6 +1707,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
       2. ``[ANALYST RESULT]`` — the computed answer
       3. ``[FILE: ...]`` — explicit user-pasted paths
       4. ``[FOLDER: ...]`` — explicit user-pasted directory paths
+      4b. ``extra_blocks`` — what the seam hands in (the knowledge graph's
+          cited neighbourhood, KG4) [turn_context]
       5. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
 
     Per-block cap: each block is head/tail-trimmed to roughly ``n_ctx//8``
@@ -1741,9 +1756,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # to fit the budget. Slotted ABOVE individual matches so the
     # filename list always reaches the model. Not droppable; tiny in
     # tokens (~15/file × ~50 files = ~750 tokens worst case).
+    # [turn_context] PRIO_EXTRA: a block the seam hands in (``extra_blocks``
+    # — the knowledge graph's cited neighbourhood, KG4): below what the user
+    # named, above the speculative vault search; capped per block and
+    # evictable like a folder listing, never dropped in the first pass.
     (PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
-     PRIO_EXPLICIT, PRIO_FOLDER,
-     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 1, 2, 3, 4, 5, 6
+     PRIO_EXPLICIT, PRIO_FOLDER, PRIO_EXTRA,
+     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 1, 2, 3, 4, 5, 6, 7
     DROPPABLE_FROM = PRIO_VAULT   # only individual vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
@@ -2187,6 +2206,14 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         except Exception as _de:
             print('[DEBUG inject] dataset overview failed: ' + repr(_de),
                   file=_sys_dbg.stderr)
+
+    # -- [turn_context] Blocks the seam hands in (priority PRIO_EXTRA) ------
+    # (label, text) pairs from prepare_turn — the knowledge graph's cited
+    # neighbourhood (KG4) — assembled, capped and evicted with the rest.
+    for _x_label, _x_text in (extra_blocks or ()):
+        if _x_label and _x_text and str(_x_text).strip():
+            candidates.append((PRIO_EXTRA, str(_x_label),
+                               f"{_x_label}\n{str(_x_text).strip()}"))
 
     # -- NO DATA marker (priority 1, never dropped) -------------------------
     # Critical defense against cross-machine hallucination: when the user
@@ -3305,6 +3332,29 @@ def _build_analyst_failure_block(code: str, error_log: str) -> str:
 # 1,166-line _send, and the Qt shell had none of it: it sent the typed
 # question alone, so a fact in the vault reached 0 of 13 prompts. Both shells
 # now call prepare_turn and send what it returns.
+#
+# THE BLOCKS A TURN IS GIVEN BESIDES THE QUESTION — one seam, three blocks:
+#
+#   the vault            prepare_turn -> _inject_file_contents: the files
+#                        and folders the user named, vault and value matches,
+#                        the dataset overview, the analyst's result, the task
+#                        memo. Put IN FRONT OF the question, so every role and
+#                        the judge see it (as the Tk shell always did).
+#   this conversation    council_core.memory_scope -> PersonalityModel
+#                        .respond: RECENT CONVERSATION (this session's earlier
+#                        turns) and, after Load as Prior, PRIOR SESSION
+#                        CONTEXT. Added per role inside respond(), because each
+#                        role reads the conversation under its own session id
+#                        and the scope decides which of them may go in; it is
+#                        never put in front of the question, and nothing here
+#                        reads an older session (the vault search cannot find
+#                        one: conversation_logger.PROTECTED_*).
+#   the knowledge graph  knowledge_graph_block below — KG4's cited
+#                        neighbourhood for a question that names a known
+#                        person, part or project. NOT BUILT: the hook returns
+#                        None. What it returns is assembled with the vault
+#                        blocks (budgeted, in front of the question) and the
+#                        files it cites become the answer's sources.
 
 from collections import OrderedDict as _OrderedDict          # noqa: E402
 from dataclasses import dataclass as _dataclass               # noqa: E402
@@ -3449,6 +3499,40 @@ class PreparedTurn:
     def answerable_from_data(self) -> bool:
         """A deterministic answer is ready and nothing went wrong."""
         return bool(self.fast_answer) and not self.analyst_error
+
+
+# ------------------------------------------------------------------
+# The knowledge graph's block — the hook KG4 fills
+# ------------------------------------------------------------------
+
+#: The label the knowledge graph's block carries in the assembled prompt and
+#: in the injection breakdown.
+KNOWLEDGE_GRAPH_LABEL = "[KNOWLEDGE GRAPH: cited neighbourhood]"
+
+
+@_dataclass
+class ContextBlock:
+    """A block handed to the seam: the text the models are shown and the
+    files it cites (absolute or vault-relative paths, or names), which
+    become the answer's sources when the block is kept."""
+    text: str
+    sources: List[str] = _field(default_factory=list)
+
+
+def knowledge_graph_block(question: str,
+                          state: TurnState) -> Optional[ContextBlock]:
+    """KG4 — NOT BUILT. The knowledge graph's cited neighbourhood for a
+    question that names a known person, part or project
+    (docs/handoff/knowledge_graph_desktop.md, KG4): the linked items and,
+    for each link, where it was found (file, row or line).
+
+    Returns None: no block. When KG4 lands, this reads the graph
+    (council_core.knowledge_graph, the store in ``state.vault_dir``) and
+    returns a ContextBlock; prepare_turn already puts it in front of the
+    question with the vault blocks, inside the same window budget, and cites
+    its files under the answer. It must not raise for an ordinary reason (a
+    missing or locked store is "no block"); prepare_turn catches what does."""
+    return None
 
 
 def condense_with_local_model(prompt: str) -> str:
@@ -3699,9 +3783,18 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         except Exception:                                 # noqa: BLE001
             n_ctx = 4096
     pins = state.current_pins() if pinned_files is None else pinned_files
+    # The knowledge graph's block (KG4; None until it is built) goes into
+    # the same assembly as the vault blocks.
+    try:
+        graph = knowledge_graph_block(question, state)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[KnowledgeGraph] block failed: {exc!r}")
+        graph = None
+    extra = ([(KNOWLEDGE_GRAPH_LABEL, graph.text)]
+             if graph is not None and (graph.text or "").strip() else None)
     augmented, fuzzy, breakdown = _inject_file_contents(
         question, analyst_block=block, n_ctx=n_ctx,
-        task_memo_block=memo_block, pinned_files=pins)
+        task_memo_block=memo_block, pinned_files=pins, extra_blocks=extra)
     prepared.text = augmented
     prepared.fuzzy_matches = dict(fuzzy or {})
     prepared.breakdown = breakdown if isinstance(breakdown, dict) else {}
@@ -3718,8 +3811,9 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
     has_file = any(lb.startswith("[FILE:") for lb in labels)
     has_folder = any(lb.startswith("[FOLDER:") for lb in labels)
     has_nodata = any(lb.startswith("[NO DATA AVAILABLE") for lb in labels)
+    has_graph = KNOWLEDGE_GRAPH_LABEL in labels
     prepared.injected = bool(has_vault or has_file or has_folder
-                             or has_nodata)
+                             or has_nodata or has_graph)
 
     # 4. The sources --------------------------------------------------------
     try:
@@ -3732,6 +3826,9 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         if match:
             sources.append(match.group(1).strip())
     sources.extend(prepared.explicit_paths)
+    if has_graph and graph is not None:
+        # Only when it was kept: a block left out to fit cited nothing.
+        sources.extend(str(src) for src in (graph.sources or []) if src)
     prepared.sources = sources
     try:
         prepared.source_paths = resolve_source_paths(sources,

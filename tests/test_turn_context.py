@@ -462,3 +462,85 @@ def test_the_folder_renderers_protect_the_vault_s_own_folders(vault_env):
         for folder in ("conversations", "conversation_logs", "logs",
                        "memory"):
             assert f"{folder}/" not in text.replace("\\", "/"), text
+
+
+# ============================================================
+# The seam's hook for the knowledge graph's block (KG4, not built)
+# ============================================================
+
+def test_the_knowledge_graph_hook_adds_nothing_until_kg4_is_built(vault_env):
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    state = tc.TurnState(vault)
+    assert tc.knowledge_graph_block("which pump is ORCHID?", state) is None
+    prepared, _said, _ = _prepare(vault, "which pump is in bay 4?",
+                                  state=state)
+    labels = [label for label, _ in prepared.breakdown.get("costs", [])]
+    assert tc.KNOWLEDGE_GRAPH_LABEL not in labels, labels
+
+
+def test_a_knowledge_graph_block_goes_in_front_of_the_question(vault_env,
+                                                               monkeypatch):
+    """What KG4 will return - a cited neighbourhood - is one more block in
+    the same assembly: budgeted with the others, in front of the question
+    (so every role and the judge see it), and the files it cites are the
+    answer's sources."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    cited = vault / "data_in" / "pumps.csv"
+    seen = []
+
+    def neighbourhood(question, state):
+        seen.append((question, state))
+        return tc.ContextBlock(
+            text="Pump P1 (ORCHID) is serviced by Dana Whitfield "
+                 "KGMARKER [pumps.csv, row 2]",
+            sources=[str(cited)])
+
+    monkeypatch.setattr(tc, "knowledge_graph_block", neighbourhood)
+    prepared, _said, state = _prepare(vault, "who services pump P1?")
+    assert seen and seen[0][0] == "who services pump P1?"
+    assert seen[0][1] is state
+    head, _sep, tail = prepared.text.partition("KGMARKER")
+    assert _sep, "the block did not reach the text the models are sent"
+    assert tc.KNOWLEDGE_GRAPH_LABEL.strip("]") in head
+    assert tail.rstrip().endswith("who services pump P1?")
+    labels = [label for label, _ in prepared.breakdown["costs"]]
+    assert tc.KNOWLEDGE_GRAPH_LABEL in labels
+    assert cited in prepared.source_paths
+
+
+def test_a_knowledge_graph_block_left_out_cites_nothing(vault_env,
+                                                        monkeypatch):
+    """Left out to fit the window (eviction, condensing switched off), the
+    block's files are not the answer's sources."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    monkeypatch.setenv("COUNCIL_CONDENSE_OVERFLOW", "0")
+    (vault / "data_in" / "big_notes.txt").write_text(
+        "notes " * 4000 + "\n", encoding="utf-8")
+    monkeypatch.setattr(tc, "knowledge_graph_block",
+                        lambda q, s: tc.ContextBlock(
+                            text="KGMARKER " + "neighbour " * 3000,
+                            sources=[str(vault / "data_in" / "pumps.csv")]))
+    prepared, _said, _ = _prepare(vault, "summarize big_notes.txt",
+                                  n_ctx=1024)
+    dropped = [label for label, _ in prepared.breakdown.get("dropped", [])]
+    assert any(label.startswith(tc.KNOWLEDGE_GRAPH_LABEL)
+               for label in dropped), dropped
+    assert "KGMARKER" not in prepared.text
+    assert "pumps.csv" not in [p.name for p in prepared.source_paths]
+
+
+def test_a_failing_knowledge_graph_hook_does_not_stop_the_turn(vault_env,
+                                                              monkeypatch):
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+
+    def broken(_question, _state):
+        raise RuntimeError("the graph store is locked")
+
+    monkeypatch.setattr(tc, "knowledge_graph_block", broken)
+    prepared, _said, _ = _prepare(vault, "summarize pumps.csv")
+    assert "ORCHID" in prepared.text
+    assert prepared.text.rstrip().endswith("summarize pumps.csv")
