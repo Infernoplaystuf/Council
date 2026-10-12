@@ -55,12 +55,18 @@ class _Actions(VarGraphActions):
     def __init__(self, path):
         self.files = [str(path)]
         self.folder = ""
+        self.export_to = ""
+        self.suggested = ""
 
     def pick_files(self, parent):
         return self.files
 
     def pick_folder(self, parent):
         return self.folder
+
+    def pick_export(self, parent, suggested):
+        self.suggested = suggested
+        return self.export_to
 
 
 @pytest.fixture
@@ -199,3 +205,70 @@ def test_add_appends_to_the_chosen_scripts(tab, tmp_path):
      if "Add" in b.text()][0].click()
     assert _pump(app, lambda: len(page.state["graph"].modules) == 2)
     assert " ; " in page.path_edit.text()
+
+
+def test_export_is_off_until_a_graph_is_shown(tab):
+    app, page, script = tab
+    assert not page.export_button.isEnabled()
+    _load(app, page, script)
+    assert not page.export_button.isEnabled()      # nothing traced yet
+    page.focus_on("main::total")
+    assert page.export_button.isEnabled()
+
+
+def test_export_png_is_the_whole_graph(tab, tmp_path):
+    from PySide6.QtGui import QImage
+    app, page, script = tab
+    _load(app, page, script)
+    page.focus_on("main::total")
+    out = tmp_path / "maps" / "total.png"
+    page.actions.export_to = str(out)
+    page.export_button.click()
+    assert page.actions.suggested == "total_variable_map.png"
+    assert out.is_file(), page.status.text()
+    img = QImage(str(out))
+    assert not img.isNull()
+    # every node fits, at 2x: wider than the scene's bounding box
+    scene_w = page.view.scene().itemsBoundingRect().width()
+    assert img.width() >= scene_w * 2
+    assert str(out) in page.status.text()
+    assert [p.name for p in out.parent.iterdir()] == ["total.png"]   # no temp left
+
+
+def test_export_svg_names_the_variables(tab, tmp_path):
+    app, page, script = tab
+    _load(app, page, script)
+    page.focus_on("main::total")
+    out = tmp_path / "total.svg"
+    page.actions.export_to = str(out)
+    page.export()
+    text = out.read_text(encoding="utf-8")
+    assert text.lstrip().startswith("<?xml") and "<svg" in text
+    assert "total" in text and "Cart.total" in text
+    assert "what feeds it" in text                 # the caption
+
+
+def test_export_replaces_an_old_image_and_cancel_writes_nothing(tab, tmp_path):
+    app, page, script = tab
+    _load(app, page, script)
+    page.focus_on("main::total")
+    out = tmp_path / "out" / "map.png"
+    out.parent.mkdir()
+    out.write_bytes(b"old")
+    page.actions.export_to = str(out)
+    page.export()
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    page.actions.export_to = ""                    # dialog cancelled
+    before = out.stat().st_mtime_ns
+    page.export()
+    assert out.stat().st_mtime_ns == before
+    assert sorted(p.name for p in out.parent.iterdir()) == ["map.png"]
+
+
+def test_export_without_a_suffix_is_png(tab, tmp_path):
+    app, page, script = tab
+    _load(app, page, script)
+    page.focus_on("main::prices")
+    page.actions.export_to = str(tmp_path / "prices")
+    page.export()
+    assert (tmp_path / "prices.png").is_file()

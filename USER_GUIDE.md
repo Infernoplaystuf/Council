@@ -234,6 +234,7 @@ For tracking down a bug in a Python script — or in a GUI and the scripts it ca
 
 - **Click a node** to make it the centre; **click a link** or a row in **Trace** to jump to that line in **Source** (it switches file when the line is in another one). Orange links cross from one file to another.
 - **➕ Add** puts more scripts alongside the ones already open — e.g. a script the GUI calls that lives in another folder. The file box at the top of the list shows one file's variables at a time.
+- **🖼 Export image…** saves the graph as a PNG (sharp, 2× resolution) or an SVG — the whole graph, not just the part on screen, with a caption naming the variable traced.
 - **Depth** is how many hops out to show. **Include if/while conditions** also links the variables an `if`/`while` tests to what it guards — useful for "why did this branch run?", but busier.
 - **Worth a look** lists the usual suspects: names read but never assigned (typos), values assigned and never read, parameters replaced before they're used, and scripts that don't parse.
 
