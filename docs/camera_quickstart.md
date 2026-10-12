@@ -495,8 +495,10 @@ clash stops the recording and says so; see *Reading the status line*).
 **Every Typhon that saves into a shared folder must be this version or
 later:** an older Typhon still picks its run name only by looking at the
 folder, so an older and a newer window pressing Start in the same second
-can still pick one name — the newer one then refuses to write over the
-older one's frames and stops its recording at its first frame, saying so.
+can still pick one name. The newer one never writes over a file — it stops
+its recording at the first frame the older one saved first, and says so —
+but the older one still REPLACES files, so it can write over the newer
+one's frames without either window saying anything.
 
 **The camera record.** A bird-bath run's PNGs are 160 x 120 — but which 160 x
 120 of the sensor? `<run>_camera.json` says, written once at **Start** (after
@@ -1216,7 +1218,7 @@ so a 12-bit frame reads dark *to the classifier*.
 | Saving a preset says the path is past 260 characters | The project folder is nested too deep for Windows. Move the project somewhere shorter (or enable long paths in Windows). |
 | Which file does what, or which Python is this? | **Settings → Python Scripts**. |
 | `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
-| `RECORDING STOPPED — frame N not saved — …` | A frame could not be written, and nothing after it is saved: a full disk, a folder that went away, or (`FileExistsError`) a file of that frame's name already there — usually another window, an older Typhon, saving into the same folder under the same run name in the same second. Nothing was written over. Press **Stop**, free space or update every Typhon that shares the folder, and Start again. |
+| `RECORDING STOPPED — frame N not saved — …` | A frame could not be written, and nothing after it is saved: a full disk, a folder that went away, or (`FileExistsError`) a file of that frame's name already there — usually another window, an older Typhon, saving into the same folder under the same run name in the same second. This Typhon wrote over nothing; an older one saving under the same name may have (it replaces files). Press **Stop**, free space or update every Typhon that shares the folder, and Start again. |
 | `N failed grabs` in the status line | Basler: grabs that came back failed (often an incomplete frame on the link). Each is a gap in the frame numbers; the end record counts them. If it keeps rising, run the Basler scan's link checks. |
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
 | **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |

@@ -2186,9 +2186,13 @@ the rows above, from the review:
   before the live view stops.
 - Not fixable in code: a Typhon from before M0 still picks its run name by
   looking at the folder, so an old and a new Typhon starting in the same
-  second into one folder can still pick one name. Nothing is overwritten;
-  the new one's recording stops at its first frame, and says so. Every copy
-  sharing a folder should be on M0 or later.
+  second into one folder can still pick one name (the review measured it in
+  2 of 3 tries; after these fixes 0 of 3, which is timing, not a fix). The
+  new one never replaces a file: where the old one saved a frame number
+  first, the new one's recording stops there and says so (measured: at
+  frame 1). The old one still writes "wb", so where the new one saved first
+  the old one replaces its frames silently (code reading, not measured).
+  Every copy sharing a folder must be on M0 or later.
 
 ### Stage M1: MODE 1, several cameras with their own settings (about 24-37 days, estimate)
 
