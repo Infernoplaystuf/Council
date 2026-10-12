@@ -4358,157 +4358,12 @@ class LoadAwareDispatcher:
 # Conversation saving + role memory
 # ============================================================
 
-class ConversationStore:
-    def __init__(self, base_dir: Path):
-        self.base_dir = base_dir
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        # Cache keyed by (session_id, n) — invalidated when append() is called
-        # so agents re-reading history during a deliberation hit memory, not disk.
-        self._cache: Dict[tuple, List[Dict[str, Any]]] = {}
-
-    def session_path(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.jsonl"
-
-    def append(self, session_id: str, record: Dict[str, Any]) -> None:
-        p = self.session_path(session_id)
-        line = json.dumps(record, ensure_ascii=False)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        # Invalidate all cached views of this session
-        stale = [k for k in self._cache if k[0] == session_id]
-        for k in stale:
-            del self._cache[k]
-
-    def load_last(self, session_id: str, n: int = 12) -> List[Dict[str, Any]]:
-        cache_key = (session_id, n)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        p = self.session_path(session_id)
-        if not p.exists():
-            return []
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-        out: List[Dict[str, Any]] = []
-        for ln in lines[-n:]:
-            try:
-                out.append(json.loads(ln))
-            except Exception:
-                pass
-        self._cache[cache_key] = out
-        return out
-
-    def list_sessions(self) -> List[str]:
-        """Return session IDs sorted newest-first."""
-        files = sorted(self.base_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return [p.stem for p in files]
-
-    def rename_session(self, old_id: str, new_id: str) -> bool:
-        """
-        Rename a session file from old_id to new_id.
-        Returns True on success. No-ops if old doesn't exist or new already exists.
-        """
-        old_p = self.session_path(old_id)
-        new_p = self.session_path(new_id)
-        if not old_p.exists() or new_p.exists():
-            return False
-        old_p.rename(new_p)
-        return True
-
-    def summary_path(self, session_id: str) -> Path:
-        """Path for the generated prose summary of a completed session."""
-        return self.base_dir / f"{safe_name(session_id, 64)}.summary.md"
-
-    def save_session_summary(self, session_id: str, summary_text: str) -> None:
-        """Persist a generated prose summary for a completed session."""
-        p = self.summary_path(session_id)
-        p.write_text(summary_text.strip() + "\n", encoding="utf-8")
-
-    def load_generated_summary(self, session_id: str) -> str:
-        """Load a previously generated prose summary, or '' if none exists."""
-        p = self.summary_path(session_id)
-        if not p.exists():
-            return ""
-        return p.read_text(encoding="utf-8", errors="replace").strip()
-
-    # ── Crash-recovery sentinel ────────────────────────────────
-    # A session writes an `.active` sentinel when it starts deliberating,
-    # and removes it on clean shutdown. On startup, any remaining sentinel
-    # indicates a crash mid-deliberation — the orphaned session can be
-    # offered for resume.
-
-    def _active_sentinel(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.active"
-
-    def mark_session_active(self, session_id: str, query: str = "") -> None:
-        """Mark the session as in-flight. Safe to call repeatedly."""
-        p = self._active_sentinel(session_id)
-        try:
-            p.write_text(json.dumps({
-                "session_id": session_id,
-                "started_at": now_iso(),
-                "query":      query[:200],
-            }), encoding="utf-8")
-        except Exception:
-            pass  # never let a sentinel write block deliberation
-
-    def mark_session_done(self, session_id: str) -> None:
-        """Remove the in-flight sentinel after a clean deliberation."""
-        p = self._active_sentinel(session_id)
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-
-    def find_orphaned_sessions(self) -> List[Dict[str, Any]]:
-        """
-        Return metadata for any sessions that have an `.active` sentinel
-        without a matching clean shutdown. Used at startup to offer resume.
-        """
-        orphans: List[Dict[str, Any]] = []
-        for p in self.base_dir.glob("*.active"):
-            try:
-                meta = json.loads(p.read_text(encoding="utf-8"))
-                # Only surface orphans whose .jsonl actually exists
-                if self.session_path(meta.get("session_id", "")).exists():
-                    orphans.append(meta)
-            except Exception:
-                # Malformed sentinel — best-effort cleanup
-                try: p.unlink()
-                except Exception: pass
-        # Newest first
-        orphans.sort(key=lambda m: m.get("started_at", ""), reverse=True)
-        return orphans
-
-    def clear_orphan(self, session_id: str) -> None:
-        """Discard an orphan's sentinel (user chose not to resume)."""
-        self.mark_session_done(session_id)
-
-    def load_session_summary(self, session_id: str, max_turns: int = 6) -> str:
-        """
-        Return a condensed text summary of a past session suitable for
-        injecting into role context, keeping token count bounded.
-
-        Prefers a generated prose summary (saved by save_session_summary)
-        over the raw turn fallback, since generated summaries are more
-        compressed and more useful as prior context.
-        """
-        generated = self.load_generated_summary(session_id)
-        if generated:
-            return f"[Prior session summary: {session_id}]\n{generated}"
-
-        # Fallback: build a crude summary from the last N raw turns
-        turns = self.load_last(session_id, n=max_turns)
-        if not turns:
-            return ""
-        lines = [f"[Past session: {session_id}]"]
-        for t in turns:
-            who = t.get("who", "?")
-            text = t.get("text", "")
-            # Truncate very long turns
-            if len(text) > 400:
-                text = text[:400] + "…"
-            lines.append(f"{who}: {text}")
-        return "\n".join(lines)
+# The store moved to council_core.conversations so the Sessions list and
+# History can read it without loading the engine; this name is that class.
+# Its read cache is now keyed on the file (the personalities' own store used
+# to serve stale history after another store appended), and a record is one
+# whole-line write.
+from council_core.conversations import ConversationStore  # noqa: E402
 
 
 class RoleMemoryManager:
@@ -5680,6 +5535,12 @@ class PersonalityModel:
     session_id: Optional[str] = None
     prior_session_id: Optional[str] = None  # inject context from a past session
     trace: bool = True
+    # What this model may remember: "none" | "conversation" | "all"
+    # (council_core.memory_scope). None reads the environment —
+    # COUNCIL_MEMORY_SCOPE, else COUNCIL_DEMO_SILO for "none", else "all" —
+    # which is what every caller got before scopes existed. The Qt shell sets
+    # it on each personality ("This conversation only" by default).
+    memory_scope: Optional[str] = None
     # A STANDING primer for this model, prepended to every respond() call.
     #
     # Four call sites already assigned `model.extra_context = ...` —
@@ -5706,12 +5567,25 @@ class PersonalityModel:
         use_prior     = profile["use_prior"]
         use_vault     = profile["use_vault"]  # "full" | "lite" | "none"
 
-        # ── Role memory (always — small and high-signal) ──────────────
-        mem = self.memory_manager.read(self.name) if self.memory_manager else ""
+        # ── What may be remembered (council_core.memory_scope) ────────
+        # One setting decides which remembered blocks may go in. "none" is
+        # what COUNCIL_DEMO_SILO always did (blank them all); "conversation"
+        # keeps this session's earlier turns and a prior session only when
+        # the user LOADED one; "all" is the engine with SILO unset. A block
+        # the scope forbids is not even read.
+        from council_core import memory_scope as _memory_scope
+        _allowed = _memory_scope.blocks(
+            self.memory_scope or _memory_scope.resolve(),
+            prior_loaded=bool(self.prior_session_id))
+
+        # ── Role memory (small and high-signal, when the scope allows) ─
+        mem = (self.memory_manager.read(self.name)
+               if self.memory_manager and _allowed.role_memory else "")
 
         # ── Conversation history (role-gated) ─────────────────────────
         history_txt = ""
-        if history_turns > 0 and self.conversation_store and self.session_id:
+        if (history_turns > 0 and self.conversation_store and self.session_id
+                and _allowed.recent_conversation):
             turns = self.conversation_store.load_last(self.session_id, n=history_turns)
             if turns:
                 chunks = []
@@ -5725,7 +5599,8 @@ class PersonalityModel:
 
         # ── Prior session (role-gated) ────────────────────────────────
         prior_txt = ""
-        if use_prior and self.conversation_store and self.prior_session_id:
+        if (use_prior and self.conversation_store and self.prior_session_id
+                and _allowed.prior_session):
             prior_txt = self.conversation_store.load_session_summary(
                 self.prior_session_id, max_turns=6
             )
@@ -5781,7 +5656,7 @@ class PersonalityModel:
         # ── Assemble prefix ───────────────────────────────────────────
         # Shared project memory — written by observer roles, readable by all.
         proj_mem = ""
-        if self.memory_manager is not None:
+        if self.memory_manager is not None and _allowed.project_memory:
             proj_mem = self.memory_manager.read(_PROJECT_MEMORY_KEY)
 
         # Gated user profile — durable user preferences compiled by
@@ -5792,16 +5667,13 @@ class PersonalityModel:
         # profile for a session whose ask conflicts with their normal
         # preferences, while observation keeps running underneath.
         user_profile = ""
-        if self.memory_manager is not None and user_profile_apply_enabled():
+        if (self.memory_manager is not None and _allowed.profile
+                and user_profile_apply_enabled()):
             user_profile = self.memory_manager.read(_USER_PROFILE_KEY)
 
-        # Demo silo: keep memory files on disk, but skip cross-session injection.
-        if os.environ.get('COUNCIL_DEMO_SILO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
-            mem = ''
-            proj_mem = ''
-            prior_txt = ''
-            history_txt = ''
-            user_profile = ''
+        # Demo silo (COUNCIL_DEMO_SILO): memory files stay on disk and nothing
+        # remembered is injected. It is the scope "none" now, applied above —
+        # memory_scope.resolve() reads SILO when COUNCIL_MEMORY_SCOPE is unset.
 
         prefix_parts = []
         if mem.strip():
