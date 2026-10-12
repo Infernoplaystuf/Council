@@ -25,7 +25,9 @@ handling runs:
     proactor, which connects without them) to anything but a loopback
     address or "localhost";
   * a UDP datagram (sendto / sendmsg, or send on a UDP socket connected
-    elsewhere) to anything but loopback. A UDP connect() alone sends nothing
+    elsewhere - and the same through asyncio's Windows proactor, which
+    sends with WSASend / WSASendTo, e.g. a create_datagram_endpoint with a
+    remote_addr) to anything but loopback. A UDP connect() alone sends nothing
     - the Council uses one to learn which LAN address a route would use - so
     that is still allowed;
   * a connect to port 11434 - the real Ollama's - on ANY address, unless the
@@ -370,26 +372,59 @@ def _patch_socket():
     setattr(cls, _MARK, True)
 
 
+def _udp_peer_check(conn):
+    """A datagram sent on a UDP socket connected elsewhere goes to its peer:
+    check that. (The proactor's send also writes to PIPES - a subprocess's
+    stdin - which are not sockets and are left alone.)"""
+    if not (isinstance(conn, socket.socket) and _inet(conn.family)
+            and conn.type == socket.SOCK_DGRAM):
+        return
+    try:
+        peer = conn.getpeername()
+    except OSError:
+        return                                       # not connected
+    check_datagram(peer)
+
+
 def _patch_proactor(module):
-    """asyncio's Windows event loop connects with ConnectEx, not
-    socket.connect - so its connect and sendto are checked here."""
+    """asyncio's Windows event loop connects and sends with ConnectEx,
+    WSASend and WSASendTo, not socket.connect / send / sendto - so its
+    connect, send and sendto are checked here.
+
+    send too: a CONNECTED UDP endpoint (create_datagram_endpoint with
+    remote_addr, or sock_sendall on a UDP socket connected elsewhere) sends
+    its datagrams with WSASend, to the peer. Without this a datagram to
+    192.0.2.1 went out neither refused nor recorded (review, 2026-10-12)."""
     proactor = getattr(module, "IocpProactor", None)
     if proactor is None or proactor.__dict__.get(_MARK):
         return
     real_connect = proactor.connect
+    real_send = getattr(proactor, "send", None)
     real_sendto = getattr(proactor, "sendto", None)
 
     def connect(self, conn, address):
         if _inet(conn.family) and conn.type != socket.SOCK_DGRAM:
             check_connect(address)
         return real_connect(self, conn, address)
+    setattr(connect, _MARK, True)
     proactor.connect = connect
+
+    if real_send is not None:
+        def send(self, conn, buf, flags=0):
+            _udp_peer_check(conn)
+            return real_send(self, conn, buf, flags)
+        setattr(send, _MARK, True)
+        proactor.send = send
 
     if real_sendto is not None:
         def sendto(self, conn, buf, flags=0, addr=None):
-            if _inet(conn.family) and addr is not None:
-                check_datagram(addr)
+            if _inet(conn.family):
+                if addr is not None:
+                    check_datagram(addr)
+                else:
+                    _udp_peer_check(conn)
             return real_sendto(self, conn, buf, flags, addr)
+        setattr(sendto, _MARK, True)
         proactor.sendto = sendto
     setattr(proactor, _MARK, True)
 

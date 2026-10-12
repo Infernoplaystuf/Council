@@ -225,6 +225,133 @@ def test_asyncio_is_refused_too():
     _taken(1)
 
 
+class _StopAtWSASend:
+    """asyncio.windows_events' _overlapped, for one test: what reaches
+    WSASend / WSASendTo - i.e. got past the guard - is recorded and stopped
+    there, so a broken guard fails the test without a datagram leaving."""
+
+    def __init__(self, real):
+        self._real = real
+        self.reached = []
+
+    def Overlapped(self, *args):
+        stop = self
+
+        class Ov:
+            def __init__(self, ov):
+                self._ov = ov
+
+            def WSASend(self, handle, buf, flags):
+                stop.reached.append(bytes(buf))
+                raise OSError("stopped at WSASend: past the guard")
+
+            def WSASendTo(self, handle, buf, flags, addr):
+                stop.reached.append(bytes(buf))
+                raise OSError("stopped at WSASendTo: past the guard")
+
+            def __getattr__(self, name):
+                return getattr(self._ov, name)
+
+        return Ov(self._real.Overlapped(*args))
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def proactor_send(monkeypatch):
+    """The proactor's sends, checked and stopped short of the network."""
+    if sys.platform != "win32":
+        pytest.skip("the proactor event loop is Windows'")
+    from asyncio import windows_events
+    for name in ("connect", "send", "sendto"):
+        assert getattr(getattr(windows_events.IocpProactor, name),
+                       "_council_offline", False), \
+            f"IocpProactor.{name} is not the guard's"
+    stop = _StopAtWSASend(windows_events._overlapped)
+    monkeypatch.setattr(windows_events, "_overlapped", stop)
+    return stop
+
+
+def test_asyncio_udp_to_a_connected_peer_is_refused(proactor_send):
+    """A datagram endpoint with a remote_addr connects its socket (no
+    packet) and then sends with WSASend - not sendto - to that peer. It
+    went out neither refused nor recorded (review, 2026-10-12)."""
+    _require_guard()
+    errors = []
+
+    class Protocol(asyncio.DatagramProtocol):
+        def error_received(self, exc):
+            errors.append(exc)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.create_datagram_endpoint(
+            Protocol, remote_addr=("192.0.2.1", 9))
+        try:
+            transport.sendto(b"x")
+            for _ in range(50):
+                if errors:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            transport.close()
+
+    asyncio.run(go())
+    assert proactor_send.reached == [], "the datagram got past the guard"
+    assert errors and isinstance(errors[0], guard.EgressRefused), errors
+    (_pid, _test, what, _where), = _taken(1)
+    assert what == "a UDP datagram to 192.0.2.1:9"
+
+
+def test_asyncio_sock_sendall_on_a_connected_udp_socket_is_refused(
+        proactor_send):
+    _require_guard()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
+    try:
+        try:
+            s.connect(("192.0.2.1", 9))                      # no packet
+        except guard.EgressRefused:
+            raise
+        except OSError:
+            pytest.skip("no route off this PC to check against")
+
+        async def go():
+            await asyncio.get_running_loop().sock_sendall(s, b"x")
+
+        with pytest.raises(guard.EgressRefused, match="a UDP datagram"):
+            asyncio.run(go())
+    finally:
+        s.close()
+    assert proactor_send.reached == [], "the datagram got past the guard"
+    _taken(1)
+
+
+def test_asyncio_udp_on_loopback_still_works():
+    _require_guard()
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(("127.0.0.1", 0))
+    rx.settimeout(5)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol, remote_addr=rx.getsockname())
+        try:
+            transport.sendto(b"ping")
+            await asyncio.sleep(0.05)
+        finally:
+            transport.close()
+
+    try:
+        asyncio.run(go())
+        assert rx.recvfrom(16)[0] == b"ping"
+    finally:
+        rx.close()
+    _taken(0)
+
+
 def test_a_fake_server_on_loopback_works():
     _require_guard()
     with FakeOllama() as srv:
