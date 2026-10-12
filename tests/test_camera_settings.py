@@ -368,6 +368,129 @@ def test_a_model_with_one_trigger_and_no_selector_is_read_too():
     assert simulated("frame").settings_provider().triggers_on() == []
 
 
+def test_the_selected_triggers_mode_is_written_after_its_source_edge_and_delay():
+    """The other triggers' modes were written last (apply_triggers), but the
+    SELECTED trigger's plain keys went in describe order — selector, MODE,
+    source, edge, delay — so applying a preset turned that trigger On while
+    its source and edge were still the old ones (measured on this fake: a
+    write log with TriggerMode before TriggerSource)."""
+    dev, cam = trigger_basler(full=True)
+    done = dev.apply_settings({
+        "TriggerSelector": "FrameBurstStart", "TriggerMode": "On",
+        "TriggerSource": "Line1", "TriggerActivation": "FallingEdge",
+        "TriggerDelay": 5.0, "Gain": 2.0})
+    assert done.ok, done.summary()
+    assert cam.log == [
+        ("Gain", 2.0), ("TriggerSelector", "FrameBurstStart"),
+        ("TriggerSource", "Line1"), ("TriggerActivation", "FallingEdge"),
+        ("TriggerDelay", 5.0), ("TriggerMode", "On")], cam.log
+    # The rows keep their order: the mode under the selector.
+    keys = [s.key for s in dev.settings() if s.group == "Trigger"]
+    assert keys == ["TriggerSelector", "TriggerMode", "TriggerSource",
+                    "TriggerActivation", "TriggerDelay"]
+    # Without a source in the set the mode stays where it was.
+    cam.log.clear()
+    dev.apply_settings({"TriggerMode": "Off", "TriggerSelector": "FrameStart"})
+    assert cam.log == [("TriggerSelector", "FrameStart"),
+                       ("TriggerMode", "Off")], cam.log
+
+
+def _preset_of(dev):
+    """What camera_presets.capture saves: the rows and every other trigger."""
+    provider = dev.settings_provider()
+    settings = cs.snapshot(dev, provider.describe())
+    settings.update(provider.trigger_settings())
+    return settings
+
+
+def test_an_unchanged_trigger_is_no_reason_to_stop_when_the_mode_is_locked():
+    """stops_needed counted EVERY other trigger's key as blocking whenever
+    the selected trigger's node was locked by the stream — even for a preset
+    just saved, so nothing would change (measured on this fake: [
+    'TriggerMode[FrameBurstStart]', 'TriggerMode[ExposureStart]']). That
+    restarted the live view for nothing and named raw keys. Only CHANGES
+    count: the other triggers are read (the selector moved, then put back)
+    and compared."""
+    dev, cam = trigger_basler(full=True)
+    cam.TriggerMode.locked = True             # locked while grabbing
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerMode.SetValue("On")
+    sel.value = "FrameStart"
+    preset = _preset_of(dev)
+    assert preset["TriggerMode[FrameBurstStart]"] == "On"
+    dev.start()
+    assert by_key(dev)["TriggerMode"].live is False
+    assert cs.stops_needed(dev, preset) == []
+    assert sel.value == "FrameStart", "reading them moved the selector"
+    cam.log.clear()
+    done = dev.apply_settings(preset)
+    assert done.ok, done.summary()
+    assert ("TriggerMode", "On") not in cam.log and \
+        ("TriggerMode", "Off") not in cam.log, cam.log
+    # A real change still needs the stream stopped, and only that one.
+    changed = dict(preset, **{"TriggerMode[FrameBurstStart]": "Off"})
+    assert cs.stops_needed(dev, changed) == ["TriggerMode[FrameBurstStart]"]
+    with pytest.raises(cs.NeedsStop):
+        dev.apply_settings(changed)
+    # A trigger this camera does not have is refused, not stopped for.
+    other = dict(preset, **{"TriggerMode[AcquisitionStart]": "On"})
+    assert cs.stops_needed(dev, other) == []
+
+
+def test_a_trigger_key_is_named_for_a_person():
+    """The restart message ("The live view restarted for …") and a refusal
+    named a raw "TriggerMode[FrameBurstStart]"."""
+    dev, _ = trigger_basler(full=True)
+    labels = cs.labels_of(dev.settings(), ["TriggerMode[FrameBurstStart]",
+                                           "TriggerDelay[ExposureStart]",
+                                           "Gain"])
+    assert labels["TriggerMode[FrameBurstStart]"] == \
+        "Trigger mode (FrameBurstStart trigger)"
+    assert labels["TriggerDelay[ExposureStart]"] == \
+        "Trigger delay (ExposureStart trigger)"
+    assert labels["Gain"] == "Gain"
+    # A camera without the trigger rows still names them by the table.
+    assert cs.labels_of([], ["TriggerSource[FrameStart]"]) == {
+        "TriggerSource[FrameStart]": "Trigger source (FrameStart trigger)"}
+
+
+def test_a_selector_locked_by_the_stream_is_said_not_taken_for_a_missing_trigger():
+    """With TriggerSelector locked while grabbing, _each_trigger can visit
+    the selected trigger only. A preset then saved no other trigger and said
+    nothing; applying one refused each with "this camera has no
+    FrameBurstStart trigger" — the camera has it, only the selector could
+    not move; and stops_needed did not count the selector's lock."""
+    dev, cam = trigger_basler(full=True)
+    cam.TriggerSelector.locked = True
+    provider = dev.settings_provider()
+    assert provider.unreadable_triggers() == [], "not streaming: it moves"
+    dev.start()
+    assert provider.unreadable_triggers() == ["FrameBurstStart",
+                                              "ExposureStart"]
+    assert provider.trigger_settings() == {}, "nothing it could not read"
+    wanted = {"TriggerMode[FrameBurstStart]": "Off",
+              "TriggerMode[AcquisitionStart]": "On"}
+    # The selector must move for FrameBurstStart: the stream is in the way.
+    # AcquisitionStart is not this camera's: refused, not stopped for.
+    assert cs.stops_needed(dev, wanted) == ["TriggerMode[FrameBurstStart]"]
+    refused = {c.key: c.note for c in provider.apply_triggers(wanted)}
+    assert refused["TriggerMode[AcquisitionStart]"] == \
+        "this camera has no AcquisitionStart trigger"
+    note = refused["TriggerMode[FrameBurstStart]"]
+    assert "has no" not in note, note
+    assert note == ("the FrameBurstStart trigger cannot be selected now — "
+                    "the camera locks the trigger selector while it "
+                    "streams"), note
+    # Stopped, the selector moves and every trigger is read and written.
+    dev.stop()
+    assert provider.unreadable_triggers() == []
+    changes = provider.apply_triggers({"TriggerMode[FrameBurstStart]": "On"})
+    assert [c.ok for c in changes] == [True]
+    assert cam.TriggerMode.values["FrameBurstStart"] == "On"
+
+
 def test_a_set_turns_the_auto_loop_off_before_the_value_it_owns():
     dev, cam = basler()
     done = dev.apply_settings({"ExposureTime": 2000, "ExposureAuto": "Off"})

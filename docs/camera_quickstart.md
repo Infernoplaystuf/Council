@@ -1116,11 +1116,23 @@ source is `Software`). So:
   keeps **every** trigger's mode, source, edge and delay: the selected
   trigger's under the rows' own names, the others' as
   `TriggerMode[FrameBurstStart]` and so on. Applying it puts each trigger
-  back (a trigger's mode last, after its source) and leaves the selector
-  where it was when the preset was saved. A preset saved before this holds
-  the selected trigger only, and still applies as it did; an older Typhon
-  applying a newer preset reports the other triggers as settings it does
-  not know.
+  back — every trigger's mode, the selected one's too, last, after its
+  source, edge and delay — and leaves the selector where it was when the
+  preset was saved. A preset saved before this holds the selected trigger
+  only, and still applies as it did; an older Typhon applying a newer
+  preset reports the other triggers as settings it does not know.
+- the stream is stopped for another trigger's setting only when the
+  camera locks that setting (or its trigger selector) while it streams and
+  the setting would **change** — or, with the selector locked, cannot be
+  read to tell; the pylon emulator locks neither. The live view's
+  restart message names it in words (`Trigger mode (FrameBurstStart
+  trigger)`). On a camera that locks its trigger selector while it
+  streams, a preset saved during the live view can hold the selected
+  trigger only, and the save **says so** (`The other triggers (…) were NOT
+  saved`). Applying a preset there stops the live view for the other
+  triggers (the selector must move); a trigger that still cannot be
+  selected is refused as `cannot be selected now`, not as one the camera
+  does not have.
 
 Each run writes under its own timestamped stem, so a second run into the same
 folder can never overwrite the first. Unplugging the camera mid-capture ends

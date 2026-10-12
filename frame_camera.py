@@ -2689,7 +2689,9 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     if live_ok and (roi is not None or blocked):
         _refuse_while_capturing(doing)
     stop = bool(blocked)
-    labels = {s.key: s.label for s in described or []}
+    # Another trigger's key in words ("Trigger mode (FrameBurstStart
+    # trigger)"), not the preset's raw "TriggerMode[FrameBurstStart]".
+    labels = camera_settings.labels_of(described or [], values)
     restarted = [labels.get(k, "the area" if k == "area" else k)
                  for k in blocked]
     before = _roi_or_none(device)
@@ -2977,6 +2979,15 @@ def save_preset(name: Any, include_roi: Any = True,
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
              else ", area left as it is when applied.")
+    unread = _unreadable_triggers(device)
+    if unread:
+        # A preset keeps every trigger — unless the selector cannot move:
+        # then it held the selected one only, and said nothing.
+        said += (f" The other triggers ({', '.join(unread)}) were NOT "
+                 f"saved: the camera does not let its trigger selector move "
+                 + ("while it streams — stop the live view and save again "
+                    "to keep them." if getattr(device, "streaming", False)
+                    else "now."))
     if moved is not None and store.repaired == "entry":
         said += (f" This camera's presets in the file were damaged: the "
                  f"file as it was is kept as {moved.name}; the other "
@@ -2985,6 +2996,16 @@ def save_preset(name: Any, include_roi: Any = True,
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
     return _presets_changed(preset.name, said)
+
+
+def _unreadable_triggers(device: Any) -> List[str]:
+    """The triggers a preset saved now could not hold (the provider's
+    unreadable_triggers); [] when the camera cannot say."""
+    try:
+        return [str(entry) for entry in
+                device.settings_provider().unreadable_triggers()]
+    except Exception:                                     # noqa: BLE001
+        return []
 
 
 def _presets_changed(name: str, said: str) -> Dict[str, Any]:
