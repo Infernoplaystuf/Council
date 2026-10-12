@@ -8191,6 +8191,32 @@ def test_model_downloader() -> None:
                                   url="http://127.0.0.1/m.gguf")
             _check("re-download skips an already-present valid file",
                    r2["skipped"] is True)
+
+            # huggingface_hub installed but FAILING (offline, auth, a bad
+            # repo) must fall back to the direct URL. Before the hub was
+            # hidden above, the real hf_hub_download failing against
+            # huggingface.co was what ran this branch - online. Now a fake
+            # hub fails instead; no other check reaches it.
+            import types
+            asked = []
+
+            def _failing_hub_download(**kw):
+                asked.append(kw)
+                raise OSError("offline")
+
+            sys.modules["huggingface_hub"] = types.SimpleNamespace(
+                hf_hub_download=_failing_hub_download)
+            seen.clear()
+            r3 = md.download_gguf("repo", "m.gguf", d / "fallback",
+                                  url="http://127.0.0.1/m.gguf",
+                                  progress=lambda done, total: seen.append(done))
+            _check("a failing huggingface_hub was asked first",
+                   [(k.get("repo_id"), k.get("filename")) for k in asked]
+                   == [("repo", "m.gguf")], repr(asked))
+            _check("hub failed -> the direct URL is streamed instead",
+                   md.looks_like_gguf(r3["path"]) and r3["bytes"] > 0
+                   and r3.get("via") != "huggingface_hub" and len(seen) >= 1,
+                   repr(r3))
         finally:
             _ureq.urlopen = prev_urlopen
             md._HF_HOST = prev_host
