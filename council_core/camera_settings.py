@@ -12,9 +12,11 @@ whether it can change while the camera streams. That is `Setting`.
 
 RANGES COME FROM THE CAMERA, NEVER FROM THIS FILE
 A Basler node reports its own minimum, maximum and increment, and an
-enumeration only the entries this model offers. An EVK4 bias reports its
-allowed and recommended range through LL_Bias_Info; the ERC, anti-flicker and
-trail filter report their supported bounds. The tables here say only WHICH
+enumeration only the entries this model offers. An EVK4 bias reports
+get_bias_range() — as Typhon opens one, the only range its HAL accepts —
+and the recommended one through LL_Bias_Info (EvkSettings says why that is
+not the "allowed" range); the ERC,
+anti-flicker and trail filter report their supported bounds. The tables here say only WHICH
 features to look for, what to call them, and in what order to write them.
 (The one bound written here is the EVK4's picture window, which is this app's
 own display setting, not the camera's.)
@@ -314,6 +316,36 @@ class Trigger:
         return f"its {which} is On (source {self.source or 'unknown'})"
 
 
+#: A trigger's own settings: a Basler holds one value of each PER
+#: TriggerSelector entry (SFNC; on the emulator each entry's mode, source,
+#: edge and delay changed alone — measured), and its rows show the selected
+#: entry's. In the order a set writes them — every other trigger's in
+#: apply_triggers, the selected one's in BaslerSettings.plan: the mode LAST,
+#: so a trigger is never On while its source and edge are still the old
+#: ones.
+TRIGGER_FEATURES: Tuple[str, ...] = ("TriggerSource", "TriggerActivation",
+                                     "TriggerDelay", "TriggerMode")
+
+
+def trigger_key(entry: str, key: str) -> str:
+    """A preset's key for one trigger's setting, other than the selected
+    trigger's: "TriggerMode[FrameBurstStart]". Still a plain name: value
+    pair, so a presets file keeps its format, and an older Typhon applying
+    one reports these keys as settings it does not know, not as damage."""
+    return f"{key}[{entry}]"
+
+
+def split_trigger_key(key: Any) -> Optional[Tuple[str, str]]:
+    """(setting key, selector entry) for a trigger_key, else None."""
+    text = str(key)
+    if not text.endswith("]"):
+        return None
+    base, mark, entry = text[:-1].partition("[")
+    if not mark or not entry or base not in TRIGGER_FEATURES:
+        return None
+    return base, entry
+
+
 def trigger_warning(source: str) -> str:
     """Under a TriggerMode row that is On: what that does to the picture."""
     if Trigger("", source).software:
@@ -472,6 +504,28 @@ class Provider:
         connected); what was changed, one line each."""
         return []
 
+    def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
+        """Every OTHER trigger's settings, for a preset: {"TriggerMode
+        [FrameBurstStart]": "On", ...} (trigger_key). The selected trigger's
+        are the plain keys a snapshot already holds — with `selected` they
+        are listed this way too (to compare a preset with the camera). {}
+        for a camera with one trigger or none."""
+        return {}
+
+    def apply_triggers(self, values: Mapping[str, Any]) -> List[Change]:
+        """Write trigger_settings() values back, each trigger selected in
+        turn, the selector left where it was; one Change per key. A camera
+        without them refuses each, by name."""
+        return [Change(key, asked, None, ok=False,
+                       note="this camera has no such setting")
+                for key, asked in values.items()]
+
+    def unreadable_triggers(self) -> List[str]:
+        """The triggers trigger_settings cannot read now, by selector entry
+        (a selector locked by the stream), so a preset saved now would not
+        hold them; [] when it reads them all, or there are none."""
+        return []
+
     # ------------------------------------------------------------------
     def find(self, key: str) -> Setting:
         for setting in self.describe():
@@ -620,12 +674,88 @@ def stops_needed(device: Any, values: Mapping[str, Any],
                if key in by_key and not by_key[key].live
                and not by_key[key].read_only
                and _would_change(by_key[key], values[key])]
+    blocked += _triggers_in_the_way(device, values, by_key)
     if (roi is not None and not getattr(device, "area_live", False)
             and _fits(device, roi) and not area_unchanged(device, roi)):
         # An area off the sensor is refused, not written (apply): no reason
         # to stop the stream for it.
         blocked.append("area")
     return blocked
+
+
+def _locked(setting: Optional[Setting]) -> bool:
+    """Locked by the stream (and writable once it stops)."""
+    return setting is not None and not setting.live and not setting.read_only
+
+
+def _triggers_in_the_way(device: Any, values: Mapping[str, Any],
+                         by_key: Mapping[str, Setting]) -> List[str]:
+    """The other triggers' settings (trigger_key) the stream is in the way
+    of. Writing one selects its trigger, then writes the node the rows show
+    for the selected one (SFNC), so it is in the way when that node is
+    locked by the stream — or the SELECTOR is, and the trigger is not the
+    selected one.
+
+    ONLY CHANGES COUNT, as for the rows: every one was counted whenever
+    the selected trigger's node was locked, so a preset just saved stopped
+    and restarted the live view for nothing (measured on the test fake).
+    So the triggers are read (trigger_settings: only the selector moves,
+    and is put back) and compared. One that cannot be read — the selector
+    locked — cannot be known unchanged, and counts. A trigger the camera
+    does not have is refused by apply_triggers, nothing written: no reason
+    to stop. (On the emulator every trigger node, the selector too, stays
+    writable while grabbing — measured — so none of this costs it a read.)
+    """
+    asked = {key: split for key in values
+             for split in [split_trigger_key(key)] if split}
+    if not asked:
+        return []
+    selector = by_key.get("TriggerSelector")
+    if not _locked(selector) and not any(_locked(by_key.get(base))
+                                         for base, _ in asked.values()):
+        return []
+    entries = set(selector.choices) if selector is not None else set()
+    current = str(selector.value) if selector is not None else ""
+    try:
+        now: Optional[Mapping[str, Any]] = dict(
+            device.settings_provider().trigger_settings(selected=True))
+    except Exception:                                       # noqa: BLE001
+        now = None
+    out: List[str] = []
+    for key, (base, entry) in asked.items():
+        shown = by_key.get(base)
+        if shown is None or shown.read_only or entry not in entries:
+            continue                    # refused, not written
+        moves = _locked(selector) and entry != current
+        if not (moves or _locked(shown)):
+            continue
+        if now is None or key not in now:
+            out.append(key)             # cannot tell: it may change
+            continue
+        try:
+            wanted, _ = coerce(shown, values[key])
+        except SettingError:
+            continue                    # refused before any write
+        if not same(wanted, now[key]):
+            out.append(key)
+    return out
+
+
+def labels_of(described: Sequence[Setting],
+              keys: Iterable[str] = ()) -> Dict[str, str]:
+    """key: label, for a person — every described setting's, and each
+    trigger_key among `keys` as its row says it, with the trigger named:
+    "Trigger mode (FrameBurstStart trigger)". The restart message said
+    "The live view restarted for TriggerMode[FrameBurstStart]"."""
+    out = {s.key: s.label for s in described}
+    table = {f.key: f.label for f in BASLER_FEATURES}
+    for key in keys:
+        split = split_trigger_key(key)
+        if split is not None:
+            base, entry = split
+            out[key] = (f"{out.get(base) or table.get(base, base)} "
+                        f"({entry} trigger)")
+    return out
 
 
 def _fits(device: Any, roi: Roi) -> bool:
@@ -655,6 +785,11 @@ def apply(device: Any, values: Mapping[str, Any],
     way of any change in the set (`stops_needed`), so a half-applied set is
     never mistaken for a whole one: the caller stops the stream and calls
     again (frame_camera does that for a restartable camera).
+
+    The OTHER TRIGGERS' settings (trigger_key: "TriggerMode[FrameBurstStart]")
+    go last, through the provider's apply_triggers, which selects each
+    trigger in turn and leaves the selector where this set put it — where
+    the user had it when the preset was saved.
     """
     provider = device.settings_provider()
     described = provider.describe()
@@ -665,7 +800,9 @@ def apply(device: Any, values: Mapping[str, Any],
     by_key = {s.key: s for s in described}
     done = Applied(roi_asked=roi)
     batch = dict(values)
-    for key in provider.plan(values.keys(), described, roi is not None):
+    triggers = {k: v for k, v in values.items() if split_trigger_key(k)}
+    plain = [k for k in values if k not in triggers]
+    for key in provider.plan(plain, described, roi is not None):
         if key is None:
             if not _fits(device, roi):
                 # Written AFTER binning (plan order), so the sensor's size
@@ -705,6 +842,8 @@ def apply(device: Any, values: Mapping[str, Any],
         except SettingError as exc:
             done.changes.append(Change(key, asked, setting.value, ok=False,
                                        note=str(exc)))
+    if triggers:
+        done.changes.extend(provider.apply_triggers(triggers))
     return done
 
 
@@ -796,8 +935,9 @@ BASLER_FEATURES: Tuple[_Feature, ...] = (
     _Feature("TriggerSelector", ("TriggerSelector",), "Trigger",
              "Trigger", help="Which trigger the settings below are for — "
                              "FrameStart starts each frame. Each trigger "
-                             "has its own mode, source and edge: these "
-                             "rows show the selected one only."),
+                             "has its own mode, source, edge and delay: "
+                             "these rows show the selected one only (a "
+                             "preset keeps every trigger's)."),
     _Feature("TriggerMode", ("TriggerMode",), "Trigger mode", "Trigger",
              help="On: the camera waits for the trigger selected above "
                   "before each frame, and the live view shows nothing until "
@@ -919,7 +1059,50 @@ class BaslerSettings(Provider):
             raise SettingError(f"this camera has no {key}")
         return _plain(found[1].GetValue())
 
+    def plan(self, keys: Iterable[str], described: Sequence[Setting],
+             with_roi: bool) -> List[Optional[str]]:
+        """Describe order, except THE SELECTED TRIGGER'S MODE GOES AFTER ITS
+        SOURCE, EDGE AND DELAY (TRIGGER_FEATURES' order), as every other
+        trigger's does in apply_triggers. The rows keep the mode under the
+        selector; written in that order, applying a preset turned the
+        selected trigger On while its source and edge were still the old
+        ones (measured on the test fake's write log)."""
+        out = super().plan(keys, described, with_roi)
+        if "TriggerMode" in out:
+            at = out.index("TriggerMode")
+            before = [i for i, k in enumerate(out)
+                      if k in TRIGGER_FEATURES and k != "TriggerMode"]
+            if before and before[-1] > at:
+                out.insert(before[-1], out.pop(at))
+        return out
+
     # -- triggers ------------------------------------------------------------
+    def _selector(self) -> Tuple[Any, str, List[str]]:
+        """(TriggerSelector node, the entry selected, every entry) — (None,
+        "", []) on a model with no readable selector."""
+        selector = self.device._node("TriggerSelector")
+        if selector is None or not _readable(selector):
+            return None, "", []
+        was = ""
+        try:
+            was = str(_plain(selector.GetValue()))
+            return selector, was, [str(s) for s in selector.GetSymbolics()]
+        except Exception:                                   # noqa: BLE001
+            return selector, was, []
+
+    def unreadable_triggers(self) -> List[str]:
+        """The triggers trigger_settings cannot reach now, by selector entry:
+        every one but the selected, while the selector cannot be written
+        (locked by the stream on a model that locks it — the emulator does
+        not, measured). [] when it reaches them all."""
+        mode = self.device._node("TriggerMode")
+        if mode is None or not _readable(mode):
+            return []
+        selector, was, entries = self._selector()
+        if len(entries) < 2 or _writable(selector):
+            return []
+        return [entry for entry in entries if entry != was]
+
     def _each_trigger(self, visit: Callable[[str, Any, Any], None]) -> None:
         """Call visit(selector entry, TriggerMode node, TriggerSource node)
         with each of the camera's triggers selected in turn, then select
@@ -935,15 +1118,7 @@ class BaslerSettings(Provider):
         if mode is None or not _readable(mode):
             return
         source = self.device._node("TriggerSource")
-        selector = self.device._node("TriggerSelector")
-        entries: List[str] = []
-        was = ""
-        if selector is not None and _readable(selector):
-            try:
-                was = str(_plain(selector.GetValue()))
-                entries = [str(s) for s in selector.GetSymbolics()]
-            except Exception:                               # noqa: BLE001
-                entries = []
+        selector, was, entries = self._selector()
         if len(entries) < 2 or not _writable(selector):
             visit(was, mode, source)
             return
@@ -1005,6 +1180,108 @@ class BaslerSettings(Provider):
                             f"to {wanted} — {_why(exc)}")
         self._each_trigger(visit)
         return done
+
+    def _selected_trigger(self) -> str:
+        selector = self.device._node("TriggerSelector")
+        if selector is None or not _readable(selector):
+            return ""
+        try:
+            return str(_plain(selector.GetValue()))
+        except Exception:                                   # noqa: BLE001
+            return ""
+
+    def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
+        """EVERY TRIGGER IN A PRESET, NOT THE SELECTED ONE ONLY. A snapshot
+        holds the rows — the selected trigger's mode, source, edge and
+        delay — so a preset kept one trigger of nine (the emulator's): a
+        FrameBurstStart trigger On from Line1, saved while the selector
+        showed FrameStart, was lost. These are the others', by trigger_key;
+        only the selector is written to read them, and put back."""
+        current = self._selected_trigger()
+        streaming = self._streaming()
+        out: Dict[str, Any] = {}
+
+        def visit(entry: str, _mode: Any, _source: Any) -> None:
+            if not entry or (entry == current and not selected):
+                return
+            for base in TRIGGER_FEATURES:
+                setting = self._describe_one(self._feature(base), streaming)
+                if setting is not None and setting.savable \
+                        and setting.value is not None:
+                    out[trigger_key(entry, base)] = setting.value
+        self._each_trigger(visit)
+        return out
+
+    def apply_triggers(self, values: Mapping[str, Any]) -> List[Change]:
+        """Each trigger selected in turn (in the camera's order), its
+        settings written — source, edge and delay before the mode — and
+        the selector put back where it was (_each_trigger). A value the
+        trigger already has is not written again. A trigger this camera
+        does not have is refused by name, and one it has but cannot select
+        now (the selector locked by the stream) says that instead."""
+        wanted: Dict[str, Dict[str, Tuple[str, Any]]] = {}
+        done: List[Change] = []
+        for key, asked in values.items():
+            split = split_trigger_key(key)
+            if split is None:
+                done.append(Change(key, asked, None, ok=False,
+                                   note="this camera has no such setting"))
+                continue
+            base, entry = split
+            wanted.setdefault(entry, {})[base] = (key, asked)
+        streaming = self._streaming()
+
+        def visit(entry: str, _mode: Any, _source: Any) -> None:
+            asks = wanted.pop(entry, None) if entry else None
+            for base in TRIGGER_FEATURES:
+                if asks and base in asks:
+                    key, asked = asks[base]
+                    done.append(self._set_trigger(key, base, asked,
+                                                  streaming))
+        self._each_trigger(visit)
+        # Not visited: a trigger this camera does not have — or one it has
+        # that could not be selected now. Said apart: "has no FrameBurstStart
+        # trigger" was the answer for both, with the selector locked by the
+        # stream (on the test fake) and the trigger right there.
+        mode = self.device._node("TriggerMode")
+        selector, _was, entries = (self._selector() if mode is not None
+                                   and _readable(mode) else (None, "", []))
+        for entry, asks in wanted.items():
+            if entry not in entries:
+                why = f"this camera has no {entry} trigger"
+            elif not _writable(selector):
+                why = (f"the {entry} trigger cannot be selected now — the "
+                       + ("camera locks the trigger selector while it "
+                          "streams" if streaming else
+                          "camera does not allow changing the trigger "
+                          "selector now"))
+            else:
+                why = (f"the {entry} trigger cannot be selected now — the "
+                       f"camera refused to select it")
+            for key, asked in asks.values():
+                done.append(Change(key, asked, None, ok=False, note=why))
+        return done
+
+    def _set_trigger(self, key: str, base: str, asked: Any,
+                     streaming: bool) -> Change:
+        """One setting of the trigger now selected, reported under its
+        trigger_key."""
+        setting = self._describe_one(self._feature(base), streaming)
+        if setting is None:
+            return Change(key, asked, None, ok=False,
+                          note="this camera has no such setting")
+        if setting.read_only:
+            return Change(key, asked, setting.value, ok=False,
+                          note="read-only on this camera")
+        if _unchanged(setting, asked):
+            return Change(key, asked, setting.value)
+        try:
+            change = self.set(base, asked, batch={}, setting=setting)
+        except NeedsStop:
+            raise
+        except SettingError as exc:
+            return Change(key, asked, setting.value, ok=False, note=str(exc))
+        return replace(change, key=key)
 
     def held_by(self, setting: Setting, batch: Mapping[str, Any]) -> str:
         feature = self._feature(setting.key)
@@ -1296,11 +1573,44 @@ _BIAS_HELP = {
                      "means fewer, stronger events.",
     "bias_fo": "Low-pass filter: lower filters out fast flicker and noise.",
     "bias_hpf": "High-pass filter: higher removes slow changes.",
-    "bias_refr": "Refractory period: how long a pixel waits before it can "
-                 "fire again.",
+    "bias_refr": "Refractory period: how long a pixel rests after an event "
+                 "before it can fire again. Higher shortens the rest, so "
+                 "more events; lower gives fewer events each time an edge "
+                 "crosses a pixel.",
     "bias_diff": "Reference level the ON and OFF thresholds are set "
                  "against.",
 }
+
+# WHAT THE FILTERS DELETE, said where they are switched on. Checked against
+# the OpenEB 5.2 source (tests/test_camera_settings.py reads it where it is
+# on the machine): the IMX636 driver (Gen41Erc) counts the rate over a
+# 200 µs reference period with time-based dropping only (row and column
+# dropping off); its trail filter takes 1000-100000 µs and keeps
+# roundf(threshold / 1000) whole milliseconds. What STC and TRAIL keep, and
+# what a burst is, is I_EventTrailFilterModule::Type's own description; the
+# name STC (spatio-temporal contrast) is Prophesee's documentation's — the
+# OpenEB source never spells it out.
+ERC_HELP = (
+    "Caps the event rate so a busy scene cannot swamp the link — but not "
+    "evenly: on the EVK4's IMX636 it drops events by time slot (OpenEB's "
+    "driver counts the rate in 200 µs slots and drops by time only, not by "
+    "row or column), so a track gets gaps in time, and signal quality "
+    "degrades once it acts. Prefer a smaller area (ROI) and the filters; "
+    "keep this as a safety cap.")
+TRAIL_HELP = (
+    "A burst is a run of events of the same polarity (all ON, brighter, or "
+    "all OFF, darker) at one pixel, closer together than the threshold "
+    "below. STC is Prophesee's spatio-temporal contrast filter. "
+    "TRAIL keeps the first event of each burst and removes the trail a "
+    "moving edge leaves behind it. Both STC modes drop the first event of "
+    "each burst and every lone event (STC_CUT_TRAIL keeps only the second "
+    "event of a burst, STC_KEEP_TRAIL the second and later), so STC can "
+    "delete a small, fast particle that fires a pixel once. TRAIL for fast "
+    "particles; test STC on a real recording first.")
+TRAIL_THRESHOLD_HELP = (
+    "A burst is events of one polarity closer together than this. On the "
+    "EVK4's IMX636 it is 1-100 ms (1,000-100,000 µs), rounded to the "
+    "nearest whole millisecond.")
 
 
 class EvkSettings(Provider):
@@ -1314,10 +1624,23 @@ class EvkSettings(Provider):
     get_i_erc_module, get_i_roi and the rest all return None — so each
     facility is optional here and a missing one is simply not listed.
 
-    THE HAL REPORTS SUCCESS AS A BOOL. set(), enable() and the set_* calls
-    return False rather than raising when the sensor refuses, so a False is
-    turned into a refusal here; ignoring it would report a bias the camera
-    never took.
+    THE HAL REPORTS SUCCESS AS A BOOL — OR RAISES. set(), enable() and the
+    set_* calls return False for some refusals, so a False is turned into a
+    refusal here; ignoring it would report a bias the camera never took.
+    Others raise (OpenEB source: a bias outside its range, an IMX636 trail
+    threshold outside 1-100 ms), which Provider.set reports as a refusal too.
+
+    A BIAS RUNS OVER LL_Bias_Info.get_bias_range(). Without the range-check
+    bypass (DeviceConfig ll_biases_range_check_bypass) that is the
+    RECOMMENDED range, and exactly what I_LL_Biases::set checks — and
+    DeviceDiscovery.open(serial), as cameras.EvkBackend opens one, does not
+    set the bypass. An IMX636's allowed bias_diff_on is -150..200, but only
+    -85..140 is accepted (OpenEB's imx636_bias_settings*.h); bounded by the
+    allowed range, a slider or a preset asked for values the HAL always
+    refused. WITH the bypass, set() checks no range at all and
+    get_bias_range() only reports the allowed one, which then bounds the
+    slider (OpenEB i_ll_biases.cpp). The recommended range is reported
+    either way.
     """
 
     roi_after_group = None          # the area last: nothing depends on it
@@ -1401,8 +1724,10 @@ class EvkSettings(Provider):
 
     def _bias(self, name: Any, value: Any) -> Setting:
         info = _ask(self.biases, "get_bias_info", name)
-        allowed = _pair(_ask(info, "get_bias_allowed_range")) or _pair(
-            _ask(info, "get_bias_range"))
+        # get_bias_range(): what set() checks without the bypass, the
+        # allowed range only with it (see the class notes).
+        allowed = _pair(_ask(info, "get_bias_range")) or _pair(
+            _ask(info, "get_bias_allowed_range"))
         recommended = _pair(_ask(info, "get_bias_recommended_range"))
         modifiable = _ask(info, "is_modifiable")
         described = _ask(info, "get_description") or ""
@@ -1420,8 +1745,7 @@ class EvkSettings(Provider):
             return []
         out = [Setting("erc.enabled", "Event rate controller on", G_ERC,
                        BOOL, bool(_ask(erc, "is_enabled")),
-                       help="Drops events evenly once the rate passes the "
-                            "limit, so a busy scene cannot swamp the link.")]
+                       help=ERC_HELP)]
         rate = _ask(erc, "get_cd_event_rate")
         if rate is not None:
             out.append(Setting(
@@ -1483,10 +1807,7 @@ class EvkSettings(Provider):
         if trail is None:
             return []
         out = [Setting("trail.enabled", "Trail filter on", G_TRAIL, BOOL,
-                       bool(_ask(trail, "is_enabled")),
-                       help="Removes the trail of events a moving edge "
-                            "leaves behind (TRAIL), or keeps only "
-                            "confirmed events (STC).")]
+                       bool(_ask(trail, "is_enabled")), help=TRAIL_HELP)]
         kind = _ask(trail, "get_type")
         if kind is not None:
             available = _ask(trail, "get_available_types")
@@ -1503,7 +1824,7 @@ class EvkSettings(Provider):
                 "trail.threshold", "Threshold", G_TRAIL, INT, int(threshold),
                 minimum=_num(_ask(trail, "get_min_supported_threshold")),
                 maximum=_num(_ask(trail, "get_max_supported_threshold")),
-                step=1, unit="µs"))
+                step=1, unit="µs", help=TRAIL_THRESHOLD_HELP))
         return out
 
     def _activity(self) -> List[Setting]:

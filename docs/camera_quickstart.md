@@ -763,8 +763,11 @@ forward. A pop-out opens **as wide as its rows** (the range and the ↺ beside
 each never need a sideways scroll), and cannot be made narrower than that.
 
 - Every setting of the category, with the **camera's own range and unit**
-  beside it (`-85 … 140`, and under it `rec. -25 … 60` for a bias), as the
-  camera reports them.
+  beside it (`-85 … 140`, and under it `rec. -85 … 140` for a bias), as the
+  camera reports them. An EVK4's HAL accepts a bias only inside its
+  recommended range unless the camera is opened with OpenEB's range-check
+  bypass, which Typhon does not do, so the two read the same; with the
+  bypass, `bias_diff_on` would read `-150 … 200` over `rec. -85 … 140`.
 - **Live**: drag a bias and the live picture shows it as you drag, through
   the same 60 ms throttle — the camera is not sent a value per pixel of the
   drag.
@@ -889,8 +892,12 @@ every setting the connected camera has; the camera describes them itself,
 with its own ranges, increments and units, so nothing is guessed:
 
 - **EVK4** (through the Metavision HAL, as Metavision Studio shows them): every
-  bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`, …,
-  with the allowed and the recommended range the sensor reports), the **event
+  bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`,
+  `bias_diff` on an IMX636, with the range the HAL reports for it — the
+  recommended one, the only range the HAL accepts as Typhon opens the
+  camera; on a camera opened with the range-check bypass, the allowed one,
+  and the HAL then checks none — and the recommended range the sensor
+  reports), the **event
   rate controller** (on/off, rate limit), **anti-flicker** (on/off, band pass /
   band stop, the frequency band, duty cycle, thresholds), the **event trail
   filter** (on/off, TRAIL / STC_CUT_TRAIL / STC_KEEP_TRAIL, threshold), the
@@ -922,7 +929,9 @@ area** in sensor pixels, the **presets**, and **What the last change did**.
   may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
   bias — the control shows the camera's value and the row says
   `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
-- A bias outside its **recommended** range says so under its row.
+- A bias outside its **recommended** range says so under its row (on an
+  EVK4, only one opened with the range-check bypass: otherwise the HAL
+  accepts the recommended range only, and the slider ends there).
 - A setting another one owns is **greyed out and says why** (`Greyed out
   while "Auto exposure" is Continuous — change that first`). One the stream is
   in the way of (a Basler's pixel format, mirror, binning) says `Changing
@@ -1104,7 +1113,26 @@ source is `Software`). So:
   left On while the selector shows FrameStart is named — and **Reset Trigger
   (as connected)** / **Reset all** put **every** trigger's mode back as
   connected, saying which (`the FrameBurstStart trigger Off again`). A preset
-  keeps the selected trigger only.
+  keeps **every** trigger's mode, source, edge and delay: the selected
+  trigger's under the rows' own names, the others' as
+  `TriggerMode[FrameBurstStart]` and so on. Applying it puts each trigger
+  back — every trigger's mode, the selected one's too, last, after its
+  source, edge and delay — and leaves the selector where it was when the
+  preset was saved. A preset saved before this holds the selected trigger
+  only, and still applies as it did; an older Typhon applying a newer
+  preset reports the other triggers as settings it does not know.
+- the stream is stopped for another trigger's setting only when the
+  camera locks that setting (or its trigger selector) while it streams and
+  the setting would **change** — or, with the selector locked, cannot be
+  read to tell; the pylon emulator locks neither. The live view's
+  restart message names it in words (`Trigger mode (FrameBurstStart
+  trigger)`). On a camera that locks its trigger selector while it
+  streams, a preset saved during the live view can hold the selected
+  trigger only, and the save **says so** (`The other triggers (…) were NOT
+  saved`). Applying a preset there stops the live view for the other
+  triggers (the selector must move); a trigger that still cannot be
+  selected is refused as `cannot be selected now`, not as one the camera
+  does not have.
 
 Each run writes under its own timestamped stem, so a second run into the same
 folder can never overwrite the first. Unplugging the camera mid-capture ends

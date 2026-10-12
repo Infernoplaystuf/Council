@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from council_core import camera_settings as cs
 from council_core import cameras
 from council_core.cameras import CameraInfo, Roi
+from tests import fake_evk4
 
 
 # ======================================================================
@@ -284,8 +285,8 @@ class Selected(Node):
     """A node of the SELECTED trigger (SFNC): TriggerMode and TriggerSource
     hold one value per TriggerSelector entry, as a Basler's do."""
 
-    def __init__(self, values, choices):
-        super().__init__(next(iter(values.values())), choices=choices)
+    def __init__(self, values, choices=None, **node):
+        super().__init__(next(iter(values.values())), choices=choices, **node)
         self.values = dict(values)
 
     def GetValue(self):
@@ -296,13 +297,23 @@ class Selected(Node):
         self.values[self.cam.TriggerSelector.value] = value
 
 
-def trigger_basler():
+def trigger_basler(full=False):
+    """Three triggers; `full`: each with its own edge and delay too, as
+    the emulator's nine have (measured: TriggerSource, TriggerActivation
+    and TriggerDelay change per TriggerSelector entry)."""
     entries = ("FrameBurstStart", "FrameStart", "ExposureStart")
+    extra = {}
+    if full:
+        extra = dict(
+            TriggerActivation=Selected({e: "RisingEdge" for e in entries},
+                                       ("RisingEdge", "FallingEdge")),
+            TriggerDelay=Selected({e: 0.0 for e in entries}, low=0.0,
+                                  high=10000.0, unit="us"))
     return basler(
         TriggerSelector=Node("FrameStart", choices=entries),
         TriggerMode=Selected({e: "Off" for e in entries}, ("Off", "On")),
         TriggerSource=Selected({e: "Software" for e in entries},
-                               ("Software", "Line1")))
+                               ("Software", "Line1")), **extra)
 
 
 def test_every_trigger_is_seen_not_only_the_selected_one():
@@ -355,6 +366,129 @@ def test_a_model_with_one_trigger_and_no_selector_is_read_too():
     assert cam.TriggerMode.value == "Off"
     # Cameras with no trigger at all say none.
     assert simulated("frame").settings_provider().triggers_on() == []
+
+
+def test_the_selected_triggers_mode_is_written_after_its_source_edge_and_delay():
+    """The other triggers' modes were written last (apply_triggers), but the
+    SELECTED trigger's plain keys went in describe order — selector, MODE,
+    source, edge, delay — so applying a preset turned that trigger On while
+    its source and edge were still the old ones (measured on this fake: a
+    write log with TriggerMode before TriggerSource)."""
+    dev, cam = trigger_basler(full=True)
+    done = dev.apply_settings({
+        "TriggerSelector": "FrameBurstStart", "TriggerMode": "On",
+        "TriggerSource": "Line1", "TriggerActivation": "FallingEdge",
+        "TriggerDelay": 5.0, "Gain": 2.0})
+    assert done.ok, done.summary()
+    assert cam.log == [
+        ("Gain", 2.0), ("TriggerSelector", "FrameBurstStart"),
+        ("TriggerSource", "Line1"), ("TriggerActivation", "FallingEdge"),
+        ("TriggerDelay", 5.0), ("TriggerMode", "On")], cam.log
+    # The rows keep their order: the mode under the selector.
+    keys = [s.key for s in dev.settings() if s.group == "Trigger"]
+    assert keys == ["TriggerSelector", "TriggerMode", "TriggerSource",
+                    "TriggerActivation", "TriggerDelay"]
+    # Without a source in the set the mode stays where it was.
+    cam.log.clear()
+    dev.apply_settings({"TriggerMode": "Off", "TriggerSelector": "FrameStart"})
+    assert cam.log == [("TriggerSelector", "FrameStart"),
+                       ("TriggerMode", "Off")], cam.log
+
+
+def _preset_of(dev):
+    """What camera_presets.capture saves: the rows and every other trigger."""
+    provider = dev.settings_provider()
+    settings = cs.snapshot(dev, provider.describe())
+    settings.update(provider.trigger_settings())
+    return settings
+
+
+def test_an_unchanged_trigger_is_no_reason_to_stop_when_the_mode_is_locked():
+    """stops_needed counted EVERY other trigger's key as blocking whenever
+    the selected trigger's node was locked by the stream — even for a preset
+    just saved, so nothing would change (measured on this fake: [
+    'TriggerMode[FrameBurstStart]', 'TriggerMode[ExposureStart]']). That
+    restarted the live view for nothing and named raw keys. Only CHANGES
+    count: the other triggers are read (the selector moved, then put back)
+    and compared."""
+    dev, cam = trigger_basler(full=True)
+    cam.TriggerMode.locked = True             # locked while grabbing
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerMode.SetValue("On")
+    sel.value = "FrameStart"
+    preset = _preset_of(dev)
+    assert preset["TriggerMode[FrameBurstStart]"] == "On"
+    dev.start()
+    assert by_key(dev)["TriggerMode"].live is False
+    assert cs.stops_needed(dev, preset) == []
+    assert sel.value == "FrameStart", "reading them moved the selector"
+    cam.log.clear()
+    done = dev.apply_settings(preset)
+    assert done.ok, done.summary()
+    assert ("TriggerMode", "On") not in cam.log and \
+        ("TriggerMode", "Off") not in cam.log, cam.log
+    # A real change still needs the stream stopped, and only that one.
+    changed = dict(preset, **{"TriggerMode[FrameBurstStart]": "Off"})
+    assert cs.stops_needed(dev, changed) == ["TriggerMode[FrameBurstStart]"]
+    with pytest.raises(cs.NeedsStop):
+        dev.apply_settings(changed)
+    # A trigger this camera does not have is refused, not stopped for.
+    other = dict(preset, **{"TriggerMode[AcquisitionStart]": "On"})
+    assert cs.stops_needed(dev, other) == []
+
+
+def test_a_trigger_key_is_named_for_a_person():
+    """The restart message ("The live view restarted for …") and a refusal
+    named a raw "TriggerMode[FrameBurstStart]"."""
+    dev, _ = trigger_basler(full=True)
+    labels = cs.labels_of(dev.settings(), ["TriggerMode[FrameBurstStart]",
+                                           "TriggerDelay[ExposureStart]",
+                                           "Gain"])
+    assert labels["TriggerMode[FrameBurstStart]"] == \
+        "Trigger mode (FrameBurstStart trigger)"
+    assert labels["TriggerDelay[ExposureStart]"] == \
+        "Trigger delay (ExposureStart trigger)"
+    assert labels["Gain"] == "Gain"
+    # A camera without the trigger rows still names them by the table.
+    assert cs.labels_of([], ["TriggerSource[FrameStart]"]) == {
+        "TriggerSource[FrameStart]": "Trigger source (FrameStart trigger)"}
+
+
+def test_a_selector_locked_by_the_stream_is_said_not_taken_for_a_missing_trigger():
+    """With TriggerSelector locked while grabbing, _each_trigger can visit
+    the selected trigger only. A preset then saved no other trigger and said
+    nothing; applying one refused each with "this camera has no
+    FrameBurstStart trigger" — the camera has it, only the selector could
+    not move; and stops_needed did not count the selector's lock."""
+    dev, cam = trigger_basler(full=True)
+    cam.TriggerSelector.locked = True
+    provider = dev.settings_provider()
+    assert provider.unreadable_triggers() == [], "not streaming: it moves"
+    dev.start()
+    assert provider.unreadable_triggers() == ["FrameBurstStart",
+                                              "ExposureStart"]
+    assert provider.trigger_settings() == {}, "nothing it could not read"
+    wanted = {"TriggerMode[FrameBurstStart]": "Off",
+              "TriggerMode[AcquisitionStart]": "On"}
+    # The selector must move for FrameBurstStart: the stream is in the way.
+    # AcquisitionStart is not this camera's: refused, not stopped for.
+    assert cs.stops_needed(dev, wanted) == ["TriggerMode[FrameBurstStart]"]
+    refused = {c.key: c.note for c in provider.apply_triggers(wanted)}
+    assert refused["TriggerMode[AcquisitionStart]"] == \
+        "this camera has no AcquisitionStart trigger"
+    note = refused["TriggerMode[FrameBurstStart]"]
+    assert "has no" not in note, note
+    assert note == ("the FrameBurstStart trigger cannot be selected now — "
+                    "the camera locks the trigger selector while it "
+                    "streams"), note
+    # Stopped, the selector moves and every trigger is read and written.
+    dev.stop()
+    assert provider.unreadable_triggers() == []
+    changes = provider.apply_triggers({"TriggerMode[FrameBurstStart]": "On"})
+    assert [c.ok for c in changes] == [True]
+    assert cam.TriggerMode.values["FrameBurstStart"] == "On"
 
 
 def test_a_set_turns_the_auto_loop_off_before_the_value_it_owns():
@@ -471,51 +605,20 @@ def test_a_snapshot_holds_what_a_user_chose_not_readings():
 # ======================================================================
 # A fake Metavision HAL, shaped like the real facilities
 # ======================================================================
-class BiasInfo:
-    def __init__(self, allowed, recommended, modifiable=True):
-        self.allowed, self.recommended = allowed, recommended
-        self.modifiable = modifiable
-
-    def get_bias_allowed_range(self):
-        return self.allowed
-
-    def get_bias_recommended_range(self):
-        return self.recommended
-
-    def is_modifiable(self):
-        return self.modifiable
-
-    def get_description(self):
-        return "from the HAL"
-
-
-class Biases:
-    RANGES = {"bias_diff_on": (-85, 140), "bias_diff_off": (-35, 190),
-              "bias_fo": (-35, 55), "bias_hpf": (0, 120),
-              "bias_refr": (-20, 235)}
+class Biases(fake_evk4.Biases):
+    """The fake EVK4's IMX636 biases — OpenEB's own tables, checked by the
+    HAL's rule (fake_evk4.Biases) — with each write logged, and a sensor
+    that quantises: an odd bias_hpf lands on the even below."""
 
     def __init__(self):
-        self.values = {name: 0 for name in self.RANGES}
-        self.log = []
-
-    def get_all_biases(self):
-        return dict(self.values)
-
-    def get_bias_info(self, name):
-        low, high = self.RANGES[name]
-        return BiasInfo((low, high), (max(low, -25), min(high, 60)))
-
-    def get(self, name):
-        return self.values[name]
+        super().__init__()
+        self.log = self.writes
 
     def set(self, name, value):
-        low, high = self.RANGES[name]
-        self.log.append((name, value))
-        if not low <= value <= high:
-            return False                 # the HAL's answer: a bool
-        # The sensor quantises: an odd bias_hpf lands on the even below.
-        self.values[name] = value - (value % 2 if name == "bias_hpf" else 0)
-        return True
+        took = super().set(name, value)
+        if name == "bias_hpf":
+            self.values[name] = value - value % 2
+        return took
 
 
 class Module:
@@ -697,11 +800,96 @@ def evk(**kw):
 def test_every_bias_the_hal_lists_is_offered_with_its_ranges():
     found = by_key(evk()[0])
     on = found["bias.bias_diff_on"]
+    # The range the HAL accepts — the recommended one, without the bypass.
     assert (on.minimum, on.maximum) == (-85, 140)
-    assert on.recommended == (-25, 60)
+    assert on.recommended == (-85, 140)
     assert on.group == cs.G_BIASES and on.kind == cs.INT
     assert {k for k in found if k.startswith("bias.")} == {
         f"bias.{n}" for n in Biases.RANGES}
+
+
+def test_the_fake_evk4s_biases_are_openebs_imx636_tables():
+    """tests/fake_evk4 reported each bias's RECOMMENDED range as "allowed"
+    and an invented -25 … 60 slice as "recommended", and it had five
+    biases, not six (bias_diff was missing). Its table is now OpenEB's,
+    read here from the source where it is on the machine."""
+    import re
+
+    recommended = fake_evk4.openeb_source(
+        "hal_psee_plugins/include/devices/imx636/imx636_bias_settings.h")
+    allowed = fake_evk4.openeb_source(
+        "hal_psee_plugins/include/devices/imx636/"
+        "imx636_bias_settings_iterator.h")
+    ll_biases = fake_evk4.openeb_source(
+        "hal_psee_plugins/psee_hw_layer_headers/include/metavision/"
+        "psee_hw_layer/devices/imx636/imx636_ll_biases.h")
+    if None in (recommended, allowed, ll_biases):
+        pytest.skip("the OpenEB source is not on this machine")
+    # The table's fields are in this order (struct imx636_bias_setting).
+    assert re.search(r"std::string name;\s*int min_allowed_offset;\s*"
+                     r"int max_allowed_offset;\s*int min_recommended_offset;"
+                     r"\s*int max_recommended_offset;", ll_biases)
+    offsets = {k: int(v) for k, v in re.findall(
+        r"static constexpr int (\w+)\s*=\s*(-?\d+);", recommended)}
+    rows = re.findall(r'\{"(\w+)",\s*(-?\d+),\s*(-?\d+),\s*(\w+),\s*(\w+),'
+                      r'\s*(true|false)\}', allowed)
+    table = {name: ((int(lo), int(hi)), (offsets[rlo], offsets[rhi]))
+             for name, lo, hi, rlo, rhi, _mod in rows}
+    assert table == fake_evk4.Biases.RANGES
+    assert table["bias_diff_on"] == ((-150, 200), (-85, 140))
+    assert sorted(fake_evk4.Biases.RANGES) == list(fake_evk4.Biases.RANGES), \
+        "get_all_biases is a std::map: by name"
+
+
+def test_a_bias_runs_over_the_range_the_hal_accepts_not_the_allowed_one():
+    """I_LL_Biases::set refuses (raises) a value outside get_bias_range(),
+    which is the RECOMMENDED range unless the device was opened with the
+    range-check bypass — and Typhon opens an EVK4 without it
+    (DeviceDiscovery.open(serial)). The slider and a preset were bounded by
+    the ALLOWED range: bias_diff_on 180 was offered and always refused.
+    The fake had hidden it by calling the recommended range "allowed"."""
+    hal = fake_evk4.FakeEvk4()
+    dev = cameras.EvkDevice(fake_evk4.info(), hal)
+    on = by_key(dev)["bias.bias_diff_on"]
+    assert (on.minimum, on.maximum) == (-85, 140)
+    assert on.recommended == (-85, 140)
+    change = dev.set_setting("bias.bias_diff_on", 180)
+    assert change.ok, change.note
+    assert change.value == 140 and change.note == "clamped to the maximum, 140"
+    done = dev.apply_settings({"bias.bias_refr": 250, "bias.bias_diff": -40})
+    assert done.ok, done.summary()
+    assert hal.biases.values["bias_refr"] == 235
+    assert hal.biases.values["bias_diff"] == -25
+    # Opened with the bypass, set() checks no range at all, and
+    # get_bias_range() REPORTS the allowed one — which the slider then uses.
+    hal.biases.bypass = True
+    on = by_key(dev)["bias.bias_diff_on"]
+    assert (on.minimum, on.maximum) == (-150, 200)
+    assert on.recommended == (-85, 140)
+    assert dev.set_setting("bias.bias_diff_on", 180).value == 180
+
+
+def test_with_the_bypass_the_hal_checks_no_range_and_neither_does_the_fake():
+    """With biases_range_check_bypass, I_LL_Biases::set skips the range
+    check ENTIRELY (OpenEB i_ll_biases.cpp); get_bias_info only makes
+    get_bias_range() report the allowed range. The fake raised outside the
+    allowed range instead, so it modelled a HAL that does not exist."""
+    biases = fake_evk4.Biases(bypass=True)
+    assert biases.get_bias_info("bias_diff_on").get_bias_range() == (-150, 200)
+    assert biases.set("bias_diff_on", 230) is True
+    assert biases.get("bias_diff_on") == 230
+    assert biases.set("bias_hpf", -10) is True
+    # Without the bypass the recommended range is checked, as before.
+    with pytest.raises(RuntimeError, match=r"within range \[-85, 140\]"):
+        fake_evk4.Biases().set("bias_diff_on", 141)
+    source = fake_evk4.openeb_source("hal/cpp/src/facilities/i_ll_biases.cpp")
+    if source is not None:
+        check = source.index(
+            "if (!device_config_.biases_range_check_bypass())")
+        assert source.index("get_bias_range()", check) < source.index(
+            "return set_impl(bias_name, bias_value);", check), \
+            "the range is checked only without the bypass"
+        assert "bias_info.disable_recommended_range();" in source
 
 
 def test_the_filters_and_the_readings_are_described():
@@ -720,19 +908,85 @@ def test_the_filters_and_the_readings_are_described():
     assert not found["camera.serial"].savable
 
 
+def test_the_help_says_which_way_refr_goes_and_what_erc_and_stc_delete():
+    """Three texts the velocity design (docs/typhon_velocity_design.md 5.1)
+    found wrong or missing: bias_refr gave no direction; the ERC said it
+    "drops events evenly", when on the IMX636 it drops by time slot and
+    quality degrades once it acts; the trail filter said STC "keeps only
+    confirmed events", hiding that it deletes every lone event — which is
+    what a small, fast particle makes."""
+    found = by_key(evk()[0])
+    refr = found["bias.bias_refr"].help
+    assert "Higher shortens the rest, so more events" in refr
+    assert "lower gives fewer events each time an edge crosses" in refr
+    erc = found["erc.enabled"].help
+    assert "Drops events evenly" not in erc and "not evenly" in erc
+    assert "drops events by time slot" in erc
+    assert "200 µs" in erc and "IMX636" in erc
+    assert "signal quality degrades once it acts" in erc
+    assert "Prefer a smaller area (ROI) and the filters" in erc
+    trail = found["trail.enabled"].help
+    assert "confirmed events" not in trail
+    assert "TRAIL keeps the first event of each burst" in trail
+    assert ("Both STC modes drop the first event of each burst and every "
+            "lone event") in trail
+    assert "small, fast particle" in trail
+    # Read by an engineer who may not know the vendor's words: the burst,
+    # the polarity and STC are said before (or where) they are used.
+    assert trail.index("A burst is") < trail.index("of each burst")
+    assert "same polarity (all ON, brighter, or all OFF, darker)" in trail
+    assert "STC is Prophesee's spatio-temporal contrast filter" in trail
+    assert trail.index("STC is") < trail.index("Both STC modes")
+    threshold = found["trail.threshold"].help
+    assert "1-100 ms" in threshold
+    assert "rounded to the nearest whole millisecond" in threshold
+    # The same words for the simulated event camera's rows.
+    sim = by_key(simulated("event"))
+    assert sim["bias.bias_refr"].help == refr
+
+
+def test_the_numbers_the_help_quotes_are_openebs():
+    """Checked against the OpenEB source where it is on this machine
+    (C:/ceb/openeb, or OPENEB_SOURCE): the IMX636 trail filter takes
+    1000-100000 µs and keeps whole milliseconds; the IMX636's ERC (the
+    Gen41 one) counts over 200 µs and drops by time only."""
+    from tests import fake_evk4
+
+    trail = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/"
+        "imx636_event_trail_filter_module.cpp")
+    erc = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/gen41/gen41_erc.cpp")
+    device = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/imx636_tz_device.cpp")
+    if None in (trail, erc, device):
+        pytest.skip("the OpenEB source is not on this machine")
+    assert "get_min_supported_threshold() const {\n    return 1000;" in trail
+    assert "get_max_supported_threshold() const {\n    return 100000;" in trail
+    assert "threshold_ms_ = std::roundf(threshold / 1000.0);" in trail
+    assert "std::make_unique<Gen41Erc>" in device
+    assert '{"erc_reference_period", 200}' in erc
+    assert '{"h_dropping_en", 0}' in erc and '{"v_dropping_en", 0}' in erc
+    assert '{"t_dropping_en", en}' in erc
+
+
 def test_a_bias_the_sensor_refuses_is_a_refusal_not_a_success():
-    """set() returns False rather than raising."""
+    """Outside its range I_LL_Biases::set RAISES (HalException
+    ValueOutOfRange, OpenEB source) — it does not return False, as this
+    test used to say; the fake it ran on returned False. A False from the
+    sensor is a refusal too. Either way the camera keeps what it had."""
     dev, hal = evk()
-    change = dev.settings_provider().set(
-        "bias.bias_fo", 50, setting=cs.Setting(
-            "bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0))  # no clamp
-    assert change.ok
-    hal.biases.RANGES = dict(hal.biases.RANGES, bias_fo=(-35, 10))
-    refused = dev.settings_provider().set(
-        "bias.bias_fo", 40, setting=cs.Setting(
-            "bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0))
-    assert not refused.ok and "refused" in refused.note
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    provider = dev.settings_provider()
+    assert provider.set("bias.bias_fo", 50, setting=unclamped).ok
+    refused = provider.set("bias.bias_fo", 60, setting=unclamped)
+    assert not refused.ok
+    assert "Value should be within range [-35, 55]" in refused.note
     assert refused.value == 50, "the camera kept what it had"
+    hal.biases.set = lambda name, value: False
+    refused = provider.set("bias.bias_fo", 40, setting=unclamped)
+    assert not refused.ok and "refused" in refused.note
+    assert refused.value == 50
 
 
 def test_a_quantised_bias_reports_what_the_sensor_holds():
@@ -1000,8 +1254,9 @@ def test_every_facility_method_used_exists_in_the_real_bindings():
         "BandPass", "BandStop"}
     assert {"TRAIL", "STC_CUT_TRAIL", "STC_KEEP_TRAIL"} <= set(
         hal.I_EventTrailFilterModule.Type.__members__)
-    for name in ("get_bias_allowed_range", "get_bias_recommended_range",
-                 "is_modifiable", "get_description"):
+    for name in ("get_bias_range", "get_bias_allowed_range",
+                 "get_bias_recommended_range", "is_modifiable",
+                 "get_description"):
         assert hasattr(hal.LL_Bias_Info, name), name
     assert hasattr(hal.I_ROI, "Window") and hasattr(hal.I_ROI, "Mode")
 

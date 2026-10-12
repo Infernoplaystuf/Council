@@ -171,8 +171,14 @@ def test_an_evk4s_eight_groups_share_four_tabs_and_each_keeps_its_pop_out():
     assert afk.shown == ("afk.enabled", "afk.low_hz", "afk.high_hz")
     assert set(afk.more) == {"afk.mode", "afk.duty_cycle",
                              "afk.start_threshold", "afk.stop_threshold"}
+    # The most used first (camera_categories.MOST_USED), whatever order the
+    # HAL lists them in — a real one lists them by name, bias_diff first —
+    # and a tab to itself shows six rows: all of an IMX636's.
     biases = plan[0].sections[0]
-    assert biases.shown == tuple(f"bias.{n}" for n in fake_evk4.Biases.RANGES)
+    assert biases.shown == ("bias.bias_diff_on", "bias.bias_diff_off",
+                            "bias.bias_fo", "bias.bias_hpf", "bias.bias_refr",
+                            "bias.bias_diff")
+    assert set(biases.shown) == {f"bias.{n}" for n in fake_evk4.Biases.RANGES}
     assert plan[3].groups == ("Status", "Camera")
 
 
@@ -237,7 +243,9 @@ def test_a_pop_out_reads_its_own_category_not_the_whole_camera(
     assert [s["key"] for s in listed["settings"]] == [
         "window_ms", "display.events", "display.palette"]
     assert calls == [], "the biases were read for the display's settings"
-    assert len(frame_camera.settings_list("Biases")["settings"]) == 5
+    # An IMX636 has six biases (bias_diff too; the fake used to leave it out).
+    assert len(frame_camera.settings_list("Biases")["settings"]) == len(
+        fake_evk4.Biases.RANGES) == 6
     assert calls == [1]
 
 
@@ -315,8 +323,12 @@ def test_an_evk4_fills_the_tabs_with_every_facility(clean, typhon_dir,
         row = tabs.rows[f"bias.{name}"]
         assert row.compact and row.slider is not None
     on = tabs.rows["bias.bias_diff_on"]
+    # What the HAL accepts (the recommended range, without the bypass) —
+    # OpenEB's IMX636 table; the fake's "-25 … 60" was invented.
     assert (on.editor.minimum(), on.editor.maximum()) == (-85, 140)
-    assert "Recommended: -25 … 60" in on.label.toolTip()
+    assert "Recommended: -85 … 140" in on.label.toolTip()
+    assert tabs.pop_out("Biases").rows["bias.bias_diff_on"].range_label \
+        .text() == "-85 … 140\nrec. -85 … 140"
     assert set(tabs.pop_buttons) == {
         "Biases", "Event rate controller", "Anti-flicker",
         "Event trail filter", "Event rate activity filter", "Display",
@@ -742,15 +754,24 @@ def test_a_pop_out_shows_each_settings_range_and_a_bias_its_recommended_one(
     """A pop-out is where a category is tuned: each row says the camera's
     own range and unit, and a bias the range the sensor recommends — they
     were only in a tooltip. The recommended part of a bias's slider is
-    marked, in the pop-out and in the narrower tab."""
+    marked, in the pop-out and in the narrower tab.
+
+    AS TYPHON OPENS AN EVK4 (no range-check bypass) the HAL accepts the
+    recommended range only, so the slider IS the recommended range
+    (test_an_evk4_fills_the_tabs_with_every_facility). The bar marks a
+    part of it on a camera opened with the bypass — as here, where OpenEB's
+    IMX636 table allows bias_diff_on -150 … 200 and recommends -85 … 140.
+    (This test used to expect "-85 … 140 / rec. -25 … 60": the fake's
+    recommended range as "allowed", and an invented one.)"""
+    evk4.biases.bypass = True
     ui = construct(typhon_dir)
     connect(ui, "00051234")
     tabs = tabs_of(ui)
     window = tabs.pop_out("Biases")
     on = window.rows["bias.bias_diff_on"]
-    assert on.range_label.text() == "-85 … 140\nrec. -25 … 60"
-    assert on.slider.recommended == (on.scale.position(-25),
-                                     on.scale.position(60))
+    assert on.range_label.text() == "-150 … 200\nrec. -85 … 140"
+    assert on.slider.recommended == (on.scale.position(-85),
+                                     on.scale.position(140))
     low = tabs.pop_out("Anti-flicker").rows["afk.low_hz"]
     assert low.range_label.text() == "50 … 520 Hz"
     rate = tabs.pop_out("Event rate controller").rows["erc.rate"]
@@ -762,15 +783,15 @@ def test_a_pop_out_shows_each_settings_range_and_a_bias_its_recommended_one(
     row = tabs.rows["bias.bias_diff_on"]
     assert row.range_label is None
     assert row.slider.recommended == on.slider.recommended
-    # Drawn: under the recommended part only (-25 … 60 of -85 … 140 is
-    # the 27th to the 64th hundredth of the groove).
+    # Drawn: under the recommended part only (-85 … 140 of -150 … 200 is
+    # the 19th to the 83rd hundredth of the groove).
     for slider in (row.slider, on.slider):
         slider.resize(300, slider.sizeHint().height())
         marked = good_pixels(slider)
         assert marked, "the recommended range is not drawn"
         width = slider.width()
-        assert 0.15 * width < marked[0] < 0.40 * width, (marked[0], width)
-        assert 0.50 * width < marked[-1] < 0.75 * width, (marked[-1], width)
+        assert 0.10 * width < marked[0] < 0.30 * width, (marked[0], width)
+        assert 0.70 * width < marked[-1] < 0.92 * width, (marked[-1], width)
 
 
 def test_the_tabs_move_the_boxes_beside_start_and_start_keeps_quiet(

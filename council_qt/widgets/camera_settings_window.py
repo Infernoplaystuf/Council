@@ -220,8 +220,12 @@ def _short(value: Any) -> str:
 
 def range_text(setting: Dict[str, Any]) -> str:
     """The camera's own range for a number setting, with its unit and, for
-    a bias, the sensor's recommended range: "-85 … 140" / "rec. -25 … 60".
-    "" for a setting the camera gives no range."""
+    a bias, the sensor's recommended range. bias_diff_on on an IMX636
+    opened with the range-check bypass: "-150 … 200" / "rec. -85 … 140"
+    (OpenEB's imx636_bias_settings*.h). Opened as Typhon opens it, the HAL
+    accepts the recommended range only, so both lines read -85 … 140
+    (camera_settings.EvkSettings). "" for a setting the camera gives no
+    range."""
     low, high = setting.get("min"), setting.get("max")
     if _number(low) is None or _number(high) is None:
         return ""
@@ -354,10 +358,13 @@ class RangeSlider(QSlider):
     the groove from the low to the high end of what the sensor recommends
     (a bias's get_bias_recommended_range).
 
-    An EVK4's bias may be set far outside what works well (bias_diff_on runs
-    -85 … 140; -25 … 60 is recommended). The row already says so in words
-    once the value is outside; the bar shows where "inside" is while the
-    slider is being dragged, in a tab too narrow for the words."""
+    OpenEB's IMX636 table allows bias_diff_on -150 … 200 and recommends
+    -85 … 140, but the HAL takes a value outside the recommended range only
+    on a camera opened with the range-check bypass. Opened as Typhon opens
+    it, the slider runs over the recommended range and the bar spans all
+    of it. Where the slider is wider than what is recommended, the row says
+    so in words once the value is outside; the bar shows where "inside" is
+    while the slider is being dragged, in a tab too narrow for the words."""
 
     def __init__(self, orientation: Qt.Orientation, parent: QWidget):
         super().__init__(orientation, parent)

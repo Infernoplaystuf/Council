@@ -643,6 +643,74 @@ def _trigger_modes(cam):
     return modes
 
 
+def _every_trigger(cam):
+    """Each trigger's (mode, source, edge, delay), the selector put back."""
+    keep = cam.TriggerSelector.GetValue()
+    out = {}
+    for entry in cam.TriggerSelector.GetSymbolics():
+        cam.TriggerSelector.SetValue(entry)
+        out[entry] = (cam.TriggerMode.GetValue(), cam.TriggerSource.GetValue(),
+                      cam.TriggerActivation.GetValue(),
+                      cam.TriggerDelay.GetValue())
+    cam.TriggerSelector.SetValue(keep)
+    return out
+
+
+def _all_triggers_off(cam):
+    keep = cam.TriggerSelector.GetValue()
+    for entry in cam.TriggerSelector.GetSymbolics():
+        cam.TriggerSelector.SetValue(entry)
+        cam.TriggerMode.SetValue("Off")
+        cam.TriggerSource.SetValue("Software")
+        cam.TriggerActivation.SetValue("RisingEdge")
+        cam.TriggerDelay.SetValue(0.0)
+    cam.TriggerSelector.SetValue(keep)
+
+
+def test_a_preset_keeps_every_trigger_on_the_emulator(emulator_window,
+                                                      tmp_path):
+    """The emulator's nine triggers each have their own mode, source, edge
+    and delay (measured); a preset kept the SELECTED one's only (an open
+    item). Saved with FrameBurstStart On from Line1 on the falling edge,
+    12 µs late, and ExposureStart's source Line2, while the selector
+    showed FrameStart — then every trigger put back to the defaults and
+    the selector moved: applying the preset restores each trigger and
+    leaves the selector on FrameStart, where the user had it."""
+    import json
+
+    fc, _window, app = emulator_window
+    cam = fc._LIVE.device._cam
+    sel = cam.TriggerSelector
+    try:
+        sel.SetValue("FrameBurstStart")
+        cam.TriggerSource.SetValue("Line1")
+        cam.TriggerActivation.SetValue("FallingEdge")
+        cam.TriggerDelay.SetValue(12.0)
+        cam.TriggerMode.SetValue("On")
+        sel.SetValue("ExposureStart")
+        cam.TriggerSource.SetValue("Line2")
+        sel.SetValue("FrameStart")
+        wanted = _every_trigger(cam)
+        fc.save_preset("Triggers", include_roi=False)
+        assert sel.GetValue() == "FrameStart", "saving moved the selector"
+        doc = json.loads((tmp_path / "camera_presets.json").read_text(
+            encoding="utf-8"))
+        saved = next(iter(doc["cameras"].values()))["presets"]["Triggers"]
+        assert saved["settings"]["TriggerMode[FrameBurstStart]"] == "On"
+        assert saved["settings"]["TriggerSource[ExposureStart]"] == "Line2"
+        _all_triggers_off(cam)
+        sel.SetValue("ExposureEnd")
+        assert _every_trigger(cam) != wanted
+        out = fc.apply_preset("Triggers")
+        assert _pump(app, 5.0, until=lambda: fc._LIVE.job is None)
+        assert out["ok"] or out.get("pending"), out["summary"]
+        assert _every_trigger(cam) == wanted
+        assert sel.GetValue() == "FrameStart"
+    finally:
+        _all_triggers_off(cam)
+        sel.SetValue("FrameStart")
+
+
 def test_trigger_mode_on_says_why_the_picture_stopped(emulator_typhon,
                                                       tmp_path):
     """MEASURED (review, 2026-10-08): one click on Trigger mode On in the

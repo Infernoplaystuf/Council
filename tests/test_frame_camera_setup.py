@@ -1305,6 +1305,107 @@ def test_a_setting_of_the_preset_the_camera_no_longer_lists_is_a_difference(
     assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
 
 
+def test_a_preset_holding_every_trigger_is_saved_applied_and_still_named(
+        tmp_path, monkeypatch):
+    """A preset keeps every trigger, not only the selected one
+    (camera_presets.capture): the others are not rows, so at Start they are
+    read from the camera to compare (frame_camera._held_triggers). Without
+    that, every such preset read as changed in the run's record. Here the
+    simulated camera stands in for a Basler with a second trigger."""
+    from council_core import camera_settings as cs
+
+    connected("frame")
+    burst = {"TriggerMode[FrameBurstStart]": "On",
+             "TriggerSource[FrameBurstStart]": "Line1"}
+    reads = []
+
+    def trigger_settings(self, selected=False):
+        reads.append(selected)
+        return dict(burst)
+
+    def apply_triggers(self, values):
+        burst.update(values)
+        return [cs.Change(k, v, v) for k, v in values.items()]
+
+    monkeypatch.setattr(cs.SyntheticSettings, "trigger_settings",
+                        trigger_settings)
+    monkeypatch.setattr(cs.SyntheticSettings, "apply_triggers",
+                        apply_triggers)
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Burst")
+    saved = frame_camera.list_presets()["details"][0]["settings"]
+    assert saved["TriggerMode[FrameBurstStart]"] == "On"
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Burst", _record(out)
+    assert reads[-1] is True, "compared with every trigger, selected too"
+    burst["TriggerMode[FrameBurstStart]"] = "Off"       # changed since
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset_changed"] == {
+        "name": "Burst", "differs": ["TriggerMode[FrameBurstStart]"]}
+    applied = frame_camera.apply_preset("Burst")
+    assert applied["ok"], applied["summary"]
+    assert burst["TriggerMode[FrameBurstStart]"] == "On"
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Burst"
+
+
+def test_another_triggers_setting_that_restarts_the_live_view_is_named_in_words(
+        monkeypatch):
+    """On a camera that locks a trigger's nodes while grabbing, another
+    trigger's setting stops the stream (camera_settings.stops_needed), and
+    the answer said "The live view restarted for TriggerMode[FrameBurstStart]"
+    — the raw preset key. It names the row and the trigger. The simulated
+    camera stands in for such a Basler."""
+    from council_core import camera_settings as cs
+
+    live("frame")
+    key = "TriggerMode[FrameBurstStart]"
+    real = cs.stops_needed
+    monkeypatch.setattr(
+        cs, "stops_needed",
+        lambda device, values, roi=None, described=None:
+        [k for k in values if k == key] if getattr(device, "streaming", False)
+        else real(device, values, roi, described))
+    monkeypatch.setattr(cs.SyntheticSettings, "apply_triggers",
+                        lambda self, values: [cs.Change(k, v, v)
+                                              for k, v in values.items()])
+    out = frame_camera.apply_camera_settings({key: "On", "Gain": 2})
+    assert out["ok"] and not out["pending"], out["summary"]
+    assert out["restarted"] == ["Trigger mode (FrameBurstStart trigger)"]
+    assert ("The live view restarted for Trigger mode (FrameBurstStart "
+            "trigger)") in out["summary"], out["summary"]
+    assert "TriggerMode[" not in out["summary"]
+
+
+def test_a_preset_saved_while_the_other_triggers_cannot_be_read_says_so(
+        monkeypatch):
+    """A camera that locks its trigger selector while grabbing lets only
+    the selected trigger be read: a preset saved then held none of the
+    others and said nothing — "every trigger" was silently one."""
+    from council_core import camera_settings as cs
+
+    live("frame")
+    monkeypatch.setattr(cs.SyntheticSettings, "unreadable_triggers",
+                        lambda self: ["FrameBurstStart", "ExposureStart"],
+                        raising=False)
+    out = frame_camera.save_preset("Locked", include_roi=False)
+    said = out["summary"]
+    assert said.startswith("Saved preset 'Locked'"), said
+    assert ("The other triggers (FrameBurstStart, ExposureStart) were NOT "
+            "saved: the camera does not let its trigger selector move while "
+            "it streams — stop the live view and save again to keep "
+            "them.") in said, said
+    # A camera that reads them all says nothing of the kind.
+    monkeypatch.setattr(cs.SyntheticSettings, "unreadable_triggers",
+                        lambda self: [], raising=False)
+    assert "NOT saved" not in frame_camera.save_preset(
+        "Free", include_roi=False)["summary"]
+
+
 def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
         tmp_path, monkeypatch):
     """The record's read of every setting happens BEFORE the recorder is

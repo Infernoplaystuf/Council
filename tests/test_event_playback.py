@@ -129,6 +129,18 @@ def play(tmp_path, *batches, window_us=20_000):
     return playback, hal
 
 
+def test_the_module_says_how_fast_the_pass_was_measured_not_a_guess():
+    """It said the pass "runs at tens of millions of events a second". The
+    velocity design measured RawPlayback at 1.8-4.7 Mev/s (docs/typhon_
+    velocity_design.md 7.1): every window pays 5-9 ms of whole-sensor
+    drawing, so a sparse recording is the slowest. Anyone sizing the
+    velocity work from the old words was out by a factor of ten."""
+    said = " ".join(ep.__doc__.split())
+    assert "tens of millions" not in said
+    assert "1.8-4.7 million events a second (measured" in said
+    assert "5-9 ms" in said
+
+
 # ======================================================================
 # Windows
 # ======================================================================

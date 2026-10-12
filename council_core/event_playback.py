@@ -26,9 +26,12 @@ live camera uses. Each window is rendered exactly as the live view renders it
 (cameras.accumulate_events), and only the pixels that CHANGED are kept: 4
 bytes each, appended to a temporary file outside the capture folder. After
 that, window k is one read and one fill — well under a millisecond — at any k,
-in any order. The pass runs at tens of millions of events a second, and the
-windows it has finished are usable while it carries on, so a long recording
-opens at once and fills in.
+in any order. The pass ran at 1.8-4.7 million events a second (measured on
+the i7-14700HX laptop, docs/typhon_velocity_design.md 7.1), not faster:
+every window pays 5-9 ms of drawing the whole sensor (921,600 pixels), so a
+sparse recording is the slowest — 1.8 Mev/s on a 1 Mev/s one, 0.91 with 1 ms
+windows. The windows it has finished are usable while it carries on, so a
+long recording opens at once and fills in.
 
 TIME
 Windows are counted from the CAPTURE'S ORIGIN — the first event the live view

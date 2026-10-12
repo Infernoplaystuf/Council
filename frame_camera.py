@@ -127,7 +127,7 @@ import itertools
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 #: How often a UI timer should call `pump`. ~30 Hz: a display consumes about
 #: thirty frames a second no matter what the sensor does.
@@ -1646,7 +1646,8 @@ def _camera_record(run: str, device: Any
         listed, error = [], _said(exc)
     try:
         limits, area = device.limits(), device.roi()
-        preset, changed = _preset_still_in_use(listed, area, error)
+        preset, changed = _preset_still_in_use(listed, area, error,
+                                               _held_triggers(device))
         info = _LIVE.info
         camera = {k: getattr(info, k, "") for k in
                   ("backend", "model", "serial", "vendor", "kind")}
@@ -1679,8 +1680,26 @@ def _not_recorded(run: str, exc: BaseException) -> str:
             f"was NOT written: {_said(exc)}.")
 
 
+def _held_triggers(device: Any) -> Optional[Dict[str, Any]]:
+    """Every trigger's settings by trigger_key, when the preset in use holds
+    other triggers' (camera_presets.capture saves them all): {} when it
+    holds none — nothing to read — and None when they could not be read."""
+    from council_core import camera_settings
+
+    held = _LIVE.preset_in_use
+    if not held or not any(camera_settings.split_trigger_key(k)
+                           for k in held.get("settings") or {}):
+        return {}
+    try:
+        return dict(device.settings_provider().trigger_settings(
+            selected=True))
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
 def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any,
-                         error: str = ""
+                         error: str = "",
+                         triggers: Optional[Mapping[str, Any]] = None
                          ) -> "tuple[str, Optional[Dict[str, Any]]]":
     """(the preset's name, None) when the camera is still as the preset in
     use left it, else ("", {"name", "differs"}) — or ("", None) with none.
@@ -1699,7 +1718,11 @@ def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any,
     preset and says why, rather than the preset's name beside a camera
     whose gain had really changed (MEASURED before: a box set the gain to
     9 after preset "Day" (gain 3), the node map timed out at Start, and the
-    run's record said "Day")."""
+    run's record said "Day").
+
+    THE OTHER TRIGGERS a preset holds (camera_settings.trigger_key) are not
+    rows; `triggers` is every trigger's settings as the camera has them now
+    (_held_triggers), None when they could not be read."""
     from council_core import camera_settings
 
     held = _LIVE.preset_in_use
@@ -1711,6 +1734,11 @@ def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any,
     now = {str(row.get("key")): row for row in listed}
     differs = []
     for key, value in dict(held.get("settings") or {}).items():
+        if camera_settings.split_trigger_key(key):
+            if triggers is None or key not in triggers or \
+                    not camera_settings.same(value, triggers[key]):
+                differs.append(key)
+            continue
         row = now.get(key)
         if row is None:
             differs.append(key)         # nothing to compare it with
@@ -2661,7 +2689,9 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     if live_ok and (roi is not None or blocked):
         _refuse_while_capturing(doing)
     stop = bool(blocked)
-    labels = {s.key: s.label for s in described or []}
+    # Another trigger's key in words ("Trigger mode (FrameBurstStart
+    # trigger)"), not the preset's raw "TriggerMode[FrameBurstStart]".
+    labels = camera_settings.labels_of(described or [], values)
     restarted = [labels.get(k, "the area" if k == "area" else k)
                  for k in blocked]
     before = _roi_or_none(device)
@@ -2949,6 +2979,15 @@ def save_preset(name: Any, include_roi: Any = True,
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
              else ", area left as it is when applied.")
+    unread = _unreadable_triggers(device)
+    if unread:
+        # A preset keeps every trigger — unless the selector cannot move:
+        # then it held the selected one only, and said nothing.
+        said += (f" The other triggers ({', '.join(unread)}) were NOT "
+                 f"saved: the camera does not let its trigger selector move "
+                 + ("while it streams — stop the live view and save again "
+                    "to keep them." if getattr(device, "streaming", False)
+                    else "now."))
     if moved is not None and store.repaired == "entry":
         said += (f" This camera's presets in the file were damaged: the "
                  f"file as it was is kept as {moved.name}; the other "
@@ -2957,6 +2996,16 @@ def save_preset(name: Any, include_roi: Any = True,
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
     return _presets_changed(preset.name, said)
+
+
+def _unreadable_triggers(device: Any) -> List[str]:
+    """The triggers a preset saved now could not hold (the provider's
+    unreadable_triggers); [] when the camera cannot say."""
+    try:
+        return [str(entry) for entry in
+                device.settings_provider().unreadable_triggers()]
+    except Exception:                                     # noqa: BLE001
+        return []
 
 
 def _presets_changed(name: str, said: str) -> Dict[str, Any]:
