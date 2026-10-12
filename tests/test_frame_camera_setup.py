@@ -1305,6 +1305,54 @@ def test_a_setting_of_the_preset_the_camera_no_longer_lists_is_a_difference(
     assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
 
 
+def test_a_preset_holding_every_trigger_is_saved_applied_and_still_named(
+        tmp_path, monkeypatch):
+    """A preset keeps every trigger, not only the selected one
+    (camera_presets.capture): the others are not rows, so at Start they are
+    read from the camera to compare (frame_camera._held_triggers). Without
+    that, every such preset read as changed in the run's record. Here the
+    simulated camera stands in for a Basler with a second trigger."""
+    from council_core import camera_settings as cs
+
+    connected("frame")
+    burst = {"TriggerMode[FrameBurstStart]": "On",
+             "TriggerSource[FrameBurstStart]": "Line1"}
+    reads = []
+
+    def trigger_settings(self, selected=False):
+        reads.append(selected)
+        return dict(burst)
+
+    def apply_triggers(self, values):
+        burst.update(values)
+        return [cs.Change(k, v, v) for k, v in values.items()]
+
+    monkeypatch.setattr(cs.SyntheticSettings, "trigger_settings",
+                        trigger_settings)
+    monkeypatch.setattr(cs.SyntheticSettings, "apply_triggers",
+                        apply_triggers)
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Burst")
+    saved = frame_camera.list_presets()["details"][0]["settings"]
+    assert saved["TriggerMode[FrameBurstStart]"] == "On"
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Burst", _record(out)
+    assert reads[-1] is True, "compared with every trigger, selected too"
+    burst["TriggerMode[FrameBurstStart]"] = "Off"       # changed since
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset_changed"] == {
+        "name": "Burst", "differs": ["TriggerMode[FrameBurstStart]"]}
+    applied = frame_camera.apply_preset("Burst")
+    assert applied["ok"], applied["summary"]
+    assert burst["TriggerMode[FrameBurstStart]"] == "On"
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Burst"
+
+
 def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
         tmp_path, monkeypatch):
     """The record's read of every setting happens BEFORE the recorder is

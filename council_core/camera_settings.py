@@ -315,6 +315,34 @@ class Trigger:
         return f"its {which} is On (source {self.source or 'unknown'})"
 
 
+#: A trigger's own settings: a Basler holds one value of each PER
+#: TriggerSelector entry (SFNC; on the emulator each entry's mode, source,
+#: edge and delay changed alone — measured), and its rows show the selected
+#: entry's. In the order apply_triggers writes them: the mode LAST, so a
+#: trigger is never On while its source and edge are still the old ones.
+TRIGGER_FEATURES: Tuple[str, ...] = ("TriggerSource", "TriggerActivation",
+                                     "TriggerDelay", "TriggerMode")
+
+
+def trigger_key(entry: str, key: str) -> str:
+    """A preset's key for one trigger's setting, other than the selected
+    trigger's: "TriggerMode[FrameBurstStart]". Still a plain name: value
+    pair, so a presets file keeps its format, and an older Typhon applying
+    one reports these keys as settings it does not know, not as damage."""
+    return f"{key}[{entry}]"
+
+
+def split_trigger_key(key: Any) -> Optional[Tuple[str, str]]:
+    """(setting key, selector entry) for a trigger_key, else None."""
+    text = str(key)
+    if not text.endswith("]"):
+        return None
+    base, mark, entry = text[:-1].partition("[")
+    if not mark or not entry or base not in TRIGGER_FEATURES:
+        return None
+    return base, entry
+
+
 def trigger_warning(source: str) -> str:
     """Under a TriggerMode row that is On: what that does to the picture."""
     if Trigger("", source).software:
@@ -473,6 +501,22 @@ class Provider:
         connected); what was changed, one line each."""
         return []
 
+    def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
+        """Every OTHER trigger's settings, for a preset: {"TriggerMode
+        [FrameBurstStart]": "On", ...} (trigger_key). The selected trigger's
+        are the plain keys a snapshot already holds — with `selected` they
+        are listed this way too (to compare a preset with the camera). {}
+        for a camera with one trigger or none."""
+        return {}
+
+    def apply_triggers(self, values: Mapping[str, Any]) -> List[Change]:
+        """Write trigger_settings() values back, each trigger selected in
+        turn, the selector left where it was; one Change per key. A camera
+        without them refuses each, by name."""
+        return [Change(key, asked, None, ok=False,
+                       note="this camera has no such setting")
+                for key, asked in values.items()]
+
     # ------------------------------------------------------------------
     def find(self, key: str) -> Setting:
         for setting in self.describe():
@@ -621,6 +665,15 @@ def stops_needed(device: Any, values: Mapping[str, Any],
                if key in by_key and not by_key[key].live
                and not by_key[key].read_only
                and _would_change(by_key[key], values[key])]
+    # Another trigger's setting (trigger_key) is locked when the selected
+    # trigger's same setting is: reading whether it would change means
+    # moving the selector, so a locked one counts. (On the emulator every
+    # trigger node stays writable while grabbing — measured.)
+    for key in values:
+        split = split_trigger_key(key)
+        shown = by_key.get(split[0]) if split else None
+        if shown is not None and not shown.live and not shown.read_only:
+            blocked.append(key)
     if (roi is not None and not getattr(device, "area_live", False)
             and _fits(device, roi) and not area_unchanged(device, roi)):
         # An area off the sensor is refused, not written (apply): no reason
@@ -656,6 +709,11 @@ def apply(device: Any, values: Mapping[str, Any],
     way of any change in the set (`stops_needed`), so a half-applied set is
     never mistaken for a whole one: the caller stops the stream and calls
     again (frame_camera does that for a restartable camera).
+
+    The OTHER TRIGGERS' settings (trigger_key: "TriggerMode[FrameBurstStart]")
+    go last, through the provider's apply_triggers, which selects each
+    trigger in turn and leaves the selector where this set put it — where
+    the user had it when the preset was saved.
     """
     provider = device.settings_provider()
     described = provider.describe()
@@ -666,7 +724,9 @@ def apply(device: Any, values: Mapping[str, Any],
     by_key = {s.key: s for s in described}
     done = Applied(roi_asked=roi)
     batch = dict(values)
-    for key in provider.plan(values.keys(), described, roi is not None):
+    triggers = {k: v for k, v in values.items() if split_trigger_key(k)}
+    plain = [k for k in values if k not in triggers]
+    for key in provider.plan(plain, described, roi is not None):
         if key is None:
             if not _fits(device, roi):
                 # Written AFTER binning (plan order), so the sensor's size
@@ -706,6 +766,8 @@ def apply(device: Any, values: Mapping[str, Any],
         except SettingError as exc:
             done.changes.append(Change(key, asked, setting.value, ok=False,
                                        note=str(exc)))
+    if triggers:
+        done.changes.extend(provider.apply_triggers(triggers))
     return done
 
 
@@ -797,8 +859,9 @@ BASLER_FEATURES: Tuple[_Feature, ...] = (
     _Feature("TriggerSelector", ("TriggerSelector",), "Trigger",
              "Trigger", help="Which trigger the settings below are for — "
                              "FrameStart starts each frame. Each trigger "
-                             "has its own mode, source and edge: these "
-                             "rows show the selected one only."),
+                             "has its own mode, source, edge and delay: "
+                             "these rows show the selected one only (a "
+                             "preset keeps every trigger's)."),
     _Feature("TriggerMode", ("TriggerMode",), "Trigger mode", "Trigger",
              help="On: the camera waits for the trigger selected above "
                   "before each frame, and the live view shows nothing until "
@@ -1006,6 +1069,91 @@ class BaslerSettings(Provider):
                             f"to {wanted} — {_why(exc)}")
         self._each_trigger(visit)
         return done
+
+    def _selected_trigger(self) -> str:
+        selector = self.device._node("TriggerSelector")
+        if selector is None or not _readable(selector):
+            return ""
+        try:
+            return str(_plain(selector.GetValue()))
+        except Exception:                                   # noqa: BLE001
+            return ""
+
+    def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
+        """EVERY TRIGGER IN A PRESET, NOT THE SELECTED ONE ONLY. A snapshot
+        holds the rows — the selected trigger's mode, source, edge and
+        delay — so a preset kept one trigger of nine (the emulator's): a
+        FrameBurstStart trigger On from Line1, saved while the selector
+        showed FrameStart, was lost. These are the others', by trigger_key;
+        only the selector is written to read them, and put back."""
+        current = self._selected_trigger()
+        streaming = self._streaming()
+        out: Dict[str, Any] = {}
+
+        def visit(entry: str, _mode: Any, _source: Any) -> None:
+            if not entry or (entry == current and not selected):
+                return
+            for base in TRIGGER_FEATURES:
+                setting = self._describe_one(self._feature(base), streaming)
+                if setting is not None and setting.savable \
+                        and setting.value is not None:
+                    out[trigger_key(entry, base)] = setting.value
+        self._each_trigger(visit)
+        return out
+
+    def apply_triggers(self, values: Mapping[str, Any]) -> List[Change]:
+        """Each trigger selected in turn (in the camera's order), its
+        settings written — source, edge and delay before the mode — and
+        the selector put back where it was (_each_trigger). A value the
+        trigger already has is not written again; an entry this camera
+        cannot select is refused by name."""
+        wanted: Dict[str, Dict[str, Tuple[str, Any]]] = {}
+        done: List[Change] = []
+        for key, asked in values.items():
+            split = split_trigger_key(key)
+            if split is None:
+                done.append(Change(key, asked, None, ok=False,
+                                   note="this camera has no such setting"))
+                continue
+            base, entry = split
+            wanted.setdefault(entry, {})[base] = (key, asked)
+        streaming = self._streaming()
+
+        def visit(entry: str, _mode: Any, _source: Any) -> None:
+            asks = wanted.pop(entry, None) if entry else None
+            for base in TRIGGER_FEATURES:
+                if asks and base in asks:
+                    key, asked = asks[base]
+                    done.append(self._set_trigger(key, base, asked,
+                                                  streaming))
+        self._each_trigger(visit)
+        for entry, asks in wanted.items():
+            for key, asked in asks.values():
+                done.append(Change(key, asked, None, ok=False,
+                                   note=f"this camera has no {entry} "
+                                        f"trigger"))
+        return done
+
+    def _set_trigger(self, key: str, base: str, asked: Any,
+                     streaming: bool) -> Change:
+        """One setting of the trigger now selected, reported under its
+        trigger_key."""
+        setting = self._describe_one(self._feature(base), streaming)
+        if setting is None:
+            return Change(key, asked, None, ok=False,
+                          note="this camera has no such setting")
+        if setting.read_only:
+            return Change(key, asked, setting.value, ok=False,
+                          note="read-only on this camera")
+        if _unchanged(setting, asked):
+            return Change(key, asked, setting.value)
+        try:
+            change = self.set(base, asked, batch={}, setting=setting)
+        except NeedsStop:
+            raise
+        except SettingError as exc:
+            return Change(key, asked, setting.value, ok=False, note=str(exc))
+        return replace(change, key=key)
 
     def held_by(self, setting: Setting, batch: Mapping[str, Any]) -> str:
         feature = self._feature(setting.key)

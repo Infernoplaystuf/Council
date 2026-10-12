@@ -292,6 +292,140 @@ def test_a_preset_without_an_area_leaves_the_area_alone(store):
     assert dev.roi() == Roi(0, 0, 320, 240)
 
 
+# ======================================================================
+# Every trigger, not only the selected one
+# ======================================================================
+def _triggers(cam):
+    """Each trigger's mode, source, edge and delay, by selector entry."""
+    return {e: (cam.TriggerMode.values[e], cam.TriggerSource.values[e],
+                cam.TriggerActivation.values[e], cam.TriggerDelay.values[e])
+            for e in cam.TriggerSelector.choices}
+
+
+def test_a_preset_keeps_every_trigger_not_only_the_selected_one(store):
+    """A Basler has one trigger per TriggerSelector entry, each with its
+    own mode, source, edge and delay (measured on the emulator), and the
+    rows show the selected one. A preset kept that one only: a
+    FrameBurstStart trigger On from Line1, saved while the selector showed
+    FrameStart, was not in it, and applying the preset left the burst
+    trigger as it happened to be — on a real camera, frames that never
+    come. Now every trigger is saved and put back, the selector where the
+    user had it."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerActivation.SetValue("FallingEdge")
+    cam.TriggerDelay.SetValue(12.0)
+    cam.TriggerMode.SetValue("On")
+    sel.value = "ExposureStart"
+    cam.TriggerSource.SetValue("Line1")
+    sel.value = "FrameStart"
+    saved = _triggers(cam)
+    settings, _ = cp.capture(dev, include_roi=False)
+    assert sel.value == "FrameStart", "saving moved the selector"
+    # The selected trigger in the plain keys, as before; the others beside.
+    assert settings["TriggerSelector"] == "FrameStart"
+    assert settings["TriggerMode"] == "Off"
+    assert settings["TriggerMode[FrameBurstStart]"] == "On"
+    assert settings["TriggerSource[FrameBurstStart]"] == "Line1"
+    assert settings["TriggerActivation[FrameBurstStart]"] == "FallingEdge"
+    assert settings["TriggerDelay[FrameBurstStart]"] == 12.0
+    assert settings["TriggerSource[ExposureStart]"] == "Line1"
+    assert not [k for k in settings if k.endswith("[FrameStart]")]
+    owner = cp.Identity.of(dev.info)
+    store.save(owner, "Burst", settings, None)
+    # Every trigger put back to the defaults, the selector elsewhere.
+    for entry in sel.choices:
+        sel.value = entry
+        cam.TriggerMode.SetValue("Off")
+        cam.TriggerSource.SetValue("Software")
+        cam.TriggerActivation.SetValue("RisingEdge")
+        cam.TriggerDelay.SetValue(0.0)
+    sel.value = "ExposureStart"
+    cam.log.clear()
+    done = cp.apply(dev, store.get(owner, "Burst"))
+    assert done.ok, done.summary()
+    assert _triggers(cam) == saved
+    assert sel.value == "FrameStart", "the selector where the user had it"
+    took = {c.key: c for c in done.changes}
+    assert took["TriggerMode[FrameBurstStart]"].value == "On"
+    # A trigger's mode goes On only after its source, edge and delay.
+    burst = cam.log.index(("TriggerSelector", "FrameBurstStart"))
+    assert cam.log[burst + 1:burst + 5] == [
+        ("TriggerSource", "Line1"), ("TriggerActivation", "FallingEdge"),
+        ("TriggerDelay", 12.0), ("TriggerMode", "On")], cam.log
+    # The other triggers: a value one already had is not written again
+    # (before them, the plain keys wrote the selected one's, as always).
+    assert cam.log[burst:] == [
+        ("TriggerSelector", "FrameBurstStart"), ("TriggerSource", "Line1"),
+        ("TriggerActivation", "FallingEdge"), ("TriggerDelay", 12.0),
+        ("TriggerMode", "On"), ("TriggerSelector", "FrameStart"),
+        ("TriggerSelector", "ExposureStart"), ("TriggerSource", "Line1"),
+        ("TriggerSelector", "FrameStart")], cam.log[burst:]
+
+
+def test_a_preset_saved_with_one_triggers_values_still_applies(store):
+    """A preset saved before every trigger was kept holds the selected
+    trigger's values only. It still reads and applies as it did: that
+    trigger and the selector set, the others left alone."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    owner = cp.Identity.of(dev.info)
+    store.path.write_text(json.dumps({
+        "format": cp.FORMAT, "cameras": {owner.key: {
+            "backend": owner.backend, "model": owner.model,
+            "serial": owner.serial, "kind": owner.kind,
+            "presets": {"Old": {
+                "settings": {"Gain": 2.0, "TriggerSelector": "ExposureStart",
+                             "TriggerMode": "On", "TriggerSource": "Line1",
+                             "TriggerActivation": "FallingEdge",
+                             "TriggerDelay": 5.0},
+                "roi": None, "created": "2026-10-01T09:00:00",
+                "updated": "2026-10-01T09:00:00", "note": ""}}}}}),
+        encoding="utf-8")
+    cam.TriggerSelector.value = "FrameBurstStart"
+    cam.TriggerMode.SetValue("On")
+    cam.TriggerSelector.value = "FrameStart"
+    old = store.get(owner, "Old")
+    assert not store.problems and len(old.settings) == 6
+    done = cp.apply(dev, old)
+    assert done.ok, done.summary()
+    assert cam.TriggerSelector.value == "ExposureStart"
+    assert _triggers(cam) == {
+        "FrameBurstStart": ("On", "Software", "RisingEdge", 0.0),
+        "FrameStart": ("Off", "Software", "RisingEdge", 0.0),
+        "ExposureStart": ("On", "Line1", "FallingEdge", 5.0)}
+
+
+def test_a_trigger_the_camera_does_not_have_is_refused_by_name(store):
+    """A preset made on a model with more triggers, or applied to a camera
+    with none: the triggers it cannot set are refused, named, and the
+    rest of the preset still applies."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    done = cp.apply(dev, cp.Preset("x", {
+        "Gain": 3.0, "TriggerMode[FrameBurstStart]": "On",
+        "TriggerMode[AcquisitionStart]": "On"}))
+    refused = {c.key: c.note for c in done.refused}
+    assert refused == {"TriggerMode[AcquisitionStart]":
+                       "this camera has no AcquisitionStart trigger"}
+    assert cam.TriggerMode.values["FrameBurstStart"] == "On"
+    assert cam.Gain.value == 3.0
+    frame = simulated("frame")
+    done = cp.apply(frame, cp.Preset("x", {
+        "Gain": 3.0, "TriggerMode[FrameBurstStart]": "On"}))
+    assert [(c.key, c.note) for c in done.refused] == [
+        ("TriggerMode[FrameBurstStart]", "this camera has no such setting")]
+    assert frame.state["Gain"] == 3.0
+    # A camera with no triggers to save saves none.
+    assert not [k for k in cp.capture(frame, False)[0] if "[" in k]
+
+
 def test_the_identity_comes_from_what_the_scan_found():
     info = cameras.CameraInfo("prophesee", "00051234", "EVK4", "00051234",
                               "Prophesee", "event")

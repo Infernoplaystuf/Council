@@ -285,8 +285,8 @@ class Selected(Node):
     """A node of the SELECTED trigger (SFNC): TriggerMode and TriggerSource
     hold one value per TriggerSelector entry, as a Basler's do."""
 
-    def __init__(self, values, choices):
-        super().__init__(next(iter(values.values())), choices=choices)
+    def __init__(self, values, choices=None, **node):
+        super().__init__(next(iter(values.values())), choices=choices, **node)
         self.values = dict(values)
 
     def GetValue(self):
@@ -297,13 +297,23 @@ class Selected(Node):
         self.values[self.cam.TriggerSelector.value] = value
 
 
-def trigger_basler():
+def trigger_basler(full=False):
+    """Three triggers; `full`: each with its own edge and delay too, as
+    the emulator's nine have (measured: TriggerSource, TriggerActivation
+    and TriggerDelay change per TriggerSelector entry)."""
     entries = ("FrameBurstStart", "FrameStart", "ExposureStart")
+    extra = {}
+    if full:
+        extra = dict(
+            TriggerActivation=Selected({e: "RisingEdge" for e in entries},
+                                       ("RisingEdge", "FallingEdge")),
+            TriggerDelay=Selected({e: 0.0 for e in entries}, low=0.0,
+                                  high=10000.0, unit="us"))
     return basler(
         TriggerSelector=Node("FrameStart", choices=entries),
         TriggerMode=Selected({e: "Off" for e in entries}, ("Off", "On")),
         TriggerSource=Selected({e: "Software" for e in entries},
-                               ("Software", "Line1")))
+                               ("Software", "Line1")), **extra)
 
 
 def test_every_trigger_is_seen_not_only_the_selected_one():

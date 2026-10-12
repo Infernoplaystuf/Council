@@ -1111,7 +1111,14 @@ source is `Software`). So:
   left On while the selector shows FrameStart is named — and **Reset Trigger
   (as connected)** / **Reset all** put **every** trigger's mode back as
   connected, saying which (`the FrameBurstStart trigger Off again`). A preset
-  keeps the selected trigger only.
+  keeps **every** trigger's mode, source, edge and delay: the selected
+  trigger's under the rows' own names, the others' as
+  `TriggerMode[FrameBurstStart]` and so on. Applying it puts each trigger
+  back (a trigger's mode last, after its source) and leaves the selector
+  where it was when the preset was saved. A preset saved before this holds
+  the selected trigger only, and still applies as it did; an older Typhon
+  applying a newer preset reports the other triggers as settings it does
+  not know.
 
 Each run writes under its own timestamped stem, so a second run into the same
 folder can never overwrite the first. Unplugging the camera mid-capture ends

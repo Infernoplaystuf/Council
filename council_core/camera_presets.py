@@ -760,10 +760,20 @@ def _project_lock(path: Path, timeout: float) -> Iterator[None]:
 # ======================================================================
 def capture(device: Any, include_roi: bool = True
             ) -> Tuple[Dict[str, Any], Optional[Roi]]:
-    """What a preset of this camera, as it is now, holds."""
+    """What a preset of this camera, as it is now, holds.
+
+    EVERY TRIGGER, not only the selected one: a Basler's trigger rows are
+    the selected trigger's, and a preset kept that one alone — FrameBurstStart
+    On from Line1, saved while the selector showed FrameStart, came back
+    Off. The other triggers are saved under camera_settings.trigger_key
+    ("TriggerMode[FrameBurstStart]") beside the plain keys, so the file's
+    format is unchanged and a preset saved before this (one trigger's
+    values) applies as it always did."""
     from . import camera_settings
 
-    settings = camera_settings.snapshot(device)
+    provider = device.settings_provider()
+    settings = camera_settings.snapshot(device, provider.describe())
+    settings.update(provider.trigger_settings())
     roi = device.roi() if include_roi else None
     return settings, roi
 
