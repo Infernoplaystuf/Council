@@ -298,7 +298,8 @@ it back shows a saved frame while the camera keeps streaming, so dragging to
 the end again is instant (see *The slider*). **Start capture** records;
 **Stop capture** comes back to live once the run's last frames are on disk,
 and for ten seconds the live line still says how the run went
-(`… · last run: 240 saved, raw 31.4 MB`). Only the **raw view** turns the
+(`… · last run: 240 saved, raw 31.4 MB`; a Basler's failed grabs too,
+`… · last run: 238 saved, 2 failed grabs`). Only the **raw view** turns the
 live view off — the camera goes quiet so it does not slow the raw reader
 down — and coming back to PNG brings it back. **Stop capture** while only
 live does nothing — there is nothing to stop. Exposure and gain are applied
@@ -483,7 +484,10 @@ that stopped the recording). Failed grabs **after the last saved frame**
 have no CSV row to show them: they are counted only here. Like the camera
 record it is written whole and never over anything; a run from before it
 simply has none. (The Council's own Capture tab writes the same run files —
-frames, CSV, end record — into the folder you pick.)
+frames, CSV, end record — into the folder you pick. There a failed write
+**ends** the recording at once, the live view going on: its `NOT saved
+(recording stopped)` count is the frame that failed and any queued behind
+it, and **Record…** starts a new run.)
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
@@ -742,21 +746,28 @@ settings in the main window — no window to open for the everyday ones.
   camera tab was). Connecting again brings back the camera tab you last
   chose — Biases stays Biases across a reconnect — or, on a camera without
   it, that camera's first tab; Basic and Presets stay where they are.
-  - **EVK4**: **Biases** (`bias_diff_on`, `bias_diff_off`, `bias_fo`,
-    `bias_hpf`, `bias_refr`, each with the sensor's own range, and a green
-    bar under the slider marking the range the sensor **recommends**),
+  - **EVK4**: **Biases** (`bias_diff`, `bias_diff_off`, `bias_diff_on`,
+    `bias_fo`, `bias_hpf`, `bias_refr`, each with the sensor's own range —
+    as Typhon opens an EVK4 that IS the range the sensor **recommends**;
+    on a camera opened with the range-check bypass a green bar under the
+    slider marks the recommended part of a wider one),
     **Filters** (the event rate controller, anti-flicker, the event trail /
-    STC filter and the event rate activity filter, each a section of its
-    own), **Display** (below), **Camera** (its area, then the readings —
-    temperature, illumination, pixel dead time — and what it is: serial,
-    sensor, event format).
+    STC filter — its threshold in **whole milliseconds, 1 … 100 ms**, as
+    the sensor keeps it — and the event rate activity filter, each a
+    section of its own), **Display** (below), **Camera** (its area, then
+    the readings — temperature, illumination, pixel dead time — and what it
+    is: serial, sensor, event format).
   - **Basler**: **Exposure** (exposure and auto exposure, gain and auto gain,
     black level, the frame-rate limit and the rate the camera will reach,
     and the trigger: mode, source, edge, delay), **Image** (pixel format,
     mirror X/Y, gamma, digital shift, binning and its mode), **Camera** (its
     area, and its temperature where the model reports one) — whichever of
     these nodes the model has.
-  - **Simulated cameras**: their small set, the same way.
+  - **Simulated cameras**: their small set, the same way. The simulated
+    event camera's biases are an IMX636's — all six, with OpenEB's ranges
+    (`cameras.IMX636_BIASES`, the one table the tests pin to OpenEB's
+    headers) — and it refuses a bias outside its range, and keeps its trail
+    threshold in whole ms, as an EVK4 does.
 - Last, **Presets** (below).
 
 A tab is a **glance and a quick change**: each section shows its category's
@@ -801,11 +812,13 @@ forward. A pop-out opens **as wide as its rows** (the range and the ↺ beside
 each never need a sideways scroll), and cannot be made narrower than that.
 
 - Every setting of the category, with the **camera's own range and unit**
-  beside it (`-85 … 140`, and under it `rec. -85 … 140` for a bias), as the
-  camera reports them. An EVK4's HAL accepts a bias only inside its
+  beside it, as the camera reports them (a trail threshold in the ms its
+  row shows: `1 … 100 ms`). An EVK4's HAL accepts a bias only inside its
   recommended range unless the camera is opened with OpenEB's range-check
-  bypass, which Typhon does not do, so the two read the same; with the
-  bypass, `bias_diff_on` would read `-150 … 200` over `rec. -85 … 140`.
+  bypass, which Typhon does not do, so a bias's range is said once:
+  `-85 … 140` and under it `recommended, enforced` (its slider has no
+  recommended bar — the whole slider is). With the bypass, `bias_diff_on`
+  reads `-150 … 200` over `rec. -85 … 140`, and the bar marks that part.
 - **Live**: drag a bias and the live picture shows it as you drag, through
   the same 60 ms throttle — the camera is not sent a value per pixel of the
   drag.
@@ -1112,7 +1125,8 @@ works while capturing too.
 - **not drawn (screen only)** counts frames the *screen* did not redraw — the
   display shows about 30 a second, whatever the camera does. Normal and
   deliberate; **every one of them is still saved.** Only **NOT saved** means
-  frames missing from disk.
+  frames missing from disk. The Stop line says it in the same words (it
+  used to say `N dropped` for the same number).
 - **saved** is frames on disk. **waiting to save** appears when the disk is
   behind; **NOT saved (storage too slow)** counts frames it could not take at
   all.
@@ -1167,8 +1181,10 @@ source is `Software`). So:
   emulator: FrameStart, FrameBurstStart, …), and the rows show the
   **selected** one only. Every trigger counts above — a FrameBurstStart
   left On while the selector shows FrameStart is named — and **Reset Trigger
-  (as connected)** / **Reset all** put **every** trigger's mode back as
-  connected, saying which (`the FrameBurstStart trigger Off again`). A preset
+  (as connected)** / **Reset all** put **every** trigger back as connected
+  — its mode, source, edge and delay, the mode last — leave the selector
+  where it is, and say which (`the FrameBurstStart trigger Off again (its
+  source Software and edge RisingEdge too)`). A preset
   keeps **every** trigger's mode, source, edge and delay: the selected
   trigger's under the rows' own names, the others' as
   `TriggerMode[FrameBurstStart]` and so on. Applying it puts each trigger
