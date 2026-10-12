@@ -388,7 +388,8 @@ def test_the_lens_keeps_learned_memory_out(qapp, engine):
     window, view = _council(qapp, engine.vault)
     try:
         assert view.conversation.scope == "conversation"
-        result = LensActions().run("The pump datasheet, draft 2.", ["writer"])
+        result = LensActions(vault_dir=engine.vault).run(
+            "The pump datasheet, draft 2.", ["writer"])
         assert result.ok, result
         prompts = _prompts(engine.fake)
         assert prompts, "the Lens asked no model"
