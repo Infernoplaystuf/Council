@@ -8531,44 +8531,11 @@ class CouncilConsole(tk.Tk):
         """Normalise a mixed list of absolute paths / vault-relative paths /
         bare filenames into existing absolute file paths, de-duplicated and
         order-preserving. Bare names are resolved against the vault input dir
-        (searched recursively as a fallback). Returns a list of Path."""
-        try:
-            in_dir = data_index.input_dir(VAULT_DIR)
-        except Exception:
-            in_dir = VAULT_DIR
-        out, seen = [], set()
-        for s in (raw_sources or []):
-            if not s or not str(s).strip():
-                continue
-            cand = None
-            try:
-                pp = Path(str(s))
-                _pat = _compile_name_pattern(pp.name)
-                if _pat is not None:
-                    # Wildcard bare name (e.g. job_####) — first basename match.
-                    for hit in in_dir.rglob("*"):
-                        if hit.is_file() and _name_matches_pattern(_pat, hit.name):
-                            cand = hit
-                            break
-                elif pp.is_absolute() and pp.exists():
-                    cand = pp
-                elif (in_dir / str(s)).exists():
-                    cand = in_dir / str(s)
-                else:
-                    # bare filename — find the first match under the vault
-                    name = pp.name
-                    for hit in in_dir.rglob(name):
-                        if hit.is_file():
-                            cand = hit
-                            break
-            except Exception:
-                cand = None
-            if cand is not None:
-                key = str(cand.resolve()).lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(cand)
-        return out
+        (searched recursively as a fallback). Returns a list of Path.
+
+        council_core.turn_context.resolve_source_paths — the Qt shell's
+        source chips resolve through the same function."""
+        return _turn_context.resolve_source_paths(raw_sources, VAULT_DIR)
 
     def _vmgr_instant_search(self):
         """Find vault files by NAME or CONTENT (indexed values / column names),
@@ -13288,6 +13255,23 @@ class CouncilConsole(tk.Tk):
             self._pin_turn_counter = 0
         return self._pinned_files_map
 
+    def _turn_state(self):
+        """This console's retrieval memory as council_core.turn_context sees
+        it: its own task memo, referenced files and provenance tracker, and
+        the module-wide indexes it registers (module_indexes) — so the shared
+        prepare_turn reads exactly what this console's code always read.
+        Rebuilt if VAULT_DIR changes (a test sets it)."""
+        state = getattr(self, "_turn_state_obj", None)
+        if state is None or Path(state.vault_dir) != Path(VAULT_DIR):
+            state = _turn_context.TurnState(
+                vault_dir=VAULT_DIR,
+                task_memory=self.task_memory,
+                referenced_files=getattr(self, "_referenced_files", None),
+                provenance=getattr(self, "provenance", None),
+                module_indexes=True)
+            self._turn_state_obj = state
+        return state
+
     def _current_pinned_filenames(self) -> List[str]:
         """Return the list of un-expired pinned filenames. Called by the
         injection pipeline each turn; expires stale entries inline."""
@@ -15099,283 +15083,40 @@ class CouncilConsole(tk.Tk):
         # everything to the Grapher).
         original_user_text = user_text
 
-        # ── Task-memo condense (runs FIRST, very fast) ─────────────────────
-        # Re-condense the per-session memo from this turn's question so
-        # the writer always sees a fresh goal+constraints+forbidden block
-        # at the TOP of its context, even when the rest of the window is
-        # eaten by file dumps. Post the result to the transcript so the
-        # user can spot a misread before the model answers.
+        # ── The turn's context: council_core.turn_context.prepare_turn ─────
+        # The task memo, the analyst step, the file/folder/vault injection,
+        # the sources, the context-window warning and provenance were written
+        # out here (280 lines). The Qt shell needs exactly the same and cannot
+        # import this module, so the sequence moved to prepare_turn and BOTH
+        # shells call it. Its notices arrive through _append_transcript in the
+        # order and wording they always had; the locals below are the ones the
+        # rest of _send reads.
         try:
-            def _condense_call(prompt: str) -> str:
-                # Small fast call; temperature 0 for stable extraction.
-                import council_engine as _ce
-                return _ce.local_chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    num_predict=240,
-                    timeout=45,
-                )
-            _memo = self.task_memory.update(original_user_text, llm_call=_condense_call)
-        except Exception as _memo_exc:
-            print(f"[TaskMemory] update failed: {_memo_exc!r}")
-            _memo = self.task_memory.current()
-        if _memo and not _memo.is_empty():
+            _prep = _turn_context.prepare_turn(
+                original_user_text, self._turn_state(),
+                condense=_turn_context.condense_with_local_model,
+                pinned_files=self._current_pinned_filenames(),
+                on_notice=lambda _who, _text, _kind: self._append_transcript(
+                    _who, _text, _kind))
+        except Exception as _prep_exc:
+            # A turn must not die because a file would not open.
+            print(f"[prepare_turn] failed: {_prep_exc!r}")
             self._append_transcript(
                 "Council",
-                self.task_memory.render_transcript_line(),
-                "observation",
-            )
-        _task_memo_block = self.task_memory.render_injection_block() or None
-
-        # ── Analyst step ────────────────────────────────────────────────
-        # The analyst computes deterministic answers from data ("how many",
-        # "what's the sum"); when it succeeds, the injection layer reduces
-        # vault-match candidates from 5 to 1 (#7) so the answer doesn't
-        # fight for budget with speculative matches. When it FAILS (e.g.
-        # NameError in the generated code), we inject a failure block that
-        # explicitly refuses any invented numeric answer instead of falling
-        # back to model freeform — that's how the cross-machine
-        # hallucination used to creep back in.
-        _analyst_block, _analyst_err, _analyst_notices = _run_analyst_step(original_user_text)
-        # Surface resolver notices FIRST so the user sees what the analyst
-        # interpreted before the result / error message — that order makes
-        # it obvious when the analyst grabbed the wrong file or scope.
-        # Notices include two kinds:
-        #   • Plain observation strings (resolver hints, scope notes, etc.)
-        #   • A special "__ANALYST_TABLE__:<...>" payload carrying the
-        #     user-facing rendering of the analyst's full DataFrame. We
-        #     surface that as an "observation" too but with a clear
-        #     "Analyst result table:" header so the user sees the
-        #     actual numbers, not just the model's prose summary.
-        # A direct-route headline (file-count / summary / stats / precomputed
-        # / collection) that the fast-answer short-circuit below can render as
-        # the final answer WITHOUT any model call — that's the O1 speed win.
-        _fast_answer = None
-        _analyst_sources: list = []
-        for _note in (_analyst_notices or []):
-            if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
-                _table = _note[len("__ANALYST_TABLE__:"):]
-                # Stash for "Save answer" (exported into the report).
-                self._last_answer_table = _table
-                self._append_transcript(
-                    "Council",
-                    "Analyst result table:\n" + _table,
-                    "observation",
-                )
-            elif isinstance(_note, str) and _note.startswith("__ANALYST_ANSWER__:"):
-                _fast_answer = _note[len("__ANALYST_ANSWER__:"):]
-            elif isinstance(_note, str) and _note.startswith("__ANALYST_SOURCES__:"):
-                try:
-                    import json as _js_src
-                    _analyst_sources = list(
-                        _js_src.loads(_note[len("__ANALYST_SOURCES__:"):]) or [])
-                except Exception:
-                    _analyst_sources = []
-            else:
-                self._append_transcript("Council", _note, "observation")
-        if _analyst_block and not _analyst_err:
-            self._append_transcript("Council", "Computing from data...", "observation")
-        elif _analyst_err:
-            self._append_transcript(
-                "Council",
-                f"⚠ Analyst tried to compute the answer but failed: "
-                f"{_analyst_err}\n"
-                f"The model will be told to refuse inventing a number; "
-                f"try rephrasing or check the file/column name.",
-                "observation",
-            )
-
-        # ── Inject file/folder/vault context with token-aware caps ────────
-        # The new pipeline (a) tags each block with its token cost, (b) caps
-        # each block at n_ctx/8 tokens with a visible head+tail trim marker,
-        # (c) drops the lowest-priority blocks (vault matches) when the
-        # cumulative cost would exceed the safe input budget. The breakdown
-        # dict is stashed for the `context info` chat intent.
-        try:
-            _n_ctx = ce.get_n_ctx()
-        except Exception:
-            _n_ctx = 4096
-        # Resolve the current pinned-file set (filenames the model
-        # referenced in a recent prior turn). Pins are stamped with the
-        # turn-index they were created on and expire after a few turns
-        # so the budget isn't permanently bloated by a one-off "show
-        # me X" reference. The pin store lives on self; this turn's
-        # number is just an incrementing counter.
-        _pinned_files = self._current_pinned_filenames()
-        augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
-            user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
-            task_memo_block=_task_memo_block,
-            pinned_files=_pinned_files,
-        )
-        self._last_injection_breakdown = _injection_breakdown
-        # Surface defensive-wrapper failures to the transcript. When the
-        # injection pipeline's top-level try/except fires, the breakdown
-        # carries an `injection_error` field — without surfacing it, the
-        # user just sees a generic answer and has no idea context
-        # retrieval failed silently.
-        _inj_err = _injection_breakdown.get("injection_error") if isinstance(_injection_breakdown, dict) else None
-        if _inj_err:
-            self._append_transcript(
-                "Council",
-                f"⚠ Context retrieval failed with an unexpected error: "
-                f"{_inj_err}\n"
-                f"The model has been told to treat this turn as no-data-"
-                f"provided and will refuse to invent specific values.",
-                "observation",
-            )
-        # ``was_injected`` is the legacy gate that suppresses the fast-path
-        # chart/lookup handlers below. The OLD pipeline only injected vault
-        # hits + explicit files (analyst was a separate post-step), so this
-        # flag meant "the model is being asked to reason about ALREADY
-        # FETCHED data — don't divert to the chart path." Now that analyst
-        # is folded into the injection pipeline, we have to recompute the
-        # flag to EXCLUDE analyst-only injections, otherwise a plain "how
-        # many X" question would block the chart fast path even though no
-        # vault context exists yet.
-        _labels = [lbl for lbl, _ in _injection_breakdown.get("costs", [])]
-        _has_vault = any(lbl.startswith("[VAULT MATCH") for lbl in _labels)
-        _has_file = any(lbl.startswith("[FILE:") for lbl in _labels)
-        _has_folder = any(lbl.startswith("[FOLDER:") for lbl in _labels)
-        _has_nodata = any(lbl.startswith("[NO DATA AVAILABLE") for lbl in _labels)
-        was_injected = bool(_has_vault or _has_file or _has_folder or _has_nodata)
-        # ── Provenance: the source files behind this turn's answer ──────────
-        # Assembled from (a) the analyst's own sources (derived result inputs,
-        # collection members), (b) vault-match / file / folder injection
-        # labels, and (c) files the user named explicitly. Rendered as
-        # clickable chips under the final answer (fast path + deliberation).
-        # Explicit paths the user named — computed ONCE and reused at all three
-        # post-injection sites below (source assembly, injected-names notice,
-        # provenance). original_user_text == user_text here (user_text isn't
-        # reassigned to the augmented text until later), and _extract_file_paths
-        # is a pure function of its text, so one call is byte-identical to three
-        # (each did a full unicodedata scan + regex + per-path resolve()).
-        try:
-            _explicit_paths_turn = _extract_file_paths(original_user_text)
-        except Exception:
-            _explicit_paths_turn = []
-        _turn_sources: list = list(_analyst_sources)
-        for _lbl in _labels:
-            _m = _SOURCE_LABEL_RE.match(_lbl)
-            if _m:
-                _turn_sources.append(_m.group(1).strip())
-        _turn_sources.extend(_explicit_paths_turn)
-        self._last_turn_sources = _turn_sources
-        if was_injected:
-            # Filter out empty names (Path("/").name == "" etc) so we don't
-            # render "Reading: , , " on edge-case paths.
-            injected_names = [n for n in (Path(p).name for p in _explicit_paths_turn) if n]
-            if injected_names:
-                self._append_transcript("Council", "Reading: " + ", ".join(injected_names), "observation")
-            elif _has_vault:
-                self._append_transcript("Council", "Reviewing matching vault files...", "observation")
-            # If only [ANALYST RESULT] was injected, the earlier "Computing
-            # from data..." line already informed the user — no extra
-            # transcript noise needed.
-        if fuzzy_matches:
-            _lines = ["Fuzzy matches used (treated as your spelling):"]
-            for orig, suggestions in fuzzy_matches.items():
-                pairs = ", ".join(f"{m} ({r:.2f})" for m, r in suggestions)
-                _lines.append(f"  • {orig} → {pairs}")
-            _lines.append(
-                "If any are wrong, type:  forget WORD  "
-                "(comma-separated for multiple) — they won't be used again."
-            )
-            self._append_transcript("Council", "\n".join(_lines), "observation")
-        # Surface dropped blocks so the user knows what got cut to fit budget.
-        _dropped = _injection_breakdown.get("dropped") or []
-        if _dropped:
-            _msg_lines = [
-                f"⚠ Dropped {len(_dropped)} lower-priority block"
-                f"{'s' if len(_dropped) != 1 else ''} to fit n_ctx="
-                f"{_injection_breakdown.get('n_ctx', 0):,}:"
-            ]
-            for _label, _cost in _dropped:
-                _msg_lines.append(f"  • {_label}  (~{_cost:,} tokens)")
-            _msg_lines.append(
-                "(Analyst result, task memo, and the NO-DATA marker are "
-                "never dropped. Explicit files / folder listings / vault "
-                "summary CAN be dropped on cumulative budget overflow — "
-                "raise COUNCIL_GGUF_N_CTX to keep them. Type 'context "
-                "info' for the full token breakdown.)"
-            )
-            self._append_transcript("Council", "\n".join(_msg_lines), "observation")
-        user_text = augmented
-
-        # ── Context-window check ──────────────────────────────────────────
-        # llama-cpp-python silently truncates any prompt that doesn't fit in
-        # `n_ctx` — it clips the tail and proceeds, which is the #1 cause of
-        # "the model hallucinated even though I gave it the file." Warn the
-        # user as soon as we cross 80% of the configured window so they can
-        # raise COUNCIL_GGUF_N_CTX before sending another query. We don't
-        # block the request — the warning goes to the transcript and the
-        # call still goes through (truncated output is still useful for
-        # diagnosing what got clipped).
-        try:
-            _budget = ce.context_budget_report(user_text)
-            self._last_context_budget = _budget
-            _used = _budget["input_tokens"]
-            _ctx  = _budget["n_ctx"]
-            _safe = _budget["safe_input"]
-            if _budget["over_window"]:
-                _maxh = _budget.get("model_max_ctx") or 0
-                _hint = (
-                    f" The model supports up to {_maxh} tokens — raising "
-                    f"COUNCIL_GGUF_N_CTX to {min(max(16384, _ctx * 4), _maxh)} "
-                    f"would fit this prompt."
-                ) if _maxh and _maxh > _ctx else (
-                    " Raise COUNCIL_GGUF_N_CTX (e.g. to 16384 or 32768) "
-                    "before launch."
-                )
-                self._append_transcript(
-                    "Council",
-                    f"⚠ Prompt is ~{_used:,} tokens but n_ctx is only {_ctx:,}. "
-                    f"The model will silently truncate the tail and may miss "
-                    f"the injected file/analyst data.{_hint}",
-                    "observation",
-                )
-            elif _used > _safe:
-                _pct = _budget["pct_of_window"]
-                self._append_transcript(
-                    "Council",
-                    f"⚠ Prompt is ~{_used:,} tokens ({_pct:.0f}% of "
-                    f"n_ctx={_ctx:,}). Reply space is tight — consider "
-                    f"raising COUNCIL_GGUF_N_CTX for fuller answers.",
-                    "observation",
-                )
-        except Exception as _e:
-            print(f"[ContextBudget] check failed: {_e!r}")
-
-        # ── Provenance: remember what we showed the model this turn ──
-        # Lets the user ask "where did $5,000 come from?" after the reply.
-        try:
-            if hasattr(self, "provenance"):
-                import provenance as _prov_mod
-                injected_records = []
-                # Recorded file paths (explicit user-given paths) — reuse the
-                # once-computed list; _read_file_for_injection is now memoized
-                # so this doesn't re-parse files injection already read.
-                for p_str in _explicit_paths_turn:
-                    block = _read_file_for_injection(p_str)
-                    if block:
-                        injected_records.append(_prov_mod.InjectedBlock(
-                            file_name=Path(p_str).name,
-                            file_path=p_str,
-                            block=block,
-                        ))
-                # If the analyst step ran, treat its result as another source
-                if _analyst_block:
-                    injected_records.append(_prov_mod.InjectedBlock(
-                        file_name="(analyst result)",
-                        file_path="(in-session)",
-                        block=_analyst_block,
-                    ))
-                self.provenance.record_turn(
-                    user_text=original_user_text,
-                    augmented_text=user_text,
-                    injected_files=injected_records,
-                )
-        except Exception as _e:
-            print(f"[Provenance] record failed: {_e!r}")
+                f"Your files could not be read for this question "
+                f"({_prep_exc!r}), so it is answered without them.",
+                "observation")
+            _prep = _turn_context.PreparedTurn(question=original_user_text,
+                                               text=original_user_text)
+        self._last_answer_table = _prep.analyst_table
+        self._last_injection_breakdown = _prep.breakdown
+        if _prep.budget:
+            self._last_context_budget = _prep.budget
+        self._last_turn_sources = list(_prep.sources)
+        _analyst_err = _prep.analyst_error
+        _fast_answer = _prep.fast_answer
+        was_injected = _prep.injected
+        user_text = _prep.text
 
         # ── Fast path: chart-shaped questions go straight to the Grapher ──
         # Skip this entirely when we just injected vault context — the user is
