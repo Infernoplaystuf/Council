@@ -808,6 +808,12 @@ def test_the_help_says_which_way_refr_goes_and_what_erc_and_stc_delete():
     assert ("Both STC modes drop the first event of each burst and every "
             "lone event") in trail
     assert "small, fast particle" in trail
+    # Read by an engineer who may not know the vendor's words: the burst,
+    # the polarity and STC are said before (or where) they are used.
+    assert trail.index("A burst is") < trail.index("of each burst")
+    assert "same polarity (all ON, brighter, or all OFF, darker)" in trail
+    assert "STC is Prophesee's spatio-temporal contrast filter" in trail
+    assert trail.index("STC is") < trail.index("Both STC modes")
     threshold = found["trail.threshold"].help
     assert "1-100 ms" in threshold
     assert "rounded to the nearest whole millisecond" in threshold

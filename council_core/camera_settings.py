@@ -1459,8 +1459,10 @@ _BIAS_HELP = {
 # on the machine): the IMX636 driver (Gen41Erc) counts the rate over a
 # 200 µs reference period with time-based dropping only (row and column
 # dropping off); its trail filter takes 1000-100000 µs and keeps
-# roundf(threshold / 1000) whole milliseconds. What STC and TRAIL keep is
-# I_EventTrailFilterModule::Type's own description.
+# roundf(threshold / 1000) whole milliseconds. What STC and TRAIL keep, and
+# what a burst is, is I_EventTrailFilterModule::Type's own description; the
+# name STC (spatio-temporal contrast) is Prophesee's documentation's — the
+# OpenEB source never spells it out.
 ERC_HELP = (
     "Caps the event rate so a busy scene cannot swamp the link — but not "
     "evenly: on the EVK4's IMX636 it drops events by time slot (OpenEB's "
@@ -1469,6 +1471,9 @@ ERC_HELP = (
     "degrades once it acts. Prefer a smaller area (ROI) and the filters; "
     "keep this as a safety cap.")
 TRAIL_HELP = (
+    "A burst is a run of events of the same polarity (all ON, brighter, or "
+    "all OFF, darker) at one pixel, closer together than the threshold "
+    "below. STC is Prophesee's spatio-temporal contrast filter. "
     "TRAIL keeps the first event of each burst and removes the trail a "
     "moving edge leaves behind it. Both STC modes drop the first event of "
     "each burst and every lone event (STC_CUT_TRAIL keeps only the second "
