@@ -1698,6 +1698,8 @@ class VaultIndex:
         # JSON-serialised to disk and sets aren't JSON-safe.
         self._search_cache: Dict[str, Dict[str, Any]] = {}
         self._denylist_cache: Optional[Set[str]] = None
+        #: Why the last add_to_fuzzy_denylist added nothing, or "".
+        self.denylist_problem = ""
         # Lazy embedding layer — only loads sentence-transformers on first use.
         self._emb_index = None
         self.load()
@@ -1763,8 +1765,28 @@ class VaultIndex:
         return deny
 
     def add_to_fuzzy_denylist(self, terms: List[str]) -> List[str]:
-        """Persist user-rejected fuzzy terms. Returns the newly-added items."""
-        deny = set(self.fuzzy_denylist())
+        """Persist user-rejected fuzzy terms. Returns the newly-added items.
+
+        The list is the user's: a file that is there but cannot be read is
+        NOT written over (that replaced every earlier word with the new
+        ones) — nothing is added and ``denylist_problem`` says why. The
+        write is atomic (a temp file, then os.replace), so a crash mid-write
+        leaves the old list. ``denylist_problem`` is "" after a good call."""
+        self.denylist_problem = ""
+        if self.denylist_path.exists():
+            try:
+                stored = json.loads(
+                    self.denylist_path.read_text(encoding="utf-8"))
+                if not isinstance(stored, list):
+                    raise ValueError("not a list")
+                deny = set(str(t).lower().strip() for t in stored)
+            except Exception as exc:
+                self.denylist_problem = (
+                    f"{self.denylist_path.name} could not be read ({exc}), "
+                    f"so it was left as it is")
+                return []
+        else:
+            deny = set()
         added: List[str] = []
         for t in terms:
             t = (t or "").lower().strip()
@@ -1772,13 +1794,21 @@ class VaultIndex:
                 deny.add(t)
                 added.append(t)
         if added:
+            tmp = self.denylist_path.with_name(
+                f".{self.denylist_path.name}.{os.getpid()}.tmp")
             try:
-                self.denylist_path.write_text(
-                    json.dumps(sorted(deny), indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+                tmp.write_text(json.dumps(sorted(deny), indent=2),
+                               encoding="utf-8")
+                os.replace(tmp, self.denylist_path)
+            except Exception as exc:
+                self.denylist_problem = (
+                    f"{self.denylist_path.name} could not be written "
+                    f"({exc})")
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return []
             self._denylist_cache = deny
         return added
 

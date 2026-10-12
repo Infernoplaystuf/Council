@@ -431,6 +431,16 @@ class CouncilActions:
         from council_core import turn_context
         return turn_context.fast_answers_enabled(self.vault_dir)
 
+    def forget(self, typed_text: str) -> Optional[str]:
+        """"forget WORD" — a close match the turn's notice offered, put on
+        the vault's list never to use again (turn_context.forget_command):
+        what to say, or None when ``typed_text`` is not that command (a
+        conversation that was offered nothing has nothing to forget)."""
+        if self._turn_state is None:
+            return None
+        from council_core import turn_context
+        return turn_context.forget_command(typed_text, self._turn_state)
+
     def _from_data(self, prepared, *, on_event=None, on_notice=None):
         """The answer the analyst computed, given as the answer, and the
         app's note under it (a notice — see send)."""
@@ -1170,7 +1180,20 @@ class CouncilTab(ViewHelpers, QWidget):
 
         Deciding is fast (regexes, at most a folder scan); the answer can call
         a model, the DREAM3D-NX env or the network, so it runs on a worker.
+
+        First "forget WORD", which the close-match notice under a vault
+        search offers (both shells show it — turn_context.prepare_turn): a
+        small file written here, no model.
         """
+        try:
+            reply = self.actions.forget(typed)
+        except Exception as exc:                          # noqa: BLE001
+            reply = f"Nothing was forgotten: {exc!r}"
+        if reply is not None:
+            self.append("User", typed)
+            self.input.clear()
+            self.append("Council", reply, "observation")
+            return True
         job = None
         for responder in (self.pipeline_chat, self.model_chat):
             try:

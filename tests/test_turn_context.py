@@ -570,3 +570,66 @@ def test_a_failing_knowledge_graph_hook_does_not_stop_the_turn(vault_env,
     prepared, _said, _ = _prepare(vault, "summarize pumps.csv")
     assert "ORCHID" in prepared.text
     assert prepared.text.rstrip().endswith("summarize pumps.csv")
+
+
+# ============================================================
+# "forget WORD" — the command the close-match notice offers
+# ============================================================
+
+def _typo_vault(vault):
+    from council_core import turn_context as tc
+    (vault / "data_in" / "real.txt").write_text(
+        "the zebrafin gasket datasheet\n", encoding="utf-8")
+    state = tc.TurnState(vault)
+    state.get_vault_index().rebuild()
+    return state
+
+
+def test_forget_takes_a_close_match_the_notice_offered(vault_env):
+    """The notice under a vault search says "If any are wrong, type: forget
+    WORD". The Qt shell now shows that notice, so the command has to work
+    there; it takes only words this conversation was offered."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    state = _typo_vault(vault)
+    prepared, said, _ = _prepare(vault, "search the vault for zebrafn",
+                                 state=state)
+    assert "zebrafin" in prepared.fuzzy_matches.get("zebrafn", [("",)])[0]
+    assert any("forget" in text for _w, text, _k in said)
+    reply = tc.forget_command("forget zebrafin", state)
+    assert reply and "zebrafin" in reply, reply
+    import json as _json
+    assert "zebrafin" in _json.loads(
+        (vault / "fuzzy_denylist.json").read_text(encoding="utf-8"))
+    again, said, _ = _prepare(vault, "search the vault for zebrafn",
+                              state=state)
+    assert "zebrafn" not in again.fuzzy_matches, again.fuzzy_matches
+
+
+@pytest.mark.parametrize("text", [
+    "forget what I said earlier and tell me about valves",
+    "forget zebrafin",                 # never offered in this conversation
+    "please forget zebrafin",
+    "what is a zebrafin?"])
+def test_forget_leaves_everything_else_to_the_council(vault_env, text):
+    """"forget …" that is not a word the notice offered is a question: Tk's
+    _send took ANY "forget …" as the command and added "what", "said"…
+    to the list."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    state = _typo_vault(vault)
+    assert tc.forget_command(text, state) is None
+    assert not (vault / "fuzzy_denylist.json").exists()
+
+
+def test_forget_never_writes_over_a_list_it_cannot_read(vault_env):
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    state = _typo_vault(vault)
+    _prepare(vault, "search the vault for zebrafn", state=state)
+    damaged = b'["kiwi", "walnut"'                # cut off mid-write
+    (vault / "fuzzy_denylist.json").write_bytes(damaged)
+    state.vault_index._denylist_cache = None
+    reply = tc.forget_command("forget zebrafin", state)
+    assert reply and "could not" in reply.lower(), reply
+    assert (vault / "fuzzy_denylist.json").read_bytes() == damaged

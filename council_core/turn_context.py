@@ -3397,6 +3397,9 @@ class TurnState:
     #: before the move — the Tk console registers its warm data index there
     #: (_register_data_index) and keeps one vault index for the process.
     module_indexes: bool = False
+    #: Lower-case words the close-match notice offered in this conversation
+    #: ("zebrafn -> zebrafin"): what "forget WORD" may take (forget_command).
+    offered_matches: Set[str] = _field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.vault_dir = Path(self.vault_dir)
@@ -3533,6 +3536,43 @@ def knowledge_graph_block(question: str,
     its files under the answer. It must not raise for an ordinary reason (a
     missing or locked store is "no block"); prepare_turn catches what does."""
     return None
+
+
+_FORGET_RE = _re.compile(r"^\s*forget\s+(.+?)\s*$", _re.IGNORECASE)
+
+
+def forget_command(text: str, state: TurnState) -> Optional[str]:
+    """The "forget WORD[, WORD]" the close-match notice offers ("If any are
+    wrong, type: forget WORD"): the words go on the vault's list of close
+    matches never to use again (vault_index.add_to_fuzzy_denylist,
+    fuzzy_denylist.json — what the Tk console's _send does). Returns what to
+    say, or None when ``text`` is not that command: every word must be one
+    the notice offered in THIS conversation, so "forget what I said earlier"
+    is a question for the council (the Tk console took any "forget …" as the
+    command and added "what", "said", … to the list)."""
+    match = _FORGET_RE.match(text or "")
+    if not match:
+        return None
+    words = [w.strip().lower() for w in _re.split(r"[,\s]+", match.group(1))
+             if w.strip()]
+    if not words or not all(w in state.offered_matches for w in words):
+        return None
+    token = _ACTIVE.set(state)
+    try:
+        index = _get_vault_index()
+    finally:
+        _ACTIVE.reset(token)
+    if index is None:
+        return ("The vault index could not be opened, so nothing was "
+                "forgotten.")
+    added = index.add_to_fuzzy_denylist(words)
+    problem = getattr(index, "denylist_problem", "")
+    if problem:
+        return f"Nothing was forgotten: {problem}."
+    if added:
+        return ("OK — these will no longer be used as close matches for "
+                "your words: " + ", ".join(added))
+    return "Those words were already on the list of matches not to use."
 
 
 def condense_with_local_model(prompt: str) -> str:
@@ -3856,6 +3896,8 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         for orig, suggestions in prepared.fuzzy_matches.items():
             pairs = ", ".join(f"{m} ({r:.2f})" for m, r in suggestions)
             lines.append(f"  • {orig} → {pairs}")
+            state.offered_matches.update(
+                str(m).lower().strip() for m, _r in suggestions if m)
         lines.append("If any are wrong, type:  forget WORD  "
                      "(comma-separated for multiple) — they won't be used "
                      "again.")

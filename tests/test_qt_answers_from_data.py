@@ -260,6 +260,36 @@ def test_the_full_council_gives_every_drafting_role_the_file(qapp, engine):
         _close(qapp, window, view)
 
 
+def test_forget_works_where_the_notice_offers_it(qapp, engine):
+    """The close-match notice under a vault search says "If any are wrong,
+    type: forget WORD". Before, the Qt tab sent "forget zebrafin" to the
+    Writer as a question; now it goes on the vault's list (no model asked)
+    and the next search does not use it."""
+    (engine.vault / "data_in" / "real.txt").write_text(
+        "the zebrafin gasket datasheet\n", encoding="utf-8")
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Search the vault for zebrafn")
+        assert "forget WORD" in view.transcript.toPlainText()
+        asked = len(engine.fake.state.chats)
+        view.input.setPlainText("forget zebrafin")
+        view.on_send()
+        for _ in range(20):
+            qapp.processEvents()
+        assert not view._turn_active
+        assert len(engine.fake.state.chats) == asked, "a model was asked"
+        text = view.transcript.toPlainText()
+        assert "no longer be used as close matches" in text, text
+        assert "zebrafin" in json.loads(
+            (engine.vault / "fuzzy_denylist.json").read_text(
+                encoding="utf-8"))
+        # "forget …" that is not an offered word is a question.
+        _ask(qapp, view, "forget what I said and summarize pumps.csv")
+        assert len(engine.fake.state.chats) > asked
+    finally:
+        _close(qapp, window, view)
+
+
 def test_a_prompt_too_long_for_the_model_is_said_and_kept(qapp, engine,
                                                          monkeypatch):
     """The context-window notice reaches the Qt transcript in plain words,
