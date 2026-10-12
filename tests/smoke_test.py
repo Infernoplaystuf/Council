@@ -127,6 +127,12 @@ if _pytest is not None:
 
 def _run(label: str, fn) -> None:
     print(f"\n── {label} ──")
+    # Each check starts with no cached Ollama answer, as each pytest test
+    # does: a cached refusal would let a later check that reaches for the
+    # real Ollama pass without asking (tests/offline_guard.py).
+    guard = sys.modules.get("tests.offline_guard")
+    if guard is not None:
+        guard.forget_cached_answers()
     try:
         fn()
     except Exception as exc:

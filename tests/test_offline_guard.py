@@ -9,8 +9,11 @@ and stops there if not, so a broken guard fails these tests WITHOUT a packet
 leaving the machine to find out. The addresses refused are 192.0.2.1
 (TEST-NET-1, reserved for documentation: routed nowhere) and names under
 .invalid, which never resolve. The real Ollama's port is only ever "reached"
-through the guard's own check function, never with a socket: on this PC
-127.0.0.1:11434 is the user's real Ollama.
+through the guard's own check function - on this PC 127.0.0.1:11434 is the
+user's real Ollama - with one exception, the pytest of its own that
+test_a_cached_refusal_does_not_let_the_next_test_pass runs: there an audit
+hook stops any connection to that port that gets past the guard, at the C
+call, before it is made.
 
 Run:  python -m pytest tests/test_offline_guard.py -q
 """
@@ -535,28 +538,35 @@ INNER_TESTS = textwrap.dedent('''
 ''')
 
 
+def _inner_pytest(tmp_path, name, tests, conftest_extra=""):
+    """Run `tests` in a pytest of its own, with this guard as its conftest
+    (and its own report, not ours)."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (tmp_path / "conftest.py").write_text(
+        f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n" + conftest_extra
+        + "from tests.offline_guard import (allow_ollama_port,  # noqa\n"
+        "    offline_network, offline_test)\n", encoding="utf-8")
+    (tmp_path / name).write_text(tests, encoding="utf-8")
+    env = dict(os.environ)
+    env.pop(guard.REPORT_ENV, None)            # its own report, not ours
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("COUNCIL_OLLAMA_HOST", None)
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(tmp_path / name)],
+        capture_output=True, text=True, timeout=300, cwd=str(tmp_path),
+        env=env)
+    return r.returncode, r.stdout + r.stderr
+
+
 def test_a_test_that_tried_fails_even_if_it_swallowed_the_refusal(tmp_path):
     """Run three tests in a pytest of their own, with this guard as their
     conftest: the two that tried to reach 192.0.2.1 - one in its own process,
     one in a child - error with the guard's message; the one that stayed on
     loopback passes."""
     _require_guard()
-    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    (tmp_path / "conftest.py").write_text(
-        f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n"
-        "from tests.offline_guard import (allow_ollama_port,  # noqa\n"
-        "    offline_network, offline_test)\n", encoding="utf-8")
-    (tmp_path / "test_inner.py").write_text(INNER_TESTS, encoding="utf-8")
-    env = dict(os.environ)
-    env.pop(guard.REPORT_ENV, None)            # its own report, not ours
-    env.pop("PYTEST_ADDOPTS", None)
-    r = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         str(tmp_path / "test_inner.py")],
-        capture_output=True, text=True, timeout=300, cwd=str(tmp_path),
-        env=env)
-    out = r.stdout + r.stderr
-    assert r.returncode == 1, out
+    code, out = _inner_pytest(tmp_path, "test_inner.py", INNER_TESTS)
+    assert code == 1, out
     # pytest counts a test whose call passed and whose teardown failed in
     # both columns: "3 passed, 2 errors" - and the run fails.
     assert "3 passed, 2 errors" in out, out
@@ -564,4 +574,50 @@ def test_a_test_that_tried_fails_even_if_it_swallowed_the_refusal(tmp_path):
     assert "ERROR at teardown of test_swallowed_in_a_child" in out
     assert out.count("tests must stay offline - this test (or a program it "
                      "started) was refused 1 time(s)") == 2, out
+    _taken(0)
+
+
+INNER_CACHED_TESTS = textwrap.dedent('''
+    from council_core import local_models
+
+    def test_asks_for_the_models():
+        local_models.ollama_tags()
+
+    def test_asks_again_while_the_refusal_is_cached():
+        local_models.ollama_tags()
+
+    def test_asks_whether_it_is_up_while_the_refusal_is_cached():
+        local_models.ollama_reachable()
+''')
+
+#: In that pytest, a connection to port 11434 that got past the guard is
+#: stopped at the C call (an audit hook runs before the connect), so a
+#: broken guard fails the test without reaching the real Ollama.
+STOP_PAST_THE_GUARD = textwrap.dedent('''
+    def _stop(event, args):
+        if (event == "socket.connect" and isinstance(args[1], tuple)
+                and len(args[1]) >= 2 and args[1][1] == 11434):
+            raise RuntimeError("past the guard: stopped at connect")
+    sys.addaudithook(_stop)
+''')
+
+
+def test_a_cached_refusal_does_not_let_the_next_test_pass(tmp_path):
+    """council_core.local_models caches what Ollama answered - a refused
+    call too, as "not running" - for 5 to 60 s. Three tests in a row that
+    each ask the real Ollama's port: only the first was refused; the other
+    two read the cached "not running", asked nothing, and passed (review,
+    2026-10-12). Each test now starts with that cache empty, so all three
+    error."""
+    _require_guard()
+    code, out = _inner_pytest(tmp_path, "test_inner_cached.py",
+                              INNER_CACHED_TESTS, STOP_PAST_THE_GUARD)
+    assert code == 1, out
+    assert "past the guard" not in out, out
+    assert "3 passed, 3 errors" in out, out
+    for name in ("test_asks_for_the_models",
+                 "test_asks_again_while_the_refusal_is_cached",
+                 "test_asks_whether_it_is_up_while_the_refusal_is_cached"):
+        assert f"ERROR at teardown of {name}" in out, out
+    assert out.count("a connection to 127.0.0.1:11434") == 3, out
     _taken(0)

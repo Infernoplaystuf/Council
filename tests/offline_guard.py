@@ -165,6 +165,23 @@ def take_refusals() -> List[Refusal]:
     return out
 
 
+def forget_cached_answers() -> None:
+    """Empty council_core.local_models' cache of what Ollama answered - if
+    that module is loaded; nothing is imported for it.
+
+    It caches a REFUSED call too, as "Ollama is not running": /api/tags for
+    5 s, reachability for 10 s, and 60 s for the callers that ask for that.
+    A test that reached for the real Ollama inside that window asked
+    nothing, so there was nothing to refuse, and it PASSED - only the first
+    offender in each window failed, and which one that was depended on
+    which tests ran together (review, 2026-10-12). With the cache emptied
+    before each test, every test that asks is refused on its own."""
+    module = sys.modules.get("council_core.local_models")
+    invalidate = getattr(module, "invalidate_cache", None)
+    if invalidate is not None:
+        invalidate()
+
+
 def describe(refusals: List[Refusal]) -> str:
     """The refusals, one per line, for a failure message."""
     return "\n".join(f"  pid {pid}, during {test}: {what}\n      asked by {where}"
@@ -202,13 +219,16 @@ if pytest is not None:
         program it started - even when the code under test caught the
         refusal. A refusal made before its own setup (a worker an earlier
         test left running, an import at collection, a module- or
-        session-scoped fixture) fails this test's setup."""
+        session-scoped fixture) fails this test's setup. Each test starts
+        with no cached Ollama answer (forget_cached_answers), so an earlier
+        refusal cannot stand in for this test's own."""
         stray = take_refusals()
         if stray:
             pytest.fail(f"{MESSAGE} - refused before this test's own setup "
                         f"(at collection, by a worker an earlier test left "
                         f"running, or in a module- or session-scoped "
                         f"fixture):\n{describe(stray)}", pytrace=False)
+        forget_cached_answers()
         opted = request.node.get_closest_marker("allow_ollama_port")
         before = os.environ.get(ALLOW_OLLAMA_ENV)
         if opted is not None:
