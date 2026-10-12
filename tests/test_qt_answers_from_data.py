@@ -1,0 +1,217 @@
+"""
+"Answers from your data" (Batch 2) — the real Qt Council tab, the real engine,
+a fake Ollama that records every prompt, a temp vault with a planted fact.
+
+The survey (docs/qt_migration/remaining_scope_2026-10-06.md section 1): the Qt
+Council sent only the typed question to the models; a fact planted in a temp
+vault reached 0 of 13 prompts with deliberation on and 0 of 1 in the default
+build, while Tk put it in the Writer's prompt and showed a file chip. The Qt
+turn now goes through council_core.turn_context.prepare_turn — the function
+the Tk shell calls too.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
+
+pytest.importorskip("PySide6", reason="the Qt tab needs PySide6")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+FACT = "ORCHID"
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+    app.processEvents()
+
+
+def _pump(app, predicate, timeout=60.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.fixture
+def engine(tmp_path, monkeypatch):
+    import council_engine as ce
+    from council_core import local_models
+    from tests.fake_ollama import FakeOllama, refuse_egress
+
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "data_in" / "pumps.csv").write_text(
+        f"pump,bay,name,pressure_bar\nP1,4,{FACT},12.5\nP2,5,LILAC,9.1\n",
+        encoding="utf-8")
+    with FakeOllama() as fake:
+        monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", fake.url)
+        monkeypatch.setenv("COUNCIL_BACKEND", "ollama")
+        monkeypatch.setenv("COUNCIL_OLLAMA_MODEL", "phi3.5")
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "0")
+        for var in ("COUNCIL_GGUF_PATH", "COUNCIL_MEMORY_SCOPE",
+                    "COUNCIL_DEMO_SILO", "COUNCIL_REMOTE_NODES"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setitem(sys.modules, "llama_cpp", None)
+        monkeypatch.setattr(ce, "_hardware_gb", lambda: (8.0, 31.7))
+        monkeypatch.setattr(ce, "_OLLAMA_CPT", {})
+        local_models.invalidate_cache()
+        ce.refresh_backend_config()
+        refused = refuse_egress(monkeypatch)
+        yield SimpleNamespace(ce=ce, vault=vault, fake=fake, refused=refused)
+    ce.refresh_backend_config()
+    local_models.invalidate_cache()
+
+
+def _council(vault, *, demo_mode=True):
+    from council_qt.tabs.council import CouncilActions, CouncilTab
+    from council_qt.window import CouncilWindow
+    window = CouncilWindow()
+    view = CouncilTab(window, actions=CouncilActions(vault_dir=vault,
+                                                     demo_mode=demo_mode),
+                      demo_mode=demo_mode)
+    opened = []
+    view.open_source = opened.append
+    return window, view, opened
+
+
+def _ask(qapp, view, question, timeout=120.0):
+    view.input.setPlainText(question)
+    view.on_send()
+    assert _pump(qapp, lambda: not view._turn_active, timeout=timeout), (
+        "the turn never finished")
+    for _ in range(20):
+        qapp.processEvents()
+
+
+def _writer_prompts(fake, since=0):
+    return ["\n".join(m.get("content") or "" for m in body.get("messages")
+                      or [] if m.get("role") != "system")
+            for body in fake.state.chats[since:]]
+
+
+def _close(qapp, window, view):
+    window.request_close()
+    view.deleteLater()
+    qapp.processEvents()
+
+
+def test_the_default_build_answers_with_the_file_in_front_of_it(qapp,
+                                                                engine):
+    """The default build is one Writer (DEMO_MODE): it was a plain chatbot."""
+    window, view, opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        prompts = _writer_prompts(engine.fake)
+        answering = [p for p in prompts if "USER TASK" in p]
+        assert answering, f"no personality prompt reached the model: {prompts}"
+        assert FACT in answering[-1], answering[-1]
+        assert answering[-1].rstrip().endswith("Summarize pumps.csv")
+
+        # The chip under the answer, and a click on it.
+        assert view.sources_frame.isVisibleTo(view)
+        assert [c.text() for c in view.source_chips] == ["📄 pumps.csv"]
+        view.source_chips[0].click()
+        assert [Path(p).name for p in opened] == ["pumps.csv"]
+        assert "Sources: pumps.csv" in view.transcript.toPlainText()
+        assert not engine.refused
+    finally:
+        _close(qapp, window, view)
+    rows = [json.loads(line) for line in next(
+        (engine.vault / "conversations").glob("*.jsonl"))
+        .read_text(encoding="utf-8").splitlines()]
+    answer = next(r for r in rows if r["who"] == "Writer")
+    assert [Path(p).name for p in answer["provenance"]["sources"]] == [
+        "pumps.csv"]
+    assert rows[0]["text"] == "Summarize pumps.csv", (
+        "the conversation keeps what was TYPED, not the vault context")
+
+
+def test_a_value_question_finds_the_file_without_being_told(qapp, engine):
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Which pump is in bay 4?")
+        answering = [p for p in _writer_prompts(engine.fake)
+                     if "USER TASK" in p]
+        assert FACT in answering[-1]
+        assert "📄 pumps.csv" in [c.text() for c in view.source_chips]
+    finally:
+        _close(qapp, window, view)
+
+
+def test_a_count_is_answered_from_the_data_without_a_model(qapp, engine):
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "How many files are in the vault?")
+        assert view._last_route == "data"
+        assert "file(s)" in (view._last_answer or "")
+        assert not [p for p in _writer_prompts(engine.fake)
+                    if "USER TASK" in p], "a personality was asked anyway"
+        assert "no model was asked" in view.transcript.toPlainText()
+    finally:
+        _close(qapp, window, view)
+
+
+def test_the_next_turn_clears_the_chips(qapp, engine):
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        assert view.source_chips
+        _ask(qapp, view, "Thanks, that is all.")
+        assert not view.source_chips and not view.sources_frame.isVisibleTo(
+            view)
+    finally:
+        _close(qapp, window, view)
+
+
+def test_the_full_council_gives_every_drafting_role_the_file(qapp, engine):
+    """With deliberation on, the survey measured 0 of 13 prompts. The vault
+    blocks go in front of the question, so every role sees them (as in Tk)."""
+    window, view, _opened = _council(engine.vault, demo_mode=False)
+    try:
+        view._checkboxes["deliberate"].setChecked(True)
+        _ask(qapp, view, "Summarize pumps.csv", timeout=240)
+        answering = [p for p in _writer_prompts(engine.fake)
+                     if "USER TASK" in p or "USER REQUEST" in p]
+        assert answering
+        with_fact = [p for p in answering if FACT in p]
+        assert len(with_fact) >= len(answering) // 2, (
+            f"{len(with_fact)} of {len(answering)} prompts carried the file")
+        assert view.source_chips
+    finally:
+        _close(qapp, window, view)
+
+
+def test_a_failing_context_step_still_answers_and_says_so(qapp, engine,
+                                                         monkeypatch):
+    from council_core import turn_context
+
+    def broken(*_a, **_k):
+        raise OSError("the share went away")
+
+    monkeypatch.setattr(turn_context, "prepare_turn", broken)
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        text = view.transcript.toPlainText()
+        assert "could not be read for this question" in text
+        assert view._last_answer, "the question was not answered"
+    finally:
+        _close(qapp, window, view)

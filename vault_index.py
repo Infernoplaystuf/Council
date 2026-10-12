@@ -2055,25 +2055,38 @@ the vocabulary list. Lowercase only. Single line only.
         except Exception:
             _PROTECTED_SUBDIRS = ()
         try:
+            from conversation_logger import (
+                PROTECTED_ROOT_FILES as _PROTECTED_ROOT_FILES,
+            )
+        except Exception:
+            _PROTECTED_ROOT_FILES = ()
+        try:
             _vault_resolved = self.vault_dir.expanduser().resolve()
             _protected_prefixes = tuple(
                 str(_vault_resolved / sub).lower() + os.sep
                 for sub in _PROTECTED_SUBDIRS
             )
+            # Protected at the vault root only (conversation_logger).
+            _protected_root_files = frozenset(
+                str(_vault_resolved / name).lower()
+                for name in _PROTECTED_ROOT_FILES)
         except Exception:
             _protected_prefixes = ()
+            _protected_root_files = frozenset()
 
         def _is_protected_fast(p: Path) -> bool:
             """Cheap absolute-prefix check — equivalent to the old
             is_protected_path call on resolvable paths. Falls back to
             the slow version only when string-prefix can't help (e.g.
             symlinked subtree)."""
-            if not _protected_prefixes:
+            if not _protected_prefixes and not _protected_root_files:
                 return False
             try:
                 sp = str(p.resolve()).lower()
             except Exception:
                 return False
+            if sp in _protected_root_files:
+                return True
             return any(sp.startswith(prefix) for prefix in _protected_prefixes)
 
         # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────

@@ -159,6 +159,12 @@ class TurnResult:
     #: and the vault sources it was given. Filled by the front end's send.
     provenance: Dict[str, Any] = field(default_factory=dict)
 
+    #: The files behind the answer (council_core.turn_context: what the
+    #: analyst read, the vault and value matches, the files the user named)
+    #: — raw, and resolved to existing paths for the chips under the answer.
+    sources: List[str] = field(default_factory=list)
+    source_paths: List[Any] = field(default_factory=list)
+
 
 def final_answer(events: List[AgentEvent], synth: str = "writer") -> str:
     """The synthesised answer, last one wins."""
@@ -203,13 +209,19 @@ def run_turn(question: str, models: Any, *,
              clarification_cb: Optional[Callable[[str, str], None]] = None,
              pause_event: Optional[threading.Event] = None,
              answer_getter: Optional[Callable[[], str]] = None,
-             extra_ctx: Optional[Dict[str, Any]] = None) -> TurnResult:
+             extra_ctx: Optional[Dict[str, Any]] = None,
+             route_text: Optional[str] = None) -> TurnResult:
     """Run one full deliberation and dig the result out of it.
 
     Never raises. A turn that fails comes back as ``ok=False`` with the reason
     in ``message`` — a front end mid-turn needs something to show the user more
     than it needs a traceback, and the exception is kept in ``error`` for
     whoever does want one.
+
+    ``route_text`` is what the judge routes on — what the user TYPED — when
+    ``question`` carries the vault context in front of it (A5 in
+    docs/qt_migration/phase6_port_requirements.md: the Tk shell routes on the
+    augmented text, so a spreadsheet's contents steer the route).
     """
     question = (question or "").strip()
     if not question:
@@ -230,7 +242,7 @@ def run_turn(question: str, models: Any, *,
 
         route = ""
         try:
-            route = judge.route(question) or ""
+            route = judge.route((route_text or question).strip()) or ""
         except Exception:                                 # noqa: BLE001
             route = ""                 # an unroutable question still gets asked
         panel, synth = panel_for_route(route)

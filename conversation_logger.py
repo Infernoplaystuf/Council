@@ -53,6 +53,21 @@ PROTECTED_SUBDIRS: tuple = (
     # knowledge_graph.py). Its JSON/CSV exports quote the user's documents,
     # so a vault search must not find them as if they were documents.
     ".knowledge_graph",
+    # The app's own logs: logs/council.log is the Librarian's log of EVERY
+    # transcript line of every session (the same content as
+    # conversation_logs/), and logs/crashes/ holds crash reports. Indexed as
+    # a .log document, an older session's words came back as a "vault
+    # match" — the way past conversations must not reach a prompt under
+    # "This conversation only" (council_core.memory_scope). Only the vault's
+    # own top-level logs/ is meant: a "logs" folder inside data_in/ is the
+    # user's and stays searchable.
+    "logs",
+    # Learned memory: role and project memory and the compiled user profile
+    # (council_engine.RoleMemoryManager writes memory/*.md), and the Sage's
+    # knowledge notes. Indexed as documents, a vault search put them back
+    # into a prompt — past "This conversation only", and past SILO in Tk.
+    "memory",
+    "sage_knowledge",
 )
 
 # Lowercased once at import for the per-path membership test in
@@ -80,7 +95,20 @@ PROTECTED_STATE_FILES: tuple = (
     # Agent profiles: settings, profiles and the council's tool requests
     # (council_core/agent_profiles.py) — app state, and it quotes tool code.
     "agent_profiles.json",
+    # Older conversations, in the app's own words: every judged question
+    # (verdict_history.jsonl), every question the vault could not answer
+    # (vault_rag_misses.txt), the Librarian's gap list quoting them. A
+    # "search the vault for X" put both of the first two into the prompt
+    # (measured) — an older session's question, past "This conversation
+    # only" (council_core.memory_scope).
+    "verdict_history.jsonl", "vault_rag_misses.txt", "librarian_wishlist.md",
 )
+
+#: App files protected only at the vault ROOT — a name too ordinary to
+#: protect everywhere (a user's own trends.md in data_in/ is their data).
+#: trends.md is the cross-session trend analysis of all role memory.
+PROTECTED_ROOT_FILES: tuple = ("trends.md",)
+_PROTECTED_ROOT_FILES_LC = frozenset(s.lower() for s in PROTECTED_ROOT_FILES)
 _PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
 
 
@@ -113,6 +141,8 @@ def is_protected_path(path: Any, vault_dir: Any) -> bool:
         # (it's just outside our scope).
         return False
     parts = rel.parts
+    if len(parts) == 1 and parts[0].lower() in _PROTECTED_ROOT_FILES_LC:
+        return True
     return bool(parts) and parts[0].lower() in _PROTECTED_SUBDIRS_LC
 
 

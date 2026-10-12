@@ -1959,6 +1959,17 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # filter for future call sites).
                 all_hits = [(s, r) for s, r in all_hits
                             if r.get("path") not in explicit_paths]
+                # [turn_context] An index built before a folder was
+                # protected still lists its files until its next rebuild;
+                # a hit there is never injected (conversation_logger).
+                try:
+                    import conversation_logger as _cl_hits
+                    all_hits = [
+                        (s, r) for s, r in all_hits
+                        if not _cl_hits.is_protected_path(
+                            r.get("path") or "", _vault())]
+                except Exception:
+                    pass
                 full_hits = all_hits[:k]
                 tail_hits = all_hits[k:]
 
@@ -2441,7 +2452,7 @@ def _get_vault_index():
     """Lazy-init the vault index. Returns None on import/setup failure."""
     global _VAULT_INDEX_INSTANCE
     state = _ACTIVE.get()                      # [turn_context] a session's own
-    if state is not None:
+    if state is not None and not state.module_indexes:
         return state.get_vault_index()
     if _VAULT_INDEX_INSTANCE is not None:
         return _VAULT_INDEX_INSTANCE
@@ -2475,7 +2486,7 @@ def _get_data_index():
     """
     global _DATA_INDEX_INSTANCE
     state = _ACTIVE.get()                      # [turn_context] a session's own
-    if state is not None:
+    if state is not None and not state.module_indexes:
         return state.get_data_index()
     if _DATA_INDEX_INSTANCE is not None:
         return _DATA_INDEX_INSTANCE
@@ -3275,3 +3286,424 @@ def _build_analyst_failure_block(code: str, error_log: str) -> str:
         "datasets.]\n"
         "[END ANALYST]"
     )
+
+
+# ============================================================
+# prepare_turn — the one seam both shells call
+# ============================================================
+# Before this, the sequence below was written out inside the Tk shell's
+# 1,166-line _send, and the Qt shell had none of it: it sent the typed
+# question alone, so a fact in the vault reached 0 of 13 prompts. Both shells
+# now call prepare_turn and send what it returns.
+
+from collections import OrderedDict as _OrderedDict          # noqa: E402
+from dataclasses import dataclass as _dataclass               # noqa: E402
+from dataclasses import field as _field                       # noqa: E402
+
+#: How many turns a filename pin lives (the Tk console's PIN_LIFETIME_TURNS).
+PIN_LIFETIME_TURNS = 3
+
+#: What a turn says when the analyst answered from the data and no model was
+#: asked (the Tk fast path's line, without the Expand button it points at in
+#: Tk — the Qt build cannot send a fast question to the full council yet).
+FAST_ANSWER_NOTE = ("Answered directly from the data — no model was asked, "
+                    "so it is instant and exact.")
+
+
+@_dataclass
+class TurnState:
+    """One conversation's retrieval memory — what the next turn's context
+    builds on. Lives as long as the conversation.
+
+    The Tk console keeps these as its own attributes (task_memory,
+    _referenced_files, its pins, data_index); the Qt shell keeps one of these
+    per conversation. Neither is cross-session memory: nothing here is
+    written to disk or read from an older session.
+    """
+    vault_dir: Path
+    #: task_memory.TaskMemory — the goal/constraints sticky note.
+    task_memory: Any = None
+    #: lower-case basename -> absolute path: files the user was just shown.
+    referenced_files: "_OrderedDict[str, str]" = _field(
+        default_factory=_OrderedDict)
+    #: lower-case filename -> the turn it was pinned on.
+    pins: Dict[str, int] = _field(default_factory=dict)
+    pin_turn: int = 0
+    data_index: Any = None
+    vault_index: Any = None
+    #: provenance.ProvenanceTracker — "where did that number come from?"
+    provenance: Any = None
+    #: True: the index lookups use the module-wide instances, as they did
+    #: before the move — the Tk console registers its warm data index there
+    #: (_register_data_index) and keeps one vault index for the process.
+    module_indexes: bool = False
+
+    def __post_init__(self) -> None:
+        self.vault_dir = Path(self.vault_dir)
+        if self.task_memory is None:
+            import task_memory as _task_memory
+            self.task_memory = _task_memory.TaskMemory()
+        if self.provenance is None:
+            try:
+                import provenance as _provenance
+                self.provenance = _provenance.ProvenanceTracker(max_turns=20)
+            except Exception:                             # noqa: BLE001
+                self.provenance = None
+
+    def get_vault_index(self):
+        """This conversation's vault index, built on first use."""
+        if self.vault_index is None:
+            try:
+                import vault_index as _vi
+                self.vault_index = _vi.VaultIndex(self.vault_dir)
+            except Exception as exc:                      # noqa: BLE001
+                import sys as _sys_dbg
+                print("[VaultIndex] init failed: " + repr(exc),
+                      file=_sys_dbg.stderr)
+                return None
+        return self.vault_index
+
+    def get_data_index(self):
+        """This conversation's data index (data_in/ + the bundled samples),
+        built on first use and kept warm."""
+        if self.data_index is None:
+            try:
+                import data_index as _di
+                self.data_index = _di.DataIndex(
+                    search_roots=[_di.input_dir(self.vault_dir),
+                                  _di.bundled_samples_dir()],
+                    write_root=_di.output_dir(self.vault_dir))
+            except Exception as exc:                      # noqa: BLE001
+                import sys as _sys_dbg
+                print("[DataIndex] init failed: " + repr(exc),
+                      file=_sys_dbg.stderr)
+                return None
+        return self.data_index
+
+    # -- filename pins (the Tk console's _current_pinned_filenames) ------
+    def current_pins(self) -> List[str]:
+        for name in list(self.pins):
+            if self.pin_turn - self.pins[name] >= PIN_LIFETIME_TURNS:
+                self.pins.pop(name, None)
+        return list(self.pins)
+
+    def update_pins(self, response_text: str) -> None:
+        """After an answer: pin the vault files it names, so the next turn's
+        follow-up ("tell me more about orders.csv") gets the whole file.
+        Only names that are real vault records are pinned. (The Tk console's
+        _update_pins_from_response.)"""
+        if not response_text:
+            self.pin_turn += 1
+            return
+        token = _ACTIVE.set(self)
+        try:
+            idx = _get_vault_index()
+            known = {str(rec.get("name", "")).lower()
+                     for rec in idx.records.values() if rec.get("name")}
+        except Exception:                                 # noqa: BLE001
+            known = set()
+        finally:
+            _ACTIVE.reset(token)
+        if not known:
+            self.pin_turn += 1
+            return
+        current = self.pin_turn
+        for match in _re.finditer(r"[\w\-]{1,60}\.[A-Za-z0-9]{1,8}",
+                                  response_text):
+            tok = match.group(0).strip(",.;:!?)(\"' `").lower()
+            if tok and tok in known:
+                self.pins[tok] = current
+        self.pin_turn = current + 1
+
+
+@_dataclass
+class PreparedTurn:
+    """What `prepare_turn` produced. ``question`` is what the user typed
+    (intent detection reads it); ``text`` is what the models are sent."""
+    question: str
+    text: str
+    notices: List[Tuple[str, str, str]] = _field(default_factory=list)
+    sources: List[str] = _field(default_factory=list)
+    source_paths: List[Path] = _field(default_factory=list)
+    fast_answer: Optional[str] = None
+    analyst_block: Optional[str] = None
+    analyst_error: Optional[str] = None
+    analyst_table: str = ""
+    breakdown: Dict[str, Any] = _field(default_factory=dict)
+    budget: Dict[str, Any] = _field(default_factory=dict)
+    injected: bool = False
+    explicit_paths: List[str] = _field(default_factory=list)
+    fuzzy_matches: Dict[str, Any] = _field(default_factory=dict)
+
+    @property
+    def answerable_from_data(self) -> bool:
+        """A deterministic answer is ready and nothing went wrong."""
+        return bool(self.fast_answer) and not self.analyst_error
+
+
+def condense_with_local_model(prompt: str) -> str:
+    """The task memo's condenser call, as the Tk console makes it: the main
+    model, temperature 0, a short reply."""
+    return ce.local_chat(messages=[{"role": "user", "content": prompt}],
+                         temperature=0.0, num_predict=240, timeout=45)
+
+
+def fast_answers_enabled(vault_dir: Any) -> bool:
+    """The Engine settings' "fast answers" switch (backend_settings.json,
+    default on) — the Tk console reads the same key."""
+    import json as _json_mod
+    try:
+        data = _json_mod.loads((Path(vault_dir) / "backend_settings.json")
+                               .read_text(encoding="utf-8"))
+    except Exception:                                     # noqa: BLE001
+        return True
+    if not isinstance(data, dict):
+        return True
+    return bool(data.get("fast_answers", True))
+
+
+def resolve_source_paths(raw_sources: Any, vault_dir: Any) -> List[Path]:
+    """Existing absolute files for a mixed list of absolute paths,
+    vault-relative paths, bare names and name patterns — de-duplicated, in
+    order. (The Tk console's _resolve_source_paths, which now calls this.)"""
+    try:
+        in_dir = data_index.input_dir(Path(vault_dir))
+    except Exception:                                     # noqa: BLE001
+        in_dir = Path(vault_dir)
+    out: List[Path] = []
+    seen: Set[str] = set()
+    for s in (raw_sources or []):
+        if not s or not str(s).strip():
+            continue
+        cand = None
+        try:
+            pp = Path(str(s))
+            _pat = _compile_name_pattern(pp.name)
+            if _pat is not None:
+                for hit in in_dir.rglob("*"):
+                    if hit.is_file() and _name_matches_pattern(_pat, hit.name):
+                        cand = hit
+                        break
+            elif pp.is_absolute() and pp.exists():
+                cand = pp
+            elif (in_dir / str(s)).exists():
+                cand = in_dir / str(s)
+            else:
+                for hit in in_dir.rglob(pp.name):
+                    if hit.is_file():
+                        cand = hit
+                        break
+        except Exception:                                 # noqa: BLE001
+            cand = None
+        if cand is not None:
+            key = str(cand.resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(cand)
+    return out
+
+
+def prepare_turn(question: str, state: TurnState, *,
+                 n_ctx: Optional[int] = None,
+                 condense: Optional[Callable[[str], str]] = None,
+                 pinned_files: Optional[List[str]] = None,
+                 on_notice: Optional[Callable[[str, str, str], None]] = None
+                 ) -> PreparedTurn:
+    """Build what the models are sent for ``question``: the Tk console's
+    sequence, once, for both shells.
+
+      1. the task memo (``condense`` asks a model; None = heuristics only)
+      2. the analyst step — a deterministic answer from the data, or its
+         refusal; a direct answer is returned as ``fast_answer``
+      3. the injection: named files and folders, vault and value matches, a
+         dataset overview, the analyst block, the memo — capped to the
+         context window, the droppable blocks dropped
+      4. the sources behind the turn (for the chips under the answer)
+      5. a warning when the prompt will not fit (context_budget_report)
+      6. provenance: what the model was shown, for "where did X come from?"
+
+    Every line the user should see goes to ``on_notice(who, text, kind)`` as
+    it happens, in the Tk console's order and wording, and is also kept in
+    ``notices``. Runs with ``state`` active, so the index lookups and the
+    referenced files are this conversation's. Blocking (it may call a model
+    and read files): the Qt shell calls it on its turn worker; the Tk console
+    calls it where it always ran this code."""
+    prepared = PreparedTurn(question=question, text=question)
+
+    def say(who: str, text: str, kind: str = "observation") -> None:
+        prepared.notices.append((who, text, kind))
+        if on_notice is not None:
+            on_notice(who, text, kind)
+
+    token = _ACTIVE.set(state)
+    try:
+        _prepare(question, state, prepared, say, n_ctx=n_ctx,
+                 condense=condense, pinned_files=pinned_files)
+    finally:
+        _ACTIVE.reset(token)
+    return prepared
+
+
+def _prepare(question, state, prepared, say, *, n_ctx, condense,
+             pinned_files) -> None:
+    # 1. The task memo ------------------------------------------------------
+    try:
+        memo = state.task_memory.update(question, llm_call=condense)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[TaskMemory] update failed: {exc!r}")
+        memo = state.task_memory.current()
+    if memo and not memo.is_empty():
+        say("Council", state.task_memory.render_transcript_line())
+    memo_block = state.task_memory.render_injection_block() or None
+
+    # 2. The analyst step ---------------------------------------------------
+    block, err, notes = _run_analyst_step(question)
+    analyst_sources: List[str] = []
+    for note in (notes or []):
+        if isinstance(note, str) and note.startswith("__ANALYST_TABLE__:"):
+            prepared.analyst_table = note[len("__ANALYST_TABLE__:"):]
+            say("Council", "Analyst result table:\n" + prepared.analyst_table)
+        elif isinstance(note, str) and note.startswith("__ANALYST_ANSWER__:"):
+            prepared.fast_answer = note[len("__ANALYST_ANSWER__:"):]
+        elif isinstance(note, str) and note.startswith("__ANALYST_SOURCES__:"):
+            import json as _json_mod
+            try:
+                analyst_sources = list(_json_mod.loads(
+                    note[len("__ANALYST_SOURCES__:"):]) or [])
+            except Exception:                             # noqa: BLE001
+                analyst_sources = []
+        else:
+            say("Council", note)
+    prepared.analyst_block, prepared.analyst_error = block, err
+    if block and not err:
+        say("Council", "Computing from data...")
+    elif err:
+        say("Council",
+            f"⚠ Analyst tried to compute the answer but failed: {err}\n"
+            f"The model will be told to refuse inventing a number; "
+            f"try rephrasing or check the file/column name.")
+
+    # 3. The injection ------------------------------------------------------
+    if n_ctx is None:
+        try:
+            n_ctx = ce.get_n_ctx()
+        except Exception:                                 # noqa: BLE001
+            n_ctx = 4096
+    pins = state.current_pins() if pinned_files is None else pinned_files
+    augmented, fuzzy, breakdown = _inject_file_contents(
+        question, analyst_block=block, n_ctx=n_ctx,
+        task_memo_block=memo_block, pinned_files=pins)
+    prepared.text = augmented
+    prepared.fuzzy_matches = dict(fuzzy or {})
+    prepared.breakdown = breakdown if isinstance(breakdown, dict) else {}
+    failure = prepared.breakdown.get("injection_error")
+    if failure:
+        say("Council",
+            f"⚠ Context retrieval failed with an unexpected error: "
+            f"{failure}\n"
+            f"The model has been told to treat this turn as no-data-"
+            f"provided and will refuse to invent specific values.")
+
+    labels = [label for label, _ in prepared.breakdown.get("costs", [])]
+    has_vault = any(lb.startswith("[VAULT MATCH") for lb in labels)
+    has_file = any(lb.startswith("[FILE:") for lb in labels)
+    has_folder = any(lb.startswith("[FOLDER:") for lb in labels)
+    has_nodata = any(lb.startswith("[NO DATA AVAILABLE") for lb in labels)
+    prepared.injected = bool(has_vault or has_file or has_folder
+                             or has_nodata)
+
+    # 4. The sources --------------------------------------------------------
+    try:
+        prepared.explicit_paths = _extract_file_paths(question)
+    except Exception:                                     # noqa: BLE001
+        prepared.explicit_paths = []
+    sources: List[str] = list(analyst_sources)
+    for label in labels:
+        match = _SOURCE_LABEL_RE.match(label)
+        if match:
+            sources.append(match.group(1).strip())
+    sources.extend(prepared.explicit_paths)
+    prepared.sources = sources
+    try:
+        prepared.source_paths = resolve_source_paths(sources,
+                                                     state.vault_dir)
+    except Exception:                                     # noqa: BLE001
+        prepared.source_paths = []
+    if prepared.injected:
+        names = [n for n in (Path(p).name for p in prepared.explicit_paths)
+                 if n]
+        if names:
+            say("Council", "Reading: " + ", ".join(names))
+        elif has_vault:
+            say("Council", "Reviewing matching vault files...")
+    if prepared.fuzzy_matches:
+        lines = ["Fuzzy matches used (treated as your spelling):"]
+        for orig, suggestions in prepared.fuzzy_matches.items():
+            pairs = ", ".join(f"{m} ({r:.2f})" for m, r in suggestions)
+            lines.append(f"  • {orig} → {pairs}")
+        lines.append("If any are wrong, type:  forget WORD  "
+                     "(comma-separated for multiple) — they won't be used "
+                     "again.")
+        say("Council", "\n".join(lines))
+    dropped = prepared.breakdown.get("dropped") or []
+    if dropped:
+        lines = [f"⚠ Dropped {len(dropped)} lower-priority block"
+                 f"{'s' if len(dropped) != 1 else ''} to fit n_ctx="
+                 f"{prepared.breakdown.get('n_ctx', 0):,}:"]
+        for label, cost in dropped:
+            lines.append(f"  • {label}  (~{cost:,} tokens)")
+        lines.append("(Analyst result, task memo, and the NO-DATA marker are "
+                     "never dropped. Explicit files / folder listings / vault "
+                     "summary CAN be dropped on cumulative budget overflow — "
+                     "raise COUNCIL_GGUF_N_CTX to keep them. Type 'context "
+                     "info' for the full token breakdown.)")
+        say("Council", "\n".join(lines))
+
+    # 5. Will it fit? -------------------------------------------------------
+    try:
+        budget = ce.context_budget_report(augmented)
+        prepared.budget = budget
+        used, ctx = budget["input_tokens"], budget["n_ctx"]
+        if budget["over_window"]:
+            most = budget.get("model_max_ctx") or 0
+            if most and most > ctx:
+                hint = (f" The model supports up to {most} tokens — raising "
+                        f"COUNCIL_GGUF_N_CTX to "
+                        f"{min(max(16384, ctx * 4), most)} would fit this "
+                        f"prompt.")
+            else:
+                hint = (" Raise COUNCIL_GGUF_N_CTX (e.g. to 16384 or 32768) "
+                        "before launch.")
+            say("Council",
+                f"⚠ Prompt is ~{used:,} tokens but n_ctx is only {ctx:,}. "
+                f"The model will silently truncate the tail and may miss the "
+                f"injected file/analyst data.{hint}")
+        elif used > budget["safe_input"]:
+            say("Council",
+                f"⚠ Prompt is ~{used:,} tokens "
+                f"({budget['pct_of_window']:.0f}% of n_ctx={ctx:,}). Reply "
+                f"space is tight — consider raising COUNCIL_GGUF_N_CTX for "
+                f"fuller answers.")
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[ContextBudget] check failed: {exc!r}")
+
+    # 6. Provenance: what the model was shown -------------------------------
+    try:
+        if state.provenance is not None:
+            import provenance as _provenance
+            injected = []
+            for path in prepared.explicit_paths:
+                file_block = _read_file_for_injection(path)
+                if file_block:
+                    injected.append(_provenance.InjectedBlock(
+                        file_name=Path(path).name, file_path=path,
+                        block=file_block))
+            if block:
+                injected.append(_provenance.InjectedBlock(
+                    file_name="(analyst result)", file_path="(in-session)",
+                    block=block))
+            state.provenance.record_turn(user_text=question,
+                                         augmented_text=augmented,
+                                         injected_files=injected)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[Provenance] record failed: {exc!r}")

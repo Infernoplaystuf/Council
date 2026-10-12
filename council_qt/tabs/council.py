@@ -65,8 +65,8 @@ import threading
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QPlainTextEdit, QPushButton, QSplitter,
@@ -141,6 +141,10 @@ class CouncilActions:
         self.conversation = conversation
         self._models = None
         self._models_problem = ""
+        #: This conversation's retrieval memory (council_core.turn_context
+        #: .TurnState): the task memo, the files just shown, filename pins,
+        #: a warm data index. Built on the first turn, on the worker.
+        self._turn_state = None
 
     # -- implemented -----------------------------------------------------
     def specialists(self):
@@ -224,36 +228,109 @@ class CouncilActions:
         # from the NEXT turn, never halfway through this one.
         snapshot = (self.conversation.snapshot()
                     if self.conversation is not None else None)
-        models, problem = self.models()
-        if models is None:
-            return council_turn.TurnResult(False, message=problem)
-        if self.conversation is not None:
-            self.conversation.apply_to(models, snapshot)
 
-        if not getattr(options, "deliberate", True):
-            # The fast path: one personality, no panel, no verdict. It is a
-            # real answer and it is NOT a deliberation, so it produces no
-            # verdict id — which is what keeps the verdict bar honest (A3).
-            result = self._direct(typed_text, models, on_event=on_event)
+        # The vault, in front of the question — the same code the Tk shell
+        # runs (council_core.turn_context.prepare_turn). The models are sent
+        # `prepared.text`; everything that decides WHAT to do reads the
+        # typed text (A5).
+        prepared = self.prepare(typed_text, on_event=on_event)
+        sent = prepared.text if prepared is not None else typed_text
+
+        if prepared is not None and prepared.answerable_from_data and \
+                self._fast_answers():
+            # Answered from the data — a count, a summary, a fresh derived
+            # result. No model is asked, so none has to be loaded.
+            result = self._from_data(prepared, on_event=on_event)
+            models = None
         else:
-            result = council_turn.run_turn(
-                typed_text, models,
-                enable_tools=bool(getattr(options, "tools", False)),
-                on_event=on_event,
-                on_token=on_token if getattr(options, "stream", True)
-                else None)
+            models, problem = self.models()
+            if models is None:
+                return council_turn.TurnResult(False, message=problem)
+            if self.conversation is not None:
+                self.conversation.apply_to(models, snapshot)
+            if not getattr(options, "deliberate", True):
+                # The fast path: one personality, no panel, no verdict. It is
+                # a real answer and it is NOT a deliberation, so it produces
+                # no verdict id — which is what keeps the verdict bar honest
+                # (A3). It gets the vault context: the default build is this
+                # path, and without it the default build was a chatbot.
+                result = self._direct(sent, models, on_event=on_event)
+            else:
+                result = council_turn.run_turn(
+                    sent, models,
+                    enable_tools=bool(getattr(options, "tools", False)),
+                    on_event=on_event,
+                    on_token=on_token if getattr(options, "stream", True)
+                    else None,
+                    route_text=typed_text)
+        if prepared is not None:
+            result.sources = list(prepared.sources)
+            result.source_paths = list(prepared.source_paths)
         if result.ok:
+            if self._turn_state is not None:
+                # The files the answer names are pinned for the follow-up.
+                self._turn_state.update_pins(result.answer)
             result.provenance = self._provenance(result, models, snapshot)
             result.session_name = self._session_name(typed_text, result,
                                                      models)
         return result
 
+    # -- the vault context ---------------------------------------------
+    def turn_state(self):
+        """This conversation's retrieval memory, built on first use."""
+        if self._turn_state is None:
+            from council_core import turn_context
+            self._turn_state = turn_context.TurnState(self.vault_dir)
+        return self._turn_state
+
+    def prepare(self, typed_text: str, *, on_event=None):
+        """council_core.turn_context.prepare_turn for this conversation, its
+        notices reported as the turn's own events. None if it could not run
+        at all — the question is then asked without the vault, and the
+        transcript says so (a turn must not die because a file would not
+        open)."""
+        from council_core.deliberation import AgentEvent
+
+        def notice(who: str, text: str, kind: str = "observation") -> None:
+            if on_event is not None:
+                on_event(AgentEvent(who or "Council", "observation", text))
+
+        try:
+            from council_core import turn_context
+            return turn_context.prepare_turn(
+                typed_text, self.turn_state(),
+                condense=turn_context.condense_with_local_model,
+                on_notice=notice)
+        except Exception as exc:                          # noqa: BLE001
+            notice("Council", f"Your files could not be read for this "
+                              f"question ({exc!r}), so it is answered "
+                              f"without them.")
+            return None
+
+    def _fast_answers(self) -> bool:
+        from council_core import turn_context
+        return turn_context.fast_answers_enabled(self.vault_dir)
+
+    def _from_data(self, prepared, *, on_event=None):
+        """The answer the analyst computed, given as the answer."""
+        from council_core import council_turn, turn_context
+        from council_core.deliberation import AgentEvent
+        events = [AgentEvent("Writer", "final", prepared.fast_answer),
+                  AgentEvent("Council", "observation",
+                             turn_context.FAST_ANSWER_NOTE)]
+        if on_event is not None:
+            for event in events:
+                on_event(event)
+        return council_turn.TurnResult(True, answer=prepared.fast_answer,
+                                       route="data", events=events)
+
     def _provenance(self, result, models, snapshot) -> dict:
         """Where this answer came from, saved with it (see TurnResult)."""
-        roles = (["writer"] if result.route == "direct"
-                 else list(result.panel or []))
+        council = result.route not in ("direct", "data")
+        roles = (list(result.panel or []) if council
+                 else ["writer"] if result.route == "direct" else [])
         backends = {}
-        for role in roles + (["judge"] if result.route != "direct" else []):
+        for role in roles + (["judge"] if council else []):
             key = getattr(getattr(models, role, None), "backend_key", None)
             if isinstance(key, str):
                 backends[role] = key
@@ -264,7 +341,8 @@ class CouncilActions:
             "backends": backends,
             "memory": snapshot.scope if snapshot else memory_scope.for_qt(),
             "prior_session": snapshot.prior_session_id if snapshot else None,
-            "sources": [],
+            "sources": [str(p) for p in (result.source_paths or [])]
+            or list(result.sources or []),
             "verdict_id": result.verdict_id or None,
         }
 
@@ -281,7 +359,8 @@ class CouncilActions:
         if conversation is None or conversation.named:
             return ""
         judge = getattr(models, "judge", None)
-        if result.route != "direct" and hasattr(judge, "name_session"):
+        if result.route not in ("direct", "data") and hasattr(
+                judge, "name_session"):
             try:
                 name = conversations.clean_name(
                     judge.name_session(typed_text, result.critique or ""))
@@ -469,7 +548,60 @@ class CouncilTab(ViewHelpers, QWidget):
         layout.addWidget(QLabel("Transcript"))
         self.transcript = TranscriptView()
         layout.addWidget(self.transcript, 1)
+        layout.addWidget(self._sources_bar())
         return panel
+
+    #: How many source chips one answer shows before "+N more".
+    MAX_CHIPS = 12
+
+    def _sources_bar(self) -> QWidget:
+        """The files behind the last answer, one chip each — click to open
+        the folder that holds it. Hidden while there are none, so an answer
+        that used no file looks like one."""
+        self.sources_frame = QFrame()
+        self._sources_row = QHBoxLayout(self.sources_frame)
+        self._sources_row.setContentsMargins(0, 2, 0, 2)
+        self.sources_frame.hide()
+        self.source_chips: List[QPushButton] = []
+        #: Opens a chip's folder. Replaced in tests (the desktop is not
+        #: theirs to open).
+        self.open_source = lambda path: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(Path(path).parent)))
+        return self.sources_frame
+
+    def show_sources(self, paths) -> None:
+        """Chips for ``paths`` under the transcript, replacing the last
+        answer's; nothing when there are none."""
+        self.clear_sources()
+        paths = [Path(p) for p in (paths or [])]
+        if not paths:
+            return
+        title = QLabel("Sources:")
+        title.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        self._sources_row.addWidget(title)
+        for path in paths[:self.MAX_CHIPS]:
+            chip = QPushButton(f"📄 {path.name}")
+            chip.setFlat(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setToolTip(f"{path}\nClick to open the folder it is in.")
+            chip.clicked.connect(lambda _=False, p=path: self.open_source(p))
+            self._sources_row.addWidget(chip)
+            self.source_chips.append(chip)
+        if len(paths) > self.MAX_CHIPS:
+            more = QLabel(f"(+{len(paths) - self.MAX_CHIPS} more)")
+            more.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+            self._sources_row.addWidget(more)
+        self._sources_row.addStretch(1)
+        self.sources_frame.show()
+
+    def clear_sources(self) -> None:
+        while self._sources_row.count():
+            item = self._sources_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.source_chips = []
+        self.sources_frame.hide()
 
     def _judge_side(self) -> QWidget:
         panel = QWidget()
@@ -771,6 +903,7 @@ class CouncilTab(ViewHelpers, QWidget):
         self.clarif_frame.hide()
         self.hide_verdict_bar()
         self.stream_box.clear_all()
+        self.clear_sources()
 
     def on_send(self) -> None:
         typed = self.input.toPlainText().strip()
@@ -1012,6 +1145,16 @@ class CouncilTab(ViewHelpers, QWidget):
         if result.critique:
             self.set_judge(result.critique)
         self._turn_provenance = dict(getattr(result, "provenance", None) or {})
+        # The chips under the answer: the files it was given (Tk's
+        # _render_source_chips). Said in the transcript too, not kept — the
+        # answer's provenance carries them.
+        source_paths = list(getattr(result, "source_paths", None) or [])
+        self._last_sources = source_paths
+        if source_paths:
+            self.show_sources(source_paths)
+            self.append("Council", "Sources: " + ", ".join(
+                Path(p).name for p in source_paths[:self.MAX_CHIPS]),
+                "phase", keep=False)
         if getattr(result, "verdict_id", ""):
             # Recorded where the Tk shell records it, with this turn's id. The
             # bar that would let the user answer it stays as Batch 0 left it.
