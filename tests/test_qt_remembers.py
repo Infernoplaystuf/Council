@@ -321,6 +321,66 @@ def test_the_question_is_saved_before_the_answer_and_close_ends_the_log(
         qapp.processEvents()
 
 
+# ============================================================
+# The other tabs that ask a model: Lens, the Designer's Review, Agents
+# ============================================================
+#
+# Found in review: only the Council tab set the scope on its personalities
+# (Conversation.apply_to). Every other tab loads its own through
+# council_turn.load_personalities, which left PersonalityModel.memory_scope
+# unset, so respond() fell back to the ENGINE default — "all" with SILO unset
+# — and the Lens and the Designer's Review (both in the default tab list) sent
+# role memory, project memory and the profile while the toolbar said "Memory:
+# this conversation only".
+
+def test_the_lens_keeps_learned_memory_out(qapp, engine):
+    from council_qt.tabs.lens import LensActions
+    window, view = _council(qapp, engine.vault)
+    try:
+        assert view.conversation.scope == "conversation"
+        result = LensActions().run("The pump datasheet, draft 2.", ["writer"])
+        assert result.ok, result
+        prompts = _prompts(engine.fake)
+        assert prompts, "the Lens asked no model"
+        for prompt in prompts:
+            assert not _found(prompt), (
+                f"{sorted(_found(prompt))} reached a Lens prompt:\n{prompt}")
+        assert not engine.refused
+    finally:
+        _close(qapp, window, view)
+
+
+def test_the_designer_review_keeps_learned_memory_out(qapp, engine):
+    from council_qt.tabs.designer import DesignerActions
+    said = DesignerActions(engine.vault).review(
+        "Review this layout: one button, one label.")
+    assert not said.startswith("review unavailable"), said
+    prompts = _prompts(engine.fake)
+    assert prompts, "the Review asked no model"
+    for prompt in prompts:
+        assert not _found(prompt), (
+            f"{sorted(_found(prompt))} reached a Review prompt:\n{prompt}")
+    assert not engine.refused
+
+
+def test_every_tab_s_personalities_get_the_qt_scope(engine):
+    """load_personalities is the Qt shell's one door to the personalities —
+    the Agents and Nodes tabs load through it too."""
+    from council_core import council_turn
+    from council_qt.tabs.agents import AgentsActions
+    models, problem = council_turn.load_personalities(engine.vault)
+    assert models is not None, problem
+    assert {m.memory_scope for m in models.personalities.values()} == {
+        "conversation"}
+    # Not a conversation: no session file is read as its RECENT CONVERSATION.
+    assert {m.session_id for m in models.personalities.values()} == {""}
+    agents, problem = AgentsActions(engine.vault).models()
+    assert agents is not None, problem
+    assert agents.writer.memory_scope == "conversation"
+    off, _ = council_turn.load_personalities(engine.vault, scope="none")
+    assert off.writer.memory_scope == "none"
+
+
 def test_the_memory_scope_is_shown(qapp, tmp_path, monkeypatch):
     from council_qt.tabs.council import CouncilActions, CouncilTab
     monkeypatch.delenv("COUNCIL_MEMORY_SCOPE", raising=False)

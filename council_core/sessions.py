@@ -286,6 +286,10 @@ def rebuild_with_prior(vault_dir: Any, session_id: Optional[str], *,
     if loaded.missing:
         return None, ("Missing required personalities: "
                       f"{', '.join(loaded.missing)}.")
+    # The Qt shell's memory scope, as load_personalities gives every other
+    # set: unset, respond() falls back to the engine's "all".
+    from . import memory_scope
+    council_turn.set_scope(loaded, memory_scope.for_qt())
     return loaded, ""
 
 

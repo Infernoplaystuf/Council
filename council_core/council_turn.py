@@ -328,15 +328,34 @@ class Personalities:
 
 
 def load_personalities(vault_dir: Any, *, pins: Optional[Dict[str, str]] = None,
-                       session_id: str = "qt",
-                       dispatcher: Any = None) -> Tuple[Optional[Personalities], str]:
+                       session_id: str = "",
+                       dispatcher: Any = None,
+                       scope: Optional[str] = None
+                       ) -> Tuple[Optional[Personalities], str]:
     """(personalities, problem). Exactly one is meaningful.
 
     Never raises. Building the personalities loads models from disk and can
     fail for a dozen ordinary reasons — a missing pin, a moved file, a GGUF
     that will not map — and a front end needs to say which, not show a
     traceback.
+
+    WHAT THEY MAY REMEMBER. Every personality is given ``scope`` (council_core
+    .memory_scope), the Qt shell's — "This conversation only" — unless the
+    caller names one. This is the Qt shell's one door to the personalities
+    (the Council, Lens, Designer Review, Agents and Nodes tabs), and only the
+    Council tab used to set a scope: the others left it unset, respond() fell
+    back to the ENGINE default ("all" with SILO unset), and the Lens and the
+    Designer's Review sent role memory, project memory and the profile while
+    the toolbar said "Memory: this conversation only" (found in review).
+
+    ``session_id`` "" (the default) is for a tab that is not a conversation:
+    no session file is read as its RECENT CONVERSATION. It was "qt", which
+    named conversations/qt.jsonl — any session someone had called "qt". The
+    Council tab passes its own session, and Conversation.apply_to keeps it.
     """
+    from . import memory_scope
+
+    scope = scope or memory_scope.for_qt()
     try:
         import council_engine
     except Exception as exc:                              # noqa: BLE001
@@ -366,4 +385,13 @@ def load_personalities(vault_dir: Any, *, pins: Optional[Dict[str, str]] = None,
         return None, ("Missing required personalities: "
                       f"{', '.join(loaded.missing)}. Check the model pins in "
                       "the Models tab.")
+    set_scope(loaded, scope)
     return loaded, ""
+
+
+def set_scope(models: Any, scope: str) -> None:
+    """Give every personality on ``models`` the memory scope ``scope``."""
+    from .conversations import personalities_of
+    for model in personalities_of(models):
+        if hasattr(model, "memory_scope"):
+            model.memory_scope = scope
