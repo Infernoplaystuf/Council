@@ -1296,11 +1296,39 @@ _BIAS_HELP = {
                      "means fewer, stronger events.",
     "bias_fo": "Low-pass filter: lower filters out fast flicker and noise.",
     "bias_hpf": "High-pass filter: higher removes slow changes.",
-    "bias_refr": "Refractory period: how long a pixel waits before it can "
-                 "fire again.",
+    "bias_refr": "Refractory period: how long a pixel rests after an event "
+                 "before it can fire again. Higher shortens the rest, so "
+                 "more events; lower gives fewer events each time an edge "
+                 "crosses a pixel.",
     "bias_diff": "Reference level the ON and OFF thresholds are set "
                  "against.",
 }
+
+# WHAT THE FILTERS DELETE, said where they are switched on. Checked against
+# the OpenEB 5.2 source (tests/test_camera_settings.py reads it where it is
+# on the machine): the IMX636 driver (Gen41Erc) counts the rate over a
+# 200 µs reference period with time-based dropping only (row and column
+# dropping off); its trail filter takes 1000-100000 µs and keeps
+# roundf(threshold / 1000) whole milliseconds. What STC and TRAIL keep is
+# I_EventTrailFilterModule::Type's own description.
+ERC_HELP = (
+    "Caps the event rate so a busy scene cannot swamp the link — but not "
+    "evenly: on the EVK4's IMX636 it drops events by time slot (OpenEB's "
+    "driver counts the rate in 200 µs slots and drops by time only, not by "
+    "row or column), so a track gets gaps in time, and signal quality "
+    "degrades once it acts. Prefer a smaller area (ROI) and the filters; "
+    "keep this as a safety cap.")
+TRAIL_HELP = (
+    "TRAIL keeps the first event of each burst and removes the trail a "
+    "moving edge leaves behind it. Both STC modes drop the first event of "
+    "each burst and every lone event (STC_CUT_TRAIL keeps only the second "
+    "event of a burst, STC_KEEP_TRAIL the second and later), so STC can "
+    "delete a small, fast particle that fires a pixel once. TRAIL for fast "
+    "particles; test STC on a real recording first.")
+TRAIL_THRESHOLD_HELP = (
+    "A burst is events of one polarity closer together than this. On the "
+    "EVK4's IMX636 it is 1-100 ms (1,000-100,000 µs), rounded to the "
+    "nearest whole millisecond.")
 
 
 class EvkSettings(Provider):
@@ -1420,8 +1448,7 @@ class EvkSettings(Provider):
             return []
         out = [Setting("erc.enabled", "Event rate controller on", G_ERC,
                        BOOL, bool(_ask(erc, "is_enabled")),
-                       help="Drops events evenly once the rate passes the "
-                            "limit, so a busy scene cannot swamp the link.")]
+                       help=ERC_HELP)]
         rate = _ask(erc, "get_cd_event_rate")
         if rate is not None:
             out.append(Setting(
@@ -1483,10 +1510,7 @@ class EvkSettings(Provider):
         if trail is None:
             return []
         out = [Setting("trail.enabled", "Trail filter on", G_TRAIL, BOOL,
-                       bool(_ask(trail, "is_enabled")),
-                       help="Removes the trail of events a moving edge "
-                            "leaves behind (TRAIL), or keeps only "
-                            "confirmed events (STC).")]
+                       bool(_ask(trail, "is_enabled")), help=TRAIL_HELP)]
         kind = _ask(trail, "get_type")
         if kind is not None:
             available = _ask(trail, "get_available_types")
@@ -1503,7 +1527,7 @@ class EvkSettings(Provider):
                 "trail.threshold", "Threshold", G_TRAIL, INT, int(threshold),
                 minimum=_num(_ask(trail, "get_min_supported_threshold")),
                 maximum=_num(_ask(trail, "get_max_supported_threshold")),
-                step=1, unit="µs"))
+                step=1, unit="µs", help=TRAIL_THRESHOLD_HELP))
         return out
 
     def _activity(self) -> List[Setting]:

@@ -18,7 +18,9 @@ live picture, as it would on the sensor.
 from __future__ import annotations
 
 import enum
+import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -29,6 +31,20 @@ EVENT_DTYPE = np.dtype([("x", "<u2"), ("y", "<u2"), ("p", "<i2"),
                         ("t", "<i8")])
 WIDTH, HEIGHT = 1280, 720
 SERIAL = "00051234"
+
+#: Where OpenEB's source is on the machine this was written on (the build
+#: is C:/ceb/build); OPENEB_SOURCE says where it is elsewhere.
+OPENEB = Path(os.environ.get("OPENEB_SOURCE") or "C:/ceb/openeb")
+
+
+def openeb_source(relative: str) -> Optional[str]:
+    """One OpenEB source file's text, or None where the source is not on
+    this machine — tests that check numbers against it skip then."""
+    path = OPENEB / relative
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 class BiasInfo:

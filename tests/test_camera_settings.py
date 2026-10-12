@@ -720,6 +720,62 @@ def test_the_filters_and_the_readings_are_described():
     assert not found["camera.serial"].savable
 
 
+def test_the_help_says_which_way_refr_goes_and_what_erc_and_stc_delete():
+    """Three texts the velocity design (docs/typhon_velocity_design.md 5.1)
+    found wrong or missing: bias_refr gave no direction; the ERC said it
+    "drops events evenly", when on the IMX636 it drops by time slot and
+    quality degrades once it acts; the trail filter said STC "keeps only
+    confirmed events", hiding that it deletes every lone event — which is
+    what a small, fast particle makes."""
+    found = by_key(evk()[0])
+    refr = found["bias.bias_refr"].help
+    assert "Higher shortens the rest, so more events" in refr
+    assert "lower gives fewer events each time an edge crosses" in refr
+    erc = found["erc.enabled"].help
+    assert "Drops events evenly" not in erc and "not evenly" in erc
+    assert "drops events by time slot" in erc
+    assert "200 µs" in erc and "IMX636" in erc
+    assert "signal quality degrades once it acts" in erc
+    assert "Prefer a smaller area (ROI) and the filters" in erc
+    trail = found["trail.enabled"].help
+    assert "confirmed events" not in trail
+    assert "TRAIL keeps the first event of each burst" in trail
+    assert ("Both STC modes drop the first event of each burst and every "
+            "lone event") in trail
+    assert "small, fast particle" in trail
+    threshold = found["trail.threshold"].help
+    assert "1-100 ms" in threshold
+    assert "rounded to the nearest whole millisecond" in threshold
+    # The same words for the simulated event camera's rows.
+    sim = by_key(simulated("event"))
+    assert sim["bias.bias_refr"].help == refr
+
+
+def test_the_numbers_the_help_quotes_are_openebs():
+    """Checked against the OpenEB source where it is on this machine
+    (C:/ceb/openeb, or OPENEB_SOURCE): the IMX636 trail filter takes
+    1000-100000 µs and keeps whole milliseconds; the IMX636's ERC (the
+    Gen41 one) counts over 200 µs and drops by time only."""
+    from tests import fake_evk4
+
+    trail = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/"
+        "imx636_event_trail_filter_module.cpp")
+    erc = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/gen41/gen41_erc.cpp")
+    device = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/imx636_tz_device.cpp")
+    if None in (trail, erc, device):
+        pytest.skip("the OpenEB source is not on this machine")
+    assert "get_min_supported_threshold() const {\n    return 1000;" in trail
+    assert "get_max_supported_threshold() const {\n    return 100000;" in trail
+    assert "threshold_ms_ = std::roundf(threshold / 1000.0);" in trail
+    assert "std::make_unique<Gen41Erc>" in device
+    assert '{"erc_reference_period", 200}' in erc
+    assert '{"h_dropping_en", 0}' in erc and '{"v_dropping_en", 0}' in erc
+    assert '{"t_dropping_en", en}' in erc
+
+
 def test_a_bias_the_sensor_refuses_is_a_refusal_not_a_success():
     """set() returns False rather than raising."""
     dev, hal = evk()
