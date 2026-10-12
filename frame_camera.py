@@ -2665,11 +2665,12 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
         if change.ok and not change.skipped:
             _camera_set([key])
         # SAID AS THE ROW SAYS IT: its label and unit ("Picture window:
-        # 99.9 ms", not "window_ms: 99.901") — and, like a preset or a
-        # reset, that the live view restarted when the write needed it.
+        # 99.9 ms", not "window_ms: 99.901"; a trail threshold in the ms
+        # its row shows, not the µs the camera holds) — and, like a preset
+        # or a reset, that the live view restarted when the write needed it.
         out = {"change": change.as_dict(), "key": key, "value": change.value,
                "ok": change.ok, "what": "setting", "pending": False,
-               "summary": change.line(setting.label, setting.unit)}
+               "summary": change.line(setting.label, *setting.shown())}
         now = _roi_or_none(device) if moves_area else None
         if now is not None and now != before:
             # The picture's pixels changed under the crop box: cleared, as

@@ -81,8 +81,12 @@ def ticks(seconds=0.25):
 
 
 def connect(kind="frame", live=True):
+    """Connect the SIMULATED camera of `kind` — named, not the first row of
+    that kind: with PYLON_CAMEMU set (the pylon env) an emulated Basler is
+    a "frame" camera listed before it."""
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith(kind)))
+    frame_camera.connect(next(r for r in rows
+                              if "Simulated" in r and r.endswith(kind)))
     if live:
         # The first Connect in a process starts the picture only once
         # Pillow's plugins have loaded on their own thread
@@ -196,18 +200,82 @@ def test_the_example_bias_ranges_are_the_imx636s_own():
     assert csw.range_text({"min": -150, "max": 200,
                            "recommended": [-85, 140]}) == \
         "-150 … 200\nrec. -85 … 140"
+    # As Typhon opens an EVK4 the range it accepts IS the recommended one:
+    # said once, not "-85 … 140 / rec. -85 … 140".
+    assert csw.range_text({"min": -85, "max": 140,
+                           "recommended": [-85, 140]}) == \
+        "-85 … 140\nrecommended, enforced"
+    # In the unit a setting is shown in.
+    assert csw.range_text({"min": 1000, "max": 100000, "unit": "µs",
+                           "shown_unit": "ms", "shown_per": 1000.0}) == \
+        "1 … 100 ms"
 
 
-def test_an_event_cameras_biases_say_when_they_leave_the_recommended_range():
-    connect("event")
+def test_the_wheel_guards_example_is_one_an_imx636_can_hold():
+    """Its example, "10000 -> 8706 µs", was measured on the fake EVK4,
+    which then kept any µs; a real IMX636 keeps whole milliseconds."""
+    said = " ".join(csw.WheelGuard.__doc__.split())
+    assert "8706" not in said
+    assert "on the fake EVK4" in said and "whole milliseconds" in said
+
+
+def test_an_event_cameras_biases_say_when_they_leave_the_recommended_range(
+        monkeypatch):
+    """Only an EVK4 opened with the range-check bypass takes a bias outside
+    the recommended range (Typhon never opens one so; the fake EVK4 can
+    be). This ran on the simulated event camera, whose invented
+    recommended -50 … 50 sat inside the range it took."""
+    from tests import fake_evk4
+
+    hal = fake_evk4.install(monkeypatch, frame_camera)
+    hal.biases.bypass = True
+    rows = frame_camera.list_cameras()["rows"]
+    frame_camera.connect(next(r for r in rows if "Prophesee" in r))
     w = window()
     row = w.rows["bias.bias_diff_on"]
-    assert row.scale.exact and row.editor.minimum() == -85
+    assert row.scale.exact and row.editor.minimum() == -150
     assert not w.defaults_button.isVisible() and w.factory == ""
-    row.slider.setValue(row.scale.position(60))
+    row.slider.setValue(row.scale.position(160))
     w.flush_now()
-    assert device().state["bias.bias_diff_on"] == 60
-    assert "Outside the recommended -50 … 50" in row.note.text()
+    assert hal.biases.values["bias_diff_on"] == 160
+    assert "Outside the recommended -85 … 140" in row.note.text()
+    # The bar marks the recommended part of a slider wider than it.
+    start, end = row.slider.recommended
+    assert 0 < start < end < row.scale.steps
+    tip = row.label.toolTip()
+    assert "Allowed: -150 … 200" in tip and "Recommended: -85 … 140" in tip
+
+
+def test_the_simulated_event_camera_has_an_imx636s_biases_and_refusals():
+    """The simulated event camera showed an invented recommended -50 … 50
+    for every bias and had no bias_diff, so its tabs looked like no EVK4's.
+    It has the IMX636's six biases now, each with its own recommended range
+    — which, like an EVK4 opened as Typhon opens one, is what it accepts —
+    and it refuses outside that range in the HAL's words."""
+    connect("event")
+    w = window()
+    assert [k for k in w.rows if k.startswith("bias.")] == [
+        f"bias.{name}" for name in cameras.IMX636_BIASES]
+    assert "bias.bias_diff" in w.rows
+    for name, (_allowed, (low, high)) in cameras.IMX636_BIASES.items():
+        row = w.rows[f"bias.{name}"]
+        assert (row.editor.minimum(), row.editor.maximum()) == (low, high)
+        assert list(row.setting["recommended"]) == [low, high]
+        assert row.slider.recommended is None
+    on = w.rows["bias.bias_diff_on"]
+    assert (on.editor.minimum(), on.editor.maximum()) == (-85, 140)
+    assert "which this camera enforces" in on.label.toolTip()
+    on.slider.setValue(on.scale.position(140))
+    w.flush_now()
+    assert device().state["bias.bias_diff_on"] == 140
+    assert on.note.text() == "", "inside the recommended range: nothing to say"
+    # Asked outside it the way only a preset or a script can: refused, in
+    # the words I_LL_Biases::set uses, and the camera keeps what it had.
+    with pytest.raises(cameras.CameraError,
+                       match=r'Invalid value 141 for bias "bias_diff_on"\. '
+                             r'Value should be within range \[-85, 140\]'):
+        device().write_setting("bias.bias_diff_on", 141)
+    assert device().state["bias.bias_diff_on"] == 140
 
 
 # ======================================================================

@@ -60,6 +60,7 @@ SetValue as "the camera refused that area", blaming the camera for a typo.
 """
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -1768,6 +1769,64 @@ class EvkDevice(Device):
 
 
 # ======================================================================
+# The IMX636 — an EVK4's sensor — as OpenEB describes it
+# ======================================================================
+#: Its six biases: name -> ((allowed low, high), (recommended low, high)),
+#: offsets from OpenEB's hal_psee_plugins/include/devices/imx636/
+#: imx636_bias_settings_iterator.h (allowed) and imx636_bias_settings.h
+#: (recommended), in the order its get_all_biases lists them (a std::map:
+#: by name). tests/test_camera_settings.py pins this table to those files
+#: where the OpenEB source is on the machine.
+#:
+#: ONE TABLE, read by the simulated event camera (SyntheticDevice) and by
+#: the tests' fake EVK4 (tests/fake_evk4.py). The simulated camera used to
+#: invent -50 … 50 as every bias's recommended range and had no bias_diff,
+#: so its tabs looked like no EVK4's.
+#:
+#: WHAT IS SETTABLE: I_LL_Biases::set checks get_bias_range(), which is the
+#: RECOMMENDED range unless the device was opened with the range-check
+#: bypass (DeviceConfig ll_biases_range_check_bypass) — and then it checks
+#: nothing (OpenEB i_ll_biases.cpp). EvkBackend opens an EVK4 without it.
+IMX636_BIASES: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
+    "bias_diff": ((-150, 200), (-25, 23)),
+    "bias_diff_off": ((-150, 200), (-35, 190)),
+    "bias_diff_on": ((-150, 200), (-85, 140)),
+    "bias_fo": ((-150, 200), (-35, 55)),
+    "bias_hpf": ((0, 255), (0, 120)),
+    "bias_refr": ((-50, 255), (-20, 235)),
+}
+
+#: The trail filter's threshold, in µs: what every OpenEB trail filter
+#: takes (imx636_event_trail_filter_module.cpp and the common
+#: event_trail_filter.cpp), which keeps it in WHOLE MILLISECONDS.
+TRAIL_THRESHOLD_US: Tuple[int, int] = (1000, 100_000)
+
+
+def bias_refusal(name: str, value: Any, low: Any, high: Any) -> str:
+    """The HAL's own words when I_LL_Biases::set refuses a bias outside the
+    range it checks (HalException ValueOutOfRange, OpenEB i_ll_biases.cpp)."""
+    return (f'Invalid value {value} for bias "{name}". Value should be '
+            f"within range [{low}, {high}].")
+
+
+def trail_threshold_kept(threshold_us: Any) -> int:
+    """What an OpenEB trail filter keeps of a threshold asked in µs: the
+    nearest whole millisecond, in µs (set_threshold: threshold_ms_ =
+    std::roundf(threshold / 1000.0); get_threshold returns threshold_ms_ *
+    1000). roundf takes a half AWAY from zero — 2500 µs is 3 ms — where
+    Python's round() would take it to the even 2 ms.
+
+    Outside TRAIL_THRESHOLD_US it refuses, with the HAL's words, as
+    ValueError (the HAL raises HalException, a RuntimeError in Python)."""
+    low, high = TRAIL_THRESHOLD_US
+    value = int(threshold_us)
+    if value < low or value > high:
+        raise ValueError(f"Bad STC threshold value: {value}. Value should be "
+                         f"in range [{low}, {high}].")
+    return int(math.floor(value / 1000.0 + 0.5)) * 1000
+
+
+# ======================================================================
 # Synthetic — so the app is usable and testable with no hardware at all
 # ======================================================================
 class SyntheticBackend(Backend):
@@ -1812,22 +1871,26 @@ class SyntheticDevice(Device):
     FRAME_FPS = 30.0
 
     # -- the settings a settings window and presets are exercised against --
-    #: An IMX636's biases (the EVK4's sensor), by the names its HAL uses.
-    BIASES: Tuple[str, ...] = ("bias_diff_on", "bias_diff_off", "bias_fo",
-                               "bias_hpf", "bias_refr")
+    #: An IMX636's biases (the EVK4's sensor), by the names its HAL uses,
+    #: in the order its get_all_biases lists them — all six, bias_diff too.
+    BIASES: Tuple[str, ...] = tuple(IMX636_BIASES)
+    #: Each bias's (allowed, recommended) range: the IMX636's own.
+    BIAS_TABLE = IMX636_BIASES
     #: I_EventTrailFilterModule.Type's members, in their enum order.
     TRAIL_TYPES: Tuple[str, ...] = ("TRAIL", "STC_CUT_TRAIL", "STC_KEEP_TRAIL")
     #: Two formats: one 8-bit, one that arrives as uint16 like a Mono12 Basler.
     PIXEL_FORMATS: Tuple[str, ...] = ("Mono8", "Mono12")
     #: Every range the simulated sensor reports. The settings provider READS
     #: these (camera_settings.SyntheticSettings), as it reads a real node map.
+    #: A bias's is what an EVK4 opened as Typhon opens one accepts — the
+    #: IMX636's RECOMMENDED range (get_bias_range() without the bypass) —
+    #: and write_setting refuses outside it, as I_LL_Biases::set does.
     RANGES: Dict[str, Tuple[float, float]] = {
         "ExposureTime": (20.0, 100000.0), "Gain": (0.0, 24.0),
         "BlackLevel": (0, 64), "AcquisitionFrameRate": (1.0, 1000.0),
-        "bias.bias_diff_on": (-85, 140), "bias.bias_diff_off": (-35, 190),
-        "bias.bias_fo": (-35, 55), "bias.bias_hpf": (0, 120),
-        "bias.bias_refr": (-20, 235),
-        "erc.rate": (0, 1_000_000_000), "trail.threshold": (1, 100_000),
+        **{f"bias.{name}": recommended
+           for name, (_allowed, recommended) in IMX636_BIASES.items()},
+        "erc.rate": (0, 1_000_000_000), "trail.threshold": TRAIL_THRESHOLD_US,
     }
     #: What a real Basler refuses while grabbing (measured on the emulator).
     LOCKED_WHILE_STREAMING: Tuple[str, ...] = ("PixelFormat", "ReverseX")
@@ -1883,11 +1946,25 @@ class SyntheticDevice(Device):
     def write_setting(self, key: str, value: Any) -> None:
         """One setting, as camera_settings.SyntheticSettings writes it:
         already coerced to its type and range. Refuses what a Basler refuses
-        while grabbing, the way a Basler does — before changing anything."""
+        while grabbing, the way a Basler does — before changing anything.
+
+        The event camera's HAL rules too: a bias outside the range it
+        reports is refused in the HAL's words (I_LL_Biases::set, without
+        the range-check bypass), and the trail filter's threshold is kept
+        in whole milliseconds, 1-100 ms, or refused (trail_threshold_kept)."""
         if key not in self.state:
             raise CameraError(f"this camera has no setting called {key!r}")
         if self._started and key in self.LOCKED_WHILE_STREAMING:
             raise NeedsStop(key)
+        if key.startswith("bias."):
+            low, high = self.RANGES[key]
+            if not low <= value <= high:
+                raise CameraError(bias_refusal(key[5:], value, low, high))
+        elif key == "trail.threshold":
+            try:
+                value = trail_threshold_kept(value)
+            except ValueError as exc:
+                raise CameraError(str(exc)) from None
         self.state[key] = value
 
     def set_frame_rate(self, fps: float) -> float:

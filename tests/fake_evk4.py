@@ -87,7 +87,10 @@ class Biases:
     RANGES is name: (allowed, recommended), from hal_psee_plugins/include/
     devices/imx636/imx636_bias_settings_iterator.h (allowed) and
     imx636_bias_settings.h (recommended), in the order the real
-    get_all_biases lists them (a std::map: by name).
+    get_all_biases lists them (a std::map: by name). It IS the product's
+    table (cameras.IMX636_BIASES, which the simulated event camera reads
+    too): one table, pinned to the OpenEB headers by tests/
+    test_camera_settings.py.
 
     set() CHECKS LIKE THE HAL (I_LL_Biases::set, i_ll_biases.cpp). Without
     `bypass` (DeviceConfig's ll_biases_range_check_bypass, which Typhon
@@ -98,14 +101,7 @@ class Biases:
     range. (The IMX636 driver then clamps the register — its factory
     default plus the offset — to 0..255, imx636_ll_biases.cpp; the fake has
     no factory default, so it keeps the offset as asked.)"""
-    RANGES = {
-        "bias_diff": ((-150, 200), (-25, 23)),
-        "bias_diff_off": ((-150, 200), (-35, 190)),
-        "bias_diff_on": ((-150, 200), (-85, 140)),
-        "bias_fo": ((-150, 200), (-35, 55)),
-        "bias_hpf": ((0, 255), (0, 120)),
-        "bias_refr": ((-50, 255), (-20, 235)),
-    }
+    RANGES = cameras.IMX636_BIASES
 
     def __init__(self, bypass: bool = False):
         self.values = {name: 0 for name in self.RANGES}
@@ -126,9 +122,7 @@ class Biases:
         self.writes.append((name, value))
         low, high = self.get_bias_info(name).get_bias_range()
         if not self.bypass and not low <= value <= high:
-            raise RuntimeError(f'Invalid value {value} for bias "{name}". '
-                               f"Value should be within range [{low}, "
-                               f"{high}].")
+            raise RuntimeError(cameras.bias_refusal(name, value, low, high))
         self.values[name] = int(value)
         return True
 
@@ -247,6 +241,14 @@ class AntiFlicker(_Module):
 
 
 class Trail(_Module):
+    """I_EventTrailFilterModule of an IMX636 (OpenEB imx636_event_trail_
+    filter_module.cpp): 1000-100000 µs, kept as the NEAREST WHOLE ms
+    (std::roundf), and a threshold outside that RAISES (HalException, a
+    RuntimeError in Python) — cameras.trail_threshold_kept, the product's
+    one statement of the rule. It used to take 1-100000 and keep any µs:
+    a wheel turn measured on it moved 10000 to 8706 µs, a value no IMX636
+    can hold."""
+
     class Type(enum.IntEnum):
         TRAIL = 0
         STC_CUT_TRAIL = 1
@@ -271,16 +273,17 @@ class Trail(_Module):
         return self.threshold
 
     def set_threshold(self, value):
-        if not 1 <= value <= 100_000:
-            return False
-        self.threshold = int(value)
+        try:
+            self.threshold = cameras.trail_threshold_kept(value)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
         return True
 
     def get_min_supported_threshold(self):
-        return 1
+        return cameras.TRAIL_THRESHOLD_US[0]
 
     def get_max_supported_threshold(self):
-        return 100_000
+        return cameras.TRAIL_THRESHOLD_US[1]
 
 
 class Thresholds:

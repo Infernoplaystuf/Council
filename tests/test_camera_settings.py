@@ -835,9 +835,13 @@ def test_the_fake_evk4s_biases_are_openebs_imx636_tables():
                       r'\s*(true|false)\}', allowed)
     table = {name: ((int(lo), int(hi)), (offsets[rlo], offsets[rhi]))
              for name, lo, hi, rlo, rhi, _mod in rows}
-    assert table == fake_evk4.Biases.RANGES
+    # ONE table in the product, read by the simulated event camera and the
+    # fake EVK4 alike — pinned here to the OpenEB headers.
+    assert table == cameras.IMX636_BIASES
+    assert fake_evk4.Biases.RANGES is cameras.IMX636_BIASES
+    assert cameras.SyntheticDevice.BIAS_TABLE is cameras.IMX636_BIASES
     assert table["bias_diff_on"] == ((-150, 200), (-85, 140))
-    assert sorted(fake_evk4.Biases.RANGES) == list(fake_evk4.Biases.RANGES), \
+    assert sorted(cameras.IMX636_BIASES) == list(cameras.IMX636_BIASES), \
         "get_all_biases is a std::map: by name"
 
 
@@ -1088,6 +1092,129 @@ def test_the_simulated_picture_honours_its_settings():
     after = dev.read().image
     assert after.dtype == np.uint16 and int(after.max()) <= 4095
     assert before.dtype == np.uint8
+
+
+def test_the_simulated_event_camera_has_the_imx636s_biases_and_ranges():
+    """It showed an invented recommended -50 … 50 for every bias and had
+    five biases, not six (no bias_diff), so its tabs looked like no EVK4's.
+    Now every bias is the IMX636's, described as an EVK4 opened as Typhon
+    opens one describes it: the range it accepts is the recommended one."""
+    dev = simulated("event")
+    found = by_key(dev)
+    sim = {k: s for k, s in found.items() if k.startswith("bias.")}
+    real = {k: s for k, s in by_key(fake_evk4_device()).items()
+            if k.startswith("bias.")}
+    assert list(sim) == list(real) == [
+        f"bias.{n}" for n in ("bias_diff", "bias_diff_off", "bias_diff_on",
+                              "bias_fo", "bias_hpf", "bias_refr")]
+    for key, setting in sim.items():
+        twin = real[key]
+        assert (setting.minimum, setting.maximum, setting.recommended) == (
+            twin.minimum, twin.maximum, twin.recommended), key
+        assert setting.help == twin.help, key
+    assert found["bias.bias_diff"].recommended == (-25, 23)
+    assert found["bias.bias_refr"].recommended == (-20, 235)
+    assert all(s.recommended != (-50, 50) for s in sim.values())
+
+
+def test_the_simulated_event_camera_refuses_a_bias_as_the_hal_does():
+    """I_LL_Biases::set (without the range-check bypass) RAISES outside
+    get_bias_range() in its own words, and the camera keeps what it had —
+    the simulated camera stored any number it was handed."""
+    dev = simulated("event")
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    provider = dev.settings_provider()
+    assert provider.set("bias.bias_fo", 50, setting=unclamped).ok
+    refused = provider.set("bias.bias_fo", 60, setting=unclamped)
+    assert not refused.ok
+    assert refused.note == ('Invalid value 60 for bias "bias_fo". Value '
+                            'should be within range [-35, 55].')
+    assert refused.value == 50 and dev.state["bias.bias_fo"] == 50
+    # The fake EVK4 says it in the same words (one statement of them).
+    with pytest.raises(RuntimeError) as raised:
+        fake_evk4.Biases().set("bias_fo", 60)
+    assert str(raised.value) == refused.note
+    # Through the row's own range a slider or a preset is clamped first.
+    change = dev.set_setting("bias.bias_diff_on", 180)
+    assert change.ok and change.value == 140
+    assert change.note == "clamped to the maximum, 140"
+
+
+def fake_evk4_device():
+    return cameras.EvkDevice(fake_evk4.info(), fake_evk4.FakeEvk4())
+
+
+# ======================================================================
+# The trail filter's threshold: whole milliseconds, 1-100 ms
+# ======================================================================
+def test_the_trail_threshold_is_kept_in_whole_ms_as_openeb_keeps_it():
+    """threshold_ms_ = std::roundf(threshold / 1000.0): the nearest whole
+    ms, a half AWAY from zero (Python's round would make 2500 µs 2 ms);
+    outside 1000-100000 µs a HalException in the HAL's words."""
+    kept = cameras.trail_threshold_kept
+    assert [kept(v) for v in (1000, 1499, 1500, 2500, 10400, 10500, 99_999,
+                              100_000)] == [
+        1000, 1000, 2000, 3000, 10000, 11000, 100_000, 100_000]
+    for bad in (0, 1, 999, 100_001):
+        with pytest.raises(ValueError, match=rf"Bad STC threshold value: "
+                                             rf"{bad}\. Value should be in "
+                                             rf"range \[1000, 100000\]\."):
+            kept(bad)
+    source = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/"
+        "imx636_event_trail_filter_module.cpp")
+    if source is not None:
+        assert ('"Bad STC threshold value: " << threshold << ". Value should '
+                'be in range [1000, 100000]."') in source
+        assert "throw HalException(HalErrorCode::InvalidArgument" in source
+
+
+def test_the_fake_evk4s_trail_filter_rounds_and_raises_like_the_hal():
+    """It took 1-100000 µs and kept any of them — 8706 µs, measured after a
+    wheel turn, is a value no IMX636 can hold — and said False outside,
+    where the HAL raises."""
+    trail = fake_evk4.Trail()
+    assert (trail.get_min_supported_threshold(),
+            trail.get_max_supported_threshold()) == (1000, 100_000)
+    assert trail.set_threshold(8706) is True
+    assert trail.get_threshold() == 9000
+    assert trail.set_threshold(2500) and trail.get_threshold() == 3000
+    for bad in (1, 999, 100_001):
+        with pytest.raises(RuntimeError, match="Bad STC threshold value"):
+            trail.set_threshold(bad)
+    assert trail.get_threshold() == 3000, "a refusal changes nothing"
+
+
+def test_the_trail_threshold_steps_and_is_shown_in_whole_ms():
+    """The row stepped by 1 µs over 1-100000: 99,001 slider positions of
+    which 99 exist on the sensor. It steps by 1000 µs from 1000 and is
+    SHOWN in ms; the value and a preset stay in µs, the HAL's unit."""
+    for dev in (fake_evk4_device(), simulated("event")):
+        row = by_key(dev)["trail.threshold"]
+        assert (row.minimum, row.maximum, row.step) == (1000, 100_000, 1000)
+        assert row.unit == "µs" and row.shown() == ("ms", 1000.0)
+        assert row.as_dict()["shown_unit"] == "ms"
+        assert row.value == 10_000
+        change = dev.set_setting("trail.threshold", 12_400)
+        assert change.ok and change.value == 12_000, change
+        assert change.note == "snapped to whole ms"
+        assert change.line(row.label, *row.shown()) == \
+            "Threshold: 12 ms, asked 12.4 (snapped to whole ms)"
+        assert cs.snapshot(dev)["trail.threshold"] == 12_000
+        assert dev.set_setting("trail.threshold", 500).value == 1000
+    # A threshold range that is not whole ms (no OpenEB sensor reports one)
+    # keeps a 1 µs step, shown in µs.
+    odd = cs.trail_threshold_setting(10_000, 1, 100_000)
+    assert odd.step == 1 and odd.shown() == ("µs", 1.0)
+
+
+def test_the_simulated_trail_filter_keeps_whole_ms_and_refuses_like_the_hal():
+    dev = simulated("event")
+    dev.write_setting("trail.threshold", 2500)
+    assert dev.state["trail.threshold"] == 3000
+    with pytest.raises(cameras.CameraError, match="Bad STC threshold"):
+        dev.write_setting("trail.threshold", 999)
+    assert dev.state["trail.threshold"] == 3000
 
 
 def test_the_simulated_event_camera_fires_less_at_a_higher_threshold():
