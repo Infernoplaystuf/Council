@@ -117,6 +117,24 @@ class NeedsStop(CameraError):
         self.key = key
 
 
+class GrabFailed(CameraError):
+    """One grab came back FAILED: an exposure the camera made and could not
+    deliver (on a boost, for example, an incomplete frame on the CoaXPress
+    link). Recoverable like any CameraError — the grab loop carries on —
+    but it USED UP A FRAME NUMBER: `index` is the number that frame would
+    have had. So the saved files show a gap where it was, as they do for a
+    frame the save queue skipped, and a capture counts it
+    (capture.Stats.grab_failures, and the frames CSV's grab_failures).
+
+    Before, a failed grab raised before the number moved on and left no
+    trace: with a trigger cable, every frame after it would have been paired
+    with the wrong exposure edge (docs/typhon_multicamera_design.md 3.7)."""
+
+    def __init__(self, message: str, index: int = 0):
+        super().__init__(message)
+        self.index = int(index)
+
+
 class CameraEnded(CameraError):
     """The source is FINISHED — not "this grab failed, try again".
 
@@ -189,6 +207,13 @@ class Frame:
     frame was taken in ("Mono12"). Mono10, Mono12 and Mono16 all arrive as
     uint16, so the dtype alone cannot tell a display that the bit depth
     changed under it (live_display.DisplayPrep).
+
+    `timestamp_us` IS NOT ALWAYS MICROSECONDS. It is the camera's own clock
+    as the camera gave it: microseconds for an event camera, but for a
+    Basler the grab result's TICK COUNT (GetTimeStamp), whose tick length
+    depends on the model — and 0 on a boost CXP camera (the boA5320), which
+    has no timestamp. The name is kept because every run's frames CSV
+    already has a column of it.
     """
     image: Any
     index: int = 0
@@ -423,6 +448,12 @@ class Device:
     #: pylon emulator), so its area needs the stream stopped first.
     area_live = False
 
+    #: Whether read() reports a grab that came back failed as GrabFailed,
+    #: using up its frame number. True for a Basler. An event camera has no
+    #: grabs to fail, and the simulated one never fails; for those the frames
+    #: CSV's grab_failures column is left blank rather than claiming a 0.
+    counts_grab_failures = False
+
     @property
     def streaming(self) -> bool:
         """The camera has been started and not stopped."""
@@ -639,6 +670,9 @@ class BaslerBackend(Backend):
 
 class BaslerDevice(Device):
     """An open pylon InstantCamera."""
+
+    #: A failed grab is GrabFailed and uses up its frame number (read()).
+    counts_grab_failures = True
 
     #: Pylon buffers while recording, as a byte budget. The grab loop hands
     #: frames on at once, so these only ride out a hiccup; the save queue
@@ -888,8 +922,18 @@ class BaslerDevice(Device):
         LatestImageOnly while recording discarded frames INSIDE pylon,
         before the app's save queue ever saw them — memory and CPU sat idle
         while frames went missing (measured: 27 silent skips in 2 s with a
-        half-speed consumer). Anything the camera or driver still has to
-        drop is counted (Frame.meta["skipped_by_camera"]).
+        half-speed consumer).
+
+        PYLON DOES NOT COUNT WHAT IS LOST WHILE RECORDING. Its skipped-image
+        count (Frame.meta["skipped_by_camera"]) counts only in the "latest
+        image" strategies; in OneByOne it stays 0 (vendor docs; measured on
+        the emulator: 0, against 161 under LatestImageOnly with a slow
+        reader — docs/typhon_multicamera_design.md 3.7). What IS counted
+        while recording is a grab that comes back failed: read() raises
+        GrabFailed and the frame number moves on, leaving a gap. A frame
+        lost on the link with no failed grab at all is NOT seen here; only
+        a check against the camera's own count (a trigger cable's edges, a
+        frame counter) can find that.
         """
         if self._started:
             return
@@ -939,11 +983,18 @@ class BaslerDevice(Device):
                 return None
             if not grab.GrabSucceeded():
                 said = _call(grab, "GetErrorDescription") or "grab failed"
-                raise CameraError(str(said))
+                # The camera exposed this frame (with a trigger cable it sent
+                # an edge for it), so it takes its frame number: the saved
+                # files show the gap, and the pairing after it stays right.
+                self._index += 1
+                raise GrabFailed(f"grab {self._index} failed: {said}",
+                                 index=self._index)
             image = self._pixels(grab)
-            # A tick count, not microseconds — and the boost CXP models do
-            # not support Timestamp at all, so this is 0 on a boA5320. Kept
-            # because other Basler families do fill it in.
+            # A TICK COUNT, NOT MICROSECONDS, though it goes into
+            # Frame.timestamp_us (and the frames CSV's timestamp_us) as it
+            # is: the tick's length depends on the model, and the boost CXP
+            # models do not support Timestamp at all, so this is 0 on a
+            # boA5320. Kept because other Basler families do fill it in.
             stamp = int(_call(grab, "GetTimeStamp") or 0)
             skipped = int(_call(grab, "GetNumberOfSkippedImages") or 0)
         finally:

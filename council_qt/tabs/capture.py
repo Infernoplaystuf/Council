@@ -27,10 +27,19 @@ DISCONNECTING IS NOT OPTIONAL
 A grab thread outliving its window crashes on exit. `shutdown` joins it, and
 it is wired to the application's aboutToQuit as well as to the button, so
 quitting mid-capture is as safe as pressing Stop.
+
+EVERY RECORDING IS A RUN, AS IN TYPHON
+Record… writes <run>_frame_NNNNNN.png, <run>_frames.csv and, when the
+recording ends, <run>_run_end.json into the folder chosen (capture.claim_run
+and run_recorder), so a reconnect — frame numbers start again at every
+Connect — never writes over an earlier recording. The folder dialog starts
+at the vault: a recording saved there adds its CSV and end record to the
+vault index (it indexes .csv and .json), one data table per recording.
 """
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -332,9 +341,22 @@ class CaptureTab(ViewHelpers, QWidget):
         where = self.ask_dir("Save frames to", str(paths.vault_dir()))
         if not where:
             return
+        folder = Path(where)
+        recorder = None
         try:
-            self.session.record_to(capture.Recorder(Path(where)))
+            # A RUN OF ITS OWN for every recording, named and reserved as
+            # Typhon reserves one (capture.claim_run): frame numbers start
+            # again at every Connect, so the fixed "frame" name this used
+            # had a reconnect write over the earlier recording's frames.
+            # The reservation's CSV stays open for the recorder, and the
+            # run ends with <run>_run_end.json (capture.run_recorder).
+            run, claim = capture.claim_run(folder,
+                                           time.strftime("%Y%m%d_%H%M%S"))
+            recorder = capture.run_recorder(folder, run, claim)
+            self.session.record_to(recorder)
         except OSError as exc:
+            if recorder is not None:
+                recorder.close()
             self.status.setText(f"Could not record there: {exc}")
             return
         self._sync()

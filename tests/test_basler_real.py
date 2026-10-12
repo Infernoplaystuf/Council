@@ -178,6 +178,98 @@ def test_frames_kept_by_the_app_are_never_overwritten(changing_camera):
         dev.stop()
 
 
+def test_two_emulated_baslers_in_one_folder_in_one_second_lose_nothing(
+        tmp_path, monkeypatch):
+    """Stage M0 (docs/typhon_multicamera_design.md 2.6) with real pypylon:
+    two emulated Baslers, each named its run in the same second the way
+    Typhon names it, recording into one folder. Before the run names were
+    reserved, both got the same name and half the frames were written over.
+    Also: a Basler's frames CSV carries the running grab_failures count."""
+    import csv
+
+    import frame_camera
+
+    backend = cameras.BaslerBackend()
+    found = [c for c in backend.discover() if "Emulation" in (c.model or "")]
+    if len(found) < 2:
+        pytest.skip("needs two emulated cameras (PYLON_CAMEMU=2)")
+    monkeypatch.setattr(frame_camera.time, "strftime",
+                        lambda fmt, *a: "20261012_120000")
+    capture.warm_imports()
+    devices = [backend.open(info) for info in found[:2]]
+    # Both named before either writes a thing: two windows, one second.
+    runs = [frame_camera._unique_run(tmp_path) for _ in devices]
+    sessions = []
+    try:
+        for dev, run in zip(devices, runs):
+            dev._cam.PixelFormat.SetValue("Mono8")
+            dev.prepare(True)
+            session = capture.CaptureSession(dev)
+            session.record_to(capture.Recorder(
+                tmp_path, stem=f"{run}_frame",
+                index_name=f"{run}_frames.csv"), reset=True)
+            sessions.append(session)
+        for session in sessions:
+            session.start()
+        time.sleep(1.0)
+        for session in sessions:
+            session.stop()
+            session.record_to(None)
+        recorded = [s.run_stats().recorded for s in sessions]
+    finally:
+        for dev in devices:
+            dev.close()
+    assert all(n >= 5 for n in recorded), recorded
+    on_disk = len(list(tmp_path.glob("*.png")))
+    assert on_disk == sum(recorded), (
+        f"{sum(recorded)} frames reported saved, {on_disk} PNGs on disk")
+    assert len(set(runs)) == 2, runs
+    for run, count in zip(runs, recorded):
+        with open(tmp_path / f"{run}_frames.csv", newline="",
+                  encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == count == len({r["file"] for r in rows})
+        assert {r["grab_failures"] for r in rows} == {"0"}
+
+
+def test_an_emulated_basler_run_ends_with_its_grab_totals(tmp_path):
+    """The M0 review: a run's grab attempts and failures are written when
+    it ends (<run>_run_end.json), with real pypylon — through the reserved
+    CSV kept open from Start (capture.claim_run), as Typhon records."""
+    import json
+
+    backend = cameras.BaslerBackend()
+    found = [c for c in backend.discover() if "Emulation" in (c.model or "")]
+    if not found:
+        pytest.skip("needs an emulated camera (PYLON_CAMEMU)")
+    capture.warm_imports()
+    dev = backend.open(found[0])
+    try:
+        dev._cam.PixelFormat.SetValue("Mono8")
+        dev.prepare(True)
+        run, claim = capture.claim_run(tmp_path, "20261012_120000")
+        session = capture.CaptureSession(dev)
+        session.record_to(capture.run_recorder(tmp_path, run, claim),
+                          reset=True)
+        session.start()
+        time.sleep(0.8)
+        session.stop()
+        session.record_to(None)
+        stats = session.run_stats()
+    finally:
+        dev.close()
+    end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+    pngs = list(tmp_path.glob(f"{run}_frame_*.png"))
+    assert stats.recorded >= 5 and end["frames_saved"] == len(pngs) \
+        == stats.recorded, (end, stats)
+    assert end["grab_failures"] == stats.grab_failures == 0, end
+    assert end["grab_attempts"] == (stats.recorded
+                                    + end["frames_not_saved"]
+                                    ["storage_too_slow"]), end
+    assert end["first_index"] == 1 and end["recording_failed"] == "", end
+
+
 # ======================================================================
 # Settings (council_core.camera_settings) on the emulator's node map
 # ======================================================================

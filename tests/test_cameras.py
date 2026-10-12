@@ -363,6 +363,29 @@ def test_read_releases_the_grab_even_when_it_failed():
     assert held["grab"].released, "a failed grab was never released"
 
 
+def test_a_failed_grab_uses_up_its_frame_number():
+    """The failed grab WAS an exposure (it has a trigger edge): it must leave
+    a gap in the frame numbers, as a frame the save queue skipped does, or
+    every pairing after it is off by one (design 3.7, stage M0)."""
+    backend, pylon = basler()
+    device = backend.open(CameraInfo("basler", "40012345"))
+    script = [True, False, True]
+
+    def retrieve(timeout, handling):
+        return FakeGrab(np.full((2, 2), 7, np.uint8), ok=script.pop(0))
+
+    pylon.camera.RetrieveResult = retrieve
+    device.start()
+    assert device.read().index == 1
+    with pytest.raises(cameras.GrabFailed) as failed:
+        device.read()
+    assert isinstance(failed.value, CameraError)    # the grab loop's catch
+    assert failed.value.index == 2
+    assert "camera reported an error" in str(failed.value)
+    assert device.read().index == 3, "the failed grab left no gap"
+    assert device.counts_grab_failures is True
+
+
 def test_start_asks_for_the_newest_frame_not_a_queue():
     backend, pylon = basler()
     device = backend.open(CameraInfo("basler", "40012345"))

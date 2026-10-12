@@ -161,7 +161,18 @@ def write(folder: Any, run: str, record: Mapping[str, Any]) -> Path:
 
     Raises RecordExists when the run already has one (it is left as it
     is), and OSError when the folder cannot be written."""
-    final = record_path(folder, run)
+    return write_once(record_path(folder, run), record)
+
+
+def write_once(final: Any, record: Mapping[str, Any]) -> Path:
+    """Write `record` as JSON at `final`, WHOLE and ONCE: to a temporary
+    name first, then renamed into a name that must not exist — so a crash
+    mid-write leaves no half record and nothing is ever replaced. The camera
+    record and a run's end record (capture.Recorder.finish) both use it.
+
+    Raises RecordExists when `final` is already there (it is left as it
+    is), and OSError when the folder cannot be written."""
+    final = Path(str(final))
     text = json.dumps(dict(record), indent=2, ensure_ascii=False,
                       allow_nan=False) + "\n"
     if final.exists():

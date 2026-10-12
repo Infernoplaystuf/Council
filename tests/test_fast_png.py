@@ -194,8 +194,9 @@ def test_a_noisy_camera_frame_is_stored_not_compressed(tmp_path):
 
 @pytest.mark.parametrize("compress", [True, False])
 def test_forced_either_way_is_still_exact(compress, tmp_path):
-    for img in (event_picture(), rng.integers(0, 4095, (97, 131), endpoint=True).astype(np.uint16)):
-        path = tmp_path / f"f{compress}.png"
+    for n, img in enumerate((event_picture(), rng.integers(0, 4095, (97, 131), endpoint=True).astype(np.uint16))):
+        # A name each: write_png never replaces a file (FileExistsError).
+        path = tmp_path / f"f{compress}_{n}.png"
         fast_png.write_png(img, path, compress=compress)
         assert np.array_equal(decode(path.read_bytes()), img)
         assert np.array_equal(np.asarray(Image.open(path)), img)

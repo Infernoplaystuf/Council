@@ -52,6 +52,10 @@ The capture folder IS the browse folder. Each run writes, side by side:
                                  setting at Start, the preset if it was
                                  still as applied, the app and the software
                                  (council_core.camera_record) — written once
+    <run>_run_end.json           when the recording ends: frames saved and
+                                 not, failed grabs and grab attempts, the
+                                 write that stopped it if one did
+                                 (capture.Recorder.finish) — written once
 
 PNG specifically, because frame_timing, frame_roi and frame_classes all
 discover frames by IMAGE_SUFFIXES and open them with Pillow — a capture
@@ -119,7 +123,10 @@ A generated app is forbidden from even SPELLING remove/unlink/rmtree (the gate
 checks attribute names whether or not they are called), and a capture app that
 could silently drop a run would be wrong regardless. Each run writes under its
 own stamped stem, so a second run never overwrites the first and no cleanup is
-required to make one safe.
+required to make one safe. The stem is reserved before the run writes
+anything (its frames CSV is created exclusively, `_unique_run`), and frames
+are created exclusively too, so not even two windows sharing a folder can
+write one file over another.
 """
 from __future__ import annotations
 
@@ -518,7 +525,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
 
     Each run writes under its own stamped name, so starting a second run into
     the same folder adds to it and can never overwrite the first — this module
-    has no way to delete anything and should not have one.
+    has no way to delete anything and should not have one. The name is
+    RESERVED before anything else is written (_unique_run), so two windows
+    starting in the same second into one folder cannot share it either, and
+    every frame is created exclusively: a clash from any other cause stops
+    the recording loudly, as a frame not saved, instead of replacing one.
 
     AN EVENT CAMERA ALSO RECORDS ITS .raw, started BEFORE the stream so the
     file holds the whole run (see EvkDevice.start_raw).
@@ -594,30 +605,45 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     restartable = getattr(device, "restartable", True)
     if _stream_dead(session):
         raise RuntimeError(_DEAD_STREAM)
-    if session.running and restartable:
-        _stop_preview(session)
-    elif restartable:
-        _release_dead_stream(session)
-
-    run = _unique_run(out)
-    # READ after the boxes beside Start were applied and before the run's
-    # recording begins — the camera as every picture of this run will have
-    # it — and WRITTEN only once the capture has started, so a Start that
-    # fails below leaves no record of a run that never happened. Read
-    # BEFORE the switch below, not after it: an event camera's stream is
-    # already running, so from the switch on every moment Start spends here
-    # is frames of the run, and reading every setting of a real camera is
-    # the slow part of the record.
-    content, record_note = _camera_record(run, device)
-    recorder = capture.Recorder(out, stem=f"{run}_frame",
-                                index_name=f"{run}_frames.csv")
+    # RESERVED, and the recorder OPENED, before anything stops: a folder
+    # that cannot be written is refused with the picture still running,
+    # like every other refusal. The reservation's CSV stays open and the
+    # recorder writes through it (capture.claim_run): closed and opened
+    # again, a program that briefly took the new file without sharing made
+    # Start fail after the live view had stopped (measured).
     try:
+        run, claim = _claim_run(out)
+    except OSError as exc:
+        raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
+    recorder = capture.run_recorder(out, run, claim)
+    try:
+        recorder.open()
+        if session.running and restartable:
+            _stop_preview(session)
+        elif restartable:
+            _release_dead_stream(session)
+
+        # READ after the boxes beside Start were applied and before the
+        # run's recording begins — the camera as every picture of this run
+        # will have it — and WRITTEN only once the capture has started, so
+        # a Start that fails below leaves no record of a run that never
+        # happened. Read BEFORE the switch below, not after it: an event
+        # camera's stream is already running, so from the switch on every
+        # moment Start spends here is frames of the run, and reading every
+        # setting of a real camera is the slow part of the record.
+        content, record_note = _camera_record(run, device)
         # reset: this run's numbers only — frames the preview showed were
         # never meant to be saved, and counting them would read as frames the
         # capture lost. In the same step as the switch (see record_to).
         session.record_to(recorder, reset=True)
-    except OSError as exc:
-        raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
+    except BaseException as exc:
+        # Refused before the recording began: let go of the reservation's
+        # CSV (it stays, header only, and keeps the name taken).
+        recorder.close()
+        if isinstance(exc, OSError):
+            raise RuntimeError(
+                f"cannot save frames into {out}: {exc}") from exc
+        raise
 
     raw = None
     if getattr(device, "records_raw", False):
@@ -744,6 +770,9 @@ def _run_note(session: Any) -> str:
         bits[0] += f" — {_LIVE.run_waited}"
     if stats.skipped:
         bits.append(f"{stats.skipped} NOT saved")
+    if stats.recording_failed:
+        bits.append(f"RECORDING HAD STOPPED ({stats.recording_failed}): "
+                    f"{stats.unsaved} NOT saved")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -762,6 +791,12 @@ def _stopped_line(session: Any) -> str:
     if _LIVE.run_waited:
         # First: the line is one row, and the reason is what matters.
         line = f"Stopped — {_LIVE.run_waited}. {stats.line()}"
+    if stats.recording_failed:
+        # Before anything else: the run did not save what it grabbed after
+        # this, and stats.line() counts those frames "NOT saved (recording
+        # stopped)". Before, this line said "1 error(s)" and left them out.
+        line = (f"Stopped — RECORDING HAD STOPPED: "
+                f"{stats.recording_failed}. {stats.line()}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -920,9 +955,15 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     if say is None or session is None:
         return
     if _LIVE.capturing or session.saving:
-        line = _status_line(session.stats(), frame)
+        stats = session.stats()
+        line = _status_line(stats, frame)
         quiet = _quiet_note(session) if _LIVE.capturing else ""
-        say(f"{quiet} · {line}" if quiet else line)
+        if quiet:
+            line = f"{quiet} · {line}"
+        stopped = _recording_stopped(stats) if _LIVE.capturing else ""
+        if stopped:
+            line = f"{stopped} · {line}"
+        say(line)
         _LIVE.reported = False
     elif _LIVE.job is not None:
         # The stream is stopped ON PURPOSE for a moment; not "quiet".
@@ -934,6 +975,29 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     elif not _LIVE.reported:
         say(_idle_line(session))
         _LIVE.reported = True
+
+
+def _recording_stopped(stats: Any) -> str:
+    """While capturing: "RECORDING STOPPED — frame 20 not saved —
+    FileExistsError: ... — nothing more is saved; press Stop", once a frame
+    could not be written (capture.Stats.recording_failed), else "".
+
+    FIRST IN EVERY LIVE LINE UNTIL STOP. The first failed write ends the
+    recording (capture.FrameWriter) while the camera, and this run, go on;
+    before, the line said only "1 error(s)" — and with nothing saved it did
+    not even say "saved" — so a run could look like it was capturing for
+    an hour while saving nothing (measured after a frame-name clash). The
+    capture is left on, not ended here: the message stays on screen until
+    someone reads it and presses Stop, and an EVK4's .raw, which is written
+    apart from the PNGs, is not cut short. Every frame grabbed meanwhile is
+    counted "NOT saved (recording stopped)"."""
+    said = str(getattr(stats, "recording_failed", "") or "")
+    if not said:
+        return ""
+    if _LIVE.raw_path is not None:
+        return (f"RECORDING STOPPED — {said} — no more PNGs are saved (the "
+                f".raw is written apart); press Stop")
+    return f"RECORDING STOPPED — {said} — nothing more is saved; press Stop"
 
 
 def _preview_line(session: Any, stats: Any, frame: Any) -> str:
@@ -1579,28 +1643,34 @@ def _require_reviewer() -> Any:
 
 
 def _unique_run(out: Path) -> str:
-    """The run's name: the time it started, made unique if a run started in
-    the same second is already in the folder. The raw log would otherwise
-    truncate the first run's .raw, silently."""
-    import os
+    """The run's name, RESERVED in `out`: the time it started, with _2, _3
+    added when a run of that name is already there (any of its files, or a
+    folder of its name — a run of several cameras is a folder).
 
-    base = time.strftime("%Y%m%d_%H%M%S")
-    try:
-        names = [e.name for e in os.scandir(out)] if out.is_dir() else []
-    except OSError:
-        names = []
-    taken = set()
-    for name in names:
-        for marker in ("_frame_", "_events.raw", "_frames.csv",
-                       "_camera.json"):
-            head, found, _ = name.partition(marker)
-            if found:
-                taken.add(head)
-    run, n = base, 1
-    while run in taken:
-        n += 1
-        run = f"{base}_{n}"
-    return run
+    Reserved, not just looked for (council_core.capture.reserve_run): its
+    `<run>_frames.csv` is created with exclusive creation and its header
+    written at once, and the recorder appends to it. Looking was not
+    enough: two Typhon windows pressing Start in the same second into one
+    folder both looked before either wrote anything, got the same name, and
+    overwrote each other's frames silently (measured: 184-185 frames
+    reported saved, 92-93 on disk — docs/typhon_multicamera_design.md 2.6).
+    A shared name would also truncate the first run's .raw.
+
+    Creates `out` if it is not there. Raises OSError when it cannot be
+    written. Start uses _claim_run, which keeps the CSV open for the run's
+    recorder."""
+    from council_core import capture
+
+    return capture.reserve_run(out, time.strftime("%Y%m%d_%H%M%S"))
+
+
+def _claim_run(out: Path) -> tuple:
+    """_unique_run, with the reserved CSV still OPEN: (the run's name, the
+    handle), for capture.run_recorder — never closed and opened again, so
+    no other program can take the file in between (capture.claim_run)."""
+    from council_core import capture
+
+    return capture.claim_run(out, time.strftime("%Y%m%d_%H%M%S"))
 
 
 def _on_network_share(path: Path) -> bool:

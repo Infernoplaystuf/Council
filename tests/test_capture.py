@@ -865,9 +865,13 @@ def test_published_rows_are_on_disk_while_the_run_is_still_open(tmp_path):
     writer.close(5)
 
 
-def test_a_recording_that_fails_freezes_its_counts(tmp_path):
-    """The camera keeps streaming after a failed recording (an EVK4 does);
-    later frames must not read as grabbed-and-not-saved."""
+def test_a_failed_recording_counts_its_run_until_the_app_ends_it(tmp_path):
+    """The camera keeps streaming after a failed write (an EVK4 does). Until
+    the app ends the recording (Typhon's Stop), every frame is a frame of
+    the run, grabbed and NOT saved — counted, not frozen out at the failure
+    (frozen there, a Stop said "20 grabbed" for a run that grabbed 62, and
+    nothing said the 42 were lost). Once the app has ended the recording,
+    later frames are not the run's and must not read as lost."""
     def explode(image, path):
         raise OSError("disk full")
 
@@ -877,12 +881,16 @@ def test_a_recording_that_fails_freezes_its_counts(tmp_path):
     session.flush(5)
     session._took(frame(2))                   # finds the failure
     for i in range(3, 9):
+        session._took(frame(i))               # the run goes on
+    during = session.run_stats()
+    assert (during.grabbed, during.recorded, during.unsaved) == (8, 0, 8)
+    session.record_to(None)                   # the app ends the recording
+    for i in range(9, 12):
         session._took(frame(i))               # still streaming
-    # Frozen when the failure was found, as frame 2 arrived: the run
-    # grabbed one frame, whose write failed. Nothing after it counts.
-    assert session.run_stats().grabbed == 1
-    assert session.stats().grabbed == 8
-    assert "disk full" in session.run_stats().recording_failed
+    ended = session.run_stats()
+    assert (ended.grabbed, ended.recorded, ended.unsaved) == (8, 0, 8)
+    assert session.stats().grabbed == 11
+    assert "disk full" in ended.recording_failed
 
 
 
