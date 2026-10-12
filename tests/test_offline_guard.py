@@ -154,18 +154,33 @@ def test_the_opt_in_ends_with_the_test():
 
 
 def test_a_name_lookup_is_refused_without_asking_dns():
+    """The guard's own checks are asked FIRST, so one that stopped refusing
+    fails this test before any lookup is made. huggingface.co and
+    raspberrypi.local go to the check alone: through the socket functions,
+    a broken check would have sent a real DNS query and an mDNS multicast on
+    the LAN (review, 2026-10-12). The lookups themselves use reserved names
+    (.invalid never resolves) and TEST-NET / loopback addresses."""
     _require_guard()
-    for name in ("huggingface.co", "localhost.council-test.invalid",
-                 "raspberrypi.local"):
-        with pytest.raises(socket.gaierror, match="would ask DNS"):
-            socket.getaddrinfo(name, 443)
+    for name in ("huggingface.co", "raspberrypi.local",
+                 "localhost.council-test.invalid", "council-test.invalid"):
+        with pytest.raises(guard.LookupRefused, match="would ask DNS"):
+            guard._CORE.check_name(name)
+    for address in ("192.0.2.1", "127.0.0.2"):
+        with pytest.raises(guard.LookupRefused, match="would ask DNS"):
+            guard._CORE.check_reverse(address)
+    _taken(6)
+    # The checks refuse; now the functions the code under test calls.
+    with pytest.raises(socket.gaierror, match="would ask DNS"):
+        socket.getaddrinfo("localhost.council-test.invalid", 443)
     with pytest.raises(guard.LookupRefused):
         socket.gethostbyname("council-test.invalid")
+    with pytest.raises(guard.LookupRefused):
+        socket.gethostbyname_ex("council-test.invalid")
     with pytest.raises(guard.LookupRefused):
         socket.gethostbyaddr("192.0.2.1")
     with pytest.raises(guard.LookupRefused):
         socket.gethostbyaddr("127.0.0.2")      # loopback, but it went out
-    _taken(6)
+    _taken(5)
 
 
 def test_this_pc_is_still_looked_up():
