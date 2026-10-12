@@ -199,6 +199,27 @@ def test_the_full_council_gives_every_drafting_role_the_file(qapp, engine):
         _close(qapp, window, view)
 
 
+def test_a_prompt_too_long_for_the_model_is_said_and_kept(qapp, engine,
+                                                         monkeypatch):
+    """The context-window notice reaches the Qt transcript in plain words,
+    and the conversation keeps it as the app's own line."""
+    monkeypatch.setattr(engine.ce, "effective_n_ctx", lambda *_a, **_k: 64)
+    window, view, _opened = _council(engine.vault)
+    try:
+        _ask(qapp, view, "Summarize pumps.csv")
+        text = view.transcript.toPlainText()
+        assert "too long for what the model can read at once" in text, text
+        assert "n_ctx" not in text
+        assert view._last_answer, "the question was not answered"
+    finally:
+        _close(qapp, window, view)
+    rows = [json.loads(line) for line in next(
+        (engine.vault / "conversations").glob("*.jsonl"))
+        .read_text(encoding="utf-8").splitlines()]
+    assert any(r["who"] == "Council" and "too long" in r["text"]
+               for r in rows), rows
+
+
 def test_a_failing_context_step_still_answers_and_says_so(qapp, engine,
                                                          monkeypatch):
     from council_core import turn_context

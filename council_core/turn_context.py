@@ -3513,6 +3513,105 @@ def resolve_source_paths(raw_sources: Any, vault_dir: Any) -> List[Path]:
     return out
 
 
+# ------------------------------------------------------------------
+# What the turn says about the context window, in plain words
+# ------------------------------------------------------------------
+# The Tk wording these replace: "⚠ Prompt is ~N tokens but n_ctx is only M.
+# The model will silently truncate the tail and may miss the injected
+# file/analyst data. Raise COUNCIL_GGUF_N_CTX …" — settings jargon, and the
+# wrong setting whenever Ollama serves the model (its window is
+# COUNCIL_OLLAMA_NUM_CTX; council_engine.effective_n_ctx).
+
+#: The share of the window past which a turn always says the prompt is
+#: nearly full. The engine keeps a quarter of the window for the answer
+#: (context_budget_report's safe_input; at least 256 tokens), so the notice
+#: comes from about 75% — the point where the answer starts to lose its
+#: room — and never later than this.
+NEARLY_FULL = 0.8
+
+
+def window_setting() -> str:
+    """The setting that sizes the main model's window: Ollama's num_ctx when
+    Ollama serves it, else the GGUF context size. Never loads a model."""
+    try:
+        if ce._ollama_will_serve("main"):
+            return "COUNCIL_OLLAMA_NUM_CTX"
+    except Exception:                                     # noqa: BLE001
+        pass
+    return "COUNCIL_GGUF_N_CTX"
+
+
+def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
+    """What the transcript says when the prompt does not fit, or nearly
+    fills, what the model can read at once (``budget`` is
+    council_engine.context_budget_report's); None when it fits easily."""
+    used, ctx = int(budget["input_tokens"]), int(budget["n_ctx"])
+    setting = window_setting()
+    if budget.get("over_window") or used > ctx:
+        most = int(budget.get("model_max_ctx") or 0)
+        if most and most > ctx:
+            hint = (f" This model can read up to {most:,}: start the app "
+                    f"with {setting} set to "
+                    f"{min(max(16384, ctx * 4), most)} and it will fit.")
+        else:
+            hint = (f" To fit it, start the app with {setting} set higher "
+                    f"(16384 or 32768, if your PC has the memory), or ask "
+                    f"about fewer files at once.")
+        return (f"⚠ This question, with what was found in your files, is too "
+                f"long for what the model can read at once: about {used:,} "
+                f"tokens, and it reads {ctx:,}. The end will be cut off, so "
+                f"the answer may miss some of your data.{hint}")
+    threshold = min(float(budget.get("safe_input") or ctx),
+                    NEARLY_FULL * ctx)
+    if used > threshold:
+        pct = budget.get("pct_of_window")
+        pct = float(pct) if pct is not None else used / max(1, ctx) * 100
+        return (f"⚠ This question, with what was found in your files, fills "
+                f"{pct:.0f}% of what the model can read at once ({used:,} of "
+                f"{ctx:,} tokens). That leaves little room for the answer, "
+                f"so it may be cut short. Starting the app with {setting} "
+                f"set higher gives it more room.")
+    return None
+
+
+def _plain_label(label: str) -> str:
+    """A context block's label ("[VAULT MATCH: a.csv] (budget overflow)") in
+    words."""
+    label = _re.sub(r"\s*\(budget overflow\)\s*$", "", str(label)).strip()
+    match = _re.match(r"\[(VAULT MATCH(?:\s*\(pinned\))?|FILE|FOLDER"
+                      r"(?: SUMMARY)?):\s*(.+?)\]$", label)
+    if match:
+        kind, name = match.group(1), match.group(2)
+        if kind.startswith("VAULT MATCH"):
+            return f"{name} (a matching file)"
+        if kind == "FILE":
+            return f"{name} (a file you named)"
+        return f"the list of files in {name}"
+    return {
+        "[VAULT SEARCH SUMMARY]": "the list of every matching file",
+        "[DATASET OVERVIEW]": "the overview of your data files",
+        "[VALUE MATCHES]": "the rows that hold the words you asked about",
+    }.get(label, label.strip("[]").capitalize())
+
+
+def left_out_notice(dropped, n_ctx: int) -> str:
+    """What the transcript says when parts of the context were left out so
+    the question fits (``dropped`` is the injection's (label, tokens)
+    list)."""
+    count = len(dropped)
+    lines = [f"⚠ Left out {count} part{'s' if count != 1 else ''} of what "
+             f"was found, so the question fits in the {int(n_ctx or 0):,} "
+             f"tokens the model reads at a time:"]
+    for label, cost in dropped:
+        lines.append(f"  • {_plain_label(label)}  (about {int(cost):,} "
+                     f"tokens)")
+    lines.append(f"A computed answer, the task memo and a \"file not found\" "
+                 f"note are never left out; files you named and folder lists "
+                 f"can be. Starting the app with {window_setting()} set "
+                 f"higher keeps more.")
+    return "\n".join(lines)
+
+
 def prepare_turn(question: str, state: TurnState, *,
                  n_ctx: Optional[int] = None,
                  condense: Optional[Callable[[str], str]] = None,
@@ -3657,43 +3756,16 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         say("Council", "\n".join(lines))
     dropped = prepared.breakdown.get("dropped") or []
     if dropped:
-        lines = [f"⚠ Dropped {len(dropped)} lower-priority block"
-                 f"{'s' if len(dropped) != 1 else ''} to fit n_ctx="
-                 f"{prepared.breakdown.get('n_ctx', 0):,}:"]
-        for label, cost in dropped:
-            lines.append(f"  • {label}  (~{cost:,} tokens)")
-        lines.append("(Analyst result, task memo, and the NO-DATA marker are "
-                     "never dropped. Explicit files / folder listings / vault "
-                     "summary CAN be dropped on cumulative budget overflow — "
-                     "raise COUNCIL_GGUF_N_CTX to keep them. Type 'context "
-                     "info' for the full token breakdown.)")
-        say("Council", "\n".join(lines))
+        say("Council", left_out_notice(
+            dropped, prepared.breakdown.get("n_ctx", 0)))
 
     # 5. Will it fit? -------------------------------------------------------
     try:
         budget = ce.context_budget_report(augmented)
         prepared.budget = budget
-        used, ctx = budget["input_tokens"], budget["n_ctx"]
-        if budget["over_window"]:
-            most = budget.get("model_max_ctx") or 0
-            if most and most > ctx:
-                hint = (f" The model supports up to {most} tokens — raising "
-                        f"COUNCIL_GGUF_N_CTX to "
-                        f"{min(max(16384, ctx * 4), most)} would fit this "
-                        f"prompt.")
-            else:
-                hint = (" Raise COUNCIL_GGUF_N_CTX (e.g. to 16384 or 32768) "
-                        "before launch.")
-            say("Council",
-                f"⚠ Prompt is ~{used:,} tokens but n_ctx is only {ctx:,}. "
-                f"The model will silently truncate the tail and may miss the "
-                f"injected file/analyst data.{hint}")
-        elif used > budget["safe_input"]:
-            say("Council",
-                f"⚠ Prompt is ~{used:,} tokens "
-                f"({budget['pct_of_window']:.0f}% of n_ctx={ctx:,}). Reply "
-                f"space is tight — consider raising COUNCIL_GGUF_N_CTX for "
-                f"fuller answers.")
+        notice = context_window_notice(budget)
+        if notice:
+            say("Council", notice)
     except Exception as exc:                              # noqa: BLE001
         print(f"[ContextBudget] check failed: {exc!r}")
 

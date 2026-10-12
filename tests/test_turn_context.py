@@ -146,12 +146,99 @@ def test_each_conversation_reads_its_own_vault(vault_env, tmp_path):
     assert "PEONY" in second.text and "ORCHID" not in second.text
 
 
+#: Words a context-window notice is not to use: settings jargon the user
+#: never typed, and the Tk wording's "truncate the tail" / "injected".
+JARGON = ("n_ctx", "truncate", "injected", "analyst data", "context info")
+
+
+def _window_notices(said):
+    return [text for _w, text, _k in said
+            if "what the model can read" in text]
+
+
+def _big_file(vault):
+    """A data file large enough that the prompt it makes needs a window of
+    a realistic size (thousands of tokens, not a few hundred, where the
+    engine's 256-token answer reserve is most of the window)."""
+    (vault / "data_in" / "notes.txt").write_text(
+        "The supplier says the gasket seats need re-torquing. " * 160 + "\n",
+        encoding="utf-8")
+    return "summarize notes.txt"
+
+
+def _prompt_tokens(vault, question):
+    """How many tokens the prepared prompt comes to, on a window that is
+    large enough for no warning."""
+    import council_engine as ce
+    prepared, _said, _ = _prepare(vault, question, n_ctx=32768)
+    return ce.estimate_tokens(prepared.text)
+
+
 def test_a_prompt_that_will_not_fit_says_so(vault_env, monkeypatch):
+    """Over the window: said, in plain words, with the numbers and what to
+    do. The Tk wording was "Prompt is ~N tokens but n_ctx is only 64. The
+    model will silently truncate the tail and may miss the injected
+    file/analyst data."""
     import council_engine as ce
     vault, _fake = vault_env
     monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 64)
     _prepared, said, _ = _prepare(vault, "summarize pumps.csv")
-    assert any("n_ctx is only 64" in text for _w, text, _k in said), said
+    notices = _window_notices(said)
+    assert len(notices) == 1, said
+    text = notices[0]
+    assert "too long" in text and "64" in text, text
+    # The setting that sizes THIS model's window: Ollama serves it here.
+    assert "COUNCIL_OLLAMA_NUM_CTX" in text, "the notice does not say what to do"
+    for word in JARGON:
+        assert word not in text, f"{word!r} in {text!r}"
+
+
+def test_a_prompt_over_80_percent_of_the_window_says_so(vault_env,
+                                                        monkeypatch):
+    import council_engine as ce
+    vault, _fake = vault_env
+    question = _big_file(vault)
+    used = _prompt_tokens(vault, question)
+    window = int(used / 0.85)                 # the prompt fills ~85% of it
+    assert window >= 2048, window
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: window)
+    _prepared, said, _ = _prepare(vault, question, n_ctx=32768)
+    notices = _window_notices(said)
+    assert len(notices) == 1, said
+    text = notices[0]
+    assert f"{used / window * 100:.0f}%" in text, text
+    assert f"{window:,}" in text, text
+    assert "too long" not in text and "room" in text, text
+    for word in JARGON:
+        assert word not in text, f"{word!r} in {text!r}"
+
+
+def test_a_prompt_well_inside_the_window_says_nothing_about_it(vault_env,
+                                                              monkeypatch):
+    import council_engine as ce
+    vault, _fake = vault_env
+    question = _big_file(vault)
+    used = _prompt_tokens(vault, question)
+    window = used * 2                         # the prompt fills half of it
+    assert window >= 2048, window
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: window)
+    _prepared, said, _ = _prepare(vault, question, n_ctx=32768)
+    assert not _window_notices(said), said
+
+
+def test_blocks_left_out_to_fit_are_said_in_plain_words(vault_env):
+    """A small window leaves vault matches out; the notice says what was
+    left out and why without the settings jargon."""
+    vault, _fake = vault_env
+    for i in range(12):
+        (vault / "data_in" / f"gasket_{i}.txt").write_text(
+            ("zebrafin gasket line %d " % i) * 400 + "\n", encoding="utf-8")
+    _prepared, said, _ = _prepare(vault, "search the vault for zebrafin",
+                                  n_ctx=1024)
+    left_out = [text for _w, text, _k in said if "left out" in text]
+    assert left_out, said
+    for word in JARGON:
+        assert word not in left_out[0], f"{word!r} in {left_out[0]!r}"
 
 
 #: App files that hold OLDER conversations or learned memory, each with a
