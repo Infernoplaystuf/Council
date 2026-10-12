@@ -146,13 +146,19 @@ def run_next_sitecustomize(here):
     Putting a sitecustomize first on PYTHONPATH hides any other — an
     interpreter's own, or coverage's for measuring subprocesses — so the
     next one on sys.path is found and run too. (None of this machine's
-    conda envs has one.)"""
+    conda envs has one.)
+
+    Only entries AFTER this folder are searched: tests/_offline's hook runs
+    the next one too, and with both on PYTHONPATH in either order, searching
+    every other entry would have each run the other in a loop."""
     import importlib.machinery
     import importlib.util
     import os
     mine = os.path.normcase(os.path.abspath(here))
-    rest = [p for p in sys.path
-            if p and os.path.normcase(os.path.abspath(p)) != mine]
+    norm = [os.path.normcase(os.path.abspath(p)) if p else "" for p in sys.path]
+    start = norm.index(mine) + 1 if mine in norm else 0
+    rest = [p for p, n in zip(sys.path[start:], norm[start:])
+            if p and n != mine]
     spec = importlib.machinery.PathFinder.find_spec("sitecustomize", rest)
     if spec is None or spec.loader is None:
         return

@@ -33,3 +33,11 @@ from tests.desktop_guard import desktop_openers  # noqa: E402,F401
 # No Tk window, in this process or any python child — installed on import,
 # before a test module is collected. See tests/no_tk_guard.py.
 from tests.no_tk_guard import no_tk_windows  # noqa: E402,F401
+
+# Tests must stay offline: no connection off loopback, none to the real
+# Ollama's port (11434), no DNS lookup — in this process or any python child,
+# installed on import like the Tk guard; a test that tried fails. Opt in to
+# port 11434 (for a fake of your own there) with the allow_ollama_port marker
+# or fixture. See tests/offline_guard.py.
+from tests.offline_guard import (allow_ollama_port, offline_network,  # noqa: E402,F401
+                                 offline_test)

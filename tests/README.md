@@ -8,13 +8,14 @@ Run everything with the Council's Python:
 script (`python tests/smoke_test.py`), which is how `setup_council.py` and
 `installs.txt` use it.
 
-Three guards are on for every test (`tests/conftest.py`; `inferno_local/tests`
+Four guards are on for every test (`tests/conftest.py`; `inferno_local/tests`
 imports the same ones):
 
 - `tests/sandbox_vault.py`: a throwaway app folder and vault, never `~/.council`.
 - `tests/desktop_guard.py`: nothing may open a window on the desktop (Explorer,
   a browser, `os.startfile`), and Qt runs offscreen.
 - `tests/no_tk_guard.py`: **no test may open a Tk window.**
+- `tests/offline_guard.py`: **tests must stay offline** (see "Offline" below).
 
 ## No Tk windows
 
@@ -62,3 +63,53 @@ test fails (exit 1, not 3) instead of a modal opening.
 
 On 2026-10-09 this was applied to all 72 tests that made a Tk window: the
 ports and Qt retargets are in the commits that removed them.
+
+## Offline
+
+The Council is offline by design, and so are its tests. For the whole run
+
+- a connection (TCP, or a UDP datagram) to anything but loopback,
+- a connection to port **11434** - the real Ollama's - on any address,
+- looking up a name other than `localhost` or this PC's own (a DNS query),
+  and a reverse lookup of anything but 127.0.0.1 / ::1,
+
+raise
+
+    EgressRefused: tests must stay offline - a connection to 1.2.3.4:443 would leave this PC; only loopback may be reached (...)
+
+in the pytest process and in every python child a test starts: the guard puts
+`tests/_offline/` on `PYTHONPATH` right after `tests/_no_tk/` (whose
+`sitecustomize.py` runs the next one), the same design as the Tk guard.
+`EgressRefused` is a `ConnectionRefusedError` (a name lookup's is a
+`socket.gaierror` too), so the code under test sees what it would see with
+the network unplugged and runs its own "offline" path. That cannot hide a
+test that reached out: every refusal, in this process or a child, is written
+to a report, and the autouse `offline_test` fixture **fails the test** it
+happened in, naming what was refused and the line that asked. Set
+`COUNCIL_OFFLINE_LOG=<file>` to have every refusal recorded there too (pid,
+test, what, where); in a clean run only `tests/test_offline_guard.py`
+appears in it. `python tests/smoke_test.py` installs the same guard, and its
+runner fails a check that tried.
+
+A fake server on loopback works as before - `tests/fake_ollama.py`'s
+`FakeOllama` (127.0.0.1, 127.0.0.2 or ::1, on a port of its own), or any
+server on `("127.0.0.1", 0)`. A test that must connect to port 11434 itself
+(one that puts its own fake there) opts in with `@pytest.mark.allow_ollama_port`
+or the `allow_ollama_port` fixture - loopback only, still.
+
+When a test trips it:
+
+- **It lists the installed models** (`local_models.list_local_models`, which
+  asks the localhost Ollama for `/api/tags`): stub that, as the Models-tab
+  tests do, or point `COUNCIL_OLLAMA_HOST` at a `FakeOllama`.
+- **It builds a tab whose worker probes Ollama hosts** (Nodes,
+  Connections): give it a stand-in dispatcher or stub its actions - see the
+  `window` fixture in `tests/test_council_qt_foundation.py`. Wait for the
+  worker before the test ends, or it asks during the next test.
+- **It would download something**: stub the download (`urlopen`, and
+  `huggingface_hub` - `model_downloader` tries it first when it is installed;
+  see `test_model_downloader` in `smoke_test.py`).
+
+Not covered: children started with `-I`, `-E` or `-S`, or with an
+environment without `PYTHONPATH`, and programs that are not Python (`git`,
+`ssh`, `curl`, `ollama`) - no test starts one that goes online today.

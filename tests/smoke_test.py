@@ -66,10 +66,16 @@ if str(REPO) not in sys.path:
 # before any import below can find the user's real ~/.council. Measured: a run
 # of this file rewrote three index files in the real vault. The Tk guard is
 # installed here for the same reason: no check may open a Tk window (the Tk
-# GUIs are deprecated — tests/no_tk_guard.py).
+# GUIs are deprecated — tests/no_tk_guard.py). So is the offline guard: no
+# check may connect off loopback or to the real Ollama's port, or look up a
+# name (tests/offline_guard.py), and _run fails a check that tried even when
+# the code under test swallowed the refusal. Measured 2026-10-12: as a
+# script, the model-downloader check made real HTTPS connections to
+# huggingface.co, just as it did under pytest.
 if __name__ == "__main__":
     import tests.sandbox_vault  # noqa: E402,F401
     import tests.no_tk_guard  # noqa: E402,F401
+    import tests.offline_guard  # noqa: E402,F401
 
 
 # ─── Test runner ────────────────────────────────────────────────────
@@ -127,6 +133,14 @@ def _run(label: str, fn) -> None:
         _FAILS.append((label, repr(exc)))
         print(f"  ✗ {label} raised: {exc!r}")
         traceback.print_exc()
+    # Script mode loads no conftest, so there is no offline_test fixture: a
+    # check that tried to go online fails here (tests/offline_guard.py).
+    guard = sys.modules.get("tests.offline_guard")
+    refused = guard.take_refusals() if guard is not None else []
+    if refused:
+        detail = f"{guard.MESSAGE} - refused:\n{guard.describe(refused)}"
+        _FAILS.append((label, detail))
+        print(f"  ✗ {label}: {detail}")
 
 
 _ABSENT_OPTIONAL = "isn't installed"
