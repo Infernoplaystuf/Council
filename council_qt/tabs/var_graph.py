@@ -1,10 +1,17 @@
 """
 council_qt.tabs.var_graph — which variables in a script feed which, drawn.
 
-For a bug hunt: open a script, pick the variable whose value is wrong, and see
-what it was made from (left of it) and what it goes on to make (right of it),
-each link labelled with the line that makes it. Click a link or a trace row to
+For a bug hunt: open a script - or a folder of them, such as a GUI and the
+scripts it calls - pick the variable whose value is wrong, and see what it was
+made from (left of it) and what it goes on to make (right of it), each link
+labelled with the file and line that makes it. Click a link or a trace row to
 read that line in the source; click a node to make it the centre.
+
+Across files, values are followed through imports and calls between the
+scripts, GUI ports (self.ports.x.get() / .set()), subprocess launches into
+sys.argv, and Thread(target=..., args=...). Imports of anything that is not
+one of the opened scripts (numpy, PySide6, the standard library) are not
+followed; a call into one links its arguments to its result.
 
 The analysis is council_core.var_graph (static, `ast` only — the script is
 never run or imported). It runs on a worker; the result comes back through the
@@ -19,7 +26,7 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import (QBrush, QColor, QFont, QPainter, QPainterPath,
                            QPainterPathStroker, QPen, QTextCursor, QTextFormat)
-from PySide6.QtWidgets import (QCheckBox, QGraphicsPathItem,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGraphicsPathItem,
                                QGraphicsRectItem, QGraphicsScene,
                                QGraphicsSimpleTextItem, QGraphicsView,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -35,26 +42,38 @@ from ..view import amp
 
 ROLE_VAR = Qt.ItemDataRole.UserRole          # a node id
 ROLE_LINE = Qt.ItemDataRole.UserRole + 1     # a source line
+ROLE_FILE = Qt.ItemDataRole.UserRole + 2     # the file that line is in
 
 #: Most nodes drawn in one column before the rest are summarised.
 COLUMN_CAP = 18
 NODE_W, NODE_H, COL_GAP, ROW_GAP = 190, 30, 90, 12
 
 KIND_COLOUR = {"variable": "#5b7fa6", "param": "#7ea16d", "attribute": "#a07cc0",
-               "return": "#c9a227", "import": "#7a7575", "global": "#5b7fa6"}
+               "return": "#c9a227", "import": "#7a7575", "global": "#5b7fa6",
+               "port": "#d32f2f", "argv": "#e0884a"}
+
+#: A link between two different files is drawn in this colour.
+CROSS_FILE = "#e0884a"
+
+#: Paths in the path box are separated by this.
+SEP = " ; "
 
 
 class VarGraphActions:
     """What the tab asks of the application; a test can swap any of it."""
 
-    def analyze(self, path: str, conditions: bool) -> vgm.VarGraph:
-        return vgm.analyze_file(path, conditions)
+    def analyze(self, paths: List[str], conditions: bool) -> vgm.VarGraph:
+        return vgm.analyze_paths(paths, conditions)
 
-    def pick_file(self, parent) -> str:
+    def pick_files(self, parent) -> List[str]:
         from .. import dialogs
-        return dialogs.askopenfilename("Open a Python script",
-                                       filetypes=[("Python", "*.py *.pyw")],
-                                       parent=parent)
+        return dialogs.askopenfilenames("Open Python scripts",
+                                        filetypes=[("Python", "*.py *.pyw")],
+                                        parent=parent)
+
+    def pick_folder(self, parent) -> str:
+        from .. import dialogs
+        return dialogs.askdirectory("Open a folder of scripts", parent=parent)
 
 
 def neighbourhood(g: vgm.VarGraph, focus: str, depth: int,
@@ -79,7 +98,9 @@ class _Node(QGraphicsRectItem):
         self.setBrush(QBrush(colour.darker(170) if not focus else colour))
         self.setPen(QPen(colour.lighter(130), 3 if focus else 1))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        label = var.name if var.kind != "return" else f"{var.scope}() ⏎"
+        label = var.name if var.kind != "return" else f"{var.local_scope}() ⏎"
+        if var.module and var.kind != "port":
+            label += f" · {var.module.rsplit('.', 1)[-1]}"
         text = QGraphicsSimpleTextItem(label, self)
         text.setBrush(QBrush(QColor("#f0f0f0")))
         f = QFont()
@@ -90,8 +111,12 @@ class _Node(QGraphicsRectItem):
             text.setText(label + "…")
         r = text.boundingRect()
         text.setPos((NODE_W - r.width()) / 2, (NODE_H - r.height()) / 2)
-        self.setToolTip(f"{var.label}\n{var.kind}\nwritten on "
-                        f"{vgm._lines(var.defined)}\nread on {vgm._lines(var.used)}")
+        self.setToolTip(f"{var.label}\n{var.kind}"
+                        + (f" in {Path(var.file).name}" if var.file else "")
+                        + f"\nwritten on {vgm._lines(var.defined)}"
+                        f"\nread on {vgm._lines(var.used)}"
+                        + (f"\nalso: {', '.join(var.elsewhere[:8])}"
+                           if var.elsewhere else ""))
 
     def mousePressEvent(self, event):                      # noqa: N802
         self._on_click(self.var.id)
@@ -99,18 +124,20 @@ class _Node(QGraphicsRectItem):
 
 
 class _Link(QGraphicsPathItem):
-    def __init__(self, path: QPainterPath, edges: List[vgm.Edge], on_click):
+    def __init__(self, path: QPainterPath, edges: List[vgm.Edge], on_click,
+                 cross: bool = False):
         super().__init__(path)
         self.edges = edges
         self._on_click = on_click
         dashed = all(e.kind == "condition" for e in edges)
-        pen = QPen(QColor("#9a9090"), 1.4)
+        pen = QPen(QColor(CROSS_FILE if cross else "#9a9090"), 2 if cross else 1.4)
         if dashed:
             pen.setStyle(Qt.PenStyle.DashLine)
         self.setPen(pen)
         self.setZValue(-1)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("\n".join(f"L{e.line} {e.kind}: {e.code}" for e in edges[:6]))
+        self.setToolTip("\n".join(f"{Path(e.file).name}:{e.line} {e.kind}: {e.code}"
+                                  for e in edges[:6]))
 
     def shape(self):                                       # wider hit area
         s = QPainterPathStroker()
@@ -118,7 +145,7 @@ class _Link(QGraphicsPathItem):
         return s.createStroke(self.path())
 
     def mousePressEvent(self, event):                      # noqa: N802
-        self._on_click(self.edges[0].line)
+        self._on_click(self.edges[0].line, self.edges[0].file)
         event.accept()
 
 
@@ -132,7 +159,7 @@ class GraphView(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.on_node = lambda vid: None
-        self.on_line = lambda line: None
+        self.on_line = lambda line, file=None: None
         self.nodes: Dict[str, _Node] = {}
 
     def wheelEvent(self, event):                           # noqa: N802
@@ -202,7 +229,10 @@ class GraphView(QGraphicsView):
             path.lineTo(tip - u * 9 + p * 4)
             path.moveTo(tip)
             path.lineTo(tip - u * 9 - p * 4)
-            scene.addItem(_Link(path, edges, self.on_line))
+            cross = bool(g.modules) and g.vars[s].file != g.vars[d].file \
+                and g.vars[s].kind != "port" and g.vars[d].kind != "port"
+            scene.addItem(_Link(path, edges, self.on_line,
+                                cross or any(e.kind in ("argv", "import") for e in edges)))
         rect = scene.itemsBoundingRect().adjusted(-30, -30, 30, 30)
         scene.setSceneRect(rect)
         self.resetTransform()
@@ -233,9 +263,10 @@ def fill_trace(tree: QTreeWidget, g: vgm.VarGraph, focus: str, depth: int,
                 v = g.vars[nxt]
                 again = nxt in expanded
                 item = QTreeWidgetItem([v.label + ("   ↑ see above" if again and step(nxt, conditions) else ""),
-                                        f"L{e.line} {e.kind}", e.code])
+                                        f"{vgm._at(g, e)} {e.kind}", e.code])
                 item.setData(0, ROLE_VAR, nxt)
                 item.setData(0, ROLE_LINE, e.line)
+                item.setData(0, ROLE_FILE, e.file)
                 parent.addChild(item)
                 if not again:
                     expanded.add(nxt)
@@ -254,15 +285,27 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     tokens = theme.tokens("dark")
     page = QWidget()
     page.actions = actions
-    state: Dict[str, object] = {"graph": None, "focus": None}
+    state: Dict[str, object] = {"graph": None, "focus": None, "file": None}
     layout = QVBoxLayout(page)
 
     row = QHBoxLayout()
     path_edit = QLineEdit(page)
-    path_edit.setPlaceholderText("Path to a .py script")
+    path_edit.setPlaceholderText("A .py script, or a folder of scripts "
+                                 f"(several: separate with '{SEP.strip()}')")
+    path_edit.setToolTip("Every script in a folder is read together, so a "
+                         "value can be followed from a GUI into the scripts "
+                         "it calls. Outside packages are not followed.")
     row.addWidget(path_edit, 1)
-    browse = QPushButton(amp("📂 Browse…"), page)
-    row.addWidget(browse)
+    pick_files = QPushButton(amp("📄 Scripts…"), page)
+    pick_files.setToolTip("Choose one or more .py files")
+    row.addWidget(pick_files)
+    pick_folder = QPushButton(amp("📁 Folder…"), page)
+    pick_folder.setToolTip("Choose a folder: every .py in it, and below it")
+    row.addWidget(pick_folder)
+    add_more = QPushButton(amp("➕ Add"), page)
+    add_more.setToolTip("Add more scripts to the ones already chosen - e.g. a "
+                        "script the GUI calls that lives somewhere else")
+    row.addWidget(add_more)
     run = QPushButton(amp("🔗 Map variables"), page)
     run.setObjectName("analyze")
     row.addWidget(run)
@@ -279,17 +322,25 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     row.addWidget(depth)
     layout.addLayout(row)
 
-    status = QLabel("Open a script to see how its variables feed each other.", page)
+    status = QLabel("Open a script, or a folder of scripts, to see how their "
+                    "variables feed each other.", page)
     status.setStyleSheet(f"color: {tokens['muted_fg']};")
+    status.setWordWrap(True)
     layout.addWidget(status)
 
     split = QSplitter(Qt.Orientation.Horizontal, page)
     layout.addWidget(split, 1)
 
-    # left: search + variables + findings
+    # left: file filter + search + variables + findings
     left = QWidget(split)
     lv = QVBoxLayout(left)
     lv.setContentsMargins(0, 0, 0, 0)
+    file_filter = QComboBox(left)
+    file_filter.setObjectName("files")
+    file_filter.setToolTip("Show the variables of one file only")
+    file_filter.addItem("All files", None)
+    file_filter.setVisible(False)
+    lv.addWidget(file_filter)
     search = QLineEdit(left)
     search.setPlaceholderText("Find a variable…")
     lv.addWidget(search)
@@ -301,7 +352,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     findings.setObjectName("findings")
     findings.setToolTip("Patterns that are often the bug: names read but never "
                         "assigned, values assigned and never read, parameters "
-                        "overwritten before use.")
+                        "replaced before use, scripts that do not parse.")
     lv.addWidget(findings, 1)
 
     # middle: graph over trace
@@ -311,7 +362,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     trace = QTreeWidget(tabs)
     trace.setObjectName("trace")
     trace.setHeaderLabels(["Variable", "How", "Line"])
-    trace.setColumnWidth(0, 260)
+    trace.setColumnWidth(0, 300)
     tabs.addTab(trace, "Trace")
     code = QPlainTextEdit(tabs)
     code.setObjectName("source")
@@ -324,32 +375,38 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     mid.setSizes([520, 340])
     split.setStretchFactor(0, 1)
     split.setStretchFactor(1, 4)
-    split.setSizes([280, 1100])
+    split.setSizes([300, 1100])
 
     page.view, page.trace, page.code = view, trace, code
     page.var_list, page.findings, page.status = var_list, findings, status
     page.path_edit, page.conditions, page.depth = path_edit, conds, depth
+    page.file_filter, page.search = file_filter, search
 
     # -- behaviour -------------------------------------------------------
-    def show_line(line: int, others: List[int] = ()) -> None:
-        """Highlight `line` (and lightly, `others`) in the source and scroll
+    def open_file(file: Optional[str]) -> None:
+        """Put `file`'s source in the Source tab, if it is not there."""
+        g = state["graph"]
+        if g is None or not file or file == state["file"]:
+            return
+        code.setPlainText(g.source_of(file) or g.source)
+        state["file"] = file
+        tabs.setTabText(tabs.indexOf(code), f"Source — {Path(file).name}")
+
+    def show_line(line: int, file: Optional[str] = None) -> None:
+        """Highlight `line` of `file` (the one shown, if None) and scroll
         to it."""
+        open_file(file)
         sels = []
-        for n, colour in [(n, "#3a2f1a") for n in others if n != line] + \
-                [(line, tokens["selection_bg"])]:
-            block = code.document().findBlockByNumber(n - 1)
-            if not block.isValid():
-                continue
+        block = code.document().findBlockByNumber(max(line - 1, 0))
+        if block.isValid() and line > 0:
             sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(QColor(colour))
+            sel.format.setBackground(QColor(tokens["selection_bg"]))
             sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
             sel.cursor = QTextCursor(block)
             sels.append(sel)
-        code.setExtraSelections(sels)
-        block = code.document().findBlockByNumber(max(line - 1, 0))
-        if block.isValid():
             code.setTextCursor(QTextCursor(block))
             code.centerCursor()
+        code.setExtraSelections(sels)
         tabs.setCurrentWidget(code)
 
     def focus_on(vid: str) -> None:
@@ -362,17 +419,26 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         fill_trace(trace, g, vid, depth.value(), c)
         tabs.setCurrentWidget(trace)
         v = g.vars[vid]
-        up = len(g.upstream(vid, None, c))
-        down = len(g.downstream(vid, None, c))
-        status.setText(f"{v.label} — {v.kind}; written on {vgm._lines(v.defined)}, "
-                       f"read on {vgm._lines(v.used)}. {up} variables can affect it; "
-                       f"it can affect {down}.")
+        up = g.upstream(vid, None, c)
+        down = g.downstream(vid, None, c)
+        files = {s.var.file for s in up + down if s.var.file} - {v.file}
+        across = f" across {len(files) + 1} files" if files else ""
+        where = f" in {Path(v.file).name}" if g.modules and v.file else ""
+        others = sorted(dict.fromkeys(v.elsewhere), key=lambda x: x.startswith("read"))
+        lines = [f"written on {vgm._lines(v.defined)}"] if v.defined else []
+        lines += [f"read on {vgm._lines(v.used)}"] if v.used else []
+        lines += [", ".join(others[:6]) + ("…" if len(others) > 6 else "")] if others else []
+        status.setText(f"{v.label} — {v.kind}{where}"
+                       + (f"; {'; '.join(lines)}" if lines else "")
+                       + f". {len(up)} variables can affect it; it can "
+                       f"affect {len(down)}{across}.")
         for i in range(var_list.count()):
             if var_list.item(i).data(ROLE_VAR) == vid:
                 var_list.blockSignals(True)
                 var_list.setCurrentRow(i)
                 var_list.blockSignals(False)
                 break
+        open_file(v.file)
         code.setExtraSelections([])
 
     def fill_list() -> None:
@@ -381,14 +447,23 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         if g is None:
             return
         text = search.text().strip()
+        only = file_filter.currentData()
         vs = g.find(text) if text else sorted(
-            g.vars.values(), key=lambda v: (v.scope != vgm.MODULE, v.scope, v.name))
+            g.vars.values(), key=lambda v: (v.kind != "port", v.module,
+                                            v.local_scope != vgm.MODULE,
+                                            v.local_scope, v.name))
         for v in vs:
-            item = QListWidgetItem(f"{v.label}")
+            if only and v.file != only:
+                continue
+            item = QListWidgetItem(v.label)
             item.setData(ROLE_VAR, v.id)
             item.setForeground(QColor(KIND_COLOUR.get(v.kind, tokens["fg"])).lighter(140))
-            item.setToolTip(f"{v.kind}; written on {vgm._lines(v.defined)}; "
-                            f"read on {vgm._lines(v.used)}")
+            item.setToolTip(f"{v.kind}"
+                            + (f" in {Path(v.file).name}" if v.file else "")
+                            + f"; written on {vgm._lines(v.defined)}; "
+                            f"read on {vgm._lines(v.used)}"
+                            + (f"; also {', '.join(v.elsewhere[:6])}"
+                               if v.elsewhere else ""))
             var_list.addItem(item)
 
     def deliver(g: Optional[vgm.VarGraph], error: str) -> None:
@@ -398,16 +473,28 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
             window.set_status("Variable map failed")
             return
         state["graph"] = g
-        code.setPlainText(g.source)
+        state["file"] = None
+        open_file(g.files[0] if g.files else None)
+        if not g.files:
+            code.setPlainText(g.source)
+        file_filter.blockSignals(True)
+        file_filter.clear()
+        file_filter.addItem("All files", None)
+        for mod in sorted(g.modules):
+            file_filter.addItem(f"{mod}  ({Path(g.modules[mod]).name})", g.modules[mod])
+        file_filter.setVisible(bool(g.modules))
+        file_filter.blockSignals(False)
         fill_list()
         findings.clear()
         for f in g.findings:
-            item = QListWidgetItem(f"L{f.line}  {f.message}")
+            at = f"{Path(f.file).name}:{f.line}" if g.modules else f"L{f.line}"
+            item = QListWidgetItem(f"{at}  {f.message}")
             item.setData(ROLE_LINE, f.line)
+            item.setData(ROLE_FILE, f.file)
             item.setData(ROLE_VAR, f"{f.scope}::{f.name}")
             findings.addItem(item)
-        status.setText(f"{Path(g.filename).name}: {vgm.summary(g)}. "
-                       "Pick a variable to trace it.")
+        what = f"{len(g.modules)} files" if g.modules else Path(g.filename).name
+        status.setText(f"{what}: {vgm.summary(g)}. Pick a variable to trace it.")
         window.set_status("Variable map ready")
         prev = state["focus"]
         if isinstance(prev, str) and prev in g.vars:
@@ -416,36 +503,47 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
             view.scene().clear()
             trace.clear()
 
+    def chosen_paths() -> List[str]:
+        return [p.strip().strip('"') for p in path_edit.text().split(SEP.strip())
+                if p.strip().strip('"')]
+
     def analyze() -> None:
-        path = path_edit.text().strip().strip('"')
-        if not path:
-            status.setText("Choose a script first.")
+        paths = chosen_paths()
+        if not paths:
+            status.setText("Choose a script or a folder first.")
             return
-        if not Path(path).is_file():
-            status.setText(f"No such file: {path}")
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            status.setText(f"No such file or folder: {missing[0]}")
             return
         run.setEnabled(False)
-        status.setText("Reading the script…")
+        status.setText("Reading the scripts…")
         window.set_status("Mapping variables …")
         c = conds.isChecked()
 
         def work() -> None:
             try:
-                g, err = actions.analyze(path, c), ""
+                g, err = actions.analyze(paths, c), ""
             except SyntaxError as exc:
-                g, err = None, f"The script does not parse (line {exc.lineno}): {exc.msg}"
+                g, err = None, (f"{Path(exc.filename or '').name or 'The script'} "
+                                f"does not parse (line {exc.lineno}): {exc.msg}")
+            except FileNotFoundError as exc:
+                g, err = None, str(exc)
             except Exception as exc:                       # noqa: BLE001
                 g, err = None, f"Could not read it: {exc}"
             window.bridge.call_on_ui(lambda: deliver(g, err))
 
         threading.Thread(target=work, name="var-graph", daemon=True).start()
 
-    def on_browse() -> None:
-        path = actions.pick_file(page)
-        if path:
-            path_edit.setText(path)
+    def set_paths(paths: List[str], add: bool = False) -> None:
+        if not paths:
+            return
+        current = chosen_paths() if add else []
+        merged = current + [p for p in paths if p not in current]
+        path_edit.setText(SEP.join(merged))
+        if not add:
             state["focus"] = None
-            analyze()
+        analyze()
 
     def on_var(item: Optional[QListWidgetItem]) -> None:
         if item is not None:
@@ -456,12 +554,12 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
         vid = item.data(ROLE_VAR)
         if g is not None and vid in g.vars:
             focus_on(vid)
-        show_line(item.data(ROLE_LINE))
+        show_line(item.data(ROLE_LINE), item.data(ROLE_FILE))
 
     def on_trace(item: QTreeWidgetItem, _col: int) -> None:
         line = item.data(0, ROLE_LINE)
         if line:
-            show_line(line)
+            show_line(line, item.data(0, ROLE_FILE))
 
     def on_trace_double(item: QTreeWidgetItem, _col: int) -> None:
         vid = item.data(0, ROLE_VAR)
@@ -479,10 +577,14 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
 
     view.on_node = focus_on
     view.on_line = show_line
-    browse.clicked.connect(on_browse)
+    pick_files.clicked.connect(lambda: set_paths(actions.pick_files(page)))
+    pick_folder.clicked.connect(
+        lambda: set_paths([p] if (p := actions.pick_folder(page)) else []))
+    add_more.clicked.connect(lambda: set_paths(actions.pick_files(page), add=True))
     run.clicked.connect(analyze)
     path_edit.returnPressed.connect(analyze)
     search.textChanged.connect(lambda _t: fill_list())
+    file_filter.currentIndexChanged.connect(lambda _i: fill_list())
     var_list.currentItemChanged.connect(lambda cur, _prev: on_var(cur))
     findings.itemClicked.connect(on_finding)
     trace.itemClicked.connect(on_trace)
@@ -491,6 +593,7 @@ def build_var_graph(window, actions: Optional[VarGraphActions] = None) -> QWidge
     conds.toggled.connect(lambda _on: on_conditions())
 
     page.analyze = analyze
+    page.set_paths = set_paths
     page.focus_on = focus_on
     page.show_line = show_line
     page.state = state

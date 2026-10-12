@@ -208,3 +208,243 @@ def test_every_script_in_the_repo_analyzes():
         for vid in list(g.vars)[:10]:
             g.upstream(vid)
             g.downstream(vid)
+
+
+# ----------------------------------------------------------------------
+# across files: a GUI and the scripts it calls
+# ----------------------------------------------------------------------
+#: Shaped like a GUI Designer project (main.py, app.py = HandlerMixin +
+#: MainUi, handlers.py, ui/ports.py) with the scripts it hands values to:
+#: by a direct call (frame_timing), a thread (scripts/analysis) and a
+#: subprocess (worker.py), and a config module read both ways.
+GUI_PROJECT = {
+    "main.py": '''
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent))
+        from app import App
+
+        if __name__ == "__main__":
+            App().run()
+    ''',
+    "app.py": '''
+        from handlers import HandlerMixin
+        from ui.main_ui import MainUi
+
+
+        class App(HandlerMixin, MainUi):
+            def run(self):
+                self.build()
+    ''',
+    "handlers.py": '''
+        import subprocess
+        import sys
+        import threading
+
+        from scripts.analysis import summarize
+
+
+        class HandlerMixin:
+            def on_scan(self):
+                try:
+                    from frame_timing import scan_report
+                    result = scan_report(self.ports.capture_folder.get())
+                    self.ports.bad_count.set(result["count"])
+                except Exception as exc:
+                    self.report_error("Scan", exc)
+
+            def on_export(self):
+                folder = self.ports.capture_folder.get()
+                limit = self.ports.limit.get()
+                subprocess.run([sys.executable, "worker.py", folder, str(limit)])
+
+            def on_summary(self):
+                t = threading.Thread(target=summarize,
+                                     args=(self.ports.capture_folder.get(),))
+                t.start()
+
+            def report_error(self, title, exc):
+                self.last_error = f"{title}: {exc}"
+                self.status_text = self.last_error
+    ''',
+    "ui/__init__.py": "",
+    "ui/ports.py": '''
+        class _TextPort:
+            def __init__(self, name, widget):
+                self.name = name
+                self.widget = widget
+
+
+        class Ports:
+            def __init__(self, ui):
+                self.capture_folder = _TextPort("capture_folder", ui.folder_edit)
+                self.limit = _TextPort("limit", ui.limit_spin)
+                self.bad_count = _TextPort("bad_count", ui.count_label)
+    ''',
+    "ui/main_ui.py": '''
+        from .ports import Ports
+
+
+        class MainUi:
+            def build(self):
+                self.ports = Ports(self)
+                self.status_text = ""
+    ''',
+    "frame_timing.py": '''
+        import numpy as np
+
+        import config
+        from config import THRESHOLD
+
+
+        def list_frames(folder):
+            return sorted(folder.glob("*.png"))
+
+
+        def scan_report(folder):
+            frames = list_frames(folder)
+            gaps = np.diff([f.stat().st_mtime for f in frames])
+            bad = [g for g in gaps if g > THRESHOLD * config.SCALE]
+            return {"count": len(bad), "names": bad}
+    ''',
+    "config.py": '''
+        THRESHOLD = 0.5
+        SCALE = 2
+    ''',
+    "scripts/analysis.py": '''
+        def summarize(folder):
+            total = len(list(folder.iterdir()))
+            return total
+    ''',
+    "worker.py": '''
+        import argparse
+        import sys
+
+        folder = sys.argv[1]
+        limit = int(sys.argv[2])
+        parser = argparse.ArgumentParser()
+        args = parser.parse_args()
+        print(folder, limit, args)
+    ''',
+    # Not part of the project: the Designer's backups are skipped.
+    ".backups/old_handlers.py": "def broken(:\n",
+}
+
+
+def write_project(root: Path, files=GUI_PROJECT) -> Path:
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(textwrap.dedent(text), encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def gui(tmp_path):
+    return vg.analyze_paths([write_project(tmp_path / "proj")])
+
+
+def test_project_files_names_modules_and_skips_backups(tmp_path):
+    root = write_project(tmp_path / "proj")
+    mods = vg.project_files([root])
+    assert set(mods) == {"main", "app", "handlers", "ui", "ui.ports",
+                         "ui.main_ui", "frame_timing", "config",
+                         "scripts.analysis", "worker"}
+    assert mods["ui"].endswith("__init__.py")
+
+
+def test_gui_port_flows_into_the_called_script_and_back(gui):
+    port = gui.resolve("ports.capture_folder")
+    assert port.kind == "port"
+    down = downs(gui, "ports.capture_folder")
+    assert "frame_timing:scan_report::folder" in down       # direct call
+    assert "frame_timing:list_frames::folder" in down       # and on within it
+    assert "ports.bad_count" in {gui.vars[v].name for v in down}   # result shown
+    chain = gui.path(port.id, "<gui ports>::ports.bad_count")
+    files = [Path(e.file).name for e in chain]
+    assert files[0] == "handlers.py" and "frame_timing.py" in files
+    assert files[-1] == "handlers.py"
+
+
+def test_the_widget_feeds_its_port(gui):
+    up = ups(gui, "ports.capture_folder")
+    assert "ui.ports:Ports.__init__::ui" in up
+
+
+def test_subprocess_arguments_become_the_scripts_argv(gui):
+    up = ups(gui, "worker.folder")
+    assert {"worker:<module>::sys.argv[1]", "handlers:HandlerMixin.on_export::folder",
+            "<gui ports>::ports.capture_folder"} <= up
+    assert "<gui ports>::ports.limit" in ups(gui, "worker.limit")
+    assert "<gui ports>::ports.limit" not in ups(gui, "worker.folder")
+    # argparse reads all of sys.argv
+    assert "<gui ports>::ports.capture_folder" in ups(gui, "worker.args")
+
+
+def test_thread_target_gets_its_args(gui):
+    assert "<gui ports>::ports.capture_folder" in ups(gui, "scripts.analysis.summarize.total")
+
+
+def test_module_variables_cross_files(gui):
+    up = ups(gui, "frame_timing.scan_report.bad")
+    assert "config:<module>::THRESHOLD" in up              # from config import
+    assert "config:<module>::SCALE" in up                  # config.SCALE
+    kinds = {(e.src, e.dst): e.kind for e in gui.edges}
+    assert kinds[("config:<module>::THRESHOLD",
+                  "frame_timing:<module>::THRESHOLD")] == "import"
+
+
+def test_outside_packages_are_not_followed(gui):
+    # numpy is a black box: np is a name in frame_timing, nothing inside it
+    assert not any(v.module == "numpy" or v.scope.startswith("numpy")
+                   for v in gui.vars.values())
+    assert "frame_timing:<module>::np" in ups(gui, "frame_timing.scan_report.gaps")
+
+
+def test_mixins_share_self_attributes_and_methods(gui):
+    # App(HandlerMixin, MainUi): MainUi sets self.status_text, the mixin's
+    # report_error sets it too - one node, in the App family
+    v = gui.resolve("self.status_text")
+    assert v.scope == "app:App"
+    assert "app:App::self.last_error" in ups(gui, "self.status_text")
+    # self.report_error(...) inside the mixin lands in the mixin's method
+    assert "handlers:HandlerMixin.on_scan::exc" in ups(gui, "handlers.HandlerMixin.report_error.exc")
+    assert not [f for f in gui.findings if f.kind == "undefined"]
+
+
+def test_relative_imports_and_findings_carry_files(tmp_path):
+    root = write_project(tmp_path / "pkg", {
+        "pkg/__init__.py": "",
+        "pkg/a.py": "from .b import helper\n\ndef run(x):\n    y = helper(x)\n    return y\n",
+        "pkg/b.py": "def helper(v):\n    unused = 1\n    return v * 2\n",
+    })
+    g = vg.analyze_paths([root])
+    assert "pkg.a:run::x" in ups(g, "pkg.b.helper.v")
+    f = next(f for f in g.findings if f.kind == "unused")
+    assert f.file.endswith("b.py") and "pkg.b" in f.message
+
+
+def test_a_broken_file_is_skipped_and_reported(tmp_path):
+    root = write_project(tmp_path / "p", {"good.py": "x = 1\n",
+                                          "bad.py": "def (:\n"})
+    g = vg.analyze_paths([root])
+    assert "good:<module>::x" in g.vars
+    assert any(f.kind == "syntax" and f.file.endswith("bad.py") for f in g.findings)
+
+
+def test_files_and_folders_mix(tmp_path):
+    root = write_project(tmp_path / "gui", {"gui.py": "from tool import go\n\ndef click(v):\n    go(v)\n"})
+    lib = write_project(tmp_path / "elsewhere", {"tool.py": "def go(n):\n    return n\n"})
+    g = vg.analyze_paths([root, lib / "tool.py"])
+    assert "gui:click::v" in ups(g, "tool.go.n")
+
+
+def test_command_line_on_a_folder(tmp_path, capsys):
+    root = write_project(tmp_path / "proj")
+    assert vg.main([str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "10 files" in out
+    assert vg.main([str(root), "--up", "worker.folder"]) == 0
+    out = capsys.readouterr().out
+    assert "handlers.py:" in out and "ports.capture_folder" in out
+    assert vg.main([str(tmp_path / "nope")]) == 2
