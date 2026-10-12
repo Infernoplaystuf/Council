@@ -228,6 +228,38 @@ Useful for hands-free brainstorming.
 
 ---
 
+## Variable Map
+
+For tracking down a bug in a Python script — or in a GUI and the scripts it calls. Open a script (**📄 Scripts…**) or a whole folder (**📁 Folder…**), pick the variable whose value is wrong, and the map shows **what fed it** (left) and **what it feeds** (right), each link labelled with the file and line that makes it. The scripts are only read, never run.
+
+- **Click a node** to make it the centre; **click a link** or a row in **Trace** to jump to that line in **Source** (it switches file when the line is in another one). Orange links cross from one file to another.
+- **➕ Add** puts more scripts alongside the ones already open — e.g. a script the GUI calls that lives in another folder. The file box at the top of the list shows one file's variables at a time.
+- **Depth** is how many hops out to show. **Include if/while conditions** also links the variables an `if`/`while` tests to what it guards — useful for "why did this branch run?", but busier.
+- **Worth a look** lists the usual suspects: names read but never assigned (typos), values assigned and never read, parameters replaced before they're used, and scripts that don't parse.
+
+**Across files** a value is followed through:
+
+- imports and calls between the open scripts (`from frame_timing import scan_report` → `scan_report(x)` links `x` to its parameter, and its `return` back), and module variables (`from config import RATE`, `config.RATE`);
+- **GUI ports** — `self.ports.capture_folder.get()` / `.set(...)` is one node per port, so a GUI Designer app traces from the widget, through `handlers.py`, into the attached script and back to the port that shows the result;
+- `subprocess.run([sys.executable, "worker.py", a, b])` → `worker.py`'s `sys.argv[1]`, `sys.argv[2]` (and argparse);
+- `threading.Thread(target=f, args=(a,))`, `functools.partial(f, a)`, `pool.submit(f, a)`;
+- `self.x` shared by classes that inherit from each other (`App(HandlerMixin, MainUi)`).
+
+Packages that aren't among the open scripts — numpy, PySide6, the standard library — are not followed: a call into one just links its arguments to its result. Values passed through files on disk, environment variables, queues or `getattr` aren't followed either.
+
+The same analysis runs from a shell, no GUI needed:
+
+```
+python -m council_core.var_graph script.py              # summary + findings
+python -m council_core.var_graph my_gui_folder/          # a GUI and its scripts
+python -m council_core.var_graph script.py --up total   # what feeds `total`
+python -m council_core.var_graph my_gui_folder/ --up worker.folder
+python -m council_core.var_graph my_gui_folder/ --path ports.capture_folder ports.bad_count
+python -m council_core.var_graph script.py --dot --up total > total.dot   # Graphviz
+```
+
+---
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
