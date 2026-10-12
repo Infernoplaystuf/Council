@@ -130,3 +130,26 @@ python child `subprocess.Popen` starts out of the guard's reach gets a line
 there - `a python child without the guard (started with -I): <command
 line>`, and the line that started it - which fails nothing, but shows which
 children only their own fences and code review vouch for.
+
+## Cameras
+
+The Typhon and camera tests run in the council env, which has neither
+camera SDK, and in the `pylon` env, which has pypylon (and OpenEB on the
+path): there they run in ONE process with `PYLON_CAMEMU=2`, which puts two
+emulated Baslers at the TOP of every camera list. So:
+
+- **A test means the simulated camera: it picks it by name** -
+  `tests/sim_cameras.py`'s `simulated_row(rows, kind)` /
+  `simulated_index(rows, kind)` (its row says "Simulated"), never "the
+  first row ending in frame", which is an emulated Basler there
+  (`'BaslerDevice' object has no attribute 'state'`).
+- **A test of a PC without an SDK hides them**: `without_camera_sdks(
+  monkeypatch)` makes `pypylon` and `metavision_hal` unimportable for that
+  test, whatever is installed.
+- **Only the emulator's own tests set `PYLON_CAMEMU`**, per test, in an
+  autouse fixture (`tests/test_basler_real.py`, `tests/test_basler_scan.py`)
+  - never at import, where it stayed set for the whole process. pylon reads
+  it at every enumeration (measured), so that is enough.
+- `council_qt.tabs` imports its tabs when its registry is first asked for,
+  so `tests/test_capture_tab.py` collects where matplotlib (the Grapher's)
+  is not installed - the pylon env.

@@ -44,6 +44,7 @@ from council_core import camera_presets, camera_settings, cameras
 from council_qt.widgets import camera_settings_window as csw
 from council_qt.widgets import settings_tabs as st
 from tests import fake_evk4
+from tests.sim_cameras import is_simulated
 
 GENERATED = ("app", "handlers", "ui", "ui.main_ui", "ui.ports", "ui.widgets")
 
@@ -112,11 +113,15 @@ def pump(seconds=0.2, until=None):
 
 
 def connect(ui, which):
-    """Scan, pick the row ending in `which` (or holding it), Connect."""
+    """Scan, pick a row, Connect: "frame" or "event" is the SIMULATED
+    camera of that kind, by name (in the pylon env, PYLON_CAMEMU, the
+    first "frame" row is an emulated Basler); anything else is the row
+    holding it (a serial)."""
     ui.on_btn_scan_for_cameras()
     rows = ui.ports.cameras.items()
     index = next(i for i, r in enumerate(rows)
-                 if r.endswith(which) or which in r)
+                 if (is_simulated(r, which) if which in ("frame", "event")
+                     else which in r))
     ui.ports.cameras.widget.setCurrentRow(index)
     ui.on_btn_connect()
     assert ui.ports.capture_status.get().startswith("Connected"), \

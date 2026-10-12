@@ -65,6 +65,32 @@ def connect_to(tab, kind="frame"):
 
 
 # ======================================================================
+# The tab imports on its own
+# ======================================================================
+def test_the_capture_tab_imports_without_every_other_tab():
+    """`from council_qt.tabs.capture import CaptureTab` ran council_qt/tabs/
+    __init__.py, which imported EVERY tab — the Grapher's matplotlib with
+    them — so this file could not even be collected where matplotlib is not
+    installed (the pylon env: ModuleNotFoundError: No module named
+    'matplotlib'). The registry imports the tabs when it is first asked
+    for now. Checked in a child Python with matplotlib hidden."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    code = ("import sys\n"
+            "sys.modules['matplotlib'] = None\n"
+            "from council_qt.tabs.capture import CaptureTab\n"
+            "from council_qt.tabs import build_capture\n"
+            "print(sorted(m for m in sys.modules\n"
+            "             if m.startswith('council_qt.tabs.')))\n")
+    done = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                          env=dict(os.environ, QT_QPA_PLATFORM="offscreen"),
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.strip() == "['council_qt.tabs.capture']", done.stdout
+
+
+# ======================================================================
 # numpy -> QImage
 # ======================================================================
 def test_the_qimage_owns_its_pixels(app):
@@ -161,8 +187,14 @@ def test_scanning_lists_the_cameras(tab):
     assert tab.cameras_list.count() == 2
 
 
-def test_a_skipped_backend_is_explained(app):
-    """An empty list with no reason sends the user to check cables."""
+def test_a_skipped_backend_is_explained(app, monkeypatch):
+    """An empty list with no reason sends the user to check cables. On
+    a PC without pypylon - made so here, whatever this one has: in the
+    pylon env it is installed, and PYLON_CAMEMU lists emulated Baslers
+    (tests/sim_cameras.py)."""
+    from tests.sim_cameras import without_camera_sdks
+
+    without_camera_sdks(monkeypatch)
     made = CaptureTab(backends=[cameras.BaslerBackend(sdk=None)],
                       auto_scan=False)
     try:

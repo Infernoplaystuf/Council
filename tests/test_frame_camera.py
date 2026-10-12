@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import frame_camera
 from council_core import cameras
+from tests.sim_cameras import simulated_row, without_camera_sdks
 
 
 @pytest.fixture(autouse=True)
@@ -41,10 +42,11 @@ def clean():
 
 
 def connected(kind="frame"):
+    """Connect the SIMULATED `kind` camera — by name, not the first row of
+    that kind, which in the pylon env (PYLON_CAMEMU) is an emulated Basler
+    (tests/sim_cameras.py)."""
     listed = frame_camera.list_cameras()
-    rows = [r for r in listed["rows"] if r.endswith(kind)]
-    assert rows, f"no simulated {kind} camera in {listed['rows']}"
-    return frame_camera.connect(rows[0])
+    return frame_camera.connect(simulated_row(listed["rows"], kind))
 
 
 def settle(seconds=0.2):
@@ -60,8 +62,11 @@ def test_listing_returns_rows_and_a_summary():
     assert "found" in listed["summary"]
 
 
-def test_a_missing_sdk_is_explained_in_the_notes():
-    """An empty list with no reason sends the user to check cables."""
+def test_a_missing_sdk_is_explained_in_the_notes(monkeypatch):
+    """An empty list with no reason sends the user to check cables. Both
+    SDKs missing, whatever this PC has (the pylon env has pypylon and, with
+    PYLON_CAMEMU, emulated Baslers: no Basler note to find)."""
+    without_camera_sdks(monkeypatch)
     listed = frame_camera.list_cameras()
     notes = listed["notes"]
     joined = " ".join(notes).lower()

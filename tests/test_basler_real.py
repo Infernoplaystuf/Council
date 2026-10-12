@@ -12,8 +12,6 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("PYLON_CAMEMU", "1")
-
 import numpy as np
 import pytest
 
@@ -22,6 +20,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from council_core import cameras, capture
 
 pylon = pytest.importorskip("pypylon.pylon")
+
+
+@pytest.fixture(autouse=True)
+def camera_emulator(monkeypatch):
+    """pylon's camera emulator for THIS FILE'S TESTS ONLY: as many emulated
+    cameras as PYLON_CAMEMU asks for, else one.
+
+    It was set at import (os.environ.setdefault), so it stayed set for the
+    whole pytest process: every test collected with this file listed an
+    emulated Basler, and the simulated-camera tests that took "the first
+    frame camera" connected to it ("'BaslerDevice' object has no attribute
+    'state'"). pylon reads PYLON_CAMEMU at every enumeration (measured:
+    set after the first EnumerateDevices, the next one lists the emulated
+    cameras; removed, none), so a per-test setting is enough."""
+    if not os.environ.get("PYLON_CAMEMU"):
+        monkeypatch.setenv("PYLON_CAMEMU", "1")
 
 
 @pytest.fixture

@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import frame_camera
 from council_core import cameras
 from council_core.live_display import DisplayPrep
+from tests.sim_cameras import simulated_row
 
 
 @pytest.fixture(autouse=True)
@@ -51,8 +52,10 @@ def clean(tmp_path):
 
 
 def connected(kind="frame"):
+    """Connect the SIMULATED `kind` camera, by name: in the pylon env
+    (PYLON_CAMEMU) the first "frame" row is an emulated Basler."""
     rows = frame_camera.list_cameras()["rows"]
-    return frame_camera.connect(next(r for r in rows if r.endswith(kind)))
+    return frame_camera.connect(simulated_row(rows, kind))
 
 
 class Viewer:
@@ -798,7 +801,8 @@ os.environ.pop("COUNCIL_NO_DIALOGS", None)
 import frame_camera
 frame_camera._LIVE.setup_path = {setup!r}
 rows = frame_camera.list_cameras()["rows"]
-frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+frame_camera.connect(next(r for r in rows
+                          if "Simulated" in r and r.endswith("frame")))
 print("SETTINGS", frame_camera.camera_settings()["summary"], flush=True)
 print("SETUP", frame_camera.setup()["summary"], flush=True)
 frame_camera.disconnect()
