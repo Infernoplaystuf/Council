@@ -505,16 +505,16 @@ advice below is a starting point (no physical camera was used).
     -35..55, `hpf` 0..120, `refr` -20..235. The wider **allowed** ranges are
     `fo` -150..200, `hpf` 0..255, `diff_on`/`diff_off` -150..200, `refr`
     -50..255. By default the HAL **refuses** any value outside the
-    recommended range (`I_LL_Biases::set`); only a device opened with
-    `biases_range_check_bypass` accepts the rest. Typhon never sets that
-    bypass.
-  - Typhon's Biases tab shows each bias's *allowed* range, with a green bar
-    marking the recommended one (`camera_settings.py:1402-1415`). So a value
-    such as `hpf` 140 can be dialled in Typhon but is refused by the camera.
-    (The simulated camera's table, `cameras.py:1773-1779`, uses the
-    recommended ranges.) Take ranges from this section, not from the
-    example in `camera_settings_window.py`'s docstrings, which is wrong
-    (5.1).
+    recommended range (`I_LL_Biases::set`); a device opened with
+    `biases_range_check_bypass` skips the check altogether (any value is
+    taken; the driver clamps the register to 0..255) and only reports the
+    allowed range. Typhon never sets that bypass.
+  - Typhon's Biases tab runs each bias's slider over `get_bias_range()`
+    (`EvkSettings._bias`, fixed on `typhon/text-fixes`). Opened as Typhon
+    opens an EVK4, that is the recommended range, so a value such as `hpf`
+    140 cannot be dialled; the green bar marking the recommended range
+    spans the whole slider. (The simulated camera's table,
+    `cameras.py:1773-1779`, uses the recommended ranges.)
   - Prophesee's active-marker bias set, meant to give one event per blink
     (`diff_off` 180, `diff_on` 60, `fo` 30, `hpf` 140, `refr` 0; vendor docs),
     is therefore **not used**: its `hpf` 140 is refused by default, and it
@@ -528,7 +528,9 @@ advice below is a starting point (no physical camera was used).
     driver uses only the time part.)
   - What hurts is missed LED edges, not uneven weighting. Losing whole 200 µs
     slots: 20 % loss still found the LED 6/6 (0.036 px); 30 % found it 5/6
-    (0.085 px); 50 % found it 0/10 (measured).
+    (0.085 px); 50 % found it 0/10 (measured on a simulation that drops
+    whole slots; which events the driver drops inside a slot is set by its
+    `t_drop_lut`, which is not documented).
   - By contrast, dropping 50 % of events at random still gave 0.064 px, and
     dropping 50 % on every other column shifted x by only 0.008 px
     (measured).
@@ -925,7 +927,7 @@ and never writes over anything.
 | `bias_hpf` | High-pass filter. Higher removes slow background changes | Raise against slow drifts in light |
 | `bias_refr` | **Raising it shortens the rest period, which gives more events**; lowering it gives fewer events per crossing | Lower only to thin heavy streams |
 | **Anti-flicker** | Needed under mains lighting (100/120 Hz flicker) | A narrow band such as 90-130 Hz |
-| **ERC** | Caps the rate. Prophesee's manual says it drops "spatially and temporally" and that signal quality degrades once it triggers (vendor docs); OpenEB's IMX636 driver drops whole 200 µs time slots (OpenEB source). For tracks that means gaps in time | Off where possible; prefer the area and filters. If used as a safety cap, its state is recorded with the run |
+| **ERC** | Caps the rate. Prophesee's manual says it drops "spatially and temporally" and that signal quality degrades once it triggers (vendor docs); OpenEB's IMX636 driver drops in 200 µs time slots, by time only (OpenEB source; which events inside a slot, its `t_drop_lut`, is not documented). For tracks that means gaps in time | Off where possible; prefer the area and filters. If used as a safety cap, its state is recorded with the run |
 | **Event-rate activity filter** | Not on the EVK4. OpenEB 5.2 implements it only for Gen3.1 and GenX320 sensors (OpenEB source), so `get_i_event_rate` should return None and Typhon's `_activity` (`camera_settings.py:1509-1512`) hides the group | Confirm with a real camera |
 | **Picture window vs slice** | Independent: the picture can stay at 20 ms while Particles use 1 ms slices | Leave the picture at 20 ms |
 
