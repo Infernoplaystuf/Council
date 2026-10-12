@@ -183,3 +183,54 @@ merge), `council_core/agent_profiles.py`, the KG store, field-search fixes and l
 `deliberation.py`, `council_qt/tabs/council.py` or `council_gui_engine.py`. Its merge-base
 is qt-migration, so Batches 0 and 1 can proceed in parallel; Batch 2 and 7 should follow a
 merge.
+
+## 7. Status after Batches 1 and 2 (branch `qt/batch1-2`, 2026-10-12)
+
+Decisions applied (6 October 2026): memory "This conversation only"; default build one
+Writer; launchers unchanged (Qt).
+
+**Batch 1 — Qt remembers.**
+- `council_core.memory_scope`: `COUNCIL_MEMORY_SCOPE` = `none | conversation | all`
+  (explicit value wins; else `COUNCIL_DEMO_SILO` means `none`; else the caller's default —
+  `all` for the engine, `conversation` for Qt). `PersonalityModel.memory_scope` lets Qt set it
+  per model. In `conversation` a prompt gets this session's RECENT CONVERSATION and, only
+  after Load as Prior, PRIOR SESSION CONTEXT — never role/project memory or the profile.
+  Tk keeps SILO (`none`) unchanged. The toolbar says "Memory: this conversation only".
+- `council_core.conversations`: `ConversationStore` moved out of the engine
+  (`council_engine.ConversationStore` is the same class; cache keyed on the file — the
+  personalities' own store served stale history after another store appended; one-write
+  appends; `claim()`). `Conversation` = one Qt launch: Tk-format session id claimed
+  exclusively (a second launch in the same second gets `_2`; a Tk-taken id moves to a fresh
+  one), the same files as Tk (`conversations/<id>.jsonl`, `conversation_logs/`,
+  `question_history.json`, `verdict_history.jsonl`). The question is saved when asked, the
+  turn when it ends (the answer with provenance), anything pending on close
+  (`window.close_hooks`). A full council's drafts/cross-fire go to the debug log only (kept,
+  one turn filled the 12-entry history). Lines that quote other sessions (History's list,
+  a loaded session's name) are shown but not kept.
+- History and the Sessions list read both shells' files. Load as Prior sets the prior on the
+  conversation (no rebuild — the old rebuild went to a callback nobody connected) and the
+  transcript says so. Sessions are named after the first answer (judge after a
+  deliberation; the question's words on the fast path). Verdicts are recorded with a unique
+  id; the verdict bar stays disabled. Role/project memory is not written by Qt (never read
+  in this scope; Tk writes it only after full deliberations anyway).
+- `question_history.json`: a cross-process lock (on Windows a just-deleted lock file is
+  "access denied", which had sent writers on unlocked) and an unreadable file is never
+  written over.
+
+**Batch 2 — answers from your data.**
+- `council_core.turn_context`: the Tk module's lines 330-3515 moved (65 names re-exported;
+  `VAULT_DIR` reads became `_vault()`, the index accessors ask the prepared turn's session
+  first). `prepare_turn()` is the Tk `_send` sequence once — task memo, analyst step (a
+  direct answer comes back as `fast_answer`), injection, sources, context-window warning,
+  provenance — and BOTH shells call it (`CouncilConsole._turn_state` gives Tk's own state,
+  `module_indexes=True`). `TurnState` is one conversation's retrieval memory.
+- Qt: the augmented text goes to the Writer on the direct path and to the council; the judge
+  routes on the typed text (`run_turn(route_text=...)`, A5); deterministic answers need no
+  model; source chips under the answer; provenance carries the sources.
+- Vault search no longer returns older conversations or learned memory: `logs/`,
+  `memory/`, `sage_knowledge/`, `verdict_history.jsonl`, `vault_rag_misses.txt`,
+  `librarian_wishlist.md`, the root `trends.md` and the app's settings files are protected
+  (measured before: "search the vault for X" injected older questions from the verdict
+  history and the miss log).
+- Not done: KG4's neighbourhood block (not built on `knowledge-graph` either — it becomes
+  one more block in `prepare_turn`); Expand with council (Batch 3); the per-role carrier.
