@@ -1056,6 +1056,16 @@ class CaptureSession:
         #: not ended yet (record_to): every frame grabbed meanwhile is a
         #: frame of that run NOT saved (Stats.unsaved), not a preview frame.
         self._broken: Optional[FrameWriter] = None
+        #: What a failed write does to the RECORDING. False (Typhon): the
+        #: run goes on — the camera, and frame_camera's capture — and every
+        #: frame grabbed until the app ends it (Stop) is counted NOT saved.
+        #: True (the Council's Capture tab, where recording is a toggle
+        #: beside a live view that goes on): the recording ENDS at the
+        #: failure, and the count stops there — the frame that failed and
+        #: those queued behind it. That tab counted "NOT saved (recording
+        #: stopped)" for every live frame after a failed write, until the
+        #: next Record or Disconnect.
+        self.end_recording_on_failure = False
 
     # ------------------------------------------------------------------
     @property
@@ -1338,6 +1348,18 @@ class CaptureSession:
             said = writer.failed
             self.writer = None
             self.recorder = None
+            if self.end_recording_on_failure:
+                # ENDED HERE (end_recording_on_failure): this frame came
+                # after the recording, and is not counted against it. The
+                # writer finishes on its own threads after a failure — its
+                # end record and index close there — so nothing waits here.
+                with self._lock:
+                    self._stats = replace(
+                        self._stats, recording_failed=said,
+                        last_error=f"recording stopped: {said}",
+                        errors=self._stats.errors + 1)
+                    self._ended_stats = self.stats()
+                return False
             # NOT frozen here (record_to freezes it when the app ends the
             # recording): until then every frame grabbed is the run's and
             # is counted NOT saved — this one first. Frozen here, a Stop a

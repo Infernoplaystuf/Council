@@ -401,6 +401,62 @@ def test_each_recording_is_a_run_of_its_own(tab, tmp_path):
         assert end["run"] == run and end["frames_saved"] == len(pngs), end
 
 
+def test_a_failed_write_ends_the_recording_and_its_count_stops_there(
+        tab, tmp_path):
+    """A failed write stops a recording, but the live view goes on — and
+    the tab kept counting "NOT saved (recording stopped)" for every live
+    frame after it, until the next Record or Disconnect: a number that grew
+    for as long as the window stayed open. The recording ENDS at the
+    failure now (CaptureSession.end_recording_on_failure); the count is
+    the frame that failed and any queued behind it, and stays so."""
+    precious = b"an earlier frame - never to be replaced"
+    connect_to(tab)
+    tab.ask_dir = lambda *a, **k: str(tmp_path)
+    tab.on_start()
+
+    def pump(seconds, until=None):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            QApplication.processEvents()
+            tab._draw()
+            if until is not None and until():
+                return True
+            time.sleep(0.01)
+        return until() if until is not None else True
+
+    try:
+        tab.on_record()
+        session = tab.session
+        (index,) = list(tmp_path.glob("*_frames.csv"))
+        run = index.name[:-len("_frames.csv")]
+        at = session.stats().grabbed + 8
+        clash = tmp_path / f"{run}_frame_{at:06d}.png"
+        with open(clash, "xb") as handle:
+            handle.write(precious)
+        assert pump(15.0, until=lambda: session.stats().recording_failed)
+        assert pump(5.0, until=lambda: session.recorder is None)
+        pump(0.3)
+        then = session.stats()
+        pump(0.6)
+        now = session.stats()
+        assert now.grabbed >= then.grabbed + 5, "the live view stopped"
+        assert now.unsaved == then.unsaved, (then.unsaved, now.unsaved)
+        assert 1 <= now.unsaved <= 3, now
+        assert f"frame {at} not saved" in now.recording_failed, now
+        line = tab.status.text()
+        assert f"{now.unsaved} NOT saved (recording stopped)" in line, line
+        assert "Stop recording" not in tab.record_btn.text()
+        assert clash.read_bytes() == precious, "a frame on disk was replaced"
+        # The run is whole on disk, its end record saying why it ended.
+        assert pump(5.0, until=lambda: (tmp_path / f"{run}_run_end.json")
+                    .exists())
+        end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+            encoding="utf-8"))
+        assert end["recording_failed"].startswith(f"frame {at} not saved")
+    finally:
+        tab.on_stop()
+
+
 def test_declining_the_folder_does_not_start_recording(tab):
     connect_to(tab)
     tab.ask_dir = lambda *a, **k: None

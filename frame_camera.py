@@ -752,20 +752,31 @@ def stop() -> Dict[str, Any]:
         _announce({"what": "stopped",
                    "summary": "The camera did not stop cleanly."})
         return {"summary": "The camera did not stop cleanly.",
-                "status": stats.line()}
+                "status": _stats_line(stats)}
     line = _stopped_line(session)
     _LIVE.run_note_until = time.monotonic() + RUN_NOTE_SECONDS
     _LIVE.run_note = ""            # this run's, read from the session
     _announce({"what": "stopped", "summary": line})
-    return {"summary": line, "status": stats.line()}
+    return {"summary": line, "status": _stats_line(stats)}
 
 
 #: How long the live line carries the last run's result after Stop.
 RUN_NOTE_SECONDS = 10.0
 
 
+def _stats_line(stats: Any) -> str:
+    """capture.Stats.line in this app's words: the display drops are "not
+    drawn (screen only)" (SCREEN_DROPS) in EVERY line — the live one, Stop's,
+    a capture that ended and status(). Stop's said "N dropped" for the very
+    number the live line had just called "not drawn (screen only)"."""
+    return stats.line(SCREEN_DROPS)
+
+
 def _run_note(session: Any) -> str:
-    """The last run, short: what was saved, what was not, the .raw."""
+    """The last run, short: what was saved, what was not, the failed grabs,
+    the .raw. A failed grab is an exposure the camera made and could not
+    deliver — a gap in the run's frame numbers (capture.Stats.grab_failures)
+    — and the note said nothing of it while Stop's line did."""
     stats = session.run_stats()
     bits = [f"{stats.recorded} saved"]
     if _LIVE.run_waited:
@@ -775,6 +786,9 @@ def _run_note(session: Any) -> str:
     if stats.recording_failed:
         bits.append(f"RECORDING HAD STOPPED ({stats.recording_failed}): "
                     f"{stats.unsaved} NOT saved")
+    if stats.grab_failures:
+        failed = stats.grab_failures
+        bits.append(f"{failed} failed grab{'' if failed == 1 else 's'}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -787,18 +801,19 @@ def _run_note(session: Any) -> str:
 def _stopped_line(session: Any) -> str:
     """What the status line says once a run is over — or nearly over."""
     stats = session.run_stats()
-    line = f"Stopped. {stats.line()}"
+    said = _stats_line(stats)
+    line = f"Stopped. {said}"
     if stats.waiting:
-        line = f"Stopped — still saving. {stats.line()}"
+        line = f"Stopped — still saving. {said}"
     if _LIVE.run_waited:
         # First: the line is one row, and the reason is what matters.
-        line = f"Stopped — {_LIVE.run_waited}. {stats.line()}"
+        line = f"Stopped — {_LIVE.run_waited}. {said}"
     if stats.recording_failed:
         # Before anything else: the run did not save what it grabbed after
         # this, and stats.line() counts those frames "NOT saved (recording
         # stopped)". Before, this line said "1 error(s)" and left them out.
         line = (f"Stopped — RECORDING HAD STOPPED: "
-                f"{stats.recording_failed}. {stats.line()}")
+                f"{stats.recording_failed}. {said}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -818,7 +833,7 @@ def status() -> Dict[str, Any]:
     session = _LIVE.session
     if session is None:
         return {"summary": "No camera open.", "status": ""}
-    line = session.stats().line()
+    line = _stats_line(session.stats())
     return {"summary": line, "status": line}
 
 
@@ -1035,7 +1050,7 @@ def _idle_line(session: Any) -> str:
         return _stopped_line(session)
     if _LIVE.idle == "ended":
         return (f"Capture ended — {_LIVE.idle_reason}. "
-                f"{session.run_stats().line()}")
+                f"{_stats_line(session.run_stats())}")
     label = getattr(_LIVE.info, "label", "") or "camera"
     if _LIVE.idle == "preview-off":
         return (f"Connected to {label}. The live view is off while the raw "

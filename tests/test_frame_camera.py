@@ -241,12 +241,18 @@ def test_starting_into_a_file_is_refused(tmp_path):
 
 
 def test_stopping_reports_the_measured_rate_and_the_drops(tmp_path):
+    """In the live line's words: Stop said "N dropped" for the number the
+    live line had just called "not drawn (screen only)" — and "dropped" is
+    read as frames lost, which these never are."""
     connected()
     frame_camera.start(str(tmp_path))
     settle()
     out = frame_camera.stop()
     assert "fps" in out["status"]
-    assert "dropped" in out["status"]           # Stats.line itself, unchanged
+    for said in (out["status"], out["summary"],
+                 frame_camera.status()["status"]):
+        assert "not drawn (screen only)" in said, said
+        assert "dropped" not in said, said
 
 
 def test_stopping_when_not_started_is_not_an_error():

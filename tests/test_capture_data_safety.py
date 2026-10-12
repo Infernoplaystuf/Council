@@ -558,6 +558,61 @@ def test_frames_after_a_failed_write_are_counted_not_saved(tmp_path):
     assert "4 NOT saved (recording stopped)" in ended.line(), ended.line()
 
 
+def test_a_recording_set_to_end_at_a_failed_write_stops_its_count_there(
+        tmp_path):
+    """The Council's Capture tab ends a recording at its failed write
+    (end_recording_on_failure): the live view goes on, and the frames it
+    grabs after the failure are no recording's — counted NOT saved they
+    grew the number until the next Record or Disconnect."""
+    (tmp_path / "run_frame_000002.png").write_bytes(PRECIOUS)
+    session = capture.CaptureSession(cameras.Device())
+    session.end_recording_on_failure = True
+    session.record_to(capture.Recorder(tmp_path, stem="run_frame",
+                                       index_name="run_frames.csv"))
+    for i in range(1, 8):
+        session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8),
+                                    index=i))
+        session.flush(5)
+    stats = session.stats()
+    assert (stats.grabbed, stats.recorded, stats.unsaved) == (7, 1, 1), stats
+    assert "1 NOT saved (recording stopped)" in stats.line(), stats.line()
+    assert "frame 2" in stats.recording_failed, stats
+    assert session.recorder is None and session.writer is None
+    assert session.run_stats().unsaved == 1
+    assert (tmp_path / "run_frame_000002.png").read_bytes() == PRECIOUS
+    # Typhon's capture goes on until Stop, counting what it did not save.
+    assert capture.CaptureSession(cameras.Device()).end_recording_on_failure \
+        is False
+
+
+def test_the_last_run_note_says_its_failed_grabs(tmp_path, typhon):
+    """The live line's "last run:" note after Stop said what was saved and
+    not saved, and nothing of the grabs that failed — gaps in the run's
+    frame numbers that Stop's own line counts."""
+    capture.warm_imports()
+    device = basler_with([True, False, True, False, True])
+    session = capture.CaptureSession(device, timeout_ms=5)
+    session.record_to(capture.Recorder(tmp_path, stem="run_frame",
+                                       index_name="run_frames.csv"),
+                      reset=True)
+    session.start()
+    wait_for(lambda: session.stats().grabbed == 3)
+    session.stop()
+    session.record_to(None)
+    note = typhon._run_note(session)
+    assert note == "last run: 3 saved, 2 failed grabs", note
+    one = basler_with([True, False, True])
+    session = capture.CaptureSession(one, timeout_ms=5)
+    session.record_to(capture.Recorder(tmp_path, stem="other_frame",
+                                       index_name="other_frames.csv"),
+                      reset=True)
+    session.start()
+    wait_for(lambda: session.stats().grabbed == 2)
+    session.stop()
+    session.record_to(None)
+    assert typhon._run_note(session) == "last run: 2 saved, 1 failed grab"
+
+
 def test_typhon_says_a_stopped_recording_until_stop_and_at_stop(
         tmp_path, typhon):
     """Measured on the build: after a clash at frame 20 the live line said

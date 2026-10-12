@@ -271,6 +271,12 @@ class CaptureTab(ViewHelpers, QWidget):
     def _opened(self, device: cameras.Device) -> None:
         self.device = device
         self.session = capture.CaptureSession(device)
+        # A failed write ENDS the recording here, and its "NOT saved
+        # (recording stopped)" count stops at the failure: the live view
+        # goes on, and with the recording left open every live frame after
+        # it was counted against it until the next Record or Disconnect.
+        # Record… (which the button reads again at once) starts a new run.
+        self.session.end_recording_on_failure = True
         self._shown = None
         limits = device.limits()
         roi = device.roi()
