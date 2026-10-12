@@ -189,6 +189,23 @@ def test_a_follow_up_sees_this_conversation_and_nothing_older(qapp, engine):
         _close(qapp, window, view)
 
 
+def test_naming_the_vault_folder_brings_in_no_older_session(qapp, engine):
+    """Found in review: "What is in <vault> ?" listed conversations/ and
+    memory/ in the Writer's prompt — the older session's NAME (Qt names a
+    session from its first question's words) at the default window."""
+    window, view = _council(qapp, engine.vault)
+    try:
+        _ask(qapp, view, f"What is in {engine.vault} ?")
+        prompts = _prompts(engine.fake)
+        assert prompts, "the question reached no model"
+        for prompt in prompts:
+            assert OLDER not in prompt, prompt
+            assert not _found(prompt), (
+                f"{sorted(_found(prompt))} reached a prompt:\n{prompt}")
+    finally:
+        _close(qapp, window, view)
+
+
 def test_load_as_prior_is_the_one_way_an_older_session_gets_in(qapp, engine):
     from council_qt.tabs.sessions import SessionsTab
     window, view = _council(qapp, engine.vault)

@@ -984,7 +984,12 @@ def _render_folder_summary_compact(folder, max_files=120, max_chars=4500,
             continue
         if _cl is not None:
             try:
-                if _cl.is_protected_path(p, folder.parent):
+                # Against the vault too: when the named folder IS the vault,
+                # its parent is the folder above it and conversations/,
+                # conversation_logs/, logs/ and memory/ were not recognised
+                # (older sessions and learned memory reached the prompt).
+                if (_cl.is_protected_path(p, folder.parent)
+                        or _cl.is_protected_path(p, _vault())):
                     continue
             except Exception:
                 pass
@@ -1086,7 +1091,12 @@ def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
             continue
         if _cl is not None:
             try:
-                if _cl.is_protected_path(p, folder.parent):
+                # Against the vault too: when the named folder IS the vault,
+                # its parent is the folder above it and conversations/,
+                # conversation_logs/, logs/ and memory/ were not recognised
+                # (older sessions and learned memory reached the prompt).
+                if (_cl.is_protected_path(p, folder.parent)
+                        or _cl.is_protected_path(p, _vault())):
                     continue
             except Exception:
                 pass

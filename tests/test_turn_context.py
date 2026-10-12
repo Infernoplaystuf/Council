@@ -216,3 +216,65 @@ def test_trends_md_is_protected_only_at_the_vault_root(tmp_path):
     assert not cl.is_protected_path(vault / "data_in" / "trends.md", vault)
     assert not cl.is_protected_path(vault / "data_in" / "logs" / "x.log",
                                     vault)
+
+
+#: Older sessions and learned memory, planted where the app keeps them, each
+#: with a marker that must not reach the prompt when the user names the vault
+#: folder itself in a question.
+VAULT_ROOT_APP_FILES = {
+    "conversations/spare_impeller_tangerine.jsonl":
+        '{"who": "User", "text": "the spare impeller is OLDTANGERINE"}',
+    "conversation_logs/session_20261001_090000.jsonl":
+        '{"who": "User", "text": "OLDLOGLINE"}',
+    "logs/council.log": "[2026-10-01] User: OLDCOUNCILLOG",
+    "memory/writer.md": "- the user likes WALNUTMEMORY",
+    "memory/_user_profile.md": "- always HAIKUPROFILE",
+}
+
+
+@pytest.mark.parametrize("n_ctx", [4096, 32768])
+def test_naming_the_vault_folder_never_lists_older_sessions_or_memory(
+        vault_env, n_ctx):
+    """Found in review: "What is in <vault> ?" listed conversations/,
+    conversation_logs/, logs/ and memory/ — their file names at a 4 K window
+    (an older session is named after its first question) and their CONTENTS
+    at 32 K. Both folder renderers checked the protection against the named
+    folder's PARENT, which for the vault root is the folder above the vault,
+    so none of the protected sub-folders was recognised."""
+    vault, _fake = vault_env
+    for rel, text in VAULT_ROOT_APP_FILES.items():
+        path = vault / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+    prepared, _said, _ = _prepare(vault, f"What is in {vault} ?",
+                                  n_ctx=n_ctx)
+    assert "pumps.csv" in prepared.text, (
+        "the user's own file is no longer listed:\n" + prepared.text)
+    for needle in ("tangerine", "OLDTANGERINE", "session_2026", "OLDLOGLINE",
+                   "council.log", "OLDCOUNCILLOG", "writer.md",
+                   "WALNUTMEMORY", "_user_profile", "HAIKUPROFILE"):
+        assert needle not in prepared.text, (
+            f"{needle!r} reached the prompt at n_ctx={n_ctx}:\n"
+            + prepared.text)
+
+
+def test_the_folder_renderers_protect_the_vault_s_own_folders(vault_env):
+    """Both renderers, called directly on the vault root."""
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    for rel, text in VAULT_ROOT_APP_FILES.items():
+        path = vault / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+    state = tc.TurnState(vault)
+    token = tc._ACTIVE.set(state)
+    try:
+        compact = tc._render_folder_summary_compact(vault) or ""
+        rich = tc._render_folder_for_injection(vault) or ""
+    finally:
+        tc._ACTIVE.reset(token)
+    for text in (compact, rich):
+        assert "pumps.csv" in text
+        for folder in ("conversations", "conversation_logs", "logs",
+                       "memory"):
+            assert f"{folder}/" not in text.replace("\\", "/"), text
