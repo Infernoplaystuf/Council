@@ -129,9 +129,17 @@ def session_label(session_id: str, record: Optional[dict]) -> str:
     """The row text. Never parsed back — see SessionRow."""
     if not record:
         return session_id
-    confidence = record.get("confidence", 0)
     badge = "✓" if record.get("passed") else "✗"
-    return f"{session_id:<30}  [{confidence}/10 {badge}]"
+    return f"{session_id:<30}  [{record_confidence_pct(record)}% {badge}]"
+
+
+def record_confidence_pct(record: dict) -> int:
+    """A verdict record's confidence as a percentage. New records carry
+    `confidence_pct`; older ones a 0–10 `confidence`."""
+    from .confidence import clamp, from_legacy
+    if record.get("confidence_pct") is not None:
+        return clamp(record["confidence_pct"])
+    return from_legacy(record.get("confidence", 0) or 0)
 
 
 def verdict_summary(total: int, sample: Sequence[dict]) -> str:

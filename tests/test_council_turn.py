@@ -330,3 +330,55 @@ def test_the_judge_contract_is_three_methods():
         assert hasattr(FakeJudge(), method), (
             f"the contract grew a method the test double does not have: "
             f"{method}")
+
+
+# ============================================================
+# A tool that raises is a failed call, not a failed turn
+# ============================================================
+
+class _ToolThenAnswer:
+    """Asks for one tool call, then answers whatever the results were."""
+
+    def __init__(self, tool="run_python"):
+        self.tool = tool
+        self.asked = []
+
+    def respond(self, prompt, **kwargs):
+        self.asked.append(prompt)
+        if len(self.asked) == 1:
+            return '{"tool": "%s", "args": {"code": "while True: pass"}}' % (
+                self.tool)
+        return "the answer, without the tool"
+
+
+def test_a_tool_that_raises_is_reported_to_the_model_and_the_turn_goes_on():
+    import subprocess
+    from council_core.deliberation import AgentContext, ModelAgent
+
+    def run_python(args):
+        raise subprocess.TimeoutExpired(cmd="python scratch.py", timeout=120)
+
+    model = _ToolThenAnswer()
+    agent = ModelAgent("Coder", model, enable_tools=True,
+                       tools={"run_python": run_python})
+    events = agent.act(AgentContext("make it loop"))
+
+    assert events[-1].kind == "final"
+    assert events[-1].text == "the answer, without the tool"
+    obs = [e.text for e in events if e.kind == "observation"]
+    assert obs and "run_python: FAIL" in obs[0]
+    assert "TimeoutExpired" in obs[0]
+    # The model saw the failure and could answer around it.
+    assert "TimeoutExpired" in model.asked[1]
+
+
+def test_a_tool_that_works_is_unchanged():
+    from council_core.deliberation import AgentContext, ModelAgent
+
+    ctx = AgentContext("sum")
+    agent = ModelAgent("Coder", _ToolThenAnswer(), enable_tools=True,
+                       tools={"run_python": lambda a: (True, "rc=0", {"rc": 0})})
+    events = agent.act(ctx)
+    assert "run_python: OK" in [e.text for e in events
+                                if e.kind == "observation"][0]
+    assert ctx.shared["tool_payloads"] == {"run_python_1": {"rc": 0}}

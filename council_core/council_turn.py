@@ -82,6 +82,21 @@ def panel_for_route(route: str) -> Tuple[List[str], str]:
     return list(panel), synth
 
 
+#: Who gets tools when the tools are a plain dict rather than a ToolSet
+#: (which carries its own split, tool_kit.ROLE_TOOLS).
+PLAIN_TOOL_ROLES = ("coder", "intern")
+
+
+def tools_for_role(tools: Any, role: str) -> Dict[str, Any]:
+    """`role`'s share of `tools`: a ToolSet's role split, or the whole dict
+    for the coder and intern."""
+    if not tools:
+        return {}
+    if hasattr(tools, "for_role"):
+        return tools.for_role(role)
+    return dict(tools) if role in PLAIN_TOOL_ROLES else {}
+
+
 def build_agents(models: Any, *,
                  token_callback: Optional[Callable[[str, str], None]] = None,
                  enable_tools: bool = False,
@@ -96,6 +111,7 @@ def build_agents(models: Any, *,
     """
     agents: Dict[str, ModelAgent] = {}
     for role, display in AGENT_NAMES.items():
+        role_tools = tools_for_role(tools, role) if enable_tools else {}
         model = getattr(models, role, None)
         if model is None and role == "sage":
             # The Sage is reached through a wrapper in some builds.
@@ -105,8 +121,8 @@ def build_agents(models: Any, *,
             continue
         agents[role] = ModelAgent(
             display, model,
-            enable_tools=enable_tools and role in ("coder", "intern"),
-            tools=tools if enable_tools else None,
+            enable_tools=enable_tools and bool(role_tools),
+            tools=role_tools or None,
             token_callback=token_callback)
     return agents
 
@@ -137,6 +153,24 @@ class TurnResult:
     events: List[AgentEvent] = field(default_factory=list)
     message: str = ""
     error: Optional[BaseException] = None
+    #: Members who rated their own answer 40% or lower, as the deliberation
+    #: collected them ({"who", "topic", "reason"}) — for the librarian's
+    #: wishlist (council_core.after_turn).
+    low_conf_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    #: The question as asked (council_core.after_turn writes memory from it).
+    question: str = ""
+    #: What the question cost (council_core.turn_meter.Meter.as_dict):
+    #: model calls, model time, wall time, model loads.
+    meter: Dict[str, Any] = field(default_factory=dict)
+    #: The depth it was answered at (council_core.depth): quick / standard /
+    #: deep.
+    depth: str = ""
+    #: The synthesising role, and who the Judge ranked first.
+    synth: str = ""
+    winner: str = ""
+    #: The members' drafts as the Judge saw them: {role: {"answer",
+    #: "rebuttal", "self_confidence"}} (council_core.verdict_log).
+    candidates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     #: Identifies THIS turn's verdict, or "" when it produced none.
     #:
@@ -157,12 +191,29 @@ def final_answer(events: List[AgentEvent], synth: str = "writer") -> str:
 
 
 def judge_critique(events: List[AgentEvent]) -> str:
-    return next((e.text for e in reversed(events)
-                 if e.who == "Judge" and e.kind == "observation"), "")
+    """The Judge's last critique: its last observation carrying a verdict
+    (the required-changes and code-check lines it posts after a critique
+    are not the critique)."""
+    judge = [e for e in events if e.who == "Judge" and e.kind == "observation"]
+    return next((e.text for e in reversed(judge) if "Verdict:" in e.text),
+                judge[-1].text if judge else "")
+
+
+def judge_winner(events: List[AgentEvent]) -> str:
+    """The role the Judge ranked first, or "" when it did not say."""
+    import json
+    for e in reversed(events):
+        if e.who == "Judge" and e.text.startswith("Ranking:"):
+            try:
+                return str(json.loads(e.text.split("Ranking:\n", 1)[-1])
+                           .get("winner", "") or "")
+            except Exception:                             # noqa: BLE001
+                return ""
+    return ""
 
 
 def judge_confidence(events: List[AgentEvent]) -> int:
-    """The judge's 0-10 confidence, or 0 when it did not say.
+    """The judge's confidence, 0–100%, or 0 when it did not say.
 
     Parsed defensively on purpose: it arrives as JSON inside a text event, and
     a malformed one must cost the confidence reading rather than the answer the
@@ -192,7 +243,9 @@ def run_turn(question: str, models: Any, *,
              clarification_cb: Optional[Callable[[str, str], None]] = None,
              pause_event: Optional[threading.Event] = None,
              answer_getter: Optional[Callable[[], str]] = None,
-             extra_ctx: Optional[Dict[str, Any]] = None) -> TurnResult:
+             extra_ctx: Optional[Dict[str, Any]] = None,
+             parallel_members: bool = False,
+             depth: str = "auto") -> TurnResult:
     """Run one full deliberation and dig the result out of it.
 
     Never raises. A turn that fails comes back as ``ok=False`` with the reason
@@ -209,8 +262,16 @@ def run_turn(question: str, models: Any, *,
         return TurnResult(False, message="No judge model is loaded.")
 
     try:
+        if enable_tools and tools is not None and hasattr(tools, "new_turn"):
+            tools.new_turn()             # a fresh cache and scratchpad
         agents = build_agents(models, token_callback=on_token,
                               enable_tools=enable_tools, tools=tools)
+        if enable_tools and tools and "quote_check" in tools:
+            from .tool_kit import judge_checks
+            extra_ctx = dict(extra_ctx or {})
+            extra_ctx.setdefault(
+                "judge_checks",
+                lambda cands, _t=tools: judge_checks(_t, cands))
         if not agents:
             return TurnResult(
                 False,
@@ -225,6 +286,14 @@ def run_turn(question: str, models: Any, *,
         panel, synth = panel_for_route(route)
         panel = usable_panel(panel, agents)
 
+        # How much council this question gets (council_core.depth).
+        from .depth import decide
+        chosen = decide(question, route, forced=depth)
+        extra_ctx = dict(extra_ctx or {})
+        extra_ctx["depth"] = chosen
+        if on_event is not None:
+            on_event(AgentEvent("Judge", "phase", "▶ " + chosen.note()))
+
         collected: List[AgentEvent] = []
 
         def collect(event: AgentEvent) -> None:
@@ -236,17 +305,32 @@ def run_turn(question: str, models: Any, *,
             judge_model=judge, agents=agents,
             max_rounds=max_rounds, debate_turns=debate_turns,
             event_callback=collect, clarification_cb=clarification_cb,
-            pause_event=pause_event, answer_getter=answer_getter)
-        events = orchestrator.run(question, panel=panel, synth=synth,
-                                  extra_ctx=extra_ctx) or collected
+            pause_event=pause_event, answer_getter=answer_getter,
+            parallel_members=parallel_members)
+        from .turn_meter import TurnMeter
+        with TurnMeter() as meter:
+            events = orchestrator.run(question, panel=panel, synth=synth,
+                                      extra_ctx=extra_ctx) or collected
+        note = meter.result.note()
+        if note:
+            collect(AgentEvent("Orchestrator", "observation", note))
 
         critique = judge_critique(events)
         verdict = "PASS" if "Verdict: PASS" in critique else "NEEDS_WORK"
         answer = final_answer(events, synth)
+        last_ctx = getattr(orchestrator, "_last_ctx", None)
+        shared = getattr(last_ctx, "shared", None) or {}
+        gaps = list(shared.get("_low_conf_gaps", []))
+        cands = {r: {"answer": str(c.get("answer", "")),
+                     "rebuttal": str(c.get("rebuttal", "")),
+                     "self_confidence": c.get("self_confidence")}
+                 for r, c in (shared.get("candidates") or {}).items()}
         result = TurnResult(
             True, answer=answer, critique=critique, verdict=verdict,
             confidence=judge_confidence(events), route=route, panel=panel,
-            events=list(events))
+            events=list(events), low_conf_gaps=gaps, question=question,
+            meter=meter.result.as_dict(), depth=chosen.level, synth=synth,
+            winner=judge_winner(events), candidates=cands)
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
         if critique:
             result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"

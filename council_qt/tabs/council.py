@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -109,6 +109,36 @@ NOT_AVAILABLE = "{what} — not available in this build yet."
 _SPEAKERS = frozenset(council_turn.AGENT_NAMES.values()) | {"Judge"}
 
 
+def docs_readers(models, docs) -> list:
+    """Who reads the documentation block: the Coder and the Writer."""
+    if not getattr(docs, "text", ""):
+        return []
+    from council_core import docs_brief
+    return docs_brief.readers(models)
+
+
+def prepare_parallel(steps):
+    """Run each non-None step at the same time; {name: result}. A step that
+    raises is left out and its error kept under "_errors", so one failed
+    lookup costs that lookup, not the question."""
+    from concurrent.futures import ThreadPoolExecutor
+    steps = {k: fn for k, fn in steps.items() if fn is not None}
+    out, errors = {}, {}
+    if not steps:
+        return out
+    with ThreadPoolExecutor(max_workers=len(steps),
+                            thread_name_prefix="council-prep") as pool:
+        futures = {k: pool.submit(fn) for k, fn in steps.items()}
+        for k, fut in futures.items():
+            try:
+                out[k] = fut.result()
+            except Exception as exc:                      # noqa: BLE001
+                errors[k] = exc
+    if errors:
+        out["_errors"] = errors
+    return out
+
+
 class CouncilActions:
     """What the Council tab can ask the application to do.
 
@@ -125,6 +155,19 @@ class CouncilActions:
         self.demo_mode = bool(demo_mode)
         self._models = None
         self._models_problem = ""
+        self._tools = None
+        from council_core.preload import Preloader
+        self._preloader = Preloader()
+        #: One conversation per app run, so the Sessions tab can tell runs
+        #: apart and each run's history starts clean.
+        import time as _time
+        self.session_id = "qt-" + _time.strftime("%Y%m%d-%H%M%S")
+        #: The [TASK MEMO] carried from question to question (task_memory).
+        import task_memory as _task_memory
+        self.task_memory = _task_memory.TaskMemory()
+        #: The condenser's model call, or None for the keyword rules only.
+        #: "engine" means council_engine.local_chat on a fast role.
+        self.memo_llm: Any = "engine"
 
     # -- implemented -----------------------------------------------------
     def specialists(self):
@@ -184,8 +227,44 @@ class CouncilActions:
 
         if self._models is None and not self._models_problem:
             self._models, self._models_problem = (
-                council_turn.load_personalities(self.vault_dir))
+                council_turn.load_personalities(
+                    self.vault_dir, session_id=self.session_id))
         return self._models, self._models_problem
+
+    def preload(self) -> bool:
+        """Warm the Writer's and the Judge's models while the user types
+        (council_core.preload). Only once the real personalities are
+        loaded — never for stand-ins, and never by loading them itself."""
+        models = self._models
+        if models is None:
+            return False
+        import sys
+        engine = sys.modules.get("council_engine")
+        if engine is None:
+            return False
+        real = [r for r in ("writer", "judge")
+                if isinstance(getattr(models, r, None),
+                              engine.PersonalityModel)]
+        return self._preloader.kick(real) if real else False
+
+    def tools(self):
+        """The members' tools (a tool_kit.ToolSet: each role gets its own
+        short list), built on the first turn that asks.
+
+        council_core.council_tools, over this vault. Without it the Tools
+        switch reached run_turn as enable_tools with tools=None, and
+        ModelAgent ran with an empty tool table: the switch did nothing.
+        """
+        if self._tools is None:
+            import council_engine
+            from council_core import council_tools
+            runner = council_engine.LocalRunner(
+                paths.ensure(self.vault_dir / "workspace"))
+            librarian = council_engine.Librarian(
+                self.vault_dir, self.vault_dir / "logs" / "council.log")
+            self._tools = council_tools.make_tools(runner, librarian,
+                                                   self.vault_dir)
+        return self._tools
 
     def send(self, typed_text: str, options, *, on_event=None,
              on_token=None):
@@ -197,21 +276,196 @@ class CouncilActions:
         """
         from council_core import council_turn
 
+        from council_core import vault_context
+
         models, problem = self.models()
         if models is None:
             return council_turn.TurnResult(False, message=problem)
 
+        # Everything gathered before the council starts — the vault brief,
+        # the Sage's knowledge base, the task memo, past decisions, the
+        # Analyst's figures and the docs — is independent, so it runs side
+        # by side (prepare_parallel); the wait is the slowest step, not the
+        # sum. Model calls among them (memo, Analyst) are serialised per
+        # model file by the engine's own locks. The transcript lines still
+        # come out in the same order as before.
+        from council_core import past_decisions
+        from council_core.deliberation import AgentEvent
+
+        def say(who: str, text: str) -> None:
+            if on_event is not None and text:
+                on_event(AgentEvent(who, "observation", text))
+
+        sage = getattr(models, "sage", None)
+        writer = getattr(models, "writer", None)
+        got = prepare_parallel({
+            "brief": ((lambda: self.vault_brief(typed_text))
+                      if getattr(options, "vault", True) else None),
+            "sage_kb": ((lambda: vault_context.sage_block(typed_text,
+                                                          self.vault_dir))
+                        if sage is not None else None),
+            "memo": lambda: self.task_memo(typed_text),
+            "past": lambda: past_decisions.recall(self.vault_dir, typed_text),
+            "analysis": lambda: self.analyst(typed_text),
+            "docs": lambda: self.docs_brief(typed_text, models),
+        })
+
+        # The vault passages this question needs, for this question only
+        # (council_core.vault_context). Which roles see them is the engine's
+        # per-role rule; the transcript says what was found.
+        block, judge_evidence = "", ""
+        brief = got.get("brief")
+        if brief is not None:
+            block = brief.text
+            judge_evidence = vault_context.evidence(brief)
+            say("Librarian", brief.note())
+
+        # The Sage's own knowledge base, for the Sage alone.
+        sage_kb = got.get("sage_kb") or ""
+        if sage_kb:
+            n = sum(1 for line in sage_kb.splitlines()
+                    if line.strip().startswith(("[", "•")))
+            say("Librarian", f"Sage: {n} item(s) from its knowledge base.")
+
+        # The [TASK MEMO]: the goal and constraints, carried forward when
+        # this is a follow-up, at the top of every member's context.
+        memo = got.get("memo") or ""
+        if memo:
+            say("Task memo", self.task_memory.render_transcript_line())
+
+        # How similar questions were decided before (past_decisions): for
+        # the Judge with the evidence, and for the Writer.
+        past = got.get("past") or []
+        past_block = past_decisions.block(past)
+        if past:
+            say("Librarian", past_decisions.note(past))
+        if past_block:
+            judge_evidence = "\n\n".join(
+                x for x in (judge_evidence, past_block) if x)
+
+        # Figures computed from the data files for a numbers question
+        # (analyst_step): to every member and the Judge.
+        from council_core.analyst_step import AnalystResult
+        analysis = got.get("analysis") or AnalystResult()
+        say("Librarian", analysis.note)
+        say("Analyst", analysis.table)
+        if analysis.block:
+            judge_evidence = "\n\n".join(
+                x for x in (judge_evidence, analysis.block) if x)
+
+        # Real documentation for a coding question (docs_brief): to the
+        # Coder and the Writer, so they use the documented API.
+        from council_core.docs_brief import DocsBrief
+        docs = got.get("docs") or DocsBrief()
+        say("Librarian", docs.note())
+        for name, exc in got.get("_errors", {}).items():
+            say("Librarian", f"{name}: skipped ({exc})")
+
+        turn_models = vault_context.turn_models(models)
+        with vault_context.applied(turn_models, memo), \
+                vault_context.applied(turn_models, block), \
+                vault_context.applied([sage] if sage_kb else [], sage_kb), \
+                vault_context.applied([writer] if past_block else [],
+                                      past_block), \
+                vault_context.applied(docs_readers(models, docs), docs.text), \
+                vault_context.applied(turn_models, analysis.block):
+            result = self._answer(typed_text, models, options, judge_evidence,
+                                  on_event=on_event, on_token=on_token)
+        # Before the next question can start: this exchange is history, and
+        # a deliberated one is a decision to remember.
+        if getattr(result, "ok", False):
+            from council_core import after_turn
+            after_turn.record_exchange(models, typed_text, result.answer)
+            if getattr(result, "critique", ""):
+                past_decisions.record(self.vault_dir, typed_text,
+                                      result.answer, result.verdict,
+                                      result.panel)
+                self._keep_for_reuse(typed_text, result, brief, analysis)
+                from council_core import verdict_log
+                verdict_log.record(self.vault_dir, verdict_log.entry(
+                    result, getattr(result, "candidates", {}) or {}))
+        return result
+
+    def _keep_for_reuse(self, question, result, brief, analysis) -> None:
+        """A passed answer, with the vault files it rested on, for
+        council_core.answer_reuse."""
+        from council_core import answer_reuse
+        try:
+            sources = answer_reuse.source_paths(
+                self.vault_dir, getattr(brief, "sources", None) or [])
+            if getattr(analysis, "block", ""):
+                import vault_analyst
+                from council_core.analyst_step import data_folder
+                sources += vault_analyst.list_data_files(
+                    [data_folder(self.vault_dir)])
+            answer_reuse.record(self.vault_dir, question, result.answer,
+                                result.verdict, sources)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    def reusable(self, question: str):
+        """An earlier passed answer to this same question whose files are
+        unchanged (council_core.answer_reuse), or None. Fast: one file."""
+        from council_core import answer_reuse
+        try:
+            return answer_reuse.find(self.vault_dir, question)
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def task_memo(self, question: str) -> str:
+        """Update the task memo from this question; its prompt block."""
+        llm = self.memo_llm
+        if llm == "engine":
+            def llm(prompt: str) -> str:
+                import council_engine
+                return council_engine.local_chat(
+                    [{"role": "user", "content": prompt}], role="intern",
+                    num_predict=200, temperature=0.0, timeout=60)
+        try:
+            self.task_memory.update(question, llm)
+            return self.task_memory.render_injection_block()
+        except Exception:                                 # noqa: BLE001
+            return ""
+
+    def _answer(self, typed_text, models, options, judge_evidence, *,
+                on_event=None, on_token=None):
+        """The answer itself: one personality, or the council."""
+        from council_core import council_turn
         if not getattr(options, "deliberate", True):
             # The fast path: one personality, no panel, no verdict. It is a
             # real answer and it is NOT a deliberation, so it produces no
-            # verdict id — which is what keeps the verdict bar honest (A3).
+            # verdict id — which keeps the verdict bar honest (A3).
             return self._direct(typed_text, models, on_event=on_event)
 
+        enable_tools = bool(getattr(options, "tools", False))
         return council_turn.run_turn(
             typed_text, models,
-            enable_tools=bool(getattr(options, "tools", False)),
+            enable_tools=enable_tools,
+            tools=self.tools() if enable_tools else None,
+            parallel_members=bool(getattr(options, "parallel", False)),
+            depth=str(getattr(options, "depth", "auto") or "auto"),
+            extra_ctx=({"judge_evidence": judge_evidence}
+                       if judge_evidence else None),
             on_event=on_event,
             on_token=on_token if getattr(options, "stream", True) else None)
+
+    def analyst(self, question: str):
+        """Figures from the data files for a numbers question (blocking: a
+        model call and a sandboxed child process)."""
+        from council_core import analyst_step
+        return analyst_step.run(question, self.vault_dir)
+
+    def docs_brief(self, question: str, models):
+        """The DOCUMENTATION block for a coding question (blocking: a
+        keyword search on the documentation servers, no model)."""
+        from council_core import docs_brief
+        return docs_brief.build(question, docs_brief.route_of(models,
+                                                               question))
+
+    def vault_brief(self, question: str):
+        """The VAULT CONTEXT for a question (blocking: a search)."""
+        from council_core import vault_context
+        return vault_context.build(question, self.vault_dir)
 
     def _direct(self, typed_text: str, models, *, on_event=None):
         """One personality answering directly, with no council."""
@@ -249,6 +503,15 @@ class CouncilActions:
             return dict(getter() or {}) if callable(getter) else {}
         except Exception:                                 # noqa: BLE001
             return {}
+
+    def learn(self, result):
+        """What this answered question leaves behind (after_turn.learn).
+        Blocking: the tab calls it on a worker."""
+        from council_core import after_turn
+        models, _problem = self.models()
+        if models is None:
+            return None
+        return after_turn.learn(models, result, self.vault_dir)
 
     def record_verdict_response(self, verdict_id: str, agreed: bool,
                                 objection: str = ""):
@@ -343,10 +606,13 @@ class CouncilTab(ViewHelpers, QWidget):
         label("Find & Chart", self.find_chart_btn)
         label("Look Up", self.look_up_btn)
         label("Defer to Vault", self.defer_btn)
-        label("Expand with council", self.expand_btn,
-              why="It would re-ask the same question the same way and "
-                  "repeat the answer: this build has no way yet to send a "
-                  "fast question to the full council.")
+        if self.demo_mode:
+            # The full build expands a fast answer through the whole council
+            # at Deep depth (on_expand_with_council); this build answers with
+            # one Writer and no panel, so an expand would repeat the answer.
+            label("Expand with council", self.expand_btn,
+                  why="This build answers with a single model, so there is "
+                      "no fuller council to send the question to.")
         label("Council instructions", self.inst_name, self.inst_text,
               self.inst_add_btn, self.inst_manage_btn)
         label("Content style", self.content_style_btn)
@@ -438,6 +704,8 @@ class CouncilTab(ViewHelpers, QWidget):
         self.input = QPlainTextEdit()
         self.input.setMaximumHeight(96)
         layout.addWidget(self.input)
+        # Typing a question warms the models it will need (preload).
+        self.input.textChanged.connect(self._on_typing)
         self._shortcut("Ctrl+Return", self.on_send, self.input)
 
         layout.addLayout(self._action_row())
@@ -447,8 +715,34 @@ class CouncilTab(ViewHelpers, QWidget):
         layout.addWidget(self._instruction_bar())
         layout.addWidget(self._save_panel())
         layout.addWidget(self._clarification_panel())
+        layout.addWidget(self._reuse_bar())
         layout.addLayout(self._override_row())
         return panel
+
+    def _reuse_bar(self) -> QWidget:
+        """[Use it] [Ask the council again] under an earlier answer shown
+        for a repeated question (council_core.answer_reuse)."""
+        self.reuse_frame = QFrame()
+        row = QHBoxLayout(self.reuse_frame)
+        row.setContentsMargins(0, 4, 0, 0)
+        row.addWidget(QLabel("Earlier answer shown above."))
+        self._button(row, amp("✓ Use it"), self.on_reuse_accept)
+        self._button(row, amp("↻ Ask the council again"), self.on_reuse_again)
+        row.addStretch(1)
+        self.reuse_frame.hide()
+        self._reuse_question = ""
+        return self.reuse_frame
+
+    def on_reuse_accept(self) -> None:
+        self.reuse_frame.hide()
+        self._reuse_question = ""
+
+    def on_reuse_again(self) -> None:
+        question, self._reuse_question = self._reuse_question, ""
+        self.reuse_frame.hide()
+        if question:
+            self.input.setPlainText(question)
+            self._send(reuse=False)
 
     def _action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -462,10 +756,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self._button(row, "Clear", self.on_clear_input)
         self.defer_btn = self._button(row, amp("⤓ Defer to Vault"),
                                       self.on_defer_to_vault)
-        # Meant to re-ask the last FAST question through the full council
-        # (A4: per-turn state, reset in reset_turn()). Disabled and labelled
-        # in _label_unavailable until a turn can be sent to the full council
-        # on request — see finish_turn.
+        # Re-asks the last FAST question through the full council (A4:
+        # per-turn state, reset in reset_turn()). Enabled by finish_turn after
+        # a fast answer in the full build; labelled unavailable in DEMO_MODE.
         self.expand_btn = self._button(row, amp("⤢ Expand with council"),
                                        self.on_expand_with_council)
         self.expand_btn.setEnabled(False)
@@ -593,6 +886,16 @@ class CouncilTab(ViewHelpers, QWidget):
         row.addWidget(self.backend_box)
 
         row.addSpacing(12)
+        depth = QLabel("Depth:")
+        depth.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        row.addWidget(depth)
+        self.depth_box = QComboBox()
+        for label, level in council_options.DEPTH_CHOICES:
+            self.depth_box.addItem(label, level)
+        self.depth_box.setToolTip(council_options.DEPTH_HINT)
+        row.addWidget(self.depth_box)
+
+        row.addSpacing(12)
         ask = QLabel("Ask:")
         ask.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         row.addWidget(ask)
@@ -620,6 +923,9 @@ class CouncilTab(ViewHelpers, QWidget):
         for switch in council_options.SWITCHES:
             if switch.key not in self._checkboxes:
                 setattr(snapshot, switch.key, getattr(self._opts, switch.key))
+        box = getattr(self, "depth_box", None)
+        if box is not None:
+            snapshot.depth = box.currentData() or "auto"
         return snapshot.effective(self.demo_mode)
 
     def begin_turn(self) -> bool:
@@ -663,16 +969,50 @@ class CouncilTab(ViewHelpers, QWidget):
         self.hide_verdict_bar()
         self.stream_box.clear_all()
 
+    def _offer_reuse(self, typed: str) -> bool:
+        """Show an earlier passed answer to the same question, with
+        [Use it] / [Ask the council again]. True when one was shown."""
+        find = getattr(self.actions, "reusable", None)
+        hit = find(typed) if find is not None else None
+        if hit is None:
+            return False
+        self.append("User", typed)
+        self.input.clear()
+        self.append("Librarian", hit.note(), "observation")
+        self.append("Writer", hit.answer)
+        self._reuse_question = typed
+        self.reuse_frame.show()
+        return True
+
+    def _on_typing(self) -> None:
+        preload = getattr(self.actions, "preload", None)
+        if preload is not None and self.input.toPlainText().strip():
+            try:
+                preload()
+            except Exception:                             # noqa: BLE001
+                pass
+
     def on_send(self) -> None:
+        # No arguments: QPushButton.clicked passes `checked`, which a
+        # keyword here would swallow.
+        self._send(reuse=True)
+
+    def _send(self, *, reuse: bool, full: bool = False) -> None:
+        """`reuse`: offer an earlier passed answer first (answer_reuse).
+        `full`: the whole council at Deep depth, whatever the switches say
+        (Expand with council)."""
         typed = self.input.toPlainText().strip()
         if not typed:
             return
         # "Expand with council" re-sends an earlier QUESTION through here
-        # (_force_full_council); only words typed for this send can ask for a
-        # take-over.
-        if not self._force_full_council and self._take_over(typed):
+        # (full, and _force_full_council); only words typed for this send can
+        # ask for a take-over — an expanded "take over x.py" is answered by
+        # the pipeline chat, never acted on (test_expand_with_council_is_not_a_door).
+        if not (full or self._force_full_council) and self._take_over(typed):
             return
         if self._send_command(typed):
+            return
+        if reuse and not self._turn_active and self._offer_reuse(typed):
             return
         if not self.begin_turn():
             return
@@ -688,6 +1028,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self.input.clear()
 
         options = self.options()          # on the GUI thread, before the worker
+        if full:
+            options.deliberate = True
+            options.depth = "deep"
 
         def work() -> None:
             try:
@@ -699,6 +1042,7 @@ class CouncilTab(ViewHelpers, QWidget):
                         lambda who=who, tok=tok: self.on_token(who, tok)))
                 if result is not None:
                     self._to_ui(lambda: self.finish_turn(result))
+                    self._learn_later(result)
             # THE MESSAGE IS BOUND HERE, NOT READ LATER. Python deletes the
             # `except ... as exc` name at the end of the block, so a lambda
             # that closes over `exc` and runs later raises NameError instead of
@@ -716,6 +1060,35 @@ class CouncilTab(ViewHelpers, QWidget):
                 self._to_ui(self.end_turn)
 
         threading.Thread(target=work, name="council-turn", daemon=True).start()
+
+    def _learn_later(self, result) -> None:
+        """Keep what the question taught — wishlist gaps, role and project
+        memory (council_core.after_turn) — on its own worker, so the next
+        question need not wait. Its model calls queue behind any new
+        question's on the same model or machine."""
+        learn = getattr(self.actions, "learn", None)
+        if learn is None or not getattr(result, "ok", False) \
+                or not getattr(result, "panel", None):
+            return
+
+        def work() -> None:
+            try:
+                learned = learn(result)
+            except Exception as exc:                      # noqa: BLE001
+                said = f"Could not keep what this question taught: {exc!r}"
+                self._to_ui(lambda: self.append("Librarian", said,
+                                                "observation"))
+                return
+            if learned is not None and (learned.roles_updated
+                                        or learned.gaps_logged
+                                        or learned.sage_gap
+                                        or learned.errors):
+                said = "Kept from this question: " + learned.summary()
+                self._to_ui(lambda: self.append("Librarian", said,
+                                                "observation"))
+
+        threading.Thread(target=work, name="council-turn-learn",
+                         daemon=True).start()
 
     def pipeline_chat(self):
         """The pipeline-command responder, built on first use."""
@@ -898,13 +1271,14 @@ class CouncilTab(ViewHelpers, QWidget):
             self.set_judge(result.critique)
         if result.route == "direct" and result.answer:
             # Only a fast answer can be expanded, and only until the next turn
-            # resets it (A4). The question is kept; the BUTTON stays disabled
-            # (_label_unavailable): nothing in this build can send a fast
-            # question to the full council yet — _force_full_council is reset
-            # before the options are taken and the actions never read it, and
-            # DEMO_MODE forces deliberation off — so enabling it here made a
-            # click repeat the same answer.
+            # resets it (A4). The full build re-asks it through the whole
+            # council at Deep depth (_send(full=True) sets the options itself,
+            # so nothing depends on _force_full_council surviving the reset).
+            # The DEMO_MODE build has no panel to expand to: there the button
+            # stays disabled and labelled (_label_unavailable).
             self._last_fast_question = self._last_query
+            if not self.demo_mode:
+                self.expand_btn.setEnabled(True)
         self._last_route = result.route
         # A3: the bar follows the verdict id, which a turn without a verdict
         # does not have.
@@ -1104,7 +1478,10 @@ class CouncilTab(ViewHelpers, QWidget):
             return
         self._force_full_council = True
         self.input.setPlainText(self._last_fast_question)
-        self.on_send()
+        # The whole council, at Deep depth, and no earlier answer offered
+        # instead: `full` carries that through the send itself, because
+        # reset_turn clears _force_full_council before the options are taken.
+        self._send(reuse=False, full=True)
 
     def on_clarify(self, skip: bool = False) -> None:
         self.clarif_frame.hide()

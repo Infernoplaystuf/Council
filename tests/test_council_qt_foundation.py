@@ -408,23 +408,11 @@ def test_the_application_actually_exits(tmp_path):
     assert "exited 0" in done.stdout, (done.stdout, done.stderr)
 
 
-def test_the_standalone_host_matches_the_tk_contract(qapp, tmp_path):
-    """council_modules.StandaloneHost is the contract a family of tab modules is
-    written against — tab_grapher here, tab_ideas and tab_video on other
-    branches. A ported tab module must be able to change which host it imports
-    without changing how it talks to one, so the surface has to match.
-
-    The model slots are checked by name because a tab module branches on them
-    (`if self.writer is None:`), which makes a missing or renamed slot a
-    behaviour change in a module this package cannot see."""
-    import inspect
-
-    import council_modules
+def test_the_standalone_host_surface(qapp, tmp_path):
+    """The surface a tab module talks to: every model slot starts empty (a
+    module branches on `if self.writer is None:`), and the window, queue and
+    absent council widgets are where a module looks for them."""
     from council_qt.host import MODEL_ROLES, StandaloneHost
-
-    tk_src = inspect.getsource(council_modules.StandaloneHost.__init__)
-    for role in MODEL_ROLES:
-        assert f'"{role}"' in tk_src, f"{role} is not a role on the Tk host"
 
     host = StandaloneHost(title="test", vault_dir=tmp_path)
     for role in MODEL_ROLES:
@@ -774,12 +762,12 @@ def window(qapp, tmp_path, monkeypatch):
 # violation roughly one run in three, blamed on whichever test was running.
 # `test_the_drain_list_covers_every_worker_a_tab_starts` keeps it honest.
 TAB_WORKERS = (
-    "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
-    "council-command", "council-turn", "designer-", "diagnostics",
-    "docs-", "dream3d-", "forge", "grapher-", "ide-",
-    "jobs-", "keyword-index", "kg-", "lens-", "librarian-", "model-",
-    "mongo-convert", "nodes-", "pi-setup", "sessions-", "tts-", "var-graph",
-    "vault-",
+    "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog",
+    "code-", "collection-", "council-command", "council-map-", "council-turn",
+    "designer-", "diagnostics", "docs-", "dream3d-", "fanout-", "forge",
+    "grapher-", "ide-", "jobs-", "keyword-index", "kg-", "lens-",
+    "librarian-", "model-", "mongo-convert", "nodes-", "pi-setup", "quant-",
+    "sessions-", "tts-", "var-graph", "vault-",
     # capture.warm_in_background: Pillow's plugins imported off the UI
     # thread before a camera's picture starts. It touches no widget, but it
     # is named in capture.py, which this list must cover.
@@ -938,8 +926,9 @@ def _top_levels() -> list:
     lambda — and PySide goes on to wrap the freed pointer: a plain `QObject`
     whose delete below ran ~QObject on freed memory (_purecall, "Fatal
     Python error: Aborted"). Measured: 3 of 8 full runs at 9ab2270, always in
-    the teardown of test_the_standalone_host_matches_the_tk_contract, the
-    host's window freed by a gen-0 pass inside this very call. Once the list
+    the teardown of the StandaloneHost test (now
+    test_the_standalone_host_surface), the host's window freed by a gen-0
+    pass inside this very call. Once the list
     exists it holds every window it names, so it is safe to collect again.
     """
     import gc

@@ -53,6 +53,19 @@ PROTECTED_SUBDIRS: tuple = (
     # knowledge_graph.py). Its JSON/CSV exports quote the user's documents,
     # so a vault search must not find them as if they were documents.
     ".knowledge_graph",
+    # The model-call meter (council_core.usage_log) and the weekly placement
+    # reviews (council_core.placement): the app's bookkeeping, not documents.
+    ".council_usage",
+    # How the council decided earlier questions (council_core.past_decisions).
+    ".council_memory",
+    # The council benchmark's runs (council_core.council_bench): measurements
+    # of the app, not the user's documents.
+    ".council_bench",
+    # Code projects the council works on (council_core.project): briefs,
+    # job notes and git worktrees — whole copies of code, not documents.
+    ".council_projects",
+    # The user's coding-agent profiles (council_core.agent_profiles).
+    ".council_agents",
 )
 
 # Lowercased once at import for the per-path membership test in
@@ -80,6 +93,9 @@ PROTECTED_STATE_FILES: tuple = (
     # Agent profiles: settings, profiles and the council's tool requests
     # (council_core/agent_profiles.py) — app state, and it quotes tool code.
     "agent_profiles.json",
+    # Which role answers on which machine (council_core.node_routing) and
+    # the Quant Duel's settings (council_core.quant_duel): app settings.
+    "node_routing.json", "quant_duel.json",
 )
 _PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
 
