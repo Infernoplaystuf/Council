@@ -84,7 +84,11 @@ def pump(seconds):
         time.sleep(0.005)
 
 
-def pump_until(condition, seconds=3.0):
+def pump_until(condition, seconds=10.0):
+    """Pump until condition() holds; every caller asserts that it does.
+
+    Returns as soon as it holds, so a generous deadline costs a passing test
+    nothing. 3 s failed under load (the whole suite running beside it)."""
     end = time.monotonic() + seconds
     while not condition() and time.monotonic() < end:
         pump(0.01)
@@ -344,7 +348,7 @@ def test_playing_during_a_capture_catches_up_to_live(ui, tmp_path):
     pump(0.05)
     assert not rv.live
     rv.play_pause()
-    assert pump_until(lambda: rv.live, seconds=3)
+    assert pump_until(lambda: rv.live)
     assert not rv.playing
     assert ui.ports.current_frame.get() == ""
 
@@ -388,7 +392,7 @@ def test_play_advances_and_stops_at_the_end(ui, tmp_path):
     ui.ports.capture_folder.set(str(tmp_path))
     pump(0.3)
     assert "Playing" in frame_camera.play_pause()["summary"]
-    assert pump_until(lambda: not rv.playing, seconds=3)
+    assert pump_until(lambda: not rv.playing)
     assert rv.scrubber.get() == 7
     assert ui.ports.current_frame.get() == os.path.basename(rv.files[7])
 
@@ -715,7 +719,7 @@ def test_playing_to_the_end_of_the_saved_frames_goes_live(ui, tmp_path):
     drag(rv, 2)
     pump(0.05)
     rv.play_pause()
-    assert pump_until(lambda: rv.live, seconds=3)
+    assert pump_until(lambda: rv.live)
     assert rv.scrubber.get() == 6
 
 
