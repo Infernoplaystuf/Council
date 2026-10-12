@@ -432,8 +432,10 @@ def test_the_emulator_tests_leave_pylon_camemu_alone_when_imported(
             importlib.import_module(module)
         except pytest.skip.Exception:
             pass                        # no pypylon here: skipped at import
-        assert "PYLON_CAMEMU" not in os.environ, \
-            f"importing {module} set PYLON_CAMEMU"
+        # The one variable, not os.environ: a failed `not in os.environ`
+        # prints the whole environment into the test report.
+        leaked = os.environ.get("PYLON_CAMEMU")
+        assert leaked is None, f"importing {module} set PYLON_CAMEMU={leaked}"
     finally:
         sys.modules.pop(module, None)
         if kept is not None:
