@@ -514,11 +514,19 @@ def test_a_typhon_from_before_the_tabs_gets_them_and_keeps_its_code(
         "print(type(tabs).__name__, tabs.titles())\n"
         "print(all(page.isAncestorOf(getattr(ui.ports, p).widget)\n"
         "          for p in ('exposure', 'gain', 'frame_rate')))\n"
+        # An EVK4 listed FIRST, as discovery lists a real one plugged in
+        # (the fake EVK4 stands in for it, so nothing real is opened):
+        # this test means the SIMULATED event camera.
+        "import pytest\n"
+        "from tests import fake_evk4\n"
+        "fake_evk4.install(pytest.MonkeyPatch(), frame_camera)\n"
         "ui.on_btn_scan_for_cameras()\n"
         "rows = ui.ports.cameras.items()\n"
         "ui.ports.cameras.widget.setCurrentRow(\n"
-        "    next(i for i, r in enumerate(rows) if r.endswith('event')))\n"
+        "    next(i for i, r in enumerate(rows)\n"
+        "         if 'Simulated' in r and r.endswith('event')))\n"
         "ui.on_btn_connect()\n"
+        "print(type(frame_camera._LIVE.device).__name__)\n"
         "print(tabs.titles())\n"
         # An arrow click to 25: the box's link runs on a step or a
         # committed number (_SpinBox.committed), not on every setValue.
@@ -532,8 +540,10 @@ def test_a_typhon_from_before_the_tabs_gets_them_and_keeps_its_code(
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
     printed = done.stdout.strip().splitlines()
-    assert printed[-4] == "SettingsTabs ['Basic', 'Camera', 'Presets']"
-    assert printed[-3] == "True", "a box beside Start is not in Basic"
+    assert printed[-5] == "SettingsTabs ['Basic', 'Camera', 'Presets']"
+    assert printed[-4] == "True", "a box beside Start is not in Basic"
+    assert printed[-3] == "SyntheticDevice", \
+        "connected to the first event camera listed, not the simulated one"
     assert printed[-2] == ("['Basic', 'Biases', 'Filters', 'Display', "
                            "'Camera', 'Presets']")
     # The FPS box still applies its rate through its (hand-edited) link:
