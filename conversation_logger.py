@@ -66,6 +66,10 @@ PROTECTED_SUBDIRS: tuple = (
     # (council_engine.RoleMemoryManager writes memory/*.md), and the Sage's
     # knowledge notes. Indexed as documents, a vault search put them back
     # into a prompt — past "This conversation only", and past SILO in Tk.
+    # (The Sage itself still reads its own knowledge base, through
+    # council_core.vault_context.sage_block — what the user taught it in the
+    # Agents tab — in the Qt scopes "conversation" and "all", never in
+    # "none"; a vault search never returns it to any role.)
     "memory",
     "sage_knowledge",
     # The model-call meter (council_core.usage_log) and the weekly placement

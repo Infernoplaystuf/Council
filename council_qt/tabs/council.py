@@ -467,14 +467,20 @@ class CouncilActions:
         # slowest step, not the sum. Earlier conversations' decisions only
         # where the memory scope lets other conversations in: "This
         # conversation only" (the Qt default) keeps every older session out
-        # of a prompt unless the user loads it.
+        # of a prompt unless the user loads it. The Sage's own knowledge
+        # base (taught by the user in the Agents tab — facts, and
+        # corrections that quote older questions) is left out when memory
+        # is off ("none": nothing remembered); in "This conversation only"
+        # it is kept as what the user taught it on purpose (decided on the
+        # review of the council-map merge; the scope doc, section 8).
         lookups = start_parallel({
             "brief": ((lambda: self.vault_brief(typed_text))
                       if asking and getattr(options, "vault", True)
                       else None),
             "sage_kb": ((lambda: vault_context.sage_block(typed_text,
                                                           self.vault_dir))
-                        if sage is not None else None),
+                        if sage is not None
+                        and scope != memory_scope.NONE else None),
             "past": ((lambda: past_decisions.recall(self.vault_dir,
                                                     typed_text))
                      if asking and memory_scope.uses_other_sessions(scope)

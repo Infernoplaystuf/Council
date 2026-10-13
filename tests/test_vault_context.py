@@ -467,6 +467,40 @@ def test_only_the_sage_reads_its_knowledge_for_the_turn(tmp_path):
     assert models.sage.extra_context == ""
 
 
+@pytest.mark.parametrize("scope, given", [("none", False),
+                                          ("conversation", True),
+                                          ("all", True)])
+def test_the_sage_s_knowledge_follows_the_memory_scope(tmp_path, monkeypatch,
+                                                       scope, given):
+    """Found in review: the Sage's knowledge base reached the Sage in every
+    scope, "Memory: off" ("none" — nothing remembered) included; its
+    corrections quote older questions. Decided here: left out in "none";
+    in "This conversation only" it is kept as what the user taught the
+    Sage on purpose (the Agents tab's Teach and Correct), like a document
+    — a call the user may still change (the scope doc, section 8)."""
+    from council_core import council_options
+    from council_qt.tabs.council import CouncilActions
+    from tests.test_council_turn import FakeJudge
+    monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", scope)
+    _teach(tmp_path)
+    actions = CouncilActions(vault_dir=tmp_path)
+    assert actions._scope() == scope
+    models = _models()
+    models.sage = Recording()
+    models.judge = FakeJudge(route="sage")
+    actions._models = models
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.memo_llm = None
+    events = []
+    result = actions.send("which pump for 40 litres per minute?",
+                          council_options.CouncilOptions.defaults(),
+                          on_event=events.append)
+    assert result.ok and "sage" in result.panel, result.message
+    assert models.sage.seen
+    assert any("P-200" in s for s in models.sage.seen) is given
+    assert any("Sage: 2 item(s)" in e.text for e in events) is given
+
+
 def test_a_gap_the_sage_admits_is_logged_to_its_knowledge(tmp_path):
     import sage_agent
     from council_core import after_turn
