@@ -57,6 +57,13 @@ QUIET_INTERVALS = 3.0
 #: that repeats every time rather than clearing.
 MAX_CONSECUTIVE_ERRORS = 50
 
+#: What the display-drop count (Stats.dropped) is called in a status line.
+#: "dropped" was read as frames LOST; they are frames the screen did not
+#: redraw — every one of them is still saved. ONE wording for Typhon's
+#: lines (frame_camera) and the Council's Capture tab, which said "N
+#: dropped" for the number Typhon calls this.
+SCREEN_DROPS = "not drawn (screen only)"
+
 
 @dataclass(frozen=True)
 class Stats:
@@ -102,14 +109,14 @@ class Stats:
         grab: nothing came back."""
         return self.grabbed + self.grab_failures
 
-    def line(self, dropped_label: str = "dropped") -> str:
+    def line(self, dropped_label: str = SCREEN_DROPS) -> str:
         """The one line a status bar shows.
 
         The drop count is always present, including at zero. A number that
         only appears once it is bad is a number nobody is watching when it
-        goes bad. `dropped_label` lets a view say what it means in its own
-        words ("not drawn (screen only)" in Typhon, where "dropped" was read
-        as frames lost).
+        goes bad. It is called SCREEN_DROPS ("not drawn (screen only)") in
+        every view — "dropped" was read as frames lost; `dropped_label`
+        says it otherwise.
         """
         bits = [f"{self.rate:.1f} fps", f"{self.grabbed} grabbed",
                 f"{self.dropped} {dropped_label}"]

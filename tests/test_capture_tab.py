@@ -292,7 +292,7 @@ def test_starting_draws_a_frame_and_reports_the_rate(tab):
             tab._draw()
         assert tab.view._pixmap is not None, "nothing was ever drawn"
         assert "grabbed" in tab.status.text()
-        assert "dropped" in tab.status.text()
+        assert "not drawn (screen only)" in tab.status.text()
     finally:
         tab.on_stop()
 
@@ -461,7 +461,9 @@ def test_a_failed_write_ends_the_recording_and_its_count_stops_there(
         session = tab.session
         (index,) = list(tmp_path.glob("*_frames.csv"))
         run = index.name[:-len("_frames.csv")]
-        at = session.stats().grabbed + 8
+        # The camera's own frame number: Record counts afresh, so the
+        # grabbed count is no longer the number in the file names.
+        at = next_frame_number(tab) + 8
         clash = tmp_path / f"{run}_frame_{at:06d}.png"
         with open(clash, "xb") as handle:
             handle.write(precious)
@@ -485,6 +487,116 @@ def test_a_failed_write_ends_the_recording_and_its_count_stops_there(
         end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
             encoding="utf-8"))
         assert end["recording_failed"].startswith(f"frame {at} not saved")
+    finally:
+        tab.on_stop()
+
+
+def next_frame_number(tab):
+    """The number the simulated camera gives its next frame (its own
+    counter, which runs from Connect: the file names use it)."""
+    return int(tab.device._index) + 1
+
+
+def pump_tab(tab, seconds, until=None):
+    """Run the tab's UI for `seconds` — its 33 ms draw included — or until
+    `until()` holds."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        QApplication.processEvents()
+        tab._draw()
+        if until is not None and until():
+            return True
+        time.sleep(0.01)
+    return until() if until is not None else True
+
+
+def fail_a_recording(tab, folder):
+    """Record into `folder` and make a write fail: a file already where a
+    frame a little ahead will be written (never written over). Returns
+    once the recording has ended at the failure."""
+    tab.on_record()
+    session = tab.session
+    (index,) = list(folder.glob("*_frames.csv"))
+    run = index.name[:-len("_frames.csv")]
+    at = next_frame_number(tab) + 8
+    with open(folder / f"{run}_frame_{at:06d}.png", "xb") as handle:
+        handle.write(b"in the way")
+    assert pump_tab(tab, 15.0, until=lambda: session.stats().recording_failed)
+    assert pump_tab(tab, 5.0, until=lambda: session.recorder is None)
+    return at
+
+
+def test_the_next_record_after_a_failed_one_is_a_new_run_on_the_line(
+        tab, tmp_path):
+    """After a failed recording, the next Record's line still said the old
+    failure — measured: "52 saved · 1 NOT saved (recording stopped) · 1
+    error(s) · recording stopped: frame 9 not saved — FileExistsError …"
+    during a healthy second recording, its "52 saved" the 7 of the first
+    and the 45 of the second (on_record did not count afresh, as Typhon's
+    Start does: record_to(reset=True))."""
+    first, second = tmp_path / "one", tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    folders = iter([first, second])
+    connect_to(tab)
+    tab.ask_dir = lambda *a, **k: str(next(folders))
+    tab.on_start()
+    try:
+        at = fail_a_recording(tab, first)
+        assert f"frame {at} not saved" in tab.status.text()
+        tab.on_record()                     # Record… into the second folder
+        session = tab.session
+        assert session.recorder is not None
+        assert pump_tab(tab, 10.0, until=lambda: session.stats().recorded >= 10)
+        line = tab.status.text()
+        for old in ("NOT saved", "recording stopped", "error",
+                    f"frame {at}"):
+            assert old not in line, (old, line)
+        tab.on_record()                     # ■ Stop recording
+        pump_tab(tab, 0.2)
+        saved = len(list(second.glob("*.png")))
+        assert saved >= 10
+        assert session.stats().recorded == saved
+        assert f" {saved} saved" in tab.status.text(), tab.status.text()
+    finally:
+        tab.on_stop()
+
+
+def test_after_a_failed_recording_the_draw_does_not_resync_every_tick(
+        tab, tmp_path, monkeypatch):
+    """_draw called _sync() every 33 ms for the rest of the connection once
+    a recording had failed (stats.recording_failed never cleared): it is
+    called when the recording's state changes, once."""
+    connect_to(tab)
+    tab.ask_dir = lambda *a, **k: str(tmp_path)
+    tab.on_start()
+    try:
+        fail_a_recording(tab, tmp_path)
+        pump_tab(tab, 0.2)
+        assert "Stop recording" not in tab.record_btn.text()
+        calls = []
+        monkeypatch.setattr(tab, "_sync", lambda: calls.append(1))
+        for _ in range(20):
+            tab._draw()
+        assert calls == [], f"{len(calls)} resyncs in 20 draws"
+    finally:
+        monkeypatch.undo()
+        tab.on_stop()
+
+
+def test_the_screen_drops_are_said_in_typhons_words(tab):
+    """The tab said "N dropped" for the frames the screen did not redraw,
+    which Typhon calls "not drawn (screen only)" in every line — "dropped"
+    was read as frames lost, and every one of them is saved."""
+    from council_core import capture
+
+    connect_to(tab)
+    tab.on_start()
+    try:
+        pump_tab(tab, 0.3)
+        line = tab.status.text()
+        assert f" {capture.SCREEN_DROPS}" in line, line
+        assert "dropped" not in line, line
     finally:
         tab.on_stop()
 

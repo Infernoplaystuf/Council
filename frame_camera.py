@@ -767,11 +767,12 @@ RUN_NOTE_SECONDS = 10.0
 
 
 def _stats_line(stats: Any) -> str:
-    """capture.Stats.line in this app's words: the display drops are "not
-    drawn (screen only)" (SCREEN_DROPS) in EVERY line — the live one, Stop's,
-    a capture that ended and status(). Stop's said "N dropped" for the very
-    number the live line had just called "not drawn (screen only)"."""
-    return stats.line(SCREEN_DROPS)
+    """capture.Stats.line: the display drops are "not drawn (screen only)"
+    (capture.SCREEN_DROPS, the line's own wording) in EVERY line — the live
+    one, Stop's, a capture that ended and status(), and the Council's
+    Capture tab. Stop's said "N dropped" for the very number the live line
+    had just called "not drawn (screen only)"."""
+    return stats.line()
 
 
 def _run_note(session: Any) -> str:
@@ -2039,14 +2040,9 @@ def _port_widget(app: Any, name: str) -> Any:
     return widget
 
 
-#: What the display-drop count is called in the status line. "dropped" was
-#: read as frames LOST; they are frames the screen did not redraw — every one
-#: of them is still saved.
-SCREEN_DROPS = "not drawn (screen only)"
-
-
 def _status_line(stats: Any, frame: Any) -> str:
-    line = stats.line(SCREEN_DROPS)
+    # The display drops in capture.SCREEN_DROPS's words, as every line.
+    line = stats.line()
     note = _rate_note()
     if note:
         # Beside the MEASURED rate, so the two can be compared while the

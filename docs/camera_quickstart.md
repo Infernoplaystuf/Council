@@ -487,7 +487,10 @@ simply has none. (The Council's own Capture tab writes the same run files —
 frames, CSV, end record — into the folder you pick. There a failed write
 **ends** the recording at once, the live view going on: its `NOT saved
 (recording stopped)` count is the frame that failed and any queued behind
-it, and **Record…** starts a new run.)
+it, and **Record…** starts a new run — its status line counts afresh, so
+the old failure, its NOT-saved count and errors leave the line, and
+`saved` is that recording's own. The tab calls the screen's skipped
+frames `not drawn (screen only)`, as Typhon does.)
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
@@ -1130,7 +1133,8 @@ works while capturing too.
   display shows about 30 a second, whatever the camera does. Normal and
   deliberate; **every one of them is still saved.** Only **NOT saved** means
   frames missing from disk. The Stop line says it in the same words (it
-  used to say `N dropped` for the same number).
+  used to say `N dropped` for the same number), and so does the Council's
+  Capture tab.
 - **saved** is frames on disk. **waiting to save** appears when the disk is
   behind; **NOT saved (storage too slow)** counts frames it could not take at
   all.

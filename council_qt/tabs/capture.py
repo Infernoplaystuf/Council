@@ -82,6 +82,7 @@ class CaptureTab(ViewHelpers, QWidget):
         # "events/window" vanished whenever a tick came between two frames.
         self._shown: Optional[cameras.Frame] = None
         self._busy = False
+        self._synced_recording = False
 
         self._build()
         self._timer = QTimer(self)
@@ -359,7 +360,12 @@ class CaptureTab(ViewHelpers, QWidget):
             run, claim = capture.claim_run(folder,
                                            time.strftime("%Y%m%d_%H%M%S"))
             recorder = capture.run_recorder(folder, run, claim)
-            self.session.record_to(recorder)
+            # COUNTED AFRESH, in the same step as the switch (as Typhon's
+            # Start does): after a failed recording the next one's line
+            # still said "1 NOT saved (recording stopped) · 1 error(s) ·
+            # recording stopped: frame 9 not saved …", and "52 saved" for
+            # 7 saved by the first and 45 by this one.
+            self.session.record_to(recorder, reset=True)
         except OSError as exc:
             if recorder is not None:
                 recorder.close()
@@ -377,11 +383,16 @@ class CaptureTab(ViewHelpers, QWidget):
             self._shown = frame
         stats = self.session.stats()
         self.status.setText(self._status_line(stats, self._shown))
-        if stats.recording_failed:
+        if (self.session.recorder is not None) != self._synced_recording:
+            # A recording ENDED BY ITS FAILED WRITE (on the grab thread):
+            # the button says Record again. Once — it was every 33 ms for
+            # the rest of the connection, while recording_failed stayed.
             self._sync()
 
     def _status_line(self, stats: capture.Stats,
                      frame: Optional[cameras.Frame]) -> str:
+        # The display drops in Typhon's words (capture.SCREEN_DROPS, the
+        # line's own): this said "N dropped" for the same number.
         line = stats.line()
         meta = getattr(frame, "meta", None) or {}
         if meta.get("kind") == "event":
@@ -501,6 +512,9 @@ class CaptureTab(ViewHelpers, QWidget):
         running = self.session is not None and self.session.running
         recording = (self.session is not None
                      and self.session.recorder is not None)
+        #: What the record button was last set for (_draw follows a
+        #: recording that ended on its own).
+        self._synced_recording = recording
         idle = not self._busy
 
         self.scan_btn.setEnabled(idle and not connected)
