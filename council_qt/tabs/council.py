@@ -167,42 +167,12 @@ def docs_readers(models, docs) -> list:
     return docs_brief.readers(models)
 
 
-class _Started:
-    """Steps started side by side by `start_parallel`; `wait()` gives
-    {name: result} as prepare_parallel does."""
-
-    def __init__(self, steps):
-        self._results, self._errors, self._threads = {}, {}, []
-        for name, fn in steps.items():
-            if fn is None:
-                continue
-            thread = threading.Thread(target=self._run, args=(name, fn),
-                                      name=f"council-prep-{name}",
-                                      daemon=True)
-            self._threads.append(thread)
-            thread.start()
-
-    def _run(self, name, fn):
-        try:
-            self._results[name] = fn()
-        except Exception as exc:                          # noqa: BLE001
-            self._errors[name] = exc
-
-    def wait(self) -> dict:
-        for thread in self._threads:
-            thread.join()
-        out = dict(self._results)
-        if self._errors:
-            out["_errors"] = dict(self._errors)
-        return out
-
-
-def start_parallel(steps) -> _Started:
+def start_parallel(steps):
     """Start each non-None step on its own thread now; `.wait()` for
-    {name: result}. Daemon threads: a turn that never waits for them — an
-    answer straight from the data — leaves them to finish on their own, and
-    one that hangs cannot keep the app from closing."""
-    return _Started(steps)
+    {name: result} (council_core.side_by_side). A turn that never waits —
+    an answer straight from the data — leaves them to finish on their own."""
+    from council_core import side_by_side
+    return side_by_side.start(steps)
 
 
 def prepare_parallel(steps):
