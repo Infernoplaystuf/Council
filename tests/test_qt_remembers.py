@@ -42,8 +42,41 @@ FACTS = {
     "role": "WALNUT",          # the Writer's role memory
     "project": "KESTREL",      # the shared project memory
     "profile": "HAIKU",        # the compiled user profile
+    # council-map's stores (planted by _plant_council_map_stores):
+    "past": "PRETZEL",         # how an older question was decided
+    "reuse": "GINGER",         # an older passed answer, offered again
+    "verdictlog": "NUTMEG",    # who helped on an older question
+    "verdicts": "MARZIPAN",    # an older judged question
+    "wishlist": "CLOVE",       # the Librarian's gap list
+    "councillog": "PAPRIKA",   # logs/council.log
 }
 OLDER = "older_pump_talk"
+
+
+def _plant_council_map_stores(vault):
+    """What council-map keeps from older conversations — past decisions and
+    passed answers (.council_memory), who helped (verdict_log), the judged
+    questions, the gap list, the Librarian's log — each with a fact."""
+    from council_core import answer_reuse, past_decisions, verdict_log
+    assert past_decisions.record(
+        vault, "What is the pump in bay 4 called?",
+        f"The pump in bay 4 is called {FACTS['past']}.", "PASS", ["writer"])
+    assert answer_reuse.record(
+        vault, "Which gasket fits the pump in bay 4?",
+        f"Gasket {FACTS['reuse']} fits it.", "PASS")
+    verdict_log.record(vault, {"ts": time.time(), "question":
+                               f"the pump in bay 4 {FACTS['verdictlog']}"})
+    (vault / "verdict_history.jsonl").write_text(json.dumps(
+        {"ts": "2026-10-01T09:00:10", "session_id": OLDER,
+         "query": f"the pump in bay 4 is {FACTS['verdicts']}",
+         "confidence": 8, "passed": True}) + "\n", encoding="utf-8")
+    (vault / "librarian_wishlist.md").write_text(
+        f"- [ ] writer | the pump in bay 4 {FACTS['wishlist']}\n",
+        encoding="utf-8")
+    (vault / "logs").mkdir(exist_ok=True)
+    (vault / "logs" / "council.log").write_text(
+        f"User: the pump in bay 4 is {FACTS['councillog']}\n",
+        encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -533,32 +566,127 @@ def test_the_memory_scope_is_shown(qapp, tmp_path, monkeypatch):
 # The full council (DI_DEMO_MODE=0): every role's prompt
 # ============================================================
 
+def _whole_council(view):
+    """Every council-map switch on, at Deep depth: Auto answers "What is the
+    pump in bay 4 called?" at Quick (one member and the Judge), which is not
+    the panel this file means to cover."""
+    for key in ("deliberate", "tools", "parallel", "vault"):
+        if key in view._checkboxes:
+            view._checkboxes[key].setChecked(True)
+    view.depth_box.setCurrentIndex(view.depth_box.findData("deep"))
+    opts = view.options()
+    assert (opts.deliberate, opts.tools, opts.parallel, opts.vault,
+            opts.depth) == (True, True, True, True, "deep"), opts
+
+
+def _wait_for_learning(qapp):
+    assert _pump(qapp, lambda: not any(
+        t.name == "council-turn-learn" and t.is_alive()
+        for t in threading.enumerate()), timeout=120)
+
+
 def test_the_full_council_keeps_every_role_to_this_conversation(qapp,
                                                                  engine):
     """The judge records a verdict, as the Tk shell does after a
     deliberation; no role's prompt carries an older session, memory or the
-    profile."""
+    profile — nor anything council-map keeps from older conversations (past
+    decisions, passed answers, who helped, the gap list), with every switch
+    on at Deep depth."""
+    _plant_council_map_stores(engine.vault)
+    older_verdicts = (engine.vault / "verdict_history.jsonl").read_text(
+        encoding="utf-8")
     window, view = _council(qapp, engine.vault, demo_mode=False)
     try:
-        view._checkboxes["deliberate"].setChecked(True)
+        _whole_council(view)
         _ask(qapp, view, f"Note: the pump in bay 4 is called "
-                         f"{FACTS['turn']}.", timeout=180)
+                         f"{FACTS['turn']}.", timeout=240)
+        _wait_for_learning(qapp)
         first = len(engine.fake.state.chats)
-        _ask(qapp, view, "What is the pump in bay 4 called?", timeout=180)
+        _ask(qapp, view, "What is the pump in bay 4 called?", timeout=240)
+        _wait_for_learning(qapp)
         prompts = _prompts(engine.fake)
-        assert len(prompts) > first, "turn 2 reached no model"
+        assert len(prompts) > first + 5, "turn 2 was not the whole council"
         for prompt in prompts:
             leaked = _found(prompt) - {"turn"}
             assert not leaked, f"{sorted(leaked)} reached a prompt:\n{prompt}"
         assert any("turn" in _found(p) for p in prompts[first:]), (
             "no prompt in turn 2 carried turn 1")
+        assert "recall_decision" not in view.actions.tools()
+        assert view._last_route not in (None, "direct", "data")
         verdicts = engine.vault / "verdict_history.jsonl"
-        if view._last_route and view._last_route != "direct":
-            rows = [json.loads(line) for line in
-                    verdicts.read_text(encoding="utf-8").splitlines()]
-            assert rows and rows[-1]["session_id"] == \
-                view.conversation.session_id
-            assert rows[-1]["verdict_id"]
+        rows = [json.loads(line) for line in
+                verdicts.read_text(encoding="utf-8")[
+                    len(older_verdicts):].splitlines() if line]
+        assert rows and rows[-1]["session_id"] == \
+            view.conversation.session_id
+        assert rows[-1]["verdict_id"]
+        assert not engine.refused
+    finally:
+        _close(qapp, window, view)
+
+
+def test_in_scope_all_the_planted_stores_do_reach_a_prompt(qapp, engine,
+                                                           monkeypatch):
+    """The control for the test above: the stores are planted where a
+    prompt CAN read them — in the memory scope "all" the past decision and
+    the role memory get in."""
+    monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", "all")
+    _plant_council_map_stores(engine.vault)
+    window, view = _council(qapp, engine.vault, demo_mode=False)
+    try:
+        assert view.conversation.scope == "all"
+        _whole_council(view)
+        _ask(qapp, view, "What is the pump in bay 4 called?", timeout=240)
+        _wait_for_learning(qapp)
+        got = set().union(*(_found(p) for p in _prompts(engine.fake)))
+        assert {"past", "role"} <= got, got
+        assert "recall_decision" in view.actions.tools()
+    finally:
+        _close(qapp, window, view)
+
+
+def _tool_calls_first(body):
+    """FakeOllama's reply: a member offered tools calls vault_search, or
+    vault_read on the judged-question history, before it answers."""
+    text = "\n".join(m.get("content") or "" for m in body.get("messages")
+                     or [])
+    if 'output ONLY JSON: {"tool"' in text and \
+            "TOOL RESULTS SO FAR" not in text:
+        if "- vault_search:" in text:
+            return '{"tool": "vault_search", "args": {"query": "pump"}}'
+        if "- vault_read:" in text:
+            return ('{"tool": "vault_read", "args": '
+                    '{"name": "verdict_history.jsonl"}}')
+    return None
+
+
+def test_members_tools_never_read_older_conversations(qapp, engine):
+    """Found in review: with Tools on, vault_search found every word of the
+    question in question_history.json (older conversations' questions, and
+    the one being asked) and vault_read read verdict_history.jsonl, and the
+    results went into the members' next prompts (TOOL RESULTS SO FAR) and
+    the synthesizer's PRIOR TOOL OUTPUTS — 23 of 80 prompts."""
+    _plant_council_map_stores(engine.vault)
+    (engine.vault / "pumps.md").write_text(
+        "The pump in bay 4 is a P-200.\n", encoding="utf-8")
+    engine.fake.state.reply_fn = _tool_calls_first
+    window, view = _council(qapp, engine.vault, demo_mode=False)
+    try:
+        _whole_council(view)
+        # A coding question: the panel is the Coder, the Intern and the
+        # Skeptic, who have vault_search and vault_read (tool_kit.ROLE_TOOLS).
+        _ask(qapp, view, "Write a short python function that returns the "
+                         "name of the pump in bay 4.", timeout=300)
+        _wait_for_learning(qapp)
+        prompts = _prompts(engine.fake)
+        with_results = [p for p in prompts if "TOOL RESULTS SO FAR" in p]
+        assert with_results, "no member called a tool"
+        assert any("P-200" in p for p in with_results), (
+            "the user's own file was not found by the tools")
+        for prompt in prompts:
+            leaked = _found(prompt)
+            assert not leaked, f"{sorted(leaked)} reached a prompt:\n{prompt}"
+        assert not engine.refused
     finally:
         _close(qapp, window, view)
 
