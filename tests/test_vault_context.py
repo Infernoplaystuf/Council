@@ -264,6 +264,52 @@ def test_a_passage_from_a_file_already_in_front_is_not_repeated(tmp_path,
                                                            "valves.md"]
 
 
+@pytest.mark.parametrize("deliberate, think", [(True, "high"),
+                                               (False, None)])
+def test_the_turn_context_is_sized_with_the_blocks_set_before_it(
+        tmp_path, roomy, monkeypatch, deliberate, think):
+    """prepare_turn sizes the vault blocks for the Writer's call, which it
+    measures with the Writer's standing context (prompt_frame folds it):
+    the docs and the past decisions council-map sets on the Writer are on
+    it when prepare_turn runs, the passages — fitted to what is left after
+    — are not yet; and the call is measured at the thinking level it is
+    made at (the council's synthesis thinks "high", a plain answer not)."""
+    from council_core import council_options
+    from council_core import past_decisions
+    from council_core.docs_brief import DocsBrief
+    from council_qt.tabs.council import CouncilActions
+    monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", "all")
+    past_decisions.record(tmp_path, "which pump for 40 litres per minute?",
+                          "The P-200.", "PASS", ["writer"])
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = _models()
+    models.judge = EvidenceJudge()
+    actions._models = models
+    actions.memo_llm = None
+    actions.docs_brief = lambda q, m: DocsBrief(
+        "DOCUMENTATION — pages\n[1] pumps API\npump.size(lpm)", ["pumps API"])
+    actions.vault_brief = lambda q: vc.build("pump", tmp_path,
+                                             rag=FakeRag(CHUNKS))
+    at_prepare = []
+    real = actions.prepare
+
+    def prepare(*a, **kw):
+        at_prepare.append((kw["writer"].extra_context, kw.get("think")))
+        return real(*a, **kw)
+    actions.prepare = prepare
+    options = council_options.CouncilOptions.defaults()
+    options.deliberate = deliberate
+    options.depth = "deep"
+    result = actions.send("which pump for 40 litres per minute?", options)
+    assert result.ok, result.message
+    (standing, seen_think), = at_prepare
+    assert "DOCUMENTATION" in standing and "PAST DECISIONS" in standing
+    assert vc.MARKER not in standing
+    assert seen_think == think
+    assert any(vc.MARKER in s for s in models.writer.seen)
+    assert models.writer.extra_context == ""
+
+
 def test_the_vault_switch_turns_it_off(tmp_path):
     from council_core import council_options
     from council_qt.tabs.council import CouncilActions
