@@ -193,7 +193,10 @@ def run(vault_dir: Path, project: pj.Project, *, label: str = "code",
     folder = bench_dir(vault_dir)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = folder / f"code-{re.sub(r'[^\w.-]+', '_', label)}-{stamp}.jsonl"
+    # Outside the f-string: a backslash inside one is Python 3.12+ only, and
+    # the app runs on 3.11 (CLAUDE.md) — there this file did not import.
+    safe_label = re.sub(r"[^\w.-]+", "_", label)
+    path = folder / f"code-{safe_label}-{stamp}.jsonl"
     outcomes: List[Outcome] = []
     for i, t in enumerate(tasks, 1):
         if should_stop():
