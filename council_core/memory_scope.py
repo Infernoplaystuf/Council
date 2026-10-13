@@ -28,10 +28,9 @@ HOW IT IS DECIDED
     3. The caller's default: "all" for the engine (what it did with SILO
        unset), "conversation" for the Qt shell.
 
-The Tk module sets SILO when it is imported (set_tk_default) and marks it as
-its own default; the Qt shell (for_qt) does not read a SILO so marked, so an
-import of the Tk module cannot turn Qt's memory off. A SILO the user set is
-read by both.
+The retired Tk shell sets SILO when its module is imported (its own default,
+"none"). The Qt app never imports it (CLAUDE.md, "The Tk shell is retired"),
+so that default never reaches a Qt scope; a SILO the user set does.
 
 An unknown COUNCIL_MEMORY_SCOPE is not guessed at: it is ignored and the rest
 of the rule applies. An unknown scope handed to `blocks()` is treated as
@@ -79,38 +78,10 @@ def resolve(environ: Optional[Mapping[str, str]] = None, *,
     return default if default in SCOPES else NONE
 
 
-#: Set beside COUNCIL_DEMO_SILO when the Tk module set SILO as ITS default
-#: (set_tk_default), rather than the user.
-TK_DEFAULT_MARK = "COUNCIL_DEMO_SILO_SOURCE"
-_TK_DEFAULT = "tk-default"
-
-
-def set_tk_default(environ: Optional[dict] = None) -> None:
-    """The Tk shell's default — SILO on — unless the environment already
-    says something; marked as the Tk shell's when it is set here.
-
-    The Tk module used to run os.environ.setdefault("COUNCIL_DEMO_SILO",
-    "1") when it was IMPORTED, and the Qt shell reads the environment when
-    its conversation is built — so any import of the Tk module before the
-    Council tab (a probe, a test file, a future eager import) silently
-    switched Qt to "Memory: off" (found in review). The mark lets for_qt
-    tell the Tk shell's default from a SILO the user set. The Tk shell
-    itself — and anything it starts — still sees SILO=1, as before."""
-    env = os.environ if environ is None else environ
-    if "COUNCIL_DEMO_SILO" not in env:
-        env["COUNCIL_DEMO_SILO"] = "1"
-        env[TK_DEFAULT_MARK] = _TK_DEFAULT
-
-
 def for_qt(environ: Optional[Mapping[str, str]] = None) -> str:
     """The Qt shell's scope: "This conversation only" unless the environment
-    says otherwise (COUNCIL_MEMORY_SCOPE, or SILO for none). A SILO the Tk
-    module set as its own default (set_tk_default) is not the user's choice
-    and is not read here."""
-    env = os.environ if environ is None else environ
-    if env.get(TK_DEFAULT_MARK) == _TK_DEFAULT:
-        env = {k: v for k, v in env.items() if k != "COUNCIL_DEMO_SILO"}
-    return resolve(env, default=QT_DEFAULT)
+    says otherwise (COUNCIL_MEMORY_SCOPE, or SILO for none)."""
+    return resolve(environ, default=QT_DEFAULT)
 
 
 @dataclass(frozen=True)

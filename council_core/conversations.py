@@ -432,11 +432,14 @@ def claim_session_id(store: "ConversationStore", log_dir: Optional[Path],
     "_2". (The session's own file is claimed on its first record, so a
     launch nobody asks anything leaves no empty session in the list.)
 
-    BOTH shells call this. Only the Qt shell did: the Tk console took
-    datetime.now() and its logger buffers, so nothing of a Tk launch was on
-    disk yet, and a Qt launch in the same second took the same id — the two
-    wrote into one session file, and a Tk question reached the Qt Writer's
-    RECENT CONVERSATION under "This conversation only" (found in review).
+    The Qt shell calls this. The retired Tk console does not: it takes
+    datetime.now() and its logger buffers, so nothing of a Tk launch is on
+    disk yet, and a Qt launch in the same second can take the same id — the
+    two then write into one session file, and a Tk question reaches the Qt
+    Writer's RECENT CONVERSATION under "This conversation only" (found in
+    review). The fix to the Tk console was dropped with the rest of its
+    Batch 1-2 edits: the Tk shell is retired and keeps its old code
+    (CLAUDE.md).
 
     ``problem`` is "" or why the log file could not be made (the id is
     still returned, unclaimed)."""

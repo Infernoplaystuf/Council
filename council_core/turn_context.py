@@ -1,11 +1,10 @@
 """
 council_core.turn_context — what a turn is given besides the question.
 
-MOVED FROM council_gui_engine.py (lines 330-3515 of qt-migration @ be07131),
-so both shells build a turn's context with the same code. The Tk engine
-re-exports every name, so its 285-odd call sites and the smoke tests keep
-working; the Qt shell imports this module on its turn worker. Toolkit-free:
-nothing here touches a widget.
+COPIED FROM council_gui_engine.py (lines 330-3515 of qt-migration @ be07131)
+for the Qt app, which imports this module on its turn worker. The Tk shell is
+retired (CLAUDE.md) and keeps its own copy of this code, untouched; fixes go
+here, never there. Toolkit-free: nothing here touches a widget.
 
 What it does, in the order a turn uses it (see `prepare_turn` at the end):
 the analyst step (deterministic answers computed from the data — counts,
@@ -16,11 +15,9 @@ data index, a dataset overview, the analyst's result or its refusal, and the
 task memo — each block tagged with its token cost and capped, the droppable
 ones dropped to fit the context window.
 
-THE EDITS THE MOVE MADE (everything else is byte-for-byte):
-  * `VAULT_DIR` reads became `_vault()` (22 places). The Tk engine
-    registers its own VAULT_DIR (`use_vault_dir`), so a test that sets
-    `council_gui_engine.VAULT_DIR` still steers these functions; a turn
-    prepared by `prepare_turn` uses its session's vault; otherwise
+THE EDITS THE MOVE MADE (everything else was byte-for-byte):
+  * `VAULT_DIR` reads became `_vault()` (22 places): a turn prepared by
+    `prepare_turn` uses its session's vault; otherwise
     council_core.paths.vault_dir().
   * `_get_vault_index`, `_get_data_index` and `_resolve_referenced_path`
     first ask the session a turn is being prepared for (`TurnState`, set
@@ -29,9 +26,9 @@ THE EDITS THE MOVE MADE (everything else is byte-for-byte):
     second vault in one process (two Qt windows, a test after a test) was
     searched through the first vault's index.
   * The module-wide instances (`_VAULT_INDEX_INSTANCE`,
-    `_DATA_INDEX_INSTANCE`, `_REFERENCED_FILES_MAP`) are NOT re-exported
-    by the Tk engine: a copy of a name that is rebound later would go stale
-    silently. Set them here (`council_core.turn_context`).
+    `_DATA_INDEX_INSTANCE`, `_REFERENCED_FILES_MAP`) are this module's own;
+    the Tk shell's copies are separate. Set them here
+    (`council_core.turn_context`).
   * `_inject_file_contents` takes `extra_blocks` (default None: no change),
     placed at a new priority band PRIO_EXTRA between the folder listings
     and the vault search — where prepare_turn hands in the knowledge graph's
@@ -61,24 +58,12 @@ from . import paths as _paths
 _ACTIVE: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
     "council_turn_state", default=None)
 
-_VAULT_DIR_GETTER: Optional[Callable[[], Any]] = None
-
-
-def use_vault_dir(getter: Optional[Callable[[], Any]]) -> None:
-    """The Tk engine's hook: these functions read ITS VAULT_DIR (a test that
-    sets council_gui_engine.VAULT_DIR steers them) outside a prepared turn."""
-    global _VAULT_DIR_GETTER
-    _VAULT_DIR_GETTER = getter
-
-
 def _vault() -> Path:
-    """The vault these functions read: the prepared turn's, else the one the
-    Tk engine registered, else council_core.paths.vault_dir()."""
+    """The vault these functions read: the prepared turn's, else
+    council_core.paths.vault_dir()."""
     state = _ACTIVE.get()
     if state is not None:
         return Path(state.vault_dir)
-    if _VAULT_DIR_GETTER is not None:
-        return Path(_VAULT_DIR_GETTER())
     return _paths.vault_dir()
 
 
@@ -2691,7 +2676,7 @@ def _get_vault_index():
     """Lazy-init the vault index. Returns None on import/setup failure."""
     global _VAULT_INDEX_INSTANCE
     state = _ACTIVE.get()                      # [turn_context] a session's own
-    if state is not None and not state.module_indexes:
+    if state is not None:
         return state.get_vault_index()
     if _VAULT_INDEX_INSTANCE is not None:
         return _VAULT_INDEX_INSTANCE
@@ -2725,7 +2710,7 @@ def _get_data_index():
     """
     global _DATA_INDEX_INSTANCE
     state = _ACTIVE.get()                      # [turn_context] a session's own
-    if state is not None and not state.module_indexes:
+    if state is not None:
         return state.get_data_index()
     if _DATA_INDEX_INSTANCE is not None:
         return _DATA_INDEX_INSTANCE
@@ -3528,12 +3513,13 @@ def _build_analyst_failure_block(code: str, error_log: str) -> str:
 
 
 # ============================================================
-# prepare_turn — the one seam both shells call
+# prepare_turn — the seam the Qt Council calls
 # ============================================================
 # Before this, the sequence below was written out inside the Tk shell's
 # 1,166-line _send, and the Qt shell had none of it: it sent the typed
-# question alone, so a fact in the vault reached 0 of 13 prompts. Both shells
-# now call prepare_turn and send what it returns.
+# question alone, so a fact in the vault reached 0 of 13 prompts. The Qt
+# Council now calls prepare_turn and sends what it returns (the retired Tk
+# shell keeps its own _send).
 #
 # THE BLOCKS A TURN IS GIVEN BESIDES THE QUESTION — one seam, three blocks:
 #
@@ -3567,7 +3553,8 @@ PIN_LIFETIME_TURNS = 3
 
 #: What a turn says when the analyst answered from the data and no model was
 #: asked (the Tk fast path's line, without the Expand button it points at in
-#: Tk — the Qt build cannot send a fast question to the full council yet).
+#: Tk — the Qt Council's Expand re-asks a Writer's fast answer, not one from
+#: the data).
 FAST_ANSWER_NOTE = ("Answered directly from the data — no model was asked, "
                     "so it is instant and exact.")
 
@@ -3577,10 +3564,10 @@ class TurnState:
     """One conversation's retrieval memory — what the next turn's context
     builds on. Lives as long as the conversation.
 
-    The Tk console keeps these as its own attributes (task_memory,
-    _referenced_files, its pins, data_index); the Qt shell keeps one of these
-    per conversation. Neither is cross-session memory: nothing here is
-    written to disk or read from an older session.
+    The Qt shell keeps one of these per conversation (the retired Tk
+    console keeps the same things as its own attributes). It is not
+    cross-session memory: nothing here is written to disk or read from an
+    older session.
     """
     vault_dir: Path
     #: task_memory.TaskMemory — the goal/constraints sticky note.
@@ -3595,10 +3582,6 @@ class TurnState:
     vault_index: Any = None
     #: provenance.ProvenanceTracker — "where did that number come from?"
     provenance: Any = None
-    #: True: the index lookups use the module-wide instances, as they did
-    #: before the move — the Tk console registers its warm data index there
-    #: (_register_data_index) and keeps one vault index for the process.
-    module_indexes: bool = False
     #: Lower-case words the close-match notice offered in this conversation
     #: ("zebrafn -> zebrafin"): what "forget WORD" may take (forget_command).
     offered_matches: Set[str] = _field(default_factory=set)
@@ -3818,7 +3801,7 @@ def _vault_sources(raw_sources: Any, vault_dir: Any) -> List[Path]:
 def resolve_source_paths(raw_sources: Any, vault_dir: Any) -> List[Path]:
     """Existing absolute files for a mixed list of absolute paths,
     vault-relative paths, bare names and name patterns — de-duplicated, in
-    order. (The Tk console's _resolve_source_paths, which now calls this.)"""
+    order. (As the Tk console's _resolve_source_paths resolves them.)"""
     try:
         in_dir = data_index.input_dir(Path(vault_dir))
     except Exception:                                     # noqa: BLE001
@@ -4029,7 +4012,7 @@ def prepare_turn(question: str, state: TurnState, *,
                  writer: Any = None,
                  think: Optional[str] = None) -> PreparedTurn:
     """Build what the models are sent for ``question``: the Tk console's
-    sequence, once, for both shells.
+    sequence, for the Qt Council.
 
       1. the task memo (``condense`` asks a model; None = heuristics only)
       2. the analyst step — a deterministic answer from the data, or its
@@ -4058,8 +4041,7 @@ def prepare_turn(question: str, state: TurnState, *,
     it happens, in the Tk console's order and wording, and is also kept in
     ``notices``. Runs with ``state`` active, so the index lookups and the
     referenced files are this conversation's. Blocking (it may call a model
-    and read files): the Qt shell calls it on its turn worker; the Tk console
-    calls it where it always ran this code."""
+    and read files): the Qt shell calls it on its turn worker."""
     prepared = PreparedTurn(question=question, text=question)
 
     def say(who: str, text: str, kind: str = "observation") -> None:

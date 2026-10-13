@@ -4744,9 +4744,6 @@ def test_known_field_names_harvests_real_labels() -> None:
     try:
         import council_gui_engine as g
         import vault_index as vi
-        # The vault-index instance moved with the context code; it is set
-        # where it lives now (council_core.turn_context).
-        from council_core import turn_context as tc
     except Exception as exc:  # pragma: no cover
         _check(f"imports ({exc!r})", False)
         return
@@ -4756,7 +4753,7 @@ def test_known_field_names_harvests_real_labels() -> None:
     from pathlib import Path
 
     scratch = Path(tempfile.mkdtemp(prefix="smoke_harvest_"))
-    saved = tc._VAULT_INDEX_INSTANCE
+    saved = g._VAULT_INDEX_INSTANCE
     try:
         root = scratch / "data_in"
         root.mkdir(parents=True)
@@ -4772,7 +4769,7 @@ def test_known_field_names_harvests_real_labels() -> None:
 
         idx = vi.VaultIndex(scratch)
         idx.rebuild()
-        tc._VAULT_INDEX_INSTANCE = idx
+        g._VAULT_INDEX_INSTANCE = idx
 
         class _Fake(g.CouncilConsole):
             def __init__(self):
@@ -4799,7 +4796,7 @@ def test_known_field_names_harvests_real_labels() -> None:
                    "how often does each Router_Point_of_Contact appear")
                 or "").lower() == "router_point_of_contact")
     finally:
-        tc._VAULT_INDEX_INSTANCE = saved
+        g._VAULT_INDEX_INSTANCE = saved
         shutil.rmtree(scratch, ignore_errors=True)
 
 
@@ -6981,15 +6978,14 @@ def test_vault_search_runs_on_main_path() -> None:
         vi.rebuild()
         di = data_index.DataIndex(
             search_roots=[vroot / "data_in"], write_root=vroot / "out")
-        from council_core import turn_context as tc   # where it lives now
-        saved = tc._VAULT_INDEX_INSTANCE
-        tc._VAULT_INDEX_INSTANCE = vi
+        saved = cge._VAULT_INDEX_INSTANCE
+        cge._VAULT_INDEX_INSTANCE = vi
         cge._register_data_index(di)
         try:
             _aug, _fuzzy, bd = cge._inject_file_contents_impl(
                 "find files about promethium", n_ctx=8192)
         finally:
-            tc._VAULT_INDEX_INSTANCE = saved
+            cge._VAULT_INDEX_INSTANCE = saved
             cge._register_data_index(None)
         labels = [l for l, _ in bd.get("costs", [])]
         _check("vault search produces a VAULT block (no swallowed NameError)",

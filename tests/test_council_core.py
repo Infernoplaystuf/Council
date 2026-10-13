@@ -914,18 +914,10 @@ def test_the_engine_keeps_the_names_the_smoke_suite_uses():
     import importlib
     spec = importlib.util.find_spec("council_gui_engine")
     assert spec is not None
-    import re
     source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    # Imported under these names — first from council_core.vault_search,
-    # and since the turn-context code moved, re-exported from
-    # council_core.turn_context (which imports them from vault_search).
-    reexport = source[source.index("from council_core.turn_context import ("):]
-    reexport = reexport[:reexport.index(")")]
     for name in ("_search_vault_filenames", "_compile_name_pattern",
                  "_name_matches_pattern"):
-        assert (f"as {name}," in source
-                or re.search(rf"\b{name}\b", reexport)), (
-            f"{name} is no longer importable")
+        assert f"as {name}," in source, f"{name} is no longer importable"
 
 
 # ================================================================= vault_jobs
