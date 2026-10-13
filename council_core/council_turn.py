@@ -321,6 +321,10 @@ def run_turn(question: str, models: Any, *,
         chosen = decide(typed, route, forced=depth)
         extra_ctx = dict(extra_ctx or {})
         extra_ctx["depth"] = chosen
+        # What the user typed, for what NAMES the question (a low-confidence
+        # gap's wishlist topic): `question` may carry the task memo and the
+        # vault in front of it.
+        extra_ctx["typed"] = typed
         if on_event is not None:
             on_event(AgentEvent("Judge", "phase", "▶ " + chosen.note()))
 

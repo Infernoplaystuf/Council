@@ -172,6 +172,51 @@ def test_run_turn_carries_the_gaps_and_the_question_out():
     assert {g["who"] for g in result.low_conf_gaps} <= set(result.panel)
 
 
+def test_a_gap_names_the_typed_question_not_the_text_in_front_of_it(
+        tmp_path, monkeypatch):
+    """Found in review: the Qt Council sends the augmented text (the task
+    memo and the vault in front of the question) to run_turn, and a gap's
+    topic was its first 80 characters — "writer answer to: [TASK MEMO — the
+    user's ORIGINAL request …\\ngoal: wha" — so the wishlist line named the
+    memo, and its newline split the list item in two. The topic names what
+    was typed, on one line."""
+    from council_core import council_options
+    from council_core import vault_context as vc
+    from council_core.docs_brief import DocsBrief
+    from council_qt.tabs.council import CouncilActions
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "data_in" / "pumps.csv").write_text(
+        "bay,pump,size\n4,P-17,large\n5,P-9,small\n", encoding="utf-8")
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    monkeypatch.delenv("COUNCIL_MEMORY_SCOPE", raising=False)
+    actions = CouncilActions(vault_dir=vault)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer, models.peasant = LowConfidence(), LowConfidence()
+    models.judge = FakeJudge()
+    actions._models = models
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = lambda q, m: DocsBrief()
+    actions.memo_llm = None
+    opts = council_options.CouncilOptions.defaults()
+    opts.depth = "deep"                 # the Judge ranks only past Quick
+    typed = "How big is the pump\nin bay 4 (see pumps.csv)?"
+    result = actions.send(typed, opts)
+    assert result.ok, result.message
+    topics = [g["topic"] for g in result.low_conf_gaps]
+    assert topics, "no gaps"
+    for topic in topics:
+        assert "TASK MEMO" not in topic and "\n" not in topic, topic
+        assert topic.endswith("answer to: How big is the pump in bay 4 "
+                              "(see pumps.csv)?"), topic
+    assert at.log_gaps(vault, result.low_conf_gaps) == len(topics)
+    lines = (vault / "librarian_wishlist.md").read_text(
+        encoding="utf-8").splitlines()
+    items = [ln for ln in lines if ln.startswith("- [ ]")]
+    assert len(items) == len(topics), lines
+    assert all("How big is the pump in bay 4" in ln for ln in items), items
+
+
 def test_with_the_real_engine_memory_files_are_written(tmp_path):
     import council_engine as ce
     mgr = ce.RoleMemoryManager(tmp_path / "memory")

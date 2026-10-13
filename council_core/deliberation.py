@@ -1275,10 +1275,15 @@ class DeliberationOrchestrator:
                 # 4a) Low-confidence gap logging ─────────────────────────────────
                 # Roles that reported self-confidence ≤40% are flagged so the
                 # Librarian wishlist captures what vault data would have helped.
+                # The topic names what the user TYPED (ctx.shared["typed"],
+                # run_turn's) — user_text can start with the task memo and
+                # the vault — on one line: it becomes a wishlist list item.
+                _lc_asked = " ".join(str(ctx.shared.get("typed")
+                                         or user_text).split())[:80]
                 for _lc_role, _lc_data in candidates.items():
                     if _lc_data.get("self_confidence", 100) <= _cf_LOW:
                         try:
-                            _lc_topic = f"{_lc_role} answer to: {user_text[:80]}"
+                            _lc_topic = f"{_lc_role} answer to: {_lc_asked}"
                             _lc_why = _lc_data.get("confidence_reason", "")
                             _lc_reason = (
                                 f"{_lc_role} self-reported confidence "
