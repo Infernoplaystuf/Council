@@ -112,6 +112,48 @@ def test_the_facts_the_map_is_for():
     assert _edge(m, "judge", "debate", "REQUIRED_CHANGES").status == "partial"
 
 
+def test_the_map_s_memory_claims_hold_in_this_conversation_only(
+        monkeypatch):
+    """Found in review: in the Qt default ("This conversation only") the
+    map still said role memory, project memory and the profile reach every
+    role ("live"), that each member gets them, that the Strategist recalls
+    past decisions and that similar earlier questions go to the Judge and
+    the Writer — none of which happens in that scope."""
+    from council_core import memory_scope
+    monkeypatch.delenv("COUNCIL_MEMORY_SCOPE", raising=False)
+    monkeypatch.delenv("COUNCIL_DEMO_SILO", raising=False)
+    assert memory_scope.for_qt() == "conversation"
+    allowed = memory_scope.blocks(memory_scope.for_qt())
+    m = cm.static_map()
+    memory = [e for e in m.edges if e.src == "role_memory"]
+    for edge in memory:
+        claims_learned = any(w in edge.data for w in ("profile",
+                                                      "project memory",
+                                                      "own memory", "own +"))
+        if claims_learned and edge.status == "live":
+            assert allowed.profile and allowed.role_memory, (
+                f"role_memory → {edge.dst} says {edge.data!r} is live")
+    # Every role still gets this conversation's turns — that link is live.
+    for role in ("writer", "judge", "coder"):
+        live = [e for e in memory if e.dst == role and e.status == "live"]
+        assert live and all("conversation" in e.data for e in live), role
+        learned = [e for e in memory if e.dst == role and
+                   "profile" in e.data]
+        assert learned and all(e.status == "partial" and '"all"' in e.note
+                               for e in learned), role
+    nodes = {n.id: n for n in cm._NODES}
+    assert '"all"' in nodes["council_memory"].summary
+    members = next(s for s in cm.GUIDE
+                   if s.title == "Each member writes an answer")
+    assert '"all"' in members.body
+    assert "its own memory, the project memory, your profile and recent " \
+        "conversation" not in members.body
+    tools = next(s for s in cm.GUIDE if s.title.startswith("Tools"))
+    recall = [part for part in tools.body.split(";") if "past decision" in
+              part]
+    assert recall and all('"all"' in part for part in recall), recall
+
+
 def test_visible_edges_filters_by_layer_and_status():
     m = cm.static_map()
     tools = m.visible_edges(layers=["tools"])

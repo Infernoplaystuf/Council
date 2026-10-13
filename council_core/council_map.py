@@ -195,20 +195,24 @@ _NODES: Tuple[Node, ...] = (
          "search otherwise (no model loaded, nothing downloaded).",
          "council_core/vault_context.py (build, fit)"),
     Node("analyst", "Analyst", "agent",
-         "For a numbers question: writes pandas code (a local model), runs "
-         "it over <vault>/data_in in the sandbox — it reads only that "
-         "folder and never writes — and puts the figures in front of the "
-         "question for every member and the Judge, or tells them not to "
+         "For a numbers question: the Coder's model writes pandas code (a "
+         "failure goes back to it once), which runs over <vault>/data_in in "
+         "the sandbox, in its own process with a time limit — it reads only "
+         "that folder and never writes — and the figures go in front of the "
+         "question for every member and the Judge, or they are told not to "
          "invent a number when it fails. A count or a saved result is "
-         "answered straight from the data, with no model asked.",
+         "answered straight from the data, with no model asked. "
+         "COUNCIL_ANALYST=0 turns it off.",
          "council_core/turn_context.py (prepare_turn, _run_analyst_step); "
-         "vault_analyst.py"),
+         "council_core/analyst_step.py (run_code); vault_analyst.py"),
     Node("task_memo", "Task memo", "agent",
          "Before each question, condenses it into a short [TASK MEMO] — the "
          "goal, constraints and what to avoid — carrying the constraints "
-         "forward when the question follows up the last one. It goes in "
-         "front of that question, for every member and the Judge.",
-         "task_memory.py; council_core/turn_context.py (prepare_turn)"),
+         "forward when the question follows up the last one (keyword rules, "
+         "and the Intern's model). It goes in front of that question, for "
+         "every member and the Judge.",
+         "task_memory.py; council_core/turn_context.py (begin_turn, "
+         "condense_with_local_model)"),
     Node("vault", "Vault", "supplier", "Your documents and data files.",
          "council_core/paths.py"),
     Node("vault_rag", "Vault RAG", "supplier",
@@ -264,8 +268,10 @@ _NODES: Tuple[Node, ...] = (
     Node("council_memory", "Past decisions", "store",
          "Every deliberated question, its verdict and the start of its "
          "answer, across sessions (.council_memory/decisions.jsonl). "
-         "Similar earlier questions go to the Judge and the Writer. Keyword "
-         "matching: no model, nothing downloaded.",
+         "Similar earlier questions go to the Judge and the Writer — only "
+         "in the memory scope \"all\"; \"This conversation only\" (the Qt "
+         "default) keeps them out. Keyword matching: no model, nothing "
+         "downloaded.",
          "council_core/past_decisions.py"),
     Node("answer_store", "Passed answers", "store",
          "Every answer the Judge passed, whole, with a fingerprint of the "
@@ -508,9 +514,17 @@ def _edges() -> List[Edge]:
                      "build on", "context", note=why,
                      cite="council_engine.py (ROLE_CONTEXT_PROFILES)"))
     for role in ("judge", "writer") + MEMBERS + ("peasant",):
-        out.append(E("role_memory", role, "own + project memory, profile, "
-                     "history, prior session", "memory", "live",
-                     cite="council_engine.py:5645-5770"))
+        # What every scope but "none" lets in, and what only "all" does
+        # (council_core.memory_scope.blocks).
+        out.append(E("role_memory", role, "this conversation's earlier "
+                     "turns, and a session you load (Load as Prior)",
+                     "memory", "live",
+                     cite="council_engine.py (PersonalityModel.stitch); "
+                          "council_core/memory_scope.py (blocks)"))
+        out.append(E("role_memory", role, "own + project memory, profile",
+                     "memory", "partial", note=_ALL_ONLY,
+                     cite="council_engine.py (PersonalityModel.stitch); "
+                          "council_core/memory_scope.py (blocks)"))
     return out
 
 
@@ -955,10 +969,11 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_core/council_turn.py (PANEL_FOR_ROUTE)"),
     GuideStep(
         "Each member writes an answer",
-        "Each member gets the question plus its own memory, the project "
-        "memory, your profile and recent conversation (Role memory), writes "
-        "a full answer, and ends it with how sure it is (0–100%) and what "
-        "it is least sure of.\n\n"
+        "Each member gets the question plus this conversation's earlier "
+        "turns (Role memory) — and, only in the memory scope \"all\", its "
+        "own memory, the project memory and your profile — writes a full "
+        "answer, and ends it with how sure it is (0–100%) and what it is "
+        "least sure of.\n\n"
         "By default they answer one at a time, and each later member also "
         "reads the answers before it. With 'Parallel members' on (Council "
         "tab), they all answer at once, each without seeing the others — "
@@ -991,8 +1006,9 @@ GUIDE: Tuple[GuideStep, ...] = (
         "Each has its own short list: the Coder checks, tests and searches "
         "code; the Intern looks at data files and computes from them; the "
         "Skeptic checks quotes and numbers; the Sage and Writer read parts "
-        "of long files; the Strategist recalls past decisions and sees "
-        "which machines are busy; the Artist draws charts. The result goes "
+        "of long files; the Strategist recalls past decisions (only in the "
+        "memory scope \"all\") and sees which machines are busy; the Artist "
+        "draws charts. The result goes "
         "back to the member, and to the Writer later as 'prior tool "
         "outputs'. Members can leave each other notes, and a repeated "
         "lookup in the same question is answered from a cache.\n\n"
