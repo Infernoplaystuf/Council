@@ -367,3 +367,37 @@ Still open after the second review:
   window). Whether to keep the 4,096-sized caps for those blocks is a choice not made here.
 - Tk's own `_preview_data_file` still reads on Tk's GUI thread (now bounded reads).
 - RECENT CONVERSATION still holds the question being answered (Qt, and Tk with SILO off).
+
+## 8. After merging council-map (branch `merge/council-map`, 2026-10-13)
+
+origin/qt-migration (council-map: depth, structured replies, per-step thinking, native
+tools, the Council Map, the Code tab, Quant Duel, the Variable Map …) merged with Batches
+1-2. Its CLAUDE.md retires the Tk shell, so what Batches 1-2 did to Tk is undone:
+`council_gui_engine.py` is its e0b7a3c code again (its own copy of the context code; it
+does not call `prepare_turn`, claim its session id or append through `append_line`), and
+the tests that ran the Tk shell or compared it with Qt are gone (`test_shell_parity.py`,
+`test_tk_answers_from_data.py`, the Tk halves of the planted-fact, conversation, memory
+scope and turn-context tests). Section 7's "both shells" now means the Qt app; the Tk shell
+keeps its old behaviour.
+
+How the Qt turn combines the two (`CouncilActions.send`): council-map's lookups (vault
+passages, the Sage's taught knowledge, past decisions, docs) side by side; the Sage, past
+and docs blocks on their roles; then `prepare_turn`, sized to the Writer's call with those
+blocks in it and at the call's thinking level (`prompt_room(think=…)`); then the vault
+passages, minus files already in front of the question and cut to the room left
+(`vault_context.fit`). One task memo and one analyst — `prepare_turn`'s.
+
+"This conversation only" holds for council-map: past decisions (the block and the
+`recall_decision` tool) and the after-answer role/project memory updates only in scope
+`all`; an earlier passed answer is shown, not kept, unless the scope is `all`.
+
+Open:
+- `prepare_turn`'s analyst runs the model's pandas code in-process with no time limit;
+  council-map's `analyst_step` ran it in a child process with a 2-minute limit and a
+  memory cap (unused by the Qt turn now).
+- The Vault switch turns off council-map's passages only; the matches `prepare_turn` puts
+  in front of the question do not read it.
+- A Tk launch and a Qt launch in the same second can share a session id again (the Tk
+  console no longer claims its id).
+- Native tool specs (Tools on) and the members' draft wrappers are not in the Writer's
+  measured frame; the engine's clamp still fits those calls.
