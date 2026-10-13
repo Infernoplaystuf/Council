@@ -167,26 +167,49 @@ def docs_readers(models, docs) -> list:
     return docs_brief.readers(models)
 
 
+class _Started:
+    """Steps started side by side by `start_parallel`; `wait()` gives
+    {name: result} as prepare_parallel does."""
+
+    def __init__(self, steps):
+        self._results, self._errors, self._threads = {}, {}, []
+        for name, fn in steps.items():
+            if fn is None:
+                continue
+            thread = threading.Thread(target=self._run, args=(name, fn),
+                                      name=f"council-prep-{name}",
+                                      daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def _run(self, name, fn):
+        try:
+            self._results[name] = fn()
+        except Exception as exc:                          # noqa: BLE001
+            self._errors[name] = exc
+
+    def wait(self) -> dict:
+        for thread in self._threads:
+            thread.join()
+        out = dict(self._results)
+        if self._errors:
+            out["_errors"] = dict(self._errors)
+        return out
+
+
+def start_parallel(steps) -> _Started:
+    """Start each non-None step on its own thread now; `.wait()` for
+    {name: result}. Daemon threads: a turn that never waits for them — an
+    answer straight from the data — leaves them to finish on their own, and
+    one that hangs cannot keep the app from closing."""
+    return _Started(steps)
+
+
 def prepare_parallel(steps):
     """Run each non-None step at the same time; {name: result}. A step that
     raises is left out and its error kept under "_errors", so one failed
     lookup costs that lookup, not the question."""
-    from concurrent.futures import ThreadPoolExecutor
-    steps = {k: fn for k, fn in steps.items() if fn is not None}
-    out, errors = {}, {}
-    if not steps:
-        return out
-    with ThreadPoolExecutor(max_workers=len(steps),
-                            thread_name_prefix="council-prep") as pool:
-        futures = {k: pool.submit(fn) for k, fn in steps.items()}
-        for k, fut in futures.items():
-            try:
-                out[k] = fut.result()
-            except Exception as exc:                      # noqa: BLE001
-                errors[k] = exc
-    if errors:
-        out["_errors"] = errors
-    return out
+    return start_parallel(steps).wait()
 
 
 class CouncilActions:
@@ -378,22 +401,26 @@ class CouncilActions:
 
         WHAT THE COUNCIL IS GIVEN, in this order:
 
-          1. side by side (prepare_parallel), council-map's lookups: the
-             vault passages that match the question (council_core
+          1. started side by side (start_parallel), council-map's lookups:
+             the vault passages that match the question (council_core
              .vault_context — the Vault switch), the Sage's taught knowledge,
              how similar questions were decided before (council_core
              .past_decisions — only when the memory scope lets other
              conversations in, memory_scope.uses_other_sessions), and the
              documentation for a coding question (docs_brief);
-          2. for this question only, the Sage's knowledge on the Sage, the
+          2. while they run, turn_context.begin_turn: the task memo (the
+             Intern's model) and the analyst (the Coder's), side by side. A
+             question the data answers is answered now — no model asked,
+             and the lookups not waited for;
+          3. for this question only, the Sage's knowledge on the Sage, the
              past decisions on the Writer, the docs on the Coder and the
              Writer (their standing context, folded into every respond());
-          3. prepare_turn: the task memo, the analyst's figures, the files
-             the user names, vault and value matches — in front of the
-             question, sized to the Writer's call WITH step 2's blocks in it
+          4. the rest of prepare_turn: the memo, the analyst's figures, the
+             files the user names, vault and value matches — in front of the
+             question, sized to the Writer's call WITH step 3's blocks in it
              (prompt_frame measures the standing context) and at the
              thinking level that call is made at;
-          4. the vault passages of step 1, without any from a file step 3
+          5. the vault passages of step 1, without any from a file step 4
              already put in front of the question and cut to the room the
              Writer's call has left (vault_context.fit), on every member —
              the engine gates them per role — and, as evidence, the Judge.
@@ -436,12 +463,12 @@ class CouncilActions:
         writer = getattr(models, "writer", None)
         deliberate = bool(getattr(options, "deliberate", True))
 
-        # 1. council-map's lookups, side by side: the wait is the slowest
-        # step, not the sum. Earlier conversations' decisions only where the
-        # memory scope lets other conversations in: "This conversation only"
-        # (the Qt default) keeps every older session out of a prompt unless
-        # the user loads it.
-        got = prepare_parallel({
+        # 1. council-map's lookups, started side by side: the wait is the
+        # slowest step, not the sum. Earlier conversations' decisions only
+        # where the memory scope lets other conversations in: "This
+        # conversation only" (the Qt default) keeps every older session out
+        # of a prompt unless the user loads it.
+        lookups = start_parallel({
             "brief": ((lambda: self.vault_brief(typed_text))
                       if asking and getattr(options, "vault", True)
                       else None),
@@ -455,27 +482,47 @@ class CouncilActions:
             "docs": ((lambda: self.docs_brief(typed_text, models))
                      if asking else None),
         })
+        # 2. Meanwhile, the task memo and the analyst (turn_context
+        # .begin_turn): neither needs what the lookups add. A question the
+        # data answers (a count, a summary, a fresh derived result) is
+        # answered without waiting for the lookups at all: no model is
+        # asked, and none of their results would be used.
+        think = THINK.get("synthesis") if deliberate else None
+        started = self.begin(typed_text, on_event=on_event,
+                             on_notice=on_notice)
+        if started is not None and started.answerable_from_data and \
+                self._fast_answers():
+            prepared = self.prepare(
+                typed_text, on_event=on_event, on_notice=on_notice,
+                writer=writer, think=think, started=started) or started
+            result = self._from_data(prepared, on_event=on_event,
+                                     on_notice=on_notice)
+            return self._finish(typed_text, result, prepared, None, None,
+                                models, snapshot)
+
+        got = lookups.wait()
         sage_kb = got.get("sage_kb") or ""
         past = got.get("past") or []
         past_block = past_decisions.block(past)
         docs = got.get("docs") or DocsBrief()
 
         brief = None
-        # 2. Those blocks on the roles that read them, for this question.
+        # 3. Those blocks on the roles that read them, for this question.
         with vault_context.applied([sage] if sage_kb else [], sage_kb), \
                 vault_context.applied([writer] if past_block else [],
                                       past_block), \
                 vault_context.applied(docs_readers(models, docs), docs.text):
-            # 3. The vault, in front of the question — the code the Tk shell
-            # ran (council_core.turn_context.prepare_turn). The models are
-            # sent `prepared.text`; everything that decides WHAT to do reads
-            # the typed text (A5). Sized for the Writer's call as it will be
-            # made: its plain respond() on the fast path, its synthesis —
-            # the step that thinks hardest — in the council.
-            prepared = self.prepare(
+            # 4. The vault, in front of the question — the code the Tk shell
+            # ran (council_core.turn_context.prepare_turn, continuing from
+            # step 2). The models are sent `prepared.text`; everything that
+            # decides WHAT to do reads the typed text (A5). Sized for the
+            # Writer's call as it will be made: its plain respond() on the
+            # fast path, its synthesis — the step that thinks hardest — in
+            # the council.
+            prepared = (self.prepare(
                 typed_text, on_event=on_event, on_notice=on_notice,
-                writer=writer,
-                think=THINK.get("synthesis") if deliberate else None)
+                writer=writer, think=think, started=started)
+                if started is not None else None)
             sent = prepared.text if prepared is not None else typed_text
 
             if prepared is not None and prepared.answerable_from_data and \
@@ -488,7 +535,7 @@ class CouncilActions:
             elif models is None:
                 return council_turn.TurnResult(False, message=problem)
             else:
-                # 4. The passages, in what the Writer's call has left. The
+                # 5. The passages, in what the Writer's call has left. The
                 # Judge's copy is not cut to the Writer's room (its calls
                 # are its own); neither repeats a file already in front of
                 # the question, which the Judge reads too.
@@ -522,6 +569,14 @@ class CouncilActions:
                                           on_token=on_token)
                 answered_with = models
 
+        return self._finish(typed_text, result, prepared, brief,
+                            answered_with, models, snapshot)
+
+    def _finish(self, typed_text, result, prepared, brief, answered_with,
+                models, snapshot):
+        """What every answered turn ends with: the files behind it (chips,
+        provenance, what a reuse checks), the pins for the follow-up, the
+        session's name, and _after_answer."""
         sources = list(prepared.sources) if prepared is not None else []
         paths = list(prepared.source_paths) if prepared is not None else []
         if brief is not None and brief.sources:
@@ -636,14 +691,31 @@ class CouncilActions:
             self._turn_state = turn_context.TurnState(self.vault_dir)
         return self._turn_state
 
+    def begin(self, typed_text: str, *, on_event=None, on_notice=None):
+        """council_core.turn_context.begin_turn for this conversation — the
+        task memo and the analyst, prepare_turn's first two steps — its
+        notices reported through ``on_notice`` (see send). None if it could
+        not run at all: the question is then asked without the vault, and
+        the transcript says so."""
+        notice = _notice_sink(on_event, on_notice)
+        try:
+            from council_core import turn_context
+            return turn_context.begin_turn(
+                typed_text, self.turn_state(),
+                condense=self._condenser(), on_notice=notice)
+        except Exception as exc:                          # noqa: BLE001
+            self._unread(notice, exc)
+            return None
+
     def prepare(self, typed_text: str, *, on_event=None, on_notice=None,
-                writer=None, think=None):
+                writer=None, think=None, started=None):
         """council_core.turn_context.prepare_turn for this conversation, its
         notices reported through ``on_notice`` (see send), its vault blocks
-        sized around ``writer``'s call at thinking level ``think``. None if
-        it could not run at all — the question is then asked without the
-        vault, and the transcript says so (a turn must not die because a
-        file would not open)."""
+        sized around ``writer``'s call at thinking level ``think``;
+        ``started`` is what `begin` returned (the memo and the analyst are
+        then not run again). None if it could not run at all — the question
+        is then asked without the vault, and the transcript says so (a turn
+        must not die because a file would not open)."""
         notice = _notice_sink(on_event, on_notice)
 
         try:
@@ -651,16 +723,22 @@ class CouncilActions:
             return turn_context.prepare_turn(
                 typed_text, self.turn_state(),
                 condense=self._condenser(),
-                on_notice=notice, writer=writer, think=think)
+                on_notice=notice, writer=writer, think=think,
+                started=started)
         except Exception as exc:                          # noqa: BLE001
-            notice("Council", f"Your files could not be read for this "
-                              f"question ({exc!r}), so it is answered "
-                              f"without them.")
+            self._unread(notice, exc)
             return None
+
+    @staticmethod
+    def _unread(notice, exc) -> None:
+        notice("Council", f"Your files could not be read for this "
+                          f"question ({exc!r}), so it is answered "
+                          f"without them.")
 
     def _condenser(self):
         """The task memo's model call (``memo_llm``): "engine" is
-        prepare_turn's own (turn_context.condense_with_local_model)."""
+        prepare_turn's own (turn_context.condense_with_local_model — the
+        Intern's model, as council-map asked it)."""
         llm = self.memo_llm
         if llm == "engine":
             from council_core import turn_context

@@ -162,3 +162,137 @@ def test_the_result_reaches_every_member_and_the_judge(tmp_path,
     assert models.writer.extra_context == ""
     assert ("Council", "Analyst result table:\n20") in [
         (e.who, e.text) for e in events]
+
+
+# ============================================================
+# The Qt turn's analyst keeps council-map's contract
+# ============================================================
+#
+# The merged Qt Council's analyst is the turn context's
+# (turn_context.prepare_turn). Found in review: it ignored COUNCIL_ANALYST=0,
+# asked the main model (role None) once with no retry, ran the model's code
+# in-process with no time limit or memory cap, and handed it save_app_tool /
+# run_app_tool — one numbers question wrote App_Built_tools/ and
+# analyst_results/ into the vault. Each test sends a real question through
+# CouncilActions.send over a temp vault, with council_engine.local_chat
+# stubbed; the code runs in the real child process.
+
+class _Writer:
+    def __init__(self):
+        self.extra_context, self.prompts = "", []
+
+    def respond(self, prompt, **kw):
+        self.prompts.append(prompt)
+        return "It is 20."
+
+
+def _qt_turn(vault, monkeypatch, replies):
+    """(actions, writer, calls): the Qt Council's actions over `vault` with
+    one Writer, local_chat answering the analyst's code prompts with
+    `replies` in turn (the last one repeated); `calls` are those prompts.
+    (The vault search's own word-matching call gets "".)"""
+    import council_engine
+    from council_core import council_turn as ct
+    from council_core import vault_context as vc
+    from council_core.docs_brief import DocsBrief
+    from council_qt.tabs.council import CouncilActions
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    calls = []
+
+    def local_chat(messages=None, *a, **kw):
+        prompt = messages[-1]["content"]
+        if "pandas snippet" not in prompt:
+            return ""
+        calls.append(dict(kw, prompt=prompt))
+        return replies[min(len(calls), len(replies)) - 1]
+    monkeypatch.setattr(council_engine, "local_chat", local_chat)
+    actions = CouncilActions(vault_dir=vault)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer = _Writer()
+    actions._models = models
+    actions.memo_llm = None
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = lambda q, m: DocsBrief()
+    return actions, models.writer, calls
+
+
+def _direct():
+    from council_core import council_options
+    opts = council_options.CouncilOptions.defaults()
+    opts.deliberate = False
+    return opts
+
+
+#: The analyst's block in a prompt (the task memo's rules NAME it, "Quote
+#: numbers only from [ANALYST RESULT] …", without the dash).
+BLOCK = "[ANALYST RESULT —"
+
+
+def _files(vault):
+    """The vault's files, without the app's own bookkeeping (the vault
+    index's files at the root, dot-folders): what the user would find."""
+    import conversation_logger
+    return sorted(str(p.relative_to(vault)) for p in vault.rglob("*")
+                  if p.is_file()
+                  and not conversation_logger.is_protected_path(p, vault)
+                  and not any(part.startswith(".")
+                              for part in p.relative_to(vault).parts))
+
+
+def test_the_qt_turn_s_analyst_can_be_turned_off(vault, monkeypatch):
+    monkeypatch.setenv("COUNCIL_ANALYST", "0")
+    actions, writer, calls = _qt_turn(vault, monkeypatch, [GOOD])
+    assert actions.send(QUESTION, _direct()).ok
+    assert calls == [], "the analyst asked a model while switched off"
+    assert writer.prompts and not any(BLOCK in p for p in writer.prompts)
+
+
+def test_the_qt_turn_asks_the_coder_and_retries_once(vault, monkeypatch):
+    monkeypatch.delenv("COUNCIL_ANALYST", raising=False)
+    actions, writer, calls = _qt_turn(vault, monkeypatch, [BAD, GOOD])
+    assert actions.send(QUESTION, _direct()).ok
+    assert len(calls) == 2, calls
+    assert [c.get("role") for c in calls] == ["coder", "coder"]
+    assert calls[0]["num_predict"] == 700 and calls[0]["timeout"] == 120
+    assert "YOUR CODE FAILED" in calls[1]["prompt"]
+    assert "nope.csv" in calls[1]["prompt"]
+    shown = writer.prompts[-1]
+    assert BLOCK in shown and "20" in shown
+    assert "COMPUTATION FAILED" not in shown
+
+
+def test_the_qt_turn_s_analyst_writes_nothing_to_the_vault(vault,
+                                                           monkeypatch):
+    """The model's code is not handed save_app_tool (it is not in the
+    sandbox, so the call fails and goes back to the model), and the result
+    table is not saved into the vault."""
+    tool = "def mean_hours(x=1):\n    return x\n"
+    saves = ("```python\nimport pandas as pd\n"
+             f"msg = save_app_tool('mean_hours', 'a tool', {tool!r})\n"
+             "result_df = pd.DataFrame({'msg': [str(msg)]})\n```")
+    monkeypatch.delenv("COUNCIL_ANALYST", raising=False)
+    actions, writer, calls = _qt_turn(vault, monkeypatch, [saves, GOOD])
+    before = _files(vault)
+    assert actions.send(QUESTION, _direct()).ok
+    assert "save_app_tool" not in calls[0]["prompt"], (
+        "the prompt still offers a tool the sandbox does not have")
+    assert len(calls) == 2 and "save_app_tool" in calls[1]["prompt"]
+    assert _files(vault) == before
+    assert BLOCK in writer.prompts[-1]
+
+
+def test_the_qt_turn_runs_the_code_in_a_child_with_a_time_limit(
+        vault, monkeypatch):
+    """An endless loop is stopped at the analyst's time limit (shortened
+    here) and the council is told the computation failed — in-process it
+    had no limit and hung the question for good."""
+    monkeypatch.delenv("COUNCIL_ANALYST", raising=False)
+    monkeypatch.setattr(an, "TIME_LIMIT_S", 3)
+    loop = "```python\nwhile True:\n    pass\n```"
+    actions, writer, calls = _qt_turn(vault, monkeypatch, [loop])
+    t0 = time.monotonic()
+    assert actions.send(QUESTION, _direct()).ok
+    assert time.monotonic() - t0 < 30
+    assert len(calls) == an.MAX_TRIES
+    assert "COMPUTATION FAILED" in writer.prompts[-1]
+    assert "stopped" in writer.prompts[-1]

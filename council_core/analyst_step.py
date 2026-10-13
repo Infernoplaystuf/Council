@@ -117,9 +117,10 @@ def run(question: str, vault_dir: Path, *,
             pass
         inventory = va.preview_csv_inventory([folder], max_files=15,
                                              max_cols=30)
+        # No save_app_tool / run_app_tool: the child has none to give.
         prompt = va.build_pandas_code_prompt(
             question, [folder], inventory,
-            filename_hints=hints_text or None)
+            filename_hints=hints_text or None, app_tools=False)
     except Exception as exc:                              # noqa: BLE001
         return AnalystResult(error=f"analyst setup failed: {exc}")
 

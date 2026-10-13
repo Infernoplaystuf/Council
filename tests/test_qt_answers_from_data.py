@@ -431,14 +431,18 @@ def test_named_files_reach_the_writer_whole_or_are_said_left_out(qapp,
     assert not engine.refused
 
 
+@pytest.mark.parametrize("step", ["prepare_turn", "begin_turn"])
 def test_a_failing_context_step_still_answers_and_says_so(qapp, engine,
-                                                         monkeypatch):
+                                                         monkeypatch, step):
+    """The memo and the analyst (begin_turn) run before the rest of the
+    turn context now, beside council-map's lookups: either failing costs
+    the vault, not the answer."""
     from council_core import turn_context
 
     def broken(*_a, **_k):
         raise OSError("the share went away")
 
-    monkeypatch.setattr(turn_context, "prepare_turn", broken)
+    monkeypatch.setattr(turn_context, step, broken)
     window, view, _opened = _council(engine.vault)
     try:
         _ask(qapp, view, "Summarize pumps.csv")

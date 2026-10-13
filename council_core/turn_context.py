@@ -2817,7 +2817,14 @@ def _run_analyst_step(query):
     mid-call, malformed vault state, OOM mid-tokenize, etc.) degrades
     cleanly to "no analyst" rather than crashing `_send`. The caller's
     transcript stays interactive instead of hanging on "computing…".
+
+    COUNCIL_ANALYST=0 turns the whole step off (council_core.analyst_step
+    .enabled — council-map's switch): no direct answer from the data, no
+    model-written code, no block.
     """
+    from . import analyst_step as _analyst_step
+    if not _analyst_step.enabled():
+        return None, None, []
     try:
         return _run_analyst_step_impl(query)
     except Exception as _top_e:
@@ -3283,74 +3290,74 @@ def _run_analyst_step_impl(query):
         print('[analyst] filename hints:\n' + filename_hints_text,
               file=_sys_dbg.stderr)
 
+    # [turn_context] council-map's contract for the model-written code
+    # (council_core.analyst_step): the CODER's model writes it (its Models-
+    # tab pin and machine binding apply), a failure goes back to it once,
+    # and the code runs in a CHILD PROCESS under the sandbox with a time
+    # limit and a memory cap (analyst_step.run_code) — in-process it had
+    # neither, and a generated `while True:` hung the question for good. The
+    # code gets no save_app_tool / run_app_tool (the Tk shell handed it both,
+    # and one numbers question wrote App_Built_tools/ into the vault), and
+    # the prompt no longer offers them.
+    from . import analyst_step as _analyst_step
     inventory = _va.preview_csv_inventory(allowed_folders, max_files=15, max_cols=30)
     prompt = _va.build_pandas_code_prompt(
         query, allowed_folders, inventory,
         filename_hints=filename_hints_text or None,
         subfolder_scope=scope_folder,
+        app_tools=False,
     )
+    import council_engine as _ce
+    code, log, result_df, feedback = "", "", None, ""
+    for _attempt in range(_analyst_step.MAX_TRIES):
+        try:
+            # Backend-agnostic helper — works in both Ollama and GGUF modes.
+            with _ce._TimingScope("analyst.codegen"):
+                raw = _ce.local_chat(
+                    messages=[{'role': 'user', 'content': prompt + feedback}],
+                    role="coder",
+                    temperature=0.0,
+                    num_predict=700,
+                    timeout=120,
+                )
+        except Exception as _e:
+            msg = f"code generation failed: {_e!r}"
+            print('[analyst] ' + msg, file=_sys_dbg.stderr)
+            _record_app_failure("analyst.codegen_error", "council_gui_engine",
+                                msg, context={"query": query[:200]})
+            return (_build_analyst_failure_block(code or "(no code generated)",
+                                                 log or msg), msg, notices)
+        code = _va.extract_python_code(raw)
+        if not code.strip():
+            log = ""
+            feedback = "\n\nYou wrote no code. Reply with one python block."
+            continue
+        print('[analyst] generated code (first 300):\n' + code[:300],
+              file=_sys_dbg.stderr)
+        try:
+            with _ce._TimingScope("analyst.exec"):
+                result_df, log = _analyst_step.run_code(
+                    code, allowed_folders[0],
+                    timeout=_analyst_step.TIME_LIMIT_S)
+        except Exception as _e:
+            result_df, log = None, f"the analysis could not run: {_e!r}"
+        if result_df is not None:
+            break
+        print('[analyst] exec failed: ' + str(log)[:400], file=_sys_dbg.stderr)
+        feedback = (f"\n\nYOUR CODE FAILED:\n{str(log)[-1200:]}\nFix it and "
+                    "reply with the corrected python block only.")
 
-    try:
-        import council_engine as _ce
-        # Backend-agnostic helper — works in both Ollama and GGUF modes.
-        with _ce._TimingScope("analyst.codegen"):
-            raw = _ce.local_chat(
-                messages=[{'role': 'user', 'content': prompt}],
-                temperature=0.0,
-                num_predict=600,
-                timeout=90,
-            )
-    except Exception as _e:
-        msg = f"code generation failed: {_e!r}"
-        print('[analyst] ' + msg, file=_sys_dbg.stderr)
-        _record_app_failure("analyst.codegen_error", "council_gui_engine",
-                            msg, context={"query": query[:200]})
-        return _build_analyst_failure_block("(no code generated)", msg), msg, notices
-
-    code = _va.extract_python_code(raw)
-    if not code.strip():
+    if result_df is None and not code.strip():
         msg = "the model produced no executable pandas code"
         print('[analyst] empty code from model', file=_sys_dbg.stderr)
         _record_app_failure("analyst.empty_code", "council_gui_engine",
                             msg, context={"query": query[:200]})
         return _build_analyst_failure_block("(empty)", msg), msg, notices
-    print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
-
-    # Hand the analyst a way to BUILD its own tools when a capability is
-    # missing. save_app_tool validates via the sandbox and persists to the
-    # vault's App_Built_tools/ (UNREVIEWED); run/list let it reuse them. These
-    # are curated app callables — NOT passed to app-built tools themselves, so
-    # a tool can't spawn more tools.
-    def _save_app_tool(name, description, code):
-        import app_built_tools as _abt
-        ok, msg, _ = _abt.save_tool(name, description, code,
-                                    author="council", vault_dir=_vault())
-        return msg
-
-    def _run_app_tool(name, args=None):
-        import app_built_tools as _abt
-        _df, _msg = _abt.run_tool(name, args or {},
-                                  allowed_folders=allowed_folders,
-                                  vault_dir=_vault())
-        return _df if _df is not None else _msg
-
-    def _list_app_tools():
-        import app_built_tools as _abt
-        return _abt.list_tools(vault_dir=_vault())
-
-    _analyst_extra = {
-        "save_app_tool": _save_app_tool,
-        "run_app_tool":  _run_app_tool,
-        "list_app_tools": _list_app_tools,
-    }
-    with _ce._TimingScope("analyst.exec"):
-        result_df, log = _va.execute_pandas_code(
-            code, allowed_folders, extra_globals=_analyst_extra)
     if result_df is None:
         # Extract the first traceback line for a concise transcript message.
         # The full log keeps the entire traceback for debugging in the block.
+        log = str(log or "")
         first_err = _summarise_analyst_error(log)
-        print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
         _record_app_failure("analyst.exec_error", "vault_analyst",
                             first_err, detail=log,
                             context={"query": query[:200]})
@@ -3377,12 +3384,12 @@ def _run_analyst_step_impl(query):
     )
 
     # Build a separate USER-FACING render of the full result (or as
-    # much as fits in a transcript box) AND save the complete DataFrame
-    # to vault/analyst_results/ so nothing is ever silently lost. The
-    # caller posts the transcript render to the chat AND mentions the
-    # saved-file path so the user can re-open the result later.
+    # much as fits in a transcript box). [turn_context] Not saved into the
+    # vault: the Tk shell wrote every result to vault/analyst_results/, where
+    # the next conversation's vault search found it — an older question's
+    # figures, past "This conversation only" — and council-map's analyst
+    # writes nothing (analyst_step). The child hands back at most 5,000 rows.
     user_table_lines: list = []
-    full_table_path = None
     try:
         nrows = len(result_df)
         ncols = len(result_df.columns)
@@ -3390,9 +3397,7 @@ def _run_analyst_step_impl(query):
             f"Analyst result: {nrows:,} row{'s' if nrows != 1 else ''} "
             f"× {ncols} column{'s' if ncols != 1 else ''}"
         )
-        # Render up to 500 rows directly into the transcript. Beyond
-        # that, save a CSV and tell the user where it is — Tk text
-        # widgets get sluggish above a few thousand rows of text.
+        # Render up to 500 rows directly into the transcript.
         TRANSCRIPT_DISPLAY_ROWS = 500
         if nrows <= TRANSCRIPT_DISPLAY_ROWS:
             user_table_lines.append(
@@ -3405,27 +3410,8 @@ def _run_analyst_step_impl(query):
             )
             user_table_lines.append(
                 f"\n... ({nrows - TRANSCRIPT_DISPLAY_ROWS:,} more rows "
-                f"omitted from this transcript view; full table saved "
-                f"to file — see path below.)"
+                f"not shown here.)"
             )
-
-        # Save the complete DataFrame as CSV under
-        # vault/analyst_results/<timestamp>_<rows>x<cols>.csv. Users
-        # can open it from disk to verify or share the full data.
-        try:
-            from datetime import datetime as _dt
-            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-            results_dir = _vault() / "analyst_results"
-            results_dir.mkdir(parents=True, exist_ok=True)
-            full_table_path = results_dir / f"{stamp}_{nrows}x{ncols}.csv"
-            result_df.to_csv(full_table_path, index=False)
-            user_table_lines.append(
-                f"\nFull table saved to: {full_table_path}"
-            )
-        except Exception as _save_exc:
-            print(f"[analyst] could not save full table: {_save_exc!r}",
-                  file=_sys_dbg.stderr)
-            full_table_path = None
     except Exception as _render_exc:
         print(f"[analyst] could not build user-facing table: "
               f"{_render_exc!r}", file=_sys_dbg.stderr)
@@ -3682,6 +3668,10 @@ class PreparedTurn:
     injected: bool = False
     explicit_paths: List[str] = _field(default_factory=list)
     fuzzy_matches: Dict[str, Any] = _field(default_factory=dict)
+    #: Steps 1-2's output for steps 3-6 (begin_turn -> prepare_turn): the
+    #: memo's block and the files the analyst's answer came from.
+    memo_block: Optional[str] = None
+    analyst_sources: List[str] = _field(default_factory=list)
 
     @property
     def answerable_from_data(self) -> bool:
@@ -3761,10 +3751,12 @@ def forget_command(text: str, state: TurnState) -> Optional[str]:
 
 
 def condense_with_local_model(prompt: str) -> str:
-    """The task memo's condenser call, as the Tk console makes it: the main
-    model, temperature 0, a short reply."""
+    """The task memo's condenser call, as council-map makes it: the
+    INTERN's model (its Models-tab pin and machine binding apply — the Tk
+    console asked the main model), temperature 0, a short reply."""
     return ce.local_chat(messages=[{"role": "user", "content": prompt}],
-                         temperature=0.0, num_predict=240, timeout=45)
+                         role="intern", temperature=0.0, num_predict=200,
+                         timeout=60)
 
 
 def fast_answers_enabled(vault_dir: Any) -> bool:
@@ -4004,19 +3996,53 @@ def left_out_notice(dropped, n_ctx: int) -> str:
     return "\n".join(lines)
 
 
+def _sayer(prepared: PreparedTurn,
+            on_notice: Optional[Callable[[str, str, str], None]]):
+    def say(who: str, text: str, kind: str = "observation") -> None:
+        prepared.notices.append((who, text, kind))
+        if on_notice is not None:
+            on_notice(who, text, kind)
+    return say
+
+
+def begin_turn(question: str, state: TurnState, *,
+               condense: Optional[Callable[[str], str]] = None,
+               on_notice: Optional[Callable[[str, str, str], None]] = None
+               ) -> PreparedTurn:
+    """Steps 1 and 2 of `prepare_turn` — the task memo and the analyst —
+    which need nothing the Writer's call adds, so the Qt Council runs them
+    while council-map's lookups (vault passages, the Sage's knowledge, the
+    docs) run beside them, and gives an answer from the data
+    (``answerable_from_data``) without waiting for those lookups at all.
+    The memo's model call (the Intern's) and the analyst's (the Coder's)
+    run side by side too. Hand the result to `prepare_turn(started=…)` for
+    steps 3-6. Notices go to ``on_notice`` as in `prepare_turn`."""
+    prepared = PreparedTurn(question=question, text=question)
+    token = _ACTIVE.set(state)
+    try:
+        _begin(question, state, prepared, _sayer(prepared, on_notice),
+               condense=condense)
+    finally:
+        _ACTIVE.reset(token)
+    return prepared
+
+
 def prepare_turn(question: str, state: TurnState, *,
                  n_ctx: Optional[int] = None,
                  condense: Optional[Callable[[str], str]] = None,
                  pinned_files: Optional[List[str]] = None,
                  on_notice: Optional[Callable[[str, str, str], None]] = None,
                  writer: Any = None,
-                 think: Optional[str] = None) -> PreparedTurn:
+                 think: Optional[str] = None,
+                 started: Optional[PreparedTurn] = None) -> PreparedTurn:
     """Build what the models are sent for ``question``: the Tk console's
     sequence, for the Qt Council.
 
       1. the task memo (``condense`` asks a model; None = heuristics only)
       2. the analyst step — a deterministic answer from the data, or its
          refusal; a direct answer is returned as ``fast_answer``
+         (``started``: steps 1 and 2 were run already, by `begin_turn`, and
+         this continues from them)
       3. the injection: named files and folders, vault and value matches, a
          dataset overview, the analyst block, the memo — capped to the
          context window, the droppable blocks dropped
@@ -4042,37 +4068,48 @@ def prepare_turn(question: str, state: TurnState, *,
     ``notices``. Runs with ``state`` active, so the index lookups and the
     referenced files are this conversation's. Blocking (it may call a model
     and read files): the Qt shell calls it on its turn worker."""
-    prepared = PreparedTurn(question=question, text=question)
-
-    def say(who: str, text: str, kind: str = "observation") -> None:
-        prepared.notices.append((who, text, kind))
-        if on_notice is not None:
-            on_notice(who, text, kind)
-
+    prepared = (started if started is not None
+                else PreparedTurn(question=question, text=question))
+    say = _sayer(prepared, on_notice)
     token = _ACTIVE.set(state)
     try:
+        if started is None:
+            _begin(question, state, prepared, say, condense=condense)
         _prepare(question, state, prepared, say, n_ctx=n_ctx,
-                 condense=condense, pinned_files=pinned_files,
-                 writer=writer, think=think)
+                 pinned_files=pinned_files, writer=writer, think=think)
     finally:
         _ACTIVE.reset(token)
     return prepared
 
 
-def _prepare(question, state, prepared, say, *, n_ctx, condense,
-             pinned_files, writer=None, think=None) -> None:
-    # 1. The task memo ------------------------------------------------------
+def _update_memo(state, question, condense):
     try:
-        memo = state.task_memory.update(question, llm_call=condense)
+        return state.task_memory.update(question, llm_call=condense)
     except Exception as exc:                              # noqa: BLE001
         print(f"[TaskMemory] update failed: {exc!r}")
-        memo = state.task_memory.current()
+        return state.task_memory.current()
+
+
+def _begin(question, state, prepared, say, *, condense) -> None:
+    # 1 and 2 side by side: the memo's model call (the Intern's) and the
+    # analyst's (the Coder's) do not depend on each other — council-map ran
+    # them so, and one after the other the wait was their sum. Their lines
+    # are said in the Tk order: the memo's, then the analyst's.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1,
+                            thread_name_prefix="council-memo") as pool:
+        memo_job = pool.submit(_update_memo, state, question, condense)
+        try:
+            block, err, notes = _run_analyst_step(question)
+        finally:
+            memo = memo_job.result()
+
+    # 1. The task memo ------------------------------------------------------
     if memo and not memo.is_empty():
         say("Council", state.task_memory.render_transcript_line())
-    memo_block = state.task_memory.render_injection_block() or None
+    prepared.memo_block = state.task_memory.render_injection_block() or None
 
     # 2. The analyst step ---------------------------------------------------
-    block, err, notes = _run_analyst_step(question)
     analyst_sources: List[str] = []
     for note in (notes or []):
         if isinstance(note, str) and note.startswith("__ANALYST_TABLE__:"):
@@ -4090,6 +4127,7 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
         else:
             say("Council", note)
     prepared.analyst_block, prepared.analyst_error = block, err
+    prepared.analyst_sources = analyst_sources
     if block and not err:
         say("Council", "Computing from data...")
     elif err:
@@ -4097,6 +4135,13 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
             f"⚠ Analyst tried to compute the answer but failed: {err}\n"
             f"The model will be told to refuse inventing a number; "
             f"try rephrasing or check the file/column name.")
+
+
+def _prepare(question, state, prepared, say, *, n_ctx, pinned_files,
+             writer=None, think=None) -> None:
+    memo_block = prepared.memo_block
+    block = prepared.analyst_block
+    analyst_sources = list(prepared.analyst_sources or [])
 
     # 3. The injection ------------------------------------------------------
     # Sized for the window the Writer's model really has (effective_n_ctx:

@@ -1080,9 +1080,10 @@ def test_the_steps_before_a_question_run_side_by_side(tmp_path,
                                                       monkeypatch):
     """The vault brief, the Sage's knowledge and the docs used to run one
     after another before the first member spoke; they are independent.
-    (The turn context — the memo, the analyst, the files in front of the
-    question — runs after them, sized around what they add: stubbed here,
-    this is about the three.)"""
+    (The turn context — the memo and the analyst beside them, the files in
+    front of the question after them, sized around what they add: stubbed
+    here, this is about the three. test_the_memo_and_the_analyst_run_beside
+    _the_lookups is about the first two.)"""
     import time
     from types import SimpleNamespace as NS
     from council_core import council_options
@@ -1104,6 +1105,7 @@ def test_the_steps_before_a_question_run_side_by_side(tmp_path,
     models.sage = FakeModel()
     actions._models = models
     actions.memo_llm = None
+    actions.begin = lambda *a, **k: None
     actions.prepare = lambda *a, **k: None
     actions.vault_brief = slow(vc.Brief())
     monkeypatch.setattr(vc, "sage_block", slow(""))
@@ -1111,6 +1113,115 @@ def test_the_steps_before_a_question_run_side_by_side(tmp_path,
     t0 = time.perf_counter()
     assert actions.send("q", council_options.CouncilOptions.defaults()).ok
     assert time.perf_counter() - t0 < 1.0, "the three 0.4 s steps ran in turn"
+
+
+def _slow(value, seconds, record=None):
+    def fn(*_a, **_k):
+        if record is not None:
+            record.append(1)
+        time.sleep(seconds)
+        return value
+    return fn
+
+
+def _writer_only(tmp_path):
+    from types import SimpleNamespace as NS
+    from council_core import council_turn as ct
+    from tests.test_council_turn import FakeModel
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "data_in" / "pumps.csv").write_text(
+        "pump,bay\nP1,4\nP2,5\n", encoding="utf-8")
+    actions = CouncilActions(vault_dir=vault)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer = FakeModel("an answer")
+    actions._models = models
+    return actions
+
+
+def test_an_answer_from_the_data_does_not_wait_for_the_lookups(
+        tmp_path, monkeypatch):
+    """Found in review: "How many files are in the vault?" (answered from
+    the data, "no model was asked, so it is instant") waited for
+    council-map's lookups — the vault passage search among them, an
+    embedding search on a vault with a semantic index — though the answer
+    uses none of them: 3.05 s with a 3 s search, 0.05 s before the merge."""
+    from council_core import council_options
+    from council_core.docs_brief import DocsBrief
+    from council_core import vault_context as vc
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    actions = _writer_only(tmp_path)
+    actions.memo_llm = None
+    opts = council_options.CouncilOptions.defaults()
+    opts.deliberate = False
+    # A warm-up turn: the data index and the vault index are built once.
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = lambda q, m: DocsBrief()
+    assert actions.send("How many files are in the vault?", opts).route \
+        == "data"
+    actions.vault_brief = _slow(vc.Brief(), 3.0)
+    actions.docs_brief = _slow(DocsBrief(), 3.0)
+    t0 = time.perf_counter()
+    result = actions.send("How many files are in the vault?", opts)
+    took = time.perf_counter() - t0
+    assert result.ok and result.route == "data", result
+    assert took < 1.5, f"the data answer waited {took:.2f} s for the lookups"
+
+
+def test_the_memo_and_the_analyst_run_beside_the_lookups(tmp_path,
+                                                         monkeypatch):
+    """council-map's d07d290 gathered the memo and the analyst with the
+    lookups; the merge ran them after the lookups (the wait was the sum:
+    1.26 s with a 0.6 s memo and 0.6 s lookups, measured). Now the lookups
+    are started first and the memo and the analyst run while they do."""
+    from council_core import council_options
+    from council_core.docs_brief import DocsBrief
+    from council_core import vault_context as vc
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    actions = _writer_only(tmp_path)
+    memo_calls = []
+    opts = council_options.CouncilOptions.defaults()
+    opts.deliberate = False
+    actions.memo_llm = _slow("GOAL: size a pump", 0, memo_calls)
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = lambda q, m: DocsBrief()
+    assert actions.send("warm up", opts).ok
+    memo_calls.clear()
+    actions.memo_llm = _slow("GOAL: size a pump", 0.8, memo_calls)
+    actions.vault_brief = _slow(vc.Brief(), 0.8)
+    actions.docs_brief = _slow(DocsBrief(), 0.8)
+    t0 = time.perf_counter()
+    assert actions.send("I need a pump for bay 4 under 40 l/min", opts).ok
+    took = time.perf_counter() - t0
+    assert memo_calls, "the memo asked no model"
+    assert took < 1.4, f"the memo waited for the lookups: {took:.2f} s"
+
+
+def test_the_task_memo_is_asked_of_the_intern(tmp_path, monkeypatch):
+    """council-map asked the memo of the Intern's model (its pin and its
+    machine binding apply); the merge sent it to the main model."""
+    import council_engine
+    from council_core import council_options
+    from council_core.docs_brief import DocsBrief
+    from council_core import vault_context as vc
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    calls = []
+
+    def local_chat(messages=None, *a, role=None, **kw):
+        if "pandas snippet" not in messages[-1]["content"]:
+            calls.append((role, kw.get("num_predict")))
+        return "GOAL: size a pump\nCONSTRAINTS: under 40 l/min"
+    monkeypatch.setattr(council_engine, "local_chat", local_chat)
+    actions = _writer_only(tmp_path)
+    assert actions.memo_llm == "engine"
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = lambda q, m: DocsBrief()
+    opts = council_options.CouncilOptions.defaults()
+    opts.deliberate = False
+    assert actions.send("I need a pump for bay 4, flow under 40 litres per "
+                        "minute.", opts).ok
+    # (role, num_predict): the merge's memo call was (None, 240).
+    assert ("intern", 200) in calls and (None, 240) not in calls, calls
 
 
 def test_a_failed_step_before_the_question_costs_only_that_step(tmp_path):

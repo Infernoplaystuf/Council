@@ -4592,12 +4592,28 @@ def execute_pandas_code(
 # Code generation prompt
 # ============================================================
 
+#: The part of the code prompt that offers the model save_app_tool /
+#: run_app_tool / list_app_tools. Only for a caller that hands those to the
+#: code (execute_pandas_code's extra_globals — the Tk shell's analyst); the
+#: Qt Council's analyst runs the code in a child process with no extras and
+#: writes nothing (council_core.analyst_step), so it is left out there.
+APP_TOOLS_NOTE = """If a capability you need is genuinely missing, you MAY build a reusable tool:
+  save_app_tool(name, description, code)  — `code` must define EXACTLY ONE
+      top-level function; it is sandbox-validated (no delete / write-outside-
+      output / network / shell) and saved UNREVIEWED under App_Built_tools/.
+  run_app_tool(name, args_dict)   list_app_tools()
+Prefer the helper functions below; only build a tool for something they cannot do.
+
+"""
+
+
 def build_pandas_code_prompt(
     question: str,
     data_folders: List[Path],
     inventory: str,
     filename_hints: Optional[str] = None,
     subfolder_scope: Optional[Path] = None,
+    app_tools: bool = True,
 ) -> str:
     folder_lines = "\n".join(f"- {p}" for p in data_folders)
     # When the analyst pre-resolved filename references or restricted the
@@ -4642,14 +4658,7 @@ Counting files / folders (do NOT `import os` — it is blocked; use these):
   list_dir(folder=None)                         -> list[str] of names
   folder_file_counts(data_folder)               -> DataFrame of counts by type
 
-If a capability you need is genuinely missing, you MAY build a reusable tool:
-  save_app_tool(name, description, code)  — `code` must define EXACTLY ONE
-      top-level function; it is sandbox-validated (no delete / write-outside-
-      output / network / shell) and saved UNREVIEWED under App_Built_tools/.
-  run_app_tool(name, args_dict)   list_app_tools()
-Prefer the helper functions below; only build a tool for something they cannot do.
-
-Available helper functions (prefer these over raw pandas — they handle
+""" + (APP_TOOLS_NOTE if app_tools else "") + """Available helper functions (prefer these over raw pandas — they handle
 case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
   list_csv_files(data_folder, recursive=True)
   csv_inventory(data_folder, recursive=True, max_files=None)
