@@ -251,7 +251,9 @@ class _Live:
         #: Source[FrameBurstStart]"; Provider.trigger_settings(selected=
         #: True)): a Basler's trigger rows are the SELECTED trigger's, so
         #: as_connected holds one of nine; Reset puts them all back from
-        #: here (Provider.restore_triggers), the selector left where it is.
+        #: here (Provider.restore_triggers). The SELECTOR goes back as
+        #: connected too — it is in as_connected, written by the set
+        #: before them — and restoring the triggers does not move it again.
         self.as_connected_triggers: Dict[str, Any] = {}
         #: The camera's description read by Connect, while Connect is being
         #: announced to the views (settings_list answers from it); else None.

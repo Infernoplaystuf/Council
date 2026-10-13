@@ -1186,8 +1186,10 @@ source is `Software`). So:
   **selected** one only. Every trigger counts above — a FrameBurstStart
   left On while the selector shows FrameStart is named — and **Reset Trigger
   (as connected)** / **Reset all** put **every** trigger back as connected
-  — its mode, source, edge and delay, the mode last — leave the selector
-  where it is, and say which (`the FrameBurstStart trigger Off again (its
+  — its mode, source, edge and delay, the mode last — put the **selector**
+  back on the entry it showed when the camera was connected (it is a
+  setting like the others; putting the triggers back does not move it
+  again), and say which (`the FrameBurstStart trigger Off again (its
   source Software and edge RisingEdge too)`). A preset
   keeps **every** trigger's mode, source, edge and delay: the selected
   trigger's under the rows' own names, the others' as

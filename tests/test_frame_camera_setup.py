@@ -525,6 +525,34 @@ def test_reset_puts_every_trigger_back_with_its_source_edge_and_delay(
         out["summary"], out["summary"]
 
 
+def test_reset_puts_the_trigger_selector_back_as_connected_too(monkeypatch):
+    """What Reset does with the SELECTOR, as the docs now say it (they
+    said Reset left it "where it is"): TriggerSelector is a setting read
+    at Connect like any other, so Reset all and Reset Trigger put it back
+    to the entry it was on then — and restoring every trigger
+    (restore_triggers) does not move it after that. The tests before
+    moved it back to the connected entry themselves before Reset."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    monkeypatch.setattr(cameras, "discover", lambda known=None:
+                        cameras.Discovery([dev.info], []))
+    monkeypatch.setattr(cameras, "open_camera",
+                        lambda chosen, known=None: dev)
+    frame_camera.connect(frame_camera.list_cameras()["rows"][0])
+    connected = every_trigger(cam)
+    sel = cam.TriggerSelector
+    assert sel.value == "FrameStart"
+    for group in (None, "Trigger"):
+        sel.value = "FrameBurstStart"
+        cam.TriggerSource.SetValue("Line1")
+        sel.value = "ExposureStart"          # left here, not as connected
+        out = frame_camera.reset_camera_settings(group)
+        assert out["ok"], out["summary"]
+        assert sel.value == "FrameStart", (group, "back as connected")
+        assert every_trigger(cam) == connected
+
+
 def test_reset_all_is_refused_while_capturing(tmp_path):
     connected("frame")
     frame_camera.start(str(tmp_path / "run"))

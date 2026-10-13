@@ -877,8 +877,12 @@ def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
     window.flush_now()
     window.rows["TriggerMode"]._from_choice("On")
     window.flush_now()
-    window.rows["TriggerSelector"]._from_choice("FrameStart")
+    # Left on an entry it was not on at Connect: the selector is a setting
+    # like the others, and Reset puts it back too (the docs said it was
+    # left where it is; this test moved it back itself before Reset).
+    window.rows["TriggerSelector"]._from_choice("FrameEnd")
     window.flush_now()
+    assert cam.TriggerSelector.GetValue() == "FrameEnd"
     assert _trigger_modes(cam)["FrameBurstStart"] == "On"
     assert _every_trigger(cam)["FrameBurstStart"][1:] == (
         "Line1", "FallingEdge", 250.0)
@@ -887,5 +891,5 @@ def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
     assert _pump(app, 4.0, until=lambda: fc._LIVE.job is None)
     assert _trigger_modes(cam) == connected
     assert _every_trigger(cam) == every
-    assert cam.TriggerSelector.GetValue() == "FrameStart"
+    assert cam.TriggerSelector.GetValue() == "FrameStart", "as connected"
     assert "the FrameBurstStart trigger Off again" in window.status.text()
