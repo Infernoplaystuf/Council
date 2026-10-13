@@ -24,6 +24,9 @@ THE SEARCH: semantic when the vault already has a semantic index (the
 Agents tab builds it); otherwise keyword (TF-IDF) search, which loads no
 model and downloads nothing. A question never builds a semantic index or
 loads an embedding model — that can take minutes and may fetch the model.
+A hit from the app's own files (`is_app_source`: older conversations, logs,
+learned memory, settings, dot-folders) is dropped: an index built before
+they were protected still lists them.
 
 BESIDE THE TURN CONTEXT. The Council tab also puts council_core.turn_context
 .prepare_turn's blocks — the files the user names, vault and value matches,
@@ -132,11 +135,63 @@ def _rag_for(vault_dir: Path) -> Any:
         return _keyword[key]
 
 
+#: How many hits a search is asked for per passage wanted: room for the
+#: app's own files `users_chunks` drops from an index built before they were
+#: protected, so a question still gets its passages.
+OVERFETCH = 3
+
+
+def is_app_source(source: Any, vault_dir: Path) -> bool:
+    """Whether a search hit's file (as the index names it: relative to the
+    vault, or absolute) is the app's own and not the user's: in a dot-folder
+    of the vault (.council_memory, .council_projects …), or protected
+    (conversation_logger.is_protected_path — older conversations, logs/,
+    learned memory, the judged-question history, the app's settings).
+
+    The index's own walk skips these (vault_rag._collect_files), but an index
+    built BEFORE they were protected — the Tk shell builds one at every start
+    — still lists them until a re-index removes them; the user's own index
+    did (memory/ and logs/). A hit from one is never handed over: it would
+    put an older session or learned memory into a prompt past "This
+    conversation only" (council_core.memory_scope). turn_context drops such
+    hits from its own index the same way."""
+    raw = str(source or "").strip()
+    if not raw or raw == "?":
+        return False
+    vault_dir = Path(vault_dir)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = vault_dir / path
+    try:
+        rel = path.resolve().relative_to(vault_dir.resolve())
+    except (OSError, ValueError):
+        rel = None
+    if rel is not None and any(part.startswith(".") for part in rel.parts):
+        return True
+    try:
+        import conversation_logger
+        return bool(conversation_logger.is_protected_path(path, vault_dir))
+    except Exception:                                     # noqa: BLE001
+        return True
+
+
+def users_chunks(chunks: Iterable[Any], vault_dir: Path) -> List[Any]:
+    """`chunks` (search hits with a "source") without the app's own files
+    (`is_app_source`), in order."""
+    out = []
+    for chunk in chunks or ():
+        source = chunk.get("source", "?") if isinstance(chunk, dict) else "?"
+        if not is_app_source(source, vault_dir):
+            out.append(chunk)
+    return out
+
+
 def build(question: str, vault_dir: Path, *, rag: Any = None,
           max_passages: int = MAX_PASSAGES,
           max_chars: int = MAX_CHARS) -> Brief:
     """The VAULT CONTEXT block for `question`. Blocking (a search, and on
-    the semantic backend an embedding) — call it from a worker."""
+    the semantic backend an embedding) — call it from a worker. A hit from
+    one of the app's own files (`is_app_source`) is never in it."""
     question = (question or "").strip()
     if not question:
         return Brief()
@@ -154,11 +209,13 @@ def build(question: str, vault_dir: Path, *, rag: Any = None,
         except Exception:                                 # noqa: BLE001
             pass
     try:
-        result = rag.search(question, n_results=max_passages)
+        result = rag.search(question,
+                            n_results=max(1, max_passages) * OVERFETCH)
     except Exception as exc:                              # noqa: BLE001
         return Brief(backend=backend,
                      problem=f"the vault search failed ({exc})")
-    chunks = list(getattr(result, "chunks", result) or [])
+    chunks = users_chunks(getattr(result, "chunks", result) or [],
+                          vault_dir)
     parts, sources, used = [HEADER], [], len(HEADER)
     pieces: List[Tuple[str, str]] = []
     for i, c in enumerate(chunks[:max_passages], start=1):
@@ -305,4 +362,5 @@ def turn_models(models: Any, roles: Optional[Iterable[str]] = None
 
 
 __all__ = ["MARKER", "EVIDENCE_MARKER", "Brief", "build", "fit", "applied",
-           "turn_models", "evidence", "sage_block"]
+           "turn_models", "evidence", "sage_block", "is_app_source",
+           "users_chunks"]

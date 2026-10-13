@@ -123,6 +123,32 @@ def test_the_index_walk_skips_app_folders_and_protected_files(vault):
     assert found == {"notes/pumps.md"}
 
 
+def test_a_hit_from_the_apps_own_files_is_never_a_passage(vault):
+    """An index built before logs/, memory/ and the root's app files were
+    protected still returns them (found in review: the user's own index
+    lists memory/ and logs/ files). They are dropped, the search is asked
+    for more so the user's files still fill the block, and the numbering
+    has no gaps. tests/test_stale_semantic_index.py does it on a real
+    chromadb index."""
+    app = [{"source": s, "score": 0.99, "text": f"older session {i}"}
+           for i, s in enumerate((
+               "logs\\council.log", "memory/memory_writer.md",
+               "verdict_history.jsonl", "question_history.json",
+               "conversations/old.md", ".council_memory/decisions.jsonl",
+               "sage_knowledge/facts.jsonl", "trends.md"))]
+    # Six of the app's hits rank first; asked for 3 passages, the search
+    # is asked for 9, so the user's three still come back.
+    rag = FakeRag(app[:6] + CHUNKS)
+    b = vc.build("pump", vault, rag=rag, max_passages=3)
+    assert b.sources == ["notes/pumps.md", "specs/valves.md"]
+    assert "older session" not in b.text
+    assert "[1] notes/pumps.md" in b.text and "[3] notes/pumps.md" in b.text
+    assert all(vc.is_app_source(c["source"], vault) for c in app)
+    assert not vc.is_app_source("notes/pumps.md", vault)
+    # A user's own logs/ folder inside data_in/ is theirs.
+    assert not vc.is_app_source("data_in/logs/run.log", vault)
+
+
 # ---- for one turn only ----------------------------------------------------------
 
 def test_applied_adds_and_restores_even_on_error():

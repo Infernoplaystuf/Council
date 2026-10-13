@@ -691,13 +691,16 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
         k = max(1, min(10, int(args.get("k", 5) or 5)))
         from . import vault_context
         rag = vault_context._rag_for(vault_dir)
-        result = rag.search(query, n_results=k)
-        chunks = list(getattr(result, "chunks", result) or [])
+        result = rag.search(query, n_results=k * vault_context.OVERFETCH)
+        # Never the app's own files: an index built before they were
+        # protected still lists older sessions and learned memory.
+        chunks = vault_context.users_chunks(
+            getattr(result, "chunks", result) or [], vault_dir)[:k]
         backend = str(getattr(rag, "backend_name", "") or "keyword")
         if not chunks:
             return True, f"No passages match ({backend} search).", {"hits": 0}
         parts = [f"{len(chunks)} passage(s), {backend} search:"]
-        for i, c in enumerate(chunks[:k], 1):
+        for i, c in enumerate(chunks, 1):
             parts.append(f"[{i}] {c.get('source', '?')}\n"
                          f"{str(c.get('text', '')).strip()[:700]}")
         return True, _clip("\n\n".join(parts)), {"hits": len(chunks),

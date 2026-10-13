@@ -438,8 +438,38 @@ class _ChromaBackend:
             self._hashes[rel] = current_hash
             stats.total_chunks += len(chunks)
 
+        self._prune(files, vault_dir)
         self._save_hashes()
         return stats
+
+    def _prune(self, files: List[Path], vault_dir: Path) -> None:
+        """Remove the chunks (and file_hashes.json entries) of every source
+        this walk no longer collects: a file the user deleted, and the app's
+        own files an older build indexed before they were protected — logs/,
+        memory/, the judged-question history at the root, dot-folders. Kept,
+        they were found for good: a re-index skips only by hash, so it never
+        looked at them again, and a search kept handing an older session or
+        learned memory to the council as "your vault"."""
+        current = {str(p.relative_to(vault_dir)) for p in files}
+        stale = {rel for rel in self._hashes if rel not in current}
+        try:
+            got = self._collection.get(include=["metadatas"])
+            for meta in got.get("metadatas") or []:
+                source = (meta or {}).get("source")
+                if source and source not in current:
+                    stale.add(source)
+        except Exception as exc:
+            print(f"[VaultRAG] could not list the indexed files: {exc!r}")
+        for rel in sorted(stale):
+            try:
+                existing = self._collection.get(where={"source": rel})
+                if existing["ids"]:
+                    self._collection.delete(ids=existing["ids"])
+            except Exception as exc:
+                # Kept in the hash list, so the next re-index tries again.
+                print(f"[VaultRAG] could not remove {rel}: {exc!r}")
+                continue
+            self._hashes.pop(rel, None)
 
     def search(self, query: str, n_results: int = MAX_RESULTS) -> List[Dict[str, Any]]:
         try:
