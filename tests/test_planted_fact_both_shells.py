@@ -89,8 +89,14 @@ def _writer_prompts(fake):
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
     import council_engine as ce
-    from council_core import local_models, turn_context
+    from council_core import local_models
     from tests.fake_ollama import FakeOllama, refuse_egress
+    # Batch 2's module; absent on older code, where these tests are to fail
+    # on their own assertions, not in the fixture (found in review).
+    try:
+        from council_core import turn_context
+    except ImportError:
+        turn_context = None
 
     vault = tmp_path / "vault"
     (vault / "data_in").mkdir(parents=True)
@@ -115,7 +121,8 @@ def engine(tmp_path, monkeypatch):
         # The Tk console's process-wide indexes start empty for this vault.
         for name in ("_VAULT_INDEX_INSTANCE", "_DATA_INDEX_INSTANCE",
                      "_REFERENCED_FILES_MAP"):
-            monkeypatch.setattr(turn_context, name, None)
+            if turn_context is not None:
+                monkeypatch.setattr(turn_context, name, None)
         local_models.invalidate_cache()
         ce.refresh_backend_config()
         refused = refuse_egress(monkeypatch)
@@ -150,7 +157,7 @@ def _qt_ask(qapp, monkeypatch, demo_mode: bool):
             "the turn never finished")
         for _ in range(20):
             qapp.processEvents()
-        chips = [chip.text() for chip in view.source_chips]
+        chips = [chip.text() for chip in getattr(view, "source_chips", [])]
         route, answer = view._last_route, view._last_answer
         session = view.conversation.session_id
         vault = view.actions.vault_dir
@@ -290,7 +297,9 @@ def _tk_ask(monkeypatch, vault: Path):
     class Console:
         _send = C._send
         _poll_ui_queue = C._poll_ui_queue
-        _turn_state = C._turn_state
+        # (Older consoles had no _turn_state: the test then fails on what
+        # the Writer was sent, not here.)
+        _turn_state = getattr(C, "_turn_state", None)
         _current_pinned_filenames = C._current_pinned_filenames
         _pin_state = C._pin_state
         _update_pins_from_response = C._update_pins_from_response

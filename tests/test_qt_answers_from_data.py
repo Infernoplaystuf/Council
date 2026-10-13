@@ -339,7 +339,13 @@ def test_forget_works_where_the_notice_offers_it(qapp, engine):
         assert "zebrafin" in json.loads(
             (engine.vault / "fuzzy_denylist.json").read_text(
                 encoding="utf-8"))
+        # The next search does not use the forgotten match.
+        offered = text.count("zebrafn → zebrafin")
+        _ask(qapp, view, "Search the vault for zebrafn")
+        assert view.transcript.toPlainText().count(
+            "zebrafn → zebrafin") == offered, "the forgotten match was used"
         # "forget …" that is not an offered word is a question.
+        asked = len(engine.fake.state.chats)
         _ask(qapp, view, "forget what I said and summarize pumps.csv")
         assert len(engine.fake.state.chats) > asked
     finally:
