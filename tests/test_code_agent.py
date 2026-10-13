@@ -118,6 +118,25 @@ def test_the_planning_prompt_has_the_brief_map_and_note(setup):
     assert "Left to do: the GUI." in p
 
 
+@pytest.mark.parametrize("scope", ["none", "conversation", "all"])
+def test_the_last_job_s_note_is_part_of_the_project_in_every_scope(
+        setup, monkeypatch, scope):
+    """Decided on the review of the council-map merge (a design call the
+    user may still change; docs/qt_migration/remaining_scope_2026-10-06.md
+    section 8): a job's handoff note is one of the PROJECT's files — like
+    its brief and code map, it lives in the project's folder, the Code tab
+    shows it, and the next job is built on it — not a conversation's
+    memory, so the memory scope (COUNCIL_MEMORY_SCOPE, SILO) does not
+    remove it from the Code tab's context."""
+    monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", scope)
+    vault, project, _repo = setup
+    notes = pj.project_dir(vault, project) / "notes"
+    notes.mkdir(parents=True)
+    (notes / "job1.md").write_text("Left to do: the GUI.", encoding="utf-8")
+    ctx = ca.context(vault, project, "reset")
+    assert "THE LAST JOB'S HANDOFF NOTE" in ctx and "the GUI" in ctx
+
+
 def test_a_job_runs_test_first_and_commits_on_its_branch(setup):
     vault, project, repo = setup
     plan = ca.plan_from_json(PLAN)

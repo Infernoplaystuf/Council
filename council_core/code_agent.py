@@ -184,6 +184,14 @@ def latest_note(vault_dir: Path, project: pj.Project) -> str:
 
 def context(vault_dir: Path, project: pj.Project, focus: str, *,
             root: Optional[Path] = None, map_chars: int = 6000) -> str:
+    """What every model call about this project starts from: the brief,
+    the code map, the matching references and the last job's handoff note.
+
+    The note is one of the PROJECT's files (its notes/ folder, shown in the
+    Code tab, what the next job is planned from), not a conversation's
+    memory, so it is here in every memory scope (council_core.memory_scope)
+    — decided on the review of the council-map merge; see
+    docs/qt_migration/remaining_scope_2026-10-06.md, section 8."""
     root = Path(root or project.root)
     parts = [pj.brief(vault_dir, project, root)]
     cmap = cm.for_project(root, pj.project_dir(vault_dir, project)
