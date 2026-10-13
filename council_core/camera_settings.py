@@ -69,7 +69,8 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
 
 from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
                       EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
-                      Roi, _ask, _interface, fit_roi, off_sensor, on_sensor)
+                      Roi, _ask, _interface, fit_roi, nearest_whole,
+                      off_sensor, on_sensor)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "Trigger", "trigger_warning", "area_unchanged",
@@ -431,20 +432,40 @@ def coerce(setting: Setting, value: Any) -> Tuple[Any, str]:
             raise SettingError(f"{setting.label} must be a finite number")
         note = ""
         low, high = setting.minimum, setting.maximum
+        shown_unit, per = setting.shown()
+
+        def bound(value: Any) -> str:
+            # In the unit the row SHOWS: "Threshold: 1 ms, asked 0.5
+            # (clamped to the minimum, 1000)" gave it in µs, in an ms line.
+            if per != 1.0:
+                return f"{show(float(value) / per)} {shown_unit}".rstrip()
+            return show(value)
+
         if low is not None and number < low:
-            number, note = float(low), f"clamped to the minimum, {show(low)}"
+            number, note = float(low), f"clamped to the minimum, {bound(low)}"
         if high is not None and number > high:
-            number, note = float(high), f"clamped to the maximum, {show(high)}"
+            number, note = (float(high),
+                            f"clamped to the maximum, {bound(high)}")
         if kind == INT:
             step = int(setting.step or 1)
-            base = int(low) if low is not None else 0
-            snapped = base + int(round((number - base) / step)) * step
+            # Stepped by one whole unit of what it is shown in (a trail
+            # threshold: whole ms, in µs): snapped AS THE SENSOR ROUNDS IT,
+            # from zero and a half away from zero (cameras.nearest_whole,
+            # OpenEB's std::roundf). round() from the minimum took 3500 µs
+            # to 3 ms where an IMX636 keeps 4. A Basler's integer node keeps
+            # this snap: from its minimum, by its increment.
+            whole = per != 1.0 and step == per
+            if whole:
+                snapped = nearest_whole(number / step) * step
+            else:
+                base = int(low) if low is not None else 0
+                snapped = base + int(round((number - base) / step)) * step
             if high is not None and snapped > high:
                 snapped -= step
+            if whole and low is not None and snapped < low:
+                snapped += step
             if snapped != number and not note:
-                shown_unit, per = setting.shown()
-                note = (f"snapped to whole {shown_unit}"
-                        if per != 1.0 and step == per
+                note = (f"snapped to whole {shown_unit}" if whole
                         else f"snapped to a multiple of {step}")
             return int(snapped), note
         return float(number), note

@@ -152,6 +152,54 @@ def test_what_took_lists_the_problems_first():
     assert lines[3] == "✓ Gain: 3"
 
 
+def test_what_took_says_each_value_in_the_unit_its_row_shows():
+    """A preset holding a trail threshold of 8706 µs (an older Typhon's,
+    made on the fake EVK4, which kept any µs) said "≈ Threshold: 9000
+    (asked 8706)" beside a row whose box read "9 ms". Given the rows'
+    settings, each value is said as its row shows it, with its unit — as
+    a single change's line already was (Change.line)."""
+    threshold = {"key": "trail.threshold", "label": "Threshold",
+                 "unit": "µs", "shown_unit": "ms", "shown_per": 1000.0}
+    gain = {"key": "Gain", "label": "Gain", "unit": "dB"}
+    lines = csw.took_lines({"changes": [
+        {"key": "Gain", "asked": 3, "value": 3.0, "ok": True,
+         "adjusted": False, "skipped": False, "note": ""},
+        {"key": "trail.threshold", "asked": 8706, "value": 9000, "ok": True,
+         "adjusted": True, "skipped": False, "note": "snapped to whole ms"},
+        {"key": "ExposureTime", "asked": 900, "value": 5000.0, "ok": True,
+         "adjusted": False, "skipped": True, "note": "auto exposure is on"}]},
+        labels={"trail.threshold": "Threshold"},
+        settings={"trail.threshold": threshold, "Gain": gain,
+                  "ExposureTime": {"unit": "µs"}})
+    assert lines == ["≈ Threshold: 9 ms (asked 8.706)",
+                     "– ExposureTime: left at 5000 µs — auto exposure is on",
+                     "✓ Gain: 3 dB"]
+
+
+def test_a_preset_threshold_is_said_in_ms_where_its_row_is_in_ms():
+    """The settings window, the simulated event camera, a set holding the
+    trail threshold in µs off the whole-ms grid: the What-took box said
+    "≈ Threshold: 9000 (asked 8706)"; the reset button's tip said "Back to
+    10" beside a box suffixed " ms"; the row's note said "The camera made
+    it 9 (asked 8.706)"."""
+    connect("event")
+    w = window()
+    row = w.rows["trail.threshold"]
+    frame_camera.apply_camera_settings({"trail.threshold": 8706,
+                                        "bias.bias_fo": 80})
+    QApplication.processEvents()
+    took = w.took_box.toPlainText()
+    assert "≈ Threshold: 9 ms (asked 8.706)" in took, took
+    assert "≈ bias_fo: 55 (asked 80)" in took, took
+    assert row.editor.value() == 9 and row.editor.suffix() == " ms"
+    assert row.reset_button.toolTip() == (
+        "Back to 10 ms — as the camera had it when it was connected")
+    frame_camera.set_camera_setting("trail.threshold", 12_400)
+    QApplication.processEvents()
+    assert row.note.text().startswith(
+        "The camera made it 12 ms (asked 12.4)"), row.note.text()
+
+
 # ======================================================================
 # Built from what the camera describes
 # ======================================================================
@@ -340,7 +388,8 @@ def test_what_the_camera_made_of_a_value_is_what_the_control_shows():
                         "ok": True, "adjusted": True, "skipped": False,
                         "note": "clamped to the maximum, 24"}})
     assert row.editor.value() == 24.0
-    assert "made it 24 (asked 30)" in row.note.text()
+    # With its unit: the note is a line under the row, not the box.
+    assert "made it 24 dB (asked 30)" in row.note.text()
     assert "asked 30" in w.status.text()
 
 

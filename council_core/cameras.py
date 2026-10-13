@@ -1809,12 +1809,23 @@ def bias_refusal(name: str, value: Any, low: Any, high: Any) -> str:
             f"within range [{low}, {high}].")
 
 
+def nearest_whole(value: float) -> int:
+    """The nearest whole number, a half AWAY FROM ZERO — C's roundf, as
+    every OpenEB trail filter rounds its threshold. Python's round() takes
+    a half to the EVEN whole: 3.5 ms to 4 but 2.5 ms to 2, and 1.5 to 2 but
+    0.5 to 0. ONE statement of the rule: trail_threshold_kept (what the
+    sensor keeps) and camera_settings.coerce (what Typhon sends, snapped
+    before the camera sees it) both round with it."""
+    return int(math.copysign(math.floor(abs(float(value)) + 0.5), value))
+
+
 def trail_threshold_kept(threshold_us: Any) -> int:
     """What an OpenEB trail filter keeps of a threshold asked in µs: the
     nearest whole millisecond, in µs (set_threshold: threshold_ms_ =
     std::roundf(threshold / 1000.0); get_threshold returns threshold_ms_ *
-    1000). roundf takes a half AWAY from zero — 2500 µs is 3 ms — where
-    Python's round() would take it to the even 2 ms.
+    1000). roundf takes a half AWAY from zero — 2500 µs is 3 ms and 3500 µs
+    4 ms — where Python's round() would take both to the even ms
+    (nearest_whole).
 
     Outside TRAIL_THRESHOLD_US it refuses, with the HAL's words, as
     ValueError (the HAL raises HalException, a RuntimeError in Python)."""
@@ -1823,7 +1834,7 @@ def trail_threshold_kept(threshold_us: Any) -> int:
     if value < low or value > high:
         raise ValueError(f"Bad STC threshold value: {value}. Value should be "
                          f"in range [{low}, {high}].")
-    return int(math.floor(value / 1000.0 + 0.5)) * 1000
+    return nearest_whole(value / 1000.0) * 1000
 
 
 # ======================================================================

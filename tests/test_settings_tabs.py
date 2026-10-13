@@ -843,6 +843,26 @@ def test_the_trail_threshold_steps_and_reads_in_whole_ms(clean, typhon_dir,
     assert popped.slider.value() == popped.scale.position(25_000)
 
 
+def test_a_set_that_moved_the_threshold_says_it_in_ms_in_the_tabs(
+        clean, typhon_dir, evk4):
+    """A set (a preset made by an older Typhon on the fake EVK4, which then
+    kept any µs) holding 8706 µs: the tabs' status line said "≈ Threshold:
+    9000 (asked 8706)" — the What-took box's first problem — beside a row
+    reading 9 ms. It says it as the row does now, in ms; and so does the
+    reset button's tip ("Back to 10", beside a box in ms)."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    row = tabs.rows["trail.threshold"]
+    frame_camera.apply_camera_settings({"trail.threshold": 8706})
+    pump(0.1)
+    assert evk4.trail.get_threshold() == 9000
+    said = tabs.said
+    assert "≈ Threshold: 9 ms (asked 8.706)" in said, said
+    assert row.editor.value() == 9
+    assert row.reset_button.toolTip().startswith("Back to 10 ms — ")
+
+
 def test_the_tabs_move_the_boxes_beside_start_and_start_keeps_quiet(
         clean, typhon_dir, evk4, tmp_path):
     """The other way round (review): Exposure 12000 typed in the Basic box,

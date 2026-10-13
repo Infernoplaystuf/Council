@@ -1260,6 +1260,46 @@ def test_the_simulated_trail_filter_keeps_whole_ms_and_refuses_like_the_hal():
     assert dev.state["trail.threshold"] == 3000
 
 
+def test_a_half_millisecond_threshold_is_rounded_as_the_hal_rounds_it():
+    """coerce snapped the row BEFORE the camera saw it, with Python's
+    round(), which takes a half to the EVEN whole: 3500 µs became 3 ms and
+    99500 µs 99 ms, where an IMX636 asked for them keeps 4 and 100
+    (std::roundf, a half away from zero: cameras.trail_threshold_kept).
+    Only a preset or a script asks for one — the box and the slider give
+    whole ms — so a preset holding 3500 loaded as 3 ms. A Basler's integer
+    node keeps its own snap (from its minimum, by its increment)."""
+    row = cs.trail_threshold_setting(10_000, 1000, 100_000)
+    for asked in (1499, 1500, 2500, 3500, 11_500, 12_400, 50_500, 99_500):
+        assert cs.coerce(row, asked)[0] == \
+            cameras.trail_threshold_kept(asked), asked
+    assert cs.coerce(row, 3500) == (4000, "snapped to whole ms")
+    assert cs.coerce(row, 99_500) == (100_000, "snapped to whole ms")
+    for dev in (fake_evk4_device(), simulated("event")):
+        change = dev.set_setting("trail.threshold", 3500)
+        assert change.ok and change.value == 4000, change
+        assert dev.set_setting("trail.threshold", 99_500).value == 100_000
+        applied = cs.apply(dev, {"trail.threshold": 11_500})
+        assert applied.changes[0].value == 12_000, applied.changes
+    basler = setting(cs.INT, minimum=16, maximum=99, step=4)
+    assert cs.coerce(basler, 18)[0] == 16, "a Basler node's snap is its own"
+
+
+def test_a_clamped_threshold_says_its_bound_in_the_unit_it_is_shown_in():
+    """'Threshold: 1 ms, asked 0.5 (clamped to the minimum, 1000)': the
+    note gave the bound in µs inside a line in ms."""
+    row = cs.trail_threshold_setting(10_000, 1000, 100_000)
+    assert cs.coerce(row, 500) == (1000, "clamped to the minimum, 1 ms")
+    assert cs.coerce(row, 100_400) == (100_000,
+                                       "clamped to the maximum, 100 ms")
+    dev = simulated("event")
+    change = dev.set_setting("trail.threshold", 500)
+    assert change.line(row.label, *row.shown()) == \
+        "Threshold: 1 ms, asked 0.5 (clamped to the minimum, 1 ms)"
+    # A setting shown in its own unit says the bound as before.
+    assert cs.coerce(setting(cs.FLOAT, minimum=1.0, maximum=10.0, unit="dB"),
+                     99) == (10.0, "clamped to the maximum, 10")
+
+
 def test_the_simulated_event_camera_fires_less_at_a_higher_threshold():
     dev = simulated("event")
     dev.start()

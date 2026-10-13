@@ -753,7 +753,9 @@ settings in the main window — no window to open for the everyday ones.
     slider marks the recommended part of a wider one),
     **Filters** (the event rate controller, anti-flicker, the event trail /
     STC filter — its threshold in **whole milliseconds, 1 … 100 ms**, as
-    the sensor keeps it — and the event rate activity filter, each a
+    the sensor keeps it; a preset's threshold between two whole ms is
+    rounded as the sensor rounds it, a half up (3500 µs is 4 ms), and the
+    What-took box says it in ms — and the event rate activity filter, each a
     section of its own), **Display** (below), **Camera** (its area, then
     the readings — temperature, illumination, pixel dead time — and what it
     is: serial, sensor, event format).
@@ -979,7 +981,7 @@ area** in sensor pixels, the **presets**, and **What the last change did**.
   clamped before it is sent (pylon refuses rather than clamps), the camera
   may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
   bias — the control shows the camera's value and the row says
-  `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
+  `The camera made it 5004 µs (asked 5003.7)` or `NOT changed — …`.
 - A bias outside its **recommended** range says so under its row (on an
   EVK4, only one opened with the range-check bypass: otherwise the HAL
   accepts the recommended range only, and the slider ends there).

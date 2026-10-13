@@ -347,15 +347,35 @@ class Scale:
         return v
 
 
+def with_unit(setting: Dict[str, Any], value: Any) -> str:
+    """A value of `setting` as its row shows it, with the unit it is shown
+    in: "10 ms" for a trail threshold the camera holds as 10000 (µs)."""
+    said = show(in_shown_unit(setting, value))
+    unit, _per = shown_unit(setting)
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return f"{said} {unit}" if unit and numeric else said
+
+
 def took_lines(applied: Dict[str, Any],
-               labels: Optional[Dict[str, str]] = None) -> List[str]:
+               labels: Optional[Dict[str, str]] = None,
+               settings: Optional[Dict[str, Dict[str, Any]]] = None
+               ) -> List[str]:
     """What a set did, one line per setting, problems first — the "What
-    took" box. `applied` is camera_settings.Applied.as_dict()."""
+    took" box. `applied` is camera_settings.Applied.as_dict().
+
+    `settings` (key: the setting's dict, as its row holds it) says each
+    value as its row SHOWS it, with its unit — what the camera took, and
+    what was asked in the same unit (Change.line's way). Without it a trail
+    threshold of 9000 µs read "Threshold: 9000 (asked 8706)" beside a row
+    whose box said "9 ms"."""
     labels = labels or {}
+    settings = settings or {}
     refused, adjusted, left, done = [], [], [], []
     for change in applied.get("changes") or []:
         name = labels.get(change.get("key"), change.get("key", "?"))
-        value, asked = show(change.get("value")), show(change.get("asked"))
+        setting = settings.get(str(change.get("key")), {})
+        value = with_unit(setting, change.get("value"))
+        asked = show(in_shown_unit(setting, change.get("asked")))
         note = change.get("note") or ""
         if not change.get("ok", True):
             refused.append(f"✗ {name}: NOT changed — {note}")
@@ -750,6 +770,11 @@ class SettingRow(QObject):
         trail threshold the camera holds as 10000 (µs)."""
         return show(in_shown_unit(self.setting, value))
 
+    def said_with_unit(self, value: Any) -> str:
+        """said(), with the unit the row shows: "10 ms". A line away from
+        the number box (a tooltip, a note) has no suffix beside it."""
+        return with_unit(self.setting, value)
+
     def _boxed(self, value: float) -> Any:
         """A value of the setting's own unit as its number box holds it."""
         number = float(value) / self._per()
@@ -919,8 +944,9 @@ class SettingRow(QObject):
         self.reset_button.setVisible(writable and connected_value is not None)
         self.reset_button.setEnabled(enabled and can_reset)
         self.reset_button.setToolTip(
-            f"Back to {self.said(connected_value)} — as the camera had it "
-            f"when it was connected" if connected_value is not None else "")
+            f"Back to {self.said_with_unit(connected_value)} — as the camera "
+            f"had it when it was connected" if connected_value is not None
+            else "")
 
         notes: List[Tuple[str, str]] = []
         if s.get("warning"):
@@ -1485,7 +1511,8 @@ class SettingsCore:
             elif change.get("adjusted"):
                 # In the unit the row shows (a trail threshold in ms).
                 row.result, row.result_tone = (
-                    f"The camera made it {row.said(change.get('value'))} "
+                    f"The camera made it "
+                    f"{row.said_with_unit(change.get('value'))} "
                     f"(asked {row.said(change.get('asked'))})", "warn")
             else:
                 row.result, row.result_tone = "", ""
@@ -1508,8 +1535,15 @@ class SettingsCore:
     def _took_set(self, out: Dict[str, Any]) -> None:
         applied = dict(out.get("applied") or {})
         labels = {k: r.setting.get("label", k) for k, r in self.rows.items()}
-        lines = took_lines(applied, labels)
+        # Each value in the unit its row shows it in (a trail threshold in
+        # ms), as the rows themselves say it.
+        lines = took_lines(applied, labels,
+                           {k: r.setting for k, r in self.rows.items()})
         head = str(out.get("summary") or "")
+        # The summary FIRST, then what took: a view that says the first
+        # problem beside the summary (SettingsTabs._show_took) had it
+        # replaced at once by this summary alone.
+        self.say(head, tone="" if out.get("ok", True) else "warn")
         self._show_took(head, lines)
         for row in self.rows.values():
             row.result, row.result_tone = "", ""
@@ -1520,7 +1554,6 @@ class SettingsCore:
             if row is not None and change.get("ok", True) \
                     and not row.busy_editing():
                 row.show_value(change.get("value"))
-        self.say(head, tone="" if out.get("ok", True) else "warn")
         if out.get("what") == "preset" and out.get("name"):
             self.select_preset(str(out["name"]))
         self._soon()
