@@ -380,24 +380,91 @@ the tests that ran the Tk shell or compared it with Qt are gone (`test_shell_par
 scope and turn-context tests). Section 7's "both shells" now means the Qt app; the Tk shell
 keeps its old behaviour.
 
-How the Qt turn combines the two (`CouncilActions.send`): council-map's lookups (vault
-passages, the Sage's taught knowledge, past decisions, docs) side by side; the Sage, past
-and docs blocks on their roles; then `prepare_turn`, sized to the Writer's call with those
-blocks in it and at the call's thinking level (`prompt_room(think=…)`); then the vault
-passages, minus files already in front of the question and cut to the room left
-(`vault_context.fit`). One task memo and one analyst — `prepare_turn`'s.
+How the Qt turn combines the two (`CouncilActions.send`, as fixed on
+`merge/council-map-fixed`): council-map's lookups (vault passages, the Sage's taught
+knowledge, past decisions, docs) are started side by side; while they run,
+`turn_context.begin_turn` — the task memo (the Intern's model) and the analyst (the Coder's),
+side by side too; an answer from the data is given then, without waiting for the lookups;
+otherwise the Sage, past and docs blocks go on their roles and `prepare_turn(started=…)`
+continues — sized to the Writer's call with those blocks in it and at the call's thinking
+level (`prompt_room(think=…)`); then the vault passages, minus files already in front of
+the question and cut to the room left (`vault_context.fit`). One task memo and one analyst
+— the turn context's, with council-map's contract (below).
 
 "This conversation only" holds for council-map: past decisions (the block and the
 `recall_decision` tool) and the after-answer role/project memory updates only in scope
 `all`; an earlier passed answer is shown, not kept, unless the scope is `all`.
 
+**Review fixes (2026-10-13, branch `merge/council-map-fixed`).** Each was reproduced by a
+test that fails on 05bef12 (the coverage-only ones are said).
+- A semantic index (`<vault>/.chromadb`) built before `logs/`, `memory/` and the root's
+  app files were protected — the Tk shell builds one at every start; the user's lists
+  `memory/` and `logs/` files — put an older session, role memory and older judged
+  questions into the Writer's prompt (default build) and 30 of 34 Deep-council calls
+  through council-map's passages, and into the `semantic_search` tool. Both now drop a hit
+  from a dot-folder or a protected file (`vault_context.is_app_source`), and a re-index
+  removes the chunks and hashes of every file it no longer collects (also a file the user
+  deleted). `tests/test_stale_semantic_index.py` uses a real chromadb index built under the
+  old rules.
+- With Tools on, `vault_list` / `vault_read` / `vault_search` read the app's root files
+  (`question_history.json`, `verdict_history.jsonl`, the wishlist) into members' prompts;
+  they now refuse what `tool_kit`'s reading tools refuse. `vault_save` refuses an app file
+  name (a dot-file, `VAULT_ROOT_STATE`, anything protected): a model-written
+  `node_routing.json` had become the next launch's opt-in to send the Writer's prompts to
+  another machine.
+- The analyst keeps council-map's contract: `COUNCIL_ANALYST=0` turns the whole step off
+  (the direct answers from the data too); the code is asked of the Coder's model
+  (num_predict 700, 120 s), one retry with the error; it runs in a child process with the
+  time limit and memory cap (`analyst_step.run_code`) and is given no
+  `save_app_tool`/`run_app_tool` (one question had written `App_Built_tools/`); the
+  prompt no longer offers them.
+- The memo is asked of the Intern's model (it was the main model's).
+- A low-confidence gap's wishlist line names the typed question, on one line (it quoted
+  the task memo in front of it).
+- The Council Map no longer says role/project memory and the profile reach every role
+  "live", nor the guide that each member gets them or that the Strategist recalls past
+  decisions, in the default scope.
+- `memory_scope.pin_launch_environment`: `council_qt.py` pins `COUNCIL_MEMORY_SCOPE` and
+  `COUNCIL_DEMO_SILO` first, so importing the Tk module (which sets SILO) cannot turn Qt's
+  memory off; a test builds every Qt tab in a child and finds neither Tk module imported
+  (coverage: nothing imports it today).
+- `test_qt_remembers`' full-council test runs at Deep with Tools, Parallel and Vault on and
+  plants council-map's stores (past decisions, a passed answer, verdict_log, judged
+  questions, the gap list, `logs/council.log`); with a control in scope `all` (coverage
+  only: it passed before).
+
+**Decided on the review** (design calls the user may change):
+- The Sage's knowledge base (`sage_knowledge/`: facts and corrections taught in the Agents
+  tab; a correction quotes an older question) reaches the Sage in `conversation` and `all`
+  as what the user taught it on purpose, and not in `none`. A vault search never returns it.
+- A Code-tab job's handoff note (`.council_projects/<p>/notes/`) is the project's, like its
+  brief and code map — shown in the Code tab, what the next job is planned from — so it is
+  in the Code agent's context in every scope.
+- The analyst's result table is no longer saved to `vault/analyst_results/` (the next
+  conversation's vault search found an older question's figures there); the transcript
+  shows up to 500 rows. A final failure still adds a line to the app's protected
+  `.failures.jsonl` (read by the shutdown's FailureAnalyzer, never by a prompt).
+
+**What this merge overrides in section 7:**
+- "Not done: … Expand with council (Batch 3)": Expand works (council-map's version: the
+  fast answer is re-asked through the whole council at Deep depth).
+- "Role/project memory is not written by Qt": it is, in scope `all` only
+  (`after_turn.learn`); never in `conversation` or `none`.
+- "Importing the Tk module no longer turns Qt's memory off … `set_tk_default`": that
+  mechanism is gone with the Tk edits; the launch pin above replaces it.
+- The Tk-only items left open in section 7 are won't-fix (the Tk shell is retired): Tk's
+  first verdict before naming, Tk's Agree/Disagree stamping the last line, Tk's
+  `council.log` `open("a")`, Tk's "New session" not claiming its id, Tk's
+  `_preview_data_file` on its GUI thread.
+- Still true: Qt writes no crash-recovery sentinel and offers no resume (USER_GUIDE's
+  Sessions section now says so, with "This conversation only" and Load as Prior).
+
 Open:
-- `prepare_turn`'s analyst runs the model's pandas code in-process with no time limit;
-  council-map's `analyst_step` ran it in a child process with a 2-minute limit and a
-  memory cap (unused by the Qt turn now).
 - The Vault switch turns off council-map's passages only; the matches `prepare_turn` puts
   in front of the question do not read it.
 - A Tk launch and a Qt launch in the same second can share a session id again (the Tk
   console no longer claims its id).
 - Native tool specs (Tools on) and the members' draft wrappers are not in the Writer's
   measured frame; the engine's clamp still fits those calls.
+- `analyst_results/` files the Tk shell wrote are not protected: a vault search can still
+  find them.
