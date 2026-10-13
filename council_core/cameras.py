@@ -61,6 +61,7 @@ SetValue as "the camera refused that area", blaming the camera for a typo.
 from __future__ import annotations
 
 import math
+import re
 import sys
 import threading
 import time
@@ -1802,6 +1803,58 @@ IMX636_BIASES: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {
 TRAIL_THRESHOLD_US: Tuple[int, int] = (1000, 100_000)
 
 
+#: An OpenEB exception, as Python gets it. The bindings raise RuntimeError
+#: with BaseException::what() (sdk/base/utils/error_utils.h): a rule, the
+#: category's name, "Error <code in hex>: ", the message, the category's
+#: own message for the code (the HAL's is always "", hal_exception.cpp),
+#: a rule. Measured in the pylon env: open_raw_file on a missing path said
+#: "\n----…\nMetavision HAL exception\n\nError 101000: Unable to open RAW
+#: file '…'\n\n----…\n". tests/test_camera_settings.py pins all of it to
+#: the source and to the real bindings where they are on the machine.
+HAL_RULE = "-" * 48
+HAL_CATEGORY = "Metavision HAL exception"
+#: HalErrorCode (hal_error_code.h): what a bias or trail threshold out of
+#: range is refused with (i_ll_biases.cpp, imx636_event_trail_filter_
+#: module.cpp).
+HAL_INVALID_ARGUMENT = 0x102000
+HAL_VALUE_OUT_OF_RANGE = 0x102001
+
+
+def hal_exception_text(code: int, what: str = "",
+                       category: str = HAL_CATEGORY,
+                       message: str = "") -> str:
+    """str() of an OpenEB exception — what the fakes raise, so the tests
+    see what a real EVK4's refusal looks like (camera_settings._why says
+    it plainly)."""
+    text = f"\n{HAL_RULE}\n{category}\n\nError {int(code):x}: "
+    if what:
+        text += what + "\n"
+    return text + message + f"\n{HAL_RULE}\n"
+
+
+#: One hal_exception_text block, wherever it is in a text ("could not open
+#: '00051234': <block>" too).
+_HAL_BLOCK = re.compile(
+    r"(?:\r?\n)?-{8,}[ \t]*\r?\n"
+    r"(?P<category>[^\r\n]*)\r?\n\s*"
+    r"Error (?P<code>[0-9a-fA-F]+): (?P<what>[^\r\n]*)"
+    r"(?P<rest>.*?)"
+    r"\r?\n-{8,}[ \t]*(?:\r?\n)?", re.S)
+
+
+def said_plainly(text: str) -> str:
+    """`text` with each OpenEB exception block in it (hal_exception_text)
+    said as its message alone — "Unable to open RAW file '…'", not a rule
+    of dashes, the category and "Error 101000: " around it. A block with
+    no message of its own says its category and code. Any other text is
+    returned as it is."""
+    def plain(match: "re.Match[str]") -> str:
+        said = match.group("what").strip() or match.group("rest").strip()
+        return said or (f"{match.group('category').strip()}, error "
+                        f"{match.group('code')}")
+    return _HAL_BLOCK.sub(plain, str(text))
+
+
 def bias_refusal(name: str, value: Any, low: Any, high: Any) -> str:
     """The HAL's own words when I_LL_Biases::set refuses a bias outside the
     range it checks (HalException ValueOutOfRange, OpenEB i_ll_biases.cpp)."""
@@ -1970,12 +2023,17 @@ class SyntheticDevice(Device):
         if key.startswith("bias."):
             low, high = self.RANGES[key]
             if not low <= value <= high:
-                raise CameraError(bias_refusal(key[5:], value, low, high))
+                # In the block a real HalException's text is
+                # (hal_exception_text): what a refusal looks like on an EVK4.
+                raise CameraError(hal_exception_text(
+                    HAL_VALUE_OUT_OF_RANGE,
+                    bias_refusal(key[5:], value, low, high)))
         elif key == "trail.threshold":
             try:
                 value = trail_threshold_kept(value)
             except ValueError as exc:
-                raise CameraError(str(exc)) from None
+                raise CameraError(hal_exception_text(
+                    HAL_INVALID_ARGUMENT, str(exc))) from None
         self.state[key] = value
 
     def set_frame_rate(self, fps: float) -> float:

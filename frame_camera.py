@@ -2456,7 +2456,12 @@ def _tell_status(text: str) -> None:
 
 
 def _said(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    from council_core.cameras import said_plainly
+
+    # An OpenEB exception's text is a block of dashes, its category and
+    # "Error <code>: " around the message (cameras.said_plainly), also when
+    # a CameraError carries it ("could not open …: {exc}").
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     return text.split(" : ")[0][:300]
 
 

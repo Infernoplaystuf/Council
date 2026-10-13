@@ -1173,10 +1173,13 @@ def test_the_simulated_event_camera_refuses_a_bias_as_the_hal_does():
     assert refused.note == ('Invalid value 60 for bias "bias_fo". Value '
                             'should be within range [-35, 55].')
     assert refused.value == 50 and dev.state["bias.bias_fo"] == 50
-    # The fake EVK4 says it in the same words (one statement of them).
+    # The fake EVK4 says it in the same words (one statement of them), in
+    # the block a real HalException's text is (hal_exception_text).
     with pytest.raises(RuntimeError) as raised:
         fake_evk4.Biases().set("bias_fo", 60)
-    assert str(raised.value) == refused.note
+    assert str(raised.value) == cameras.hal_exception_text(
+        cameras.HAL_VALUE_OUT_OF_RANGE, refused.note)
+    assert cs._why(raised.value) == refused.note
     # Through the row's own range a slider or a preset is clamped first.
     change = dev.set_setting("bias.bias_diff_on", 180)
     assert change.ok and change.value == 140
@@ -1185,6 +1188,73 @@ def test_the_simulated_event_camera_refuses_a_bias_as_the_hal_does():
 
 def fake_evk4_device():
     return cameras.EvkDevice(fake_evk4.info(), fake_evk4.FakeEvk4())
+
+
+# ======================================================================
+# An OpenEB exception, as Python gets it
+# ======================================================================
+RULE = "-" * 48
+
+
+def test_an_openeb_exception_is_said_by_its_message_not_its_frame():
+    """A real HalException reaches Python as a RuntimeError whose text is
+    a BLOCK — a rule of dashes, the category, "Error <hex>: " and the
+    message, a rule (BaseException::what, OpenEB sdk/base/utils/
+    error_utils.h; measured in the pylon env, open_raw_file on a missing
+    path). _why passed the block through whole, so a refusal that reached
+    a row's one-line "NOT changed —" note was a run of dashes. The fakes
+    raised the bare message, so the tests never saw it."""
+    said = ('Invalid value 141 for bias "bias_diff_on". Value should be '
+            'within range [-85, 140].')
+    block = cameras.hal_exception_text(cameras.HAL_VALUE_OUT_OF_RANGE, said)
+    assert block == (f"\n{RULE}\nMetavision HAL exception\n\nError 102001: "
+                     f"{said}\n\n{RULE}\n")
+    assert cs._why(RuntimeError(block)) == said
+    assert cs._why(RuntimeError(block.strip())) == said
+    # No message of its own (HalException(UnsupportedValue)): the code.
+    bare = cameras.hal_exception_text(0x102004, "")
+    assert cs._why(RuntimeError(bare)) == \
+        "Metavision HAL exception, error 102004"
+    # Anything else as it was: a GenICam text loses its file/line tail.
+    assert cs._why(RuntimeError("Node not writable : RuntimeException "
+                                "thrown (file 'x.cpp', line 9)")) == \
+        "Node not writable"
+    # Through a provider: the fake EVK4's refusals come as blocks now, and
+    # a row's note is the message alone.
+    dev = fake_evk4_device()
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    refused = dev.settings_provider().set("bias.bias_fo", 60,
+                                          setting=unclamped)
+    assert refused.note == ('Invalid value 60 for bias "bias_fo". Value '
+                            'should be within range [-35, 55].')
+    assert "\n" not in refused.line() and RULE not in refused.line()
+
+
+def test_the_exception_block_is_openebs_own():
+    """hal_exception_text against OpenEB's source, where it is on the
+    machine: the layout (error_utils.h), the HAL category's name and its
+    empty message (hal_exception.cpp), the codes (hal_error_code.h)."""
+    utils = fake_evk4.openeb_source(
+        "sdk/modules/base/cpp/include/metavision/sdk/base/utils/"
+        "error_utils.h")
+    category = fake_evk4.openeb_source("hal/cpp/src/utils/hal_exception.cpp")
+    codes = fake_evk4.openeb_source(
+        "hal/cpp/include/metavision/hal/utils/hal_error_code.h")
+    if None in (utils, category, codes):
+        pytest.skip("OpenEB's source is not on this machine")
+    assert f'msg_ = "\\n{RULE}\\n";' in utils
+    assert 'msg_ += std::string(ecat.name()) + "\\n\\n";' in utils
+    assert 'msg_ += "Error " + error_as_hex.str() + ": ";' in utils
+    assert 'msg_ += what_arg + "\\n";' in utils
+    assert f'msg_ += "\\n{RULE}\\n";' in utils
+    assert 'return "Metavision HAL exception";' in category
+    assert "message(int err) const override {\n        return \"\";" in \
+        category
+    assert "CameraError = 0x100000" in codes
+    assert "InvalidArgument = CameraError | 0x02000" in codes
+    assert "ValueOutOfRange = InvalidArgument | 0x1" in codes
+    assert cameras.HAL_INVALID_ARGUMENT == 0x100000 | 0x02000
+    assert cameras.HAL_VALUE_OUT_OF_RANGE == cameras.HAL_INVALID_ARGUMENT | 1
 
 
 # ======================================================================
@@ -1451,6 +1521,19 @@ def _hal():
     except Exception:                                       # noqa: BLE001
         pytest.skip("the Metavision HAL is not importable here")
     return metavision_hal
+
+
+def test_a_real_hal_exception_is_the_block_and_is_said_plainly(tmp_path):
+    """The real bindings' text for a HalException (a missing RAW file is
+    one no camera is needed for): exactly hal_exception_text's block, and
+    _why says the message alone."""
+    hal = _hal()
+    missing = tmp_path / "nothing_here.raw"
+    with pytest.raises(RuntimeError) as raised:
+        hal.DeviceDiscovery.open_raw_file(str(missing))
+    said = f"Unable to open RAW file '{missing}'"
+    assert str(raised.value) == cameras.hal_exception_text(0x101000, said)
+    assert cs._why(raised.value) == said
 
 
 def test_every_facility_method_used_exists_in_the_real_bindings():

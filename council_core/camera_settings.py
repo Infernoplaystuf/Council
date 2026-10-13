@@ -70,7 +70,7 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
 from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
                       EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
                       Roi, _ask, _interface, fit_roi, nearest_whole,
-                      off_sensor, on_sensor)
+                      off_sensor, on_sensor, said_plainly)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "Trigger", "trigger_warning", "area_unchanged",
@@ -663,7 +663,10 @@ class NoSettings(Provider):
 
 
 def _why(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    # An OpenEB exception's text is a block — rules of dashes, the
+    # category, "Error <code>: " (cameras.said_plainly): its message alone,
+    # or a row's one-line "NOT changed —" note was a run of dashes.
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     # GenICam exceptions carry a file/line tail nobody needs to read.
     return text.split(" : ")[0][:200]
 

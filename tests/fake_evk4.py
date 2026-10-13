@@ -96,7 +96,10 @@ class Biases:
     `bypass` (DeviceConfig's ll_biases_range_check_bypass, which Typhon
     never sets) it checks get_bias_range() — the recommended range — and
     outside it RAISES (HalException ValueOutOfRange, a RuntimeError in
-    Python), with the HAL's own words. With `bypass` it checks NOTHING:
+    Python), with the HAL's own words inside the block of dashes a real
+    one's text is (cameras.hal_exception_text — it raised the bare words,
+    so the tests never saw what camera_settings._why has to clean up).
+    With `bypass` it checks NOTHING:
     get_bias_info then only makes get_bias_range() report the allowed
     range. (The IMX636 driver then clamps the register — its factory
     default plus the offset — to 0..255, imx636_ll_biases.cpp; the fake has
@@ -122,7 +125,11 @@ class Biases:
         self.writes.append((name, value))
         low, high = self.get_bias_info(name).get_bias_range()
         if not self.bypass and not low <= value <= high:
-            raise RuntimeError(cameras.bias_refusal(name, value, low, high))
+            # As the bindings raise it: the message inside OpenEB's block
+            # (cameras.hal_exception_text), not the bare message.
+            raise RuntimeError(cameras.hal_exception_text(
+                cameras.HAL_VALUE_OUT_OF_RANGE,
+                cameras.bias_refusal(name, value, low, high)))
         self.values[name] = int(value)
         return True
 
@@ -243,9 +250,11 @@ class AntiFlicker(_Module):
 class Trail(_Module):
     """I_EventTrailFilterModule of an IMX636 (OpenEB imx636_event_trail_
     filter_module.cpp): 1000-100000 µs, kept as the NEAREST WHOLE ms
-    (std::roundf), and a threshold outside that RAISES (HalException, a
-    RuntimeError in Python) — cameras.trail_threshold_kept, the product's
-    one statement of the rule. It used to take 1-100000 and keep any µs:
+    (std::roundf), and a threshold outside that RAISES (HalException
+    InvalidArgument, a RuntimeError in Python, its text the block
+    cameras.hal_exception_text makes) — cameras.trail_threshold_kept, the
+    product's one statement of the rule. It used to take 1-100000 and keep
+    any µs:
     a wheel turn measured on it moved 10000 to 8706 µs, a value no IMX636
     can hold."""
 
@@ -276,7 +285,8 @@ class Trail(_Module):
         try:
             self.threshold = cameras.trail_threshold_kept(value)
         except ValueError as exc:
-            raise RuntimeError(str(exc)) from None
+            raise RuntimeError(cameras.hal_exception_text(
+                cameras.HAL_INVALID_ARGUMENT, str(exc))) from None
         return True
 
     def get_min_supported_threshold(self):

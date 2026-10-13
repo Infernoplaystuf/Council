@@ -981,7 +981,9 @@ area** in sensor pixels, the **presets**, and **What the last change did**.
   clamped before it is sent (pylon refuses rather than clamps), the camera
   may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
   bias — the control shows the camera's value and the row says
-  `The camera made it 5004 µs (asked 5003.7)` or `NOT changed — …`.
+  `The camera made it 5004 µs (asked 5003.7)` or `NOT changed — …` (an
+  EVK4's refusal in the HAL's own message, without the frame of dashes,
+  category and error code OpenEB puts around it).
 - A bias outside its **recommended** range says so under its row (on an
   EVK4, only one opened with the range-check bypass: otherwise the HAL
   accepts the recommended range only, and the slider ends there).

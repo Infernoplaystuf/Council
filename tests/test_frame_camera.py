@@ -53,6 +53,21 @@ def settle(seconds=0.2):
     time.sleep(seconds)
 
 
+def test_an_openeb_exception_inside_a_message_is_said_plainly():
+    """OpenEB's exception text is a block: a rule of dashes, the category,
+    "Error <code>: " and the message, a rule (cameras.hal_exception_text;
+    the real bindings' text, measured in the pylon env). Wrapped in a
+    CameraError ("could not open …: {exc}") and said by _said, the status
+    line got the block — dashes and all."""
+    said = "Unable to open RAW file 'run.raw'"
+    block = cameras.hal_exception_text(0x101000, said)
+    wrapped = cameras.CameraError(f"could not start the stream: {block}")
+    assert frame_camera._said(wrapped) == \
+        f"could not start the stream: {said}"
+    assert frame_camera._said(RuntimeError(block)) == said
+    assert frame_camera._said(RuntimeError("plain : with a tail")) == "plain"
+
+
 # ======================================================================
 # Finding
 # ======================================================================

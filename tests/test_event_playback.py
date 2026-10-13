@@ -252,6 +252,25 @@ def test_a_missing_file_is_an_error_not_a_hang(tmp_path):
     pb.close()
 
 
+def test_a_raw_the_hal_will_not_open_is_said_in_one_line(tmp_path):
+    """OpenEB's exception text is a block — a rule of dashes, the category,
+    "Error <code>: " and the message, a rule (cameras.hal_exception_text;
+    the real bindings' text for open_raw_file, measured in the pylon env).
+    "cannot open run.raw: {exc}" carried the whole block into the error."""
+    raw = tmp_path / "run_events.raw"
+    raw.write_bytes(b"% end\n")
+    hal = FakeHal([])
+    said = f"Unable to open RAW file '{raw}'"
+
+    def refuse(path, config):
+        raise RuntimeError(cameras.hal_exception_text(0x101000, said))
+    hal.DeviceDiscovery.open_raw_file = staticmethod(refuse)
+    pb = ep.RawPlayback(raw, hal=hal)
+    assert pb.wait_done(5)
+    assert pb.error == f"cannot open run_events.raw: {said}", pb.error
+    pb.close()
+
+
 def test_a_runs_area_is_drawn_as_its_pngs_were(tmp_path):
     """A .raw holds the whole sensor's geometry, events in sensor
     coordinates; the run's PNGs are its area alone. Given the area (from the
