@@ -1,11 +1,12 @@
 """
-council_core.turn_context — the context a turn is given, shared by both shells.
+council_core.turn_context — the context a Qt Council turn is given.
 
 The Qt Council sent only the typed question to the models: a fact planted in a
 vault reached 0 of 13 prompts (docs/qt_migration/remaining_scope_2026-10-06.md).
 The Tk shell's context code — file and folder injection, vault and value
 matches, the analyst step — was 3,186 toolkit-free lines inside the Tk module,
-which the Qt shell cannot import. It moved here; the Tk module re-exports it.
+which the Qt shell cannot import. A copy of it lives here, for the Qt app; the
+retired Tk shell keeps its own.
 """
 from __future__ import annotations
 
@@ -28,33 +29,20 @@ def test_the_module_imports_no_toolkit():
         assert toolkit not in source, toolkit
 
 
-def test_the_tk_engine_calls_the_same_functions():
-    """Re-exported, not copied: one body, two shells."""
-    import council_gui_engine as cge
+def test_outside_a_turn_the_vault_is_the_app_s(tmp_path, monkeypatch):
+    """The Tk engine's hook that steered this code to ITS vault is gone with
+    the Tk edits: outside a prepared turn these functions read the app's
+    vault (council_core.paths), inside one the turn's."""
+    from council_core import paths
     from council_core import turn_context as tc
-    for name in ("_inject_file_contents", "_inject_file_contents_impl",
-                 "_run_analyst_step", "_extract_file_paths",
-                 "_read_file_for_injection", "_get_vault_index",
-                 "_get_data_index", "_register_data_index",
-                 "_FILE_INJECT_CACHE", "looks_like_file_count"):
-        assert getattr(cge, name) is getattr(tc, name), name
-
-
-def test_the_rebound_instances_are_not_copied_into_the_tk_engine():
-    """A copy of a name rebound later goes stale silently — so they are not
-    re-exported at all, and a stale read fails loudly."""
-    import council_gui_engine as cge
-    for name in ("_VAULT_INDEX_INSTANCE", "_DATA_INDEX_INSTANCE",
-                 "_REFERENCED_FILES_MAP"):
-        assert not hasattr(cge, name), name
-
-
-def test_setting_the_tk_vault_still_steers_the_moved_code(tmp_path,
-                                                         monkeypatch):
-    import council_gui_engine as cge
-    from council_core import turn_context as tc
-    monkeypatch.setattr(cge, "VAULT_DIR", tmp_path / "tk_vault")
-    assert tc._vault() == tmp_path / "tk_vault"
+    monkeypatch.setattr(paths, "vault_dir", lambda: tmp_path / "app_vault")
+    assert tc._vault() == tmp_path / "app_vault"
+    assert not hasattr(tc, "use_vault_dir")
+    token = tc._ACTIVE.set(tc.TurnState(tmp_path / "turn_vault"))
+    try:
+        assert tc._vault() == tmp_path / "turn_vault"
+    finally:
+        tc._ACTIVE.reset(token)
 
 
 def test_no_vault_directory_name_is_left_in_the_moved_code():

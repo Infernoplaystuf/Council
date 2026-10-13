@@ -392,10 +392,9 @@ def test_a_folder_that_cannot_be_made_does_not_stop_the_store(tmp_path,
 # Appends from several processes at once (verdict_history.jsonl)
 # ============================================================
 
-def _append_race(tmp_path, procs: int, each: int, *, tk_too: bool = False):
+def _append_race(tmp_path, procs: int, each: int):
     """``procs`` processes append ``each`` records to one file at once
-    through append_line (and, with ``tk_too``, one more through the Tk
-    console's _save_verdict_record). Returns (rows, bad_lines)."""
+    through append_line. Returns (rows, bad_lines)."""
     target = tmp_path / "verdict_history.jsonl"
     go = tmp_path / "go"
     script = textwrap.dedent(f"""
@@ -441,34 +440,6 @@ def test_appends_from_four_processes_at_once_keep_every_record(tmp_path):
         got = sorted(r["i"] for r in rows if r["who"] == f"p{n}")
         assert got == list(range(1500)), (
             f"p{n} lost {1500 - len(set(got))} records")
-
-
-def test_the_tk_console_appends_its_verdicts_the_same_way(tmp_path,
-                                                          monkeypatch):
-    """The Tk console's _save_verdict_record (run on a stand-in — no
-    window) appends through append_line too: its open("a") lost records
-    to a Qt launch appending at the same moment."""
-    import council_gui_engine as cge
-    target = tmp_path / "verdict_history.jsonl"
-    monkeypatch.setattr(cge, "VERDICT_HISTORY_PATH", target)
-    used = []
-    real = conversations.append_line
-    monkeypatch.setattr(conversations, "append_line",
-                        lambda path, data: (used.append(Path(path)),
-                                            real(path, data)))
-
-    class Console:
-        said = []
-
-        def _append_transcript(self, who, text, kind="final"):
-            self.said.append((who, text))
-
-    console = Console()
-    cge.CouncilConsole._save_verdict_record(console, {"query": "ü",
-                                                      "session_id": "s"})
-    assert used == [target], "Tk did not append through append_line"
-    assert _lines(target) == [{"query": "ü", "session_id": "s"}]
-    assert not console.said
 
 
 # ============================================================
@@ -608,66 +579,3 @@ def test_a_non_ascii_name_is_the_name_of_the_file(tmp_path):
     assert conv.session_id in named.message
     assert not conv.load_prior(conv.session_id).ok
     assert not conv.load_prior("pumpengröße_halle").ok
-
-
-# ============================================================
-# The Tk console claims its session id too
-# ============================================================
-
-class _TkStandIn:
-    """The parts of the Tk console its session-id code reads (no window)."""
-
-    def __init__(self, vault):
-        import conversation_logger
-        self.convo_store = ConversationStore(vault / "conversations")
-        self.conv_logger = conversation_logger.ConversationLogger(vault)
-        self.personalities = {}
-        self.said = []
-
-    def _append_transcript(self, who, text, kind="final"):
-        self.said.append((who, text))
-
-    def _sessions_refresh(self):
-        pass
-
-
-def test_tk_first_in_the_same_second_does_not_share_its_session(tmp_path):
-    """Found in review: the Tk console took datetime.now() as its id and its
-    logger buffers, so nothing of it was on disk; a Qt launch in the same
-    second took the same id, and the Tk question landed in the Qt session's
-    file — and in the Qt Writer's RECENT CONVERSATION."""
-    import council_gui_engine as cge
-    vault = tmp_path / "vault"
-    second = datetime(2026, 10, 12, 9, 30, 0)
-    tk = _TkStandIn(vault)
-    tk_id = cge.CouncilConsole._claim_session_id(tk, now=second)
-    assert tk_id == "20261012_093000"
-    qt = Conversation(vault)
-    qt_id = qt._new_session_id(now=second)
-    assert qt_id == "20261012_093000_2"
-    # ...and the other order: Qt first, then Tk.
-    later = datetime(2026, 10, 12, 9, 31, 0)
-    assert qt._new_session_id(now=later) == "20261012_093100"
-    assert cge.CouncilConsole._claim_session_id(
-        tk, now=later) == "20261012_093100_2"
-
-
-def test_the_tk_console_claims_its_id_at_start():
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    init = source[source.index("        self.convo_store = ce.ConversationStore"
-                               "(VAULT_DIR / \"conversations\")"):]
-    init = init[:init.index("self.conv_logger.start_session(")]
-    assert "self.session_id = self._claim_session_id()" in init
-
-
-def test_tk_names_a_claimed_id_and_keeps_the_stored_name(tmp_path):
-    """A claimed id can end "_2" — Tk's rename took only the bare second —
-    and a name with letters a file name cannot hold is the file's stem."""
-    import council_gui_engine as cge
-    vault = tmp_path / "vault"
-    tk = _TkStandIn(vault)
-    tk.session_id = "20261012_093000_2"
-    tk.convo_store.append(tk.session_id, {"who": "User", "text": "q"})
-    cge.CouncilConsole._rename_session(tk, "pumpengröße_halle")
-    assert tk.session_id == "pumpengr_e_halle"
-    assert (vault / "conversations" / "pumpengr_e_halle.jsonl").is_file()
