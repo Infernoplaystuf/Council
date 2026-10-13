@@ -30,7 +30,10 @@ HOW IT IS DECIDED
 
 The retired Tk shell sets SILO when its module is imported (its own default,
 "none"). The Qt app never imports it (CLAUDE.md, "The Tk shell is retired"),
-so that default never reaches a Qt scope; a SILO the user set does.
+and the Qt entry point pins the two settings as the user started it with
+them before anything else is imported (`pin_launch_environment`), so that
+default never reaches a Qt scope even if something did; a SILO the user set
+does.
 
 An unknown COUNCIL_MEMORY_SCOPE is not guessed at: it is ignored and the rest
 of the rule applies. An unknown scope handed to `blocks()` is treated as
@@ -78,9 +81,43 @@ def resolve(environ: Optional[Mapping[str, str]] = None, *,
     return default if default in SCOPES else NONE
 
 
+#: The two settings as they were when the Qt app started (see
+#: `pin_launch_environment`); None until the Qt entry point pins them.
+_LAUNCH: Optional[dict] = None
+_LAUNCH_KEYS = ("COUNCIL_MEMORY_SCOPE", "COUNCIL_DEMO_SILO")
+
+
+def pin_launch_environment(environ: Optional[Mapping[str, str]] = None
+                           ) -> None:
+    """Remember COUNCIL_MEMORY_SCOPE and COUNCIL_DEMO_SILO as the user
+    started the Qt app with them; `for_qt` reads these from then on.
+
+    council_qt.py calls this first, before anything else is imported. The
+    retired Tk module sets COUNCIL_DEMO_SILO=1 when it is imported (its own
+    default, "none"), so an import of it anywhere in the Qt process would
+    otherwise turn the Qt app's memory off from then on. Batches 1-2 had
+    the Tk module mark its default instead (set_tk_default); the Tk module
+    is not edited any more (CLAUDE.md), so the Qt side keeps the user's
+    values itself."""
+    global _LAUNCH
+    env = os.environ if environ is None else environ
+    _LAUNCH = {k: env[k] for k in _LAUNCH_KEYS if k in env}
+
+
+def unpin_launch_environment() -> None:
+    """Forget the pinned values: `for_qt` reads the live environment again
+    (for tests)."""
+    global _LAUNCH
+    _LAUNCH = None
+
+
 def for_qt(environ: Optional[Mapping[str, str]] = None) -> str:
     """The Qt shell's scope: "This conversation only" unless the environment
-    says otherwise (COUNCIL_MEMORY_SCOPE, or SILO for none)."""
+    says otherwise (COUNCIL_MEMORY_SCOPE, or SILO for none) — the
+    environment the app was started with, once council_qt.py has pinned it
+    (`pin_launch_environment`), else the live one."""
+    if environ is None and _LAUNCH is not None:
+        environ = _LAUNCH
     return resolve(environ, default=QT_DEFAULT)
 
 

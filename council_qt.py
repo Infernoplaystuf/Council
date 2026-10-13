@@ -24,6 +24,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def main() -> int:
+    # The memory scope as the user started the app, FIRST: the retired Tk
+    # module sets COUNCIL_DEMO_SILO=1 when it is imported, and an import of
+    # it anywhere in this process would otherwise turn the Qt app's memory
+    # off ("This conversation only" -> "none") from then on
+    # (council_core.memory_scope.pin_launch_environment).
+    from council_core import memory_scope
+    memory_scope.pin_launch_environment()
+
     # The main model, before anything can import council_engine. The run-*
     # launchers export the FIRST *.gguf they find when COUNCIL_GGUF_PATH is
     # unset, and that guess used to beat the model saved in the Models tab on
