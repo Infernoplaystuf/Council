@@ -86,6 +86,14 @@ if pytest is not None:
         cannot switch it off for the rest of the run. monkeypatch changes
         are already undone by the time this runs (it is set up first)."""
         yield
+        # A test that ran council_qt.py's main() pinned the memory scope to
+        # ITS environment (council_core.memory_scope.pin_launch_environment);
+        # left pinned, every later test's COUNCIL_MEMORY_SCOPE would be read
+        # as that one's.
+        import sys
+        scope = sys.modules.get("council_core.memory_scope")
+        if scope is not None and getattr(scope, "_LAUNCH", None) is not None:
+            scope.unpin_launch_environment()
         changed = restore()
         if changed:
             import warnings
