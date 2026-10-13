@@ -324,6 +324,85 @@ def test_vault_save_never_overwrites(vault):
     assert (vault / "manual.md").read_text().startswith("# Manual")
 
 
+def _app_files(vault):
+    """The app's own files at the vault root, each holding a word an older
+    conversation said (found in review: they reached members' prompts)."""
+    import question_history
+    question_history.QuestionHistory(vault).add(
+        "what is the spare impeller called - it is MARZIPAN")
+    (vault / "verdict_history.jsonl").write_text(json.dumps(
+        {"session_id": "older", "query": "the spare impeller is TANGERINE",
+         "passed": True}) + "\n", encoding="utf-8")
+    (vault / "librarian_wishlist.md").write_text(
+        "- [ ] writer | the spare impeller CINNAMON\n", encoding="utf-8")
+    (vault / "trends.md").write_text("impeller trend SAFFRON\n",
+                                     encoding="utf-8")
+    (vault / ".onboarded").write_text("impeller PAPRIKA\n", encoding="utf-8")
+    (vault / "pumps.md").write_text("The spare impeller is part P-200.\n",
+                                    encoding="utf-8")
+    return ("MARZIPAN", "TANGERINE", "CINNAMON", "SAFFRON", "PAPRIKA")
+
+
+def test_vault_list_read_and_search_never_reach_the_apps_own_files(vault):
+    """vault_list / vault_read / vault_search (council-map's Tools) read
+    every file at the vault root: question_history.json and
+    verdict_history.jsonl hold every older conversation's questions, and a
+    search for any word of the question hit them. They now refuse what
+    tool_kit's own reading tools refuse (conversation_logger-protected
+    files and dot-files)."""
+    import council_engine
+    words = _app_files(vault)
+    lib = council_engine.Librarian(vault, vault / "logs" / "council.log")
+    tools = council_tools.make_tools(None, lib, vault)
+
+    ok, listed, payload = call(tools, "vault_list")
+    assert ok and "pumps.md" in payload["items"]
+    for name in ("question_history.json", "verdict_history.jsonl",
+                 "librarian_wishlist.md", "trends.md", ".onboarded"):
+        assert name not in payload["items"], payload["items"]
+
+    ok, found, payload = call(tools, "vault_search", query="impeller")
+    assert ok and [m["file"] for m in payload["matches"]] == ["pumps.md"]
+    assert not [w for w in words if w in found], found
+
+    for name in ("verdict_history.jsonl", "question_history.json",
+                 "trends.md", ".onboarded", "../outside.txt"):
+        ok, text, _ = call(tools, "vault_read", name=name)
+        assert not ok, (name, text)
+        assert not [w for w in words if w in text], (name, text)
+    ok, text, _ = call(tools, "vault_read", name="pumps.md")
+    assert ok and "P-200" in text
+
+
+@pytest.mark.parametrize("name", [
+    "node_routing.json", "council_instructions.json", "model_slots.json",
+    "backend_settings.json", "question_history.json", "Node_Routing.JSON",
+    "trends.md", ".onboarded", "../node_routing.json"])
+def test_vault_save_never_writes_an_app_file(vault, name):
+    """A member's vault_save created node_routing.json at the vault root, and
+    the next launch read it as the user's opt-in to send the Writer's
+    prompts to another machine (found in review: route('writer') gave
+    http://203.0.113.9:11434). An app file name is refused, present or
+    not."""
+    import council_engine
+    from council_core import node_routing
+    lib = council_engine.Librarian(vault, vault / "logs" / "council.log")
+    tools = council_tools.make_tools(None, lib, vault)
+    routing = {"version": 1, "routing_enabled": True,
+               "nodes": {"box": {"url": "http://203.0.113.9:11434",
+                                 "enabled": True}},
+               "roles": {"writer": {"node": "box", "fallback": "here"}}}
+    before = sorted(p.name for p in vault.iterdir())
+    ok, msg, _ = call(tools, "vault_save", name=name,
+                      content=json.dumps(routing))
+    assert not ok and "app" in msg, msg
+    assert sorted(p.name for p in vault.iterdir()) == before
+    assert node_routing.route("writer", node_routing.load(vault)) is None
+    ok, msg, p = call(tools, "vault_save", name="pump_notes.md",
+                      content="P-200 notes")
+    assert ok and Path(p["path"]).name == "pump_notes.md"
+
+
 # ============================================================
 # The tool set: roles, cache, notes, meter
 # ============================================================

@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from council_core.deliberation import ToolFn
-from council_core.tool_kit import (SharedNotes, ToolSet, make_extra_tools,
-                                   tool)
+from council_core.tool_kit import (PathError, SharedNotes, ToolSet,
+                                   _readable, make_extra_tools, read_text,
+                                   resolve_in, tool)
 
 
 def vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Dict[str, Any]:
@@ -34,6 +35,12 @@ def vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Di
     scanned = 0
     for p in files:
         if scanned >= max_files or not p.is_file():
+            continue
+        # Never the app's own files (tool_kit._readable): question_history
+        # .json and verdict_history.jsonl hold every older conversation's
+        # questions, and the question being asked — a search for any of its
+        # words hit them, and the excerpt went into the member's prompt.
+        if not _readable(p, vault_dir):
             continue
         scanned += 1
         try:
@@ -53,6 +60,29 @@ def vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Di
         if len(matches) >= 12:
             break
     return {"query": q, "matches": matches, "scanned": scanned}
+
+
+def is_app_file_name(name: str, vault_dir: Path) -> bool:
+    """Whether a file called `name` at the vault root would be one of the
+    app's own: a dot-file, one of council_core.vault_setup.VAULT_ROOT_STATE
+    (the settings the app reads at the root), or what conversation_logger
+    protects (older conversations, learned memory, settings). Case does not
+    matter (Windows' file names do not)."""
+    low = str(name or "").strip().lower()
+    if not low or low.startswith("."):
+        return True
+    try:
+        from council_core.vault_setup import VAULT_ROOT_STATE
+        if low in {n.lower() for n in VAULT_ROOT_STATE}:
+            return True
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        import conversation_logger
+        return bool(conversation_logger.is_protected_path(
+            Path(vault_dir) / low, vault_dir))
+    except Exception:                                     # noqa: BLE001
+        return True
 
 
 def free_name(folder: Path, name: str) -> str:
@@ -101,13 +131,28 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
         if not content:
             return False, "No content provided.", {}
         folder = Path(getattr(librarian, "vault_dir", vault_dir))
+        # Never one of the app's files, present or not: a model-written
+        # node_routing.json was the next launch's opt-in to send a role's
+        # prompts to another machine (found in review), and the others are
+        # settings or older conversations the app reads back.
+        try:
+            from council_engine import safe_name
+            saved_as = safe_name(name, 128)
+        except Exception:                                 # noqa: BLE001
+            saved_as = name
+        if is_app_file_name(saved_as, folder):
+            return False, (f"'{saved_as}' is one of the app's own files; "
+                           "save under another name."), {}
         name = free_name(folder, name)
         p = librarian.save_text(name, content)
         return True, f"Saved to vault as '{p.name}'.", {"path": str(p)}
 
     @tool("{} — the files at the top of the vault")
     def vault_list(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-        items = librarian.list_items()
+        # The user's files only (tool_kit._readable): not the app's own at
+        # the root — older conversations' questions, settings, dot-files.
+        items = [n for n in librarian.list_items()
+                 if _readable(Path(vault_dir) / n, vault_dir)]
         return True, "\n".join(items) if items else "(empty)", {"items": items}
 
     @tool('{"name": "file.txt"} — one whole vault file')
@@ -115,8 +160,15 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
         name = str(args.get("name", "")).strip()
         if not name:
             return False, "Provide {'name': 'file.txt'}", {}
-        txt = librarian.read_text(name)
-        return True, txt, {"name": name}
+        # Through tool_kit.resolve_in, as the other reading tools: inside
+        # the vault, never a dot-folder or one of the app's own files.
+        try:
+            p = resolve_in(name, [Path(vault_dir).resolve()], vault_dir)
+        except PathError as exc:
+            return False, str(exc), {}
+        if not p.is_file():
+            return False, f"{name} is not a file", {}
+        return True, read_text(p), {"name": p.name}
 
     @tool('{"query": "exact words"} — vault files containing the words, '
           "with an excerpt")
