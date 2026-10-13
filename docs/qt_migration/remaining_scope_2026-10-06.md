@@ -324,3 +324,46 @@ Still open after the review (not fixed on this branch):
   does — Batch 6 (crash recovery).
 - The notices Qt now keeps take slots in the Writer's 12-entry RECENT CONVERSATION (about
   three entries per default-build turn instead of two), as they would in Tk with SILO off.
+
+**Second review fixes (2026-10-12/13, same branch).** Each was reproduced by a test that
+fails on the commit before it (two junction tests record a decision and pass before too).
+- The vault blocks are sized for what the Writer's call leaves, not for 75% of the window
+  less a guessed 500 tokens. `council_engine.prompt_room` counts the call the way the
+  engine's clamp fits it (the reply — 2,400 for the Writer, at most half the window, plus
+  thinking headroom when the model thinks — the template margin, chars/3 or denser when a
+  model was measured so); `PersonalityModel.prompt_frame` says what the call sends besides
+  the text (its system prompt, this conversation's turns). `prepare_turn(writer=…)` uses
+  both; Qt builds the personalities (no model loads) before preparing, Tk passes its Writer.
+  Measured before: on Ollama's 8,192 the engine cut the middle out of a named file with no
+  notice. Several named files share the room (head and tail of each). The context-window
+  notice measures the whole call: "too long … part of it will be cut out", or "nearly
+  fills" above 90% of the room. At 4,096 the Writer's own prompt leaves little room: vault
+  blocks are left out, and said.
+- A chip names the file its block was read from (it was the first file of that name in
+  `data_in/`; a match outside `data_in/` had none); a named file left out, missing or
+  unreadable gets no chip; a folder chip lists the folder; a click reads the file on a
+  worker; previews read only the start of a file (large JSON/parquet are not parsed whole).
+- The data index keeps its own files in `data_out/.index/` as gzip JSON (no pickle), writes
+  them only when a user's file changed, and the older builds' copies in `data_in/` are not
+  data anywhere (discover, the overview and its signature, the file count). Measured before:
+  every refresh rewrote them, so the dataset overview was rebuilt on every turn.
+- Not vault matches or data any more: the app's own `data_in/README.txt` and
+  `data_out/README.txt` (while they hold the app's text), and files named like the app's
+  state in `data_in/` (the vault search already treated them so). A file outside the vault
+  that shares an app-state name is read when named; an app file inside the vault that is
+  named is not read, and that is said. URLs are not paths (a `file://` URL is). A named
+  file that cannot be read is no longer reported as missing. KG4's block cites only vault
+  files that are not the app's own. Tk's "forget" says when the list could not be read.
+- Decided: a folder linked into the vault (junction/symlink) is searched — it is how a
+  folder is added without copying; protection is decided on the resolved path, so a link to
+  `memory/` is still the app's memory.
+
+Still open after the second review:
+- The full panel (Batch 3) and Tk's per-turn `respond` patches (specialists, instructions,
+  content style) add text the sizing does not measure: a panel Writer's synthesis prompt
+  carries the drafts, and the engine can still cut it, unreported.
+- Prompts are larger than at the branch point for questions that only weakly match the data
+  (the overview cap is 2,500 characters at 8,192; vault and value blocks scale with the
+  window). Whether to keep the 4,096-sized caps for those blocks is a choice not made here.
+- Tk's own `_preview_data_file` still reads on Tk's GUI thread (now bounded reads).
+- RECENT CONVERSATION still holds the question being answered (Qt, and Tk with SILO off).
