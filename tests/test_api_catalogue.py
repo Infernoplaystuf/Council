@@ -94,8 +94,8 @@ def test_the_tools_do_not_import_or_exec_vault_modules():
     """Structural backstop for the same property."""
     import ast
     import inspect
-    import council_gui_engine as cge
-    src = inspect.getsource(cge._make_tools)
+    from council_core import council_tools
+    src = inspect.getsource(council_tools.make_tools)
     tree = ast.parse(src.lstrip())
     fns = [f for f in ast.walk(tree)
            if isinstance(f, ast.FunctionDef) and f.name.startswith("api_")]
@@ -219,8 +219,8 @@ def test_self_is_never_offered_on_a_method(vault):
 # ============================================================
 
 def tools_for(vault):
-    import council_gui_engine as cge
-    return cge._make_tools(None, None, vault)
+    from council_core import council_tools
+    return council_tools.make_tools(None, None, vault)
 
 
 def test_both_tools_are_registered(vault):

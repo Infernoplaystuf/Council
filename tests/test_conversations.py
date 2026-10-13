@@ -320,15 +320,18 @@ def test_a_verdict_line_is_tks_record_plus_its_id(tmp_path):
     from council_core.council_turn import TurnResult
     from council_core.deliberation import AgentEvent
     events = [AgentEvent("Judge", "observation", "Verdict: PASS (round 1)")]
+    # The Judge's confidence is a percentage (council-map): kept as such,
+    # and as the 0-10 the file has always held.
     result = TurnResult(True, answer="a", critique="Verdict: PASS",
-                        confidence=8, route="chat", events=events,
+                        confidence=80, route="chat", events=events,
                         verdict_id="chat:1:PASS:abc")
     conv = Conversation(tmp_path / "vault")
     assert conv.record_verdict(conversations.verdict_record(
         result, conv.session_id, "why?"))
     (row,) = _lines(tmp_path / "vault" / "verdict_history.jsonl")
     assert row["session_id"] == conv.session_id and row["passed"] is True
-    assert row["confidence"] == 8 and row["rounds"] == 1
+    assert row["confidence"] == 8 and row["confidence_pct"] == 80
+    assert row["rounds"] == 1
     assert row["verdict_id"] == "chat:1:PASS:abc"
     assert set(row) >= {"ts", "route", "query"}
 

@@ -19,8 +19,9 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QListWidget, QPlainTextEdit,
+                               QSplitter, QVBoxLayout, QWidget)
 from PySide6.QtCore import Qt
 
 from council_core import forge_jobs
@@ -40,7 +41,63 @@ class ForgeActions:
         return forge_jobs.list_tools(self.vault_dir)
 
     def forge(self, task: str):
-        return forge_jobs.forge(task, self.vault_dir)
+        """Write the tool, then its tests (council_core.tool_review), and
+        run them — so the user sees at once whether it works."""
+        result = forge_jobs.forge(task, self.vault_dir)
+        if result.ok and result.name:
+            from council_core import tool_review
+            try:
+                tool_review.write_tests(result.name, task, self.vault_dir,
+                                        forge_jobs.default_model_call)
+                result.body = (result.body + "\n\n" + self.tests_text(
+                    result.name)).strip()
+            except Exception as exc:                      # noqa: BLE001
+                result.body += f"\n\nTests could not be written: {exc}"
+        return result
+
+    def tests_text(self, name: str) -> str:
+        from council_core import tool_review
+        results = tool_review.run_tests(name, self.vault_dir)
+        passed = sum(ok for ok, _ in results)
+        lines = [f"TESTS for {name}: {passed}/{len(results)} pass"]
+        lines += [("  ✓ " if ok else "  ✗ ") + what for ok, what in results]
+        return "\n".join(lines)
+
+    def run_tests(self, name: str):
+        text = self.tests_text(name)
+        return forge_jobs.ForgeResult(True, text.splitlines()[0], body=text)
+
+    def approve(self, name: str, roles: List[str]):
+        from council_core import tool_review
+        ok, msg = tool_review.approve(name, roles, self.vault_dir)
+        return forge_jobs.ForgeResult(ok, msg, body=msg)
+
+    def revoke(self, name: str):
+        from council_core import tool_review
+        ok = tool_review.revoke(name, self.vault_dir)
+        msg = (f"{name} is no longer approved; the council stops using it."
+               if ok else f"{name} was not approved.")
+        return forge_jobs.ForgeResult(ok, msg, body=msg)
+
+    def status(self, name: str) -> str:
+        from council_core import tool_review
+        try:
+            return tool_review.status(name, self.vault_dir)
+        except Exception:                                 # noqa: BLE001
+            return "unreviewed"
+
+    def proposals(self) -> List[dict]:
+        """Pending tool-gap proposals (tool_gap_analyzer), newest first."""
+        try:
+            import tool_gap_analyzer
+            q = tool_gap_analyzer.ProposalQueue(
+                self.vault_dir / tool_gap_analyzer.ProposalQueue
+                .DEFAULT_FILENAME)
+            items = [p for p in q.current_status()
+                     if p.get("status") == "pending"]
+        except Exception:                                 # noqa: BLE001
+            return []
+        return sorted(items, key=lambda p: -int(p.get("ts") or 0))
 
     def save_edited(self, code: str):
         return forge_jobs.save_edited(code, self.vault_dir)
@@ -92,6 +149,28 @@ class ForgeTab(ViewHelpers, QWidget):
         row.addStretch(1)
         outer.addLayout(row)
 
+        # Review: tests, then the user's approval for named roles
+        # (council_core.tool_review). Only an approved tool reaches the
+        # council, and only for those roles.
+        review = QHBoxLayout()
+        self.tests_btn = self._button(review, "🧪 Run Tests", self.on_tests)
+        review.addWidget(QLabel("Roles:"))
+        self.roles = QLineEdit("intern")
+        self.roles.setToolTip("Council roles that may call the tool, "
+                              "comma-separated: intern, coder, skeptic, …")
+        self.roles.setMaximumWidth(220)
+        review.addWidget(self.roles)
+        self.approve_btn = self._button(review, "✓ Approve for roles",
+                                        self.on_approve)
+        self.revoke_btn = self._button(review, "Revoke", self.on_revoke)
+        review.addSpacing(16)
+        review.addWidget(QLabel("From a request:"))
+        self.proposal_box = QComboBox()
+        self.proposal_box.setMinimumWidth(220)
+        review.addWidget(self.proposal_box, 1)
+        self._button(review, "Use", self.on_use_proposal)
+        outer.addLayout(review)
+
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self._code_box())
         split.addWidget(self._right_side())
@@ -137,8 +216,17 @@ class ForgeTab(ViewHelpers, QWidget):
         result = self.actions.list_tools()
         self.tools.clear()
         self._names = list(result.names)
+        status = getattr(self.actions, "status", lambda n: "")
         for name, blurb in result.rows:
-            self.tools.addItem(f"{name}  —  {blurb}")
+            mark = {"approved": "  [approved]",
+                    "changed since approval": "  [changed — re-approve]"}.get(
+                status(name), "")
+            self.tools.addItem(f"{name}  —  {blurb}{mark}")
+        self.proposal_box.clear()
+        for p in getattr(self.actions, "proposals", lambda: [])()[:30]:
+            self.proposal_box.addItem(
+                f"{p.get('proposed_name')} (asked {p.get('observed_count', 1)}×)",
+                p)
         if not result.ok:
             # The Tk version swallows any failure into an empty list, so a
             # broken tools directory looks exactly like an empty one.
@@ -176,8 +264,43 @@ class ForgeTab(ViewHelpers, QWidget):
         threading.Thread(target=work, name="forge", daemon=True).start()
 
     def _set_buttons(self, enabled: bool) -> None:
-        for button in (self.generate_btn, self.save_btn, self.run_btn):
+        for button in (self.generate_btn, self.save_btn, self.run_btn,
+                       self.tests_btn, self.approve_btn, self.revoke_btn):
             button.setEnabled(enabled)
+
+    def on_tests(self) -> None:
+        name = self.selected_tool()
+        if not name:
+            self.status.setText("Select a tool in the list first.")
+            return
+        self._start(f"Testing '{name}'…", lambda: self.actions.run_tests(name))
+
+    def on_approve(self) -> None:
+        name = self.selected_tool()
+        if not name:
+            self.status.setText("Select a tool in the list first.")
+            return
+        roles = [r.strip().lower() for r in self.roles.text().split(",")
+                 if r.strip()]
+        self._start(f"Testing '{name}' before approving…",
+                    lambda: self.actions.approve(name, roles),
+                    then=lambda result: self.refresh_list())
+
+    def on_revoke(self) -> None:
+        name = self.selected_tool()
+        if name:
+            self._start("Revoking…", lambda: self.actions.revoke(name),
+                        then=lambda result: self.refresh_list())
+
+    def on_use_proposal(self) -> None:
+        p = self.proposal_box.currentData()
+        if not p:
+            self.status.setText("No tool requests are waiting.")
+            return
+        from council_core import tool_review
+        self.task.setPlainText(tool_review.task_from_proposal(p))
+        self.status.setText("The request is in the task box — Generate to "
+                            "build it.")
 
     def on_generate(self) -> None:
         task = self.task.toPlainText().strip()

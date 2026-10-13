@@ -228,6 +228,72 @@ Useful for hands-free brainstorming.
 
 ---
 
+## Variable Map
+
+For tracking down a bug in a Python script — or in a GUI and the scripts it calls. Open a script (**📄 Scripts…**) or a whole folder (**📁 Folder…**), pick the variable whose value is wrong, and the map shows **what fed it** (left) and **what it feeds** (right), each link labelled with the file and line that makes it. The scripts are only read, never run.
+
+- **Click a node** to make it the centre; **click a link** or a row in **Trace** to jump to that line in **Source** (it switches file when the line is in another one). Orange links cross from one file to another.
+- **➕ Add** puts more scripts alongside the ones already open — e.g. a script the GUI calls that lives in another folder. The file box at the top of the list shows one file's variables at a time.
+- **🖼 Export image…** saves the graph as a PNG (sharp, 2× resolution) or an SVG — the whole graph, not just the part on screen, with a caption naming the variable traced.
+- **Depth** is how many hops out to show. **Include if/while conditions** also links the variables an `if`/`while` tests to what it guards — useful for "why did this branch run?", but busier.
+- **Worth a look** lists the usual suspects: names read but never assigned (typos), values assigned and never read, parameters replaced before they're used, and scripts that don't parse.
+
+**Across files** a value is followed through:
+
+- imports and calls between the open scripts (`from frame_timing import scan_report` → `scan_report(x)` links `x` to its parameter, and its `return` back), and module variables (`from config import RATE`, `config.RATE`);
+- **GUI ports** — `self.ports.capture_folder.get()` / `.set(...)` is one node per port, so a GUI Designer app traces from the widget, through `handlers.py`, into the attached script and back to the port that shows the result;
+- `subprocess.run([sys.executable, "worker.py", a, b])` → `worker.py`'s `sys.argv[1]`, `sys.argv[2]` (and argparse);
+- `threading.Thread(target=f, args=(a,))`, `functools.partial(f, a)`, `pool.submit(f, a)`;
+- `self.x` shared by classes that inherit from each other (`App(HandlerMixin, MainUi)`).
+
+Packages that aren't among the open scripts — numpy, PySide6, the standard library — are not followed: a call into one just links its arguments to its result. Values passed through files on disk, environment variables, queues or `getattr` aren't followed either.
+
+The same analysis runs from a shell, no GUI needed:
+
+```
+python -m council_core.var_graph script.py              # summary + findings
+python -m council_core.var_graph my_gui_folder/          # a GUI and its scripts
+python -m council_core.var_graph script.py --up total   # what feeds `total`
+python -m council_core.var_graph my_gui_folder/ --up worker.folder
+python -m council_core.var_graph my_gui_folder/ --path ports.capture_folder ports.bad_count
+python -m council_core.var_graph script.py --dot --up total > total.dot   # Graphviz
+```
+
+---
+
+## The Quant Duel tab
+
+A paper-trading experiment the Council can run for you: node **A** reads
+news, node **B** never does, and after about a month `compare` says whether
+news helped. Paper trading only — it has no way to place an order. The duel
+lives in its own folder (a checkout of the `quant-duel` branch, with its own
+`.venv`); the Council runs its commands as separate processes.
+
+1. **Folder** — the checkout; **Python** blank uses its `.venv`.
+2. Tick the nodes this PC runs (both, or one if the other node is a Pi
+   running the duel itself), tick **On**, and **Save**. Nothing runs before
+   that. Once on, the duel fetches daily prices from Yahoo Finance and
+   (node A) headlines from RSS feeds — nothing else leaves this PC.
+3. **Where its LLM runs** — by default the model in the duel's own
+   `config.yaml` on this PC. To use a Raspberry Pi (or any machine with
+   Ollama): **Machines & roles…**, add the machine, enable it, and bind the
+   **quant** role to it. The duel's LLM jobs (news scoring, the weekly
+   tuning round, report summaries) then run there, using one of the
+   machine's call slots so they never pile up on it. A machine that fails
+   rests (30 s, doubling to 5 min); meanwhile the job runs here (fallback
+   *here*) or waits (fallback *fail*). The Council Map shows the link.
+4. **Run due jobs while the Council is open** runs whatever is due every
+   15 minutes (news hourly on A in market hours, the daily step after 16:45
+   New York time, the report, Saturday's tuning). Use this OR a systemd
+   timer / Task Scheduler for a folder, not both: the duel's locks keep two
+   daily steps or two LLM jobs from overlapping, but two news polls could
+   (harmless — a headline is stored once — just wasted work).
+5. **Check** runs the duel's pre-flight list, **Replay last month** runs
+   both nodes over last month with news off (it must end PASS), **Compare**
+   writes the A-vs-B report after the experiment.
+
+The duel's own `deploy/README_PI.md` covers running a node directly on a Pi.
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |

@@ -131,10 +131,19 @@ def session_label(session_id: str, record: Optional[dict], *,
     if not record:
         label = session_id
     else:
-        confidence = record.get("confidence", 0)
         badge = "✓" if record.get("passed") else "✗"
-        label = f"{session_id:<30}  [{confidence}/10 {badge}]"
+        label = (f"{session_id:<30}  "
+                 f"[{record_confidence_pct(record)}% {badge}]")
     return f"{label}  ({note})" if note else label
+
+
+def record_confidence_pct(record: dict) -> int:
+    """A verdict record's confidence as a percentage. New records carry
+    `confidence_pct`; older ones a 0–10 `confidence`."""
+    from .confidence import clamp, from_legacy
+    if record.get("confidence_pct") is not None:
+        return clamp(record["confidence_pct"])
+    return from_legacy(record.get("confidence", 0) or 0)
 
 
 def verdict_summary(total: int, sample: Sequence[dict]) -> str:

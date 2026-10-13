@@ -366,3 +366,73 @@ def test_without_route_text_the_judge_routes_on_the_question():
     models.judge = Judge()
     ct.run_turn("plain question", models)
     assert routed == ["plain question"]
+
+
+def test_the_depth_and_the_kept_question_are_what_was_typed():
+    """council-map decides the depth from the question (council_core.depth:
+    600 characters or more is "long", so Deep) and keeps it on the result
+    for after_turn, which writes memory and the Sage's gaps from it. With
+    the vault in front of the question (route_text), both read the typed
+    question: a short one stays short, and nothing quotes the vault."""
+    models = Models(writer=FakeModel("ok"), peasant=FakeModel("ok"))
+    models.judge = FakeJudge()
+    vault = "[FILE: notes.txt]\n" + "pump data, " * 120 + "\n[END FILE]\n\n"
+    result = ct.run_turn(vault + "hi there", models, route_text="hi there")
+    assert result.ok, result.message
+    assert result.question == "hi there"
+    assert result.depth != "deep", (
+        "the vault block decided the depth: " + result.depth)
+    plain = ct.run_turn(vault + "hi there", models)
+    assert plain.depth == "deep"            # without route_text, as before
+
+
+# ============================================================
+# A tool that raises is a failed call, not a failed turn
+# ============================================================
+
+class _ToolThenAnswer:
+    """Asks for one tool call, then answers whatever the results were."""
+
+    def __init__(self, tool="run_python"):
+        self.tool = tool
+        self.asked = []
+
+    def respond(self, prompt, **kwargs):
+        self.asked.append(prompt)
+        if len(self.asked) == 1:
+            return '{"tool": "%s", "args": {"code": "while True: pass"}}' % (
+                self.tool)
+        return "the answer, without the tool"
+
+
+def test_a_tool_that_raises_is_reported_to_the_model_and_the_turn_goes_on():
+    import subprocess
+    from council_core.deliberation import AgentContext, ModelAgent
+
+    def run_python(args):
+        raise subprocess.TimeoutExpired(cmd="python scratch.py", timeout=120)
+
+    model = _ToolThenAnswer()
+    agent = ModelAgent("Coder", model, enable_tools=True,
+                       tools={"run_python": run_python})
+    events = agent.act(AgentContext("make it loop"))
+
+    assert events[-1].kind == "final"
+    assert events[-1].text == "the answer, without the tool"
+    obs = [e.text for e in events if e.kind == "observation"]
+    assert obs and "run_python: FAIL" in obs[0]
+    assert "TimeoutExpired" in obs[0]
+    # The model saw the failure and could answer around it.
+    assert "TimeoutExpired" in model.asked[1]
+
+
+def test_a_tool_that_works_is_unchanged():
+    from council_core.deliberation import AgentContext, ModelAgent
+
+    ctx = AgentContext("sum")
+    agent = ModelAgent("Coder", _ToolThenAnswer(), enable_tools=True,
+                       tools={"run_python": lambda a: (True, "rc=0", {"rc": 0})})
+    events = agent.act(ctx)
+    assert "run_python: OK" in [e.text for e in events
+                                if e.kind == "observation"][0]
+    assert ctx.shared["tool_payloads"] == {"run_python_1": {"rc": 0}}

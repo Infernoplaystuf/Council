@@ -1410,7 +1410,9 @@ def test_each_door_is_reached_only_from_the_users_send_or_click():
             uses.add((rel, where, name))
     assert uses == {
         # Qt: the Council box (the Dream3D chat sends through it).
-        ("council_qt/tabs/council.py", "CouncilTab.on_send", "_take_over"),
+        # on_send delegates to _send since the council-map merge (Expand calls
+        # _send(full=True) directly and is guarded there).
+        ("council_qt/tabs/council.py", "CouncilTab._send", "_take_over"),
         ("council_qt/tabs/council.py", "CouncilTab._take_over",
          "take_over_ref"),
         # Qt: the Dream3D box with no Council tab, and the button.

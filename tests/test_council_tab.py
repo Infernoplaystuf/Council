@@ -779,15 +779,17 @@ def _check_labelled(widget, name):
 #: build, 16/16 in the full one), and Profile's tooltip promised "Unchecking
 #: skips it on the next message" while the profile reached the prompt
 #: either way.
-UNREAD_SWITCHES = ("tools", "fill_ide", "use_profile", "adversarial",
+UNREAD_SWITCHES = ("fill_ide", "use_profile", "adversarial",
                    "judge_panel", "robust_voices")
+# ("tools" left this list in the merge of council-map: the switch hands the
+# turn a real tool table now — test_the_tools_switch_hands_the_turn_real_tools.)
 
 
 def test_the_unwired_controls_are_disabled_and_say_why(qapp, tmp_path):
     view = _full(qapp, tmp_path)
     try:
         for name in ("find_chart_btn", "look_up_btn", "defer_btn",
-                     "expand_btn", "inst_name", "inst_text", "inst_add_btn",
+                     "inst_name", "inst_text", "inst_add_btn",
                      "inst_manage_btn", "content_style_btn", "backend_box",
                      "vfb_agree", "vfb_disagree", "redeliberate_btn",
                      "specialist_box"):
@@ -800,7 +802,8 @@ def test_the_unwired_controls_are_disabled_and_say_why(qapp, tmp_path):
 
 def test_they_are_labelled_in_the_default_build_too(qapp, tmp_path):
     """The default build shows four switches; three of them (Tools, Fill IDE,
-    Profile) changed nothing and looked live."""
+    Profile) changed nothing and looked live. Tools works now (council-map);
+    the other two are still labelled."""
     view = CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault",
                                              demo_mode=True), demo_mode=True)
     try:
@@ -809,7 +812,8 @@ def test_they_are_labelled_in_the_default_build_too(qapp, tmp_path):
                      "backend_box", "specialist_box"):
             _check_labelled(getattr(view, name), name)
         shown = [key for key in UNREAD_SWITCHES if key in view._checkboxes]
-        assert shown == ["tools", "fill_ide", "use_profile"], shown
+        assert shown == ["fill_ide", "use_profile"], shown
+        assert view._checkboxes["tools"].isEnabled()
         for key in shown:
             _check_labelled(view._checkboxes[key], key)
     finally:
@@ -938,8 +942,9 @@ def test_a_refused_second_turn_does_not_point_at_a_missing_stop_button(tab):
 
 def test_expand_stays_disabled_after_a_fast_answer(qapp, monkeypatch,
                                                    tmp_path):
-    """It used to light up after every fast answer, and a click re-asked the
-    same question the same way: the same single answer, twice."""
+    """In the DEMO_MODE build. It used to light up after every fast answer,
+    and a click re-asked the same question the same way: the same single
+    answer, twice — this build has no panel to expand to."""
     from tests.test_council_turn import FakeModel, Models
 
     window, view = _council(qapp, monkeypatch, tmp_path,
@@ -951,3 +956,211 @@ def test_expand_stays_disabled_after_a_fast_answer(qapp, monkeypatch,
         _check_labelled(view.expand_btn, "expand_btn")
     finally:
         window.request_close()
+
+
+
+def test_expand_lights_up_after_a_fast_answer_in_the_full_build(
+        qapp, tmp_path):
+    """The full build has a council to expand to: after a fast (direct)
+    answer the button is live — and runs the whole council,
+    test_expanding_a_fast_answer_runs_the_whole_council — and the next turn
+    turns it off again (A4). The DEMO_MODE build keeps it disabled
+    (test_expand_stays_disabled_after_a_fast_answer)."""
+    from council_core.council_turn import TurnResult
+
+    view = CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault",
+                                             demo_mode=False),
+                      demo_mode=False)
+    try:
+        assert not view.expand_btn.isEnabled()
+        assert "Expand with council" not in view.unavailable
+        view._last_query = "quick one"
+        view.finish_turn(TurnResult(ok=True, answer="a fast answer",
+                                    route="direct"))
+        assert view._last_fast_question == "quick one"
+        assert view.expand_btn.isEnabled()
+        view.reset_turn()
+        assert not view.expand_btn.isEnabled()
+        # a deliberated answer has nothing to expand
+        view._last_query = "a hard one"
+        view.finish_turn(TurnResult(ok=True, answer="considered",
+                                    route="council"))
+        assert not view.expand_btn.isEnabled()
+    finally:
+        view.deleteLater()
+
+
+# ============================================================
+# Tools reach the turn
+# ============================================================
+
+def _send_with(tmp_path, monkeypatch, tools_on: bool):
+    """`send` with a fake run_turn: what does the turn get handed?"""
+    from council_core import council_turn
+    seen = {}
+
+    def fake_run_turn(question, models, **kwargs):
+        seen.update(kwargs)
+        return council_turn.TurnResult(True, answer="ok")
+
+    monkeypatch.setattr(council_turn, "run_turn", fake_run_turn)
+    actions = CouncilActions(vault_dir=tmp_path / "vault")
+    actions._models = object()
+    options = council_options.CouncilOptions.defaults()
+    options.tools = tools_on
+    options.deliberate = True
+    assert actions.send("why?", options).ok
+    return actions, seen
+
+
+def test_the_tools_switch_hands_the_turn_real_tools(tmp_path, monkeypatch):
+    """The Tools switch used to reach run_turn as enable_tools=True with
+    tools=None, so ModelAgent's tool table was empty and the switch did
+    nothing."""
+    actions, seen = _send_with(tmp_path, monkeypatch, tools_on=True)
+    assert seen["enable_tools"] is True
+    assert {"run_python", "vault_search", "vault_read", "api_search",
+            "api_signature"} <= set(seen["tools"])
+    # Built once and kept.
+    assert actions.tools() is seen["tools"]
+
+
+def test_tools_off_builds_nothing(tmp_path, monkeypatch):
+    actions, seen = _send_with(tmp_path, monkeypatch, tools_on=False)
+    assert seen["enable_tools"] is False and seen["tools"] is None
+    assert actions._tools is None
+
+
+def test_the_qt_tools_work_against_the_vault(tmp_path):
+    """The tools the Qt council builds run end to end in a temp vault."""
+    actions = CouncilActions(vault_dir=tmp_path / "vault")
+    tools = actions.tools()
+    ok, msg, _ = tools["vault_save"]({"name": "note.txt",
+                                      "content": "bearing torque 42 Nm"})
+    assert ok, msg
+    ok, msg, payload = tools["vault_search"]({"query": "torque"})
+    assert ok and payload["matches"], msg
+    ok, msg, payload = tools["run_python"]({"code": "print(6 * 7)"})
+    assert ok and payload["rc"] == 0 and "42" in payload["stdout"], msg
+    assert (tmp_path / "vault" / "workspace").is_dir()
+
+
+# ============================================================
+# What a question leaves behind
+# ============================================================
+
+def test_learning_runs_after_the_answer_and_says_what_it_kept(qapp, tab):
+    from council_core import after_turn
+    from council_core.council_turn import TurnResult
+    seen = []
+
+    def learn(result):
+        seen.append(result)
+        return after_turn.Learned(gaps_logged=1, roles_updated=["coder"])
+
+    tab.actions.learn = learn
+    result = TurnResult(True, answer="a", panel=["coder"])
+    tab._learn_later(result)
+    assert _pump(qapp, lambda: "Kept from this question" in
+                 tab.transcript.toPlainText())
+    assert seen == [result]
+    assert "memory updated for coder" in tab.transcript.toPlainText()
+
+
+def test_learning_is_skipped_for_a_direct_answer(qapp, tab):
+    called = []
+    tab.actions.learn = lambda r: called.append(r)
+    from council_core.council_turn import TurnResult
+    tab._learn_later(TurnResult(True, answer="a", route="direct"))
+    qapp.processEvents()
+    assert called == []
+
+
+def test_the_steps_before_a_question_run_side_by_side(tmp_path,
+                                                      monkeypatch):
+    """The vault brief, the Sage's knowledge and the docs used to run one
+    after another before the first member spoke; they are independent.
+    (The turn context — the memo, the analyst, the files in front of the
+    question — runs after them, sized around what they add: stubbed here,
+    this is about the three.)"""
+    import time
+    from types import SimpleNamespace as NS
+    from council_core import council_options
+    from council_core import council_turn as ct
+    from council_core import vault_context as vc
+    from council_core.docs_brief import DocsBrief
+    from council_qt.tabs.council import CouncilActions
+    from tests.test_council_turn import FakeJudge, FakeModel
+
+    def slow(value):
+        def fn(*_a):
+            time.sleep(0.4)
+            return value
+        return fn
+
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer, models.judge = FakeModel(), FakeJudge()
+    models.sage = FakeModel()
+    actions._models = models
+    actions.memo_llm = None
+    actions.prepare = lambda *a, **k: None
+    actions.vault_brief = slow(vc.Brief())
+    monkeypatch.setattr(vc, "sage_block", slow(""))
+    actions.docs_brief = slow(DocsBrief())
+    t0 = time.perf_counter()
+    assert actions.send("q", council_options.CouncilOptions.defaults()).ok
+    assert time.perf_counter() - t0 < 1.0, "the three 0.4 s steps ran in turn"
+
+
+def test_a_failed_step_before_the_question_costs_only_that_step(tmp_path):
+    from types import SimpleNamespace as NS
+    from council_core import council_options
+    from council_core import council_turn as ct
+    from council_core import vault_context as vc
+    from council_qt.tabs.council import CouncilActions
+    from tests.test_council_turn import FakeJudge, FakeModel
+
+    def boom(*_a):
+        raise RuntimeError("docs server gone")
+
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer, models.judge = FakeModel(), FakeJudge()
+    actions._models = models
+    actions.memo_llm = None
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = boom
+    events = []
+    assert actions.send("q", council_options.CouncilOptions.defaults(),
+                        on_event=events.append).ok
+    assert any("docs: skipped (docs server gone)" in e.text for e in events)
+
+
+def test_expanding_a_fast_answer_runs_the_whole_council(qapp, tmp_path):
+    """Expand with council set a flag nothing read; now the re-ask is
+    deliberated at Deep depth, and no earlier answer is offered instead."""
+    seen = {}
+
+    class Actions(CouncilActions):
+        def reusable(self, q):
+            raise AssertionError("an expand must not offer an old answer")
+
+        def send(self, typed, options, **kw):
+            seen.update(typed=typed, deliberate=options.deliberate,
+                        depth=options.depth)
+
+    widget = CouncilTab(actions=Actions(vault_dir=tmp_path))
+    widget._last_fast_question = "which pump?"
+    widget.on_expand_with_council()
+    deadline = time.monotonic() + 5
+    while "typed" not in seen and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert seen == {"typed": "which pump?", "deliberate": True,
+                    "depth": "deep"}
+    while any(t.name == "council-turn" and t.is_alive()
+              for t in threading.enumerate()):
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()

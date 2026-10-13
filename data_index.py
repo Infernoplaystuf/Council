@@ -204,6 +204,10 @@ _APP_INTERNAL_FILENAMES = {
     "semantic_cache.json",
     "fuzzy_denylist.json",
     "graph_presets.json",
+    # council-map's settings at the vault root (VAULT_ROOT_STATE names them
+    # too): which role answers on which machine, and the Quant Duel's.
+    "node_routing.json",
+    "quant_duel.json",
 }
 
 

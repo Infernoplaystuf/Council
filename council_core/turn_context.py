@@ -4026,7 +4026,8 @@ def prepare_turn(question: str, state: TurnState, *,
                  condense: Optional[Callable[[str], str]] = None,
                  pinned_files: Optional[List[str]] = None,
                  on_notice: Optional[Callable[[str, str, str], None]] = None,
-                 writer: Any = None) -> PreparedTurn:
+                 writer: Any = None,
+                 think: Optional[str] = None) -> PreparedTurn:
     """Build what the models are sent for ``question``: the Tk console's
     sequence, once, for both shells.
 
@@ -4046,6 +4047,12 @@ def prepare_turn(question: str, state: TurnState, *,
     has (``n_ctx``, else council_engine.effective_n_ctx), counted the way
     the engine will fit the call (council_engine.prompt_room). Without a
     ``writer`` the Writer role's own prompt and reply budget are assumed.
+    ``writer``'s frame includes its standing extra_context, so blocks a
+    caller sets on it for the question (council_core.vault_context.applied)
+    are measured when they are set before this is called. ``think`` is the
+    thinking level of the Writer's call (None: a plain respond(); in the
+    council, the step's — deliberation.THINK), which sets the reply's
+    thinking headroom (prompt_room).
 
     Every line the user should see goes to ``on_notice(who, text, kind)`` as
     it happens, in the Tk console's order and wording, and is also kept in
@@ -4064,14 +4071,14 @@ def prepare_turn(question: str, state: TurnState, *,
     try:
         _prepare(question, state, prepared, say, n_ctx=n_ctx,
                  condense=condense, pinned_files=pinned_files,
-                 writer=writer)
+                 writer=writer, think=think)
     finally:
         _ACTIVE.reset(token)
     return prepared
 
 
 def _prepare(question, state, prepared, say, *, n_ctx, condense,
-             pinned_files, writer=None) -> None:
+             pinned_files, writer=None, think=None) -> None:
     # 1. The task memo ------------------------------------------------------
     try:
         memo = state.task_memory.update(question, llm_call=condense)
@@ -4135,7 +4142,7 @@ def _prepare(question, state, prepared, say, *, n_ctx, condense,
     frame_text, predict = writer_frame(writer)
     try:
         room = ce.prompt_room(slot, frame=frame_text, num_predict=predict,
-                              n_ctx=n_ctx)
+                              n_ctx=n_ctx, think=think)
     except Exception as exc:                              # noqa: BLE001
         print(f"[prepare_turn] the Writer's room could not be measured: "
               f"{exc!r}")

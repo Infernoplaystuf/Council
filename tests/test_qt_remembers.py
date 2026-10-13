@@ -586,7 +586,8 @@ def test_the_first_verdict_is_kept_under_the_session_s_name(qapp, engine):
         assert _pump(qapp, lambda: any(r.id == session
                                        for r in sessions._shown))
         label = next(r.label for r in sessions._shown if r.id == session)
-        assert "/10" in label and label.endswith("(this conversation)"), label
+        # The badge is a percentage since council-map (confidence_pct).
+        assert "% " in label and label.endswith("(this conversation)"), label
         sessions.deleteLater()
     finally:
         _close(qapp, window, view)
@@ -601,10 +602,17 @@ def test_a_full_council_turn_keeps_the_question_and_the_answer(qapp, engine):
     window, view = _council(qapp, engine.vault, demo_mode=False)
     try:
         view._checkboxes["deliberate"].setChecked(True)
+        # The whole council: Auto depth answers a five-word note at Quick
+        # (one member, the Judge) — council_core.depth, from council-map.
+        view.depth_box.setCurrentIndex(view.depth_box.findData("deep"))
         _ask(qapp, view, "Note: the pump is quiet.", timeout=180)
         # Learned memory is neither read nor WRITTEN in "This conversation
         # only": the Tk shell writes it after a deliberation (two model calls
-        # a role); nothing here would ever use it.
+        # a role); nothing here would ever use it. council-map's after_turn
+        # writes it on its own worker after the answer — waited for here.
+        assert _pump(qapp, lambda: not any(
+            t.name == "council-turn-learn" and t.is_alive()
+            for t in threading.enumerate()), timeout=120)
         assert {p.name: p.read_bytes() for p in
                 (engine.vault / "memory").iterdir()} == memory
         session = view.conversation.session_id

@@ -30,22 +30,19 @@ this is. Recorded rather than resolved: per the standing correction about the
 branch's feature, and merging or deleting either one is not a decision to make
 while porting a GUI.
 
-KNOWN DEFECTS, PRESERVED AND PINNED
-Two confirmed defects live in here and are deliberately NOT fixed in this
-commit, because moving code and changing it in the same step makes both
-unreviewable:
+ROUNDS
+Round 1 is the full council: drafts, the Peasant's questions, rebuttals,
+cross-fire, the Judge's ranking, the Writer's answer, the Judge's critique.
+On NEEDS_WORK the next round is a REVISION — the Writer rewrites its own
+answer against the critique and the Judge checks it again, two calls instead
+of ~30 — unless the critique rejects the approach, names nothing to change,
+or comes with very low confidence (needs_full_round); then the whole panel
+runs again.
 
-  * `for r in range(self.max_rounds)` materialises the range once, so the
-    escalation `self.max_rounds = 3` cannot lengthen the loop — while the
-    phase message tells the user an extra round is being added. It also
-    corrupts the `Round {r+1}/{self.max_rounds}` counter for any round that
-    does run, so a two-round run prints "Round 2/3".
-  * `parse_required_changes` is skipped exactly when confidence is lowest,
-    because the `else` belongs to the low-confidence branch.
-
-Both are A7 and A8 in docs/qt_migration/phase6_port_requirements.md, and there
-are tests here that assert the CURRENT behaviour so the fix is a visible,
-separate change rather than a silent one.
+The two defects this file once carried (A7: an extra round announced but
+never run, because `for r in range(...)` fixed the count; A8: the required
+changes skipped exactly when confidence was lowest) are fixed; see
+tests/test_revision_round.py.
 """
 from __future__ import annotations
 
@@ -55,6 +52,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from .confidence import HIGH as _cf_HIGH, LOW as _cf_LOW, \
+    VERY_LOW as _cf_VERY_LOW
 
 
 @dataclass
@@ -211,7 +211,101 @@ def peasant_cross_exam(
         "and must not duplicate any question from the prior Q&A list above."
     )
 
-    return peasant_model.respond(prompt, extra_context=extra_context)
+    from .council_schemas import QUESTIONS_SCHEMA, enabled, render_questions
+    return render_questions(_ask(
+        peasant_model, prompt, extra_context=extra_context,
+        json_schema=QUESTIONS_SCHEMA if enabled() else None,
+        think=THINK["peasant"]))
+
+#: How hard each step thinks, on models that think (council_engine.
+#: think_level): short, frequent steps low; the answer itself and the
+#: Judge high.
+THINK = {"draft": "medium", "rebuttal": "medium", "cross_fire": "low",
+         "peasant": "low", "confidence": "low", "adversarial": "low",
+         "synthesis": "high"}
+
+
+def _ask(model: Any, prompt: str, **kw: Any) -> str:
+    """model.respond(prompt, **kw), dropping json_schema / think for a
+    model that does not take them (stand-ins, older wrappers)."""
+    try:
+        return model.respond(prompt, **kw)
+    except TypeError as exc:
+        if not any(k in str(exc) for k in ("json_schema", "think",
+                                           "unexpected keyword")):
+            raise
+        kw.pop("json_schema", None)
+        kw.pop("think", None)
+        return model.respond(prompt, **kw)
+
+
+def _prior_qa_block(prior_qa: Optional[List[Dict[str, str]]]) -> str:
+    if not prior_qa:
+        return ""
+    lines = ["━━━ QUESTIONS YOU HAVE ALREADY ASKED THIS SESSION ━━━",
+             "Do NOT ask any of these again, even in paraphrased form.", ""]
+    for i, item in enumerate(prior_qa[-30:], 1):
+        lines.append(f"[{i}] Q: {item['q']}")
+        if item.get("a"):
+            lines.append(f"    A: {item['a']}")
+    lines.append("━━━ END OF PRIOR Q&A ━━━")
+    return "\n".join(lines)
+
+
+def peasant_turn_questions(peasant_model, *, messages: Dict[str, str],
+                           user_text: str, turn: int,
+                           prior_qa: Optional[List[Dict[str, str]]] = None,
+                           query_mode: str = "") -> str:
+    """ONE Peasant call for a whole cross-fire turn: two questions for each
+    member's message, under a TO <ROLE>: heading. It used to be one call
+    per member per turn, plus a reformat call whenever the reply lacked
+    Q1/Q2 labels."""
+    parts = [f"ORIGINAL REQUEST:\n{user_text}\n"]
+    for role, msg in messages.items():
+        parts.append(f"{role.upper()} — CROSS-FIRE TURN {turn}:\n{msg}\n")
+    if prior := _prior_qa_block(prior_qa):
+        parts.append(prior)
+    if query_mode == "conversational":
+        parts.append("⚠ CONVERSATIONAL MODE: ask about accuracy, clarity and "
+                     "whether it answers the user — not about code.")
+    elif query_mode == "technical":
+        parts.append("⚠ TECHNICAL MODE: focus on correctness, edge cases "
+                     "and robustness.")
+    roles = ", ".join(r.upper() for r in messages)
+    prompt = (
+        f"For EACH of these members ({roles}), ask two NEW questions about "
+        "something specific in their message above. Use exactly this form "
+        "for every member:\n"
+        "TO <ROLE>:\nQ1: <question>?\nQ2: <question>?\n"
+        "Do not repeat any earlier question.")
+    from .council_schemas import (enabled, render_turn_questions,
+                                  turn_questions_schema)
+    roles_l = [r.lower() for r in messages]
+    return render_turn_questions(_ask(
+        peasant_model, prompt, extra_context="\n\n".join(parts),
+        max_tokens=160 * max(1, len(messages)),
+        json_schema=turn_questions_schema(roles_l) if enabled() else None,
+        think=THINK["peasant"]), roles_l)
+
+
+_TO_ROLE = re.compile(r"^\s*\**\s*TO\s+([A-Za-z_]+)\s*\**\s*:?\s*\**\s*$",
+                      re.IGNORECASE | re.MULTILINE)
+
+
+def split_turn_questions(text: str, roles: List[str]) -> Dict[str, str]:
+    """{role: its questions} from peasant_turn_questions' reply. A reply
+    without the headings goes to every member whole."""
+    marks = [(m.start(), m.end(), m.group(1).lower())
+             for m in _TO_ROLE.finditer(text or "")]
+    out: Dict[str, str] = {}
+    for i, (_s, end, role) in enumerate(marks):
+        stop = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        if role in roles:
+            out[role] = text[end:stop].strip()
+    if not out:
+        return {r: (text or "").strip() for r in roles}
+    return out
+
 
 def _looks_like_two_questions(text: str) -> bool:
     """
@@ -268,6 +362,57 @@ def _peasant_quality_score(
     total = sum(scores.values())
     return {"total": total, "max": 4, "axes": scores}
 
+#: Words in a critique that reject the APPROACH rather than name fixes.
+_START_OVER = re.compile(
+    r"wrong (approach|method|question|problem|file|data)|start over|"
+    r"from scratch|fundamentally|misunderst|does not answer|doesn't answer|"
+    r"did not answer|didn't answer|off[- ]topic|irrelevant|wrong language|"
+    r"not what (the user|was) asked", re.IGNORECASE)
+
+
+def _depth_of(ctx: "AgentContext"):
+    """The question's depth (council_core.depth) from ctx.shared["depth"];
+    Deep when nobody said, which is how the council always ran."""
+    from .depth import DEEP, Depth
+    d = ctx.shared.get("depth")
+    if isinstance(d, Depth):
+        return d
+    if isinstance(d, str) and d:
+        return Depth(d, "", forced=True)
+    return Depth(DEEP, "")
+
+
+def required_changes_of(judge: Any, critique: str) -> List[str]:
+    """The critique's REQUIRED_CHANGES bullets — the judge's own parser when
+    it has one, else the same rule here."""
+    parse = getattr(type(judge), "parse_required_changes", None)
+    if callable(parse):
+        try:
+            return list(parse(critique) or [])
+        except Exception:                                 # noqa: BLE001
+            pass
+    if "Verdict: PASS" in (critique or ""):
+        return []
+    m = re.search(r"REQUIRED_CHANGES:\s*\n((?:\s*-\s*.+\n?)+)", critique or "")
+    if not m:
+        return []
+    return [ln.strip().lstrip("- ").strip() for ln in m.group(1).splitlines()
+            if ln.strip().startswith("-")]
+
+
+def needs_full_round(critique: str, changes: List[str], confidence: int) -> str:
+    """Why the next round must be the whole panel again, or "" when the
+    Writer can revise its answer against the critique instead."""
+    from .confidence import VERY_LOW
+    if _START_OVER.search(critique or ""):
+        return "the Judge rejected the approach, not just details"
+    if not changes:
+        return "the Judge named no specific changes to make"
+    if confidence <= VERY_LOW:
+        return f"the Judge's confidence is very low ({confidence}%)"
+    return ""
+
+
 class ModelAgent:
     def __init__(
         self,
@@ -287,7 +432,8 @@ class ModelAgent:
         # token_callback(who, token) — called for each streamed token
         self.token_callback = token_callback
 
-    def _compose_prompt(self, ctx: AgentContext) -> str:
+    def _compose_prompt(self, ctx: AgentContext, *,
+                        ask_confidence: bool = False) -> str:
         parts: List[str] = []
 
         # Inject query mode so every personality knows what type of response to give.
@@ -342,6 +488,13 @@ class ModelAgent:
             except Exception:
                 pass
             parts.append(f"JUDGE RANKING (JSON):\n{rank}\n")
+        previous = ctx.shared.get("previous_answer", "")
+        if previous:
+            parts.append(
+                "YOUR PREVIOUS ANSWER — the Judge's critique of it follows. "
+                "REVISE it: keep everything that was right, fix every "
+                "required change, and write the whole improved answer (not a "
+                "list of edits):\n" + previous + "\n")
         if critique:
             parts.append(f"JUDGE CRITIQUE:\n{critique}\n")
         required_changes = ctx.shared.get("required_changes", [])
@@ -378,14 +531,26 @@ class ModelAgent:
             )
 
         parts.append(f"USER REQUEST:\n{ctx.user_text}")
+        if ask_confidence:
+            from .confidence import DRAFT_INSTRUCTION
+            parts += ["", DRAFT_INSTRUCTION]
 
         if self.enable_tools and self.tools:
-            tool_list = ", ".join(sorted(self.tools.keys()))
+            # A tool's one-line `help` (args and purpose) when it has one:
+            # a bare name list left a small model guessing the arguments.
+            helps = [f"- {n}: {getattr(fn, 'help', '')}".rstrip(": ")
+                     for n, fn in self.tools.items()]
+            if any(getattr(fn, "help", "") for fn in self.tools.values()):
+                parts += ["", "TOOLS AVAILABLE (args — what it does):",
+                          *helps]
+            else:
+                parts += ["", "TOOLS AVAILABLE: "
+                          + ", ".join(sorted(self.tools.keys()))]
             parts += [
-                "",
-                f"TOOLS AVAILABLE: {tool_list}",
                 "To use a tool, output ONLY JSON: {\"tool\":\"name\",\"args\":{...}}",
-                "Otherwise write a normal answer.",
+                "Use a tool when it replaces a guess (a number, a quote, a "
+                "file's contents, whether code runs); otherwise write a "
+                "normal answer.",
             ]
         return "\n".join(parts)
 
@@ -398,20 +563,53 @@ class ModelAgent:
             cb(who, token)
         return _cb
 
-    def act(self, ctx: AgentContext) -> List[AgentEvent]:
+    def act(self, ctx: AgentContext, *,
+            ask_confidence: bool = False,
+            think: Optional[str] = None) -> List[AgentEvent]:
+        """The member's answer as events. `ask_confidence`: a draft, which
+        ends with a CONFIDENCE line (council_core.confidence). `think`: the
+        step's thinking effort (THINK)."""
         events: List[AgentEvent] = []
-        prompt = self._compose_prompt(ctx)
+        prompt = self._compose_prompt(ctx, ask_confidence=ask_confidence)
 
         if not (self.enable_tools and self.tools):
             events.append(AgentEvent(self.display_name, "thought", "Generating response…"))
-            text = self.model.respond(prompt, token_callback=self._make_token_cb())
+            text = _ask(self.model, prompt,
+                        token_callback=self._make_token_cb(), think=think)
             return [AgentEvent(self.display_name, "final", text)]
 
+        # NATIVE tool calling when the member's model has it (an Ollama
+        # model with the "tools" capability): the server returns the calls
+        # as data, with arguments checked against each tool's schema
+        # (tool_kit.PARAMS). Elsewhere the model writes {"tool": …} JSON in
+        # its text and _extract_tool_calls finds it, as before.
+        specs = self._native_specs()
+
+        def ask(text_prompt: str):
+            """(text, calls) for one model call."""
+            nonlocal specs
+            if specs:
+                try:
+                    reply = self.model.respond_with_tools(
+                        text_prompt, specs, think=think)
+                    calls = [{"tool": c.get("name"),
+                              "args": c.get("arguments") or {}}
+                             for c in reply.get("tool_calls") or []]
+                    return str(reply.get("content") or ""), calls
+                except Exception as exc:                  # noqa: BLE001
+                    events.append(AgentEvent(
+                        self.display_name, "thought",
+                        f"Native tool calling failed ({exc}); using text."))
+                    specs = []
+            out = _ask(self.model, text_prompt,
+                       token_callback=self._make_token_cb(), think=think)
+            return out, _extract_tool_calls(out)
+
         events.append(AgentEvent(self.display_name, "thought", "Calling model backend…"))
-        text = self.model.respond(prompt, token_callback=self._make_token_cb())
+        text, calls = ask(prompt)
+        results: List[str] = []
 
         for _ in range(self.max_tool_steps):
-            calls = _extract_tool_calls(text)
             if not calls:
                 events.append(AgentEvent(self.display_name, "final", text))
                 return events
@@ -429,7 +627,15 @@ class ModelAgent:
                 if not isinstance(args, dict):
                     obs_lines.append(f"[{i}] ERROR: args must be a dict")
                     continue
-                ok, msg, payload = self.tools[tool_name](args)
+                # A tool that raises (run_python past its timeout raises
+                # TimeoutExpired; a vault read of a missing file raises) is a
+                # failed call the model can see and work around — not the end
+                # of the whole turn, which is what letting it escape meant.
+                try:
+                    ok, msg, payload = self.tools[tool_name](args)
+                except Exception as exc:                  # noqa: BLE001
+                    ok, msg, payload = (False, f"the tool raised "
+                                        f"{type(exc).__name__}: {exc}", {})
                 obs_lines.append(f"[{i}] {tool_name}: {'OK' if ok else 'FAIL'}\n{msg}")
                 if payload:
                     payloads[f"{tool_name}_{i}"] = payload
@@ -437,16 +643,40 @@ class ModelAgent:
             ctx.shared.setdefault("tool_payloads", {}).update(payloads)
             obs_text = "\n\n".join(obs_lines).strip() or "(no tool output)"
             events.append(AgentEvent(self.display_name, "observation", obs_text))
+            results.append(obs_text)
 
+            # The follow-up carries the ORIGINAL prompt and every result so
+            # far. It used to send the results alone — each call is
+            # stateless, so the model answered without seeing the question.
             followup = (
-                f"TOOL RESULTS:\n{obs_text}\n\n"
-                "Now produce the best possible answer (no tool JSON unless more tools needed)."
+                f"{prompt}\n\nTOOL RESULTS SO FAR:\n"
+                + "\n\n".join(results) + "\n\n"
+                "Now produce the best possible answer (no tool call unless "
+                "more tools are needed)."
             )
+            if ask_confidence:
+                from .confidence import DRAFT_INSTRUCTION
+                followup += "\n\n" + DRAFT_INSTRUCTION
             events.append(AgentEvent(self.display_name, "thought", "Calling model (post-tool)…"))
-            text = self.model.respond(followup, token_callback=self._make_token_cb())
+            text, calls = ask(followup)
 
         events.append(AgentEvent(self.display_name, "final", text))
         return events
+
+    def _native_specs(self) -> List[Dict[str, Any]]:
+        """The tools as native specs when this member's model calls tools
+        natively; [] for the text path."""
+        if not hasattr(self.model, "respond_with_tools"):
+            return []
+        try:
+            import council_engine
+            if not council_engine.native_tools(getattr(self.model, "name",
+                                                       None)):
+                return []
+            from .tool_kit import tool_specs
+            return tool_specs(self.tools)
+        except Exception:                                 # noqa: BLE001
+            return []
 
 class DeliberationOrchestrator:
     """
@@ -465,10 +695,17 @@ class DeliberationOrchestrator:
         clarification_cb: Optional[Callable[[str, str], None]] = None,
         pause_event: Optional[threading.Event] = None,
         answer_getter: Optional[Callable[[], str]] = None,
+        parallel_members: bool = False,
     ):
         self.judge = judge_model
+        #: Draft and rebut side by side (see _draft_all). Off by default: it
+        #: only saves time when the members' models are on different
+        #: machines or are different in-app models — calls to the same
+        #: model or machine still queue (node_routing.host_slot).
+        self.parallel_members = bool(parallel_members)
         self.agents = agents
         self.max_rounds = max_rounds
+        self._confidence_reasons: Dict[str, str] = {}
         self.debate_turns = max(1, int(debate_turns))
         self.event_callback = event_callback or (lambda e: None)
         # Clarification pause support
@@ -478,6 +715,104 @@ class DeliberationOrchestrator:
 
     def _emit(self, event: AgentEvent) -> None:
         self.event_callback(event)
+
+    # -- members side by side ---------------------------------------------
+    def _draft_one(self, key: str, ctx: AgentContext,
+                   emit: Optional[Callable[[AgentEvent], None]] = None):
+        """One member's answer and its self-rated confidence:
+        (events, answer, confidence). With `emit`, the answer's events go
+        out as soon as they exist (the one-at-a-time path)."""
+        from . import confidence as _cf
+        evs = self.agents[key].act(ctx, ask_confidence=True,
+                                   think=THINK["draft"])
+        # Self-reported confidence, 0–100%, from the draft's own last line
+        # (CONFIDENCE: 85% — reason). The line is cut from the answer the
+        # others read. Only when it is missing is the member asked again,
+        # with the whole answer in view this time, not its first 400
+        # characters.
+        reason = ""
+        conf = None
+        for i in range(len(evs) - 1, -1, -1):
+            if evs[i].kind == "final":
+                cleaned, conf, reason = _cf.split_draft(evs[i].text)
+                evs[i] = AgentEvent(evs[i].who, "final", cleaned)
+                break
+        answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
+        if emit is not None:
+            for ev in evs:
+                emit(ev)
+        if conf is None:
+            conf = _cf.DEFAULT
+            try:
+                raw = _ask(
+                    self.agents[key].model,
+                    "How confident are you in this answer, from 0 to 100 "
+                    "percent? Reply with ONLY the number.\n\n"
+                    f"THE ANSWER:\n{answer[:4000]}",
+                    max_tokens=8, think=THINK["confidence"],
+                )
+                got = _cf.parse_reply(raw)
+                conf = got if got is not None else _cf.DEFAULT
+            except Exception:
+                pass
+        self._confidence_reasons[key] = reason
+        return evs, answer, conf
+
+    def _side_by_side(self, keys: List[str], fn: Callable[[str], Any]
+                      ) -> Dict[str, Any]:
+        """fn(key) for every key at once; results by key. Token streaming
+        is off meanwhile — two members streaming together would interleave
+        in one view — and the first error is raised once all have finished,
+        as the one-at-a-time path would have raised it."""
+        from . import node_routing
+        saved = {k: self.agents[k].token_callback for k in keys}
+        for k in keys:
+            self.agents[k].token_callback = None
+        try:
+            outcomes = node_routing.run_parallel(
+                [(lambda k=k: fn(k)) for k in keys])
+        finally:
+            for k, cb in saved.items():
+                self.agents[k].token_callback = cb
+        for o in outcomes:
+            if not o.ok:
+                raise o.error
+        return {k: o.value for k, o in zip(keys, outcomes)}
+
+    def _model_of(self, key: str) -> Tuple[str, str]:
+        """(machine, model) this member's calls run on — council_engine.
+        model_key for a real personality; ("", "") for anything else."""
+        import sys
+        agent = self.agents.get(key)
+        model = getattr(agent, "model", None)
+        engine = sys.modules.get("council_engine")
+        if engine is None or not isinstance(model, engine.PersonalityModel):
+            return "", ""
+        try:
+            return engine.model_key(getattr(model, "name", key))
+        except Exception:                                 # noqa: BLE001
+            return "", ""
+
+    def _swap_risk(self, role: str, others: List[str]) -> bool:
+        """Would `role` and one of `others` swap models on one machine?"""
+        where, which = self._model_of(role)
+        if not which:
+            return False
+        for k in others:
+            if k == role:
+                continue
+            w2, m2 = self._model_of(k)
+            if m2 and w2 == where and m2 != which:
+                return True
+        return False
+
+    def _group_by_model(self, keys: List[str]) -> List[str]:
+        """`keys` with members on the same model next to each other, in the
+        order each model first appears."""
+        order: Dict[Tuple[str, str], int] = {}
+        for k in keys:
+            order.setdefault(self._model_of(k), len(order))
+        return sorted(keys, key=lambda k: order[self._model_of(k)])
 
     def _phase(self, label: str) -> None:
         self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
@@ -492,6 +827,13 @@ class DeliberationOrchestrator:
         # Guard: synth must exist in agents — fall back to writer or first panel member
         if synth not in self.agents:
             synth = "writer" if "writer" in self.agents else (panel[0] if panel else synth)
+
+        # A QUICK question (council_core.depth): one member — the
+        # synthesiser — answers and the Judge checks it; no Peasant, no
+        # rebuttal, no ranking, no separate synthesis.
+        _quick = _depth_of(ctx).level == "quick"
+        if _quick and synth in self.agents:
+            panel = [synth]
 
         # Accumulates every Peasant question across all rounds and cross-fire
         # turns so the model is never shown a blank slate and cannot re-ask
@@ -513,7 +855,12 @@ class DeliberationOrchestrator:
             all_events.append(ev)
             self._emit(ev)
 
-        for r in range(self.max_rounds):
+        # A while loop, so an extra round granted below (max_rounds = 3)
+        # really runs; `for r in range(...)` had fixed the count at the start.
+        r = -1
+        _revising = False
+        while r + 1 < self.max_rounds:
+            r += 1
             # ── Check pause at start of each round ──────────────────
             # If a clarification is pending, wait here before any
             # new model calls fire. This ensures the whole round
@@ -521,72 +868,44 @@ class DeliberationOrchestrator:
             if self._pause_event and not self._pause_event.is_set():
                 self._pause_event.wait(timeout=300)
 
-            self._phase(f"Round {r+1}/{self.max_rounds} — Candidate generation")
+            if _revising:
+                # A REVISION round (council_core.deliberation, round 2+):
+                # the Judge named what to fix, so the Writer revises its
+                # own answer against the critique and the Judge checks
+                # again — two calls. The panel's drafts, the Peasant's
+                # questions and the ranking are the previous round's and
+                # stay in ctx.shared for the Writer to read.
+                self._phase(f"Round {r+1}/{self.max_rounds} — Writer revises "
+                            "against the critique")
+                ctx.shared["previous_answer"] = synth_final
+            else:
+                ctx.shared.pop("previous_answer", None)
+                self._phase(f"Round {r+1}/{self.max_rounds} — Candidate generation")
 
-            candidates: Dict[str, Dict[str, str]] = {}
-            discussion_lines: List[str] = []
+                candidates: Dict[str, Dict[str, str]] = {}
+                discussion_lines: List[str] = []
 
-            # 1) Candidates + Peasant cross-exam
-            for key in panel:
-                self._phase(f"{key.capitalize()} — drafting answer")
-                evs = self.agents[key].act(ctx)
-                for ev in evs:
-                    emit(ev)
-                answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
-                # Strip code from candidate answers on conversational routes
-                # so they don't contaminate what other panel members read.
-                _qmode = ctx.shared.get("query_mode", "")
-                _stored_answer = answer
-                if _qmode == "conversational":
-                    _stored_answer = _strip_code_blocks(answer)
-                # ── #8 Self-reported confidence ─────────────────────────────
-                # Ask each candidate to rate their own confidence 1-10.
-                # A single cheap token call — models are usually well-calibrated
-                # at distinguishing "I'm guessing" from "I'm certain".
-                _self_conf = 5  # default if call fails
-                try:
-                    _conf_raw = self.agents[key].model.respond(
-                        "Rate your confidence in the answer you just gave, 1–10. "
-                        "Reply with ONLY the single digit — no words, no punctuation.\n\n"
-                        f"YOUR ANSWER (first 400 chars):\n{answer[:400]}",
-                        max_tokens=5,
-                    ).strip()
-                    _self_conf = int(_conf_raw[0]) if _conf_raw and _conf_raw[0].isdigit() else 5
-                    _self_conf = max(1, min(10, _self_conf))
-                except Exception:
-                    pass
-                candidates[key] = {
-                    "answer": _stored_answer,
-                    "peasant_q": "", "rebuttal": "", "discussion": "",
-                    "self_confidence": _self_conf,
-                }
-                if _self_conf <= 4:
-                    emit(AgentEvent(key.capitalize(), "observation",
-                                   f"⚠ Self-confidence: {_self_conf}/10 — answer may be weak"))
-                else:
-                    emit(AgentEvent(key.capitalize(), "observation",
-                                   f"Confidence: {_self_conf}/10"))
-                discussion_lines.append(f"{key.upper()} CANDIDATE [conf:{_self_conf}/10]:\n{_stored_answer}\n")
-
-                # ── Clarification pause ──────────────────────────────
-                # If a non-Peasant personality asked the user a direct question,
-                # pause deliberation and wait for the user to answer.
-                if key != "peasant" and self._clarification_cb and self._pause_event:
-                    _q = _detect_user_question(_stored_answer)
-                    if _q:
-                        self._pause_event.clear()  # pause
-                        self._clarification_cb(key.capitalize(), _q)
-                        # Block the worker thread until user answers (5 min max)
-                        self._pause_event.wait(timeout=300)
-                        _user_answer = self._answer_getter() if self._answer_getter else ""
-                        if _user_answer and not _user_answer.startswith("[User skipped"):
-                            _clarif_note = (f"\n\nUSER CLARIFICATION for {key}:\n"
-                                           f"  Q: {_q}\n  A: {_user_answer}\n")
-                            user_text = user_text + _clarif_note
-                            ctx.user_text = user_text
-                            discussion_lines.append(_clarif_note)
-
-                if key != "peasant" and "peasant" in self.agents:
+                # 1) Candidates + Peasant cross-exam
+                # Parallel: every member drafts at once, then the drafts are
+                # taken in panel order below — clarifications and the Peasant's
+                # cross-examination stay one at a time, since each builds on the
+                # last.
+                # THIS CHANGES THE DEBATE, deliberately: one at a time, each
+                # member drafts after reading the earlier members' answers and
+                # the Peasant's questions about them (_compose_prompt reads
+                # ctx.shared["candidates"]), so later members can anchor on the
+                # first. Side by side, the drafts are independent and the members
+                # first meet each other's answers in the rebuttal. A
+                # clarification then reaches the next round, not the members
+                # drafting alongside.
+                # The Peasant's questions about each draft, as soon as it is
+                # written — or, when the Peasant's model and a member's
+                # model share a machine but differ (they would unload each
+                # other at every turn: member, Peasant, member, Peasant),
+                # after all the drafts, so each model loads once
+                # (_swap_risk). Later drafts then read the earlier drafts
+                # without the Peasant's questions about them.
+                def _cross_examine(key: str, answer: str) -> None:
                     self._phase(f"Peasant — cross-examining {key}")
                     _pexam_mode = ctx.shared.get("query_mode", "")
                     qtxt = peasant_cross_exam(
@@ -623,213 +942,405 @@ class DeliberationOrchestrator:
                     emit(ev)
                     discussion_lines.append(f"PEASANT → {key}:\n{qtxt}\n")
 
-                ctx.shared["candidates"] = candidates
-                ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-40:])
-
-            # 2) Rebuttals
-            if self._pause_event and not self._pause_event.is_set():
-                self._pause_event.wait(timeout=300)
-            self._phase("Rebuttal round")
-            for key in panel:
-                if key == "peasant" or key not in candidates:
-                    continue
-                other_roles = [r for r in candidates if r != key]
-                debate_lines = [
-                    "DEBATE CONTEXT:",
-                    f"User request:\n{user_text}\n",
-                    f"Your original answer ({key}):\n{candidates[key].get('answer','')}\n",
-                ]
-                if my_pq := candidates[key].get("peasant_q", ""):
-                    debate_lines.append(f"Peasant questions about YOUR answer:\n{my_pq}\n")
-                for rr in other_roles:
-                    debate_lines.append(f"Other candidate ({rr}):\n{candidates[rr].get('answer','')}\n")
-                    if pq := candidates[rr].get("peasant_q", ""):
-                        debate_lines.append(f"Peasant questions about {rr}:\n{pq}\n")
-                _rb_mode = ctx.shared.get("query_mode", "")
-                _rb_mode_line = (
-                    "⚠ MODE: CONVERSATIONAL — rebuttal must be in prose only, no code.\n"
-                    if _rb_mode == "conversational" else
-                    "⚠ MODE: TECHNICAL — focus on code correctness and completeness.\n"
-                    if _rb_mode == "technical" else ""
-                )
-                debate_lines += [
-                    _rb_mode_line,
-                    "INSTRUCTIONS:",
-                    "- Write a rebuttal/improvement note.",
-                    "- Explicitly state disagreements.",
-                    "- Address Peasant questions.",
-                    "- Propose concrete fixes.",
-                    "- Keep under 12 bullet points.",
-                    "- Do NOT introduce code unless this is a TECHNICAL query.",
-                ]
-                extra_context = "\n".join(debate_lines)
-                self._phase(f"{key.capitalize()} — rebuttal")
-                rebuttal_text = self.agents[key].model.respond(
-                    "Produce your rebuttal now.", extra_context=extra_context,
-                    token_callback=self.agents[key]._make_token_cb(),
-                    max_tokens=600,  # rebuttals must be concise bullets, not essays
-                )
-                candidates[key]["rebuttal"] = rebuttal_text
-                ev = AgentEvent(key.capitalize(), "observation", f"Rebuttal:\n{rebuttal_text}")
-                emit(ev)
-                discussion_lines.append(f"{key.upper()} REBUTTAL:\n{rebuttal_text}\n")
-
-                # ── Back-fill Peasant QA answers (Change 8) ────────────
-                # The candidate's rebuttal IS their answer to Peasant's questions.
-                # Fill the "a" slot in _peasant_qa_log so that in cross-fire,
-                # Peasant sees what was already answered and can go deeper.
-                if _peasant_qa_log:
-                    peasant_qs_for_key = candidates[key].get("peasant_q", "")
-                    for qa_entry in _peasant_qa_log:
-                        if not qa_entry.get("a") and qa_entry["q"][:60] in peasant_qs_for_key:
-                            qa_entry["a"] = rebuttal_text[:400].strip()
-                ctx.shared["candidates"] = candidates
-                ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-60:])
-
-            # 3) Cross-fire
-            if self._pause_event and not self._pause_event.is_set():
-                self._pause_event.wait(timeout=300)
-            self._phase(f"Cross-fire — {self.debate_turns} turns")
-            for turn in range(1, self.debate_turns + 1):
+                _defer_exam = (not self.parallel_members and not _quick
+                               and "peasant" in self.agents
+                               and self._swap_risk("peasant", panel))
+                if _defer_exam:
+                    self._phase("Peasant questions held until every draft is "
+                                "written — its model would swap with the "
+                                "members'")
+                drafts: Dict[str, Any] = {}
+                if self.parallel_members and len(panel) > 1:
+                    self._phase(f"Drafting — {len(panel)} members at once")
+                    drafts = self._side_by_side(
+                        list(panel), lambda k: self._draft_one(k, ctx))
                 for key in panel:
-                    if key == "peasant" or key not in candidates:
-                        continue
-                    _cf_mode = ctx.shared.get("query_mode", "")
-                    _cf_mode_note = (
-                        "⚠ CONVERSATIONAL mode: respond in prose only, no code.\n"
-                        if _cf_mode == "conversational" else
-                        "⚠ TECHNICAL mode: focus on code quality and correctness.\n"
-                        if _cf_mode == "technical" else ""
-                    )
-                    extra_context = (
-                        f"CROSS-FIRE CONTEXT — Turn {turn}/{self.debate_turns}\n\n"
-                        + _cf_mode_note +
-                        "Rules:\n"
-                        "- Write ONE short message.\n"
-                        "- Include: AGREE: ... | DISAGREE: ... | ADD: ...\n"
-                        "- Address Peasant questions about your answer.\n"
-                        "- Keep under 10 lines.\n\n"
-                        f"Discussion so far:\n{ctx.shared.get('discussion_transcript','')}\n"
-                    )
-                    self._phase(f"{key.capitalize()} — cross-fire T{turn}")
-                    msg = self.agents[key].model.respond(
-                        "Post your cross-fire message now.", extra_context=extra_context,
-                        token_callback=self.agents[key]._make_token_cb(),
-                        max_tokens=400,  # cross-fire must be tight — 10 lines max
-                    )
-                    candidates[key]["discussion"] = (
-                        candidates[key].get("discussion", "") + f"\nTURN {turn}:\n{msg}\n"
-                    ).strip()
-                    ev = AgentEvent(key.capitalize(), "observation", f"Cross-fire T{turn}:\n{msg}")
-                    emit(ev)
-                    discussion_lines.append(f"{key.upper()} CROSS-FIRE T{turn}:\n{msg}\n")
+                    if key in drafts:
+                        evs, answer, _self_conf = drafts[key]
+                        for ev in evs:
+                            emit(ev)
+                    else:
+                        self._phase(f"{key.capitalize()} — drafting answer")
+                        evs, answer, _self_conf = self._draft_one(key, ctx, emit)
+                    # Strip code from candidate answers on conversational routes
+                    # so they don't contaminate what other panel members read.
+                    _qmode = ctx.shared.get("query_mode", "")
+                    _stored_answer = answer
+                    if _qmode == "conversational":
+                        _stored_answer = _strip_code_blocks(answer)
+                    candidates[key] = {
+                        "answer": _stored_answer,
+                        "peasant_q": "", "rebuttal": "", "discussion": "",
+                        "self_confidence": _self_conf,
+                    }
+                    _why = self._confidence_reasons.get(key, "")
+                    candidates[key]["confidence_reason"] = _why
+                    _why_txt = f" — least sure of: {_why}" if _why else ""
+                    if _self_conf <= _cf_LOW:
+                        emit(AgentEvent(key.capitalize(), "observation",
+                                       f"⚠ Self-confidence: {_self_conf}% — answer may be weak{_why_txt}"))
+                    else:
+                        emit(AgentEvent(key.capitalize(), "observation",
+                                       f"Confidence: {_self_conf}%{_why_txt}"))
+                    discussion_lines.append(f"{key.upper()} CANDIDATE [conf:{_self_conf}%]:\n{_stored_answer}\n")
 
-                    if "peasant" in self.agents:
-                        self._phase(f"Peasant — questions after {key} T{turn}")
-                        _cf_pmode = ctx.shared.get("query_mode", "")
-                        pq = peasant_cross_exam(
-                            self.agents["peasant"].model,
-                            candidate_role=f"{key} (T{turn})", candidate_text=msg, user_text=user_text,
-                            prior_qa=_peasant_qa_log if _peasant_qa_log else None,
-                            query_mode=_cf_pmode,
-                        )
-                        _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
-                        if not _looks_like_two_questions(pq):
-                            # Reformat rather than regenerate — same ideas, proper labels
-                            _cf_reformat = (
-                                "Your response below is good but needs exactly two questions "
-                                "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
-                                "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
-                                f"YOUR RESPONSE:\n{pq}"
-                            )
-                            pq = self.agents["peasant"].model.respond(
-                                _cf_reformat, max_tokens=300)
-                            _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
-                            if not _looks_like_two_questions(pq):
-                                _axes = ", ".join(
-                                    k + ("=✓" if v else "=✗")
-                                    for k, v in _cf_score["axes"].items()
-                                )
-                                emit(AgentEvent("Peasant", "observation",
-                                    "⚠ CF quality low after reformat ("
-                                    + str(_cf_score["total"]) + "/4: " + _axes + ")"))
-                        _log_peasant_questions(pq)
-                        _cftag = " [q:" + str(_cf_score["total"]) + "/4]"
-                        pev = AgentEvent("Peasant", "observation",
-                                        f"Cross-fire questions after {key} T{turn}" + _cftag + ":\n" + pq)
-                        emit(pev)
-                        discussion_lines.append(f"PEASANT → {key} T{turn}:\n{pq}\n")
+                    # ── Clarification pause ──────────────────────────────
+                    # If a non-Peasant personality asked the user a direct question,
+                    # pause deliberation and wait for the user to answer.
+                    if key != "peasant" and self._clarification_cb and self._pause_event:
+                        _q = _detect_user_question(_stored_answer)
+                        if _q:
+                            self._pause_event.clear()  # pause
+                            self._clarification_cb(key.capitalize(), _q)
+                            # Block the worker thread until user answers (5 min max)
+                            self._pause_event.wait(timeout=300)
+                            _user_answer = self._answer_getter() if self._answer_getter else ""
+                            if _user_answer and not _user_answer.startswith("[User skipped"):
+                                _clarif_note = (f"\n\nUSER CLARIFICATION for {key}:\n"
+                                               f"  Q: {_q}\n  A: {_user_answer}\n")
+                                user_text = user_text + _clarif_note
+                                ctx.user_text = user_text
+                                discussion_lines.append(_clarif_note)
+
+                    if key != "peasant" and "peasant" in self.agents \
+                            and not _quick and not _defer_exam:
+                        _cross_examine(key, answer)
 
                     ctx.shared["candidates"] = candidates
-                    ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-80:])
+                    ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-40:])
 
-            # 4) Judge ranks
-            self._phase("Judge — ranking candidates")
-            rank_json = self.judge.rank_candidates(user_text, candidates)
-            ctx.shared["judge_ranking"] = rank_json
-            try:
-                import json as _rj
-                ctx.shared["judge_confidence"] = int(_rj.loads(rank_json).get("confidence", 0))
-            except Exception:
-                ctx.shared["judge_confidence"] = 0
-            ev = AgentEvent("Judge", "observation", f"Ranking:\n{rank_json}")
-            emit(ev)
+                if _defer_exam:
+                    for key in panel:
+                        if key != "peasant" and key in candidates:
+                            _cross_examine(key, candidates[key]["answer"])
+                    ctx.shared["candidates"] = candidates
+                    ctx.shared["discussion_transcript"] = \
+                        "\n".join(discussion_lines[-40:])
 
-            # 4a) Low-confidence gap logging ─────────────────────────────────
-            # Roles that reported self-confidence ≤4 are flagged so the
-            # Librarian wishlist captures what vault data would have helped.
-            for _lc_role, _lc_data in candidates.items():
-                if _lc_data.get("self_confidence", 10) <= 4:
+                # 2) Rebuttals
+                if self._pause_event and not self._pause_event.is_set():
+                    self._pause_event.wait(timeout=300)
+                self._phase("Rebuttal round")
+
+                def _rebuttal_context(key: str) -> str:
+                    other_roles = [r for r in candidates if r != key]
+                    debate_lines = [
+                        "DEBATE CONTEXT:",
+                        f"User request:\n{user_text}\n",
+                        f"Your original answer ({key}):\n{candidates[key].get('answer','')}\n",
+                    ]
+                    if my_pq := candidates[key].get("peasant_q", ""):
+                        debate_lines.append(f"Peasant questions about YOUR answer:\n{my_pq}\n")
+                    for rr in other_roles:
+                        debate_lines.append(f"Other candidate ({rr}):\n{candidates[rr].get('answer','')}\n")
+                        if pq := candidates[rr].get("peasant_q", ""):
+                            debate_lines.append(f"Peasant questions about {rr}:\n{pq}\n")
+                    _rb_mode = ctx.shared.get("query_mode", "")
+                    _rb_mode_line = (
+                        "⚠ MODE: CONVERSATIONAL — rebuttal must be in prose only, no code.\n"
+                        if _rb_mode == "conversational" else
+                        "⚠ MODE: TECHNICAL — focus on code correctness and completeness.\n"
+                        if _rb_mode == "technical" else ""
+                    )
+                    debate_lines += [
+                        _rb_mode_line,
+                        "INSTRUCTIONS:",
+                        "- Write a rebuttal/improvement note.",
+                        "- Explicitly state disagreements.",
+                        "- Address Peasant questions.",
+                        "- Propose concrete fixes.",
+                        "- Keep under 12 bullet points.",
+                        "- Do NOT introduce code unless this is a TECHNICAL query.",
+                    ]
+                    return "\n".join(debate_lines)
+
+                def _rebut(key: str) -> str:
+                    return _ask(
+                        self.agents[key].model,
+                        "Produce your rebuttal now.",
+                        extra_context=_rebuttal_context(key),
+                        token_callback=self.agents[key]._make_token_cb(),
+                        max_tokens=600,  # rebuttals must be concise bullets, not essays
+                        think=THINK["rebuttal"],
+                    )
+
+                rebutters = [k for k in panel
+                             if k != "peasant" and k in candidates
+                             and not _quick]
+                # One at a time, members on the same model go one after
+                # another, so each model loads once (rebuttals are
+                # independent; the order changes nothing else).
+                rebutters = self._group_by_model(rebutters)
+                # Each rebuttal reads only the finished drafts and the Peasant's
+                # questions — never another rebuttal — so writing them side by
+                # side changes nothing but the time it takes.
+                rebuttals: Dict[str, str] = {}
+                if self.parallel_members and len(rebutters) > 1:
+                    self._phase(f"Rebuttals — {len(rebutters)} members at once")
+                    rebuttals = self._side_by_side(rebutters, _rebut)
+                for key in rebutters:
+                    if key in rebuttals:
+                        rebuttal_text = rebuttals[key]
+                    else:
+                        self._phase(f"{key.capitalize()} — rebuttal")
+                        rebuttal_text = _rebut(key)
+                    candidates[key]["rebuttal"] = rebuttal_text
+                    ev = AgentEvent(key.capitalize(), "observation", f"Rebuttal:\n{rebuttal_text}")
+                    emit(ev)
+                    discussion_lines.append(f"{key.upper()} REBUTTAL:\n{rebuttal_text}\n")
+
+                    # ── Back-fill Peasant QA answers (Change 8) ────────────
+                    # The candidate's rebuttal IS their answer to Peasant's questions.
+                    # Fill the "a" slot in _peasant_qa_log so that in cross-fire,
+                    # Peasant sees what was already answered and can go deeper.
+                    if _peasant_qa_log:
+                        peasant_qs_for_key = candidates[key].get("peasant_q", "")
+                        for qa_entry in _peasant_qa_log:
+                            if not qa_entry.get("a") and qa_entry["q"][:60] in peasant_qs_for_key:
+                                qa_entry["a"] = rebuttal_text[:400].strip()
+                    ctx.shared["candidates"] = candidates
+                    ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-60:])
+
+                # 3) Cross-fire — council_core.depth decides whether it runs:
+                # Deep questions only (a Standard one is lifted when a
+                # member is unsure), not when the drafts already agree, and
+                # it ends after a turn in which nobody disagrees. The
+                # Peasant asks about a whole turn in ONE call.
+                from . import depth as _dp
+                _depth = _depth_of(ctx)
+                _members = [k for k in panel
+                            if k != "peasant" and k in candidates]
+                _unsure = [k for k in _members
+                           if candidates[k].get("self_confidence", 100)
+                           <= _cf_LOW]
+                _skip_cf = ""
+                if not _depth.cross_fire and not (
+                        _depth.debate and _unsure and not _depth.forced):
+                    _skip_cf = f"{_depth.level} depth"
+                elif self.debate_turns < 1 or len(_members) < 2:
+                    _skip_cf = "fewer than two members to argue"
+                else:
+                    _skip_cf = _dp.agree(candidates)
+                if _skip_cf:
+                    self._phase(f"Cross-fire skipped — {_skip_cf}")
+                else:
+                    if not _depth.cross_fire:
+                        self._phase(f"Cross-fire added — {', '.join(_unsure)} "
+                                    "unsure of its answer")
+                    self._phase(f"Cross-fire — up to {self.debate_turns} turns")
+                for turn in (range(1, self.debate_turns + 1)
+                             if not _skip_cf else ()):
+                    if self._pause_event and not self._pause_event.is_set():
+                        self._pause_event.wait(timeout=300)
+
+                    def _cf_context(turn=turn) -> str:
+                        _cf_mode = ctx.shared.get("query_mode", "")
+                        _cf_mode_note = (
+                            "⚠ CONVERSATIONAL mode: respond in prose only, no code.\n"
+                            if _cf_mode == "conversational" else
+                            "⚠ TECHNICAL mode: focus on code quality and correctness.\n"
+                            if _cf_mode == "technical" else ""
+                        )
+                        return (
+                            f"CROSS-FIRE CONTEXT — Turn {turn}/{self.debate_turns}\n\n"
+                            + _cf_mode_note +
+                            "Rules:\n"
+                            "- Write ONE short message.\n"
+                            "- Include: AGREE: ... | DISAGREE: ... | ADD: ...\n"
+                            "- Write 'DISAGREE: none' if nothing is left to dispute.\n"
+                            "- Address Peasant questions about your answer.\n"
+                            "- Keep under 10 lines.\n\n"
+                            f"Discussion so far:\n{ctx.shared.get('discussion_transcript','')}\n"
+                        )
+
+                    def _post(key: str, turn=turn) -> str:
+                        return _ask(
+                            self.agents[key].model,
+                            "Post your cross-fire message now.",
+                            extra_context=_cf_context(turn),
+                            token_callback=self.agents[key]._make_token_cb(),
+                            max_tokens=400,  # cross-fire must be tight
+                            think=THINK["cross_fire"],
+                        )
+
+                    def _record(key: str, msg: str, turn=turn) -> None:
+                        candidates[key]["discussion"] = (
+                            candidates[key].get("discussion", "")
+                            + f"\nTURN {turn}:\n{msg}\n").strip()
+                        emit(AgentEvent(key.capitalize(), "observation",
+                                        f"Cross-fire T{turn}:\n{msg}"))
+                        discussion_lines.append(
+                            f"{key.upper()} CROSS-FIRE T{turn}:\n{msg}\n")
+                        ctx.shared["candidates"] = candidates
+                        ctx.shared["discussion_transcript"] = \
+                            "\n".join(discussion_lines[-80:])
+
+                    # Side by side, every member of a turn reads the
+                    # discussion up to the previous turn (as rebuttals read
+                    # the drafts); one at a time, each also reads the
+                    # messages before it in this turn.
+                    msgs: Dict[str, str] = {}
+                    if self.parallel_members and len(_members) > 1:
+                        self._phase(f"Cross-fire T{turn} — "
+                                    f"{len(_members)} members at once")
+                        msgs = self._side_by_side(_members, _post)
+                        for key in _members:
+                            _record(key, msgs[key])
+                    else:
+                        for key in _members:
+                            self._phase(f"{key.capitalize()} — cross-fire T{turn}")
+                            msgs[key] = _post(key)
+                            _record(key, msgs[key])
+
+                    if "peasant" in self.agents:
+                        self._phase(f"Peasant — questions on cross-fire T{turn}")
+                        pq = peasant_turn_questions(
+                            self.agents["peasant"].model, messages=msgs,
+                            user_text=user_text, turn=turn,
+                            prior_qa=_peasant_qa_log or None,
+                            query_mode=ctx.shared.get("query_mode", ""))
+                        _log_peasant_questions(pq)
+                        for key, qs in split_turn_questions(
+                                pq, _members).items():
+                            emit(AgentEvent(
+                                "Peasant", "observation",
+                                f"Cross-fire questions for {key} T{turn}:\n{qs}"))
+                            discussion_lines.append(
+                                f"PEASANT → {key} T{turn}:\n{qs}\n")
+                        ctx.shared["discussion_transcript"] = \
+                            "\n".join(discussion_lines[-80:])
+
+                    if turn < self.debate_turns and \
+                            not _dp.has_disagreement(msgs.values()):
+                        self._phase("Cross-fire ended — no disagreements left")
+                        break
+
+                # 4) Judge ranks
+                self._phase("Judge — ranking candidates")
+                # Each candidate's Python, parsed (never run) — judge_view.
+                from . import judge_view as _jv
+                for _ck, _cd in candidates.items():
+                    _chk = _jv.code_check(_cd.get("answer", ""))
+                    _cd["code_check"] = _chk
+                    if _chk and _jv.has_problems(_chk):
+                        emit(AgentEvent("Judge", "observation",
+                                        f"{_ck.capitalize()} — {_chk}"))
+                # The vault's evidence, for ranking and critique only (never for
+                # routing): ctx.shared["judge_evidence"], set by the front end
+                # (council_core.vault_context.evidence). Passed only when there
+                # is some, so a judge without the keyword still works.
+                _evidence = str(ctx.shared.get("judge_evidence") or "")
+                # The Judge's own checks (tool_kit.judge_checks): each passage a
+                # candidate quotes, looked up in the vault. Run by the app, not
+                # by the Judge — the Judge ranks, it does not call tools.
+                _checker = ctx.shared.get("judge_checks")
+                if callable(_checker):
                     try:
-                        _lc_topic = f"{_lc_role} answer to: {user_text[:80]}"
-                        _lc_reason = (
-                            f"{_lc_role} self-reported confidence "
-                            f"{_lc_data['self_confidence']}/10 — vault data on this topic "
-                            "would have strengthened the answer"
-                        )
-                        ctx.shared.setdefault("_low_conf_gaps", []).append(
-                            {"who": _lc_role, "topic": _lc_topic, "reason": _lc_reason}
-                        )
-                    except Exception:
-                        pass
-
-            # 4b) Peasant adversarial challenge (optional)
-            _adversarial_challenge = ""
-            if (ctx.shared.get("peasant_adversarial", False)
-                    and "peasant" in self.agents):
+                        _checks = str(_checker(candidates) or "")
+                    except Exception as _cexc:                # noqa: BLE001
+                        _checks = ""
+                        emit(AgentEvent("Judge", "observation",
+                                        f"Quote checks failed: {_cexc}"))
+                    if _checks:
+                        emit(AgentEvent("Judge", "observation", _checks))
+                        _evidence = "\n\n".join(x for x in (_evidence, _checks)
+                                                 if x)
+                if _quick:
+                    # One candidate: nothing to rank. Its own confidence
+                    # stands in for the Judge's until the critique.
+                    _only = next(iter(candidates), synth)
+                    _oc = int(candidates.get(_only, {}).get("self_confidence", 50))
+                    rank_json = json.dumps({
+                        "winner": _only, "scores": {_only: _oc},
+                        "rationale": "quick depth: one member answered",
+                        "confidence": _oc})
+                elif _evidence:
+                    rank_json = self.judge.rank_candidates(
+                        user_text, candidates, extra_context=_evidence)
+                else:
+                    rank_json = self.judge.rank_candidates(user_text, candidates)
+                ctx.shared["judge_ranking"] = rank_json
                 try:
-                    import json as _aj
-                    _robj = _aj.loads(rank_json)
-                    _winner_role = _robj.get("winner", "")
-                    _winner_ans = candidates.get(_winner_role, {}).get("answer", "")
+                    import json as _rj
+                    from .confidence import normalise_ranking as _nr
+                    _robj = _nr(_rj.loads(rank_json))
+                    rank_json = _rj.dumps(_robj, ensure_ascii=False)
+                    ctx.shared["judge_ranking"] = rank_json
+                    ctx.shared["judge_confidence"] = int(_robj.get("confidence", 0))
                 except Exception:
-                    _winner_role, _winner_ans = "", ""
-                if _winner_role and _winner_ans:
-                    self._phase("Peasant — adversarial challenge")
-                    _adv_ctx = (
-                        "USER REQUEST:\n" + user_text + "\n\n"
-                        "WINNING CANDIDATE: " + _winner_role + "\n"
-                        "WINNING ANSWER:\n" + _winner_ans + "\n\n"
-                        "Your task: argue AGAINST this answer. Identify the single most\n"
-                        "dangerous flaw, edge case, or false assumption.\n"
-                        "Be specific and adversarial. Do NOT offer improvements.\n"
-                        "Format: CHALLENGE: <your strongest objection in 3-6 sentences>"
-                    )
-                    _adversarial_challenge = self.agents["peasant"].model.respond(
-                        "State your adversarial challenge now.",
-                        extra_context=_adv_ctx,
-                        max_tokens=300,
-                    )
-                    ctx.shared["adversarial_challenge"] = _adversarial_challenge
-                    ctx.shared["adversarial_target"] = _winner_role
-                    emit(AgentEvent("Peasant", "observation",
-                                   "Adversarial: " + _adversarial_challenge))
+                    ctx.shared["judge_confidence"] = 0
+                ev = AgentEvent("Judge", "observation", f"Ranking:\n{rank_json}")
+                emit(ev)
+
+                # 4a) Low-confidence gap logging ─────────────────────────────────
+                # Roles that reported self-confidence ≤40% are flagged so the
+                # Librarian wishlist captures what vault data would have helped.
+                for _lc_role, _lc_data in candidates.items():
+                    if _lc_data.get("self_confidence", 100) <= _cf_LOW:
+                        try:
+                            _lc_topic = f"{_lc_role} answer to: {user_text[:80]}"
+                            _lc_why = _lc_data.get("confidence_reason", "")
+                            _lc_reason = (
+                                f"{_lc_role} self-reported confidence "
+                                f"{_lc_data['self_confidence']}%"
+                                + (f" — least sure of: {_lc_why}" if _lc_why
+                                   else " — vault data on this topic would "
+                                        "have strengthened the answer")
+                            )
+                            ctx.shared.setdefault("_low_conf_gaps", []).append(
+                                {"who": _lc_role, "topic": _lc_topic, "reason": _lc_reason}
+                            )
+                        except Exception:
+                            pass
+
+                # 4b) Peasant adversarial challenge (optional)
+                _adversarial_challenge = ""
+                if (ctx.shared.get("peasant_adversarial", False)
+                        and "peasant" in self.agents):
+                    try:
+                        import json as _aj
+                        _robj = _aj.loads(rank_json)
+                        _winner_role = _robj.get("winner", "")
+                        _winner_ans = candidates.get(_winner_role, {}).get("answer", "")
+                    except Exception:
+                        _winner_role, _winner_ans = "", ""
+                    if _winner_role and _winner_ans:
+                        self._phase("Peasant — adversarial challenge")
+                        _adv_ctx = (
+                            "USER REQUEST:\n" + user_text + "\n\n"
+                            "WINNING CANDIDATE: " + _winner_role + "\n"
+                            "WINNING ANSWER:\n" + _winner_ans + "\n\n"
+                            "Your task: argue AGAINST this answer. Identify the single most\n"
+                            "dangerous flaw, edge case, or false assumption.\n"
+                            "Be specific and adversarial. Do NOT offer improvements.\n"
+                            "Format: CHALLENGE: <your strongest objection in 3-6 sentences>"
+                        )
+                        _adversarial_challenge = _ask(
+                            self.agents["peasant"].model,
+                            "State your adversarial challenge now.",
+                            extra_context=_adv_ctx,
+                            max_tokens=300, think=THINK["adversarial"],
+                        )
+                        ctx.shared["adversarial_challenge"] = _adversarial_challenge
+                        ctx.shared["adversarial_target"] = _winner_role
+                        emit(AgentEvent("Peasant", "observation",
+                                       "Adversarial: " + _adversarial_challenge))
 
             # 5) Writer synthesizes
-            self._phase("Writer — synthesizing final answer")
-            synth_evs = self.agents[synth].act(ctx)
+            _quick_answer = _quick and not _revising and synth in candidates
+            if _quick_answer:
+                # The quick answer IS the answer; its draft events are
+                # already out under the synthesiser's name.
+                synth_evs = [AgentEvent(self.agents[synth].display_name,
+                                        "final", candidates[synth]["answer"])]
+            else:
+                self._phase("Writer — revising the answer" if _revising
+                            else "Writer — synthesizing final answer")
+                synth_evs = self.agents[synth].act(ctx,
+                                                   think=THINK["synthesis"])
             for ev in synth_evs:
-                emit(ev)
+                if not _quick_answer:
+                    emit(ev)
             synth_final = next((e.text for e in reversed(synth_evs) if e.kind == "final"), "")
             # T1-D: Track per-round Writer output, emit unified diff on round 2+
             _round_outputs = ctx.shared.setdefault("_round_outputs", [])
@@ -855,7 +1366,16 @@ class DeliberationOrchestrator:
 
             # 6) Judge critiques
             self._phase("Judge — critiquing synthesis")
-            critique = self.judge.critique(user_text, synth_final, extra_context=f"Ranking:\n{rank_json}", query_mode=ctx.shared.get("query_mode", ""))
+            _crit_ctx = f"Ranking:\n{rank_json}"
+            if _evidence:
+                _crit_ctx += f"\n\n{_evidence}"
+            _synth_chk = _jv.code_check(synth_final)
+            if _synth_chk:
+                _crit_ctx += f"\n\nTHE ANSWER'S {_synth_chk}"
+                if _jv.has_problems(_synth_chk):
+                    emit(AgentEvent("Judge", "observation",
+                                    f"Final answer — {_synth_chk}"))
+            critique = self.judge.critique(user_text, synth_final, extra_context=_crit_ctx, query_mode=ctx.shared.get("query_mode", ""))
             ctx.shared["judge_critique"] = critique
             ev = AgentEvent("Judge", "observation", critique)
             emit(ev)
@@ -865,34 +1385,50 @@ class DeliberationOrchestrator:
                 break
 
             # ── Confidence-gated early exit ──────────────────────────────
-            # Even on NEEDS_WORK, if Judge confidence is very high (≥8/10)
+            # Even on NEEDS_WORK, if Judge confidence is very high (≥80%)
             # and this is the final round, skip re-deliberation — the answer
             # is probably good enough and more rounds won't help much.
             _conf = ctx.shared.get("judge_confidence", 0)
             _is_last_round = (r == self.max_rounds - 1)
-            if _conf >= 8 and _is_last_round:
+            if _conf >= _cf_HIGH and _is_last_round:
                 self._phase(
-                    f"✓ High confidence ({_conf}/10) — accepting answer despite NEEDS_WORK"
+                    f"✓ High confidence ({_conf}%) — accepting answer despite NEEDS_WORK"
                 )
                 break
 
             # ── Confidence-gated extra round ─────────────────────────────
-            # If confidence is very low (≤2/10) on round 1, allow an extra
+            # If confidence is very low (≤20%) on round 1, allow an extra
             # round beyond max_rounds — the answer needs more work.
-            if _conf <= 2 and r == 0 and self.max_rounds < 3:
+            if _conf <= _cf_VERY_LOW and r == 0 and self.max_rounds < 3:
                 self._phase(
-                    f"⚠ Low confidence ({_conf}/10) — adding extra deliberation round"
+                    f"⚠ Low confidence ({_conf}%) — adding extra deliberation round"
                 )
                 self.max_rounds = 3
 
-            else:
-                # T2-C: Parse REQUIRED_CHANGES for targeted round-2 Writer brief
-                _changes = self.judge.__class__.parse_required_changes(critique)
-                if _changes:
-                    ctx.shared["required_changes"] = _changes
-                    _chg_txt = "\n".join("- " + c for c in _changes)
-                    emit(AgentEvent("Judge", "observation",
-                                   "Required changes for next round:\n" + _chg_txt))
+            # T2-C: the REQUIRED_CHANGES for the next round's Writer. Parsed
+            # on every NEEDS_WORK (it used to be skipped exactly when
+            # confidence was lowest — the `else` belonged to the branch
+            # above).
+            _changes = required_changes_of(self.judge, critique)
+            ctx.shared["required_changes"] = _changes
+            if _changes:
+                _chg_txt = "\n".join("- " + c for c in _changes)
+                emit(AgentEvent("Judge", "observation",
+                               "Required changes for next round:\n" + _chg_txt))
+
+            # Revise or start over? A critique that names what to change
+            # gets a revision (Writer + Judge); one that rejects the
+            # approach — or gives the Writer nothing to act on, or comes
+            # with very low confidence — gets the whole panel again.
+            _redo = needs_full_round(critique, _changes, _conf)
+            _revising = not _redo
+            if r + 1 < self.max_rounds:
+                emit(AgentEvent(
+                    "Orchestrator", "observation",
+                    "Next round: the whole panel again — "
+                    + _redo if _redo else
+                    "Next round: the Writer revises against the critique "
+                    "(no new drafts)."))
 
         # Expose shared context so caller can retrieve low-confidence gaps etc.
         self._last_ctx = ctx

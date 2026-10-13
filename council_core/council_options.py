@@ -73,9 +73,12 @@ class Switch:
 #: table; the Tk toolbar is its own code, and those switches work there.
 SWITCHES: Tuple[Switch, ...] = (
     Switch("deliberate", "Deliberation", True, shown_in_demo=False),
-    # run_turn is given enable_tools but no tool table, so nothing is called.
-    Switch("tools", "Tools", False, available=False,
-           unavailable_why="The council has no tools to call yet."),
+    Switch("tools", "Tools", False,
+           hint="Lets the members look things up while they work — run and "
+                "test code, check a quote against your vault, compute a "
+                "number, read part of a long file, draw a chart. Each member "
+                "has its own short list (see Council Map ▸ Role specs). "
+                "Slower: each tool use is another model call."),
     Switch("fill_ide", "Fill IDE", True, available=False,
            unavailable_why="Code in an answer is not copied to the IDE tab "
                            "yet."),
@@ -98,6 +101,19 @@ SWITCHES: Tuple[Switch, ...] = (
            available=False),
     Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False,
            available=False),
+    Switch("vault", "📚 Vault", True,
+           hint="Also give the council passages from your vault's search "
+                "index that match the question, in whatever room the "
+                "Writer's prompt has left after the files and matches put "
+                "in front of the question (those are always given). The "
+                "Writer, Coder, Sage and Strategist read them in full, the "
+                "Peasant in part; the others do not."),
+    Switch("parallel", "Parallel members", False, shown_in_demo=False,
+           hint="Members draft and rebut at the same time. Their first "
+                "drafts are then independent — none reads another's before "
+                "the rebuttals. Faster only when their models are on "
+                "different machines (Machines & roles) or are different "
+                "in-app models; token streaming pauses meanwhile."),
     Switch("robust_voices", "Robust voices ✦", False, shown_in_demo=False, row=2,
            hint="gives each personality a distinct character and tone",
            available=False),
@@ -143,12 +159,17 @@ class CouncilOptions:
     """
     deliberate: bool = True
     tools: bool = False
+    vault: bool = True
     fill_ide: bool = True
     stream: bool = True
     use_profile: bool = True
     adversarial: bool = False
     judge_panel: bool = False
+    parallel: bool = False
     robust_voices: bool = False
+    #: How much council a question gets: "auto" (council_core.depth
+    #: decides per question), "quick", "standard" or "deep".
+    depth: str = "auto"
 
     @classmethod
     def defaults(cls, demo_mode: bool = False,
@@ -216,6 +237,19 @@ def specialist_choices(names: List[str]) -> List[str]:
 # ============================================================
 
 #: The backends the override dropdown offers, in the Tk shell's order.
+#: The Depth box: label -> council_core.depth level.
+DEPTH_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("Auto depth", "auto"),
+    ("Quick", "quick"),
+    ("Standard", "standard"),
+    ("Deep", "deep"),
+)
+DEPTH_HINT = ("How much council a question gets. Auto decides per question: "
+              "Quick (one member answers, the Judge checks — greetings, short "
+              "plain questions), Standard (drafts, the Peasant's questions, "
+              "rebuttals, the Judge — no cross-fire), Deep (everything, for "
+              "code, data, design and planning).")
+
 BACKEND_CHOICES: Tuple[str, ...] = (
     "(default)", "local_general_primary", "local_general_alt",
     "local_coder_primary", "local_coder_fast", "local_judge_fast",

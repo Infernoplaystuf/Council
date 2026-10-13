@@ -514,6 +514,46 @@ def test_a_thinking_model_keeps_its_thinking_room(monkeypatch):
     assert room["reply"] == 2400 + ce._think_headroom()
 
 
+GPT_OSS = {"name": "gpt-oss:20b", "family": "gptoss",
+           "capabilities": ["completion", "tools", "thinking"]}
+OTHER_THINKER = {"name": "olmo-think:7b", "family": "olmo",
+                 "capabilities": ["completion", "thinking"]}
+
+
+@pytest.mark.parametrize("entry, think, extra", [
+    # gpt-oss always thinks: low by default, the step's level otherwise
+    # (council-map's per-step thinking — the Writer's synthesis is "high").
+    (GPT_OSS, None, "low"), (GPT_OSS, "medium", "medium"),
+    (GPT_OSS, "high", "high"),
+    # A model that can stop thinking thinks only on a "high" step.
+    (OTHER_THINKER, None, None), (OTHER_THINKER, "medium", None),
+    (OTHER_THINKER, "high", True)])
+def test_the_room_keeps_the_thinking_the_call_will_do(monkeypatch, entry,
+                                                      think, extra):
+    """The reply the clamp keeps room for is num_predict plus the headroom
+    the CALL gets — council-map made that the step's thinking level, so the
+    slot's last call (what _OLLAMA_THINKS held) says nothing about the next.
+    Sized for "high", the Writer's synthesis is not cut by 2,304 tokens of
+    thinking nobody planned for."""
+    import council_engine as ce
+    monkeypatch.delenv("COUNCIL_OLLAMA_THINK", raising=False)
+    monkeypatch.delenv("COUNCIL_OLLAMA_THINK_HEADROOM", raising=False)
+    monkeypatch.setattr(ce, "_OLLAMA_THINKS", {"main": dict(entry)})
+    room = ce.prompt_room("main", num_predict=2400, n_ctx=32768, think=think)
+    want = 2400 + (ce._think_headroom(extra) if extra is not None else 0)
+    assert room["reply"] == want
+    with ce.think_level(think):
+        sent = ce.ollama_think(entry)
+    assert (sent not in (None, False)) == (extra is not None)
+
+
+def test_a_model_that_cannot_think_gets_no_thinking_room(monkeypatch):
+    import council_engine as ce
+    monkeypatch.setattr(ce, "_OLLAMA_THINKS", {"main": False})
+    room = ce.prompt_room("main", num_predict=2400, n_ctx=16384, think="high")
+    assert room["reply"] == 2400
+
+
 def test_the_frame_is_what_respond_sends_besides_the_text(tmp_path):
     """PersonalityModel.prompt_frame is the system prompt and the blocks
     respond() puts in front of the text — the same stitch respond() sends —

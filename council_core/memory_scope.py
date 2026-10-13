@@ -138,6 +138,18 @@ def blocks(scope: str, *, prior_loaded: bool = False) -> Blocks:
     return Blocks(False, False, False, False, False)
 
 
+def uses_other_sessions(scope: str) -> bool:
+    """Whether what the council kept from OTHER conversations may reach a
+    prompt outside the blocks above: how it decided similar questions
+    before (council_core.past_decisions — the PAST DECISIONS block, and the
+    recall_decision tool) and what it learns into role and project memory
+    after a question (council_core.after_turn.learn, whose merge call puts
+    the existing memory in front of the model). Only in "all": "This
+    conversation only" keeps every older conversation out unless the user
+    loads one (Load as Prior), and "none" keeps everything out."""
+    return scope == ALL
+
+
 def describe(scope: str) -> str:
     """One plain line for the UI."""
     if scope == CONVERSATION:

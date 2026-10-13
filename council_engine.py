@@ -57,7 +57,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
 import urllib.request
 
 
@@ -2321,7 +2321,8 @@ def prompt_count(slot: str = "main") -> Callable[[str], int]:
 
 def prompt_room(slot: str = "main", *, frame: str = "",
                 num_predict: int = 0,
-                n_ctx: Optional[int] = None) -> Dict[str, Any]:
+                n_ctx: Optional[int] = None,
+                think: Optional[str] = None) -> Dict[str, Any]:
     """What a call on ``slot`` leaves for the text a caller is about to put
     in it — counted the way _clamp_messages_to_ctx will fit the call, so a
     text sized to ``room`` is not cut by it.
@@ -2330,22 +2331,31 @@ def prompt_room(slot: str = "main", *, frame: str = "",
     role's system prompt and a user message. ``frame`` is everything the
     call sends besides the caller's text (PersonalityModel.prompt_frame:
     the system prompt, this conversation's earlier turns, …);
-    ``num_predict`` the reply it asks for. ``n_ctx``: the window, else
-    effective_n_ctx(slot).
+    ``num_predict`` the reply it asks for; ``think`` the thinking level the
+    call is made at (think_level: None for a plain respond(), the council
+    step's level — deliberation.THINK — for a member's call). ``n_ctx``:
+    the window, else effective_n_ctx(slot).
 
     Returns a dict: ``n_ctx``; ``reply`` (the reply the clamp keeps room
-    for — num_predict, plus the thinking headroom when the slot's Ollama
-    model thinks, at most half the window); ``budget`` (what the messages
-    may take: the window less the reply and the template margin);
+    for — num_predict, plus the thinking headroom the slot's Ollama model
+    gets at that level, at most half the window); ``budget`` (what the
+    messages may take: the window less the reply and the template margin);
     ``frame_tokens``; ``room`` (budget - frame_tokens, at least 0); and
     ``count``, the counter all of these were counted with (prompt_count)."""
     window = int(n_ctx) if n_ctx else int(effective_n_ctx(slot))
     margin = _template_margin(2)
     want = int(num_predict or 0)
     with _ROUTE_LOCK:
-        thinks = bool(_OLLAMA_THINKS.get(slot or "main"))
-    if thinks and want:
-        want += _think_headroom()
+        known = _OLLAMA_THINKS.get(slot or "main")
+    if isinstance(known, dict):
+        # What the call will send — ollama_think at the call's level, as
+        # _ollama_local_gated asks it — and so the headroom it will add.
+        with think_level(think):
+            sends = ollama_think(known)
+    else:
+        sends = True if known else None
+    if sends not in (None, False) and want:
+        want += _think_headroom(sends)
     reply = max(16, min(want, max(16, (window - margin) // 2)))
     budget = max(64, window - reply - margin)
     count = prompt_count(slot)
@@ -2543,6 +2553,22 @@ _STATS_SEQ = 0
 _ANY_ROLE = "\x00any"
 
 
+#: Called with a copy of every call's stats (council_core.usage_log keeps
+#: them for the weekly placement review). A listener that raises is skipped:
+#: bookkeeping must never fail a model call.
+_STATS_LISTENERS: List[Callable[[Dict[str, Any]], None]] = []
+
+
+def add_stats_listener(fn: Callable[[Dict[str, Any]], None]) -> None:
+    if fn not in _STATS_LISTENERS:
+        _STATS_LISTENERS.append(fn)
+
+
+def remove_stats_listener(fn: Callable[[Dict[str, Any]], None]) -> None:
+    if fn in _STATS_LISTENERS:
+        _STATS_LISTENERS.remove(fn)
+
+
 def _record_stats(role: Optional[str], stats: Dict[str, Any]) -> None:
     global _STATS_SEQ
     s = dict(stats)
@@ -2552,6 +2578,11 @@ def _record_stats(role: Optional[str], stats: Dict[str, Any]) -> None:
         s["seq"] = _STATS_SEQ
         _LAST_STATS[role or ""] = s
         _LAST_STATS[_ANY_ROLE] = s
+    for listener in list(_STATS_LISTENERS):
+        try:
+            listener(dict(s))
+        except Exception:                                 # noqa: BLE001
+            pass
 
 
 def last_call_stats(role: Optional[str] = None) -> Dict[str, Any]:
@@ -2894,9 +2925,13 @@ _AUTO_OLLAMA: Dict[str, str] = {}
 #: slot -> the num_ctx sent for it. effective_n_ctx reads this, so a prompt
 #: builder budgets for the window Ollama really has, without a config read.
 _OLLAMA_WINDOWS: Dict[str, int] = {}
-#: slot -> whether the model serving it thinks (its calls get
-#: _think_headroom() more num_predict); prompt_room reads it.
-_OLLAMA_THINKS: Dict[str, bool] = {}
+#: slot -> the Ollama entry of the model serving it when that model can
+#: think (its calls get _think_headroom(think) more num_predict), else False;
+#: prompt_room reads it. The entry, not whether the LAST call thought: how
+#: much a call thinks is the step's (think_level — low for the Peasant, high
+#: for the Writer's synthesis), so the slot's last call says nothing about
+#: the next one. True (an older form) is "it thinks, at the default level".
+_OLLAMA_THINKS: Dict[str, Any] = {}
 #: The installed model picked when nothing names one (cached per refresh).
 _AUTO_PICK: Optional[str] = None
 _ROUTE_LOCK = threading.Lock()
@@ -3085,6 +3120,68 @@ def _target_for(slot: str, model: Optional[str] = None) -> Tuple[str, str]:
     return "gguf", ""
 
 
+def model_key(role: Optional[str]) -> Tuple[str, str]:
+    """(where, which): the machine a call for `role` runs on ("local", or
+    the routed node's URL) and the model that answers it ("ollama:<name>"
+    or a GGUF path). Two roles with the same `where` and different `which`
+    swap models on that machine when it cannot hold both. Never loads a
+    model; ("local", "") when it cannot tell."""
+    try:
+        slot = _slot_for_role(role)
+        target = _node_target(role)
+        return (target.url if target is not None else "local",
+                served_model(slot))
+    except Exception:                                     # noqa: BLE001
+        return "local", ""
+
+
+def warm(roles: Sequence[str], *, timeout: float = 300.0) -> List[str]:
+    """Load the models `roles` answer with, before they are needed: an
+    Ollama model not already loaded gets a load request (an empty prompt,
+    which Ollama answers by loading it and keeping it for keep_alive); a
+    GGUF slot is loaded in process. Blocking — call it from a background
+    thread. Two roles on DIFFERENT models of the same machine: only the
+    first is warmed, so warming never itself causes a swap. Never raises;
+    returns what it did, one line each."""
+    from council_core import local_models
+    done: List[str] = []
+    seen: Dict[str, str] = {}
+    for role in dict.fromkeys(roles):
+        try:
+            where, which = model_key(role)
+            if not which:
+                continue
+            if where in seen:
+                if seen[where] != which:
+                    done.append(f"{role}: not warmed — {seen[where]} is on "
+                                "that machine and they would swap")
+                continue
+            seen[where] = which
+            slot = _slot_for_role(role)
+            backend, name = _target_for(slot)
+            if backend == "gguf":
+                _slot_llm_and_lock(slot)
+                done.append(f"{role}: {Path(which).name} loaded")
+                continue
+            host = (where if where != "local"
+                    else local_models.ollama_host()).rstrip("/")
+            if not local_models.is_loopback_url(host) and not (
+                    _remote_nodes_enabled() or _routing_allows(host)):
+                continue
+            ps = local_models._get_json(host + "/api/ps", 2.0) or {}
+            loaded = {m.get("name") for m in ps.get("models") or []}
+            if name in loaded or f"{name}:latest" in loaded:
+                done.append(f"{role}: {name} already loaded")
+                continue
+            local_models._get_json(host + "/api/generate", timeout,
+                                   {"model": name,
+                                    "keep_alive": _ollama_keep_alive()})
+            done.append(f"{role}: {name} loaded")
+        except Exception as exc:                          # noqa: BLE001
+            done.append(f"{role}: not warmed ({exc})")
+    return done
+
+
 def served_model(slot: str = "main") -> str:
     """The model id that WOULD answer a call on ``slot`` right now —
     "ollama:<name>" or a GGUF path — or "" when nothing can.
@@ -3172,6 +3269,28 @@ def _ollama_num_ctx(slot: str, entry: Optional[Dict[str, Any]]) -> int:
 _THINK_LEVEL_FAMILIES = ("gptoss", "gpt-oss")
 
 
+import contextvars as _contextvars
+from contextlib import contextmanager as _contextmanager
+
+#: The thinking effort the CURRENT call asked for ("low" / "medium" /
+#: "high"), set by PersonalityModel.respond(think=...) for the duration of
+#: one call. None: the default below.
+_THINK_LEVEL: "_contextvars.ContextVar[Optional[str]]" = \
+    _contextvars.ContextVar("council_think_level", default=None)
+THINK_LEVELS = ("low", "medium", "high")
+
+
+@_contextmanager
+def think_level(level: Optional[str]):
+    """Calls made inside this block think at `level` — per step of the
+    council: low for the Peasant and cross-fire, high for the Judge."""
+    token = _THINK_LEVEL.set(level if level in THINK_LEVELS else None)
+    try:
+        yield
+    finally:
+        _THINK_LEVEL.reset(token)
+
+
 def ollama_think(entry: Optional[Dict[str, Any]]) -> Any:
     """The "think" value to send for this model, or None to send nothing.
 
@@ -3187,16 +3306,26 @@ def ollama_think(entry: Optional[Dict[str, Any]]) -> Any:
     if "thinking" not in caps:
         return None
     want = os.environ.get("COUNCIL_OLLAMA_THINK", "").strip().lower()
+    level = _THINK_LEVEL.get()
     who = f"{(entry or {}).get('family', '')} {(entry or {}).get('name', '')}"
     if any(f in who.lower() for f in _THINK_LEVEL_FAMILIES):
-        return want if want in ("low", "medium", "high") else "low"
-    return want in ("1", "true", "on", "yes")
+        # COUNCIL_OLLAMA_THINK, when set, is the user's word and wins;
+        # otherwise the step's level (think_level), else "low".
+        if want in THINK_LEVELS:
+            return want
+        return level if level in THINK_LEVELS else "low"
+    if want:
+        return want in ("1", "true", "on", "yes")
+    return level == "high"
 
 
-def _think_headroom() -> int:
-    """Extra num_predict for a call whose model will think first."""
+def _think_headroom(think: Any = None) -> int:
+    """Extra num_predict for a call whose model will think first: more for
+    a higher thinking level."""
     raw = os.environ.get("COUNCIL_OLLAMA_THINK_HEADROOM", "").strip()
-    return int(raw) if raw.isdigit() else 768
+    base = int(raw) if raw.isdigit() else 768
+    return base * {"medium": 2, "high": 4}.get(think, 1) \
+        if isinstance(think, str) else base
 
 
 class _OllamaHTTPError(RuntimeError):
@@ -3530,9 +3659,52 @@ def _ollama_local(
     if should_stop is not None and should_stop():
         raise GenerationCancelled("stopped before the call started")
     host = (host or local_models.ollama_host()).rstrip("/")
-    allow_remote = (_remote_nodes_enabled()
-                    and not local_models.is_loopback_url(host))
+    remote = not local_models.is_loopback_url(host)
+    allow_remote = remote and (_remote_nodes_enabled()
+                               or _routing_allows(host))
     _ensure_localhost(host, allow_remote=allow_remote)
+    from council_core import node_routing
+    with node_routing.host_slot(host):
+        return _ollama_local_gated(
+            name, messages, host=host, remote=remote,
+            allow_remote=allow_remote, slot=slot, role=role,
+            temperature=temperature, num_predict=num_predict,
+            token_callback=token_callback, json_schema=json_schema,
+            seed=seed, stop=stop, should_stop=should_stop, timeout=timeout,
+            tools=tools)
+
+
+def _routing_allows(host: str) -> bool:
+    """A registered, enabled node with routing on (council_core.
+    node_routing) — the user's opt-in for that one machine."""
+    try:
+        from council_core import node_routing
+        return node_routing.is_allowed_host(host)
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
+def _ollama_local_gated(
+    name: str,
+    messages: List[Dict[str, Any]],
+    *,
+    host: str,
+    remote: bool,
+    allow_remote: bool,
+    slot: str,
+    role: Optional[str],
+    temperature: float,
+    num_predict: int,
+    token_callback: Optional[Callable[[str], None]] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """_ollama_local's body, inside the machine's call gate."""
+    from council_core import local_models
     entry = local_models.ollama_model(name, host, allow_remote=allow_remote,
                                       max_age=60.0)
     if entry is None:
@@ -3546,12 +3718,14 @@ def _ollama_local(
     think = ollama_think(entry)
     with _ROUTE_LOCK:
         _OLLAMA_WINDOWS[slot] = num_ctx
-        _OLLAMA_THINKS[slot] = think not in (None, False)
+        _OLLAMA_THINKS[slot] = (
+            dict(entry) if "thinking" in (entry.get("capabilities") or [])
+            else False)
     if think not in (None, False):
         # Thinking tokens count against num_predict: without room for them
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
         # tokens thinking on a short warm call, measured).
-        num_predict = int(num_predict) + _think_headroom()
+        num_predict = int(num_predict) + _think_headroom(think)
     model_name = entry["name"]
     wanted_predict = num_predict
     cpt = _ollama_cpt(model_name)
@@ -3565,11 +3739,15 @@ def _ollama_local(
     while i < len(fmts):
         fmt = fmts[i]
         try:
+            node_limits = ({"first_reply": _node_first_reply_s(),
+                            "connect_timeout": _node_connect_timeout_s()}
+                           if remote else {})
             text, stats, calls = _ollama_stream(
                 host, model_name, msgs, temperature=temperature,
                 num_predict=num_predict, num_ctx=num_ctx, fmt=fmt, seed=seed,
                 stop=stop, should_stop=should_stop, timeout=timeout,
-                token_callback=token_callback, tools=tools, think=think)
+                token_callback=token_callback, tools=tools, think=think,
+                **node_limits)
         except _OllamaHTTPError as exc:
             told = _ollama_overflow(exc)
             if told is not None and refits < 2:
@@ -3614,6 +3792,7 @@ def _ollama_local(
                       stats.get("prompt_tokens"))
         if refits:
             stats["prompt_refits"] = refits
+        stats["host"] = host
         with _SLOT_LOAD_LOCK:
             _SLOT_STATUS[slot] = {"path": local_models.ollama_id(entry["name"]),
                                   "n_ctx": num_ctx, "on_gpu": None,
@@ -3664,9 +3843,80 @@ def _route_chat(
                               **extras)
         except BackendUnavailable as exc:
             name = _fallback_to_ollama(slot, exc)
+    if host is None:
+        target = _node_target(role)
+        if target is not None:
+            return _route_to_node(
+                target, name, messages, slot=slot, role=role,
+                temperature=temperature, num_predict=num_predict,
+                token_callback=token_callback, extras=extras)
     text, _calls = _ollama_local(
         name, messages, slot=slot, role=role, temperature=temperature,
         num_predict=num_predict, token_callback=token_callback, host=host,
+        **extras)
+    return text if token_callback is not None else text.strip()
+
+
+def _node_target(role: Optional[str]):
+    """The machine `role` is bound to (council_core.node_routing), or None
+    for this PC. Never raises: a routing problem keeps the call here."""
+    try:
+        from council_core import node_routing
+        return node_routing.route(role)
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def _route_to_node(target, name: str, messages: List[Dict[str, Any]], *,
+                   slot: str, role: Optional[str], temperature: float,
+                   num_predict: int,
+                   token_callback: Optional[Callable[[str], None]],
+                   extras: Dict[str, Any]) -> str:
+    """One call on the role's machine, with the fallback the user chose.
+
+    Falls back ONLY when nothing was generated: the node refused, did not
+    answer, lacks the model, or did not start within its first-reply limit.
+    Output already produced is never re-sent — that error is raised. A node
+    that fails rests (node_routing.mark_failed), so the next calls go
+    straight to the fallback until it has cooled down."""
+    from council_core import node_routing
+    produced = []
+
+    def track(tok: str) -> None:
+        produced.append(1)
+        if token_callback is not None:
+            token_callback(tok)
+
+    resting = node_routing.cooling(target.url)
+    if resting <= 0:
+        try:
+            text, _calls = _ollama_local(
+                name, messages, slot=slot, role=role,
+                temperature=temperature, num_predict=num_predict,
+                token_callback=track, host=target.url, **extras)
+            node_routing.mark_ok(target.url)
+            return text if token_callback is not None else text.strip()
+        except GenerationCancelled:
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            partial = getattr(exc, "partial", "")
+            if produced or partial:
+                raise
+            resting = node_routing.mark_failed(target.url)
+            _LOG.warning("[nodes] %s on %s failed before answering (%s); "
+                         "resting it %.0f s", role, target.node, exc, resting)
+            if target.fallback == "fail":
+                raise BackendUnavailable(
+                    f"The {role} is bound to {target.node}, which did not "
+                    f"answer ({exc}); its fallback is 'fail'.") from exc
+    elif target.fallback == "fail":
+        raise BackendUnavailable(
+            f"The {role} is bound to {target.node}, which is resting after "
+            f"a failure ({resting:.0f} s left); its fallback is 'fail'.")
+    # Fallback "here": the role's own model on this PC's Ollama.
+    text, _calls = _ollama_local(
+        name, messages, slot=slot, role=role, temperature=temperature,
+        num_predict=num_predict, token_callback=token_callback, host=None,
         **extras)
     return text if token_callback is not None else text.strip()
 
@@ -3875,6 +4125,30 @@ def _native_tool_calls(calls: List[Dict[str, Any]], names: List[str]
     return out
 
 
+def _native_tools_allowed() -> bool:
+    """COUNCIL_NATIVE_TOOLS=0: every tool call goes through the emulated,
+    schema-constrained form — for a model whose native tool calls misfire."""
+    return os.environ.get("COUNCIL_NATIVE_TOOLS", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def native_tools(role: Optional[str]) -> bool:
+    """Does `role`'s model call tools NATIVELY — an Ollama model whose
+    capabilities include "tools" (llama3.1, gpt-oss)? Never loads a model;
+    False whenever it cannot tell."""
+    if not _native_tools_allowed():
+        return False
+    try:
+        from council_core import local_models
+        backend, name = _target_for(_slot_for_role(role))
+        if backend != "ollama":
+            return False
+        entry = local_models.ollama_model(name, max_age=60.0) or {}
+        return "tools" in (entry.get("capabilities") or [])
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
 def chat_tools(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
@@ -3926,7 +4200,7 @@ def chat_tools(
                 backend = "ollama"
             except BackendUnavailable:
                 pass
-    if backend == "ollama" and plain:
+    if backend == "ollama" and plain and _native_tools_allowed():
         entry = local_models.ollama_model(name, max_age=60.0) or {}
         caps = entry.get("capabilities")
         if caps is None or "tools" in caps:
@@ -4148,6 +4422,7 @@ class LocalBackendSpec:
         trace: bool = True,
         token_callback: Optional[Callable[[str], None]] = None,
         role: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> str:
         temp = self.default_temperature if temperature is None else float(temperature)
         mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
@@ -4171,8 +4446,13 @@ class LocalBackendSpec:
         # Ollama fallback when no GGUF can load (_route_chat). With no slot
         # file every role is on "main". `model`, `host`, `allow_remote`
         # retained for trace/registry compatibility.
+        if json_schema is None:
+            return _route_chat(messages, slot=slot, role=role,
+                               temperature=temp, num_predict=mtok,
+                               token_callback=token_callback)
         return _route_chat(messages, slot=slot, role=role, temperature=temp,
-                           num_predict=mtok, token_callback=token_callback)
+                           num_predict=mtok, token_callback=token_callback,
+                           json_schema=json_schema)
 
 
 class BackendRegistry:
@@ -4551,7 +4831,8 @@ Give PASS generously for conversational queries — conversation need not be exh
 RANKING
 ═══════════════════════════════════════════
 Output ONLY valid JSON, no markdown fences:
-{"winner":"<role>","scores":{"<role>":0..10,...},"rationale":"<one sentence>","confidence":0..10}
+{"winner":"<role>","scores":{"<role>":0..100,...},"rationale":"<one sentence>","confidence":0..100}
+Scores and confidence are percentages: any whole number 0-100.
 """,
 
     "writer": """\
@@ -5629,9 +5910,15 @@ class PersonalityModel:
         extra_context: str = "",
         token_callback: Optional[Callable[[str], None]] = None,
         max_tokens: Optional[int] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        think: Optional[str] = None,
     ) -> str:
+        """One call as this personality. ``json_schema`` constrains the
+        reply (structured output; the text is returned either way).
+        ``think`` is this step's thinking effort, "low" / "medium" /
+        "high", for models that think (think_level). The user message is
+        the one stitch() builds — the one prompt_frame() measures."""
         stitched_user = self.stitch(user_text, extra_context=extra_context)
-
         spec = (
             self.registry.get(self.backend_key)
             if self.backend_key
@@ -5639,36 +5926,71 @@ class PersonalityModel:
         )
 
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
-        return spec.generate(
-            developer_instructions=self.system_prompt,
-            user_text=stitched_user,
-            temperature=self.temperature,
-            max_tokens=effective_max_tokens,
-            trace=self.trace,
-            token_callback=token_callback,
-            role=self.name,
-        )
+        kw: Dict[str, Any] = {}
+        if json_schema is not None:
+            kw["json_schema"] = json_schema
+        with think_level(think):
+            return spec.generate(
+                developer_instructions=self.system_prompt,
+                user_text=stitched_user,
+                temperature=self.temperature,
+                max_tokens=effective_max_tokens,
+                trace=self.trace,
+                token_callback=token_callback,
+                role=self.name,
+                **kw,
+            )
+
+    def respond_with_tools(
+        self,
+        user_text: str,
+        tools: List[Dict[str, Any]],
+        *,
+        extra_context: str = "",
+        max_tokens: Optional[int] = None,
+        think: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One call that may use the model's NATIVE tool calling (Ollama
+        models with the "tools" capability): {"content", "tool_calls"}.
+        Same prompt as respond. Callers check native_tools(role) first —
+        elsewhere chat_tools emulates, which squeezes a free-text
+        answer into JSON."""
+        messages = [{"role": "system", "content": self.system_prompt},
+                    {"role": "user",
+                     "content": self.stitch(user_text,
+                                            extra_context=extra_context)}]
+        with think_level(think):
+            return chat_tools(
+                messages, tools, role=self.name, temperature=self.temperature,
+                num_predict=(max_tokens if max_tokens is not None
+                             else self.max_output_tokens))
 
     def prompt_frame(self, *, extra_context: str = "") -> Tuple[str, int]:
         """(what a respond() call sends besides the text it is given, the
         reply it asks for in tokens): its system prompt and the blocks
         stitch() puts in front of the text — this conversation's earlier
-        turns, what the memory scope allows, the standing primer — read now,
-        as respond() would read them. Calls no model.
+        turns, what the memory scope allows, the standing primer (the
+        per-question blocks council_core.vault_context.applied sets on it
+        among them) — read now, as respond() would read them. Calls no model.
 
         For a caller that SIZES the text before respond() is called
         (council_core.turn_context.prepare_turn sizes the vault blocks around
         it): the engine's clamp fits the whole call — system prompt, these
         blocks, the text and the reply — into the window, and cuts the
-        middle out of the largest message when it does not fit."""
+        middle out of the largest message when it does not fit. The reply's
+        thinking headroom is prompt_room's (its ``think``)."""
         return (self.system_prompt + "\n"
                 + self.stitch("", extra_context=extra_context),
                 int(self.max_output_tokens))
 
-    def stitch(self, user_text: str, *, extra_context: str = "") -> str:
-        """The user message respond() sends for ``user_text``: the remembered
-        blocks the role and the memory scope allow, then "USER TASK:" and the
-        text. Reads the conversation and memory files; calls no model."""
+    def stitch(self, user_text: str, extra_context: str = "") -> str:
+        """The user message respond() and respond_with_tools() send for
+        ``user_text``: the remembered blocks the role and the memory scope
+        allow, then "USER TASK:" and the text. Reads the conversation and
+        memory files; calls no model.
+
+        The parts that stay the same through a question come first, so the
+        server can reuse its cached prefix (tests/test_stable_prefix.py)."""
         # ── Role-aware context profile ─────────────────────────────────
         profile       = ROLE_CONTEXT_PROFILES.get(self.name, _DEFAULT_CONTEXT_PROFILE)
         history_turns = profile["history_turns"]
@@ -5802,6 +6124,10 @@ class PersonalityModel:
             prefix_parts.append("COUNCIL CONTEXT:\n" + filtered_extra.strip())
 
         return "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
+
+    #: stitch() under the name council-map's code knew it by (the same
+    #: function, so its source is stitch's).
+    _stitched = stitch
 
 
 
@@ -6652,7 +6978,19 @@ class JudgeModel(PersonalityModel):
             f"User request:\n{user_text}\n\n"
             f"Candidate response:\n{candidate_text}\n"
         )
-        return self.respond(prompt, extra_context=extra_context)
+        # Structured: the verdict, findings and required changes come back
+        # as JSON (council_schemas) and are rendered into the layout above,
+        # which parse_required_changes and the verdict check read. Thinks
+        # hard — this decides whether the answer ships.
+        from council_core import council_schemas as _cs
+        if _cs.enabled():
+            raw = self.respond(prompt + "\n" + _cs.CRITIQUE_JSON_NOTE,
+                               extra_context=extra_context,
+                               json_schema=_cs.CRITIQUE_SCHEMA, think="high")
+        else:
+            raw = self.respond(prompt, extra_context=extra_context,
+                               think="high")
+        return _cs.render_critique(raw)
 
     @staticmethod
     def parse_required_changes(critique: str) -> list:
@@ -6708,31 +7046,55 @@ class JudgeModel(PersonalityModel):
     ) -> str:
         parts = [
             "Rank candidates. Output ONLY valid JSON (no markdown), format:\n"
-            '{"winner":"<role>","scores":{"<role>":0..10},"rationale":"<one sentence>","confidence":0..10}\n'
-            "confidence = your overall certainty 0 (no good answer) to 10 (clear best answer).\n"
-            "IMPORTANT: each candidate has self-reported a confidence score 1-10.\n"
-            "Weight low self-confidence answers (≤4) skeptically — they may be guessing.\n"
-            "Weight high self-confidence answers (≥8) positively — but verify they earned it.\n\n"
+            '{"winner":"<role>","scores":{"<role>":0..100},"rationale":"<one sentence>","confidence":0..100}\n'
+            "Scores and confidence are percentages (any whole number 0-100). "
+            "confidence = your overall certainty: 0 (no good answer) to 100 (clear best answer).\n"
+            "IMPORTANT: each candidate has self-reported a confidence percentage.\n"
+            "Weight low self-confidence answers (≤40%) skeptically — they may be guessing.\n"
+            "Weight high self-confidence answers (≥80%) positively — but verify they earned it.\n\n"
             f"USER REQUEST:\n{user_text}\n\nCANDIDATES:\n"
         ]
+        # Each answer gets a share of this judge's real window (judge_view),
+        # condensed — start, end and the lines about the question kept —
+        # when longer; it used to be cut at 2,000 characters, which ranked
+        # long code answers without their second half.
+        try:
+            from council_core import judge_view as _jv
+            _budget = _jv.answer_budget(_jv.judge_window(self),
+                                        len(candidates))
+            _fit = _jv.fit
+        except Exception:                                 # noqa: BLE001
+            _budget = 2000
+            def _fit(t, n, q=""):
+                return (t or "")[:n]
+        _side = max(600, int(_budget * 0.15))
         for role, data in candidates.items():
-            # Truncate per-field to keep judge context bounded regardless of round count.
-            # Answer is the most important signal — give it the most budget.
-            answer      = data.get("answer",          "")[:2000]
-            peasant_q   = data.get("peasant_q",       "")[:600]
-            rebuttal    = data.get("rebuttal",         "")[:600]
-            discussion  = data.get("discussion",       "")[:400]
-            self_conf   = data.get("self_confidence",  5)
+            answer      = _fit(data.get("answer", ""), _budget, user_text)
+            peasant_q   = data.get("peasant_q",       "")[:_side]
+            rebuttal    = data.get("rebuttal",         "")[:_side]
+            discussion  = data.get("discussion",       "")[:max(400, _side // 2)]
+            self_conf   = data.get("self_confidence",  50)
+            code_check  = data.get("code_check", "")
             parts.append(
-                f"--- {role} [self-confidence: {self_conf}/10] ---\n"
+                f"--- {role} [self-confidence: {self_conf}%] ---\n"
                 f"ANSWER:\n{answer}\n\n"
+                + (f"{code_check}\n\n" if code_check else "") +
                 f"PEASANT QUESTIONS:\n{peasant_q}\n\n"
                 f"REBUTTAL:\n{rebuttal}\n\n"
                 f"DISCUSSION:\n{discussion}\n"
             )
-        raw = self.respond("\n".join(parts), extra_context=extra_context)
+        from council_core import council_schemas as _cs
+        raw = self.respond("\n".join(parts), extra_context=extra_context,
+                           json_schema=(_cs.ranking_schema(list(candidates))
+                                        if _cs.enabled() else None),
+                           think="high")
         # Validate and normalise — returns clean JSON string
         parsed = _parse_ranking_json(raw)
+        try:
+            from council_core.confidence import normalise_ranking
+            parsed = normalise_ranking(parsed)     # percentages, 0-100
+        except Exception:                                 # noqa: BLE001
+            pass
         import json as _json
         return _json.dumps(parsed, ensure_ascii=False)
 

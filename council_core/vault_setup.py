@@ -170,6 +170,8 @@ VAULT_ROOT_STATE = frozenset({
     "semantic_cache.json",        # vault_index.SEMANTIC_CACHE_FILENAME
     "fuzzy_denylist.json",        # vault_index.DENYLIST_FILENAME
     "graph_presets.json",         # the Grapher's presets
+    "node_routing.json",          # council_core.node_routing (Machines & roles)
+    "quant_duel.json",            # council_core.quant_duel (the duel's settings)
 })
 
 

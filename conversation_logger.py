@@ -68,6 +68,19 @@ PROTECTED_SUBDIRS: tuple = (
     # into a prompt — past "This conversation only", and past SILO in Tk.
     "memory",
     "sage_knowledge",
+    # The model-call meter (council_core.usage_log) and the weekly placement
+    # reviews (council_core.placement): the app's bookkeeping, not documents.
+    ".council_usage",
+    # How the council decided earlier questions (council_core.past_decisions).
+    ".council_memory",
+    # The council benchmark's runs (council_core.council_bench): measurements
+    # of the app, not the user's documents.
+    ".council_bench",
+    # Code projects the council works on (council_core.project): briefs,
+    # job notes and git worktrees — whole copies of code, not documents.
+    ".council_projects",
+    # The user's coding-agent profiles (council_core.agent_profiles).
+    ".council_agents",
 )
 
 # Lowercased once at import for the per-path membership test in
@@ -115,6 +128,9 @@ PROTECTED_STATE_FILES: tuple = (
     # .VAULT_ROOT_STATE this list did not name. "search the vault for X"
     # put both into the prompt when they held the word (measured).
     "model_slots.json", "model_bench.json",
+    # Which role answers on which machine (council_core.node_routing) and
+    # the Quant Duel's settings (council_core.quant_duel): app settings.
+    "node_routing.json", "quant_duel.json",
 )
 
 #: App files protected only at the vault ROOT — a name too ordinary to

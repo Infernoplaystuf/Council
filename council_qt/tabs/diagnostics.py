@@ -54,6 +54,15 @@ def build_diagnostics(window) -> QWidget:
     row.addWidget(refresh)
     copy = QPushButton(amp("📋 Copy report"), page)
     row.addWidget(copy)
+    ready = QPushButton("Readiness check", page)
+    ready.setToolTip("git, pytest, the offscreen GUI check, Ollama, and which "
+                     "model answers each role (seconds, no model calls)")
+    row.addWidget(ready)
+    ready_live = QPushButton("…with live model calls", page)
+    ready_live.setToolTip("Also asks each model one short question, checks "
+                          "it follows a JSON schema, and that the coder calls "
+                          "a tool (a minute or two)")
+    row.addWidget(ready_live)
     row.addStretch(1)
     status = QLabel("", page)
     status.setStyleSheet(f"color: {tokens['muted_fg']};")
@@ -64,6 +73,32 @@ def build_diagnostics(window) -> QWidget:
     output.setReadOnly(True)
     output.setFont(QFont("Consolas", 10))
     layout.addWidget(output, 1)
+
+    def readiness(live: bool) -> None:
+        """council_core.readiness on a worker; progress in the status bar."""
+        for b in (ready, ready_live):
+            b.setEnabled(False)
+        window.set_status("Checking readiness …")
+
+        def work() -> None:
+            from council_core import readiness as rd
+            try:
+                text = rd.report(rd.run(live=live, say=lambda s: window.bridge
+                                        .call_on_ui(lambda: window.set_status(s))))
+            except Exception as exc:                      # noqa: BLE001
+                text = f"The readiness check failed: {exc!r}"
+
+            def deliver() -> None:
+                output.setPlainText(text)
+                for b in (ready, ready_live):
+                    b.setEnabled(True)
+                window.set_status("Readiness check done")
+            window.bridge.call_on_ui(deliver)
+
+        threading.Thread(target=work, name="diagnostics-readiness", daemon=True).start()
+
+    ready.clicked.connect(lambda: readiness(False))
+    ready_live.clicked.connect(lambda: readiness(True))
 
     def run() -> None:
         """Gather on a worker, deliver through the bridge.

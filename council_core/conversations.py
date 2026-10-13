@@ -501,15 +501,27 @@ def clean_name(raw: str) -> str:
 def verdict_record(result: Any, session_id: str, question: str) -> Dict[str, Any]:
     """The line verdict_history.jsonl gets for a judged turn — the Tk
     shell's record (ts, session_id, route, query, confidence, passed, rounds)
-    plus the turn's verdict id, so a response can find ITS line later."""
+    plus the turn's verdict id, so a response can find ITS line later.
+
+    The Judge's confidence is a percentage since council-map (council_core
+    .confidence): it is kept as ``confidence_pct``, which the Sessions list
+    reads (sessions.record_confidence_pct), and as the 0–10 ``confidence``
+    the file has always held — the Tk shell reads that one from the same
+    file."""
     events = list(getattr(result, "events", None) or [])
     critique = getattr(result, "critique", "") or ""
+    try:
+        pct = max(0, min(100, int(round(float(
+            getattr(result, "confidence", 0) or 0)))))
+    except (TypeError, ValueError):
+        pct = 0
     return {
         "ts": now_iso(),
         "session_id": session_id,
         "route": getattr(result, "route", "") or "",
         "query": (question or "")[:120],
-        "confidence": int(getattr(result, "confidence", 0) or 0),
+        "confidence": int(round(pct / 10)),
+        "confidence_pct": pct,
         "passed": "Verdict: PASS" in critique,
         "rounds": sum(1 for e in events
                       if getattr(e, "who", "") == "Judge"
