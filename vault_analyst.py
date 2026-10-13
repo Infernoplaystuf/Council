@@ -239,6 +239,27 @@ _CENSUS_SKIP_DIRS = {".stats_cache", ".vault_index", "__pycache__",
                      "derived", "deferred_results"}
 
 
+def _is_index_file(name: str) -> bool:
+    """The data index's own files (data_index.APP_SIDECAR_NAMES): an older
+    build left its cache and column index in data_in/, and "how many files
+    are in data_in" counted them ("… 1 .pickle")."""
+    try:
+        import data_index
+        return data_index.is_app_sidecar(name)
+    except Exception:
+        return False
+
+
+def _is_app_state_name(name: str) -> bool:
+    """Named like the app's own state (data_index.is_app_state_file) — the
+    vault search and the data index never take it as data."""
+    try:
+        import data_index
+        return data_index.is_app_state_file(name)
+    except Exception:
+        return False
+
+
 def folder_file_counts(data_folder: Any, recursive: bool = True
                        ) -> Dict[str, Any]:
     """Cheap file census — total count + breakdown by extension — WITHOUT
@@ -266,6 +287,8 @@ def folder_file_counts(data_folder: Any, recursive: bool = True
                 for p in rp.iterdir():
                     if p.name in _CENSUS_SKIP_DIRS or p.name.startswith("."):
                         continue
+                    if _is_index_file(p.name):
+                        continue
                     try:
                         if p.is_dir():
                             nfolders += 1
@@ -285,7 +308,7 @@ def folder_file_counts(data_folder: Any, recursive: bool = True
                            if d not in _CENSUS_SKIP_DIRS and not d.startswith(".")]
             nfolders += len(dirnames)
             for fn in filenames:
-                if fn.startswith("."):
+                if fn.startswith(".") or _is_index_file(fn):
                     continue
                 total += 1
                 ext = Path(fn).suffix.lower() or "(no extension)"
@@ -1720,6 +1743,8 @@ def folder_data_summary(
                     continue
                 if p.suffix.lower() not in _EXTRA_EXT:
                     continue
+                if _is_index_file(p.name) or _is_app_state_name(p.name):
+                    continue      # the app's own files, never a dataset
                 key = str(p.resolve()).lower()
                 if key not in seen:
                     seen.add(key)

@@ -39,9 +39,12 @@ ROLES_PER_ROW = 6
 class LensActions:
     """What the Lens tab can ask the application to do."""
 
-    def __init__(self, models=None):
+    def __init__(self, models=None, vault_dir=None):
         self._models = models
         self._problem = ""
+        #: The vault the personalities are built from; None is the app's
+        #: (council_core.paths), as every other tab's Actions defaults.
+        self.vault_dir = vault_dir
 
     def models(self):
         """(personalities, problem). Loaded lazily and kept."""
@@ -50,7 +53,7 @@ class LensActions:
         if self._models is None and not self._problem:
             from council_core import paths
             self._models, self._problem = council_turn.load_personalities(
-                paths.vault_dir())
+                self.vault_dir or paths.vault_dir())
         return self._models, self._problem
 
     def available_roles(self) -> Dict[str, bool]:

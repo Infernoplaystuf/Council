@@ -139,7 +139,8 @@ def test_the_turn_worker_is_handed_the_snapshot_and_the_typed_text(tab, qapp):
     seen = {}
 
     class Recording(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             seen["text"] = typed_text
             seen["options"] = options
             seen["thread"] = threading.current_thread().name
@@ -199,7 +200,8 @@ def test_a_second_send_is_refused_while_one_is_running(tab, qapp):
     release = threading.Event()
 
     class Slow(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             release.wait(2.0)
 
     tab.actions = Slow()
@@ -223,7 +225,8 @@ def test_the_send_button_is_disabled_for_the_duration(tab, qapp):
     release = threading.Event()
 
     class Slow(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             release.wait(2.0)
 
     tab.actions = Slow()
@@ -238,7 +241,8 @@ def test_a_failing_turn_still_releases_the_lock(tab, qapp):
     """Otherwise one exception makes the tab permanently unusable, and the
     only cue is a button that never comes back."""
     class Boom(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             raise RuntimeError("model gone")
 
     tab.actions = Boom()
@@ -392,7 +396,8 @@ def test_a_new_turn_resets_the_previous_one(tab, qapp):
     # while the main thread pumped Qt events — which is what it was actually
     # asserting on, and it is not what this test is about.
     class Recording(CouncilActions):
-        def send(self, typed_text, options, *, on_event=None, on_token=None):
+        def send(self, typed_text, options, *, on_event=None, on_token=None,
+                 on_notice=None):
             from council_core import council_turn
             return council_turn.TurnResult(True, message="done")
 
@@ -785,7 +790,7 @@ def test_the_unwired_controls_are_disabled_and_say_why(qapp, tmp_path):
                      "expand_btn", "inst_name", "inst_text", "inst_add_btn",
                      "inst_manage_btn", "content_style_btn", "backend_box",
                      "vfb_agree", "vfb_disagree", "redeliberate_btn",
-                     "specialist_box", "history_btn"):
+                     "specialist_box"):
             _check_labelled(getattr(view, name), name)
         for key in UNREAD_SWITCHES:
             _check_labelled(view._checkboxes[key], key)
@@ -801,7 +806,7 @@ def test_they_are_labelled_in_the_default_build_too(qapp, tmp_path):
     try:
         for name in ("find_chart_btn", "look_up_btn", "defer_btn",
                      "expand_btn", "inst_text", "content_style_btn",
-                     "backend_box", "specialist_box", "history_btn"):
+                     "backend_box", "specialist_box"):
             _check_labelled(getattr(view, name), name)
         shown = [key for key in UNREAD_SWITCHES if key in view._checkboxes]
         assert shown == ["tools", "fill_ide", "use_profile"], shown
@@ -815,8 +820,11 @@ def test_the_controls_that_work_are_left_alone(qapp, tmp_path):
     """Labelling must not spread: these all do something today."""
     view = _full(qapp, tmp_path)
     try:
-        for widget in (view.send_btn, view.save_btn, view.input):
+        # History reads the questions both shells save (Batch 1).
+        for widget in (view.send_btn, view.save_btn, view.input,
+                       view.history_btn):
             assert widget.isEnabled(), widget
+            assert UNAVAILABLE not in widget.toolTip()
         for key in ("deliberate", "stream"):
             assert view._checkboxes[key].isEnabled(), key
             assert UNAVAILABLE not in view._checkboxes[key].toolTip()
@@ -831,6 +839,8 @@ def test_the_profile_box_no_longer_promises_what_it_cannot_do(qapp, tmp_path):
         assert "Unchecking skips it" not in tip, tip
         assert tip.startswith("Profile — not available"), tip
         assert "COUNCIL_QUIRKS_APPLY" in tip, "it does not say what decides"
+        assert "this conversation only" in tip, (
+            "it does not say the default keeps the profile out")
     finally:
         view.deleteLater()
 
@@ -838,35 +848,55 @@ def test_the_profile_box_no_longer_promises_what_it_cannot_do(qapp, tmp_path):
 @pytest.mark.parametrize("value, applied", [
     (None, True), ("1", True), ("0", False), ("off", False), (" No ", False),
     ("false", False), ("yes", True)])
+@pytest.mark.parametrize("scope", [None, "conversation", "all", "none"])
 def test_the_profile_box_shows_what_the_engine_does(qapp, tmp_path,
                                                     monkeypatch, value,
-                                                    applied):
+                                                    applied, scope):
     """It cannot be changed here, so it must at least be TRUE: ticked exactly
-    when the engine injects a learned profile. The rule is read without
-    importing the engine; this holds the copy to the engine's own."""
+    when the engine injects a learned profile — which, in "This conversation
+    only" (the Qt default), is never. The rule is read without importing the
+    engine; this holds the copy to the engine's own."""
     ce = _engine()
+    monkeypatch.delenv("COUNCIL_DEMO_SILO", raising=False)
     if value is None:
         monkeypatch.delenv("COUNCIL_QUIRKS_APPLY", raising=False)
     else:
         monkeypatch.setenv("COUNCIL_QUIRKS_APPLY", value)
+    if scope is None:
+        monkeypatch.delenv("COUNCIL_MEMORY_SCOPE", raising=False)
+    else:
+        monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", scope)
     assert ce.user_profile_apply_enabled() is applied
     assert council_options.profile_applied() is applied
+    shown = applied and scope == "all"
     view = _full(qapp, tmp_path)
     try:
-        assert view._checkboxes["use_profile"].isChecked() is applied
-        assert view.options().use_profile is applied
+        assert view._checkboxes["use_profile"].isChecked() is shown
+        assert view.options().use_profile is shown
     finally:
         view.deleteLater()
 
 
-def test_history_reached_anyway_does_not_say_nothing_was_asked(tab):
-    """There is no question store in this build. "No questions asked yet this
-    session" — said straight after a question, in review — was false."""
+def test_history_lists_the_questions_both_shells_asked(tab):
+    """History used to import `convo_store`, which does not exist, so it was
+    disabled. It reads question_history.json — the file the Tk shell's
+    History reads — and a question asked here is in it."""
+    import question_history
+    question_history.QuestionHistory(tab.actions.vault_dir).add(
+        "asked in the Tk shell")
     tab.append("User", "what was Q3 revenue?")
     tab.on_history()
     text = tab.transcript.toPlainText()
     assert "No questions asked yet" not in text, text
-    assert "History — not available in this build yet" in text, text
+    assert "not available" not in text, text
+    listing = text[text.index("Recent questions:"):]
+    assert listing.index("what was Q3 revenue?") < listing.index(
+        "asked in the Tk shell"), "newest first"
+
+
+def test_history_with_nothing_asked_says_so(tab):
+    tab.on_history()
+    assert "No questions asked yet." in tab.transcript.toPlainText()
 
 
 def test_reaching_one_anyway_says_not_available_not_phase_6(tab):

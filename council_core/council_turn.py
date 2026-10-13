@@ -28,6 +28,7 @@ it likes, and renders what comes back.
 from __future__ import annotations
 
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -148,6 +149,22 @@ class TurnResult:
     #: say so, and an empty string is how it says it.
     verdict_id: str = ""
 
+    #: The name this turn gives its session, or "" — set by the front end's
+    #: send when the session has no name yet (the Tk shell asks the judge
+    #: after a deliberation; see council_core.conversations).
+    session_name: str = ""
+
+    #: Where the answer came from, saved with it in the conversation record:
+    #: route, panel, memory scope, the prior session it could see, the models,
+    #: and the vault sources it was given. Filled by the front end's send.
+    provenance: Dict[str, Any] = field(default_factory=dict)
+
+    #: The files behind the answer (council_core.turn_context: what the
+    #: analyst read, the vault and value matches, the files the user named)
+    #: — raw, and resolved to existing paths for the chips under the answer.
+    sources: List[str] = field(default_factory=list)
+    source_paths: List[Any] = field(default_factory=list)
+
 
 def final_answer(events: List[AgentEvent], synth: str = "writer") -> str:
     """The synthesised answer, last one wins."""
@@ -192,13 +209,19 @@ def run_turn(question: str, models: Any, *,
              clarification_cb: Optional[Callable[[str, str], None]] = None,
              pause_event: Optional[threading.Event] = None,
              answer_getter: Optional[Callable[[], str]] = None,
-             extra_ctx: Optional[Dict[str, Any]] = None) -> TurnResult:
+             extra_ctx: Optional[Dict[str, Any]] = None,
+             route_text: Optional[str] = None) -> TurnResult:
     """Run one full deliberation and dig the result out of it.
 
     Never raises. A turn that fails comes back as ``ok=False`` with the reason
     in ``message`` — a front end mid-turn needs something to show the user more
     than it needs a traceback, and the exception is kept in ``error`` for
     whoever does want one.
+
+    ``route_text`` is what the judge routes on — what the user TYPED — when
+    ``question`` carries the vault context in front of it (A5 in
+    docs/qt_migration/phase6_port_requirements.md: the Tk shell routes on the
+    augmented text, so a spreadsheet's contents steer the route).
     """
     question = (question or "").strip()
     if not question:
@@ -219,7 +242,7 @@ def run_turn(question: str, models: Any, *,
 
         route = ""
         try:
-            route = judge.route(question) or ""
+            route = judge.route((route_text or question).strip()) or ""
         except Exception:                                 # noqa: BLE001
             route = ""                 # an unroutable question still gets asked
         panel, synth = panel_for_route(route)
@@ -248,8 +271,11 @@ def run_turn(question: str, models: Any, *,
             confidence=judge_confidence(events), route=route, panel=panel,
             events=list(events))
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
+        # Unique, because it is how a response finds ITS line in
+        # verdict_history.jsonl (route, size and verdict repeat).
         if critique:
-            result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"
+            result.verdict_id = (f"{route or 'turn'}:{len(events)}:{verdict}:"
+                                 f"{uuid.uuid4().hex[:12]}")
         return result
     except Exception as exc:                              # noqa: BLE001
         return TurnResult(False, message=f"The turn failed: {exc!r}", error=exc)
@@ -302,15 +328,34 @@ class Personalities:
 
 
 def load_personalities(vault_dir: Any, *, pins: Optional[Dict[str, str]] = None,
-                       session_id: str = "qt",
-                       dispatcher: Any = None) -> Tuple[Optional[Personalities], str]:
+                       session_id: str = "",
+                       dispatcher: Any = None,
+                       scope: Optional[str] = None
+                       ) -> Tuple[Optional[Personalities], str]:
     """(personalities, problem). Exactly one is meaningful.
 
     Never raises. Building the personalities loads models from disk and can
     fail for a dozen ordinary reasons — a missing pin, a moved file, a GGUF
     that will not map — and a front end needs to say which, not show a
     traceback.
+
+    WHAT THEY MAY REMEMBER. Every personality is given ``scope`` (council_core
+    .memory_scope), the Qt shell's — "This conversation only" — unless the
+    caller names one. This is the Qt shell's one door to the personalities
+    (the Council, Lens, Designer Review, Agents and Nodes tabs), and only the
+    Council tab used to set a scope: the others left it unset, respond() fell
+    back to the ENGINE default ("all" with SILO unset), and the Lens and the
+    Designer's Review sent role memory, project memory and the profile while
+    the toolbar said "Memory: this conversation only" (found in review).
+
+    ``session_id`` "" (the default) is for a tab that is not a conversation:
+    no session file is read as its RECENT CONVERSATION. It was "qt", which
+    named conversations/qt.jsonl — any session someone had called "qt". The
+    Council tab passes its own session, and Conversation.apply_to keeps it.
     """
+    from . import memory_scope
+
+    scope = scope or memory_scope.for_qt()
     try:
         import council_engine
     except Exception as exc:                              # noqa: BLE001
@@ -340,4 +385,13 @@ def load_personalities(vault_dir: Any, *, pins: Optional[Dict[str, str]] = None,
         return None, ("Missing required personalities: "
                       f"{', '.join(loaded.missing)}. Check the model pins in "
                       "the Models tab.")
+    set_scope(loaded, scope)
     return loaded, ""
+
+
+def set_scope(models: Any, scope: str) -> None:
+    """Give every personality on ``models`` the memory scope ``scope``."""
+    from .conversations import personalities_of
+    for model in personalities_of(models):
+        if hasattr(model, "memory_scope"):
+            model.memory_scope = scope

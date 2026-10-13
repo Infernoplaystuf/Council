@@ -1698,6 +1698,8 @@ class VaultIndex:
         # JSON-serialised to disk and sets aren't JSON-safe.
         self._search_cache: Dict[str, Dict[str, Any]] = {}
         self._denylist_cache: Optional[Set[str]] = None
+        #: Why the last add_to_fuzzy_denylist added nothing, or "".
+        self.denylist_problem = ""
         # Lazy embedding layer — only loads sentence-transformers on first use.
         self._emb_index = None
         self.load()
@@ -1763,8 +1765,28 @@ class VaultIndex:
         return deny
 
     def add_to_fuzzy_denylist(self, terms: List[str]) -> List[str]:
-        """Persist user-rejected fuzzy terms. Returns the newly-added items."""
-        deny = set(self.fuzzy_denylist())
+        """Persist user-rejected fuzzy terms. Returns the newly-added items.
+
+        The list is the user's: a file that is there but cannot be read is
+        NOT written over (that replaced every earlier word with the new
+        ones) — nothing is added and ``denylist_problem`` says why. The
+        write is atomic (a temp file, then os.replace), so a crash mid-write
+        leaves the old list. ``denylist_problem`` is "" after a good call."""
+        self.denylist_problem = ""
+        if self.denylist_path.exists():
+            try:
+                stored = json.loads(
+                    self.denylist_path.read_text(encoding="utf-8"))
+                if not isinstance(stored, list):
+                    raise ValueError("not a list")
+                deny = set(str(t).lower().strip() for t in stored)
+            except Exception as exc:
+                self.denylist_problem = (
+                    f"{self.denylist_path.name} could not be read ({exc}), "
+                    f"so it was left as it is")
+                return []
+        else:
+            deny = set()
         added: List[str] = []
         for t in terms:
             t = (t or "").lower().strip()
@@ -1772,13 +1794,21 @@ class VaultIndex:
                 deny.add(t)
                 added.append(t)
         if added:
+            tmp = self.denylist_path.with_name(
+                f".{self.denylist_path.name}.{os.getpid()}.tmp")
             try:
-                self.denylist_path.write_text(
-                    json.dumps(sorted(deny), indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+                tmp.write_text(json.dumps(sorted(deny), indent=2),
+                               encoding="utf-8")
+                os.replace(tmp, self.denylist_path)
+            except Exception as exc:
+                self.denylist_problem = (
+                    f"{self.denylist_path.name} could not be written "
+                    f"({exc})")
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return []
             self._denylist_cache = deny
         return added
 
@@ -2055,25 +2085,47 @@ the vocabulary list. Lowercase only. Single line only.
         except Exception:
             _PROTECTED_SUBDIRS = ()
         try:
+            from conversation_logger import (
+                PROTECTED_ROOT_FILES as _PROTECTED_ROOT_FILES,
+            )
+        except Exception:
+            _PROTECTED_ROOT_FILES = ()
+        try:
             _vault_resolved = self.vault_dir.expanduser().resolve()
             _protected_prefixes = tuple(
                 str(_vault_resolved / sub).lower() + os.sep
                 for sub in _PROTECTED_SUBDIRS
             )
+            # Protected at the vault root only (conversation_logger).
+            _protected_root_files = frozenset(
+                str(_vault_resolved / name).lower()
+                for name in _PROTECTED_ROOT_FILES)
         except Exception:
             _protected_prefixes = ()
+            _protected_root_files = frozenset()
 
         def _is_protected_fast(p: Path) -> bool:
             """Cheap absolute-prefix check — equivalent to the old
             is_protected_path call on resolvable paths. Falls back to
             the slow version only when string-prefix can't help (e.g.
             symlinked subtree)."""
-            if not _protected_prefixes:
+            if not _protected_prefixes and not _protected_root_files:
                 return False
             try:
                 sp = str(p.resolve()).lower()
             except Exception:
                 return False
+            if sp in _protected_root_files:
+                return True
+            if p.name.lower() == "readme.txt":
+                # The app's own README in data_in/ or data_out/, while it
+                # holds the app's text (conversation_logger._is_app_readme).
+                try:
+                    from conversation_logger import is_protected_path
+                    if is_protected_path(p, self.vault_dir):
+                        return True
+                except Exception:
+                    pass
             return any(sp.startswith(prefix) for prefix in _protected_prefixes)
 
         # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────
@@ -2081,6 +2133,13 @@ the vocabulary list. Lowercase only. Single line only.
         # collect every (path, mtime) tuple that needs work, THEN parse
         # in parallel. This lets the progress callback emit an accurate
         # total at the start instead of counting up forever.
+        #
+        # A folder LINKED into the vault (a junction or a symlink) is walked
+        # like any other: linking is how a folder is put in the vault
+        # without copying it, and it stays on this PC. Protection is decided
+        # on the RESOLVED path (_is_protected_fast, is_protected_path), so a
+        # link to the app's own memory/ is still the app's memory (decided
+        # 2026-10-12; tests/test_turn_context.py pins both).
         #
         # Hidden + cache dirs we deliberately skip: .git, .chromadb,
         # .git_clones, __pycache__, node_modules, .venv. Without this

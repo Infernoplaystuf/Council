@@ -330,3 +330,39 @@ def test_the_judge_contract_is_three_methods():
         assert hasattr(FakeJudge(), method), (
             f"the contract grew a method the test double does not have: "
             f"{method}")
+
+
+def test_the_judge_routes_on_what_was_typed_not_on_the_vault_context():
+    """A5: the Tk shell routes on the augmented text, so a spreadsheet's
+    contents steer the route ("plot" in a game description sent everything to
+    the Grapher). The council deliberates on the augmented text; the judge
+    routes on the typed one."""
+    routed = []
+
+    class Judge(FakeJudge):
+        def route(self, text):
+            routed.append(text)
+            return "chat"
+
+    models = Models(writer=FakeModel("ok"), peasant=FakeModel("ok"))
+    models.judge = Judge()
+    augmented = "[FILE: games.csv]\nplot,genre\n[END FILE]\n\nwhat is fun?"
+    result = ct.run_turn(augmented, models, route_text="what is fun?")
+    assert result.ok, result.message
+    assert routed == ["what is fun?"]
+    assert any("[FILE: games.csv]" in p for p in models.writer.asked), (
+        "the council was not given the context")
+
+
+def test_without_route_text_the_judge_routes_on_the_question():
+    routed = []
+
+    class Judge(FakeJudge):
+        def route(self, text):
+            routed.append(text)
+            return "chat"
+
+    models = Models(writer=FakeModel("ok"), peasant=FakeModel("ok"))
+    models.judge = Judge()
+    ct.run_turn("plain question", models)
+    assert routed == ["plain question"]

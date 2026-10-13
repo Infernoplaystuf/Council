@@ -1927,6 +1927,7 @@ def _release_slots() -> None:
     with _ROUTE_LOCK:
         _AUTO_OLLAMA.clear()
         _OLLAMA_WINDOWS.clear()
+        _OLLAMA_THINKS.clear()
         _AUTO_PICK = None
     try:
         from council_core import local_models, model_slots
@@ -2290,6 +2291,70 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
     }
 
 
+#: The template margin _clamp_messages_to_ctx keeps for a call of ``n``
+#: messages (see the comment there): what a prompt builder must leave free.
+def _template_margin(n_messages: int) -> int:
+    return 64 + 8 * int(n_messages)
+
+
+def _budget_cpt() -> float:
+    """Chars per token to budget a prompt with BEFORE its call, when the
+    model that will count it is not known yet: the clamp's starting ratio
+    for an unmeasured Ollama model (_OLLAMA_CPT_DEFAULT, 3.0), or the
+    densest ratio any model in this process has been measured at, if that
+    is denser. A GGUF's own tokenizer is not asked (it may be busy in a
+    call); 3.0 is under what the Llama and Phi tokenizers count for prose,
+    code and JSON (measured 3.05-4.09, _OLLAMA_CPT_DEFAULT's note), so an
+    estimate made with it errs on the side of fitting."""
+    with _OLLAMA_CPT_LOCK:
+        seen = [r for ratios in _OLLAMA_CPT.values() for r in ratios]
+    return max(1.0, min([_OLLAMA_CPT_DEFAULT] + seen))
+
+
+def prompt_count(slot: str = "main") -> Callable[[str], int]:
+    """How a prompt for ``slot`` is counted when it is SIZED before the call
+    (prompt_room): chars / _budget_cpt(), rounded up — never fewer tokens
+    than the clamp will count for an Ollama model at the ratios it has
+    measured. Never loads a model, never asks the network."""
+    return _ollama_counter(_budget_cpt())
+
+
+def prompt_room(slot: str = "main", *, frame: str = "",
+                num_predict: int = 0,
+                n_ctx: Optional[int] = None) -> Dict[str, Any]:
+    """What a call on ``slot`` leaves for the text a caller is about to put
+    in it — counted the way _clamp_messages_to_ctx will fit the call, so a
+    text sized to ``room`` is not cut by it.
+
+    The call is the two messages LocalBackendSpec.generate sends: the
+    role's system prompt and a user message. ``frame`` is everything the
+    call sends besides the caller's text (PersonalityModel.prompt_frame:
+    the system prompt, this conversation's earlier turns, …);
+    ``num_predict`` the reply it asks for. ``n_ctx``: the window, else
+    effective_n_ctx(slot).
+
+    Returns a dict: ``n_ctx``; ``reply`` (the reply the clamp keeps room
+    for — num_predict, plus the thinking headroom when the slot's Ollama
+    model thinks, at most half the window); ``budget`` (what the messages
+    may take: the window less the reply and the template margin);
+    ``frame_tokens``; ``room`` (budget - frame_tokens, at least 0); and
+    ``count``, the counter all of these were counted with (prompt_count)."""
+    window = int(n_ctx) if n_ctx else int(effective_n_ctx(slot))
+    margin = _template_margin(2)
+    want = int(num_predict or 0)
+    with _ROUTE_LOCK:
+        thinks = bool(_OLLAMA_THINKS.get(slot or "main"))
+    if thinks and want:
+        want += _think_headroom()
+    reply = max(16, min(want, max(16, (window - margin) // 2)))
+    budget = max(64, window - reply - margin)
+    count = prompt_count(slot)
+    frame_tokens = count(frame) if frame else 0
+    return {"n_ctx": window, "reply": reply, "budget": budget,
+            "frame_tokens": frame_tokens,
+            "room": max(0, budget - frame_tokens), "count": count}
+
+
 def _clamp_messages_to_ctx(
     messages: List[Dict[str, str]], num_predict: int,
     model_n_ctx: Optional[int] = None,
@@ -2360,7 +2425,7 @@ def _clamp_messages_to_ctx(
     # 69-message prompt at the content budget then passed n_ctx by 299
     # tokens and llama-cpp cut the 2400-token reply to 2101. 64 + 8 per
     # message keeps a 2-message call within 16 tokens of the old budget.
-    margin = 64 + 8 * len(messages)
+    margin = _template_margin(len(messages))
     reply = max(16, min(int(num_predict), max(16, (n_ctx - margin) // 2)))
     prompt_budget = max(64, n_ctx - reply - margin)
 
@@ -2829,6 +2894,9 @@ _AUTO_OLLAMA: Dict[str, str] = {}
 #: slot -> the num_ctx sent for it. effective_n_ctx reads this, so a prompt
 #: builder budgets for the window Ollama really has, without a config read.
 _OLLAMA_WINDOWS: Dict[str, int] = {}
+#: slot -> whether the model serving it thinks (its calls get
+#: _think_headroom() more num_predict); prompt_room reads it.
+_OLLAMA_THINKS: Dict[str, bool] = {}
 #: The installed model picked when nothing names one (cached per refresh).
 _AUTO_PICK: Optional[str] = None
 _ROUTE_LOCK = threading.Lock()
@@ -3475,9 +3543,10 @@ def _ollama_local(
             f"(`ollama pull {name}` — the council never downloads), or pick "
             "another model for this role in the Models tab.")
     num_ctx = _ollama_num_ctx(slot, entry)
+    think = ollama_think(entry)
     with _ROUTE_LOCK:
         _OLLAMA_WINDOWS[slot] = num_ctx
-    think = ollama_think(entry)
+        _OLLAMA_THINKS[slot] = think not in (None, False)
     if think not in (None, False):
         # Thinking tokens count against num_predict: without room for them
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
@@ -4358,157 +4427,12 @@ class LoadAwareDispatcher:
 # Conversation saving + role memory
 # ============================================================
 
-class ConversationStore:
-    def __init__(self, base_dir: Path):
-        self.base_dir = base_dir
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        # Cache keyed by (session_id, n) — invalidated when append() is called
-        # so agents re-reading history during a deliberation hit memory, not disk.
-        self._cache: Dict[tuple, List[Dict[str, Any]]] = {}
-
-    def session_path(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.jsonl"
-
-    def append(self, session_id: str, record: Dict[str, Any]) -> None:
-        p = self.session_path(session_id)
-        line = json.dumps(record, ensure_ascii=False)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        # Invalidate all cached views of this session
-        stale = [k for k in self._cache if k[0] == session_id]
-        for k in stale:
-            del self._cache[k]
-
-    def load_last(self, session_id: str, n: int = 12) -> List[Dict[str, Any]]:
-        cache_key = (session_id, n)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        p = self.session_path(session_id)
-        if not p.exists():
-            return []
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-        out: List[Dict[str, Any]] = []
-        for ln in lines[-n:]:
-            try:
-                out.append(json.loads(ln))
-            except Exception:
-                pass
-        self._cache[cache_key] = out
-        return out
-
-    def list_sessions(self) -> List[str]:
-        """Return session IDs sorted newest-first."""
-        files = sorted(self.base_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return [p.stem for p in files]
-
-    def rename_session(self, old_id: str, new_id: str) -> bool:
-        """
-        Rename a session file from old_id to new_id.
-        Returns True on success. No-ops if old doesn't exist or new already exists.
-        """
-        old_p = self.session_path(old_id)
-        new_p = self.session_path(new_id)
-        if not old_p.exists() or new_p.exists():
-            return False
-        old_p.rename(new_p)
-        return True
-
-    def summary_path(self, session_id: str) -> Path:
-        """Path for the generated prose summary of a completed session."""
-        return self.base_dir / f"{safe_name(session_id, 64)}.summary.md"
-
-    def save_session_summary(self, session_id: str, summary_text: str) -> None:
-        """Persist a generated prose summary for a completed session."""
-        p = self.summary_path(session_id)
-        p.write_text(summary_text.strip() + "\n", encoding="utf-8")
-
-    def load_generated_summary(self, session_id: str) -> str:
-        """Load a previously generated prose summary, or '' if none exists."""
-        p = self.summary_path(session_id)
-        if not p.exists():
-            return ""
-        return p.read_text(encoding="utf-8", errors="replace").strip()
-
-    # ── Crash-recovery sentinel ────────────────────────────────
-    # A session writes an `.active` sentinel when it starts deliberating,
-    # and removes it on clean shutdown. On startup, any remaining sentinel
-    # indicates a crash mid-deliberation — the orphaned session can be
-    # offered for resume.
-
-    def _active_sentinel(self, session_id: str) -> Path:
-        return self.base_dir / f"{safe_name(session_id, 64)}.active"
-
-    def mark_session_active(self, session_id: str, query: str = "") -> None:
-        """Mark the session as in-flight. Safe to call repeatedly."""
-        p = self._active_sentinel(session_id)
-        try:
-            p.write_text(json.dumps({
-                "session_id": session_id,
-                "started_at": now_iso(),
-                "query":      query[:200],
-            }), encoding="utf-8")
-        except Exception:
-            pass  # never let a sentinel write block deliberation
-
-    def mark_session_done(self, session_id: str) -> None:
-        """Remove the in-flight sentinel after a clean deliberation."""
-        p = self._active_sentinel(session_id)
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-
-    def find_orphaned_sessions(self) -> List[Dict[str, Any]]:
-        """
-        Return metadata for any sessions that have an `.active` sentinel
-        without a matching clean shutdown. Used at startup to offer resume.
-        """
-        orphans: List[Dict[str, Any]] = []
-        for p in self.base_dir.glob("*.active"):
-            try:
-                meta = json.loads(p.read_text(encoding="utf-8"))
-                # Only surface orphans whose .jsonl actually exists
-                if self.session_path(meta.get("session_id", "")).exists():
-                    orphans.append(meta)
-            except Exception:
-                # Malformed sentinel — best-effort cleanup
-                try: p.unlink()
-                except Exception: pass
-        # Newest first
-        orphans.sort(key=lambda m: m.get("started_at", ""), reverse=True)
-        return orphans
-
-    def clear_orphan(self, session_id: str) -> None:
-        """Discard an orphan's sentinel (user chose not to resume)."""
-        self.mark_session_done(session_id)
-
-    def load_session_summary(self, session_id: str, max_turns: int = 6) -> str:
-        """
-        Return a condensed text summary of a past session suitable for
-        injecting into role context, keeping token count bounded.
-
-        Prefers a generated prose summary (saved by save_session_summary)
-        over the raw turn fallback, since generated summaries are more
-        compressed and more useful as prior context.
-        """
-        generated = self.load_generated_summary(session_id)
-        if generated:
-            return f"[Prior session summary: {session_id}]\n{generated}"
-
-        # Fallback: build a crude summary from the last N raw turns
-        turns = self.load_last(session_id, n=max_turns)
-        if not turns:
-            return ""
-        lines = [f"[Past session: {session_id}]"]
-        for t in turns:
-            who = t.get("who", "?")
-            text = t.get("text", "")
-            # Truncate very long turns
-            if len(text) > 400:
-                text = text[:400] + "…"
-            lines.append(f"{who}: {text}")
-        return "\n".join(lines)
+# The store moved to council_core.conversations so the Sessions list and
+# History can read it without loading the engine; this name is that class.
+# Its read cache is now keyed on the file (the personalities' own store used
+# to serve stale history after another store appended), and a record is one
+# whole-line write.
+from council_core.conversations import ConversationStore  # noqa: E402
 
 
 class RoleMemoryManager:
@@ -5680,6 +5604,12 @@ class PersonalityModel:
     session_id: Optional[str] = None
     prior_session_id: Optional[str] = None  # inject context from a past session
     trace: bool = True
+    # What this model may remember: "none" | "conversation" | "all"
+    # (council_core.memory_scope). None reads the environment —
+    # COUNCIL_MEMORY_SCOPE, else COUNCIL_DEMO_SILO for "none", else "all" —
+    # which is what every caller got before scopes existed. The Qt shell sets
+    # it on each personality ("This conversation only" by default).
+    memory_scope: Optional[str] = None
     # A STANDING primer for this model, prepended to every respond() call.
     #
     # Four call sites already assigned `model.extra_context = ...` —
@@ -5700,24 +5630,78 @@ class PersonalityModel:
         token_callback: Optional[Callable[[str], None]] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
+        stitched_user = self.stitch(user_text, extra_context=extra_context)
+
+        spec = (
+            self.registry.get(self.backend_key)
+            if self.backend_key
+            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
+        )
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
+        return spec.generate(
+            developer_instructions=self.system_prompt,
+            user_text=stitched_user,
+            temperature=self.temperature,
+            max_tokens=effective_max_tokens,
+            trace=self.trace,
+            token_callback=token_callback,
+            role=self.name,
+        )
+
+    def prompt_frame(self, *, extra_context: str = "") -> Tuple[str, int]:
+        """(what a respond() call sends besides the text it is given, the
+        reply it asks for in tokens): its system prompt and the blocks
+        stitch() puts in front of the text — this conversation's earlier
+        turns, what the memory scope allows, the standing primer — read now,
+        as respond() would read them. Calls no model.
+
+        For a caller that SIZES the text before respond() is called
+        (council_core.turn_context.prepare_turn sizes the vault blocks around
+        it): the engine's clamp fits the whole call — system prompt, these
+        blocks, the text and the reply — into the window, and cuts the
+        middle out of the largest message when it does not fit."""
+        return (self.system_prompt + "\n"
+                + self.stitch("", extra_context=extra_context),
+                int(self.max_output_tokens))
+
+    def stitch(self, user_text: str, *, extra_context: str = "") -> str:
+        """The user message respond() sends for ``user_text``: the remembered
+        blocks the role and the memory scope allow, then "USER TASK:" and the
+        text. Reads the conversation and memory files; calls no model."""
         # ── Role-aware context profile ─────────────────────────────────
         profile       = ROLE_CONTEXT_PROFILES.get(self.name, _DEFAULT_CONTEXT_PROFILE)
         history_turns = profile["history_turns"]
         use_prior     = profile["use_prior"]
         use_vault     = profile["use_vault"]  # "full" | "lite" | "none"
 
-        # ── Role memory (always — small and high-signal) ──────────────
-        mem = self.memory_manager.read(self.name) if self.memory_manager else ""
+        # ── What may be remembered (council_core.memory_scope) ────────
+        # One setting decides which remembered blocks may go in. "none" is
+        # what COUNCIL_DEMO_SILO always did (blank them all); "conversation"
+        # keeps this session's earlier turns and a prior session only when
+        # the user LOADED one; "all" is the engine with SILO unset. A block
+        # the scope forbids is not even read.
+        from council_core import memory_scope as _memory_scope
+        _allowed = _memory_scope.blocks(
+            self.memory_scope or _memory_scope.resolve(),
+            prior_loaded=bool(self.prior_session_id))
+
+        # ── Role memory (small and high-signal, when the scope allows) ─
+        mem = (self.memory_manager.read(self.name)
+               if self.memory_manager and _allowed.role_memory else "")
 
         # ── Conversation history (role-gated) ─────────────────────────
         history_txt = ""
-        if history_turns > 0 and self.conversation_store and self.session_id:
+        if (history_turns > 0 and self.conversation_store and self.session_id
+                and _allowed.recent_conversation):
             turns = self.conversation_store.load_last(self.session_id, n=history_turns)
             if turns:
                 chunks = []
                 for t in turns:
                     who  = t.get("who", "unknown")
-                    text = t.get("text", "")
+                    # null or a number on a hand-edited line: as text, not
+                    # a TypeError that fails the whole answer.
+                    text = str(t.get("text") or "")
                     if len(text) > 600:
                         text = text[:600] + "…"
                     chunks.append(f"{who}: {text}")
@@ -5725,7 +5709,8 @@ class PersonalityModel:
 
         # ── Prior session (role-gated) ────────────────────────────────
         prior_txt = ""
-        if use_prior and self.conversation_store and self.prior_session_id:
+        if (use_prior and self.conversation_store and self.prior_session_id
+                and _allowed.prior_session):
             prior_txt = self.conversation_store.load_session_summary(
                 self.prior_session_id, max_turns=6
             )
@@ -5781,7 +5766,7 @@ class PersonalityModel:
         # ── Assemble prefix ───────────────────────────────────────────
         # Shared project memory — written by observer roles, readable by all.
         proj_mem = ""
-        if self.memory_manager is not None:
+        if self.memory_manager is not None and _allowed.project_memory:
             proj_mem = self.memory_manager.read(_PROJECT_MEMORY_KEY)
 
         # Gated user profile — durable user preferences compiled by
@@ -5792,16 +5777,13 @@ class PersonalityModel:
         # profile for a session whose ask conflicts with their normal
         # preferences, while observation keeps running underneath.
         user_profile = ""
-        if self.memory_manager is not None and user_profile_apply_enabled():
+        if (self.memory_manager is not None and _allowed.profile
+                and user_profile_apply_enabled()):
             user_profile = self.memory_manager.read(_USER_PROFILE_KEY)
 
-        # Demo silo: keep memory files on disk, but skip cross-session injection.
-        if os.environ.get('COUNCIL_DEMO_SILO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
-            mem = ''
-            proj_mem = ''
-            prior_txt = ''
-            history_txt = ''
-            user_profile = ''
+        # Demo silo (COUNCIL_DEMO_SILO): memory files stay on disk and nothing
+        # remembered is injected. It is the scope "none" now, applied above —
+        # memory_scope.resolve() reads SILO when COUNCIL_MEMORY_SCOPE is unset.
 
         prefix_parts = []
         if mem.strip():
@@ -5819,24 +5801,7 @@ class PersonalityModel:
         if filtered_extra.strip():
             prefix_parts.append("COUNCIL CONTEXT:\n" + filtered_extra.strip())
 
-        stitched_user = "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
-
-        spec = (
-            self.registry.get(self.backend_key)
-            if self.backend_key
-            else self.registry.best_for(weights=self.weights, fallback_key="local_fast")
-        )
-
-        effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
-        return spec.generate(
-            developer_instructions=self.system_prompt,
-            user_text=stitched_user,
-            temperature=self.temperature,
-            max_tokens=effective_max_tokens,
-            trace=self.trace,
-            token_callback=token_callback,
-            role=self.name,
-        )
+        return "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
 
 
 
@@ -7463,6 +7428,24 @@ def get_model_size_label(model: "PersonalityModel") -> str:
     return BACKEND_SIZE_LABELS.get(bk, bk or "?")
 
 
+#: The reply budget (num_predict) of the roles that produce long output; the
+#: others keep PersonalityModel's default. build_personalities applies it,
+#: and a caller sizing a prompt for a role before its personality exists
+#: (council_core.turn_context) reads it here.
+ROLE_TOKEN_BUDGETS: Dict[str, int] = {
+    "pitcher":   3200,   # full pitch: title, hook, premise, 6-8 outline sections,
+                         # thumbnail, audience, why-it-works, variants, tags, notes
+    "ideator":   1000,   # raw idea only — 5 short fields, no bloat needed
+    "writer":    2400,   # long-form synthesis and essays
+    "sage":      2400,   # detailed knowledge responses
+    "director":  2000,   # script outlines and style breakdowns
+    "content":   1800,   # packaging writeups
+    "strategist":1600,   # strategic plans
+    "coach":     1800,   # delivery breakdowns with drill sections
+    "algorithm": 1600,   # retention analysis
+}
+
+
 def build_personalities(
     *,
     pins: Dict[str, str],
@@ -7593,22 +7576,8 @@ def build_personalities(
         if role not in pins:
             models[role].backend_key = default_key
 
-    # ── Token budget overrides ────────────────────────────────────────
-    # Roles that produce long structured output get a larger budget.
-    # The default 1400 is fine for most roles; pitcher/sage/writer need more.
-    token_budgets = {
-        "pitcher":   3200,   # full pitch: title, hook, premise, 6-8 outline sections,
-                             # thumbnail, audience, why-it-works, variants, tags, notes
-        "ideator":   1000,   # raw idea only — 5 short fields, no bloat needed
-        "writer":    2400,   # long-form synthesis and essays
-        "sage":      2400,   # detailed knowledge responses
-        "director":  2000,   # script outlines and style breakdowns
-        "content":   1800,   # packaging writeups
-        "strategist":1600,   # strategic plans
-        "coach":     1800,   # delivery breakdowns with drill sections
-        "algorithm": 1600,   # retention analysis
-    }
-    for role, budget in token_budgets.items():
+    # ── Token budget overrides (ROLE_TOKEN_BUDGETS) ───────────────────
+    for role, budget in ROLE_TOKEN_BUDGETS.items():
         if role in models:
             models[role].max_output_tokens = budget
 

@@ -183,3 +183,187 @@ merge), `council_core/agent_profiles.py`, the KG store, field-search fixes and l
 `deliberation.py`, `council_qt/tabs/council.py` or `council_gui_engine.py`. Its merge-base
 is qt-migration, so Batches 0 and 1 can proceed in parallel; Batch 2 and 7 should follow a
 merge.
+
+## 7. Status after Batches 1 and 2 (branch `qt/batch1-2`, 2026-10-12)
+
+Decisions applied (6 October 2026): memory "This conversation only"; default build one
+Writer; launchers unchanged (Qt).
+
+**Batch 1 — Qt remembers.**
+- `council_core.memory_scope`: `COUNCIL_MEMORY_SCOPE` = `none | conversation | all`
+  (explicit value wins; else `COUNCIL_DEMO_SILO` means `none`; else the caller's default —
+  `all` for the engine, `conversation` for Qt). `PersonalityModel.memory_scope` lets Qt set it
+  per model. In `conversation` a prompt gets this session's RECENT CONVERSATION and, only
+  after Load as Prior, PRIOR SESSION CONTEXT — never role/project memory or the profile.
+  Tk keeps SILO (`none`) unchanged. The toolbar says "Memory: this conversation only".
+- `council_core.conversations`: `ConversationStore` moved out of the engine
+  (`council_engine.ConversationStore` is the same class; cache keyed on the file — the
+  personalities' own store served stale history after another store appended; one-write
+  appends; `claim()`). `Conversation` = one Qt launch: Tk-format session id claimed
+  exclusively (a second launch in the same second gets `_2`; a Tk-taken id moves to a fresh
+  one), the same files as Tk (`conversations/<id>.jsonl`, `conversation_logs/`,
+  `question_history.json`, `verdict_history.jsonl`). The question is saved when asked, the
+  turn when it ends (the answer with provenance), anything pending on close
+  (`window.close_hooks`). A full council's drafts/cross-fire go to the debug log only (kept,
+  one turn filled the 12-entry history). Lines that quote other sessions (History's list,
+  a loaded session's name) are shown but not kept.
+- History and the Sessions list read both shells' files. Load as Prior sets the prior on the
+  conversation (no rebuild — the old rebuild went to a callback nobody connected) and the
+  transcript says so. Sessions are named after the first answer (judge after a
+  deliberation; the question's words on the fast path). Verdicts are recorded with a unique
+  id; the verdict bar stays disabled. Role/project memory is not written by Qt (never read
+  in this scope; Tk writes it only after full deliberations anyway).
+- `question_history.json`: a cross-process lock (on Windows a just-deleted lock file is
+  "access denied", which had sent writers on unlocked) and an unreadable file is never
+  written over.
+
+**Batch 2 — answers from your data.**
+- `council_core.turn_context`: the Tk module's lines 330-3515 moved (65 names re-exported;
+  `VAULT_DIR` reads became `_vault()`, the index accessors ask the prepared turn's session
+  first). `prepare_turn()` is the Tk `_send` sequence once — task memo, analyst step (a
+  direct answer comes back as `fast_answer`), injection, sources, context-window warning,
+  provenance — and BOTH shells call it (`CouncilConsole._turn_state` gives Tk's own state,
+  `module_indexes=True`). `TurnState` is one conversation's retrieval memory.
+- Qt: the augmented text goes to the Writer on the direct path and to the council; the judge
+  routes on the typed text (`run_turn(route_text=...)`, A5); deterministic answers need no
+  model; source chips under the answer; provenance carries the sources.
+- Vault search no longer returns older conversations or learned memory: `logs/`,
+  `memory/`, `sage_knowledge/`, `verdict_history.jsonl`, `vault_rag_misses.txt`,
+  `librarian_wishlist.md`, the root `trends.md` and the app's settings files are protected
+  (measured before: "search the vault for X" injected older questions from the verdict
+  history and the miss log).
+- Not done: KG4's neighbourhood block (not built on `knowledge-graph` either — it becomes
+  one more block in `prepare_turn`); Expand with council (Batch 3); the per-role carrier.
+
+**Batch 2, finished (2026-10-12, same branch).**
+- A source chip shows the file READ-ONLY in the app (its first rows and columns, no model —
+  Tk's `_preview_data_file`) with a "Show in folder" button that selects it in Explorer /
+  Finder; a file that has gone since is said. It used to open the folder only. Nothing
+  writes to the file; an offscreen run never starts the file manager
+  (`council_qt.widgets.source_preview`).
+- "forget WORD", which the close-match notice under a vault search offers in both shells,
+  works in Qt (`turn_context.forget_command`; before, Qt sent it to the Writer as a
+  question). It takes only words the notice offered in this conversation — Tk takes any
+  "forget …" and put "what", "said" … on the list; Tk's handling is unchanged. The list
+  (`fuzzy_denylist.json`) is written atomically and never over a file that cannot be read.
+- Context-window notices in plain words in both shells ("too long for what the model can
+  read at once", "fills 85% of …", "Left out 2 parts of what was found …"), naming the
+  setting that sizes THIS model's window — when Ollama serves it, the main slot's `n_ctx`
+  in `model_slots.json` if set, else `COUNCIL_OLLAMA_NUM_CTX`; otherwise
+  `COUNCIL_GGUF_N_CTX` (Tk always said the GGUF one). The "nearly full" notice comes at
+  the engine's answer reserve (75% of the window; earlier on windows under 1,024 tokens)
+  and never later than 80%.
+- `council_core.vault_setup.VAULT_ROOT_STATE` is in `data_index._APP_INTERNAL_FILENAMES` and
+  `conversation_logger.PROTECTED_STATE_FILES` (measured before: `model_slots.json` and
+  `model_bench.json` reached the prompt on "search the vault for X"; the data index's own
+  migration copied all eight into `data_in/`).
+- The seam names its three blocks (`turn_context`, above `prepare_turn`): the vault (in
+  front of the question), this conversation (Batch 1, per role inside `respond()`), and
+  the knowledge graph's cited neighbourhood — `turn_context.knowledge_graph_block`, a hook
+  that returns None until KG4. What it returns is assembled with the vault blocks
+  (`_inject_file_contents(extra_blocks=…)`, priority band PRIO_EXTRA: below named files,
+  above the vault search) and cites its files under the answer when it is kept.
+- `tests/test_planted_fact_both_shells.py`: one FakeOllama, a question that names no file —
+  Qt as the app builds it (default build; the panel with `DI_DEMO_MODE=0`) and Tk (real
+  `_send`/`_poll_ui_queue` on a stand-in, no window): the fact is in every Writer prompt,
+  the answer, the chips and the saved sources; both shells give the Writer the same vault
+  text; a follow-up gets turn 1 and the file, and not an older session. On 21f7e18 the Qt
+  Writer was sent the bare question and 0 of 12 panel Writer prompts had the file.
+- Open, found while doing this: (1) RECENT CONVERSATION includes the question being
+  answered (it is saved when asked, and `respond()` reads the session file), so it appears
+  twice in each Qt prompt — Tk with SILO off does the same; (2) FIXED: the injection was
+  sized with `get_n_ctx()` (the configured 4,096 when unset) while the notices measured the
+  real window (`effective_n_ctx`: 8,192 for Ollama by default, 16,384 for a GGUF the ladder
+  loaded so) — `prepare_turn` now sizes it with `effective_n_ctx`, in both shells, as the
+  engine's own note on `get_n_ctx` asks; (3) the Tk stand-in
+  tests share the Tk console's process-wide indexes unless reset (fixed in the tests);
+  (4) the analyst's own notices ("Analyst direct-routed to folder_data_summary …", "Context
+  retrieval failed with an unexpected error …") are still Tk's technical wording, now in
+  both shells.
+
+**Review fixes (2026-10-12, same branch).** Each was reproduced by a test first.
+- Every Qt tab's personalities get the Qt scope (`council_turn.load_personalities(scope=…)`,
+  default `memory_scope.for_qt()`; `sessions.rebuild_with_prior` too). The Lens and the
+  Designer's Review — default tabs — sent role/project memory and the profile before; the
+  default session id of a non-conversation tab is "" (no RECENT CONVERSATION), not "qt".
+- Naming the vault folder in a question ("What is in <vault>?") no longer lists
+  `conversations/`, `conversation_logs/`, `logs/` or `memory/` (both folder renderers also
+  check the protection against the vault, not only the named folder's parent).
+- A vault that cannot keep conversations (read-only, permission denied) no longer stops the
+  Qt app from starting; the transcript says the conversation is not being saved and the
+  toolbar says "Memory: not saved".
+- Appends are atomic between processes on Windows (`append_line` opens with
+  `FILE_APPEND_DATA` only; `open("a")` lost records under load). Tk's verdict append uses it.
+- Load as Prior loads the listed file (a stem `safe_name` would change — "pump notes",
+  "older - Copy" — is reached by its own name); a prior another launch renamed away is
+  dropped and said at the next turn; a session line that is not a record no longer fails
+  every turn; a non-ASCII judge name becomes the stored file stem.
+- The first verdict of a judged session is recorded under the session's name (rename
+  first).
+- The turn's own notices ("Tracking → goal", "Reading: …", context-window warnings, the
+  note under an answer from the data) are kept in the conversation file as Tk keeps them;
+  Qt writes `logs/council.log`; each entry is logged when it is said, under the id it was
+  said under (tests/test_shell_parity.py compares one turn in both shells).
+- Importing the Tk module no longer turns Qt's memory off: Tk sets SILO through
+  `memory_scope.set_tk_default()`, which marks it `COUNCIL_DEMO_SILO_SOURCE=tk-default`,
+  and `for_qt` ignores a SILO so marked (a user's SILO still counts).
+- The Tk console claims its session id on disk at start (`conversations.claim_session_id`,
+  the Qt rule), so Tk and Qt in the same second never share a session, whichever starts
+  first. Tk's rename accepts a claimed `_2` id and keeps the stored stem.
+
+Still open after the review (not fixed on this branch):
+- Tk records its first verdict before naming the session (its record carries the id at
+  queue time), so Tk's one-deliberation sessions still have no badge.
+- Tk's Agree/Disagree (A3) stamps `user_agreed` on the LAST line of
+  `verdict_history.jsonl` — now possibly a Qt verdict — and rewrites the whole file with
+  `write_text` (not atomic; on Windows CRLF; `ensure_ascii` escapes). Fix with the verdict
+  bar in Batch 4: stamp by `verdict_id`, append a response record instead of rewriting.
+- Tk's council.log is still appended with `open("a")` (can lose a line to a concurrent
+  append on Windows); Tk's "New session" menu action does not claim its id.
+- Qt writes no crash-recovery sentinel (`conversations/<id>.active`) around a turn, as Tk
+  does — Batch 6 (crash recovery).
+- The notices Qt now keeps take slots in the Writer's 12-entry RECENT CONVERSATION (about
+  three entries per default-build turn instead of two), as they would in Tk with SILO off.
+
+**Second review fixes (2026-10-12/13, same branch).** Each was reproduced by a test that
+fails on the commit before it (two junction tests record a decision and pass before too).
+- The vault blocks are sized for what the Writer's call leaves, not for 75% of the window
+  less a guessed 500 tokens. `council_engine.prompt_room` counts the call the way the
+  engine's clamp fits it (the reply — 2,400 for the Writer, at most half the window, plus
+  thinking headroom when the model thinks — the template margin, chars/3 or denser when a
+  model was measured so); `PersonalityModel.prompt_frame` says what the call sends besides
+  the text (its system prompt, this conversation's turns). `prepare_turn(writer=…)` uses
+  both; Qt builds the personalities (no model loads) before preparing, Tk passes its Writer.
+  Measured before: on Ollama's 8,192 the engine cut the middle out of a named file with no
+  notice. Several named files share the room (head and tail of each). The context-window
+  notice measures the whole call: "too long … part of it will be cut out", or "nearly
+  fills" above 90% of the room. At 4,096 the Writer's own prompt leaves little room: vault
+  blocks are left out, and said.
+- A chip names the file its block was read from (it was the first file of that name in
+  `data_in/`; a match outside `data_in/` had none); a named file left out, missing or
+  unreadable gets no chip; a folder chip lists the folder; a click reads the file on a
+  worker; previews read only the start of a file (large JSON/parquet are not parsed whole).
+- The data index keeps its own files in `data_out/.index/` as gzip JSON (no pickle), writes
+  them only when a user's file changed, and the older builds' copies in `data_in/` are not
+  data anywhere (discover, the overview and its signature, the file count). Measured before:
+  every refresh rewrote them, so the dataset overview was rebuilt on every turn.
+- Not vault matches or data any more: the app's own `data_in/README.txt` and
+  `data_out/README.txt` (while they hold the app's text), and files named like the app's
+  state in `data_in/` (the vault search already treated them so). A file outside the vault
+  that shares an app-state name is read when named; an app file inside the vault that is
+  named is not read, and that is said. URLs are not paths (a `file://` URL is). A named
+  file that cannot be read is no longer reported as missing. KG4's block cites only vault
+  files that are not the app's own. Tk's "forget" says when the list could not be read.
+- Decided: a folder linked into the vault (junction/symlink) is searched — it is how a
+  folder is added without copying; protection is decided on the resolved path, so a link to
+  `memory/` is still the app's memory.
+
+Still open after the second review:
+- The full panel (Batch 3) and Tk's per-turn `respond` patches (specialists, instructions,
+  content style) add text the sizing does not measure: a panel Writer's synthesis prompt
+  carries the drafts, and the engine can still cut it, unreported.
+- Prompts are larger than at the branch point for questions that only weakly match the data
+  (the overview cap is 2,500 characters at 8,192; vault and value blocks scale with the
+  window). Whether to keep the 4,096-sized caps for those blocks is a choice not made here.
+- Tk's own `_preview_data_file` still reads on Tk's GUI thread (now bounded reads).
+- RECENT CONVERSATION still holds the question being answered (Qt, and Tk with SILO off).

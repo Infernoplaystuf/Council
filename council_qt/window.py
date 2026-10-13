@@ -47,6 +47,13 @@ class CouncilWindow(QMainWindow):
         #: with no transcript to land in must not grow without limit.
         self._held_notices: "collections.deque" = collections.deque(
             maxlen=100)
+        #: This launch's conversation (council_core.conversations.Conversation)
+        #: — created and owned by the Council tab, which runs the turns; the
+        #: Sessions tab loads an older session into it. None until then.
+        self.conversation = None
+        #: Called first on close, each guarded, before on_close: a tab that
+        #: holds something unsaved (the Council tab's turn) saves it here.
+        self.close_hooks: List[Callable[[], None]] = []
 
         self.tabs = QTabWidget(self)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -210,6 +217,11 @@ class CouncilWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        for hook in list(self.close_hooks):
+            try:
+                hook()
+            except Exception as exc:                    # noqa: BLE001
+                print(f"a close hook failed: {exc!r}")
         try:
             self.on_close()
         except Exception as exc:                        # noqa: BLE001

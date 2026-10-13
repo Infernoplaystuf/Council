@@ -90,8 +90,10 @@ SWITCHES: Tuple[Switch, ...] = (
                 "answers. Unchecking skips it on the next message while "
                 "learning continues underneath.",
            available=False,
-           unavailable_why="A learned profile is applied while "
-                           "COUNCIL_QUIRKS_APPLY is not 0, as the box shows."),
+           unavailable_why="Memory is \"this conversation only\" unless "
+                           "COUNCIL_MEMORY_SCOPE=all, and then a learned "
+                           "profile is applied while COUNCIL_QUIRKS_APPLY is "
+                           "not 0 — the box shows which."),
     Switch("adversarial", "Adversarial", False, shown_in_demo=False,
            available=False),
     Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False,
@@ -121,6 +123,14 @@ def profile_applied(environ: Optional[Mapping[str, str]] = None) -> bool:
     env = os.environ if environ is None else environ
     return (env.get("COUNCIL_QUIRKS_APPLY", "1").strip().lower()
             not in ("0", "false", "no", "off"))
+
+
+def profile_reaches_prompt(scope: str,
+                           environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether a learned profile goes into this shell's prompts: only in the
+    memory scope "all" (council_core.memory_scope), and there only while
+    `profile_applied`. In "This conversation only" — the Qt default — never."""
+    return scope == "all" and profile_applied(environ)
 
 
 @dataclass

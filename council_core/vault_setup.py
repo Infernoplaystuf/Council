@@ -157,8 +157,10 @@ class DataDirs:
 #: and the data index then offered them as the user's datasets — every user
 #: who sets a model. Tk did the same through the same call; the real vault
 #: here has data_in/vault_index.json and semantic_cache.json from it.
-#: data_index.py is another branch's to change, so the extra names live here
-#: until its list is extended. Each one checked to be written at the root.
+#: Each one checked to be written at the root. data_index._APP_INTERNAL_FILENAMES
+#: and conversation_logger.PROTECTED_STATE_FILES now name every one of them
+#: too (qt/batch1-2; tests/test_turn_context.py checks the three agree), so the
+#: data index's own migration skips them and a vault search never returns one.
 VAULT_ROOT_STATE = frozenset({
     "backend_settings.json",      # onboarding / engine settings
     "model_slots.json",           # council_core.model_slots

@@ -1,29 +1,33 @@
 """
-council_qt.tabs.sessions — past conversations, and loading one as prior.
+council_qt.tabs.sessions — past conversations, and loading one into this one.
 
-45 toolkit lines and the widest blast radius of phase 7: loading a session as
-prior rebuilds EVERY personality, and the Tk version does that on the GUI
-thread while a model call runs on a worker that writes into the transcript.
+The list is every saved session — the Tk shell's and the Qt shell's are the
+same files (council_core.conversations) — badged with how each one ended. It
+used to be empty: it opened `convo_store`, a module that does not exist.
 
-Here both halves are workers and neither touches a widget. The rebuild is the
-slow one — it loads weights — and the summary is the one the Tk build gets
-wrong: an AST pass over all 61 `Thread(target=...)` sites in the engine found
-its summary worker is the ONLY one that calls a UI method directly.
+LOAD AS PRIOR, AND NOTHING ELSE, BRINGS AN OLDER SESSION IN
+Memory is "This conversation only" by default (council_core.memory_scope):
+follow-ups see this session's turns and nothing older. Loading a session here
+is the one way an older one reaches a prompt. It is handed to the conversation
+the Council tab owns (window.conversation), which applies it to the
+personalities at the start of the next turn and says so in the transcript.
 
-The prior session is global state. This tab does not own the personalities, so
-it hands the rebuilt set to whoever does through `on_models_changed` rather
-than reaching across into another tab.
+Nothing is rebuilt. The Tk version — and this tab until Batch 1 — rebuilt
+every personality to change one field, on the GUI thread in Tk; and here the
+rebuilt set was handed to a callback nobody connected, so loading a prior
+changed nothing. Setting the field at the next turn's start is all it takes.
 """
 from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QPlainTextEdit, QVBoxLayout,
                                QWidget)
 
+from council_core import conversations
 from council_core import sessions as sessions_core
 from council_core import paths
 
@@ -35,10 +39,12 @@ class SessionsActions:
     """What the Sessions tab can ask the application to do."""
 
     def __init__(self, vault_dir: Optional[Path] = None, store=None,
-                 models=None):
+                 conversation=None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self._store = store
-        self.models = models
+        #: This launch's conversation (the Council tab's), or None when the
+        #: tab is built without one.
+        self.conversation = conversation
 
     @property
     def verdict_path(self) -> Path:
@@ -48,8 +54,7 @@ class SessionsActions:
         """The conversation store, opened on first use."""
         if self._store is None:
             try:
-                import convo_store
-                self._store = convo_store.ConvoStore(
+                self._store = conversations.ConversationStore(
                     self.vault_dir / "conversations")
             except Exception:                             # noqa: BLE001
                 return None
@@ -60,19 +65,33 @@ class SessionsActions:
         if store is None:
             return sessions_core.SessionListResult(
                 False, "The conversation store is unavailable.")
-        return sessions_core.list_sessions(store, self.verdict_path)
+        snapshot = (self.conversation.snapshot()
+                    if self.conversation is not None else None)
+        return sessions_core.list_sessions(
+            store, self.verdict_path,
+            current=snapshot.session_id if snapshot else None,
+            prior=snapshot.prior_session_id if snapshot else None)
 
     def preview(self, session_id: str) -> str:
         store = self.store()
         return "" if store is None else sessions_core.preview(store, session_id)
 
-    def rebuild(self, session_id: Optional[str]):
-        return sessions_core.rebuild_with_prior(self.vault_dir, session_id)
+    def prior(self) -> Optional[str]:
+        if self.conversation is None:
+            return None
+        return self.conversation.snapshot().prior_session_id
 
-    def ensure_summary(self, session_id: str):
-        writer = getattr(self.models, "writer", None)
-        store = getattr(writer, "conversation_store", None) or self.store()
-        return sessions_core.ensure_summary(store, writer, session_id)
+    def load_prior(self, session_id: str) -> conversations.Outcome:
+        if self.conversation is None:
+            return conversations.Outcome(
+                False, "There is no conversation to load it into — the "
+                       "Council tab is not in this build.")
+        return self.conversation.load_prior(session_id)
+
+    def clear_prior(self) -> conversations.Outcome:
+        if self.conversation is None:
+            return conversations.Outcome(True, "Nothing is loaded.")
+        return self.conversation.clear_prior()
 
     def verdict_summary(self) -> str:
         sample, total = sessions_core.read_verdicts(self.verdict_path)
@@ -82,17 +101,21 @@ class SessionsActions:
 class SessionsTab(ViewHelpers, QWidget):
     """A filtered list of past sessions, and what to do with one."""
 
-    def __init__(self, window=None, actions: Optional[SessionsActions] = None,
-                 on_models_changed: Optional[Callable] = None):
+    def __init__(self, window=None, actions: Optional[SessionsActions] = None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
-        self.actions = actions or SessionsActions()
-        self.on_models_changed = on_models_changed
+        shared = getattr(window, "conversation", None)
+        # The list is of the vault the conversation is kept in.
+        self.actions = actions or SessionsActions(
+            vault_dir=getattr(shared, "vault_dir", None), conversation=shared)
+        if self.actions.conversation is None:
+            self.actions.conversation = shared
+        if self.actions.conversation is not None:
+            self.actions.conversation.subscribe(self._on_conversation)
         self._tokens = theme.tokens("dark")
         self._all: List[sessions_core.SessionRow] = []
         self._shown: List[sessions_core.SessionRow] = []
-        self._busy = False
 
         self._build()
         self.refresh()
@@ -101,7 +124,8 @@ class SessionsTab(ViewHelpers, QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
 
-        outer.addWidget(QLabel("Past Sessions (double-click to load as prior)"))
+        outer.addWidget(QLabel(
+            "Past Sessions (double-click to load one into this conversation)"))
 
         row = QHBoxLayout()
         glass = QLabel("🔍")
@@ -123,14 +147,19 @@ class SessionsTab(ViewHelpers, QWidget):
 
         buttons = QHBoxLayout()
         self._button(buttons, "Refresh", self.refresh)
-        self._button(buttons, "Load as Prior", self.on_load_prior)
+        self.load_btn = self._button(buttons, "Load as Prior",
+                                     self.on_load_prior)
+        self.load_btn.setToolTip(
+            "Bring this session into the current conversation: from the "
+            "next question on, the council uses it as background. The only "
+            "way an older session is used.")
         self._button(buttons, "Preview Session", self.on_preview)
         self._button(buttons, "Clear Prior", self.on_clear_prior)
         self._button(buttons, "Verdict History", self.on_verdict_history)
         buttons.addStretch(1)
         outer.addLayout(buttons)
 
-        self.prior = QLabel(sessions_core.prior_label(None))
+        self.prior = QLabel(sessions_core.prior_label(self.actions.prior()))
         self.prior.setWordWrap(True)
         outer.addWidget(self.prior)
 
@@ -200,68 +229,28 @@ class SessionsTab(ViewHelpers, QWidget):
         threading.Thread(target=work, name="sessions-verdicts",
                          daemon=True).start()
 
-    # -- the wide one ---------------------------------------------------
+    # -- the prior --------------------------------------------------------
     def on_load_prior(self) -> None:
+        """Hand the selected session to this launch's conversation. The
+        Council transcript says it was loaded (the conversation tells it)."""
         session_id = self.selected_session()
         if not session_id:
             self.status.setText("Select a session to load.")
             return
-        self._rebuild(session_id, f"Loading '{session_id}' as prior…")
+        self.status.setText(self.actions.load_prior(session_id).message)
 
     def on_clear_prior(self) -> None:
-        self._rebuild(None, "Clearing the prior session…")
+        self.status.setText(self.actions.clear_prior().message)
 
-    def _rebuild(self, session_id: Optional[str], status: str) -> None:
-        """Rebuild every personality against a prior session.
+    def _on_conversation(self, event: str, **_details) -> None:
+        """Keep the prior line and the list's marks true, whoever changed
+        them."""
+        def show() -> None:
+            self.prior.setText(sessions_core.prior_label(self.actions.prior()))
+            self.refresh()
 
-        On a WORKER. The Tk version does this on the GUI thread, which is a
-        freeze of however long the weights take to load.
-        """
-        if self._busy:
-            self.status.setText("Already rebuilding — wait for it to finish.")
-            return
-        self._busy = True
-        self.status.setText(status)
-
-        def work() -> None:
-            models, problem = self.actions.rebuild(session_id)
-
-            def show() -> None:
-                self._busy = False
-                if models is None:
-                    self.status.setText(problem)
-                    return
-                self.actions.models = models
-                self.prior.setText(sessions_core.prior_label(session_id))
-                self.status.setText(
-                    f"Prior session loaded: {session_id}" if session_id
-                    else "Prior session cleared.")
-                if self.on_models_changed is not None:
-                    # This tab does not own the personalities. Handing them
-                    # over beats reaching across into another tab's state.
-                    self.on_models_changed(models, session_id)
-                if session_id:
-                    self._summarise(session_id)
-
+        if event in ("prior_loaded", "prior_cleared", "renamed"):
             self._to_ui(show)
-
-        threading.Thread(target=work, name="sessions-rebuild",
-                         daemon=True).start()
-
-    def _summarise(self, session_id: str) -> None:
-        """Write the session's prose summary once, in the background.
-
-        The Tk equivalent calls _append_transcript from inside the worker —
-        the only one of the engine's 61 threads that touches a UI method
-        directly.
-        """
-        def work() -> None:
-            result = self.actions.ensure_summary(session_id)
-            if result.message:
-                self._to_ui(lambda: self.status.setText(result.message))
-
-        threading.Thread(target=work, name="sessions-summary",
-                         daemon=True).start()
 
 
 def build_sessions(window) -> QWidget:

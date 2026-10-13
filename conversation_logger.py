@@ -53,6 +53,21 @@ PROTECTED_SUBDIRS: tuple = (
     # knowledge_graph.py). Its JSON/CSV exports quote the user's documents,
     # so a vault search must not find them as if they were documents.
     ".knowledge_graph",
+    # The app's own logs: logs/council.log is the Librarian's log of EVERY
+    # transcript line of every session (the same content as
+    # conversation_logs/), and logs/crashes/ holds crash reports. Indexed as
+    # a .log document, an older session's words came back as a "vault
+    # match" — the way past conversations must not reach a prompt under
+    # "This conversation only" (council_core.memory_scope). Only the vault's
+    # own top-level logs/ is meant: a "logs" folder inside data_in/ is the
+    # user's and stays searchable.
+    "logs",
+    # Learned memory: role and project memory and the compiled user profile
+    # (council_engine.RoleMemoryManager writes memory/*.md), and the Sage's
+    # knowledge notes. Indexed as documents, a vault search put them back
+    # into a prompt — past "This conversation only", and past SILO in Tk.
+    "memory",
+    "sage_knowledge",
 )
 
 # Lowercased once at import for the per-path membership test in
@@ -74,14 +89,61 @@ PROTECTED_STATE_FILES: tuple = (
     "fuzzy_denylist.json", "semantic_cache.json", "backend_settings.json",
     "sql_connections.json", "mongo_connections.json",
     "data_index_cache.pickle", ".vault_col_index.json",
+    "data_index_cache.json.gz",
     ".agent_runs.jsonl", ".tool_gaps.jsonl", ".failures.jsonl",
     ".user_quirks.jsonl", ".tool_proposals.jsonl",
     ".onboarded", ".council_python",
     # Agent profiles: settings, profiles and the council's tool requests
     # (council_core/agent_profiles.py) — app state, and it quotes tool code.
     "agent_profiles.json",
+    # Older conversations, in the app's own words: every judged question
+    # (verdict_history.jsonl), every question the vault could not answer
+    # (vault_rag_misses.txt), the Librarian's gap list quoting them. A
+    # "search the vault for X" put both of the first two into the prompt
+    # (measured) — an older session's question, past "This conversation
+    # only" (council_core.memory_scope).
+    "verdict_history.jsonl", "vault_rag_misses.txt", "librarian_wishlist.md",
+    # The app's own settings at the vault root: the Personal Specialists, the
+    # council instructions and content style, the model pins, the node list
+    # and the Grapher presets. A vault search returned specialists.json as a
+    # "source" for questions about sales (docs/qt_migration/
+    # remaining_scope_2026-10-06.md, the source-chips row).
+    "specialists.json", "council_instructions.json", "content_style.json",
+    "personality_backends.json", "node_registry.json", "graph_presets.json",
+    # The model slots and the PC check's benchmark (council_core.model_slots,
+    # council_core.pc_check) — the last two of council_core.vault_setup
+    # .VAULT_ROOT_STATE this list did not name. "search the vault for X"
+    # put both into the prompt when they held the word (measured).
+    "model_slots.json", "model_bench.json",
 )
+
+#: App files protected only at the vault ROOT — a name too ordinary to
+#: protect everywhere (a user's own trends.md in data_in/ is their data).
+#: trends.md is the cross-session trend analysis of all role memory.
+PROTECTED_ROOT_FILES: tuple = ("trends.md",)
+_PROTECTED_ROOT_FILES_LC = frozenset(s.lower() for s in PROTECTED_ROOT_FILES)
 _PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
+
+#: The README the app writes in data_in/ and data_out/
+#: (data_index.init_data_dirs) — protected while it IS the app's text: a
+#: vault search returned both as matches and chips (found in review). Not
+#: every README.txt (a user's data_in/jobs/README.txt is theirs), and not one
+#: the user has rewritten (then it is theirs too).
+APP_README_FOLDERS: tuple = ("data_in", "data_out")
+APP_README_NAME = "readme.txt"
+
+
+def _is_app_readme(path: Path) -> bool:
+    """True when ``path`` holds the app's own README text, word for word."""
+    try:
+        import data_index
+        with open(path, "rb") as fh:
+            data = fh.read(8192)
+        text = data.decode("utf-8").replace("\r\n", "\n").strip()
+    except Exception:
+        return False
+    return text in (data_index._README_INPUT.strip(),
+                    data_index._README_OUTPUT.strip())
 
 
 def is_protected_path(path: Any, vault_dir: Any) -> bool:
@@ -113,6 +175,11 @@ def is_protected_path(path: Any, vault_dir: Any) -> bool:
         # (it's just outside our scope).
         return False
     parts = rel.parts
+    if len(parts) == 1 and parts[0].lower() in _PROTECTED_ROOT_FILES_LC:
+        return True
+    if (len(parts) == 2 and parts[0].lower() in APP_README_FOLDERS
+            and parts[1].lower() == APP_README_NAME and _is_app_readme(p)):
+        return True
     return bool(parts) and parts[0].lower() in _PROTECTED_SUBDIRS_LC
 
 

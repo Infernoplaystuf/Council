@@ -125,13 +125,16 @@ def latest_by_session(records: Sequence[dict]) -> Dict[str, dict]:
     return latest
 
 
-def session_label(session_id: str, record: Optional[dict]) -> str:
+def session_label(session_id: str, record: Optional[dict], *,
+                  note: str = "") -> str:
     """The row text. Never parsed back — see SessionRow."""
     if not record:
-        return session_id
-    confidence = record.get("confidence", 0)
-    badge = "✓" if record.get("passed") else "✗"
-    return f"{session_id:<30}  [{confidence}/10 {badge}]"
+        label = session_id
+    else:
+        confidence = record.get("confidence", 0)
+        badge = "✓" if record.get("passed") else "✗"
+        label = f"{session_id:<30}  [{confidence}/10 {badge}]"
+    return f"{label}  ({note})" if note else label
 
 
 def verdict_summary(total: int, sample: Sequence[dict]) -> str:
@@ -153,9 +156,20 @@ def verdict_summary(total: int, sample: Sequence[dict]) -> str:
 # The list
 # ============================================================
 
+#: What the list says beside the session the app is in, and beside the one
+#: loaded into it.
+THIS_CONVERSATION = "this conversation"
+LOADED_AS_PRIOR = "loaded into this conversation"
+
+
 def list_sessions(store: Any, verdict_path: Any, *,
-                  last_n: int = VERDICT_SAMPLE) -> SessionListResult:
-    """Every past session, badged with how it ended."""
+                  last_n: int = VERDICT_SAMPLE,
+                  current: Optional[str] = None,
+                  prior: Optional[str] = None) -> SessionListResult:
+    """Every past session — the Tk shell's and the Qt shell's, which are the
+    same files — badged with how it ended. ``current`` and ``prior`` are
+    marked, so the list says which one the app is in and which one it has
+    loaded."""
     try:
         ids = list(store.list_sessions())
     except Exception as exc:                              # noqa: BLE001
@@ -169,16 +183,19 @@ def list_sessions(store: Any, verdict_path: Any, *,
     rows = []
     for session_id in ids:
         record = latest.get(session_id)
+        note = (THIS_CONVERSATION if session_id == current else
+                LOADED_AS_PRIOR if session_id == prior else "")
         rows.append(SessionRow(
             id=session_id,
-            label=session_label(session_id, record),
+            label=session_label(session_id, record, note=note),
             confidence=(record or {}).get("confidence"),
             passed=(record or {}).get("passed")))
 
     return SessionListResult(
         True,
         (f"{len(rows)} session(s)." if rows else
-         "No past sessions yet — they appear here after you close one."),
+         "No saved sessions yet — one appears here once you ask the "
+         "council something."),
         rows=rows)
 
 
@@ -269,6 +286,10 @@ def rebuild_with_prior(vault_dir: Any, session_id: Optional[str], *,
     if loaded.missing:
         return None, ("Missing required personalities: "
                       f"{', '.join(loaded.missing)}.")
+    # The Qt shell's memory scope, as load_personalities gives every other
+    # set: unset, respond() falls back to the engine's "all".
+    from . import memory_scope
+    council_turn.set_scope(loaded, memory_scope.for_qt())
     return loaded, ""
 
 
