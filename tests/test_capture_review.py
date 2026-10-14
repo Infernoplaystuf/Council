@@ -31,6 +31,7 @@ import frame_camera
 import run_example_gui as rex
 from council_core import event_playback
 from council_qt.widgets import capture_review as cr
+from tests.sim_cameras import simulated_row
 from PySide6.QtWidgets import QApplication
 
 GENERATED = ("app", "handlers", "ui", "ui.main_ui", "ui.ports", "ui.widgets")
@@ -104,7 +105,7 @@ def capture_into(ui, folder):
     ui.ports.capture_folder.set(str(folder))
     pump(0.25)
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith("event")))
+    frame_camera.connect(simulated_row(rows, "event"))
     frame_camera.start(str(folder))
 
 
@@ -584,7 +585,7 @@ def test_a_new_capture_leaves_the_raw_view(ui, tmp_path):
     with_playback(rv, playback)
     rv.toggle_view()
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith("event")))
+    frame_camera.connect(simulated_row(rows, "event"))
     frame_camera.start(str(tmp_path))
     assert pump_until(lambda: rv.live)
     assert playback.closed and rv.mode == cr.PNG
@@ -649,7 +650,7 @@ def test_a_run_name_is_read_from_its_files():
 # ======================================================================
 def connect_event_camera():
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith("event")))
+    frame_camera.connect(simulated_row(rows, "event"))
 
 
 def test_connected_with_an_empty_folder_shows_the_camera_live(ui, tmp_path):
@@ -935,7 +936,7 @@ def test_the_raw_view_shows_the_runs_area_from_its_camera_record(
 # ======================================================================
 def connect_frame_camera():
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+    frame_camera.connect(simulated_row(rows, "frame"))
 
 
 def test_a_12_bit_live_frame_is_shown_as_the_camera_saw_it(ui, tmp_path):

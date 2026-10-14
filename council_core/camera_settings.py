@@ -69,7 +69,8 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
 
 from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
                       EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
-                      Roi, _ask, _interface, fit_roi, off_sensor, on_sensor)
+                      Roi, _ask, _interface, fit_roi, nearest_whole,
+                      off_sensor, on_sensor, said_plainly)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "Trigger", "trigger_warning", "area_unchanged",
@@ -129,11 +130,24 @@ class Setting:
     #: "": a Basler's TriggerMode On means no frame until a trigger arrives,
     #: which froze the live view with no word said (trigger_warning).
     warning: str = ""
+    #: The unit a person is SHOWN it in, when not `unit`, and how many of
+    #: `unit` make one of it. A trail filter's threshold is µs to the HAL
+    #: and in a preset, but the sensor keeps whole milliseconds: it steps
+    #: by 1000 µs and is shown in ms ("ms", 1000). The value, its range and
+    #: its step stay in `unit`; only what is shown is divided.
+    shown_unit: str = ""
+    shown_per: float = 1.0
 
     @property
     def savable(self) -> bool:
         """Belongs in a preset: something the user chose, not a reading."""
         return not self.read_only and self.kind != TEXT
+
+    def shown(self) -> Tuple[str, float]:
+        """(the unit a person sees this in, how many of `unit` to one)."""
+        if self.shown_unit:
+            return self.shown_unit, float(self.shown_per or 1.0)
+        return self.unit, 1.0
 
     def as_dict(self) -> Dict[str, Any]:
         """Plain data, for a window or a JSON file."""
@@ -141,6 +155,7 @@ class Setting:
                 "type": self.kind, "value": self.value,
                 "min": self.minimum, "max": self.maximum, "step": self.step,
                 "choices": list(self.choices), "unit": self.unit,
+                "shown_unit": self.shown_unit, "shown_per": self.shown_per,
                 "read_only": self.read_only, "live": self.live,
                 "held": self.held, "warning": self.warning,
                 "help": self.help,
@@ -169,16 +184,25 @@ class Change:
         """Took, but not exactly as asked (clamped or snapped)."""
         return self.ok and not self.skipped and not same(self.asked, self.value)
 
-    def line(self, label: str = "", unit: str = "") -> str:
+    def line(self, label: str = "", unit: str = "", per: float = 1.0) -> str:
         """One line for a status bar or a list — said by `label`, the name
         on the setting's row, with its `unit`, when given. The key alone
         ("window_ms: 99.901", "PixelFormat: Mono12") was what every tab's
         and pop-out's status line said under a row called "Picture window"
-        or "Pixel format"."""
+        or "Pixel format". `per`: how many of the value's own unit make one
+        of `unit` (Setting.shown) — a trail threshold of 10000 µs is said
+        "10 ms", as its row shows it."""
         name = label or self.key
+        per = float(per or 1.0)
+
+        def number(value: Any) -> Any:
+            if per != 1.0 and isinstance(value, (int, float)) \
+                    and not isinstance(value, bool):
+                return value / per
+            return value
 
         def said(value: Any) -> str:
-            text = show(value)
+            text = show(number(value))
             numeric = isinstance(value, (int, float)) and not isinstance(
                 value, bool)
             return f"{text} {unit}" if unit and numeric else text
@@ -190,7 +214,7 @@ class Change:
         if self.adjusted:
             why = f" ({self.note})" if self.note else ""
             return (f"{name}: {said(self.value)}, asked "
-                    f"{show(self.asked)}{why}")
+                    f"{show(number(self.asked))}{why}")
         return f"{name}: {said(self.value)}"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -408,18 +432,41 @@ def coerce(setting: Setting, value: Any) -> Tuple[Any, str]:
             raise SettingError(f"{setting.label} must be a finite number")
         note = ""
         low, high = setting.minimum, setting.maximum
+        shown_unit, per = setting.shown()
+
+        def bound(value: Any) -> str:
+            # In the unit the row SHOWS: "Threshold: 1 ms, asked 0.5
+            # (clamped to the minimum, 1000)" gave it in µs, in an ms line.
+            if per != 1.0:
+                return f"{show(float(value) / per)} {shown_unit}".rstrip()
+            return show(value)
+
         if low is not None and number < low:
-            number, note = float(low), f"clamped to the minimum, {show(low)}"
+            number, note = float(low), f"clamped to the minimum, {bound(low)}"
         if high is not None and number > high:
-            number, note = float(high), f"clamped to the maximum, {show(high)}"
+            number, note = (float(high),
+                            f"clamped to the maximum, {bound(high)}")
         if kind == INT:
             step = int(setting.step or 1)
-            base = int(low) if low is not None else 0
-            snapped = base + int(round((number - base) / step)) * step
+            # Stepped by one whole unit of what it is shown in (a trail
+            # threshold: whole ms, in µs): snapped AS THE SENSOR ROUNDS IT,
+            # from zero and a half away from zero (cameras.nearest_whole,
+            # OpenEB's std::roundf). round() from the minimum took 3500 µs
+            # to 3 ms where an IMX636 keeps 4. A Basler's integer node keeps
+            # this snap: from its minimum, by its increment.
+            whole = per != 1.0 and step == per
+            if whole:
+                snapped = nearest_whole(number / step) * step
+            else:
+                base = int(low) if low is not None else 0
+                snapped = base + int(round((number - base) / step)) * step
             if high is not None and snapped > high:
                 snapped -= step
+            if whole and low is not None and snapped < low:
+                snapped += step
             if snapped != number and not note:
-                note = f"snapped to a multiple of {step}"
+                note = (f"snapped to whole {shown_unit}" if whole
+                        else f"snapped to a multiple of {step}")
             return int(snapped), note
         return float(number), note
     raise SettingError(f"{setting.label} cannot be set")
@@ -494,14 +541,12 @@ class Provider:
         EVK4 here, the simulated cameras): it runs free."""
         return []
 
-    def trigger_modes(self) -> Dict[str, str]:
-        """Each trigger's mode by its selector entry ({"FrameStart": "Off",
-        "FrameBurstStart": "On", ...}); {} with none to report."""
-        return {}
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
-        """Put each trigger's mode back as `modes` has it (trigger_modes, as
-        connected); what was changed, one line each."""
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """Put EVERY trigger back as `values` has it — trigger_settings(
+        selected=True), read when the camera was connected: each one's
+        source, edge and delay, then its mode, the selector left where it
+        was. What changed or could not be put back, one line per trigger.
+        [] for a camera with no triggers."""
         return []
 
     def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
@@ -618,7 +663,10 @@ class NoSettings(Provider):
 
 
 def _why(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    # An OpenEB exception's text is a block — rules of dashes, the
+    # category, "Error <code>: " (cameras.said_plainly): its message alone,
+    # or a row's one-line "NOT changed —" note was a run of dashes.
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     # GenICam exceptions carry a file/line tail nobody needs to read.
     return text.split(" : ")[0][:200]
 
@@ -1152,34 +1200,59 @@ class BaslerSettings(Provider):
         self._each_trigger(visit)
         return found
 
-    def trigger_modes(self) -> Dict[str, str]:
-        modes: Dict[str, str] = {}
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """EVERY TRIGGER BACK AS CONNECTED, NOT ONLY ITS MODE. A Basler
+        holds a source, an edge and a delay per TriggerSelector entry as
+        well as a mode (measured on the emulator: each changed alone), and
+        "Reset as connected" put back the modes only — a FrameBurstStart
+        trigger moved to Line1 on the falling edge stayed there.
 
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            try:
-                modes[entry] = str(_plain(mode.GetValue()))
-            except Exception:                               # noqa: BLE001
-                pass
-        self._each_trigger(visit)
-        return modes
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
+        Written by apply_triggers: each trigger selected in turn, its
+        source, edge and delay before its mode, a value it already has not
+        written again, and the selector put back where it was. Read first
+        (trigger_settings), so what CHANGED is said: "the FrameBurstStart
+        trigger Off again (its source Software and edge RisingEdge too)"."""
+        if not values:
+            return []
+        try:
+            before = self.trigger_settings(selected=True)
+        except Exception:                                   # noqa: BLE001
+            before = {}
+        words = {"TriggerMode": "mode", "TriggerSource": "source",
+                 "TriggerActivation": "edge", "TriggerDelay": "delay"}
+        changed: Dict[str, Dict[str, Any]] = {}
+        refused: List[str] = []
+        for change in self.apply_triggers(values):
+            split = split_trigger_key(change.key)
+            if split is None:
+                continue
+            base, entry = split
+            if not change.ok:
+                refused.append(f"the {entry} trigger's {words[base]} NOT put "
+                               f"back to {show(change.asked)} — "
+                               f"{change.note}")
+            elif change.key not in before or not same(before[change.key],
+                                                      change.value):
+                changed.setdefault(entry, {})[base] = change.value
         done: List[str] = []
-
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            wanted = modes.get(entry)
-            if wanted is None:
-                return
-            try:
-                if str(_plain(mode.GetValue())) == wanted:
-                    return
-                mode.SetValue(wanted)
-                done.append(f"the {entry or 'camera'} trigger {wanted} again")
-            except Exception as exc:                        # noqa: BLE001
-                done.append(f"the {entry or 'camera'} trigger NOT put back "
-                            f"to {wanted} — {_why(exc)}")
-        self._each_trigger(visit)
-        return done
+        for entry, now in changed.items():
+            parts = []
+            for base in ("TriggerSource", "TriggerActivation",
+                         "TriggerDelay"):
+                word = words[base]
+                if base in now:
+                    unit = " µs" if base == "TriggerDelay" else ""
+                    parts.append(f"{word} {show(now[base])}{unit}")
+            said = (", ".join(parts[:-1]) + " and " + parts[-1]
+                    if len(parts) > 1 else "".join(parts))
+            if "TriggerMode" in now:
+                line = f"the {entry} trigger {show(now['TriggerMode'])} again"
+                if said:
+                    line += f" (its {said} too)"
+            else:
+                line = f"the {entry} trigger's {said} again"
+            done.append(line)
+        return done + refused
 
     def _selected_trigger(self) -> str:
         selector = self.device._node("TriggerSelector")
@@ -1613,6 +1686,26 @@ TRAIL_THRESHOLD_HELP = (
     "nearest whole millisecond.")
 
 
+def trail_threshold_setting(value: Any, low: Any, high: Any) -> Setting:
+    """The trail filter's threshold row.
+
+    IN WHOLE MILLISECONDS, AS THE SENSOR KEEPS IT. Every OpenEB trail
+    filter takes 1000-100000 µs, keeps the nearest whole ms and raises
+    outside that (cameras.trail_threshold_kept); the slider stepped by
+    1 µs, so it offered 99,001 positions of which 99 exist, and a drag said
+    values the camera never held. The value stays in µs — what the HAL and
+    a preset hold — stepped by 1000 and SHOWN in ms (Setting.shown_unit).
+    A range that is not in whole ms (no OpenEB sensor reports one) keeps a
+    1 µs step, shown in µs."""
+    whole_ms = all(v is not None and float(v) % 1000 == 0
+                   for v in (low, high))
+    return Setting(
+        "trail.threshold", "Threshold", G_TRAIL, INT, int(value),
+        minimum=low, maximum=high, step=1000 if whole_ms else 1, unit="µs",
+        help=TRAIL_THRESHOLD_HELP, shown_unit="ms" if whole_ms else "",
+        shown_per=1000.0 if whole_ms else 1.0)
+
+
 class EvkSettings(Provider):
     """An EVK4's HAL facilities, as Settings.
 
@@ -1820,11 +1913,9 @@ class EvkSettings(Provider):
                                _enum_name(kind), choices=names))
         threshold = _ask(trail, "get_threshold")
         if threshold is not None:
-            out.append(Setting(
-                "trail.threshold", "Threshold", G_TRAIL, INT, int(threshold),
-                minimum=_num(_ask(trail, "get_min_supported_threshold")),
-                maximum=_num(_ask(trail, "get_max_supported_threshold")),
-                step=1, unit="µs", help=TRAIL_THRESHOLD_HELP))
+            out.append(trail_threshold_setting(
+                threshold, _num(_ask(trail, "get_min_supported_threshold")),
+                _num(_ask(trail, "get_max_supported_threshold"))))
         return out
 
     def _activity(self) -> List[Setting]:
@@ -2088,11 +2179,16 @@ class SyntheticSettings(Provider):
         out: List[Setting] = []
         if dev.info.kind == "event":
             for name in dev.BIASES:
+                # Like an EVK4 opened as Typhon opens one: the range it
+                # accepts (RANGES — the IMX636's recommended range, what
+                # get_bias_range() reports without the bypass) and the
+                # recommended range itself, both the sensor's own.
                 low, high = ranges[f"bias.{name}"]
+                _allowed, recommended = dev.BIAS_TABLE[name]
                 out.append(Setting(f"bias.{name}", name, G_BIASES, INT,
                                    state[f"bias.{name}"], low, high, 1,
                                    help=_BIAS_HELP.get(name, ""),
-                                   recommended=(max(low, -50), min(high, 50))))
+                                   recommended=tuple(recommended)))
             out.append(Setting("erc.enabled", "Event rate controller on",
                                G_ERC, BOOL, state["erc.enabled"]))
             low, high = ranges["erc.rate"]
@@ -2104,9 +2200,8 @@ class SyntheticSettings(Provider):
                                state["trail.type"],
                                choices=dev.TRAIL_TYPES))
             low, high = ranges["trail.threshold"]
-            out.append(Setting("trail.threshold", "Threshold", G_TRAIL, INT,
-                               state["trail.threshold"], low, high, 1,
-                               unit="µs"))
+            out.append(trail_threshold_setting(state["trail.threshold"],
+                                               low, high))
             out.extend(display_settings(dev))
             out.append(Setting("status.temperature", "Temperature", G_STATUS,
                                INT, 31, unit="°C", read_only=True))

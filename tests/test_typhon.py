@@ -31,6 +31,7 @@ import gui_projects as gpj
 import python_envs as pe
 import run_example_gui as rex
 from council_core import camera_setup as cs
+from tests.sim_cameras import simulated_index
 from PySide6.QtWidgets import QApplication
 
 EXAMPLES = ROOT / "examples" / "gui"
@@ -672,10 +673,11 @@ def test_first_run_fills_the_camera_panel(qapp, typhon_dir, monkeypatch,
 # The camera's own set-up: area, settings, presets — in the generated app
 # ======================================================================
 def _connect(ui, kind):
+    """Scan and Connect the SIMULATED `kind` camera, by name: in the
+    pylon env (PYLON_CAMEMU) the first "frame" row is an emulated Basler."""
     ui.on_btn_scan_for_cameras()
     rows = ui.ports.cameras.items()
-    ui.ports.cameras.widget.setCurrentRow(
-        next(i for i, r in enumerate(rows) if r.endswith(kind)))
+    ui.ports.cameras.widget.setCurrentRow(simulated_index(rows, kind))
     ui.on_btn_connect()
     assert ui.ports.capture_status.get().startswith("Connected"), \
         ui.ports.capture_status.get()

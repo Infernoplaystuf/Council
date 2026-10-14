@@ -12,8 +12,6 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("PYLON_CAMEMU", "1")
-
 import numpy as np
 import pytest
 
@@ -22,6 +20,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from council_core import cameras, capture
 
 pylon = pytest.importorskip("pypylon.pylon")
+
+
+@pytest.fixture(autouse=True)
+def camera_emulator(monkeypatch):
+    """pylon's camera emulator for THIS FILE'S TESTS ONLY: as many emulated
+    cameras as PYLON_CAMEMU asks for, else one.
+
+    It was set at import (os.environ.setdefault), so it stayed set for the
+    whole pytest process: every test collected with this file listed an
+    emulated Basler, and the simulated-camera tests that took "the first
+    frame camera" connected to it ("'BaslerDevice' object has no attribute
+    'state'"). pylon reads PYLON_CAMEMU at every enumeration (measured:
+    set after the first EnumerateDevices, the next one lists the emulated
+    cameras; removed, none), so a per-test setting is enough."""
+    if not os.environ.get("PYLON_CAMEMU"):
+        monkeypatch.setenv("PYLON_CAMEMU", "1")
 
 
 @pytest.fixture
@@ -849,17 +863,33 @@ def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
     cam = fc._LIVE.device._cam
     connected = _trigger_modes(cam)
     assert set(connected.values()) == {"Off"}
+    every = _every_trigger(cam)
     window = ui._settings_tabs.pop_out("Trigger")
     window.rows["TriggerSelector"]._from_choice("FrameBurstStart")
     window.flush_now()
+    # Its source, edge and delay too: "Reset" put back only the MODE of a
+    # trigger the selector was not on, and these stayed as changed.
+    window.rows["TriggerSource"]._from_choice("Line1")
+    window.flush_now()
+    window.rows["TriggerActivation"]._from_choice("FallingEdge")
+    window.flush_now()
+    window.rows["TriggerDelay"].editor.setValue(250.0)
+    window.flush_now()
     window.rows["TriggerMode"]._from_choice("On")
     window.flush_now()
-    window.rows["TriggerSelector"]._from_choice("FrameStart")
+    # Left on an entry it was not on at Connect: the selector is a setting
+    # like the others, and Reset puts it back too (the docs said it was
+    # left where it is; this test moved it back itself before Reset).
+    window.rows["TriggerSelector"]._from_choice("FrameEnd")
     window.flush_now()
+    assert cam.TriggerSelector.GetValue() == "FrameEnd"
     assert _trigger_modes(cam)["FrameBurstStart"] == "On"
+    assert _every_trigger(cam)["FrameBurstStart"][1:] == (
+        "Line1", "FallingEdge", 250.0)
     assert fc._triggers_on(fc._LIVE.device)[0].selector == "FrameBurstStart"
     window.reset_group()
     assert _pump(app, 4.0, until=lambda: fc._LIVE.job is None)
     assert _trigger_modes(cam) == connected
-    assert cam.TriggerSelector.GetValue() == "FrameStart"
+    assert _every_trigger(cam) == every
+    assert cam.TriggerSelector.GetValue() == "FrameStart", "as connected"
     assert "the FrameBurstStart trigger Off again" in window.status.text()

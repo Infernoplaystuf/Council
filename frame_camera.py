@@ -246,11 +246,15 @@ class _Live:
         #: keeps what it was last given until it is powered off, so it also
         #: offers its own factory set (load_camera_defaults).
         self.as_connected: Dict[str, Any] = {}
-        #: Each trigger's mode by its selector entry as connected (camera_
-        #: settings Provider.trigger_modes): a Basler's TriggerMode is the
-        #: SELECTED trigger's, so as_connected holds one of nine; Reset puts
-        #: the others back from here.
-        self.as_connected_triggers: Dict[str, str] = {}
+        #: Every trigger's settings by selector entry as connected — mode,
+        #: source, edge and delay, by camera_settings.trigger_key ("Trigger
+        #: Source[FrameBurstStart]"; Provider.trigger_settings(selected=
+        #: True)): a Basler's trigger rows are the SELECTED trigger's, so
+        #: as_connected holds one of nine; Reset puts them all back from
+        #: here (Provider.restore_triggers). The SELECTOR goes back as
+        #: connected too — it is in as_connected, written by the set
+        #: before them — and restoring the triggers does not move it again.
+        self.as_connected_triggers: Dict[str, Any] = {}
         #: The camera's description read by Connect, while Connect is being
         #: announced to the views (settings_list answers from it); else None.
         self.connect_listing: Optional[List[Any]] = None
@@ -459,7 +463,7 @@ def connect(which: Any) -> Dict[str, Any]:
     # facility calls for a Connect that made 46 before the tabs).
     described = _describe_or_none(device)
     _LIVE.as_connected = _snapshot_or_nothing(device, described)
-    _LIVE.as_connected_triggers = _trigger_modes_or_nothing(device)
+    _LIVE.as_connected_triggers = _every_trigger_or_nothing(device)
     _LIVE.connect_listing = described
     try:
         _announce({"what": "connected",
@@ -750,20 +754,32 @@ def stop() -> Dict[str, Any]:
         _announce({"what": "stopped",
                    "summary": "The camera did not stop cleanly."})
         return {"summary": "The camera did not stop cleanly.",
-                "status": stats.line()}
+                "status": _stats_line(stats)}
     line = _stopped_line(session)
     _LIVE.run_note_until = time.monotonic() + RUN_NOTE_SECONDS
     _LIVE.run_note = ""            # this run's, read from the session
     _announce({"what": "stopped", "summary": line})
-    return {"summary": line, "status": stats.line()}
+    return {"summary": line, "status": _stats_line(stats)}
 
 
 #: How long the live line carries the last run's result after Stop.
 RUN_NOTE_SECONDS = 10.0
 
 
+def _stats_line(stats: Any) -> str:
+    """capture.Stats.line: the display drops are "not drawn (screen only)"
+    (capture.SCREEN_DROPS, the line's own wording) in EVERY line — the live
+    one, Stop's, a capture that ended and status(), and the Council's
+    Capture tab. Stop's said "N dropped" for the very number the live line
+    had just called "not drawn (screen only)"."""
+    return stats.line()
+
+
 def _run_note(session: Any) -> str:
-    """The last run, short: what was saved, what was not, the .raw."""
+    """The last run, short: what was saved, what was not, the failed grabs,
+    the .raw. A failed grab is an exposure the camera made and could not
+    deliver — a gap in the run's frame numbers (capture.Stats.grab_failures)
+    — and the note said nothing of it while Stop's line did."""
     stats = session.run_stats()
     bits = [f"{stats.recorded} saved"]
     if _LIVE.run_waited:
@@ -773,6 +789,9 @@ def _run_note(session: Any) -> str:
     if stats.recording_failed:
         bits.append(f"RECORDING HAD STOPPED ({stats.recording_failed}): "
                     f"{stats.unsaved} NOT saved")
+    if stats.grab_failures:
+        failed = stats.grab_failures
+        bits.append(f"{failed} failed grab{'' if failed == 1 else 's'}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -785,18 +804,19 @@ def _run_note(session: Any) -> str:
 def _stopped_line(session: Any) -> str:
     """What the status line says once a run is over — or nearly over."""
     stats = session.run_stats()
-    line = f"Stopped. {stats.line()}"
+    said = _stats_line(stats)
+    line = f"Stopped. {said}"
     if stats.waiting:
-        line = f"Stopped — still saving. {stats.line()}"
+        line = f"Stopped — still saving. {said}"
     if _LIVE.run_waited:
         # First: the line is one row, and the reason is what matters.
-        line = f"Stopped — {_LIVE.run_waited}. {stats.line()}"
+        line = f"Stopped — {_LIVE.run_waited}. {said}"
     if stats.recording_failed:
         # Before anything else: the run did not save what it grabbed after
         # this, and stats.line() counts those frames "NOT saved (recording
         # stopped)". Before, this line said "1 error(s)" and left them out.
         line = (f"Stopped — RECORDING HAD STOPPED: "
-                f"{stats.recording_failed}. {stats.line()}")
+                f"{stats.recording_failed}. {said}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -816,7 +836,7 @@ def status() -> Dict[str, Any]:
     session = _LIVE.session
     if session is None:
         return {"summary": "No camera open.", "status": ""}
-    line = session.stats().line()
+    line = _stats_line(session.stats())
     return {"summary": line, "status": line}
 
 
@@ -882,9 +902,12 @@ def _triggers_on(device: Any) -> List[Any]:
         return []
 
 
-def _trigger_modes_or_nothing(device: Any) -> Dict[str, str]:
+def _every_trigger_or_nothing(device: Any) -> Dict[str, Any]:
+    """Every trigger's mode, source, edge and delay (trigger_settings with
+    the selected one's too), or {} when the camera has none or cannot say."""
     try:
-        return dict(device.settings_provider().trigger_modes())
+        return dict(device.settings_provider().trigger_settings(
+            selected=True))
     except Exception:                                     # noqa: BLE001
         return {}
 
@@ -1030,7 +1053,7 @@ def _idle_line(session: Any) -> str:
         return _stopped_line(session)
     if _LIVE.idle == "ended":
         return (f"Capture ended — {_LIVE.idle_reason}. "
-                f"{session.run_stats().line()}")
+                f"{_stats_line(session.run_stats())}")
     label = getattr(_LIVE.info, "label", "") or "camera"
     if _LIVE.idle == "preview-off":
         return (f"Connected to {label}. The live view is off while the raw "
@@ -2017,14 +2040,9 @@ def _port_widget(app: Any, name: str) -> Any:
     return widget
 
 
-#: What the display-drop count is called in the status line. "dropped" was
-#: read as frames LOST; they are frames the screen did not redraw — every one
-#: of them is still saved.
-SCREEN_DROPS = "not drawn (screen only)"
-
-
 def _status_line(stats: Any, frame: Any) -> str:
-    line = stats.line(SCREEN_DROPS)
+    # The display drops in capture.SCREEN_DROPS's words, as every line.
+    line = stats.line()
     note = _rate_note()
     if note:
         # Beside the MEASURED rate, so the two can be compared while the
@@ -2436,7 +2454,12 @@ def _tell_status(text: str) -> None:
 
 
 def _said(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    from council_core.cameras import said_plainly
+
+    # An OpenEB exception's text is a block of dashes, its category and
+    # "Error <code>: " around the message (cameras.said_plainly), also when
+    # a CameraError carries it ("could not open …: {exc}").
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     return text.split(" : ")[0][:300]
 
 
@@ -2665,11 +2688,12 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
         if change.ok and not change.skipped:
             _camera_set([key])
         # SAID AS THE ROW SAYS IT: its label and unit ("Picture window:
-        # 99.9 ms", not "window_ms: 99.901") — and, like a preset or a
-        # reset, that the live view restarted when the write needed it.
+        # 99.9 ms", not "window_ms: 99.901"; a trail threshold in the ms
+        # its row shows, not the µs the camera holds) — and, like a preset
+        # or a reset, that the live view restarted when the write needed it.
         out = {"change": change.as_dict(), "key": key, "value": change.value,
                "ok": change.ok, "what": "setting", "pending": False,
-               "summary": change.line(setting.label, setting.unit)}
+               "summary": change.line(setting.label, *setting.shown())}
         now = _roi_or_none(device) if moves_area else None
         if now is not None and now != before:
             # The picture's pixels changed under the crop box: cleared, as
@@ -2721,7 +2745,7 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                name: str, live_ok: bool = False,
-               after: Optional[Callable[[], List[str]]] = None
+               triggers: Optional[Dict[str, Any]] = None
                ) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
@@ -2732,9 +2756,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     preset that applied live reads differently from one that blanked the
     live view for a moment, and the user knows which settings did it.
 
-    `after`, when given, runs right after the set (on the worker with it,
-    when the stream is stopped for it) and says what else it put back, one
-    line each — a reset's triggers other than the selected one.
+    `triggers`, when given, is every trigger as connected (trigger_key:
+    value, _LIVE.as_connected_triggers): put back right after the set (on
+    the worker with it, when the stream is stopped for it — a change among
+    them that the stream is in the way of stops it too), and what that
+    changed is said one line per trigger — a reset's.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -2753,15 +2779,16 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         described = device.settings_provider().describe()
     except Exception:                                     # noqa: BLE001
         described = None
-    blocked = (camera_settings.stops_needed(device, values, roi, described)
+    checked = dict(values, **(triggers or {}))
+    blocked = (camera_settings.stops_needed(device, checked, roi, described)
                if described is not None else
-               camera_settings.stops_needed(device, values, roi))
+               camera_settings.stops_needed(device, checked, roi))
     if live_ok and (roi is not None or blocked):
         _refuse_while_capturing(doing)
     stop = bool(blocked)
     # Another trigger's key in words ("Trigger mode (FrameBurstStart
     # trigger)"), not the preset's raw "TriggerMode[FrameBurstStart]".
-    labels = camera_settings.labels_of(described or [], values)
+    labels = camera_settings.labels_of(described or [], checked)
     restarted = [labels.get(k, "the area" if k == "area" else k)
                  for k in blocked]
     before = _roi_or_none(device)
@@ -2770,11 +2797,13 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
 
     def work() -> Any:
         applied = camera_settings.apply(device, values, roi)
-        if after is not None:
+        if triggers:
             try:
-                also.extend(after())
+                also.extend(device.settings_provider().restore_triggers(
+                    triggers))
             except Exception as exc:                      # noqa: BLE001
-                also.append(f"the rest NOT put back — {_said(exc)}")
+                also.append(f"the other triggers NOT put back — "
+                            f"{_said(exc)}")
         return applied
 
     def finish(applied: Any) -> Dict[str, Any]:
@@ -2889,18 +2918,17 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         raise RuntimeError("the camera's settings were not read when it was "
                            "connected — there is nothing to put back")
     wanted = _group_names(group)
+    # The SELECTED trigger is in the set; a Basler has a mode, a source, an
+    # edge and a delay for each of its triggers (nine on the emulator): one
+    # left On stops the frames — Reset said "applied" over a burst trigger
+    # still On — and one put back On from another line or edge waits for
+    # the wrong signal. Every one goes back as connected.
     triggers = dict(_LIVE.as_connected_triggers)
-
-    def every_trigger() -> List[str]:
-        # The SELECTED trigger is in the set; a Basler has a mode for each
-        # of its triggers (nine on the emulator), and one left On stops
-        # the frames — Reset said "applied" over a burst trigger still On.
-        return device.settings_provider().restore_trigger_modes(triggers)
 
     if not wanted:
         return _apply_set(dict(_LIVE.as_connected), None,
                           "Putting the settings back as connected", "reset",
-                          "", after=every_trigger if triggers else None)
+                          "", triggers=triggers or None)
     # Before the group is read: a change on the worker owns the camera.
     _refuse_while_busy("put it back")
     try:
@@ -2916,8 +2944,8 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
                            f"was connected — there is nothing to put back")
     return _apply_set(values, None, f"Putting {what} back as connected",
                       "reset", what, live_ok=True,
-                      after=(every_trigger if triggers
-                             and "TriggerMode" in values else None))
+                      triggers=(triggers if triggers
+                                and "TriggerMode" in values else None))
 
 
 def load_camera_defaults() -> Dict[str, Any]:

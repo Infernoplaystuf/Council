@@ -57,6 +57,13 @@ QUIET_INTERVALS = 3.0
 #: that repeats every time rather than clearing.
 MAX_CONSECUTIVE_ERRORS = 50
 
+#: What the display-drop count (Stats.dropped) is called in a status line.
+#: "dropped" was read as frames LOST; they are frames the screen did not
+#: redraw — every one of them is still saved. ONE wording for Typhon's
+#: lines (frame_camera) and the Council's Capture tab, which said "N
+#: dropped" for the number Typhon calls this.
+SCREEN_DROPS = "not drawn (screen only)"
+
 
 @dataclass(frozen=True)
 class Stats:
@@ -102,14 +109,14 @@ class Stats:
         grab: nothing came back."""
         return self.grabbed + self.grab_failures
 
-    def line(self, dropped_label: str = "dropped") -> str:
+    def line(self, dropped_label: str = SCREEN_DROPS) -> str:
         """The one line a status bar shows.
 
         The drop count is always present, including at zero. A number that
         only appears once it is bad is a number nobody is watching when it
-        goes bad. `dropped_label` lets a view say what it means in its own
-        words ("not drawn (screen only)" in Typhon, where "dropped" was read
-        as frames lost).
+        goes bad. It is called SCREEN_DROPS ("not drawn (screen only)") in
+        every view — "dropped" was read as frames lost; `dropped_label`
+        says it otherwise.
         """
         bits = [f"{self.rate:.1f} fps", f"{self.grabbed} grabbed",
                 f"{self.dropped} {dropped_label}"]
@@ -1056,6 +1063,16 @@ class CaptureSession:
         #: not ended yet (record_to): every frame grabbed meanwhile is a
         #: frame of that run NOT saved (Stats.unsaved), not a preview frame.
         self._broken: Optional[FrameWriter] = None
+        #: What a failed write does to the RECORDING. False (Typhon): the
+        #: run goes on — the camera, and frame_camera's capture — and every
+        #: frame grabbed until the app ends it (Stop) is counted NOT saved.
+        #: True (the Council's Capture tab, where recording is a toggle
+        #: beside a live view that goes on): the recording ENDS at the
+        #: failure, and the count stops there — the frame that failed and
+        #: those queued behind it. That tab counted "NOT saved (recording
+        #: stopped)" for every live frame after a failed write, until the
+        #: next Record or Disconnect.
+        self.end_recording_on_failure = False
 
     # ------------------------------------------------------------------
     @property
@@ -1338,6 +1355,18 @@ class CaptureSession:
             said = writer.failed
             self.writer = None
             self.recorder = None
+            if self.end_recording_on_failure:
+                # ENDED HERE (end_recording_on_failure): this frame came
+                # after the recording, and is not counted against it. The
+                # writer finishes on its own threads after a failure — its
+                # end record and index close there — so nothing waits here.
+                with self._lock:
+                    self._stats = replace(
+                        self._stats, recording_failed=said,
+                        last_error=f"recording stopped: {said}",
+                        errors=self._stats.errors + 1)
+                    self._ended_stats = self.stats()
+                return False
             # NOT frozen here (record_to freezes it when the app ends the
             # recording): until then every frame grabbed is the run's and
             # is counted NOT saved — this one first. Frozen here, a Stop a

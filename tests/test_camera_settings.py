@@ -324,6 +324,7 @@ def test_every_trigger_is_seen_not_only_the_selected_one():
     dev, cam = trigger_basler()
     provider = dev.settings_provider()
     assert provider.triggers_on() == []
+    connected = provider.trigger_settings(selected=True)
     cam.TriggerSelector.value = "FrameBurstStart"
     cam.TriggerMode.SetValue("On")
     cam.TriggerSelector.value = "FrameStart"
@@ -343,15 +344,55 @@ def test_every_trigger_is_seen_not_only_the_selected_one():
     assert by_key(dev)["TriggerMode"].warning == \
         "No picture until a trigger arrives on Line1"
     assert not provider.triggers_on()[-1].software
-    # Put back as connected: every trigger's mode, the selector as it was.
-    connected = {"FrameBurstStart": "Off", "FrameStart": "Off",
-                 "ExposureStart": "Off"}
-    said = provider.restore_trigger_modes(connected)
+    # Put back as connected: every trigger, the selector as it was.
+    said = provider.restore_triggers(connected)
     assert said == ["the FrameBurstStart trigger Off again",
-                    "the FrameStart trigger Off again"]
-    assert provider.trigger_modes() == connected
+                    "the FrameStart trigger Off again (its source Software "
+                    "too)"]
+    assert provider.trigger_settings(selected=True) == connected
     assert cam.TriggerSelector.value == "FrameStart"
-    assert provider.restore_trigger_modes(connected) == [], "nothing to do"
+    assert provider.restore_triggers(connected) == [], "nothing to do"
+
+
+def test_putting_every_trigger_back_puts_its_source_edge_and_delay_too():
+    """"Reset as connected" put back each trigger's MODE only. A Basler
+    holds a source, an edge and a delay per TriggerSelector entry too
+    (measured on the emulator), so a FrameBurstStart trigger moved to
+    Line1 on the falling edge, 250 µs late, stayed so after a reset. Every
+    one goes back now — each trigger's mode after its source, edge and
+    delay — the selector left where it was, and what changed is said."""
+    dev, cam = trigger_basler(full=True)
+    provider = dev.settings_provider()
+    connected = provider.trigger_settings(selected=True)
+    assert connected["TriggerSource[FrameBurstStart]"] == "Software"
+    assert connected["TriggerActivation[FrameBurstStart]"] == "RisingEdge"
+    assert connected["TriggerDelay[ExposureStart]"] == 0.0
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerActivation.SetValue("FallingEdge")
+    cam.TriggerDelay.SetValue(250.0)
+    sel.value = "ExposureStart"
+    cam.TriggerDelay.SetValue(40.0)
+    cam.TriggerMode.SetValue("On")
+    sel.value = "FrameStart"
+    cam.log.clear()
+    said = provider.restore_triggers(connected)
+    assert provider.trigger_settings(selected=True) == connected
+    assert sel.value == "FrameStart", "the selector left where it was"
+    assert said == [
+        "the FrameBurstStart trigger's source Software, edge RisingEdge and "
+        "delay 0 µs again",
+        "the ExposureStart trigger Off again (its delay 0 µs too)"], said
+    written = [w for w in cam.log if w[0] != "TriggerSelector"]
+    assert written == [("TriggerSource", "Software"),
+                       ("TriggerActivation", "RisingEdge"),
+                       ("TriggerDelay", 0.0),
+                       ("TriggerDelay", 0.0), ("TriggerMode", "Off")], written
+    # A trigger this camera does not have is said, not dropped.
+    said = provider.restore_triggers({"TriggerMode[AcquisitionStart]": "Off"})
+    assert said == ["the AcquisitionStart trigger's mode NOT put back to "
+                    "Off — this camera has no AcquisitionStart trigger"], said
 
 
 def test_a_model_with_one_trigger_and_no_selector_is_read_too():
@@ -360,12 +401,14 @@ def test_a_model_with_one_trigger_and_no_selector_is_read_too():
                                                            "Line1")))
     provider = dev.settings_provider()
     assert provider.triggers_on() == [cs.Trigger("", "Line1")]
-    assert provider.trigger_modes() == {"": "On"}
-    assert provider.restore_trigger_modes({"": "Off"}) == [
-        "the camera trigger Off again"]
-    assert cam.TriggerMode.value == "Off"
+    # Its one trigger's settings are the rows' own (the snapshot holds
+    # them): none listed apart, nothing to put back apart.
+    assert provider.trigger_settings(selected=True) == {}
+    assert provider.restore_triggers({}) == []
     # Cameras with no trigger at all say none.
     assert simulated("frame").settings_provider().triggers_on() == []
+    assert simulated("frame").settings_provider().restore_triggers(
+        {"TriggerMode[FrameStart]": "Off"}) == []
 
 
 def test_the_selected_triggers_mode_is_written_after_its_source_edge_and_delay():
@@ -835,9 +878,13 @@ def test_the_fake_evk4s_biases_are_openebs_imx636_tables():
                       r'\s*(true|false)\}', allowed)
     table = {name: ((int(lo), int(hi)), (offsets[rlo], offsets[rhi]))
              for name, lo, hi, rlo, rhi, _mod in rows}
-    assert table == fake_evk4.Biases.RANGES
+    # ONE table in the product, read by the simulated event camera and the
+    # fake EVK4 alike — pinned here to the OpenEB headers.
+    assert table == cameras.IMX636_BIASES
+    assert fake_evk4.Biases.RANGES is cameras.IMX636_BIASES
+    assert cameras.SyntheticDevice.BIAS_TABLE is cameras.IMX636_BIASES
     assert table["bias_diff_on"] == ((-150, 200), (-85, 140))
-    assert sorted(fake_evk4.Biases.RANGES) == list(fake_evk4.Biases.RANGES), \
+    assert sorted(cameras.IMX636_BIASES) == list(cameras.IMX636_BIASES), \
         "get_all_biases is a std::map: by name"
 
 
@@ -1090,6 +1137,239 @@ def test_the_simulated_picture_honours_its_settings():
     assert before.dtype == np.uint8
 
 
+def test_the_simulated_event_camera_has_the_imx636s_biases_and_ranges():
+    """It showed an invented recommended -50 … 50 for every bias and had
+    five biases, not six (no bias_diff), so its tabs looked like no EVK4's.
+    Now every bias is the IMX636's, described as an EVK4 opened as Typhon
+    opens one describes it: the range it accepts is the recommended one."""
+    dev = simulated("event")
+    found = by_key(dev)
+    sim = {k: s for k, s in found.items() if k.startswith("bias.")}
+    real = {k: s for k, s in by_key(fake_evk4_device()).items()
+            if k.startswith("bias.")}
+    assert list(sim) == list(real) == [
+        f"bias.{n}" for n in ("bias_diff", "bias_diff_off", "bias_diff_on",
+                              "bias_fo", "bias_hpf", "bias_refr")]
+    for key, setting in sim.items():
+        twin = real[key]
+        assert (setting.minimum, setting.maximum, setting.recommended) == (
+            twin.minimum, twin.maximum, twin.recommended), key
+        assert setting.help == twin.help, key
+    assert found["bias.bias_diff"].recommended == (-25, 23)
+    assert found["bias.bias_refr"].recommended == (-20, 235)
+    assert all(s.recommended != (-50, 50) for s in sim.values())
+
+
+def test_the_simulated_event_camera_refuses_a_bias_as_the_hal_does():
+    """I_LL_Biases::set (without the range-check bypass) RAISES outside
+    get_bias_range() in its own words, and the camera keeps what it had —
+    the simulated camera stored any number it was handed."""
+    dev = simulated("event")
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    provider = dev.settings_provider()
+    assert provider.set("bias.bias_fo", 50, setting=unclamped).ok
+    refused = provider.set("bias.bias_fo", 60, setting=unclamped)
+    assert not refused.ok
+    assert refused.note == ('Invalid value 60 for bias "bias_fo". Value '
+                            'should be within range [-35, 55].')
+    assert refused.value == 50 and dev.state["bias.bias_fo"] == 50
+    # The fake EVK4 says it in the same words (one statement of them), in
+    # the block a real HalException's text is (hal_exception_text).
+    with pytest.raises(RuntimeError) as raised:
+        fake_evk4.Biases().set("bias_fo", 60)
+    assert str(raised.value) == cameras.hal_exception_text(
+        cameras.HAL_VALUE_OUT_OF_RANGE, refused.note)
+    assert cs._why(raised.value) == refused.note
+    # Through the row's own range a slider or a preset is clamped first.
+    change = dev.set_setting("bias.bias_diff_on", 180)
+    assert change.ok and change.value == 140
+    assert change.note == "clamped to the maximum, 140"
+
+
+def fake_evk4_device():
+    return cameras.EvkDevice(fake_evk4.info(), fake_evk4.FakeEvk4())
+
+
+# ======================================================================
+# An OpenEB exception, as Python gets it
+# ======================================================================
+RULE = "-" * 48
+
+
+def test_an_openeb_exception_is_said_by_its_message_not_its_frame():
+    """A real HalException reaches Python as a RuntimeError whose text is
+    a BLOCK — a rule of dashes, the category, "Error <hex>: " and the
+    message, a rule (BaseException::what, OpenEB sdk/base/utils/
+    error_utils.h; measured in the pylon env, open_raw_file on a missing
+    path). _why passed the block through whole, so a refusal that reached
+    a row's one-line "NOT changed —" note was a run of dashes. The fakes
+    raised the bare message, so the tests never saw it."""
+    said = ('Invalid value 141 for bias "bias_diff_on". Value should be '
+            'within range [-85, 140].')
+    block = cameras.hal_exception_text(cameras.HAL_VALUE_OUT_OF_RANGE, said)
+    assert block == (f"\n{RULE}\nMetavision HAL exception\n\nError 102001: "
+                     f"{said}\n\n{RULE}\n")
+    assert cs._why(RuntimeError(block)) == said
+    assert cs._why(RuntimeError(block.strip())) == said
+    # No message of its own (HalException(UnsupportedValue)): the code.
+    bare = cameras.hal_exception_text(0x102004, "")
+    assert cs._why(RuntimeError(bare)) == \
+        "Metavision HAL exception, error 102004"
+    # Anything else as it was: a GenICam text loses its file/line tail.
+    assert cs._why(RuntimeError("Node not writable : RuntimeException "
+                                "thrown (file 'x.cpp', line 9)")) == \
+        "Node not writable"
+    # Through a provider: the fake EVK4's refusals come as blocks now, and
+    # a row's note is the message alone.
+    dev = fake_evk4_device()
+    unclamped = cs.Setting("bias.bias_fo", "bias_fo", cs.G_BIASES, cs.INT, 0)
+    refused = dev.settings_provider().set("bias.bias_fo", 60,
+                                          setting=unclamped)
+    assert refused.note == ('Invalid value 60 for bias "bias_fo". Value '
+                            'should be within range [-35, 55].')
+    assert "\n" not in refused.line() and RULE not in refused.line()
+
+
+def test_the_exception_block_is_openebs_own():
+    """hal_exception_text against OpenEB's source, where it is on the
+    machine: the layout (error_utils.h), the HAL category's name and its
+    empty message (hal_exception.cpp), the codes (hal_error_code.h)."""
+    utils = fake_evk4.openeb_source(
+        "sdk/modules/base/cpp/include/metavision/sdk/base/utils/"
+        "error_utils.h")
+    category = fake_evk4.openeb_source("hal/cpp/src/utils/hal_exception.cpp")
+    codes = fake_evk4.openeb_source(
+        "hal/cpp/include/metavision/hal/utils/hal_error_code.h")
+    if None in (utils, category, codes):
+        pytest.skip("OpenEB's source is not on this machine")
+    assert f'msg_ = "\\n{RULE}\\n";' in utils
+    assert 'msg_ += std::string(ecat.name()) + "\\n\\n";' in utils
+    assert 'msg_ += "Error " + error_as_hex.str() + ": ";' in utils
+    assert 'msg_ += what_arg + "\\n";' in utils
+    assert f'msg_ += "\\n{RULE}\\n";' in utils
+    assert 'return "Metavision HAL exception";' in category
+    assert "message(int err) const override {\n        return \"\";" in \
+        category
+    assert "CameraError = 0x100000" in codes
+    assert "InvalidArgument = CameraError | 0x02000" in codes
+    assert "ValueOutOfRange = InvalidArgument | 0x1" in codes
+    assert cameras.HAL_INVALID_ARGUMENT == 0x100000 | 0x02000
+    assert cameras.HAL_VALUE_OUT_OF_RANGE == cameras.HAL_INVALID_ARGUMENT | 1
+
+
+# ======================================================================
+# The trail filter's threshold: whole milliseconds, 1-100 ms
+# ======================================================================
+def test_the_trail_threshold_is_kept_in_whole_ms_as_openeb_keeps_it():
+    """threshold_ms_ = std::roundf(threshold / 1000.0): the nearest whole
+    ms, a half AWAY from zero (Python's round would make 2500 µs 2 ms);
+    outside 1000-100000 µs a HalException in the HAL's words."""
+    kept = cameras.trail_threshold_kept
+    assert [kept(v) for v in (1000, 1499, 1500, 2500, 10400, 10500, 99_999,
+                              100_000)] == [
+        1000, 1000, 2000, 3000, 10000, 11000, 100_000, 100_000]
+    for bad in (0, 1, 999, 100_001):
+        with pytest.raises(ValueError, match=rf"Bad STC threshold value: "
+                                             rf"{bad}\. Value should be in "
+                                             rf"range \[1000, 100000\]\."):
+            kept(bad)
+    source = fake_evk4.openeb_source(
+        "hal_psee_plugins/src/devices/imx636/"
+        "imx636_event_trail_filter_module.cpp")
+    if source is not None:
+        assert ('"Bad STC threshold value: " << threshold << ". Value should '
+                'be in range [1000, 100000]."') in source
+        assert "throw HalException(HalErrorCode::InvalidArgument" in source
+
+
+def test_the_fake_evk4s_trail_filter_rounds_and_raises_like_the_hal():
+    """It took 1-100000 µs and kept any of them — 8706 µs, measured after a
+    wheel turn, is a value no IMX636 can hold — and said False outside,
+    where the HAL raises."""
+    trail = fake_evk4.Trail()
+    assert (trail.get_min_supported_threshold(),
+            trail.get_max_supported_threshold()) == (1000, 100_000)
+    assert trail.set_threshold(8706) is True
+    assert trail.get_threshold() == 9000
+    assert trail.set_threshold(2500) and trail.get_threshold() == 3000
+    for bad in (1, 999, 100_001):
+        with pytest.raises(RuntimeError, match="Bad STC threshold value"):
+            trail.set_threshold(bad)
+    assert trail.get_threshold() == 3000, "a refusal changes nothing"
+
+
+def test_the_trail_threshold_steps_and_is_shown_in_whole_ms():
+    """The row stepped by 1 µs over 1-100000: 99,001 slider positions of
+    which 99 exist on the sensor. It steps by 1000 µs from 1000 and is
+    SHOWN in ms; the value and a preset stay in µs, the HAL's unit."""
+    for dev in (fake_evk4_device(), simulated("event")):
+        row = by_key(dev)["trail.threshold"]
+        assert (row.minimum, row.maximum, row.step) == (1000, 100_000, 1000)
+        assert row.unit == "µs" and row.shown() == ("ms", 1000.0)
+        assert row.as_dict()["shown_unit"] == "ms"
+        assert row.value == 10_000
+        change = dev.set_setting("trail.threshold", 12_400)
+        assert change.ok and change.value == 12_000, change
+        assert change.note == "snapped to whole ms"
+        assert change.line(row.label, *row.shown()) == \
+            "Threshold: 12 ms, asked 12.4 (snapped to whole ms)"
+        assert cs.snapshot(dev)["trail.threshold"] == 12_000
+        assert dev.set_setting("trail.threshold", 500).value == 1000
+    # A threshold range that is not whole ms (no OpenEB sensor reports one)
+    # keeps a 1 µs step, shown in µs.
+    odd = cs.trail_threshold_setting(10_000, 1, 100_000)
+    assert odd.step == 1 and odd.shown() == ("µs", 1.0)
+
+
+def test_the_simulated_trail_filter_keeps_whole_ms_and_refuses_like_the_hal():
+    dev = simulated("event")
+    dev.write_setting("trail.threshold", 2500)
+    assert dev.state["trail.threshold"] == 3000
+    with pytest.raises(cameras.CameraError, match="Bad STC threshold"):
+        dev.write_setting("trail.threshold", 999)
+    assert dev.state["trail.threshold"] == 3000
+
+
+def test_a_half_millisecond_threshold_is_rounded_as_the_hal_rounds_it():
+    """coerce snapped the row BEFORE the camera saw it, with Python's
+    round(), which takes a half to the EVEN whole: 3500 µs became 3 ms and
+    99500 µs 99 ms, where an IMX636 asked for them keeps 4 and 100
+    (std::roundf, a half away from zero: cameras.trail_threshold_kept).
+    Only a preset or a script asks for one — the box and the slider give
+    whole ms — so a preset holding 3500 loaded as 3 ms. A Basler's integer
+    node keeps its own snap (from its minimum, by its increment)."""
+    row = cs.trail_threshold_setting(10_000, 1000, 100_000)
+    for asked in (1499, 1500, 2500, 3500, 11_500, 12_400, 50_500, 99_500):
+        assert cs.coerce(row, asked)[0] == \
+            cameras.trail_threshold_kept(asked), asked
+    assert cs.coerce(row, 3500) == (4000, "snapped to whole ms")
+    assert cs.coerce(row, 99_500) == (100_000, "snapped to whole ms")
+    for dev in (fake_evk4_device(), simulated("event")):
+        change = dev.set_setting("trail.threshold", 3500)
+        assert change.ok and change.value == 4000, change
+        assert dev.set_setting("trail.threshold", 99_500).value == 100_000
+        applied = cs.apply(dev, {"trail.threshold": 11_500})
+        assert applied.changes[0].value == 12_000, applied.changes
+    basler = setting(cs.INT, minimum=16, maximum=99, step=4)
+    assert cs.coerce(basler, 18)[0] == 16, "a Basler node's snap is its own"
+
+
+def test_a_clamped_threshold_says_its_bound_in_the_unit_it_is_shown_in():
+    """'Threshold: 1 ms, asked 0.5 (clamped to the minimum, 1000)': the
+    note gave the bound in µs inside a line in ms."""
+    row = cs.trail_threshold_setting(10_000, 1000, 100_000)
+    assert cs.coerce(row, 500) == (1000, "clamped to the minimum, 1 ms")
+    assert cs.coerce(row, 100_400) == (100_000,
+                                       "clamped to the maximum, 100 ms")
+    dev = simulated("event")
+    change = dev.set_setting("trail.threshold", 500)
+    assert change.line(row.label, *row.shown()) == \
+        "Threshold: 1 ms, asked 0.5 (clamped to the minimum, 1 ms)"
+    # A setting shown in its own unit says the bound as before.
+    assert cs.coerce(setting(cs.FLOAT, minimum=1.0, maximum=10.0, unit="dB"),
+                     99) == (10.0, "clamped to the maximum, 10")
+
+
 def test_the_simulated_event_camera_fires_less_at_a_higher_threshold():
     dev = simulated("event")
     dev.start()
@@ -1241,6 +1521,19 @@ def _hal():
     except Exception:                                       # noqa: BLE001
         pytest.skip("the Metavision HAL is not importable here")
     return metavision_hal
+
+
+def test_a_real_hal_exception_is_the_block_and_is_said_plainly(tmp_path):
+    """The real bindings' text for a HalException (a missing RAW file is
+    one no camera is needed for): exactly hal_exception_text's block, and
+    _why says the message alone."""
+    hal = _hal()
+    missing = tmp_path / "nothing_here.raw"
+    with pytest.raises(RuntimeError) as raised:
+        hal.DeviceDiscovery.open_raw_file(str(missing))
+    said = f"Unable to open RAW file '{missing}'"
+    assert str(raised.value) == cameras.hal_exception_text(0x101000, said)
+    assert cs._why(raised.value) == said
 
 
 def test_every_facility_method_used_exists_in_the_real_bindings():

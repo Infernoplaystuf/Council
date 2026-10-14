@@ -218,22 +218,69 @@ def _short(value: Any) -> str:
                 else int(number))
 
 
+def shown_unit(setting: Dict[str, Any]) -> Tuple[str, float]:
+    """(the unit a setting is shown in, how many of its own unit make one
+    of it) — camera_settings.Setting.shown, from its dict. A trail filter's
+    threshold is held in µs and shown in whole ms: ("ms", 1000.0)."""
+    unit = str(setting.get("shown_unit") or "")
+    if unit:
+        per = _number(setting.get("shown_per")) or 1.0
+        return unit, (per if per > 0 else 1.0)
+    return str(setting.get("unit") or ""), 1.0
+
+
+def in_shown_unit(setting: Dict[str, Any], value: Any) -> Any:
+    """A value of the setting's own unit in the unit it is shown in."""
+    _unit, per = shown_unit(setting)
+    number = _number(value)
+    if per == 1.0 or number is None or isinstance(value, bool):
+        return value
+    return number / per
+
+
+def enforced(setting: Dict[str, Any]) -> bool:
+    """The range the camera accepts IS the recommended one: an EVK4 opened
+    without the range-check bypass, as Typhon opens it (I_LL_Biases::set
+    checks get_bias_range(), which is then the recommended range), and the
+    simulated event camera."""
+    rec = setting.get("recommended")
+    low, high = _number(setting.get("min")), _number(setting.get("max"))
+    if not rec or low is None or high is None:
+        return False
+    try:
+        return (math.isclose(float(rec[0]), low)
+                and math.isclose(float(rec[1]), high))
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+#: Under a range the camera enforces as recommended (enforced): said once,
+#: short — the pop-out's range column is as wide as its widest line.
+ENFORCED_NOTE = "recommended, enforced"
+
+
 def range_text(setting: Dict[str, Any]) -> str:
     """The camera's own range for a number setting, with its unit and, for
     a bias, the sensor's recommended range. bias_diff_on on an IMX636
     opened with the range-check bypass: "-150 … 200" / "rec. -85 … 140"
     (OpenEB's imx636_bias_settings*.h). Opened as Typhon opens it, the HAL
-    accepts the recommended range only, so both lines read -85 … 140
-    (camera_settings.EvkSettings). "" for a setting the camera gives no
-    range."""
+    accepts the recommended range only (camera_settings.EvkSettings), and
+    the range is said ONCE: "-85 … 140" / "recommended, enforced" — it read
+    "-85 … 140 / rec. -85 … 140", the same range twice. In the unit the
+    setting is shown in (a trail threshold: "1 … 100 ms"). "" for a
+    setting the camera gives no range."""
     low, high = setting.get("min"), setting.get("max")
     if _number(low) is None or _number(high) is None:
         return ""
-    unit = str(setting.get("unit") or "")
-    text = f"{_short(low)} … {_short(high)} {unit}".rstrip()
+    unit, _per = shown_unit(setting)
+    text = (f"{_short(in_shown_unit(setting, low))} … "
+            f"{_short(in_shown_unit(setting, high))} {unit}").rstrip()
     rec = setting.get("recommended")
-    if rec:
-        text += f"\nrec. {_short(rec[0])} … {_short(rec[1])}"
+    if rec and enforced(setting):
+        text += f"\n{ENFORCED_NOTE}"
+    elif rec:
+        text += (f"\nrec. {_short(in_shown_unit(setting, rec[0]))} … "
+                 f"{_short(in_shown_unit(setting, rec[1]))}")
     return text
 
 
@@ -300,15 +347,35 @@ class Scale:
         return v
 
 
+def with_unit(setting: Dict[str, Any], value: Any) -> str:
+    """A value of `setting` as its row shows it, with the unit it is shown
+    in: "10 ms" for a trail threshold the camera holds as 10000 (µs)."""
+    said = show(in_shown_unit(setting, value))
+    unit, _per = shown_unit(setting)
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return f"{said} {unit}" if unit and numeric else said
+
+
 def took_lines(applied: Dict[str, Any],
-               labels: Optional[Dict[str, str]] = None) -> List[str]:
+               labels: Optional[Dict[str, str]] = None,
+               settings: Optional[Dict[str, Dict[str, Any]]] = None
+               ) -> List[str]:
     """What a set did, one line per setting, problems first — the "What
-    took" box. `applied` is camera_settings.Applied.as_dict()."""
+    took" box. `applied` is camera_settings.Applied.as_dict().
+
+    `settings` (key: the setting's dict, as its row holds it) says each
+    value as its row SHOWS it, with its unit — what the camera took, and
+    what was asked in the same unit (Change.line's way). Without it a trail
+    threshold of 9000 µs read "Threshold: 9000 (asked 8706)" beside a row
+    whose box said "9 ms"."""
     labels = labels or {}
+    settings = settings or {}
     refused, adjusted, left, done = [], [], [], []
     for change in applied.get("changes") or []:
         name = labels.get(change.get("key"), change.get("key", "?"))
-        value, asked = show(change.get("value")), show(change.get("asked"))
+        setting = settings.get(str(change.get("key")), {})
+        value = with_unit(setting, change.get("value"))
+        asked = show(in_shown_unit(setting, change.get("asked")))
         note = change.get("note") or ""
         if not change.get("ok", True):
             refused.append(f"✗ {name}: NOT changed — {note}")
@@ -361,10 +428,12 @@ class RangeSlider(QSlider):
     OpenEB's IMX636 table allows bias_diff_on -150 … 200 and recommends
     -85 … 140, but the HAL takes a value outside the recommended range only
     on a camera opened with the range-check bypass. Opened as Typhon opens
-    it, the slider runs over the recommended range and the bar spans all
-    of it. Where the slider is wider than what is recommended, the row says
-    so in words once the value is outside; the bar shows where "inside" is
-    while the slider is being dragged, in a tab too narrow for the words."""
+    it, the slider runs over the recommended range — and there is NO bar:
+    one spanning the whole slider marked nothing (SettingRow says the range
+    is the recommended one in words instead). Where the slider is wider
+    than what is recommended, the row says so in words once the value is
+    outside; the bar shows where "inside" is while the slider is being
+    dragged, in a tab too narrow for the words."""
 
     def __init__(self, orientation: Qt.Orientation, parent: QWidget):
         super().__init__(orientation, parent)
@@ -407,9 +476,11 @@ class WheelGuard(QObject):
 
     A tab and a pop-out are scrolling columns of sliders, boxes and lists,
     and Qt gives a wheel turn to the control under the pointer: measured at
-    1400 x 820, wheeling down the Filters tab moved the trail filter's
-    threshold 10000 -> 8706 µs on the camera and the page never moved; one
-    notch over the pixel format changed it (on a Basler, a stream restart).
+    1400 x 820 on the fake EVK4, wheeling down the Filters tab moved the
+    trail filter's threshold off its 10 ms and the page never moved (on a
+    real IMX636, which keeps whole milliseconds, a few notches are a few
+    ms — the slider steps by them now); one notch over the pixel format
+    changed it (on a Basler, a stream restart).
 
     So a control takes the wheel only once it has been clicked or tabbed to
     (focus) — otherwise the turn is ignored, and Qt hands it to the parents,
@@ -521,10 +592,6 @@ class SettingRow(QObject):
             small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
             self.range_label.setFont(small)
             _colour(self.range_label, _tone(self.range_label, "dim"))
-            self.range_label.setToolTip(
-                "The camera's own range for this setting"
-                + (" — and, under it, the range its maker recommends"
-                   if setting.get("recommended") else ""))
             grid.addWidget(self.range_label, row, 3)
             self._show_range()
         self.reset_button = QToolButton(parent)
@@ -550,12 +617,19 @@ class SettingRow(QObject):
         s = self.setting
         bits = [str(s.get("help") or "").strip()]
         low, high = s.get("min"), s.get("max")
+        unit, _per = shown_unit(s)
         if low is not None or high is not None:
-            bits.append(f"Allowed: {show(low)} … {show(high)} "
-                        f"{s.get('unit') or ''}".rstrip())
-        if s.get("recommended"):
+            said = (f"{show(in_shown_unit(s, low))} … "
+                    f"{show(in_shown_unit(s, high))} {unit}").rstrip()
+            if enforced(s):
+                bits.append(f"Allowed: {said} — the recommended range, "
+                            f"which this camera enforces")
+            else:
+                bits.append(f"Allowed: {said}")
+        if s.get("recommended") and not enforced(s):
             lo, hi = s["recommended"]
-            bits.append(f"Recommended: {show(lo)} … {show(hi)}")
+            bits.append(f"Recommended: {show(in_shown_unit(s, lo))} … "
+                        f"{show(in_shown_unit(s, hi))}")
         if s.get("type") == CHOICE and s.get("choices"):
             bits.append("One of: " + ", ".join(map(str, s["choices"])))
         bits.append(f"({self.key})")
@@ -604,13 +678,14 @@ class SettingRow(QObject):
 
     def _mark_recommended(self) -> None:
         """The recommended part of the slider (RangeSlider), from the
-        setting's own description."""
+        setting's own description — none when the slider IS the
+        recommended range (enforced): a bar from end to end marks nothing."""
         if not isinstance(self.slider, RangeSlider) or self.scale is None:
             return
         rec = self.setting.get("recommended")
         try:
             span = ((self.scale.position(rec[0]), self.scale.position(rec[1]))
-                    if rec else None)
+                    if rec and not enforced(self.setting) else None)
         except (TypeError, IndexError):
             span = None
         self.slider.mark(span)
@@ -621,11 +696,34 @@ class SettingRow(QObject):
                     if self.kind in (FLOAT, INT) and not self.read_only
                     else "")
             self.range_label.setText(text)
+            if enforced(self.setting):
+                tip = ("The camera's own range for this setting: the range "
+                       "its maker recommends, which this camera enforces "
+                       "(an EVK4 opened without the range-check bypass, as "
+                       "Typhon opens one, refuses anything outside it)")
+            elif self.setting.get("recommended"):
+                tip = ("The camera's own range for this setting — and, "
+                       "under it, the range its maker recommends")
+            else:
+                tip = "The camera's own range for this setting"
+            self.range_label.setToolTip(tip)
+
+    def _box_bounds(self) -> Tuple[Optional[float], Optional[float],
+                                   Optional[float]]:
+        """(min, max, step) for the number box: in the unit the setting is
+        SHOWN in (shown_unit) — a trail threshold's 1000 … 100000 µs in
+        steps of 1000 is a box of 1 … 100 ms in steps of 1. The slider
+        works in the setting's own unit (Scale)."""
+        s = self.setting
+        _unit, per = shown_unit(s)
+        low, high = _number(s.get("min")), _number(s.get("max"))
+        step = _number(s.get("step"))
+        return tuple(v / per if v is not None else None
+                     for v in (low, high, step))         # type: ignore
 
     def _number_box(self, parent: QWidget) -> QAbstractSpinBox:
         s = self.setting
-        low, high = _number(s.get("min")), _number(s.get("max"))
-        step = _number(s.get("step"))
+        low, high, step = self._box_bounds()
         whole = self.kind == INT and all(
             v is None or abs(v) <= INT32 for v in (low, high))
         if whole:
@@ -645,7 +743,7 @@ class SettingRow(QObject):
                 box.setSingleStep(10 ** math.floor(math.log10(
                     max((high - low) / 100.0, 1e-6))))
             box.valueChanged.connect(self._from_box)
-        unit = str(s.get("unit") or "")
+        unit, _per = shown_unit(s)
         if unit:
             box.setSuffix(f" {unit}")
         # Typing writes on Return or on leaving the box, never per keystroke
@@ -659,7 +757,30 @@ class SettingRow(QObject):
 
     # -- the user's changes -----------------------------------------------
     def _typed(self, value: float) -> Any:
+        """A value in the setting's OWN unit, as its kind holds it."""
         return int(round(value)) if self.kind == INT else float(value)
+
+    def _per(self) -> float:
+        """How many of the setting's own unit one shown unit is (1 unless
+        it is shown in another unit — shown_unit)."""
+        return shown_unit(self.setting)[1]
+
+    def said(self, value: Any) -> str:
+        """A value of this setting as its row shows it: "10" (ms) for a
+        trail threshold the camera holds as 10000 (µs)."""
+        return show(in_shown_unit(self.setting, value))
+
+    def said_with_unit(self, value: Any) -> str:
+        """said(), with the unit the row shows: "10 ms". A line away from
+        the number box (a tooltip, a note) has no suffix beside it."""
+        return with_unit(self.setting, value)
+
+    def _boxed(self, value: float) -> Any:
+        """A value of the setting's own unit as its number box holds it."""
+        number = float(value) / self._per()
+        if isinstance(self.editor, QSpinBox):
+            return int(round(number))
+        return number
 
     @property
     def live(self) -> bool:
@@ -670,7 +791,8 @@ class SettingRow(QObject):
         if self._quiet or self.scale is None:
             return
         value = self._typed(self.scale.value(position))
-        self._quietly(lambda: self.editor.setValue(value))
+        boxed = self._boxed(value)
+        self._quietly(lambda: self.editor.setValue(boxed))
         if not self.live and self.slider.isSliderDown():
             return                      # written on release (_released)
         self.edited.emit(self.key, value)
@@ -686,7 +808,9 @@ class SettingRow(QObject):
     def _from_box(self, value: float) -> None:
         if self._quiet:
             return
-        value = self._typed(value)
+        # The box is in the unit the setting is SHOWN in; the camera and
+        # the slider take its own.
+        value = self._typed(value * self._per())
         if self.slider is not None and self.scale is not None:
             position = self.scale.position(value)
             self._quietly(lambda: self.slider.setValue(position))
@@ -750,15 +874,17 @@ class SettingRow(QObject):
     def _new_range(self) -> None:
         s = self.setting
         low, high = _number(s.get("min")), _number(s.get("max"))
+        box_low, box_high, _step = self._box_bounds()
         box = self.editor
 
         def apply() -> None:
             if isinstance(box, QSpinBox):
-                box.setRange(int(low) if low is not None else -INT32,
-                             int(high) if high is not None else INT32)
+                box.setRange(int(box_low) if box_low is not None else -INT32,
+                             int(box_high) if box_high is not None
+                             else INT32)
             elif isinstance(box, QDoubleSpinBox):
-                box.setRange(low if low is not None else -1e15,
-                             high if high is not None else 1e15)
+                box.setRange(box_low if box_low is not None else -1e15,
+                             box_high if box_high is not None else 1e15)
         self._quietly(apply)
         if self.slider is not None and low is not None and high is not None \
                 and high > low:
@@ -773,8 +899,8 @@ class SettingRow(QObject):
 
         def put() -> None:
             if isinstance(editor, QLabel):
-                unit = str(self.setting.get("unit") or "")
-                editor.setText(f"{show(value)} {unit}".strip())
+                unit, _per = shown_unit(self.setting)
+                editor.setText(f"{self.said(value)} {unit}".strip())
             elif isinstance(editor, QCheckBox):
                 editor.setChecked(bool(value))
             elif isinstance(editor, QComboBox):
@@ -787,7 +913,7 @@ class SettingRow(QObject):
             elif isinstance(editor, QAbstractSpinBox):
                 number = _number(value)
                 if number is not None:
-                    editor.setValue(number)
+                    editor.setValue(self._boxed(number))
                     line = editor.lineEdit()
                     if line is not None:
                         line.setModified(False)
@@ -818,8 +944,9 @@ class SettingRow(QObject):
         self.reset_button.setVisible(writable and connected_value is not None)
         self.reset_button.setEnabled(enabled and can_reset)
         self.reset_button.setToolTip(
-            f"Back to {show(connected_value)} — as the camera had it when it "
-            f"was connected" if connected_value is not None else "")
+            f"Back to {self.said_with_unit(connected_value)} — as the camera "
+            f"had it when it was connected" if connected_value is not None
+            else "")
 
         notes: List[Tuple[str, str]] = []
         if s.get("warning"):
@@ -848,8 +975,8 @@ class SettingRow(QObject):
         rec = s.get("recommended")
         value = _number(s.get("value"))
         if rec and value is not None and not rec[0] <= value <= rec[1]:
-            notes.append((f"Outside the recommended {show(rec[0])} … "
-                          f"{show(rec[1])}", "warn"))
+            notes.append((f"Outside the recommended {self.said(rec[0])} … "
+                          f"{self.said(rec[1])}", "warn"))
         if notes:
             text, tone = notes[0]
             if len(notes) > 1:
@@ -1382,9 +1509,11 @@ class SettingsCore:
                 row.result, row.result_tone = (str(change.get("note") or ""),
                                                "dim")
             elif change.get("adjusted"):
+                # In the unit the row shows (a trail threshold in ms).
                 row.result, row.result_tone = (
-                    f"The camera made it {show(change.get('value'))} "
-                    f"(asked {show(change.get('asked'))})", "warn")
+                    f"The camera made it "
+                    f"{row.said_with_unit(change.get('value'))} "
+                    f"(asked {row.said(change.get('asked'))})", "warn")
             else:
                 row.result, row.result_tone = "", ""
             row.set_state(self.capturing, self.busy or not self.connected,
@@ -1406,8 +1535,15 @@ class SettingsCore:
     def _took_set(self, out: Dict[str, Any]) -> None:
         applied = dict(out.get("applied") or {})
         labels = {k: r.setting.get("label", k) for k, r in self.rows.items()}
-        lines = took_lines(applied, labels)
+        # Each value in the unit its row shows it in (a trail threshold in
+        # ms), as the rows themselves say it.
+        lines = took_lines(applied, labels,
+                           {k: r.setting for k, r in self.rows.items()})
         head = str(out.get("summary") or "")
+        # The summary FIRST, then what took: a view that says the first
+        # problem beside the summary (SettingsTabs._show_took) had it
+        # replaced at once by this summary alone.
+        self.say(head, tone="" if out.get("ok", True) else "warn")
         self._show_took(head, lines)
         for row in self.rows.values():
             row.result, row.result_tone = "", ""
@@ -1418,7 +1554,6 @@ class SettingsCore:
             if row is not None and change.get("ok", True) \
                     and not row.busy_editing():
                 row.show_value(change.get("value"))
-        self.say(head, tone="" if out.get("ok", True) else "warn")
         if out.get("what") == "preset" and out.get("name"):
             self.select_preset(str(out["name"]))
         self._soon()

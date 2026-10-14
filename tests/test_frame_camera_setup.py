@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import frame_camera
 from council_core import cameras
 from council_core.live_display import DisplayPrep
+from tests.sim_cameras import simulated_row
 
 
 @pytest.fixture(autouse=True)
@@ -51,8 +52,10 @@ def clean(tmp_path):
 
 
 def connected(kind="frame"):
+    """Connect the SIMULATED `kind` camera, by name: in the pylon env
+    (PYLON_CAMEMU) the first "frame" row is an emulated Basler."""
     rows = frame_camera.list_cameras()["rows"]
-    return frame_camera.connect(next(r for r in rows if r.endswith(kind)))
+    return frame_camera.connect(simulated_row(rows, kind))
 
 
 class Viewer:
@@ -464,6 +467,92 @@ def test_reset_all_puts_every_setting_back_and_leaves_the_area():
     assert frame_camera._LIVE.session.running
 
 
+def every_trigger(cam):
+    """Each trigger's (mode, source, edge, delay), the selector put back."""
+    keep = cam.TriggerSelector.value
+    out = {}
+    for entry in cam.TriggerSelector.choices:
+        cam.TriggerSelector.value = entry
+        out[entry] = (cam.TriggerMode.GetValue(), cam.TriggerSource.GetValue(),
+                      cam.TriggerActivation.GetValue(),
+                      cam.TriggerDelay.GetValue())
+    cam.TriggerSelector.value = keep
+    return out
+
+
+def test_reset_puts_every_trigger_back_with_its_source_edge_and_delay(
+        monkeypatch):
+    """"Reset as connected" put back only each trigger's MODE (frame_camera
+    kept as_connected_triggers as modes). A Basler holds a source, an edge
+    and a delay per TriggerSelector entry too, so a burst trigger moved to
+    Line1, falling edge, 250 µs late, kept all three. A fake Basler with
+    three triggers, through frame_camera as Typhon calls it."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    monkeypatch.setattr(cameras, "discover", lambda known=None:
+                        cameras.Discovery([dev.info], []))
+    monkeypatch.setattr(cameras, "open_camera",
+                        lambda chosen, known=None: dev)
+    frame_camera.connect(frame_camera.list_cameras()["rows"][0])
+    connected = every_trigger(cam)
+    sel = cam.TriggerSelector
+    sel.value = "FrameBurstStart"
+    cam.TriggerSource.SetValue("Line1")
+    cam.TriggerActivation.SetValue("FallingEdge")
+    cam.TriggerDelay.SetValue(250.0)
+    cam.TriggerMode.SetValue("On")
+    sel.value = "ExposureStart"
+    cam.TriggerDelay.SetValue(40.0)
+    sel.value = "FrameStart"
+    assert every_trigger(cam) != connected
+    out = frame_camera.reset_camera_settings()
+    assert out["ok"], out["summary"]
+    assert every_trigger(cam) == connected
+    assert sel.value == "FrameStart", "the selector is where it was"
+    assert ("the FrameBurstStart trigger Off again (its source Software, "
+            "edge RisingEdge and delay 0 µs too)") in out["summary"], \
+        out["summary"]
+    assert "the ExposureStart trigger's delay 0 µs again" in out["summary"]
+    # The Trigger category's own Reset puts the others back too.
+    sel.value = "ExposureStart"
+    cam.TriggerSource.SetValue("Line1")
+    sel.value = "FrameStart"
+    out = frame_camera.reset_camera_settings("Trigger")
+    assert out["ok"], out["summary"]
+    assert every_trigger(cam) == connected
+    assert "the ExposureStart trigger's source Software again" in \
+        out["summary"], out["summary"]
+
+
+def test_reset_puts_the_trigger_selector_back_as_connected_too(monkeypatch):
+    """What Reset does with the SELECTOR, as the docs now say it (they
+    said Reset left it "where it is"): TriggerSelector is a setting read
+    at Connect like any other, so Reset all and Reset Trigger put it back
+    to the entry it was on then — and restoring every trigger
+    (restore_triggers) does not move it after that. The tests before
+    moved it back to the connected entry themselves before Reset."""
+    from tests.test_camera_settings import trigger_basler
+
+    dev, cam = trigger_basler(full=True)
+    monkeypatch.setattr(cameras, "discover", lambda known=None:
+                        cameras.Discovery([dev.info], []))
+    monkeypatch.setattr(cameras, "open_camera",
+                        lambda chosen, known=None: dev)
+    frame_camera.connect(frame_camera.list_cameras()["rows"][0])
+    connected = every_trigger(cam)
+    sel = cam.TriggerSelector
+    assert sel.value == "FrameStart"
+    for group in (None, "Trigger"):
+        sel.value = "FrameBurstStart"
+        cam.TriggerSource.SetValue("Line1")
+        sel.value = "ExposureStart"          # left here, not as connected
+        out = frame_camera.reset_camera_settings(group)
+        assert out["ok"], out["summary"]
+        assert sel.value == "FrameStart", (group, "back as connected")
+        assert every_trigger(cam) == connected
+
+
 def test_reset_all_is_refused_while_capturing(tmp_path):
     connected("frame")
     frame_camera.start(str(tmp_path / "run"))
@@ -740,7 +829,8 @@ os.environ.pop("COUNCIL_NO_DIALOGS", None)
 import frame_camera
 frame_camera._LIVE.setup_path = {setup!r}
 rows = frame_camera.list_cameras()["rows"]
-frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+frame_camera.connect(next(r for r in rows
+                          if "Simulated" in r and r.endswith("frame")))
 print("SETTINGS", frame_camera.camera_settings()["summary"], flush=True)
 print("SETUP", frame_camera.setup()["summary"], flush=True)
 frame_camera.disconnect()

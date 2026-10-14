@@ -95,7 +95,9 @@ def test_take_on_an_empty_mailbox_is_none():
 # ======================================================================
 def test_the_drop_count_is_shown_even_when_it_is_zero():
     """A number that only appears once it is bad is not being watched."""
-    assert "0 dropped" in Stats(grabbed=5, dropped=0, rate=30.0).line()
+    # In the one wording every view uses (SCREEN_DROPS), not "dropped".
+    assert "0 not drawn (screen only)" in Stats(grabbed=5, dropped=0,
+                                                rate=30.0).line()
 
 
 def test_the_status_line_reports_the_measured_rate():

@@ -13,13 +13,23 @@ import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("PYLON_CAMEMU", "2")        # before pylon starts
-
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from council_core import basler_scan as bs
+
+
+@pytest.fixture(autouse=True)
+def camera_emulator(monkeypatch):
+    """Two emulated Baslers for THIS FILE'S TESTS ONLY, unless PYLON_CAMEMU
+    already says how many. Set at import ("before pylon starts") it stayed
+    set for the whole pytest process, so every simulated-camera test
+    collected with this file listed emulated Baslers too — and pylon reads
+    PYLON_CAMEMU at every enumeration anyway (measured), so a per-test
+    setting is enough."""
+    if not os.environ.get("PYLON_CAMEMU"):
+        monkeypatch.setenv("PYLON_CAMEMU", "2")
 
 
 # ======================================================================

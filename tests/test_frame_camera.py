@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import frame_camera
 from council_core import cameras
+from tests.sim_cameras import simulated_row, without_camera_sdks
 
 
 @pytest.fixture(autouse=True)
@@ -41,14 +42,30 @@ def clean():
 
 
 def connected(kind="frame"):
+    """Connect the SIMULATED `kind` camera — by name, not the first row of
+    that kind, which in the pylon env (PYLON_CAMEMU) is an emulated Basler
+    (tests/sim_cameras.py)."""
     listed = frame_camera.list_cameras()
-    rows = [r for r in listed["rows"] if r.endswith(kind)]
-    assert rows, f"no simulated {kind} camera in {listed['rows']}"
-    return frame_camera.connect(rows[0])
+    return frame_camera.connect(simulated_row(listed["rows"], kind))
 
 
 def settle(seconds=0.2):
     time.sleep(seconds)
+
+
+def test_an_openeb_exception_inside_a_message_is_said_plainly():
+    """OpenEB's exception text is a block: a rule of dashes, the category,
+    "Error <code>: " and the message, a rule (cameras.hal_exception_text;
+    the real bindings' text, measured in the pylon env). Wrapped in a
+    CameraError ("could not open …: {exc}") and said by _said, the status
+    line got the block — dashes and all."""
+    said = "Unable to open RAW file 'run.raw'"
+    block = cameras.hal_exception_text(0x101000, said)
+    wrapped = cameras.CameraError(f"could not start the stream: {block}")
+    assert frame_camera._said(wrapped) == \
+        f"could not start the stream: {said}"
+    assert frame_camera._said(RuntimeError(block)) == said
+    assert frame_camera._said(RuntimeError("plain : with a tail")) == "plain"
 
 
 # ======================================================================
@@ -60,8 +77,11 @@ def test_listing_returns_rows_and_a_summary():
     assert "found" in listed["summary"]
 
 
-def test_a_missing_sdk_is_explained_in_the_notes():
-    """An empty list with no reason sends the user to check cables."""
+def test_a_missing_sdk_is_explained_in_the_notes(monkeypatch):
+    """An empty list with no reason sends the user to check cables. Both
+    SDKs missing, whatever this PC has (the pylon env has pypylon and, with
+    PYLON_CAMEMU, emulated Baslers: no Basler note to find)."""
+    without_camera_sdks(monkeypatch)
     listed = frame_camera.list_cameras()
     notes = listed["notes"]
     joined = " ".join(notes).lower()
@@ -241,12 +261,18 @@ def test_starting_into_a_file_is_refused(tmp_path):
 
 
 def test_stopping_reports_the_measured_rate_and_the_drops(tmp_path):
+    """In the live line's words: Stop said "N dropped" for the number the
+    live line had just called "not drawn (screen only)" — and "dropped" is
+    read as frames lost, which these never are."""
     connected()
     frame_camera.start(str(tmp_path))
     settle()
     out = frame_camera.stop()
     assert "fps" in out["status"]
-    assert "dropped" in out["status"]           # Stats.line itself, unchanged
+    for said in (out["status"], out["summary"],
+                 frame_camera.status()["status"]):
+        assert "not drawn (screen only)" in said, said
+        assert "dropped" not in said, said
 
 
 def test_stopping_when_not_started_is_not_an_error():
