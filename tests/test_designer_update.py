@@ -158,9 +158,12 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
     # Pop out, Settings, then the camera's own set-up: the area line, the
     # presets heading, the preset picker, Save preset, Camera settings;
     # then the classifier library (s64-s78); then the camera settings tabs
-    # under the image folder (s79 the notebook, s80 Basic, s81 its note).
+    # under the image folder (s79 the notebook, s80 Basic, s81 its note);
+    # then the capture set-up in Basic and Capture now (s82-s92).
     assert [a.rsplit(" (", 1)[-1].rsplit(" ", 1)[-1].rstrip(")")
-            for a in changes.added] == [f"s{i}" for i in range(57, 82)]
+            for a in changes.added] == [f"s{i}" for i in range(57, 93)]
+    assert {"Downsample (s83)", "Capture (s85)", "From (s87)",
+            "Capture now (F9) (s92)"} <= set(changes.added), changes.added
     assert changes.added[:2] == ["Pop out (s57)", "Settings ▾ (s58)"]
     assert {"Preset (s61)", "Save preset (s62)",
             "Camera settings… (s63)"} <= set(changes.added)
@@ -182,7 +185,7 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 25 added, 0 removed, 8 rewired")
+    assert lines[0].startswith("  shapes: 36 added, 0 removed, 8 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
