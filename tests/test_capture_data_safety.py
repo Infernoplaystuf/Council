@@ -427,9 +427,12 @@ def test_a_failed_grab_in_a_recording_leaves_a_counted_gap(tmp_path):
     with open(tmp_path / "run_frames.csv", newline="",
               encoding="utf-8") as handle:
         header = next(csv.reader(handle))
-    assert header[-1] == "grab_failures", "the new column is not at the end"
-    assert header[:len(capture.INDEX_COLUMNS) - 1] == [
-        "file", "index", "timestamp_us", "raw_t_us", "events", "window_us"]
+    # Added after window_us, and every column since after it: an older
+    # reader finds each column where it always was.
+    assert header[:7] == [
+        "file", "index", "timestamp_us", "raw_t_us", "events", "window_us",
+        "grab_failures"], header
+    assert header == list(capture.INDEX_COLUMNS)
     rows = read_rows(tmp_path / "run_frames.csv")
     assert [r["index"] for r in rows] == ["1", "2", "4", "5"]
     assert [r["grab_failures"] for r in rows] == ["0", "0", "1", "1"]

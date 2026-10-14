@@ -933,9 +933,12 @@ class SettingRow(QObject):
         self.connected_value = connected_value
         held = str(s.get("held") or "")
         live = bool(s.get("live", True))
+        # The capture set-up (Capture, its trigger, Downsample) is one per
+        # run: fixed while capturing, though it never stops the stream.
+        fixed = bool(s.get("per_run"))
         writable = not self.read_only and self.kind != TEXT
         enabled = writable and not busy and not held and not (
-            capturing and not live)
+            capturing and (not live or fixed))
         for widget in (self.slider, self.editor):
             if widget is not None and writable:
                 widget.setEnabled(enabled)
@@ -962,7 +965,7 @@ class SettingRow(QObject):
         if held:
             notes.append((f"Greyed out while {held} — change that first",
                           "dim"))
-        elif not live and capturing:
+        elif (not live or fixed) and capturing:
             # A tab's row is ~230 px of note: the short form keeps it to
             # one line (three such rows of two lines filled a 190 px page).
             notes.append(("Stop the capture to change this" if self.compact

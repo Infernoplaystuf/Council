@@ -40,7 +40,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from . import cameras
+from . import cameras, reduce, triggered
 
 #: How long a stop() waits for the grab loop before reporting failure.
 STOP_TIMEOUT = 3.0
@@ -102,6 +102,10 @@ class Stats:
     #: until the app ended the recording (record_to). Not frozen at the
     #: failure: a run that went on for a minute after it lost a minute.
     unsaved: int = 0
+    #: Frames of a "Triggered: snapshot" run that came BETWEEN triggers:
+    #: grabbed and shown, never asked for, so not saved — and not a loss
+    #: (council_core.triggered). Always 0 for any other run.
+    passed: int = 0
 
     @property
     def grab_attempts(self) -> int:
@@ -122,6 +126,8 @@ class Stats:
                 f"{self.dropped} {dropped_label}"]
         if self.recorded:
             bits.append(f"{self.recorded} saved")
+        if self.passed:
+            bits.append(f"{self.passed} between triggers (not asked for)")
         if self.waiting:
             bits.append(f"{self.waiting} waiting to save")
         if self.skipped:
@@ -336,15 +342,36 @@ def imports_warm() -> bool:
 #: no grabs to fail). A failed grab uses up a frame number, so it is also a
 #: gap in `index`.
 #:
+#: A TRIGGERED RUN'S COLUMNS (council_core.triggered), blank in any other:
+#:   trigger          the trigger the frame was saved for, 1, 2, 3 … in the
+#:                    order they came (<run>_capture_triggers.csv has a row
+#:                    for every one, missed ones too)
+#:   trigger_frame    which of that trigger's frames it is: 1 .. per trigger
+#:   trigger_source   Software, Timer, or the camera's input (Line1 …)
+#:   trigger_time     when Typhon fired it, seconds since 1970 — blank for
+#:                    the camera's own input, whose moment is the camera's
+#:                    timestamp_us
+#:   arrived          when the frame reached Typhon, seconds since 1970
+#: frame_id is the camera's own frame (block) number where it gives one —
+#: blank where it does not (pylon's emulator: none).
+#: downsample, downsample_method: the frame's Downsample factor and how it
+#: was made (council_core.reduce: camera_binning_average, camera_binning_
+#: sum_divided, typhon_block_mean) — blank when Downsample is Off.
+#:
 #: NEW COLUMNS GO AT THE END ONLY: every reader takes the CSV by column name
 #: (event_playback.raw_origin, run_window_us, frame_times), and a reader of
 #: an older run finds the columns it knows where they always were.
 INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
-                 "window_us", "grab_failures")
+                 "window_us", "grab_failures", "trigger", "trigger_frame",
+                 "trigger_source", "trigger_time", "arrived", "frame_id",
+                 "downsample", "downsample_method")
 
 #: A run's frame index is "<run>_frames.csv" — and creating it is what
 #: reserves the run's name (reserve_run).
 INDEX_SUFFIX = "_frames.csv"
+
+#: A triggered run's "<run>_capture_triggers.csv" (council_core.triggered).
+TRIGGERS_SUFFIX = triggered.TRIGGERS_SUFFIX
 
 #: A run's end record, "<run>_run_end.json": what only the end of a
 #: recording knows (Recorder.finish) — above all the failed grabs, which
@@ -358,7 +385,7 @@ RUN_END_VERSION = 1
 #: with any file of these there is taken, and so is a FOLDER of the run's
 #: name (a run of several cameras is a folder; the multi-camera design 2.6).
 RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json",
-               RUN_END_SUFFIX)
+               RUN_END_SUFFIX, TRIGGERS_SUFFIX)
 
 #: How many names reserve_run tries (base, base_2, ...) before giving up.
 RESERVE_TRIES = 1000
@@ -496,6 +523,12 @@ class Recorder:
         #: Why the end record was not written, or "".
         self.end_note = ""
         self._finished = False
+        #: A triggered run's capture block for the end record — a function
+        #: (council_core.triggered.TriggerRun.summary), asked when the
+        #: recording ends — or None.
+        self.capture_info: Optional[Callable[[], Dict[str, Any]]] = None
+        #: The run's Downsample block for the end record, or None for Off.
+        self.downsample_info: Optional[Dict[str, Any]] = None
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -531,8 +564,13 @@ class Recorder:
 
     def save(self, frame: cameras.Frame, path: Path) -> None:
         """Encode and write one frame. Safe to call from several threads at
-        once: it touches nothing but its own file."""
-        self._writer(frame.image, path)
+        once: it touches nothing but its own file.
+
+        DOWNSAMPLED HERE, on the writer threads, when the camera that took
+        it says Typhon reduces it (Frame.meta "reduce", "divide";
+        council_core.reduce.prepared) — never on the grab thread, whose
+        budget at 150 fps is 6.7 ms against 22-34 ms for a full frame."""
+        self._writer(reduce.prepared(frame.image, frame.meta), path)
 
     def log(self, frame: cameras.Frame, path: Path) -> None:
         """Count a saved frame and give it its index row. NOT thread-safe:
@@ -541,11 +579,18 @@ class Recorder:
         if self._index_rows is not None:
             meta = frame.meta or {}
             window = meta.get("window_ms")
+            factor = meta.get("downsample")
             self._index_rows.writerow((
                 path.name, frame.index, frame.timestamp_us,
                 meta.get("raw_t_us", ""), meta.get("events", ""),
                 int(round(float(window) * 1000)) if window else "",
-                meta.get("grab_failures", "")))
+                meta.get("grab_failures", ""),
+                meta.get("trigger", ""), meta.get("trigger_frame", ""),
+                meta.get("trigger_source", ""), meta.get("trigger_time", ""),
+                meta.get("arrived", ""), meta.get("frame_id", ""),
+                factor if factor and int(factor) > 1 else "",
+                meta.get("downsample_method", "")
+                if factor and int(factor) > 1 else ""))
 
     def write(self, frame: cameras.Frame) -> Path:
         path = self.path_for(frame)
@@ -598,6 +643,21 @@ class Recorder:
                               it were not offered to the recording and are
                               not counted here (the app's Stop line counts
                               them "NOT saved (recording stopped)").
+            capture           A TRIGGERED RUN ONLY (added in version 1, so a
+                              reader of version 1 may meet it): its mode,
+                              source, frames per trigger, and what came of
+                              its triggers — triggers, ok, missed (camera
+                              busy, no frame, failed grab, not fired, and
+                              hardware edges the camera counted and
+                              ignored), cut short, frames arrived, the rule
+                              for which frames a trigger saved, and the
+                              triggers CSV (council_core.triggered).
+                              Frames passed over between snapshot triggers
+                              are `frames_between_triggers`, not a loss.
+            downsample        DOWNSAMPLE ON ONLY: its factor and method
+                              (council_core.reduce), the picture's size, and
+                              the right and bottom pixels a block could not
+                              hold.
 
         NEVER OVER ANYTHING: written whole to a temporary name and renamed
         into a name that must not exist (camera_record.write_once). A record
@@ -628,6 +688,16 @@ class Recorder:
             "last_index": totals.get("last_index"),
             "recording_failed": str(totals.get("recording_failed") or ""),
         }
+        info = self.capture_info
+        if callable(info):
+            try:
+                doc["capture"] = dict(info())
+            except Exception as exc:                        # noqa: BLE001
+                doc["capture"] = {"error": f"{type(exc).__name__}: {exc}"}
+            doc["capture"]["frames_between_triggers"] = int(
+                totals.get("passed", 0) or 0)
+        if self.downsample_info:
+            doc["downsample"] = dict(self.downsample_info)
         from . import camera_record
         try:
             return camera_record.write_once(self.end_path, doc)
@@ -762,6 +832,9 @@ class FrameWriter:
         #: camera that reports them (set by CaptureSession.record_to).
         self.grab_failures = 0
         self.counts_grab_failures = False
+        #: Snapshot frames that came between triggers (note_passed): the
+        #: camera's, never asked for, so not offered — for the end record.
+        self.passed = 0
         #: Frames offered (submit), and the first and last frame number
         #: offered or failed, for the end record.
         self.offered = 0
@@ -836,6 +909,11 @@ class FrameWriter:
             self.grab_failures += 1
             self._saw_index(index)
 
+    def note_passed(self) -> None:
+        """A snapshot frame no trigger asked for went by (not offered)."""
+        with self._cond:
+            self.passed += 1
+
     def _saw_index(self, index: Any) -> None:
         """Called with the lock held."""
         try:
@@ -859,6 +937,7 @@ class FrameWriter:
                 "first_index": self.first_index,
                 "last_index": self.last_index,
                 "recording_failed": self.failed,
+                "passed": self.passed,
             }
 
     def _run(self) -> None:
@@ -1073,6 +1152,12 @@ class CaptureSession:
         #: stopped)" for every live frame after a failed write, until the
         #: next Record or Disconnect.
         self.end_recording_on_failure = False
+        #: A TRIGGERED recording's books (council_core.triggered.
+        #: TriggerRun), set with the recorder (record_to): asked on the grab
+        #: thread which trigger each frame belongs to — and, in snapshot
+        #: mode, whether any trigger asked for it at all. None otherwise:
+        #: every frame is offered, as always.
+        self.gate: Any = None
 
     # ------------------------------------------------------------------
     @property
@@ -1141,7 +1226,7 @@ class CaptureSession:
 
     def record_to(self, recorder: Optional[Recorder],
                   drain_timeout: Optional[float] = DRAIN_TIMEOUT,
-                  reset: bool = False) -> bool:
+                  reset: bool = False, gate: Any = None) -> bool:
         """Start writing frames to disk, or stop and let what is queued land.
 
         Called while running: the grab loop picks it up on its next frame.
@@ -1153,6 +1238,9 @@ class CaptureSession:
         the camera already streaming (an EVK4 going from preview to capture)
         doing the two separately let a frame land between them, counted as
         grabbed and never recorded — measured: "11 grabbed, 10 saved".
+
+        `gate`, with a recorder: a triggered run's books (see `self.gate`),
+        switched in the same step. Stopping drops it.
         """
         finished = True
         writer = None
@@ -1170,6 +1258,7 @@ class CaptureSession:
                 self._reset_locked()
             old = self.writer
             broken, self._broken = self._broken, None
+            self.gate = gate if writer is not None else None
             if writer is not None:
                 self._writers.append(writer)
                 self.writer = writer
@@ -1379,6 +1468,25 @@ class CaptureSession:
                                       errors=self._stats.errors + 1,
                                       unsaved=self._stats.unsaved + 1)
             return False
+        gate = self.gate
+        if gate is not None:
+            # A TRIGGERED RUN: which trigger this frame is for — or, in
+            # snapshot mode, none (a frame between triggers: grabbed and
+            # shown, never asked for, not saved, and not a loss).
+            try:
+                tags = gate.tag(frame)
+            except Exception as exc:                        # noqa: BLE001
+                tags = {"trigger": "", "trigger_source":
+                        f"error: {type(exc).__name__}"}
+            if tags is None:
+                with self._lock:
+                    self._stats = replace(self._stats,
+                                          passed=self._stats.passed + 1)
+                writer.note_passed()
+                return False
+            meta = frame.meta if frame.meta is not None else {}
+            meta.update(tags)
+            frame.meta = meta
         if writer.counts_grab_failures:
             # The running count goes on the frame's CSV row: this
             # recording's own failed grabs so far (a recording can begin in
@@ -1397,6 +1505,12 @@ class CaptureSession:
             writer = self.writer
             if writer is not None and not writer.failed:
                 writer.note_failed_grab(getattr(exc, "index", None))
+                gate = self.gate
+                if gate is not None:
+                    try:
+                        gate.failed_grab(getattr(exc, "index", None))
+                    except Exception:                       # noqa: BLE001
+                        pass
 
     def _rate(self) -> float:
         """Frames per second over the last `RATE_WINDOW` seconds.

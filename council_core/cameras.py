@@ -247,6 +247,30 @@ class CameraInfo:
         return f"{head} ({self.serial})" if self.serial else head
 
 
+#: A grab result's block ID that means "none" (pylon's emulator gives it).
+NO_BLOCK_ID = 2 ** 64 - 1
+
+
+def downsample_meta(setup: Any, method: str) -> Dict[str, Any]:
+    """What each frame of a stream carries about Downsample (Frame.meta):
+    its factor and method for the frames CSV — and, for Typhon to apply on
+    the writer threads and the display (council_core.reduce.prepared),
+    "reduce" (Typhon averages the blocks) or "divide" (a camera's Sum
+    binning made as bright as unbinned). {} when Downsample is Off."""
+    from . import reduce as red
+
+    factor = int(getattr(setup, "downsample", 1) or 1)
+    if factor <= 1:
+        return {}
+    if method == red.CAMERA_AVERAGE:
+        return {"downsample": factor, "downsample_method": method}
+    if method == red.CAMERA_SUM_DIVIDED:
+        return {"downsample": factor, "downsample_method": method,
+                "divide": factor * factor}
+    return {"downsample": factor, "downsample_method": red.TYPHON_MEAN,
+            "reduce": factor}
+
+
 # ======================================================================
 # AOI arithmetic — the part that is wrong everywhere else
 # ======================================================================
@@ -456,10 +480,54 @@ class Device:
     #: CSV's grab_failures column is left blank rather than claiming a 0.
     counts_grab_failures = False
 
+    #: The CAPTURE SET-UP (council_core.triggered.CaptureSetup) of a frame
+    #: camera Typhon can trigger and downsample — Continuous or a trigger,
+    #: its source, Downsample. None for a camera it cannot (an event
+    #: camera: its stream is left exactly as it was).
+    capture: Any = None
+
     @property
     def streaming(self) -> bool:
         """The camera has been started and not stopped."""
         return bool(getattr(self, "_started", False))
+
+    # -- the capture set-up: triggers and Downsample (council_core.triggered)
+    def capture_options(self) -> Any:
+        """What this camera offers the set-up (triggered.CaptureOptions),
+        or None when it has no set-up."""
+        return None
+
+    def trigger_problem(self, setup: Any) -> str:
+        """Why this camera cannot be armed for `setup`, in words, or "" —
+        asked at Start BEFORE anything stops."""
+        return "this camera cannot be triggered from Typhon"
+
+    def arm_trigger(self, setup: Any) -> Dict[str, Any]:
+        """Arm the camera's own trigger for an exact run; returns what
+        disarm_trigger puts back."""
+        raise CameraError("this camera cannot be triggered from Typhon")
+
+    def disarm_trigger(self, armed: Any) -> List[str]:
+        """Put back what arm_trigger changed; what changed, in words."""
+        return []
+
+    def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
+        """Is the camera waiting for its next frame trigger? Waits up to
+        `timeout_s` for it. None: it cannot say."""
+        return None
+
+    def fire_trigger(self) -> None:
+        """Fire one software trigger."""
+        raise CameraError("this camera has no software trigger")
+
+    def count_edges(self, armed: Any) -> Tuple[Optional[int], str]:
+        """The camera's own count of edges on the armed hardware input since
+        Start, or (None, why not)."""
+        return None, "the camera has no edge counter Typhon can use"
+
+    def downsample_info(self) -> Dict[str, Any]:
+        """How Downsample is made now: {"factor", "method", "note"}."""
+        return {"factor": 1, "method": "", "note": ""}
 
     def start_raw(self, path: Any) -> Path:
         """Begin recording the camera's raw stream into `path`."""
@@ -702,6 +770,23 @@ class BaslerDevice(Device):
         #: ["format"]), read once at start for the same reason: it is
         #: locked while grabbing too.
         self._format = ""
+        from .triggered import CaptureSetup
+        #: The capture set-up (council_core.triggered), Continuous and Off
+        #: until chosen: a camera opened is captured as it always was.
+        self.capture = CaptureSetup()
+        #: Held while the TRIGGER SELECTOR is moved (camera_settings.
+        #: BaslerSettings._each_trigger, arming) and while a software
+        #: trigger is fired: a trigger fired with the selector on another
+        #: entry is lost with no error (measured on the emulator).
+        self.trigger_lock = threading.RLock()
+        #: How Downsample is made now: "" (Off), reduce.CAMERA_AVERAGE,
+        #: reduce.CAMERA_SUM_DIVIDED or reduce.TYPHON_MEAN — and why, when
+        #: the camera could not do it (downsample_note).
+        self.downsample_method = ""
+        self.downsample_note = ""
+        #: The camera's binning as it was before Typhon binned it, put back
+        #: when Downsample goes Off; None while Typhon has not binned it.
+        self._binning_before: Optional[Dict[str, Any]] = None
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
@@ -914,6 +999,301 @@ class BaslerDevice(Device):
         from .camera_settings import BaslerSettings
         return BaslerSettings(self)
 
+    # -- the capture set-up: triggers (council_core.triggered) -------------
+    def capture_options(self) -> Any:
+        return self.settings_provider().capture_options()
+
+    def trigger_problem(self, setup: Any) -> str:
+        return self.settings_provider().trigger_problem(setup)
+
+    def arm_trigger(self, setup: Any) -> Dict[str, Any]:
+        return self.settings_provider().arm(setup)
+
+    def disarm_trigger(self, armed: Any) -> List[str]:
+        return self.settings_provider().disarm(armed)
+
+    def count_edges(self, armed: Any) -> Tuple[Optional[int], str]:
+        return self.settings_provider().count_edges(armed)
+
+    def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
+        """Is the camera waiting for a frame trigger (FrameTriggerWait)?
+        Waits up to `timeout_s`. pylon's own WaitForFrameTriggerReady where
+        the camera can (it polls AcquisitionStatus), else the node read
+        here; None when the camera cannot say.
+
+        WHY ASK. A trigger that comes while the camera is still busy with
+        the last frame is IGNORED, with no error and no gap in the frame
+        numbers (measured on the emulator: 20 triggers 10 ms apart at
+        100 ms exposure gave 10 frames, nothing counted). And one fired
+        right after the stream started is lost too: 0 frames of 10 without
+        this wait, 10 of 10 with it (measured)."""
+        timeout_s = max(0.0, float(timeout_s or 0.0))
+        cam = self._cam
+        can = getattr(cam, "CanWaitForFrameTriggerReady", None)
+        wait = getattr(cam, "WaitForFrameTriggerReady", None)
+        if callable(can) and callable(wait):
+            try:
+                if can():
+                    return bool(wait(int(round(timeout_s * 1000)),
+                                     self._pylon.TimeoutHandling_Return))
+            except Exception:                               # noqa: BLE001
+                pass
+        selector = self._node("AcquisitionStatusSelector")
+        status = self._node("AcquisitionStatus")
+        if selector is None or status is None:
+            return None
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                if str(selector.GetValue()) != "FrameTriggerWait":
+                    selector.SetValue("FrameTriggerWait")
+                ready = bool(status.GetValue())
+            except Exception:                               # noqa: BLE001
+                return None
+            if ready or time.monotonic() >= deadline:
+                return ready
+            time.sleep(0.002)
+
+    def fire_trigger(self) -> None:
+        """One software trigger, with the trigger selector on the entry the
+        run armed — under trigger_lock, so a settings view reading every
+        trigger cannot move the selector away in between (a trigger fired
+        with the selector elsewhere is lost with no error, measured)."""
+        with self.trigger_lock:
+            entry = getattr(self, "_armed_entry", "")
+            selector = self._node("TriggerSelector") if entry else None
+            if selector is not None:
+                try:
+                    if str(selector.GetValue()) != entry:
+                        selector.SetValue(entry)
+                except Exception:                           # noqa: BLE001
+                    pass
+            node = self._node("TriggerSoftware")
+            execute = getattr(node, "Execute", None) if node is not None \
+                else None
+            if callable(execute):
+                execute()
+                return
+            execute = getattr(self._cam, "ExecuteSoftwareTrigger", None)
+            if callable(execute):
+                execute()
+                return
+        raise CameraError("this camera has no software trigger "
+                          "(TriggerSoftware)")
+
+    # -- Downsample: the camera's own binning, in Average mode -------------
+    def _binning_state(self) -> Optional[Dict[str, Any]]:
+        """The binning nodes' values now, or None without binning."""
+        if self._node("BinningHorizontal") is None or \
+                self._node("BinningVertical") is None:
+            return None
+        state: Dict[str, Any] = {
+            "h": int(self._value("BinningHorizontal", 1) or 1),
+            "v": int(self._value("BinningVertical", 1) or 1)}
+        for key, name in (("selector", "BinningSelector"),
+                          ("hmode", "BinningHorizontalMode"),
+                          ("vmode", "BinningVerticalMode")):
+            if self._node(name) is not None:
+                state[key] = str(self._value(name, "") or "")
+        return state
+
+    def binning_mode(self) -> str:
+        """The mode Downsample bins in: "Average" where the camera offers
+        it, else "Sum", else "" (no mode node: what it does is unknown, so
+        Typhon averages instead)."""
+        node = self._node("BinningHorizontalMode")
+        if node is None:
+            return ""
+        entries = [str(s) for s in (_ask(node, "GetSymbolics") or ())]
+        if not entries:
+            entries = [str(self._value("BinningHorizontalMode", "") or "")]
+        if "Average" in entries:
+            return "Average"
+        if "Sum" in entries:
+            return "Sum"
+        return ""
+
+    def can_bin(self, factor: int) -> bool:
+        """Does the camera offer binning `factor` x `factor` in a mode
+        Downsample can use?"""
+        if factor <= 1 or not self.binning_mode():
+            return False
+        highs = []
+        for name in ("BinningHorizontal", "BinningVertical"):
+            node = self._node(name)
+            high = _ask(node, "GetMax") if node is not None else None
+            if high is None:
+                return False
+            highs.append(int(high))
+        return min(highs) >= factor
+
+    def downsample_needs_stop(self, factor: int) -> bool:
+        """Would apply_downsample(factor) write binning the running stream
+        locks (it does on the emulator, measured)?"""
+        if not self._started:
+            return False
+        writes = (self.can_bin(int(factor)) or self._binning_before
+                  is not None)
+        node = self._node("BinningHorizontal")
+        if not writes or node is None:
+            return False
+        writable = getattr(node, "IsWritable", None)
+        return bool(callable(writable) and not writable())
+
+    def apply_downsample(self, factor: int) -> str:
+        """Downsample `factor`: by the camera's binning in Average mode
+        where it can (Sum, divided again by Typhon, where Sum is all it
+        has), else by Typhon averaging before saving. Returns what was done.
+
+        CHECKED, NOT ASSUMED: a camera can accept binning and do nothing
+        (pylon's emulator does, measured), so the binning is kept only when
+        the camera's own maximum width and height really became 1/factor of
+        what they were; otherwise it is put back and Typhon averages.
+
+        THE SAME PART OF THE SENSOR STAYS IN VIEW. A binned camera's area is
+        in binned pixels; the area is rewritten in the new pixels whatever
+        the camera did with it. Raises NeedsStop, before writing anything,
+        while the stream locks the binning."""
+        from . import reduce as red
+
+        factor = max(1, min(4, int(factor)))
+        if self.downsample_needs_stop(factor):
+            raise NeedsStop("save.downsample", "Downsample by the camera's "
+                                               "binning needs the stream "
+                                               "stopped")
+        if self._binning_before is not None:
+            self._restore_binning()
+        self.capture.downsample = factor
+        self.downsample_note = ""
+        if factor <= 1:
+            self.downsample_method = ""
+            return "Off — every pixel as the camera sends it"
+        if not self.can_bin(factor):
+            self.downsample_method = red.TYPHON_MEAN
+            self.downsample_note = (f"the camera has no {factor} x {factor} "
+                                    f"binning in Average or Sum mode")
+            return (f"{factor}x by Typhon, averaging each {factor} x "
+                    f"{factor} block before saving ({self.downsample_note})")
+        took, why = self._bin(factor)
+        if not took:
+            self.downsample_method = red.TYPHON_MEAN
+            self.downsample_note = why
+            return (f"{factor}x by Typhon, averaging each {factor} x "
+                    f"{factor} block before saving — {why}")
+        mode = self.binning_mode()
+        if mode == "Average":
+            self.downsample_method = red.CAMERA_AVERAGE
+            return (f"{factor}x by the camera: binning {factor} x {factor}, "
+                    f"Average")
+        self.downsample_method = red.CAMERA_SUM_DIVIDED
+        self.downsample_note = (f"the camera only SUMS its binned pixels: "
+                                f"Typhon divides each by {factor * factor} "
+                                f"so the picture is as bright as unbinned; "
+                                f"what the camera clipped stays clipped, at "
+                                f"1/{factor * factor} of its range")
+        return (f"{factor}x by the camera: binning {factor} x {factor}, Sum, "
+                f"divided by {factor * factor} by Typhon — "
+                f"{self.downsample_note}")
+
+    def _sensor_area(self) -> Tuple[int, int, int, int]:
+        """The camera's area in UNBINNED sensor pixels."""
+        state = self._binning_state() or {"h": 1, "v": 1}
+        area = self.roi()
+        return (area.x * state["h"], area.y * state["v"],
+                area.w * state["h"], area.h * state["v"])
+
+    def _put_area(self, sensor: Tuple[int, int, int, int]) -> None:
+        """Write a sensor-pixel area in the camera's current pixels."""
+        state = self._binning_state() or {"h": 1, "v": 1}
+        bh, bv = max(1, state["h"]), max(1, state["v"])
+        x, y, w, h = sensor
+        try:
+            self.set_roi(Roi(x // bh, y // bv, max(1, w // bh),
+                             max(1, h // bv)))
+        except CameraError:
+            pass
+
+    def _write_binning(self, state: Dict[str, Any]) -> None:
+        """Binning as `state` has it: the selector first, the modes, then
+        horizontal before vertical (some models say so)."""
+        for key, name in (("selector", "BinningSelector"),
+                          ("hmode", "BinningHorizontalMode"),
+                          ("vmode", "BinningVerticalMode"),
+                          ("h", "BinningHorizontal"),
+                          ("v", "BinningVertical")):
+            if key in state and self._node(name) is not None:
+                self._set(name, state[key])
+
+    def _bin(self, factor: int) -> Tuple[bool, str]:
+        before = self._binning_state()
+        if before is None:
+            return False, "the camera has no binning"
+        sensor = self._sensor_area()
+        mode = self.binning_mode()
+        try:
+            want: Dict[str, Any] = {}
+            selector = self._node("BinningSelector")
+            if selector is not None:
+                entries = [str(s) for s in (_ask(selector, "GetSymbolics")
+                                            or ())]
+                # A boost's FPGA binning (Region1) averages; its Sensor
+                # binning is 2 x 2 Sum only (vendor docs).
+                if "Region1" in entries:
+                    want["selector"] = "Region1"
+            want.update(h=1, v=1)
+            self._write_binning(want)
+            width1 = int(self._value("WidthMax", 0) or 0)
+            height1 = int(self._value("HeightMax", 0) or 0)
+            want = {k: v for k, v in want.items() if k == "selector"}
+            if self._node("BinningHorizontalMode") is not None:
+                want["hmode"] = mode
+            if self._node("BinningVerticalMode") is not None:
+                want["vmode"] = mode
+            want.update(h=factor, v=factor)
+            self._write_binning(want)
+            width = int(self._value("WidthMax", 0) or 0)
+            height = int(self._value("HeightMax", 0) or 0)
+        except Exception as exc:                            # noqa: BLE001
+            self._write_binning_quietly(before)
+            self._put_area(sensor)
+            return False, f"the camera refused binning: {exc}"
+        took = (0 < width < width1 and 0 < height < height1
+                and width <= -(-width1 // factor)
+                and height <= -(-height1 // factor))
+        if not took:
+            self._write_binning_quietly(before)
+            self._put_area(sensor)
+            return False, ("the camera accepted binning but its picture did "
+                           "not get smaller")
+        self._binning_before = before
+        self._put_area(sensor)
+        return True, ""
+
+    def _write_binning_quietly(self, state: Dict[str, Any]) -> None:
+        try:
+            self._write_binning(state)
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _restore_binning(self) -> None:
+        """Binning back as it was before Typhon binned it."""
+        before, self._binning_before = self._binning_before, None
+        if before is None:
+            return
+        sensor = self._sensor_area()
+        self._write_binning_quietly(before)
+        self._put_area(sensor)
+
+    def downsample_info(self) -> Dict[str, Any]:
+        out = {"factor": int(self.capture.downsample),
+               "method": self.downsample_method, "note": self.downsample_note}
+        state = self._binning_state()
+        if state is not None and self.downsample_method.startswith("camera"):
+            out["binning"] = [state["h"], state["v"]]
+            if "hmode" in state:
+                out["binning_mode"] = state["hmode"]
+        return out
+
     def start(self) -> None:
         """Grab. What pylon keeps when the app falls behind depends on why:
 
@@ -999,6 +1379,7 @@ class BaslerDevice(Device):
             # boA5320. Kept because other Basler families do fill it in.
             stamp = int(_call(grab, "GetTimeStamp") or 0)
             skipped = int(_call(grab, "GetNumberOfSkippedImages") or 0)
+            block = _call(grab, "GetBlockID", None)
         finally:
             try:
                 grab.Release()
@@ -1012,6 +1393,16 @@ class BaslerDevice(Device):
             meta["format"] = self._format
         if skipped:
             meta["skipped_by_camera"] = skipped
+        if isinstance(block, int) and not isinstance(block, bool) and \
+                0 <= block < NO_BLOCK_ID:
+            # The camera's own frame number (GigE/USB block ID). pylon's
+            # emulator gives 2**64 - 1, "none": left out, never a guess.
+            meta["frame_id"] = block
+        # Downsample, as it is NOW: the live view follows a change at once
+        # (a capture's own is fixed — refused while capturing).
+        extra = downsample_meta(self.capture, self.downsample_method)
+        if extra:
+            meta.update(extra)
         return Frame(image=image, index=self._index, timestamp_us=stamp,
                      meta=meta)
 
@@ -1985,6 +2376,107 @@ class SyntheticDevice(Device):
         #: An event camera's area is set live, like an EVK4's; a frame
         #: camera's needs the stream stopped, like a Basler's.
         self.area_live = info.kind == "event"
+        # THE CAPTURE SET-UP, a frame camera's only (an event camera has
+        # none, as an EVK4 has none). A SOFTWARE TRIGGER like a Basler's:
+        # armed, the camera sends a frame only when one is fired, ignores
+        # one fired while it is still exposing the last (silently, as a
+        # Basler does) or in its first READY_AFTER_START after the stream
+        # starts, and says whether it is ready (trigger_ready). No hardware
+        # inputs and no binning: Downsample is Typhon's averaging.
+        self.capture = None
+        if info.kind != "event":
+            from .triggered import CaptureSetup
+            self.capture = CaptureSetup()
+        self.downsample_method = ""
+        self._trigger = threading.Condition()
+        self._armed = False
+        self._fired = 0
+        self._busy_until = 0.0
+        self._ready_at = 0.0
+        #: Software triggers the camera ignored (busy, or too soon), for
+        #: tests: a real camera keeps no such count.
+        self.ignored_triggers = 0
+
+    #: A simulated camera is not ready for a trigger until this long after
+    #: its stream starts (pylon's emulator: 14-15 ms, measured).
+    READY_AFTER_START = 0.015
+
+    # -- the capture set-up --------------------------------------------------
+    def capture_options(self) -> Any:
+        if self.capture is None:
+            return None
+        from .triggered import CaptureOptions
+        return CaptureOptions(downsample_help=(
+            "Saves smaller pictures: each 2 x 2, 3 x 3 or 4 x 4 block of "
+            "pixels becomes one, AVERAGED by Typhon before saving (the "
+            "simulated camera cannot bin). Off (the default) never changes "
+            "the data. Kept in presets; fixed while capturing."))
+
+    def trigger_problem(self, setup: Any) -> str:
+        if self.capture is None:
+            return "an event camera is not triggered from Typhon"
+        if getattr(setup, "triggered", False) and \
+                not getattr(setup, "typhon_fires", True):
+            return (f"the simulated camera has no hardware inputs — "
+                    f"{setup.source} cannot trigger it; choose Software or "
+                    f"Timer")
+        return ""
+
+    def arm_trigger(self, setup: Any) -> Dict[str, Any]:
+        problem = self.trigger_problem(setup)
+        if problem:
+            raise CameraError(problem)
+        with self._trigger:
+            self._armed = True
+            self._fired = 0
+        return {"armed": True, "said": []}
+
+    def disarm_trigger(self, armed: Any) -> List[str]:
+        with self._trigger:
+            self._armed = False
+            self._fired = 0
+            self._trigger.notify_all()
+        return []
+
+    def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
+        deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
+        while True:
+            now = time.monotonic()
+            with self._trigger:
+                ready = (self._started and now >= self._ready_at
+                         and now >= self._busy_until and self._fired == 0)
+            if ready or now >= deadline:
+                return ready
+            time.sleep(0.001)
+
+    def fire_trigger(self) -> None:
+        now = time.monotonic()
+        with self._trigger:
+            if (not self._armed or not self._started or now < self._ready_at
+                    or now < self._busy_until or self._fired):
+                self.ignored_triggers += 1
+                return
+            self._fired += 1
+            self._busy_until = now + float(
+                self.state.get("ExposureTime", 0.0)) / 1e6
+            self._trigger.notify_all()
+
+    def apply_downsample(self, factor: int) -> str:
+        from . import reduce as red
+
+        factor = max(1, min(4, int(factor)))
+        self.capture.downsample = factor
+        if factor <= 1:
+            self.downsample_method = ""
+            return "Off — every pixel as the camera sends it"
+        self.downsample_method = red.TYPHON_MEAN
+        return (f"{factor}x by Typhon, averaging each {factor} x {factor} "
+                f"block before saving")
+
+    def downsample_info(self) -> Dict[str, Any]:
+        factor = int(getattr(self.capture, "downsample", 1) or 1)
+        return {"factor": factor, "method": self.downsample_method,
+                "note": ""}
 
     def load_defaults(self) -> None:
         """A Basler's UserSet "Default", simulated: every setting and the
@@ -2093,13 +2585,37 @@ class SyntheticDevice(Device):
         return got
 
     def start(self) -> None:
-        self._started = True
+        with self._trigger:
+            self._started = True
+            self._ready_at = time.monotonic() + self.READY_AFTER_START
+            self._busy_until = 0.0
+            self._fired = 0
 
     def stop(self) -> None:
-        self._started = False
+        with self._trigger:
+            self._started = False
+            self._trigger.notify_all()
+
+    def _wait_for_trigger(self, timeout_ms: int) -> bool:
+        """Armed: wait for a fired trigger; True when one came."""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        with self._trigger:
+            while self._fired == 0 and self._started and self._armed:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._trigger.wait(left)
+            if self._fired == 0:
+                return False
+            self._fired -= 1
+            return True
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
         np = _numpy()
+        if self._armed and self.info.kind != "event":
+            if not self._wait_for_trigger(timeout_ms):
+                return None
+            return self._with_downsample(self._picture(np))
         now = time.monotonic()
         wait = self._due - now
         if wait > 0:
@@ -2108,6 +2624,17 @@ class SyntheticDevice(Device):
                 return None
             time.sleep(wait)
         self._due = max(self._due, now) + self._interval()
+        return self._with_downsample(self._picture(np))
+
+    def _with_downsample(self, frame: Frame) -> Frame:
+        """Downsample as it is now (Frame.meta): Typhon averages this
+        camera's pictures — it cannot bin."""
+        extra = downsample_meta(self.capture, self.downsample_method)
+        if extra:
+            frame.meta.update(extra)
+        return frame
+
+    def _picture(self, np: Any) -> Frame:
         roi = self._roi
         self._index += 1
         column = (self._index * 7) % max(1, roi.w)
