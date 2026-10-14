@@ -514,20 +514,36 @@ the data.** It is kept in presets and fixed while capturing.
   moment. The camera's area stays on the **same part of the sensor** (it is
   rewritten in the binned pixels), the Binning rows are greyed while
   Downsample owns them, and a preset keeps Downsample rather than them.
-- **By the camera, Sum only** (some ace models): the camera adds the
-  pixels, and Typhon divides each by 4, 9 or 16 so the picture is as bright
-  as unbinned. What the camera clipped at its maximum stays clipped — at a
-  quarter (ninth, sixteenth) of the range — and Start and the run's record
-  say so.
+  How the camera rounds its average is its own (the record says `rounding:
+  "the camera's"`).
 - **By Typhon** everywhere else (the simulated camera, a colour model
-  without binning, and pylon's emulator, which accepts binning and does
-  nothing — Typhon checks the picture really got smaller): each block is
-  averaged before the frame is saved and before it is shown, on the save
-  queue's threads, never the camera's. 16-bit safe, rounded half up (half a
-  count at most from the exact mean); a Mono12 frame stays 0..4095. The
-  right and bottom pixels that do not fill a block are left out (the
-  record says how many). A **raw Bayer** picture is refused at Start —
+  without binning, a camera whose binning can only **Sum**, and pylon's
+  emulator, which accepts binning and does nothing — Typhon checks the
+  picture really got smaller): each block is averaged before the frame is
+  saved and before it is shown, on the save queue's threads, never the
+  camera's. 16-bit safe, rounded half up (half a count at most from the
+  exact mean); a Mono12 frame stays 0..4095. The right and bottom pixels
+  that do not fill a block are left out (the record says how many). A
+  **raw Bayer** picture is refused at Start, before anything stops —
   averaging neighbouring pixels would mix its colours; choose Mono or RGB.
+  A Sum-only binning is never used: the sum clips at the pixel format's
+  top, so divided back to brightness most of a bright picture came out
+  flat (on the test fake, 77% of a Mono12 picture more than a count off).
+
+**Typhon's binning never outlives Downsample.** Disconnect (and closing
+Typhon) put back the binning Downsample set, and the area with it — a
+Basler keeps its binning until it is powered off, so the next Connect would
+otherwise find a binned camera with Downsample Off. A camera that already
+bins when it is connected (its own Binning rows, or a session that crashed)
+is **said by Connect**, and Downsample Off then says the camera still bins
+rather than "every pixel". **Load camera defaults** resets the camera's
+binning: Downsample, which is Typhon's and kept as chosen, is made again
+from the camera as it is then, and the answer says so. And at Start the
+camera's binning is checked against Downsample once more: one that changed
+under Typhon turns Downsample Off for the run, said in Start's answer — a
+run is never recorded as binned while the camera sends full frames. A
+preset's own Binning rows (Downsample Off) are written after Downsample, so
+they are what the camera ends with.
 
 The live picture is the picture the run saves, so the slider's saved frames,
 the live end, the crop box and a box drawn for the camera's area all agree;
@@ -602,7 +618,7 @@ end, so older runs read the same):
 | `trigger`, `trigger_frame`, `trigger_source` | a triggered run only: the trigger the frame was saved for (1, 2, 3 … — its row in `<run>_capture_triggers.csv`), which of its frames this is, and where it came from |
 | `trigger_time`, `arrived` | a triggered run only: when Typhon fired the trigger and when the frame reached Typhon, seconds since 1970. `trigger_time` is blank for the camera's own input — its moment is the camera's `timestamp_us` |
 | `frame_id` | the camera's own frame (block) number where it gives one; blank where it does not (pylon's emulator) |
-| `downsample`, `downsample_method` | Downsample on only: the factor, and `camera_binning_average`, `camera_binning_sum_divided` or `typhon_block_mean` |
+| `downsample`, `downsample_method` | Downsample on only: the factor, and `camera_binning_average` or `typhon_block_mean` |
 
 **A gap in the frame numbers is a frame not saved**, and there are two
 kinds: a frame the save queue had to skip because storage fell behind

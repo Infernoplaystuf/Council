@@ -78,15 +78,6 @@ def test_colour_is_averaged_per_channel_and_bayer_is_refused():
                         {"reduce": 2, "format": "BayerRG8"})
 
 
-def test_a_sum_binned_picture_is_divided_back_to_its_brightness():
-    """A camera that can only SUM its binned pixels gives f x f times the
-    brightness; divided, rounding half up, it is as bright as unbinned."""
-    summed = np.array([[4 * 1000, 4 * 1000 + 2, 7]], np.uint16)
-    assert reduce.divided(summed, 4).tolist() == [[1000, 1001, 2]]
-    meta = {"divide": 4}
-    assert reduce.prepared(summed, meta).tolist() == [[1000, 1001, 2]]
-
-
 def test_the_threaded_bands_equal_one_pass():
     rng = np.random.default_rng(7)
     big = rng.integers(0, 65536, (1203, 1001), dtype=np.uint16)
@@ -100,7 +91,7 @@ def test_off_hands_the_picture_back_untouched():
     image = np.arange(12, dtype=np.uint8).reshape(3, 4)
     assert reduce.prepared(image, {}) is image
     assert reduce.prepared(image, None) is image
-    assert reduce.prepared(image, {"reduce": 1, "divide": 1}) is image
+    assert reduce.prepared(image, {"reduce": 1}) is image
     assert reduce.block_mean(image, 1) is image
 
 
@@ -160,9 +151,8 @@ def test_what_each_frame_carries_for_each_method():
         "reduce": 2}
     assert meta(_setup(3), reduce.CAMERA_AVERAGE) == {
         "downsample": 3, "downsample_method": "camera_binning_average"}
-    assert meta(_setup(2), reduce.CAMERA_SUM_DIVIDED) == {
-        "downsample": 2, "downsample_method": "camera_binning_sum_divided",
-        "divide": 4}
+    assert not hasattr(reduce, "CAMERA_SUM_DIVIDED"), \
+        "a camera that only sums is averaged by Typhon, never divided back"
     assert meta(None, "") == {}, "an event camera has no set-up"
 
 

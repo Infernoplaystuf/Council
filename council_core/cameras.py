@@ -255,8 +255,7 @@ def downsample_meta(setup: Any, method: str) -> Dict[str, Any]:
     """What each frame of a stream carries about Downsample (Frame.meta):
     its factor and method for the frames CSV — and, for Typhon to apply on
     the writer threads and the display (council_core.reduce.prepared),
-    "reduce" (Typhon averages the blocks) or "divide" (a camera's Sum
-    binning made as bright as unbinned). {} when Downsample is Off."""
+    "reduce" when Typhon averages the blocks. {} when Downsample is Off."""
     from . import reduce as red
 
     factor = int(getattr(setup, "downsample", 1) or 1)
@@ -264,9 +263,6 @@ def downsample_meta(setup: Any, method: str) -> Dict[str, Any]:
         return {}
     if method == red.CAMERA_AVERAGE:
         return {"downsample": factor, "downsample_method": method}
-    if method == red.CAMERA_SUM_DIVIDED:
-        return {"downsample": factor, "downsample_method": method,
-                "divide": factor * factor}
     return {"downsample": factor, "downsample_method": red.TYPHON_MEAN,
             "reduce": factor}
 
@@ -779,9 +775,9 @@ class BaslerDevice(Device):
         #: trigger is fired: a trigger fired with the selector on another
         #: entry is lost with no error (measured on the emulator).
         self.trigger_lock = threading.RLock()
-        #: How Downsample is made now: "" (Off), reduce.CAMERA_AVERAGE,
-        #: reduce.CAMERA_SUM_DIVIDED or reduce.TYPHON_MEAN — and why, when
-        #: the camera could not do it (downsample_note).
+        #: How Downsample is made now: "" (Off), reduce.CAMERA_AVERAGE or
+        #: reduce.TYPHON_MEAN — and why, when the camera could not do it
+        #: (downsample_note).
         self.downsample_method = ""
         self.downsample_note = ""
         #: The camera's binning as it was before Typhon binned it, put back
@@ -1097,35 +1093,56 @@ class BaslerDevice(Device):
                 state[key] = str(self._value(name, "") or "")
         return state
 
-    def binning_mode(self) -> str:
-        """The mode Downsample bins in: "Average" where the camera offers
-        it, else "Sum", else "" (no mode node: what it does is unknown, so
-        Typhon averages instead)."""
+    def _mode_entries(self) -> List[str]:
         node = self._node("BinningHorizontalMode")
         if node is None:
-            return ""
+            return []
         entries = [str(s) for s in (_ask(node, "GetSymbolics") or ())]
+        return entries or [str(self._value("BinningHorizontalMode", "") or "")]
+
+    def binning_mode(self) -> str:
+        """How the camera's binning combines pixels: "Average" where it
+        offers it — or offers a Region1 binning, which a boost's FPGA does
+        in Average (vendor docs; checked when it is written, _bin) — else
+        "Sum", else "" (no mode node: what it does is unknown)."""
+        entries = self._mode_entries()
         if not entries:
-            entries = [str(self._value("BinningHorizontalMode", "") or "")]
+            return ""
         if "Average" in entries:
+            return "Average"
+        selector = self._node("BinningSelector")
+        if selector is not None and "Region1" in [
+                str(s) for s in (_ask(selector, "GetSymbolics") or ())]:
             return "Average"
         if "Sum" in entries:
             return "Sum"
         return ""
 
-    def can_bin(self, factor: int) -> bool:
-        """Does the camera offer binning `factor` x `factor` in a mode
-        Downsample can use?"""
-        if factor <= 1 or not self.binning_mode():
-            return False
+    def _bin_high(self) -> int:
+        """The largest binning the camera offers on both axes (1: none)."""
         highs = []
         for name in ("BinningHorizontal", "BinningVertical"):
             node = self._node(name)
             high = _ask(node, "GetMax") if node is not None else None
             if high is None:
-                return False
+                return 1
             highs.append(int(high))
-        return min(highs) >= factor
+        return min(highs) if highs else 1
+
+    def can_bin(self, factor: int) -> bool:
+        """Does the camera offer binning `factor` x `factor` in AVERAGE
+        mode — the only binning Downsample uses?
+
+        NOT SUM. A camera's Sum binning adds the f x f pixels and clips at
+        the pixel format's top: divided back to brightness, everything
+        above 1/(f x f) of the range came out flat (review, on the test
+        fake: 77% of a Mono12 picture off by more than a count, a mid-grey
+        scene saved at half its value). Typhon's own average loses nothing
+        and makes the same smaller file, so a camera that can only sum is
+        averaged by Typhon instead (apply_downsample)."""
+        if factor <= 1 or self.binning_mode() != "Average":
+            return False
+        return self._bin_high() >= factor
 
     def downsample_needs_stop(self, factor: int) -> bool:
         """Would apply_downsample(factor) write binning the running stream
@@ -1141,9 +1158,9 @@ class BaslerDevice(Device):
         return bool(callable(writable) and not writable())
 
     def apply_downsample(self, factor: int) -> str:
-        """Downsample `factor`: by the camera's binning in Average mode
-        where it can (Sum, divided again by Typhon, where Sum is all it
-        has), else by Typhon averaging before saving. Returns what was done.
+        """Downsample `factor`: by the camera's binning in AVERAGE mode where
+        it can, else by Typhon averaging before saving (a camera that can
+        only SUM is averaged by Typhon — can_bin). Returns what was done.
 
         CHECKED, NOT ASSUMED: a camera can accept binning and do nothing
         (pylon's emulator does, measured), so the binning is kept only when
@@ -1167,11 +1184,23 @@ class BaslerDevice(Device):
         self.downsample_note = ""
         if factor <= 1:
             self.downsample_method = ""
+            own = self.binned_note()
+            if own:
+                # Off is Typhon's word: it reduces nothing. The camera's
+                # own binning (the user's, or one left from before this
+                # connection) is not Typhon's to undo — said, not hidden.
+                return f"Off — Typhon reduces nothing; {own}"
             return "Off — every pixel as the camera sends it"
         if not self.can_bin(factor):
             self.downsample_method = red.TYPHON_MEAN
-            self.downsample_note = (f"the camera has no {factor} x {factor} "
-                                    f"binning in Average or Sum mode")
+            if self.binning_mode() == "Sum" and self._bin_high() >= factor:
+                self.downsample_note = (
+                    "the camera's binning only SUMS its pixels, which clips "
+                    "the bright ones — Typhon averages instead (nothing "
+                    "clipped; the camera still sends full-size frames)")
+            else:
+                self.downsample_note = (f"the camera has no {factor} x "
+                                        f"{factor} binning in Average mode")
             return (f"{factor}x by Typhon, averaging each {factor} x "
                     f"{factor} block before saving ({self.downsample_note})")
         took, why = self._bin(factor)
@@ -1180,20 +1209,76 @@ class BaslerDevice(Device):
             self.downsample_note = why
             return (f"{factor}x by Typhon, averaging each {factor} x "
                     f"{factor} block before saving — {why}")
-        mode = self.binning_mode()
-        if mode == "Average":
-            self.downsample_method = red.CAMERA_AVERAGE
-            return (f"{factor}x by the camera: binning {factor} x {factor}, "
-                    f"Average")
-        self.downsample_method = red.CAMERA_SUM_DIVIDED
-        self.downsample_note = (f"the camera only SUMS its binned pixels: "
-                                f"Typhon divides each by {factor * factor} "
-                                f"so the picture is as bright as unbinned; "
-                                f"what the camera clipped stays clipped, at "
-                                f"1/{factor * factor} of its range")
-        return (f"{factor}x by the camera: binning {factor} x {factor}, Sum, "
-                f"divided by {factor * factor} by Typhon — "
-                f"{self.downsample_note}")
+        self.downsample_method = red.CAMERA_AVERAGE
+        return (f"{factor}x by the camera: binning {factor} x {factor}, "
+                f"Average")
+
+    def binned_note(self) -> str:
+        """"" — or, when the camera bins NOT for Downsample (its own
+        binning: the user's, or one a crash left), what it does: said at
+        Connect and with Downsample Off, so a binned camera is never taken
+        for one sending every pixel."""
+        if str(self.downsample_method).startswith("camera"):
+            return ""
+        state = self._binning_state()
+        if state is None or (state["h"] <= 1 and state["v"] <= 1):
+            return ""
+        mode = state.get("hmode") or ""
+        return (f"the camera itself bins {state['h']} x {state['v']}"
+                f"{f' ({mode})' if mode else ''} — its own Binning rows "
+                f"(Image tab), not Downsample")
+
+    def check_downsample(self, rebin: bool = False) -> str:
+        """Downsample made by the camera's binning, checked against the
+        binning the camera has NOW — "" when it is as Typhon left it.
+
+        Something put the binning back under Typhon (the camera's own
+        defaults: a UserSet resets binning and the area, vendor docs): every
+        frame was then recorded as 2x camera binning at full size, and the
+        records contradicted themselves (review, on the test fake). With
+        `rebin` (the stream stopped: after loading the defaults) Downsample
+        is made again from the camera as it is now; else it goes Off — the
+        frames are what the camera sends — and the answer says so."""
+        from . import reduce as red
+
+        if self.downsample_method != red.CAMERA_AVERAGE:
+            return ""
+        factor = int(self.capture.downsample or 1)
+        state = self._binning_state() or {"h": 1, "v": 1}
+        mode = str(state.get("hmode") or "Average")
+        if state["h"] == factor and state["v"] == factor and \
+                mode == "Average":
+            return ""
+        now = f"{state['h']} x {state['v']}" + (
+            f" {mode}" if state.get("hmode") else "")
+        # The binning Typhon set is gone: what is there now is the camera's
+        # own, and nothing of Typhon's is left to put back.
+        self._binning_before = None
+        if rebin and not self.downsample_needs_stop(factor):
+            said = self.apply_downsample(factor)
+            return (f"the camera's binning had become {now}, so Downsample "
+                    f"{factor}x was made again: {said}")
+        self.capture.downsample = 1
+        self.downsample_method = ""
+        self.downsample_note = ""
+        return (f"Downsample is OFF now: the camera's binning is {now}, not "
+                f"the {factor} x {factor} Average Downsample set — every "
+                f"frame is saved as the camera sends it; choose Downsample "
+                f"again to bin")
+
+    def release_downsample(self) -> None:
+        """The binning Typhon set put back as it was (Disconnect, the app
+        closing — close()). A Basler keeps binning in its volatile settings
+        across a pylon Close/Open until it is powered off or a user set is
+        loaded (vendor docs): left binned, the next Connect found the camera
+        binning 2 x 2 while Downsample said Off, and Off could not undo it
+        (review, on the test fake)."""
+        if self._binning_before is None:
+            return
+        self._restore_binning()
+        self.capture.downsample = 1
+        self.downsample_method = ""
+        self.downsample_note = ""
 
     def _sensor_area(self) -> Tuple[int, int, int, int]:
         """The camera's area in UNBINNED sensor pixels."""
@@ -1229,7 +1314,6 @@ class BaslerDevice(Device):
         if before is None:
             return False, "the camera has no binning"
         sensor = self._sensor_area()
-        mode = self.binning_mode()
         try:
             want: Dict[str, Any] = {}
             selector = self._node("BinningSelector")
@@ -1242,13 +1326,20 @@ class BaslerDevice(Device):
                     want["selector"] = "Region1"
             want.update(h=1, v=1)
             self._write_binning(want)
+            if "Average" not in self._mode_entries():
+                # The binning chosen (Region1, on a model that has it)
+                # offers no Average after all: Typhon averages instead.
+                self._write_binning_quietly(before)
+                self._put_area(sensor)
+                return False, ("the camera's binning has no Average mode "
+                               "(it would sum, and clip the bright pixels)")
             width1 = int(self._value("WidthMax", 0) or 0)
             height1 = int(self._value("HeightMax", 0) or 0)
             want = {k: v for k, v in want.items() if k == "selector"}
             if self._node("BinningHorizontalMode") is not None:
-                want["hmode"] = mode
+                want["hmode"] = "Average"
             if self._node("BinningVerticalMode") is not None:
-                want["vmode"] = mode
+                want["vmode"] = "Average"
             want.update(h=factor, v=factor)
             self._write_binning(want)
             width = int(self._value("WidthMax", 0) or 0)
@@ -1292,6 +1383,9 @@ class BaslerDevice(Device):
             out["binning"] = [state["h"], state["v"]]
             if "hmode" in state:
                 out["binning_mode"] = state["hmode"]
+        own = self.binned_note()
+        if own:
+            out["camera_bins"] = own
         return out
 
     def start(self) -> None:
@@ -1505,8 +1599,15 @@ class BaslerDevice(Device):
         exclusive per process, so that can leave the camera unopenable by the
         next run — or by the pylon Viewer — until the interpreter exits.
         pypylon's own context manager calls both, for this reason.
+
+        THE BINNING TYPHON SET IS PUT BACK FIRST (release_downsample), with
+        the stream stopped: the camera keeps it after Close otherwise.
         """
         self.stop()
+        try:
+            self.release_downsample()
+        except Exception:                                   # noqa: BLE001
+            pass
         for step in ("Close", "DestroyDevice"):
             fn = getattr(self._cam, step, None)
             if fn is None:

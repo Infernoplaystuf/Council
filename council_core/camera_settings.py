@@ -1185,9 +1185,16 @@ class BaslerSettings(Provider):
         selected trigger On while its source and edge were still the old
         ones (measured on the test fake's write log).
 
-        DOWNSAMPLE BEFORE THE AREA. It may bin the camera, which changes the
-        area's pixels: a preset's area is in the pixels its Downsample made,
-        so it is written after Downsample, not before."""
+        DOWNSAMPLE BEFORE THE BINNING ROWS, AND SO BEFORE THE AREA. It may
+        bin the camera, which changes the area's pixels: a preset's area is
+        in the pixels its Downsample made, so it is written after Downsample,
+        not before. And Downsample Off puts back the binning Typhon set
+        (BaslerDevice._restore_binning) — written AFTER a set's own Binning
+        rows, that undid them: a preset holding the user's own 2 x 2 binning,
+        applied while Downsample binned the camera, ended 1 x 1 with its
+        area on a quarter of the sensor, and said "applied" (review, on the
+        test fake). Before them, the set's own binning is written last; and
+        Reset as connected keeps the area, carried over by the restore."""
         from . import triggered
 
         out = super().plan(keys, described, with_roi)
@@ -1197,9 +1204,13 @@ class BaslerSettings(Provider):
                       if k in TRIGGER_FEATURES and k != "TriggerMode"]
             if before and before[-1] > at:
                 out.insert(before[-1], out.pop(at))
-        if triggered.DOWNSAMPLE_KEY in out and None in out:
-            key = out.pop(out.index(triggered.DOWNSAMPLE_KEY))
-            out.insert(out.index(None), key)
+        if triggered.DOWNSAMPLE_KEY in out:
+            at = out.index(triggered.DOWNSAMPLE_KEY)
+            key = out.pop(at)
+            binning = {s.key for s in described if s.group == "Binning"}
+            spot = next((i for i, k in enumerate(out)
+                         if k is None or k in binning), None)
+            out.insert(at if spot is None or spot > at else spot, key)
         return out
 
     # -- triggers ------------------------------------------------------------

@@ -355,8 +355,8 @@ def imports_warm() -> bool:
 #: frame_id is the camera's own frame (block) number where it gives one —
 #: blank where it does not (pylon's emulator: none).
 #: downsample, downsample_method: the frame's Downsample factor and how it
-#: was made (council_core.reduce: camera_binning_average, camera_binning_
-#: sum_divided, typhon_block_mean) — blank when Downsample is Off.
+#: was made (council_core.reduce: camera_binning_average or
+#: typhon_block_mean) — blank when Downsample is Off.
 #:
 #: NEW COLUMNS GO AT THE END ONLY: every reader takes the CSV by column name
 #: (event_playback.raw_origin, run_window_us, frame_times), and a reader of
@@ -567,7 +567,7 @@ class Recorder:
         once: it touches nothing but its own file.
 
         DOWNSAMPLED HERE, on the writer threads, when the camera that took
-        it says Typhon reduces it (Frame.meta "reduce", "divide";
+        it says Typhon reduces it (Frame.meta "reduce";
         council_core.reduce.prepared) — never on the grab thread, whose
         budget at 150 fps is 6.7 ms against 22-34 ms for a full frame."""
         self._writer(reduce.prepared(frame.image, frame.meta), path)

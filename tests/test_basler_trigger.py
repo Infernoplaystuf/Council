@@ -159,7 +159,7 @@ class FakeBasler:
                  modes=("Average", "Sum"), really_bins=True,
                  rescales_aoi=False, binning=True, sensor=(64, 48),
                  exposure_s=0.03, debounce="BslInputFilterTime",
-                 line_modes=None, sources=SOURCES):
+                 line_modes=None, sources=SOURCES, user_set=False):
         self.grabbing = False
         self.log = []
         self.cond = threading.Condition()
@@ -240,6 +240,26 @@ class FakeBasler:
             locked=True)
         add("OffsetX", 0, low=0, high=lambda: w, inc=1)
         add("OffsetY", 0, low=0, high=lambda: h, inc=1)
+        if user_set:
+            # The factory user set: loading it puts binning, its modes and
+            # selector, and the area back as the camera came (vendor docs).
+            add("UserSetSelector", "Default", choices=("Default",
+                                                       "UserSet1"))
+            self.UserSetLoad = Command(self._load_factory)
+            self.factory_loads = 0
+        self._as_made = {name: node.value for name, node in self.nodes.items()
+                         if name.startswith("Binning") and not node.per}
+
+    def _load_factory(self):
+        self.factory_loads += 1
+        for name, value in self._as_made.items():
+            node = self.nodes[name]
+            old, node.value = node.value, value
+            if node.on_set is not None:
+                node.on_set(old, value)
+        w, h = self.sensor
+        self.nodes["Width"].value, self.nodes["Height"].value = w, h
+        self.nodes["OffsetX"].value = self.nodes["OffsetY"].value = 0
 
     # -- nodes -----------------------------------------------------------
     def _add(self, name, value, **kw):
@@ -902,21 +922,223 @@ def test_downsample_by_the_cameras_binning_in_average_mode(monkeypatch,
     assert frame_camera.current_area()["area"] == "16, 8, 40, 32"
 
 
-def test_a_sum_only_camera_is_divided_back_to_its_brightness(monkeypatch,
-                                                            tmp_path):
+def test_a_sum_only_camera_is_averaged_by_typhon_losing_nothing(monkeypatch,
+                                                               tmp_path):
+    """A camera whose binning only SUMS clips at the format's top: binned
+    and divided back, 77% of a Mono12 picture came out more than a count
+    off and a mid-grey scene saved at half its value (review). Typhon's
+    own average makes the same smaller file and loses nothing: the camera
+    is not binned, and the saved picture is the exact block mean."""
     cam = FakeBasler(modes=("Sum",), region=False)
     connect(monkeypatch, cam)
+    full = cam.picture()
     said = frame_camera.set_downsample("2x")["summary"]
-    assert "Sum, divided by 4 by Typhon" in said, said
-    assert "clipped" in said
+    assert "by Typhon" in said and "only SUMS" in said, said
+    assert cam.value("BinningHorizontal") == 1, "the camera never binned"
     out = frame_camera.start(str(tmp_path))
     assert wait_for(lambda: frame_camera._LIVE.session.stats().grabbed >= 2)
     frame_camera.stop()
     from PIL import Image
     saved = np.asarray(Image.open(sorted(tmp_path.glob("*.png"))[0]))
-    assert np.array_equal(saved, reduce.divided(cam.picture(), 4))
-    assert run_files(tmp_path, out["run"])["frames"][0][
-        "downsample_method"] == "camera_binning_sum_divided"
+    assert np.array_equal(saved, reduce.block_mean(full, 2))
+    assert int(saved.max()) > 1024, "the top of the range is kept"
+    files = run_files(tmp_path, out["run"])
+    assert files["frames"][0]["downsample_method"] == "typhon_block_mean"
+    assert files["record"]["downsample"]["rounding"] == "half_up"
+
+
+def test_bayer_on_a_sum_only_camera_is_refused_before_anything_stops(
+        monkeypatch, tmp_path):
+    """Before: a Sum-only camera binned a Bayer picture, Start accepted the
+    run, and every frame then failed "NOT saved (recording stopped)"
+    (review). Now a Sum-only camera is averaged by Typhon, which refuses a
+    raw Bayer picture at Start — the live view goes on, nothing written."""
+    cam = FakeBasler(modes=("Sum",), region=False)
+    connect(monkeypatch, cam)
+    frame_camera.set_camera_setting("PixelFormat", "BayerRG8")
+    frame_camera.set_downsample("2x")
+    preview()
+    with pytest.raises(RuntimeError, match="raw Bayer"):
+        frame_camera.start(str(tmp_path / "runs"))
+    assert not (tmp_path / "runs").exists()
+    assert frame_camera._LIVE.previewing
+
+
+def test_the_cameras_own_average_is_not_said_to_round_half_up(monkeypatch,
+                                                               tmp_path):
+    """Typhon knows how it rounds (half up); the camera's Average binning
+    rounds as its FPGA or sensor does, which Typhon does not know."""
+    cam = FakeBasler()
+    connect(monkeypatch, cam)
+    frame_camera.set_downsample("2x")
+    out = frame_camera.start(str(tmp_path))
+    assert wait_for(lambda: frame_camera._LIVE.session.stats().grabbed >= 1)
+    frame_camera.stop()
+    files = run_files(tmp_path, out["run"])
+    assert files["record"]["downsample"]["method"] == "camera_binning_average"
+    assert files["record"]["downsample"]["rounding"] == "the camera's"
+    assert files["end"]["downsample"]["rounding"] == "the camera's"
+
+
+# ======================================================================
+# Downsample's binning never outlives Typhon's word for it
+# ======================================================================
+def test_disconnect_puts_the_binning_typhon_set_back(monkeypatch, tmp_path):
+    """A Basler keeps binning across a pylon Close/Open until it is powered
+    off (vendor docs). Before: after Downsample 2x, Disconnect and Connect,
+    the Downsample box said Off while the camera still binned 2 x 2, a run
+    saved half-size frames with a blank downsample column, and Off could
+    not undo it (review). Now Disconnect puts the binning and the area back
+    as they were before Downsample."""
+    from PIL import Image
+
+    cam = FakeBasler(sensor=(64, 48))
+    connect(monkeypatch, cam)
+    frame_camera.set_camera_area("16, 8, 40, 32")
+    frame_camera.set_downsample("2x")
+    assert cam.value("BinningHorizontal") == 2
+    frame_camera.disconnect()
+    assert (cam.value("BinningHorizontal"), cam.value("BinningVertical"),
+            cam.value("BinningHorizontalMode")) == (1, 1, "Sum")
+    connect(monkeypatch, cam)                  # the same camera, still on
+    assert frame_camera.current_area()["area"] == "16, 8, 40, 32"
+    rows = {s["key"]: s for s in frame_camera.settings_list()["settings"]}
+    assert rows[tg.DOWNSAMPLE_KEY]["value"] == "Off"
+    assert rows["BinningHorizontal"]["value"] == 1
+    out = frame_camera.start(str(tmp_path))
+    assert wait_for(lambda: frame_camera._LIVE.session.stats().grabbed >= 2)
+    frame_camera.stop()
+    assert Image.open(sorted(tmp_path.glob("*.png"))[0]).size == (40, 32)
+    assert run_files(tmp_path, out["run"])["frames"][0]["downsample"] == ""
+
+
+def test_a_camera_found_binned_at_connect_is_said_and_off_says_it_bins(
+        monkeypatch):
+    """A camera binned by something else (its user, or a session that
+    crashed before Disconnect) sends smaller frames with Downsample Off:
+    Connect says so, and so does Off — never "every pixel as the camera
+    sends it" over a camera that bins."""
+    cam = FakeBasler()
+    cam.BinningHorizontalMode.SetValue("Average")
+    cam.BinningHorizontal.SetValue(2)
+    cam.BinningVertical.SetValue(2)
+    pylon = FakePylon(cam)
+    monkeypatch.setattr(frame_camera, "_backends_for", lambda choice: None)
+    monkeypatch.setattr(cameras, "backends",
+                        lambda *a, **k: [cameras.BaslerBackend(sdk=pylon)])
+    rows = frame_camera.list_cameras()["rows"]
+    said = frame_camera.connect(rows[0])["summary"]
+    assert "the camera itself bins 2 x 2 (Average)" in said, said
+    frame_camera.set_downsample("2x")
+    said = frame_camera.set_downsample("Off")["summary"]
+    assert "every pixel as the camera sends it" not in said, said
+    assert "the camera itself bins 2 x 2" in said, said
+    assert cam.value("BinningHorizontal") == 2, "its own: Typhon's to say"
+
+
+def test_camera_defaults_under_downsample_bin_again_and_records_agree(
+        monkeypatch, tmp_path):
+    """Before: Downsample 2x by the camera's binning, then the camera's
+    own defaults (a UserSet resets binning and the area) — the camera sent
+    full frames, every frames CSV row said 2x camera binning, and the
+    records contradicted themselves (review). Now the defaults are loaded
+    and Downsample, Typhon's own and kept as chosen, is made again."""
+    from PIL import Image
+
+    cam = FakeBasler(sensor=(64, 48), user_set=True)
+    connect(monkeypatch, cam)
+    frame_camera.set_downsample("2x")
+    said = frame_camera.load_camera_defaults()["summary"]
+    assert cam.factory_loads == 1
+    assert "Downsample 2x was made again" in said, said
+    assert (cam.value("BinningHorizontal"),
+            cam.value("BinningHorizontalMode")) == (2, "Average")
+    out = frame_camera.start(str(tmp_path))
+    assert wait_for(lambda: frame_camera._LIVE.session.stats().grabbed >= 2)
+    frame_camera.stop()
+    assert Image.open(sorted(tmp_path.glob("*.png"))[0]).size == (32, 24)
+    files = run_files(tmp_path, out["run"])
+    assert {(r["downsample"], r["downsample_method"])
+            for r in files["frames"]} == {("2", "camera_binning_average")}
+    assert files["record"]["downsample"]["binning"] == [2, 2]
+    assert files["record"]["downsample"]["picture"] == [32, 24]
+    # Downsample Off afterwards puts the FACTORY binning back, not the one
+    # from before the defaults.
+    frame_camera.set_downsample("Off")
+    assert cam.value("BinningHorizontal") == 1
+
+
+def test_binning_put_back_under_typhon_is_never_recorded_as_downsample(
+        monkeypatch, tmp_path):
+    """The camera's binning changed with nothing of Typhon's told (pylon's
+    emulator ignores UserSetLoad; another program; a reset of the device):
+    Start checks the binning against Downsample, turns it Off and says so —
+    a run is never recorded as binned while the camera sends full frames."""
+    from PIL import Image
+
+    cam = FakeBasler(sensor=(64, 48))
+    connect(monkeypatch, cam)
+    frame_camera.set_downsample("2x")
+    for name in ("BinningHorizontal", "BinningVertical"):
+        node = cam.nodes[name]
+        old, node.value = node.value, 1
+        node.on_set(old, 1)
+    cam.nodes["Width"].value, cam.nodes["Height"].value = 64, 48
+    out = frame_camera.start(str(tmp_path))
+    assert "Downsample is OFF now" in out["summary"], out["summary"]
+    assert wait_for(lambda: frame_camera._LIVE.session.stats().grabbed >= 2)
+    frame_camera.stop()
+    assert Image.open(sorted(tmp_path.glob("*.png"))[0]).size == (64, 48)
+    files = run_files(tmp_path, out["run"])
+    assert {r["downsample"] for r in files["frames"]} == {""}
+    assert "downsample" not in files["record"]
+    assert files["record"]["capture"]["downsample"] == 1
+
+
+def test_a_preset_with_its_own_binning_applied_under_downsample(monkeypatch,
+                                                                 tmp_path):
+    """Before: a preset holding the user's own 2 x 2 binning (Downsample
+    Off), applied while Downsample binned the camera, ended 1 x 1 with its
+    area on a quarter of the sensor, and said "applied" — Downsample Off
+    was written after the preset's Binning rows and undid them (review).
+    Now Downsample goes first and the preset's own binning lands last."""
+    cam = FakeBasler(sensor=(64, 48))
+    connect(monkeypatch, cam)
+    for key in ("BinningHorizontal", "BinningVertical"):
+        assert frame_camera.set_camera_setting(key, 2)["ok"]
+    frame_camera.save_preset("Manual 2x2")
+    saved = frame_camera.list_presets()["details"][0]["settings"]
+    assert saved["BinningHorizontal"] == 2
+    for key in ("BinningHorizontal", "BinningVertical"):
+        frame_camera.set_camera_setting(key, 1)
+    frame_camera.set_downsample("2x")
+    assert cam.value("BinningHorizontalMode") == "Average"
+    out = frame_camera.apply_preset("Manual 2x2")
+    assert out["ok"], out["summary"]
+    assert (cam.value("BinningHorizontal"), cam.value("BinningVertical"),
+            cam.value("BinningHorizontalMode")) == (2, 2, "Sum")
+    assert frame_camera._LIVE.device.capture.downsample == 1
+    assert frame_camera.current_area()["area"] == "0, 0, 32, 24", \
+        "the whole sensor, in the preset's binned pixels"
+    assert cam.value("Width") == 32 and cam.value("Height") == 24
+
+
+def test_reset_as_connected_after_downsample_keeps_the_area(monkeypatch):
+    """Reset as connected writes the as-connected Binning rows and
+    Downsample Off: Downsample first, so the binning goes back through
+    _restore_binning, which carries the area over — the same part of the
+    sensor, not the binned numbers read as unbinned (review: plausible;
+    with a camera that does not rescale its area itself)."""
+    cam = FakeBasler(sensor=(64, 48), rescales_aoi=False)
+    connect(monkeypatch, cam)
+    frame_camera.set_camera_area("8, 8, 32, 24")
+    frame_camera.set_downsample("2x")
+    assert frame_camera.current_area()["area"] == "4, 4, 16, 12"
+    out = frame_camera.reset_camera_settings()
+    assert out["ok"], out["summary"]
+    assert cam.value("BinningHorizontal") == 1
+    assert frame_camera._LIVE.device.capture.downsample == 1
+    assert frame_camera.current_area()["area"] == "8, 8, 32, 24"
 
 
 def test_a_camera_that_bins_without_getting_smaller_is_averaged_by_typhon(

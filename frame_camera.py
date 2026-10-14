@@ -509,9 +509,15 @@ def connect(which: Any) -> Dict[str, Any]:
                    "summary": f"Connected to {info.label}."})
     finally:
         _LIVE.connect_listing = None
+    said = f"Connected to {info.label}. Sensor {limits.width}x{limits.height}."
+    binned = _binned_note(device)
+    if binned:
+        # A camera already binned (its own binning, or one a crash of an
+        # earlier session left) sends smaller frames with Downsample Off:
+        # said here, where the user looks first, not found in the files.
+        said += f" Note: {binned}."
     return {
-        "summary": (f"Connected to {info.label}. "
-                    f"Sensor {limits.width}x{limits.height}."),
+        "summary": said,
         "area": _area_text(area),
         "sensor": f"{limits.width}x{limits.height}",
         # An event camera has no exposure and no gain. Reporting the real
@@ -706,6 +712,13 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             _stop_preview(session)
         elif restartable:
             _release_dead_stream(session)
+        # Downsample made by the camera's binning, checked against the
+        # binning the camera has now (BaslerDevice.check_downsample): a run
+        # is never recorded as binned while the camera sends full frames.
+        downsample_note = _check_downsample(device)
+        if downsample_note:
+            setup.downsample = int(getattr(getattr(device, "capture", None),
+                                           "downsample", 1) or 1)
 
         # READ after the boxes beside Start were applied and before the
         # run's recording begins — the camera as every picture of this run
@@ -791,6 +804,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
 
     said = f"Capturing into {out}."
     said += _capture_words(setup, armed, device)
+    if downsample_note:
+        said += f" {downsample_note[0].upper()}{downsample_note[1:]}."
     if raw is not None:
         said += f" Raw: {raw.name}."
     if record_note:
@@ -1280,6 +1295,26 @@ def _downsample_state(device: Any) -> Dict[str, Any]:
         return {}
 
 
+def _binned_note(device: Any) -> str:
+    """What the camera's OWN binning does ("the camera itself bins 2 x 2
+    (Average) — ..."), or "" when it bins nothing beyond Downsample."""
+    ask = getattr(device, "binned_note", None)
+    try:
+        return str(ask() or "") if callable(ask) else ""
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def _check_downsample(device: Any, rebin: bool = False) -> str:
+    """The camera's binning checked against Downsample (BaslerDevice.
+    check_downsample): "" when they agree, else what was done about it."""
+    check = getattr(device, "check_downsample", None)
+    try:
+        return str(check(rebin) or "") if callable(check) else ""
+    except Exception as exc:                              # noqa: BLE001
+        return f"Downsample could not be checked: {_said(exc)}"
+
+
 def _arm(device: Any, setup: Any) -> Any:
     """Arm the camera's own trigger for an exact run (the stream stopped);
     what arming changed, for Stop. Refused in words."""
@@ -1374,8 +1409,13 @@ def _downsample_record(device: Any, area: Any = None) -> Optional[Dict[str,
     if factor <= 1:
         return None
     method = str(info.get("method") or reduce.TYPHON_MEAN)
-    out: Dict[str, Any] = {"factor": [factor, factor], "method": method,
-                           "rounding": "half_up"}
+    out: Dict[str, Any] = {"factor": [factor, factor], "method": method}
+    # How a block's mean is rounded: Typhon's own, half up (council_core.
+    # reduce). The camera's Average binning rounds as its FPGA or sensor
+    # does, which Typhon does not know (unverified on hardware): said so,
+    # not claimed as half up.
+    out["rounding"] = ("half_up" if method == reduce.TYPHON_MEAN
+                       else "the camera's")
     if info.get("note"):
         out["note"] = str(info["note"])
     if info.get("binning"):
@@ -1389,8 +1429,6 @@ def _downsample_record(device: Any, area: Any = None) -> Optional[Dict[str,
             out["picture"] = [int(roi.w), int(roi.h)]
     except Exception:                                     # noqa: BLE001
         pass
-    if method == reduce.CAMERA_SUM_DIVIDED:
-        out["divided_by"] = factor * factor
     return out
 
 
@@ -1401,14 +1439,13 @@ def _downsample_words(device: Any) -> str:
     info = _downsample_state(device)
     factor = int(info.get("factor") or 1)
     if factor <= 1:
-        return "every pixel as the camera sends it"
+        own = str(info.get("camera_bins") or "")
+        return (f"Typhon reduces nothing — but {own}" if own
+                else "every pixel as the camera sends it")
     method = str(info.get("method") or reduce.TYPHON_MEAN)
     note = str(info.get("note") or "")
     if method == reduce.CAMERA_AVERAGE:
         return f"by the camera's own binning, {factor} x {factor} Average"
-    if method == reduce.CAMERA_SUM_DIVIDED:
-        return (f"by the camera's own binning, {factor} x {factor} Sum, "
-                f"divided by {factor * factor} by Typhon ({note})")
     said = (f"by Typhon, averaging each {factor} x {factor} block before "
             f"saving and showing")
     return f"{said} ({note})" if note else said
@@ -1434,17 +1471,17 @@ def _capture_words(setup: Any, armed: Any, device: Any) -> str:
         if extra:
             said += f" ({'; '.join(extra)}.)"
     elif setup.snapshot:
-        said += (f" Snapshot: {setup.short()} — the live view runs and only "
-                 f"the frames each trigger asks for are saved.")
+        said += (f" Snapshot ({setup.source_words()}) — the live view runs "
+                 f"and only the frames each trigger asks for are saved.")
     info = _downsample_state(device)
     factor = int(info.get("factor") or 1)
     if factor > 1:
         method = str(info.get("method") or "")
         how = ("by the camera's binning (Average)" if method.endswith(
-            "average") else "by the camera's binning (Sum, divided by "
-                            f"{factor * factor})" if "sum" in method
-               else "by Typhon, averaging each block before saving")
+            "average") else "by Typhon, averaging each block before saving")
         said += f" Downsample {factor}x {how}."
+    elif info.get("camera_bins"):
+        said += f" Downsample Off — but {info['camera_bins']}."
     return said
 
 
@@ -3520,6 +3557,7 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     before = _roi_or_none(device)
 
     also: List[str] = []
+    checked_downsample: List[str] = []
 
     def work() -> Any:
         applied = camera_settings.apply(device, values, roi)
@@ -3530,6 +3568,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
             except Exception as exc:                      # noqa: BLE001
                 also.append(f"the other triggers NOT put back — "
                             f"{_said(exc)}")
+        # The set's own Binning rows are written after its Downsample
+        # (BaslerSettings.plan): what they left is checked, never assumed.
+        note = _check_downsample(device)
+        if note:
+            checked_downsample.append(note)
         return applied
 
     def finish(applied: Any) -> Dict[str, Any]:
@@ -3553,6 +3596,8 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         said = f"{head}: {applied.summary(labels)}"
         if also:
             said = said[:-1] + f"; {', '.join(also)}."
+        if checked_downsample:
+            said = said[:-1] + f" — {'; '.join(checked_downsample)}."
         if restarted:
             said += (f" The live view restarted for {', '.join(restarted)} "
                      f"(the stream must stop to change "
@@ -3693,18 +3738,29 @@ def load_camera_defaults() -> Dict[str, Any]:
     _refuse_while_capturing("loading the camera's defaults")
     _refuse_while_busy("load the camera's defaults")
 
+    notes: List[str] = []
+
     def work() -> Any:
         provider.load_defaults()
+        # The factory set puts the binning back (and the area): Downsample,
+        # which is Typhon's and kept as chosen, is made again from the
+        # camera as it is now — with the stream still stopped for it. Left,
+        # every frame was recorded as 2x camera binning at full size.
+        note = _check_downsample(device, rebin=True)
+        if note:
+            notes.append(note)
         return device.roi()
 
     def finish(area: Any) -> Dict[str, Any]:
         text = _area_text(area)
         # Every setting went back: the latest word on all of the boxes.
         _camera_set(key for keys in START_BOXES.values() for key in keys)
+        said = f"Loaded the camera's own defaults ({source}); its area is " \
+               f"{text}."
+        if notes:
+            said = said[:-1] + f" — {'; '.join(notes)}."
         return {"area": text, "crop": "", "ok": True, "pending": False,
-                "what": "defaults",
-                "summary": f"Loaded the camera's own defaults ({source}); "
-                           f"its area is {text}."}
+                "what": "defaults", "summary": said}
 
     return _run_change("Loading the camera's defaults", work, finish,
                        bool(getattr(device, "streaming", False)))

@@ -98,7 +98,7 @@ class DisplayPrep:
         data = image
         if data is None:
             return None
-        if meta and (meta.get("reduce") or meta.get("divide")):
+        if meta and meta.get("reduce"):
             from . import reduce
 
             try:

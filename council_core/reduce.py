@@ -34,11 +34,11 @@ A RAW BAYER PICTURE IS REFUSED. Its neighbouring pixels are different
 colours; averaging them would mix red, green and blue into a grey that is
 neither. Choose a Mono or RGB pixel format to downsample (`refusal`).
 
-`divided` is the other half of "brightness kept": a camera that can only SUM
-its binned pixels (some ace models) gives f x f times the brightness, and
-Typhon divides each pixel by f x f, rounding half up, so the picture is as
-bright as unbinned. What the camera clipped at its maximum stays clipped —
-at max / (f x f) after the division — which the run's record says.
+A CAMERA THAT CAN ONLY SUM ITS BINNED PIXELS is averaged here instead of
+binning: a sum clips at the pixel format's top, and divided back to
+brightness everything above 1/(f x f) of the range came out flat (review:
+77% of a Mono12 picture off by more than a count). The same smaller file,
+nothing lost (cameras.BaslerDevice.can_bin).
 
 NO TOOLKIT, NO SDK. numpy only.
 """
@@ -52,7 +52,6 @@ FACTORS: Tuple[int, ...] = (1, 2, 3, 4)
 #: How a reduced picture was made, as the frames CSV and the records say it.
 TYPHON_MEAN = "typhon_block_mean"
 CAMERA_AVERAGE = "camera_binning_average"
-CAMERA_SUM_DIVIDED = "camera_binning_sum_divided"
 
 #: Below this many pixels a frame is reduced on one thread.
 PARALLEL_PIXELS = 1_000_000
@@ -92,32 +91,28 @@ def _check(image: Any) -> Any:
     return data
 
 
-def block_mean(image: Any, factor: int, divide: int = 1,
-               pool: Any = None) -> Any:
+def block_mean(image: Any, factor: int, pool: Any = None) -> Any:
     """`image` with every `factor` x `factor` block averaged into one pixel
     (rounding half up), the input's dtype kept, and the right and bottom
     remainders left out. A 3-channel picture is averaged per channel.
 
-    `divide` (> 1) also divides each result by it — a camera's Sum binning
-    compensated (see the module notes); with `factor` 1 that is all it does.
     `pool` (a concurrent.futures executor) splits a large picture into row
     bands worked on at once — the display's pool, never the grab thread.
-    `factor` 1 and `divide` 1 hand the picture back as it is."""
+    `factor` 1 hands the picture back as it is."""
     np = _np()
     factor = int(factor)
-    divide = max(1, int(divide or 1))
     if factor < 1:
         raise ValueError(f"the downsample factor must be 1 or more, "
                          f"not {factor}")
     data = _check(image)
-    if factor == 1 and divide == 1:
+    if factor == 1:
         return data
     rows, cols = data.shape[0] // factor, data.shape[1] // factor
     if rows < 1 or cols < 1:
         raise ValueError(f"a {data.shape[1]} x {data.shape[0]} picture is "
                          f"smaller than one {factor} x {factor} block")
     out = np.empty((rows, cols) + data.shape[2:], dtype=data.dtype)
-    n = factor * factor * divide
+    n = factor * factor
 
     def band(start: int, stop: int) -> None:
         part = data[start * factor:stop * factor, :cols * factor]
@@ -141,28 +136,21 @@ def block_mean(image: Any, factor: int, divide: int = 1,
     return out
 
 
-def divided(image: Any, divide: int) -> Any:
-    """Each pixel divided by `divide`, rounding half up, dtype kept."""
-    return block_mean(image, 1, divide=divide)
-
-
 def prepared(image: Any, meta: Optional[Mapping[str, Any]],
              pool: Any = None) -> Any:
     """A frame's picture as it is saved and shown: reduced by
-    meta["reduce"] (Typhon's block mean) and divided by meta["divide"]
-    (a camera's Sum binning compensated), when the camera that took it
-    said so — else the picture as it came. A raw Bayer frame with a
-    reduction to make raises ValueError (refusal): a run fails loudly
-    rather than saving mixed colours."""
+    meta["reduce"] (Typhon's block mean) when the camera that took it said
+    so — else the picture as it came. A raw Bayer frame with a reduction
+    to make raises ValueError (refusal): a run fails loudly rather than
+    saving mixed colours (and Start refuses it before anything stops)."""
     meta = meta or {}
     factor = int(meta.get("reduce", 1) or 1)
-    divide = int(meta.get("divide", 1) or 1)
-    if factor <= 1 and divide <= 1:
+    if factor <= 1:
         return image
     why = refusal(meta.get("format", ""))
     if why:
         raise ValueError(why)
-    return block_mean(image, factor, divide=divide, pool=pool)
+    return block_mean(image, factor, pool=pool)
 
 
 def sensor_position(x_picture: float, factor: int, area_x: float = 0.0,

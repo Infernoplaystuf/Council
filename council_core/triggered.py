@@ -180,12 +180,16 @@ class CaptureSetup:
         if not self.triggered:
             return "continuous"
         how = "exact" if self.exact else "snapshot"
+        return f"{how}, {self.source_words()}"
+
+    def source_words(self) -> str:
+        """"Line1", "Timer every 2 s", "Software, 3 frames per trigger"."""
         source = self.source
         if source == TIMER:
             source = f"Timer every {show_seconds(self.every_s)}"
         per = (f", {self.per_trigger} frames per trigger"
                if self.per_trigger > 1 else "")
-        return f"{how}, {source}{per}"
+        return f"{source}{per}"
 
     def as_record(self) -> Dict[str, Any]:
         """The set-up as a run's records say it."""
