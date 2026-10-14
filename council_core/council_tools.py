@@ -62,13 +62,28 @@ def vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Di
     return {"query": q, "matches": matches, "scanned": scanned}
 
 
+def saved_name(name: str) -> str:
+    """The name a file called `name` really gets at the vault root: the
+    Librarian's characters (council_engine.safe_name), without trailing dots
+    and spaces — Windows drops them when it creates the file, so a file
+    saved as "node_routing.json." IS node_routing.json. "" when nothing is
+    left."""
+    try:
+        from council_engine import safe_name
+        base = safe_name(str(name or ""), 128)
+    except Exception:                                     # noqa: BLE001
+        base = str(name or "").strip()
+    return base.rstrip(". ")
+
+
 def is_app_file_name(name: str, vault_dir: Path) -> bool:
     """Whether a file called `name` at the vault root would be one of the
     app's own: a dot-file, one of council_core.vault_setup.VAULT_ROOT_STATE
     (the settings the app reads at the root), or what conversation_logger
     protects (older conversations, learned memory, settings). Case does not
-    matter (Windows' file names do not)."""
-    low = str(name or "").strip().lower()
+    matter (Windows' file names do not), and neither do trailing dots and
+    spaces (Windows drops them: "node_routing.json." is node_routing.json)."""
+    low = str(name or "").strip().rstrip(". ").lower()
     if not low or low.startswith("."):
         return True
     try:
@@ -134,16 +149,15 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
         # Never one of the app's files, present or not: a model-written
         # node_routing.json was the next launch's opt-in to send a role's
         # prompts to another machine (found in review), and the others are
-        # settings or older conversations the app reads back.
-        try:
-            from council_engine import safe_name
-            saved_as = safe_name(name, 128)
-        except Exception:                                 # noqa: BLE001
-            saved_as = name
+        # settings or older conversations the app reads back. Checked, and
+        # saved, under the name the file really gets (saved_name): Windows
+        # drops a trailing dot, so "node_routing.json." was node_routing
+        # .json past a check of the name as given.
+        saved_as = saved_name(name)
         if is_app_file_name(saved_as, folder):
-            return False, (f"'{saved_as}' is one of the app's own files; "
-                           "save under another name."), {}
-        name = free_name(folder, name)
+            return False, (f"'{saved_as or name}' is one of the app's own "
+                           "files; save under another name."), {}
+        name = free_name(folder, saved_as)
         p = librarian.save_text(name, content)
         return True, f"Saved to vault as '{p.name}'.", {"path": str(p)}
 

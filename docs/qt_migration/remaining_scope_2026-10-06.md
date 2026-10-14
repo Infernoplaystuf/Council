@@ -411,7 +411,9 @@ test that fails on 05bef12 (the coverage-only ones are said).
   they now refuse what `tool_kit`'s reading tools refuse. `vault_save` refuses an app file
   name (a dot-file, `VAULT_ROOT_STATE`, anything protected): a model-written
   `node_routing.json` had become the next launch's opt-in to send the Writer's prompts to
-  another machine.
+  another machine. The name is checked, and the file saved, as Windows will name it
+  (`council_tools.saved_name`): `node_routing.json.` (trailing dot) had still created
+  `node_routing.json` (fixed on `merge/council-map-fixed2`).
 - The analyst keeps council-map's contract: `COUNCIL_ANALYST=0` turns the whole step off
   (the direct answers from the data too); the code is asked of the Coder's model
   (num_predict 700, 120 s), one retry with the error; it runs in a child process with the

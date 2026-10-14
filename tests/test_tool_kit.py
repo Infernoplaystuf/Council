@@ -377,13 +377,17 @@ def test_vault_list_read_and_search_never_reach_the_apps_own_files(vault):
 @pytest.mark.parametrize("name", [
     "node_routing.json", "council_instructions.json", "model_slots.json",
     "backend_settings.json", "question_history.json", "Node_Routing.JSON",
-    "trends.md", ".onboarded", "../node_routing.json"])
+    "trends.md", ".onboarded", "../node_routing.json",
+    # Windows drops a name's trailing dots and spaces when it creates the
+    # file: saved as "node_routing.json.", the file IS node_routing.json.
+    "node_routing.json.", "Node_Routing.JSON..", "question_history.json.",
+    "council_instructions.json. "])
 def test_vault_save_never_writes_an_app_file(vault, name):
     """A member's vault_save created node_routing.json at the vault root, and
     the next launch read it as the user's opt-in to send the Writer's
     prompts to another machine (found in review: route('writer') gave
     http://203.0.113.9:11434). An app file name is refused, present or
-    not."""
+    not, however it is spelled."""
     import council_engine
     from council_core import node_routing
     lib = council_engine.Librarian(vault, vault / "logs" / "council.log")
@@ -401,6 +405,24 @@ def test_vault_save_never_writes_an_app_file(vault, name):
     ok, msg, p = call(tools, "vault_save", name="pump_notes.md",
                       content="P-200 notes")
     assert ok and Path(p["path"]).name == "pump_notes.md"
+
+
+def test_vault_save_says_the_name_the_file_really_has(vault):
+    """A trailing dot is not part of a file's name (Windows drops it): the
+    file is saved, and named, without it — and an existing file of that
+    name is not overwritten."""
+    import council_engine
+    lib = council_engine.Librarian(vault, vault / "logs" / "council.log")
+    tools = council_tools.make_tools(None, lib, vault)
+    ok, msg, p = call(tools, "vault_save", name="pump notes.",
+                      content="P-200 notes")
+    assert ok and Path(p["path"]).name == "pump_notes", (msg, p)
+    assert "'pump_notes'" in msg, msg
+    assert (vault / "pump_notes").read_text(encoding="utf-8") == \
+        "P-200 notes"
+    ok, msg, p = call(tools, "vault_save", name="manual.md.", content="new")
+    assert ok and Path(p["path"]).name == "manual_2.md", (msg, p)
+    assert (vault / "manual.md").read_text().startswith("# Manual")
 
 
 # ============================================================
