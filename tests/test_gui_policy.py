@@ -422,3 +422,270 @@ def test_generated_output_folders_are_not_read_as_code(tmp_path):
                                               encoding="utf-8")
     good, errs = pol.validate_dir(pdir)
     assert good, errs
+
+
+# ============================================================
+# What the Typhon plugin research measured passing (2026-10-15)
+# ============================================================
+#
+# Each of these passed the gate, and the ones that can run safely were run
+# from a gated temp project before the fix: asyncio started a child Python
+# that wrote a canary file, asyncio and socketserver+xmlrpc served and
+# answered on 127.0.0.1, a ProcessPoolExecutor worker wrote a canary, and
+# os._exit(7) ended the process without running its `finally`. os.startfile
+# and webbrowser were judged statically only — running them opens windows.
+# The allowlist is sys.stdlib_module_names, so every stdlib module nobody
+# had named was admitted.
+
+def _refused(code, reason, mode="linked"):
+    """The gate refuses ``code`` in both toolkits, and says why."""
+    for toolkit in ("qt", "tk"):
+        good, errs = pol.validate(code, mode, (), toolkit)
+        assert not good, f"passed the gate ({toolkit}): {code!r}"
+        assert any(reason in e for e in errs), (code, reason, errs)
+
+
+@pytest.mark.parametrize("code,reason", [
+    ("import os\nos._exit(0)", pol.WHY_EXIT),
+    ("from os import _exit\n_exit(0)", pol.WHY_EXIT),
+    ("import os\nbye = os._exit", pol.WHY_EXIT),
+    ("import asyncio", pol.WHY_ASYNCIO),
+    ("import asyncio.subprocess", pol.WHY_ASYNCIO),
+    ("from asyncio import create_subprocess_exec", pol.WHY_ASYNCIO),
+    ("from asyncio.subprocess import PIPE", pol.WHY_ASYNCIO),
+    # a loop handed over by anything, no asyncio import in sight
+    ("def go(loop):\n    return loop.subprocess_exec(None, 'x')",
+     pol.WHY_PROGRAM),
+    ("def go(loop):\n    return loop.create_connection(None, 'h', 1)",
+     pol.WHY_NETWORK),
+    ("import socketserver\nsocketserver.TCPServer(('', 0), None)",
+     pol.WHY_NETWORK),
+    ("import xmlrpc.client", pol.WHY_NETWORK),
+    ("from xmlrpc.server import SimpleXMLRPCServer", pol.WHY_NETWORK),
+    ("import concurrent.futures as cf\ncf.ProcessPoolExecutor()",
+     pol.WHY_PROGRAM),
+    ("from concurrent.futures import ProcessPoolExecutor", pol.WHY_PROGRAM),
+    ("import concurrent.futures.process", pol.WHY_PROGRAM),
+    ("from concurrent.futures import process", pol.WHY_PROGRAM),
+    ("from concurrent.futures.process import _process_worker",
+     pol.WHY_PROGRAM),
+    ("import os\nos.startfile('x')", pol.WHY_DESKTOP),
+    ("from os import startfile", pol.WHY_DESKTOP),
+    ("import webbrowser\nwebbrowser.open('http://x')", pol.WHY_DESKTOP),
+    ("from webbrowser import open as browse", pol.WHY_DESKTOP),
+])
+def test_what_the_plugin_research_measured_is_refused_with_a_reason(
+        code, reason):
+    _refused(code, reason)
+
+
+# ---- their relatives: what else the same gaps let through ----
+
+@pytest.mark.parametrize("name", [
+    "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve",
+    "spawnvp", "spawnvpe", "execl", "execle", "execlp", "execlpe", "execv",
+    "execve", "execvp", "execvpe", "posix_spawn", "posix_spawnp"])
+def test_every_spelling_of_os_spawn_and_exec_is_refused(name):
+    """spawnl/spawnv/execl/execv/execve were denied; their siblings
+    spawnvp, execvpe, posix_spawn ... passed — the same call, one letter
+    over."""
+    _refused(f"import os\nos.{name}('x')", pol.WHY_PROGRAM)
+    _refused(f"from os import {name}", pol.WHY_PROGRAM)
+
+
+@pytest.mark.parametrize("code,reason", [
+    # processes
+    ("import _multiprocessing", pol.WHY_PROGRAM),
+    ("from multiprocessing.dummy import Pool", pol.WHY_PROGRAM),
+    ("import _winapi\n_winapi.CreateProcess", pol.WHY_PROGRAM),
+    ("import _posixsubprocess", pol.WHY_PROGRAM),
+    ("import pipes", pol.WHY_PROGRAM),
+    ("import distutils.spawn", pol.WHY_PROGRAM),
+    ("import ensurepip", pol.WHY_PROGRAM),
+    ("import venv", pol.WHY_PROGRAM),
+    ("import idlelib.rpc", pol.WHY_PROGRAM),
+    ("import logging.handlers as h\nh.subprocess", pol.WHY_PROGRAM),
+    # ending the app at once
+    ("import os\nos.abort()", pol.WHY_EXIT),
+    ("import os as o\no.abort()", pol.WHY_EXIT),
+    ("import shutil\nshutil.os.abort()", pol.WHY_EXIT),
+    ("from os import abort", pol.WHY_EXIT),
+    ("import signal\nsignal.raise_signal(signal.SIGTERM)", pol.WHY_EXIT),
+    ("import signal\nsignal.alarm(1)", pol.WHY_EXIT),
+    ("import faulthandler\nfaulthandler._sigsegv()", pol.WHY_EXIT),
+    # the network, by module, by private module, by attribute route
+    ("import poplib", pol.WHY_NETWORK),
+    ("import imaplib", pol.WHY_NETWORK),
+    ("import nntplib", pol.WHY_NETWORK),
+    ("import smtpd", pol.WHY_NETWORK),
+    ("import asyncore", pol.WHY_NETWORK),
+    ("import asynchat", pol.WHY_NETWORK),
+    ("from wsgiref.simple_server import make_server", pol.WHY_NETWORK),
+    ("import ssl", pol.WHY_NETWORK),
+    ("import _ssl", pol.WHY_NETWORK),
+    ("import _socket", pol.WHY_NETWORK),
+    ("import _overlapped", pol.WHY_NETWORK),
+    ("import _asyncio", pol.WHY_ASYNCIO),
+    ("import logging.handlers\nlogging.handlers.socket.create_connection",
+     pol.WHY_NETWORK),
+    ("import logging.handlers\nlogging.handlers.SocketHandler('h', 1)",
+     pol.WHY_NETWORK),
+    ("import logging.config\nlogging.config.listen(9030)", pol.WHY_NETWORK),
+    ("from logging import config\nconfig.listen(9030)", pol.WHY_NETWORK),
+    ("import frame_camera\nframe_camera.socket.socket()", pol.WHY_NETWORK),
+    # the desktop and the registry
+    ("import antigravity", pol.WHY_DESKTOP),
+    ("import winreg", pol.WHY_REGISTRY),
+    # ctypes by another door
+    ("import _ctypes", pol.WHY_NATIVE),
+    ("import numpy as np\nnp.ctypeslib.load_library('x', '.')",
+     pol.WHY_NATIVE),
+    ("import numpy as np\nnp.ctypeslib.ctypes.windll.kernel32",
+     pol.WHY_NATIVE),
+    ("from numpy import ctypeslib", pol.WHY_NATIVE),
+    ("import frame_camera\nframe_camera.ctypes.CDLL('x')", pol.WHY_NATIVE),
+    ("import os\nos.add_dll_directory('x')", pol.WHY_NATIVE),
+    # an import by a name built at runtime, or text run as code
+    ("import sys\nsys.modules['subprocess'].Popen(['x'])",
+     pol.WHY_MODULE_TABLE),
+    ("import sys\nsys.modules.get('builtins')", pol.WHY_MODULE_TABLE),
+    ("from sys import modules", pol.WHY_MODULE_TABLE),
+    ("import os\nos.sys.modules", pol.WHY_MODULE_TABLE),
+    ("import sys\nsys.meta_path.insert(0, None)", pol.WHY_MODULE_TABLE),
+    ("import sys\nsys.path_hooks.append(None)", pol.WHY_MODULE_TABLE),
+    ("import gc\ngc.get_objects()", pol.WHY_ALL_OBJECTS),
+    ("import sys\nsys._getframe().f_builtins['eval']", pol.WHY_INTERPRETER),
+    ("import pkgutil\npkgutil.resolve_name('subprocess:Popen')",
+     pol.WHY_CODE),
+    ("import pydoc\npydoc.locate('subprocess.Popen')", pol.WHY_CODE),
+    ("import zipimport", pol.WHY_CODE),
+    ("import site\nsite.addsitedir('x')", pol.WHY_CODE),
+    ("import _imp", pol.WHY_CODE),
+    ("import _frozen_importlib", pol.WHY_CODE),
+    ("import frame_camera\nframe_camera.importlib", pol.WHY_CODE),
+    ("import timeit\ntimeit.timeit('1')", pol.WHY_CODE),
+    ("from timeit import Timer", pol.WHY_CODE),
+    ("import cProfile\ncProfile.run('1')", pol.WHY_CODE),
+    ("import trace", pol.WHY_CODE),
+    ("import pdb", pol.WHY_CODE),
+    ("import doctest", pol.WHY_CODE),
+    ("import os, operator\noperator.attrgetter('system')(os)",
+     pol.WHY_PROGRAM),
+    ("import os\nfrom operator import attrgetter\n"
+     "attrgetter('path.system')(os)", pol.WHY_PROGRAM),
+    ("import os, operator\noperator.methodcaller('startfile', 'x')(os)",
+     pol.WHY_DESKTOP),
+    ("import os, inspect\ninspect.getattr_static(os, '_exit')",
+     pol.WHY_EXIT),
+    ("import os\ngetattr(os, 'abort')()", pol.WHY_EXIT),
+])
+def test_the_relatives_of_those_escapes_are_refused_too(code, reason):
+    _refused(code, reason)
+
+
+@pytest.mark.parametrize("mod", sorted(pol.DENIED_MODULE_REASONS))
+def test_every_denied_module_is_refused_in_both_modes_with_its_reason(mod):
+    """Every name on the list, not a sample: a module added to it is tested
+    the moment it is added. Static, so whether it is installed is moot."""
+    _refused(f"import {mod}", pol.DENIED_MODULE_REASONS[mod])
+    _refused(f"import {mod}", pol.DENIED_MODULE_REASONS[mod], "standalone")
+    _refused(f"from {mod} import x", pol.DENIED_MODULE_REASONS[mod])
+
+
+@pytest.mark.parametrize("name,reason", [
+    ("asyncio", pol.WHY_ASYNCIO), ("socketserver", pol.WHY_NETWORK),
+    ("xmlrpc.client", pol.WHY_NETWORK), ("webbrowser", pol.WHY_DESKTOP),
+    ("concurrent.futures.process", pol.WHY_PROGRAM),
+    ("_winapi", pol.WHY_PROGRAM), ("ssl", pol.WHY_NETWORK)])
+def test_a_denied_module_cannot_be_declared_into_the_allowlist(name, reason):
+    errs = pol.check_requires([name])
+    assert errs and "never permitted" in errs[0] and reason in errs[0], errs
+
+
+def test_a_helper_module_using_asyncio_fails_the_project(tmp_path):
+    pdir = _proj(tmp_path)
+    (pdir / "helpers.py").write_text(
+        "import asyncio\n"
+        "async def go():\n"
+        "    await asyncio.create_subprocess_shell('x')\n",
+        encoding="utf-8")
+    good, errs = pol.validate_dir(pdir)
+    assert not good
+    assert any(e.startswith("helpers.py:") and "asyncio" in e for e in errs)
+
+
+@pytest.mark.parametrize("code", [
+    # the same words, on the things they are ordinary on
+    "import gc\ngc.collect()",
+    "import faulthandler\nfaulthandler.enable()",
+    "import threading\nthreading.Timer(1.0, print).start()",
+    "from timeit import default_timer\nt0 = default_timer()",
+    "import timeit\nt0 = timeit.default_timer()",
+    "class Job:\n    def abort(self):\n        pass\nJob().abort()",
+    "import signal\nsignal.signal(signal.SIGINT, signal.SIG_DFL)",
+    "import logging.config\nlogging.config.dictConfig({'version': 1})",
+    "import logging.handlers\nlogging.handlers.RotatingFileHandler('a.log')",
+    "from concurrent.futures import ThreadPoolExecutor",
+    "from concurrent import futures\nfutures.ThreadPoolExecutor()",
+    "import operator\nkey = operator.attrgetter('name')",
+    "x = getattr(object(), 'value', None)",
+    "import sys\nsys.path.insert(0, 'x')\nsys.exit(0)",
+    "import os\nos.path.join('a', 'b')\nos.environ.get('X')",
+    "from PySide6.QtWidgets import QApplication\n"
+    "app = QApplication([])\napp.exec()",
+])
+def test_the_ordinary_uses_of_those_modules_still_pass(code):
+    """A gate that refuses honest code teaches people to ignore it: these
+    are the near-misses of each new rule."""
+    for toolkit in ("qt", "tk"):
+        if "PySide6" in code and toolkit == "tk":
+            continue
+        good, errs = pol.validate(code, "linked", (), toolkit)
+        assert good, (code, errs)
+
+
+def test_a_label_that_is_now_a_denied_name_gets_a_port_the_gate_passes():
+    """gui_ports derives port names from labels and steers clear of every
+    name the gate denies (a "Remove" button's port is remove_button). The
+    new names join that list, so a "Socket" or "Modules" button drawn today
+    gets a port the gate accepts instead of an app that cannot Run."""
+    import gui_ports
+    for label in ("Socket", "Modules", "Startfile", "Asyncio"):
+        name = gui_ports.default_port_name("button", label)
+        assert name == f"{label.lower()}_button", (label, name)
+        good, errs = pol.validate(f"class Ports:\n    def __init__(self):\n"
+                                  f"        self.{name} = None\n")
+        assert good, (label, name, errs)
+
+
+# ============================================================
+# Every shipped example still passes
+# ============================================================
+
+def _example_params():
+    import gui_examples
+    return [(name, toolkit) for name in gui_examples.names()
+            for toolkit in ("qt", "tk")]
+
+
+@pytest.mark.parametrize("example,toolkit", _example_params())
+def test_every_shipped_example_still_passes_the_gate(example, toolkit,
+                                                     tmp_path):
+    """Typhon, the Barbie capture forms and the image viewer, each built the
+    way "New from example" builds it (into a temp vault) for both targets,
+    and gated the way Run gates it. The Tk target only writes text here — no
+    window is made. (The qt_tests wireframes are gated by
+    test_qt_wireframes.)"""
+    import gui_projects
+    from council_core import designer_examples as dx
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    built = dx.build_project(example, f"ex_{example}_{toolkit}", vault,
+                             toolkit=toolkit)
+    project = gui_projects.open_project(f"ex_{example}_{toolkit}",
+                                        vault_dir=vault)
+    mode = gui_projects.load_manifest(built.project_dir).mode
+    good, errs = pol.validate_dir(built.project_dir, mode,
+                                  list(project.requires or []),
+                                  toolkit=toolkit)
+    assert good, errs
