@@ -180,6 +180,11 @@ class _Live:
     it is an open device with a thread attached, and reopening it per call
     would be both slow and wrong. So the state is here, explicitly, with one
     instance and an explicit shutdown.
+
+    On the typhon-plugins branch this class DECLARES the fields, and no
+    instance of it is the state any more: what clear() resets lives on each
+    camera slot, the rest on the rig, and _LIVE is a view over them (see
+    _RIG below and council_core.camera_rig). Add a field here as before.
     """
 
     def __init__(self) -> None:
@@ -370,7 +375,16 @@ class _Live:
         self.disarm_note = ""
 
 
-_LIVE = _Live()
+#: Every camera this window runs (council_core.camera_rig): a slot per camera
+#: holding the fields _Live.clear() resets, and the rig holding the rest —
+#: the app's. _LIVE is the one-camera object of before as a VIEW over it:
+#: per-connection names go to the active slot, app-level names to the rig,
+#: so every function here and every caller runs unchanged. _Live above still
+#: declares every field; the split is read off it (camera_rig.split_fields).
+from council_core import camera_rig as _camera_rig  # noqa: E402
+
+_RIG = _camera_rig.Rig(_Live)
+_LIVE = _camera_rig.LiveView(_RIG)
 _LOCK = threading.Lock()
 _STAMPS = itertools.count(1)
 
