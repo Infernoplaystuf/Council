@@ -44,3 +44,7 @@ same list.
 - The knowledge graph (Connections tab), agent profiles (Agent Creator tab) and the
   "Set up a Pi" wizard: `docs/handoff/knowledge_graph_desktop.md` (decisions, plan and
   progress; it was written for the desktop's `knowledge-graph` branch).
+- The plugin Typhon on branch `typhon-plugins` (design: `docs/typhon_plugins_design.md`):
+  `docs/typhon_plugins_branch.md` says how "Typhon (plugins)" runs beside today's Typhon
+  (`run-typhon-plugins.bat`, its side vault), its traps, and the branch gate every commit
+  passes (`python tools/typhon_plugins_gate.py`).

@@ -46,6 +46,10 @@ SANDBOX_ENV = {
     "COUNCIL_APP_DIR": ROOT,
     "COUNCIL_VAULT_ROOT": VAULT,
     "COUNCIL_SKIP_PATH_MIGRATION": "1",
+    # Typhon's plugin home (docs/typhon_plugins_design.md 4.1: base set,
+    # approvals, third-party plugins; else ~/.council/typhon) — inside the
+    # throwaway app folder, like the app folder's own twin.
+    "TYPHON_PLUGIN_HOME": str(Path(ROOT) / "typhon"),
     # The engine answers from a localhost Ollama when no GGUF can load
     # (council_engine._route_chat). On a developer PC that server is real and
     # has real models, so a test that expects "no model configured" — e.g.
