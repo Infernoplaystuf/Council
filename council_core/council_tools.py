@@ -32,6 +32,15 @@ def _plain_run_python_reason(err: str) -> str:
     "" when none fits — the sandbox's line is left to speak for itself."""
     e = str(err or "")
     low = e.lower()
+    # First: the refusal names the attribute it was asked to change, which
+    # may be a writer's name (pd.DataFrame.to_csv = ...) the write case below
+    # would otherwise take for a write.
+    if ("may not change pandas" in low or "cannot be rebound" in low
+            or re.search(r"forbidden: (setattr|delattr) on", low)):
+        return ("the sandbox does not let code change pandas, numpy, pathlib "
+                "or the other modules and classes it provides; assign only "
+                "to your own variables, and set pandas display options with "
+                "pd.set_option(...)")
     if ("import blocked by sandbox" in low or "forbidden import" in low
             or ("blocked unsafe pattern" in low and "import" in low)):
         return ("the sandbox does not allow that import; allowed: pandas, "

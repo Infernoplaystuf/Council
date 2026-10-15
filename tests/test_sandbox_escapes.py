@@ -347,3 +347,137 @@ def test_legitimate_attribute_assignments_still_work(box, code):
     data, _ = box
     df, msg = run(code, data)
     assert df is not None, msg
+
+
+# ── legitimate code the rebinding refusal must not catch ─────────────────
+# Measured 2026-10-15 on 430fdb0 with a 40-snippet battery through
+# run_python / data_query / validate_generated_code: these ran on 43b317e and
+# were refused by the new assignment check.
+_PD_OPTION_KEYS = ("display.max_columns", "display.width",
+                   "mode.chained_assignment", "display.float_format")
+
+
+@pytest.fixture
+def pd_options_restored():
+    """execute_pandas_code runs in THIS process here, so an option the code
+    sets would outlive the test: put back every one it may touch."""
+    saved = {k: va.pd.get_option(k) for k in _PD_OPTION_KEYS}
+    yield
+    for k, v in saved.items():
+        va.pd.set_option(k, v)
+
+
+@pytest.mark.parametrize("code", [
+    "pd.options.display.max_columns = None\npd.options.display.width = 200",
+    "pd.options.mode.chained_assignment = None",
+    "pd.options.display.float_format = '{:,.2f}'.format",
+    "import pandas as p2\np2.options.display.max_columns = 50",
+])
+def test_setting_a_pandas_option_by_attribute_still_works(
+        box, pd_options_restored, code):
+    """`pd.options.display.max_columns = None` is everyday LLM pandas; it
+    changes an option pandas checks itself, not a module or class."""
+    data, _ = box
+    df, msg = run(code + "\nresult_df = pd.read_csv('ok.csv')", data)
+    assert df is not None, msg
+
+
+def test_tool_code_that_sets_a_pandas_option_passes_the_check():
+    """validate_generated_code is the gate a Forge / Agent Creator tool is
+    approved through, so the same line must pass there too."""
+    ok, msg = va.validate_generated_code(
+        "def summarise():\n"
+        "    pd.options.display.max_columns = None\n"
+        "    return pd.read_csv('ok.csv').describe()\n")
+    assert ok, msg
+
+
+@pytest.mark.parametrize("code", [
+    "pd.options = None",
+    "pd.options.plotting.backend = 'x'",
+    "pd.options.io.excel.xlsx.writer = 'x'",
+    "pd.options.display = None",
+    "del pd.options.display.max_columns",
+    "pd.options.display.__class__ = None",
+    "pd.read_csv.options.display.x = None",
+    "pd.options['display'].max_columns = None",
+])
+def test_only_display_style_pandas_options_are_let_through(code):
+    """The exception is `pd.options.<group>.<name> = value` for the groups
+    that only change how pandas shows or computes; anything else on pd is
+    still refused."""
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    ("from scipy import stats\n"
+     "df = pd.read_csv('ok.csv')\n"
+     "t = stats.ttest_1samp(df['a'], 0)\n"
+     "stats = df.groupby('a')['b'].describe()\n"
+     "stats.index.name = 'a'\n"
+     "result_df = stats.reset_index()"),
+    ("from statistics import mean\n"
+     "df = pd.read_csv('ok.csv')\n"
+     "overall = mean(df['b'])\n"
+     "mean = df.groupby('a')['b'].mean()\n"
+     "mean.name = 'avg_b'\n"
+     "result_df = mean.reset_index()"),
+])
+def test_an_imported_name_reused_for_the_model_s_own_frame_can_be_changed(
+        box, code):
+    """`stats` / `mean` are imported, then rebound to the model's own
+    frame/Series; setting .name on THAT is not changing a module."""
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    "from scipy import stats\nstats.ttest_1samp = None",
+    "import json\njson.loads = None",
+    "from pathlib import Path as P\nP.resolve = None",
+])
+def test_an_imported_module_the_code_does_not_rebind_stays_protected(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    "pd.read_csv = None",
+    "del Path.relative_to",
+    "setattr(Path, 'resolve', None)",
+])
+def test_the_rebinding_refusal_says_what_to_do_instead(code):
+    """No sandbox jargon ("proxy", "rebound") and a way forward."""
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+    assert "proxy" not in msg and "rebound" not in msg, msg
+    assert "your own variables" in msg, msg
+    assert "pd.set_option" in msg, msg
+
+
+# ── the containment is one helper ─────────────────────────────────────────
+def test_the_containment_is_one_module_level_helper(box, tmp_path):
+    """_contain_helpers no longer takes the resolve_dir it stopped using,
+    _BudgetedPandas.contain (no caller) is gone, and the one resolver every
+    read surface uses keeps a prefix-sharing sibling (data vs data_old) and
+    a `..` route outside."""
+    import inspect
+    assert "resolve_dir" not in inspect.signature(
+        va._contain_helpers).parameters
+    assert not hasattr(va._BudgetedPandas, "contain")
+    data, outside = box
+    sibling = tmp_path / "data_old"
+    sibling.mkdir()
+    (sibling / "x.csv").write_text("x\n1\n", encoding="utf-8")
+    roots = [str(data)]
+    reals = [va._sandbox_real_norm(r) for r in roots]
+    inside = va._sandbox_resolve_within("ok.csv", roots, reals)
+    assert inside is not None and inside.endswith("ok.csv")
+    assert va._sandbox_resolve_within(str(sibling / "x.csv"),
+                                      roots, reals) is None
+    assert va._sandbox_resolve_within("../outside/private.txt",
+                                      roots, reals) is None
+    assert va._sandbox_resolve_within(str(outside / "private.txt"),
+                                      roots, reals) is None

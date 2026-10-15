@@ -210,6 +210,35 @@ def test_legitimate_assignments_run_through_run_python(box):
     assert "200" in payload["stdout"], payload["stdout"]
 
 
+@pytest.mark.parametrize("role", ["coder", "intern"])
+def test_setting_a_pandas_display_option_runs_through_run_python(box, role):
+    """`pd.options.display.max_columns = None` ran on 43b317e and was refused
+    by the rebinding check (measured 2026-10-15): it changes an option, not
+    pandas itself, and the child process throws it away."""
+    ok, msg, payload = member_tool(box, role)({"code": (
+        "import pandas as pd\n"
+        "pd.options.display.max_columns = None\n"
+        "pd.options.display.width = 200\n"
+        "pd.options.mode.chained_assignment = None\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "print(int(df['runtime'].sum()))\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "100" in payload["stdout"], payload["stdout"]
+
+
+def test_an_imported_name_reused_for_a_series_runs_through_run_python(box):
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "import pandas as pd\n"
+        "from statistics import mean\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "overall = mean(df['runtime'])\n"
+        "mean = df.groupby('pump')['runtime'].mean()\n"
+        "mean.name = 'avg_runtime'\n"
+        "print(overall, mean.name)\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "avg_runtime" in payload["stdout"], payload["stdout"]
+
+
 def test_an_endless_loop_is_stopped_at_the_limit_the_model_asked_for(box):
     t0 = time.monotonic()
     ok, msg, payload = member_tool(box, "coder")(
@@ -361,6 +390,8 @@ def test_a_small_timeout_still_runs_trivial_code(box, t):
      "run_python cannot write files"),
     ("class Pump:\n    pass\nprint(Pump())",
      "class definitions are not available in the sandbox"),
+    ("import pandas as pd\npd.read_csv = None",
+     "the sandbox does not let code change pandas"),
 ])
 def test_a_refusal_comes_back_in_plain_words(box, code, plain):
     """A refusal reaches the model and the transcript as one plain sentence
