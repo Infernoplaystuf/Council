@@ -25,7 +25,9 @@ council member could call it, and nothing said whether it worked.
                recurring gap becomes a tool in one step.
 
 Nothing here relaxes the sandbox: an approved tool runs exactly as an
-unreviewed one does (app_built_tools.run_tool → the analyst sandbox).
+unreviewed one does (app_built_tools.run_tool → the analyst sandbox, behind
+the analyst's fence: a child process with its time limit and memory cap, so
+one that never returns no longer hangs the member's turn).
 """
 from __future__ import annotations
 
@@ -155,12 +157,16 @@ def run_tests(name: str, vault_dir: Any,
     """[(passed, what happened)] for each saved test."""
     out = []
     for t in load_tests(name, vault_dir) or [{"args": {}, "expect": "any"}]:
-        df, msg = _abt().run_tool(name, t.get("args") or {},
-                                  vault_dir=vault_dir,
-                                  allowed_folders=allowed_folders)
+        # Behind the analyst's fence (app_built_tools.run_tool_detail): a
+        # test that never returns, or wants too much memory, is stopped and
+        # fails with a plain reason.
+        run = _abt().run_tool_detail(name, t.get("args") or {},
+                                     vault_dir=vault_dir,
+                                     allowed_folders=allowed_folders)
+        df = run.df
         call = f"{name}(**{t.get('args') or {}})"
         if df is None:
-            out.append((False, f"{call} failed: {msg[-300:]}"))
+            out.append((False, f"{call} failed: {run.brief(300)}"))
             continue
         value = _value(df)
         if not _kind_ok(value, t.get("expect", "any")):

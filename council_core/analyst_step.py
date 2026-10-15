@@ -31,6 +31,17 @@ never more: time_limit) and a MEMORY_MB commit cap, the whole process tree
 killed at the limit. They differ only in what counts as an answer: a
 result_df for run_code; for run_script, code that ran to its end, with what
 it printed.
+
+The same fence runs every other piece of model-written code the app runs
+(2026-10-15): run_tool_code — a model-built tool's one function, called
+with its arguments (passed as JSON) and its return value brought back
+(app_built_tools: the Forge tab's test runs and Run Selected, tool tests,
+the Council's approved tools; agent_profiles: an agent's attached tools);
+and run_script for the agents' and background jobs' run_pandas_analysis
+(safe_agent). In-process, with no limit, a tool's `while True:` hung its
+worker for good, a huge allocation took the app's own memory, and a tool
+could replace the app's json.dumps or Path.home for the rest of the
+session.
 """
 from __future__ import annotations
 
@@ -40,7 +51,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 TIME_LIMIT_S = 120
@@ -86,17 +97,21 @@ def time_limit(requested: Any = TIME_LIMIT_S) -> int:
     return max(1, min(t, TIME_LIMIT_S))
 
 
-def _run_child(code: str, folder: Path, *, timeout: Any,
+def _run_child(code: str, folder: Optional[Path], *, timeout: Any,
                runner: Optional[Callable[..., Any]],
-               vault: Optional[Path] = None, no_data_ok: bool = False):
+               vault: Optional[Path] = None, no_data_ok: bool = False,
+               call: Optional[Dict[str, Any]] = None):
     """(the child's report as a dict, or None; why there is none; whether
     it was stopped at the time limit). The one
     way model code runs here: council_core.analyst_child — the sandbox — in
     a child process under child_proc, at most TIME_LIMIT_S (time_limit) and
     MEMORY_MB, the code written to a temporary folder. `vault`: the vault
     whose data_out the sandbox's helpers may write (council_core.paths
-    .vault_dir() in the child). `no_data_ok`: a missing `folder` is an
-    empty one (in the temporary folder) rather than a refusal."""
+    .vault_dir() in the child). `no_data_ok`: a missing `folder` (or
+    None) is an empty one (in the temporary folder) rather than a refusal.
+    `call`: a tool call ({"entry", "args", "folders"}, see analyst_child),
+    written beside the code as JSON — a TypeError when it is not plain
+    JSON."""
     from . import child_proc
     runner = runner or child_proc.run
     limit = time_limit(timeout)
@@ -106,18 +121,23 @@ def _run_child(code: str, folder: Path, *, timeout: Any,
         code_file = Path(tmp) / "code.py"
         out_file = Path(tmp) / "out.json"
         code_file.write_text(code, encoding="utf-8")
-        folder = Path(folder)
+        folder = Path(folder) if folder else Path(tmp) / "no_data"
         if no_data_ok and not folder.is_dir():
             folder = Path(tmp) / "no_data"
             folder.mkdir()
+        argv = [sys.executable, "-m", "council_core.analyst_child",
+                str(code_file), str(folder), str(out_file)]
+        if call is not None:
+            call_file = Path(tmp) / "call.json"
+            call_file.write_text(json.dumps(call), encoding="utf-8")
+            argv.append(str(call_file))
         # The wall-clock timeout is the model's code budget PLUS a fixed
         # start-up grace, so importing the sandbox is not charged to the
         # code. retries=0: model code runs ONCE — child_proc's default
         # re-runs an "infra" exit (a commit-limit death near the memory cap
         # counts as one), which would run the model's code, and its data_out
         # writes, again (up to three times) for one run_python call.
-        res = runner([sys.executable, "-m", "council_core.analyst_child",
-                      str(code_file), str(folder), str(out_file)],
+        res = runner(argv,
                      cwd=str(APP_ROOT), env=child_proc.child_env(extra),
                      timeout=limit + SANDBOX_STARTUP_S, retries=0,
                      memory_limit_mb=MEMORY_MB)
@@ -125,15 +145,28 @@ def _run_child(code: str, folder: Path, *, timeout: Any,
             return None, (f"the code ran longer than {limit} s and was "
                           "stopped"), True
         if not out_file.exists():
+            infra = getattr(res, "infra", "") or ""
             err = (getattr(res, "stderr", "") or getattr(res, "error", "")
-                   or "the analysis process ended without a result")
+                   or "the analysis process ended without a result"
+                   + (f" ({infra})" if infra else ""))
             return None, str(err)[-2000:], False
-        return json.loads(out_file.read_text(encoding="utf-8")), "", False
+        try:
+            report = json.loads(out_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = None
+        if not isinstance(report, dict):
+            return None, ("the code's result could not be read (the sandbox "
+                          "process's report was damaged)"), False
+        return report, "", False
 
 
-def _frame(table: str):
+def _frame(table: str, *, exact: bool = False):
+    """The child's "split" JSON as a DataFrame. `exact`: text stays text
+    (pandas' reader otherwise turns a column of "007" into 7)."""
     import io
     import pandas as pd
+    if exact:
+        return pd.read_json(io.StringIO(table), orient="split", dtype=False)
     return pd.read_json(io.StringIO(table), orient="split")
 
 
@@ -151,6 +184,12 @@ def run_code(code: str, folder: Path, *, timeout: float = TIME_LIMIT_S,
     return _frame(out["table"]), str(out.get("log") or "")
 
 
+#: What the sandbox, or the process around it, says when the memory cap
+#: (MEMORY_MB) stopped the code.
+_MEMORY_WORDS = ("memoryerror", "unable to allocate", "commitment_limit",
+                 "status_no_memory")
+
+
 @dataclass
 class ScriptRun:
     ran: bool = False          # passed the checks and ran to its end
@@ -160,36 +199,128 @@ class ScriptRun:
     error: str = ""            # the refusal, traceback or stop when not ran
     note: str = ""             # why a result_df it set could not be used
     timed_out: bool = False
+    #: The sandbox's own log (what execute_pandas_code returns): what the
+    #: code printed, or the refusal or traceback with it.
+    log: str = ""
+    #: The result's full (rows, cols); `df` holds at most 5000 rows.
+    shape: Optional[Tuple[int, int]] = None
+
+    @property
+    def stopped_by_memory(self) -> bool:
+        low = f"{self.error}\n{self.log}".lower()
+        return not self.ran and any(w in low for w in _MEMORY_WORDS)
+
+    @property
+    def message(self) -> str:
+        """For a person or a model: the log when the code ran; when it did
+        not, why — one plain sentence first when the time limit or the
+        memory cap stopped it."""
+        if self.ran:
+            return self.log or "ok"
+        detail = (self.log or self.error or "the code did not run").strip()
+        if self.timed_out:
+            return self.error or detail
+        if self.stopped_by_memory:
+            return (f"the code needed more memory than the sandbox allows "
+                    f"({MEMORY_MB} MB) and was stopped\n{detail}")
+        return detail
+
+    def brief(self, limit: int = 300) -> str:
+        """What went wrong, short ("" when it ran): the plain sentence for a
+        stop, else the error's tail — a traceback's last lines say what to
+        fix."""
+        if self.ran:
+            return ""
+        if self.timed_out:
+            return self.message[:limit]
+        if self.stopped_by_memory:
+            return self.message.splitlines()[0][:limit]
+        text = (self.error or self.log or "the code did not run").strip()
+        return text if len(text) <= limit else "…" + text[-(limit - 1):]
 
 
-def run_script(code: str, folder: Path, *, timeout: Any = TIME_LIMIT_S,
-               runner: Optional[Callable[..., Any]] = None,
-               vault: Optional[Path] = None) -> ScriptRun:
-    """The code as a script, under exactly run_code's fence (the sandbox in
-    a child process, at most TIME_LIMIT_S and MEMORY_MB): for the Council's
-    run_python, where code that prints its answer has worked even without
-    a result_df. A missing data folder is an empty one. Never raises."""
-    try:
-        out, why, stopped = _run_child(code, folder, timeout=timeout,
-                                       runner=runner, vault=vault,
-                                       no_data_ok=True)
-    except Exception as exc:                              # noqa: BLE001
-        return ScriptRun(error=f"the code could not run: {exc}")
+def _script_run(out: Optional[Dict[str, Any]], why: str, stopped: bool, *,
+                exact: bool = False) -> ScriptRun:
+    """The child's report (from _run_child) as a ScriptRun."""
     if out is None:
         return ScriptRun(error=why, timed_out=stopped)
     run = ScriptRun(ran=bool(out.get("ran")),
                     stdout=str(out.get("stdout") or ""),
                     stderr=str(out.get("stderr") or ""),
                     error=str(out.get("error") or ""),
-                    note=str(out.get("note") or ""))
+                    note=str(out.get("note") or ""),
+                    log=str(out.get("log") or ""))
     if not run.ran and not run.error:
         run.error = str(out.get("log") or "the code did not run")
-    if out.get("ok") and out.get("table"):
+    shape = out.get("shape")
+    if isinstance(shape, list) and len(shape) == 2:
+        run.shape = (int(shape[0]), int(shape[1]))
+    if out.get("ok") and "value" in out:
+        # A tool's returned value, exactly (see analyst_child): the
+        # one-cell frame run_tool always made of it.
+        import pandas as pd
+        run.df = pd.DataFrame([{"result": out["value"]}])
+    elif out.get("ok") and out.get("table"):
         try:
-            run.df = _frame(out["table"])
+            run.df = _frame(out["table"], exact=exact)
         except Exception as exc:                          # noqa: BLE001
             run.note = f"the result could not be read: {exc}"
     return run
+
+
+def run_script(code: str, folder: Path, *, timeout: Any = TIME_LIMIT_S,
+               runner: Optional[Callable[..., Any]] = None,
+               vault: Optional[Path] = None,
+               exact: bool = False) -> ScriptRun:
+    """The code as a script, under exactly run_code's fence (the sandbox in
+    a child process, at most TIME_LIMIT_S and MEMORY_MB): for the Council's
+    run_python, where code that prints its answer has worked even without
+    a result_df, and the agents' run_pandas_analysis. A missing data folder
+    is an empty one. `exact`: a result_df's text columns stay text. Never
+    raises."""
+    try:
+        out, why, stopped = _run_child(code, folder, timeout=timeout,
+                                       runner=runner, vault=vault,
+                                       no_data_ok=True)
+    except Exception as exc:                              # noqa: BLE001
+        return ScriptRun(error=f"the code could not run: {exc}")
+    return _script_run(out, why, stopped, exact=exact)
+
+
+def run_tool_code(code: str, entry: str, args: Any,
+                  folders: Union[Path, str, Sequence[Any], None], *,
+                  timeout: Any = TIME_LIMIT_S,
+                  runner: Optional[Callable[..., Any]] = None,
+                  vault: Optional[Path] = None) -> ScriptRun:
+    """A model-built tool's code, under run_code's fence: its function
+    `entry` called with `args` (a dict, handed to the child as JSON — no
+    pickle, and nothing pasted into the code), and what it returns as `df`
+    — the table it returned, or a one-cell "result" frame holding any
+    other value, exactly as app_built_tools always gave it. `folders`: the
+    data folders it may read (the first is DATA_FOLDER; a missing one is
+    an empty one). Never raises."""
+    if not isinstance(args, dict):
+        return ScriptRun(error="the tool's arguments must be an object "
+                               "(names and values)")
+    try:
+        json.dumps(args)
+    except (TypeError, ValueError) as exc:
+        return ScriptRun(error="the tool's arguments must be plain values "
+                               f"(text, numbers, true/false, lists, "
+                               f"objects): {exc}")
+    if isinstance(folders, (str, Path)):
+        folders = [folders]
+    folders = [Path(f) for f in (folders or []) if f]
+    first = folders[0] if folders else None
+    call = {"entry": str(entry or ""), "args": args,
+            "folders": [str(f) for f in folders[1:]]}
+    try:
+        out, why, stopped = _run_child(code, first, timeout=timeout,
+                                       runner=runner, vault=vault,
+                                       no_data_ok=True, call=call)
+    except Exception as exc:                              # noqa: BLE001
+        return ScriptRun(error=f"the tool could not run: {exc}")
+    return _script_run(out, why, stopped, exact=True)
 
 
 def run(question: str, vault_dir: Path, *,
@@ -281,4 +412,4 @@ def run(question: str, vault_dir: Path, *,
 
 
 __all__ = ["AnalystResult", "ScriptRun", "run", "run_code", "run_script",
-           "time_limit", "data_folder", "enabled"]
+           "run_tool_code", "time_limit", "data_folder", "enabled"]

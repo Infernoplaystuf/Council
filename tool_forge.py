@@ -15,7 +15,9 @@ not defined", UnicodeDecodeError), feeds the error back to the model to fix.
 
 Nothing here relaxes security: the generated code passes the exact same
 validator the analyst sandbox uses (no delete / write-outside-output / network
-/ shell), and it runs only through vault_analyst.execute_pandas_code.
+/ shell), and it runs only through vault_analyst.execute_pandas_code, behind
+the analyst's fence (a child process with a time limit and a memory cap —
+app_built_tools.run_code_detail).
 """
 from __future__ import annotations
 
@@ -152,23 +154,25 @@ def _entry_has_no_required_args(code: str) -> bool:
 def _test_run_error(name: Optional[str], code: str, vault_dir: Any) -> str:
     """Run the tool with no args (only if it needs none) and return an error
     string if it failed, else ''. Used to drive the self-correction loop.
-    ``name`` None runs ``code`` from memory (a draft that was not saved)."""
+    ``name`` None runs ``code`` from memory (a draft that was not saved).
+
+    The run is behind the analyst's fence (app_built_tools.run_code_detail:
+    a child process, the time limit and the memory cap), so a tool that
+    never returns is stopped and counts as failing, with a plain reason the
+    model can fix — in-process it hung generation for good."""
     if not _entry_has_no_required_args(code):
         return ""   # needs arguments — can't auto-test; accept as saved
     try:
         import app_built_tools as abt
         if name is None:
-            _df, msg = abt.run_code(code, {}, vault_dir=vault_dir)
+            run = abt.run_code_detail(code, {}, vault_dir=vault_dir)
         else:
-            _df, msg = abt.run_tool(name, {}, vault_dir=vault_dir)
+            run = abt.run_tool_detail(name, {}, vault_dir=vault_dir)
     except Exception as exc:
         return repr(exc)[:300]
-    m = str(msg)
-    if "EXECUTION ERROR" in m:
-        return m.split("EXECUTION ERROR:", 1)[-1].strip()[:300]
-    if "SAFETY CHECK FAILED" in m:
-        return m[:300]
-    return ""
+    if run.ran:
+        return ""
+    return run.brief(300).replace("EXECUTION ERROR:", "").strip()
 
 
 def generate_tool(task: str,

@@ -33,7 +33,9 @@ What an agent may use, and why it is safe:
     (save_tool overwrites by name) changes nothing for the agent;
   * every tool runs in the analyst sandbox (vault_analyst.execute_pandas_code:
     data folders only, no writes, no network, no pickle — see
-    tests/test_sandbox_escapes.py).
+    tests/test_sandbox_escapes.py), behind the analyst's fence: a child
+    process stopped at safe_agent.CODE_TIME_S and a memory cap
+    (council_core.analyst_step; tests/test_tool_fence.py).
 
 Storage: ``<vault>/agent_profiles.json`` (settings, profiles, tool requests),
 written atomically; listed in both of the vault's exclusion lists so a vault
@@ -531,30 +533,30 @@ def _graph_tools(vault: Path):
 
 
 def run_attached_tool(tool: AttachedTool, args: Dict[str, Any],
-                      allowed_folders: List[Path]) -> Dict[str, Any]:
-    """Run the PINNED code, never the file on disk, through the sandbox."""
-    import vault_analyst as va
+                      allowed_folders: List[Path], *,
+                      vault: Optional[Path] = None) -> Dict[str, Any]:
+    """Run the PINNED code, never the file on disk, through the sandbox —
+    behind the analyst's fence (app_built_tools.run_code_detail: a child
+    process stopped at safe_agent.CODE_TIME_S and the memory cap, the
+    arguments passed as JSON). In this process, as it ran before
+    2026-10-15, the agent's 60 s tool timeout stopped only the waiting.
+    `vault`: whose data_out the sandbox's helpers may write (the app's when
+    None)."""
+    import app_built_tools as abt
+    import safe_agent
     if sha256(tool.code) != tool.sha256:
         return {"error": "this tool's pinned code no longer matches its approval"}
     if not isinstance(args, dict):
         return {"error": "args must be an object"}
-    call = (f"\n\n_ret = {tool.entry}(**{args!r})\n"
-            "result_df = _ret if isinstance(_ret, (pd.DataFrame, pd.Series, dict)) "
-            "else pd.DataFrame([{'result': _ret}])\n")
-    df, msg = va.execute_pandas_code(tool.code + call, list(allowed_folders))
-    out: Dict[str, Any] = {"message": msg}
-    if df is not None:
-        try:
-            out["preview"] = df.head(20).to_dict(orient="records")
-            out["shape"] = list(df.shape)
-        except Exception:
-            out["preview"] = str(df)[:2000]
-    return out
+    run = abt.run_code_detail(tool.code, args, entry=tool.entry,
+                              allowed_folders=list(allowed_folders),
+                              vault_dir=vault, timeout=safe_agent.CODE_TIME_S)
+    return safe_agent._frame_out(run)
 
 
 def build_registry(profile: AgentProfile, vault: Path, file_root: Path):
     """A frozen registry holding ONLY this profile's tools."""
-    from safe_agent import Tool, default_tools, AgentPolicy
+    from safe_agent import Tool, default_tools, AgentPolicy, fenced_timeout
     from tool_registry import ToolRegistry
 
     probe = AgentPolicy(allowed_tools=(), file_root=file_root, output_dir=file_root)
@@ -570,8 +572,10 @@ def build_registry(profile: AgentProfile, vault: Path, file_root: Path):
             continue
 
         def fn(args, policy, _t=t):
-            return run_attached_tool(_t, args, [policy.file_root])
-        reg.register(Tool(t.name, fn, dict(t.params), 60.0,
+            return run_attached_tool(_t, args, [policy.file_root], vault=vault)
+        # The fence stops the code at safe_agent.CODE_TIME_S; the
+        # dispatcher's timeout is only a backstop behind it.
+        reg.register(Tool(t.name, fn, dict(t.params), fenced_timeout(),
                           f"{t.description} (council-made tool)"))
     reg.freeze()
     return reg
