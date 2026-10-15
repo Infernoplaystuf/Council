@@ -22,7 +22,9 @@ Public surface:
 The default tool set (file, pandas, memory) is built by
 ``default_tools(policy)`` so a single AgentPolicy + LocalMemory is enough
 to spin up a working agent. The pandas tool routes through the EXISTING
-``vault_analyst.execute_pandas_code`` — NO NEW EXECUTION SURFACE.
+``vault_analyst.execute_pandas_code`` — NO NEW EXECUTION SURFACE — behind
+the analyst's fence (a child process stopped at CODE_TIME_S and a memory
+cap; see CODE_TIME_S), as does run_app_tool.
 
 Tool-call protocol (model-side):
 
@@ -240,29 +242,67 @@ def _tool_read_local_file(args: Dict[str, Any],
     }
 
 
+#: Seconds of code a tool that runs model-written code may use —
+#: run_pandas_analysis, run_app_tool, and an agent's attached tools
+#: (council_core.agent_profiles). The analyst's fence stops the code there
+#: (council_core.analyst_step: a child process, killed with its whole tree,
+#: under a memory cap). Before 2026-10-15 the code ran in this process: the
+#: dispatcher's 60 s timeout only stopped WAITING (a thread cannot be
+#: killed), so a `while True:` ran on, and held the job's worker, for good.
+CODE_TIME_S = 60.0
+
+
+def fenced_timeout() -> float:
+    """The dispatcher's timeout for a fenced tool: longer than the fence's
+    own stop (CODE_TIME_S plus the sandbox's start-up grace), so the fence's
+    plain "stopped" message comes back; only a backstop."""
+    from council_core import analyst_step
+    return CODE_TIME_S + analyst_step.SANDBOX_STARTUP_S + 30.0
+
+
+def _sandbox_vault() -> Optional[Path]:
+    """The vault the sandbox's helpers write into (its data_out): the app's,
+    as when the code ran in this process."""
+    try:
+        from council_core import paths
+        return Path(paths.vault_dir())
+    except Exception:
+        return None
+
+
+def _frame_out(run: Any) -> Dict[str, Any]:
+    """A fenced run (analyst_step.ScriptRun) as a tool observation."""
+    out: Dict[str, Any] = {"message": run.message}
+    if run.timed_out:
+        out["timed_out"] = True
+    df = run.df
+    if df is not None:
+        try:
+            out["preview"] = df.head(20).to_dict(orient="records")
+            out["shape"] = list(run.shape or df.shape)
+        except Exception:
+            out["preview"] = str(df)[:2000]
+    return out
+
+
 def _tool_run_pandas_analysis(args: Dict[str, Any],
                               policy: AgentPolicy) -> Dict[str, Any]:
-    """Routes to the EXISTING vault_analyst sandbox. We add NO new
-    execution surface — just pass the code through to the validated
-    pandas runner that the Council already ships."""
+    """Routes to the EXISTING vault_analyst sandbox, behind the analyst's
+    fence (analyst_step.run_script: a child process, stopped at CODE_TIME_S
+    and the memory cap). We add NO new execution surface — the validated
+    pandas runner the Council already ships, run the way its run_python
+    runs it."""
     code = str(args.get("code", ""))
     if not code.strip():
         return {"error": "missing 'code' argument"}
     try:
-        # Lazy-import vault_analyst — it pulls pandas/openpyxl which
-        # are heavy at import time.
-        from vault_analyst import execute_pandas_code
+        from council_core import analyst_step
     except Exception as exc:
-        return {"error": f"vault_analyst unavailable: {exc!r}"}
-    df, msg = execute_pandas_code(code, [policy.file_root])
-    out: Dict[str, Any] = {"message": msg}
-    if df is not None:
-        try:
-            out["preview"] = df.head(20).to_dict(orient="records")
-            out["shape"] = list(df.shape)
-        except Exception:
-            out["preview"] = str(df)[:2000]
-    return out
+        return {"error": f"the sandbox is unavailable: {exc!r}"}
+    run = analyst_step.run_script(code, policy.file_root,
+                                  timeout=analyst_step.time_limit(CODE_TIME_S),
+                                  vault=_sandbox_vault(), exact=True)
+    return _frame_out(run)
 
 
 def _tool_query_memory(args: Dict[str, Any],
@@ -413,7 +453,8 @@ def _tool_write_tool(args: Dict[str, Any],
 def _tool_run_app_tool(args: Dict[str, Any],
                        policy: AgentPolicy) -> Dict[str, Any]:
     """Run a previously-authored app-built tool by 'name' with an 'args' dict.
-    Runs in the same sandbox; the result is flagged UNVERIFIED."""
+    Runs in the same sandbox, behind the same fence (CODE_TIME_S, the memory
+    cap); the result is flagged UNVERIFIED."""
     name = str(args.get("name") or "").strip()
     targs = args.get("args") or {}
     if not isinstance(targs, dict):
@@ -422,16 +463,13 @@ def _tool_run_app_tool(args: Dict[str, Any],
         return {"error": "run_app_tool needs 'name'"}
     try:
         import app_built_tools as abt
-        df, msg = abt.run_tool(name, targs, allowed_folders=[policy.file_root])
+        run = abt.run_tool_detail(name, targs,
+                                  allowed_folders=[policy.file_root],
+                                  timeout=CODE_TIME_S)
     except Exception as exc:
         return {"error": f"run_app_tool failed: {exc!r}"}
-    out: Dict[str, Any] = {"message": msg}
-    if df is not None:
-        try:
-            out["preview"] = df.head(20).to_dict(orient="records")
-            out["shape"] = list(df.shape)
-        except Exception:
-            out["preview"] = str(df)[:2000]
+    out = _frame_out(run)
+    out["message"] = abt.LABEL + out["message"]
     return out
 
 
@@ -483,7 +521,8 @@ def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
                         "`result_df` (a DataFrame, Series or dict) or print "
                         "it — nothing else is returned.",
             schema={"code": "str"},
-            timeout_s=60.0,
+            # The fence stops the code at CODE_TIME_S; this is a backstop.
+            timeout_s=fenced_timeout(),
         ),
         "query_memory": Tool(
             name="query_memory",
@@ -518,7 +557,7 @@ def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
             description="Run an app-built tool by name with an args dict. Runs "
                         "in the sandbox; result is flagged UNVERIFIED.",
             schema={"name": "str", "args": "dict (optional)"},
-            timeout_s=60.0,
+            timeout_s=fenced_timeout(),
         ),
     }
 

@@ -13,7 +13,9 @@ boundaries.
 Security is structural, not policy: the agent's data tools are READ-ONLY and
 sandboxed to file_root — list_files (discover), search_files (grep contents ->
 file list), read_local_file, run_pandas_analysis (the validated pandas
-sandbox), and query_memory. It may also AUTHOR tools (write_tool -> run_app_tool
+sandbox, behind the analyst's fence: a child process stopped at
+safe_agent.CODE_TIME_S and a memory cap, so a `while True:` no longer holds
+this worker for good), and query_memory. It may also AUTHOR tools (write_tool -> run_app_tool
 -> list_app_tools): the code is validated by the SAME sandbox rules and can
 only ever be read-only itself, so a self-built tool still cannot delete,
 write outside the output dir, use the network, or shell out. The only write the

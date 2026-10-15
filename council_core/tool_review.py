@@ -25,7 +25,9 @@ council member could call it, and nothing said whether it worked.
                recurring gap becomes a tool in one step.
 
 Nothing here relaxes the sandbox: an approved tool runs exactly as an
-unreviewed one does (app_built_tools.run_tool → the analyst sandbox).
+unreviewed one does (app_built_tools.run_tool → the analyst sandbox, behind
+the analyst's fence: a child process with its time limit and memory cap, so
+one that never returns no longer hangs the member's turn).
 """
 from __future__ import annotations
 
@@ -155,12 +157,16 @@ def run_tests(name: str, vault_dir: Any,
     """[(passed, what happened)] for each saved test."""
     out = []
     for t in load_tests(name, vault_dir) or [{"args": {}, "expect": "any"}]:
-        df, msg = _abt().run_tool(name, t.get("args") or {},
-                                  vault_dir=vault_dir,
-                                  allowed_folders=allowed_folders)
+        # Behind the analyst's fence (app_built_tools.run_tool_detail): a
+        # test that never returns, or wants too much memory, is stopped and
+        # fails with a plain reason.
+        run = _abt().run_tool_detail(name, t.get("args") or {},
+                                     vault_dir=vault_dir,
+                                     allowed_folders=allowed_folders)
+        df = run.df
         call = f"{name}(**{t.get('args') or {}})"
         if df is None:
-            out.append((False, f"{call} failed: {msg[-300:]}"))
+            out.append((False, f"{call} failed: {run.brief(300)}"))
             continue
         value = _value(df)
         if not _kind_ok(value, t.get("expect", "any")):
@@ -171,8 +177,10 @@ def run_tests(name: str, vault_dir: Any,
             out.append((False, f"{call} returned {value!r}, expected "
                                f"{t['equals']!r}"))
             continue
+        # The table's full shape (run.shape): `df` holds only its first
+        # frame_codec.MAX_ROWS rows.
         shown = str(value)[:120] if not hasattr(value, "columns") else \
-            f"a table {getattr(value, 'shape', '')}"
+            f"a table {run.shape or getattr(value, 'shape', '')}"
         out.append((True, f"{call} → {shown}"))
     return out
 
@@ -275,14 +283,17 @@ def approved_tools(vault_dir: Any) -> List[Tuple[str, Callable, List[str]]]:
         meta = abt.get_tool(name, vault_dir) or {}
 
         def fn(args, _n=name):
-            df, msg = abt.run_tool(_n, dict(args or {}), vault_dir=vault_dir)
-            if df is None:
-                return False, msg, {}
-            value = _value(df)
+            run = abt.run_tool_detail(_n, dict(args or {}),
+                                      vault_dir=vault_dir)
+            if run.df is None:
+                return False, abt.LABEL + run.message, {}
+            value = _value(run.df)
             text = value.to_string(max_rows=40) if hasattr(value, "to_string") \
                 else str(value)
-            return True, f"{text[:4000]}\n(app-built tool, approved by you)", \
-                {"tool": _n}
+            # Only the table's first rows come back: say so, with its size.
+            cut = f"\n({run.cut})" if run.cut else ""
+            return True, (f"{text[:4000]}{cut}\n"
+                          "(app-built tool, approved by you)"), {"tool": _n}
         fn.help = (meta.get("description") or name)[:200]
         fn.params = _params(code)
         out.append((f"app_{name}", fn, list(rec.get("roles") or [])))
