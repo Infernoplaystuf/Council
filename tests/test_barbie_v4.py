@@ -130,6 +130,17 @@ def test_attach_starts_a_timer_that_is_kept_alive(app):
     assert app._frame_camera_live is timer
 
 
+def test_attach_leaves_f9_alone_in_an_app_without_capture_now(app):
+    """Typhon's Capture now key (F9, application-wide) is installed only in
+    an app with a Capture now button or the capture set-up's boxes: before,
+    every attached app took it, and F9 in a Barbie told it to choose a mode
+    "(Basic tab)", a tab it does not have (review)."""
+    frame_camera.attach(app)
+    assert app._capture_now_key is None
+    assert frame_camera._LIVE.capture_key is None
+    assert not hasattr(app, "_typed_timer_hook"), "no timer box to hook"
+
+
 def test_attach_refuses_a_port_that_is_not_an_image_canvas(app):
     with pytest.raises(RuntimeError, match="not an image canvas"):
         frame_camera.attach(app, view="capture_status")

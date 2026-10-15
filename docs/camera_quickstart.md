@@ -55,6 +55,23 @@ exported, deleted, imported back under its name; a Barbie project's model
 listed with where it came from, the filter narrowing to each app, and
 Typhon refused to train Barbie's model but allowed to copy it.
 
+**Triggered capture and Downsample** (below). On pylon's emulator: a
+software trigger per **Capture now** / F9 (one frame each), several frames
+per trigger, the **Timer** (and a timer too fast for the camera, its ticks
+counted missed), **snapshot** saving only the frames after each press, a
+forced failed grab while armed, every trigger put back by **Stop**, a
+press at the very moment of Start not lost, and **Downsample** on a camera
+that accepts binning without its picture getting smaller (the emulator:
+Typhon averages instead, checked pixel for pixel). The emulator **cannot**
+raise an input line or count edges, has no burst trigger and does not
+really bin, so the **hardware-line path** (Line1 …, `CxpTrigger0`), burst
+triggers, the camera's edge counter and binning that does make the picture
+smaller are verified only against a fake Basler built from Basler's
+documentation. **Nothing here has run on a boA5320 or a CoaXPress card**:
+which trigger sources the card forwards, whether its counter counts edges
+the camera ignored while busy, and how its binning treats the camera's
+area are the first real test.
+
 ## 1. Get the branch
 
 ```bash
@@ -156,8 +173,13 @@ settings tabs has the exposure, gain and FPS boxes loose under the image
 folder and no tabs. Updating moves those three boxes into the **Basic** tab
 with their names, ports and links, so your own code in their handlers and
 in Start is kept and keeps working (checked on the Typhon example as it
-was just before the tabs, with the FPS and Start handlers edited). To bring it up to date
-without losing your own code:
+was just before the tabs, with the FPS and Start handlers edited). One
+built before **triggered capture** has no Capture, From, frames-per-trigger,
+timer or **Downsample** boxes in Basic and no **Capture now (F9)** button:
+updating adds them (11 shapes) and narrows Start and Stop to make room for
+Capture now, keeping your Start and Stop handlers as they are (checked on
+the Typhon example as it was the day before, with both edited). To bring
+it up to date without losing your own code:
 
 1. **GUI Designer → Open**, pick your Typhon (`example_typhon` if you used the
    command above).
@@ -298,7 +320,8 @@ it back shows a saved frame while the camera keeps streaming, so dragging to
 the end again is instant (see *The slider*). **Start capture** records;
 **Stop capture** comes back to live once the run's last frames are on disk,
 and for ten seconds the live line still says how the run went
-(`… · last run: 240 saved, raw 31.4 MB`). Only the **raw view** turns the
+(`… · last run: 240 saved, raw 31.4 MB`; a Basler's failed grabs too,
+`… · last run: 238 saved, 2 failed grabs`). Only the **raw view** turns the
 live view off — the camera goes quiet so it does not slow the raw reader
 down — and coming back to PNG brings it back. **Stop capture** while only
 live does nothing — there is nothing to stop. Exposure and gain are applied
@@ -405,6 +428,159 @@ On the emulator `AcquisitionFrameRate` stays **writable while grabbing**
 camera's rate is also limited by exposure and the CoaXPress link — the status
 line reports what the camera says it will reach.
 
+### Triggered capture
+
+Normally a run saves every frame from **Start** to **Stop**. To save
+pictures only at particular moments, choose **Capture** on the Basic tab
+(a frame camera only — an event camera's stream is never triggered here):
+
+- **Continuous** — every frame, as always. The default.
+- **Triggered: exact** — the camera takes a picture **only when the
+  trigger comes**. The timing is exact (it is the camera's own trigger).
+  Between triggers there is nothing new to show, so the picture stays on
+  the last capture.
+- **Triggered: snapshot** — the live view keeps running, and each trigger
+  saves **the next frame(s) that arrive after it**. Up to one frame late:
+  the first saved frame may have begun its exposure up to one frame period
+  before the trigger. Everything between triggers is shown but not saved.
+
+**From** says where the trigger comes from. Since the signal is not
+decided yet, every source Typhon can offer is there:
+
+- **Software** — the **Capture now (F9)** button, between Start and Stop,
+  or the **F9** key anywhere in Typhon (a popped-out picture too).
+- **Timer** — every **Timer every (s)** seconds (0.05 s to a day; type any
+  number into the box — it is applied when you press Return or leave the
+  box).
+- **The camera's own inputs**, as the camera lists them — `Line1`,
+  `Line2` … and, on a boost behind a CoaXPress card, `CxpTrigger0` — for
+  an **exact** run only. Which edge triggers, a delay, and the line's
+  debounce or input filter are rows of the **Capture** section (Exposure
+  tab), where the camera has them. A source the camera does not list, a
+  line Typhon cannot find among its lines, or a line that can only be an
+  output is **refused at Start, with why**, before anything stops. A line
+  set as an output that can be an input is made an input for the run and
+  put back after (Start says so).
+
+**Frames per trigger** (default 1) saves a short burst per trigger. From a
+hardware input that needs a camera with burst triggers (a boost or ace 2:
+`AcquisitionBurstFrameCount`); a camera without them is refused at Start.
+
+**Start arms, Stop disarms.** In an exact run, Start sets the camera's own
+trigger — FrameStart On from Software or the input, every other trigger
+Off — after the live view stops, and the run's camera record shows it as
+armed. Stop (and Disconnect) put **every** trigger back as it was — mode,
+source, edge, delay, the selector. A camera left armed by a crash is put
+right at the next Connect (pylon turns every trigger off when a camera is
+opened). The capture set-up is fixed while capturing, like the area, and
+the trigger rows are refused while a run has the trigger armed.
+
+**Nothing is lost silently.** A camera still busy with the last frame
+**ignores** a trigger — no error, no gap (measured on the emulator: 20
+triggers, 10 frames, nothing counted). So before each trigger it fires,
+Typhon asks the camera whether it is ready; one it could not fire is
+counted **missed (camera busy)**. A camera that cannot say whether it is
+ready is fired only once the frame of the last trigger has come. A fired
+trigger whose frame never comes is **no frame**; a snapshot trigger that
+comes before the last one's frames is **cut short**. A trigger is **ok**
+only when the run **holds** its frames: frames that came but were not
+saved (the save queue full because storage fell behind, or the recording
+stopped by a failed write) make it **not saved: storage too slow, 1 of 3
+frames** (or `recording stopped`), counted as missed. A frame that comes
+late — after its trigger's deadline (the exposure and a second), say from
+ExposureAuto lengthening the exposure — is still its own trigger's
+(`ok (late frame: it came 1.3 s after the trigger)`), never the next
+one's; where the camera numbers its frames, a frame whose number skips one
+says the one before was lost, not late. **Stop in the middle of a burst**
+ends it there: nothing more is exposed, Stop answers at once, and the
+trigger says **cut short by Stop: 5 of 300 fired** — not a miss. The live
+line says it all:
+
+`Armed — every 2 s, next in 1.4 s · 30 triggers · 29 ok · 1 MISSED (camera busy)`
+
+`Snapshot — live, saving 1 frame per Capture now (F9) · 4 triggers · 4 ok · 0 missed · 0 cut short`
+
+and Stop: `Stopped — 12 triggers, 12 ok · the camera counted 12 edges on
+Line1.` A trigger on a **hardware input** that the camera ignored never
+reaches Typhon at all; where the camera has an edge counter on that line
+(a boost or ace 2: `Counter1`), Typhon sets it for the run and Stop
+compares its count with the triggers seen — **unverified on hardware**.
+The count is taken **while the camera takes triggers**: from when it is
+first ready after Start to Stop, read before the stream stops, the
+camera's input then closed (its trigger source set to Software until Stop
+puts every trigger back) and the frames it had exposed let arrive. Before,
+it ran from arming to after the stream stopped, so a periodic signal
+always counted edges nothing could have triggered (a false "1 missed" in
+every run, 9 with a slow camera record). An edge at either end of the
+window, which the camera may or may not have taken, is never called
+missed, and a count that cannot cover the triggers seen is said as
+untrusted. The end record says the window (`edges_counted_between`).
+Without a counter Stop says the misses were **not counted**.
+
+Each trigger is a row of `<run>_capture_triggers.csv` (missed ones too),
+each saved frame says its trigger in the frames CSV, and the run's end
+record holds the counts (see *What a run writes*). File-number gaps
+between snapshot triggers are expected — those frames were never asked
+for — and the status line counts them `between triggers (not asked for)`,
+not `NOT saved`.
+
+### Downsample
+
+**Downsample** (Basic tab, beside FPS) saves smaller pictures: each 2 x 2,
+3 x 3 or 4 x 4 block of pixels becomes one, **averaged** — a quarter, a
+ninth or a sixteenth of the file. **Off is the default and never changes
+the data.** It is kept in presets and fixed while capturing.
+
+- **By the camera** where it can: binning in **Average** mode (on a boost,
+  its FPGA binning, `BinningSelector` Region1). The link carries less too,
+  so the camera may run faster. Binning restarts the live view for a
+  moment. The camera's area stays on the **same part of the sensor** (it is
+  rewritten in the binned pixels), the Binning rows are greyed while
+  Downsample owns them, and a preset keeps Downsample rather than them.
+  How the camera rounds its average is its own (the record says `rounding:
+  "the camera's"`).
+- **By Typhon** everywhere else (the simulated camera, a colour model
+  without binning, a camera whose binning can only **Sum**, and pylon's
+  emulator, which accepts binning and does nothing — Typhon checks the
+  picture really got smaller): each block is averaged before the frame is
+  saved and before it is shown, on the save queue's threads, never the
+  camera's. 16-bit safe, rounded half up (half a count at most from the
+  exact mean); a Mono12 frame stays 0..4095. The right and bottom pixels
+  that do not fill a block are left out (the record says how many). A
+  **raw Bayer** picture is refused at Start, before anything stops —
+  averaging neighbouring pixels would mix its colours; choose Mono or RGB.
+  A Sum-only binning is never used: the sum clips at the pixel format's
+  top, so divided back to brightness most of a bright picture came out
+  flat (on the test fake, 77% of a Mono12 picture more than a count off).
+
+**Typhon's binning never outlives Downsample.** Disconnect (and closing
+Typhon) put back the binning Downsample set, and the area with it — a
+Basler keeps its binning until it is powered off, so the next Connect would
+otherwise find a binned camera with Downsample Off. A camera that already
+bins when it is connected (its own Binning rows, or a session that crashed)
+is **said by Connect**, and Downsample Off then says the camera still bins
+rather than "every pixel". **Load camera defaults** resets the camera's
+binning: Downsample, which is Typhon's and kept as chosen, is made again
+from the camera as it is then, and the answer says so. And at Start the
+camera's binning is checked against Downsample once more: one that changed
+under Typhon turns Downsample Off for the run, said in Start's answer — a
+run is never recorded as binned while the camera sends full frames. A
+preset's own Binning rows (Downsample Off) are written after Downsample, so
+they are what the camera ends with.
+
+The Basic tab's **Downsample** and **Timer every (s)** boxes always show
+the camera's set-up — after a preset, a change in the Capture pop-out,
+Reset or a reconnect — and their tooltips say what they do. While
+Downsample is on, the live line before Start ends `· Downsample 2x`.
+
+The live picture is the picture the run saves, so the slider's saved frames,
+the live end, the crop box and a box drawn for the camera's area all agree;
+**Apply area** scales a box drawn on a Typhon-averaged picture back up to
+the camera's pixels. The frames CSV says each frame's `downsample` and
+`downsample_method`; the camera record and end record say the factor, the
+method and the picture's size. A script measuring on a saved frame can map
+a pixel back to the sensor with `council_core.reduce.sensor_position`.
+
 ### Settings → Python Scripts
 
 **Settings ▾** (top right) drops a menu; **Python Scripts** opens a window
@@ -456,6 +632,7 @@ side by side in the capture folder:
 | `<run>_events.raw` | **EVK4 only.** Every event the sensor sent, in Prophesee's own format — opens in Metavision Studio and Prophesee's tools. |
 | `<run>_camera.json` | **The run's camera record**: which camera, where on its sensor the pictures are, and how it was set at Start (below). |
 | `<run>_run_end.json` | **The run's end record**, written once when the recording ends (below). |
+| `<run>_capture_triggers.csv` | **A triggered run only** (*Triggered capture*): one row per trigger — `trigger`, `source`, `fired_at`, `first_frame_at` (seconds since 1970), `frames_asked`, `frames_arrived`, `failed_grabs`, `outcome` (`ok`, `missed: camera busy`, `no frame`, `failed grab`, `not saved: storage too slow, k of N frames` or `not saved: recording stopped, …`, `cut short: …`, `cut short by Stop: k of N fired`; a note in brackets says more, e.g. `ok (late frame: it came 1.3 s after the trigger)`). Created exclusively, never over a file. |
 
 The frames CSV's columns, read by name (new ones are only ever added at the
 end, so older runs read the same):
@@ -466,24 +643,50 @@ end, so older runs read the same):
 | `timestamp_us` | **the camera's own clock, as it gave it.** Microseconds for an event camera; for a Basler it is the grab's **tick count**, not microseconds (the tick's length depends on the model), and **0 on a boA5320**, which has no timestamp |
 | `raw_t_us`, `events`, `window_us` | event camera only: where the PNG falls in the `.raw`, how many events it holds, how long it collected them |
 | `grab_failures` | Basler only: a running count of the grabs that came back **failed** so far in this run (for example an incomplete frame on the CoaXPress link). Blank for an event camera or the simulated one, which report no failed grabs |
+| `trigger`, `trigger_frame`, `trigger_source` | a triggered run only: the trigger the frame was saved for (1, 2, 3 … — its row in `<run>_capture_triggers.csv`), which of its frames this is, and where it came from |
+| `trigger_time`, `arrived` | a triggered run only: when Typhon fired the trigger and when the frame reached Typhon, seconds since 1970. `trigger_time` is blank for the camera's own input — its moment is the camera's `timestamp_us` |
+| `frame_id` | the camera's own frame (block) number where it gives one; blank where it does not (pylon's emulator) |
+| `downsample`, `downsample_method` | Downsample on only: the factor, and `camera_binning_average` or `typhon_block_mean` |
 
-**A gap in the frame numbers is a frame not saved**, and there are two
+**A gap in the frame numbers is a frame not saved**, and there are three
 kinds: a frame the save queue had to skip because storage fell behind
-(`NOT saved (storage too slow)`), and a **failed grab** — an exposure the
-camera made and could not deliver. A failed grab uses up its frame number,
-so it shows as a gap, and `grab_failures` steps up on the next saved row.
+(`NOT saved (storage too slow)`); a **failed grab** — an exposure the
+camera made and could not deliver; and, in a **snapshot** run, the frames
+the live view showed **between triggers**, never asked for and so never
+offered for saving — expected, not a loss, and counted apart (the status
+line's `between triggers (not asked for)`, the end record's
+`frames_between_triggers`). A failed grab uses up its frame number, so it
+shows as a gap, and `grab_failures` steps up on the next saved row.
 
 **The end record** (`"format": "typhon-run-end"`) holds what only the end of
 a recording knows: `frames_saved`, `frames_not_saved` (`storage_too_slow`,
 and `write_failed`: a frame whose write failed and those queued behind it),
 `grab_failures` and `grab_attempts` (frames the recording was given plus
 failed grabs; `null` for a camera that reports no failed grabs),
-`first_index` and `last_index`, and `recording_failed` (empty, or the write
-that stopped the recording). Failed grabs **after the last saved frame**
+`first_index` and `last_index` (in a snapshot run their span also covers
+the frames between triggers, which are not among `grab_attempts`), and
+`recording_failed` (empty, or the write that stopped the recording) — and,
+for a **triggered** run, a `capture` block (its mode, source, frames per
+trigger, the triggers and what came of them — `missed` by kind, among
+them `not_saved`, and `cut_by_stop` — the frames between snapshot
+triggers, the camera's edge count where it gave one and between which
+moments it was counted, and which frames a trigger saved, in words), and
+with
+**Downsample** on, a `downsample` block. Failed grabs **after the last saved frame**
 have no CSV row to show them: they are counted only here. Like the camera
 record it is written whole and never over anything; a run from before it
 simply has none. (The Council's own Capture tab writes the same run files —
-frames, CSV, end record — into the folder you pick.)
+frames, CSV, end record — into the folder you pick. There a failed write
+**ends** the recording at once, the live view going on: its `NOT saved
+(recording stopped)` count is the frame that failed and any queued behind
+it, and **Record…** starts a new run — its status line counts afresh, so
+the old failure, its NOT-saved count and errors leave the line, and
+`saved` is that recording's own. The tab calls the screen's skipped
+frames `not drawn (screen only)`, as Typhon does. Its frames CSV, like
+every app's that saves through the same code (the Barbie apps too), has
+the columns of the table above: the trigger and Downsample ones are blank
+in a run that is neither triggered nor downsampled — the Capture tab's
+never are — and `frame_id` is filled for a Basler.)
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
@@ -513,6 +716,8 @@ the exposure, gain and FPS boxes are applied, before the run's first frame):
 | `app` | the app that ran it: window title, Designer project, the example it was built from, when it was last generated |
 | `software` | the Council's version, the source commit it runs from (read from its git folder, `""` in a build without one), the record writer's version, Python |
 | `host`, `written`, `at` | which PC, and when |
+| `capture` | a frame camera's capture set-up for the run (*Triggered capture*), the trigger Start armed and what arming changed, and the run's triggers CSV |
+| `downsample` | Downsample on only: the factor, the method, the picture's size and the edge pixels a block could not hold. With the camera's binning, `sensor` and `area` are in **binned** pixels, as the camera counts them |
 
 It is plain JSON (`"format": "typhon-camera-record"`), written whole to a
 temporary name and renamed into place, and **never written over**: a record
@@ -742,21 +947,30 @@ settings in the main window — no window to open for the everyday ones.
   camera tab was). Connecting again brings back the camera tab you last
   chose — Biases stays Biases across a reconnect — or, on a camera without
   it, that camera's first tab; Basic and Presets stay where they are.
-  - **EVK4**: **Biases** (`bias_diff_on`, `bias_diff_off`, `bias_fo`,
-    `bias_hpf`, `bias_refr`, each with the sensor's own range, and a green
-    bar under the slider marking the range the sensor **recommends**),
+  - **EVK4**: **Biases** (`bias_diff`, `bias_diff_off`, `bias_diff_on`,
+    `bias_fo`, `bias_hpf`, `bias_refr`, each with the sensor's own range —
+    as Typhon opens an EVK4 that IS the range the sensor **recommends**;
+    on a camera opened with the range-check bypass a green bar under the
+    slider marks the recommended part of a wider one),
     **Filters** (the event rate controller, anti-flicker, the event trail /
-    STC filter and the event rate activity filter, each a section of its
-    own), **Display** (below), **Camera** (its area, then the readings —
-    temperature, illumination, pixel dead time — and what it is: serial,
-    sensor, event format).
+    STC filter — its threshold in **whole milliseconds, 1 … 100 ms**, as
+    the sensor keeps it; a preset's threshold between two whole ms is
+    rounded as the sensor rounds it, a half up (3500 µs is 4 ms), and the
+    What-took box says it in ms — and the event rate activity filter, each a
+    section of its own), **Display** (below), **Camera** (its area, then
+    the readings — temperature, illumination, pixel dead time — and what it
+    is: serial, sensor, event format).
   - **Basler**: **Exposure** (exposure and auto exposure, gain and auto gain,
     black level, the frame-rate limit and the rate the camera will reach,
     and the trigger: mode, source, edge, delay), **Image** (pixel format,
     mirror X/Y, gamma, digital shift, binning and its mode), **Camera** (its
     area, and its temperature where the model reports one) — whichever of
     these nodes the model has.
-  - **Simulated cameras**: their small set, the same way.
+  - **Simulated cameras**: their small set, the same way. The simulated
+    event camera's biases are an IMX636's — all six, with OpenEB's ranges
+    (`cameras.IMX636_BIASES`, the one table the tests pin to OpenEB's
+    headers) — and it refuses a bias outside its range, and keeps its trail
+    threshold in whole ms, as an EVK4 does.
 - Last, **Presets** (below).
 
 A tab is a **glance and a quick change**: each section shows its category's
@@ -801,11 +1015,13 @@ forward. A pop-out opens **as wide as its rows** (the range and the ↺ beside
 each never need a sideways scroll), and cannot be made narrower than that.
 
 - Every setting of the category, with the **camera's own range and unit**
-  beside it (`-85 … 140`, and under it `rec. -85 … 140` for a bias), as the
-  camera reports them. An EVK4's HAL accepts a bias only inside its
+  beside it, as the camera reports them (a trail threshold in the ms its
+  row shows: `1 … 100 ms`). An EVK4's HAL accepts a bias only inside its
   recommended range unless the camera is opened with OpenEB's range-check
-  bypass, which Typhon does not do, so the two read the same; with the
-  bypass, `bias_diff_on` would read `-150 … 200` over `rec. -85 … 140`.
+  bypass, which Typhon does not do, so a bias's range is said once:
+  `-85 … 140` and under it `recommended, enforced` (its slider has no
+  recommended bar — the whole slider is). With the bypass, `bias_diff_on`
+  reads `-150 … 200` over `rec. -85 … 140`, and the bar marks that part.
 - **Live**: drag a bias and the live picture shows it as you drag, through
   the same 60 ms throttle — the camera is not sent a value per pixel of the
   drag.
@@ -966,7 +1182,9 @@ area** in sensor pixels, the **presets**, and **What the last change did**.
   clamped before it is sent (pylon refuses rather than clamps), the camera
   may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
   bias — the control shows the camera's value and the row says
-  `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
+  `The camera made it 5004 µs (asked 5003.7)` or `NOT changed — …` (an
+  EVK4's refusal in the HAL's own message, without the frame of dashes,
+  category and error code OpenEB puts around it).
 - A bias outside its **recommended** range says so under its row (on an
   EVK4, only one opened with the range-check bypass: otherwise the HAL
   accepts the recommended range only, and the slider ends there).
@@ -1093,7 +1311,9 @@ Basler's area change restarted the stream *into the same run*, leaving one
 run with frames of two sizes; an EVK4's `.raw` would change meaning
 halfway. Settings that change live — exposure, gain, an EVK4 bias, the FPS
 box — still apply mid-capture. Saving a preset only reads the camera, so it
-works while capturing too.
+works while capturing too. The **capture set-up** (Capture, From, frames
+per trigger, the timer, Downsample) is one per run as well: its boxes are
+greyed while capturing, though changing it never stops the stream.
 
 ### Reading the status line
 
@@ -1112,7 +1332,9 @@ works while capturing too.
 - **not drawn (screen only)** counts frames the *screen* did not redraw — the
   display shows about 30 a second, whatever the camera does. Normal and
   deliberate; **every one of them is still saved.** Only **NOT saved** means
-  frames missing from disk.
+  frames missing from disk. The Stop line says it in the same words (it
+  used to say `N dropped` for the same number), and so does the Council's
+  Capture tab.
 - **saved** is frames on disk. **waiting to save** appears when the disk is
   behind; **NOT saved (storage too slow)** counts frames it could not take at
   all.
@@ -1158,17 +1380,23 @@ source is `Software`). So:
   it with the change;
 - the live line says how long there has been no picture and which trigger
   it waits for (above);
-- **Start capture is refused** while a trigger waits for **Software** —
-  nothing in Typhon sends one, so the run would save nothing; with a
-  trigger on an **input line** the run starts, says which trigger it waits
-  for, and after Stop says `Stopped — the camera waited for a trigger on
-  Line1 all run.` if none came;
+- in a **Continuous** (or snapshot) run, **Start capture is refused** while
+  a trigger waits for **Software** — such a run sends none, so it would
+  save nothing; the refusal says to choose **Capture: Triggered: exact**,
+  where Typhon arms the trigger itself and fires it (*Triggered capture*).
+  With a trigger on an **input line** the run starts, says which trigger
+  it waits for, and after Stop says `Stopped — the camera waited for a
+  trigger on Line1 all run.` if none came;
 - a Basler has **one trigger per TriggerSelector entry** (nine on the
   emulator: FrameStart, FrameBurstStart, …), and the rows show the
   **selected** one only. Every trigger counts above — a FrameBurstStart
   left On while the selector shows FrameStart is named — and **Reset Trigger
-  (as connected)** / **Reset all** put **every** trigger's mode back as
-  connected, saying which (`the FrameBurstStart trigger Off again`). A preset
+  (as connected)** / **Reset all** put **every** trigger back as connected
+  — its mode, source, edge and delay, the mode last — put the **selector**
+  back on the entry it showed when the camera was connected (it is a
+  setting like the others; putting the triggers back does not move it
+  again), and say which (`the FrameBurstStart trigger Off again (its
+  source Software and edge RisingEdge too)`). A preset
   keeps **every** trigger's mode, source, edge and delay: the selected
   trigger's under the rows' own names, the others' as
   `TriggerMode[FrameBurstStart]` and so on. Applying it puts each trigger

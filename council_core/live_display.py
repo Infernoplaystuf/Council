@@ -30,6 +30,12 @@ the window measured 1.6 ms; decimating would save little and would put the
 picture in different pixels from the frame — and a box drawn on it must be
 in the frame's own pixels (frame_camera.set_area adds the camera area's
 origin and nothing else).
+
+EXCEPT WHAT THE RUN SAVES SMALLER. With Downsample made by Typhon (the
+frame says "reduce", council_core.reduce), the live picture is averaged
+exactly as the saved PNG is — on this module's thread pool, in row bands
+— so the live picture, the slider's saved frames and a box drawn on
+either are one geometry (frame_camera.set_area scales the box back up).
 """
 from __future__ import annotations
 
@@ -87,11 +93,18 @@ class DisplayPrep:
         self._format = None
         self._pool.clear()
 
-    def __call__(self, image: Any, fmt: Any = None) -> Any:
+    def __call__(self, image: Any, fmt: Any = None, meta: Any = None) -> Any:
         np = _numpy()
         data = image
         if data is None:
             return None
+        if meta and meta.get("reduce"):
+            from . import reduce
+
+            try:
+                data = reduce.prepared(data, meta, pool=_executor())
+            except ValueError:
+                pass            # a Bayer picture is shown as it came
         kind = (fmt, data.dtype.str, data.ndim)
         if kind != self._format:
             self._format = kind

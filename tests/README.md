@@ -130,3 +130,37 @@ python child `subprocess.Popen` starts out of the guard's reach gets a line
 there - `a python child without the guard (started with -I): <command
 line>`, and the line that started it - which fails nothing, but shows which
 children only their own fences and code review vouch for.
+
+## Cameras
+
+The Typhon and camera tests run in the council env, which has neither
+camera SDK, and in the `pylon` env, which has pypylon (and OpenEB on the
+path): there they run in ONE process with `PYLON_CAMEMU=2`, which puts two
+emulated Baslers at the TOP of every camera list. So:
+
+- **A test means the simulated camera: it picks it by name** -
+  `tests/sim_cameras.py`'s `simulated_row(rows, kind)` /
+  `simulated_index(rows, kind)` (its row says "Simulated"), never "the
+  first row ending in frame", which is an emulated Basler there
+  (`'BaslerDevice' object has no attribute 'state'`).
+- **A test of a PC without an SDK hides them**: `without_camera_sdks(
+  monkeypatch)` makes `pypylon` and `metavision_hal` unimportable for that
+  test, whatever is installed.
+- **Only the emulator's own tests set `PYLON_CAMEMU`**, per test, in an
+  autouse fixture (`tests/test_basler_real.py`, `tests/test_basler_scan.py`)
+  - never at import, where it stayed set for the whole process. pylon reads
+  it at every enumeration (measured), so that is enough.
+- `council_qt.tabs` imports its tabs when its registry is first asked for,
+  so `tests/test_capture_tab.py` collects where matplotlib (the Grapher's)
+  is not installed - the pylon env.
+- **Triggered capture and Downsample** are tested at three levels: the
+  books alone (`test_triggered.py`, `test_reduce.py`), a **fake Basler**
+  (`test_basler_trigger.py`: per-selector triggers, input lines, a counter,
+  burst triggers and binning that really shrinks the picture - what the
+  emulator cannot show; it patches `cameras.backends`, so it never sees an
+  emulated camera), and the **emulator** (`test_basler_real.py`: software
+  triggers, the timer, snapshot, a forced failed grab, Downsample falling
+  back to Typhon's average). A built Typhon is driven in
+  `test_typhon_capture.py`. Wait helpers there ask a condition once per
+  step and never again after it came true: a condition that TAKES a frame
+  (`frame_camera.latest`) asked twice loses it.

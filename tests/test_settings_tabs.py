@@ -44,6 +44,7 @@ from council_core import camera_presets, camera_settings, cameras
 from council_qt.widgets import camera_settings_window as csw
 from council_qt.widgets import settings_tabs as st
 from tests import fake_evk4
+from tests.sim_cameras import is_simulated
 
 GENERATED = ("app", "handlers", "ui", "ui.main_ui", "ui.ports", "ui.widgets")
 
@@ -112,11 +113,15 @@ def pump(seconds=0.2, until=None):
 
 
 def connect(ui, which):
-    """Scan, pick the row ending in `which` (or holding it), Connect."""
+    """Scan, pick a row, Connect: "frame" or "event" is the SIMULATED
+    camera of that kind, by name (in the pylon env, PYLON_CAMEMU, the
+    first "frame" row is an emulated Basler); anything else is the row
+    holding it (a serial)."""
     ui.on_btn_scan_for_cameras()
     rows = ui.ports.cameras.items()
     index = next(i for i, r in enumerate(rows)
-                 if r.endswith(which) or which in r)
+                 if (is_simulated(r, which) if which in ("frame", "event")
+                     else which in r))
     ui.ports.cameras.widget.setCurrentRow(index)
     ui.on_btn_connect()
     assert ui.ports.capture_status.get().startswith("Connected"), \
@@ -324,11 +329,19 @@ def test_an_evk4_fills_the_tabs_with_every_facility(clean, typhon_dir,
         assert row.compact and row.slider is not None
     on = tabs.rows["bias.bias_diff_on"]
     # What the HAL accepts (the recommended range, without the bypass) —
-    # OpenEB's IMX636 table; the fake's "-25 … 60" was invented.
+    # OpenEB's IMX636 table; the fake's "-25 … 60" was invented. Said ONCE:
+    # the pop-out read "-85 … 140 / rec. -85 … 140" and the tooltip gave
+    # the same range twice, with a recommended bar from end to end.
     assert (on.editor.minimum(), on.editor.maximum()) == (-85, 140)
-    assert "Recommended: -85 … 140" in on.label.toolTip()
-    assert tabs.pop_out("Biases").rows["bias.bias_diff_on"].range_label \
-        .text() == "-85 … 140\nrec. -85 … 140"
+    tip = on.label.toolTip()
+    assert ("Allowed: -85 … 140 — the recommended range, which this camera "
+            "enforces") in tip, tip
+    assert "Recommended:" not in tip, tip
+    popped = tabs.pop_out("Biases").rows["bias.bias_diff_on"]
+    assert popped.range_label.text() == "-85 … 140\nrecommended, enforced"
+    assert "which this camera enforces" in popped.range_label.toolTip()
+    assert popped.slider.recommended is None, "a bar end to end marks nothing"
+    assert on.slider.recommended is None
     assert set(tabs.pop_buttons) == {
         "Biases", "Event rate controller", "Anti-flicker",
         "Event trail filter", "Event rate activity filter", "Display",
@@ -342,8 +355,12 @@ def test_an_evk4_fills_the_tabs_with_every_facility(clean, typhon_dir,
     assert not ui.ports.gain.widget.isEnabled()
     assert ui.ports.frame_rate.widget.isEnabled()
     note = ui.ports.settings_note.get()
-    assert "IMX636" in note and "Biases, Filters, Display" in note
-    assert "No exposure or gain" in note
+    # One line (the note is one row under the capture boxes: it was cut
+    # off naming the camera and every tab), still saying what the greyed
+    # boxes cannot do here — the tabs and the camera's name are in view.
+    assert note == st.NOTE_EVENT
+    assert "no exposure, gain or trigger" in note
+    assert "FPS: its picture window" in note
     # Disconnected: back to the boxes and "connect".
     ui.on_btn_disconnect()
     assert tabs.titles() == ["Basic", "Camera", "Presets"]
@@ -794,6 +811,62 @@ def test_a_pop_out_shows_each_settings_range_and_a_bias_its_recommended_one(
         assert 0.70 * width < marked[-1] < 0.92 * width, (marked[-1], width)
 
 
+def test_the_trail_threshold_steps_and_reads_in_whole_ms(clean, typhon_dir,
+                                                         evk4):
+    """The IMX636 keeps the trail filter's threshold in whole milliseconds,
+    1-100 ms (OpenEB rounds what it is given). Its row stepped by 1 µs over
+    1-100000: 99,001 slider positions, a box in µs, and a drag said values
+    no sensor holds. It steps by 1 ms and reads in ms now, in the tab and
+    the pop-out; the camera is still asked in µs, its own unit."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    row = tabs.rows["trail.threshold"]
+    window = tabs.pop_out("Event trail filter")
+    popped = window.rows["trail.threshold"]
+    for each in (row, popped):
+        assert isinstance(each.editor, QSpinBox)
+        assert (each.editor.minimum(), each.editor.maximum(),
+                each.editor.singleStep()) == (1, 100, 1)
+        assert each.editor.suffix() == " ms" and each.editor.value() == 10
+        assert each.scale.exact and each.scale.steps == 99
+        assert "Allowed: 1 … 100 ms" in each.label.toolTip()
+    assert popped.range_label.text() == "1 … 100 ms"
+    # One slider step is one millisecond on the camera.
+    popped.slider.setValue(popped.slider.value() + 1)
+    window.flush_now()
+    assert evk4.trail.get_threshold() == 11_000
+    assert popped.editor.value() == 11
+    assert window.status.text() == "Threshold: 11 ms", window.status.text()
+    # Typed in ms, written in µs.
+    row.editor.setValue(25)
+    tabs.flush_now()
+    assert evk4.trail.get_threshold() == 25_000
+    pump(0.1)
+    assert row.editor.value() == 25 and popped.editor.value() == 25
+    assert popped.slider.value() == popped.scale.position(25_000)
+
+
+def test_a_set_that_moved_the_threshold_says_it_in_ms_in_the_tabs(
+        clean, typhon_dir, evk4):
+    """A set (a preset made by an older Typhon on the fake EVK4, which then
+    kept any µs) holding 8706 µs: the tabs' status line said "≈ Threshold:
+    9000 (asked 8706)" — the What-took box's first problem — beside a row
+    reading 9 ms. It says it as the row does now, in ms; and so does the
+    reset button's tip ("Back to 10", beside a box in ms)."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    row = tabs.rows["trail.threshold"]
+    frame_camera.apply_camera_settings({"trail.threshold": 8706})
+    pump(0.1)
+    assert evk4.trail.get_threshold() == 9000
+    said = tabs.said
+    assert "≈ Threshold: 9 ms (asked 8.706)" in said, said
+    assert row.editor.value() == 9
+    assert row.reset_button.toolTip().startswith("Back to 10 ms — ")
+
+
 def test_the_tabs_move_the_boxes_beside_start_and_start_keeps_quiet(
         clean, typhon_dir, evk4, tmp_path):
     """The other way round (review): Exposure 12000 typed in the Basic box,
@@ -1213,9 +1286,10 @@ def test_the_wheel_scrolls_a_tab_and_never_changes_what_it_passes_over(
         clean, typhon_dir, evk4):
     """MEASURED (review, 2026-10-08): at 1400 x 820 the Filters tab has to
     be scrolled, and wheeling over the middle of it moved a slider instead —
-    the trail filter's threshold went 10000 -> 8706 µs on the camera and
-    the page did not move. A slider, a box or a list under the pointer now
-    takes the wheel only once it has been clicked (focus)."""
+    the trail filter's threshold went 10000 -> 8706 µs on the fake EVK4
+    (which then kept any µs; a real IMX636 keeps whole ms) and the page did
+    not move. A slider, a box or a list under the pointer now takes the
+    wheel only once it has been clicked (focus)."""
     from PySide6.QtCore import QPoint
     from PySide6.QtWidgets import QScrollArea
 

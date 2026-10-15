@@ -477,8 +477,11 @@ class CaptureReviewer(QObject):
 
         if self.live and self.mode == PNG and frame is not None:
             # No copy: see council_core.live_display for why it is safe.
-            fmt = (getattr(frame, "meta", None) or {}).get("format")
-            self.canvas.set_array(self.prep(frame.image, fmt), copy=False)
+            # Downsampled by Typhon as the run saves it (the frame's meta
+            # says so), so live and saved frames are one geometry.
+            meta = getattr(frame, "meta", None) or {}
+            self.canvas.set_array(self.prep(frame.image, meta.get("format"),
+                                            meta=meta), copy=False)
             self._shown = None
             return True
         return False

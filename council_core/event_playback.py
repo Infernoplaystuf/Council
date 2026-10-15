@@ -251,7 +251,10 @@ class RawPlayback:
             try:
                 device = hal.DeviceDiscovery.open_raw_file(str(self.path), config)
             except Exception as exc:                        # noqa: BLE001
-                raise RawUnavailable(f"cannot open {self.path.name}: {exc}") from exc
+                # OpenEB's text is a block of dashes around the message.
+                raise RawUnavailable(
+                    f"cannot open {self.path.name}: "
+                    f"{cameras.said_plainly(str(exc)).strip()}") from exc
             if device is None:
                 raise RawUnavailable(f"cannot open {self.path.name}")
             geometry = device.get_i_geometry()

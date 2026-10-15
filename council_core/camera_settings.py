@@ -69,7 +69,8 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
 
 from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
                       EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
-                      Roi, _ask, _interface, fit_roi, off_sensor, on_sensor)
+                      Roi, _ask, _interface, fit_roi, nearest_whole,
+                      off_sensor, on_sensor, said_plainly)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "Trigger", "trigger_warning", "area_unchanged",
@@ -129,11 +130,34 @@ class Setting:
     #: "": a Basler's TriggerMode On means no frame until a trigger arrives,
     #: which froze the live view with no word said (trigger_warning).
     warning: str = ""
+    #: The unit a person is SHOWN it in, when not `unit`, and how many of
+    #: `unit` make one of it. A trail filter's threshold is µs to the HAL
+    #: and in a preset, but the sensor keeps whole milliseconds: it steps
+    #: by 1000 µs and is shown in ms ("ms", 1000). The value, its range and
+    #: its step stay in `unit`; only what is shown is divided.
+    shown_unit: str = ""
+    shown_per: float = 1.0
+    #: Chosen before a run and FIXED WHILE CAPTURING, though writing it
+    #: never needs the stream stopped: the capture set-up (Continuous or a
+    #: trigger, its source, Downsample — council_core.triggered). One run
+    #: keeps one set-up, so its frames all mean the same thing.
+    per_run: bool = False
+    #: The key of the setting that SETS this one now, or "": a Basler's
+    #: binning while Downsample bins the camera (save.downsample). A preset
+    #: keeps the owner, not this — applied, the owner sets it again (and
+    #: puts it back as it was when it goes Off).
+    owned_by: str = ""
 
     @property
     def savable(self) -> bool:
         """Belongs in a preset: something the user chose, not a reading."""
-        return not self.read_only and self.kind != TEXT
+        return not self.read_only and self.kind != TEXT and not self.owned_by
+
+    def shown(self) -> Tuple[str, float]:
+        """(the unit a person sees this in, how many of `unit` to one)."""
+        if self.shown_unit:
+            return self.shown_unit, float(self.shown_per or 1.0)
+        return self.unit, 1.0
 
     def as_dict(self) -> Dict[str, Any]:
         """Plain data, for a window or a JSON file."""
@@ -141,9 +165,11 @@ class Setting:
                 "type": self.kind, "value": self.value,
                 "min": self.minimum, "max": self.maximum, "step": self.step,
                 "choices": list(self.choices), "unit": self.unit,
+                "shown_unit": self.shown_unit, "shown_per": self.shown_per,
                 "read_only": self.read_only, "live": self.live,
                 "held": self.held, "warning": self.warning,
-                "help": self.help,
+                "help": self.help, "per_run": self.per_run,
+                "owned_by": self.owned_by,
                 "recommended": (list(self.recommended)
                                 if self.recommended else None)}
 
@@ -169,16 +195,25 @@ class Change:
         """Took, but not exactly as asked (clamped or snapped)."""
         return self.ok and not self.skipped and not same(self.asked, self.value)
 
-    def line(self, label: str = "", unit: str = "") -> str:
+    def line(self, label: str = "", unit: str = "", per: float = 1.0) -> str:
         """One line for a status bar or a list — said by `label`, the name
         on the setting's row, with its `unit`, when given. The key alone
         ("window_ms: 99.901", "PixelFormat: Mono12") was what every tab's
         and pop-out's status line said under a row called "Picture window"
-        or "Pixel format"."""
+        or "Pixel format". `per`: how many of the value's own unit make one
+        of `unit` (Setting.shown) — a trail threshold of 10000 µs is said
+        "10 ms", as its row shows it."""
         name = label or self.key
+        per = float(per or 1.0)
+
+        def number(value: Any) -> Any:
+            if per != 1.0 and isinstance(value, (int, float)) \
+                    and not isinstance(value, bool):
+                return value / per
+            return value
 
         def said(value: Any) -> str:
-            text = show(value)
+            text = show(number(value))
             numeric = isinstance(value, (int, float)) and not isinstance(
                 value, bool)
             return f"{text} {unit}" if unit and numeric else text
@@ -190,7 +225,7 @@ class Change:
         if self.adjusted:
             why = f" ({self.note})" if self.note else ""
             return (f"{name}: {said(self.value)}, asked "
-                    f"{show(self.asked)}{why}")
+                    f"{show(number(self.asked))}{why}")
         return f"{name}: {said(self.value)}"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -302,13 +337,15 @@ class Trigger:
     MEASURED on pylon's emulator: TriggerMode On (its source is Software by
     default) stopped the frames at once; the live line kept its last
     "62.5 fps", and a 4 s capture saved nothing, with no word on why.
-    Nothing in this app sends a software trigger."""
+    Typhon sends a software trigger only in a "Triggered: exact" run,
+    which arms the trigger itself (council_core.triggered) — never for a
+    trigger left On in the rows."""
     selector: str
     source: str
 
     @property
     def software(self) -> bool:
-        """Only a program can fire it — and nothing here does."""
+        """Only a program can fire it — and only a triggered run does."""
         return self.source.strip().lower().startswith("software")
 
     def said(self) -> str:
@@ -350,7 +387,8 @@ def trigger_warning(source: str) -> str:
     """Under a TriggerMode row that is On: what that does to the picture."""
     if Trigger("", source).software:
         return ("No picture: it waits for a software trigger, and nothing "
-                "here sends one — set it Off")
+                "here sends one in the live view — set it Off (to capture "
+                "on a trigger, choose Capture: Triggered: exact)")
     return (f"No picture until a trigger arrives on {source or 'its source'}")
 
 
@@ -408,18 +446,41 @@ def coerce(setting: Setting, value: Any) -> Tuple[Any, str]:
             raise SettingError(f"{setting.label} must be a finite number")
         note = ""
         low, high = setting.minimum, setting.maximum
+        shown_unit, per = setting.shown()
+
+        def bound(value: Any) -> str:
+            # In the unit the row SHOWS: "Threshold: 1 ms, asked 0.5
+            # (clamped to the minimum, 1000)" gave it in µs, in an ms line.
+            if per != 1.0:
+                return f"{show(float(value) / per)} {shown_unit}".rstrip()
+            return show(value)
+
         if low is not None and number < low:
-            number, note = float(low), f"clamped to the minimum, {show(low)}"
+            number, note = float(low), f"clamped to the minimum, {bound(low)}"
         if high is not None and number > high:
-            number, note = float(high), f"clamped to the maximum, {show(high)}"
+            number, note = (float(high),
+                            f"clamped to the maximum, {bound(high)}")
         if kind == INT:
             step = int(setting.step or 1)
-            base = int(low) if low is not None else 0
-            snapped = base + int(round((number - base) / step)) * step
+            # Stepped by one whole unit of what it is shown in (a trail
+            # threshold: whole ms, in µs): snapped AS THE SENSOR ROUNDS IT,
+            # from zero and a half away from zero (cameras.nearest_whole,
+            # OpenEB's std::roundf). round() from the minimum took 3500 µs
+            # to 3 ms where an IMX636 keeps 4. A Basler's integer node keeps
+            # this snap: from its minimum, by its increment.
+            whole = per != 1.0 and step == per
+            if whole:
+                snapped = nearest_whole(number / step) * step
+            else:
+                base = int(low) if low is not None else 0
+                snapped = base + int(round((number - base) / step)) * step
             if high is not None and snapped > high:
                 snapped -= step
+            if whole and low is not None and snapped < low:
+                snapped += step
             if snapped != number and not note:
-                note = f"snapped to a multiple of {step}"
+                note = (f"snapped to whole {shown_unit}" if whole
+                        else f"snapped to a multiple of {step}")
             return int(snapped), note
         return float(number), note
     raise SettingError(f"{setting.label} cannot be set")
@@ -494,14 +555,12 @@ class Provider:
         EVK4 here, the simulated cameras): it runs free."""
         return []
 
-    def trigger_modes(self) -> Dict[str, str]:
-        """Each trigger's mode by its selector entry ({"FrameStart": "Off",
-        "FrameBurstStart": "On", ...}); {} with none to report."""
-        return {}
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
-        """Put each trigger's mode back as `modes` has it (trigger_modes, as
-        connected); what was changed, one line each."""
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """Put EVERY trigger back as `values` has it — trigger_settings(
+        selected=True), read when the camera was connected: each one's
+        source, edge and delay, then its mode, the selector left where it
+        was. What changed or could not be put back, one line per trigger.
+        [] for a camera with no triggers."""
         return []
 
     def trigger_settings(self, selected: bool = False) -> Dict[str, Any]:
@@ -618,7 +677,10 @@ class NoSettings(Provider):
 
 
 def _why(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    # An OpenEB exception's text is a block — rules of dashes, the
+    # category, "Error <code>: " (cameras.said_plainly): its message alone,
+    # or a row's one-line "NOT changed —" note was a run of dashes.
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     # GenICam exceptions carry a file/line tail nobody needs to read.
     return text.split(" : ")[0][:200]
 
@@ -998,10 +1060,16 @@ class BaslerSettings(Provider):
             setting = self._describe_one(feature, streaming)
             if setting is not None:
                 out.append(setting)
+        # The capture set-up last (council_core.triggered): Typhon's own,
+        # read from the device, not the node map — but its Downsample is
+        # written BEFORE the area by plan().
+        out.extend(self._capture_rows())
         return out
 
     def describe_groups(self, groups: Iterable[str]) -> List[Setting]:
         """The nodes of `groups` only — not the whole table."""
+        from . import triggered
+
         wanted = set(groups)
         streaming = self._streaming()
         out = []
@@ -1011,19 +1079,55 @@ class BaslerSettings(Provider):
             setting = self._describe_one(feature, streaming)
             if setting is not None:
                 out.append(setting)
+        if triggered.GROUP in wanted:
+            out.extend(self._capture_rows())
         return out
 
     def find(self, key: str) -> Setting:
         """ONE feature's nodes, not the whole table: a settings window
         writes one setting per step of a slider, and each write looks its
         setting up first."""
+        from . import triggered
+
+        if triggered.is_capture_key(key):
+            for setting in self._capture_rows():
+                if setting.key == key:
+                    return setting
+            raise SettingError(f"this camera has no setting called {key!r}")
         setting = self._describe_one(self._feature(key), self._streaming())
         if setting is None:
             raise SettingError(f"this camera has no setting called {key!r}")
         return setting
 
+    def _capture_rows(self) -> List[Setting]:
+        from . import triggered
+
+        setup = getattr(self.device, "capture", None)
+        if setup is None:
+            return []
+        return triggered.capture_settings(setup, self.capture_options())
+
+    def _downsample_owns_binning(self, batch: Mapping[str, Any]) -> str:
+        """'"Downsample" is 2x' while Typhon's Downsample bins the camera
+        (and the set being written does not turn it Off), else ""."""
+        from . import triggered
+
+        dev = self.device
+        if not str(getattr(dev, "downsample_method", "")).startswith(
+                "camera"):
+            return ""
+        factor = getattr(getattr(dev, "capture", None), "downsample", 1)
+        if triggered.DOWNSAMPLE_KEY in batch:
+            try:
+                factor = triggered.factor_of(batch[triggered.DOWNSAMPLE_KEY])
+            except ValueError:
+                pass
+        return f'"Downsample" is {factor}x' if int(factor) > 1 else ""
+
     def _describe_one(self, feature: _Feature,
                       streaming: bool) -> Optional[Setting]:
+        from . import triggered
+
         found = self._resolve(feature)
         if found is None:
             return None
@@ -1031,6 +1135,14 @@ class BaslerSettings(Provider):
         setting = _node_setting(feature, name, node)
         if setting is None:
             return None
+        if feature.group == "Binning":
+            owner = self._downsample_owns_binning({})
+            if owner:
+                # Typhon's Downsample set it: greyed with the reason, and
+                # left out of a preset (which keeps Downsample instead).
+                return replace(setting, held=owner,
+                               owned_by=triggered.DOWNSAMPLE_KEY,
+                               live=not streaming or _writable(node))
         held = self.held_by(setting, {})
         if feature.read_only or setting.kind == TEXT:
             setting = replace(setting, read_only=True)
@@ -1054,6 +1166,11 @@ class BaslerSettings(Provider):
         return setting
 
     def read(self, key: str) -> Any:
+        from . import triggered
+
+        if triggered.is_capture_key(key):
+            return triggered.read_capture(self.device.capture,
+                                          self.capture_options(), key)
         found = self._resolve(self._feature(key))
         if found is None:
             raise SettingError(f"this camera has no {key}")
@@ -1066,7 +1183,20 @@ class BaslerSettings(Provider):
         trigger's does in apply_triggers. The rows keep the mode under the
         selector; written in that order, applying a preset turned the
         selected trigger On while its source and edge were still the old
-        ones (measured on the test fake's write log)."""
+        ones (measured on the test fake's write log).
+
+        DOWNSAMPLE BEFORE THE BINNING ROWS, AND SO BEFORE THE AREA. It may
+        bin the camera, which changes the area's pixels: a preset's area is
+        in the pixels its Downsample made, so it is written after Downsample,
+        not before. And Downsample Off puts back the binning Typhon set
+        (BaslerDevice._restore_binning) — written AFTER a set's own Binning
+        rows, that undid them: a preset holding the user's own 2 x 2 binning,
+        applied while Downsample binned the camera, ended 1 x 1 with its
+        area on a quarter of the sensor, and said "applied" (review, on the
+        test fake). Before them, the set's own binning is written last; and
+        Reset as connected keeps the area, carried over by the restore."""
+        from . import triggered
+
         out = super().plan(keys, described, with_roi)
         if "TriggerMode" in out:
             at = out.index("TriggerMode")
@@ -1074,6 +1204,13 @@ class BaslerSettings(Provider):
                       if k in TRIGGER_FEATURES and k != "TriggerMode"]
             if before and before[-1] > at:
                 out.insert(before[-1], out.pop(at))
+        if triggered.DOWNSAMPLE_KEY in out:
+            at = out.index(triggered.DOWNSAMPLE_KEY)
+            key = out.pop(at)
+            binning = {s.key for s in described if s.group == "Binning"}
+            spot = next((i for i, k in enumerate(out)
+                         if k is None or k in binning), None)
+            out.insert(at if spot is None or spot > at else spot, key)
         return out
 
     # -- triggers ------------------------------------------------------------
@@ -1117,25 +1254,31 @@ class BaslerSettings(Provider):
         mode = self.device._node("TriggerMode")
         if mode is None or not _readable(mode):
             return
-        source = self.device._node("TriggerSource")
-        selector, was, entries = self._selector()
-        if len(entries) < 2 or not _writable(selector):
-            visit(was, mode, source)
-            return
-        try:
-            for entry in entries:
-                try:
-                    if entry != str(_plain(selector.GetValue())):
-                        selector.SetValue(entry)
-                except Exception:                           # noqa: BLE001
-                    continue            # an entry this model cannot select
-                visit(entry, mode, source)
-        finally:
+        # UNDER THE DEVICE'S TRIGGER LOCK: a run armed to fire software
+        # triggers fires with the same lock held, so the selector is never
+        # moved away from the armed trigger at the moment one is fired — a
+        # trigger fired with the selector on another entry is lost with no
+        # error (measured on the emulator: 0 frames).
+        with _trigger_lock(self.device):
+            source = self.device._node("TriggerSource")
+            selector, was, entries = self._selector()
+            if len(entries) < 2 or not _writable(selector):
+                visit(was, mode, source)
+                return
             try:
-                if str(_plain(selector.GetValue())) != was:
-                    selector.SetValue(was)
-            except Exception:                               # noqa: BLE001
-                pass
+                for entry in entries:
+                    try:
+                        if entry != str(_plain(selector.GetValue())):
+                            selector.SetValue(entry)
+                    except Exception:                       # noqa: BLE001
+                        continue        # an entry this model cannot select
+                    visit(entry, mode, source)
+            finally:
+                try:
+                    if str(_plain(selector.GetValue())) != was:
+                        selector.SetValue(was)
+                except Exception:                           # noqa: BLE001
+                    pass
 
     def triggers_on(self) -> List[Trigger]:
         found: List[Trigger] = []
@@ -1152,34 +1295,59 @@ class BaslerSettings(Provider):
         self._each_trigger(visit)
         return found
 
-    def trigger_modes(self) -> Dict[str, str]:
-        modes: Dict[str, str] = {}
+    def restore_triggers(self, values: Mapping[str, Any]) -> List[str]:
+        """EVERY TRIGGER BACK AS CONNECTED, NOT ONLY ITS MODE. A Basler
+        holds a source, an edge and a delay per TriggerSelector entry as
+        well as a mode (measured on the emulator: each changed alone), and
+        "Reset as connected" put back the modes only — a FrameBurstStart
+        trigger moved to Line1 on the falling edge stayed there.
 
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            try:
-                modes[entry] = str(_plain(mode.GetValue()))
-            except Exception:                               # noqa: BLE001
-                pass
-        self._each_trigger(visit)
-        return modes
-
-    def restore_trigger_modes(self, modes: Mapping[str, str]) -> List[str]:
+        Written by apply_triggers: each trigger selected in turn, its
+        source, edge and delay before its mode, a value it already has not
+        written again, and the selector put back where it was. Read first
+        (trigger_settings), so what CHANGED is said: "the FrameBurstStart
+        trigger Off again (its source Software and edge RisingEdge too)"."""
+        if not values:
+            return []
+        try:
+            before = self.trigger_settings(selected=True)
+        except Exception:                                   # noqa: BLE001
+            before = {}
+        words = {"TriggerMode": "mode", "TriggerSource": "source",
+                 "TriggerActivation": "edge", "TriggerDelay": "delay"}
+        changed: Dict[str, Dict[str, Any]] = {}
+        refused: List[str] = []
+        for change in self.apply_triggers(values):
+            split = split_trigger_key(change.key)
+            if split is None:
+                continue
+            base, entry = split
+            if not change.ok:
+                refused.append(f"the {entry} trigger's {words[base]} NOT put "
+                               f"back to {show(change.asked)} — "
+                               f"{change.note}")
+            elif change.key not in before or not same(before[change.key],
+                                                      change.value):
+                changed.setdefault(entry, {})[base] = change.value
         done: List[str] = []
-
-        def visit(entry: str, mode: Any, _source: Any) -> None:
-            wanted = modes.get(entry)
-            if wanted is None:
-                return
-            try:
-                if str(_plain(mode.GetValue())) == wanted:
-                    return
-                mode.SetValue(wanted)
-                done.append(f"the {entry or 'camera'} trigger {wanted} again")
-            except Exception as exc:                        # noqa: BLE001
-                done.append(f"the {entry or 'camera'} trigger NOT put back "
-                            f"to {wanted} — {_why(exc)}")
-        self._each_trigger(visit)
-        return done
+        for entry, now in changed.items():
+            parts = []
+            for base in ("TriggerSource", "TriggerActivation",
+                         "TriggerDelay"):
+                word = words[base]
+                if base in now:
+                    unit = " µs" if base == "TriggerDelay" else ""
+                    parts.append(f"{word} {show(now[base])}{unit}")
+            said = (", ".join(parts[:-1]) + " and " + parts[-1]
+                    if len(parts) > 1 else "".join(parts))
+            if "TriggerMode" in now:
+                line = f"the {entry} trigger {show(now['TriggerMode'])} again"
+                if said:
+                    line += f" (its {said} too)"
+            else:
+                line = f"the {entry} trigger's {said} again"
+            done.append(line)
+        return done + refused
 
     def _selected_trigger(self) -> str:
         selector = self.device._node("TriggerSelector")
@@ -1284,7 +1452,15 @@ class BaslerSettings(Provider):
         return replace(change, key=key)
 
     def held_by(self, setting: Setting, batch: Mapping[str, Any]) -> str:
+        from . import triggered
+
+        if triggered.is_capture_key(setting.key):
+            return ""
         feature = self._feature(setting.key)
+        if feature.group == "Binning":
+            owner = self._downsample_owns_binning(batch)
+            if owner:
+                return owner
         if feature.depends is None:
             return ""
         other, needed = feature.depends
@@ -1307,6 +1483,17 @@ class BaslerSettings(Provider):
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:
+        from . import triggered
+
+        if triggered.is_capture_key(setting.key):
+            if setting.key == triggered.DOWNSAMPLE_KEY:
+                # The camera's binning (or Typhon's averaging) — raises
+                # NeedsStop before writing while the stream locks binning.
+                self.device.apply_downsample(triggered.factor_of(value))
+            else:
+                triggered.write_capture(self.device.capture, setting.key,
+                                        value)
+            return
         found = self._resolve(self._feature(setting.key))
         if found is None:
             raise SettingError(f"this camera has no {setting.key}")
@@ -1359,6 +1546,598 @@ class BaslerSettings(Provider):
         selector, load = found
         selector.SetValue(self.FACTORY_SET)
         load.Execute()
+
+    # -- the capture set-up: arming the camera's own trigger -------------
+    #: The nodes a line's debounce or input filter has, by family: ace
+    #: Classic/U/L LineDebouncerTime (ace GigE ...Abs); ace 2, boost and
+    #: dart R the input filter instead (vendor docs). First one found wins.
+    DEBOUNCE_NODES: Tuple[Tuple[str, str], ...] = (
+        ("LineDebouncerTime", "Debounce"),
+        ("LineDebouncerTimeAbs", "Debounce"),
+        ("BslInputFilterTime", "Input filter"))
+
+    def _entries(self, name: str) -> List[str]:
+        node = self.device._node(name)
+        if node is None:
+            return []
+        try:
+            return [str(s) for s in node.GetSymbolics()]
+        except Exception:                                   # noqa: BLE001
+            return []
+
+    def _on_entry(self, entry: str, read: Callable[[], Any]) -> Any:
+        """read() with the trigger selector on `entry` (when the camera has
+        it), the selector put back — under the trigger lock."""
+        with _trigger_lock(self.device):
+            selector, was, entries = self._selector()
+            moved = (selector is not None and entry in entries
+                     and entry != was and _writable(selector))
+            try:
+                if moved:
+                    selector.SetValue(entry)
+                return read()
+            finally:
+                if moved:
+                    try:
+                        selector.SetValue(was)
+                    except Exception:                       # noqa: BLE001
+                        pass
+
+    def capture_options(self) -> Any:
+        """What this camera offers the capture set-up: its hardware trigger
+        sources and the edge and delay of its FrameStart trigger, read ONCE
+        per connection (they are the camera's, and every view describes the
+        camera often; reading them moves the selector), and the debounce of
+        its lines; whether Downsample can change while it streams."""
+        dev = self.device
+        cached = getattr(dev, "_capture_options", None)
+        if cached is None:
+            cached = self._read_capture_options()
+            try:
+                dev._capture_options = cached
+            except Exception:                               # noqa: BLE001
+                pass
+        live = not (self._streaming() and self._binning_locked())
+        method = ("by the camera (binning, " + dev.binning_mode() + ")"
+                  if callable(getattr(dev, "can_bin", None))
+                  and dev.can_bin(2) else "by Typhon before saving")
+        return replace(cached, downsample_live=live, downsample_help=(
+            f"Saves smaller pictures: each 2 x 2, 3 x 3 or 4 x 4 block of "
+            f"pixels becomes one, AVERAGED — on this camera {method} where "
+            f"it can, else by Typhon before saving (a camera that accepts "
+            f"binning without its picture getting smaller is checked for). "
+            f"Off (the default) never changes the data. Kept in presets; "
+            f"fixed while capturing."
+            + (" Changing it restarts the live view." if not live else "")))
+
+    def _binning_locked(self) -> bool:
+        node = self.device._node("BinningHorizontal")
+        dev = self.device
+        if node is None or _writable(node):
+            return False
+        can = getattr(dev, "can_bin", None)
+        return bool((callable(can) and can(2))
+                    or getattr(dev, "_binning_before", None) is not None)
+
+    def _read_capture_options(self) -> Any:
+        from . import triggered
+
+        dev = self.device
+        hardware: Tuple[str, ...] = ()
+        edges: Tuple[str, ...] = ()
+        edge_now, delay, delay_now = "", None, 0.0
+        if dev._node("TriggerMode") is not None and \
+                dev._node("TriggerSource") is not None:
+            def read() -> Tuple[Any, ...]:
+                sources = self._entries("TriggerSource")
+                activations = tuple(self._entries("TriggerActivation"))
+                now = ""
+                if activations:
+                    now = str(dev._value("TriggerActivation", "") or "")
+                span, at = None, 0.0
+                name = dev._first_node("TriggerDelay", "TriggerDelayAbs")
+                if name is not None:
+                    node = dev._node(name)
+                    low, high = _ask(node, "GetMin"), _ask(node, "GetMax")
+                    if low is not None and high is not None:
+                        span = (float(low), float(high))
+                        at = float(dev._value(name, 0.0) or 0.0)
+                return sources, activations, now, span, at
+            sources, edges, edge_now, delay, delay_now = self._on_entry(
+                "FrameStart", read)
+            hardware = triggered.hardware_sources(sources)
+        label, debounce, debounce_now = "Debounce", None, 0.0
+        if hardware:
+            for name, said in self.DEBOUNCE_NODES:
+                node = dev._node(name)
+                if node is None:
+                    continue
+                low, high = _ask(node, "GetMin"), _ask(node, "GetMax")
+                if low is None or high is None:
+                    continue
+                label, debounce = said, (float(low), float(high))
+                debounce_now = float(dev._value(name, 0.0) or 0.0)
+                break
+        return triggered.CaptureOptions(
+            hardware=hardware, edges=edges, edge_now=edge_now, delay=delay,
+            delay_now=delay_now, debounce_label=label, debounce=debounce,
+            debounce_now=debounce_now)
+
+    def _burst_count_node(self) -> Any:
+        return self.device._node("AcquisitionBurstFrameCount")
+
+    def trigger_problem(self, setup: Any) -> str:
+        """Why the camera cannot be armed for `setup`, or "": asked at
+        Start before anything stops, so a refusal leaves the live view as
+        it was. A HARDWARE source is used only where Typhon can confirm the
+        camera has it: listed as a trigger source of the trigger it arms,
+        and — for an input line — among the camera's lines, not an output
+        that cannot be made an input."""
+        from . import triggered
+
+        if not setup.triggered:
+            return ""
+        if setup.snapshot:
+            if not setup.typhon_fires:
+                return (f"Snapshot takes its trigger from Software (Capture "
+                        f"now) or the Timer; {setup.source} is the camera's "
+                        f"own input, which only an exact run waits for — "
+                        f"choose Triggered: exact, or Software / Timer")
+            return ""
+        dev = self.device
+        if dev._node("TriggerMode") is None or \
+                dev._node("TriggerSource") is None:
+            return ("this camera has no trigger Typhon can arm (no "
+                    "TriggerMode / TriggerSource node)")
+        burst = not setup.typhon_fires and setup.per_trigger > 1
+        entry = "FrameBurstStart" if burst else "FrameStart"
+        selectors = self._entries("TriggerSelector")
+        if burst and (entry not in selectors
+                      or self._burst_count_node() is None):
+            return (f"this camera cannot take {setup.per_trigger} frames per "
+                    f"hardware trigger (it has no burst trigger, "
+                    f"AcquisitionBurstFrameCount) — set Frames per trigger "
+                    f"to 1, or capture with Software or the Timer")
+        if burst:
+            high = _ask(self._burst_count_node(), "GetMax")
+            if high is not None and setup.per_trigger > int(high):
+                return (f"this camera takes at most {int(high)} frames per "
+                        f"burst trigger, not {setup.per_trigger}")
+        if selectors and entry not in selectors:
+            return f"this camera has no {entry} trigger to arm"
+        sources = self._on_entry(entry, lambda: self._entries(
+            "TriggerSource"))
+        want = triggered.SOFTWARE if setup.typhon_fires else setup.source
+        if want not in sources:
+            if setup.typhon_fires:
+                return "this camera has no Software trigger source"
+            listed = triggered.hardware_sources(sources)
+            return (f"this camera does not list {want} as a trigger source "
+                    f"— it lists {', '.join(listed) or 'no hardware input'}; "
+                    f"choose one of those, or Software / Timer")
+        if setup.typhon_fires:
+            node = dev._node("TriggerSoftware")
+            if node is None and not callable(getattr(
+                    dev._cam, "ExecuteSoftwareTrigger", None)):
+                return ("this camera has no software trigger command "
+                        "(TriggerSoftware)")
+            return ""
+        if want.startswith("Line"):
+            return self._line_problem(want)
+        return ""
+
+    def _line_problem(self, line: str) -> str:
+        dev = self.device
+        lines = self._entries("LineSelector")
+        if dev._node("LineSelector") is None:
+            return ""                     # one line, no selector: as listed
+        if line not in lines:
+            return (f"Typhon cannot confirm {line} exists on this camera — "
+                    f"its lines are {', '.join(lines) or 'not listed'}")
+        node = dev._node("LineSelector")
+        was = str(_plain(node.GetValue()))
+        try:
+            if was != line:
+                node.SetValue(line)
+            mode = dev._node("LineMode")
+            if mode is None:
+                return ""
+            now = str(_plain(mode.GetValue()))
+            if now != "Input" and "Input" not in self._entries("LineMode"):
+                return (f"{line} is an output on this camera (LineMode "
+                        f"{now}) and cannot be made an input")
+            if now != "Input" and not _writable(mode):
+                return (f"{line} is set as {now} and the camera does not let "
+                        f"Typhon make it an input now")
+            return ""
+        except Exception as exc:                            # noqa: BLE001
+            return f"Typhon cannot read {line} on this camera: {_why(exc)}"
+        finally:
+            try:
+                if str(_plain(node.GetValue())) != was:
+                    node.SetValue(was)
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def arm(self, setup: Any) -> Dict[str, Any]:
+        """ARM the camera for an exact run: the trigger it waits for On
+        from the run's source, every other trigger Off, the selector left
+        on the armed one. Returns everything changed, for disarm — which
+        Stop and a failed Start call. A camera left armed by a crash is put
+        right by the next Connect: pylon's AcquireContinuousConfiguration
+        turns every trigger Off (measured on the emulator).
+
+        Software / Timer: FrameStart On from Software (Typhon fires one per
+        frame). A hardware source: FrameStart On from it — or, for more than
+        one frame per trigger, FrameBurstStart On from it with
+        AcquisitionBurstFrameCount the frames, FrameStart Off. Its edge and
+        delay as the set-up has them (where the camera has the nodes); for
+        an input line, LineMode Input and its debounce, put back after."""
+        from . import triggered
+
+        dev = self.device
+        hardware = not setup.typhon_fires
+        burst = hardware and setup.per_trigger > 1
+        entry = "FrameBurstStart" if burst else "FrameStart"
+        value = setup.source if hardware else triggered.SOFTWARE
+        saved: Dict[str, Any] = {"entry": entry, "source": value,
+                                 "said": []}
+        with _trigger_lock(dev):
+            saved["selector"] = self._selected_trigger()
+            saved["triggers"] = self.trigger_settings(selected=True)
+            if not saved["triggers"]:
+                # One trigger, no selector: its plain rows.
+                saved["plain"] = {
+                    key: dev._value(name, None) for key, name in (
+                        ("TriggerMode", "TriggerMode"),
+                        ("TriggerSource", "TriggerSource"),
+                        ("TriggerActivation", "TriggerActivation"),
+                        ("TriggerDelay", dev._first_node(
+                            "TriggerDelay", "TriggerDelayAbs") or
+                         "TriggerDelay"))
+                    if dev._node(name) is not None}
+            try:
+                self._arm_writes(setup, saved, entry, value, hardware, burst)
+            except Exception as exc:                        # noqa: BLE001
+                self.disarm(saved)
+                raise SettingError(f"the camera refused to be armed: "
+                                   f"{_why(exc)}") from exc
+            dev._armed_entry = entry if self._selector()[0] is not None \
+                else ""
+        return saved
+
+    def _arm_writes(self, setup: Any, saved: Dict[str, Any], entry: str,
+                    value: str, hardware: bool, burst: bool) -> None:
+        dev = self.device
+        selector, _was, entries = self._selector()
+        if selector is not None and len(entries) >= 2:
+            for other in entries:
+                if other == entry:
+                    continue
+                try:
+                    selector.SetValue(other)
+                except Exception:                           # noqa: BLE001
+                    continue
+                mode = dev._node("TriggerMode")
+                if mode is not None and str(_plain(mode.GetValue())) == "On":
+                    mode.SetValue("Off")
+                    saved["said"].append(f"the {other} trigger Off for the "
+                                         f"run")
+            selector.SetValue(entry)
+        mode = dev._node("TriggerMode")
+        if mode is not None and str(_plain(mode.GetValue())) == "On":
+            # Off while its source changes: never On from the old source.
+            mode.SetValue("Off")
+        dev._node("TriggerSource").SetValue(value)
+        if hardware:
+            if setup.edge and setup.edge in self._entries("TriggerActivation"):
+                dev._node("TriggerActivation").SetValue(setup.edge)
+            name = dev._first_node("TriggerDelay", "TriggerDelayAbs")
+            if setup.delay_us is not None and name is not None:
+                node = dev._node(name)
+                low, high = _ask(node, "GetMin"), _ask(node, "GetMax")
+                delay = float(setup.delay_us)
+                if low is not None:
+                    delay = max(float(low), delay)
+                if high is not None:
+                    delay = min(float(high), delay)
+                node.SetValue(delay)
+        if burst:
+            count = self._burst_count_node()
+            saved["burst_count"] = int(_plain(count.GetValue()))
+            count.SetValue(int(setup.per_trigger))
+        if hardware and value.startswith("Line"):
+            saved["line"] = self._arm_line(setup, value, saved["said"])
+        if hardware:
+            saved["counter"] = self._start_counter(setup)
+        dev._node("TriggerMode").SetValue("On")
+
+    def _arm_line(self, setup: Any, line: str,
+                  said: List[str]) -> Optional[Dict[str, Any]]:
+        """The input line ready for the run: LineMode Input, its debounce
+        (or input filter) as the set-up has it. What was there, for
+        disarm."""
+        dev = self.device
+        node = dev._node("LineSelector")
+        if node is None:
+            return None
+        out: Dict[str, Any] = {"selector": str(_plain(node.GetValue())),
+                               "line": line}
+        node.SetValue(line)
+        try:
+            mode = dev._node("LineMode")
+            if mode is not None:
+                now = str(_plain(mode.GetValue()))
+                if now != "Input":
+                    out["mode"] = now
+                    mode.SetValue("Input")
+                    said.append(f"{line} made an input for the run (it was "
+                                f"{now})")
+            if setup.debounce_us is not None:
+                for name, _label in self.DEBOUNCE_NODES:
+                    found = dev._node(name)
+                    if found is None:
+                        continue
+                    out["debounce"] = (name, float(_plain(found.GetValue())))
+                    low, high = _ask(found, "GetMin"), _ask(found, "GetMax")
+                    value = float(setup.debounce_us)
+                    if low is not None:
+                        value = max(float(low), value)
+                    if high is not None:
+                        value = min(float(high), value)
+                    found.SetValue(value)
+                    break
+        finally:
+            node.SetValue(out["selector"])
+        return out
+
+    def _start_counter(self, setup: Any) -> Optional[Dict[str, Any]]:
+        """Count the hardware input's edges in the camera (Counter1), so
+        Stop can say how many it IGNORED while busy — the camera says
+        nothing of those. Only where the camera's counter can count that
+        input (ace 2 and boost list lines as CounterEventSource; an ace
+        USB's Counter1 counts images only). UNVERIFIED ON HARDWARE: none
+        was on the machine this was written on; a count below the
+        triggers seen is said as untrusted, never as missed triggers."""
+        dev = self.device
+        names = ("CounterSelector", "CounterEventSource", "CounterValue",
+                 "CounterReset")
+        if any(dev._node(n) is None for n in names):
+            return None
+        selector = dev._node("CounterSelector")
+        if "Counter1" not in self._entries("CounterSelector"):
+            return None
+        out: Dict[str, Any] = {"selector": str(_plain(selector.GetValue()))}
+        try:
+            selector.SetValue("Counter1")
+            if setup.source not in self._entries("CounterEventSource"):
+                return None
+            source = dev._node("CounterEventSource")
+            out["event_source"] = str(_plain(source.GetValue()))
+            source.SetValue(setup.source)
+            activation = dev._node("CounterEventActivation")
+            if activation is not None and setup.edge and setup.edge in \
+                    self._entries("CounterEventActivation"):
+                out["activation"] = str(_plain(activation.GetValue()))
+                activation.SetValue(setup.edge)
+            reset_source = dev._node("CounterResetSource")
+            if reset_source is not None and "Software" in self._entries(
+                    "CounterResetSource"):
+                out["reset_source"] = str(_plain(reset_source.GetValue()))
+                reset_source.SetValue("Software")
+            dev._node("CounterReset").Execute()
+            out["base"] = int(_plain(dev._node("CounterValue").GetValue()))
+            return out
+        except Exception:                                   # noqa: BLE001
+            return None
+        finally:
+            try:
+                selector.SetValue(out["selector"])
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def _read_counter(self, counter: Dict[str, Any]) -> int:
+        """Counter1's value now, its selector put back. Raises."""
+        dev = self.device
+        selector = dev._node("CounterSelector")
+        try:
+            selector.SetValue("Counter1")
+            return int(_plain(dev._node("CounterValue").GetValue()))
+        finally:
+            try:
+                selector.SetValue(counter["selector"])
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def count_from_now(self, armed: Any) -> None:
+        """THE COUNT STARTS HERE: called once the stream runs and the
+        camera says it is ready for a trigger. Edges before that (between
+        arming and the stream, while the camera's record was read, before
+        it was ready) triggered nothing and were counted — every run with
+        a periodic signal said "missed" for them (review: 51 edges for 50
+        triggers the camera kept up with; 9 with a 150 ms record read).
+
+        The count at arming is kept too ("armed"): the camera began taking
+        triggers somewhere between the two reads, so an edge between them
+        may have triggered a frame — count_edges never calls it missed."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return
+        try:
+            value = self._read_counter(counter)
+        except Exception:                                   # noqa: BLE001
+            return
+        counter["armed"] = int(counter.get("base", 0))
+        counter["base"] = value
+
+    def count_to_now(self, armed: Any) -> None:
+        """THE COUNT ENDS HERE, before the stream stops: the count is read,
+        then the armed trigger takes Software as its source, so the camera
+        accepts no more edges while the stream winds down — edges counted
+        after StopGrabbing triggered nothing, and were "missed" too (the
+        same review). Disarm puts every trigger back after. Whether the
+        camera took Software is kept ("closed"): one that refuses it while
+        grabbing goes on taking edges until the stream stops."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return
+        dev = self.device
+        try:
+            counter["final"] = self._read_counter(counter)
+        except Exception:                                   # noqa: BLE001
+            return
+        entry = str(armed.get("entry") or "")
+        closed = False
+        with _trigger_lock(dev):
+            selector, was, entries = self._selector()
+            try:
+                if selector is not None and entry in entries and was != entry:
+                    selector.SetValue(entry)
+                if "Software" in self._entries("TriggerSource"):
+                    dev._node("TriggerSource").SetValue("Software")
+                    closed = True
+            except Exception:                               # noqa: BLE001
+                pass
+            finally:
+                if selector is not None and was and was != entry:
+                    try:
+                        selector.SetValue(was)
+                    except Exception:                       # noqa: BLE001
+                        pass
+        counter["closed"] = closed
+
+    def count_edges(self, armed: Any, seen: Optional[int] = None
+                    ) -> Tuple[Optional[int], str]:
+        """The edges the camera counted while it was taking triggers, read
+        after the stream stopped; `seen` the triggers Typhon saw.
+
+        BRACKETED, NEVER GUESSED. The count is sure between the read after
+        the camera was ready (count_from_now) and the read before the
+        stream stopped (count_to_now): an edge outside them may or may not
+        have triggered a frame, and is never called missed. Typhon's
+        triggers are checked against the most the counter can have counted
+        while the camera took edges — from arming to now — so a count that
+        cannot cover them is untrusted, never "missed"."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return None, ("the camera has no edge counter Typhon can set to "
+                          "this input")
+        try:
+            now = self._read_counter(counter)
+        except Exception as exc:                            # noqa: BLE001
+            if "final" not in counter:
+                return None, f"the camera's edge counter could not be " \
+                             f"read: {_why(exc)}"
+            now = int(counter["final"])
+        final = int(counter.get("final", now))
+        edges = max(0, final - int(counter.get("base", 0)))
+        most = max(0, now - int(counter.get("armed", counter.get("base", 0))))
+        if seen is not None and int(seen) > most:
+            return None, (f"the camera's edge counter read {most}, fewer than "
+                          f"the {int(seen)} triggers seen — its count is not "
+                          f"trusted on this camera")
+        return edges, ""
+
+    def disarm(self, saved: Any) -> List[str]:
+        """Put back everything arm changed: every trigger's mode, source,
+        edge and delay (restore_triggers), the burst count, the line and the
+        counter, then the selector where it was. What changed, in words."""
+        if not isinstance(saved, dict):
+            return []
+        dev = self.device
+        said: List[str] = []
+        with _trigger_lock(dev):
+            dev._armed_entry = ""
+            counter = saved.get("counter")
+            if counter:
+                self._put_back(("CounterSelector", "Counter1"), (
+                    ("CounterEventSource", counter.get("event_source")),
+                    ("CounterEventActivation", counter.get("activation")),
+                    ("CounterResetSource", counter.get("reset_source"))),
+                    counter.get("selector"))
+            line = saved.get("line")
+            if line:
+                writes = [("LineMode", line.get("mode"))]
+                if line.get("debounce"):
+                    writes.append(tuple(line["debounce"]))
+                self._put_back(("LineSelector", line["line"]), writes,
+                               line.get("selector"))
+            if "burst_count" in saved:
+                count = self._burst_count_node()
+                try:
+                    count.SetValue(int(saved["burst_count"]))
+                except Exception:                           # noqa: BLE001
+                    said.append("the burst frame count NOT put back")
+            if saved.get("triggers"):
+                try:
+                    said.extend(self.restore_triggers(saved["triggers"]))
+                except Exception as exc:                    # noqa: BLE001
+                    said.append(f"the triggers NOT put back — {_why(exc)}")
+            elif saved.get("plain"):
+                plain = saved["plain"]
+                for key in ("TriggerSource", "TriggerActivation",
+                            "TriggerDelay", "TriggerMode"):
+                    if plain.get(key) is None:
+                        continue
+                    name = (dev._first_node("TriggerDelay", "TriggerDelayAbs")
+                            if key == "TriggerDelay" else key)
+                    try:
+                        dev._node(name).SetValue(plain[key])
+                    except Exception:                       # noqa: BLE001
+                        said.append(f"{key} NOT put back")
+            selector = dev._node("TriggerSelector")
+            was = saved.get("selector")
+            if selector is not None and was:
+                try:
+                    if str(_plain(selector.GetValue())) != was:
+                        selector.SetValue(was)
+                except Exception:                           # noqa: BLE001
+                    pass
+        return said
+
+    def _put_back(self, select: Tuple[str, str],
+                  writes: Sequence[Tuple[str, Any]],
+                  back_to: Any) -> None:
+        dev = self.device
+        name, entry = select
+        node = dev._node(name)
+        if node is None:
+            return
+        try:
+            node.SetValue(entry)
+            for key, value in writes:
+                if value is None or dev._node(key) is None:
+                    continue
+                try:
+                    dev._node(key).SetValue(value)
+                except Exception:                           # noqa: BLE001
+                    pass
+        except Exception:                                   # noqa: BLE001
+            pass
+        finally:
+            if back_to:
+                try:
+                    node.SetValue(back_to)
+                except Exception:                           # noqa: BLE001
+                    pass
+
+
+class _NoLock:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_exc: Any) -> None:
+        return None
+
+
+def _trigger_lock(device: Any) -> Any:
+    """The device's trigger lock (cameras.BaslerDevice.trigger_lock), or a
+    lock that holds nothing for a device without one (a test fake)."""
+    lock = getattr(device, "trigger_lock", None)
+    return lock if lock is not None else _NoLock()
 
 
 def _readable(node: Any) -> bool:
@@ -1613,6 +2392,26 @@ TRAIL_THRESHOLD_HELP = (
     "nearest whole millisecond.")
 
 
+def trail_threshold_setting(value: Any, low: Any, high: Any) -> Setting:
+    """The trail filter's threshold row.
+
+    IN WHOLE MILLISECONDS, AS THE SENSOR KEEPS IT. Every OpenEB trail
+    filter takes 1000-100000 µs, keeps the nearest whole ms and raises
+    outside that (cameras.trail_threshold_kept); the slider stepped by
+    1 µs, so it offered 99,001 positions of which 99 exist, and a drag said
+    values the camera never held. The value stays in µs — what the HAL and
+    a preset hold — stepped by 1000 and SHOWN in ms (Setting.shown_unit).
+    A range that is not in whole ms (no OpenEB sensor reports one) keeps a
+    1 µs step, shown in µs."""
+    whole_ms = all(v is not None and float(v) % 1000 == 0
+                   for v in (low, high))
+    return Setting(
+        "trail.threshold", "Threshold", G_TRAIL, INT, int(value),
+        minimum=low, maximum=high, step=1000 if whole_ms else 1, unit="µs",
+        help=TRAIL_THRESHOLD_HELP, shown_unit="ms" if whole_ms else "",
+        shown_per=1000.0 if whole_ms else 1.0)
+
+
 class EvkSettings(Provider):
     """An EVK4's HAL facilities, as Settings.
 
@@ -1820,11 +2619,9 @@ class EvkSettings(Provider):
                                _enum_name(kind), choices=names))
         threshold = _ask(trail, "get_threshold")
         if threshold is not None:
-            out.append(Setting(
-                "trail.threshold", "Threshold", G_TRAIL, INT, int(threshold),
-                minimum=_num(_ask(trail, "get_min_supported_threshold")),
-                maximum=_num(_ask(trail, "get_max_supported_threshold")),
-                step=1, unit="µs", help=TRAIL_THRESHOLD_HELP))
+            out.append(trail_threshold_setting(
+                threshold, _num(_ask(trail, "get_min_supported_threshold")),
+                _num(_ask(trail, "get_max_supported_threshold"))))
         return out
 
     def _activity(self) -> List[Setting]:
@@ -2088,11 +2885,16 @@ class SyntheticSettings(Provider):
         out: List[Setting] = []
         if dev.info.kind == "event":
             for name in dev.BIASES:
+                # Like an EVK4 opened as Typhon opens one: the range it
+                # accepts (RANGES — the IMX636's recommended range, what
+                # get_bias_range() reports without the bypass) and the
+                # recommended range itself, both the sensor's own.
                 low, high = ranges[f"bias.{name}"]
+                _allowed, recommended = dev.BIAS_TABLE[name]
                 out.append(Setting(f"bias.{name}", name, G_BIASES, INT,
                                    state[f"bias.{name}"], low, high, 1,
                                    help=_BIAS_HELP.get(name, ""),
-                                   recommended=(max(low, -50), min(high, 50))))
+                                   recommended=tuple(recommended)))
             out.append(Setting("erc.enabled", "Event rate controller on",
                                G_ERC, BOOL, state["erc.enabled"]))
             low, high = ranges["erc.rate"]
@@ -2104,9 +2906,8 @@ class SyntheticSettings(Provider):
                                state["trail.type"],
                                choices=dev.TRAIL_TYPES))
             low, high = ranges["trail.threshold"]
-            out.append(Setting("trail.threshold", "Threshold", G_TRAIL, INT,
-                               state["trail.threshold"], low, high, 1,
-                               unit="µs"))
+            out.append(trail_threshold_setting(state["trail.threshold"],
+                                               low, high))
             out.extend(display_settings(dev))
             out.append(Setting("status.temperature", "Temperature", G_STATUS,
                                INT, 31, unit="°C", read_only=True))
@@ -2136,11 +2937,28 @@ class SyntheticSettings(Provider):
         out.append(replace(rate, held=self.held_by(rate, {})))
         out.append(Setting("DeviceTemperature", "Temperature", G_STATUS,
                            FLOAT, 38.5, unit="°C", read_only=True))
+        out.extend(self._capture_rows())
         return out
 
+    def _capture_rows(self) -> List[Setting]:
+        """The frame camera's capture set-up (council_core.triggered)."""
+        from . import triggered
+
+        setup = getattr(self.device, "capture", None)
+        if setup is None:
+            return []
+        return triggered.capture_settings(setup,
+                                          self.device.capture_options())
+
     def read(self, key: str) -> Any:
+        from . import triggered
+
         if key in DISPLAY_ATTRIBUTES:
             return read_display(self.device, key)
+        if triggered.is_capture_key(key) and getattr(
+                self.device, "capture", None) is not None:
+            return triggered.read_capture(self.device.capture,
+                                          self.device.capture_options(), key)
         if key in self.device.state:
             return self.device.state[key]
         raise SettingError(f"this camera has no setting called {key!r}")
@@ -2155,8 +2973,18 @@ class SyntheticSettings(Provider):
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:
+        from . import triggered
+
         if setting.key in DISPLAY_ATTRIBUTES:
             write_display(self.device, setting.key, value)
+            return
+        if triggered.is_capture_key(setting.key) and getattr(
+                self.device, "capture", None) is not None:
+            if setting.key == triggered.DOWNSAMPLE_KEY:
+                self.device.apply_downsample(triggered.factor_of(value))
+            else:
+                triggered.write_capture(self.device.capture, setting.key,
+                                        value)
             return
         self.device.write_setting(setting.key, value)
 

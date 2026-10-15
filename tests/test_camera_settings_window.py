@@ -81,8 +81,12 @@ def ticks(seconds=0.25):
 
 
 def connect(kind="frame", live=True):
+    """Connect the SIMULATED camera of `kind` — named, not the first row of
+    that kind: with PYLON_CAMEMU set (the pylon env) an emulated Basler is
+    a "frame" camera listed before it."""
     rows = frame_camera.list_cameras()["rows"]
-    frame_camera.connect(next(r for r in rows if r.endswith(kind)))
+    frame_camera.connect(next(r for r in rows
+                              if "Simulated" in r and r.endswith(kind)))
     if live:
         # The first Connect in a process starts the picture only once
         # Pillow's plugins have loaded on their own thread
@@ -148,6 +152,54 @@ def test_what_took_lists_the_problems_first():
     assert lines[3] == "✓ Gain: 3"
 
 
+def test_what_took_says_each_value_in_the_unit_its_row_shows():
+    """A preset holding a trail threshold of 8706 µs (an older Typhon's,
+    made on the fake EVK4, which kept any µs) said "≈ Threshold: 9000
+    (asked 8706)" beside a row whose box read "9 ms". Given the rows'
+    settings, each value is said as its row shows it, with its unit — as
+    a single change's line already was (Change.line)."""
+    threshold = {"key": "trail.threshold", "label": "Threshold",
+                 "unit": "µs", "shown_unit": "ms", "shown_per": 1000.0}
+    gain = {"key": "Gain", "label": "Gain", "unit": "dB"}
+    lines = csw.took_lines({"changes": [
+        {"key": "Gain", "asked": 3, "value": 3.0, "ok": True,
+         "adjusted": False, "skipped": False, "note": ""},
+        {"key": "trail.threshold", "asked": 8706, "value": 9000, "ok": True,
+         "adjusted": True, "skipped": False, "note": "snapped to whole ms"},
+        {"key": "ExposureTime", "asked": 900, "value": 5000.0, "ok": True,
+         "adjusted": False, "skipped": True, "note": "auto exposure is on"}]},
+        labels={"trail.threshold": "Threshold"},
+        settings={"trail.threshold": threshold, "Gain": gain,
+                  "ExposureTime": {"unit": "µs"}})
+    assert lines == ["≈ Threshold: 9 ms (asked 8.706)",
+                     "– ExposureTime: left at 5000 µs — auto exposure is on",
+                     "✓ Gain: 3 dB"]
+
+
+def test_a_preset_threshold_is_said_in_ms_where_its_row_is_in_ms():
+    """The settings window, the simulated event camera, a set holding the
+    trail threshold in µs off the whole-ms grid: the What-took box said
+    "≈ Threshold: 9000 (asked 8706)"; the reset button's tip said "Back to
+    10" beside a box suffixed " ms"; the row's note said "The camera made
+    it 9 (asked 8.706)"."""
+    connect("event")
+    w = window()
+    row = w.rows["trail.threshold"]
+    frame_camera.apply_camera_settings({"trail.threshold": 8706,
+                                        "bias.bias_fo": 80})
+    QApplication.processEvents()
+    took = w.took_box.toPlainText()
+    assert "≈ Threshold: 9 ms (asked 8.706)" in took, took
+    assert "≈ bias_fo: 55 (asked 80)" in took, took
+    assert row.editor.value() == 9 and row.editor.suffix() == " ms"
+    assert row.reset_button.toolTip() == (
+        "Back to 10 ms — as the camera had it when it was connected")
+    frame_camera.set_camera_setting("trail.threshold", 12_400)
+    QApplication.processEvents()
+    assert row.note.text().startswith(
+        "The camera made it 12 ms (asked 12.4)"), row.note.text()
+
+
 # ======================================================================
 # Built from what the camera describes
 # ======================================================================
@@ -196,18 +248,82 @@ def test_the_example_bias_ranges_are_the_imx636s_own():
     assert csw.range_text({"min": -150, "max": 200,
                            "recommended": [-85, 140]}) == \
         "-150 … 200\nrec. -85 … 140"
+    # As Typhon opens an EVK4 the range it accepts IS the recommended one:
+    # said once, not "-85 … 140 / rec. -85 … 140".
+    assert csw.range_text({"min": -85, "max": 140,
+                           "recommended": [-85, 140]}) == \
+        "-85 … 140\nrecommended, enforced"
+    # In the unit a setting is shown in.
+    assert csw.range_text({"min": 1000, "max": 100000, "unit": "µs",
+                           "shown_unit": "ms", "shown_per": 1000.0}) == \
+        "1 … 100 ms"
 
 
-def test_an_event_cameras_biases_say_when_they_leave_the_recommended_range():
-    connect("event")
+def test_the_wheel_guards_example_is_one_an_imx636_can_hold():
+    """Its example, "10000 -> 8706 µs", was measured on the fake EVK4,
+    which then kept any µs; a real IMX636 keeps whole milliseconds."""
+    said = " ".join(csw.WheelGuard.__doc__.split())
+    assert "8706" not in said
+    assert "on the fake EVK4" in said and "whole milliseconds" in said
+
+
+def test_an_event_cameras_biases_say_when_they_leave_the_recommended_range(
+        monkeypatch):
+    """Only an EVK4 opened with the range-check bypass takes a bias outside
+    the recommended range (Typhon never opens one so; the fake EVK4 can
+    be). This ran on the simulated event camera, whose invented
+    recommended -50 … 50 sat inside the range it took."""
+    from tests import fake_evk4
+
+    hal = fake_evk4.install(monkeypatch, frame_camera)
+    hal.biases.bypass = True
+    rows = frame_camera.list_cameras()["rows"]
+    frame_camera.connect(next(r for r in rows if "Prophesee" in r))
     w = window()
     row = w.rows["bias.bias_diff_on"]
-    assert row.scale.exact and row.editor.minimum() == -85
+    assert row.scale.exact and row.editor.minimum() == -150
     assert not w.defaults_button.isVisible() and w.factory == ""
-    row.slider.setValue(row.scale.position(60))
+    row.slider.setValue(row.scale.position(160))
     w.flush_now()
-    assert device().state["bias.bias_diff_on"] == 60
-    assert "Outside the recommended -50 … 50" in row.note.text()
+    assert hal.biases.values["bias_diff_on"] == 160
+    assert "Outside the recommended -85 … 140" in row.note.text()
+    # The bar marks the recommended part of a slider wider than it.
+    start, end = row.slider.recommended
+    assert 0 < start < end < row.scale.steps
+    tip = row.label.toolTip()
+    assert "Allowed: -150 … 200" in tip and "Recommended: -85 … 140" in tip
+
+
+def test_the_simulated_event_camera_has_an_imx636s_biases_and_refusals():
+    """The simulated event camera showed an invented recommended -50 … 50
+    for every bias and had no bias_diff, so its tabs looked like no EVK4's.
+    It has the IMX636's six biases now, each with its own recommended range
+    — which, like an EVK4 opened as Typhon opens one, is what it accepts —
+    and it refuses outside that range in the HAL's words."""
+    connect("event")
+    w = window()
+    assert [k for k in w.rows if k.startswith("bias.")] == [
+        f"bias.{name}" for name in cameras.IMX636_BIASES]
+    assert "bias.bias_diff" in w.rows
+    for name, (_allowed, (low, high)) in cameras.IMX636_BIASES.items():
+        row = w.rows[f"bias.{name}"]
+        assert (row.editor.minimum(), row.editor.maximum()) == (low, high)
+        assert list(row.setting["recommended"]) == [low, high]
+        assert row.slider.recommended is None
+    on = w.rows["bias.bias_diff_on"]
+    assert (on.editor.minimum(), on.editor.maximum()) == (-85, 140)
+    assert "which this camera enforces" in on.label.toolTip()
+    on.slider.setValue(on.scale.position(140))
+    w.flush_now()
+    assert device().state["bias.bias_diff_on"] == 140
+    assert on.note.text() == "", "inside the recommended range: nothing to say"
+    # Asked outside it the way only a preset or a script can: refused, in
+    # the words I_LL_Biases::set uses, and the camera keeps what it had.
+    with pytest.raises(cameras.CameraError,
+                       match=r'Invalid value 141 for bias "bias_diff_on"\. '
+                             r'Value should be within range \[-85, 140\]'):
+        device().write_setting("bias.bias_diff_on", 141)
+    assert device().state["bias.bias_diff_on"] == 140
 
 
 # ======================================================================
@@ -272,7 +388,8 @@ def test_what_the_camera_made_of_a_value_is_what_the_control_shows():
                         "ok": True, "adjusted": True, "skipped": False,
                         "note": "clamped to the maximum, 24"}})
     assert row.editor.value() == 24.0
-    assert "made it 24 (asked 30)" in row.note.text()
+    # With its unit: the note is a line under the row, not the box.
+    assert "made it 24 dB (asked 30)" in row.note.text()
     assert "asked 30" in w.status.text()
 
 
@@ -441,6 +558,30 @@ def test_what_a_capture_refuses_is_greyed_out_while_capturing(tmp_path):
     finally:
         frame_camera.stop()
     assert not w.capturing and w.area_apply.isEnabled()
+
+
+def test_the_capture_set_up_is_greyed_while_capturing_though_it_is_live(
+        tmp_path):
+    """The capture set-up (Capture, its trigger, Downsample) never stops
+    the stream — and is still one per run: its rows are greyed and say
+    so while capturing, and writable again after Stop."""
+    connect("frame")
+    w = window()
+    mode = w.rows["capture.mode"]
+    assert mode.live and mode.setting["per_run"]
+    assert mode.editor.isEnabled()
+    frame_camera.start(str(tmp_path / "run"))
+    try:
+        w.refresh_values()
+        for key in ("capture.mode", "capture.source", "save.downsample"):
+            row = w.rows[key]
+            assert not row.editor.isEnabled(), key
+            assert "Stop the capture" in row.note.text(), key
+        assert w.rows["Gain"].editor.isEnabled(), "a live setting stays live"
+    finally:
+        frame_camera.stop()
+    w.refresh_values()
+    assert w.rows["capture.mode"].editor.isEnabled()
 
 
 def test_a_slow_change_greys_the_window_until_its_answer_arrives():

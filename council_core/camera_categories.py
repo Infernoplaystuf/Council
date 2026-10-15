@@ -36,9 +36,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 #: Tabs that hold more than one group: (title, its groups in order, what its
 #: tooltip says). A group in none of these has a tab of its own.
 SHARED_TABS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
-    ("Exposure", ("Exposure", "Gain", "Frame rate", "Trigger"),
+    # The capture set-up (council_core.triggered) beside the camera's own
+    # trigger rows: one more tab did not fit the column at Typhon's
+    # smallest window (441 px of tabs in 431, measured).
+    ("Exposure", ("Exposure", "Gain", "Frame rate", "Trigger", "Capture"),
      "Exposure, gain, the frame rate and the trigger, with their auto "
-     "modes"),
+     "modes — and how a run captures: every frame, or on a trigger, and "
+     "Downsample"),
     ("Image", ("Image", "Binning"),
      "Pixel format, mirroring, gamma and binning"),
     ("Filters", ("Event rate controller", "Anti-flicker",
@@ -60,6 +64,9 @@ TIPS: Dict[str, str] = {
               "event, its filters and how long a pixel rests",
     "Display": "How the event picture is drawn — the live view and the PNGs "
                "(never the .raw)",
+    "Capture": "How a run captures: every frame, or only on a trigger "
+               "(Capture now / F9, a timer, or the camera's own input) — "
+               "and Downsample, for smaller pictures",
 }
 
 #: Each group's settings in the order a tab shows them — the ones changed
@@ -83,6 +90,8 @@ MOST_USED: Dict[str, Tuple[str, ...]] = {
                                    "activity.upper_bound_start"),
     "Display": ("window_ms", "display.events", "display.palette"),
     "Status": ("status.temperature", "DeviceTemperature"),
+    "Capture": ("capture.mode", "capture.source", "capture.per_trigger",
+                "capture.every_s", "save.downsample", "capture.edge"),
 }
 
 #: Rows a section shows when it has its tab to itself, and when it shares.

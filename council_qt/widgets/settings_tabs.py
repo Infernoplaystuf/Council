@@ -61,9 +61,14 @@ NO_CAMERA = ("Connect a camera to see its settings. They come from the "
              "a frame camera's exposure, gain and image format — each with "
              "Pop out.")
 
-#: The Basic tab's note while no camera is connected.
+#: The Basic tab's note while no camera is connected — and with one (a
+#: frame camera; an event camera, whose exposure and gain boxes are
+#: greyed). Each one line of Arial 10 at the smallest window (measured).
 NOTE_NO_CAMERA = ("Connect a camera to see its settings — they fill the tabs "
                   "beside Basic.")
+NOTE_FRAME = "More settings in the tabs beside Basic — Pop out opens one."
+NOTE_EVENT = ("Event camera — no exposure, gain or trigger. FPS: its picture "
+              "window.")
 
 
 def _quietly_set(port: Any, value: Any) -> None:
@@ -97,12 +102,26 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
     (Basic) are kept as they are and never removed; `note` the Basic tab's
     note label port, or None; `boxes` the ports of the boxes beside Start
     ("exposure", "gain", "frame_rate"), greyed when the connected camera
-    cannot honour them; `font` the app's font, for what is made here."""
+    cannot honour them; `capture` the ports of the Basic tab's capture
+    set-up boxes (CAPTURE_BOXES: Capture, From, frames per trigger, the
+    timer, Downsample), kept showing the camera's set-up; `font` the
+    app's font, for what is made here."""
+
+    #: The Basic tab's capture boxes: port name -> the setting it shows
+    #: (council_core.triggered). Each one's own link writes it.
+    CAPTURE_BOXES: Dict[str, str] = {
+        "capture_mode": "capture.mode",
+        "trigger_source": "capture.source",
+        "frames_per_trigger": "capture.per_trigger",
+        "timer_s": "capture.every_s",
+        "downsample": "save.downsample",
+    }
 
     def __init__(self, api: Any, book: QTabWidget, note: Any = None,
                  boxes: Optional[Dict[str, Any]] = None,
                  font: Optional[QFont] = None,
-                 parent: Optional[QObject] = None):
+                 parent: Optional[QObject] = None,
+                 capture: Optional[Dict[str, Any]] = None):
         super().__init__(parent)
         self._init_core(api)
         self._init_presets()
@@ -111,6 +130,13 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self.fixed = book.count()
         self.note_port = note
         self.boxes = dict(boxes or {})
+        self.capture_ports = {k: v for k, v in dict(capture or {}).items()
+                              if v is not None}
+        #: The capture set-up as last read, by key (_saw_settings) — its
+        #: boxes show it whether or not a tab has a row for the key.
+        self.capture_settings: Dict[str, Dict[str, Any]] = {}
+        #: The connected camera has a capture set-up (a frame camera).
+        self.has_capture = False
         self.font = QFont(font) if font is not None else QFont(book.font())
         #: The tabs made here for the camera, by title, in order.
         self.pages: Dict[str, QWidget] = {}
@@ -289,6 +315,8 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             if state.get("connected") else True
         self.has_gain = bool(state.get("has_gain", True)) \
             if state.get("connected") else True
+        self.has_capture = bool(state.get("has_capture")) \
+            if state.get("connected") else False
 
     def _related(self, groups: set) -> Optional[set]:
         """A change in a group can move the rest of its TAB (a Basler's
@@ -318,6 +346,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self._rebuilding = True
         try:
             self.rows = {}
+            self.capture_settings = {}
             self._shape = None
             self.plan = []
             self._remove_pages()
@@ -529,6 +558,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         for button in self.pop_buttons.values():
             button.setEnabled(self.connected)
         self._basic_boxes()
+        self._basic_capture()
         self._basic_note()
 
     def _basic_boxes(self) -> None:
@@ -549,22 +579,26 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
     #: setting.
     NOT_HERE = "n/a — event camera"
 
-    def _look_off(self, widget: Any, off: bool) -> None:
+    def _look_off(self, widget: Any, off: bool,
+                  special: Optional[str] = NOT_HERE) -> None:
         """A box that is off LOOKS off. The generated style sheet gives each
         spin box the app's colours with no :disabled rule, so the disabled
         Exposure box was the live FPS box pixel for pixel (review: 0 of
         5148 pixels differed) — only a click that did nothing, or the
         tooltip, said it was off. While off it is drawn flat on the window's
-        colour, in a dim dashed outline, and says NOT_HERE for its 0."""
+        colour, in a dim dashed outline, and says `special` (NOT_HERE) for
+        its 0 — or keeps its own text, with None."""
         if bool(widget.property("council_off")) == off:
             return                       # apply_state runs often: no repolish
         if widget.property("council_sheet") is None:
             widget.setProperty("council_sheet", widget.styleSheet())
-            special = getattr(widget, "specialValueText", None)
+            got = getattr(widget, "specialValueText", None)
             widget.setProperty("council_special",
-                               special() if callable(special) else "")
+                               got() if callable(got) else "")
         sheet = str(widget.property("council_sheet") or "")
         set_special = getattr(widget, "setSpecialValueText", None)
+        if special is None:
+            set_special = None
         if off:
             # By its name: the generated class is a subclass of QSpinBox
             # whose own name a type selector would have to spell. An id
@@ -580,7 +614,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
                 f"background-color: {ground}; color: {dim}; "
                 f"border: 1px dashed {dim}; }}")
             if callable(set_special):
-                set_special(self.NOT_HERE)
+                set_special(special)
         else:
             widget.setStyleSheet(sheet)
             if callable(set_special):
@@ -593,15 +627,145 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
     def _took_setting(self, out: Dict[str, Any]) -> None:
         super()._took_setting(out)
         change = dict(out.get("change") or {})
+        key = str(out.get("key") or change.get("key") or "")
         if change.get("ok", out.get("ok", True)) and not change.get(
                 "skipped"):
-            self._follow_boxes([str(out.get("key") or "")])
+            self._follow_boxes([key])
+            kept = self.capture_settings.get(key)
+            if kept is not None and key not in self.rows:
+                # A capture key no tab row shows (Downsample, the timer —
+                # pop-out only): its box shows what the camera took now,
+                # and the set-up is read again after (its help, choices).
+                kept["value"] = change.get("value", out.get("value"))
+                self._want_refresh({str(kept.get("group") or "")})
+        self._basic_capture()
+
+    def _saw_settings(self, settings: Sequence[Dict[str, Any]]) -> None:
+        """The capture set-up's settings as read, kept for the Basic tab's
+        boxes (CAPTURE_BOXES). MEASURED (review): the boxes read only the
+        tab rows, and Downsample and the timer are pop-out rows, so after a
+        preset, a pop-out change, Reset or a reconnect the Downsample box
+        said Off over a camera set to 2x (and the reverse), and neither box
+        ever showed its tooltip."""
+        wanted = set(self.CAPTURE_BOXES.values())
+        for setting in settings:
+            key = str(setting.get("key") or "")
+            if key in wanted:
+                self.capture_settings[key] = dict(setting)
 
     def _took_set(self, out: Dict[str, Any]) -> None:
         super()._took_set(out)
         self._follow_boxes(str(c.get("key")) for c in
                            (out.get("applied") or {}).get("changes") or []
                            if c.get("ok", True) and not c.get("skipped"))
+        self._basic_capture()
+
+    # ------------------------------------------------------------------
+    # The Basic tab's capture boxes show the camera's capture set-up
+    # ------------------------------------------------------------------
+    def _basic_capture(self) -> None:
+        """The Basic tab's Capture, From, frames-per-trigger, timer and
+        Downsample boxes show what the camera's set-up is (the rows of the
+        Capture tab, read from the camera) — QUIETLY, as the boxes beside
+        Start do (no link fires): each box's own link writes the camera
+        when the USER changes it. A dropdown's list is the setting's own
+        choices — "From" lists this camera's inputs (Line1, CxpTrigger0 …),
+        which a link cannot fill.
+
+        GREYED where they cannot apply: no camera, an event camera (its
+        stream is never triggered or downsampled here), and while
+        capturing (one set-up per run); From and frames per trigger only
+        in a triggered mode, the timer only with the Timer source."""
+        ports = self.capture_ports
+        if not ports:
+            return
+        values: Dict[str, Any] = {}
+        for name, key in self.CAPTURE_BOXES.items():
+            row = self.rows.get(key)
+            # A row's setting is the latest (it follows each write); a key
+            # no tab row shows is as last read (_saw_settings).
+            setting = row.setting if row is not None else \
+                self.capture_settings.get(key)
+            if setting is not None:
+                values[key] = setting
+        on = self.connected and self.has_capture and not self.busy
+        settled = on and not self.capturing
+        mode = str((values.get("capture.mode") or {}).get("value") or "")
+        source = str((values.get("capture.source") or {}).get("value") or "")
+        triggered = mode not in ("", "Continuous")
+        for name, port in ports.items():
+            key = self.CAPTURE_BOXES.get(name)
+            setting = values.get(key) if key else None
+            widget = getattr(port, "widget", None)
+            if widget is None:
+                continue
+            if setting is not None:
+                self._fill_choices(widget, setting.get("choices"))
+                value = setting.get("value")
+                if name == "timer_s" and value is not None:
+                    value = f"{float(value):g}"
+                if not widget.hasFocus() or not getattr(
+                        widget, "isEditable", lambda: False)():
+                    self._show_capture_value(port, widget, value)
+            enabled = settled
+            tip = ""
+            if not self.connected:
+                tip = "Connect a camera first"
+            elif not self.has_capture:
+                tip = ("An event camera is not triggered or downsampled "
+                       "here — its .raw keeps every event")
+            elif self.capturing:
+                tip = ("Stop the capture to change this — one run keeps one "
+                       "set-up")
+            elif name in ("trigger_source", "frames_per_trigger") and \
+                    not triggered:
+                enabled, tip = False, ("For a triggered capture: choose "
+                                       "Capture: Triggered: exact or "
+                                       "Triggered: snapshot first")
+            elif name == "timer_s" and (not triggered or source != "Timer"):
+                enabled, tip = False, "For the Timer source only"
+            elif setting is not None:
+                tip = str(setting.get("help") or "")
+            if widget.isEnabled() != enabled:
+                widget.setEnabled(enabled)
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
+            if hasattr(widget, "setSpecialValueText"):
+                # A spin box greyed must look it (see _look_off).
+                self._look_off(widget, not enabled, special=None)
+
+    @staticmethod
+    def _fill_choices(widget: Any, choices: Any) -> None:
+        """A dropdown's list as the setting's choices (quietly). A number
+        (the timer's seconds) keeps the wireframe's own list."""
+        if not choices or not hasattr(widget, "addItems"):
+            return
+        wanted = [str(c) for c in choices]
+        have = [widget.itemText(i) for i in range(widget.count())]
+        if have == wanted:
+            return
+        held = widget.blockSignals(True)
+        try:
+            text = widget.currentText()
+            widget.clear()
+            widget.addItems(wanted)
+            index = widget.findText(text)
+            if index >= 0:
+                widget.setCurrentIndex(index)
+        finally:
+            widget.blockSignals(held)
+
+    @staticmethod
+    def _show_capture_value(port: Any, widget: Any, value: Any) -> None:
+        if value is None:
+            return
+        try:
+            now = port.get()
+        except Exception:                                 # noqa: BLE001
+            now = None
+        if str(now) == str(value):
+            return
+        _quietly_set(port, value)
 
     def _follow_boxes(self, keys: Any) -> None:
         """A tab, a pop-out, a preset or a reset set what a box beside Start
@@ -670,13 +834,16 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         if not self.connected:
             text = NOTE_NO_CAMERA
         else:
-            titles = [t.title for t in self.plan]
-            text = (f"{self.label}: its own settings are in the tabs beside "
-                    f"Basic — {', '.join(titles + [PRESETS_TAB])}. Pop out "
-                    f"opens a category in a window of its own.")
+            # ONE LINE: the note is one row under the capture boxes, 25 px
+            # high at the smallest window (1400 x 820). MEASURED (review):
+            # the event camera's note named the camera and every tab, took
+            # three lines, and was cut off at both window sizes; the frame
+            # camera's, two lines, was cut at 1400 x 820. The camera's name
+            # is said by Connect and the camera list; its tabs are in view.
             if not self.has_exposure and not self.has_gain:
-                text += (" No exposure or gain on an event camera: FPS sets "
-                         "its picture window.")
+                text = NOTE_EVENT
+            else:
+                text = NOTE_FRAME
         try:
             if port.get() != text:
                 port.set(text)

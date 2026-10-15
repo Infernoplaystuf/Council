@@ -158,9 +158,12 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
     # Pop out, Settings, then the camera's own set-up: the area line, the
     # presets heading, the preset picker, Save preset, Camera settings;
     # then the classifier library (s64-s78); then the camera settings tabs
-    # under the image folder (s79 the notebook, s80 Basic, s81 its note).
+    # under the image folder (s79 the notebook, s80 Basic, s81 its note);
+    # then the capture set-up in Basic and Capture now (s82-s92).
     assert [a.rsplit(" (", 1)[-1].rsplit(" ", 1)[-1].rstrip(")")
-            for a in changes.added] == [f"s{i}" for i in range(57, 82)]
+            for a in changes.added] == [f"s{i}" for i in range(57, 93)]
+    assert {"Downsample (s83)", "Capture (s85)", "From (s87)",
+            "Capture now (F9) (s92)"} <= set(changes.added), changes.added
     assert changes.added[:2] == ["Pop out (s57)", "Settings ▾ (s58)"]
     assert {"Preset (s61)", "Save preset (s62)",
             "Camera settings… (s63)"} <= set(changes.added)
@@ -182,7 +185,7 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 25 added, 0 removed, 8 rewired")
+    assert lines[0].startswith("  shapes: 36 added, 0 removed, 8 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
@@ -514,11 +517,19 @@ def test_a_typhon_from_before_the_tabs_gets_them_and_keeps_its_code(
         "print(type(tabs).__name__, tabs.titles())\n"
         "print(all(page.isAncestorOf(getattr(ui.ports, p).widget)\n"
         "          for p in ('exposure', 'gain', 'frame_rate')))\n"
+        # An EVK4 listed FIRST, as discovery lists a real one plugged in
+        # (the fake EVK4 stands in for it, so nothing real is opened):
+        # this test means the SIMULATED event camera.
+        "import pytest\n"
+        "from tests import fake_evk4\n"
+        "fake_evk4.install(pytest.MonkeyPatch(), frame_camera)\n"
         "ui.on_btn_scan_for_cameras()\n"
         "rows = ui.ports.cameras.items()\n"
         "ui.ports.cameras.widget.setCurrentRow(\n"
-        "    next(i for i, r in enumerate(rows) if r.endswith('event')))\n"
+        "    next(i for i, r in enumerate(rows)\n"
+        "         if 'Simulated' in r and r.endswith('event')))\n"
         "ui.on_btn_connect()\n"
+        "print(type(frame_camera._LIVE.device).__name__)\n"
         "print(tabs.titles())\n"
         # An arrow click to 25: the box's link runs on a step or a
         # committed number (_SpinBox.committed), not on every setValue.
@@ -532,8 +543,10 @@ def test_a_typhon_from_before_the_tabs_gets_them_and_keeps_its_code(
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
     printed = done.stdout.strip().splitlines()
-    assert printed[-4] == "SettingsTabs ['Basic', 'Camera', 'Presets']"
-    assert printed[-3] == "True", "a box beside Start is not in Basic"
+    assert printed[-5] == "SettingsTabs ['Basic', 'Camera', 'Presets']"
+    assert printed[-4] == "True", "a box beside Start is not in Basic"
+    assert printed[-3] == "SyntheticDevice", \
+        "connected to the first event camera listed, not the simulated one"
     assert printed[-2] == ("['Basic', 'Biases', 'Filters', 'Display', "
                            "'Camera', 'Presets']")
     # The FPS box still applies its rate through its (hand-edited) link:

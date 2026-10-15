@@ -56,6 +56,20 @@ The capture folder IS the browse folder. Each run writes, side by side:
                                  not, failed grabs and grab attempts, the
                                  write that stopped it if one did
                                  (capture.Recorder.finish) — written once
+    <run>_capture_triggers.csv   A TRIGGERED RUN ONLY: one row per trigger,
+                                 missed ones too (council_core.triggered)
+
+TRIGGERED CAPTURE AND DOWNSAMPLE
+A frame camera has a CAPTURE SET-UP (council_core.triggered): Continuous —
+every frame, as always — or "Triggered: exact" (Start arms the camera's own
+trigger, Stop puts every trigger back) or "Triggered: snapshot" (the live
+view runs; the next frames after each trigger are saved); the trigger comes
+from Software (capture_now: the Capture now button, F9 anywhere in the
+app), a Timer, or the camera's own input. Downsample (Off, 2x, 3x, 4x)
+averages blocks of pixels — by the camera's binning where it can, else by
+Typhon (council_core.reduce) as each frame is saved and shown. The set-up
+is a setting of the camera like any other (presets, the tabs, the run's
+record) and fixed while capturing. An event camera has none.
 
 PNG specifically, because frame_timing, frame_roi and frame_classes all
 discover frames by IMAGE_SUFFIXES and open them with Pillow — a capture
@@ -93,7 +107,9 @@ Two boxes, two coordinate systems, kept apart:
 The live picture of a camera with an area IS that area, so a box drawn on it
 is turned into sensor pixels by adding the origin of the area the shown frame
 was taken with (Frame.meta["aoi"]) — `set_area`. The live view is shown at
-full resolution, never decimated, so there is no display scale to undo. The
+full resolution, never decimated, so there is no display scale to undo —
+except Downsample by Typhon (Frame.meta["reduce"]), whose live picture is
+the saved one's size: set_area scales the box back up by it. The
 camera's area is never written back into the crop box.
 
 ONE SET-UP PER RUN
@@ -246,11 +262,15 @@ class _Live:
         #: keeps what it was last given until it is powered off, so it also
         #: offers its own factory set (load_camera_defaults).
         self.as_connected: Dict[str, Any] = {}
-        #: Each trigger's mode by its selector entry as connected (camera_
-        #: settings Provider.trigger_modes): a Basler's TriggerMode is the
-        #: SELECTED trigger's, so as_connected holds one of nine; Reset puts
-        #: the others back from here.
-        self.as_connected_triggers: Dict[str, str] = {}
+        #: Every trigger's settings by selector entry as connected — mode,
+        #: source, edge and delay, by camera_settings.trigger_key ("Trigger
+        #: Source[FrameBurstStart]"; Provider.trigger_settings(selected=
+        #: True)): a Basler's trigger rows are the SELECTED trigger's, so
+        #: as_connected holds one of nine; Reset puts them all back from
+        #: here (Provider.restore_triggers). The SELECTOR goes back as
+        #: connected too — it is in as_connected, written by the set
+        #: before them — and restoring the triggers does not move it again.
+        self.as_connected_triggers: Dict[str, Any] = {}
         #: The camera's description read by Connect, while Connect is being
         #: announced to the views (settings_list answers from it); else None.
         self.connect_listing: Optional[List[Any]] = None
@@ -293,6 +313,24 @@ class _Live:
         self.preset_in_use: Optional[Dict[str, Any]] = None
         #: The latest run's camera record (<run>_camera.json), or None.
         self.record_path: Optional[Path] = None
+        #: A TRIGGERED run's books and its trigger thread (council_core.
+        #: triggered.TriggerRun) while it runs, else None; the last one,
+        #: for what Stop and the live line say after it.
+        self.trigger_run: Any = None
+        self.last_trigger_run: Any = None
+        #: What arming the camera's own trigger changed (Start, an exact
+        #: run), put back by Stop; None when nothing was armed.
+        self.armed: Any = None
+        #: The Downsample factor Typhon applied to the picture on screen
+        #: (Frame.meta "reduce"): a box drawn on it is in pixels that many
+        #: times larger on the camera.
+        self.shown_reduce = 1
+        #: The attached app's "Capture now (F9)" button and F9 shortcut,
+        #: held so they live as long as the window. About the app.
+        self.capture_button: Any = None
+        self.capture_key: Any = None
+        #: What Stop could not put back after an exact run, or "".
+        self.disarm_note = ""
 
     def clear(self) -> None:
         self.device = None
@@ -325,6 +363,11 @@ class _Live:
         self.queued = {}
         self.preset_in_use = None
         self.record_path = None
+        self.trigger_run = None
+        self.last_trigger_run = None
+        self.armed = None
+        self.shown_reduce = 1
+        self.disarm_note = ""
 
 
 _LIVE = _Live()
@@ -459,16 +502,22 @@ def connect(which: Any) -> Dict[str, Any]:
     # facility calls for a Connect that made 46 before the tabs).
     described = _describe_or_none(device)
     _LIVE.as_connected = _snapshot_or_nothing(device, described)
-    _LIVE.as_connected_triggers = _trigger_modes_or_nothing(device)
+    _LIVE.as_connected_triggers = _every_trigger_or_nothing(device)
     _LIVE.connect_listing = described
     try:
         _announce({"what": "connected",
                    "summary": f"Connected to {info.label}."})
     finally:
         _LIVE.connect_listing = None
+    said = f"Connected to {info.label}. Sensor {limits.width}x{limits.height}."
+    binned = _binned_note(device)
+    if binned:
+        # A camera already binned (its own binning, or one a crash of an
+        # earlier session left) sends smaller frames with Downsample Off:
+        # said here, where the user looks first, not found in the files.
+        said += f" Note: {binned}."
     return {
-        "summary": (f"Connected to {info.label}. "
-                    f"Sensor {limits.width}x{limits.height}."),
+        "summary": said,
         "area": _area_text(area),
         "sensor": f"{limits.width}x{limits.height}",
         # An event camera has no exposure and no gain. Reporting the real
@@ -485,6 +534,7 @@ def disconnect() -> Dict[str, Any]:
     with _LOCK:
         session = _LIVE.session
         job = _LIVE.job
+        trig, armed = _LIVE.trigger_run, _LIVE.armed
         _LIVE.clear()
     if job is not None:
         # A change still stopping or restarting the stream owns it until it
@@ -492,7 +542,17 @@ def disconnect() -> Dict[str, Any]:
         # so it does not start a stream that is about to be closed.
         job.cancelled = True
         job.done.wait(JOB_JOIN_SECONDS)
+    if trig is not None:
+        # Its thread fires the camera: stopped before the camera closes.
+        trig.stop()
     if session is not None:
+        if armed is not None:
+            # Disconnect in the middle of an exact run: the camera's
+            # triggers put back as they were before Start, not left armed.
+            try:
+                session.device.disarm_trigger(armed)
+            except Exception:                             # noqa: BLE001
+                pass
         session.close()
         _announce({"what": "disconnected", "summary": "Disconnected."})
     return {"summary": "Disconnected.", "status": ""}
@@ -514,6 +574,17 @@ def shutdown() -> Dict[str, Any]:
 #: still queued after that keep saving in the background, and the status line
 #: counts them down; the app waits for them in full when it quits.
 STOP_DRAIN_SECONDS = 1.0
+
+#: How long Stop gives a trigger fired a moment before it to bring its frame
+#: (the exposure and half a second, at most this).
+STOP_TRIGGER_WAIT_SECONDS = 1.5
+
+#: The grab loop's read timeout while an exact run has the camera armed,
+#: and otherwise (capture.CaptureSession's own). Armed, nothing comes
+#: between triggers, and a 1 s read held Stop up to a second (measured on
+#: the test fake: session.stop 1.00 s of a 1.05 s Stop).
+ARMED_READ_MS = 200
+FREE_READ_MS = 1000
 
 
 def start(folder: Any, exposure: Any = "", gain: Any = "",
@@ -559,8 +630,25 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     started again for the capture. An EVK4's stream is left running and the
     .raw opens inside it — restarting would carry stale decoder state into
     the capture (EvkDevice.restartable). Everything that can refuse (the
-    folder, exposure, gain) is checked BEFORE anything stops, so a refused
-    Start leaves the picture running.
+    folder, exposure, gain, the capture set-up) is checked BEFORE anything
+    stops, so a refused Start leaves the picture running.
+
+    A TRIGGERED RUN (the camera's capture set-up, council_core.triggered).
+    "Triggered: exact": Start ARMS the camera's own trigger once the live
+    view has stopped and before the record is read, so the record shows
+    the trigger armed — FrameStart On from Software (Typhon fires it:
+    Capture now, F9, the Timer) or from the camera's input (Line1 …) —
+    and Stop puts every trigger back. "Triggered: snapshot": the camera
+    free-runs as always and only the frames a trigger asks for are saved.
+    Each trigger is a row of <run>_capture_triggers.csv; each saved frame
+    says its trigger in the frames CSV. A hardware source Typhon cannot
+    confirm the camera has is refused here, with why.
+
+    DOWNSAMPLE (the set-up's too): set before Start — the camera's binning
+    is set when Downsample is chosen, so the live view is already the
+    picture the run saves; Typhon's own averaging happens as each frame is
+    saved and shown. The run's records and frames CSV say the factor and
+    how it was made.
     """
     from council_core import capture
 
@@ -574,7 +662,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     out = Path(where)
     if out.exists() and not out.is_dir():
         raise RuntimeError(f"{out} is a file, not a folder")
-    waits_for = _waits_for_trigger(session.device)
+    setup = _capture_setup(session.device)
+    problem = _capture_problem(session.device, setup)
+    if problem:
+        raise RuntimeError(problem)
+    waits_for = _waits_for_trigger(session.device, setup)
 
     for box, value in (("exposure", exposure), ("gain", gain),
                        ("frame_rate", frame_rate)):
@@ -605,6 +697,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     restartable = getattr(device, "restartable", True)
     if _stream_dead(session):
         raise RuntimeError(_DEAD_STREAM)
+    # The live view's measured rate: how long a snapshot trigger waits for
+    # its frames before it says "no frame".
+    rate = float(session.stats().rate or 0.0) if session.running else 0.0
     # RESERVED, and the recorder OPENED, before anything stops: a folder
     # that cannot be written is refused with the picture still running,
     # like every other refusal. The reservation's CSV stays open and the
@@ -616,12 +711,21 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
     recorder = capture.run_recorder(out, run, claim)
+    armed = None
+    trig = None
     try:
         recorder.open()
         if session.running and restartable:
             _stop_preview(session)
         elif restartable:
             _release_dead_stream(session)
+        # Downsample made by the camera's binning, checked against the
+        # binning the camera has now (BaslerDevice.check_downsample): a run
+        # is never recorded as binned while the camera sends full frames.
+        downsample_note = _check_downsample(device)
+        if downsample_note:
+            setup.downsample = int(getattr(getattr(device, "capture", None),
+                                           "downsample", 1) or 1)
 
         # READ after the boxes beside Start were applied and before the
         # run's recording begins — the camera as every picture of this run
@@ -631,14 +735,33 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # camera's stream is already running, so from the switch on every
         # moment Start spends here is frames of the run, and reading every
         # setting of a real camera is the slow part of the record.
-        content, record_note = _camera_record(run, device)
+        # Compared with the preset in use BEFORE an exact run arms the
+        # trigger: the trigger Typhon arms is the run's, not "the preset
+        # changed".
+        listing = _camera_listing(device)
+        if setup.exact:
+            armed = _arm(device, setup)
+            # An armed camera sends nothing between triggers: the grab loop
+            # waits in short reads, so Stop is not held up to a second by
+            # one (it notices Stop between reads).
+            session.timeout_ms = ARMED_READ_MS
+        content, record_note = _camera_record(
+            run, device, listing,
+            setup if getattr(device, "capture", None) is not None else None,
+            armed)
+        if setup.triggered:
+            trig = _trigger_run(setup, device, out, run, listing, rate)
+            recorder.capture_info = trig.summary
+        recorder.downsample_info = _downsample_record(device)
         # reset: this run's numbers only — frames the preview showed were
         # never meant to be saved, and counting them would read as frames the
         # capture lost. In the same step as the switch (see record_to).
-        session.record_to(recorder, reset=True)
+        session.record_to(recorder, reset=True, gate=trig)
     except BaseException as exc:
         # Refused before the recording began: let go of the reservation's
-        # CSV (it stays, header only, and keeps the name taken).
+        # CSV (it stays, header only, and keeps the name taken), and put
+        # an armed trigger back.
+        _undo_arming(device, trig, armed)
         recorder.close()
         if isinstance(exc, OSError):
             raise RuntimeError(
@@ -651,6 +774,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             raw = device.start_raw(out / f"{run}_events.raw")
         except Exception as exc:                          # noqa: BLE001
             session.record_to(None)
+            _undo_arming(device, trig, armed)
             raise RuntimeError(f"cannot record the raw file: {exc}") from exc
     _LIVE.folder = out
     _LIVE.run = run
@@ -668,8 +792,21 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                 except Exception:                         # noqa: BLE001
                     pass
             session.record_to(None)
+            _undo_arming(device, trig, armed)
             raise
         _started_stream(session)
+    if trig is not None and armed is not None and not trig.typhon_fires:
+        # The camera's edge count starts once it can take a trigger: the
+        # edges before that (arming, the record read, the stream starting)
+        # triggered nothing.
+        _count_from_ready(device, armed)
+    if trig is not None:
+        # After the stream: the first trigger waits for the camera to say
+        # it is ready (a trigger fired before that is lost — measured).
+        trig.start()
+    _LIVE.trigger_run = trig
+    _LIVE.last_trigger_run = trig
+    _LIVE.armed = armed
     _LIVE.capturing = True
     _LIVE.previewing = False
     # The run's own silence, if any, is asked about afresh: a reason left
@@ -682,6 +819,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     _LIVE.record_path = record
 
     said = f"Capturing into {out}."
+    said += _capture_words(setup, armed, device)
+    if downsample_note:
+        said += f" {downsample_note[0].upper()}{downsample_note[1:]}."
     if raw is not None:
         said += f" Raw: {raw.name}."
     if record_note:
@@ -696,6 +836,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "skipped.")
     if waits_for:
         said += f" The camera waits for {waits_for} before each frame."
+    _capture_button_state()
     # A settings window greys out what a capture refuses (the area, a
     # preset, a setting the stream is in the way of) from this.
     _announce({"what": "capturing", "summary": said})
@@ -725,11 +866,35 @@ def stop() -> Dict[str, Any]:
     _LIVE.capturing = False
     _LIVE.idle = "stopped"
     device = session.device
+    trig, armed = _LIVE.trigger_run, _LIVE.armed
+    _LIVE.trigger_run = None
+    _LIVE.armed = None
+    if trig is not None:
+        # Fire nothing more, and give a trigger fired a moment ago its
+        # frame before the stream ends (a Timer tick at the press of Stop
+        # was "no frame" otherwise).
+        trig.halt()
+        trig.wait_pending(min(STOP_TRIGGER_WAIT_SECONDS,
+                              trig.exposure_s + 0.5))
+        if armed is not None and not trig.typhon_fires:
+            # The edge count ends BEFORE the stream: an edge after
+            # StopGrabbing triggers nothing, and was counted "missed".
+            try:
+                device.count_to_now(armed)
+            except Exception:                             # noqa: BLE001
+                pass
+            if isinstance(armed, dict) and armed.get("counter"):
+                _let_frames_land(session, device, trig)
     if getattr(device, "restartable", True):
         ended = session.stop()
+        session.timeout_ms = FREE_READ_MS
+        # The run's books closed before its recording ends, so its end
+        # record (written as the last frame lands) has every trigger.
+        _end_triggers(device, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
     else:
         ended = True
+        _end_triggers(device, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
         finish = getattr(device, "finish_raw", None)
         if callable(finish):
@@ -738,6 +903,12 @@ def stop() -> Dict[str, Any]:
             except Exception as exc:                      # noqa: BLE001
                 _LIVE.idle = (f"Stopped, but the raw file did not close "
                               f"cleanly: {exc}")
+    _LIVE.disarm_note = ""
+    if armed is not None:
+        # Every trigger back as it was before Start: the live view runs
+        # free again. What could not be put back is said with the result.
+        _LIVE.disarm_note = _disarm(device, armed)
+    _capture_button_state()
     stats = session.run_stats()
     # A run that saved nothing because the camera waited for a trigger says
     # so after Stop: "0 saved" alone read as a fault of the app.
@@ -750,29 +921,173 @@ def stop() -> Dict[str, Any]:
         _announce({"what": "stopped",
                    "summary": "The camera did not stop cleanly."})
         return {"summary": "The camera did not stop cleanly.",
-                "status": stats.line()}
+                "status": _stats_line(stats)}
     line = _stopped_line(session)
     _LIVE.run_note_until = time.monotonic() + RUN_NOTE_SECONDS
     _LIVE.run_note = ""            # this run's, read from the session
     _announce({"what": "stopped", "summary": line})
-    return {"summary": line, "status": stats.line()}
+    return {"summary": line, "status": _stats_line(stats)}
 
 
 #: How long the live line carries the last run's result after Stop.
 RUN_NOTE_SECONDS = 10.0
 
 
+# ======================================================================
+# Capture now, and the Basic tab's capture boxes
+# ======================================================================
+#: The key that does what Capture now does, anywhere in the app (attach).
+#: F9: free in Typhon (Esc closes a settings window, F4 opens the model
+#: list, F11 is a pop-out's full screen); not Space, which a focused
+#: button or spin box takes for itself.
+CAPTURE_KEY = "F9"
+
+
+def capture_now() -> Dict[str, Any]:
+    """Capture now (the button, and F9): one trigger of the triggered run
+    in progress — the camera fires at once in an exact run (Software or
+    Timer source), and a snapshot run saves the next frames that arrive.
+    Said, not raised, when there is nothing to fire: it is a key anyone may
+    press at any time.
+
+    Keys: summary"""
+    session = _LIVE.session
+    if session is None:
+        return {"summary": "Connect a camera first — Capture now fires the "
+                           "trigger of a triggered capture."}
+    trig = _LIVE.trigger_run
+    if not _LIVE.capturing or trig is None:
+        setup = getattr(session.device, "capture", None)
+        if setup is None:
+            return {"summary": "An event camera is not triggered here — "
+                               "its .raw keeps every event."}
+        if setup.triggered and setup.exact:
+            return {"summary": f"Not capturing — Start first: it arms the "
+                               f"trigger ({setup.short()}); then Capture "
+                               f"now ({CAPTURE_KEY}) takes each picture."}
+        if setup.triggered:
+            # A snapshot run arms nothing: the live view runs, and each
+            # press saves the next frame(s).
+            frames = ("frame" if setup.per_trigger <= 1
+                      else f"{setup.per_trigger} frames")
+            return {"summary": f"Not capturing — Start first ("
+                               f"{setup.short()}); then Capture now "
+                               f"({CAPTURE_KEY}) saves the next {frames}."}
+        # Not "Basic tab": every app with a camera hears F9 — the capture
+        # set-up is in its camera's Capture settings wherever it shows them.
+        return {"summary": "Capture now is for a triggered capture — choose "
+                           "Capture: Triggered: exact or Triggered: "
+                           "snapshot, then Start."}
+    said = trig.capture_now()
+    return {"summary": f"Capture now: {said}."}
+
+
+def _set_capture(key: str, value: Any) -> Dict[str, Any]:
+    """One key of the capture set-up, from a box on the Basic tab: what
+    set_camera_setting says. Not connected, or an event camera: said, not
+    raised — the box can be changed at any time."""
+    device = _LIVE.device
+    if device is None:
+        return {"summary": "Connect a camera first — the capture set-up is "
+                           "the camera's, kept in its presets."}
+    if getattr(device, "capture", None) is None:
+        return {"summary": "An event camera is not triggered or downsampled "
+                           "here — its .raw keeps every event."}
+    try:
+        out = set_camera_setting(key, value)
+    except Exception:
+        # Refused: the box goes back to what the camera has (the views read
+        # the setting again), and the refusal is raised as said.
+        _announce({"what": "box", "box": key, "keys": [key]})
+        raise
+    return {"summary": out.get("summary", ""), "ok": out.get("ok", True),
+            "pending": out.get("pending", False)}
+
+
+def set_capture_mode(mode: Any) -> Dict[str, Any]:
+    """The Basic tab's Capture box: "Continuous" (every frame, the
+    default), "Triggered: exact" or "Triggered: snapshot" (see start).
+    Fixed while capturing.
+
+    Keys: summary"""
+    from council_core import triggered
+
+    return _set_capture(triggered.MODE_KEY, _picked(mode))
+
+
+def set_trigger_source(source: Any) -> Dict[str, Any]:
+    """The Basic tab's "From" box: Software (Capture now, F9), Timer, or
+    one of the camera's own inputs as it lists them (Line1, CxpTrigger0 …).
+
+    Keys: summary"""
+    from council_core import triggered
+
+    return _set_capture(triggered.SOURCE_KEY, _picked(source))
+
+
+def set_frames_per_trigger(frames: Any) -> Dict[str, Any]:
+    """The Basic tab's frames-per-trigger box: 1 (the default), or more
+    for a short burst.
+
+    Keys: summary"""
+    from council_core import triggered
+
+    return _set_capture(triggered.PER_KEY, _picked(frames) or 1)
+
+
+def set_timer(seconds: Any) -> Dict[str, Any]:
+    """The Basic tab's timer box, seconds between triggers ("2", "0.5",
+    "2 s").
+
+    Keys: summary"""
+    from council_core import triggered
+
+    text = _picked(seconds).lower().replace("seconds", "").replace(
+        "sec", "").rstrip("s").strip()
+    return _set_capture(triggered.EVERY_KEY, text or "1")
+
+
+def set_downsample(choice: Any) -> Dict[str, Any]:
+    """The Basic tab's Downsample box: Off (the default — never changes
+    the data), 2x, 3x or 4x: each block of pixels averaged into one, by
+    the camera's binning where it can, else by Typhon before saving. A
+    camera's binning restarts the live view for a moment.
+
+    Keys: summary"""
+    from council_core import triggered
+
+    return _set_capture(triggered.DOWNSAMPLE_KEY, _picked(choice) or "Off")
+
+
+def _stats_line(stats: Any) -> str:
+    """capture.Stats.line: the display drops are "not drawn (screen only)"
+    (capture.SCREEN_DROPS, the line's own wording) in EVERY line — the live
+    one, Stop's, a capture that ended and status(), and the Council's
+    Capture tab. Stop's said "N dropped" for the very number the live line
+    had just called "not drawn (screen only)"."""
+    return stats.line()
+
+
 def _run_note(session: Any) -> str:
-    """The last run, short: what was saved, what was not, the .raw."""
+    """The last run, short: what was saved, what was not, the failed grabs,
+    the .raw. A failed grab is an exposure the camera made and could not
+    deliver — a gap in the run's frame numbers (capture.Stats.grab_failures)
+    — and the note said nothing of it while Stop's line did."""
     stats = session.run_stats()
     bits = [f"{stats.recorded} saved"]
     if _LIVE.run_waited:
         bits[0] += f" — {_LIVE.run_waited}"
+    trig = _LIVE.last_trigger_run
+    if trig is not None:
+        bits.append(trig.stopped_line())
     if stats.skipped:
         bits.append(f"{stats.skipped} NOT saved")
     if stats.recording_failed:
         bits.append(f"RECORDING HAD STOPPED ({stats.recording_failed}): "
                     f"{stats.unsaved} NOT saved")
+    if stats.grab_failures:
+        failed = stats.grab_failures
+        bits.append(f"{failed} failed grab{'' if failed == 1 else 's'}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -785,18 +1100,27 @@ def _run_note(session: Any) -> str:
 def _stopped_line(session: Any) -> str:
     """What the status line says once a run is over — or nearly over."""
     stats = session.run_stats()
-    line = f"Stopped. {stats.line()}"
+    said = _stats_line(stats)
+    line = f"Stopped. {said}"
     if stats.waiting:
-        line = f"Stopped — still saving. {stats.line()}"
+        line = f"Stopped — still saving. {said}"
+    trig = _LIVE.last_trigger_run
+    if trig is not None:
+        # The triggers first: what the run was for. "12 triggers, 12 ok,
+        # 0 missed · the camera counted 12 edges on Line1".
+        line = (f"Stopped{' — still saving' if stats.waiting else ''} — "
+                f"{trig.stopped_line()}. {said}")
+    if _LIVE.disarm_note:
+        line += f" · {_LIVE.disarm_note}"
     if _LIVE.run_waited:
         # First: the line is one row, and the reason is what matters.
-        line = f"Stopped — {_LIVE.run_waited}. {stats.line()}"
+        line = f"Stopped — {_LIVE.run_waited}. {said}"
     if stats.recording_failed:
         # Before anything else: the run did not save what it grabbed after
         # this, and stats.line() counts those frames "NOT saved (recording
         # stopped)". Before, this line said "1 error(s)" and left them out.
         line = (f"Stopped — RECORDING HAD STOPPED: "
-                f"{stats.recording_failed}. {stats.line()}")
+                f"{stats.recording_failed}. {said}")
     raw = _LIVE.raw_path
     if raw is not None:
         try:
@@ -816,7 +1140,7 @@ def status() -> Dict[str, Any]:
     session = _LIVE.session
     if session is None:
         return {"summary": "No camera open.", "status": ""}
-    line = session.stats().line()
+    line = _stats_line(session.stats())
     return {"summary": line, "status": line}
 
 
@@ -861,10 +1185,32 @@ def pump(show: Callable[[Any], Any],
     _watch_capture()
     frame = latest()
     if frame is not None:
-        show(frame.image)
+        show(_display_image(frame))
         _LIVE.shown_aoi = _aoi_of(frame)
+        _LIVE.shown_reduce = _reduce_of(frame)
     _report(say, frame)
     return frame is not None
+
+
+def _display_image(frame: Any) -> Any:
+    """The frame's picture as the run saves it: Downsampled by Typhon when
+    the camera says so (council_core.reduce.prepared), so the live picture,
+    the saved PNGs and a box drawn on either are one geometry."""
+    from council_core import reduce
+
+    try:
+        return reduce.prepared(frame.image, getattr(frame, "meta", None))
+    except Exception:                                     # noqa: BLE001
+        return frame.image
+
+
+def _reduce_of(frame: Any) -> int:
+    """The factor Typhon reduced a frame's picture by (1 for none)."""
+    try:
+        return max(1, int((getattr(frame, "meta", None) or {}).get(
+            "reduce", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 #: How long the camera may send nothing before the live line says so and
@@ -882,19 +1228,31 @@ def _triggers_on(device: Any) -> List[Any]:
         return []
 
 
-def _trigger_modes_or_nothing(device: Any) -> Dict[str, str]:
+def _every_trigger_or_nothing(device: Any) -> Dict[str, Any]:
+    """Every trigger's mode, source, edge and delay (trigger_settings with
+    the selected one's too), or {} when the camera has none or cannot say."""
     try:
-        return dict(device.settings_provider().trigger_modes())
+        return dict(device.settings_provider().trigger_settings(
+            selected=True))
     except Exception:                                     # noqa: BLE001
         return {}
 
 
-def _waits_for_trigger(device: Any) -> str:
-    """At Start, before anything stops: REFUSED when the camera waits for a
-    software trigger — nothing here sends one, so the run would save
-    nothing (measured on the emulator: a 4 s run wrote only its .csv and
-    camera record). A hardware trigger is the user's to fire: the run
-    starts, and this says what it waits for ("" for nothing)."""
+def _waits_for_trigger(device: Any, setup: Any = None) -> str:
+    """At Start, before anything stops, for a run whose trigger TYPHON does
+    not arm (Continuous, or Snapshot — the camera must run free): REFUSED
+    when the camera itself waits for a software trigger — such a run sends
+    none, so it would save nothing (measured on the emulator: a 4 s run
+    wrote only its .csv and camera record). A hardware trigger is the
+    user's to fire: the run starts, and this says what it waits for ("" for
+    nothing).
+
+    A "Triggered: exact" run is not asked: Start arms the camera's trigger
+    itself (FrameStart from Software or the chosen input, every other
+    trigger Off) and Stop puts every one back — Typhon fires a Software
+    source, so Start no longer refuses it."""
+    if setup is not None and getattr(setup, "exact", False):
+        return ""
     on = _triggers_on(device)
     software = [t for t in on if t.software]
     if software:
@@ -902,9 +1260,326 @@ def _waits_for_trigger(device: Any) -> str:
         raise RuntimeError(
             f"the camera's {which} trigger is On with its source "
             f"{software[0].source}, and nothing here sends a software "
-            f"trigger — this run would save no frames. Set Trigger mode "
+            f"trigger — this run would save no frames ({_mode_word(setup)} "
+            f"fires none). Choose Capture: Triggered: exact to have Typhon "
+            f"fire it (Capture now, F9 or the Timer), or set Trigger mode "
             f"Off (Exposure tab, Trigger), then Start")
     return _trigger_words(on)
+
+
+def _mode_word(setup: Any) -> str:
+    from council_core import triggered
+
+    if setup is not None and getattr(setup, "mode", "") == \
+            triggered.MODE_SNAPSHOT:
+        return "a snapshot run"
+    return "a Continuous run"
+
+
+# ======================================================================
+# Triggered capture and Downsample (council_core.triggered, .reduce)
+# ======================================================================
+def _capture_setup(device: Any) -> Any:
+    """The open camera's capture set-up, as Start fixes it for the run (a
+    copy: one set-up per run). A camera with none (an event camera)
+    captures continuously, as it always did."""
+    from dataclasses import replace
+
+    from council_core import triggered
+
+    setup = getattr(device, "capture", None)
+    return replace(setup) if setup is not None else triggered.CaptureSetup()
+
+
+def _capture_problem(device: Any, setup: Any) -> str:
+    """Why this run's capture set-up cannot run on this camera, in words —
+    "" when it can. Asked at Start BEFORE anything stops."""
+    from council_core import reduce
+
+    if setup.triggered:
+        try:
+            problem = device.trigger_problem(setup)
+        except Exception as exc:                          # noqa: BLE001
+            problem = f"the camera could not be asked about its triggers: " \
+                      f"{_said(exc)}"
+        if problem:
+            return f"cannot start a {setup.short()} run: {problem}"
+        if setup.source == "Timer" and setup.every_s <= 0:
+            return "the timer's interval must be more than 0 s"
+    if int(getattr(setup, "downsample", 1) or 1) > 1:
+        info = _downsample_state(device)
+        if info.get("method") in ("", reduce.TYPHON_MEAN):
+            fmt = _pixel_format(device)
+            why = reduce.refusal(fmt)
+            if why:
+                return f"cannot Downsample this run: {why}"
+    return ""
+
+
+def _pixel_format(device: Any) -> str:
+    try:
+        return str(device.settings_provider().read("PixelFormat") or "")
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def _downsample_state(device: Any) -> Dict[str, Any]:
+    info = getattr(device, "downsample_info", None)
+    try:
+        return dict(info()) if callable(info) else {}
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+
+def _binned_note(device: Any) -> str:
+    """What the camera's OWN binning does ("the camera itself bins 2 x 2
+    (Average) — ..."), or "" when it bins nothing beyond Downsample."""
+    ask = getattr(device, "binned_note", None)
+    try:
+        return str(ask() or "") if callable(ask) else ""
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def _check_downsample(device: Any, rebin: bool = False) -> str:
+    """The camera's binning checked against Downsample (BaslerDevice.
+    check_downsample): "" when they agree, else what was done about it."""
+    check = getattr(device, "check_downsample", None)
+    try:
+        return str(check(rebin) or "") if callable(check) else ""
+    except Exception as exc:                              # noqa: BLE001
+        return f"Downsample could not be checked: {_said(exc)}"
+
+
+def _arm(device: Any, setup: Any) -> Any:
+    """Arm the camera's own trigger for an exact run (the stream stopped);
+    what arming changed, for Stop. Refused in words."""
+    try:
+        return device.arm_trigger(setup)
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(f"the camera could not be armed for a "
+                           f"{setup.short()} run: {_said(exc)}") from exc
+
+
+def _disarm(device: Any, armed: Any) -> str:
+    """Every trigger back as before Start; "" when all of it went back,
+    else what did NOT (said after Stop)."""
+    try:
+        said = list(device.disarm_trigger(armed) or [])
+    except Exception as exc:                              # noqa: BLE001
+        return f"the camera's triggers were NOT put back: {_said(exc)}"
+    failed = [line for line in said if "NOT" in line]
+    return "; ".join(failed)
+
+
+def _undo_arming(device: Any, trig: Any, armed: Any) -> None:
+    """A Start that failed after arming: the triggers CSV closed (it stays,
+    header only, as the frames CSV does), the camera disarmed, the grab
+    loop's reads as long as before."""
+    session = _LIVE.session
+    if session is not None:
+        session.timeout_ms = FREE_READ_MS
+    if trig is not None:
+        try:
+            trig.close()
+        except Exception:                                 # noqa: BLE001
+            pass
+    if armed is not None:
+        _disarm(device, armed)
+
+
+def _end_triggers(device: Any, trig: Any, armed: Any) -> None:
+    """Stop a triggered run's thread and close its books: what the camera
+    counted on its input first (an exact run from a hardware source)."""
+    if trig is None:
+        return
+    if armed is not None and not trig.typhon_fires:
+        # Fewer edges than the counter can cover for the triggers seen: it
+        # did not count what triggered the camera — its set-up on this
+        # model is not known to work (unverified on hardware). Untrusted,
+        # never "missed" (BaslerSettings.count_edges).
+        try:
+            edges, why = device.count_edges(armed, trig.counts["triggers"])
+        except Exception as exc:                          # noqa: BLE001
+            edges, why = None, _said(exc)
+        trig.edges_counted(edges, why, window=EDGE_WINDOW if edges is not None
+                           else "")
+    trig.stop()
+
+
+#: Between which moments the camera's edge count is taken (the record's
+#: capture block, edges_counted_between).
+EDGE_WINDOW = ("from when the camera was first ready for a trigger after "
+               "Start, to Stop (read before the stream stopped, the camera "
+               "then taking no more hardware triggers); an edge at either "
+               "end, where the camera may or may not have taken it, is not "
+               "called missed")
+
+#: After Stop closed the camera's input: how long frames already exposed
+#: are given to reach Typhon before the stream stops (they are the run's,
+#: and their edges were counted) — at most this, and done once none has
+#: come for LAND_QUIET_SECONDS.
+LAND_SECONDS = 0.5
+LAND_QUIET_SECONDS = 0.05
+
+
+def _let_frames_land(session: Any, device: Any, trig: Any) -> None:
+    """Stop of an exact run from the camera's input: the input is closed
+    (count_to_now), so what the camera exposed before it is waited for —
+    the exposure (trigger_ready), then until no frame has come for
+    LAND_QUIET_SECONDS. A frame still on its way when the stream stopped
+    was lost, and its counted edge said "missed"."""
+    ready = getattr(device, "trigger_ready", None)
+    try:
+        if callable(ready):
+            ready(min(STOP_TRIGGER_WAIT_SECONDS, trig.exposure_s + 0.5))
+    except Exception:                                     # noqa: BLE001
+        pass
+    end = time.monotonic() + LAND_SECONDS
+    last = session.stats().grabbed
+    quiet_from = time.monotonic()
+    while time.monotonic() < end:
+        time.sleep(0.005)
+        now = session.stats().grabbed
+        if now != last:
+            last, quiet_from = now, time.monotonic()
+        elif time.monotonic() - quiet_from >= LAND_QUIET_SECONDS:
+            return
+
+
+def _count_from_ready(device: Any, armed: Any) -> None:
+    """The camera's edge count starts now (BaslerSettings.count_from_now) —
+    once the camera says it is ready for a trigger, at most FIRST_READY_S
+    after the stream started."""
+    from council_core import triggered
+
+    if not (isinstance(armed, dict) and armed.get("counter")):
+        return
+    ready = getattr(device, "trigger_ready", None)
+    try:
+        if callable(ready):
+            ready(triggered.FIRST_READY_S)
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        device.count_from_now(armed)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def _trigger_run(setup: Any, device: Any, out: Path, run: str,
+                 listing: Dict[str, Any], rate: float) -> Any:
+    """The run's trigger books, with its triggers CSV created (never over
+    a file)."""
+    from council_core import triggered
+
+    values = {str(r.get("key")): r.get("value")
+              for r in listing.get("listed") or []}
+    try:
+        exposure_s = float(values.get("ExposureTime") or 0.0) / 1e6
+    except (TypeError, ValueError):
+        exposure_s = 0.0
+    if rate <= 0:
+        # No live view measured one: the rate the camera says it runs at.
+        for key in ("ResultingFrameRate", "AcquisitionFrameRate"):
+            try:
+                rate = float(values.get(key) or 0.0)
+            except (TypeError, ValueError):
+                rate = 0.0
+            if rate > 0:
+                break
+    trig = triggered.TriggerRun(
+        setup, device, out / f"{run}{triggered.TRIGGERS_SUFFIX}",
+        exposure_s=exposure_s,
+        frame_period_s=(1.0 / rate) if rate > 0 else 0.0)
+    trig.open()
+    return trig
+
+
+def _downsample_record(device: Any, area: Any = None) -> Optional[Dict[str,
+                                                                      Any]]:
+    """The run's Downsample block (its records): None when Off."""
+    from council_core import reduce
+
+    info = _downsample_state(device)
+    factor = int(info.get("factor") or 1)
+    if factor <= 1:
+        return None
+    method = str(info.get("method") or reduce.TYPHON_MEAN)
+    out: Dict[str, Any] = {"factor": [factor, factor], "method": method}
+    # How a block's mean is rounded: Typhon's own, half up (council_core.
+    # reduce). The camera's Average binning rounds as its FPGA or sensor
+    # does, which Typhon does not know (unverified on hardware): said so,
+    # not claimed as half up.
+    out["rounding"] = ("half_up" if method == reduce.TYPHON_MEAN
+                       else "the camera's")
+    if info.get("note"):
+        out["note"] = str(info["note"])
+    if info.get("binning"):
+        out["binning"] = list(info["binning"])
+    try:
+        roi = area if area is not None else device.roi()
+        if method == reduce.TYPHON_MEAN:
+            out["picture"] = list(reduce.reduced_size(roi.w, roi.h, factor))
+            out["dropped"] = [int(roi.w) % factor, int(roi.h) % factor]
+        else:
+            out["picture"] = [int(roi.w), int(roi.h)]
+    except Exception:                                     # noqa: BLE001
+        pass
+    return out
+
+
+def _downsample_words(device: Any) -> str:
+    """How Downsample is made on this camera now, in words."""
+    from council_core import reduce
+
+    info = _downsample_state(device)
+    factor = int(info.get("factor") or 1)
+    if factor <= 1:
+        own = str(info.get("camera_bins") or "")
+        return (f"Typhon reduces nothing — but {own}" if own
+                else "every pixel as the camera sends it")
+    method = str(info.get("method") or reduce.TYPHON_MEAN)
+    note = str(info.get("note") or "")
+    if method == reduce.CAMERA_AVERAGE:
+        return f"by the camera's own binning, {factor} x {factor} Average"
+    said = (f"by Typhon, averaging each {factor} x {factor} block before "
+            f"saving and showing")
+    return f"{said} ({note})" if note else said
+
+
+def _capture_words(setup: Any, armed: Any, device: Any) -> str:
+    """What Start says of the capture set-up: " Armed: exact, Line1 — the
+    camera waits for it." "" for a Continuous run at full size."""
+    from council_core import triggered
+
+    said = ""
+    if setup.exact:
+        if setup.source == triggered.SOFTWARE:
+            then = "press Capture now (F9) for each picture"
+        elif setup.source == triggered.TIMER:
+            then = (f"Typhon fires it every "
+                    f"{triggered.show_seconds(setup.every_s)}")
+        else:
+            then = f"the camera waits for {setup.source}"
+        said += f" Armed: {setup.short()} — {then}."
+        extra = (list(armed.get("said") or [])
+                 if isinstance(armed, dict) else [])
+        if extra:
+            said += f" ({'; '.join(extra)}.)"
+    elif setup.snapshot:
+        said += (f" Snapshot ({setup.source_words()}) — the live view runs "
+                 f"and only the frames each trigger asks for are saved.")
+    info = _downsample_state(device)
+    factor = int(info.get("factor") or 1)
+    if factor > 1:
+        method = str(info.get("method") or "")
+        how = ("by the camera's binning (Average)" if method.endswith(
+            "average") else "by Typhon, averaging each block before saving")
+        said += f" Downsample {factor}x {how}."
+    elif info.get("camera_bins"):
+        said += f" Downsample Off — but {info['camera_bins']}."
+    return said
 
 
 def _trigger_words(on: List[Any]) -> str:
@@ -931,7 +1606,14 @@ def _quiet_note(session: Any) -> str:
 
     The camera is asked why ONCE per silence (it writes the trigger
     selector to look at each trigger, and puts it back), and again when a
-    setting changes (_camera_set) or pictures came and went."""
+    setting changes (_camera_set) or pictures came and went.
+
+    NOT WHILE AN EXACT RUN IS ARMED: silence between triggers is what it
+    is for, the armed line says what it waits for, and the camera is not
+    asked (its selector stays on the armed trigger)."""
+    trig = _LIVE.trigger_run
+    if trig is not None and _LIVE.capturing and trig.exact:
+        return ""
     gone = session.quiet(QUIET_SECONDS)
     if not gone:
         _LIVE.quiet_reason = None
@@ -960,6 +1642,11 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
         quiet = _quiet_note(session) if _LIVE.capturing else ""
         if quiet:
             line = f"{quiet} · {line}"
+        trig = _LIVE.trigger_run
+        if trig is not None and _LIVE.capturing:
+            # The run's triggers first: "Armed — waiting for Line1 · 12
+            # triggers · 12 ok · 0 missed · last 3.2 s ago".
+            line = f"{trig.line()} · {line}"
         stopped = _recording_stopped(stats) if _LIVE.capturing else ""
         if stopped:
             line = f"{stopped} · {line}"
@@ -1019,6 +1706,15 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     meta = getattr(frame, "meta", None) or {}
     if meta.get("kind") == "event" and not quiet:
         line += f" · {meta.get('events', 0)} events/window"
+    setup = getattr(session.device, "capture", None)
+    if setup is not None and setup.triggered:
+        # What Start will do, so a trigger mode chosen is not a surprise.
+        line += (f" · Start arms the trigger ({setup.short()})"
+                 if setup.exact else f" · Start: {setup.short()}")
+    if setup is not None and int(getattr(setup, "downsample", 1) or 1) > 1:
+        # It changes what is saved: said where the user looks before Start
+        # (review: the line never mentioned it).
+        line += f" · Downsample {int(setup.downsample)}x"
     if time.monotonic() < _LIVE.run_note_until:
         line += f" · {_LIVE.run_note or _run_note(session)}"
     return line
@@ -1030,7 +1726,7 @@ def _idle_line(session: Any) -> str:
         return _stopped_line(session)
     if _LIVE.idle == "ended":
         return (f"Capture ended — {_LIVE.idle_reason}. "
-                f"{session.run_stats().line()}")
+                f"{_stats_line(session.run_stats())}")
     label = getattr(_LIVE.info, "label", "") or "camera"
     if _LIVE.idle == "preview-off":
         return (f"Connected to {label}. The live view is off while the raw "
@@ -1075,7 +1771,16 @@ def _watch_capture() -> None:
         session.stop()
     except Exception:                                     # noqa: BLE001
         pass
+    trig, armed = _LIVE.trigger_run, _LIVE.armed
+    _LIVE.trigger_run = None
+    _LIVE.armed = None
+    try:
+        _end_triggers(session.device, trig, armed)
+    except Exception:                                     # noqa: BLE001
+        pass
     session.record_to(None, drain_timeout=0)
+    if armed is not None:
+        _LIVE.disarm_note = _disarm(session.device, armed)
     if not getattr(session.device, "restartable", True):
         reason += " — Disconnect and Connect again"
     _LIVE.idle = "ended"
@@ -1308,6 +2013,7 @@ def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
         return
     _poll_job()
     _watch_capture()
+    _capture_button_state()
     try:
         _manage_preview(bool(reviewer.wants_preview()))
     except Exception as exc:                              # noqa: BLE001
@@ -1316,6 +2022,7 @@ def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
     frame = latest()
     if reviewer.tick(frame):
         _LIVE.shown_aoi = _aoi_of(frame)
+        _LIVE.shown_reduce = _reduce_of(frame)
     _report(say, frame)
 
 
@@ -1451,6 +2158,8 @@ def attach(app: Any, view: str = "live_view",
         pass
 
     _hook_start_boxes(app)
+    _hook_typed_timer(app, say)
+    _attach_capture_now(app, say)
     _LIVE.setup_path = _setup_path_for(app)
     # After setup_path: the presets it lists are this app's project's.
     picker = _picker_for(app, presets, area)
@@ -1523,6 +2232,141 @@ def _hook_start_boxes(app: Any) -> None:
         _LIVE.hooked_boxes.add(box)
 
 
+def _hook_typed_timer(app: Any, say: Optional[Callable[[str], Any]],
+                      port_name: str = "timer_s") -> None:
+    """A number TYPED into the timer box is applied when the box is left,
+    as when Return is pressed. The box is an editable dropdown whose link
+    runs on textActivated, which Qt sends on leaving it only for text that
+    is already one of its items (measured, review: "3" typed, focus moved —
+    the box said 3, the camera kept 1 s, and the line said "every 1 s").
+    Return (and a pick from the list) already ran the link: the value is
+    then the camera's, and nothing is written twice."""
+    ports = getattr(app, "ports", None)
+    widget = getattr(getattr(ports, port_name, None), "widget", None)
+    line_edit = getattr(widget, "lineEdit", None)
+    edit = line_edit() if callable(line_edit) else None
+    if edit is None:
+        return                      # not an editable box: its link is enough
+
+    def left() -> None:
+        device = _LIVE.device
+        setup = getattr(device, "capture", None)
+        if setup is None or not widget.isEnabled():
+            return
+        text = str(widget.currentText() or "")
+        word = text.lower().replace("seconds", "").replace("sec", "") \
+            .rstrip("s").strip()
+        try:
+            if abs(float(word) - float(setup.every_s)) < 1e-9:
+                return              # Return or the list already applied it
+        except ValueError:
+            pass                    # refused below, in words
+        try:
+            said = set_timer(text).get("summary", "")
+        except Exception as exc:                          # noqa: BLE001
+            # Refused: the box goes back to the camera's value (_set_capture
+            # tells the views), and why is said.
+            said = f"Timer every: {exc}"
+        if say is not None and said:
+            try:
+                say(said)
+            except Exception:                             # noqa: BLE001
+                pass
+
+    edit.editingFinished.connect(left)
+    app._typed_timer_hook = left
+
+
+#: The text a "Capture now" button starts with (Typhon's "Capture now (F9)").
+CAPTURE_BUTTON = "Capture now"
+
+
+def _attach_capture_now(app: Any, say: Optional[Callable[[str], Any]]
+                        ) -> None:
+    """F9 ANYWHERE IN THE APP does what Capture now does — the main window
+    and a picture popped out of it alike (an application-wide shortcut) —
+    and says it in the status line; only in an app with a Capture now
+    button or the capture set-up's boxes. The app's "Capture now" button,
+    when it has one, is enabled only while a press can fire (_capture_
+    button_state, every tick)."""
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QPushButton
+    except Exception:                                     # noqa: BLE001
+        return
+
+    def pressed() -> None:
+        said = capture_now().get("summary", "")
+        if say is not None and said:
+            try:
+                say(said)
+            except Exception:                             # noqa: BLE001
+                pass
+
+    button = None
+    try:
+        button = next((b for b in app.findChildren(QPushButton)
+                       if b.text().startswith(CAPTURE_BUTTON)), None)
+    except Exception:                                     # noqa: BLE001
+        button = None
+    ports = getattr(app, "ports", None)
+    has_set_up = ports is not None and getattr(ports, "capture_mode",
+                                               None) is not None
+    key = None
+    if button is not None or has_set_up:
+        # ONLY AN APP THAT CAPTURES ON A TRIGGER takes F9 — one with a
+        # Capture now button or the capture set-up's boxes (Typhon). Every
+        # other app attached here (Barbie) leaves the key alone (review:
+        # F9 in a Barbie said to choose a mode on a tab it does not have).
+        try:
+            key = QShortcut(QKeySequence(CAPTURE_KEY), app)
+            key.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            key.activated.connect(pressed)
+        except Exception:                                 # noqa: BLE001
+            key = None
+    _LIVE.capture_key = key
+    app._capture_now_key = key
+    if button is not None:
+        # GREYED MUST LOOK GREYED: the generated style sheet has no
+        # :disabled rule, so a disabled button was drawn as an enabled one.
+        name = button.objectName()
+        selector = f"QPushButton#{name}" if name else "QPushButton"
+        button.setStyleSheet(
+            f"{button.styleSheet()}\n{selector}:disabled {{ color: #8fa9b2; "
+            f"border: 1px dashed #8fa9b2; }}")
+    _LIVE.capture_button = button
+    _capture_button_state()
+
+
+def _capture_button_state() -> None:
+    """Capture now is enabled while a press fires a trigger: capturing,
+    in a triggered run Typhon fires (Software, Timer — or any snapshot
+    run); else greyed, and its tooltip says why."""
+    button = _LIVE.capture_button
+    if button is None:
+        return
+    trig = _LIVE.trigger_run
+    on = bool(_LIVE.capturing and trig is not None and trig.typhon_fires)
+    try:
+        if button.isEnabled() != on:
+            button.setEnabled(on)
+        if on:
+            tip = f"Fire one trigger now ({CAPTURE_KEY} does the same)"
+        elif trig is not None and _LIVE.capturing:
+            tip = (f"This run waits for the camera's own input "
+                   f"({trig.setup.source}) — Capture now fires a Software or "
+                   f"Timer run")
+        else:
+            tip = ("For a triggered capture: choose Capture: Triggered: "
+                   "exact or Triggered: snapshot (Basic tab), Start — then "
+                   f"Capture now or {CAPTURE_KEY} takes each picture")
+        if button.toolTip() != tip:
+            button.setToolTip(tip)
+    except RuntimeError:                                  # deleted
+        _LIVE.capture_button = None
+
+
 def _picker_for(app: Any, presets: str, area: str) -> Any:
     """A PresetPicker for this app's preset box and area line, or None when
     it has neither."""
@@ -1561,9 +2405,13 @@ def _tabs_for(app: Any, tabs: str, note: str) -> Any:
         if widget is not None:
             font = widget.font()           # the app's own (Arial 11)
             break
+    # The Basic tab's capture set-up boxes, where the app has them (a
+    # Typhon updated from the example; an older one has none).
+    capture = {name: getattr(ports, name, None)
+               for name in SettingsTabs.CAPTURE_BOXES}
     return SettingsTabs(sys.modules[__name__], book,
                         note=getattr(ports, note, None) if note else None,
-                        boxes=boxes, font=font, parent=app)
+                        boxes=boxes, font=font, parent=app, capture=capture)
 
 
 def _models_for(app: Any, models: str, model_filter: str, classified: str,
@@ -1697,7 +2545,30 @@ def _on_network_share(path: Path) -> bool:
 # ======================================================================
 # The run's camera record (<run>_camera.json)
 # ======================================================================
-def _camera_record(run: str, device: Any
+def _camera_listing(device: Any) -> Dict[str, Any]:
+    """Every setting as the camera has it now, and whether the preset in
+    use is still what the camera is set to: {"listed", "error", "preset",
+    "changed"}. Read at Start BEFORE an exact run arms the camera's trigger
+    — compared after, every exact run's record said "preset changed:
+    TriggerMode", for a trigger Typhon set for the run itself."""
+    try:
+        listed = settings_list()["settings"]
+        error = ""
+    except Exception as exc:                              # noqa: BLE001
+        listed, error = [], _said(exc)
+    preset, changed = "", None
+    try:
+        preset, changed = _preset_still_in_use(listed, device.roi(), error,
+                                               _held_triggers(device))
+    except Exception:                                     # noqa: BLE001
+        pass
+    return {"listed": listed, "error": error, "preset": preset,
+            "changed": changed}
+
+
+def _camera_record(run: str, device: Any,
+                   listing: Optional[Dict[str, Any]] = None,
+                   setup: Any = None, armed: Any = None
                    ) -> "tuple[Optional[Dict[str, Any]], str]":
     """The run's camera record as it is now; (the record, "") or (None, why
     it could not be made).
@@ -1706,18 +2577,27 @@ def _camera_record(run: str, device: Any
     later — which camera, where on its sensor, how it was set — but a camera
     that cannot describe itself, a full disk or a refused name is said in
     Start's summary, never raised: the frames are the user's data and the
-    capture goes ahead."""
+    capture goes ahead.
+
+    `listing` is _camera_listing's, read before an exact run armed the
+    trigger; the Trigger rows are read AGAIN after arming, so the record
+    shows the trigger as the run had it. The capture set-up and Downsample
+    are their own blocks (`capture`, `downsample`)."""
     from council_core import camera_record
 
-    try:
-        listed = settings_list()["settings"]
-        error = ""
-    except Exception as exc:                              # noqa: BLE001
-        listed, error = [], _said(exc)
+    if listing is None:
+        listing = _camera_listing(device)
+    listed = list(listing.get("listed") or [])
+    error = str(listing.get("error") or "")
+    if armed is not None and listed:
+        try:
+            fresh = {s.key: s.as_dict() for s in device.settings_provider()
+                     .describe_groups(["Trigger"])}
+            listed = [fresh.get(str(row.get("key")), row) for row in listed]
+        except Exception:                                 # noqa: BLE001
+            pass
     try:
         limits, area = device.limits(), device.roi()
-        preset, changed = _preset_still_in_use(listed, area, error,
-                                               _held_triggers(device))
         info = _LIVE.info
         camera = {k: getattr(info, k, "") for k in
                   ("backend", "model", "serial", "vendor", "kind")}
@@ -1725,10 +2605,31 @@ def _camera_record(run: str, device: Any
         return camera_record.build(
             run=run, camera=camera, sensor=(limits.width, limits.height),
             area=area.as_tuple(), settings=listed, settings_error=error,
-            preset=preset, preset_changed=changed, app=_app_identity(),
-            software=_software(), host=_host_name()), ""
+            preset=str(listing.get("preset") or ""),
+            preset_changed=listing.get("changed"), app=_app_identity(),
+            software=_software(), host=_host_name(),
+            capture=_capture_record(run, setup, armed),
+            downsample=_downsample_record(device, area)), ""
     except Exception as exc:                              # noqa: BLE001
         return None, _not_recorded(run, exc)
+
+
+def _capture_record(run: str, setup: Any, armed: Any
+                    ) -> Optional[Dict[str, Any]]:
+    """The run's capture set-up for its camera record: None for a camera
+    with none (an event camera)."""
+    from council_core import triggered
+
+    if setup is None:
+        return None
+    out = dict(setup.as_record())
+    if setup.triggered:
+        out["triggers_file"] = f"{run}{triggered.TRIGGERS_SUFFIX}"
+    if isinstance(armed, dict) and armed.get("entry"):
+        out["armed"] = {"trigger": armed.get("entry"),
+                        "source": armed.get("source"),
+                        "changed": list(armed.get("said") or [])}
+    return out
 
 
 def _save_camera_record(folder: Path, run: str, record: Dict[str, Any]
@@ -2017,14 +2918,9 @@ def _port_widget(app: Any, name: str) -> Any:
     return widget
 
 
-#: What the display-drop count is called in the status line. "dropped" was
-#: read as frames LOST; they are frames the screen did not redraw — every one
-#: of them is still saved.
-SCREEN_DROPS = "not drawn (screen only)"
-
-
 def _status_line(stats: Any, frame: Any) -> str:
-    line = stats.line(SCREEN_DROPS)
+    # The display drops in capture.SCREEN_DROPS's words, as every line.
+    line = stats.line()
     note = _rate_note()
     if note:
         # Beside the MEASURED rate, so the two can be compared while the
@@ -2066,6 +2962,11 @@ def set_area(area: Any) -> Dict[str, Any]:
     hand-edited handler, walked across the sensor with each press).
     `set_camera_area` takes sensor pixels as they are.
 
+    A DOWNSAMPLED PICTURE (Typhon's averaging, Frame.meta "reduce") is
+    that many times smaller than the camera's area: the box is scaled up by
+    the factor before the origin is added. (A camera's own binning needs
+    nothing: its area is in binned pixels, as the picture is.)
+
     The request is SNAPPED to what the sensor accepts and the result says
     what was actually taken. `crop` is "" — the crop box was drawn on the old
     picture and means nothing on the new one — and the camera's area is never
@@ -2089,6 +2990,8 @@ def set_area(area: Any) -> Dict[str, Any]:
             "camera's now — drag the slider to its end (live) and draw the "
             "area on the live picture")
     x0, y0, width, height = _picture_area(device)
+    scale = max(1, int(_LIVE.shown_reduce or 1))
+    width, height = width // scale, height // scale
     if box[0] + box[2] > width or box[1] + box[3] > height:
         # NOT A BOX ON THIS PICTURE: one drawn on it always fits inside it.
         # Typically the camera's own area (sensor pixels) left in the crop
@@ -2101,7 +3004,8 @@ def set_area(area: Any) -> Dict[str, Any]:
             f"live picture ({width} x {height}) — draw it on the picture; "
             f"the camera's own area in sensor pixels is set in Camera "
             f"settings")
-    return _change_area(cameras.Roi(box[0] + x0, box[1] + y0, box[2], box[3]))
+    return _change_area(cameras.Roi(box[0] * scale + x0, box[1] * scale + y0,
+                                    box[2] * scale, box[3] * scale))
 
 
 def set_camera_area(area: Any) -> Dict[str, Any]:
@@ -2436,7 +3340,12 @@ def _tell_status(text: str) -> None:
 
 
 def _said(exc: BaseException) -> str:
-    text = str(exc).strip() or type(exc).__name__
+    from council_core.cameras import said_plainly
+
+    # An OpenEB exception's text is a block of dashes, its category and
+    # "Error <code>: " around the message (cameras.said_plainly), also when
+    # a CameraError carries it ("could not open …: {exc}").
+    text = said_plainly(str(exc)).strip() or type(exc).__name__
     return text.split(" : ")[0][:300]
 
 
@@ -2481,11 +3390,12 @@ def camera_state() -> Dict[str, Any]:
     sensor size.
 
     Keys: connected, label, kind, capturing, busy, streaming, area, sensor,
-    has_exposure, has_gain, summary
+    has_exposure, has_gain, has_capture, capture_now, summary
     """
     device = _LIVE.device
     session = _LIVE.session
     info = _LIVE.info
+    trig = _LIVE.trigger_run
     out = {"connected": device is not None,
            "label": getattr(info, "label", "") if info else "",
            "kind": getattr(info, "kind", "") if info else "",
@@ -2493,7 +3403,13 @@ def camera_state() -> Dict[str, Any]:
            "busy": _LIVE.job is not None,
            "streaming": bool(session is not None and session.running),
            "area": "", "sensor": "", "has_exposure": False,
-           "has_gain": False, "summary": "No camera open."}
+           "has_gain": False, "summary": "No camera open.",
+           # A capture set-up to choose (a frame camera), and whether
+           # Capture now fires anything now (a triggered run of Software
+           # or Timer, or any snapshot run).
+           "has_capture": getattr(device, "capture", None) is not None,
+           "capture_now": bool(_LIVE.capturing and trig is not None
+                               and trig.typhon_fires)}
     if device is not None:
         limits = device.limits()
         out.update(area=_area_text(device.roi()),
@@ -2647,12 +3563,23 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
     # settings window writes one of these per step of a slider.
     stop = bool(camera_settings.stops_needed(device, {key: value},
                                              described=[setting]))
-    if stop:
+    if stop or setting.per_run:
+        # The capture set-up (per_run) is one per run too, though it
+        # changes without stopping anything.
         _refuse_while_capturing(f"changing {setting.label}")
-    # Binning changes the area's own numbers (AREA_GROUPS). Read before and
-    # after for those only: the area is four node reads, and a slider
-    # writes one setting per step.
-    moves_area = setting.group in camera_settings.AREA_GROUPS
+    if setting.group == "Trigger" and _LIVE.capturing and \
+            _LIVE.armed is not None:
+        raise RuntimeError(
+            f"stop the capture before changing {setting.label} — this run "
+            f"armed the camera's trigger itself, and Stop puts every "
+            f"trigger back as it was")
+    # Binning changes the area's own numbers (AREA_GROUPS), and so does
+    # Downsample when the camera bins. Read before and after for those
+    # only: the area is four node reads, and a slider writes one setting
+    # per step.
+    from council_core import triggered as _triggered
+    moves_area = (setting.group in camera_settings.AREA_GROUPS
+                  or key == _triggered.DOWNSAMPLE_KEY)
     before = _roi_or_none(device) if moves_area else None
 
     def work() -> Any:
@@ -2665,11 +3592,12 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
         if change.ok and not change.skipped:
             _camera_set([key])
         # SAID AS THE ROW SAYS IT: its label and unit ("Picture window:
-        # 99.9 ms", not "window_ms: 99.901") — and, like a preset or a
-        # reset, that the live view restarted when the write needed it.
+        # 99.9 ms", not "window_ms: 99.901"; a trail threshold in the ms
+        # its row shows, not the µs the camera holds) — and, like a preset
+        # or a reset, that the live view restarted when the write needed it.
         out = {"change": change.as_dict(), "key": key, "value": change.value,
                "ok": change.ok, "what": "setting", "pending": False,
-               "summary": change.line(setting.label, setting.unit)}
+               "summary": change.line(setting.label, *setting.shown())}
         now = _roi_or_none(device) if moves_area else None
         if now is not None and now != before:
             # The picture's pixels changed under the crop box: cleared, as
@@ -2678,6 +3606,11 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
             out.update(area=_area_text(now), crop="", area_moved=True)
             out["summary"] += (f" — the camera's area is now "
                                f"{_area_text(now)} (in its new pixels)")
+        if key == _triggered.DOWNSAMPLE_KEY and change.ok and \
+                not change.skipped:
+            # How it is made, which the camera decides: "by the camera's
+            # binning (Average)", or Typhon's averaging and why.
+            out["summary"] += f" — {_downsample_words(device)}"
         if stop and change.ok and not change.skipped:
             out["summary"] += (". The live view restarted for it (the "
                                "stream must stop to change it).")
@@ -2721,7 +3654,7 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                name: str, live_ok: bool = False,
-               after: Optional[Callable[[], List[str]]] = None
+               triggers: Optional[Dict[str, Any]] = None
                ) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
@@ -2732,9 +3665,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     preset that applied live reads differently from one that blanked the
     live view for a moment, and the user knows which settings did it.
 
-    `after`, when given, runs right after the set (on the worker with it,
-    when the stream is stopped for it) and says what else it put back, one
-    line each — a reset's triggers other than the selected one.
+    `triggers`, when given, is every trigger as connected (trigger_key:
+    value, _LIVE.as_connected_triggers): put back right after the set (on
+    the worker with it, when the stream is stopped for it — a change among
+    them that the stream is in the way of stops it too), and what that
+    changed is said one line per trigger — a reset's.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -2753,28 +3688,48 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         described = device.settings_provider().describe()
     except Exception:                                     # noqa: BLE001
         described = None
-    blocked = (camera_settings.stops_needed(device, values, roi, described)
+    checked = dict(values, **(triggers or {}))
+    blocked = (camera_settings.stops_needed(device, checked, roi, described)
                if described is not None else
-               camera_settings.stops_needed(device, values, roi))
+               camera_settings.stops_needed(device, checked, roi))
     if live_ok and (roi is not None or blocked):
         _refuse_while_capturing(doing)
+    from council_core import triggered as _triggered
+    if live_ok and any(_triggered.is_capture_key(k) for k in checked):
+        # The capture set-up is one per run (Setting.per_run).
+        _refuse_while_capturing(doing)
+    if live_ok and _LIVE.capturing and _LIVE.armed is not None and any(
+            k in camera_settings.TRIGGER_FEATURES or k == "TriggerSelector"
+            or camera_settings.split_trigger_key(k) for k in checked):
+        raise RuntimeError(
+            "stop the capture before putting the trigger back — this run "
+            "armed the camera's trigger itself, and Stop puts every trigger "
+            "back as it was")
     stop = bool(blocked)
     # Another trigger's key in words ("Trigger mode (FrameBurstStart
     # trigger)"), not the preset's raw "TriggerMode[FrameBurstStart]".
-    labels = camera_settings.labels_of(described or [], values)
+    labels = camera_settings.labels_of(described or [], checked)
     restarted = [labels.get(k, "the area" if k == "area" else k)
                  for k in blocked]
     before = _roi_or_none(device)
 
     also: List[str] = []
+    checked_downsample: List[str] = []
 
     def work() -> Any:
         applied = camera_settings.apply(device, values, roi)
-        if after is not None:
+        if triggers:
             try:
-                also.extend(after())
+                also.extend(device.settings_provider().restore_triggers(
+                    triggers))
             except Exception as exc:                      # noqa: BLE001
-                also.append(f"the rest NOT put back — {_said(exc)}")
+                also.append(f"the other triggers NOT put back — "
+                            f"{_said(exc)}")
+        # The set's own Binning rows are written after its Downsample
+        # (BaslerSettings.plan): what they left is checked, never assumed.
+        note = _check_downsample(device)
+        if note:
+            checked_downsample.append(note)
         return applied
 
     def finish(applied: Any) -> Dict[str, Any]:
@@ -2798,6 +3753,8 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         said = f"{head}: {applied.summary(labels)}"
         if also:
             said = said[:-1] + f"; {', '.join(also)}."
+        if checked_downsample:
+            said = said[:-1] + f" — {'; '.join(checked_downsample)}."
         if restarted:
             said += (f" The live view restarted for {', '.join(restarted)} "
                      f"(the stream must stop to change "
@@ -2889,18 +3846,17 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         raise RuntimeError("the camera's settings were not read when it was "
                            "connected — there is nothing to put back")
     wanted = _group_names(group)
+    # The SELECTED trigger is in the set; a Basler has a mode, a source, an
+    # edge and a delay for each of its triggers (nine on the emulator): one
+    # left On stops the frames — Reset said "applied" over a burst trigger
+    # still On — and one put back On from another line or edge waits for
+    # the wrong signal. Every one goes back as connected.
     triggers = dict(_LIVE.as_connected_triggers)
-
-    def every_trigger() -> List[str]:
-        # The SELECTED trigger is in the set; a Basler has a mode for each
-        # of its triggers (nine on the emulator), and one left On stops
-        # the frames — Reset said "applied" over a burst trigger still On.
-        return device.settings_provider().restore_trigger_modes(triggers)
 
     if not wanted:
         return _apply_set(dict(_LIVE.as_connected), None,
                           "Putting the settings back as connected", "reset",
-                          "", after=every_trigger if triggers else None)
+                          "", triggers=triggers or None)
     # Before the group is read: a change on the worker owns the camera.
     _refuse_while_busy("put it back")
     try:
@@ -2916,8 +3872,8 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
                            f"was connected — there is nothing to put back")
     return _apply_set(values, None, f"Putting {what} back as connected",
                       "reset", what, live_ok=True,
-                      after=(every_trigger if triggers
-                             and "TriggerMode" in values else None))
+                      triggers=(triggers if triggers
+                                and "TriggerMode" in values else None))
 
 
 def load_camera_defaults() -> Dict[str, Any]:
@@ -2939,18 +3895,29 @@ def load_camera_defaults() -> Dict[str, Any]:
     _refuse_while_capturing("loading the camera's defaults")
     _refuse_while_busy("load the camera's defaults")
 
+    notes: List[str] = []
+
     def work() -> Any:
         provider.load_defaults()
+        # The factory set puts the binning back (and the area): Downsample,
+        # which is Typhon's and kept as chosen, is made again from the
+        # camera as it is now — with the stream still stopped for it. Left,
+        # every frame was recorded as 2x camera binning at full size.
+        note = _check_downsample(device, rebin=True)
+        if note:
+            notes.append(note)
         return device.roi()
 
     def finish(area: Any) -> Dict[str, Any]:
         text = _area_text(area)
         # Every setting went back: the latest word on all of the boxes.
         _camera_set(key for keys in START_BOXES.values() for key in keys)
+        said = f"Loaded the camera's own defaults ({source}); its area is " \
+               f"{text}."
+        if notes:
+            said = said[:-1] + f" — {'; '.join(notes)}."
         return {"area": text, "crop": "", "ok": True, "pending": False,
-                "what": "defaults",
-                "summary": f"Loaded the camera's own defaults ({source}); "
-                           f"its area is {text}."}
+                "what": "defaults", "summary": said}
 
     return _run_change("Loading the camera's defaults", work, finish,
                        bool(getattr(device, "streaming", False)))
@@ -3038,6 +4005,7 @@ def save_preset(name: Any, include_roi: Any = True,
     store = _preset_store()
     try:
         settings, roi = camera_presets.capture(device, with_area)
+        settings = _as_before_arming(settings)
         preset, replaced, moved = store.save(
             camera, _picked(name), settings, roi, note=str(note or ""),
             repair=True)
@@ -3066,6 +4034,37 @@ def save_preset(name: Any, include_roi: Any = True,
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
     return _presets_changed(preset.name, said)
+
+
+def _as_before_arming(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """A preset saved DURING an exact run keeps the triggers as the user
+    had them — not the one Typhon armed for the run, which Stop puts back.
+    Saved as the camera had them, a Continuous run started from that preset
+    later was refused: FrameStart On from Software."""
+    from council_core import camera_settings
+
+    armed = _LIVE.armed
+    if not isinstance(armed, dict):
+        return settings
+    out = dict(settings)
+    before = dict(armed.get("triggers") or {})
+    if before:
+        selected = str(armed.get("selector") or "")
+        out = {k: v for k, v in out.items()
+               if not camera_settings.split_trigger_key(k)}
+        if selected and "TriggerSelector" in settings:
+            out["TriggerSelector"] = selected
+        for key, value in before.items():
+            base, entry = camera_settings.split_trigger_key(key)
+            if entry == selected:
+                if base in settings:
+                    out[base] = value          # the selected one's rows
+            else:
+                out[key] = value
+    for key, value in dict(armed.get("plain") or {}).items():
+        if key in out and value is not None:
+            out[key] = value                   # one trigger, no selector
+    return out
 
 
 def _unreadable_triggers(device: Any) -> List[str]:
@@ -3113,9 +4112,24 @@ def apply_preset(name: Any) -> Dict[str, Any]:
         preset = _preset_store().get(_identity(), chosen)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
-    return _apply_set(preset.settings, preset.roi,
+    return _apply_set(_with_capture_defaults(preset.settings), preset.roi,
                       f"Applying preset {preset.name!r}", "preset",
                       preset.name)
+
+
+def _with_capture_defaults(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """A preset saved before the capture set-up existed holds none of it:
+    it was a camera that saved every frame at full size, and is applied as
+    one (Continuous, Downsample Off) — not as whatever the set-up is now."""
+    from council_core import triggered
+
+    out = dict(settings or {})
+    device = _LIVE.device
+    if getattr(device, "capture", None) is not None and not any(
+            triggered.is_capture_key(k) for k in out):
+        out[triggered.MODE_KEY] = triggered.MODE_CONTINUOUS
+        out[triggered.DOWNSAMPLE_KEY] = "Off"
+    return out
 
 
 def pick_preset(name: Any) -> Dict[str, Any]:

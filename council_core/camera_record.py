@@ -107,14 +107,32 @@ def build(*, run: str, camera: Mapping[str, Any], sensor: Tuple[int, int],
           preset_changed: Optional[Mapping[str, Any]] = None,
           app: Optional[Mapping[str, Any]] = None,
           software: Optional[Mapping[str, Any]] = None,
-          host: str = "") -> Dict[str, Any]:
+          host: str = "",
+          capture: Optional[Mapping[str, Any]] = None,
+          downsample: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The record, as a dict ready for `write`.
 
     `settings` is what frame_camera.settings_list returns under "settings"
     (one dict per setting: key, value, unit, read_only, ...); it is kept as
     key: value with the units and read-only keys beside it — readable by a
     person, and by code that wants to put a camera back as it was for this
-    run."""
+    run.
+
+    ADDED IN VERSION 1, so a reader of version 1 may meet them (format_
+    version stays 1: a reader that does not know them reads the rest as
+    before):
+      capture     a frame camera's capture set-up for the run (council_core.
+                  triggered): mode, source, frames per trigger, timer, edge,
+                  delay, debounce, Downsample; the trigger Start armed and
+                  what arming changed; the run's triggers CSV
+      downsample  Downsample ON only: the factor [x, y], the method
+                  (council_core.reduce), "half_up" rounding, the picture's
+                  size, and the right and bottom pixels a block could not
+                  hold (`dropped`). With a camera's binning, `sensor` and
+                  `area` above are in BINNED pixels, as the camera counts
+                  them; with Typhon's averaging they are the camera's own,
+                  and a saved pixel x covers camera pixels x*f .. x*f+f-1
+                  from the area's origin (reduce.sensor_position)."""
     values: Dict[str, Any] = {}
     units: Dict[str, str] = {}
     readings: List[str] = []
@@ -150,7 +168,20 @@ def build(*, run: str, camera: Mapping[str, Any], sensor: Tuple[int, int],
         out["preset_changed"] = {
             "name": str(preset_changed.get("name") or ""),
             "differs": [str(k) for k in preset_changed.get("differs") or []]}
+    if capture:
+        out["capture"] = _plain_tree(capture)
+    if downsample:
+        out["downsample"] = _plain_tree(downsample)
     return out
+
+
+def _plain_tree(value: Any) -> Any:
+    """`value` with every leaf JSON can carry (_plain), keys as text."""
+    if isinstance(value, Mapping):
+        return {str(k): _plain_tree(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_tree(v) for v in value]
+    return _plain(value)
 
 
 # ======================================================================

@@ -14,6 +14,7 @@ hardware verification, and no test here claims a camera was attached.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -396,14 +397,49 @@ def test_start_asks_for_the_newest_frame_not_a_queue():
 # ======================================================================
 # Discovery
 # ======================================================================
-def test_discovery_says_why_a_backend_was_skipped():
-    """An empty list with no explanation sends the user to check cables."""
+def test_discovery_says_why_a_backend_was_skipped(monkeypatch):
+    """An empty list with no explanation sends the user to check cables.
+
+    On a PC WITHOUT either SDK — made so here, whatever this one has: in the
+    pylon env pypylon is installed, and with PYLON_CAMEMU set it lists
+    emulated Baslers, which this test found and failed on."""
+    from tests.sim_cameras import without_camera_sdks
+
+    without_camera_sdks(monkeypatch)
     found = cameras.discover([cameras.BaslerBackend(sdk=None),
                               cameras.EvkBackend(sdk=None)])
     assert found.cameras == []
     assert any("basler" in n for n in found.notes)
     assert any("prophesee" in n for n in found.notes)
     assert any("pypylon" in n for n in found.notes)
+
+
+@pytest.mark.parametrize("module", ["tests.test_basler_real",
+                                    "tests.test_basler_scan"])
+def test_the_emulator_tests_leave_pylon_camemu_alone_when_imported(
+        module, monkeypatch):
+    """Both set PYLON_CAMEMU at IMPORT (os.environ.setdefault), so it stayed
+    set for the whole pytest process: every test collected with them saw
+    emulated Baslers, and a simulated-camera test that took "the first frame
+    camera" connected to one. They set it per test now (their own autouse
+    fixture), and only where nothing set it already."""
+    import importlib
+
+    monkeypatch.delenv("PYLON_CAMEMU", raising=False)
+    kept = sys.modules.pop(module, None)
+    try:
+        try:
+            importlib.import_module(module)
+        except pytest.skip.Exception:
+            pass                        # no pypylon here: skipped at import
+        # The one variable, not os.environ: a failed `not in os.environ`
+        # prints the whole environment into the test report.
+        leaked = os.environ.get("PYLON_CAMEMU")
+        assert leaked is None, f"importing {module} set PYLON_CAMEMU={leaked}"
+    finally:
+        sys.modules.pop(module, None)
+        if kept is not None:
+            sys.modules[module] = kept
 
 
 def test_pypylon_present_but_nothing_enumerated_names_the_grabber():

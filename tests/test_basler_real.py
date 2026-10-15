@@ -12,8 +12,6 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("PYLON_CAMEMU", "1")
-
 import numpy as np
 import pytest
 
@@ -22,6 +20,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from council_core import cameras, capture
 
 pylon = pytest.importorskip("pypylon.pylon")
+
+
+@pytest.fixture(autouse=True)
+def camera_emulator(monkeypatch):
+    """pylon's camera emulator for THIS FILE'S TESTS ONLY: as many emulated
+    cameras as PYLON_CAMEMU asks for, else one.
+
+    It was set at import (os.environ.setdefault), so it stayed set for the
+    whole pytest process: every test collected with this file listed an
+    emulated Basler, and the simulated-camera tests that took "the first
+    frame camera" connected to it ("'BaslerDevice' object has no attribute
+    'state'"). pylon reads PYLON_CAMEMU at every enumeration (measured:
+    set after the first EnumerateDevices, the next one lists the emulated
+    cameras; removed, none), so a per-test setting is enough."""
+    if not os.environ.get("PYLON_CAMEMU"):
+        monkeypatch.setenv("PYLON_CAMEMU", "1")
 
 
 @pytest.fixture
@@ -606,15 +620,20 @@ def emulator_typhon(typhon_dir, monkeypatch):
 
 def test_the_emulators_node_map_fills_the_tabs(emulator_typhon):
     """A Basler's own categories, from its node map: exposure and gain with
-    their auto modes, the frame rate and the trigger in one tab; pixel
-    format, mirroring, gamma and binning in another; its area in Camera."""
+    their auto modes, the frame rate, the trigger and the capture set-up in
+    one tab; pixel format, mirroring, gamma and binning in another; its
+    area in Camera."""
     fc, ui, _app = emulator_typhon
     cam = fc._LIVE.device._cam
     tabs = ui._settings_tabs
     assert tabs.titles() == ["Basic", "Exposure", "Image", "Camera",
                              "Presets"]
     assert [s.group for s in tabs.plan[0].sections] == [
-        "Exposure", "Gain", "Frame rate", "Trigger"]
+        "Exposure", "Gain", "Frame rate", "Trigger", "Capture"]
+    # The Basic tab's From box lists the emulator's own inputs.
+    source = ui.ports.trigger_source.widget
+    assert [source.itemText(i) for i in range(source.count())] == [
+        "Software", "Timer", "Line1", "Line2", "Line3"]
     assert [s.group for s in tabs.plan[1].sections] == ["Image", "Binning"]
     gain = tabs.rows["Gain"]
     assert gain.editor.maximum() == pytest.approx(cam.Gain.GetMax())
@@ -849,17 +868,404 @@ def test_reset_trigger_puts_every_trigger_back_not_only_the_selected(
     cam = fc._LIVE.device._cam
     connected = _trigger_modes(cam)
     assert set(connected.values()) == {"Off"}
+    every = _every_trigger(cam)
     window = ui._settings_tabs.pop_out("Trigger")
     window.rows["TriggerSelector"]._from_choice("FrameBurstStart")
     window.flush_now()
+    # Its source, edge and delay too: "Reset" put back only the MODE of a
+    # trigger the selector was not on, and these stayed as changed.
+    window.rows["TriggerSource"]._from_choice("Line1")
+    window.flush_now()
+    window.rows["TriggerActivation"]._from_choice("FallingEdge")
+    window.flush_now()
+    window.rows["TriggerDelay"].editor.setValue(250.0)
+    window.flush_now()
     window.rows["TriggerMode"]._from_choice("On")
     window.flush_now()
-    window.rows["TriggerSelector"]._from_choice("FrameStart")
+    # Left on an entry it was not on at Connect: the selector is a setting
+    # like the others, and Reset puts it back too (the docs said it was
+    # left where it is; this test moved it back itself before Reset).
+    window.rows["TriggerSelector"]._from_choice("FrameEnd")
     window.flush_now()
+    assert cam.TriggerSelector.GetValue() == "FrameEnd"
     assert _trigger_modes(cam)["FrameBurstStart"] == "On"
+    assert _every_trigger(cam)["FrameBurstStart"][1:] == (
+        "Line1", "FallingEdge", 250.0)
     assert fc._triggers_on(fc._LIVE.device)[0].selector == "FrameBurstStart"
     window.reset_group()
     assert _pump(app, 4.0, until=lambda: fc._LIVE.job is None)
     assert _trigger_modes(cam) == connected
-    assert cam.TriggerSelector.GetValue() == "FrameStart"
+    assert _every_trigger(cam) == every
+    assert cam.TriggerSelector.GetValue() == "FrameStart", "as connected"
     assert "the FrameBurstStart trigger Off again" in window.status.text()
+
+
+# ======================================================================
+# typhon/trigger-downsample on the emulator: triggered capture (Capture
+# now, the timer, bursts, snapshot) and Downsample, through frame_camera
+# ======================================================================
+def _csv_rows(path):
+    import csv
+
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _run(folder, run):
+    import json
+
+    from council_core import triggered as tg
+
+    triggers = folder / f"{run}{tg.TRIGGERS_SUFFIX}"
+    return {"frames": _csv_rows(folder / f"{run}_frames.csv"),
+            "triggers": _csv_rows(triggers) if triggers.exists() else None,
+            "end": json.loads((folder / f"{run}_run_end.json").read_text(
+                encoding="utf-8")),
+            "record": json.loads((folder / f"{run}_camera.json").read_text(
+                encoding="utf-8"))}
+
+
+def _until(cond, seconds=5.0):
+    """cond() came true within `seconds` — asked once per step and never
+    again after: a condition that takes a frame must not be asked twice."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if cond():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _set(fc, **values):
+    from council_core import triggered as tg
+
+    keys = {"mode": tg.MODE_KEY, "source": tg.SOURCE_KEY,
+            "per": tg.PER_KEY, "every": tg.EVERY_KEY,
+            "downsample": tg.DOWNSAMPLE_KEY}
+    for name, value in values.items():
+        out = fc.set_camera_setting(keys[name], value)
+        assert out["ok"], out["summary"]
+
+
+@pytest.fixture
+def armed_emulator(emulator_window):
+    """The emulator connected, small and quick: a 256 x 256 area, 1 ms
+    exposure, every trigger Off as pylon's AcquireContinuousConfiguration
+    leaves them — and put back so after."""
+    fc, window, app = emulator_window
+    cam = fc._LIVE.device._cam
+    cam.ExposureTime.SetValue(1000.0)
+    cam.PixelFormat.SetValue("Mono8")
+    fc.set_camera_area("0, 0, 256, 256")
+    yield fc, cam
+    if fc._LIVE.capturing:
+        fc.stop()
+    _all_triggers_off(cam)
+    cam.TriggerSelector.SetValue("FrameStart")
+
+
+def test_exact_capture_now_on_the_emulator_saves_one_frame_per_press(
+        armed_emulator, tmp_path):
+    """FrameStart On from Software, armed by Start: five presses, five
+    frames, each with its trigger, five rows of the triggers CSV, the run's
+    end record counting them — and Stop puts every trigger back, so the
+    live view runs free again."""
+    fc, cam = armed_emulator
+    before = _every_trigger(cam)
+    _set(fc, mode="Triggered: exact", source="Software")
+    out = fc.start(str(tmp_path))
+    assert "Armed: exact, Software — press Capture now (F9)" in \
+        out["summary"]
+    assert (cam.TriggerSelector.GetValue(), cam.TriggerMode.GetValue(),
+            cam.TriggerSource.GetValue()) == ("FrameStart", "On", "Software")
+    session = fc._LIVE.session
+    for n in range(5):
+        assert fc.capture_now()["summary"] == "Capture now: trigger sent."
+        assert _until(lambda: session.stats().grabbed == n + 1), n
+    time.sleep(0.3)
+    assert session.stats().grabbed == 5, "a frame no trigger asked for"
+    said = fc.stop()["summary"]
+    assert said.startswith("Stopped — 5 triggers, 5 ok, 0 missed."), said
+    run = _run(tmp_path, out["run"])
+    assert [r["trigger"] for r in run["frames"]] == ["1", "2", "3", "4", "5"]
+    assert {r["trigger_frame"] for r in run["frames"]} == {"1"}
+    assert all(float(r["arrived"]) > float(r["trigger_time"])
+               for r in run["frames"])
+    assert [r["outcome"] for r in run["triggers"]] == ["ok"] * 5
+    capture_block = run["end"]["capture"]
+    assert (capture_block["triggers"], capture_block["ok"]) == (5, 5)
+    assert capture_block["missed"]["camera_busy"] == 0
+    assert run["end"]["frames_saved"] == 5
+    assert run["record"]["capture"]["armed"] == {
+        "trigger": "FrameStart", "source": "Software", "changed": []}
+    assert _every_trigger(cam) == before
+    capture.warm_imports()
+    fc.latest()                          # the run's last frame, already seen
+
+    def live():
+        fc._manage_preview(True)
+        return fc.latest() is not None
+    assert _until(live), "the live view runs free again"
+
+
+def test_a_press_at_the_moment_of_start_is_not_lost(armed_emulator,
+                                                    tmp_path):
+    """MEASURED on the emulator: a trigger fired right after StartGrabbing
+    is lost, 0 frames of 10. The trigger thread waits for the camera to
+    say it is ready first."""
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software")
+    for _ in range(3):
+        fc.start(str(tmp_path))
+        fc.capture_now()
+        assert _until(lambda: fc._LIVE.session.stats().grabbed == 1)
+        fc.stop()
+
+
+def test_three_frames_per_software_trigger(armed_emulator, tmp_path):
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software", per=3)
+    out = fc.start(str(tmp_path))
+    session = fc._LIVE.session
+    for n in range(2):
+        fc.capture_now()
+        assert _until(lambda: session.stats().grabbed == 3 * (n + 1))
+    fc.stop()
+    run = _run(tmp_path, out["run"])
+    assert [(r["trigger"], r["trigger_frame"]) for r in run["frames"]] == [
+        ("1", "1"), ("1", "2"), ("1", "3"), ("2", "1"), ("2", "2"),
+        ("2", "3")]
+
+
+def test_stop_in_a_long_burst_on_the_emulator_ends_it_at_once(armed_emulator,
+                                                              tmp_path):
+    """MEASURED before (review, this emulator): Stop in an exact Software
+    burst of 300 took 6.57 s and the run saved 181 frames, ~176 of them
+    exposed after Stop was pressed, the trigger "1 missed". Now Stop ends
+    the burst there, at once, and the trigger says Stop cut it short."""
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software", per=300)
+    out = fc.start(str(tmp_path))
+    session = fc._LIVE.session
+    fc.capture_now()
+    assert _until(lambda: session.stats().grabbed >= 5)
+    began = time.perf_counter()
+    said = fc.stop()["summary"]
+    took = time.perf_counter() - began
+    assert took < 1.0, took
+    run = _run(tmp_path, out["run"])
+    saved = len(run["frames"])
+    assert 5 <= saved < 30, saved
+    assert [r["outcome"] for r in run["triggers"]] == [
+        f"cut short by Stop: {saved} of 300 fired"], run["triggers"]
+    assert "0 missed, 1 cut short by Stop" in said, said
+
+
+def test_the_timer_on_the_emulator_and_ticks_too_fast_for_it(armed_emulator,
+                                                             tmp_path):
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Timer", every=0.2)
+    out = fc.start(str(tmp_path))
+    time.sleep(1.25)
+    fc.stop()
+    trig = fc._LIVE.last_trigger_run
+    assert 6 <= trig.counts["triggers"] <= 8, trig.counts
+    assert trig.counts["ok"] == trig.counts["triggers"], trig.counts
+    run = _run(tmp_path, out["run"])
+    assert len(run["frames"]) == trig.counts["ok"]
+    # Faster than the camera can take them: twenty frames a tick, a tick
+    # every 50 ms, is 400 frames a second from an emulator that delivers
+    # some 30-60 triggered frames a second (measured) — the ticks that came
+    # while the last was being fired are counted MISSED, never fired.
+    _set(fc, every=0.05, per=20)
+    out = fc.start(str(tmp_path / "fast"))
+    time.sleep(1.5)
+    line = fc._LIVE.trigger_run.line()
+    fc.stop()
+    trig = fc._LIVE.last_trigger_run
+    c = trig.counts
+    assert c["missed_busy"] > 0, c
+    assert "MISSED" in line, line
+    # A burst Stop came in the middle of is "cut short by Stop" (stopped):
+    # Stop ends it there, rather than waiting for its 20 frames.
+    assert c["stopped"] <= 1, c
+    assert c["ok"] + c["missed_busy"] + c["no_frame"] + c["failed_grab"] \
+        + c["stopped"] == c["triggers"], c
+    rows = _run(tmp_path / "fast", out["run"])["triggers"]
+    assert len(rows) == c["triggers"]
+    assert sum(r["outcome"].startswith("missed: camera busy")
+               for r in rows) == c["missed_busy"]
+
+
+def test_a_trigger_walk_beside_the_presses_loses_nothing(armed_emulator,
+                                                         tmp_path):
+    """The emulator measured: a software trigger fired with the selector on
+    another entry gives no frame. Another view walking every trigger while
+    the presses fire: every press is a frame (the device's trigger lock)."""
+    import threading
+
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software")
+    fc.start(str(tmp_path))
+    provider = fc._LIVE.device.settings_provider()
+    stop = threading.Event()
+
+    def walk():
+        while not stop.is_set():
+            provider.triggers_on()
+    walker = threading.Thread(target=walk)
+    walker.start()
+    session = fc._LIVE.session
+    try:
+        for n in range(15):
+            fc.capture_now()
+            assert _until(lambda: session.stats().grabbed == n + 1), n
+    finally:
+        stop.set()
+        walker.join()
+    fc.stop()
+    assert fc._LIVE.last_trigger_run.counts["ok"] == 15
+
+
+def test_a_failed_grab_while_armed_on_the_emulator(armed_emulator, tmp_path):
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software")
+    out = fc.start(str(tmp_path))
+    session = fc._LIVE.session
+    fc.capture_now()
+    assert _until(lambda: session.stats().grabbed == 1)
+    assert fc._LIVE.device.trigger_ready(1.0)
+    # ONE failed buffer: the emulator's count is 100 unless told (measured:
+    # every grab after Execute failed).
+    cam.ForceFailedBufferCount.SetValue(1)
+    cam.ForceFailedBuffer.Execute()
+    fc.capture_now()
+    assert _until(lambda: session.stats().grab_failures == 1)
+    fc.capture_now()
+    assert _until(lambda: session.stats().grabbed == 2)
+    fc.stop()
+    run = _run(tmp_path, out["run"])
+    assert [r["outcome"] for r in run["triggers"]] == ["ok", "failed grab",
+                                                       "ok"]
+    assert run["end"]["grab_failures"] == 1
+    assert [r["grab_failures"] for r in run["frames"]] == ["0", "1"]
+
+
+def test_a_snapshot_on_the_emulator_saves_the_frame_after_each_press(
+        armed_emulator, tmp_path):
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: snapshot", source="Software")
+    out = fc.start(str(tmp_path))
+    assert cam.TriggerMode.GetValue() == "Off", "the camera free-runs"
+    session = fc._LIVE.session
+    pressed = []
+    for n in range(3):
+        time.sleep(0.2)
+        pressed.append(time.time())
+        fc.capture_now()
+        assert _until(lambda: session.stats().recorded == n + 1)
+    fc.stop()
+    stats = session.run_stats()
+    assert stats.recorded == 3 and stats.passed > 10, stats
+    run = _run(tmp_path, out["run"])
+    assert [r["trigger"] for r in run["frames"]] == ["1", "2", "3"]
+    for row, when in zip(run["frames"], pressed):
+        assert float(row["arrived"]) >= float(row["trigger_time"])
+        assert abs(float(row["trigger_time"]) - when) < 0.1
+    assert run["end"]["capture"]["frames_between_triggers"] == stats.passed
+
+
+def test_an_exact_run_from_line1_arms_the_line_on_the_emulator(
+        armed_emulator, tmp_path):
+    """The emulator cannot raise a line. It does fire on TriggerSoftware
+    whatever the source (measured — a real camera should not): used here as
+    a STAND-IN for a Line1 edge, to run the arming, the frames and the
+    put-back. Skipped if the emulator stops doing that."""
+    fc, cam = armed_emulator
+    before = _every_trigger(cam)
+    _set(fc, mode="Triggered: exact", source="Line1")
+    out = fc.start(str(tmp_path))
+    assert (cam.TriggerMode.GetValue(), cam.TriggerSource.GetValue()) == (
+        "On", "Line1")
+    device, session = fc._LIVE.device, fc._LIVE.session
+    assert device.trigger_ready(1.0)
+    device.fire_trigger()                         # the stand-in edge
+    if not _until(lambda: session.stats().grabbed == 1, 2.0):
+        fc.stop()
+        pytest.skip("the emulator no longer fires a Line1 trigger on "
+                    "TriggerSoftware")
+    said = fc.stop()["summary"]
+    assert "missed hardware triggers NOT counted" in said, said
+    run = _run(tmp_path, out["run"])
+    assert [(r["trigger"], r["trigger_source"], r["trigger_time"])
+            for r in run["frames"]] == [("1", "Line1", "")]
+    assert _every_trigger(cam) == before
+
+
+def test_downsample_on_the_emulator_falls_back_to_typhons_average(
+        armed_emulator, tmp_path):
+    """The emulator accepts binning and its picture stays the same size
+    (measured): Downsample 2x puts the binning back, and Typhon averages
+    each 2 x 2 block — the saved PNG half the size, its pixels the block
+    mean of the unreduced picture, Mono12 still 0..4095."""
+    from PIL import Image
+
+    from council_core import reduce
+
+    fc, cam = armed_emulator
+    picture = (np.arange(64 * 80, dtype=np.uint32).reshape(64, 80) * 3
+               % 256).astype(np.uint8)
+    Image.fromarray(picture).save(tmp_path / "scene.png")
+    cam.TestImageSelector.SetValue("Off")
+    cam.ImageFileMode.SetValue("On")
+    cam.ImageFilename.SetValue(str(tmp_path / "scene.png"))
+    try:
+        cam.PixelFormat.SetValue("Mono12")
+        said = fc.set_downsample("2x")["summary"]
+        assert "by Typhon" in said and "did not get smaller" in said, said
+        assert cam.BinningHorizontal.GetValue() == 1, "put back"
+        out = fc.start(str(tmp_path / "runs"))
+        assert _until(lambda: fc._LIVE.session.stats().recorded >= 2)
+        fc.stop()
+        saved = np.asarray(Image.open(next((tmp_path / "runs").glob(
+            f"{out['run']}_frame_*.png"))))
+        unreduced = picture.astype(np.uint16) << 4
+        assert saved.shape == (32, 40) and saved.dtype == np.uint16
+        assert np.array_equal(saved, reduce.block_mean(unreduced, 2))
+        assert int(saved.max()) <= 4095
+        run = _run(tmp_path / "runs", out["run"])
+        assert run["record"]["downsample"]["method"] == "typhon_block_mean"
+        assert {r["downsample"] for r in run["frames"]} == {"2"}
+    finally:
+        fc.set_downsample("Off")
+        cam.ImageFileMode.SetValue("Off")
+
+
+def test_a_preset_keeps_the_capture_set_up_on_the_emulator(armed_emulator):
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Line2", per=1, every=2.5,
+         downsample="3x")
+    fc.save_preset("Triggered")
+    _set(fc, mode="Continuous", source="Software", every=1.0,
+         downsample="Off")
+    out = fc.apply_preset("Triggered")
+    assert out["ok"] or out.get("pending"), out["summary"]
+    assert _until(lambda: fc._LIVE.job is None)
+    setup = fc._LIVE.device.capture
+    assert (setup.mode, setup.source, setup.every_s, setup.downsample) == (
+        "Triggered: exact", "Line2", 2.5, 3)
+    fc.set_downsample("Off")
+
+
+def test_stop_on_an_armed_camera_waiting_for_its_trigger_is_quick(
+        armed_emulator, tmp_path):
+    """MEASURED before: a waiting camera's read times out after 1 s, so
+    Stop waits up to that — not longer."""
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software")
+    fc.start(str(tmp_path))
+    time.sleep(0.3)
+    began = time.monotonic()
+    fc.stop()
+    assert time.monotonic() - began < 1.6

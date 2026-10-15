@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 import frame_camera
 from council_core import camera_setup as cs
 from council_qt.widgets import camera_wizard as cw
+from tests.sim_cameras import simulated_row, without_camera_sdks
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -332,7 +333,10 @@ def test_the_simulated_cameras_stay_available_whatever_was_chosen(
 
 
 def test_an_app_that_was_never_set_up_searches_everything(
-        clean_camera, tmp_path):
+        clean_camera, tmp_path, monkeypatch):
+    # Both SDKs missing, whatever this PC has: in the pylon env pypylon
+    # is installed and PYLON_CAMEMU lists emulated Baslers - no note.
+    without_camera_sdks(monkeypatch)
     frame_camera._LIVE.setup_path = cs.setup_path(tmp_path)
     notes = " ".join(frame_camera.list_cameras()["notes"]).lower()
     assert "pypylon" in notes or "basler" in notes
@@ -481,8 +485,7 @@ def test_the_scan_is_told_which_camera_the_app_has_open(clean_camera,
                                                         tmp_path, monkeypatch):
     """A second open of a camera the app holds fails on real hardware."""
     monkeypatch.setattr(frame_camera._LIVE, "setup_path", tmp_path / "s.json")
-    rows = [r for r in frame_camera.list_cameras()["rows"] if r.endswith("frame")]
-    frame_camera.connect(rows[0])
+    frame_camera.connect(simulated_row(frame_camera.list_cameras()["rows"]))
     frame_camera.setup()
     assert cw.held_keys() == [frame_camera._LIVE.info.key]
     frame_camera.disconnect()
