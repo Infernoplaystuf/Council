@@ -516,10 +516,19 @@ class Device:
         """Fire one software trigger."""
         raise CameraError("this camera has no software trigger")
 
-    def count_edges(self, armed: Any) -> Tuple[Optional[int], str]:
-        """The camera's own count of edges on the armed hardware input since
-        Start, or (None, why not)."""
+    def count_edges(self, armed: Any, seen: Optional[int] = None
+                    ) -> Tuple[Optional[int], str]:
+        """The camera's own count of edges on the armed hardware input
+        between count_from_now and count_to_now, or (None, why not) — also
+        when it cannot cover the `seen` triggers Typhon saw (untrusted)."""
         return None, "the camera has no edge counter Typhon can use"
+
+    def count_from_now(self, armed: Any) -> None:
+        """Start the edge count here: the stream runs, the camera ready."""
+
+    def count_to_now(self, armed: Any) -> None:
+        """End the edge count here, before the stream stops — and take no
+        more hardware triggers."""
 
     def downsample_info(self) -> Dict[str, Any]:
         """How Downsample is made now: {"factor", "method", "note"}."""
@@ -1008,8 +1017,15 @@ class BaslerDevice(Device):
     def disarm_trigger(self, armed: Any) -> List[str]:
         return self.settings_provider().disarm(armed)
 
-    def count_edges(self, armed: Any) -> Tuple[Optional[int], str]:
-        return self.settings_provider().count_edges(armed)
+    def count_edges(self, armed: Any, seen: Optional[int] = None
+                    ) -> Tuple[Optional[int], str]:
+        return self.settings_provider().count_edges(armed, seen)
+
+    def count_from_now(self, armed: Any) -> None:
+        self.settings_provider().count_from_now(armed)
+
+    def count_to_now(self, armed: Any) -> None:
+        self.settings_provider().count_to_now(armed)
 
     def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
         """Is the camera waiting for a frame trigger (FrameTriggerWait)?

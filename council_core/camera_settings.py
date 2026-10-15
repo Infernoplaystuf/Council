@@ -1936,26 +1936,110 @@ class BaslerSettings(Provider):
             except Exception:                               # noqa: BLE001
                 pass
 
-    def count_edges(self, armed: Any) -> Tuple[Optional[int], str]:
-        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
-            else None
-        if not counter:
-            return None, ("the camera has no edge counter Typhon can set to "
-                          "this input")
+    def _read_counter(self, counter: Dict[str, Any]) -> int:
+        """Counter1's value now, its selector put back. Raises."""
         dev = self.device
         selector = dev._node("CounterSelector")
         try:
             selector.SetValue("Counter1")
-            value = int(_plain(dev._node("CounterValue").GetValue()))
-        except Exception as exc:                            # noqa: BLE001
-            return None, f"the camera's edge counter could not be read: " \
-                         f"{_why(exc)}"
+            return int(_plain(dev._node("CounterValue").GetValue()))
         finally:
             try:
                 selector.SetValue(counter["selector"])
             except Exception:                               # noqa: BLE001
                 pass
-        return max(0, value - int(counter.get("base", 0))), ""
+
+    def count_from_now(self, armed: Any) -> None:
+        """THE COUNT STARTS HERE: called once the stream runs and the
+        camera says it is ready for a trigger. Edges before that (between
+        arming and the stream, while the camera's record was read, before
+        it was ready) triggered nothing and were counted — every run with
+        a periodic signal said "missed" for them (review: 51 edges for 50
+        triggers the camera kept up with; 9 with a 150 ms record read).
+
+        The count at arming is kept too ("armed"): the camera began taking
+        triggers somewhere between the two reads, so an edge between them
+        may have triggered a frame — count_edges never calls it missed."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return
+        try:
+            value = self._read_counter(counter)
+        except Exception:                                   # noqa: BLE001
+            return
+        counter["armed"] = int(counter.get("base", 0))
+        counter["base"] = value
+
+    def count_to_now(self, armed: Any) -> None:
+        """THE COUNT ENDS HERE, before the stream stops: the count is read,
+        then the armed trigger takes Software as its source, so the camera
+        accepts no more edges while the stream winds down — edges counted
+        after StopGrabbing triggered nothing, and were "missed" too (the
+        same review). Disarm puts every trigger back after. Whether the
+        camera took Software is kept ("closed"): one that refuses it while
+        grabbing goes on taking edges until the stream stops."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return
+        dev = self.device
+        try:
+            counter["final"] = self._read_counter(counter)
+        except Exception:                                   # noqa: BLE001
+            return
+        entry = str(armed.get("entry") or "")
+        closed = False
+        with _trigger_lock(dev):
+            selector, was, entries = self._selector()
+            try:
+                if selector is not None and entry in entries and was != entry:
+                    selector.SetValue(entry)
+                if "Software" in self._entries("TriggerSource"):
+                    dev._node("TriggerSource").SetValue("Software")
+                    closed = True
+            except Exception:                               # noqa: BLE001
+                pass
+            finally:
+                if selector is not None and was and was != entry:
+                    try:
+                        selector.SetValue(was)
+                    except Exception:                       # noqa: BLE001
+                        pass
+        counter["closed"] = closed
+
+    def count_edges(self, armed: Any, seen: Optional[int] = None
+                    ) -> Tuple[Optional[int], str]:
+        """The edges the camera counted while it was taking triggers, read
+        after the stream stopped; `seen` the triggers Typhon saw.
+
+        BRACKETED, NEVER GUESSED. The count is sure between the read after
+        the camera was ready (count_from_now) and the read before the
+        stream stopped (count_to_now): an edge outside them may or may not
+        have triggered a frame, and is never called missed. Typhon's
+        triggers are checked against the most the counter can have counted
+        while the camera took edges — from arming to now — so a count that
+        cannot cover them is untrusted, never "missed"."""
+        counter = (armed or {}).get("counter") if isinstance(armed, dict) \
+            else None
+        if not counter:
+            return None, ("the camera has no edge counter Typhon can set to "
+                          "this input")
+        try:
+            now = self._read_counter(counter)
+        except Exception as exc:                            # noqa: BLE001
+            if "final" not in counter:
+                return None, f"the camera's edge counter could not be " \
+                             f"read: {_why(exc)}"
+            now = int(counter["final"])
+        final = int(counter.get("final", now))
+        edges = max(0, final - int(counter.get("base", 0)))
+        most = max(0, now - int(counter.get("armed", counter.get("base", 0))))
+        if seen is not None and int(seen) > most:
+            return None, (f"the camera's edge counter read {most}, fewer than "
+                          f"the {int(seen)} triggers seen — its count is not "
+                          f"trusted on this camera")
+        return edges, ""
 
     def disarm(self, saved: Any) -> List[str]:
         """Put back everything arm changed: every trigger's mode, source,

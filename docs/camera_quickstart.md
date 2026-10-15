@@ -478,21 +478,43 @@ the trigger rows are refused while a run has the trigger armed.
 **ignores** a trigger — no error, no gap (measured on the emulator: 20
 triggers, 10 frames, nothing counted). So before each trigger it fires,
 Typhon asks the camera whether it is ready; one it could not fire is
-counted **missed (camera busy)**. A fired trigger whose frame never comes
-is **no frame**; a snapshot trigger that comes before the last one's
-frames is **cut short**. The live line says it all:
+counted **missed (camera busy)**. A camera that cannot say whether it is
+ready is fired only once the frame of the last trigger has come. A fired
+trigger whose frame never comes is **no frame**; a snapshot trigger that
+comes before the last one's frames is **cut short**. A trigger is **ok**
+only when the run **holds** its frames: frames that came but were not
+saved (the save queue full because storage fell behind, or the recording
+stopped by a failed write) make it **not saved: storage too slow, 1 of 3
+frames** (or `recording stopped`), counted as missed. A frame that comes
+late — after its trigger's deadline (the exposure and a second), say from
+ExposureAuto lengthening the exposure — is still its own trigger's
+(`ok (late frame: it came 1.3 s after the trigger)`), never the next
+one's; where the camera numbers its frames, a frame whose number skips one
+says the one before was lost, not late. **Stop in the middle of a burst**
+ends it there: nothing more is exposed, Stop answers at once, and the
+trigger says **cut short by Stop: 5 of 300 fired** — not a miss. The live
+line says it all:
 
 `Armed — every 2 s, next in 1.4 s · 30 triggers · 29 ok · 1 MISSED (camera busy)`
 
 `Snapshot — live, saving 1 frame per Capture now (F9) · 4 triggers · 4 ok · 0 missed · 0 cut short`
 
-and Stop: `Stopped — 12 triggers, 12 ok, 0 missed · the camera counted 12
-edges on Line1.` A trigger on a **hardware input** that the camera ignored
-never reaches Typhon at all; where the camera has an edge counter on that
-line (a boost or ace 2: `Counter1`), Typhon sets it for the run and Stop
-compares its count with the triggers seen — **unverified on hardware**,
-and a count below the triggers seen is said as untrusted, never as
-missed. Without a counter Stop says the misses were **not counted**.
+and Stop: `Stopped — 12 triggers, 12 ok · the camera counted 12 edges on
+Line1.` A trigger on a **hardware input** that the camera ignored never
+reaches Typhon at all; where the camera has an edge counter on that line
+(a boost or ace 2: `Counter1`), Typhon sets it for the run and Stop
+compares its count with the triggers seen — **unverified on hardware**.
+The count is taken **while the camera takes triggers**: from when it is
+first ready after Start to Stop, read before the stream stops, the
+camera's input then closed (its trigger source set to Software until Stop
+puts every trigger back) and the frames it had exposed let arrive. Before,
+it ran from arming to after the stream stopped, so a periodic signal
+always counted edges nothing could have triggered (a false "1 missed" in
+every run, 9 with a slow camera record). An edge at either end of the
+window, which the camera may or may not have taken, is never called
+missed, and a count that cannot cover the triggers seen is said as
+untrusted. The end record says the window (`edges_counted_between`).
+Without a counter Stop says the misses were **not counted**.
 
 Each trigger is a row of `<run>_capture_triggers.csv` (missed ones too),
 each saved frame says its trigger in the frames CSV, and the run's end
@@ -604,7 +626,7 @@ side by side in the capture folder:
 | `<run>_events.raw` | **EVK4 only.** Every event the sensor sent, in Prophesee's own format — opens in Metavision Studio and Prophesee's tools. |
 | `<run>_camera.json` | **The run's camera record**: which camera, where on its sensor the pictures are, and how it was set at Start (below). |
 | `<run>_run_end.json` | **The run's end record**, written once when the recording ends (below). |
-| `<run>_capture_triggers.csv` | **A triggered run only** (*Triggered capture*): one row per trigger — `trigger`, `source`, `fired_at`, `first_frame_at` (seconds since 1970), `frames_asked`, `frames_arrived`, `failed_grabs`, `outcome` (`ok`, `missed: camera busy`, `no frame`, `failed grab`, `cut short: …`). Created exclusively, never over a file. |
+| `<run>_capture_triggers.csv` | **A triggered run only** (*Triggered capture*): one row per trigger — `trigger`, `source`, `fired_at`, `first_frame_at` (seconds since 1970), `frames_asked`, `frames_arrived`, `failed_grabs`, `outcome` (`ok`, `missed: camera busy`, `no frame`, `failed grab`, `not saved: storage too slow, k of N frames` or `not saved: recording stopped, …`, `cut short: …`, `cut short by Stop: k of N fired`; a note in brackets says more, e.g. `ok (late frame: it came 1.3 s after the trigger)`). Created exclusively, never over a file. |
 
 The frames CSV's columns, read by name (new ones are only ever added at the
 end, so older runs read the same):
@@ -620,22 +642,30 @@ end, so older runs read the same):
 | `frame_id` | the camera's own frame (block) number where it gives one; blank where it does not (pylon's emulator) |
 | `downsample`, `downsample_method` | Downsample on only: the factor, and `camera_binning_average` or `typhon_block_mean` |
 
-**A gap in the frame numbers is a frame not saved**, and there are two
+**A gap in the frame numbers is a frame not saved**, and there are three
 kinds: a frame the save queue had to skip because storage fell behind
-(`NOT saved (storage too slow)`), and a **failed grab** — an exposure the
-camera made and could not deliver. A failed grab uses up its frame number,
-so it shows as a gap, and `grab_failures` steps up on the next saved row.
+(`NOT saved (storage too slow)`); a **failed grab** — an exposure the
+camera made and could not deliver; and, in a **snapshot** run, the frames
+the live view showed **between triggers**, never asked for and so never
+offered for saving — expected, not a loss, and counted apart (the status
+line's `between triggers (not asked for)`, the end record's
+`frames_between_triggers`). A failed grab uses up its frame number, so it
+shows as a gap, and `grab_failures` steps up on the next saved row.
 
 **The end record** (`"format": "typhon-run-end"`) holds what only the end of
 a recording knows: `frames_saved`, `frames_not_saved` (`storage_too_slow`,
 and `write_failed`: a frame whose write failed and those queued behind it),
 `grab_failures` and `grab_attempts` (frames the recording was given plus
 failed grabs; `null` for a camera that reports no failed grabs),
-`first_index` and `last_index`, and `recording_failed` (empty, or the write
-that stopped the recording) — and, for a **triggered** run, a `capture`
-block (its mode, source, frames per trigger, the triggers and what came of
-them, the frames between snapshot triggers, the camera's edge count where
-it gave one, and which frames a trigger saved, in words), and with
+`first_index` and `last_index` (in a snapshot run their span also covers
+the frames between triggers, which are not among `grab_attempts`), and
+`recording_failed` (empty, or the write that stopped the recording) — and,
+for a **triggered** run, a `capture` block (its mode, source, frames per
+trigger, the triggers and what came of them — `missed` by kind, among
+them `not_saved`, and `cut_by_stop` — the frames between snapshot
+triggers, the camera's edge count where it gave one and between which
+moments it was counted, and which frames a trigger saved, in words), and
+with
 **Downsample** on, a `downsample` block. Failed grabs **after the last saved frame**
 have no CSV row to show them: they are counted only here. Like the camera
 record it is written whole and never over anything; a run from before it

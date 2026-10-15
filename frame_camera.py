@@ -579,6 +579,13 @@ STOP_DRAIN_SECONDS = 1.0
 #: (the exposure and half a second, at most this).
 STOP_TRIGGER_WAIT_SECONDS = 1.5
 
+#: The grab loop's read timeout while an exact run has the camera armed,
+#: and otherwise (capture.CaptureSession's own). Armed, nothing comes
+#: between triggers, and a 1 s read held Stop up to a second (measured on
+#: the test fake: session.stop 1.00 s of a 1.05 s Stop).
+ARMED_READ_MS = 200
+FREE_READ_MS = 1000
+
 
 def start(folder: Any, exposure: Any = "", gain: Any = "",
           frame_rate: Any = None) -> Dict[str, Any]:
@@ -734,6 +741,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         listing = _camera_listing(device)
         if setup.exact:
             armed = _arm(device, setup)
+            # An armed camera sends nothing between triggers: the grab loop
+            # waits in short reads, so Stop is not held up to a second by
+            # one (it notices Stop between reads).
+            session.timeout_ms = ARMED_READ_MS
         content, record_note = _camera_record(
             run, device, listing,
             setup if getattr(device, "capture", None) is not None else None,
@@ -784,6 +795,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             _undo_arming(device, trig, armed)
             raise
         _started_stream(session)
+    if trig is not None and armed is not None and not trig.typhon_fires:
+        # The camera's edge count starts once it can take a trigger: the
+        # edges before that (arming, the record read, the stream starting)
+        # triggered nothing.
+        _count_from_ready(device, armed)
     if trig is not None:
         # After the stream: the first trigger waits for the camera to say
         # it is ready (a trigger fired before that is lost — measured).
@@ -860,8 +876,18 @@ def stop() -> Dict[str, Any]:
         trig.halt()
         trig.wait_pending(min(STOP_TRIGGER_WAIT_SECONDS,
                               trig.exposure_s + 0.5))
+        if armed is not None and not trig.typhon_fires:
+            # The edge count ends BEFORE the stream: an edge after
+            # StopGrabbing triggers nothing, and was counted "missed".
+            try:
+                device.count_to_now(armed)
+            except Exception:                             # noqa: BLE001
+                pass
+            if isinstance(armed, dict) and armed.get("counter"):
+                _let_frames_land(session, device, trig)
     if getattr(device, "restartable", True):
         ended = session.stop()
+        session.timeout_ms = FREE_READ_MS
         # The run's books closed before its recording ends, so its end
         # record (written as the last frame lands) has every trigger.
         _end_triggers(device, trig, armed)
@@ -1338,7 +1364,11 @@ def _disarm(device: Any, armed: Any) -> str:
 
 def _undo_arming(device: Any, trig: Any, armed: Any) -> None:
     """A Start that failed after arming: the triggers CSV closed (it stays,
-    header only, as the frames CSV does), the camera disarmed."""
+    header only, as the frames CSV does), the camera disarmed, the grab
+    loop's reads as long as before."""
+    session = _LIVE.session
+    if session is not None:
+        session.timeout_ms = FREE_READ_MS
     if trig is not None:
         try:
             trig.close()
@@ -1354,20 +1384,77 @@ def _end_triggers(device: Any, trig: Any, armed: Any) -> None:
     if trig is None:
         return
     if armed is not None and not trig.typhon_fires:
+        # Fewer edges than the counter can cover for the triggers seen: it
+        # did not count what triggered the camera — its set-up on this
+        # model is not known to work (unverified on hardware). Untrusted,
+        # never "missed" (BaslerSettings.count_edges).
         try:
-            edges, why = device.count_edges(armed)
+            edges, why = device.count_edges(armed, trig.counts["triggers"])
         except Exception as exc:                          # noqa: BLE001
             edges, why = None, _said(exc)
-        if edges is not None and edges < trig.counts["triggers"]:
-            # Fewer edges than triggers seen: the counter did not count
-            # what triggered the camera — its set-up on this model is not
-            # known to work (unverified on hardware). Not "missed".
-            why = (f"the camera's edge counter read {edges}, fewer than the "
-                   f"{trig.counts['triggers']} triggers seen — its count is "
-                   f"not trusted on this camera")
-            edges = None
-        trig.edges_counted(edges, why)
+        trig.edges_counted(edges, why, window=EDGE_WINDOW if edges is not None
+                           else "")
     trig.stop()
+
+
+#: Between which moments the camera's edge count is taken (the record's
+#: capture block, edges_counted_between).
+EDGE_WINDOW = ("from when the camera was first ready for a trigger after "
+               "Start, to Stop (read before the stream stopped, the camera "
+               "then taking no more hardware triggers); an edge at either "
+               "end, where the camera may or may not have taken it, is not "
+               "called missed")
+
+#: After Stop closed the camera's input: how long frames already exposed
+#: are given to reach Typhon before the stream stops (they are the run's,
+#: and their edges were counted) — at most this, and done once none has
+#: come for LAND_QUIET_SECONDS.
+LAND_SECONDS = 0.5
+LAND_QUIET_SECONDS = 0.05
+
+
+def _let_frames_land(session: Any, device: Any, trig: Any) -> None:
+    """Stop of an exact run from the camera's input: the input is closed
+    (count_to_now), so what the camera exposed before it is waited for —
+    the exposure (trigger_ready), then until no frame has come for
+    LAND_QUIET_SECONDS. A frame still on its way when the stream stopped
+    was lost, and its counted edge said "missed"."""
+    ready = getattr(device, "trigger_ready", None)
+    try:
+        if callable(ready):
+            ready(min(STOP_TRIGGER_WAIT_SECONDS, trig.exposure_s + 0.5))
+    except Exception:                                     # noqa: BLE001
+        pass
+    end = time.monotonic() + LAND_SECONDS
+    last = session.stats().grabbed
+    quiet_from = time.monotonic()
+    while time.monotonic() < end:
+        time.sleep(0.005)
+        now = session.stats().grabbed
+        if now != last:
+            last, quiet_from = now, time.monotonic()
+        elif time.monotonic() - quiet_from >= LAND_QUIET_SECONDS:
+            return
+
+
+def _count_from_ready(device: Any, armed: Any) -> None:
+    """The camera's edge count starts now (BaslerSettings.count_from_now) —
+    once the camera says it is ready for a trigger, at most FIRST_READY_S
+    after the stream started."""
+    from council_core import triggered
+
+    if not (isinstance(armed, dict) and armed.get("counter")):
+        return
+    ready = getattr(device, "trigger_ready", None)
+    try:
+        if callable(ready):
+            ready(triggered.FIRST_READY_S)
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        device.count_from_now(armed)
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 def _trigger_run(setup: Any, device: Any, out: Path, run: str,

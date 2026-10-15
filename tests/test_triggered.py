@@ -241,6 +241,173 @@ def test_the_timer_fires_on_schedule_and_counts_busy_ticks(tmp_path):
     assert len(rows_of(run.path)) == counts["triggers"]
 
 
+def test_stop_ends_a_burst_at_once_and_says_stop_cut_it(tmp_path):
+    """Before: Stop in a 300-frame burst waited the whole halt join (5 s),
+    the burst kept firing after it, and the trigger was "missed: camera
+    busy" (review: 6.6 s, 183 frames). Now the burst looks for Stop before
+    every frame: halt returns at once, nothing more is fired, and the
+    trigger says Stop cut it — not a miss."""
+    device = FakeTrigger(busy_s=0.03)
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT, per_trigger=300)
+    run.start()
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) >= 5)
+    began = time.perf_counter()
+    run.halt()
+    took = time.perf_counter() - began
+    fired = len(device.fired)
+    time.sleep(0.2)
+    assert len(device.fired) == fired, "nothing fired after Stop"
+    assert took < 0.5, took
+    tags = [run.tag(frame(n)) for n in range(1, fired + 1)]
+    run.stop()
+    assert {t["trigger"] for t in tags} == {1}
+    assert rows_of(run.path)[0]["outcome"] == \
+        f"cut short by Stop: {fired} of 300 fired"
+    assert run.counts["stopped"] == 1 and run.missed == 0
+    assert "1 cut short by Stop" in run.stopped_line()
+    assert run.summary()["cut_by_stop"] == 1
+
+
+def test_a_late_frame_is_its_own_triggers_not_the_next(tmp_path,
+                                                       monkeypatch):
+    """Before: a frame that came after its trigger's deadline was paired
+    with the NEXT trigger, and that trigger's own frame went "untriggered"
+    — both frames given the wrong trigger (review). A trigger past its
+    deadline with no frame is now held as long again: frames come in the
+    order their triggers were fired, so the late one is its own."""
+    monkeypatch.setattr(tg, "DEADLINE_S", 0.3)
+    device = FakeTrigger()
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT)
+    run.start()
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 1)
+    time.sleep(0.45)                      # trigger 1's deadline has passed
+    assert run.counts["no_frame"] == 0, "held for a late frame"
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 2)
+    late, own = run.tag(frame(1)), run.tag(frame(2))
+    run.stop()
+    assert (late["trigger"], own["trigger"]) == (1, 2)
+    rows = rows_of(run.path)
+    assert [r["trigger"] for r in rows] == ["1", "2"]
+    assert rows[0]["outcome"].startswith("ok (late frame: it came ")
+    assert rows[1]["outcome"] == "ok"
+    assert run.counts["untriggered"] == 0 and run.missed == 0
+
+
+def test_a_held_trigger_whose_frame_number_was_skipped_is_no_frame(
+        tmp_path, monkeypatch):
+    """Where the camera numbers its frames (frame_id), a frame whose
+    number skips one says the held trigger's frame was LOST on the way,
+    not late: it goes to its own trigger, and the held one is no frame."""
+    monkeypatch.setattr(tg, "DEADLINE_S", 0.2)
+    device = FakeTrigger()
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT)
+    run.start()
+
+    def numbered(fid):
+        return cameras.Frame(np.zeros((4, 4), np.uint8), fid, 0,
+                             {"frame_id": fid})
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 1)
+    assert run.tag(numbered(10))["trigger"] == 1
+    run.capture_now()                      # its frame (11) is lost
+    assert wait_for(lambda: len(device.fired) == 2)
+    time.sleep(0.3)
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 3)
+    assert run.tag(numbered(12))["trigger"] == 3
+    run.stop()
+    outcomes = {r["trigger"]: r["outcome"] for r in rows_of(run.path)}
+    assert outcomes["2"].startswith("no frame (its frame was lost")
+    assert outcomes["3"] == "ok"
+
+
+class NoReadySignal:
+    """A camera that cannot say whether it is ready (no FrameTriggerWait):
+    it IGNORES a trigger that comes while it is still exposing, and sends
+    a frame `busy_s` after each one it took (the feeder thread)."""
+
+    def __init__(self, busy_s):
+        self.busy_s = busy_s
+        self.busy_until = 0.0
+        self.took = []
+        self.ignored = 0
+        self.lock = threading.Lock()
+
+    def fire_trigger(self):
+        now = time.perf_counter()
+        with self.lock:
+            if now < self.busy_until:
+                self.ignored += 1
+                return
+            self.busy_until = now + self.busy_s
+            self.took.append(now + self.busy_s)
+
+
+def test_a_camera_that_cannot_say_it_is_ready_is_fired_after_its_frame(
+        tmp_path):
+    """Before: with no ready signal Typhon fired at once; a press while
+    the camera was still exposing was ignored by it, and the next frame
+    was paired with that ignored trigger (review). Now Typhon waits for
+    the frame of what it fired last: every press is taken, each frame is
+    its own trigger's."""
+    device = NoReadySignal(busy_s=0.1)
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT)
+    tags = []
+    stop = threading.Event()
+
+    def feeder():
+        sent = 0
+        while not stop.is_set():
+            with device.lock:
+                due = list(device.took)
+            if sent < len(due) and time.perf_counter() >= due[sent]:
+                sent += 1
+                tags.append(run.tag(frame(sent)))
+            time.sleep(0.002)
+    thread = threading.Thread(target=feeder)
+    thread.start()
+    run.start()
+    run.capture_now()
+    time.sleep(0.05)                       # still exposing the first
+    run.capture_now()
+    time.sleep(0.15)
+    run.capture_now()
+    assert wait_for(lambda: len(tags) == 3)
+    stop.set()
+    thread.join()
+    run.stop()
+    assert device.ignored == 0, "nothing fired into a busy camera"
+    assert [t["trigger"] for t in tags] == [1, 2, 3]
+    assert [r["outcome"] for r in rows_of(run.path)] == ["ok"] * 3
+
+
+def test_a_frame_not_saved_is_a_miss_not_ok(tmp_path):
+    """The session tells the books whether each frame it tagged was saved
+    (confirm_saves): a trigger whose frame the save queue skipped said
+    "ok" (review). It is "not saved", and a miss."""
+    device = FakeTrigger()
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT)
+    run.confirm_saves()
+    run.start()
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 1)
+    tags = run.tag(frame(1))
+    assert run.counts["ok"] == 0, "not settled before its save is known"
+    run.saved(tags, False, "storage too slow")
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) == 2)
+    run.saved(run.tag(frame(2)), True)
+    run.stop()
+    assert [r["outcome"] for r in rows_of(run.path)] == [
+        "not saved: storage too slow, 1 of 1 frame", "ok"]
+    assert run.counts["not_saved"] == 1 and run.missed == 1
+    assert run.summary()["missed"]["not_saved"] == 1
+    assert run.stopped_line() == "2 triggers, 1 ok, 1 missed (1 NOT saved)"
+
+
 # ======================================================================
 # Exact, from the camera's own input
 # ======================================================================
@@ -358,6 +525,104 @@ def test_a_snapshot_run_saves_only_what_its_triggers_asked_for(tmp_path):
     assert end["capture"]["frames_between_triggers"] == stats.passed
     assert end["capture"]["triggers"] == 2 and end["capture"]["ok"] == 2
     assert end["format_version"] == 1
+
+
+class _TinyWriter(capture.FrameWriter):
+    """A save queue of one frame, one writer: storage too slow on cue."""
+
+    def __init__(self, recorder, budget_bytes=1, threads=1):
+        super().__init__(recorder, budget_bytes=1, threads=1)
+
+
+def _triggered_session(tmp_path, monkeypatch, mode, per, write):
+    """The simulated camera through a capture session with `write` as the
+    recorder's frame writer; a triggered run of `per` frames per trigger."""
+    capture.warm_imports()
+    device = simulated()
+    device.capture.mode = mode
+    device.capture.per_trigger = per
+    run_name, claim = capture.claim_run(tmp_path, "20261014_120000")
+    recorder = capture.run_recorder(tmp_path, run_name, claim)
+    real = recorder._writer
+    recorder._writer = lambda image, path: write(real, image, path)
+    trig = tg.TriggerRun(device.capture, device,
+                         tmp_path / f"{run_name}{tg.TRIGGERS_SUFFIX}",
+                         frame_period_s=1 / 30)
+    trig.open()
+    recorder.capture_info = trig.summary
+    device.prepare(True)
+    session = capture.CaptureSession(device)
+    if mode == tg.MODE_EXACT:
+        device.arm_trigger(device.capture)
+    session.record_to(recorder, reset=True, gate=trig)
+    session.start()
+    trig.start()
+    return run_name, session, trig
+
+
+def _end(run_name, session, trig, tmp_path):
+    trig.halt()
+    session.stop()
+    trig.stop()
+    session.record_to(None)
+    end = json.loads((tmp_path / f"{run_name}_run_end.json").read_text(
+        encoding="utf-8"))
+    return (rows_of(tmp_path / f"{run_name}_frames.csv"),
+            rows_of(tmp_path / f"{run_name}{tg.TRIGGERS_SUFFIX}"), end)
+
+
+@pytest.mark.parametrize("mode", [tg.MODE_SNAPSHOT, tg.MODE_EXACT])
+def test_a_trigger_whose_frames_storage_skipped_is_not_saved_not_ok(
+        tmp_path, monkeypatch, mode):
+    """Before: 2 of a trigger's 3 frames saved (the save queue full), and
+    its row said "ok", Stop "1 ok, 0 missed" (review). Now the frame the
+    queue skipped makes it "not saved: storage too slow" — a miss."""
+    monkeypatch.setattr(capture, "FrameWriter", _TinyWriter)
+
+    def slow(real, image, path):
+        time.sleep(0.4)
+        real(image, path)
+    run_name, session, trig = _triggered_session(tmp_path, monkeypatch,
+                                                 mode, 3, slow)
+    time.sleep(0.2)
+    trig.capture_now()
+    assert wait_for(lambda: session.stats().skipped >= 1, 3.0)
+    time.sleep(0.3)
+    frames, triggers, end = _end(run_name, session, trig, tmp_path)
+    assert len(frames) < 3
+    assert triggers[0]["outcome"] == ("not saved: storage too slow, "
+                                      f"{3 - len(frames)} of 3 frames")
+    assert end["capture"]["ok"] == 0
+    assert end["capture"]["missed"]["not_saved"] == 1
+    assert "0 ok, 1 missed (1 NOT saved)" in trig.stopped_line()
+
+
+def test_triggers_after_a_failed_write_are_not_saved_not_no_frame(
+        tmp_path, monkeypatch):
+    """A failed write stops the recording. Before, the trigger whose frame
+    failed said "ok" and every later one "no frame", though the camera
+    delivered them (review). Now each says "not saved: recording
+    stopped"."""
+    count = {"n": 0}
+
+    def fails_second(real, image, path):
+        count["n"] += 1
+        if count["n"] == 2:
+            raise OSError(28, "No space left on device", str(path))
+        real(image, path)
+    run_name, session, trig = _triggered_session(
+        tmp_path, monkeypatch, tg.MODE_EXACT, 1, fails_second)
+    for n in range(3):
+        trig.capture_now()
+        assert wait_for(lambda: trig.counts["triggers"] == n + 1)
+        time.sleep(0.25)
+    frames, triggers, end = _end(run_name, session, trig, tmp_path)
+    assert len(frames) == 1
+    assert [r["outcome"] for r in triggers] == [
+        "ok", "not saved: recording stopped, 1 of 1 frame",
+        "not saved: recording stopped, 1 of 1 frame"]
+    assert end["recording_failed"], "the end record is written at the failure"
+    assert trig.counts["no_frame"] == 0 and trig.counts["not_saved"] == 2
 
 
 def test_older_readers_find_their_columns_where_they_always_were(tmp_path):

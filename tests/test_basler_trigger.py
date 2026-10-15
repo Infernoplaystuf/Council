@@ -573,6 +573,107 @@ def test_an_exact_run_from_line1_saves_one_frame_per_edge_and_counts_the_rest(
     assert cam.value("TriggerSelector") == "FrameStart"
 
 
+def test_a_periodic_signal_the_camera_keeps_up_with_is_never_missed(
+        monkeypatch, tmp_path):
+    """Before: Counter1 was reset at arming and read after the stream
+    stopped, so the edges before the camera took triggers (arming, the
+    camera record read, the stream starting) and after it stopped were
+    counted and said "missed" — every run with a periodic signal (review:
+    "50 ok, 1 missed · the camera counted 51 edges"; 9 with a 150 ms record
+    read). Now the count is taken while the camera takes triggers: a 50 Hz
+    signal running through Start and Stop, a 2 ms exposure, 0 missed."""
+    cam = FakeBasler(exposure_s=0.002)
+    connect(monkeypatch, cam)
+    set_up(mode=tg.MODE_EXACT, source="Line1", edge="RisingEdge")
+    real = frame_camera._camera_record
+
+    def slow_record(*args, **kwargs):
+        time.sleep(0.15)              # a real camera's every node, read
+        return real(*args, **kwargs)
+    monkeypatch.setattr(frame_camera, "_camera_record", slow_record)
+    stop = threading.Event()
+    busy = []
+
+    def signal():
+        while not stop.is_set():
+            before = cam.ignored
+            ready = cam.ready()
+            cam.raise_line("Line1")
+            if ready and cam.ignored > before:
+                busy.append(1)                 # a real miss: none expected
+            time.sleep(0.02)
+    thread = threading.Thread(target=signal)
+    thread.start()
+    try:
+        out = frame_camera.start(str(tmp_path / "runs"))
+        time.sleep(0.8)
+        said = frame_camera.stop()["summary"]
+        time.sleep(0.1)                         # edges go on after Stop
+    finally:
+        stop.set()
+        thread.join()
+    assert busy == []
+    trig = frame_camera._LIVE.last_trigger_run
+    assert trig.counts["triggers"] >= 20
+    assert trig.missed == 0, said
+    n = trig.counts["triggers"]
+    assert trig.counts["ok"] == n
+    assert f"{n} triggers, {n} ok · the camera counted " in said, said
+    end = run_files(tmp_path / "runs", out["run"])["end"]["capture"]
+    assert end["missed"]["hardware_edges_ignored"] == 0
+    assert 0 < end["edges_counted"] <= end["triggers"]
+    assert "ready for a trigger" in end["edges_counted_between"]
+    assert cam.triggers()["FrameStart"][:2] == ("Off", "Software"), \
+        "put back as before Start"
+
+
+def test_stop_in_a_long_software_burst_ends_it_at_once(monkeypatch,
+                                                       tmp_path):
+    """Before: Stop in an exact Software burst of 300 waited for the
+    burst (6.6 s, the window frozen), ~176 frames were exposed and saved
+    after Stop was pressed, and the trigger said "missed: camera busy"
+    (review, on this fake and on the emulator). Now Stop returns at once,
+    nothing more is fired, and the trigger says Stop cut it short."""
+    cam = FakeBasler(exposure_s=0.03)
+    connect(monkeypatch, cam)
+    set_up(mode=tg.MODE_EXACT, source=tg.SOFTWARE, per=300)
+    out = frame_camera.start(str(tmp_path))
+    session = frame_camera._LIVE.session
+    frame_camera.capture_now()
+    assert wait_for(lambda: session.stats().grabbed >= 5)
+    began = time.perf_counter()
+    said = frame_camera.stop()["summary"]
+    took = time.perf_counter() - began
+    assert took < 0.6, took
+    files = run_files(tmp_path, out["run"])
+    saved = len(files["frames"])
+    assert saved <= 10, saved
+    assert [r["outcome"] for r in files["triggers"]] == [
+        f"cut short by Stop: {saved} of 300 fired"]
+    assert "1 trigger, 0 ok, 0 missed, 1 cut short by Stop" in said, said
+    assert files["end"]["capture"]["cut_by_stop"] == 1
+    time.sleep(0.2)
+    assert cam.lost_software == 0, "nothing fired into a disarmed camera"
+
+
+def test_disconnect_in_a_long_software_burst_is_prompt(monkeypatch,
+                                                       tmp_path):
+    """Before: Disconnect mid-burst took 6.0 s (review). Now it ends the
+    burst at once and puts the triggers back."""
+    cam = FakeBasler(exposure_s=0.03)
+    connect(monkeypatch, cam)
+    before = cam.triggers()
+    set_up(mode=tg.MODE_EXACT, source=tg.SOFTWARE, per=300)
+    frame_camera.start(str(tmp_path))
+    session = frame_camera._LIVE.session
+    frame_camera.capture_now()
+    assert wait_for(lambda: session.stats().grabbed >= 3)
+    began = time.perf_counter()
+    frame_camera.disconnect()
+    assert time.perf_counter() - began < 0.6
+    assert cam.triggers() == before
+
+
 def test_a_burst_from_a_line_saves_n_frames_per_trigger(monkeypatch,
                                                          tmp_path):
     cam = FakeBasler(exposure_s=0.005)

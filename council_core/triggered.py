@@ -356,6 +356,12 @@ NO_FRAME = "no frame"
 FAILED_GRAB = "failed grab"
 CUT_SHORT = "cut short: the next trigger came first"
 NOT_FIRED = "not fired"
+#: Its frames came but were NOT saved — the save queue was full (storage
+#: too slow) or the recording had stopped on a failed write. A miss: the
+#: run does not hold what the trigger asked for.
+NOT_SAVED = "not saved"
+#: A burst Stop ended: the frames fired before Stop, no more after it.
+STOPPED = "cut short by Stop"
 
 #: How long the first trigger of a run waits for the camera to be ready
 #: (measured on the emulator: ready 14-15 ms after StartGrabbing; a trigger
@@ -371,6 +377,9 @@ DEADLINE_S = 1.0
 #: The worker's longest sleep: deadlines are checked and rows written this
 #: often.
 WAKE_S = 0.05
+#: How long Stop waits for the frames still being written to say whether
+#: they were saved (confirm_saves) before it closes the books.
+SAVE_WAIT_S = 1.0
 
 
 @dataclass
@@ -388,6 +397,16 @@ class _Trigger:
     deadline: Optional[float] = None
     outcome: str = ""
     note: str = ""
+    #: Frames tagged for it whose save is not yet known (confirm_saves),
+    #: and those the session could NOT save, with why.
+    waiting: int = 0
+    unsaved: int = 0
+    unsaved_why: str = ""
+    #: Stop came in the middle of its burst: no more were fired.
+    stopped: bool = False
+    #: Past its deadline with no frame, held a while longer for a LATE
+    #: frame (TriggerRun._expire) — until this moment (monotonic).
+    held_until: Optional[float] = None
 
     @property
     def done(self) -> bool:
@@ -450,6 +469,17 @@ class TriggerRun:
         self._current: Optional[_Trigger] = None      # snapshot
         self._hw_seen = 0                              # exact, hardware
         self._hw_current: Optional[_Trigger] = None
+        #: Exact, Typhon's: triggers past their deadline with no frame,
+        #: oldest first, held for a late frame (_expire).
+        self._held: Deque[_Trigger] = deque()
+        #: The camera's frame number (Frame.meta "frame_id") of the last
+        #: frame or failed grab, where it gives one: a frame whose number
+        #: skips one says a frame was lost on the way, not late.
+        self._last_fid: Optional[int] = None
+        #: The session says whether each tagged frame was saved (saved()):
+        #: a trigger is settled only then (confirm_saves).
+        self._confirm = False
+        self._awaiting: Dict[int, _Trigger] = {}
         self._ever_ready = False
         self._t0: Optional[float] = None
         self._tick = 0
@@ -460,12 +490,14 @@ class TriggerRun:
         self.counts: Dict[str, int] = {
             "triggers": 0, "ok": 0, "missed_busy": 0, "no_frame": 0,
             "failed_grab": 0, "cut_short": 0, "not_fired": 0,
-            "frames": 0, "untriggered": 0}
+            "not_saved": 0, "stopped": 0, "frames": 0, "untriggered": 0}
         #: When the last trigger was fired or seen (monotonic), or None.
         self.last_at: Optional[float] = None
         #: Hardware edges the camera counted (Stop), or None.
         self.edges: Optional[int] = None
         self.edges_note = ""
+        #: Between which moments the camera counted them, in words.
+        self.edges_window = ""
 
     # -- the triggers CSV ------------------------------------------------
     def open(self) -> Optional[Path]:
@@ -525,7 +557,14 @@ class TriggerRun:
         """Fire nothing more (the worker ends); triggers already fired keep
         waiting for their frames — Stop calls this BEFORE it ends the
         stream, so a trigger fired a moment before Stop still gets its
-        frame (wait_pending)."""
+        frame (wait_pending).
+
+        A BURST IN PROGRESS ENDS HERE: the worker looks for Stop before
+        every frame of a burst, and waits for a busy camera in short steps
+        (_wait_ready), so this returns within about one of them. It looked
+        only between triggers: Stop in a 300-frame burst blocked the window
+        for 6.5 s while ~176 frames were exposed and saved after it (review,
+        measured on the emulator)."""
         with self._cond:
             self._stopping = True
             self._cond.notify_all()
@@ -533,14 +572,22 @@ class TriggerRun:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
 
+    def _stop_asked(self) -> bool:
+        with self._cond:
+            return self._stopping
+
     def wait_pending(self, timeout: float) -> bool:
         """Wait up to `timeout` for every fired trigger's frames; True when
-        none is waiting."""
+        none is waiting. Frames that came and are still being SAVED are not
+        waited for here — stop() gives them their moment (SAVE_WAIT_S)."""
         deadline = self._clock() + max(0.0, float(timeout))
         while True:
             with self._lock:
-                waiting = bool(self._pending) or (
-                    self._current is not None and not self._current.done)
+                current = self._current
+                waiting = any(t.firing or t.arrived < t.fired
+                              for t in self._pending) or (
+                    current is not None and not current.done
+                    and current.arrived < current.asked)
             if not waiting:
                 return True
             if self._clock() >= deadline:
@@ -551,7 +598,27 @@ class TriggerRun:
         """Stop firing, then settle every trigger still waiting for frames:
         the run has ended, so what has not arrived will not."""
         self.halt(timeout)
+        # The frames still being written are given a moment to land, so
+        # their triggers say what became of them.
+        deadline = self._clock() + SAVE_WAIT_S
+        while self._confirm and self._clock() < deadline:
+            with self._lock:
+                if not self._awaiting:
+                    break
+            time.sleep(0.005)
         with self._lock:
+            # A save not told by now (a slow disk still writing at Stop; or
+            # no session telling, the books alone): handed on to be saved,
+            # and said so.
+            for trig in list(self._awaiting.values()):
+                if self._confirm and not trig.note:
+                    trig.note = "its frames were still being saved at Stop"
+                trig.waiting = 0
+                self._maybe_settle(trig)
+            self._awaiting.clear()
+            for trig in list(self._held):
+                self._settle(trig, NO_FRAME, note="the run stopped")
+            self._held.clear()
             for trig in list(self._pending):
                 self._settle(trig, NO_FRAME if trig.arrived == 0
                              else self._partial(trig), note="the run stopped")
@@ -633,6 +700,40 @@ class TriggerRun:
         except Exception:                                 # noqa: BLE001
             return None
 
+    def _own_frames_due(self, trig: _Trigger) -> bool:
+        """A frame Typhon fired for has not arrived yet (the lock held)."""
+        return trig.arrived < trig.fired or any(
+            t.arrived < t.fired for t in self._pending if t is not trig)
+
+    def _wait_ready(self, timeout: float, trig: _Trigger,
+                    stoppable: bool) -> Optional[bool]:
+        """Is the camera ready for a trigger? Asked in short steps (WAKE_S)
+        so a Stop is seen while it waits (`stoppable`): None then, as "do
+        not fire". A camera that CANNOT SAY (trigger_ready None) is taken
+        as ready once every frame Typhon fired so far has come — a trigger
+        fired into a camera still busy is ignored with no error, and the
+        next frame was then paired with it (review)."""
+        deadline = self._clock() + max(0.0, float(timeout))
+        while True:
+            left = max(0.0, deadline - self._clock())
+            ready = self._ready(min(left, WAKE_S) if stoppable else left)
+            if ready is None:
+                with self._lock:
+                    ready = not self._own_frames_due(trig)
+                if not ready and self._clock() < deadline:
+                    if stoppable and self._stop_asked():
+                        return None
+                    time.sleep(0.002)
+                    continue
+                if not ready:
+                    trig.note = trig.note or ("the camera cannot say it is "
+                                              "ready, and the last frame "
+                                              "fired had not come")
+            if ready or self._clock() >= deadline:
+                return bool(ready)
+            if stoppable and self._stop_asked():
+                return None
+
     def _trigger(self, source: str) -> None:
         number = self._next_number()
         trig = _Trigger(number, source, self.per)
@@ -640,7 +741,11 @@ class TriggerRun:
             now = self._clock()
             with self._lock:
                 current = self._current
-                if current is not None and not current.done:
+                if current is not None and not current.done and \
+                        current.arrived < current.asked:
+                    # Cut short only when its frames had not all come: one
+                    # whose frames all came, their saves still being told
+                    # (confirm_saves), settles when they are.
                     self._settle(current, CUT_SHORT)
                 trig.fired_mono, trig.fired_wall = now, self._wall()
                 trig.fired = self.per
@@ -655,8 +760,20 @@ class TriggerRun:
                 timeout = (FIRST_READY_S if not self._ever_ready else
                            0.0 if source == TIMER else PRESS_READY_S)
             else:
+                if self._stop_asked():
+                    # Stop came mid-burst: nothing more is exposed. The
+                    # frames fired so far are waited for (wait_pending).
+                    with self._lock:
+                        trig.stopped = True
+                    break
                 timeout = self.exposure_s + DEADLINE_S
-            ready = self._ready(timeout)
+            # The first frame of a press made before Stop is fired (it was
+            # answered "trigger sent"); the rest of a burst is not.
+            ready = self._wait_ready(timeout, trig, stoppable=i > 0)
+            if ready is None:
+                with self._lock:
+                    trig.stopped = True
+                break
             if ready is False:
                 with self._lock:
                     if i == 0:
@@ -691,29 +808,60 @@ class TriggerRun:
             self._maybe_settle(trig)
 
     def _expire(self) -> None:
+        """Triggers past their deadline (exposure + DEADLINE_S) with frames
+        still due are "no frame" — but an exact trigger of Typhon's that got
+        NONE is first HELD as long again: frames come in the order their
+        triggers were fired, so a frame arriving while one is held is ITS
+        late frame. Settled at once, its late frame was paired with the
+        next trigger and that trigger's own frame left "untriggered" — both
+        frames given the wrong trigger in the frames CSV (review). A late
+        frame comes from ExposureAuto lengthening the exposure after Start
+        (read once, then), a slow link, or frames queued in pylon."""
         now = self._clock()
         with self._lock:
+            for trig in list(self._held):
+                if trig.held_until is not None and now > trig.held_until:
+                    self._held.remove(trig)
+                    self._settle(trig, NO_FRAME)
             waiting = list(self._pending)
             if self._current is not None and not self._current.done:
                 waiting.append(self._current)
             for trig in waiting:
                 if trig.firing or trig.deadline is None or now <= trig.deadline:
                     continue
-                if trig.arrived < trig.fired:
-                    self._settle(trig, NO_FRAME if trig.arrived == 0
-                                 else self._partial(trig))
+                if trig.arrived >= trig.fired:
+                    continue
+                if (self.exact and self.typhon_fires and trig.arrived == 0
+                        and trig.held_until is None):
+                    trig.held_until = now + self.exposure_s + DEADLINE_S
+                    self._pending.remove(trig)
+                    self._held.append(trig)
+                    continue
+                self._settle(trig, NO_FRAME if trig.arrived == 0
+                             else self._partial(trig))
 
     # -- the books (the lock held) ---------------------------------------
     def _partial(self, trig: _Trigger) -> str:
         return f"{NO_FRAME}: {trig.arrived} of {trig.asked} frames"
 
     def _maybe_settle(self, trig: _Trigger) -> None:
-        if trig.done or trig.firing or trig.arrived < trig.fired:
+        if (trig.done or trig.firing or trig.arrived < trig.fired
+                or trig.waiting > 0):
             return
         if trig.failed:
             self._settle(trig, FAILED_GRAB)
+        elif trig.unsaved:
+            # Its frames came, and the run does not hold them: a miss,
+            # however the camera did (it was "ok" before — review).
+            self._settle(trig, f"{NOT_SAVED}: {trig.unsaved_why}, "
+                               f"{trig.unsaved} of {trig.asked} frame"
+                               f"{'' if trig.asked == 1 else 's'}")
         elif trig.got >= trig.asked:
             self._settle(trig, OK)
+        elif trig.stopped:
+            # Stop ended the burst: not the camera's doing, not a miss.
+            self._settle(trig, f"{STOPPED}: {trig.fired} of {trig.asked} "
+                               f"fired")
         else:
             # Fired fewer than asked (busy mid-burst), all of those came.
             self._settle(trig, MISSED_BUSY if trig.fired == 0 else
@@ -730,6 +878,10 @@ class TriggerRun:
             self._pending.remove(trig)
         except ValueError:
             pass
+        try:
+            self._held.remove(trig)
+        except ValueError:
+            pass
         if self._current is trig:
             self._current = None
         if outcome == OK:
@@ -744,20 +896,89 @@ class TriggerRun:
             self.counts["cut_short"] += 1
         elif outcome == NOT_FIRED:
             self.counts["not_fired"] += 1
+        elif outcome.startswith(NOT_SAVED):
+            self.counts["not_saved"] += 1
+        elif outcome.startswith(STOPPED):
+            self.counts["stopped"] += 1
         said = outcome + (f" ({trig.note})" if trig.note else "")
         self._rows.append((trig.number, trig.source, _stamp(trig.fired_wall),
                            _stamp(trig.first_wall), trig.asked, trig.got,
                            trig.failed, said))
 
     # -- the grab thread -------------------------------------------------
+    def confirm_saves(self) -> None:
+        """The capture session tells this run whether each frame it tagged
+        was saved (saved()): a trigger is settled only then — "ok" only
+        when the run holds its frames. Without it (the books alone) a
+        trigger is settled as its frames arrive."""
+        self._confirm = True
+
+    def saved(self, tags: Optional[Dict[str, Any]], ok: bool,
+              why: str = "") -> None:
+        """Whether a frame tag() answered `tags` for was saved — or not,
+        and `why` ("storage too slow", "recording stopped"). Grab thread."""
+        if not tags:
+            return
+        try:
+            number = int(tags.get("trigger") or 0)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            trig = self._awaiting.get(number)
+            if trig is None:
+                return
+            trig.waiting = max(0, trig.waiting - 1)
+            if trig.waiting == 0:
+                del self._awaiting[number]
+            if not ok:
+                trig.unsaved += 1
+                trig.unsaved_why = trig.unsaved_why or why or "not saved"
+            self._maybe_settle(trig)
+
+    def _frame_number(self, frame: Any) -> Optional[int]:
+        meta = getattr(frame, "meta", None) or {}
+        value = meta.get("frame_id")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def _exact_trigger_for(self, frame: Any) -> Optional[_Trigger]:
+        """The trigger of Typhon's an exact run's frame belongs to (the
+        lock held): the oldest HELD trigger (past its deadline, its frame
+        late) — unless the camera's frame number skips one per held
+        trigger, which says its frame was lost on the way, not late — then
+        the oldest pending one still owed a frame."""
+        fid = self._frame_number(frame)
+        if fid is not None:
+            skipped = (fid - self._last_fid - 1
+                       if self._last_fid is not None else 0)
+            self._last_fid = fid
+            while skipped > 0 and self._held:
+                lost = self._held[0]
+                owed = max(1, lost.fired - lost.arrived)
+                if owed > skipped:
+                    break
+                self._settle(lost, NO_FRAME,
+                             note="its frame was lost on the way: the "
+                                  "camera's frame numbers skip it")
+                skipped -= owed
+        if self._held:
+            trig = self._held[0]
+            late = (self._clock() - trig.fired_mono
+                    if trig.fired_mono is not None else 0.0)
+            trig.note = f"late frame: it came {late:.1f} s after the trigger"
+            if trig.arrived + 1 >= trig.fired:
+                self._held.popleft()
+            return trig
+        return next((t for t in self._pending if t.arrived < t.fired), None)
+
     def tag(self, frame: Any = None) -> Optional[Dict[str, Any]]:
         """The trigger columns of a frame that just arrived — or None: a
         snapshot frame no trigger asked for (grabbed, shown, not saved)."""
         arrived_mono, arrived_wall = self._clock(), self._wall()
         with self._lock:
             if self.exact and self.typhon_fires:
-                trig = next((t for t in self._pending
-                             if t.arrived < t.fired), None)
+                trig = self._exact_trigger_for(frame)
                 if trig is None:
                     # The camera sent a frame no trigger of Typhon's asked
                     # for: saved (it is the camera's data), and counted.
@@ -796,6 +1017,10 @@ class TriggerRun:
             trig.first_wall = wall
         self.counts["frames"] += 1
         tags = self._tags(trig, trig.arrived, wall)
+        if self._confirm:
+            # Settled once the session says the frame was saved (saved()).
+            trig.waiting += 1
+            self._awaiting[trig.number] = trig
         self._maybe_settle(trig)
         return tags
 
@@ -815,8 +1040,14 @@ class TriggerRun:
         trigger it belongs to."""
         with self._lock:
             if self.exact and self.typhon_fires:
-                trig = next((t for t in self._pending
-                             if t.arrived < t.fired), None)
+                trig = self._held[0] if self._held else next(
+                    (t for t in self._pending if t.arrived < t.fired), None)
+                if trig is not None and trig in self._held and \
+                        trig.arrived + 1 >= trig.fired:
+                    self._held.popleft()
+                if self._last_fid is not None:
+                    # It used up the camera's next frame number.
+                    self._last_fid += 1
             elif self.exact:
                 trig = self._hardware_frame(self._clock(), self._wall())
             else:
@@ -832,11 +1063,13 @@ class TriggerRun:
             self._maybe_settle(trig)
 
     # -- what is said ------------------------------------------------------
-    def edges_counted(self, edges: Optional[int], note: str = "") -> None:
+    def edges_counted(self, edges: Optional[int], note: str = "",
+                      window: str = "") -> None:
         """The camera's own count of edges on the hardware input (read at
-        Stop), or None with why not."""
+        Stop), or None with why not; `window`: between which moments."""
         self.edges = edges
         self.edges_note = note
+        self.edges_window = window
 
     def missed_hardware(self) -> Optional[int]:
         """Edges the camera counted that triggered nothing (it was busy),
@@ -848,11 +1081,12 @@ class TriggerRun:
     @property
     def missed(self) -> int:
         """Triggers that saved nothing they asked for: busy, no frame,
-        failed, not fired — and hardware edges the camera counted and
-        ignored."""
+        failed, not fired, not saved — and hardware edges the camera
+        counted and ignored."""
         c = self.counts
         return (c["missed_busy"] + c["no_frame"] + c["failed_grab"]
-                + c["not_fired"] + (self.missed_hardware() or 0))
+                + c["not_fired"] + c["not_saved"]
+                + (self.missed_hardware() or 0))
 
     def summary(self) -> Dict[str, Any]:
         """The run's capture block: its set-up and what came of it."""
@@ -865,14 +1099,18 @@ class TriggerRun:
                        "no_frame": counts["no_frame"],
                        "failed_grab": counts["failed_grab"],
                        "not_fired": counts["not_fired"],
+                       "not_saved": counts["not_saved"],
                        "hardware_edges_ignored": self.missed_hardware()},
             "cut_short": counts["cut_short"],
+            "cut_by_stop": counts["stopped"],
             "frames_arrived": counts["frames"],
             "untriggered_frames": counts["untriggered"],
             "edges_counted": self.edges,
             "rule": self.rule(),
             "triggers_file": self.path.name if self.path else "",
         })
+        if self.edges_window:
+            out["edges_counted_between"] = self.edges_window
         notes = []
         if self.edges_note:
             notes.append(self.edges_note)
@@ -923,7 +1161,7 @@ class TriggerRun:
         bits = [head, f"{c['triggers']} trigger"
                       f"{'' if c['triggers'] == 1 else 's'}", f"{c['ok']} ok"]
         missed = (c["missed_busy"] + c["no_frame"] + c["failed_grab"]
-                  + c["not_fired"])
+                  + c["not_fired"] + c["not_saved"])
         if self.exact and not self.typhon_fires:
             bits.append("missed: counted at Stop" if missed == 0 else
                         f"{missed} MISSED")
@@ -931,6 +1169,8 @@ class TriggerRun:
             bits.append(f"{missed} MISSED" if missed else "0 missed")
         if c["missed_busy"]:
             bits[-1] += " (camera busy)" if missed == c["missed_busy"] else ""
+        elif c["not_saved"]:
+            bits[-1] += " (NOT saved)" if missed == c["not_saved"] else ""
         if not self.exact:
             bits.append(f"{c['cut_short']} cut short")
         if c["untriggered"]:
@@ -948,8 +1188,12 @@ class TriggerRun:
         missed = self.missed
         if missed or self.typhon_fires or not self.exact:
             bits.append(f"{missed} missed")
+            if c["not_saved"]:
+                bits[-1] += f" ({c['not_saved']} NOT saved)"
         if not self.exact:
             bits.append(f"{c['cut_short']} cut short")
+        if c["stopped"]:
+            bits.append(f"{c['stopped']} cut short by Stop")
         said = ", ".join(bits)
         if self.exact and not self.typhon_fires:
             if self.edges is not None:

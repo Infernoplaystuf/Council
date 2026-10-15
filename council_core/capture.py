@@ -835,6 +835,12 @@ class FrameWriter:
         #: Snapshot frames that came between triggers (note_passed): the
         #: camera's, never asked for, so not offered — for the end record.
         self.passed = 0
+        #: Told of every frame it accepted, once it is known: (the frame's
+        #: meta, saved?, why not) — on a writer thread, in grab order. A
+        #: triggered run's books settle a trigger only then (CaptureSession.
+        #: record_to sets it): accepted is not saved — a write can fail.
+        self.on_done: Optional[Callable[[Dict[str, Any], bool, str],
+                                        None]] = None
         #: Frames offered (submit), and the first and last frame number
         #: offered or failed, for the end record.
         self.offered = 0
@@ -877,6 +883,12 @@ class FrameWriter:
     @property
     def alive(self) -> bool:
         return any(t.is_alive() for t in self._threads)
+
+    @property
+    def closing(self) -> bool:
+        """close() was called: nothing more is accepted."""
+        with self._cond:
+            return self._closing
 
     def submit(self, frame: cameras.Frame) -> bool:
         """Queue `frame` for saving. False if it will not be saved."""
@@ -984,7 +996,9 @@ class FrameWriter:
         # them, as grabbed and NOT saved.
         self.lost += len(self._queue)
         for seq, frame in self._queue:
-            self._finished[seq] = (None, None)
+            # The stub kept (no pixels): on_done tells its trigger it was
+            # NOT saved.
+            self._finished[seq] = (_without_image(frame), None)
         self._queue.clear()
         self._queued_bytes = 0
 
@@ -1034,6 +1048,16 @@ class FrameWriter:
                 if error and not self.failed:
                     self._fail(error)
                 self._cond.notify_all()
+            done = self.on_done
+            if callable(done):
+                for stub, path in batch:
+                    if stub is None:
+                        continue
+                    try:
+                        done(dict(stub.meta or {}), path is not None,
+                             "" if path is not None else "recording stopped")
+                    except Exception:                       # noqa: BLE001
+                        pass
             # Loop: frames that finished while this batch was being written
             # were left for us, since only one writer publishes at a time.
 
@@ -1259,6 +1283,15 @@ class CaptureSession:
             old = self.writer
             broken, self._broken = self._broken, None
             self.gate = gate if writer is not None else None
+            confirm = getattr(self.gate, "confirm_saves", None)
+            told = getattr(self.gate, "saved", None)
+            if writer is not None and callable(confirm) and callable(told):
+                # The gate hears whether each frame it tagged was saved: one
+                # the save queue would not take, here (_record); one it
+                # took, once it is written — or not (on_done). A trigger is
+                # "ok" only when the run holds its frames.
+                confirm()
+                writer.on_done = told
             if writer is not None:
                 self._writers.append(writer)
                 self.writer = writer
@@ -1426,6 +1459,21 @@ class CaptureSession:
         if self.on_stats is not None:
             self.on_stats(self.stats())
 
+    def _gate_unsaved(self, frame: cameras.Frame, why: str) -> None:
+        """A frame of a triggered run that will NOT be saved: its trigger
+        is told (council_core.triggered: "not saved: recording stopped"),
+        not left "no frame" as though the camera had sent nothing."""
+        gate = self.gate
+        if gate is None:
+            return
+        try:
+            tags = gate.tag(frame)
+            told = getattr(gate, "saved", None)
+            if tags is not None and callable(told):
+                told(tags, False, why)
+        except Exception:                                   # noqa: BLE001
+            pass
+
     def _record(self, frame: cameras.Frame) -> bool:
         """Hand `frame` to the writer. Never touches the disk itself."""
         writer = self.writer
@@ -1436,6 +1484,7 @@ class CaptureSession:
                 with self._lock:
                     self._stats = replace(self._stats,
                                           unsaved=self._stats.unsaved + 1)
+                self._gate_unsaved(frame, "recording stopped")
             return False
         if writer.failed:
             # Recording STOPS on the first failure. Carrying on would leave a
@@ -1444,6 +1493,7 @@ class CaptureSession:
             said = writer.failed
             self.writer = None
             self.recorder = None
+            self._gate_unsaved(frame, "recording stopped")
             if self.end_recording_on_failure:
                 # ENDED HERE (end_recording_on_failure): this frame came
                 # after the recording, and is not counted against it. The
@@ -1469,6 +1519,7 @@ class CaptureSession:
                                       unsaved=self._stats.unsaved + 1)
             return False
         gate = self.gate
+        tags = None
         if gate is not None:
             # A TRIGGERED RUN: which trigger this frame is for — or, in
             # snapshot mode, none (a frame between triggers: grabbed and
@@ -1496,7 +1547,20 @@ class CaptureSession:
             meta = frame.meta if frame.meta is not None else {}
             meta["grab_failures"] = writer.grab_failures
             frame.meta = meta
-        return writer.submit(frame)
+        saved = writer.submit(frame)
+        told = getattr(gate, "saved", None) if gate is not None else None
+        if tags is not None and not saved and callable(told):
+            # Its trigger hears the run does not hold the frame: tagged and
+            # then skipped by a full save queue, the trigger said "ok"
+            # (review: triggers CSV "ok" for 2 of 3 frames saved). A frame
+            # the queue took is told once written (FrameWriter.on_done).
+            try:
+                told(tags, False, "recording stopped" if writer.failed else
+                     "the recording had ended" if writer.closing
+                     else "storage too slow")
+            except Exception:                               # noqa: BLE001
+                pass
+        return saved
 
     def _count_failed_grab(self, exc: Any = None) -> None:
         with self._lock:
