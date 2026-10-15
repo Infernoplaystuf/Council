@@ -51,6 +51,16 @@ new link, an edited one is kept and named in a WARNING line when its link
 changed, and new widgets get new stubs. The old project.gspec is copied
 beside the new one first, with a timestamp in its name, so the drawing can
 be put back. Asking first is the caller's job, as it is for export.
+
+AN UPDATE FINISHES OR CHANGES NOTHING
+Every check Generate makes runs against the new layout BEFORE a byte is
+written. A refusal — most often a handler the user edited for a widget the
+new example removes — leaves the project exactly as it was and names each
+piece of their code that stopped it (UpdateBlocker). The writes then go
+behind a RestorePoint, so one that fails part-way puts every file back.
+Measured before: project.gspec and the manifest's example were written
+first, Generate then refused, and the project was left half-switched — the
+new drawing with the old ui/.
 """
 from __future__ import annotations
 
@@ -632,8 +642,16 @@ class ExampleUpdate:
     #: The layout now saved — what the Designer puts on its canvas.
     shapes: List[Any] = field(default_factory=list)
     changes: Optional[LayoutChanges] = None
-    #: The layout was replaced (True even when Generate then BLOCKED).
+    #: project.gspec holds the new layout: after a finished update — and
+    #: after a failed one that could not be put back. Never after a refusal.
     replaced: bool = False
+    #: A check refused the update, and nothing in the project was written.
+    blocked: bool = False
+    #: The user's code that stopped it, one per handler or function.
+    blockers: List["UpdateBlocker"] = field(default_factory=list)
+    #: Every file the update could write, as it was before — kept, in
+    #: .backups/update_<stamp>/ (RestorePoint).
+    restore_point: Optional[Path] = None
     seconds: float = 0.0
 
     def say(self, line: str) -> None:
@@ -715,6 +733,321 @@ def backup_gspec(project_dir: Any, stamp: str = "") -> Path:
     return target
 
 
+# ------------------------------------------------------------
+# All or nothing: the restore point, and the code that blocks
+# ------------------------------------------------------------
+
+#: The files an update may write besides project.gspec, relative to the
+#: project: the manifest, and what Generate writes (gui_emit.emit) — app.py
+#: and handlers.py (each created only when missing; handlers.py also has
+#: untouched stubs rewired or removed and new ones appended), main.py,
+#: launch.py's shim, ui/'s four modules and the orphaned-regions note. The
+#: restore point copies each one that exists, and all of ui/; putting it back
+#: removes each one the update CREATED.
+UPDATE_WRITES = (
+    "manifest.json", "app.py", "handlers.py", "main.py", "launch.py",
+    "ui/__init__.py", "ui/widgets.py", "ui/ports.py", "ui/main_ui.py",
+    ".backups/orphaned_regions.txt")
+
+#: The restore point's list of what it holds. Written last, so a restore
+#: point folder that has one is complete.
+RESTORE_INDEX = "restore.json"
+
+
+@dataclass
+class RestorePoint:
+    """The project as it was before an update wrote a byte: a copy of every
+    file the update may write, in .backups/update_<stamp>/, and the list of
+    those that did not exist yet (the update creates them).
+
+    Taken only once every check has passed — a refused update writes
+    nothing at all, not even this. It is for a WRITE that fails part-way (a
+    full disk, a file another program holds open), which otherwise leaves
+    the project half-updated: put_back() returns every file to what it was.
+
+    On disk, not in memory, so the way back survives a crash in the middle
+    and the message can name it. Kept after a finished update, as Generate's
+    own .backups/<stamp>/ is: it is the whole project from before the update
+    in one place — the drawing, the manifest, ui/ and handlers.py."""
+    project_dir: Path
+    folder: Path
+    #: Paths relative to the project, POSIX style, copied into `folder`.
+    saved: List[str] = field(default_factory=list)
+    #: Paths that did not exist; put_back removes them if the update made
+    #: them.
+    absent: List[str] = field(default_factory=list)
+
+    @classmethod
+    def take(cls, project_dir: Any, stamp: str = "") -> "RestorePoint":
+        """Copy what an update may write. Raises OSError when it cannot —
+        and then the update must not start."""
+        import shutil
+
+        import gui_projects as gpj
+
+        directory = Path(project_dir)
+        stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
+        backups = directory / gpj.BACKUPS_DIRNAME
+        folder = backups / f"update_{stamp}"
+        n = 1
+        while folder.exists():
+            n += 1
+            folder = backups / f"update_{stamp}_{n}"
+        folder.mkdir(parents=True)
+        wanted = [gpj.GSPEC_NAME, *UPDATE_WRITES]
+        ui = directory / gpj.UI_DIRNAME
+        if ui.is_dir():
+            wanted += [p.relative_to(directory).as_posix()
+                       for p in sorted(ui.rglob("*"))
+                       if p.is_file() and "__pycache__" not in p.parts]
+        point = cls(directory, folder)
+        for rel in dict.fromkeys(wanted):                # each once, in order
+            source = directory / rel
+            if source.is_file():
+                target = folder / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                point.saved.append(rel)
+            elif not source.exists():
+                point.absent.append(rel)
+        point._write_index()
+        return point
+
+    def created(self, path: Any) -> None:
+        """Note a file the update made that the list could not know of in
+        advance (the dated project.gspec backup): put_back removes it."""
+        rel = Path(path).relative_to(self.project_dir).as_posix()
+        if rel not in self.absent:
+            self.absent.append(rel)
+            self._write_index()
+
+    def put_back(self) -> List[str]:
+        """Every saved file back as it was, then every file the update made
+        removed — only once all are back, so a project that could not be
+        put back keeps everything that might help. One line per thing that
+        could not be done; [] when the project is as it was."""
+        problems = []
+        for rel in self.saved:
+            source, target = self.folder / rel, self.project_dir / rel
+            try:
+                if not (target.is_file()
+                        and target.read_bytes() == source.read_bytes()):
+                    _copy_over(source, target)
+            except Exception as exc:                     # noqa: BLE001
+                problems.append(f"{rel}: {exc}")
+        if problems:
+            return problems
+        for rel in self.absent:
+            path = self.project_dir / rel
+            try:
+                if path.is_file():
+                    path.unlink()
+            except Exception as exc:                     # noqa: BLE001
+                problems.append(f"{rel} (made by the update): {exc}")
+        return problems
+
+    def _write_index(self) -> None:
+        import json
+
+        index = {
+            "about": ("Update from example copied these files here before "
+                      "writing anything. To put the project back as it was, "
+                      "copy each one in 'saved' back over the project's, and "
+                      "remove each one in 'absent' that is there now: it did "
+                      "not exist before the update."),
+            "saved": self.saved, "absent": self.absent}
+        target = self.folder / RESTORE_INDEX
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+
+
+def _copy_over(source: Path, target: Path) -> None:
+    """`source` over `target` through a temporary file beside it, so
+    `target` is never half-written."""
+    import shutil
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".restore.tmp")
+    try:
+        shutil.copy2(source, tmp)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+@dataclass
+class UpdateBlocker:
+    """Code the user wrote that stops an update: a handler, a function, or a
+    line, in handlers.py or app.py, that uses a widget or port the new
+    layout does not have. Untouched stubs never block — Generate removes
+    those itself — so each is code a person edited or wrote, or (with
+    `called_from`) a stub kept because their code calls it.
+
+    THE SEAM FOR SETTING CODE ASIDE (docs/typhon_plugins_design.md 6.4,
+    step 2). At the plugin branch's switch-over (stage P4) the update moves
+    each blocking handler, word for word, into handlers_retired.txt instead
+    of stopping. That step is not built here. What it needs is this: the
+    file, the function, and the lines of its WHOLE definition as they are on
+    disk (first_line to last_line, decorators included). update_from_example
+    says where it runs."""
+    file: str
+    #: The handler or function the use is in; "" for a line outside one.
+    function: str
+    first_line: int
+    last_line: int
+    #: What it uses that goes, as written in the code: "self.ports.roi".
+    uses: List[str] = field(default_factory=list)
+    #: An on_<widget> handler whose widget goes: that widget, as the user
+    #: knows it ("Train (s35)").
+    widget: str = ""
+    #: An untouched stub kept only because code calls it: where ("app.py:31").
+    called_from: str = ""
+
+    @property
+    def where(self) -> str:
+        """"handlers.py:659-679", or "app.py:12" for one line."""
+        span = (f"{self.first_line}-{self.last_line}"
+                if self.last_line > self.first_line else f"{self.first_line}")
+        return f"{self.file}:{span}"
+
+    def describe(self, example: str) -> str:
+        """One line of the refusal."""
+        name = f"{self.function}, {self.where}" if self.function \
+            else self.where
+        if self.called_from:
+            return (f"  {name} — a stub you never edited, kept because "
+                    f"{self.called_from} calls it: take that call out")
+        if self.file == "handlers.py" and _is_widget_handler(self.function):
+            said = ["you edited it"]
+        else:
+            said = ["your own code"]
+        if self.widget:
+            said.append(f"its widget, {self.widget}, is not in {example}")
+        if self.uses:
+            said.append(f"it uses {', '.join(self.uses)}, which {example} "
+                        f"does not have")
+        return f"  {name} — " + "; ".join(said)
+
+
+def _is_widget_handler(name: str) -> bool:
+    import gui_projects as gpj
+
+    return name.startswith("on_") and gpj._looks_like_widget(name[3:])
+
+
+def _definitions(text: Optional[str]) -> List[Tuple[str, int, int]]:
+    """(name, first line, last line) of every top-level function and every
+    method of a top-level class, decorators included, so a span is the
+    WHOLE definition. [] for text that does not parse."""
+    import ast
+
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return []
+    found = []
+    for node in tree.body:
+        items = node.body if isinstance(node, ast.ClassDef) else [node]
+        for item in items:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = min([item.lineno]
+                            + [d.lineno for d in item.decorator_list])
+                found.append((item.name, first,
+                              item.end_lineno or item.lineno))
+    return found
+
+
+def update_blockers(checked: Any, project_dir: Any,
+                    old_shapes: Sequence[Any] = (),
+                    widget_names: Optional[Dict[str, str]] = None
+                    ) -> List[UpdateBlocker]:
+    """The user's code behind a refused check, one UpdateBlocker per
+    handler or function: Generate's blockers (gui_projects.Orphan) grouped
+    by the definition each is in, with that definition's lines AS ON DISK.
+
+    Generate cites lines in handlers.py as it WOULD leave it, after removing
+    the untouched stubs of removed widgets — on Typhon some 300 lines above
+    the code (measured: handlers.py:370 for a use at line 668). So the
+    definition is found in the planned text, then again on disk by name.
+    `old_shapes` and `widget_names` (the manifest's, shape id -> widget
+    name) put the user's label on a removed widget."""
+    directory = Path(project_dir)
+    labels = {}
+    by_id = {s.id: s for s in old_shapes}
+    for sid, widget in (widget_names or {}).items():
+        if sid in by_id:
+            labels[widget] = _shape_name(by_id[sid])
+    kept = dict(getattr(checked, "kept_stubs", []) or [])
+    planned = dict(getattr(checked, "planned", {}) or {})
+    on_disk: Dict[str, List[Tuple[str, int, int]]] = {}
+    as_planned: Dict[str, List[Tuple[str, int, int]]] = {}
+    found: Dict[Tuple[str, str], UpdateBlocker] = {}
+    for orphan in getattr(checked, "blockers", []) or []:
+        fname = orphan.referenced_in
+        if fname not in on_disk:
+            try:
+                text = (directory / fname).read_text(encoding="utf-8",
+                                                     errors="replace")
+            except OSError:
+                text = ""
+            on_disk[fname] = _definitions(text)
+            as_planned[fname] = (_definitions(planned[fname])
+                                 if fname in planned else on_disk[fname])
+        if orphan.kind == "handler":
+            function = orphan.name
+        else:
+            function = next((n for n, a, b in as_planned[fname]
+                             if a <= orphan.line <= b), "")
+        span = next(((a, b) for n, a, b in on_disk[fname]
+                     if function and n == function), None)
+        first, last = span or (orphan.line, orphan.line)
+        key = (fname, function or f":{first}")
+        blocker = found.get(key)
+        if blocker is None:
+            blocker = found[key] = UpdateBlocker(
+                file=fname, function=function, first_line=first,
+                last_line=last, called_from=kept.get(function, ""))
+        if orphan.kind == "handler":
+            widget = orphan.name[3:]
+            blocker.widget = labels.get(widget, widget)
+        else:
+            use = (f"self.ports.{orphan.name}" if orphan.kind == "port"
+                   else f"self.{orphan.name}")
+            if use not in blocker.uses:
+                blocker.uses.append(use)
+    return sorted(found.values(),
+                  key=lambda b: (b.file != "handlers.py", b.file,
+                                 b.first_line))
+
+
+def _refuse(out: "ExampleUpdate", checked: Any,
+            blockers: List[UpdateBlocker]) -> None:
+    """Say why the update was refused — nothing has been written."""
+    out.blocked = True
+    out.blockers = list(blockers)
+    head = (f"not updated — {out.name} was left exactly as it was: nothing "
+            f"was written")
+    if not blockers:
+        out.say(f"{head}. The {out.example} layout does not generate in "
+                f"it:")
+        out.lines.extend("  " + line for line in checked.lines)
+        return
+    out.say(f"{head}. Code of yours uses widgets or ports the {out.example} "
+            f"example does not have:")
+    out.lines.extend(b.describe(out.example) for b in blockers)
+    # A port rename that would collide blocks too, and has no code to name.
+    out.lines.extend(line for line in checked.lines
+                     if line.lstrip().startswith("cannot alias"))
+    out.say("What you can do:")
+    out.say("  - copy anything you want to keep out of each one named above, "
+            "then delete it (or only its lines that use what is going) and "
+            "Update again; handlers you never edited are removed for you")
+    out.say(f"  - or leave {out.name} as it is — it still works — and build "
+            f"a new project from {out.example} with New from example")
+
+
 def update_from_example(name: str, example: str, vault_dir: Any, *,
                         model_call: Any = None,
                         stamp: str = "") -> ExampleUpdate:
@@ -730,6 +1063,16 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     the clarifications — so the project IS the example again, plus the
     user's own additions. The manifest records the example, so the next
     update needs no guess.
+
+    ALL OR NOTHING. Every check Generate makes runs first, against the new
+    layout and manifest held in memory (designer_project.plan_generate), and
+    nothing is written until all have passed. A refusal — most often a
+    handler the user edited for a widget the example removes — writes
+    nothing at all and names each piece of their code that stopped it. The
+    writes then go behind a RestorePoint: one that fails part-way puts every
+    file back. Before this, project.gspec and the manifest's example were
+    written first, Generate then refused, and the project was left
+    half-switched (measured).
 
     Blocking — a whole Generate — so the Designer runs it on a worker.
     """
@@ -748,7 +1091,9 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     try:
         pdir = gpj.project_path(out.name, vault_dir)
         old = gpj.open_project(out.name, vault_dir=vault_dir)
+        old_gspec = (pdir / gpj.GSPEC_NAME).read_bytes()
         fresh = gs.load_gspec(gx.EXAMPLES_DIR / f"{out.example}.gspec")
+        manifest = gpj.load_manifest(pdir)
     except Exception as exc:                             # noqa: BLE001
         out.say(f"cannot update {out.name}: {exc}")
         return out
@@ -759,24 +1104,65 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     changes.kept = [_shape_name(s) for s in own]
     changes.window = _window_changes(old, fresh)
     out.changes = changes
+    new = gs.Project(project=old.project or out.name, mode=old.mode,
+                     canvas=fresh.canvas, window=fresh.window,
+                     shapes=shapes,
+                     clarifications=list(fresh.clarifications),
+                     requires=list(fresh.requires))
+    # The manifest as the update leaves it — in memory until the end.
+    was_example = manifest.example
+    old_names = dict(manifest.widget_names or {})
+    manifest.example = out.example
+    manifest.script_links = links_before(old.shapes, manifest)
+    renamed = _forget_rekinded(manifest, old.shapes, shapes)
+
+    # ---- 1. Every check, writing nothing ----------------------------------
+    checked, plan = dp.plan_generate(out.name, new.shapes, pdir, vault_dir,
+                                     model_call=model_call, project=new,
+                                     manifest=manifest, persist=False)
+    if plan is None:
+        # THE SEAM FOR STAGE P4 (docs/typhon_plugins_design.md 6.4, step 2).
+        # Here a handler the user edited for a widget the new layout removes
+        # stops the update, with nothing written. At the plugin branch's
+        # switch-over the update sets each one aside instead: it cuts each
+        # UpdateBlocker's definition (file, first_line..last_line, on disk)
+        # word for word out of handlers.py into handlers_retired.txt —
+        # planned in memory, checked again by plan_generate against the
+        # planned handlers.py (it reads the file from disk today, so that
+        # step hands it the planned text), and written in step 2 behind the
+        # restore point, which already covers handlers.py
+        # (RestorePoint.created records the new text file). Not built on
+        # qt-migration.
+        try:
+            blockers = update_blockers(checked, pdir, old.shapes, old_names)
+        except Exception:                                # noqa: BLE001
+            blockers = []
+        _refuse(out, checked, blockers)
+        out.seconds = time.perf_counter() - started
+        return out
+
+    # ---- 2. Write, behind a restore point ---------------------------------
+    try:
+        restore = RestorePoint.take(pdir, stamp)
+    except Exception as exc:                             # noqa: BLE001
+        out.say(f"cannot update {out.name}: its files could not be copied "
+                f"aside before writing ({exc!r}) — nothing was replaced")
+        return out
+    out.restore_point = restore.folder
     try:
         out.backup = backup_gspec(pdir, stamp)
-        new = gs.Project(project=old.project or out.name, mode=old.mode,
-                         canvas=fresh.canvas, window=fresh.window,
-                         shapes=shapes,
-                         clarifications=list(fresh.clarifications),
-                         requires=list(fresh.requires))
+        restore.created(out.backup)
         gpj.save_project(out.name, new, vault_dir=vault_dir)
-        manifest = gpj.load_manifest(pdir)
-        manifest.example = out.example
-        manifest.script_links = links_before(old.shapes, manifest)
-        renamed = _forget_rekinded(manifest, old.shapes, shapes)
-        gpj.save_manifest(pdir, manifest)
+        dp.persist_classifications(plan, checked, vault_dir)
+        generated = dp.write_generate(plan, checked)
     except Exception as exc:                             # noqa: BLE001
-        kept = (f" — the old drawing is in {out.backup.name}"
-                if out.backup is not None else " — nothing was replaced")
-        out.say(f"cannot update {out.name}: {exc!r}{kept}")
+        checked.say(f"update failed: {exc!r}")
+        generated = checked
+    out.seconds = time.perf_counter() - started
+    if not generated.ok:
+        _put_back(out, restore, generated, old_gspec, pdir, was_example)
         return out
+
     out.replaced = True
     out.shapes = list(new.shapes)
     yours = f" + {len(own)} of your own" if own else ""
@@ -788,20 +1174,8 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     warning = toolkit_warning(out.example, toolkit)
     if warning:
         out.say(f"note: {warning}")
-
     out.say("── Generate ──")
-    try:
-        generated = dp.generate(out.name, new.shapes, pdir, vault_dir,
-                                model_call=model_call)
-    except Exception as exc:                             # noqa: BLE001
-        generated = dp.GenerateResult(lines=[f"generate failed: {exc!r}"])
     out.lines.extend(generated.lines)
-    out.seconds = time.perf_counter() - started
-    if not generated.ok:
-        out.say(f"The new layout is saved but did not generate. Fix what is "
-                f"listed and press Generate — or copy {out.backup.name} back "
-                f"over {gpj.GSPEC_NAME} to return to the old drawing.")
-        return out
     names = gpj.load_manifest(pdir).widget_names
     for sid, (label, was) in renamed.items():
         now = names.get(sid, "")
@@ -813,6 +1187,52 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
             f"app.py were kept")
     out.ok = True
     return out
+
+
+def _put_back(out: ExampleUpdate, restore: RestorePoint, generated: Any,
+              old_gspec: bytes, pdir: Path, was_example: str) -> None:
+    """A write failed part-way: every file back as it was, and say so — or
+    say exactly what could not be put back, and how to do it by hand."""
+    import gui_projects as gpj
+
+    try:
+        problems = restore.put_back()
+    except Exception as exc:                             # noqa: BLE001
+        problems = [repr(exc)]
+    try:
+        out.replaced = (pdir / gpj.GSPEC_NAME).read_bytes() != old_gspec
+    except OSError:
+        out.replaced = True
+    folder = restore.folder.relative_to(pdir).as_posix()
+    if not problems:
+        out.say(f"not updated — writing {out.name} failed part-way, so every "
+                f"file it had written was put back: {out.name} is as it was "
+                f"before (and a copy of each is in {folder})")
+        out.say("── Generate ──")
+        out.lines.extend(generated.lines)
+        return
+    out.say(f"writing {out.name} failed part-way, and NOT everything could "
+            f"be put back — the project may be half-updated:")
+    out.lines.extend("  " + p for p in problems)
+    old_drawing = (f" The old drawing is also in {out.backup.name}."
+                   if out.backup is not None and out.backup.exists() else "")
+    try:
+        recorded = gpj.load_manifest(pdir).example
+    except Exception:                                    # noqa: BLE001
+        recorded = None
+    if recorded is None:
+        example = " manifest.json could not be read."
+    elif recorded != was_example:
+        example = (f" manifest.json records the example as {recorded} (it "
+                   f"was {was_example or 'not recorded'}).")
+    else:
+        example = ""
+    out.say(f"To put it back by hand, copy each file in {folder} back over "
+            f"the project's ({RESTORE_INDEX} lists them, and the files the "
+            f"update made, which were not there before).{old_drawing}"
+            f"{example}")
+    out.say("── Generate ──")
+    out.lines.extend(generated.lines)
 
 
 # ============================================================

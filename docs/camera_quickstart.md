@@ -198,7 +198,15 @@ it up to date without losing your own code:
      `handlers.py:<line>` — any handler **you edited** whose link changed, so
      you can bring it in line yourself;
    - the old `project.gspec` is copied to `project.gspec.<time>.bak` in the
-     project folder first. Copy it back over `project.gspec` to undo.
+     project folder first. Copy it back over `project.gspec` to undo;
+   - **it finishes or changes nothing.** If code you edited still uses a
+     widget or port the example no longer has (say, your own Train handler
+     when the example has dropped the classifier), nothing in the project is
+     written: the log names each such handler with its `handlers.py` lines,
+     its widget and what it uses. Copy out what you want to keep, delete it,
+     and update again — handlers you never edited go with their widgets by
+     themselves. If writing fails part-way (a full disk), every file is put
+     back; the copies stay in `.backups/update_<time>/`.
 4. The log says what changed in a few lines (shapes added, rewired, relabelled;
    the port `frame_count` renamed to `frame_rate`) and ends `policy: OK`.
    **Run** starts the updated app. Unsaved edits on the canvas are saved first,

@@ -942,7 +942,9 @@ class DesignerTab(ViewHelpers, QWidget):
                 f"handlers.py and app.py are KEPT: Generate then rewrites "
                 f"only the handler stubs nobody has edited, adds stubs for "
                 f"new widgets, and names any edited handler whose link "
-                f"changed.\n\nThe current project.gspec is copied to "
+                f"changed. If code you edited still uses a widget the "
+                f"example removes, nothing is changed and that code is "
+                f"named.\n\nThe current project.gspec is copied to "
                 f"project.gspec.<time>.bak in the project folder first."
                 f"{unsaved}"):
             self.log(f"not updated — {name} was left as it was")

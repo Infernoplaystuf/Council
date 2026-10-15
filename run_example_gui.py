@@ -31,7 +31,9 @@ rewrites, and the two most expensive to lose.
 gives an EXISTING project the example's current layout instead, keeping its
 app.py and handlers.py (the old project.gspec is backed up beside the new
 one) and generating it — what the GUI Designer's "Update from example…" does.
-Nothing is deleted.
+Nothing is deleted. An update finishes or changes nothing: when code you
+edited still uses a widget the example removes, the project is left as it
+was and that code is named.
 """
 from __future__ import annotations
 
@@ -119,6 +121,9 @@ def update(name: str, *, project: str = "", vault_dir=None,
     res = dx.update_from_example(project, name, vault_dir)
     for line in res.lines:
         print(line)
+    if res.blocked:
+        raise SystemExit(f"{project!r} was not updated — nothing in it was "
+                         f"changed; see above.")
     if not res.ok:
         raise SystemExit(f"{project!r} was not updated and generated — see "
                          f"above.")
