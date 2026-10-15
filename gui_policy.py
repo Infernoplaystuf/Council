@@ -225,7 +225,13 @@ DENIED_MODULE_ATTRS = {
     "posix": {"abort": WHY_EXIT},
     "signal": {"alarm": WHY_EXIT,            # SIGALRM's default ends it
                "setitimer": WHY_EXIT},
-    "logging.config": {"listen": WHY_NETWORK},  # a socket server for config
+    "logging.config": {"listen": WHY_NETWORK,       # a socket server for config
+                       # socketserver is re-exported INTO logging.config, so
+                       # the TCP server and handler listen() builds are
+                       # reachable directly (logging.config.ThreadingTCPServer
+                       # IS socketserver.ThreadingTCPServer).
+                       "ThreadingTCPServer": WHY_NETWORK,
+                       "StreamRequestHandler": WHY_NETWORK},
     "timeit": {"timeit": WHY_CODE, "repeat": WHY_CODE, "Timer": WHY_CODE,
                "main": WHY_CODE},
     # every live object, loaded modules included — sys.modules without the
@@ -324,6 +330,22 @@ DENIED_ATTR_REASONS = {
     **_why(WHY_CODE, "load_module", "import_module", "exec_module",
            "importlib"),
     **_why(WHY_OBJECTS, "loads", "load"),
+    # A DENIED module re-exported as a live attribute of an allowed one IS
+    # that module, reached with no import the gate can see: codecs.builtins is
+    # builtins (so codecs.builtins.eval is eval), and enum aliases it `bltns`;
+    # cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
+    # resolve_name load any callable from a dotted string); mimetypes._winreg
+    # is winreg; xml.sax.saxutils.urllib and email.utils.urllib are the urllib
+    # package (saxutils' own code calls urllib.request.urlopen). Each is
+    # already a DENIED_MODULE by root name — denied as an attribute too, the
+    # route is closed one step before the terminal .eval / .locate /
+    # .CreateKeyEx, which cannot be denied directly: re.compile,
+    # QApplication.exec() and DataFrame.eval are honest. These names also stop
+    # being port names (gui_ports steers clear of DENIED_ATTRS), like the
+    # socket/subprocess/ssl entries above.
+    **_why(WHY_CODE, "builtins", "bltns", "pydoc", "pkgutil"),
+    **_why(WHY_REGISTRY, "winreg", "_winreg"),
+    **_why(WHY_NETWORK, "urllib", "urllib2", "urllib3"),
 }
 DENIED_ATTRS = frozenset(DENIED_ATTR_REASONS)
 

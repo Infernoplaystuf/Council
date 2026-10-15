@@ -659,6 +659,87 @@ def test_a_label_that_is_now_a_denied_name_gets_a_port_the_gate_passes():
 
 
 # ============================================================
+# A denied module re-exported as an attribute of an allowed one
+# (adversarial re-review, 2026-10-15)
+# ============================================================
+#
+# The allowlist is sys.stdlib_module_names, so it admits any stdlib module
+# nobody named — and many of those keep a DENIED module bound as a live
+# attribute. Identity-checked on this interpreter: codecs.builtins IS builtins
+# (so codecs.builtins.eval(...) is eval with no `import builtins` the gate can
+# see), enum aliases the same module `bltns`; cgitb.pydoc IS pydoc and
+# unittest.mock.pkgutil IS pkgutil (locate / resolve_name load any callable by
+# a dotted string, e.g. 'subprocess.Popen'); mimetypes._winreg IS winreg
+# (writes the registry — what QSettings is denied for); xml.sax.saxutils.urllib
+# and email.utils.urllib ARE the urllib package (saxutils' own source calls
+# urllib.request.urlopen). The ast.Attribute branch refused node.attr only when
+# it was a denied ATTR or Qt name, never a denied MODULE name, so each was
+# ACCEPTED. The module name is refused where it is reached, one step before the
+# terminal .eval / .locate / .CreateKeyEx — those cannot be denied directly,
+# because re.compile, QApplication.exec() and DataFrame.eval are honest.
+
+@pytest.mark.parametrize("code,reason", [
+    # builtins -> eval/exec/compile (the finding: it collapses the whole gate)
+    ("import codecs\ncodecs.builtins.eval('1')", pol.WHY_CODE),
+    ("import inspect\ninspect.builtins.exec('x=1')", pol.WHY_CODE),
+    ("import codecs\ncodecs.builtins.compile('1', '<s>', 'eval')",
+     pol.WHY_CODE),
+    ("import dataclasses\ndataclasses.builtins.eval('1')", pol.WHY_CODE),
+    ("import reprlib\nreprlib.builtins.exec('x=1')", pol.WHY_CODE),
+    ("from gzip import builtins", pol.WHY_CODE),
+    # enum aliases builtins as `bltns` — the same module, another attr name
+    ("import enum\nenum.bltns.eval('1')", pol.WHY_CODE),
+    # pydoc / pkgutil: load an arbitrary callable from a dotted string
+    ("import cgitb\ncgitb.pydoc.locate('subprocess.Popen')", pol.WHY_CODE),
+    ("import unittest.mock as m\nm.pkgutil.resolve_name('subprocess:Popen')",
+     pol.WHY_CODE),
+    # winreg: write the registry
+    ("import mimetypes\nmimetypes._winreg.CreateKeyEx(0, 'x')",
+     pol.WHY_REGISTRY),
+    # urllib: reach the network (saxutils.urllib.request.urlopen is live)
+    ("import xml.sax.saxutils as s\ns.urllib.request.urlopen('http://x')",
+     pol.WHY_NETWORK),
+    ("import email.utils as e\ne.urllib.parse.urlencode({})", pol.WHY_NETWORK),
+    # the string-indirection door, now closed for the module name too
+    ("import codecs\ngetattr(codecs, 'builtins').eval('1')", pol.WHY_CODE),
+])
+def test_a_denied_module_reexported_as_an_attribute_is_refused(code, reason):
+    _refused(code, reason)
+
+
+@pytest.mark.parametrize("code", [
+    # socketserver re-exported into logging.config: listen() is already
+    # denied, so are the server/handler it builds, reachable directly
+    "import logging.config\nlogging.config.ThreadingTCPServer(('', 0), None)",
+    "import logging.config\nh = logging.config.StreamRequestHandler",
+    "from logging import config\nconfig.ThreadingTCPServer(('', 0), None)",
+])
+def test_socketserver_reexported_by_logging_config_is_refused(code):
+    _refused(code, pol.WHY_NETWORK)
+
+
+@pytest.mark.parametrize("code", [
+    # the terminal builtin names are NOT denied as attributes, because these
+    # are honest and common; the re-export above is closed at the module name
+    "import re\nre.compile('a+')",
+    "from PySide6.QtWidgets import QApplication\n"
+    "app = QApplication([])\napp.exec()",
+    "import logging.config\nlogging.config.dictConfig({'version': 1})",
+    "import pandas as pd\ndf = pd.DataFrame()\nr = df.eval('a + b')",
+    "import json\njson.loads('1')",
+    "import logging.handlers\nlogging.handlers.RotatingFileHandler('a.log')",
+])
+def test_terminal_names_stay_honest_as_methods(code):
+    """re.compile, QApplication.exec(), DataFrame.eval and friends must pass —
+    they are why eval/exec/compile cannot be denied as a plain attribute."""
+    for toolkit in ("qt", "tk"):
+        if "PySide6" in code and toolkit == "tk":
+            continue
+        good, errs = pol.validate(code, "linked", (), toolkit)
+        assert good, (code, errs)
+
+
+# ============================================================
 # Every shipped example still passes
 # ============================================================
 
