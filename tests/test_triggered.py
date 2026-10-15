@@ -384,6 +384,44 @@ def test_a_camera_that_cannot_say_it_is_ready_is_fired_after_its_frame(
     assert [r["outcome"] for r in rows_of(run.path)] == ["ok"] * 3
 
 
+def test_a_camera_that_cannot_say_waits_out_a_late_frame_first(
+        tmp_path, monkeypatch):
+    """With no ready signal, a trigger held for its LATE frame still has
+    the camera busy: the next press waits for that frame before firing —
+    fired at once, the camera ignored it and its trigger got "no frame"."""
+    monkeypatch.setattr(tg, "DEADLINE_S", 0.3)
+    device = NoReadySignal(busy_s=0.5)       # each frame 0.5 s after
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT)
+    tags = []
+    stop = threading.Event()
+
+    def feeder():
+        sent = 0
+        while not stop.is_set():
+            with device.lock:
+                due = list(device.took)
+            if sent < len(due) and time.perf_counter() >= due[sent]:
+                sent += 1
+                tags.append(run.tag(frame(sent)))
+            time.sleep(0.002)
+    thread = threading.Thread(target=feeder)
+    thread.start()
+    run.start()
+    run.capture_now()
+    assert wait_for(lambda: len(device.took) == 1)
+    time.sleep(0.4)            # past trigger 1's deadline, before its frame
+    run.capture_now()
+    assert wait_for(lambda: len(tags) == 2, 3.0)
+    stop.set()
+    thread.join()
+    run.stop()
+    assert device.ignored == 0, "nothing fired into the busy camera"
+    assert [t["trigger"] for t in tags] == [1, 2]
+    outcomes = [r["outcome"] for r in rows_of(run.path)]
+    assert all(o.startswith("ok") for o in outcomes), outcomes
+    assert outcomes[0].startswith("ok (late frame"), outcomes
+
+
 def test_a_frame_not_saved_is_a_miss_not_ok(tmp_path):
     """The session tells the books whether each frame it tagged was saved
     (confirm_saves): a trigger whose frame the save queue skipped said

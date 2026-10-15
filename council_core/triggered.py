@@ -704,9 +704,11 @@ class TriggerRun:
             return None
 
     def _own_frames_due(self, trig: _Trigger) -> bool:
-        """A frame Typhon fired for has not arrived yet (the lock held)."""
+        """A frame Typhon fired for has not arrived yet (the lock held) —
+        a held trigger's late frame too: the camera may still be on it."""
         return trig.arrived < trig.fired or any(
-            t.arrived < t.fired for t in self._pending if t is not trig)
+            t.arrived < t.fired for t in self._pending if t is not trig) \
+            or any(t.arrived < t.fired for t in self._held)
 
     def _wait_ready(self, timeout: float, trig: _Trigger,
                     stoppable: bool) -> Optional[bool]:
