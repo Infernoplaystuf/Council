@@ -166,6 +166,57 @@ def test_module_routes_are_refused(box, code):
     assert df is None
 
 
+# ── vars()/dir() + the unwrapped module behind the proxy (2026-10-15) ────
+# vars(x) / x.__dict__ hands back a live namespace, and a dict SUBSCRIPT on
+# it is invisible to the AST validator (it checks attribute names, not keys).
+# The proxy objects keep the real module in `_real`, so `pd._real` was the
+# unwrapped pandas and `vars(pd)['_real']['read_pickle']` ran a pickle.
+@pytest.mark.parametrize("code", [
+    "m = vars(pd)\nresult_df = pd.DataFrame([1])",
+    "m = dir(pd)\nresult_df = pd.DataFrame([1])",
+    "rp = pd._real\nresult_df = pd.DataFrame([1])",
+    "rp = np._real\nresult_df = pd.DataFrame([1])",
+    "result_df = pd.DataFrame([getattr(pd, '_real')])",
+    "rp = pd._real\nresult_df = rp.read_csv('ok.csv')",
+])
+def test_vars_dir_and_the_proxy_real_are_refused(box, code):
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is None, msg
+
+
+def test_vars_cannot_reach_read_pickle(box, capsys):
+    data, _ = box
+    code = ("a = vars(pd)['_real']\n"
+            "f = vars(a)['read_pickle']\n"
+            f"result_df = pd.DataFrame([str(f(r'{data / 'evil.pkl'}'))])\n")
+    df, msg = run(code, data)
+    assert refused(df, msg)
+    assert "PAYLOAD-RAN" not in capsys.readouterr().out
+
+
+# ── writing a file through a plot's savefig (2026-10-15) ─────────────────
+# pandas imports matplotlib internally for df.plot(); its figure/canvas
+# writers wrote a file anywhere, around every other write guard.
+@pytest.mark.parametrize("code", [
+    "ax = pd.DataFrame({{'a': [1, 2]}}).plot()\n"
+    "ax.get_figure().savefig(r'{t}')\nresult_df = pd.DataFrame([1])",
+    "ax = pd.DataFrame({{'a': [1, 2]}}).plot()\n"
+    "ax.figure.savefig(r'{t}', format='png')\nresult_df = pd.DataFrame([1])",
+    "fig = pd.DataFrame({{'a': [1, 2]}}).plot().get_figure()\n"
+    "fig.canvas.print_png(r'{t}')\nresult_df = pd.DataFrame([1])",
+    "w = pd.DataFrame({{'a': [1, 2]}}).plot().get_figure().savefig\n"
+    "w(r'{t}')\nresult_df = pd.DataFrame([1])",
+])
+def test_savefig_is_refused(box, code):
+    data, outside = box
+    target = outside / "chart.png"
+    df, _msg = run(code.format(t=target), data)
+    assert df is None
+    assert not target.exists()
+    assert not list(outside.glob("*.png"))
+
+
 # ── what must keep working ───────────────────────────────────────────────
 @pytest.mark.parametrize("code", [
     "result_df = pd.read_csv('ok.csv')",

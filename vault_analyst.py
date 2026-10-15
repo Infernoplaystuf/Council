@@ -3703,6 +3703,27 @@ _SANDBOX_FORBIDDEN_ATTRS = frozenset({
     # Path's own readers take ANY path; the sandbox's read_text(path) /
     # read_lines(path) / open() are the contained way to read a file.
     "read_text", "read_bytes",
+    # matplotlib's figure / canvas writers. pandas imports matplotlib
+    # internally for df.plot(), so .plot().get_figure().savefig('C:/x') (or
+    # the canvas print_png / print_svg / print_pdf) wrote a file anywhere —
+    # around every other write guard (reproduced 2026-10-15: a PNG written
+    # outside the vault, over an existing file, over a data_in input, and a
+    # relative name into the app folder). The sandbox has no make_chart; the
+    # Artist does.
+    "savefig", "print_figure", "print_png", "print_svg", "print_pdf",
+    "print_jpg", "print_jpeg", "print_tif", "print_tiff", "print_raw",
+    "print_rgba", "print_ps", "print_eps", "print_webp",
+})
+# The proxy objects the sandbox hands out for pandas (_BudgetedPandas) and
+# numpy (_SandboxModule) keep the REAL module in a plain instance attribute.
+# Model code reached it directly — `pd._real` is the unwrapped pandas, so
+# `pd._real.read_csv('C:/anything')` read any file and `vars(pd)['_real']`
+# then subscripted its __dict__ for read_pickle and ran a pickle payload
+# (reproduced 2026-10-15). These names are refused on ANY object; the proxy
+# internals are reached by the trusted module code itself, never by the
+# model's validated code or its getattr().
+_SANDBOX_FORBIDDEN_PROXY_ATTRS = frozenset({
+    "_real", "_budget", "_state", "_roots", "_extra",
 })
 # Methods that RETURN a string with no target but WRITE a file when given one
 # (df.to_json('C:/x') wrote anywhere). Allowed only with no positional
@@ -3746,7 +3767,8 @@ _SANDBOX_FORBIDDEN_SUBMODULES = frozenset({
 # and deleted a file outside the sandbox. Every Attribute node is now checked.
 _SANDBOX_FORBIDDEN_ANY_ATTR = (_SANDBOX_FORBIDDEN_ATTRS
                                | _SANDBOX_FORBIDDEN_DUNDERS
-                               | _SANDBOX_FORBIDDEN_MODULE_ATTRS)
+                               | _SANDBOX_FORBIDDEN_MODULE_ATTRS
+                               | _SANDBOX_FORBIDDEN_PROXY_ATTRS)
 
 
 def validate_generated_code(code: str) -> Tuple[bool, str]:
@@ -4162,14 +4184,29 @@ def execute_pandas_code(
     allowed_folders: List[Path],
     *,
     extra_globals: Optional[Dict[str, Any]] = None,
+    report: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[pd.DataFrame], str]:
+    """(result_df or None, log) for model-written code, run under the
+    sandbox described above.
+
+    `report`, when given, is filled in for a caller that wants more than the
+    frame (council_core.analyst_child, for the Council's run_python, where a
+    script that prints its answer has worked): "ran" — the code passed the
+    checks and ran to its end without raising, with or without a result_df;
+    "stdout" / "stderr" — what it printed; "error" — the refusal or the
+    traceback when it did not run; "note" — why a result_df it set could not
+    be used. The checks and the run are the same with or without it."""
+    rep: Dict[str, Any] = report if report is not None else {}
+    rep.update(ran=False, stdout="", stderr="", error="", note="")
     ok, msg = validate_generated_code(code)
     if not ok:
-        return None, f"SAFETY CHECK FAILED: {msg}"
+        rep["error"] = f"SAFETY CHECK FAILED: {msg}"
+        return None, rep["error"]
 
     normalized_folders = normalize_data_folders(allowed_folders)
     if not normalized_folders:
-        return None, "No allowed folders configured for the analyst."
+        rep["error"] = "No allowed folders configured for the analyst."
+        return None, rep["error"]
 
     # Per-execution memory budget for whole-file reads. The proxy below
     # guards `pd`; the import hook hands the SAME proxy back for any
@@ -4366,7 +4403,13 @@ def execute_pandas_code(
         "open": _sb_open,
         "getattr": _guarded_getattr, "hasattr": hasattr,
         "type": type, "repr": repr, "format": format, "hash": hash,
-        "id": id, "callable": callable, "vars": vars, "dir": dir,
+        # vars() and dir() are NOT exposed: vars(x) / x.__dict__ hand back a
+        # live namespace, and a dict SUBSCRIPT on it is not seen by the AST
+        # validator (it checks attribute names, not keys). `vars(pd)['_real']`
+        # then reached the unwrapped pandas and its read_pickle — arbitrary
+        # code execution (reproduced 2026-10-15). getattr is the guarded way
+        # to reach an attribute by a computed name.
+        "id": id, "callable": callable,
         # Iterator helpers
         "iter": iter, "next": next, "reversed": reversed,
         "map": map, "filter": filter, "slice": slice,
@@ -4387,6 +4430,11 @@ def execute_pandas_code(
 
     globals_dict: dict[str, Any] = {
         "__builtins__": safe_builtins,
+        # A script run as a script expects to be __main__: without it, the
+        # `if __name__ == "__main__":` guard a model so often writes raised
+        # NameError at exec (it worked on the old unsandboxed run_python).
+        # A plain string; it adds no capability.
+        "__name__": "__main__",
         "pd": _budgeted_pd,
         "Path": Path,
         "DATA_FOLDERS": [str(p) for p in normalized_folders],
@@ -4556,12 +4604,16 @@ def execute_pandas_code(
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             exec(code, globals_dict)
     except Exception:
-        log = "EXECUTION ERROR:\n" + traceback.format_exc()
+        rep.update(stdout=stdout_buf.getvalue(), stderr=stderr_buf.getvalue(),
+                   error="EXECUTION ERROR:\n" + traceback.format_exc())
+        log = rep["error"]
         if stdout_buf.getvalue():
             log += "\nSTDOUT:\n" + stdout_buf.getvalue()
         if stderr_buf.getvalue():
             log += "\nSTDERR:\n" + stderr_buf.getvalue()
         return None, log
+    rep.update(ran=True, stdout=stdout_buf.getvalue(),
+               stderr=stderr_buf.getvalue())
 
     result_df = globals_dict.get("result_df")
 
@@ -4580,7 +4632,8 @@ def execute_pandas_code(
     if isinstance(result_df, dict):
         result_df = pd.DataFrame([result_df])
     if not isinstance(result_df, pd.DataFrame):
-        log_parts.append(f"result_df is not a DataFrame; got {type(result_df)}")
+        rep["note"] = f"result_df is not a DataFrame; got {type(result_df)}"
+        log_parts.append(rep["note"])
         return None, "\n\n".join(log_parts)
 
     if not log_parts:

@@ -3336,9 +3336,15 @@ def _run_analyst_step_impl(query):
               file=_sys_dbg.stderr)
         try:
             with _ce._TimingScope("analyst.exec"):
+                # vault=_vault(): the sandbox's helpers write into the
+                # prepared turn's data_out, the same vault this step reads
+                # its data from — not whatever vault the child's environment
+                # resolves (they differ for a turn whose vault is not the
+                # process's, e.g. CouncilActions(vault_dir=X)).
                 result_df, log = _analyst_step.run_code(
                     code, allowed_folders[0],
-                    timeout=_analyst_step.TIME_LIMIT_S)
+                    timeout=_analyst_step.TIME_LIMIT_S,
+                    vault=_vault())
         except Exception as _e:
             result_df, log = None, f"the analysis could not run: {_e!r}"
         if result_df is not None:
