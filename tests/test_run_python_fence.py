@@ -275,7 +275,8 @@ def test_the_tool_says_what_it_is():
     from council_core import council_tools
     help_text = council_tools.make_tools(None, None, Path("."))[
         "run_python"].help
-    assert "sandbox" in help_text and "writes no files" in help_text
+    assert "sandbox" in help_text and "data_in" in help_text
+    assert "starts no processes" in help_text
     assert "workspace" not in help_text
 
 

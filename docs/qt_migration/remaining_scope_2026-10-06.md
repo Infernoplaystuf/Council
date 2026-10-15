@@ -487,7 +487,8 @@ app's environment, and a probe's `open('../node_routing.json', 'w')` made
 analyst's fence, the one `data_query` and the analyst use (`analyst_step.run_script`:
 `vault_analyst`'s sandbox in a child process, at most 120 s, which a model may lower but
 not raise, a 2048 MB commit cap and the whole tree killed). Printing the answer counts as
-an answer. It writes nothing (no `<vault>/workspace/scratch.py`); it reads only data_in;
+an answer. Nothing is written for it (no `<vault>/workspace/scratch.py`) and its code
+writes no file of its own, only through the sandbox's helpers into data_out; it reads only data_in;
 it imports only pandas, numpy, scipy, math, re, json, statistics, collections and
 pathlib; it cannot define classes or start processes, and has no network apart from the
 read-only SQL/Mongo helpers on the user's own connections. `run_tests` no longer runs

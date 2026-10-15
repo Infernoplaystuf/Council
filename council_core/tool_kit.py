@@ -39,13 +39,14 @@ the user put in node_routing.json, and only when asked).
 WHAT THEY MAY TOUCH
 Reads stay inside the vault (and any extra roots the caller names, such as a
 code folder); dot-folders and the app's protected files are refused. The only
-writes are a NEW chart file in data_out and run_tests' own temporary files;
-diff_preview shows a change and never applies it. A model's code (data_query,
-and council_tools' run_python) runs in the analyst's sandbox in a child
-process (council_core.analyst_step: reads data_in only, writes nothing, at
-most 120 s, a memory cap). run_tests runs pytest in a child process with a
-time limit and memory cap, but only inside a code root the caller names and
-never on a vault file — the Council tab names none.
+writes are a NEW chart file in data_out, what the analyst sandbox's helpers
+write into data_out, and run_tests' own temporary files; diff_preview shows a
+change and never applies it. A model's code (data_query, and council_tools'
+run_python) runs in the analyst's sandbox in a child process
+(council_core.analyst_step: reads data_in only, at most 120 s, a memory cap).
+run_tests runs pytest in a child process with a time limit and memory cap,
+but only inside a code root the caller names and never on a vault file — the
+Council tab names none.
 
 Every tool is a ToolFn: args dict in, (ok, message for the model, payload)
 out, and carries a one-line `help` the agent's prompt shows.

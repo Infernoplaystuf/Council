@@ -135,8 +135,9 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
           " — Python in the analyst's sandbox (a child process, at most "
           "120 s; timeout_s may lower it): pandas, numpy, scipy, math, re, "
           "json, statistics, collections and pathlib, reading the data "
-          "folder (data_in) only; print() the answer or set result_df. It "
-          "writes no files, starts no processes and has no network")
+          "folder (data_in) only; print() the answer or set result_df. "
+          "Only the sandbox's helpers write, into data_out; it starts no "
+          "processes")
     def run_python(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
         """The model's code under the fence data_query and the analyst use
         (analyst_step.run_script: the sandbox in a child process, the time
@@ -161,8 +162,10 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
                                     run.note) if t)
         payload: Dict[str, Any] = {"rc": rc, "stdout": run.stdout,
                                    "stderr": err}
+        # A traceback's last lines say what went wrong: keep its tail.
+        shown_err = err if len(err) <= 3000 else "…" + err[-3000:]
         msg = (f"rc={rc}\n--- stdout ---\n{_clip(run.stdout, 4000)}\n"
-               f"--- stderr ---\n{_clip(err, 3000)}")
+               f"--- stderr ---\n{shown_err}")
         if run.df is not None:
             import vault_analyst as va
             table = va.format_result_for_prompt(run.df, max_rows=100,
