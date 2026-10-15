@@ -212,6 +212,19 @@ def _env(temp: Path) -> Dict[str, str]:
     return env
 
 
+def has_pytest_timeout(python: str) -> bool:
+    """Whether `python` has the pytest-timeout plugin (its --timeout option
+    is refused, and the file runs nothing, where it is missing)."""
+    try:
+        done = subprocess.run(
+            [python, "-c", "import importlib.util, sys; sys.exit(0 if "
+             "importlib.util.find_spec('pytest_timeout') else 1)"],
+            capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
 def _stem(f: str) -> str:
     return f.replace("/", "__")
 
@@ -256,6 +269,11 @@ def run(files: Sequence[str], *, tree: Path = TREE, python: str = "",
         say=_say) -> int:
     """Run `files` one process each, `jobs` at a time. 0 when all passed."""
     python = python or sys.executable
+    # pytest-timeout's per-test limit where the interpreter has it (the
+    # `pylon` env has not: pytest refused the option and ran nothing);
+    # FILE_TIMEOUT below bounds every file either way.
+    timeout_args = ([f"--timeout={FILE_TIMEOUT // 2}"]
+                    if has_pytest_timeout(python) else [])
     out = Path(out) if out else Path(tempfile.mkdtemp(prefix="typhon_gate_"))
     out.mkdir(parents=True, exist_ok=True)
     temp_root = _short_temp()
@@ -273,7 +291,7 @@ def run(files: Sequence[str], *, tree: Path = TREE, python: str = "",
         temp.mkdir()
         base = out / _stem(f)
         cmd = [python, "-m", "pytest", f, "-q", "-rfEs", "-p",
-               "no:cacheprovider", f"--timeout={FILE_TIMEOUT // 2}",
+               "no:cacheprovider", *timeout_args,
                f"--junitxml={base}.xml", "-o", "junit_family=xunit2"]
         log = open(f"{base}.log", "w", encoding="utf-8")
         p = subprocess.Popen(cmd, cwd=str(tree), env=_env(temp), stdout=log,

@@ -81,6 +81,30 @@ def test_only_a_known_flaky_failure_reruns_a_file():
     assert not gate._only_flaky(f, [])
 
 
+def test_the_gate_runs_under_an_interpreter_without_pytest_timeout(
+        tmp_path, monkeypatch):
+    """The `pylon` env has no pytest-timeout: given --timeout, pytest
+    refused the option and every file ran nothing (rc 4). The option is
+    passed only where the plugin is; the gate's own per-file limit holds
+    either way."""
+    import importlib.util
+    assert gate.has_pytest_timeout(sys.executable) is (
+        importlib.util.find_spec("pytest_timeout") is not None)
+    assert gate.has_pytest_timeout(str(tmp_path / "no_python.exe")) is False
+    tree = tmp_path / "tree"
+    (tree / "tests").mkdir(parents=True)
+    (tree / "tests" / "test_tiny.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "has_pytest_timeout", lambda python: False)
+    out = tmp_path / "out"
+    rc = gate.run(["tests/test_tiny.py"], tree=tree, python=sys.executable,
+                  jobs=1, out=out, say=lambda line: None)
+    assert rc == 0
+    assert "--timeout" not in (out / "tests__test_tiny.py.log").read_text(
+        encoding="utf-8")
+    assert gate._counts(out / "tests__test_tiny.py.xml")["passed"] == 1
+
+
 # ======================================================================
 # The launcher
 # ======================================================================
