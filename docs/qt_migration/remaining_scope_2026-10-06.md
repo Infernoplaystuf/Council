@@ -480,12 +480,22 @@ origin there:
 - `test_code_bench.py` and `test_council_core`'s no-toolkit check of `code_bench.py` pass
   with the merge's f-string fix (a backslash inside an f-string is Python 3.12+).
 
+Fenced (2026-10-15, branch `fix/fence-run-python`, the user's decision): `run_python`
+(Tools on: the Coder and the Intern) ran a model's code in a plain child process with the
+app's environment, and a probe's `open('../node_routing.json', 'w')` made
+`node_routing.route('writer')` a remote host on the next load. It now runs behind the
+analyst's fence, the one `data_query` and the analyst use (`analyst_step.run_script`:
+`vault_analyst`'s sandbox in a child process, at most 120 s, which a model may lower but
+not raise, a 2048 MB commit cap and the whole tree killed). Printing the answer counts as
+an answer. It writes nothing (no `<vault>/workspace/scratch.py`); it reads only data_in;
+it imports only pandas, numpy, scipy, math, re, json, statistics, collections and
+pathlib; it cannot define classes or start processes, and has no network apart from the
+read-only SQL/Mongo helpers on the user's own connections. `run_tests` no longer runs
+vault files (a model's `vault_save` followed by `run_tests` ran its code with full
+permissions). It runs only inside code roots a caller names, and the Council tab names
+none. Tests: `tests/test_run_python_fence.py`.
+
 Open:
-- `run_python` (with Tools on: the Coder and the Intern) runs a model's code in a plain
-  child process with the app's environment — no sandbox. It can write what `vault_save`
-  now refuses: a probe's `open('../node_routing.json', 'w')` from the workspace made
-  `node_routing.route('writer')` a remote host on the next load. It needs the analyst's
-  sandbox, a narrower tool, or a decision that the Coder's code is trusted.
 - The Vault switch turns off council-map's passages only; the matches `prepare_turn` puts
   in front of the question do not read it.
 - A Tk launch and a Qt launch in the same second can share a session id again (the Tk
