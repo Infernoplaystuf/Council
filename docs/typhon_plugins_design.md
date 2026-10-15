@@ -89,8 +89,8 @@ Four plain truths up front:
    Most of that comes from Windows' 15.6 ms timer tick and can be fixed in the
    core (section 10), but heavy live work such as classifying every frame
    stays off the recording path by default.
-4. **It is a large piece of work.** About 34-50 days for the plugin system
-   on top of M1's 24-37 days, about 55-83 days together, plus merge upkeep
+4. **It is a large piece of work.** About 34-52 days for the plugin system
+   on top of M1's 24-37 days, about 58-89 days together, plus merge upkeep
    (estimates, section 12). The first stages leave Typhon behaving exactly as
    today; the screen changes only at stage P4.
 
@@ -285,7 +285,7 @@ What the design does with each:
   loop kept delaying frames after the watchdog had switched it off: 346 of
   587 frames late (measured, synthetic). Only a helper process can contain
   that (section 3.10).
-- **Effort:** about 55-83 days with M1, plus about half a day a week of
+- **Effort:** about 58-89 days with M1, plus about half a day a week of
   merging while the branch lives (estimates, section 12).
 
 ---
@@ -308,7 +308,7 @@ where marked).
 | Settings host | `settings_tabs.py` (904), `camera_settings_window.py` (2,561), `camera_categories.plan` (`camera_categories.py:140`), and the generic part of `camera_settings.py`: `Setting` (99), `Change` (178), `Provider` (492), `apply` (837) | About 4,200 | Draws any camera's settings from its description; already camera-neutral |
 | Slider and live view | `capture_review.py` (1,033, less the raw view), `council_core/live_display.py` (153), `pop_out.py` (126) | About 1,100 | Every recording is reviewed the same way |
 | Crop box | the `roi` port and `frame_roi.parse_roi`, which the core's area parser uses (`frame_camera.py:3112-3113`) | Small | The box is drawn on the live view and the slider; only the export moves out |
-| Set-up wizard shell | the generic parts of `council_core/camera_setup.py` (`setup_path` 365, `load_choice` 369, `save_choice` 386) and the wizard's pages (`camera_wizard.py`) | About 600 | Each camera plugin brings its own guide and checks into it |
+| Set-up wizard shell | the generic parts of `council_core/camera_setup.py` (`setup_path` 365, `load_choice` 369, `save_choice` 386) and the wizard's pages (`camera_wizard.py`) | 403 + 481, less each brand's guide, checks and scan page | Each camera plugin brings its own guide and checks into it |
 | Downsample (recommended; question 2) | `council_core/reduce.py` (165) and its calls on the writer threads and display (`capture.py:571-573`) | 165 plus the calls | It changes what is saved and the picture size every feature sees (`reduce.py:1-20`); the camera half (binning) is a camera facet |
 | Plugin host | new | 200-400 lines plus tests (estimate) | Reads manifests, loads, guards and calls plugins |
 
@@ -342,10 +342,10 @@ button or status segment (section 3.7).
 
 | Plugin | Code that moves (today's place) | Size (measured) | What it provides |
 |---|---|---|---|
-| **Basler** (`typhon.basler`) | `BaslerBackend` and `BaslerDevice` (`council_core/cameras.py:637-1634`); `BaslerSettings` (`camera_settings.py:1024-2125`); the camera-trigger helpers (`Trigger` 332, `_triggers_in_the_way` 753); `council_core/basler_scan.py`; the Basler set-up guide and checks (`camera_setup.py:97`, 239); the wizard's scan page (`camera_wizard.py:206-210`); its rows of the category tables | About 996 + 1,102 + 1,265 + set-up code: about 3,900 | Capabilities `frames`, `grab_failures`, `restartable`, `software_trigger`, `hardware_trigger`, `binning`; facets for triggering and binning |
+| **Basler** (`typhon.basler`) | `BaslerBackend` and `BaslerDevice` (`council_core/cameras.py:637-1634`); `BaslerSettings` (`camera_settings.py:1024-2125`); the camera-trigger helpers (`Trigger` 332, `_triggers_in_the_way` 753); `council_core/basler_scan.py`; the Basler set-up guide and checks (`camera_setup.py:97`, 239); the wizard's scan page (`camera_wizard.py:206-210`); its rows of the category tables | 996 + 1,102 + 1,265, plus helpers and set-up code: about 3,500-3,900 | Capabilities `frames`, `grab_failures`, `restartable`, `software_trigger`, `hardware_trigger`, `binning`; facets for triggering and binning |
 | **Prophesee** (`typhon.prophesee`) | `EvkBackend`, `EvkDevice`, `_EventSink`, `identify`, `accumulate_events` (`cameras.py:1640-2277`, 329-369); `EvkSettings` and the display settings (`camera_settings.py:2415-2769`, 2301-2331); `council_core/event_playback.py`; the raw view inside the slider (`capture_review.py:649`, 756, 774); the PNG / Raw button; the EVK set-up guide and checks (`camera_setup.py:272`); its category rows (the Filters tab) | About 620 + 470 + 468 + 190 | Capabilities `events`, `raw_recording`, `area_live` (and not `restartable`); a "review source" for the slider; later `event_stream`, `trigger_in`, `sync` (sections 3.4, 11) |
 | **Simulated** (`typhon.simulated`) | `SyntheticBackend`, `SyntheticDevice` (`cameras.py:2404-2802`), `SyntheticSettings` (`camera_settings.py:2864-3003`) | About 400 + 140 | The reference plugin for every contract suite; gains N cameras through `COUNCIL_SIM_CAMERAS=frame,frame,event` (the multi-camera design's name, its 2.10) |
-| **Triggering** (`typhon.trigger`) | `council_core/triggered.py` (1,227); `frame_camera`'s trigger code (462 lines on the trigger branch, measured), among it `capture_now` (946), `set_capture_mode` (1007), `set_trigger_source` (1018), `set_frames_per_trigger` (1028), `set_timer` (1038); the "camera waits for a trigger" diagnostics (67 lines); `settings_tabs.CAPTURE_BOXES` (`settings_tabs.py:112`); the description of the "Capture" group, which today `BaslerSettings` builds by importing `triggered` (`camera_settings.py:1071-1209`) | About 1,800 | Software and Timer sources; the record gate; the run hooks of section 3.8; the `<run>_capture_triggers.csv` file (`triggered.py:350`); the trigger columns of the frames CSV, kept under their present names; a panel, the Capture now (F9) button and a status segment |
+| **Triggering** (`typhon.trigger`) | `council_core/triggered.py` (1,227); `frame_camera`'s trigger code (462 lines on the trigger branch, measured), among it `capture_now` (946), `set_capture_mode` (1007), `set_trigger_source` (1018), `set_frames_per_trigger` (1028), `set_timer` (1038); the "camera waits for a trigger" diagnostics (67 lines); `settings_tabs.CAPTURE_BOXES` (`settings_tabs.py:112`); the description of the "Capture" group, which today `BaslerSettings` builds by importing `triggered` (`camera_settings.py:1071-1209`) | 1,227 + 462 + 67, plus parts of `settings_tabs` and `BaslerSettings`: about 1,800 | Software and Timer sources; the record gate; the run hooks of section 3.8; the `<run>_capture_triggers.csv` file (`triggered.py:350`); the trigger columns of the frames CSV, kept under their present names; a panel, the Capture now (F9) button and a status segment |
 | **Classification** (`typhon.classify`) | `council_qt/widgets/classifier_picker.py` (588) inside a pop-out; `frame_classes.py` (4,640) stays an unchanged library; 32 shapes and 17 script links leave the wireframe | 588 + a new panel | A pop-out panel; "Classify all" after Stop; its `sklearn` requirement, today declared by the whole app (`typhon.gspec` "requires") |
 | **Timing scan** (`typhon.timing`) | `frame_timing.scan_report` (`frame_timing.py`, 289 lines, unchanged); 5 shapes | 289 | A small panel with Scan and the list of bad frames |
 | **Cropped export** (`typhon.crop`) | `frame_roi.export_roi` (`frame_roi.py`, 192 lines, unchanged); 4 shapes | 192 | A small panel: output folder, Save cropped frames, status |
@@ -464,8 +464,9 @@ out features and refuse an incompatible plugin before anything runs.
   `entry` (`module:object`, imported on first use), `needs` (capabilities;
   `a|b` means either), `python` (packages it needs, checked in the
   project's interpreter, never installed), `contributes`, `files` (run file
-  suffixes), `network` (`none`, `camera-link` or `internet`; section 4.6),
-  `budget_ms` for live calls.
+  suffixes), `uses` (other plugins it works with, each optional or
+  required; section 11.5), `network` (`none`, `camera-link` or `internet`;
+  section 4.6), `budget_ms` for live calls.
 - **JSON, and no pip entry points.** Every other Typhon file is JSON
   (`tomllib` would also work, vendor docs). Entry points would let any
   package installed into a shared conda environment register itself without
@@ -640,7 +641,9 @@ class TriggerSource(Protocol):
   read-only view was made writeable again with one call, and the saved PNG
   changed (measured). The core therefore makes the frame's own array
   read-only when `read()` returns, and the frame pool makes it writeable
-  again only when it reuses it (estimate: a flag change; not measured).
+  again only when it reuses it. NumPy then refuses to make a view of it
+  writeable, which stops the common accident; a plugin that unlocks the
+  frame itself is not stopped (estimate, from NumPy's rules; not measured).
 - **What a `FrameView` says:** camera name, frame number, the saved file
   name or "not saved" (snapshot mode passes frames between triggers), and
   the Downsample factor, because plugins see the full-size frame while the
@@ -817,9 +820,10 @@ The Plugins window shows each plugin in one state, with the reason:
   with relative imports.
 - **The bytes that were checked are the bytes that run.** A `.pyc` file
   planted in a plugin's `__pycache__` ran instead of the approved source
-  while the source's sha256 still matched (measured). So the loader reads
-  each file once, checks its sha256, compiles exactly those bytes, and
-  never reads or writes `.pyc` files. It hashes every file in the folder,
+  while the source's sha256 still matched (measured). So for third-party
+  plugins the loader reads each file once, checks its sha256, compiles
+  exactly those bytes, and never reads or writes `.pyc` files (built-in
+  plugins load like the rest of the Council's code). It hashes every file in the folder,
   not only `.py`, and refuses a folder holding `__pycache__`, `.pyc`, `.pyd`
   or `.dll` files. Native code comes only from packages you install into
   the environment yourself (pypylon, OpenEB).
@@ -891,3 +895,998 @@ files (question 9).
   installed".
 
 ---
+
+## 5. How multi-camera M1 merges in
+
+### 5.1 One refactor, not two
+
+M1 replaces the one global camera with a `Rig` of camera slots (multi-camera
+design 2.2). The plugin system needs a host object that owns cameras, runs
+and plugins. They are the same object, so they are built once:
+
+- **The `Rig` is the plugin host.** It holds the registry, the project's
+  plugin list, the one timer, the toolbar and status strips, the pop-out
+  windows, the run name, and Start and Stop with the trigger slot of 3.6.
+- **A `CameraSlot` is one camera from one camera plugin.** It holds the
+  `Device` its plugin opened, the session, folder, run, status, background
+  job and lock (as M1 plans), plus the camera's capabilities and facets and
+  a dictionary of per-plugin state.
+- **Five M1 rows are the same edits the plugin core needs:** row 1 (the
+  `Rig`, slots and the `_LIVE` view, 4.5-7 days), row 4 (several camera
+  families in the set-up, 2-3), row 5 (settings following the active camera,
+  2-3), row 7 (the wireframe, 1-2) and row 8 (N simulated cameras and test
+  fakes, 3-4): 12.5-19 of M1's 24-37 days (project docs, estimates;
+  `docs/typhon_multicamera_design.md:2197-2216`). Built separately, each of
+  these files would be rewritten twice.
+
+### 5.2 What the slot hands the settings views
+
+The settings tabs, settings windows and preset picker take an `api` object
+(`settings_tabs.py:120`; `frame_camera.py:2384`, 2412). Between them they use
+18 functions (measured with `grep` at 393671b8): `on_camera_change`,
+`camera_state`, `settings_list`, `set_camera_setting`, `reset_setting`,
+`camera_defaults`, the seven preset calls (`list_presets`, `save_preset`,
+`apply_preset`, `delete_preset`, `rename_preset`, `export_preset`,
+`import_preset`), `reset_camera_settings`, `load_camera_defaults`,
+`current_area`, `set_camera_area` and `full_frame`. Two more names are read
+with a default, `START_BOXES` and `box_shows_camera`
+(`settings_tabs.py:783`, 793). **A slot provides all 20.** Leaving out the
+last two would raise no error but would silently break the link between the
+boxes beside Start and the settings tabs. Today the `api` is the whole
+`frame_camera` module, `_LIVE` included, so a narrow slot object is new work,
+not a rename (prior-art fact-check).
+
+### 5.3 Which pieces sit on the rig and which on a slot
+
+| On the rig (one per window) | On each slot (one per camera) |
+|---|---|
+| Plugin host, registry, base set and project list | The `Device` from its camera plugin; capabilities and facets |
+| Toolbar strip, status strip, "Plugins…" entry, pop-out windows | Its settings provider, settings tabs when active, presets |
+| Run name and reservation, `<run>_rig.json`, `<run>_rig_end.json` with plugin blocks | Its run folder, `<run>_camera.json` and `<run>_run_end.json` with plugin blocks |
+| Start and Stop order, the trigger slot, rig-scoped hooks | Its record gate, live-frame feed, per-plugin state |
+| Rig-scoped features: triggering several cameras, later alignment | Camera-scoped features: classification and timing scan on the active camera's folder |
+
+- **Camera-scoped features follow the active camera.** The multi-camera
+  design already re-points the slider, Classify all, the timing scan and
+  cropped export at the active camera's folder at every Start and camera
+  switch (its 2.7). The plugin context's `capture_folder()` and
+  `camera_changed` event (3.5) are how those plugins hear of it.
+- **The trigger work's seven fields** on `_Live` (`frame_camera.py:327-370`)
+  become per-plugin state on the slot. `_LIVE` stays as M1's compatibility
+  view, and its test that every field of `_Live.__init__` resolves through
+  the view now covers 49 fields, not 42 (measured: 42 at 67cad625, 49 on
+  the trigger branch).
+
+### 5.4 M1's rows in plugin terms
+
+| M1 row (estimate) | What changes because of plugins |
+|---|---|
+| 1. `Rig`, `CameraSlot`, `_LIVE` view (4.5-7 days) | The rig is the plugin host; slots carry per-plugin state; the slot provides the 20-name `api` |
+| 2. One save budget and writer pool (2-3) | None for plugins; Downsample, the one frame stage, runs on that pool |
+| 3. Run layout, reservation, rig records (2.5-3.5) | Plus the run-file suffix registry and `plugins` blocks in rig records |
+| 4. `camera_rig.json`, several camera families, wizard check boxes (2-3) | The families are the enabled camera plugins; each brings its guide, checks and (Basler) scan into the wizard |
+| 5. Settings, presets and windows follow the active camera (2-3) | Through the slot's `api`; window keys per camera |
+| 6. Tile strip, grid, live pop-outs (3-5) | Stays core; plugins add status segments, not tiles |
+| 7. Wireframe update (1-2) | One new wireframe with M1's ports and the plugin strips together, so you run Update from example once (section 6) |
+| 8. Test fakes, N simulated cameras (3-4) | The Simulated plugin, with `COUNCIL_SIM_CAMERAS` (the multi-camera design's name, its 2.10; the prototype used another), is the reference plugin |
+| 9. Busy EVK4s: one program each, or OpenEB's C++ slicer (3.5-5.5) | Inside the Prophesee plugin; if helper processes, the plugin owns them (3.8) |
+| 10. Software-trigger fan-out (0.5-1) | Done by the triggering plugin through `SoftwareTrigger` facets: 40/40 frames on two cameras (measured, synthetic) |
+
+### 5.5 What the multi-camera design said that has since changed
+
+- **M0 is merged** (be071316, 12 October 2026), although that design still
+  says "not yet merged" (`docs/typhon_multicamera_design.md:2166-2167`).
+- **Its line numbers are from commit 6560fca.** For example it puts `_LIVE`
+  at `frame_camera.py:323`; at 393671b8 it is at 373.
+- **Triggered capture has landed** (393671b8). M1 row 10 and M2's Start and
+  Stop order (its 2.3) must now drive `TriggerRun`'s books rather than fire
+  triggers of their own; the record gate already exists (`gate=` in
+  `CaptureSession.record_to`, `capture.py:1251`).
+- **Its compatibility promise assumed the wireframe only grows** ("no
+  edited handler warnings", its 2.9). The combined wireframe removes 53
+  shapes, and today's Update from example blocks a project whose user
+  edited a handler of a removed widget (measured). Section 6.4 adds the
+  missing step.
+- **Run reservation for a mixed folder.** A rig run is reserved by creating
+  its folder; a one-camera run by creating `<run>_frames.csv` (its 2.6). The
+  rig must treat both as taken, so today's Typhon (flat runs) and the plugin
+  Typhon (folders) saving into one capture folder never pick one name. The
+  interface prototype checked only folders (prototype fact-check, code
+  reading).
+
+### 5.6 Order of the combined work
+
+1. The `Rig` and slots behind `frame_camera`'s existing functions, with
+   `_LIVE` as the compatibility view, so every existing test passes
+   unchanged (M1 row 1).
+2. The plugin registry, with Basler, Prophesee and Simulated moved into
+   camera plugins behind the existing `Backend`, `Device` and `Provider`
+   classes (M1 rows 4 and 8).
+3. Run hooks and recorder extension points; triggering moved out of
+   `capture.py`, `cameras.py`'s base class and `frame_camera`.
+4. UI contribution points and the new wireframe; the classification
+   pop-out; the timing and crop plugins (M1 rows 5 and 7).
+5. M1's multi-camera screen and recording (rows 2, 3, 6, 9, 10), then the
+   switch-over.
+
+Section 12 gives each step's estimate and what you see after it.
+
+---
+
+## 6. The wireframe and the Designer
+
+### 6.1 A new example: `typhon_plugins.gspec`
+
+The new app is a new example, `examples/gui/typhon_plugins.gspec`, titled
+"Typhon (plugins)" and registered beside `typhon` in `gui_examples.py`
+(`NOTES` at 66, `INTENDED_TOOLKIT` at 147, set to `qt`). Today's
+`typhon.gspec` stays untouched until the switch-over, so the Typhon you use
+keeps its window.
+
+Today's wireframe has 93 shapes and 41 script links: 21 to `frame_camera`,
+17 to `frame_classes`, 1 each to `frame_timing`, `frame_roi` and
+`gui_settings` (measured from `examples/gui/typhon.gspec` at 393671b8).
+
+| Leaves the main window | Shapes | Goes to |
+|---|---|---|
+| Classification: model, classes, mark, train, predict, classify all, predictions, filter, save as, rename, delete, export, import, tags | 32 (`s24`-`s40`, `s64`-`s78`) | The Classification pop-out |
+| Timing scan: button, count, list | 5 (`s12`-`s16`) | The Timing scan plugin |
+| Cropped export: output folder, button, status | 4 (`s19`-`s22`) | The Cropped export plugin; the crop box itself (`s17`-`s18`) stays |
+| PNG / Raw | 1 (`s56`) | The Prophesee plugin's review source, as a toolbar button |
+| Triggering and Downsample: Capture, From, Per trigger, Timer, Capture now (F9), Downsample, with their labels | 11 (`s82`-`s92`) | The triggering pop-out and toolbar; Downsample stays in the settings notebook (2.1) |
+| **Total** | **53**, leaving 40 | |
+
+| Added | Kind | Port |
+|---|---|---|
+| Toolbar strip | `toolbar` | `plugin_toolbar` (an event port) |
+| Status strip | `status_bar` | `plugin_status` (a text port) |
+| Camera chooser, "Add camera", the active camera's folder | combobox, button, label | M1's new ports (multi-camera design 2.2) |
+
+- **Use the existing `toolbar` and `status_bar` shapes, not empty frames.**
+  The seams research suggested plain frames, but a frame has no port
+  (`gui_ports.py:195`), so `attach()`, which finds everything by port name,
+  could find a frame only by the name generated from its label, the
+  "identifier from display text" fault. The emitted `Toolbar` and
+  `StatusBar` (`gui_emit_qt.py:2332`, 2305) have ports and accepted buttons
+  and labels added at run time (measured, offscreen; seams fact-check).
+- **M1's new ports go into the same wireframe,** so a project needs one
+  Update from example, not two.
+- **The settings column.** If plugin settings stay in pop-outs (3.7), the
+  notebook keeps today's width. If you prefer a shared "Plugins" tab, the
+  column must be at least 491 px at the smallest window (measured;
+  question 3).
+
+### 6.2 What stays the same in the Designer
+
+- **The required ports** stay `live_view` and `capture_status`
+  (`frame_camera.py:166`), and `frame_camera` stays a linked module that a
+  smoke run fakes (`COUNCIL_SMOKE_FAKE`, `frame_camera.py:172`).
+- **`app.py` is not touched,** and no emitter change is needed for the
+  strips: both shape kinds exist (`gui_shapes.py:323`, 330).
+- **Plugins are not linked modules.** The app never imports them, so
+  `gui_policy.LINKED_MODULES` (`gui_policy.py:59-64`) stays as it is.
+- **Adding or removing a plugin never changes `project.gspec`.** Update from
+  example is needed only when the core wireframe changes, which is the
+  point of your request: features stop reshaping the main window.
+- **"Plugins…" in the Settings menu** (shape `s58`, linked to
+  `gui_settings.settings_menu`). That menu's items are a fixed list
+  (`gui_settings.py:122-146`) shared by every Designer app, Barbie and the
+  image viewer included. It gains a small registration call, made by
+  `frame_camera.attach()`, so only Typhon shows the entry.
+- **Declared packages.** `typhon.gspec` declares numpy, PIL and sklearn, and
+  the generated `main.py` refuses to start if one is missing
+  (`gui_emit.py:3159-3212`). The new example drops sklearn; the
+  Classification plugin declares it instead and is switched off with a hint
+  if it is missing (4.5).
+
+### 6.3 Plugin panels and the Designer
+
+Plugin panels are built by the plugin's code at run time. That means:
+
+- they are not drawn or edited in the Designer, and the Designer's layout
+  checks do not see them; the UI contract tests (9.1) cover them instead,
+  at both window sizes;
+- the classification panel reuses today's `ClassifierPicker`
+  (`council_qt/widgets/classifier_picker.py:155`) and `frame_classes`'s
+  functions, so its behaviour is today's, in another window (the prototype
+  built it as its own window in 68-200 ms, offscreen, measured).
+
+The other way, not prototyped, is a plugin panel described as a small
+wireframe fragment (shapes plus script links into the plugin's functions)
+that Typhon builds into a pop-out. It keeps Designer editing and the policy
+gate, at an estimated 3-5 more days (estimate). Question 4.
+
+### 6.4 Moving a project to the new example
+
+What was measured (seams research and its fact-check, in temporary vaults
+built from 67cad625):
+
+- **Switching a project to a differently named example works** through the
+  API and `run_example_gui.py`. A stand-in example (today's wireframe less
+  its 32 classifier shapes) took a project from 82 to 50 shapes, wrote a
+  dated backup of `project.gspec`, removed the generated handler stubs of
+  removed widgets that had not been edited (copies kept in `.backups`), kept
+  the user's own code in `handlers.py`, and recorded the new example's name
+  (`council_core/designer_examples.py:602-621`, 718-820).
+- **The Designer's Update button always uses the example the project was
+  made from** (`council_qt/tabs/designer.py:913`). Switching needs
+  `run_example_gui.py typhon_plugins --project <name> --update`
+  (`run_example_gui.py:135`, 153) or a new "Switch to example…" choice.
+- **An edited handler of a removed widget blocks the update.** With
+  `on_btn_train` edited, the update returned "BLOCKED — port rename cannot
+  proceed: port classifier_name is used in handlers.py". By then
+  `project.gspec` (with a backup) and the recorded example name had
+  already changed, but `ui/` had not been regenerated: the project was left
+  half-switched, and the recovery message mentions only the backup, not the
+  example name (measured).
+
+So the switch-over gets one more step, and the update one fix:
+
+1. **Before switching,** the switch step finds handlers of widgets the new
+   example removes that you have edited, and moves each into
+   `handlers_retired.py` beside `handlers.py` (not imported by the app):
+   kept word for word, never deleted, with a note saying which plugin now
+   does that job. Nothing of
+   yours is lost, and the project then switches cleanly.
+2. **The update itself** checks first and writes nothing (no
+   `project.gspec`, no example name) until it knows it can finish.
+
+Projects that never edited those handlers switch with no extra step.
+
+---
+
+## 7. Keeping current Typhon usable
+
+### 7.1 Two Typhons side by side: how it works, and the traps
+
+- **A project runs the camera code of the checkout that generated it.** The
+  generated `main.py` writes in the absolute path of that checkout
+  (`_APP_ROOT`, `gui_emit.py:3249`) and puts it first on Python's search
+  path (`gui_emit.py:3256-3257`; measured in a temporary build). So a
+  second checkout of the repo, on the plugin branch, builds a second app
+  that runs the branch's code, while your current Typhon project keeps
+  running `qt-migration`'s.
+- **Trap 1: regenerating your current project from the plugin checkout.**
+  If the plugin checkout's Designer ran Generate or Update from example on
+  your current Typhon project, that project would silently start running
+  plugin code. So the plugin checkout's Council runs with **its own vault**
+  (`COUNCIL_VAULT_ROOT` pointing at a separate folder). Its Designer then
+  never sees your current projects.
+- **Trap 2: a checkout that disappears.** Every app generated from a
+  checkout breaks if the checkout is deleted. The plugin checkout must sit
+  at a stable path you chose (for example `C:/Users/<you>/Typhon-plugins/`,
+  a git worktree on branch `typhon-plugins`), never under
+  `.claude/worktrees/`, where tools clean up working copies on their own.
+- **Trap 3: the classifier library depends on how the app was started.**
+  The store defaults to `<vault>/classifiers`
+  (`frame_classes.py:712-718`, 770), and an app launched from the Council
+  inherits `COUNCIL_VAULT_ROOT` (`gui_runner.py:287`) while a
+  double-clicked one does not. So the new project pins its store with a
+  `classifier_store.json` beside the app (`frame_classes.py:105-106`, 451):
+  either your current library, shared (two apps sharing a store is an
+  intended case, with locks), or a copy of its own (question 10). If it is
+  shared, the branch must not change the classifier file formats: today's
+  Typhon refuses files "written by a newer build"
+  (`frame_classes.py:1292`, 3840).
+- **One program per camera at a time.** A second open of the same camera
+  fails on real hardware, though the emulator allows it
+  (`frame_camera.py:2856`). Close one Typhon's connection before the other
+  connects.
+- **Capture folders.** Both Typhons are past M0, so neither can overwrite
+  the other's frames: runs are reserved by creating `<run>_frames.csv`
+  exclusively and frames are written with exclusive creation (code). Use
+  separate capture folders while trying the new app anyway, so a flat run
+  and a rig run folder of the same name never confuse the slider (5.5).
+- **Presets** are per project. The new project gets a copy of
+  `camera_presets.json` when you want your presets there; the original is
+  never moved.
+
+### 7.2 The branch
+
+- **Create `typhon-plugins` from `origin/qt-migration`** at 393671b8 or
+  later. Its precondition, the trigger work being merged, was met on 15
+  October 2026. (The local `qt-migration` in the research worktree was 44
+  commits ahead of and 64 behind `origin/qt-migration`, measured; the
+  branch starts from `origin`, not from a local copy.)
+- **Merge `qt-migration` into `typhon-plugins` every week,** and after any
+  Typhon bug fix, by merging, not rebasing, so every fix can be traced.
+- **Hold today's Typhon to bug fixes while the branch lives** (question 6).
+  The seven core Typhon files took 31 commits, +5,265 and −1,172 lines, in
+  the week from 7 October 2026 (measured; the larger "84 commits since 15
+  September" includes creating those files). At that rate a branch that
+  restructures them would conflict at every merge. New Typhon features go
+  to the branch as plugins.
+- **Keep old names as facades** (thin wrappers over the new code) for as
+  long as possible, so a fix merged from `qt-migration` lands in a small
+  file rather than in a restructured one.
+- **The branch's gate for every commit:** every existing Typhon test passes
+  through the facades (1,078 tests collected from 21 Typhon test files at
+  67cad625, measured, not run; plus the 79 test functions the trigger work
+  added), plus the plugin contract suites (9.1), plus the "today's readers
+  open the new runs" tests (7.5).
+- **Never pushed to `main` or `Work-Build`** (standing rule).
+
+### 7.3 What you do day to day while it is built
+
+- **Capture with today's Typhon,** from your `qt-migration` checkout, as now.
+- **Try "Typhon (plugins)"** from the plugin checkout's Council: first with
+  simulated cameras, then with a real camera while today's Typhon is not
+  connected to it.
+- **Report a bug in today's Typhon as usual.** It is fixed on
+  `qt-migration` and reaches the branch with the next weekly merge.
+
+### 7.4 The switch-over, when you say so
+
+1. **Tag** the last commit before the merge (for example
+   `typhon-classic-last`). A checkout of that tag runs the old Typhon and
+   Barbie v4/v5 at any time, with no upkeep.
+2. **Merge** `typhon-plugins` into `qt-migration`.
+3. **The new example becomes `typhon.gspec`.** The old wireframe may be kept
+   for one release as `typhon_classic`, so an old project can still be
+   rebuilt from it.
+4. **Move each project across** (7.5).
+5. **Retire Barbie v4 and v5** and their tests (section 8).
+
+### 7.5 Migrating projects, presets, runs and classifier libraries
+
+| What | How | Changes your files? |
+|---|---|---|
+| A Typhon project's window | Switch to the new example with the extra step of 6.4: edited handlers of removed widgets move to `handlers_retired.py`, then the update | `project.gspec` (a dated backup is kept) and `handlers.py` (moved parts kept word for word) |
+| `camera_setup.json` | Its one choice becomes "that camera plugin on" in `typhon_plugins.json`; `FORMAT` 1 files are still read (`camera_setup.py:47`) | No; the file is left as it is |
+| Presets (`camera_presets.json`) | Unchanged; copied, never moved, into a new project. The `capture.*` and `save.downsample` keys (`triggered.py:80-88`) are read in place by their new owners; keys of a plugin that is not loaded are kept and listed | No |
+| Runs | Nothing is rewritten. A branch test opens a run written by the plugin Typhon with today's readers (`capture_review`, `event_playback`, `frame_classes`, `frame_timing`, `frame_roi` from `qt-migration`). It holds because new CSV columns go only at the end, the camera record stays at version 1, and new files have their own suffixes | No |
+| Classifier libraries | Nothing to move if the store is shared (7.1); otherwise the existing export bundle | No |
+| `app.py` | Untouched (`frame_camera.attach(self)` stays) | No |
+
+**The real data is on the bench PC, not here.** This laptop has no Typhon
+project, no `camera_presets.json`, no `camera_setup.json` and no
+classifiers folder (measured: searched the user folder six levels deep), and
+your main checkout (`Work-Build`, 11 September 2026) has no Typhon at all
+(measured). The migration is therefore rehearsed on a copy of the bench PC's
+project, presets and library before the real ones (question 12), and the
+bench PC's checkout is confirmed to be past M0 before any capture folder is
+shared.
+
+---
+
+## 8. Leaving Barbie behind
+
+### 8.1 What Barbie shares with Typhon
+
+| Example | Shapes | Script links (measured at 393671b8) | Uses Typhon's camera module? |
+|---|---|---|---|
+| `barbie_capture` (v1) | 17 | `frame_timing` 1 | No |
+| `barbie_capture_v2` | 23 | `frame_timing` 1, `frame_roi` 1 | No |
+| `barbie_capture_v3` | 41 | `frame_timing` 1, `frame_roi` 1, `frame_classes` 7 | No |
+| `barbie_capture_v4` | 54 | as v3, plus `frame_camera` 7 | Yes: `list_cameras`, `connect`, `disconnect`, `start`, `stop`, `set_area`, `full_frame` |
+| `barbie_capture_v5` | 55 | as v3, plus `frame_camera` 8 | Yes: v4's seven plus `setup` |
+| `image_viewer` | 17 | `frame_timing` 1 | No |
+
+Only v4 and v5 touch the code this design restructures.
+
+### 8.2 From now until the switch-over
+
+- **No further Barbie work,** as you said.
+- **On `qt-migration`, nothing is removed.** Barbie keeps whatever works
+  today, because today's Typhon code stays where it is until the
+  switch-over.
+- **On the branch,** v4 and v5 call `frame_camera`'s functions, which stay
+  as facades over the rig (5.6). They may well keep working, but nothing on
+  the branch is built or tested for them beyond what the facades' own tests
+  cover (not tried).
+
+### 8.3 At the switch-over
+
+1. **The tag** `typhon-classic-last` (7.4) freezes the last Typhon and
+   Barbie that ran on the old structure. A checkout of the tag runs them,
+   with no upkeep.
+2. **Barbie v4 and v5 leave the examples:** their wireframes move out of
+   `examples/gui/` (for example into `examples/retired/`), so the
+   Designer's example list stops offering them. A project you built from
+   one keeps its files; it just gets no updates.
+3. **Their tests are retired on purpose, not lost by accident:**
+   `tests/test_barbie_v4.py` (15 tests at 393671b8, measured) and the
+   Barbie-only cases in `tests/test_typhon.py` (the v4/v5 comparisons at
+   87-131 and the builds at 426-446). Each goes into the `RETIRED` list in
+   `tests/test_retired_tests.py` (line 21) and the "Retired tests" list in
+   `CLAUDE.md`, with the reason, so a later merge cannot quietly bring one
+   back.
+4. **Two pieces of coverage are kept,** rewritten on a small fixture
+   wireframe under `tests/data/` (as `tests/data/typhon_before_capture.gspec`
+   already is):
+   - a generated app whose slider is driven by its own browser must not
+     get a second slider controller from `attach()`
+     (`tests/test_capture_review.py:169`);
+   - two different apps sharing one classifier store see each other's
+     models with where they came from (`tests/test_typhon.py:957-1006`,
+     which uses Barbie v5 as "the other app").
+5. **Barbie v1-v3 and the image viewer stay as they are.** They never touch
+   `frame_camera`, and `frame_timing`, `frame_roi` and `frame_classes` stay
+   stable libraries that this design does not change.
+
+### 8.4 Why not freeze a copy of the old camera module for Barbie
+
+`frame_camera` is not one file: it imports 15 other Council modules, and
+with them it comes to about 19,300 lines, not counting `frame_classes`,
+`frame_roi` and `frame_timing` (computed from sizes measured at 67cad625:
+24,413 − 4,640 − 192 − 289). A frozen copy would carry its
+own Basler and OpenEB code, which would need fixing whenever pypylon or
+OpenEB change. The git tag freezes all of it with no upkeep.
+
+---
+
+## 9. Testing
+
+The aim, from your request: a plugin is checked by its own tests, its kind's
+contract suite and the main window's tests, and does not need the whole of
+Typhon re-checked by hand. All tests run offscreen
+(`QT_QPA_PLATFORM=offscreen`, `COUNCIL_NO_DIALOGS=1`), in temporary vaults
+(`COUNCIL_VAULT_ROOT`) and a temporary plugin home, with pytest's
+`--basetemp` set to a scratch folder (the prototype's runs used pytest's
+shared default folder, about 25 MB, which later runs should avoid).
+
+### 9.1 One contract suite per plugin kind
+
+Like scikit-learn's `check_estimator`, one suite that every plugin of a kind
+must pass (vendor docs); each runs first against the Simulated plugin.
+
+- **Camera plugins:**
+  - without its SDK, `available()` says no and gives an install hint, and
+    importing the plugin does not crash;
+  - discover, open and close can be repeated; `read()` with nothing to read
+    returns `None` after its timeout;
+  - an area that needs the stream stopped raises `NeedsStop` before anything
+    is written; the area round-trips; the `restartable` rule holds;
+  - its settings come from the camera with their ranges, and each set
+    returns a `Change` saying what the camera actually took;
+  - every capability it declares is confirmed by the opened camera and its
+    facet works; its category hints give a valid tab plan;
+  - its record fields are plain JSON; its non-screen code imports no Qt;
+    nothing uses pickle.
+- **Trigger sources:** start and stop can be repeated; `stop()` returns
+  within a deadline; nothing fires after `stop()`.
+- **Feature plugins:**
+  - the manifest is valid and reading it imports nothing; every hook it
+    lists exists;
+  - hooks are called in the order of 3.6; `check_start` can refuse Start
+    with a reason; a failed Start undoes what was armed;
+  - record blocks are plain, namespaced and under the size limit; sidecar
+    files are created exclusively and only in the run's folders, with their
+    suffix registered; preset keys round-trip; settings saves take the lock.
+- **UI contributions:** each lands only in its host; the main window's
+  widget tree is the same before and after the plugin is switched on; with
+  its host missing, the contribution falls back to Settings → Plugins…; a
+  pop-out panel fits at both window sizes (1504 x 1016 and the smallest,
+  1400 x 820).
+- **Faults, for every kind:** raising, `SystemExit`, writing to a frame's
+  pixels or its meta, a sleeping hang, a slow plugin, a write outside the
+  run, and creating one file twice. Each must end with frames saved = frames
+  CSV rows = the end record's count, and the pixels unchanged; a fault on
+  the recording path must end the recording with its reason (3.10).
+
+The prototype's version of these suites passed for six plugins (simulated,
+Prophesee over the fake EVK4, Basler over pylon's emulator, triggering,
+classification and a deliberately misbehaving one) in both Python
+environments against both research snapshots: 35-37 tests each, 1-3
+skipped where an SDK or the trigger methods were absent (measured,
+synthetic).
+
+### 9.2 The fake host
+
+A stand-in rig with simulated cameras, a temporary project and no visible
+window, so a plugin can be tested on its own. The pattern exists in
+`council_qt/host.py` (`StandaloneHost`, line 49). Third-party authors get
+the same fake host and suites with the plugin API.
+
+### 9.3 Each plugin's own tests
+
+- **They live with the plugin** (`typhon_plugins/<name>/tests/`) and are
+  collected with the rest.
+- **For the built-ins they are today's tests, moved,** not rewritten:
+  `test_cameras.py` (91 test functions at 393671b8, measured; split by
+  camera family, about 29 Basler, 27 EVK4, 12 raw and 5 simulated at
+  67cad625 by a name heuristic), `test_camera_settings.py` (73),
+  `test_basler_scan.py` (39), `test_basler_trigger.py` (31),
+  `test_triggered.py` (27), `test_event_playback.py` (28), and
+  `test_frame_classes.py` for the classifier library.
+- **Core tests that lean on one camera's fake move to the Simulated plugin.**
+  27 of the 41 tests in `test_settings_tabs.py` drive the core tab host
+  through the fake EVK4 (measured by a name and body heuristic); they move
+  onto simulated cameras, and the EVK4-specific ones stay with the
+  Prophesee plugin.
+- **Hardware tests stay where they run:** `test_basler_real.py` (40 test
+  functions at 393671b8; it collects nothing outside the `pylon`
+  environment), the emulator runs with `PYLON_CAMEMU=2`, and the fake EVK4.
+
+### 9.4 What must still be tested together
+
+Plugins do touch each other in a few places (section 1). These pairs get
+tests of their own:
+
+- **Downsample with the crop box and classification:** a box drawn on a
+  reduced frame and a classifier trained on reduced frames; the
+  `FrameView` carries the factor.
+- **Triggering with each camera plugin:** the Basler facets on pylon's
+  emulator and the simulated cameras, including fan-out to two cameras
+  (40/40 frames, measured, synthetic).
+- **Snapshot mode with live-frame plugins:** frames between triggers reach
+  `on_frame` marked "not saved".
+- **Two plugins in one run:** their record blocks and sidecar files never
+  collide, and the record stays readable.
+- **Today's readers on new runs** (7.5).
+- **The rig's Start and Stop order** with the trigger slot and the
+  multi-camera design's leader and follower order (its 2.3), with fake
+  devices.
+- **Frame timing inside the real Qt Typhon** with the classification plugin
+  on (10.2).
+- **The main window** at both window sizes with every built-in strip
+  filled.
+- **The switch-over** on a copy of a project with edited handlers (6.4).
+
+### 9.5 What exists today, for scale
+
+1,078 tests were collected (not run) from 21 Typhon test files at 67cad625
+(measured), and the trigger work added 79 test functions (measured). The
+branch's gate (7.2) keeps all of them passing through the facades.
+
+---
+
+## 10. Performance and data safety
+
+### 10.1 What the plugin system costs
+
+| Cost | Figure |
+|---|---|
+| Reading six manifests at start-up | 3.9-4.8 ms (measured) |
+| Reading 20 plugins and hashing all their files | 33-50 ms warm; about 250 ms just after copying them in or after a reboot; 100 plugins about 1.2 s cold (measured, synthetic) |
+| Importing the plugin host | 125-150 ms in a bare interpreter, mostly modules Typhon already loads (measured) |
+| Loading one plugin, before its SDK is used | Simulated 5.2 ms, Prophesee 45 ms, triggering 2.5 ms, classification 4.8 ms, Basler 53 ms (measured, prototype) |
+| First use of a heavy package | sklearn 3.3-5.2 s; pypylon 0.6-2.0 s; first opening of the classification panel 239 ms (measured) |
+| One guarded call into a plugin | 0.39-0.41 µs, against 0.13-0.15 µs unguarded (measured); about 0.2 ms extra per second at 150 fps with 5 plugins (computed) |
+| Offering a live frame to plugins, paid by the grab thread | 5.0 µs (1 plugin), 8.4 µs (3), 16.9 µs (8), the same at full boA5320 size (measured) |
+| Hand-over to the plugin's thread | 95-164 µs median, 577 µs p99 (measured) |
+| The trigger record gate per frame | 1.0 µs median with no trigger pending, 4.5 µs with one (measured by the first report; its script is lost and no fact-check re-ran it) |
+| Memory | A frame a plugin still holds is never reused by the frame pool (`cameras.py:400-404`), so each plugin's two-slot queue keeps at most two extra frames per camera alive: 64 MB for full boA5320 Mono12 frames (computed) |
+
+One figure from the research is not used: an unpaced loop said a no-op
+plugin cut the rate from 22,400 to 15,400 frames a second, but the
+fact-check could not reproduce it (the no-op ran faster in every pair).
+
+### 10.2 The camera's grab thread and Python's lock
+
+**The finding.** A plugin on its own thread still competes with the grab
+thread for Python's lock (the GIL). On a paced 150 fps simulated camera
+recorded through the real `CaptureSession` (measured, synthetic):
+
+| Live plugin | Frames more than one period late, of about 575 | Notes |
+|---|---|---|
+| None, a no-op, or 5 ms of pure Python | 0-2 | p99 lateness 1.9-4.3 ms |
+| 20 ms of pure Python per call | 313-340 | median 7-8 ms late |
+| Live classification of 640 x 480 frames (17-49 ms per call) | 95-205 | p99 10.7-27.6 ms |
+| The same, capped at 25 % of the time | 22-32 | the worst case barely changed |
+
+**The main cause is Windows' 15.6 ms timer tick,** which makes handing the
+lock between threads slow (`triggered.py:451-454` notes the same 15.6 ms
+step). With the process timer set to 1 ms (`timeBeginPeriod(1)`) and
+Python's switch interval at 1 ms, the 20 ms plugin made **0** of about 574
+frames late (median 0.42-0.47 ms, p99 2.0 ms), and live classification 1-7
+(measured, synthetic; prototype fact-check). Two caveats:
+
+- inside a running Qt event loop the same 20 ms plugin, at the default
+  timer, made 113-125 frames late rather than 313-340 (measured), so the
+  numbers must be taken again inside the real Typhon before choosing;
+- Windows 11 may not honour the finer timer while the window is minimized
+  or hidden unless the process asks for it explicitly, and it costs some
+  power (vendor docs, Microsoft).
+
+**What the design does:**
+
+1. The core sets the finer timer and switch interval while it records,
+   once a measurement in the real Qt Typhon confirms the gain (a stage P3
+   row).
+2. Each live plugin has a time budget, a 25 % duty cap and a watchdog, as a
+   second line.
+3. Heavy per-frame work stays off the live path by default: classification
+   runs after Stop (about 1.2-1.8 ms a frame in a batch, measured, against
+   17-49 ms live); live guesses only on reduced frames and capped
+   (question 5); long jobs in a helper process.
+
+### 10.3 Data safety
+
+**What a plugin cannot do through the plugin API:**
+
+- write a run file except by creating a new one, exclusively, in the active
+  run's folders, with its suffix registered (3.9);
+- change a record after it is written, or write one that is not plain,
+  finite JSON under the size limit;
+- write a preset value that is not a plain value, or lose another plugin's
+  keys;
+- change a frame's pixels: the frame's array is read-only from `read()`
+  until the pool reuses it (3.8);
+- delete anything: the API has no delete, only `temp_dir()`, which Typhon
+  empties itself;
+- leave a run half-processed: a fault on the recording path ends the
+  recording with the reason in `<run>_run_end.json` (3.10).
+
+M0's rules stay as they are: frames and run names are created exclusively,
+and the first failed write ends the recording.
+
+**What a plugin can still do, because it runs in Typhon's process** (all
+measured): write over files with `open(..., "w")`, `os.replace` or
+`shutil.move`; undo a read-only flag with `os.chmod`; reach the main window
+and the camera's `Device`. For built-in plugins, review and the contract
+tests (9.1) guard against this; for third-party plugins, your approval
+(4.6) and, if you want it, read-only saved files (question 9).
+
+---
+
+## 11. How velocity, calibration and multi-camera alignment become plugins
+
+These designs are not redone here. Each piece they describe is given a
+place in the plugin system; their own sections, estimates and questions
+stand.
+
+### 11.1 Velocity (`typhon.velocity`, one camera, needs `events`)
+
+| Velocity design piece | Becomes |
+|---|---|
+| `VelocityTracker`, no Qt (its 2.4) | The plugin's own module |
+| The event-block reader factored out of `RawPlayback._read` (its stage 1, row 1) | Part of the Prophesee plugin, which owns `event_playback`; offered to features as a **run reader** for that camera's recordings, so the velocity plugin never imports OpenEB code |
+| The Analyse velocity job: thread, progress, cancel (stage 1, row 3) | The `analyse()` hook (3.8) |
+| The vector overlay in `ImageCanvas` (its 2.5; stage 1, row 4) | The core's **canvas overlay** contribution point (3.7), built once and shared with alignment; it changes the generated canvas, so it reaches projects through Update from example, as that design says |
+| The velocity window (stage 1, row 5) | The plugin's pop-out panel |
+| `<run>_tracks.csv`, `<run>_track_points.npy`, `<run>_velocity.json`, "added to the list in `_unique_run`" (its section 4) | Run-file suffixes registered by the plugin (3.9) |
+| Live arrows: a hook in `EvkDevice.read()`, a drop-oldest bounded queue, counted gaps (its 2.4; stage 2, row 2) | The Prophesee plugin's `EventStream` facet and the velocity plugin's live-event hook; the lock and timer findings of 10.2 apply to it |
+| Tracker set-ups linked to presets (stage 2, row 4) | Preset keys `typhon.velocity/...` |
+
+### 11.2 Calibration (`typhon.calibration`, one camera; whole rig for MODE 2)
+
+| Velocity or multi-camera design piece | Becomes |
+|---|---|
+| The store `<project>/camera_calibrations.json` and clips under `<project>/calibration/<id>/` (velocity 3.7) | The plugin's own project files, at the paths that design fixed (a built-in plugin may keep names its design already chose) |
+| The Calibrate window and steps (velocity 3.10) | The plugin's pop-out panel |
+| Recording a clip with ERC, trail and anti-flicker switched off and restored in a `finally` block (velocity 3.4, 3.10; stage 1, row 8) | Two core services added to the API: "these settings for this clip, restored afterwards and checked", and "record a short clip into this folder", outside the run folders |
+| The frozen `<run>_calibration.json` at Start and the record pointer (velocity 3.9; stage 1, row 9) | A Start-time hook writing the sidecar, plus a field in the camera record's `plugins` block |
+| The LED finder `led_locate` (velocity stage 1, row 6) | A library inside the plugin |
+| Pixels to millimetres (velocity 3.6) | A service the calibration plugin offers other plugins; velocity "uses" it when present and shows px/s when not |
+
+### 11.3 Multi-camera alignment, MODE 2 (`typhon.align`, the whole rig, uses calibration)
+
+| Multi-camera design piece (stage M3) | Becomes |
+|---|---|
+| Rig calibration: every camera records the board at once (its 4.4) | The calibration plugin's clip service run on every slot together |
+| Live side-by-side and overlay, labelled approximate (its section 5) | The canvas overlay plus a pop-out panel, on a worker thread |
+| Export corrected and `<run>_registration.json` (its section 6) | `analyse()` in a helper process for long exports; registered suffixes |
+| Plate definitions in `camera_rig.json` (its 4.12) | The plugin's namespaced block in the rig file M1 creates |
+
+### 11.4 The trigger cable, stage M2
+
+M2 splits along plugin lines:
+
+- **EVK4 Trigger In and the sync link** become Prophesee capabilities and
+  facets (`trigger_in`, `sync`); the **Basler "Lines" settings** become
+  Basler plugin settings.
+- **The rig's Start and Stop order** with leaders and followers (multi-camera
+  2.3) is the core's trigger slot (3.6).
+- **Pairing after Stop** (`<run>_triggers.csv`, `<run>_pairs.csv`, the
+  report on screen) is a rig-scoped feature in the triggering family. Its
+  `<run>_triggers.csv` (edges recorded by an EVK4) and today's
+  `<run>_capture_triggers.csv` (`triggered.py:350`, what Typhon asked for)
+  are different files and both stay.
+
+### 11.5 What to reserve in API 1.0 so these fit later
+
+1. **The canvas overlay layer** (velocity arrows, alignment overlay).
+2. **The `EventStream` facet** and the **run reader** offered by camera
+   plugins.
+3. **Temporary settings and clip recording** as core services.
+4. **Plugin dependencies:** a manifest field `uses`, each entry marked
+   optional (velocity uses calibration if present) or required (alignment
+   needs calibration).
+5. **Rig-level data:** a namespaced block per plugin in `camera_rig.json`
+   and in `<run>_rig.json` / `<run>_rig_end.json`.
+
+Reserving them costs little now (names in the API, empty in 1.0); adding
+them later as minor versions works too, but a design that never planned
+them would have to be bent (estimate). Turning each later feature into a
+plugin adds about 1-2 days to its own design's estimate for the manifest,
+contract tests and panel wiring (estimate).
+
+---
+
+## 12. Staged plan
+
+All efforts are **estimates**: working days for one developer who knows the
+codebase, tests included. M1's rows keep the multi-camera design's own
+estimates. The research put the plugin work at 29-43 days on top of M1;
+the rows below add what the fact-checks found (driving `TriggerRun`'s books
+from the rig, the hash-then-compile loader, the blocked Update from
+example, the timer finding, the branch set-up). **Stages P0-P3 leave Typhon
+behaving exactly as today;** the window changes at P4.
+
+### Stage P0: the branch, safely beside today's Typhon (about 0.5-1 day)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | Branch `typhon-plugins` from `origin/qt-migration`; a git worktree at a stable path; that checkout's Council on its own vault; the new project's classifier store pinned; a script that runs the branch's gate (7.2) | 0.5-1 day |
+
+**What you see:** nothing changes. Today's Typhon is untouched; a second
+checkout exists.
+
+### Stage P1: the rig and the plugin host, behind today's functions (about 7-12 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | M1 row 1: `Rig`, `CameraSlot`, `_LIVE` as a compatibility view (all 49 fields), every existing test passing unchanged | 4.5-7 days |
+| 2 | The plugin host on the rig: manifest reader, registry, guarded calls, the faulted state, plugin contexts, `typhon_plugin_api` 1.0 and its documentation, the base set and project lists (4-6 days alone; about 2 are shared with row 1) | 2-4 days |
+| 3 | Measure frame timing inside the real Qt Typhon with a slow plugin, at the default and the 1 ms timer (10.2) | 0.5-1 day |
+
+**What you see:** "Typhon (plugins)", built from the branch with a copy of
+today's wireframe under the new name, beside today's Typhon. It looks and
+behaves exactly like today's.
+
+### Stage P2: camera plugins (about 8-12 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | Basler, Prophesee (with its raw view as a review source) and Simulated as camera plugins behind the existing `Backend`, `Device` and `Provider` classes; category hints per plugin; capabilities instead of the "event camera" checks; `cameras.backends()` and `discover()` kept for the Capture tab | 5-8 days |
+| 2 | M1 row 8: N simulated cameras (`COUNCIL_SIM_CAMERAS`), fake EVK4 serials, trigger and sync fakes, replay rigs | 3-4 days |
+
+**What you see:** the same Typhon. The settings tabs are the same tabs
+(the prototype's merged hints gave identical tab plans, measured).
+
+### Stage P3: run hooks, and triggering out of the core (about 12-17.5 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | Run lifecycle hooks, the record-gate and frame-stage points, the run-file suffix registry, cleaned and size-checked record blocks, sidecar files | 3-4 days |
+| 2 | The triggering plugin: `TriggerRun`'s books driven by the rig, Software and Timer sources, the Basler and Simulated facets, the trigger columns kept by name, the `capture.*` keys read in place, its panel, Capture now (F9) and status segment | 4-6 days |
+| 3 | Downsample as the core's one frame stage; binning as a Basler facet; `capture.py` stops importing `reduce` and `triggered` | 1-2 days |
+| 4 | Preset and record namespacing; keys of a missing plugin kept untouched | 1.5-2 days |
+| 5 | The finer timer while recording, if P1 row 3 confirmed it | 0.5 day |
+| 6 | Contract suites for every kind and the fake host (9.1, 9.2) | 2-3 days |
+
+**What you see:** the same Typhon, with the same trigger behaviour, the
+same files and the same CSV columns; today's readers open its runs (tests).
+Only the code has moved. (The triggering panel exists but the window still
+shows today's trigger boxes until P4.)
+
+### Stage P4: the new window (about 11-16 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | UI contribution points: Typhon-owned pop-out windows that remember their place, the toolbar and status strips, the "Plugins…" registration in `gui_settings`, shortcuts, the main-window widget check | 3-4 days |
+| 2 | M1 row 7 with the strips: `typhon_plugins.gspec` (53 shapes out; the strips and M1's ports in); layout tests at both window sizes | 1-2 days |
+| 3 | M1 row 5: settings, presets and windows follow the active camera through the slot's 20-name `api` | 2-3 days |
+| 4 | The Classification pop-out; Classify all after Stop by default; a public `predict_image` in `frame_classes` so live guesses need no private calls | 3-4 days |
+| 5 | The Timing scan and Cropped export plugins | 1-1.5 days |
+| 6 | "Switch to example…" in the Designer, with edited handlers set aside, and an update that writes nothing until it can finish (6.4) | 1-1.5 days |
+
+**What you see:** the new main window: the core controls, a toolbar strip
+(Classification, Capture now, Timing scan, Crop export, PNG / Raw), a status
+strip, and Settings → Plugins…; classification and the trigger controls in
+their own windows. Still one camera.
+
+### Stage P5: the Plugins window and third-party trust (about 3.5-5 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | The Plugins window: base set, this project's additions and switch-offs, each plugin's state and reason; the crash marker and its question | 1.5-2 days |
+| 2 | The hardened loader: hash, then compile the same bytes, no `.pyc`; folder rules; `approvals.json`; the risky-pattern scan; the network field and its tripwire; each run's list of plugins and versions | 1.5-2 days |
+| 3 | An author's kit: the API documentation, the contract suites and fake host usable outside the repo, one example plugin | 0.5-1 day |
+
+**What you see:** plugins switched on and off for this project or for every
+project, and a plugin copied into `~/.council/typhon/plugins/` approved
+after you have looked at it. P5 can wait until someone else actually writes
+a plugin; the discipline of P1 (built-ins use only the plugin API) cannot,
+because it is what makes P5 cheap.
+
+### Stage P6: the rest of M1 (about 13.5-21 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | M1 rows 2, 3, 4, 6, 9 and 10: one save budget and writer pool; run layout, reservation and rig records (with plugin blocks); several camera families in the set-up and `camera_rig.json`; tiles, grid and live pop-outs; busy EVK4s; software-trigger fan-out through the triggering plugin | 13.5-21 days (multi-camera design: 2-3, 2.5-3.5, 2-3, 3-5, 3.5-5.5, 0.5-1) |
+
+**What you see:** what M1 promised: 2-4 cameras in one window, tiles, one
+Start and one Stop, a folder per camera, each with its own settings.
+
+### Stage P7: the switch-over (about 2.5-4.5 days)
+
+| # | Work | Estimate |
+|---|---|---|
+| 1 | Today's readers on new runs (tests); a rehearsal on a copy of the bench PC's project, presets and library | 1.5-2.5 days |
+| 2 | Barbie v4 and v5 retired: examples moved, the `RETIRED` list and `CLAUDE.md`, the two kept tests rewritten (8.3) | 0.5-1 day |
+| 3 | Tag, merge, rename the example, move your projects | 0.5-1 day |
+
+**What you see:** one Typhon again, the plugin one, with your projects,
+presets, runs and classifier libraries.
+
+### Totals, and how this fits with the other designs
+
+- **All stages:** about 58-89 days (computed from the rows above), of which
+  M1's own rows are 24-37 and the plugin work 34-52. Add merge upkeep of
+  about half a day a week while the branch lives, about 6-9 days over
+  12-18 weeks (estimate).
+- **Velocity** stage 1 can be built as a plugin after P3 (it needs the run
+  reader, the `analyse` hook and the suffix registry) with its overlay in
+  P4; its own estimates stand, plus about 1-2 days for the plugin form
+  (11.5).
+- **M2** (the trigger cable) follows P6, as the multi-camera design orders
+  it after M1; it now extends the triggering plugin and the camera
+  plugins' facets rather than the core.
+
+---
+
+## 13. Open questions for you
+
+The velocity design's questions (lenses, LED hardware, fields of view,
+accuracy, OpenCV, a compiled helper, the EVK4 and SDK Pro, real recordings)
+and the multi-camera design's (which cameras, the desktop and frame grabber,
+more Baslers, trigger hardware, one PC or two, rates, lighting, the working
+plane, export formats, tolerance, windows, the shared board, screen and
+folders, Start and Stop, thermal cameras, disks) still stand and are not
+repeated. These are only about plugins.
+
+1. **The app-wide base set: followed or copied?** When you later add a
+   plugin to the base set, should it appear in every existing project
+   (recommended), or only in projects made afterwards? May a project switch
+   off a base-set plugin for itself (section 4.2)?
+2. **Downsample:** keep it in the core as the one step that changes saved
+   pictures, with its control in the settings notebook (recommended), or
+   make it a plugin of its own, or part of triggering (section 2.1)?
+3. **Plugin settings:** in each plugin's own window (recommended, because
+   the tab strip is full), or one shared "Plugins" tab, which needs the
+   settings column widened to at least 491 px (sections 3.7 and 6.1)?
+4. **Plugin windows:** built in code and not editable in the Designer, or
+   described as small wireframes you can edit there, at about 3-5 more days
+   (section 6.3)?
+5. **Classification while recording:** is classifying each run right after
+   Stop enough (recommended), or do you need live guesses during capture,
+   which would run only on reduced frames and capped (section 10.2)?
+6. **Today's Typhon while the branch lives:** may it take bug fixes only,
+   with new Typhon features going to the branch as plugins? Otherwise every
+   weekly merge will conflict (section 7.2).
+7. **Plugins from other people:** how will they reach the PC (a zip, a USB
+   stick, a git checkout)? Is "you approve each version once, and a changed
+   file asks again" the right level? Should a project ever carry plugin
+   code, for sharing with a colleague (recommended: no; section 4.6)?
+8. **Extra Python packages:** if a third-party plugin needs one (for
+   example a thermal camera's SDK), is it acceptable that you install it
+   into the environment yourself, and Typhon only checks and says what is
+   missing?
+9. **Read-only saved files:** should Typhon mark each saved frame and
+   finished CSV read-only, at 0.23-0.27 ms per file, after which Windows
+   asks before deleting them (sections 4.6 and 10.3)?
+10. **The new app's classifier library:** share your current one (its file
+    formats are then frozen until the switch-over), or start with a copy of
+    its own (section 7.1)?
+11. **Barbie:** retire v4 and v5 and their tests at the switch-over, and
+    keep v1-v3 and the image viewer as they are (section 8)?
+12. **The bench PC:** which checkout runs today's Typhon there, and can a
+    copy of its Typhon project, `camera_presets.json` and classifier library
+    be used to rehearse the switch-over (section 7.5)?
+13. **The split:** do you agree that presets, run records, the crop box and
+    Downsample stay in the core, and that the camera families, triggering,
+    classification, the timing scan and cropped export become plugins
+    (section 2)?
+
+---
+
+## What has not been verified
+
+- **No hardware.** The EVK4 path ran over the fake EVK4 behind a fake
+  device discovery, not real OpenEB with a camera; the Basler path ran on
+  pylon's emulator (1024 x 1040 frames, time stamp 0), not a boA5320 on
+  CoaXPress.
+- **Nothing was built into Typhon.** The interface is a prototype outside
+  the repo. Of the screen pieces only the classification pop-out was built
+  (offscreen); the toolbar and status strips were checked as the emitted
+  classes accepting widgets at run time, not in a full Typhon build; the
+  Plugins window, plugin settings sections and the "Plugins…" registration
+  were not built.
+- **Update from example across example names** was measured with a stand-in
+  example built from 67cad625's 82-shape wireframe, not with the real new
+  wireframe; the "set edited handlers aside" step of 6.4 is a design.
+- **The timer finding** (0 late frames at a 1 ms timer) was measured in a
+  benchmark process, not inside the running Qt Typhon, and a Qt event loop
+  alone changed the counts; Windows 11's handling of a minimized window is
+  from Microsoft's documentation only.
+- **Read-only frame arrays from `read()`** (3.8) are a design; the cost and
+  the frame pool's handling were not measured.
+- **Helper processes** for live plugins were not built; only an offline
+  helper (Classify all) was measured.
+- **Records:** no rig record with plugin blocks was written; only
+  per-camera `<run>_camera.json` files carried them.
+- **Migration:** moving the trigger branch's preset keys, and the
+  "today's readers open new runs" tests, were not prototyped. That an older
+  Typhon treats `<id>/<key>` preset keys as unknown rather than as damage
+  rests on reading the code and on the prototype's `apply` test, not on
+  running an older build.
+- **Barbie v4 and v5 through the facades** were not tried.
+- **The trigger record gate's cost** (1.0 and 4.5 µs) comes from the first
+  report; its script is lost and no fact-check re-ran it.
+- **The emulated Baslers' arrival skew** varied widely between runs (median
+  0.37-1.7 ms in the first report, 2.7-15.1 ms in the fact-check), so no
+  conclusion is drawn from it.
+- **Test counts:** the 1,078 tests were collected, not run; the splits of
+  tests by camera family are name-and-body heuristics.
+- **The bench PC's data** (its Typhon project, presets and classifier
+  library) was not seen; this laptop has none.
+- **Other projects' behaviour** not checked: where napari keeps a disabled
+  plugin's state, whether QGIS's enabled key is per profile, whether Blender
+  enforces declared permissions, what OBS does on a version mismatch,
+  whether VS Code's extension host is a separate process, and what changed
+  in pluggy 1.7.0.
+- **The cold-start discovery time** (about 250 ms for 20 plugins against
+  33-50 ms warm) is put down to file-system or antivirus caching; that is an
+  assumption.
+- **The "about 19,300 lines" behind `frame_camera`** (8.4) was computed from
+  sizes at 67cad625.
+- **All efforts are estimates.**
+
+---
+
+## Where the numbers come from
+
+- **Research and fact-checks** (scratch folders, temporary), under
+  `C:/Users/apkun/AppData/Local/Temp/tplug/`:
+  - `seams/`: read-only exports of 67cad625 (`qtm/`) and the trigger branch
+    (`trig/`); `fsizes.py`, `bucket.py` (the `frame_camera` buckets),
+    `secsize.py`, `msizes.py`, `gspec_dump2.py`; `exp/switch.py` (Update
+    from example across example names);
+  - `fc-seams/`: `fsizes.py`, `livefields.py` (the `_Live` fields),
+    `glinks.py`, `gdump.py`, `evkuse.py`; `exp/switch2.py` (the blocked
+    update), `exp/hosts.py` (toolbar and status bar accepting run-time
+    widgets), `exp/gate.py` (the policy gate on a project's plugin folder);
+  - `prior_art/`: `measure_manifests.py`, `bench_guard.py`, `plugs/`;
+  - `fc-prior_art/`: `disc.py` (discovery, warm and cold), `imp_time.py`
+    (import times), `guard.py`, `pyc_tamper.py` (the planted `.pyc`),
+    `reach_main.py` (a plugin reaching the main window),
+    `startup_cost.py` (today's start-up imports), `pluggy_check.py`;
+  - `interface/proto/`: the prototype (`typhon_plugins/`, `plugins/`,
+    `user_plugins/`), its tests (`tests/test_contracts.py`,
+    `test_trigger.py`, `test_basler_emulator.py`) and benchmarks
+    (`bench/bench_hooks.py`, `bench_jitter.py`, `bench_mitigate.py`,
+    `bench_offline.py`, `bench_startup.py`), with their results in
+    `interface/bench_*_1.json`;
+  - `fc-interface/`: `tabw.py` (tab widths), `bench/gil_timer.py`,
+    `bench/gil_qt.py`, `bench/cpu_hang.py`, `pyc/pyc_test.py`,
+    `policy/check_policy.py`, `ro/` (read-only files), `rec/` (record
+    blocks), `settings_race/`, `trig/test_zero_wait.py`,
+    `trig/test_caps.py`, and the test re-runs in `pt_*`;
+  - `writer/` (this doc): `gspec_count.py` and `links.py` (shapes and
+    script links of every example at 393671b8), `sizes.py` (class sizes in
+    `cameras.py` and `camera_settings.py` at 393671b8).
+- **Typhon code** at `qt-migration` 393671b8: `frame_camera.py`,
+  `council_core/cameras.py`, `capture.py`, `camera_settings.py`,
+  `camera_categories.py`, `camera_record.py`, `camera_presets.py`,
+  `camera_setup.py`, `triggered.py`, `reduce.py`, `event_playback.py`,
+  `basler_scan.py`, `designer_examples.py`, `ide_trust.py`;
+  `council_qt/widgets/settings_tabs.py`, `camera_settings_window.py`,
+  `capture_review.py`, `classifier_picker.py`, `camera_wizard.py`,
+  `pop_out.py`, `preset_picker.py`; `council_qt/tabs/capture.py`,
+  `designer.py`; `council_qt/host.py`; `frame_classes.py`, `frame_roi.py`,
+  `frame_timing.py`; `gui_policy.py`, `gui_emit.py`, `gui_emit_qt.py`,
+  `gui_settings.py`, `gui_ports.py`, `gui_shapes.py`, `gui_examples.py`,
+  `gui_runner.py`, `gui_smoke.py`, `run_example_gui.py`;
+  `examples/gui/*.gspec`; `tests/test_retired_tests.py`,
+  `tests/test_typhon.py`, `tests/test_capture_review.py`,
+  `tests/test_barbie_v4.py` and the other Typhon tests named in section 9;
+  `CLAUDE.md`.
+- **Project docs:** `docs/typhon_multicamera_design.md` (sections 1, 2.2-2.10,
+  4.4, 4.12, 5, 6, 9 and 10) and `docs/typhon_velocity_design.md` (sections
+  2.4, 2.5, 3.4-3.10, 4, 8 and 9).
+- **Vendor and project docs** (not re-checkable offline): napari's npe2
+  (manifest reference; `schema.py`, `_command_registry.py`,
+  `_plugin_manager.py`, `_pytest_plugin.py`); QGIS (PyQGIS developer
+  cookbook, `qgspluginregistry.cpp`, `python/utils.py`, plugins.qgis.org
+  security scanning, the user manual's plugins page); Micro-Manager
+  (`MMDevice.h`, the MMDevice README, DemoCamera, hardware-based
+  synchronisation); Spyder (`spyder/api/__init__.py`,
+  `spyder/api/plugins/new_api.py`); Blender's extension manifest; VS Code
+  (the extension host, Workspace Trust); OBS (the front-end API, plugin
+  properties); ImageJ and SciJava plugin indexing; the Language Server
+  Protocol 3.17; scikit-learn's `check_estimator`; pluggy (PyPI and its
+  documentation); Python's documentation (`importlib.metadata`,
+  `sys.addaudithook`, `tomllib`); PyInstaller's hooks; the Python Packaging
+  guide on plugins; Microsoft's `timeBeginPeriod` documentation.
