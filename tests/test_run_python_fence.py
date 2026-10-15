@@ -92,6 +92,11 @@ ESCAPES = [
     ("write", "import pandas as pd\npd.DataFrame([1]).to_csv(r'{canary}')"),
     ("write", "import numpy as np\nnp.save(r'{canary}', np.arange(3))"),
     ("write", "split_csv_by_column('runs.csv', 'pump', r'{out}')"),
+    # writing a file through a plot's savefig (pandas imports matplotlib)
+    ("write", "ax = pd.read_csv('runs.csv').plot()\n"
+              "ax.get_figure().savefig(r'{canary}')"),
+    ("write", "pd.read_csv('runs.csv').plot().get_figure()"
+              ".canvas.print_png(r'{canary}')"),
     # the app's own file at the vault root
     ("routing", "open(r'{vault}/node_routing.json', 'w').write('{{}}')"),
     ("routing", "from pathlib import Path\nPath(r'{vault}')"
@@ -183,21 +188,25 @@ def test_the_model_may_lower_the_time_limit_but_never_raise_it(
     monkeypatch.setattr(child_proc, "run", rec)
     ok, msg, payload = member_tool(box, "intern")(
         {"code": "print(1)", "timeout_s": asked})
-    assert rec.timeouts == [limit]
+    # The CODE budget is `limit` (capped at TIME_LIMIT_S, a model may lower
+    # but never raise it); the child's wall timeout adds a fixed start-up
+    # grace so importing the sandbox is not charged to the code.
+    assert rec.timeouts == [limit + analyst_step.SANDBOX_STARTUP_S]
     assert not ok and payload.get("timed_out")
 
 
 def test_data_query_has_the_same_limit(box, monkeypatch):
     """The analyst's path (run_code: data_query, the analyst before a
     numbers question) is the same fence: a caller cannot raise its limit
-    past TIME_LIMIT_S either."""
+    past TIME_LIMIT_S either (plus the same fixed start-up grace)."""
     from council_core import child_proc
     rec = _Recorder()
     monkeypatch.setattr(child_proc, "run", rec)
     df, log = analyst_step.run_code("result_df = 1", box.data,
                                     timeout=10_000)
     assert df is None and "stopped" in log
-    assert rec.timeouts == [analyst_step.TIME_LIMIT_S]
+    assert rec.timeouts == [analyst_step.TIME_LIMIT_S
+                            + analyst_step.SANDBOX_STARTUP_S]
 
 
 # ============================================================
@@ -269,6 +278,65 @@ def test_nothing_is_written_for_the_code_itself(box):
     assert "path" not in payload
 
 
+def test_a_main_guard_script_runs(box):
+    """`if __name__ == "__main__":` — which a Coder asked to "write a script
+    and check it runs" very often writes — worked on the old unsandboxed
+    run_python; the sandbox now sets __name__ so it keeps working."""
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "def main():\n    print('hello from main')\n\n"
+        "if __name__ == '__main__':\n    main()\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "hello from main" in payload["stdout"]
+
+
+@pytest.mark.parametrize("t", [1, 2, 3])
+def test_a_small_timeout_still_runs_trivial_code(box, t):
+    """The sandbox's own start-up (importing pandas/numpy/scipy) must not be
+    charged to the model's code budget: a small timeout_s used to fail
+    trivial code and blame the code (reproduced 2026-10-15)."""
+    ok, msg, payload = member_tool(box, "coder")(
+        {"code": "print(6 * 7)", "timeout_s": t})
+    assert ok and payload["rc"] == 0, msg
+    assert "42" in payload["stdout"]
+    assert not payload.get("timed_out")
+
+
+@pytest.mark.parametrize("code,plain", [
+    ("import os\nprint(os.getcwd())",
+     "the sandbox does not allow that import"),
+    ("import pandas as pd\npd.DataFrame([1]).to_csv(r'x.csv')",
+     "run_python cannot write files"),
+    ("class Pump:\n    pass\nprint(Pump())",
+     "class definitions are not available in the sandbox"),
+])
+def test_a_refusal_comes_back_in_plain_words(box, code, plain):
+    """A refusal reaches the model and the transcript as one plain sentence
+    before the sandbox's own line (2026-10-15)."""
+    ok, msg, payload = member_tool(box, "coder")({"code": code})
+    assert not ok
+    assert plain in payload["stderr"], payload["stderr"]
+    assert plain in msg
+
+
+def test_run_code_writes_only_the_vault_it_is_given(box, tmp_path,
+                                                    monkeypatch):
+    """analyst_step.run_code(..., vault=V) — the data_query and analyst
+    path — puts the sandbox helpers' output in V's data_out, not the vault
+    the child's environment names (they differ for a turn whose vault is not
+    the process's)."""
+    env_vault = tmp_path / "env_vault"
+    (env_vault / "data_in").mkdir(parents=True)
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(env_vault))
+    df, log = analyst_step.run_code(
+        "result_df = split_csv_by_column('runs.csv', 'pump', 'split')",
+        box.data, vault=box.vault)
+    assert df is not None, log
+    written = sorted(p.name for p in (box.vault / "data_out" / "split")
+                     .glob("*.csv"))
+    assert written == ["runs_A.csv", "runs_B.csv", "runs_C.csv"], log
+    assert not list((env_vault / "data_out").glob("**/*.csv"))
+
+
 def test_the_tool_says_what_it_is():
     params = tool_kit.PARAMS["run_python"]["properties"]
     assert set(params) == {"code", "timeout_s"}
@@ -278,6 +346,7 @@ def test_the_tool_says_what_it_is():
     assert "sandbox" in help_text and "data_in" in help_text
     assert "starts no processes" in help_text
     assert "workspace" not in help_text
+    assert "no charts" in help_text.lower()
 
 
 # ============================================================
@@ -289,16 +358,13 @@ PLANTED = ("from pathlib import Path\n"
            "def test_planted():\n    assert True\n")
 
 
-def test_run_tests_never_runs_a_vault_file_in_the_council(box):
-    """The Intern saves a test file, the Coder runs it: that ran the
-    model's code with full permissions (the audit's probe D)."""
-    (box.vault / "test_planted.py").write_text(
-        PLANTED.format(canary=box.canary), encoding="utf-8")
-    ok, msg, payload = member_tool(box, "coder", "run_tests")(
-        {"path": "test_planted.py"})
-    assert not ok, msg
-    assert "never runs files in the vault" in msg
-    assert not box.canary.exists()
+def test_run_tests_is_not_on_the_council_tab_menu(box):
+    """The Council tab names no code roots, so run_tests could only ever
+    refuse there; it is dropped from the Coder's menu entirely, so an Intern
+    who saved a test file has no Coder tool that could run it."""
+    tools = CouncilActions(vault_dir=box.vault).tools()
+    assert "run_tests" not in tools
+    assert "run_tests" not in tools.for_role("coder")
 
 
 def test_run_tests_refuses_the_vault_even_inside_a_code_root(box, tmp_path):
@@ -310,6 +376,38 @@ def test_run_tests_refuses_the_vault_even_inside_a_code_root(box, tmp_path):
         {"path": str(box.vault / "test_planted.py")})
     assert not ok and "never runs files in the vault" in msg, msg
     assert not box.canary.exists()
+
+
+def test_run_tests_refuses_a_directory_that_contains_the_vault(box, tmp_path):
+    """The target is a code root that CONTAINS the vault (or '.'). pytest
+    would otherwise collect, import and run a model's vault_save'd test files
+    and load a vault-root conftest.py — the full-permission run the fence is
+    there to stop. --ignore drops the whole vault subtree (found 2026-10-15,
+    probe_run_tests_dir.py)."""
+    from council_core import council_tools
+    code = tmp_path / "code"
+    vault = code / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (code / "test_real.py").write_text("def test_real():\n    assert True\n",
+                                       encoding="utf-8")
+    (vault / "test_planted.py").write_text(
+        PLANTED.format(canary=box.canary), encoding="utf-8")
+    # A conftest.py at the vault root is a file vault_save could create.
+    (vault / "conftest.py").write_text(
+        f"from pathlib import Path\n"
+        f"Path(r'{box.canary.parent / 'conftest_ran.txt'}').write_text('x')\n",
+        encoding="utf-8")
+    tools = council_tools.make_tools(None, None, vault, roots=[code])
+    rt = tools.for_role("coder")["run_tests"]
+    for path in (".", str(code)):
+        ok, msg, _p = rt({"path": path})
+        # the project's own test still runs; the vault's does not
+        assert not box.canary.exists(), f"{path}: a vault test ran\n{msg}"
+        assert not (box.canary.parent / "conftest_ran.txt").exists(), \
+            f"{path}: a vault conftest loaded\n{msg}"
+    # and -k cannot reach into the vault either
+    ok, msg, _p = rt({"path": ".", "k": "planted"})
+    assert not box.canary.exists(), msg
 
 
 def test_run_tests_still_runs_a_code_project_s_tests(box, tmp_path):

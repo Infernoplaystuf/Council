@@ -44,6 +44,13 @@ from typing import Any, Callable, Optional
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 TIME_LIMIT_S = 120
+#: Wall-clock grace added to the model's code budget so the sandbox child's
+#: own start-up — importing pandas, numpy, scipy and vault_analyst, ~1–2 s at
+#: idle and more under load — is not counted against it. Without it a model
+#: that asked for a small timeout_s saw trivial code "stopped" and was told
+#: its code ran too long (reproduced 2026-10-15), and time_limit() clamps a
+#: request to at least 1 s, so timeout_s=1 could never succeed.
+SANDBOX_STARTUP_S = 8
 MEMORY_MB = 2048
 MAX_TRIES = 2
 
@@ -103,10 +110,17 @@ def _run_child(code: str, folder: Path, *, timeout: Any,
         if no_data_ok and not folder.is_dir():
             folder = Path(tmp) / "no_data"
             folder.mkdir()
+        # The wall-clock timeout is the model's code budget PLUS a fixed
+        # start-up grace, so importing the sandbox is not charged to the
+        # code. retries=0: model code runs ONCE — child_proc's default
+        # re-runs an "infra" exit (a commit-limit death near the memory cap
+        # counts as one), which would run the model's code, and its data_out
+        # writes, again (up to three times) for one run_python call.
         res = runner([sys.executable, "-m", "council_core.analyst_child",
                       str(code_file), str(folder), str(out_file)],
                      cwd=str(APP_ROOT), env=child_proc.child_env(extra),
-                     timeout=limit, memory_limit_mb=MEMORY_MB)
+                     timeout=limit + SANDBOX_STARTUP_S, retries=0,
+                     memory_limit_mb=MEMORY_MB)
         if getattr(res, "timed_out", False):
             return None, (f"the code ran longer than {limit} s and was "
                           "stopped"), True
@@ -234,7 +248,10 @@ def run(question: str, vault_dir: Path, *,
             feedback = "\n\nYou wrote no code. Reply with one python block."
             continue
         try:
-            df, log = run_code(code, folder, runner=runner)
+            # vault=vault_dir: the sandbox's helpers write into THIS turn's
+            # data_out, not whatever vault the child's environment resolves
+            # (they differ when the turn's vault is not the process's).
+            df, log = run_code(code, folder, runner=runner, vault=vault_dir)
         except Exception as exc:                          # noqa: BLE001
             df, log = None, f"the analysis could not run: {exc}"
         if df is not None:

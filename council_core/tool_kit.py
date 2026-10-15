@@ -826,7 +826,17 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
             if parent in code_roots:
                 break
         argv = [sys.executable, "-m", "pytest", "-q", "-x", "--no-header",
-                "-p", "no:cacheprovider", str(p)]
+                "-p", "no:cacheprovider"]
+        # The target can be a DIRECTORY that CONTAINS the vault (the code
+        # root, or "."). The refusal above only catches a target INSIDE the
+        # vault, so without this pytest would collect, import and run test
+        # files a model saved in the vault, and load a vault-root conftest.py
+        # — the same full-permission run the refusal is there to stop (found
+        # 2026-10-15). --ignore drops the whole vault subtree from
+        # collection, so neither its tests nor its conftest load.
+        if path_contain.is_under(vault_dir, p):
+            argv += ["--ignore", path_contain.resolved(vault_dir)[1]]
+        argv.append(str(p))
         if args.get("k"):
             argv += ["-k", str(args["k"])]
         res = child_proc.run(argv, cwd=str(cwd), timeout=test_timeout,

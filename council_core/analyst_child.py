@@ -20,8 +20,15 @@ run are for the Council's run_python, where printing the answer is enough.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+#: The app root, pinned on sys.path so model code's own imports (and the
+#: sandbox's lazy ones — analyst_helpers, scipy, duckdb …) still resolve
+#: after we chdir away from it.
+_APP_ROOT = Path(__file__).resolve().parent.parent
 
 #: What comes back of a script's own output (the tool message is cut much
 #: shorter; this only bounds the file and the payload).
@@ -35,12 +42,29 @@ def _cut(text: str, n: int = MAX_PRINTED) -> str:
 
 
 def main(argv) -> int:
-    code_file, folder, out_json = argv[1], argv[2], argv[3]
+    # Resolve everything to absolute BEFORE chdir, and pin the app root on
+    # sys.path so imports survive the chdir.
+    code_file = str(Path(argv[1]).resolve())
+    folder = str(Path(argv[2]).resolve())
+    out_json = str(Path(argv[3]).resolve())
+    if str(_APP_ROOT) not in sys.path:
+        sys.path.insert(0, str(_APP_ROOT))
     code = Path(code_file).read_text(encoding="utf-8")
     import vault_analyst
+    # Run from a throwaway folder, never the app's own directory: a relative
+    # write the sandbox does not already refuse (e.g. a filter's output
+    # path) then lands here and is discarded, not in the app's code folder
+    # (reproduced 2026-10-15: a relative savefig wrote into the app root).
     report: dict = {}
-    df, log = vault_analyst.execute_pandas_code(code, [Path(folder)],
-                                                report=report)
+    with tempfile.TemporaryDirectory(prefix="council-analyst-cwd-") as _cwd:
+        os.chdir(_cwd)
+        try:
+            df, log = vault_analyst.execute_pandas_code(code, [Path(folder)],
+                                                        report=report)
+        finally:
+            # Leave the throwaway cwd before it is removed (on Windows a
+            # directory cannot be deleted while it is the cwd).
+            os.chdir(_APP_ROOT)
     out = {"ok": df is not None, "log": str(log or "")[-4000:],
            "table": None, "ran": bool(report.get("ran")),
            "stdout": _cut(report.get("stdout")),

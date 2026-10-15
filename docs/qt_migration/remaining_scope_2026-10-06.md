@@ -491,10 +491,43 @@ an answer. Nothing is written for it (no `<vault>/workspace/scratch.py`) and its
 writes no file of its own, only through the sandbox's helpers into data_out; it reads only data_in;
 it imports only pandas, numpy, scipy, math, re, json, statistics, collections and
 pathlib; it cannot define classes or start processes, and has no network apart from the
-read-only SQL/Mongo helpers on the user's own connections. `run_tests` no longer runs
-vault files (a model's `vault_save` followed by `run_tests` ran its code with full
-permissions). It runs only inside code roots a caller names, and the Council tab names
-none. Tests: `tests/test_run_python_fence.py`.
+read-only SQL/Mongo helpers on the user's own connections. It makes no charts (matplotlib
+is not importable; the Artist's `make_chart` does). The sandbox's helpers write into
+data_out, and `column_stats` / `file_stats` also write the app's stats cache
+(`<vault>/.stats_cache`). `run_tests` no longer runs vault files (a model's `vault_save`
+followed by `run_tests` ran its code with full permissions). It runs only inside code
+roots a caller names, and the Council tab names none. Tests:
+`tests/test_run_python_fence.py`.
+
+Fix pass (2026-10-15, `fix/fence-run-python-fixed`), from the merge's audit of this fence:
+- `run_tests` refused a vault file given as the target, but a DIRECTORY that contains the
+  vault (the code root, or `.`) still let pytest collect, import and run vault test files
+  and load a vault-root `conftest.py`. It now passes `--ignore=<vault>` whenever the vault
+  is under the target, so the whole vault subtree is dropped from collection. The Council
+  tab, which names no roots, no longer carries `run_tests` at all (it could only refuse).
+- The sandbox exposed `vars` and `dir`; a dict subscript on the namespace they return is
+  not seen by the AST validator, so `vars(pd)['_real']` reached the unwrapped pandas and
+  `vars(...)['read_pickle']` ran a pickle (arbitrary code). `vars`/`dir` are removed, and
+  the proxies' private attrs (`_real`, …) are refused on any object, so `pd._real` /
+  `np._real` (the unwrapped modules, reachable as plain attributes) are blocked too.
+- A plot's `savefig` / canvas `print_png`/`print_svg`/`print_pdf` wrote a file anywhere
+  (pandas imports matplotlib internally); those names are now refused, and the sandbox
+  child runs from a throwaway cwd so a stray relative write cannot land in the app folder.
+- `if __name__ == "__main__":` raised `NameError` under the sandbox; `__name__` is set to
+  `"__main__"` so a script with that guard runs.
+- The time limit counted the sandbox child's ~1–2 s start-up, so a small `timeout_s`
+  failed trivial code; a fixed start-up grace (`analyst_step.SANDBOX_STARTUP_S`) is added
+  to the wall timeout on top of the model's code budget, which is still capped at
+  `TIME_LIMIT_S`. Model code runs once (`retries=0`): child_proc's default would re-run an
+  "infra" exit (a commit-limit death near the memory cap) and so re-run the model's code.
+- Common refusals (blocked import, no file writes, no class definitions, the memory cap)
+  reach the model and the transcript as one plain sentence before the sandbox's own line.
+- The 2048 MB memory cap is enforced by a Windows Job Object (the desktop is Windows); off
+  Windows child_proc applies no memory cap, though the time limit and process-group kill
+  still work. A POSIX `RLIMIT_AS` was not added: it also caps the virtual address space
+  numpy/scipy reserve at import and could break every sandbox run, and it cannot be tested
+  on the Windows CI here.
+Tests: `tests/test_run_python_fence.py`, `tests/test_sandbox_escapes.py`.
 
 Open:
 - The Vault switch turns off council-map's passages only; the matches `prepare_turn` puts

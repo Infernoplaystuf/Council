@@ -16,6 +16,7 @@ council_turn.run_turn when its Tools switch is on.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -23,6 +24,36 @@ from council_core.deliberation import ToolFn
 from council_core.tool_kit import (PathError, SharedNotes, ToolSet, _clip,
                                    _readable, make_extra_tools, read_text,
                                    resolve_in, tool)
+
+
+def _plain_run_python_reason(err: str) -> str:
+    """One plain sentence for a common sandbox refusal, so a model (and the
+    transcript) reads words, not the sandbox's own jargon or a traceback.
+    "" when none fits — the sandbox's line is left to speak for itself."""
+    e = str(err or "")
+    low = e.lower()
+    if ("import blocked by sandbox" in low or "forbidden import" in low
+            or ("blocked unsafe pattern" in low and "import" in low)):
+        return ("the sandbox does not allow that import; allowed: pandas, "
+                "numpy, scipy, math, re, json, statistics, collections and "
+                "pathlib")
+    if ("forbidden attribute: savefig" in low or "savefig" in low
+            or "print_figure" in low or "writing is blocked" in low
+            or "writes a file" in low
+            or re.search(r"blocked unsafe pattern.*open", low)
+            or ".to_csv" in low or ".to_excel" in low or ".to_parquet" in low
+            or re.search(r"\bto_(csv|excel|parquet|pickle)\b", low)):
+        return ("run_python cannot write files: print the answer or set "
+                "result_df (only the helpers write, into data_out)")
+    if "__build_class__" in e:
+        return "class definitions are not available in the sandbox"
+    if ("read budget exceeded" in low or "unable to allocate" in low
+            or "memoryerror" in low):
+        return "the sandbox caps memory at 2048 MB"
+    if ("outside the data folders" in low
+            or "file access is blocked" in low):
+        return "the sandbox reads only the data folder (data_in)"
+    return ""
 
 
 def vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Dict[str, Any]:
@@ -133,11 +164,13 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
     tools may look in, and the only places run_tests runs tests."""
     @tool('{"code": "df = pd.read_csv(\'runs.csv\'); print(df.describe())"}'
           " — Python in the analyst's sandbox (a child process, at most "
-          "120 s; timeout_s may lower it): pandas, numpy, scipy, math, re, "
-          "json, statistics, collections and pathlib, reading the data "
-          "folder (data_in) only; print() the answer or set result_df. "
-          "Only the sandbox's helpers write, into data_out; it starts no "
-          "processes")
+          "120 s; timeout_s may lower it, but a value under a few seconds is "
+          "not useful — the sandbox's start-up does not count against it): "
+          "pandas, numpy, scipy, math, re, json, statistics, collections "
+          "and pathlib, reading the data folder (data_in) only; print() the "
+          "answer or set result_df. No charts (matplotlib is not available; "
+          "the Artist makes charts). Only the sandbox's helpers write, into "
+          "data_out (and the app's stats cache); it starts no processes")
     def run_python(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
         """The model's code under the fence data_query and the analyst use
         (analyst_step.run_script: the sandbox in a child process, the time
@@ -160,6 +193,13 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
         rc = 0 if run.ran else 1
         err = "\n".join(t for t in (run.stderr.rstrip(), run.error.rstrip(),
                                     run.note) if t)
+        # One plain sentence before the sandbox's own line, so a refusal
+        # reads as words and not jargon — kept ahead of the original, which
+        # stays for detail.
+        if not run.ran:
+            hint = _plain_run_python_reason(run.error or err)
+            if hint:
+                err = hint + "\n" + err
         payload: Dict[str, Any] = {"rc": rc, "stdout": run.stdout,
                                    "stderr": err}
         # A traceback's last lines say what went wrong: keep its tail.

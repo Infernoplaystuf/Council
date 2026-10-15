@@ -352,6 +352,11 @@ class CouncilActions:
                                              self.vault_dir)
             if not memory_scope.uses_other_sessions(self._scope()):
                 tools.pop("recall_decision", None)
+            # run_tests runs the tests of an OPEN code project; the Council
+            # tab names no code roots, so it only ever refuses. Drop it so
+            # the Coder does not spend a round on a tool that cannot work
+            # here (its help line reads as though a project were open).
+            tools.pop("run_tests", None)
             self._tools = tools
         return self._tools
 
