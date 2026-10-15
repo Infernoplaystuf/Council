@@ -501,6 +501,23 @@ def test_a_camera_scoped_feature_has_an_instance_per_camera(builtins_pkg,
     one.ctx.state()["seen"] = 1
     assert rig.slot("cam1").plugin_state["typhon.cam"] == {"seen": 1}
     assert rig.slot("cam2").plugin_state.get("typhon.cam") is None
+    assert host.instance("typhon.cam", "cam9") is None, "no such camera"
+
+
+def test_opening_another_project_lets_go_of_the_last_ones_plugins(
+        builtins_pkg, plugin_home, tmp_path):
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    host.open_project(first, create=True)
+    old = host.instance("typhon.a")
+    host.open_project(second, create=True)
+    assert old.calls[-1] == "deactivate" and host.loaded() == []
+    new = host.instance("typhon.a")
+    assert new is not old and new.ctx.plugin_id == "typhon.a"
 
 
 @pytest.mark.parametrize("mode, hook", [("init", "loading"),

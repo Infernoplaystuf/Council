@@ -450,7 +450,11 @@ class PluginHost:
         """Use `project_dir`'s plugin list (typhon_plugins.json) and the
         plugin home it records. `create`: a project with no list gets one
         now, copying the base set as it is (question 1). Returns the notes
-        (a recorded home missing, a damaged list); never raises for them."""
+        (a recorded home missing, a damaged list); never raises for them.
+        Plugins loaded for another project are deactivated first: the list
+        decides what runs. Faults stand for the session."""
+        if self._instances:
+            self._deactivate(lambda key: True)
         with self._lock:
             self.project_dir = Path(project_dir)
             self.project = None
@@ -616,6 +620,8 @@ class PluginHost:
                 return None
             rec = self.record(pid)
             m = rec.manifest
+            if camera is not None and self._slot(camera) is None:
+                return None                 # no camera of that name
             key = self._key(m, camera)
             if key in self._instances:
                 return self._instances[key]
@@ -630,6 +636,7 @@ class PluginHost:
                 self._guard(pid, "activate", activate, (ctx,), {}, None)
             if pid in self.faults:
                 self._instances.pop(key, None)
+                self._contexts.pop(key, None)
                 return None
             return made
 
