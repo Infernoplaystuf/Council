@@ -1038,6 +1038,30 @@ def test_three_frames_per_software_trigger(armed_emulator, tmp_path):
         ("2", "3")]
 
 
+def test_stop_in_a_long_burst_on_the_emulator_ends_it_at_once(armed_emulator,
+                                                              tmp_path):
+    """MEASURED before (review, this emulator): Stop in an exact Software
+    burst of 300 took 6.57 s and the run saved 181 frames, ~176 of them
+    exposed after Stop was pressed, the trigger "1 missed". Now Stop ends
+    the burst there, at once, and the trigger says Stop cut it short."""
+    fc, cam = armed_emulator
+    _set(fc, mode="Triggered: exact", source="Software", per=300)
+    out = fc.start(str(tmp_path))
+    session = fc._LIVE.session
+    fc.capture_now()
+    assert _until(lambda: session.stats().grabbed >= 5)
+    began = time.perf_counter()
+    said = fc.stop()["summary"]
+    took = time.perf_counter() - began
+    assert took < 1.0, took
+    run = _run(tmp_path, out["run"])
+    saved = len(run["frames"])
+    assert 5 <= saved < 30, saved
+    assert [r["outcome"] for r in run["triggers"]] == [
+        f"cut short by Stop: {saved} of 300 fired"], run["triggers"]
+    assert "0 missed, 1 cut short by Stop" in said, said
+
+
 def test_the_timer_on_the_emulator_and_ticks_too_fast_for_it(armed_emulator,
                                                              tmp_path):
     fc, cam = armed_emulator
@@ -1063,8 +1087,11 @@ def test_the_timer_on_the_emulator_and_ticks_too_fast_for_it(armed_emulator,
     c = trig.counts
     assert c["missed_busy"] > 0, c
     assert "MISSED" in line, line
+    # A burst Stop came in the middle of is "cut short by Stop" (stopped):
+    # Stop ends it there, rather than waiting for its 20 frames.
+    assert c["stopped"] <= 1, c
     assert c["ok"] + c["missed_busy"] + c["no_frame"] + c["failed_grab"] \
-        == c["triggers"], c
+        + c["stopped"] == c["triggers"], c
     rows = _run(tmp_path / "fast", out["run"])["triggers"]
     assert len(rows) == c["triggers"]
     assert sum(r["outcome"].startswith("missed: camera busy")

@@ -744,6 +744,18 @@ def test_a_hardware_source_typhon_cannot_confirm_is_refused_with_why(
     assert frame_camera._LIVE.previewing and not cam.armed()
 
 
+def test_a_snapshot_start_says_its_source_once(monkeypatch, tmp_path):
+    """Before: "Snapshot: snapshot, Software — ..." (review)."""
+    connect(monkeypatch, FakeBasler())
+    set_up(mode=tg.MODE_SNAPSHOT, source=tg.SOFTWARE, per=2)
+    preview()
+    said = frame_camera.start(str(tmp_path))["summary"]
+    frame_camera.stop()
+    assert "Snapshot (Software, 2 frames per trigger) — the live view runs" \
+        in said, said
+    assert "snapshot, Software" not in said
+
+
 def test_a_snapshot_from_a_hardware_line_is_refused_plainly(monkeypatch,
                                                            tmp_path):
     connect(monkeypatch, FakeBasler())
