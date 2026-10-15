@@ -240,3 +240,110 @@ def test_refusal_points_at_the_contained_helper(box):
     df, msg = run("result_df = pd.DataFrame([Path(DATA_FOLDER + '/notes.txt').read_text()])",
                   data)
     assert df is None and "read_text(path)" in msg
+
+
+# ── Path-rebinding read escape (2026-10-15) ───────────────────────────────
+# Model code runs with the real pathlib.Path in scope. The read containment
+# USED to refuse an outside path only because Path.relative_to RAISED, so
+# rebinding it to a no-op made every outside path pass the check and read any
+# file:
+#     Path.relative_to = lambda self, *a, **k: self
+#     print(read_text(r'<file outside the data folder>'))
+# Two defences close it: (1) the AST validator refuses assigning to or
+# deleting an attribute of a sandbox module/class/proxy; (2) the containment
+# resolves and compares with captured os.path functions, never a Path method
+# model code can rebind. The first set of tests exercises (1); the monkeypatch
+# test exercises (2) in isolation.
+
+_REBINDS = [
+    "Path.relative_to = lambda self, *a, **k: self",
+    "Path.resolve = lambda self, *a, **k: self",
+    "Path.is_absolute = lambda self: False",
+    "type(Path('.')).relative_to = lambda self, *a, **k: self",
+    "import pathlib\npathlib.PurePath.relative_to = lambda self, *a, **k: self",
+    "setattr(Path, 'relative_to', lambda self, *a, **k: self)",
+    "del Path.relative_to",
+]
+
+_READ_SURFACES = [
+    "result_df = pd.DataFrame([read_text(r'{txt}')])",
+    "result_df = pd.DataFrame([open(r'{txt}').read()])",
+    "result_df = pd.read_csv(r'{csv}')",
+    "result_df = summarize_csv(r'{csv}')",
+    "result_df = pd.DataFrame(list_dir(r'{out}'))",
+]
+
+
+@pytest.mark.parametrize("rebind", _REBINDS,
+                         ids=[r.split("=")[0].split("\n")[-1].strip()[:28]
+                              for r in _REBINDS])
+@pytest.mark.parametrize("surface", _READ_SURFACES,
+                         ids=["read_text", "open", "read_csv", "summarize_csv",
+                              "list_dir"])
+def test_rebinding_a_path_method_cannot_read_outside(box, rebind, surface):
+    data, outside = box
+    code = rebind + "\n" + surface.format(
+        txt=outside / "private.txt", csv=outside / "private.csv", out=outside)
+    df, msg = run(code, data)
+    # Refused at the AST validator — nothing read, nothing leaked.
+    assert df is None, code
+    assert "TOP-SECRET" not in msg and "Forbidden" in msg, code
+
+
+def test_containment_holds_even_if_a_path_method_is_rebound(box, monkeypatch):
+    """Defence (2) in isolation: with the Path methods the old check relied on
+    ALREADY rebound in the process (as if a rebind slipped past the AST), the
+    containment still refuses outside reads and still allows inside ones,
+    because it resolves/compares with captured os.path functions."""
+    import pathlib
+    data, outside = box
+    monkeypatch.setattr(pathlib.Path, "relative_to",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "resolve",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "is_absolute",
+                        lambda self: False, raising=False)
+    monkeypatch.setattr(pathlib.PurePath, "relative_to",
+                        lambda self, *a, **k: self, raising=False)
+    for code in (
+        f"result_df = pd.DataFrame([read_text(r'{outside / 'private.txt'}')])",
+        f"result_df = pd.DataFrame([open(r'{outside / 'private.txt'}').read()])",
+        f"result_df = pd.read_csv(r'{outside / 'private.csv'}')",
+        f"result_df = summarize_csv(r'{outside / 'private.csv'}')",
+    ):
+        df, msg = run(code, data)
+        assert refused(df, msg), code
+    # ...while reads inside the data folder keep working.
+    df, msg = run("result_df = pd.read_csv('ok.csv')", data)
+    assert df is not None, msg
+    df, msg = run("result_df = pd.DataFrame([read_text('notes.txt')])", data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    "Path.relative_to = lambda self, *a, **k: self",
+    "Path.resolve = None",
+    "type(Path('.')).relative_to = None",
+    "import pathlib\npathlib.PurePath.relative_to = None",
+    "pd.read_csv = None",
+    "pd.contain = lambda self, v: v",
+    "import numpy as _n\n_n.save = None",
+    "del Path.relative_to",
+    "import json as _j\n_j.loads = None",
+])
+def test_rebinding_a_sandbox_module_class_or_proxy_is_refused(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    "df = pd.read_csv('ok.csv')\ndf.columns = ['x', 'y']\nresult_df = df",
+    "df = pd.read_csv('ok.csv')\ndf.index.name = 'idx'\nresult_df = df.reset_index()",
+    "df = pd.read_csv('ok.csv')\ndf['c'] = df['a'] + df['b']\nresult_df = df",
+    "s = pd.read_csv('ok.csv')['a']\ns.name = 'renamed'\nresult_df = s.reset_index()",
+    "df = pd.read_csv('ok.csv')\ndf.attrs['note'] = 'ok'\nresult_df = df",
+])
+def test_legitimate_attribute_assignments_still_work(box, code):
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg
