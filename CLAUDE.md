@@ -47,4 +47,5 @@ same list.
 - The plugin Typhon on branch `typhon-plugins` (design: `docs/typhon_plugins_design.md`):
   `docs/typhon_plugins_branch.md` says how "Typhon (plugins)" runs beside today's Typhon
   (`run-typhon-plugins.bat`, its side vault), its traps, and the branch gate every commit
-  passes (`python tools/typhon_plugins_gate.py`).
+  passes (`python tools/typhon_plugins_gate.py`). The plugin host and the plugin API as
+  they stand (0.x until P5): `docs/typhon_plugin_api_notes.md`.

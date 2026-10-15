@@ -16,7 +16,7 @@ passes.
 | Started with | your usual launcher | `run-typhon-plugins.bat` in that checkout |
 | Vault | `~\.council\vault` | `~\Typhon-plugins-vault` |
 | App folder | `~\.council` | `~\Typhon-plugins-app` |
-| Plugin home | (none yet) | `~\Typhon-plugins-app\typhon` |
+| Plugin home | (none) | `~\Typhon-plugins-app\typhon`: the base set, and plugins from others in `plugins\` |
 | Classifier library | `~\.council\vault\classifiers`, shared by its apps | `~\Typhon-plugins-vault\classifiers`, its own, empty at first |
 | Example | `typhon` | `typhon_plugins`, titled "Typhon (plugins)" |
 
@@ -37,7 +37,8 @@ other folders.
 3. In its Designer: New from example, `typhon_plugins`, Qt. The project
    (default name `example_typhon_plugins`) lands in the side vault with a
    `classifier_store.json` beside its `app.py` that names the side vault's
-   store.
+   store, and a `typhon_plugins.json` that lists the plugins it runs (the
+   base set as it was when the project was made).
 4. Run it from that Designer, or double-click its `main.py`. Either way it
    runs the plugin checkout's code and uses its own classifier store.
 
@@ -134,12 +135,128 @@ At the branch point (43b317e) the gate was 51 files, 2,676 passed, 0 failed,
 27 skipped (`tests/test_basler_real.py` collects nothing outside the `pylon`
 environment).
 
+After P1 rows 2 and 3 (the plugin host and the timing bench) it was 58
+files, 2,922 passed, 0 failed, 27 skipped, at 4 at a time, with no rerun.
+At `--jobs 6` it was not clean. Two timing tests in
+`tests/test_gui_settings.py` failed, and failed again on the rerun:
+
+- the known-flaky one;
+- `test_the_list_is_quick_and_a_second_look_is_quicker`, whose cold
+  Python Scripts list took 3.4 s against its 3.0 s limit.
+
+The plugin host's modules are 5 more files on Typhon's Python Scripts list
+(36 to 41). That makes a cold list about 10-20 % slower: 0.96-1.0 s against
+0.77-0.92 s on a quiet PC. Both tests passed when run alone, and so did the
+whole file at 4 jobs. On 15 October 2026 the known-flaky test also failed
+when run alone on an untouched copy of the P1 row 1 commit (710c87f), with
+a ratio of 1.84 against the 2.0 it checks for. So it is this PC on that day,
+not the plugin host.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
 `tests/test_basler_trigger.py::test_an_exact_run_from_line1_saves_one_frame_per_edge_and_counts_the_rest`,
 which reads the trigger line as soon as the third frame is grabbed, before
 it may have been counted ("3 triggers · 2 ok").
+
+## The plugin host (stage P1 row 2)
+
+The rig is the plugin host: `frame_camera._RIG.plugins`, made on first use.
+What it does, the API it offers plugins (0.1) and what each later stage
+adds are in `docs/typhon_plugin_api_notes.md`. For running the two Typhons
+side by side, three things matter:
+
+- **Nothing is wired yet.** Today's camera code never calls the host, so
+  "Typhon (plugins)" still behaves exactly like today's Typhon. A test runs
+  a whole capture and finds the host never made or imported.
+- **A new "Typhon (plugins)" project gets `typhon_plugins.json`** beside its
+  `app.py`. The file holds the app-wide base set copied as it is when the
+  project is made (question 1), and the plugin home it was made with,
+  written home-relative (`~/Typhon-plugins-app/typhon`). The Designer and
+  `run_example_gui.py` refuse to build it when the plugin home would be
+  under `~\.council`, which happens when `TYPHON_PLUGIN_HOME` is unset. The
+  launcher sets it.
+- **Plugins from someone else** go in `~\Typhon-plugins-app\typhon\plugins\`,
+  one folder each (question 7). They are listed as "needs approval" and do
+  not run until stage P5.
+
+## Frame timing with a slow plugin (stage P1 row 3)
+
+The design (10.2) asked for the cost of a live plugin to be measured
+**inside the real Qt Typhon** before deciding whether the core should set
+a finer timer while it records (stage P3 row 5). It was measured on 15
+October 2026 with `tools/typhon_plugins_timing.py`.
+
+**How the runs were made.** Each run was its own process. The "Typhon
+(plugins)" app was built for Qt, and its window was made offscreen and
+never shown, with its live view, slider and capture code running as usual.
+The simulated frame camera ran at 150 fps on a fixed sensor clock: frame i
+was due at t0 + i/150 s, and a grab thread that fell behind got the waiting
+frames at once, as from a camera's buffer. Each run was a 4 s capture
+through the app's own Start and Stop, saving PNGs. The plugin was on the
+rig's host and was fed every live frame on its own thread through a
+`LiveFeed`. It was busy for the given time per frame in pure Python, so it
+held Python's lock. There were 3 runs per row. The laptop was an HP OMEN 16
+(i7-14700HX, 32 GB) with Python 3.11.14 and PySide6 6.10.2, running its
+usual background programs (CPU about 36 % busy). "Late" means a frame
+reached the end of the grab thread's step more than one frame period
+(6.7 ms) after it was due. All figures are measured with simulated cameras.
+
+| Settings | Plugin per frame | Late frames | More than 2 periods late | Median lateness | p99 lateness | Frames read in the 4 s |
+|---|---|---|---|---|---|---|
+| today's (switch interval 5 ms, timer not asked for) | none | 0 of 599-601 | 0 | 0.9-1.0 ms | 2.6-4.4 ms | 601-604 |
+| today's | an empty `on_frame` | 0-3 of 599-602 | 0 | 1.0-1.1 ms | 3.2-5.0 ms | 600-606 |
+| today's | 5 ms | **512-544** of 585-596 | 482-501 | 38-45 ms | 76-108 ms | 586-597 |
+| today's | 20 ms | **all** of 213-232 | 212-229 | 1.1-1.2 s | 2.4-2.6 s | **215-233 of 600** |
+| today's | 20 ms, capped at 25 % | 103-106 of 599-601 | 45-48 | 1.1-1.3 ms | 17 ms | 600-606 |
+| switch interval 1 ms only | 5 ms | 452-595 of 595-599 | 265-592 | 13-72 ms | 32-100 ms | 598-602 |
+| switch interval 1 ms only | 20 ms | 206-221 of 226-315 | 172-214 | 0.37-1.1 s | 1.9-2.5 s | 227-324 of 600 |
+| switch interval 1 ms only | 20 ms, capped | 90-116 of 596-602 | 41-54 | 1.2-1.7 ms | 17-19 ms | 599-604 |
+| timer 1 ms only | 5 ms | 451-575 of 600 | 225-454 | 11-20 ms | 28-41 ms | 602-604 |
+| timer 1 ms only | 20 ms | 346-436 of 349-437 | 344-436 | 0.62-0.70 s | 1.1-1.7 s | 350-438 of 600 |
+| timer 1 ms only | 20 ms, capped | 80-95 of 600-603 | 22-31 | 1.2-1.3 ms | 16-17 ms | 602-604 |
+| **both at 1 ms** | none | 0-1 of 599-600 | 0 | 0.9-1.0 ms | 2.5-2.9 ms | 601-603 |
+| **both at 1 ms** | an empty `on_frame` | 0-4 of 600-602 | 0-1 | 1.0-1.1 ms | 3.0-4.4 ms | 602-603 |
+| **both at 1 ms** | 5 ms | **0-2** of 600 | 0 | 1.7-1.9 ms | 4.5-5.4 ms | 601-602 |
+| **both at 1 ms** | 20 ms | 147-223 of 599-601 | 32-85 | 4.5-5.1 ms | 29-138 ms | 600-603 |
+| **both at 1 ms** | 20 ms, capped at 25 % | **17-23** of 599-603 | 0-1 | 1.1-1.2 ms | 8-10 ms | 601-605 |
+
+In the table, "timer 1 ms" means `timeBeginPeriod(1)`, together with the
+Windows 11 request to honour it with no visible window.
+
+**What it says.**
+
+- **Inside the real Typhon, a live plugin hurts far more than the design's
+  benchmark process showed.** That benchmark found a 5 ms plugin harmless
+  (0-2 late), but here a 5 ms plugin, busy 75 % of the time at 150 fps,
+  made 86-92 % of the frames late. A 20 ms plugin, which is always busy,
+  starved the grab thread so badly that it read only 215-233 of the 600
+  frames due in the 4 s, up to 2.6 s behind. On a real camera with a buffer
+  of a few frames, the rest would have been lost. With no plugin, or with
+  an empty one, the numbers are those of today's Typhon (0-4 late), so the
+  host and the feed cost nothing visible.
+- **P3 row 5 is warranted, and it must set both.** A 1 ms switch interval
+  together with a 1 ms process timer took the 5 ms plugin from 86-92 % late
+  to 0-2 frames. Either one alone did not: 75-99 % were still late. This
+  agrees with the design's research, which set both.
+- **It is not enough by itself for a plugin that is always busy.** At
+  20 ms a frame, 25-37 % of the frames were still late (p99 29-138 ms).
+  With the 25 % duty cap as well, 3-4 % were late, with p99 under 10 ms.
+  So the cap should be on by default for live plugins (design 10.2,
+  second line), and heavy work stays off the live path. Classification
+  after Stop is the default (question 5).
+- **What this PC could not show.** Other programs on this laptop already
+  hold Windows' timer at 1 ms (`NtQueryTimerResolution` said 1.0 ms in
+  every run), and a 1 ms wait took about 1.0-1.9 ms even with "today's"
+  settings. On a PC where nothing asks for a finer timer, today's settings
+  may be worse than shown here. That needs checking on the bench PC.
+
+To measure again (about 4 minutes), with `--timers default,1ms,switch,period`
+for the full table:
+
+```
+python tools\typhon_plugins_timing.py --out timing.json
+```
 
 ## Progress
 
@@ -148,4 +265,6 @@ it may have been counted ("3 triggers · 2 ok").
 | P0 row 1: branch, stable checkout, side vault and plugin home, pinned classifier store, gate | done |
 | P0 row 2: Update from example writes nothing until it can finish | a bug fix for `qt-migration`, merged in when it lands |
 | P1 row 1: `Rig`, `CameraSlot`, `_LIVE` as a view | first step: `council_core/camera_rig.py`; `frame_camera._LIVE` is a view over the rig (per-connection fields on the active slot, app fields on the rig); functions still lock with the module's `_LOCK` and act on the active slot |
+| P1 row 2: the plugin host on the rig | done (`docs/typhon_plugin_api_notes.md`): manifest reader, built-in list and registry, third-party folders listed (loaded from P5), lazy loading, guarded calls and the three fault endings, the watchdog, contexts, events, the UI queue, live feeds, the base set and project lists (Q1, Q14), `TYPHON_PLUGIN_HOME`, `typhon_plugin_api` 0.1; seven empty built-in adapters; nothing wired to a feature |
+| P1 row 3: frame timing inside the real Qt Typhon | done (above): P3 row 5 is warranted (both the switch interval and the timer), plus a duty cap on by default |
 | P1 row 4: `typhon_plugins.gspec` registered | done: typhon's wireframe under the new name |
