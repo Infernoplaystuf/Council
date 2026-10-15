@@ -8,7 +8,13 @@ This doc lives on branch `docs/typhon-plugins` (revised after a design
 review on `docs/typhon-plugins-revised`), which starts at
 `qt-migration` 393671b8 ("Merge typhon/trigger-downsample-fixed2", 15
 October 2026, 09:35). **Every Typhon file and line reference below is to
-393671b8**, so they resolve on the branch the doc lives on.
+393671b8**, so they resolve on the branch the doc lives on. Your answers to
+questions 1, 2, 6, 7 and 13 (15 October 2026) were folded in on branch
+`docs/typhon-plugins-answers`, which starts at `qt-migration` 43b317e8, and
+the points a review of that change found were fixed on
+`docs/typhon-plugins-answers-fixed`. No file this doc cites changed between
+393671b8 and 43b317e8 (measured, `git diff`), so every reference resolves
+there too.
 
 **What you asked for (15 October 2026, your words):** "Now here is the last
 sort of restructuring I am thinking of for typhon. We switch to a plugin kind
@@ -26,7 +32,12 @@ section 1. In short: Barbie is left behind; plugins may later be written by
 other people; plugins are app-wide (the base every new project starts with)
 and per project (added over time); classification becomes a pop-out panel;
 and the work merges with multi-camera stage M1 on its own branch, so the
-Typhon you use today keeps working while it is built.
+Typhon you use today keeps working while it is built. Your later answers
+to five of section 13's questions are quoted there too: a plugin added to
+the base set reaches only projects made afterwards; Downsample, presets,
+run records and the crop box stay in the core; today's Typhon takes bug
+fixes only, and new features are built as plugins; and a plugin arrives as
+its own folder that you drag into the app's plugins folder, approved once.
 
 **Read this first.** No physical camera was used. The plugin interface was
 tried as a throwaway prototype outside the repo, wrapping Typhon's real
@@ -88,8 +99,9 @@ Four plain truths up front:
    Typhon's full rights.** Python cannot fence code inside its own process
    (vendor/project docs), and the Council's own policy gate says it is "a gate
    against generated code going wrong, not a sandbox" (`gui_policy.py:24-39`).
-   Trust therefore rests on you approving a plugin, pinned to the exact bytes
-   of its files. Section 4.6 says plainly what an approved plugin can do.
+   Trust therefore rests on you approving a plugin, once per plugin (your
+   answer to question 7): a later version or an edited file is not asked
+   about again. Section 4.6 says plainly what an approved plugin can do.
 3. **A plugin on its own thread is not isolated from the camera's grab
    thread.** A plugin holding Python's lock for 20 ms per call made 313-340
    of about 575 frames of a 150 fps camera arrive late (measured, synthetic).
@@ -105,10 +117,10 @@ Four plain truths up front:
 
 ## Terms used here
 
-- **Core**: the part of Typhon every project always has: the window, live view, Start and Stop, run folders and records, presets, the settings host, the slider, data-safety rules and the plugin host.
+- **Core**: the part of Typhon every project always has: the window, live view, Start and Stop, run folders and records, presets, the settings host, the slider, the crop box, Downsample, the set-up wizard's shell, data-safety rules and the plugin host (2.1; Downsample, presets, run records and the crop box by your answer to questions 2 and 13).
 - **Plugin**: a folder of Python files plus a manifest that adds one thing to Typhon (a camera family, triggering, classification), attached only at fixed places.
 - **Built-in plugin**: a plugin on the list of built-ins that ships with the Council code and is tested with it (Basler, Prophesee, Simulated, Triggering, Classification, Timing scan, Cropped export), trusted like core code. A plugin is built-in because it is on that list, never because of the folder it sits in: a test checks the list against the folders, and any other folder found among the built-ins is refused, not loaded (4.1, 4.5).
-- **Third-party plugin**: a plugin written by someone else and copied onto the PC by you; it runs only after you approve it.
+- **Third-party plugin**: a plugin written by someone else, which you drag, as its own folder, into Typhon's plugins folder; it runs only after you approve it, once (4.6).
 - **Plugin host**: the core object that reads manifests, loads plugins, calls them safely and gives them their context; in this design it is the multi-camera `Rig`.
 - **Manifest**: `plugin.json` in a plugin's folder: its id, version, the plugin API version it needs, its kind, what it provides and needs, and where it attaches. Typhon reads it without running any plugin code.
 - **Plugin API**: the one Typhon module a plugin may import (`typhon_plugin_api`), with a version number of its own: 0.x on the branch while the built-ins shape it, frozen as 1.0 at stage P5 (3.2).
@@ -128,13 +140,13 @@ Four plain truths up front:
 - **Recording path**: the record gate, the frame stage and per-frame tags; the only plugin calls whose fault ends a recording (3.10). Start-time and end-of-run hooks are not on it.
 - **Namespace**: a prefix that keeps one plugin's keys and files apart from everyone else's, for example `acme.thermal/gain` for a third-party plugin. Built-in plugins keep the keys and names that already exist or that their own designs fixed (3.9).
 - **Sidecar file**: a file a plugin writes beside a run's files, never over anything. A built-in plugin keeps the name its design fixed (`<run>_capture_triggers.csv`, `<run>_calibration.json`, `<run>_tracks.csv`); a third-party plugin's are named `<run>_<short>_<what>` (3.9).
-- **App-wide base set**: the plugins every Typhon project on this PC follows, with each plugin's default settings; the level you work at (4.2).
-- **Project additions**: plugins one project adds on top of the base set; with its switch-offs and setting overrides, all a project keeps of its own.
+- **App-wide base set**: the plugins every new Typhon project on this PC starts with, with each plugin's default settings; the level you work at (4.2). Its plugin list is copied into a project when the project is made, so a plugin added to it later reaches only projects made afterwards; its default settings are still read by every project (4.2, question 14).
+- **A project's plugin list**: copied from the base set's list once, when the plugin Typhon first opens the project: for a new project, its first run straight after Generate, which is what "made" means here for a plugin list (4.2). Changed after that only by you, in that project; with its setting overrides, all a project keeps of its own (4.2).
 - **Plugin home**: the app-wide folder holding the base set, approvals and third-party plugins: `~/.council/typhon/`, or the folder the `TYPHON_PLUGIN_HOME` variable names (tests, the plugin checkout's side vault; 4.1).
-- **Approved plugins folder**: the one folder on the PC where third-party plugins live after you copy them in (proposed: `~/.council/typhon/plugins/`).
-- **Approval**: your decision to let a third-party plugin run, recorded with a fingerprint of every file in it.
+- **Plugins folder** (the approved plugins folder): the app's one folder on the PC where third-party plugins live, each in its own folder that you drag in: the plugin home's `plugins/` (proposed: `~/.council/typhon/plugins/`; while the branch lives, the plugin checkout's side vault has its own, 7.1).
+- **Approval**: your decision to let a third-party plugin run, made once per plugin (by its id) and kept in the plugin home's `approvals.json`. There is one plugin home in use at a time, and the switch-over carries the side vault's approvals across to `~/.council/typhon/` (7.4), so a plugin is approved once on the PC. A later version or an edited file is not asked about again, and the approval outlives the plugin's folder (4.6). It keeps a fingerprint of every file as it was when you approved, for information only.
 - **sha256**: a fingerprint of a file's bytes; any change to the content gives a different value.
-- **Lazy loading**: importing a plugin's code only when one of its features is first used, not at start-up.
+- **Lazy loading**: importing a plugin's code only when one of its features is first used, not at start-up. A third-party plugin's files are still read and hashed at start-up, and what is imported later is those bytes (4.5).
 - **Guard**: the wrapper around every call into a plugin, which catches its errors so Typhon carries on.
 - **Faulted**: a plugin that raised an error and is switched off for the rest of the session.
 - **Watchdog**: a check that notices a plugin call that has run too long.
@@ -189,10 +201,11 @@ Four plain truths up front:
   kind of their own, so a future trigger box or serial input is a small
   plugin that offers one more source.
 - **Timing scan and Cropped export** become two small plugins.
-- **A Plugins window** (Settings → Plugins…): the app-wide base set, this
-  project's additions, each plugin's version and state (on, off, needs
-  approval, switched off after an error), and the approval of a third-party
-  plugin you have copied into the plugins folder.
+- **A Plugins window** (Settings → Plugins…): the app-wide base set (what
+  new projects start with), this project's own list, each plugin's version
+  and state (on, off, needs approval, switched off after an error), and the
+  one-time approval of a third-party plugin whose folder you have dragged
+  into the plugins folder.
 - **Multi-camera M1 arrives in the same branch:** 2-4 cameras in one window,
   small live tiles, settings that follow the active camera, one Start and
   one Stop (multi-camera design, section 1 and stage M1).
@@ -239,7 +252,7 @@ Four plain truths up front:
 
   Those pairs are tested together (section 9.4).
 
-### Your answers (15 October 2026, your words)
+### Your answers to the follow-up questions (15 October 2026, your words)
 
 > "Barbie gets left behind and no longer developed. 1: Plugins could be
 > written by others in the future. 2: both typhon project and app wide.
@@ -259,15 +272,15 @@ What the design does with each:
   not fixed (8.2).
 - **1, plugins by others:** one versioned plugin API (frozen as 1.0 once
   the built-ins have used every attachment point), a data-only manifest,
-  approval by you pinned to every file's sha256, contract suites an author
-  can run, a written guide for authors (3.11), and nothing ever downloaded
-  or installed by Typhon (sections 3 and 4).
+  approval by you once per plugin (your answer to question 7, below),
+  contract suites an author can run, a written guide for authors (3.11),
+  and nothing ever downloaded or installed by Typhon (sections 3 and 4).
 - **2, app-wide and per project:** the app-wide level is the base you work
   at: a base set of plugins, with each plugin's default settings, that every
-  project follows. A project adds plugins over time, may switch a base-set
-  plugin off for itself, and may override a setting (section 4.2). A plugin
-  you add to the base set turns on in every project that has not switched
-  it off (question 1 confirms this).
+  new project starts with. A project adds plugins over time, may remove one
+  for itself, and may override a setting (section 4.2). A plugin you add to
+  the base set later reaches only projects made afterwards (your answer to
+  question 1, below).
 - **3, pop-out panel:** plugins add only buttons to the toolbar strip and
   short texts to the status strip; every other control is in a pop-out
   window Typhon owns (section 3.7).
@@ -276,6 +289,51 @@ What the design does with each:
   separately named example, "Typhon (plugins)", run beside today's Typhon;
   `qt-migration`'s fixes are merged into the branch every week; a switch-over
   with migration when you are ready (sections 5 and 7).
+
+### Your answers to section 13 (15 October 2026, your words)
+
+> "Q6: Bug fixes only new features as plugins. Q2/13: Yes they stay in
+> core Q1: Only new projects Q7: Plugins will be their own folders dragged
+> into the plugins folder for the app. Approval only happens once for each
+> plugin"
+
+What the design does with each:
+
+- **Q1, new projects only:** a new project's plugin list is copied from
+  the base set when the project is made (its first run, 4.2). A plugin you
+  add to the base set later reaches only projects made afterwards; an
+  existing project keeps its own list until you add the plugin there, in
+  that project's Plugins window (section 4.2). Whether the base set's
+  default settings should also reach only new projects is left to
+  question 14.
+- **Q2 and Q13, the core:** Downsample, presets, run records and the crop
+  box stay in the core; the camera families (Basler, Prophesee,
+  Simulated), triggering, classification, the timing scan and cropped
+  export become plugins (section 2). Downsample stays the core's one frame
+  stage, with its control in the settings notebook (2.1).
+- **Q6, today's Typhon:** today's Typhon on `qt-migration` takes bug fixes
+  only while the branch lives, and every new Typhon feature is built as a
+  plugin on the branch: velocity, calibration, alignment and the trigger
+  cable (M2) included (sections 7.2 and 11). So a new feature waits until
+  the branch has the attachment points it needs: about 33-51 days of
+  branch work for one that hooks into runs or analyses recordings, such as
+  velocity's analysis, and about 45.5-69 for one with its own window
+  (computed from the stage estimates; 7.3). The question's second part,
+  from when it may take no fixes at all, was not answered and stays open
+  (question 6).
+- **Q7, plugins from others:** each plugin is its own folder, which you
+  drag into the app's one plugins folder, `~/.council/typhon/plugins/`
+  (4.1; "the plugins folder for the app" is read as that one folder, not
+  one inside each project, and question 7 asks you to confirm the
+  reading). While the branch lives, "Typhon (plugins)" uses its side
+  vault's plugins folder instead, and the switch-over carries its plugins
+  and approvals across (7.4). You approve each plugin once; a later
+  version dragged in over it, or an edited file, runs without being asked
+  about again, and the approval outlives the plugin's folder. That is the
+  trade-off, and section 4.6 states it in full. Two suggestions are left
+  open, not decided: whether the Plugins window should still show
+  "changed since you approved it", as information that never blocks, and
+  whether it should have a "Withdraw approval" button (4.6; question 7).
 
 ### The honest limits
 
@@ -286,7 +344,9 @@ What the design does with each:
   the Council side, and the risky-pattern scan you see before approving
   one is a regex speed bump. A plugin handed only its own panel disabled
   the main window's Start button in a test (measured). Approval is the
-  protection (section 4.6).
+  protection, and it is given once per plugin, so a later version or an
+  edited file runs without you looking at it again, and removing a
+  plugin's folder does not take its approval back (section 4.6).
 - **Live work competes with the camera.** A slow plugin delays frames even
   on its own thread (measured, section 10.2). Live classification of every
   640 x 480 frame took 17-49 ms per frame and made 95-205 of about 575
@@ -314,7 +374,11 @@ What the design does with each:
 ### 2.1 What stays in the core
 
 The core is what every Typhon project needs whatever its cameras and
-features, plus the rules that keep recorded data safe. Sizes are lines of
+features, plus the rules that keep recorded data safe. **Decided** (your
+answer to questions 2 and 13, "Yes they stay in core"): Downsample,
+presets, run records and the crop box stay in the core, with the rest of
+the table below; the camera families, triggering, classification, the
+timing scan and cropped export become plugins (2.3). Sizes are lines of
 code (measured with `wc -l` and Python's `ast` at 393671b8, or at 67cad625
 where marked).
 
@@ -328,10 +392,10 @@ where marked).
 | Slider and live view | `capture_review.py` (1,033, less the raw view), `council_core/live_display.py` (153), `pop_out.py` (126) | About 1,100 | Every recording is reviewed the same way |
 | Crop box | the `roi` port and `frame_roi.parse_roi`, which the core's area parser uses (`frame_camera.py:3112-3113`) | Small | The box is drawn on the live view and the slider; only the export moves out |
 | Set-up wizard shell | the generic parts of `council_core/camera_setup.py` (`setup_path` 365, `load_choice` 369, `save_choice` 386) and the wizard's pages (`camera_wizard.py`) | 403 + 481, less each brand's guide, checks and scan page | Each camera plugin brings its own guide and checks into it |
-| Downsample (recommended; question 2) | `council_core/reduce.py` (165) and its calls on the writer threads and display (`capture.py:571-573`) | 165 plus the calls | It changes what is saved and the picture size every feature sees (`reduce.py:1-20`); the camera half (binning) is a camera facet. The slot holds the factor and method, and the core adds the Downsample row to every frame camera's "Capture" group (2.5). Every plugin's coordinates convert through it (3.12) |
+| Downsample (decided: your answer to question 2) | `council_core/reduce.py` (165) and its calls on the writer threads and display (`capture.py:571-573`) | 165 plus the calls | It changes what is saved and the picture size every feature sees (`reduce.py:1-20`); the camera half (binning) is a camera facet. The slot holds the factor and method, and the core adds the Downsample row to every frame camera's "Capture" group (2.5). Every plugin's coordinates convert through it (3.12) |
 | Plugin host | new | 200-400 lines plus tests (estimate) | Reads manifests, loads, guards and calls plugins |
 
-**Recommendation on Downsample.** The interface research and its fact-check
+**Decided: Downsample in core.** The interface research and its fact-check
 both found that Downsample is half camera (Basler binning, done in the
 camera) and half a change to the picture before it is saved and shown (done
 by Typhon on the writer threads and the display's thread pool,
@@ -342,8 +406,8 @@ feature must know the factor. The camera half becomes a `Binning` facet of
 the Basler plugin. Its control leaves the main window for the settings
 notebook, where the "Capture" group already shows it
 (`camera_categories.py:41-45`); on the branch the core, not the camera
-plugin, describes that row (2.5). Not settled between the reports;
-question 2.
+plugin, describes that row (2.5). The reports did not settle it; you did,
+on 15 October 2026: "Q2/13: Yes they stay in core" (question 2).
 
 ### 2.2 The plugin kinds
 
@@ -360,6 +424,9 @@ UI is not a kind: any plugin may contribute a pop-out panel, toolbar
 button or status segment (section 3.7).
 
 ### 2.3 The built-in plugins, and the code each takes over
+
+These seven are the split you agreed to (question 13): the three camera
+families, triggering, classification, the timing scan and cropped export.
 
 **While the branch lives, this code stays where it is.** Each built-in
 plugin is an adapter: a folder with its manifest and a thin layer that
@@ -547,8 +614,10 @@ out features and refuse an incompatible plugin before anything runs.
 }
 ```
 
-- **Fields:** `schema` (the manifest's own format), `id` (reverse-domain;
-  `typhon.` is reserved for built-ins), `short` (used in a third-party
+- **Fields:** `schema` (the manifest's own format), `id` (reverse-domain:
+  lower-case letters and digits in dot-separated parts, no underscore, so
+  no two ids give one package name, 4.5; `typhon.` is reserved for
+  built-ins), `short` (used in a third-party
   plugin's file names; unique, and the built-ins' short names are
   reserved, 3.9), `version`, `api` (the plugin API it needs),
   `kind` (`camera`, `source` or `feature`), `scope` (`camera` or `rig`),
@@ -890,8 +959,8 @@ class TriggerSource(Protocol):
     its id, so a sidecar of an old run is never put down to a later plugin
     that took the same short name. Every suffix is registered, so the run
     name counts as taken.
-- **Project file** `<project>/typhon_plugins.json`: the project's additions,
-  switch-offs and setting overrides (4.2), written whole then renamed,
+- **Project file** `<project>/typhon_plugins.json`: the project's own
+  plugin list and setting overrides (4.2), written whole then renamed,
   under an OS lock and a temporary name unique to each writer. Two threads
   sharing one temporary name lost a block and failed 47 of 80 saves
   (measured); `camera_presets` already learned this lesson.
@@ -939,20 +1008,22 @@ class TriggerSource(Protocol):
 This is the outline of the author's guide that ships with API 1.0 at stage
 P5 (row 2). Everything in it is a design choice unless labelled.
 
-**The folder.** One folder per plugin, named after its id with dots turned
-into underscores (`acme_thermal/`), holding `plugin.json`, the Python
-package the `entry` names (`plugin.py` or a subfolder with `__init__.py`),
-optional data files, and optional `tests/`. No `__pycache__`, `.pyc`,
-`.pyd` or `.dll` files (4.5). A third-party plugin lives in
-`<plugin home>/plugins/<folder>/`, normally
-`~/.council/typhon/plugins/acme_thermal/` (4.1).
+**The folder.** One folder per plugin, normally named after its id with
+dots turned into underscores (`acme_thermal/`), holding `plugin.json`, the
+Python package the `entry` names (`plugin.py` or a subfolder with
+`__init__.py`), optional data files, and optional `tests/`. No
+`__pycache__`, `.pyc`, `.pyd` or `.dll` files (4.5). The folder is what
+the user drags into Typhon's plugins folder, `<plugin home>/plugins/`,
+normally giving `~/.council/typhon/plugins/acme_thermal/` (4.1); Typhon
+takes the plugin's package name from the manifest's `id`, not from the
+folder's name, so a folder dragged in under another name still loads.
 
 **The manifest, in full.**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `schema` | int | yes | 1 |
-| `id` | str | yes | reverse-domain, lower case, dots; `typhon.` is reserved for built-ins |
+| `id` | str | yes | reverse-domain: dot-separated parts of lower-case letters and digits, each part starting with a letter; no underscore or hyphen, so turning the dots into underscores gives each id a package name of its own (4.5); `typhon.` is reserved for built-ins |
 | `short` | str | yes | 2-12 lower-case letters or digits; unique; built-ins' reserved |
 | `name` | str | yes | shown on screen |
 | `version` | str | yes | `major.minor.patch` |
@@ -1067,12 +1138,15 @@ plugin's kind's contract suite and its own `tests/` against the fake host
 and `TYPHON_PLUGIN_HOME` and `COUNCIL_VAULT_ROOT` pointing at temporary
 folders.
 
-**Updating a plugin.** A new version is a new folder or changed files, so it
-asks for approval again, once for the whole PC (4.6, 4.7). Projects need
-nothing: a project names a third-party plugin by id, and each run records
-the version and sha256 that ran (4.2). One version of a plugin is
-installed at a time; going back to an older one means copying its folder
-back, which needs no new approval if that version was approved before.
+**Updating a plugin.** A new version is a new folder dragged in over the
+old one, or changed files. It is **not** approved again: the user approves
+each plugin once (4.6, 4.7), so an update runs at the next start without
+a question (the files are read at start-up, 4.5). Projects need nothing: a
+project names a third-party plugin by id, and each run records the version
+and sha256 that ran (4.2). One version of a plugin is installed at a time,
+and two folders whose ids give the same package name, the same id
+included, are both refused until one is taken out (4.1); going back to an
+older version means dragging its folder back.
 
 ### 3.12 Coordinates for plugins
 
@@ -1112,15 +1186,36 @@ area's origin (`reduce.py:156-165`, `sensor_position`;
 | What | Where | Why there |
 |---|---|---|
 | Built-in plugins | in the Council checkout, `typhon_plugins/<name>/`, each with its `plugin.json`, and named in the built-in list shipped with the code | They are reviewed and tested with the Council, and updated with it. A folder there that is not on the list is refused, so a copied-in plugin cannot skip approval |
-| Third-party plugins | `<plugin home>/plugins/<folder>/`, copied in by you; loaded as the package `typhon_thirdparty.<folder>` (the id with dots turned into underscores, for example `typhon_thirdparty.acme_thermal`) | One folder you can see; Typhon never downloads or installs anything. A separate package root never collides with the built-in `typhon_plugins` package |
-| The app-wide base set | `<plugin home>/base_set.json`: the list of plugins and each plugin's default settings | Read by every Typhon project on this PC; the level you work at |
-| Approvals | `<plugin home>/approvals.json` | Once per plugin version, for the whole PC |
-| A project's own choices | `<project>/typhon_plugins.json`: plugins `added`, base-set plugins switched `off`, and setting overrides | Travels with the project; names plugins, never holds code |
+| Third-party plugins | `<plugin home>/plugins/<folder>/`: each plugin its own folder, which you drag in (your answer to question 7); loaded as the package `typhon_thirdparty.<name>`, where `<name>` is the manifest's id with dots turned into underscores (for example `typhon_thirdparty.acme_thermal`), whatever the folder is called | One folder you can see; Typhon never downloads, unpacks or installs anything. A separate package root never collides with the built-in `typhon_plugins` package |
+| The app-wide base set | `<plugin home>/base_set.json`: the list of plugins and each plugin's default settings | Its list is what every new Typhon project on this PC starts with (your answer to question 1; 4.2); its default settings are read by every project (question 14); the level you work at |
+| Approvals | `<plugin home>/approvals.json` | Once per plugin (your answer to question 7): one entry per plugin id, holding the version and every file's sha256 as they were when you approved, kept for information, never to ask again. The file belongs to its plugin home, so the plugin checkout's side vault has its own while the branch lives, and the switch-over carries its entries across to `~/.council/typhon/` (7.4) |
+| A project's own choices | `<project>/typhon_plugins.json`: the project's plugin list, copied from the base set's list when the plugin Typhon first opens the project (for a new project, its first run; 4.2) and changed after that only by you, and setting overrides | Travels with the project; names plugins, never holds code |
 | A plugin's own data for one project | `<project>/plugin_data/<id>/` (no `.py` files) | Kept apart from the project's code |
 
 The **plugin home** is `~/.council/typhon/`, or the folder the
 `TYPHON_PLUGIN_HOME` variable names.
 
+- **Plugins arrive as folders you drag in** (your answer to question 7).
+  "The plugins folder for the app" is read here as Typhon's one plugins
+  folder on the PC, `<plugin home>/plugins/`, not a folder inside each
+  project, which the next point rules out. Settings → Plugins… has an
+  "Open plugins folder" button that opens it in Explorer, so a plugin's
+  folder can be dragged there from a USB stick, an unpacked zip or a git
+  checkout. Typhon reads only folders: anything else there (a zip, a loose
+  file) is listed as "not a plugin folder" and left alone. A folder dragged
+  in is found at the next start, or when the Plugins window is opened,
+  which rescans the plugins folder. The rescan reads and hashes a plugin it
+  finds for the first time (4.5) and lists it, as "needs approval" if its
+  id is new. A plugin already read this session whose folder was changed
+  or replaced is shown as "changed on disk, used from the next start":
+  this session keeps running the bytes read at start-up (4.5). The
+  folder's name does not matter; the manifest's id does. Two folders whose
+  ids give the same package name are both refused, and listed with both
+  folder names, until you take one out; Typhon never removes either
+  itself. The same id twice is the plain case; the id rule of 3.11 (no
+  underscore) keeps two different ids, such as `acme.my_cam` and
+  `acme.my.cam`, from both becoming `typhon_thirdparty.acme_my_cam`, and
+  the check is made on the package name anyway.
 - **Never plugin code inside a project folder.** The policy gate checks every
   `.py` file under a project, subfolders included, on Generate and Run
   (`gui_policy.py:490-529`). A plugin under `<project>/plugins/` that
@@ -1129,8 +1224,9 @@ The **plugin home** is `~/.council/typhon/`, or the folder the
   silently skipped (measured; `gui_policy.py:502`), which is a loophole,
   not a feature. VS Code reached the same rule from the other side: opening
   a folder must never run code that came inside it (vendor/project docs,
-  Workspace Trust). So a project names its plugins by id, version and, for
-  third-party ones, sha256.
+  Workspace Trust). So a project names its plugins by id only, and each
+  run records the version and, for third-party ones, the sha256 of what
+  actually ran (4.2).
 - **Plain JSON files, no Council settings.** A generated app runs as its own
   process, often without the Council open, and may not use `QSettings`
   (`gui_policy.py:99`). Every list is a JSON file written whole to a
@@ -1150,9 +1246,10 @@ The **plugin home** is `~/.council/typhon/`, or the folder the
   side vault (7.1), so projects made there record the side vault's plugin
   home. If the recorded folder is missing, Typhon warns, names it, and
   falls back to `~/.council/typhon/`, never creating a second base set
-  silently.
+  silently. The switch-over copies the side vault's plugins, approvals and
+  base set into `~/.council/typhon/` (7.4), so that fall-back finds them.
 
-### 4.2 The app-wide base set and a project's additions
+### 4.2 The app-wide base set and a project's own list
 
 The app-wide `base_set.json`, in the plugin home:
 
@@ -1164,33 +1261,70 @@ The app-wide `base_set.json`, in the plugin home:
   "settings": { "typhon.classify": { "show_after_stop": true } } }
 ```
 
-A project's `typhon_plugins.json`:
+A project's `typhon_plugins.json`, here one made from that base set and
+then given a third-party plugin:
 
 ```json
 { "format": "typhon-plugins", "format_version": 1,
   "base": "~/.council/typhon",
-  "added": ["acme.thermal"],
-  "off":   [],
+  "plugins": ["typhon.basler", "typhon.prophesee", "typhon.simulated",
+              "typhon.trigger", "typhon.classify", "typhon.timing",
+              "typhon.crop", "acme.thermal"],
   "settings": { "typhon.classify": { "show_after_stop": false } } }
 ```
 
-- **What a project runs** = the base set, plus `added`, minus `off`.
+**Decided** (your answer to question 1, "Only new projects"): the base
+set's plugin list is copied into a project when the project is made, not
+followed after that. Its default settings are another matter: they are
+still read by every project, until question 14 is answered (below).
+
+- **What a project runs** = its own `plugins` list, and nothing else.
+- **The base set** starts as all built-in plugins. You change it in the
+  Plugins window ("for new projects"). A new project starts with it,
+  which is your answer 2.
+- **A project's list is copied from the base set once, at one moment:**
+  the first time the plugin Typhon opens a project that has no
+  `typhon_plugins.json`. For a new project that is its first run, straight
+  after Generate, and that is what "made" means for a plugin list
+  throughout this doc; for an older project it is its first run after it
+  is moved across at the switch-over (7.5). So a project generated but not
+  yet run takes the base set as it is at its first run. The file is
+  created, never written over; after that the list is the project's own,
+  and only you change it, in that project's Plugins window.
+- **A missing or unreadable list.** If `typhon_plugins.json` is missing
+  from a project that has been run before, Typhon cannot tell that from a
+  first open, so it makes the list from today's base set (with the camera
+  family `camera_setup.json` names, below) and says so once, as it does
+  for every new project, in the Plugins window and the status strip:
+  "plugin list made from today's base set". So a deleted list is replaced
+  by today's base set, not by the old list. The plugins its earlier runs
+  used are in those runs' camera records (the last point below), so the
+  old list can be put back by hand. If the file is there but cannot be read
+  (damaged, or a newer `format_version`), Typhon does not write over it on
+  its own: it names the file and the reason, runs the project for that
+  session on today's base set without writing anything, and warns again at
+  each start until you mend the file or choose "Make a new list from the
+  base set", which first keeps a dated copy of the unreadable file beside
+  it, as Update keeps dated backups (7.5), and only then writes the new
+  list.
+- **A change to the base set reaches only projects made afterwards.** A
+  plugin you add to the base set is not turned on in any existing
+  project; each keeps its list until you add the plugin there. Taking a
+  plugin out of the base set likewise leaves existing projects as they
+  are. So that adding one is easy, a project's Plugins window marks each
+  base-set plugin the project does not have, "in the base set, not in this
+  project", with a tick box to add it here.
 - **What a plugin's settings are** = the base set's defaults, with this
   project's `settings` laid over them key by key. A project that changed
-  nothing follows every later change of a default.
-- **The base set** starts as all built-in plugins. You change it in the
-  Plugins window ("for every project"). A new project starts with it,
-  which is your answer 2.
-- **The base set is followed, not copied.** A plugin you add to the base
-  set turns on in every project at its next start, unless that project
-  switched it off (`off`). This makes the app-wide level the one you work
-  at, as your answer 2 says; the other reading, "copied once when the
-  project is made", would freeze old projects instead. Question 1 asks you
-  to confirm.
+  nothing follows every later change of a default. Your answer to
+  question 1 was about which plugins a project has; whether default
+  settings should also reach only new projects is part of question 14,
+  still open.
 - **The camera set-up joins the list.** Today `camera_setup.json` holds one
   choice, `basler` or `prophesee` (`camera_setup.py:41`, `FORMAT` 1 at 47).
-  Its choice becomes "this camera plugin is on", and `FORMAT` 1 files keep
-  being read, so an old project is not asked its set-up questions again.
+  When an older project's list is copied, the camera family it chose is in
+  it even if the base set lacks it, and `FORMAT` 1 files keep being read,
+  so an old project is not asked its set-up questions again.
 - **Each run records what made it:** the id, version and short name of
   every active plugin, and the sha256 of third-party ones, in the camera
   record's `plugins` block. This is new data, so it belongs there under
@@ -1202,9 +1336,14 @@ A project's `typhon_plugins.json`:
 The Plugins window shows each plugin in one state, with the reason:
 
 - **discovered**: its manifest was read;
-- **incompatible**: wrong API major version, a bad manifest, or a Python
-  package missing from the project's interpreter;
-- **needs approval**: third-party and not yet approved, or a file changed;
+- **incompatible**: wrong API major version, a bad manifest (an id that
+  breaks the rule of 3.11 among them), a Python package missing from the
+  project's interpreter, or a second folder whose id gives the same
+  package name (4.1);
+- **needs approval**: third-party, and its id has never been approved in
+  this plugin home's `approvals.json` (4.1; a later version, a changed
+  file or a folder taken out and dragged back does not bring this state
+  back, 4.6);
 - **on**: in this project's list; **off**: not in it;
 - **active**: its code has been imported because a feature was used;
 - **faulted**: it raised an error and is off until the next start;
@@ -1220,11 +1359,13 @@ them read-only; for plugins it takes the place of Python Scripts.
 
 ### 4.4 Lazy loading
 
-- **Start-up reads manifests only.** Scanning six `plugin.json` files took
-  3.9-4.8 ms (measured). Reading 20 synthetic plugins and hashing all their
-  files took 33-50 ms warm and about 250 ms just after the files were
-  copied in or after a reboot; 100 plugins took about 1.2 s cold (measured,
-  synthetic).
+- **Start-up reads, and imports nothing.** It reads every manifest, and
+  reads and hashes every file of every third-party plugin in the plugins
+  folder (4.5), but runs no plugin code. Scanning six `plugin.json` files
+  took 3.9-4.8 ms (measured). Reading 20 synthetic plugins and hashing all
+  their files took 33-50 ms warm and about 250 ms just after the files
+  were copied in or after a reboot; 100 plugins took about 1.2 s cold
+  (measured, synthetic).
 - **A plugin's code is imported when it is first needed:** its panel is
   opened, a Scan asks for its cameras, or a run uses one of its hooks.
 - **The point is to keep today's start time, not to beat it.** Today's
@@ -1252,27 +1393,48 @@ them read-only; for plugins it takes the place of Python Scripts.
   measured); files inside a plugin import each other with relative
   imports. Built-in plugins are `typhon_plugins.<name>`, and only those on
   the built-in list load (Terms). Third-party plugins get a separate
-  package root, `typhon_thirdparty.<folder>`, where `<folder>` is the id
+  package root, `typhon_thirdparty.<name>`, where `<name>` is the id
   with dots turned into underscores (`acme.thermal` →
-  `typhon_thirdparty.acme_thermal`): a dotted id cannot be a package name
-  as it is, and it must never collide with the built-in package.
-- **The bytes that were checked are the bytes that run.** A `.pyc` file
+  `typhon_thirdparty.acme_thermal`), whatever the folder is called: a
+  dotted id cannot be a package name as it is, and it must never collide
+  with the built-in package. Because an id holds no underscore (3.11), two
+  ids never give one name, and the clash check of 4.1 is made on the name
+  itself.
+- **The bytes that were hashed are the bytes that run.** A `.pyc` file
   planted in a plugin's `__pycache__` ran instead of the approved source
-  while the source's sha256 still matched (measured). So for third-party
-  plugins (built-in plugins load like the rest of the Council's code):
+  while the source's sha256 still matched (measured). Approval is once per
+  plugin (4.6), so this no longer guards an approval; it keeps each run's
+  record true, because the sha256 a run records (4.2) is of the code that
+  ran. So for third-party plugins (built-in plugins load like the rest of
+  the Council's code):
+  - **"load" means start-up.** Every file of every third-party plugin is
+    read and hashed at start-up (4.4), and the `.py` files' bytes are held
+    in memory from then on; a plugin first found by the Plugins window's
+    rescan is read and hashed then (4.1). Importing on first use (4.4)
+    compiles those held bytes and never reads the disk again, so a folder
+    changed or replaced during a session, even before the plugin is first
+    used, takes effect at the next start, and "the next start" in this
+    doc means exactly that;
   - **one importer per plugin package** serves its modules, sub-modules
     included, from the bytes read and hashed at load time. Python's normal
     file finder never sees the package, because it would re-read the disk
     for every relative import and read and write `.pyc` files; this
     importer compiles exactly the checked bytes and writes no bytecode;
   - **data files** (models, tables, JSON) are read through `ctx.read_data()`,
-    which hands back the bytes hashed at approval and refuses a file whose
-    hash has changed; a plugin that opens its files directly is breaking a
-    house rule (3.11);
-  - **every file in the folder is hashed,** not only `.py`, and a folder
-    holding `__pycache__`, `.pyc`, `.pyd` or `.dll` files is refused;
-  - **a test** changes a sub-module and a data file after approval and
-    checks that both are refused (9.1).
+    which checks each against the sha256 taken when the plugin loaded and
+    refuses one changed while Typhon is running; the changed file is used
+    from the next start, without asking (4.6). A plugin that opens its
+    files directly is breaking a house rule (3.11);
+  - **every file in the folder is hashed** at load, not only `.py`, and a
+    folder holding `__pycache__`, `.pyc`, `.pyd` or `.dll` files is
+    refused;
+  - **a test** changes a sub-module and a data file after the plugin has
+    loaded, and checks that in that session the sub-module still comes
+    from the bytes read at load and the data file is refused; that a
+    folder replaced after start-up but before the plugin's first use
+    still runs the start-up bytes in that session; and that at the next
+    start both load without an approval question and the run record
+    carries their new sha256 (9.1).
 
   Native code comes only from packages you install into the environment
   yourself (pypylon, OpenEB).
@@ -1308,9 +1470,12 @@ files. The risky-pattern scan of step 2 is a regex speed bump. The steps
 below protect against mistakes and make you look before trusting; they do
 not fence a plugin written to do harm.
 
-1. **You copy the plugin's folder** into the plugin home's `plugins/`
-   folder, normally `~/.council/typhon/plugins/` (from a zip, a USB stick
-   or a git checkout; question 7). Typhon never fetches one.
+1. **You drag the plugin's folder** into the app's plugins folder, the
+   plugin home's `plugins/`, normally `~/.council/typhon/plugins/`, and
+   while the branch lives the side vault's (7.1) (your answer to question
+   7). Each plugin is its own folder; the Plugins window's "Open plugins
+   folder" button opens the one in use (4.1). Typhon never fetches,
+   unpacks or installs one.
 2. **The Plugins window lists it as "needs approval"** and shows its
    manifest (author, version, what it attaches to, files it writes, network
    use), every file with its size and sha256, the Python packages it needs
@@ -1321,11 +1486,19 @@ not fence a plugin written to do harm.
    rather than on the policy gate, which would flag Typhon's own camera
    code (`frame_camera` imports `ctypes` at 2537, `socket` at 2795 and
    `importlib` at 3464).
-3. **You approve it once per version, for the whole PC.** The approval
-   records every file's sha256 in `approvals.json`. Any changed file sends
-   it back to "needs approval". Approval lets it run; where it runs follows
-   4.2: adding it to the base set turns it on in every project that has not
-   switched it off, adding it to one project turns it on there only.
+3. **You approve it once** (your answer to question 7: "Approval only
+   happens once for each plugin"). The approval is keyed by the plugin's
+   id and is never asked for again: not for a later version, not for a
+   changed or added file, not for a folder dragged in over the old one.
+   It is kept in the plugin home's `approvals.json`, which keeps the
+   version and every file's sha256 as they were when you approved, for
+   information only. One plugin home is in use at a time: the side
+   vault's while the branch lives, then `~/.council/typhon/`; the
+   switch-over carries the side vault's approvals across (7.4), so a
+   plugin you approved in "Typhon (plugins)" is not asked about again
+   after it. Approval lets it run; where it runs follows 4.2: adding it to
+   the base set puts it in every project made afterwards, adding it to one
+   project turns it on there only.
 4. **Network:** the manifest says `none`, `camera-link` (a GigE camera on a
    local network) or `internet`. `internet` is refused unless you opt in
    for that plugin in the Plugins window, by the standing rule that nothing
@@ -1342,6 +1515,55 @@ not fence a plugin written to do harm.
    runner blocks PySide6 and does not fence `ctypes`
    (`gui_smoke.py:29-32`), so panels could not be tested there anyway.
 6. **Each run names the plugins and versions that made it** (4.2).
+
+**The trade-off of approving once, said plainly.** Your rule is the
+design: a plugin is approved once, and that approval stands. What it
+costs:
+
+- **A plugin folder later replaced or edited is not asked about again.**
+  If a plugin's files are changed, by its author's update, by you, by
+  another program or by mistake, the new code runs at Typhon's next start,
+  with every right listed at the top of this section, and you are not
+  shown it first.
+- **The approval follows the id, not the author.** A different plugin
+  that uses an approved plugin's id also runs without a question, whether
+  it is dragged in over the approved one or comes later, from anyone.
+- **An approval outlives the plugin's folder, and nothing takes it
+  back.** Taking a plugin's folder out of the plugins folder does not
+  remove its id from `approvals.json`, so a folder with that id dragged
+  in later, months later and from any author, runs without a question
+  wherever a project lists it. The design has no way to withdraw an
+  approval short of editing `approvals.json` by hand; a "Withdraw
+  approval" button is the second open suggestion below.
+- **What still holds:** Typhon never downloads or installs anything; a
+  new plugin id always needs your approval; native files (`.pyd`, `.dll`)
+  and bytecode are still refused (4.5); a plugin whose manifest newly
+  declares `internet` is still refused until you opt it in, because that
+  opt-in is the standing offline rule, not the approval (step 4); and
+  each run still records the version and every file's sha256 that ran
+  (4.2). That record identifies what ran, but it does not keep the code:
+  once a plugin's folder is replaced, the old files are gone unless you
+  kept a copy.
+
+**Two open suggestions, not decisions.** Whether to have either is yours
+to say (question 7).
+
+- **"Changed since you approved it":** the Plugins window could still
+  show this beside a plugin whose files no longer match the sha256s kept
+  in `approvals.json`, listing the files that differ. It would be
+  information only: it would never block the plugin, never send it back
+  to "needs approval" and never ask a question, so it keeps your rule. It
+  would add almost nothing at start-up, since every file is already
+  hashed there (4.4, 4.5; estimate).
+- **"Withdraw approval":** a button beside each approved plugin, in the
+  Plugins window, that removes its id's entry from `approvals.json`
+  (written whole and renamed into place, as every list is, 4.1), so that
+  plugin, and any later folder with its id, shows "needs approval" again.
+  It would act only when you press it, so Typhon would still never ask
+  again of its own accord; but a plugin you withdraw would be asked about
+  a second time if it comes back, which is why it is a suggestion and
+  not a decision. It would fit in P5 row 1 at no change to its estimate
+  (estimate).
 
 *Footnote, about generated apps, not plugins:* the research also found what
 the policy gate lets through in a generated project's own code, measured
@@ -1363,10 +1585,13 @@ files (question 9).
 
 - **Built-in plugins** update with the Council checkout and carry its
   version.
-- **Third-party plugins** are approved per version; an update is a new
-  folder or new files, so it asks again, once for the whole PC. Projects
-  need nothing: they name the plugin by id, and each run records the
-  version and sha256 that actually ran (4.2, 3.11).
+- **Third-party plugins** are approved once per plugin, not per version
+  (your answer to question 7). An update is a new folder dragged in over
+  the old one, or new files; it runs at the next start without asking,
+  never sooner, since the files are read at start-up (4.5; 4.6 says what
+  that costs). Projects need nothing: they name the plugin
+  by id, and each run records the version and sha256 that actually ran
+  (4.2, 3.11).
 - **The plugin API's major version** is checked at scan time; a plugin for
   another major version is listed as incompatible, with both numbers.
 - **Old runs stay readable** after a plugin is removed: its record blocks
@@ -1706,12 +1931,19 @@ extra step.
   not from a local copy.)
 - **Merge `qt-migration` into `typhon-plugins` every week,** and after any
   Typhon bug fix, by merging, not rebasing, so every fix can be traced.
-- **Hold today's Typhon to bug fixes while the branch lives** (question 6).
-  The seven core Typhon files took 31 commits, +5,265 and −1,172 lines, in
-  the week from 7 October 2026 (measured; the larger "84 commits since 15
-  September" includes creating those files). At that rate a branch that
-  restructures them would conflict at every merge. New Typhon features go
-  to the branch as plugins.
+- **Today's Typhon takes bug fixes only while the branch lives.**
+  Decided (your answer to question 6, "Bug fixes only new features as
+  plugins"): on `qt-migration`, today's Typhon takes bug fixes and
+  nothing else (the rest of the Council carries on there as usual), and
+  every new Typhon feature is built as a plugin on the branch, never on
+  `qt-migration`. That includes velocity, calibration, alignment and the
+  trigger cable (M2); the velocity design had planned to start from
+  `qt-migration` (velocity 5.2; 11). A Typhon change that is not clearly
+  a fix is asked about before it goes onto `qt-migration`. The reason:
+  the seven core Typhon files took 31 commits, +5,265 and −1,172 lines,
+  in the week from 7 October 2026 (measured; the larger "84 commits since
+  15 September" includes creating those files). At that rate a branch
+  that restructures them would conflict at every merge.
 - **Plugins over the old code, not facades over new code.** Git does not
   follow code that is split across files: if `BaslerDevice`, `EvkDevice`,
   `BaslerSettings` or the trigger code moved into `typhon_plugins/<name>/`
@@ -1724,10 +1956,12 @@ extra step.
   re-exports in `typhon_plugin_api`, which also keeps the rule that
   built-in plugins import only the API. A fix merged from `qt-migration`
   lands in the same file and lines on both branches. Files move physically
-  only at stage P7, once today's Typhon on `qt-migration` is frozen, or
-  sooner if you answer question 6 that it takes no more fixes. Facades are
-  kept only where the code is new, such as `_LIVE` over the rig and the
-  `frame_camera` trigger functions `typhon_classic` links (6.4).
+  only at stage P7, once today's Typhon on `qt-migration` is frozen. Your
+  answer keeps it taking bug fixes, so the files stay in place until then,
+  unless you later say it may take no fixes at all (the part of question 6
+  still open). Facades are kept only where the code is new, such as
+  `_LIVE` over the rig and the `frame_camera` trigger functions
+  `typhon_classic` links (6.4).
 - **The branch's gate for every commit:** every existing Typhon test passes
   (1,078 tests collected from 21 Typhon test files at 67cad625, measured,
   not run; plus the 79 test functions the trigger work added), plus the
@@ -1753,6 +1987,34 @@ extra step.
   connected to it.
 - **Report a bug in today's Typhon as usual.** It is fixed on
   `qt-migration` and reaches the branch with the next weekly merge.
+- **Ask for a new Typhon feature as usual, and expect it later than
+  before.** It is built as a plugin on the branch and reaches you in
+  "Typhon (plugins)", not in today's Typhon (7.2). A plugin can attach
+  only at points the branch has already built, so a feature can be built
+  only once the stage it needs is done. Counted in working days from the
+  branch's start, for one developer, before merge upkeep (computed from
+  the stage estimates of section 12):
+  - a new camera family, such as a thermal camera: after P2, about
+    19.5-31.5 days;
+  - a feature that hooks into runs or analyses recordings: after P3,
+    about 33-51 days. Velocity's analysis is one: it needs the run
+    reader, the `analyse` hook and the suffix registry (12, Totals);
+  - a feature with its own window or toolbar button: after P4, about
+    45.5-69 days. Velocity's window and arrows are one, so velocity
+    stage 1 as you would use it is done about 65.5-98 days after the
+    branch starts at the earliest: P0-P4, plus its own stage 1 (19-27
+    days; velocity design, section 8), plus about 1-2 days for the plugin
+    form (11.5).
+
+  Before your answer, velocity could have started on `qt-migration` at
+  once (velocity 5.2).
+- **A feature asked for before the branch exists** waits for P0 (about
+  1-2 days) and then for the stage it needs; nothing goes onto today's
+  Typhon meanwhile. Its design can go ahead, and parts that attach to
+  nothing, such as velocity's tracker, which has no Qt (velocity 2.4),
+  can be written and tested on the branch from P0 and wired in when their
+  stage is done. If one feature cannot wait that long, that is yours to
+  decide for that feature; without that, your answer stands and it waits.
 
 ### 7.4 The switch-over, when you say so
 
@@ -1766,8 +2028,26 @@ extra step.
    `typhon_classic`, so an old project can still be rebuilt from it; while
    it is kept, `frame_camera`'s trigger link functions stay as facades
    (6.4). The built-in plugins' files move into their folders now (7.2).
-4. **Move each project across** (7.5).
-5. **Retire Barbie v4 and v5** and their tests (section 8).
+4. **Carry the plugin home across,** before any project is opened in the
+   plugin Typhon on `qt-migration`. While the branch lived, every plugin
+   you dragged in and approved went into the side vault's plugin home
+   (7.1), and `~/.council/typhon/` was not in use. So the side vault's
+   `plugins/` folders, `approvals.json` and `base_set.json` are copied
+   into `~/.council/typhon/`, and nothing there is written over: a
+   plugin folder whose name or package name is already there is listed,
+   not copied; `base_set.json` is copied only if none is there, and
+   otherwise both are shown for you to choose; and each id approved in
+   the side vault is added to `approvals.json` as an approval adds one,
+   never changing an entry already there. The side vault is left as it
+   is. So a plugin you approved in "Typhon (plugins)" is not asked about
+   again (4.6), and the projects moved in step 5 start from the base set
+   you built on the branch (4.2). A project made in the side vault keeps
+   naming the side vault's plugin home and works on while that folder
+   exists; if it is removed, the project falls back to
+   `~/.council/typhon/` with a warning (4.1), and finds the same plugins
+   and approvals there.
+5. **Move each project across** (7.5).
+6. **Retire Barbie v4 and v5** and their tests (section 8).
 
 ### 7.5 Migrating projects, presets, runs and classifier libraries
 
@@ -1778,6 +2058,7 @@ extra step.
 | Presets (`camera_presets.json`) | Unchanged; copied, never moved, into a new project. The `capture.*` and `save.downsample` keys (`triggered.py:81-88`) are read and written in place by their new owners, the triggering plugin and the core (2.5); keys of a plugin that is not loaded are kept and listed | No |
 | Runs | Nothing is rewritten. A branch test opens a run written by the plugin Typhon with today's readers (`capture_review`, `event_playback`, `frame_classes`, `frame_timing`, `frame_roi` from `qt-migration`). It holds because new CSV columns go only at the end, the camera record stays at version 1, and new files have their own suffixes | No |
 | Classifier libraries | Nothing to move if the store is shared (7.1); otherwise the existing export bundle | No |
+| The plugin home: third-party plugin folders, `approvals.json`, `base_set.json` | Copied from the side vault's plugin home into `~/.council/typhon/` before any project is moved (7.4 step 4): a plugin folder only where neither its folder name nor its package name is taken there, `base_set.json` only if none is there; each side-vault approval added for an id not yet in `approvals.json` | No: the side vault is left as it is, and nothing already in `~/.council/typhon/` is written over |
 | `app.py` | Untouched (`frame_camera.attach(self)` stays) | No |
 
 **The real data is on the bench PC, not here.** This laptop has no Typhon
@@ -1925,10 +2206,19 @@ must pass (vendor/project docs); each runs first against the Simulated plugin.
   `<run>_run_end.json`; a fault in a best-effort hook (`record_fields`, the
   calibration freeze, `on_run_finished`) is reported in Start's summary or
   the end record, marks the plugin faulted, and the capture carries on.
-- **Loading third-party plugins:** after approval, a changed sub-module and
-  a changed data file are each refused; no `.pyc` is read or written; a
-  folder copied among the built-ins that is not on the built-in list is
-  refused (4.5).
+- **Loading third-party plugins:** a sub-module and a data file changed
+  after the plugin loaded are not used in that session (the sub-module
+  comes from the bytes read at load, the data file is refused); a folder
+  replaced after start-up but before the plugin's first use still runs
+  the bytes read at start-up in that session; and at the next start both
+  load without an approval question, with their new sha256 in the run
+  record (your rule, 4.6); a new id still needs approval, and an approved
+  id whose folder was taken out and dragged back does not; two folders
+  whose ids give one package name are both refused, the same id twice
+  among them; an id with an underscore is refused as a bad manifest
+  (`acme.my_cam` beside `acme.my.cam`); a folder's name does not change
+  its package name; no `.pyc` is read or written; a folder copied among
+  the built-ins that is not on the built-in list is refused (4.1, 4.5).
 
 The prototype's version of these suites passed for six plugins (simulated,
 Prophesee over the fake EVK4, Basler over pylon's emulator, triggering,
@@ -1995,7 +2285,12 @@ tests of their own:
   on (10.2).
 - **The main window** at both window sizes with every built-in strip
   filled.
-- **The switch-over** on a copy of a project with edited handlers (6.4).
+- **The switch-over** on a copy of a project with edited handlers (6.4),
+  and the plugin home carried across from a temporary side vault to a
+  temporary stand-in for `~/.council/typhon/`, once empty and once
+  already holding a plugin and an approval: nothing there is written
+  over, and a plugin approved in the side vault is not asked about again
+  (7.4).
 
 ### 9.5 What exists today, for scale
 
@@ -2101,8 +2396,10 @@ before they are saved; use the network; start programs; end Typhon with
 `Device`. (The overwriting, `os.chmod` and reaching the main window and
 the `Device` were measured; the rest follows from Python's and NumPy's
 rules, vendor/project docs.) For built-in plugins, review and the contract
-tests (9.1) guard against this; for third-party plugins, your approval
-(4.6) and, if you want it, read-only saved files (question 9).
+tests (9.1) guard against this; for third-party plugins, your approval,
+given once per plugin, so it covers the files you looked at and not later
+versions or edits, which run unseen (4.6), and, if you want it, read-only
+saved files (question 9).
 
 ---
 
@@ -2122,6 +2419,15 @@ for these amendments, listed in full:
   plugin's rig-wide set-up as a namespaced block (3.6).
 - **Writing analysis files** goes through the core's write-whole service
   (3.9 (b)), which follows velocity section 4's rule exactly.
+- **Where they are built** (your answer to question 6): velocity,
+  calibration, alignment and M2 are new Typhon features, so each is built
+  as a plugin, never on today's Typhon: on the `typhon-plugins` branch
+  while it lives, and on `qt-migration` only after the switch-over has
+  made the plugin Typhon the one there. Velocity 5.2's "the velocity work
+  can start from `qt-migration` directly" no longer holds; it starts on
+  the branch after P3, about 33-51 working days after the branch starts,
+  and its window and arrows need P4, about 45.5-69 days in (computed from
+  the stage estimates; 7.3 gives the waits for every kind of feature).
 
 ### 11.1 Velocity (`typhon.velocity`, one camera, needs `events`)
 
@@ -2208,6 +2514,24 @@ on `qt-migration`, the files moving only at P7, a fuller author's kit).
 **Stages P0-P3 leave Typhon behaving exactly as today;** the window changes
 at P4.
 
+**What your answers of 15 October changed here** (section 1): the project
+lists in P1 row 2 and the Plugins window in P4 row 7 copy the base set's
+plugin list into new projects instead of following it (question 1); P5
+row 1 approves once per plugin and takes plugins as folders dragged in
+(question 7), and P7 row 3 carries the side vault's plugin home across so
+that approval stays once (7.4); and velocity and M2 are built on the
+branch (question 6, Totals). Questions 2 and 13 confirmed what the rows
+already assumed. No estimate changes: copying is no more work than
+following, approving once drops the re-approval flow while adding the
+package-name check and the "Open plugins folder" button, and the plugin
+home's copy fits in P7 row 3 (estimate). **What does change is when new
+features arrive.** Since every new Typhon feature is now a plugin on the
+branch, each waits for the stage it needs: a new camera family for P2,
+about 19.5-31.5 working days after the branch starts; a feature that
+hooks into runs, such as velocity's analysis, for P3, about 33-51 days;
+one with its own window, such as velocity's window, for P4, about
+45.5-69 days (computed from the stage headings below; 7.3).
+
 ### Stage P0: the branch, safely beside today's Typhon (about 1-2 days)
 
 | # | Work | Estimate |
@@ -2224,7 +2548,7 @@ checkout exists.
 | # | Work | Estimate |
 |---|---|---|
 | 1 | M1 row 1: `Rig`, `CameraSlot`, `_LIVE` as a compatibility view (all 49 fields), every existing test passing unchanged | 4.5-7 days |
-| 2 | The plugin host on the rig: manifest reader, registry and built-in list, guarded calls, the faulted state, plugin contexts, `typhon_plugin_api` 0.x and working notes (frozen as 1.0 only at P5, 3.2), the base set with default settings and the project lists, `TYPHON_PLUGIN_HOME` (4-6 days alone; about 2 are shared with row 1) | 2-4 days |
+| 2 | The plugin host on the rig: manifest reader, registry and built-in list, guarded calls, the faulted state, plugin contexts, `typhon_plugin_api` 0.x and working notes (frozen as 1.0 only at P5, 3.2), the base set with default settings and the project lists, each copied from the base set's list once, when the plugin Typhon first opens the project, and the handling of a missing or unreadable list (4.2), `TYPHON_PLUGIN_HOME` (4-6 days alone; about 2 are shared with row 1) | 2-4 days |
 | 3 | Measure frame timing inside the real Qt Typhon with a slow plugin, at the default and the 1 ms timer (10.2) | 0.5-1 day |
 | 4 | Register the new example: `examples/gui/typhon_plugins.gspec`, at first a copy of today's wireframe under the new name, in `gui_examples.py` (`NOTES` at 66, `INTENDED_TOOLKIT` at 147) | 0.5 day |
 
@@ -2272,27 +2596,33 @@ until P4.)
 | 4 | The Classification pop-out; Classify all after Stop by default; a public `predict_image` in `frame_classes` so live guesses need no private calls | 3-4 days |
 | 5 | The Timing scan and Cropped export plugins, with `ctx.crop_box()` and `crop_box_changed` (3.5) | 1-1.5 days |
 | 6 | The set-aside step inside the update path that both Update and "Switch to example…" use: edited handlers into `handlers_retired.txt`, `app.py` lines that use removed widgets listed (6.4) | 1-1.5 days |
-| 7 | The Plugins window (moved here from P5; required before P7): the base set with its default settings, this project's additions, switch-offs and setting overrides, each plugin's state and reason, every plugin file with its sha256, the crash marker and its question, the interrupted-run notice (3.10, 4.3) | 1.5-2 days |
+| 7 | The Plugins window (moved here from P5; required before P7): the base set with its default settings (what new projects start with, 4.2); this project's own list, with each base-set plugin it lacks marked and a tick box to add it; setting overrides; each plugin's state and reason; every plugin file with its sha256, the crash marker and its question, the interrupted-run notice (3.10, 4.3) | 1.5-2 days |
 
 **What you see:** the new main window: the core controls, a toolbar strip
 (Classification, Capture now, Timing scan, Crop export, PNG / Raw), a status
 strip, and Settings → Plugins…; classification and the trigger controls in
 their own windows; the Plugins window, where you switch built-in plugins on
-and off for this project or for every project. Still one camera.
+and off for this project, or in the base set for every project made
+afterwards. Still one camera.
 
 ### Stage P5: third-party plugins and API 1.0 (about 4-6 days)
 
 | # | Work | Estimate |
 |---|---|---|
-| 1 | The hardened loader: an importer per plugin package serving only the checked bytes, no bytecode; data files through `ctx.read_data()`; the `typhon_thirdparty` package root; folder rules and the built-in list; `approvals.json`; the risky-pattern scan; the network field, its opt-in and its tripwire (4.5, 4.6) | 2-3 days |
+| 1 | The hardened loader: an importer per plugin package serving only the checked bytes, no bytecode; data files through `ctx.read_data()`; the `typhon_thirdparty` package root; folder rules (each plugin its own folder, dragged in, any folder name, the package name from its id, ids without underscores, two folders whose ids give one package name refused) and the built-in list; every third-party file read and hashed at start-up, and the Plugins window's rescan (4.1, 4.5); the "Open plugins folder" button; `approvals.json`, one approval per plugin id, never asked again (your answer to question 7); the risky-pattern scan; the network field, its opt-in and its tripwire (4.5, 4.6) | 2-3 days |
 | 2 | API frozen as 1.0, and the author's kit of 3.11: the guide (manifest schema, threading table, types, re-exported classes, open contribution points, environment, house rules, update and approval flow), `python -m typhon_plugin_api.check` with the suites and fake host usable outside the repo, one example plugin | 2-3 days (the earlier 0.5-1 day left out most of 3.11) |
 
-**What you see:** a plugin copied into `~/.council/typhon/plugins/`
-approved after you have looked at it. Only rows 1 and 2 may wait until
-someone else actually writes a plugin, since only plugins from other people
-need them; the Plugins window, which the base set and a project's additions
-need, is already in P4. The discipline of P1 (built-ins use only the plugin
-API) cannot wait, because it is what makes P5 cheap.
+**What you see:** a plugin's folder dragged into the plugins folder that
+"Open plugins folder" opens, approved once after you have looked at it; a
+later version dragged in over it runs without a question (4.6). While the
+branch lives that folder is the side vault's (7.1), not
+`~/.council/typhon/plugins/`, and the switch-over carries it and its
+approvals across (7.4). Only rows 1 and 2 may wait until someone else
+actually writes a plugin, since only plugins from other people need them;
+the Plugins window, which the base set
+and a project's own list need, is already in P4. The discipline of P1
+(built-ins use only the plugin API) cannot wait, because it is what makes
+P5 cheap.
 
 ### Stage P6: the rest of M1 (about 12-19 days)
 
@@ -2310,7 +2640,7 @@ Start and one Stop, a folder per camera, each with its own settings.
 |---|---|---|
 | 1 | Today's readers on new runs (tests); a rehearsal on a copy of the bench PC's project, presets and library | 1.5-2.5 days |
 | 2 | Barbie v4 and v5 retired: examples moved, the `RETIRED` list and `CLAUDE.md` (those not already retired on the branch, 7.2), the two kept tests rewritten (8.3) | 0.5-1 day |
-| 3 | Tag, merge, rename the example (`typhon_classic` kept with its facades, 6.4), move your projects through Update | 0.5-1 day |
+| 3 | Tag, merge, rename the example (`typhon_classic` kept with its facades, 6.4); carry the side vault's plugin home (`plugins/`, `approvals.json`, `base_set.json`) across to `~/.council/typhon/` without writing over anything there, before any project is opened (7.4 step 4); move your projects through Update | 0.5-1 day |
 | 4 | Move the built-in plugins' code from `council_core` and `frame_camera` into `typhon_plugins/<name>/`, leaving re-exports at the old names, once today's Typhon is frozen (7.2) | 1.5-2.5 days |
 
 **What you see:** one Typhon again, the plugin one, with your projects,
@@ -2322,13 +2652,17 @@ presets, runs and classifier libraries.
   which M1's own rows are 24-37 and the plugin work 41.5-64. Add merge
   upkeep of about half a day a week while the branch lives, about 6.5-10
   days over 13-20 weeks (estimate).
-- **Velocity** stage 1 can be built as a plugin after P3 (it needs the run
-  reader, the `analyse` hook and the suffix registry) with its overlay in
-  P4; its own estimates stand, plus about 1-2 days for the plugin form
+- **Velocity** stage 1 is built as a plugin on the branch, not on today's
+  Typhon (your answer to question 6; 11), after P3 (it needs the run
+  reader, the `analyse` hook and the suffix registry) with its window and
+  overlay in P4, so it starts about 33-51 working days after the branch
+  does and can be used at the earliest about 65.5-98 days in (computed;
+  7.3); its own estimates stand, plus about 1-2 days for the plugin form
   (11.5).
 - **M2** (the trigger cable) follows P6, as the multi-camera design orders
-  it after M1; it now extends the triggering plugin and the camera
-  plugins' facets rather than the core.
+  it after M1, and is plugin work too: on the branch if it starts before
+  the switch-over, never on today's Typhon. It now extends the triggering
+  plugin and the camera plugins' facets rather than the core.
 
 ---
 
@@ -2342,14 +2676,27 @@ plane, export formats, tolerance, windows, the shared board, screen and
 folders, Start and Stop, thermal cameras, disks) still stand and are not
 repeated. These are only about plugins.
 
-1. **The app-wide base set: followed, as designed?** The design makes the
-   base set the level you work at: a plugin you add to it turns on in every
-   existing project at its next start, unless that project switched it off
-   for itself. Is that right, or should a change reach only projects made
-   afterwards (section 4.2)?
-2. **Downsample:** keep it in the core as the one step that changes saved
-   pictures, with its control in the settings notebook (recommended), or
-   make it a plugin of its own, or part of triggering (section 2.1)?
+**Answered on 15 October 2026** (your words, quoted in full in section 1):
+questions 1, 2, 6, 7 and 13. Each keeps its number and its question, with
+your answer, what the design now does, and any part still open. Questions
+3, 4, 5, 8, 9, 10, 11, 12 and 14 are open.
+
+1. **Answered. The app-wide base set: followed, or new projects only?**
+   The design had made the base set followed: a plugin you add to it would
+   turn on in every existing project at its next start. Your answer: "Q1:
+   Only new projects". So the base set's plugin list is copied into a
+   project when it is made (its first run, 4.2); a plugin added to the
+   base set later reaches only projects made afterwards, and an existing
+   project keeps its list until you add the plugin there (section 4.2).
+   The base set's default settings are read here as outside this answer:
+   whether a changed default should also reach only new projects is left
+   to question 14, and until then every project that has not overridden a
+   setting follows its default (4.2).
+2. **Answered. Downsample:** keep it in the core as the one step that
+   changes saved pictures, with its control in the settings notebook
+   (recommended), or make it a plugin of its own, or part of triggering
+   (section 2.1)? Your answer: "Q2/13: Yes they stay in core". Downsample
+   stays in the core, its control in the settings notebook (2.1, 2.5).
 3. **Plugin settings:** in each plugin's own window (recommended, because
    the tab strip is full), or one shared "Plugins" tab, which needs the
    settings column widened to at least 491 px (sections 3.7 and 6.1)?
@@ -2359,16 +2706,45 @@ repeated. These are only about plugins.
 5. **Classification while recording:** is classifying each run right after
    Stop enough (recommended), or do you need live guesses during capture,
    which would run only on reduced frames and capped (section 10.2)?
-6. **Today's Typhon while the branch lives:** may it take bug fixes only,
-   with new Typhon features going to the branch as plugins? Otherwise every
-   weekly merge will conflict (section 7.2). And from when may it take no
-   fixes at all? The built-in plugins' files move into their own folders
-   only from then (7.2; stage P7 at the latest).
-7. **Plugins from other people:** how will they reach the PC (a zip, a USB
-   stick, a git checkout)? Is "you approve each version once, and a changed
-   file asks again" the right level? Should a project ever carry plugin
-   code, for sharing with a colleague (recommended: no; section 4.6)? May
-   a plugin that declares `internet` ever be opted in (4.6)?
+6. **Answered, one part still open. Today's Typhon while the branch
+   lives:** may it take bug fixes only, with new Typhon features going to
+   the branch as plugins? Your answer: "Q6: Bug fixes only new features as
+   plugins". So today's Typhon on `qt-migration` takes bug fixes only, and
+   every new Typhon feature, velocity and M2 included, is built as a
+   plugin on the branch (7.2, 11). That means a new feature waits until
+   the branch has the stage it needs: about 33-51 working days after the
+   branch starts for one that hooks into runs, such as velocity's
+   analysis, and about 45.5-69 for one with its own window (computed;
+   7.3). **Still open:** from when may it take
+   no fixes at all? The built-in plugins' files move into their own
+   folders only from then (7.2; stage P7 at the latest).
+7. **Answered in part. Plugins from other people:** how will they reach
+   the PC, and is "you approve each version once, and a changed file asks
+   again" the right level? Your answer: "Q7: Plugins will be their own
+   folders dragged into the plugins folder for the app. Approval only
+   happens once for each plugin". So each plugin is its own folder, which
+   you drag into Typhon's plugins folder (4.1), and you approve each plugin
+   once: a later version or a changed file is not asked about again, and
+   the approval outlives the plugin's folder (4.6 states the trade-off).
+   The approval is kept in the plugin home, and the switch-over carries
+   the side vault's approvals across, so a plugin approved while the
+   branch lives is not asked about again after it (7.4). **Still open:**
+   - "The plugins folder for the app" is read as Typhon's one plugins
+     folder on the PC, `~/.council/typhon/plugins/`, not a folder inside
+     each project. Is that what you meant? If so, it also answers "should
+     a project ever carry plugin code" with no, as recommended (4.1
+     explains why plugin code inside a project is blocked by the policy
+     gate).
+   - May a plugin that declares `internet` ever be opted in (4.6)?
+   - A suggestion, not a decision: should the Plugins window show "changed
+     since you approved it" beside a plugin whose files changed, as
+     information only, never blocking and never asking again (4.6)?
+   - A second suggestion, not a decision: should the Plugins window have
+     a "Withdraw approval" button, so you can take back an approval
+     (today it outlives the plugin's folder, and a later folder with that
+     id runs without a question)? Typhon would still never ask again on
+     its own; a plugin you withdrew would be asked about once more if it
+     came back (4.6).
 8. **Extra Python packages:** if a third-party plugin needs one (for
    example a thermal camera's SDK), is it acceptable that you install it
    into the environment yourself, and Typhon only checks and says what is
@@ -2384,16 +2760,24 @@ repeated. These are only about plugins.
 12. **The bench PC:** which checkout runs today's Typhon there, and can a
     copy of its Typhon project, `camera_presets.json` and classifier library
     be used to rehearse the switch-over (section 7.5)?
-13. **The split:** do you agree that presets, run records, the crop box and
-    Downsample stay in the core, and that the camera families, triggering,
-    classification, the timing scan and cropped export become plugins
-    (section 2)?
+13. **Answered. The split:** do you agree that presets, run records, the
+    crop box and Downsample stay in the core, and that the camera
+    families, triggering, classification, the timing scan and cropped
+    export become plugins (section 2)? Your answer: "Q2/13: Yes they stay
+    in core". So presets, run records, the crop box and Downsample stay in
+    the core, and the camera families (Basler, Prophesee, Simulated),
+    triggering, classification, the timing scan and cropped export become
+    plugins (2.1, 2.3).
 14. **Plugin settings at the app-wide level:** each plugin's default
     settings live in the base set, and a project keeps only what it
     changed (4.2). When you change a setting in a plugin's window, should
     it change the app-wide default for every project that has not
     overridden it, or only this project, with a "make this the default for
-    every project" button (recommended)?
+    every project" button (recommended)? And, after your answer to
+    question 1 (the plugin list reaches only new projects): should a
+    changed default setting likewise reach only projects made afterwards,
+    or keep reaching every project that has not overridden it, as 4.2
+    has it now?
 
 ---
 
@@ -2440,6 +2824,19 @@ repeated. These are only about plugins.
   inside Update and `handlers_retired.txt` (6.4), and the author's guide
   outline (3.11), whose thread limits and refresh rate are choices to be
   checked when built.
+- **Changes after your answers of 15 October, none prototyped:** the base
+  set's plugin list copied into a project at its first open, and the
+  handling of a missing or unreadable list (4.2); approval once per plugin
+  id (4.6); the package name taken from the manifest's id rather than the
+  folder's name, the id rule without underscores, the package-name check,
+  the rescan and the "Open plugins folder" button (4.1, 3.11); every
+  third-party file read and hashed at start-up, and `ctx.read_data()`
+  checking against those hashes rather than the ones taken at approval
+  (4.5); and carrying the side vault's plugin home across at the
+  switch-over (7.4). Only the package-name clash was tried, in a
+  throwaway probe outside the repo: under the old id rule `acme.my_cam`
+  and `acme.my.cam` both loaded as `typhon_thirdparty.acme_my_cam`, the
+  second replacing the first (measured).
 - **The trigger record gate's cost** (1.0 and 4.5 µs) comes from the first
   report; its script is lost and no fact-check re-ran it.
 - **The emulated Baslers' arrival skew** varied widely between runs (median
@@ -2496,6 +2893,9 @@ repeated. These are only about plugins.
     `cameras.py` and `camera_settings.py` at 393671b8);
   - `reviser/` (the revision after the design review): `sums.py` (checks
     that each stage's rows add up to its heading, and the total).
+- **The review of your answers' changes** (temporary):
+  `C:/Users/apkun/AppData/Local/Temp/rev-design-answers/probe/pkg_collision.py`
+  (two ids giving one package name under the old id rule, 4.1).
 - **Typhon code** at `qt-migration` 393671b8: `frame_camera.py`,
   `council_core/cameras.py`, `capture.py`, `camera_settings.py`,
   `camera_categories.py`, `camera_record.py`, `camera_presets.py`,
