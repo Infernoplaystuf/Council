@@ -1,0 +1,58 @@
+"""
+tools/typhon_plugins_timing.py, the bench behind P1 row 3 (plugin design
+10.2): it runs inside the real Qt "Typhon (plugins)" app, offscreen, and
+gives numbers. Checked here for working, never for the numbers — those
+depend on the PC and are recorded in docs/typhon_plugins_branch.md.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
+
+import typhon_plugins_timing as timing  # noqa: E402
+
+
+def test_one_run_measures_a_capture_in_the_built_app(tmp_path):
+    """One short capture through the app's own Start and Stop, with a plugin
+    on the rig's host fed every live frame on its own thread."""
+    import run_example_gui as rex
+
+    pdir = rex.build("typhon_plugins", project="timing",
+                     vault_dir=tmp_path / "vault", target="qt")
+    spec = {"timer": "default", "plugin": "noop", "seconds": 1.0,
+            "fps": 60.0, "project": str(pdir),
+            "folder": str(tmp_path / "runs")}
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+               COUNCIL_NO_DIALOGS="1")
+    out = subprocess.run([sys.executable, str(ROOT / "tools" /
+                                              "typhon_plugins_timing.py"),
+                          "--child", json.dumps(spec)],
+                         capture_output=True, text=True, timeout=300,
+                         env=env, cwd=str(ROOT), encoding="utf-8")
+    assert out.returncode == 0, out.stderr[-2000:]
+    said = json.loads([line for line in out.stdout.splitlines()
+                       if line.startswith("{")][-1])
+    assert said["timer"] == "default" and said["plugin"] == "noop"
+    assert 30 <= said["frames"] <= 90, said        # about 60 in one second
+    assert said["saved"] == said["grabbed"] >= said["frames"]
+    assert said["feed"]["delivered"] > 0 and said["faults"] == []
+    for key in ("late", "late_2", "median_ms", "p99_ms", "max_ms",
+                "read_late", "event_wait_1ms", "switch_interval_ms"):
+        assert key in said, key
+    assert len(list((tmp_path / "runs").glob("*_frame_*.png"))) == \
+        said["saved"]
+    assert timing.row(said).split()[:2] == ["default", "noop"]
+
+
+def test_the_matrix_names_only_what_it_knows():
+    assert set(timing.TIMERS) == {"default", "1ms", "switch", "period"}
+    assert timing.PLUGINS["slow20cap"] == (20.0, 0.25)
+    assert timing._percentile([1, 2, 3, 4, 5], 0.99) == 5
+    assert timing._percentile([], 0.5) == 0.0
