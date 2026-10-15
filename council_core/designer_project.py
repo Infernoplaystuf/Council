@@ -173,9 +173,49 @@ class GenerateResult:
     #: applies the same to its canvas, or its next Save would write the
     #: untyped boxes back over them.
     classified: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: What hand-written code still uses that this layout removes: the
+    #: gui_projects.Orphan behind each BLOCKED line, a removed port and an
+    #: orphaned widget or handler alike, and ALL of them, even when the port
+    #: check refused first and the log names only the ports. Update from
+    #: example names the user's handlers from it. Their line numbers are in
+    #: `planned`'s text where it has the file (handlers.py as Generate would
+    #: leave it), else in the file on disk.
+    blockers: List[Any] = field(default_factory=list)
+    planned: Dict[str, str] = field(default_factory=dict)
+    #: (handler, "file:line") — an untouched stub of a removed widget kept
+    #: only because hand-written code calls it there (HandlerPlan.kept).
+    kept_stubs: List[Tuple[str, str]] = field(default_factory=list)
 
     def say(self, line: str) -> None:
         self.lines.append(line)
+
+
+@dataclass
+class GeneratePlan:
+    """Everything a Generate decided before writing a byte: plan_generate's
+    answer when nothing refused, and exactly what write_generate writes.
+
+    Generate in two halves because Update from example needs the first half
+    alone: it has to know that the NEW layout will generate before it writes
+    that layout, or a refusal leaves the project half-switched (the drawing
+    and the manifest replaced, ui/ not regenerated — measured)."""
+    name: str
+    project_dir: Path
+    spec: Any
+    manifest: Any
+    new_ports: Dict[str, str]
+    previous_links: Dict[str, Any]
+    ai_bodies: Dict[str, str]
+    aliases: Dict[str, str]
+    target: str
+    #: The shapes Generate was given, and the classifier's answers for them
+    #: that are NOT in the .gspec yet — only when plan_generate was told not
+    #: to write them (persist=False); persist_classifications writes them.
+    shapes: List[Any] = field(default_factory=list)
+    unsaved_classifications: List[Any] = field(default_factory=list)
+    #: Where in the log the line saying they were saved belongs — where
+    #: Generate says it, right after "classified N untyped shape(s)".
+    persist_at: int = 0
 
 
 @dataclass
@@ -439,29 +479,62 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
              ) -> GenerateResult:
     """Classify → spec → validate → orphan-check → back up → emit → policy.
 
-    Long, and deliberately not split: every step reads state the previous one
-    wrote, and the four refusals have to be able to return from the middle. A
-    version with a function per step would pass the same eight values through
-    each one.
+    Two halves: plan_generate runs every step that can REFUSE and writes no
+    code, and write_generate writes. It used to be one long function, which
+    kept the eight values every step shares in one place — but Update from
+    example has to run the checks against a layout it has not written yet,
+    and could not without running the writes too, so a refusal left the
+    project half-switched. GeneratePlan carries those values across.
+    """
+    out, plan = plan_generate(name, shapes, project_dir, vault_dir,
+                              model_call=model_call)
+    if plan is None:
+        return out
+    return write_generate(plan, out)
+
+
+def plan_generate(name: str, shapes: Sequence[Any], project_dir: Any,
+                  vault_dir: Any, *,
+                  model_call: Optional[Callable[[str], str]] = None,
+                  project: Any = None, manifest: Any = None,
+                  persist: bool = True
+                  ) -> Tuple[GenerateResult, Optional[GeneratePlan]]:
+    """Every step of Generate that can refuse — classify, spec, validate,
+    plan handlers.py's own edits, plan port renames, orphan-check, toolkit —
+    and none that writes the project's code or manifest. Returns (what it
+    said, the plan); the plan is None when it refused (out.blocked) or
+    failed.
+
+    ``project`` and ``manifest`` are a wireframe and a manifest to check
+    INSTEAD of the ones on disk — the layout an update is about to write —
+    and are not saved here. Left out, the project's own are read.
+
+    ``persist``: the classifier's answers for untyped shapes are written into
+    the .gspec as they arrive (Generate, as always — a refusal must not cost
+    the next Generate another model call). False writes nothing at all: the
+    plan carries the answers, and persist_classifications writes them once
+    the caller has written its layout.
     """
     import gui_classify
-    import gui_emit
     import gui_layout
-    import gui_policy
     import gui_projects
     import gui_spec
 
     out = GenerateResult()
     project_dir = Path(project_dir)
     try:
-        project = gui_projects.open_project(name, vault_dir=vault_dir)
-        manifest = gui_projects.load_manifest(project_dir)
+        if project is None:
+            project = gui_projects.open_project(name, vault_dir=vault_dir)
+        if manifest is None:
+            manifest = gui_projects.load_manifest(project_dir)
         if manifest.detached:
             out.say("this project is detached — regeneration is disabled")
             out.blocked = True
-            return out
+            return out, None
 
+        given = list(shapes)
         classifications = []
+        persist_at = 0
         if gui_classify.needs_model(shapes):
             # A model is consulted ONLY here, and only when a shape is untyped.
             # An all-typed wireframe generates with no model call at all, which
@@ -475,8 +548,12 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
                 shapes, first_pass, model_call or default_model_call,
                 n_ctx=window)
             out.say(f"classified {len(classifications)} untyped shape(s)")
-            shapes = _persist_classifications(
-                name, shapes, classifications, out, vault_dir)
+            if persist:
+                shapes = _persist_classifications(
+                    name, shapes, classifications, out, vault_dir)
+            else:
+                shapes = _classified_copies(shapes, classifications)
+                persist_at = len(out.lines)
         else:
             out.say("no untyped shapes — generated with no model call")
 
@@ -506,7 +583,7 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             out.lines.extend(f"cannot generate: {e}" for e in errors)
             out.lines.extend(_rename_hints(errors, old_ports, new_ports))
             out.blocked = True
-            return out
+            return out, None
 
         # handlers.py's OWN edits are planned before any check reads it: an
         # untouched stub whose link changed is rewritten, one whose widget is
@@ -519,31 +596,35 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         # Accepted model-written bodies still as written: the generator's
         # own, like an untouched stub (gui_emit.plan_handlers).
         ai_bodies = gui_projects.ai_bodies(manifest)
-        sources, kept_lines = _planned_sources(project_dir, spec,
-                                               previous_links, ai_bodies)
+        sources, handler_plan = _planned_sources(project_dir, spec,
+                                                 previous_links, ai_bodies)
+        kept_lines = handler_plan.kept_lines() if handler_plan else []
 
         # Renames are planned FIRST so an aliased old name is redirected rather
         # than orphaned — otherwise renaming a port and regenerating reports
         # the user's own working code as a dangling reference.
-        plan = gui_projects.plan_ports(project_dir, old_ports, new_ports,
-                                       sources=sources)
+        port_plan = gui_projects.plan_ports(project_dir, old_ports,
+                                            new_ports, sources=sources)
         # A sequence link also puts `browse_<index>` on Ports, and path()/
         # count() on it are the natural way to name the frame you are looking
         # at. That attribute is not a PORT, so find_orphans called it dead and
         # BLOCKED Generate forever on any app.py that used it.
-        valid_ports = (set(new_ports.values()) | set(plan.aliases)
+        valid_ports = (set(new_ports.values()) | set(port_plan.aliases)
                        | spec.sequence_attr_names())
         orphans = gui_projects.find_orphans(project_dir, spec.widget_names,
                                             new_port_names=valid_ports,
                                             sources=sources)
-        if plan.removed or plan.collisions:
+        out.blockers = _distinct(list(port_plan.removed) + list(orphans))
+        out.planned = dict(sources)
+        out.kept_stubs = list(handler_plan.kept) if handler_plan else []
+        if port_plan.removed or port_plan.collisions:
             out.say("BLOCKED — port rename cannot proceed:")
-            out.lines.extend("  " + o.describe() for o in plan.removed)
-            out.lines.extend("  " + c for c in plan.collisions)
+            out.lines.extend("  " + o.describe() for o in port_plan.removed)
+            out.lines.extend("  " + c for c in port_plan.collisions)
             out.blocked = True
-            return out
-        for old, new in plan.renamed:
-            tag = " (aliased for now)" if old in plan.aliases else ""
+            return out, None
+        for old, new in port_plan.renamed:
+            tag = " (aliased for now)" if old in port_plan.aliases else ""
             out.say(f"port renamed: {old} -> {new}{tag}")
 
         if orphans:
@@ -553,18 +634,15 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             # above by its own def; this names the call the user must change.
             out.lines.extend("  " + line for line in kept_lines)
             out.blocked = True
-            return out
+            return out, None
 
-        edited = gui_projects.hand_edited_ui_files(project_dir)
-        if edited:
-            out.say(f"note: ui/ edits will be overwritten: "
-                    f"{', '.join(edited)} (backed up first)")
-        gui_projects.backup(project_dir)
         # WHICH TOOLKIT. app.py is created once and never rewritten, so a
         # project that already HAS one can only be regenerated into the same
         # toolkit — emitting a Qt ui/ beside a Tk app.py would produce a
         # project that cannot start, and the failure would look like a bug in
-        # the wireframe. A new project takes the manifest's intent.
+        # the wireframe. A new project takes the manifest's intent. Checked
+        # here, with the other refusals: it used to come after the backup,
+        # so this refusal left a .backups folder behind.
         built_as = gui_projects.toolkit_of(project_dir)
         wanted = (getattr(manifest, "toolkit", "") or "tk")
         if built_as and built_as != wanted:
@@ -573,11 +651,44 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
                     f"ui/ that app.py cannot drive. Create a new project "
                     f"instead.")
             out.blocked = True
-            return out
-        target = built_as or wanted
+            return out, None
+    except Exception as exc:
+        out.say(f"generate failed: {exc!r}")
+        return out, None
+    return out, GeneratePlan(
+        name=name, project_dir=project_dir, spec=spec, manifest=manifest,
+        new_ports=new_ports, previous_links=previous_links,
+        ai_bodies=ai_bodies, aliases=dict(port_plan.aliases),
+        target=built_as or wanted, shapes=given,
+        unsaved_classifications=([] if persist else list(classifications)),
+        persist_at=persist_at)
+
+
+def write_generate(plan: GeneratePlan, out: GenerateResult) -> GenerateResult:
+    """Generate's writing half, for a plan nothing refused: back up, emit,
+    policy-gate, save the manifest. Adds to ``out`` and returns it.
+
+    A write that raises is a "generate failed" line and ok=False — and it may
+    have come part-way, after ui/ or handlers.py was written, which is why
+    Update from example takes a restore point before calling this."""
+    import gui_emit
+    import gui_policy
+    import gui_projects
+
+    project_dir = plan.project_dir
+    manifest = plan.manifest
+    spec = plan.spec
+    try:
+        edited = gui_projects.hand_edited_ui_files(project_dir)
+        if edited:
+            out.say(f"note: ui/ edits will be overwritten: "
+                    f"{', '.join(edited)} (backed up first)")
+        gui_projects.backup(project_dir)
+        target = plan.target
         written = gui_emit.emit(spec, project_dir, aliases=plan.aliases,
-                                target=target, previous_links=previous_links,
-                                ai_bodies=ai_bodies)
+                                target=target,
+                                previous_links=plan.previous_links,
+                                ai_bodies=plan.ai_bodies)
         out.say(f"wrote {len(written.files_written)} file(s); "
                 f"kept {len(written.files_skipped)} hand-written")
         if written.handlers_added:
@@ -599,9 +710,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         out.lines.extend("  " + e for e in policy_errors)
 
         manifest.widget_names = spec.name_registry()
-        manifest.port_names = new_ports
+        manifest.port_names = plan.new_ports
         manifest.script_links = _recorded_links(
-            gui_emit.script_links(spec), previous_links,
+            gui_emit.script_links(spec), plan.previous_links,
             written.handlers_stale)
         manifest.ui_checksums = gui_projects.ui_checksums(project_dir)
         # 'Run with' may have changed while this ran; keep it. So may the
@@ -618,6 +729,36 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         out.say(f"generate failed: {exc!r}")
         return out
     out.ok = True
+    return out
+
+
+def persist_classifications(plan: GeneratePlan, out: GenerateResult,
+                            vault_dir: Any) -> None:
+    """Write the classifier's answers a persist=False plan held back into
+    the .gspec on disk — the caller has just written its layout there. The
+    same merge Generate makes (_persist_classifications), so a box answered
+    during an update is not asked about again. What it says goes where
+    Generate says it, so the log reads the same."""
+    if plan.unsaved_classifications:
+        start = len(out.lines)
+        _persist_classifications(plan.name, plan.shapes,
+                                 plan.unsaved_classifications, out, vault_dir)
+        said = out.lines[start:]
+        del out.lines[start:]
+        out.lines[plan.persist_at:plan.persist_at] = said
+        plan.unsaved_classifications = []
+
+
+def _distinct(orphans: Sequence[Any]) -> List[Any]:
+    """Each (kind, name, file) once — a removed port that hand-written code
+    uses is both a port-plan removal and an orphan."""
+    seen = set()
+    out = []
+    for o in orphans:
+        key = (o.kind, o.name, o.referenced_in)
+        if key not in seen:
+            seen.add(key)
+            out.append(o)
     return out
 
 
@@ -647,21 +788,13 @@ def _persist_classifications(name: str, shapes: Sequence[Any],
     the user Save while Generate waits on the model, and that put every
     shape and window setting saved in the meantime back (review finding).
     A caller's unsaved shapes are not saved on its behalf."""
-    import copy
-
     import gui_classify
     from gui_shapes import GENERIC_KIND, Clarification
 
     answers = gui_classify.persistable(classifications)
     if not answers:
         return list(shapes)
-    updated = []
-    for s in shapes:
-        s = copy.deepcopy(s)
-        got = answers.get(s.id)
-        if got is not None:
-            apply_answer(s, got)
-        updated.append(s)
+    updated = _classified_copies(shapes, classifications)
     written: Dict[str, Dict[str, Any]] = {}
     try:
         import gui_projects
@@ -687,6 +820,25 @@ def _persist_classifications(name: str, shapes: Sequence[Any],
     out.classified = written
     out.say(f"saved {len(written)} classification(s) into the wireframe — "
             f"the next Generate will not ask the model about them again")
+    return updated
+
+
+def _classified_copies(shapes: Sequence[Any],
+                       classifications: Sequence[Any]) -> List[Any]:
+    """Copies of ``shapes``, each box the classifier answered made that
+    kind (apply_answer). Writes nothing; the caller's shapes are untouched."""
+    import copy
+
+    import gui_classify
+
+    answers = gui_classify.persistable(classifications)
+    updated = []
+    for s in shapes:
+        s = copy.deepcopy(s)
+        got = answers.get(s.id)
+        if got is not None:
+            apply_answer(s, got)
+        updated.append(s)
     return updated
 
 
@@ -732,23 +884,23 @@ def described_window(window: Any) -> Dict[str, str]:
 def _planned_sources(project_dir: Path, spec: Any,
                      previous_links: Dict[str, Any],
                      ai_bodies: Optional[Dict[str, str]] = None
-                     ) -> Tuple[Dict[str, str], List[str]]:
+                     ) -> Tuple[Dict[str, str], Any]:
     """({"handlers.py": its text after this generation's own stub edits},
-    the lines naming stubs kept because hand-written code calls them) — or
-    ({}, []) when there is no handlers.py yet. Pure — writes nothing; emit
-    makes the same plan again and writes it, after every refusal has passed.
+    the gui_emit.HandlerPlan that says what they are) — or ({}, None) when
+    there is no handlers.py yet. Pure — writes nothing; emit makes the same
+    plan again and writes it, after every refusal has passed.
     """
     import gui_emit
 
     handlers = project_dir / "handlers.py"
     if not handlers.is_file():
-        return {}, []
+        return {}, None
     src = handlers.read_text(encoding="utf-8", errors="replace")
     plan = gui_emit.plan_handlers(
         src, spec, previous_links,
         callers=gui_emit.hand_written_callers(project_dir),
         ai_bodies=ai_bodies)
-    return {"handlers.py": plan.source}, plan.kept_lines()
+    return {"handlers.py": plan.source}, plan
 
 
 def _recorded_links(links: Dict[str, Any], previous: Dict[str, Any],
