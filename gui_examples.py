@@ -143,7 +143,9 @@ NOTES: Dict[str, str] = {
         "under this name, so it looks and behaves exactly like today's "
         "Typhon. Its projects keep their classifiers in a store of their "
         "own in the vault they were built in (classifier_store.json beside "
-        "the app). Generate it for Qt (`--target qt`)."
+        "the app), and the list of plugins they run (typhon_plugins.json), "
+        "copied from the app-wide base set when the project is made. "
+        "Generate it for Qt (`--target qt`)."
     ),
 }
 
@@ -184,6 +186,21 @@ OWN_CLASSIFIER_STORE: Tuple[str, ...] = ("typhon_plugins",)
 def own_classifier_store(name: str) -> bool:
     """Whether a project built from example `name` pins a store of its own."""
     return name in OWN_CLASSIFIER_STORE
+
+
+# Examples whose projects keep a Typhon PLUGIN LIST: building one writes
+# typhon_plugins.json beside the app — the app-wide base set COPIED as it is
+# when the project is made (question 1: a plugin added to the base set later
+# reaches only projects made after it), the plugin home it was made with,
+# and room for the project's own additions, switch-offs and setting
+# overrides (docs/typhon_plugins_design.md 4.2; council_core.plugin_lists).
+# council_core.designer_examples.build_project writes the file.
+PLUGIN_LIST: Tuple[str, ...] = ("typhon_plugins",)
+
+
+def keeps_plugin_list(name: str) -> bool:
+    """Whether a project built from example `name` keeps a plugin list."""
+    return name in PLUGIN_LIST
 
 
 # The examples sent to a model when none is named. The newest version teaches

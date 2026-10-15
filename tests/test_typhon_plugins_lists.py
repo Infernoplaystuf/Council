@@ -376,3 +376,46 @@ def test_a_second_process_waits_for_the_lock(tmp_path, home):
         (out.stdout, out.stderr)
     assert (folder / pl.PROJECT_FILE).read_bytes() == kept
 
+
+# ======================================================================
+# A "Typhon (plugins)" project gets its list when it is made
+# ======================================================================
+def test_building_typhon_plugins_writes_the_projects_list(tmp_path, home):
+    import gui_examples as gx
+    import run_example_gui as rex
+
+    pl.set_base_plugins(home, BUILTINS, BUILTINS + ["acme.thermal"])
+    pdir = rex.build("typhon_plugins", project="tp", vault_dir=tmp_path / "v",
+                     target="qt")
+    listed = pl.read_project(pdir)
+    assert listed is not None
+    assert listed.base_set == BUILTINS + ["acme.thermal"]
+    assert pl.expand(listed.plugin_home).resolve() == home.resolve()
+    assert gx.keeps_plugin_list("typhon_plugins")
+    assert not gx.keeps_plugin_list("typhon")
+    today = rex.build("typhon", project="today", vault_dir=tmp_path / "v",
+                      target="qt")
+    assert not (today / pl.PROJECT_FILE).exists(), "today's Typhon: as before"
+
+
+def test_typhon_plugins_is_never_made_with_a_plugin_home_under_council(
+        tmp_path, fake_user, monkeypatch):
+    """Built with TYPHON_PLUGIN_HOME unset, its project would record
+    ~/.council/typhon, where the plugin Typhon never writes while it runs
+    beside today's Typhon. Refused before anything is written."""
+    from council_core import designer_examples as dx
+
+    monkeypatch.delenv(pl.HOME_ENV, raising=False)
+    vault = tmp_path / "side_vault"
+    with pytest.raises(dx.ExampleError, match="plugin home"):
+        dx.build_project("typhon_plugins", "tp", vault, toolkit="qt")
+    assert not any(vault.rglob("*")) if vault.exists() else True
+    answers = dx.ExampleAnswers(example="typhon_plugins", project="tp",
+                                toolkit="qt", python="")
+    assert "plugin home" in dx.problem(answers, vault)
+    assert not (fake_user / ".council").exists()
+    monkeypatch.setenv(pl.HOME_ENV, str(tmp_path / "side_home"))
+    assert dx.problem(answers, vault) == ""
+    assert dx.problem(dx.ExampleAnswers(example="typhon", project="t",
+                                        toolkit="qt", python=""),
+                      vault) == "", "today's Typhon: as before"

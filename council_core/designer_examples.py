@@ -222,6 +222,10 @@ def problem(answers: ExampleAnswers, vault_dir: Any) -> str:
         why = own_store_problem(vault_dir)
         if why:
             return why
+    if gx.keeps_plugin_list(answers.example):
+        why = plugin_home_problem()
+        if why:
+            return why
     return ""
 
 
@@ -295,6 +299,47 @@ def pin_classifier_store(project_dir: Any, vault_dir: Any) -> Path:
 
 
 # ============================================================
+# A Typhon plugin list (docs/typhon_plugins_design.md 4.2)
+# ============================================================
+
+def plugin_home_problem() -> str:
+    """Why a project that keeps a plugin list (gui_examples.PLUGIN_LIST)
+    cannot be made with the plugin home in use now, or "".
+
+    "Typhon (plugins)" runs beside today's Typhon and must never write under
+    ~/.council (docs/typhon_plugins_branch.md), and its project records the
+    plugin home it was made with. With TYPHON_PLUGIN_HOME unset that would be
+    ~/.council/typhon, so it is built from the Council run-typhon-plugins.bat
+    starts, which names a side plugin home."""
+    from council_core import plugin_lists as pl
+
+    home = pl.resolve_home().path.expanduser().resolve()
+    real = (Path.home() / ".council").resolve()
+    if home == real or real in home.parents:
+        return (f"this example records the plugin home it is made with, and "
+                f"{home} is inside the Council's own app folder, where the "
+                f"plugin Typhon never writes while it runs beside today's "
+                f"Typhon — build it from the Council run-typhon-plugins.bat "
+                f"starts, which sets {pl.HOME_ENV} to a side plugin home "
+                f"(docs/typhon_plugins_branch.md). Nothing was built.")
+    return ""
+
+
+def make_plugin_list(project_dir: Any) -> Path:
+    """Write typhon_plugins.json beside the app: the app-wide base set of the
+    plugin home in use, COPIED as it is now (question 1: a plugin added to
+    the base set later reaches only projects made after it), and that plugin
+    home, home-relative. Reads the base set, never writes it; the list is
+    created once, never over a file (council_core.plugin_lists)."""
+    from council_core import plugin_host as ph
+    from council_core import plugin_lists as pl
+
+    home = pl.resolve_home()
+    base = pl.read_base_set(home.path, [pid for pid, _ in ph.BUILTIN_PLUGINS])
+    return pl.make_project(project_dir, base, home.path).path
+
+
+# ============================================================
 # Building — the one pipeline the CLI and the Designer share
 # ============================================================
 
@@ -342,6 +387,11 @@ def build_project(example: str, project: str, vault_dir: Any, *,
         why = own_store_problem(vault_dir)
         if why:
             raise ExampleError(why)
+    plugin_list = gx.keeps_plugin_list(example)
+    if plugin_list:
+        why = plugin_home_problem()
+        if why:
+            raise ExampleError(why)
 
     try:
         proj = gs.load_gspec(gx.EXAMPLES_DIR / f"{example}.gspec")
@@ -385,6 +435,8 @@ def build_project(example: str, project: str, vault_dir: Any, *,
         gpj.save_manifest(pdir, man)
         if own_store:
             pin_classifier_store(pdir, vault_dir)
+        if plugin_list:
+            make_plugin_list(pdir)
     except Exception as exc:
         moved = ""
         try:
