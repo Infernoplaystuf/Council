@@ -153,3 +153,14 @@ emulated Baslers at the TOP of every camera list. So:
 - `council_qt.tabs` imports its tabs when its registry is first asked for,
   so `tests/test_capture_tab.py` collects where matplotlib (the Grapher's)
   is not installed - the pylon env.
+- **Triggered capture and Downsample** are tested at three levels: the
+  books alone (`test_triggered.py`, `test_reduce.py`), a **fake Basler**
+  (`test_basler_trigger.py`: per-selector triggers, input lines, a counter,
+  burst triggers and binning that really shrinks the picture - what the
+  emulator cannot show; it patches `cameras.backends`, so it never sees an
+  emulated camera), and the **emulator** (`test_basler_real.py`: software
+  triggers, the timer, snapshot, a forced failed grab, Downsample falling
+  back to Typhon's average). A built Typhon is driven in
+  `test_typhon_capture.py`. Wait helpers there ask a condition once per
+  step and never again after it came true: a condition that TAKES a frame
+  (`frame_camera.latest`) asked twice loses it.

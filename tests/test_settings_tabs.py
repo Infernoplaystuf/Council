@@ -355,8 +355,12 @@ def test_an_evk4_fills_the_tabs_with_every_facility(clean, typhon_dir,
     assert not ui.ports.gain.widget.isEnabled()
     assert ui.ports.frame_rate.widget.isEnabled()
     note = ui.ports.settings_note.get()
-    assert "IMX636" in note and "Biases, Filters, Display" in note
-    assert "No exposure or gain" in note
+    # One line (the note is one row under the capture boxes: it was cut
+    # off naming the camera and every tab), still saying what the greyed
+    # boxes cannot do here — the tabs and the camera's name are in view.
+    assert note == st.NOTE_EVENT
+    assert "no exposure, gain or trigger" in note
+    assert "FPS: its picture window" in note
     # Disconnected: back to the boxes and "connect".
     ui.on_btn_disconnect()
     assert tabs.titles() == ["Basic", "Camera", "Presets"]

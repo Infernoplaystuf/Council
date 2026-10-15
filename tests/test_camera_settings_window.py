@@ -560,6 +560,30 @@ def test_what_a_capture_refuses_is_greyed_out_while_capturing(tmp_path):
     assert not w.capturing and w.area_apply.isEnabled()
 
 
+def test_the_capture_set_up_is_greyed_while_capturing_though_it_is_live(
+        tmp_path):
+    """The capture set-up (Capture, its trigger, Downsample) never stops
+    the stream — and is still one per run: its rows are greyed and say
+    so while capturing, and writable again after Stop."""
+    connect("frame")
+    w = window()
+    mode = w.rows["capture.mode"]
+    assert mode.live and mode.setting["per_run"]
+    assert mode.editor.isEnabled()
+    frame_camera.start(str(tmp_path / "run"))
+    try:
+        w.refresh_values()
+        for key in ("capture.mode", "capture.source", "save.downsample"):
+            row = w.rows[key]
+            assert not row.editor.isEnabled(), key
+            assert "Stop the capture" in row.note.text(), key
+        assert w.rows["Gain"].editor.isEnabled(), "a live setting stays live"
+    finally:
+        frame_camera.stop()
+    w.refresh_values()
+    assert w.rows["capture.mode"].editor.isEnabled()
+
+
 def test_a_slow_change_greys_the_window_until_its_answer_arrives():
     connect("frame")
     frame_camera.set_frame_rate(1)

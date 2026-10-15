@@ -1408,7 +1408,7 @@
           "capture_status": "summary"
         }
       },
-      "w": 224,
+      "w": 144,
       "x": 24,
       "y": 960,
       "z": 47
@@ -1437,8 +1437,8 @@
           "capture_status": "summary"
         }
       },
-      "w": 224,
-      "x": 264,
+      "w": 160,
+      "x": 328,
       "y": 960,
       "z": 48
     },
@@ -2469,7 +2469,7 @@
       "fg": "",
       "font": "Arial 10",
       "freeform": false,
-      "h": 96,
+      "h": 30,
       "id": "s81",
       "kind": "label",
       "label": "Connect a camera to see its settings.",
@@ -2488,8 +2488,377 @@
       "script": {},
       "w": 432,
       "x": 40,
-      "y": 344,
+      "y": 416,
       "z": 10
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 24,
+      "id": "s82",
+      "kind": "label",
+      "label": "Downsample",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 208,
+      "x": 264,
+      "y": 272,
+      "z": 80
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s83",
+      "kind": "combobox",
+      "label": "Downsample",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "default": "Off",
+        "name": "downsample"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "Off",
+          "2x",
+          "3x",
+          "4x"
+        ]
+      },
+      "resize": "auto",
+      "script": {
+        "function": "set_downsample",
+        "inputs": [
+          "downsample"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 208,
+      "x": 264,
+      "y": 296,
+      "z": 81
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 32,
+      "id": "s84",
+      "kind": "label",
+      "label": "Capture",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 64,
+      "x": 40,
+      "y": 336,
+      "z": 82
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s85",
+      "kind": "combobox",
+      "label": "Capture",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "default": "Continuous",
+        "name": "capture_mode"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "Continuous",
+          "Triggered: exact",
+          "Triggered: snapshot"
+        ]
+      },
+      "resize": "auto",
+      "script": {
+        "function": "set_capture_mode",
+        "inputs": [
+          "capture_mode"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 168,
+      "x": 104,
+      "y": 336,
+      "z": 83
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 32,
+      "id": "s86",
+      "kind": "label",
+      "label": "From",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 48,
+      "x": 280,
+      "y": 336,
+      "z": 84
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s87",
+      "kind": "combobox",
+      "label": "From",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "default": "Software",
+        "name": "trigger_source"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "Software",
+          "Timer"
+        ]
+      },
+      "resize": "auto",
+      "script": {
+        "function": "set_trigger_source",
+        "inputs": [
+          "trigger_source"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 328,
+      "y": 336,
+      "z": 85
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 32,
+      "id": "s88",
+      "kind": "label",
+      "label": "Per trigger",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 88,
+      "x": 40,
+      "y": 376,
+      "z": 86
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s89",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frames_per_trigger"
+      },
+      "props": {
+        "command": "",
+        "from_": 1,
+        "increment": 1,
+        "to": 1000
+      },
+      "resize": "auto",
+      "script": {
+        "function": "set_frames_per_trigger",
+        "inputs": [
+          "frames_per_trigger"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 128,
+      "y": 376,
+      "z": 87
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 11 bold",
+      "freeform": false,
+      "h": 32,
+      "id": "s90",
+      "kind": "label",
+      "label": "Timer every (s)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 120,
+      "x": 280,
+      "y": 376,
+      "z": 88
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s91",
+      "kind": "combobox",
+      "label": "Every s",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "default": "1",
+        "name": "timer_s"
+      },
+      "props": {
+        "command": "",
+        "readonly": false,
+        "values": [
+          "0.5",
+          "1",
+          "2",
+          "5",
+          "10",
+          "30",
+          "60"
+        ]
+      },
+      "resize": "auto",
+      "script": {
+        "function": "set_timer",
+        "inputs": [
+          "timer_s"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 72,
+      "x": 400,
+      "y": 376,
+      "z": 89
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s92",
+      "kind": "button",
+      "label": "Capture now (F9)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "capture_now",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 176,
+      "y": 960,
+      "z": 90
     }
   ],
   "window": {

@@ -123,23 +123,27 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     settings tabs under the image folder (s79 the notebook, s80 its Basic
     page, s81 the page's note): the exposure, gain and FPS boxes and their
     labels (s03-s08) moved into Basic, and the bad-timings block (s12-s16)
-    and the camera notes moved 32 px down to give the tabs room. Nothing
-    else moved."""
+    and the camera notes moved 32 px down to give the tabs room. Then the
+    capture set-up (s82-s92): Downsample beside FPS, the Capture mode, its
+    source, frames per trigger and the timer in Basic (whose note, s81,
+    became one line under them), and Capture now (F9) between Start and
+    Stop, which narrowed (s46, s47). Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == [f"s{i}" for i in range(55, 82)]
+    assert sorted(set(new) - set(old)) == sorted(f"s{i}"
+                                                 for i in range(55, 93))
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
     assert changed == ["s03", "s04", "s05", "s06", "s07", "s08", "s09",
                        "s11", "s12", "s13", "s14", "s15", "s16", "s23",
                        "s26", "s27", "s28", "s29", "s30", "s31", "s32",
                        "s33", "s34", "s35", "s36", "s37", "s38", "s39",
-                       "s40", "s44", "s46", "s49", "s50", "s51", "s52",
-                       "s53"]
+                       "s40", "s44", "s46", "s47", "s49", "s50", "s51",
+                       "s52", "s53"]
     assert new["s25"]["label"].startswith("Model"), "only relabelled"
     assert "roi" not in new["s44"]["script"]["outputs"]
     assert new["s49"]["script"]["outputs"]["roi"] == "crop"

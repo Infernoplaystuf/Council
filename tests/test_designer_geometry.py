@@ -193,12 +193,13 @@ def test_typhon_does_not_fit_the_old_fixed_canvas():
     Save preset and Camera settings joined the bottom of the middle
     column; 59 of 79 since the classifier library filled the right
     column; still 59, of 82, since the settings tabs went under the folder
-    path, inside the old canvas), and every one is inside Typhon's own
-    canvas."""
+    path, inside the old canvas; 60 of 93 since the capture set-up's boxes
+    joined the Basic tab, inside it, and Capture now (F9) the Start row),
+    and every one is inside Typhon's own canvas."""
     project = gui_shapes.load_gspec(TYPHON)
     assert (project.canvas.w, project.canvas.h) == (1504, 1016)
-    assert len(project.shapes) == 82
-    assert len(geo.outside(project.shapes, 1100, 700)) == 59
+    assert len(project.shapes) == 93
+    assert len(geo.outside(project.shapes, 1100, 700)) == 60
     assert geo.outside(project.shapes, 1504, 1016) == []
 
 
