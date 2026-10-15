@@ -135,8 +135,27 @@ At the branch point (43b317e) the gate was 51 files, 2,676 passed, 0 failed,
 27 skipped (`tests/test_basler_real.py` collects nothing outside the `pylon`
 environment).
 
-After P1 rows 2 and 3 (the plugin host and the timing bench) it was 58
-files, 2,922 passed, 0 failed, 27 skipped, at 4 at a time, with no rerun.
+After P1 rows 2 and 3 (the plugin host and the timing bench, 0517310) it
+was 58 files, 2,926 passed, 0 failed, 27 skipped, at 4 at a time, with no
+rerun.
+
+The camera files were also run in the `pylon` environment (`--python`),
+with pylon's emulated Baslers (`PYLON_CAMEMU=2`) and OpenEB on the path:
+14 files, 608 passed, 0 failed. That includes `tests/test_basler_real.py`
+with 47 tests. The gate now passes `--timeout` only to an interpreter that
+has pytest-timeout. That environment has not, and before this fix every
+file there ran nothing.
+
+The whole suite, on 31e0e1e, 8 at a time: 234 files, 8,276 passed, 2
+failed, 36 skipped, and `smoke_test.py` passed 1,313 with 0 failed. Both
+failures were timing tests under that load, and both passed when run alone:
+
+- the known-flaky test above;
+- `tests/test_run_python_fence.py::test_a_small_timeout_still_runs_trivial_code[1]`,
+  where a 1 s limit was exceeded.
+
+The two plugin-host fixes after that commit were checked by the gate and
+the `pylon` run above.
 At `--jobs 6` it was not clean. Two timing tests in
 `tests/test_gui_settings.py` failed, and failed again on the rerun:
 
