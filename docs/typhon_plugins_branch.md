@@ -134,6 +134,13 @@ At the branch point (43b317e) the gate was 51 files, 2,676 passed, 0 failed,
 27 skipped (`tests/test_basler_real.py` collects nothing outside the `pylon`
 environment).
 
+Run it on a quiet PC. With two gates and a `pylon`-environment run going at
+once, two timing-sensitive tests failed and then passed on every run alone:
+the known-flaky one above (twice in a row) and
+`tests/test_basler_trigger.py::test_an_exact_run_from_line1_saves_one_frame_per_edge_and_counts_the_rest`,
+which reads the trigger line as soon as the third frame is grabbed, before
+it may have been counted ("3 triggers · 2 ok").
+
 ## Progress
 
 | Stage, row | State |
