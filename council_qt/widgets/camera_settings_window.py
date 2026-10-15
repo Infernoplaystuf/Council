@@ -1133,6 +1133,11 @@ class SettingsCore:
     def _show_took(self, head: str, lines: List[str]) -> None:
         pass
 
+    def _saw_settings(self, settings: Sequence[Dict[str, Any]]) -> None:
+        """Every setting read for the view (refresh_values) — those it has
+        no row for too: a view that shows a setting elsewhere (the Basic
+        tab's boxes) keeps it from here."""
+
     # ------------------------------------------------------------------
     # Reading the camera
     # ------------------------------------------------------------------
@@ -1204,6 +1209,7 @@ class SettingsCore:
             return
         self.capturing = bool(listed.get("capturing"))
         settings = list(listed.get("settings") or [])
+        self._saw_settings(settings)
         shape = tuple((s["key"], s.get("type"), bool(s.get("read_only")),
                        s.get("group")) for s in settings)
         if wanted is not None:

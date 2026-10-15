@@ -227,13 +227,16 @@ class CaptureOptions:
 MODE_HELP = (
     "Continuous saves every frame from Start to Stop. Triggered: exact arms "
     "the camera so it exposes ONLY when the trigger arrives (precise; the "
-    "picture shows the last capture between triggers). Triggered: snapshot "
-    "keeps the live view and saves the next frames that arrive after each "
-    "trigger (up to one frame late). Fixed while capturing.")
+    "picture shows the last capture between triggers) — for the run it "
+    "takes over the camera's own Trigger rows, and Stop puts them back. "
+    "Triggered: snapshot keeps the live view and saves the next frames that "
+    "arrive after each trigger (up to one frame late). Fixed while "
+    "capturing.")
 SOURCE_HELP = (
     "Software: the Capture now button or F9. Timer: every so many seconds. "
     "Line1 …: a hardware input the camera lists (exact only) — its edge, "
-    "delay and debounce are the rows below. Fixed while capturing.")
+    "delay and debounce are in the Capture settings (the Exposure tab's "
+    "Capture section; Pop out shows them all). Fixed while capturing.")
 PER_HELP = ("Frames each trigger saves: 1, or more for a short burst. A "
             "hardware trigger with more than one needs a camera with burst "
             "triggers (AcquisitionBurstFrameCount).")

@@ -449,8 +449,9 @@ decided yet, every source Typhon can offer is there:
 
 - **Software** — the **Capture now (F9)** button, between Start and Stop,
   or the **F9** key anywhere in Typhon (a popped-out picture too).
-- **Timer** — every **Every s** seconds (0.05 s to a day; type any number
-  into the box).
+- **Timer** — every **Timer every (s)** seconds (0.05 s to a day; type any
+  number into the box — it is applied when you press Return or leave the
+  box).
 - **The camera's own inputs**, as the camera lists them — `Line1`,
   `Line2` … and, on a boost behind a CoaXPress card, `CxpTrigger0` — for
   an **exact** run only. Which edge triggers, a delay, and the line's
@@ -567,6 +568,11 @@ run is never recorded as binned while the camera sends full frames. A
 preset's own Binning rows (Downsample Off) are written after Downsample, so
 they are what the camera ends with.
 
+The Basic tab's **Downsample** and **Timer every (s)** boxes always show
+the camera's set-up — after a preset, a change in the Capture pop-out,
+Reset or a reconnect — and their tooltips say what they do. While
+Downsample is on, the live line before Start ends `· Downsample 2x`.
+
 The live picture is the picture the run saves, so the slider's saved frames,
 the live end, the crop box and a box drawn for the camera's area all agree;
 **Apply area** scales a box drawn on a Typhon-averaged picture back up to
@@ -676,7 +682,11 @@ frames, CSV, end record — into the folder you pick. There a failed write
 it, and **Record…** starts a new run — its status line counts afresh, so
 the old failure, its NOT-saved count and errors leave the line, and
 `saved` is that recording's own. The tab calls the screen's skipped
-frames `not drawn (screen only)`, as Typhon does.)
+frames `not drawn (screen only)`, as Typhon does. Its frames CSV, like
+every app's that saves through the same code (the Barbie apps too), has
+the columns of the table above: the trigger and Downsample ones are blank
+in a run that is neither triggered nor downsampled — the Capture tab's
+never are — and `frame_id` is filled for a Basler.)
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.

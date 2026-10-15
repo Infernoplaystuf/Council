@@ -961,13 +961,23 @@ def capture_now() -> Dict[str, Any]:
         if setup is None:
             return {"summary": "An event camera is not triggered here — "
                                "its .raw keeps every event."}
-        if setup.triggered:
+        if setup.triggered and setup.exact:
             return {"summary": f"Not capturing — Start first: it arms the "
                                f"trigger ({setup.short()}); then Capture "
                                f"now ({CAPTURE_KEY}) takes each picture."}
+        if setup.triggered:
+            # A snapshot run arms nothing: the live view runs, and each
+            # press saves the next frame(s).
+            frames = ("frame" if setup.per_trigger <= 1
+                      else f"{setup.per_trigger} frames")
+            return {"summary": f"Not capturing — Start first ("
+                               f"{setup.short()}); then Capture now "
+                               f"({CAPTURE_KEY}) saves the next {frames}."}
+        # Not "Basic tab": every app with a camera hears F9 — the capture
+        # set-up is in its camera's Capture settings wherever it shows them.
         return {"summary": "Capture now is for a triggered capture — choose "
                            "Capture: Triggered: exact or Triggered: "
-                           "snapshot (Basic tab), then Start."}
+                           "snapshot, then Start."}
     said = trig.capture_now()
     return {"summary": f"Capture now: {said}."}
 
@@ -1701,6 +1711,10 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
         # What Start will do, so a trigger mode chosen is not a surprise.
         line += (f" · Start arms the trigger ({setup.short()})"
                  if setup.exact else f" · Start: {setup.short()}")
+    if setup is not None and int(getattr(setup, "downsample", 1) or 1) > 1:
+        # It changes what is saved: said where the user looks before Start
+        # (review: the line never mentioned it).
+        line += f" · Downsample {int(setup.downsample)}x"
     if time.monotonic() < _LIVE.run_note_until:
         line += f" · {_LIVE.run_note or _run_note(session)}"
     return line
@@ -2144,6 +2158,7 @@ def attach(app: Any, view: str = "live_view",
         pass
 
     _hook_start_boxes(app)
+    _hook_typed_timer(app, say)
     _attach_capture_now(app, say)
     _LIVE.setup_path = _setup_path_for(app)
     # After setup_path: the presets it lists are this app's project's.
@@ -2217,6 +2232,51 @@ def _hook_start_boxes(app: Any) -> None:
         _LIVE.hooked_boxes.add(box)
 
 
+def _hook_typed_timer(app: Any, say: Optional[Callable[[str], Any]],
+                      port_name: str = "timer_s") -> None:
+    """A number TYPED into the timer box is applied when the box is left,
+    as when Return is pressed. The box is an editable dropdown whose link
+    runs on textActivated, which Qt sends on leaving it only for text that
+    is already one of its items (measured, review: "3" typed, focus moved —
+    the box said 3, the camera kept 1 s, and the line said "every 1 s").
+    Return (and a pick from the list) already ran the link: the value is
+    then the camera's, and nothing is written twice."""
+    ports = getattr(app, "ports", None)
+    widget = getattr(getattr(ports, port_name, None), "widget", None)
+    line_edit = getattr(widget, "lineEdit", None)
+    edit = line_edit() if callable(line_edit) else None
+    if edit is None:
+        return                      # not an editable box: its link is enough
+
+    def left() -> None:
+        device = _LIVE.device
+        setup = getattr(device, "capture", None)
+        if setup is None or not widget.isEnabled():
+            return
+        text = str(widget.currentText() or "")
+        word = text.lower().replace("seconds", "").replace("sec", "") \
+            .rstrip("s").strip()
+        try:
+            if abs(float(word) - float(setup.every_s)) < 1e-9:
+                return              # Return or the list already applied it
+        except ValueError:
+            pass                    # refused below, in words
+        try:
+            said = set_timer(text).get("summary", "")
+        except Exception as exc:                          # noqa: BLE001
+            # Refused: the box goes back to the camera's value (_set_capture
+            # tells the views), and why is said.
+            said = f"Timer every: {exc}"
+        if say is not None and said:
+            try:
+                say(said)
+            except Exception:                             # noqa: BLE001
+                pass
+
+    edit.editingFinished.connect(left)
+    app._typed_timer_hook = left
+
+
 #: The text a "Capture now" button starts with (Typhon's "Capture now (F9)").
 CAPTURE_BUTTON = "Capture now"
 
@@ -2225,9 +2285,10 @@ def _attach_capture_now(app: Any, say: Optional[Callable[[str], Any]]
                         ) -> None:
     """F9 ANYWHERE IN THE APP does what Capture now does — the main window
     and a picture popped out of it alike (an application-wide shortcut) —
-    and says it in the status line. The app's "Capture now" button, when
-    it has one, is enabled only while a press can fire (_capture_button_
-    state, every tick)."""
+    and says it in the status line; only in an app with a Capture now
+    button or the capture set-up's boxes. The app's "Capture now" button,
+    when it has one, is enabled only while a press can fire (_capture_
+    button_state, every tick)."""
     try:
         from PySide6.QtCore import Qt
         from PySide6.QtGui import QKeySequence, QShortcut
@@ -2243,20 +2304,29 @@ def _attach_capture_now(app: Any, say: Optional[Callable[[str], Any]]
             except Exception:                             # noqa: BLE001
                 pass
 
-    try:
-        key = QShortcut(QKeySequence(CAPTURE_KEY), app)
-        key.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        key.activated.connect(pressed)
-    except Exception:                                     # noqa: BLE001
-        key = None
-    _LIVE.capture_key = key
-    app._capture_now_key = key
     button = None
     try:
         button = next((b for b in app.findChildren(QPushButton)
                        if b.text().startswith(CAPTURE_BUTTON)), None)
     except Exception:                                     # noqa: BLE001
         button = None
+    ports = getattr(app, "ports", None)
+    has_set_up = ports is not None and getattr(ports, "capture_mode",
+                                               None) is not None
+    key = None
+    if button is not None or has_set_up:
+        # ONLY AN APP THAT CAPTURES ON A TRIGGER takes F9 — one with a
+        # Capture now button or the capture set-up's boxes (Typhon). Every
+        # other app attached here (Barbie) leaves the key alone (review:
+        # F9 in a Barbie said to choose a mode on a tab it does not have).
+        try:
+            key = QShortcut(QKeySequence(CAPTURE_KEY), app)
+            key.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            key.activated.connect(pressed)
+        except Exception:                                 # noqa: BLE001
+            key = None
+    _LIVE.capture_key = key
+    app._capture_now_key = key
     if button is not None:
         # GREYED MUST LOOK GREYED: the generated style sheet has no
         # :disabled rule, so a disabled button was drawn as an enabled one.
@@ -2288,9 +2358,9 @@ def _capture_button_state() -> None:
                    f"({trig.setup.source}) — Capture now fires a Software or "
                    f"Timer run")
         else:
-            tip = ("For a triggered capture: choose Capture: Triggered "
-                   "(Basic tab), Start — then Capture now or "
-                   f"{CAPTURE_KEY} takes each picture")
+            tip = ("For a triggered capture: choose Capture: Triggered: "
+                   "exact or Triggered: snapshot (Basic tab), Start — then "
+                   f"Capture now or {CAPTURE_KEY} takes each picture")
         if button.toolTip() != tip:
             button.setToolTip(tip)
     except RuntimeError:                                  # deleted

@@ -61,9 +61,14 @@ NO_CAMERA = ("Connect a camera to see its settings. They come from the "
              "a frame camera's exposure, gain and image format — each with "
              "Pop out.")
 
-#: The Basic tab's note while no camera is connected.
+#: The Basic tab's note while no camera is connected — and with one (a
+#: frame camera; an event camera, whose exposure and gain boxes are
+#: greyed). Each one line of Arial 10 at the smallest window (measured).
 NOTE_NO_CAMERA = ("Connect a camera to see its settings — they fill the tabs "
                   "beside Basic.")
+NOTE_FRAME = "More settings in the tabs beside Basic — Pop out opens one."
+NOTE_EVENT = ("Event camera — no exposure, gain or trigger. FPS: its picture "
+              "window.")
 
 
 def _quietly_set(port: Any, value: Any) -> None:
@@ -127,6 +132,9 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self.boxes = dict(boxes or {})
         self.capture_ports = {k: v for k, v in dict(capture or {}).items()
                               if v is not None}
+        #: The capture set-up as last read, by key (_saw_settings) — its
+        #: boxes show it whether or not a tab has a row for the key.
+        self.capture_settings: Dict[str, Dict[str, Any]] = {}
         #: The connected camera has a capture set-up (a frame camera).
         self.has_capture = False
         self.font = QFont(font) if font is not None else QFont(book.font())
@@ -338,6 +346,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self._rebuilding = True
         try:
             self.rows = {}
+            self.capture_settings = {}
             self._shape = None
             self.plan = []
             self._remove_pages()
@@ -618,10 +627,31 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
     def _took_setting(self, out: Dict[str, Any]) -> None:
         super()._took_setting(out)
         change = dict(out.get("change") or {})
+        key = str(out.get("key") or change.get("key") or "")
         if change.get("ok", out.get("ok", True)) and not change.get(
                 "skipped"):
-            self._follow_boxes([str(out.get("key") or "")])
+            self._follow_boxes([key])
+            kept = self.capture_settings.get(key)
+            if kept is not None and key not in self.rows:
+                # A capture key no tab row shows (Downsample, the timer —
+                # pop-out only): its box shows what the camera took now,
+                # and the set-up is read again after (its help, choices).
+                kept["value"] = change.get("value", out.get("value"))
+                self._want_refresh({str(kept.get("group") or "")})
         self._basic_capture()
+
+    def _saw_settings(self, settings: Sequence[Dict[str, Any]]) -> None:
+        """The capture set-up's settings as read, kept for the Basic tab's
+        boxes (CAPTURE_BOXES). MEASURED (review): the boxes read only the
+        tab rows, and Downsample and the timer are pop-out rows, so after a
+        preset, a pop-out change, Reset or a reconnect the Downsample box
+        said Off over a camera set to 2x (and the reverse), and neither box
+        ever showed its tooltip."""
+        wanted = set(self.CAPTURE_BOXES.values())
+        for setting in settings:
+            key = str(setting.get("key") or "")
+            if key in wanted:
+                self.capture_settings[key] = dict(setting)
 
     def _took_set(self, out: Dict[str, Any]) -> None:
         super()._took_set(out)
@@ -652,8 +682,12 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         values: Dict[str, Any] = {}
         for name, key in self.CAPTURE_BOXES.items():
             row = self.rows.get(key)
-            if row is not None:
-                values[key] = row.setting
+            # A row's setting is the latest (it follows each write); a key
+            # no tab row shows is as last read (_saw_settings).
+            setting = row.setting if row is not None else \
+                self.capture_settings.get(key)
+            if setting is not None:
+                values[key] = setting
         on = self.connected and self.has_capture and not self.busy
         settled = on and not self.capturing
         mode = str((values.get("capture.mode") or {}).get("value") or "")
@@ -686,7 +720,8 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             elif name in ("trigger_source", "frames_per_trigger") and \
                     not triggered:
                 enabled, tip = False, ("For a triggered capture: choose "
-                                       "Capture: Triggered first")
+                                       "Capture: Triggered: exact or "
+                                       "Triggered: snapshot first")
             elif name == "timer_s" and (not triggered or source != "Timer"):
                 enabled, tip = False, "For the Timer source only"
             elif setting is not None:
@@ -799,17 +834,16 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         if not self.connected:
             text = NOTE_NO_CAMERA
         else:
-            # TWO SHORT LINES at most: the note is one row under the
-            # capture boxes (it was 96 px before they came).
-            # The camera's name is said by Connect and the camera list.
-            titles = ", ".join(t.title for t in self.plan)
+            # ONE LINE: the note is one row under the capture boxes, 25 px
+            # high at the smallest window (1400 x 820). MEASURED (review):
+            # the event camera's note named the camera and every tab, took
+            # three lines, and was cut off at both window sizes; the frame
+            # camera's, two lines, was cut at 1400 x 820. The camera's name
+            # is said by Connect and the camera list; its tabs are in view.
             if not self.has_exposure and not self.has_gain:
-                text = (f"Event camera ({self.label}): no exposure, gain or "
-                        f"trigger — FPS sets its picture window. More in "
-                        f"{titles}.")
+                text = NOTE_EVENT
             else:
-                text = (f"More settings in {titles}, {PRESETS_TAB} — Pop "
-                        f"out opens one.")
+                text = NOTE_FRAME
         try:
             if port.get() != text:
                 port.set(text)

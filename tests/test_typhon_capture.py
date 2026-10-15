@@ -291,6 +291,159 @@ def test_an_event_camera_greys_the_capture_boxes_and_keeps_its_run(
     assert not (tmp_path / f"{run}{tg.TRIGGERS_SUFFIX}").exists()
 
 
+def test_the_basic_boxes_follow_the_set_up_however_it_changes(ui, tmp_path):
+    """Before: the Basic boxes read only the tab rows, and Downsample and
+    the timer are pop-out rows — after a preset the Downsample box said
+    Off over a camera set to 2x (runs saved half size), a pop-out change
+    or Reset left it behind, a reconnect left 2x over a camera at Off, and
+    neither box ever showed its tooltip (review, a built Typhon). Now
+    each shows the camera's set-up after every kind of change."""
+    p = ui.ports
+    connect(ui, "frame")
+    device = lambda: frame_camera._LIVE.device.capture        # noqa: E731
+    ds, timer = p.downsample.widget, p.timer_s.widget
+    pick(p.downsample, "2x")
+    assert pump(1.0, until=lambda: device().downsample == 2)
+    frame_camera.save_preset("half")
+    pick(p.downsample, "Off")
+    assert pump(1.0, until=lambda: p.downsample.get() == "Off")
+    # A preset.
+    frame_camera.apply_preset("half")
+    assert device().downsample == 2
+    assert pump(2.0, until=lambda: p.downsample.get() == "2x"), \
+        p.downsample.get()
+    # The pop-out's own row (set_camera_setting).
+    frame_camera.set_camera_setting(tg.DOWNSAMPLE_KEY, "3x")
+    assert pump(2.0, until=lambda: p.downsample.get() == "3x")
+    frame_camera.set_camera_setting(tg.EVERY_KEY, 7)
+    assert pump(2.0, until=lambda: p.timer_s.get() == "7"), p.timer_s.get()
+    # The Capture group's Reset (as connected: Off, 1 s).
+    frame_camera.reset_camera_settings(tg.GROUP)
+    assert device().downsample == 1
+    assert pump(2.0, until=lambda: p.downsample.get() == "Off" and
+                p.timer_s.get() == "1"), (p.downsample.get(), p.timer_s.get())
+    # Their tooltips: Downsample's help; the timer's says why it is greyed,
+    # then its own help once it can be used.
+    assert "block of pixels" in ds.toolTip(), ds.toolTip()
+    assert timer.toolTip() == "For the Timer source only"
+    pick(p.capture_mode, tg.MODE_EXACT)
+    pick(p.trigger_source, tg.TIMER)
+    assert pump(2.0, until=timer.isEnabled)
+    assert timer.toolTip() == tg.EVERY_HELP
+    # A reconnect: the camera's set-up as it is then.
+    pick(p.downsample, "2x")
+    assert pump(1.0, until=lambda: device().downsample == 2)
+    ui.on_btn_disconnect()
+    connect(ui, "frame")
+    assert device().downsample == 1
+    assert pump(2.0, until=lambda: p.downsample.get() == "Off"), \
+        p.downsample.get()
+    # Downsample on is said in the line before Start.
+    pick(p.downsample, "2x")
+    assert pump(3.0, until=lambda: "· Downsample 2x" in
+                p.capture_status.get()), p.capture_status.get()
+
+
+def test_capture_now_before_start_says_what_start_does(ui):
+    """Before: a Snapshot set-up was told Start "arms the trigger" (it arms
+    nothing), and Continuous named the Basic tab — in every app that hears
+    F9 (review). Now each says what Start does for its mode."""
+    p = ui.ports
+    connect(ui, "frame")
+    said = frame_camera.capture_now()["summary"]
+    assert "Triggered: exact or Triggered: snapshot, then Start" in said
+    assert "Basic tab" not in said
+    pick(p.capture_mode, tg.MODE_SNAPSHOT)
+    said = frame_camera.capture_now()["summary"]
+    assert said == ("Not capturing — Start first (snapshot, Software); then "
+                    "Capture now (F9) saves the next frame."), said
+    pick(p.capture_mode, tg.MODE_EXACT)
+    said = frame_camera.capture_now()["summary"]
+    assert "it arms the trigger (exact, Software)" in said, said
+
+
+def test_a_timer_typed_and_left_is_applied(ui):
+    """Before: the timer box is an editable dropdown whose link ran only
+    on textActivated — sent on leaving the box only for a value already
+    in its list: "3" typed and focus moved, the box said 3 and the camera
+    kept 1 s (review). Now leaving the box applies it, as Return does."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    p = ui.ports
+    connect(ui, "frame")
+    pick(p.capture_mode, tg.MODE_EXACT)
+    pick(p.trigger_source, tg.TIMER)
+    combo = p.timer_s.widget
+    assert pump(2.0, until=combo.isEnabled)
+    edit = combo.lineEdit()
+    edit.selectAll()
+    QTest.keyClicks(edit, "3")
+    edit.editingFinished.emit()            # focus leaves the box
+    pump(0.2)
+    assert frame_camera._LIVE.device.capture.every_s == 3.0
+    assert "3" in p.capture_status.get(), p.capture_status.get()
+    edit.selectAll()
+    QTest.keyClicks(edit, "0.25")
+    QTest.keyClick(edit, Qt.Key.Key_Return)
+    pump(0.2)
+    assert frame_camera._LIVE.device.capture.every_s == 0.25
+
+
+@pytest.mark.skipif(not Path(r"C:\Windows\Fonts\arial.ttf").is_file(),
+                    reason="needs the Windows fonts (Arial) to measure text")
+def test_the_basic_note_fits_its_row_for_every_camera(typhon_dir, tmp_path):
+    """The note is one row under the capture boxes. MEASURED before (review,
+    offscreen with the Windows fonts): an event camera's note needed 45 px
+    and had 31 at 1504 x 1016 and 25 at 1400 x 820 — three lines, cut off;
+    a frame camera's needed 30 of 25 at 1400 x 820. Measured here as in an
+    offscreen grab, in a fresh interpreter given the Windows fonts."""
+    import subprocess
+
+    code = (
+        "import json, sys\n"
+        f"sys.path[:0] = [{str(typhon_dir)!r}, {str(ROOT)!r}]\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "app = QApplication([])\n"
+        "import app as generated, frame_camera\n"
+        "from tests.sim_cameras import simulated_index\n"
+        "ui = generated.App()\n"
+        "note = ui.ports.settings_note.widget\n"
+        "out = []\n"
+        "def measure(kind):\n"
+        "    for size in ((1504, 1016), (1400, 820)):\n"
+        "        ui.resize(*size); ui.grab(); app.processEvents(); ui.grab()\n"
+        "        out.append([kind, size, note.text(), note.height(),\n"
+        "                    note.heightForWidth(note.width()),\n"
+        "                    note.font().family()])\n"
+        "measure('none')\n"
+        "for kind in ('frame', 'event'):\n"
+        "    ui.on_btn_scan_for_cameras()\n"
+        "    rows = ui.ports.cameras.items()\n"
+        "    ui.ports.cameras.widget.setCurrentRow(simulated_index(rows, kind))\n"
+        "    ui.on_btn_connect()\n"
+        "    app.processEvents()\n"
+        "    measure(kind)\n"
+        "    ui.on_btn_disconnect()\n"
+        "print(json.dumps(out))\n"
+        "frame_camera.disconnect()\n")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
+               QT_QPA_FONTDIR=r"C:\Windows\Fonts",
+               COUNCIL_VAULT_ROOT=str(tmp_path / "vault"),
+               PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run([sys.executable, "-c", code], cwd=str(typhon_dir),
+                          env=env, capture_output=True, text=True,
+                          timeout=180)
+    assert done.returncode == 0, done.stderr[-2000:]
+    measured = json.loads(done.stdout.strip().splitlines()[-1])
+    assert {m[0] for m in measured} == {"none", "frame", "event"}
+    for kind, size, text, height, needs, family in measured:
+        assert family == "Arial", measured
+        assert text, (kind, size)
+        assert needs <= height, f"{kind} at {size}: {text!r} needs " \
+                                f"{needs} px, has {height}"
+
+
 # ======================================================================
 # Update from example: the user's Typhon gets the capture set-up
 # ======================================================================
