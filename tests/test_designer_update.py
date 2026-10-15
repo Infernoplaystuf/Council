@@ -749,10 +749,14 @@ def test_a_write_that_fails_part_way_puts_every_file_back(tmp_path,
     assert not out.ok and not out.blocked and not out.replaced, said
     assert not list(pdir.glob("project.gspec.*.bak")), \
         "the update's own backup of the drawing is not needed any more"
-    assert said.startswith("not updated — writing my_typhon failed part-way,"
-                           " so every file it had written was put back"), said
+    assert said.startswith("not updated — writing my_typhon failed part-way:"
+                           " OSError: [Errno 28] No space left on device "
+                           "(test), so every file it had written was put "
+                           "back"), said
     assert f".backups/update_{STAMP}" in said
-    assert "No space left on device (test)" in said
+    index = json.loads((pdir / ".backups" / f"update_{STAMP}"
+                        / dx.RESTORE_INDEX).read_text(encoding="utf-8"))
+    assert index["state"] == "put back"
     folder = pdir / ".backups" / f"update_{STAMP}"
     assert out.restore_point == folder
     index = json.loads((folder / dx.RESTORE_INDEX).read_text(
@@ -935,6 +939,535 @@ def test_the_cli_says_a_refused_update_changed_nothing(tmp_path, monkeypatch,
         rex.main([example, "--update", "--project", "my_typhon", "--no-run"])
     assert "on_btn_train, handlers.py:" in capsys.readouterr().out
     assert digest(pdir) == before
+
+
+# ============================================================
+# What the review of the all-or-nothing update found (15 October 2026)
+# ============================================================
+
+#: A use of a port typhon_lite does not have, in a handler of a widget it
+#: keeps.
+STATUS_USE = "        self.ports.classifier_status.set('x')\n"
+
+
+def test_every_handler_that_uses_a_removed_port_is_named(tmp_path,
+                                                         monkeypatch):
+    """Two edited handlers of KEPT widgets use one port the example removes:
+    both are named. Measured before: only on_cmb_capture, the first use
+    find_orphans met (it reports each port once)."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    for handler in ("on_cmb_capture", "on_cmb_downsample"):
+        hand_edit(pdir, handler, STATUS_USE)
+    before = digest(pdir)
+    out = dx.update_from_example("my_typhon", example, vault)
+    assert digest(pdir) == before and out.blocked, out.lines
+    assert sorted(b.function for b in out.blockers) == [
+        "on_cmb_capture", "on_cmb_downsample"], out.lines
+    assert all(b.uses == ["self.ports.classifier_status"]
+               for b in out.blockers), out.blockers
+
+
+def test_doing_what_one_refusal_says_is_enough(tmp_path, monkeypatch):
+    """One refusal names every piece of code that blocks, with every port
+    each one uses, so deleting what it names once lets the update finish.
+    Measured before: it named on_btn_train and on_cmb_capture (on_btn_train
+    without classifier_status); with those deleted it refused again, naming
+    my_status, which had blocked all along."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    hand_edit(pdir, "on_btn_train", CODE)
+    hand_edit(pdir, "on_cmb_capture", STATUS_USE)
+    handlers = pdir / "handlers.py"
+    handlers.write_text(
+        handlers.read_text(encoding="utf-8").rstrip("\n")
+        + "\n\n    def my_status(self, text):\n"
+          "        self.ports.classifier_status.set(text)\n", encoding="utf-8")
+    out = dx.update_from_example("my_typhon", example, vault)
+    assert out.blocked, out.lines
+    by_name = {b.function: b for b in out.blockers}
+    assert sorted(by_name) == ["my_status", "on_btn_train",
+                               "on_cmb_capture"], out.lines
+    assert by_name["on_btn_train"].uses == [
+        "self.ports.classifier_name", "self.ports.classifier_status"]
+    source = handlers.read_text(encoding="utf-8")
+    for name in by_name:
+        source = source.replace(method(source, name), "")
+    handlers.write_text(source, encoding="utf-8")
+    again = dx.update_from_example("my_typhon", example, vault)
+    assert again.ok, again.lines
+
+
+def test_the_lines_named_are_the_definition_the_use_is_in(tmp_path,
+                                                          monkeypatch):
+    """Two definitions with one name, in app.py and in handlers.py: the
+    lines named are those of the one the use is in — what stage P4 would
+    cut out. Measured before: app.py's Helper.__init__, the first __init__
+    in the file, for a use in App.__init__."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    app = pdir / "app.py"
+    source = app.read_text(encoding="utf-8")
+    assert "frame_camera.attach(self)\n" in source and "\nclass App(" in source
+    app.write_text(source.replace(
+        "frame_camera.attach(self)\n",
+        "frame_camera.attach(self)\n        self.ports.classes.get()\n"
+    ).replace("\nclass App(", "\nclass Helper:\n    def __init__(self):\n"
+                              "        self.x = 1\n\n\nclass App("),
+        encoding="utf-8")
+    handlers = pdir / "handlers.py"
+    source = handlers.read_text(encoding="utf-8")
+    assert "\nclass HandlerMixin:" in source
+    handlers.write_text(source.replace(
+        "\nclass HandlerMixin:",
+        "\ndef show(text):\n    return text\n\n\nclass HandlerMixin:"
+    ).rstrip("\n") + "\n\n    def show(self):\n"
+                     "        return self.ports.predictions.get()\n",
+        encoding="utf-8")
+    out = dx.update_from_example("my_typhon", example, vault)
+    assert out.blocked, out.lines
+
+    def whole(blocker) -> str:
+        lines = (pdir / blocker.file).read_text(
+            encoding="utf-8").splitlines()
+        return "\n".join(lines[blocker.first_line - 1:blocker.last_line])
+
+    [in_app] = [b for b in out.blockers if b.file == "app.py"]
+    assert whole(in_app).lstrip().startswith("def __init__(self, parent"), \
+        (in_app.where, whole(in_app))
+    assert "self.ports.classes.get()" in whole(in_app)
+    [show] = [b for b in out.blockers if b.function == "show"]
+    assert whole(show).lstrip().startswith("def show(self):"), \
+        (show.where, whole(show))
+    assert "self.ports.predictions.get()" in whole(show)
+
+
+def test_code_using_a_widget_that_changed_kind_is_told_its_new_name(
+        tmp_path, monkeypatch):
+    """A frame-count Typhon whose app.py uses the Model entry: today's
+    Typhon has that box as a dropdown, cmb_model. The refusal says so and
+    says to rename it. Measured before: "self.ent_entry_3, which typhon does
+    not have", and advice to delete the code."""
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    shutil.copyfile(OLD, examples / "typhon.gspec")
+    monkeypatch.setattr(gx, "EXAMPLES_DIR", examples)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    app = pdir / "app.py"
+    app.write_text(app.read_text(encoding="utf-8").replace(
+        "frame_camera.attach(self)\n",
+        "frame_camera.attach(self)\n        self.ent_entry_3.setText('m1')\n"),
+        encoding="utf-8")
+    shutil.copyfile(EXAMPLE, examples / "typhon.gspec")
+    before = digest(pdir)
+    out = dx.update_from_example("my_typhon", "typhon", vault)
+    said = "\n".join(out.lines)
+    assert digest(pdir) == before and out.blocked, said
+    [blocker] = out.blockers
+    assert blocker.file == "app.py"
+    assert ("self.ent_entry_3 is now self.cmb_model in typhon (a Combobox): "
+            "rename it") in blocker.describe("typhon"), said
+    assert "self.ent_entry_3, which typhon does not have" not in said
+    assert "rename each self.<name> the list says was renamed" in said
+
+
+#: A child process that runs Update from example and dies part-way, as a
+#: power cut or a closed Council does (the Designer runs the update on a
+#: daemon thread). argv: repo root, vault, examples folder, where to die —
+#: as it starts writing one of the project's files (the file truncated, as
+#: a write that is cut off leaves it), or "after-emit": with ui/ and
+#: handlers.py written and the manifest not.
+DIE_PART_WAY = r'''
+import builtins, io, os, sys
+from pathlib import Path
+root, vault, examples, point = sys.argv[1:5]
+sys.path.insert(0, root)
+import gui_emit, gui_examples as gx, gui_projects as gpj
+from gui_shapes import ATOMIC_SUFFIX
+from council_core import designer_examples as dx
+gx.EXAMPLES_DIR = Path(examples)
+pdir = gpj.project_path("my_typhon", vault).resolve()
+real_open = builtins.open
+
+def dying_open(file, mode="r", *args, **kwargs):
+    if any(c in mode for c in "wa+") and isinstance(file, (str, os.PathLike)):
+        path = Path(os.fspath(file)).resolve()
+        if path.parent == pdir and path.name in (point, point + ATOMIC_SUFFIX):
+            real_open(file, mode, *args, **kwargs).close()
+            os._exit(77)
+    return real_open(file, mode, *args, **kwargs)
+
+if point == "after-emit":
+    real_emit = gui_emit.emit
+    def emit_then_die(*args, **kwargs):
+        real_emit(*args, **kwargs)
+        os._exit(77)
+    gui_emit.emit = emit_then_die
+else:
+    builtins.open = io.open = dying_open
+dx.update_from_example("my_typhon", "typhon_lite", vault)
+sys.exit(0)
+'''
+
+
+def die_part_way(tmp_path, monkeypatch, point: str):
+    """A Typhon with an edited handler of a kept widget, and an update to
+    typhon_lite killed at `point`. Returns (vault, project dir, example,
+    the project's files before, the edited handler)."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    edited = hand_edit(pdir, "on_btn_disconnect", CODE)
+    before = outside_backups(pdir)
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+               COUNCIL_NO_DIALOGS="1", PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run(
+        [sys.executable, "-c", DIE_PART_WAY, str(ROOT), str(vault),
+         str(examples), point],
+        env=env, capture_output=True, text=True, timeout=300)
+    assert done.returncode == 77, (done.stdout, done.stderr)
+    assert outside_backups(pdir) != before, "nothing was half-written"
+    return vault, pdir, example, before, edited
+
+
+def restore_state(pdir: Path) -> str:
+    [index] = pdir.glob(f".backups/update_*/{dx.RESTORE_INDEX}")
+    return json.loads(index.read_text(encoding="utf-8")).get("state", "")
+
+
+@pytest.mark.parametrize("point", ["project.gspec", "after-emit",
+                                   "handlers.py", "manifest.json"])
+def test_an_update_killed_part_way_is_put_back_when_the_project_is_opened(
+        tmp_path, monkeypatch, point):
+    """MEASURED before: killed after project.gspec was written, the project
+    kept the new drawing with the old manifest and ui/ (half-switched);
+    killed while writing manifest.json or handlers.py, that file was left
+    empty — and the next update then wrote a handlers.py without the
+    user's edited handler. Nothing ever put the restore point back.
+
+    Now opening the project puts it back exactly as it was (what the update
+    had left is kept beside the restore point), and the update then runs
+    as normal, keeping the user's code."""
+    from council_core import designer_project as dp
+
+    vault, pdir, example, before, edited = die_part_way(
+        tmp_path, monkeypatch, point)
+    state = restore_state(pdir)
+    opened = dp.open_named("my_typhon", vault)
+    assert opened.ok, opened.message
+    assert outside_backups(pdir) == before, opened.message
+    assert state == "writing"
+    assert len(opened.shapes) == 93
+    assert opened.message.startswith(
+        "an update of my_typhon was cut off while it wrote"), opened.message
+    assert "every file is back as it was before it" in opened.message
+    assert restore_state(pdir) == "put back"
+    [left] = pdir.glob(".backups/update_*/interrupted")
+    assert any(p.is_file() for p in left.rglob("*")), "what it left is kept"
+
+    again = dx.update_from_example("my_typhon", example, vault)
+    assert again.ok, again.lines
+    assert method((pdir / "handlers.py").read_text(encoding="utf-8"),
+                  "on_btn_disconnect") == edited
+
+
+def test_an_update_after_one_killed_part_way_puts_it_back_first(
+        tmp_path, monkeypatch):
+    vault, pdir, example, before, edited = die_part_way(
+        tmp_path, monkeypatch, "after-emit")
+    again = dx.update_from_example("my_typhon", example, vault)
+    assert again.ok, again.lines
+    assert again.lines[0].startswith(
+        "an update of my_typhon was cut off while it wrote"), again.lines
+    assert method((pdir / "handlers.py").read_text(encoding="utf-8"),
+                  "on_btn_disconnect") == edited
+    assert gpj.load_manifest(pdir).example == example
+
+
+def test_generate_after_an_update_killed_part_way_puts_it_back_and_stops(
+        tmp_path, monkeypatch):
+    """Generate would build ui/ from a drawing the update had half-replaced:
+    it puts the project back, writes nothing else, and says to Open it."""
+    from council_core import designer_project as dp
+
+    vault, pdir, example, before, edited = die_part_way(
+        tmp_path, monkeypatch, "after-emit")
+    shapes = gpj.open_project("my_typhon", vault).shapes
+    result = dp.generate("my_typhon", shapes, pdir, vault)
+    said = "\n".join(result.lines)
+    assert not result.ok and result.blocked, said
+    assert outside_backups(pdir) == before, said
+    assert "cut off while it wrote" in said
+    assert "Open my_typhon again" in said
+
+
+#: A child that takes a restore point of my_typhon — an update writing —
+#: and holds it until its stdin closes. argv: repo root, vault.
+HOLD_AN_UPDATE = r'''
+import sys
+root, vault = sys.argv[1:3]
+sys.path.insert(0, root)
+import gui_projects as gpj
+from council_core import designer_examples as dx
+point = dx.RestorePoint.take(gpj.project_path("my_typhon", vault), "child")
+print("writing", flush=True)
+sys.stdin.read()
+point.mark(dx.FINISHED)
+'''
+
+
+@pytest.mark.parametrize("where", ["this process", "another process"])
+def test_an_update_still_writing_is_left_alone(tmp_path, monkeypatch,
+                                               where):
+    """Open, Generate and Update while an update of the project is writing
+    — the Designer's worker part-way, or run_example_gui in another window:
+    its restore point says WRITING, but its writer holds the lock, so
+    nothing puts it back under its feet, and Generate and Update refuse."""
+    from council_core import designer_project as dp
+
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    if where == "this process":
+        point, child = dx.RestorePoint.take(pdir, STAMP), None
+    else:
+        point = None
+        child = subprocess.Popen(
+            [sys.executable, "-c", HOLD_AN_UPDATE, str(ROOT), str(vault)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        assert child.stdout.readline().strip() == "writing"
+    try:
+        handlers = pdir / "handlers.py"
+        handlers.write_text(handlers.read_text(encoding="utf-8")
+                            + "\n# written part-way\n", encoding="utf-8")
+        during = outside_backups(pdir)
+        opened = dp.open_named("my_typhon", vault)
+        assert opened.ok, opened.message
+        assert "an update of my_typhon is being written right now" \
+            in opened.message
+        result = dp.generate("my_typhon", opened.shapes, pdir, vault)
+        assert result.blocked and not result.ok, result.lines
+        out = dx.update_from_example("my_typhon", example, vault)
+        assert out.blocked and not out.ok, out.lines
+        assert outside_backups(pdir) == during
+    finally:
+        if point is not None:
+            point.mark(dx.FINISHED)
+        if child is not None:
+            child.communicate("", timeout=60)
+    assert "being written" not in dp.open_named("my_typhon", vault).message
+
+
+def test_a_restore_point_naming_other_files_is_not_trusted(tmp_path,
+                                                           monkeypatch):
+    """put_back copies over and removes what a restore point's index names,
+    so an index naming anything an update does not write — a file outside
+    the project here — is ignored whole: nothing is touched."""
+    from council_core import designer_project as dp
+
+    without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    canary = tmp_path / "canary.txt"
+    canary.write_text("keep me", encoding="utf-8")
+    assert (pdir / ".." / ".." / ".." / "canary.txt").resolve() == \
+        canary.resolve()
+    folder = pdir / ".backups" / "update_20261015_000000"
+    folder.mkdir(parents=True)
+    shutil.copyfile(pdir / "manifest.json", folder / "manifest.json")
+    (pdir / "manifest.json").write_text("{}", encoding="utf-8")
+    for absent in ("../../../canary.txt", str(canary)):
+        (folder / dx.RESTORE_INDEX).write_text(json.dumps({
+            "state": "writing", "saved": ["manifest.json"],
+            "absent": [absent]}), encoding="utf-8")
+        before = digest(pdir)
+        opened = dp.open_named("my_typhon", vault)
+        assert opened.ok and "cut off" not in opened.message, opened.message
+        assert canary.read_text(encoding="utf-8") == "keep me"
+        assert digest(pdir) == before
+
+
+def test_ctrl_c_while_writing_puts_every_file_back(tmp_path, monkeypatch,
+                                                   capsys):
+    """Ctrl+C in run_example_gui --update after ui/ and handlers.py were
+    written: every file is put back, and the interrupt still stops the
+    command. Measured before: KeyboardInterrupt is not an Exception, so
+    nothing was put back — the new drawing with a half-regenerated ui/."""
+    import gui_emit
+    import run_example_gui as rex
+
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    hand_edit(pdir, "on_btn_disconnect", CODE)
+    before = outside_backups(pdir)
+    real = gui_emit.emit
+    reached = []
+
+    def emit_then_ctrl_c(*args, **kwargs):
+        real(*args, **kwargs)
+        reached.append(outside_backups(pdir) != before)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gui_emit, "emit", emit_then_ctrl_c)
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    with pytest.raises(KeyboardInterrupt):
+        rex.main([example, "--update", "--project", "my_typhon", "--no-run"])
+    assert reached == [True]
+    assert outside_backups(pdir) == before
+    assert restore_state(pdir) == "put back"
+    printed = capsys.readouterr().out
+    assert "every file it had written was put back" in printed, printed
+
+
+def test_a_drawing_backup_cut_off_part_way_is_not_left_behind(tmp_path,
+                                                              monkeypatch):
+    """Copying project.gspec to its dated .bak failed part-way (a full
+    disk): the truncated copy is removed with everything else. Measured
+    before: a 1000-byte project.gspec.<time>.bak was left — the file the
+    confirm and the quick-start say to copy back to undo an update."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    before = outside_backups(pdir)
+    real_copy2 = shutil.copy2
+
+    def full_disk(source, target, *args, **kwargs):
+        if str(target).endswith(".bak"):
+            Path(target).write_bytes(Path(source).read_bytes()[:1000])
+            raise OSError(28, "No space left on device (test)")
+        return real_copy2(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", full_disk)
+    out = dx.update_from_example("my_typhon", example, vault, stamp=STAMP)
+    assert not out.ok and out.backup is None, out.lines
+    assert not list(pdir.glob("project.gspec.*.bak"))
+    assert outside_backups(pdir) == before, out.lines
+
+
+def test_a_failure_put_back_names_the_file_and_marks_the_log_undone(
+        tmp_path, monkeypatch):
+    """manifest.json held open by another program: the first line names it,
+    and what Generate had done is headed as undone. Measured before:
+    "generate failed: PermissionError(13, 'Permission denied')", with no
+    file, last, after 19 lines of work presented as done."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    held = pdir / gpj.MANIFEST_NAME
+
+    def held_open(directory, manifest):
+        raise PermissionError(13, "Permission denied", str(held))
+
+    monkeypatch.setattr(gpj, "save_manifest", held_open)
+    out = dx.update_from_example("my_typhon", example, vault, stamp=STAMP)
+    assert not out.ok, out.lines
+    first = out.lines[0]
+    assert first.startswith(
+        f"not updated — writing my_typhon failed part-way: PermissionError: "
+        f"Permission denied: {held}, so every file it had written was put "
+        f"back"), first
+    undone = "── what Generate had done before that — all of it undone ──"
+    assert undone in out.lines and "── Generate ──" not in out.lines
+    assert out.lines.index("policy: OK") > out.lines.index(undone)
+    assert not any(line.startswith("generate failed") for line in out.lines)
+
+
+@pytest.mark.parametrize("fname", ["handlers.py", "app.py"])
+def test_code_that_does_not_parse_refuses_the_update(tmp_path, monkeypatch,
+                                                     fname):
+    """The checks cannot see into a file that does not parse, so the update
+    refuses, saying where it stops parsing. Measured before: with
+    on_btn_train edited and a half-typed def below it, the update went
+    ahead and removed the Train button its handler is for."""
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    example = lite(examples)
+    hand_edit(pdir, "on_btn_train", CODE)
+    path = pdir / fname
+    path.write_text(path.read_text(encoding="utf-8").rstrip("\n")
+                    + "\n\n    def half_typed(self:\n", encoding="utf-8")
+    line = len(path.read_text(encoding="utf-8").splitlines())
+    before = digest(pdir)
+    out = dx.update_from_example("my_typhon", example, vault)
+    said = "\n".join(out.lines)
+    assert digest(pdir) == before, said
+    assert out.blocked and not out.ok, said
+    assert said.startswith("not updated — my_typhon was left exactly as it "
+                           "was: nothing was written"), said
+    assert f"{fname} does not parse (line {line}:" in said, said
+
+
+def _fail_writing(monkeypatch, target: Path) -> None:
+    """The first write of `target` (or of the temporary file it is written
+    through) is cut off as a full disk cuts it: the file is truncated, then
+    the write fails."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if any(c in mode for c in "wa+") and isinstance(
+                file, (str, os.PathLike)):
+            path = Path(os.fspath(file))
+            if path.parent == target.parent and path.name in (
+                    target.name, target.name + gs.ATOMIC_SUFFIX):
+                real_open(file, mode, *args, **kwargs).close()
+                raise OSError(28, "No space left on device (test)")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    monkeypatch.setattr(io, "open", failing_open)
+
+
+@pytest.mark.parametrize("what", ["manifest.json", "project.gspec",
+                                  "handlers.py"])
+def test_a_cut_off_write_leaves_the_file_as_it_was(tmp_path, monkeypatch,
+                                                   what):
+    """manifest.json, project.gspec and handlers.py are written through a
+    temporary file, so a write cut off part-way leaves each one whole — even
+    in a plain Generate, which has no restore point. Measured before: each
+    was left empty, and handlers.py holds the user's code."""
+    from council_core import designer_project as dp
+
+    examples = without_classifier(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    pdir = build_typhon(vault)
+    hand_edit(pdir, "on_btn_disconnect", CODE)
+    target = pdir / what
+    was = target.read_bytes()
+    project = gpj.open_project("my_typhon", vault)
+    # The Generate that rewrites handlers.py: a widget whose stub goes.
+    shapes = [s for s in project.shapes if s.id != "s35"]
+    manifest = gpj.load_manifest(pdir)
+    _fail_writing(monkeypatch, target)
+    if what == "manifest.json":
+        with pytest.raises(OSError):
+            gpj.save_manifest(pdir, manifest)
+    elif what == "project.gspec":
+        with pytest.raises(OSError):
+            gpj.save_project("my_typhon", project, vault_dir=vault)
+    else:
+        result = dp.generate("my_typhon", shapes, pdir, vault)
+        assert not result.ok, result.lines
+    monkeypatch.undo()
+    assert target.read_bytes() == was
+    assert not target.with_name(target.name + gs.ATOMIC_SUFFIX).exists()
 
 
 # ============================================================

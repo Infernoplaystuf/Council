@@ -56,11 +56,15 @@ AN UPDATE FINISHES OR CHANGES NOTHING
 Every check Generate makes runs against the new layout BEFORE a byte is
 written. A refusal — most often a handler the user edited for a widget the
 new example removes — leaves the project exactly as it was and names each
-piece of their code that stopped it (UpdateBlocker). The writes then go
-behind a RestorePoint, so one that fails part-way puts every file back.
-Measured before: project.gspec and the manifest's example were written
-first, Generate then refused, and the project was left half-switched — the
-new drawing with the old ui/.
+piece of their code that stopped it, every one in one go (UpdateBlocker).
+The writes then go behind a RestorePoint, so one that fails part-way — or
+is stopped by Ctrl+C — puts every file back; and one whose process dies
+part-way (a power cut, the Council closed while its worker wrote) is put
+back by the next Open, Generate or Update (put_back_interrupted). The
+drawing, the manifest and handlers.py are each written whole, through a
+temporary file, so none is ever left empty. Measured before: project.gspec
+and the manifest's example were written first, Generate then refused, and
+the project was left half-switched — the new drawing with the old ui/.
 """
 from __future__ import annotations
 
@@ -711,25 +715,37 @@ def _forget_rekinded(manifest: Any, old: Sequence[Any],
     return dropped
 
 
-def backup_gspec(project_dir: Any, stamp: str = "") -> Path:
-    """Copy project.gspec to project.gspec.<stamp>.bak beside it.
-
-    In the project folder, not .backups/, so it is found by anyone looking
-    for the file it replaced; a second update in the same second gets _2
-    rather than overwriting the first backup."""
+def backup_gspec(project_dir: Any, stamp: str = "",
+                 target: Optional[Path] = None) -> Path:
+    """Copy project.gspec to project.gspec.<stamp>.bak beside it
+    (gspec_backup_path), or to ``target`` when the caller has already
+    chosen that name — Update from example records it in its restore point
+    BEFORE copying, so a copy cut off part-way is removed with the rest."""
     import shutil
 
     import gui_projects as gpj
 
     directory = Path(project_dir)
-    source = directory / gpj.GSPEC_NAME
+    target = target or gspec_backup_path(directory, stamp)
+    shutil.copy2(directory / gpj.GSPEC_NAME, target)
+    return target
+
+
+def gspec_backup_path(project_dir: Any, stamp: str = "") -> Path:
+    """Where backup_gspec copies project.gspec: project.gspec.<stamp>.bak.
+
+    In the project folder, not .backups/, so it is found by anyone looking
+    for the file it replaced; a second update in the same second gets _2
+    rather than overwriting the first backup."""
+    import gui_projects as gpj
+
+    directory = Path(project_dir)
     stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
     target = directory / f"{gpj.GSPEC_NAME}.{stamp}.bak"
     n = 1
     while target.exists():
         n += 1
         target = directory / f"{gpj.GSPEC_NAME}.{stamp}_{n}.bak"
-    shutil.copy2(source, target)
     return target
 
 
@@ -753,6 +769,27 @@ UPDATE_WRITES = (
 #: point folder that has one is complete.
 RESTORE_INDEX = "restore.json"
 
+#: A restore point's "state" in its index. WRITING from the moment it is
+#: complete — the update may write from then on — to FINISHED once the
+#: update has written everything, or PUT_BACK once every file is back as it
+#: was. One still WRITING whose update is not running (its lock is free) is
+#: an update whose process died part-way: put_back_interrupted puts it
+#: back. An index with no state (written before states existed) is left
+#: alone.
+WRITING, FINISHED, PUT_BACK = "writing", "finished", "put back"
+
+#: Held, through an OS lock on its first byte, by the process writing an
+#: update for as long as it writes; the OS lets go of it when that process
+#: dies. So a WRITING restore point whose lock can be taken is one nobody
+#: is writing any more — and one whose lock cannot be is an update still
+#: running, in this process or another, which must not be "put back" under
+#: its feet.
+WRITE_LOCK = "writing.lock"
+
+#: Where put_back_interrupted copies what a cut-off update had left before
+#: putting the project back: inside its restore point.
+LEFT_BY_UPDATE = "interrupted"
+
 
 @dataclass
 class RestorePoint:
@@ -765,10 +802,13 @@ class RestorePoint:
     full disk, a file another program holds open), which otherwise leaves
     the project half-updated: put_back() returns every file to what it was.
 
-    On disk, not in memory, so the way back survives a crash in the middle
-    and the message can name it. Kept after a finished update, as Generate's
-    own .backups/<stamp>/ is: it is the whole project from before the update
-    in one place — the drawing, the manifest, ui/ and handlers.py."""
+    On disk, not in memory, and marked WRITING until the update is done
+    (`state`), so the way back survives the process dying part-way — a
+    power cut, or the Council closed while the Designer's worker thread
+    wrote: the next Open, Generate or Update puts it back
+    (put_back_interrupted). Kept after a finished update, as Generate's own
+    .backups/<stamp>/ is: it is the whole project from before the update in
+    one place — the drawing, the manifest, ui/ and handlers.py."""
     project_dir: Path
     folder: Path
     #: Paths relative to the project, POSIX style, copied into `folder`.
@@ -776,14 +816,19 @@ class RestorePoint:
     #: Paths that did not exist; put_back removes them if the update made
     #: them.
     absent: List[str] = field(default_factory=list)
+    state: str = WRITING
+    #: The open WRITE_LOCK file while this process writes the update.
+    _lock: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def take(cls, project_dir: Any, stamp: str = "") -> "RestorePoint":
-        """Copy what an update may write. Raises OSError when it cannot —
-        and then the update must not start."""
+        """Copy what an update may write, take the write lock and mark it
+        WRITING. Raises OSError when it cannot — and then the update must
+        not start."""
         import shutil
 
         import gui_projects as gpj
+        from gui_shapes import ATOMIC_SUFFIX
 
         directory = Path(project_dir)
         stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
@@ -800,6 +845,10 @@ class RestorePoint:
             wanted += [p.relative_to(directory).as_posix()
                        for p in sorted(ui.rglob("*"))
                        if p.is_file() and "__pycache__" not in p.parts]
+        # What a write cut off part-way leaves beside the three files
+        # written whole (gui_shapes.write_text_atomic) — removed with the
+        # rest when the project is put back.
+        wanted += [f"{rel}{ATOMIC_SUFFIX}" for rel in _WRITTEN_WHOLE]
         point = cls(directory, folder)
         for rel in dict.fromkeys(wanted):                # each once, in order
             source = directory / rel
@@ -810,16 +859,112 @@ class RestorePoint:
                 point.saved.append(rel)
             elif not source.exists():
                 point.absent.append(rel)
-        point._write_index()
+        point._lock = _take_lock(folder / WRITE_LOCK)    # raises OSError
+        if point._lock is None:
+            raise OSError(f"{folder.name}/{WRITE_LOCK} is held by another "
+                          f"program")
+        try:
+            point._write_index()
+        except BaseException:
+            point._release()
+            raise
         return point
 
+    @classmethod
+    def load(cls, folder: Any,
+             project_dir: Any) -> Optional["RestorePoint"]:
+        """The restore point in `folder`, from its index — None when it has
+        none, or one that is not a restore point's. Only paths an update
+        could have recorded are taken from it (_restorable): put_back
+        copies over and removes what the index names, so an index that
+        named anything else is not trusted at all."""
+        import json
+
+        folder = Path(folder)
+        try:
+            raw = json.loads((folder / RESTORE_INDEX).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        saved, absent = raw.get("saved"), raw.get("absent")
+        if not (isinstance(saved, list) and isinstance(absent, list)):
+            return None
+        if not all(isinstance(p, str) and _restorable(p)
+                   for p in [*saved, *absent]):
+            return None
+        return cls(Path(project_dir), folder, saved=list(saved),
+                   absent=list(absent), state=str(raw.get("state") or ""))
+
     def created(self, path: Any) -> None:
-        """Note a file the update made that the list could not know of in
-        advance (the dated project.gspec backup): put_back removes it."""
+        """Note a file the update makes that the list could not know of in
+        advance (the dated project.gspec backup): put_back removes it.
+        Called BEFORE the file is written, so one cut off part-way is
+        removed too."""
         rel = Path(path).relative_to(self.project_dir).as_posix()
         if rel not in self.absent:
             self.absent.append(rel)
             self._write_index()
+
+    def mark(self, state: str) -> None:
+        """Record that the update FINISHED, or was PUT_BACK; then this
+        process no longer holds the write lock. Raises when the index
+        cannot be written — and then the state is still what it was, and
+        the lock still held."""
+        was, self.state = self.state, state
+        try:
+            self._write_index()
+        except BaseException:
+            self.state = was
+            raise
+        self._release()
+
+    def writer_running(self) -> bool:
+        """Whether an update is writing behind this restore point right
+        now — this process's, or another's (its lock is held). A lock file
+        that is not there, or cannot be opened, is held by nobody."""
+        if self._lock is not None:
+            return True
+        try:
+            lock = _take_lock(self.folder / WRITE_LOCK, create=False)
+        except OSError:
+            return False
+        if lock is None:
+            return True
+        _let_go(lock)
+        return False
+
+    def keep_what_is_there(self) -> str:
+        """Copy each file the update left that is not as it was — and each
+        it made — into <folder>/interrupted/, before put_back writes over
+        it or removes it: what a cut-off update left, and any edit made
+        since, is kept. That folder relative to the project, or "" when
+        there was nothing to keep. Raises OSError when a copy fails, and
+        then nothing must be put back."""
+        import shutil
+
+        dest = self.folder / LEFT_BY_UPDATE
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = self.folder / f"{LEFT_BY_UPDATE}_{n}"
+        kept = False
+        for rel in [*self.saved, *self.absent]:
+            current = self.project_dir / rel
+            if not current.is_file():
+                continue
+            if rel in self.saved:
+                try:
+                    if current.read_bytes() == (self.folder / rel).read_bytes():
+                        continue
+                except OSError:
+                    pass
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(current, target)
+            kept = True
+        return dest.relative_to(self.project_dir).as_posix() if kept else ""
 
     def put_back(self) -> List[str]:
         """Every saved file back as it was, then every file the update made
@@ -854,12 +999,179 @@ class RestorePoint:
                       "writing anything. To put the project back as it was, "
                       "copy each one in 'saved' back over the project's, and "
                       "remove each one in 'absent' that is there now: it did "
-                      "not exist before the update."),
-            "saved": self.saved, "absent": self.absent}
+                      "not exist before the update. 'state' says how the "
+                      "update ended: 'writing' while it writes (still "
+                      "'writing' with no update running: it was cut off, and "
+                      "the Designer puts it back when the project is next "
+                      "opened, generated or updated), 'finished', or "
+                      "'put back'."),
+            "state": self.state, "saved": self.saved, "absent": self.absent}
         target = self.folder / RESTORE_INDEX
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, target)
+
+    def let_go(self) -> None:
+        """Stop holding the write lock, leaving the state as it is — an
+        update that could not be put back stays WRITING, for the next Open,
+        Generate or Update to try again."""
+        self._release()
+
+    def _release(self) -> None:
+        if self._lock is not None:
+            lock, self._lock = self._lock, None
+            _let_go(lock)
+
+
+#: The files Generate and the update write whole, through a temporary file
+#: beside them (gui_shapes.write_text_atomic).
+_WRITTEN_WHOLE = ("project.gspec", "manifest.json", "handlers.py")
+
+
+def _restorable(rel: str) -> bool:
+    """Whether `rel` is a path a restore point may name: one an update
+    writes (UPDATE_WRITES, project.gspec, a file in ui/, a temporary file
+    of one written whole) or its dated drawing backup — relative, inside
+    the project, and nothing else."""
+    import gui_projects as gpj
+    from gui_shapes import ATOMIC_SUFFIX
+
+    parts = rel.split("/")
+    if (not rel or "\\" in rel or ":" in rel or rel.startswith("/")
+            or any(p in ("", ".", "..") for p in parts)):
+        return False
+    if rel in (gpj.GSPEC_NAME, *UPDATE_WRITES):
+        return True
+    if rel in (f"{name}{ATOMIC_SUFFIX}" for name in _WRITTEN_WHOLE):
+        return True
+    if parts[0] == gpj.UI_DIRNAME and len(parts) > 1:
+        return True
+    return (len(parts) == 1 and rel.startswith(f"{gpj.GSPEC_NAME}.")
+            and rel.endswith(".bak"))
+
+
+#: Where in WRITE_LOCK the lock is taken: far past its end (Windows allows
+#: that). A lock on byte 0 made the empty file unreadable to every other
+#: handle while an update ran — a program reading every file of the
+#: project (a backup, a zip, a test's digest) failed on it (measured).
+_LOCK_AT = 1 << 30
+
+
+def _take_lock(path: Path, create: bool = True) -> Any:
+    """The open file at `path` with an OS lock on one byte (_LOCK_AT),
+    taken without waiting — None when another handle holds it. msvcrt on
+    Windows, flock elsewhere (as council_core.camera_presets locks
+    presets). Raises OSError when the file cannot be opened (or, with
+    create=False, is not there)."""
+    handle = open(path, "a+b" if create else "r+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(_LOCK_AT)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _let_go(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(_LOCK_AT)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass                      # closing the handle lets go of it anyway
+    finally:
+        handle.close()
+
+
+def put_back_interrupted(project_dir: Any,
+                         name: str = "") -> Tuple[bool, List[str]]:
+    """Put back an Update from example that was cut off while it wrote.
+
+    An update marks its restore point WRITING before its first write and
+    FINISHED (or PUT_BACK) after its last, so one still WRITING with no
+    update running is one whose process died part-way: a power cut, or the
+    Council closed while the Designer's worker thread wrote (a daemon
+    thread — closing does not wait for it). MEASURED before: such a project
+    kept the new drawing with the old manifest and ui/, or was left with an
+    empty manifest.json, and nothing ever put it back; the next update even
+    wrote a handlers.py without the user's edited handler.
+
+    Every file goes back as the restore point holds it, and the update's
+    own files are removed — after what was there is copied to
+    <restore point>/interrupted/, so nothing is lost, an edit made since
+    included. Open, Generate and Update call this first.
+
+    Returns (whether the project is whole, what to say): (True, []) when
+    there was nothing to do. (False, lines) when an update is being written
+    right now, or one could not all be put back — then the lines say how to
+    do it by hand, and the restore point stays WRITING, so the next call
+    tries again. Never raises."""
+    import gui_projects as gpj
+
+    from .designer_project import failure_text
+
+    directory = Path(project_dir)
+    label = name or directory.name
+    said: List[str] = []
+    try:
+        indexes = sorted((directory / gpj.BACKUPS_DIRNAME).glob(
+            f"update_*/{RESTORE_INDEX}"), reverse=True)
+    except OSError:
+        return True, []
+    for index in indexes:
+        point = RestorePoint.load(index.parent, directory)
+        if point is None or point.state != WRITING:
+            continue
+        folder = point.folder.relative_to(directory).as_posix()
+        if point.writer_running():
+            said.append(f"an update of {label} is being written right now "
+                        f"({folder}) — what is on disk may be part-way; "
+                        f"wait for it to finish")
+            return False, said
+        kept = ""
+        try:
+            kept = point.keep_what_is_there()
+            problems = point.put_back()
+        except Exception as exc:                         # noqa: BLE001
+            problems = [failure_text(exc)]
+        if problems:
+            said.append(f"an update of {label} was cut off while it wrote, "
+                        f"and NOT everything could be put back — it may be "
+                        f"half-updated:")
+            said.extend("  " + p for p in problems)
+            left = (f" What the update had left is in {kept}." if kept
+                    else "")
+            said.append(f"To put it back by hand, copy each file in {folder} "
+                        f"back over the project's ({RESTORE_INDEX} lists "
+                        f"them, and the files the update made, which were "
+                        f"not there before).{left} The next Open, Generate "
+                        f"or Update tries again.")
+            return False, said
+        left = (f"; what it had left is kept in {kept}" if kept else "")
+        said.append(f"an update of {label} was cut off while it wrote "
+                    f"({folder}): every file is back as it was before it"
+                    f"{left}")
+        try:
+            point.mark(PUT_BACK)
+        except OSError as exc:
+            said.append(f"note: {folder}/{RESTORE_INDEX} could not be "
+                        f"marked as put back ({failure_text(exc)}), so this "
+                        f"is checked again next time")
+    return True, said
 
 
 def _copy_over(source: Path, target: Path) -> None:
@@ -890,20 +1202,29 @@ class UpdateBlocker:
     each blocking handler, word for word, into handlers_retired.txt instead
     of stopping. That step is not built here. What it needs is this: the
     file, the function, and the lines of its WHOLE definition as they are on
-    disk (first_line to last_line, decorators included). update_from_example
-    says where it runs."""
+    disk (first_line to last_line, decorators included) — of the definition
+    the use is IN, when a file has two of one name (`owner` tells a method
+    from a function of the same name). update_from_example says where it
+    runs."""
     file: str
     #: The handler or function the use is in; "" for a line outside one.
     function: str
     first_line: int
     last_line: int
-    #: What it uses that goes, as written in the code: "self.ports.roi".
+    #: What it uses that goes, as written in the code: "self.ports.roi" —
+    #: every one, in the order the code uses them.
     uses: List[str] = field(default_factory=list)
     #: An on_<widget> handler whose widget goes: that widget, as the user
     #: knows it ("Train (s35)").
     widget: str = ""
     #: An untouched stub kept only because code calls it: where ("app.py:31").
     called_from: str = ""
+    #: The class `function` is a method of; "" for a module-level function.
+    owner: str = ""
+    #: Of `uses`, each widget the new layout still has under another name,
+    #: because it is another kind of widget now: "self.ent_entry_3" ->
+    #: ("self.cmb_model", "Combobox").
+    renamed: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
     @property
     def where(self) -> str:
@@ -925,10 +1246,22 @@ class UpdateBlocker:
             said = ["your own code"]
         if self.widget:
             said.append(f"its widget, {self.widget}, is not in {example}")
-        if self.uses:
-            said.append(f"it uses {', '.join(self.uses)}, which {example} "
+        gone = [use for use in self.uses if use not in self.renamed]
+        if gone:
+            said.append(f"it uses {', '.join(gone)}, which {example} "
                         f"does not have")
+        for use in self.uses:
+            if use in self.renamed:
+                now, kind = self.renamed[use]
+                said.append(f"{use} is now {now} in {example} (a {kind}): "
+                            f"rename it")
         return f"  {name} — " + "; ".join(said)
+
+    @property
+    def only_renamed(self) -> bool:
+        """Whether renaming what it uses is all it needs."""
+        return (not self.widget and not self.called_from and bool(self.uses)
+                and all(use in self.renamed for use in self.uses))
 
 
 def _is_widget_handler(name: str) -> bool:
@@ -937,10 +1270,11 @@ def _is_widget_handler(name: str) -> bool:
     return name.startswith("on_") and gpj._looks_like_widget(name[3:])
 
 
-def _definitions(text: Optional[str]) -> List[Tuple[str, int, int]]:
-    """(name, first line, last line) of every top-level function and every
-    method of a top-level class, decorators included, so a span is the
-    WHOLE definition. [] for text that does not parse."""
+def _definitions(text: Optional[str]) -> List[Tuple[str, str, int, int]]:
+    """(owner, name, first line, last line) of every top-level function
+    (owner "") and every method of a top-level class (owner: the class),
+    decorators included, so a span is the WHOLE definition. [] for text that
+    does not parse."""
     import ast
 
     try:
@@ -949,77 +1283,151 @@ def _definitions(text: Optional[str]) -> List[Tuple[str, int, int]]:
         return []
     found = []
     for node in tree.body:
-        items = node.body if isinstance(node, ast.ClassDef) else [node]
+        if isinstance(node, ast.ClassDef):
+            owner, items = node.name, node.body
+        else:
+            owner, items = "", [node]
         for item in items:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 first = min([item.lineno]
                             + [d.lineno for d in item.decorator_list])
-                found.append((item.name, first,
+                found.append((owner, item.name, first,
                               item.end_lineno or item.lineno))
     return found
 
 
+def _containing(definitions: Sequence[Tuple[str, str, int, int]],
+                line: int) -> Optional[Tuple[str, str, int, int]]:
+    """The definition whose lines hold `line`, or None."""
+    return next((d for d in definitions if d[2] <= line <= d[3]), None)
+
+
+def _same_on_disk(found: Tuple[str, str, int, int],
+                  planned: Sequence[Tuple[str, str, int, int]],
+                  on_disk: Sequence[Tuple[str, str, int, int]]
+                  ) -> Optional[Tuple[str, str, int, int]]:
+    """The definition on disk that `found` (in the planned text) is: the
+    same class and name, and the same one of those when there are several
+    (the k-th in the planned text is the k-th on disk — Generate's planned
+    edits remove and rewrite untouched stubs, never the user's code, and
+    never reorder). A name alone took the first: Helper.__init__ for a use
+    in App.__init__ (measured)."""
+    key = found[:2]
+    nth = [d for d in planned if d[:2] == key].index(found)
+    same = [d for d in on_disk if d[:2] == key]
+    return same[nth] if nth < len(same) else None
+
+
+def _line_on_disk(line: int, planned: str, disk: str) -> int:
+    """A line outside every definition, in the planned text, as a line on
+    disk: the same text, the same one of its repeats. `line` itself when it
+    cannot be told."""
+    want = planned.splitlines()
+    have = disk.splitlines()
+    if not 0 < line <= len(want):
+        return line
+    text = want[line - 1]
+    nth = sum(1 for t in want[:line - 1] if t == text)
+    hits = [n for n, t in enumerate(have, 1) if t == text]
+    return hits[nth] if nth < len(hits) else line
+
+
 def update_blockers(checked: Any, project_dir: Any,
                     old_shapes: Sequence[Any] = (),
-                    widget_names: Optional[Dict[str, str]] = None
+                    widget_names: Optional[Dict[str, str]] = None,
+                    rekinded: Optional[Dict[str, Tuple[str, str]]] = None
                     ) -> List[UpdateBlocker]:
     """The user's code behind a refused check, one UpdateBlocker per
-    handler or function: Generate's blockers (gui_projects.Orphan) grouped
-    by the definition each is in, with that definition's lines AS ON DISK.
+    handler or function: Generate's blockers (gui_projects.Orphan — each
+    use, not only the first: designer_project._every_use) grouped by the
+    definition each is in, with that definition's lines AS ON DISK.
 
     Generate cites lines in handlers.py as it WOULD leave it, after removing
     the untouched stubs of removed widgets — on Typhon some 300 lines above
     the code (measured: handlers.py:370 for a use at line 668). So the
-    definition is found in the planned text, then again on disk by name.
-    `old_shapes` and `widget_names` (the manifest's, shape id -> widget
-    name) put the user's label on a removed widget."""
+    definition holding the line is found in the planned text, then the same
+    one on disk (_same_on_disk). A file Generate does not plan to change
+    (app.py) is read as it is. `old_shapes` and `widget_names` (the
+    manifest's, shape id -> widget name) put the user's label on a removed
+    widget; `rekinded` (old widget name -> (its new name, its kind)) says
+    what a widget that changed kind is called now."""
     directory = Path(project_dir)
     labels = {}
     by_id = {s.id: s for s in old_shapes}
     for sid, widget in (widget_names or {}).items():
         if sid in by_id:
             labels[widget] = _shape_name(by_id[sid])
+    rekinded = dict(rekinded or {})
     kept = dict(getattr(checked, "kept_stubs", []) or [])
     planned = dict(getattr(checked, "planned", {}) or {})
-    on_disk: Dict[str, List[Tuple[str, int, int]]] = {}
-    as_planned: Dict[str, List[Tuple[str, int, int]]] = {}
+    disk_text: Dict[str, str] = {}
+    on_disk: Dict[str, List[Tuple[str, str, int, int]]] = {}
+    as_planned: Dict[str, List[Tuple[str, str, int, int]]] = {}
     found: Dict[Tuple[str, str], UpdateBlocker] = {}
-    for orphan in getattr(checked, "blockers", []) or []:
+    orphans = sorted(getattr(checked, "blockers", []) or [],
+                     key=lambda o: (o.referenced_in, o.line))
+    for orphan in orphans:
         fname = orphan.referenced_in
         if fname not in on_disk:
             try:
-                text = (directory / fname).read_text(encoding="utf-8",
-                                                     errors="replace")
+                disk_text[fname] = (directory / fname).read_text(
+                    encoding="utf-8", errors="replace")
             except OSError:
-                text = ""
-            on_disk[fname] = _definitions(text)
+                disk_text[fname] = ""
+            on_disk[fname] = _definitions(disk_text[fname])
             as_planned[fname] = (_definitions(planned[fname])
                                  if fname in planned else on_disk[fname])
-        if orphan.kind == "handler":
-            function = orphan.name
+        changed = fname in planned and planned[fname] != disk_text[fname]
+        hit = _containing(as_planned[fname], orphan.line)
+        if hit is not None and changed:
+            hit = _same_on_disk(hit, as_planned[fname], on_disk[fname])
+        if hit is not None:
+            owner, function, first, last = hit
+            key = (fname, f"{first}-{last}")
         else:
-            function = next((n for n, a, b in as_planned[fname]
-                             if a <= orphan.line <= b), "")
-        span = next(((a, b) for n, a, b in on_disk[fname]
-                     if function and n == function), None)
-        first, last = span or (orphan.line, orphan.line)
-        key = (fname, function or f":{first}")
+            owner = function = ""
+            first = last = (_line_on_disk(orphan.line, planned[fname],
+                                          disk_text[fname])
+                            if changed else orphan.line)
+            key = (fname, f":{first}")
         blocker = found.get(key)
         if blocker is None:
             blocker = found[key] = UpdateBlocker(
                 file=fname, function=function, first_line=first,
-                last_line=last, called_from=kept.get(function, ""))
+                last_line=last, called_from=kept.get(function, ""),
+                owner=owner)
         if orphan.kind == "handler":
             widget = orphan.name[3:]
             blocker.widget = labels.get(widget, widget)
-        else:
-            use = (f"self.ports.{orphan.name}" if orphan.kind == "port"
-                   else f"self.{orphan.name}")
-            if use not in blocker.uses:
-                blocker.uses.append(use)
+            continue
+        use = (f"self.ports.{orphan.name}" if orphan.kind == "port"
+               else f"self.{orphan.name}")
+        if use not in blocker.uses:
+            blocker.uses.append(use)
+        if orphan.kind == "widget" and orphan.name in rekinded:
+            now, kind = rekinded[orphan.name]
+            blocker.renamed[use] = (f"self.{now}", kind)
     return sorted(found.values(),
                   key=lambda b: (b.file != "handlers.py", b.file,
                                  b.first_line))
+
+
+def _rekinded(renamed: Dict[str, Tuple[str, str]], checked: Any,
+              shapes: Sequence[Any]) -> Dict[str, Tuple[str, str]]:
+    """{old widget name: (its name now, its kind as the palette says it)}
+    for each widget that changed kind (_forget_rekinded's answer), named
+    as the new layout names it (checked.widget_names)."""
+    from gui_shapes import PALETTE
+
+    now_named = dict(getattr(checked, "widget_names", {}) or {})
+    kinds = {s.id: s.kind for s in shapes}
+    out: Dict[str, Tuple[str, str]] = {}
+    for sid, (_label, was) in renamed.items():
+        now = now_named.get(sid, "")
+        if now and now != was:
+            kind = kinds.get(sid, "")
+            out[was] = (now, PALETTE.get(kind, {}).get("label", kind))
+    return out
 
 
 def _refuse(out: "ExampleUpdate", checked: Any,
@@ -1041,18 +1449,72 @@ def _refuse(out: "ExampleUpdate", checked: Any,
     out.lines.extend(line for line in checked.lines
                      if line.lstrip().startswith("cannot alias"))
     out.say("What you can do:")
-    out.say("  - copy anything you want to keep out of each one named above, "
-            "then delete it (or only its lines that use what is going) and "
-            "Update again; handlers you never edited are removed for you")
+    if any(b.renamed for b in blockers):
+        out.say("  - rename each self.<name> the list says was renamed, and "
+                "Update again")
+    if not all(b.only_renamed for b in blockers):
+        out.say("  - copy anything you want to keep out of each one named "
+                "above, then delete it (or only its lines that use what is "
+                "going) and Update again; handlers you never edited are "
+                "removed for you")
     out.say(f"  - or leave {out.name} as it is — it still works — and build "
             f"a new project from {out.example} with New from example")
+
+
+#: The user's own code, which every check reads: a file that does not
+#: parse is one they cannot see into.
+_HAND_WRITTEN = ("app.py", "handlers.py")
+
+
+def _does_not_parse(project_dir: Path) -> List[str]:
+    """"handlers.py does not parse (line 897: '(' was never closed)" for
+    each of app.py and handlers.py that does not.
+
+    find_orphans and port_references skip a file they cannot parse, so with
+    one the checks are blind to it: with on_btn_train edited and a half-typed
+    def below it, the update went ahead and removed the Train button its
+    handler is for (measured). Plain Generate has always gone ahead (and
+    its policy gate refuses to Run the result); an update, which replaces
+    the drawing, refuses."""
+    import ast
+
+    problems = []
+    for fname in _HAND_WRITTEN:
+        path = Path(project_dir) / fname
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            ast.parse(text, filename=fname)
+        except SyntaxError as exc:
+            problems.append(f"{fname} does not parse (line {exc.lineno}: "
+                            f"{exc.msg})")
+        except ValueError as exc:                        # a NUL byte
+            problems.append(f"{fname} does not parse ({exc})")
+    return problems
+
+
+def _refuse_unparsed(out: "ExampleUpdate", problems: List[str]) -> None:
+    out.blocked = True
+    out.say(f"not updated — {out.name} was left exactly as it was: nothing "
+            f"was written. "
+            + "; ".join(problems)
+            + ", so the update cannot tell which of your code it would "
+              "break.")
+    out.say("What you can do:")
+    out.say("  - finish or fix it there (Run refuses the app as it is, too), "
+            "then Update again")
 
 
 def update_from_example(name: str, example: str, vault_dir: Any, *,
                         model_call: Any = None,
                         stamp: str = "") -> ExampleUpdate:
     """Replace project `name`'s layout with `example`'s current one, then
-    Generate. Never raises. The caller has asked the user first.
+    Generate. Never raises — except that Ctrl+C (KeyboardInterrupt) or
+    SystemExit during the writes is raised again once every file is put
+    back, with this ExampleUpdate on it as `example_update`. The caller has
+    asked the user first.
 
     Kept: the project's name, its mode (the manifest's, which the gate
     enforces), app.py, handlers.py and everything else in the folder — and
@@ -1068,11 +1530,14 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     layout and manifest held in memory (designer_project.plan_generate), and
     nothing is written until all have passed. A refusal — most often a
     handler the user edited for a widget the example removes — writes
-    nothing at all and names each piece of their code that stopped it. The
-    writes then go behind a RestorePoint: one that fails part-way puts every
-    file back. Before this, project.gspec and the manifest's example were
-    written first, Generate then refused, and the project was left
-    half-switched (measured).
+    nothing at all and names each piece of their code that stopped it (and
+    app.py or handlers.py that does not parse, which the checks cannot see
+    into, refuses too). The writes then go behind a RestorePoint: one that
+    fails part-way puts every file back, and an update whose process dies
+    part-way is put back by the next Open, Generate or Update
+    (put_back_interrupted) — this one starts with that. Before this,
+    project.gspec and the manifest's example were written first, Generate
+    then refused, and the project was left half-switched (measured).
 
     Blocking — a whole Generate — so the Designer runs it on a worker.
     """
@@ -1083,6 +1548,14 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     from . import designer_project as dp
 
     out = ExampleUpdate(name=str(name or ""), example=str(example or ""))
+    # An earlier update of this project cut off part-way is put back first:
+    # this one must start from the project as it was, not half-switched.
+    whole, earlier = _put_back_earlier(out.name, vault_dir)
+    out.lines.extend(earlier)
+    if not whole:
+        out.blocked = True
+        out.say("not updated — nothing was written (see above)")
+        return out
     why = update_problem(out.name, out.example, vault_dir)
     if why:
         out.say(why)
@@ -1096,6 +1569,11 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         manifest = gpj.load_manifest(pdir)
     except Exception as exc:                             # noqa: BLE001
         out.say(f"cannot update {out.name}: {exc}")
+        return out
+    unparsed = _does_not_parse(pdir)
+    if unparsed:
+        _refuse_unparsed(out, unparsed)
+        out.seconds = time.perf_counter() - started
         return out
 
     own = drawn_by_user(old.shapes, fresh.shapes)
@@ -1125,16 +1603,20 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         # Here a handler the user edited for a widget the new layout removes
         # stops the update, with nothing written. At the plugin branch's
         # switch-over the update sets each one aside instead: it cuts each
-        # UpdateBlocker's definition (file, first_line..last_line, on disk)
-        # word for word out of handlers.py into handlers_retired.txt —
-        # planned in memory, checked again by plan_generate against the
-        # planned handlers.py (it reads the file from disk today, so that
-        # step hands it the planned text), and written in step 2 behind the
-        # restore point, which already covers handlers.py
-        # (RestorePoint.created records the new text file). Not built on
-        # qt-migration.
+        # UpdateBlocker's definition (file, first_line..last_line, on disk —
+        # the one the use is in, `owner` and `function` naming it) word for
+        # word out of handlers.py into handlers_retired.txt — planned in
+        # memory, checked again by plan_generate against the planned
+        # handlers.py (it reads the file from disk today, so that step hands
+        # it the planned text), and written in step 2 behind the restore
+        # point, which already covers handlers.py (RestorePoint.created
+        # records the new text file BEFORE it is written; _restorable has to
+        # accept its name, or put_back_interrupted will not trust the
+        # index). Not built on qt-migration.
         try:
-            blockers = update_blockers(checked, pdir, old.shapes, old_names)
+            blockers = update_blockers(
+                checked, pdir, old.shapes, old_names,
+                _rekinded(renamed, checked, shapes))
         except Exception:                                # noqa: BLE001
             blockers = []
         _refuse(out, checked, blockers)
@@ -1146,21 +1628,42 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         restore = RestorePoint.take(pdir, stamp)
     except Exception as exc:                             # noqa: BLE001
         out.say(f"cannot update {out.name}: its files could not be copied "
-                f"aside before writing ({exc!r}) — nothing was replaced")
+                f"aside before writing ({dp.failure_text(exc)}) — nothing "
+                f"was replaced")
         return out
     out.restore_point = restore.folder
+    stopped: Optional[BaseException] = None
     try:
-        out.backup = backup_gspec(pdir, stamp)
-        restore.created(out.backup)
+        backup = gspec_backup_path(pdir, stamp)
+        # Recorded BEFORE the copy: a copy cut off part-way (a full disk)
+        # would otherwise be left behind, truncated — the very file the
+        # confirm and the quick-start say to copy back to undo an update.
+        restore.created(backup)
+        out.backup = backup_gspec(pdir, target=backup)
         gpj.save_project(out.name, new, vault_dir=vault_dir)
         dp.persist_classifications(plan, checked, vault_dir)
         generated = dp.write_generate(plan, checked)
-    except Exception as exc:                             # noqa: BLE001
-        checked.say(f"update failed: {exc!r}")
+        if generated.ok:
+            # The last write, and the one that makes it final: until the
+            # restore point says FINISHED, the next Open would put the
+            # update back — so failing it fails the update, as any other.
+            restore.mark(FINISHED)
+    except BaseException as exc:                         # noqa: BLE001
+        # BaseException: Ctrl+C in run_example_gui --update is not an
+        # Exception, and it left the project half-written (measured). It is
+        # raised again once every file is back.
+        checked.ok = False
+        checked.failure = dp.failure_text(exc)
+        checked.say(f"update failed: {checked.failure}")
         generated = checked
+        if not isinstance(exc, Exception):
+            stopped = exc
     out.seconds = time.perf_counter() - started
     if not generated.ok:
         _put_back(out, restore, generated, old_gspec, pdir, was_example)
+        if stopped is not None:
+            stopped.example_update = out                 # type: ignore
+            raise stopped
         return out
 
     out.replaced = True
@@ -1189,30 +1692,67 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     return out
 
 
+def _put_back_earlier(name: str, vault_dir: Any) -> Tuple[bool, List[str]]:
+    """put_back_interrupted for project `name`, when it is one: (True, [])
+    for a name that is not a project yet — update_problem says why."""
+    import gui_projects as gpj
+
+    if not name:
+        return True, []
+    try:
+        pdir = gpj.project_path(name, vault_dir)
+    except Exception:                                    # noqa: BLE001
+        return True, []
+    if not pdir.is_dir():
+        return True, []
+    return put_back_interrupted(pdir, name)
+
+
 def _put_back(out: ExampleUpdate, restore: RestorePoint, generated: Any,
               old_gspec: bytes, pdir: Path, was_example: str) -> None:
     """A write failed part-way: every file back as it was, and say so — or
-    say exactly what could not be put back, and how to do it by hand."""
+    say exactly what could not be put back, and how to do it by hand.
+
+    The first line says what failed, with its file (measured before: last,
+    after 19 lines of undone work, "PermissionError(13, 'Permission
+    denied')" — no file). What Generate had done comes after it, headed as
+    undone when it was."""
     import gui_projects as gpj
+
+    from .designer_project import failure_text
 
     try:
         problems = restore.put_back()
     except Exception as exc:                             # noqa: BLE001
-        problems = [repr(exc)]
+        problems = [failure_text(exc)]
+    if not problems:
+        try:
+            restore.mark(PUT_BACK)
+        except OSError:
+            # Left WRITING: the next Open puts it back again, which changes
+            # nothing — every file already is as the restore point holds it.
+            restore.let_go()
+    else:
+        # Left WRITING, and let go of: the next Open, Generate or Update in
+        # this process or another tries again (put_back_interrupted).
+        restore.let_go()
     try:
         out.replaced = (pdir / gpj.GSPEC_NAME).read_bytes() != old_gspec
     except OSError:
         out.replaced = True
     folder = restore.folder.relative_to(pdir).as_posix()
+    why = generated.failure or "a write failed"
+    done = [line for line in generated.lines
+            if line not in (f"generate failed: {why}", f"update failed: {why}")]
     if not problems:
-        out.say(f"not updated — writing {out.name} failed part-way, so every "
-                f"file it had written was put back: {out.name} is as it was "
-                f"before (and a copy of each is in {folder})")
-        out.say("── Generate ──")
-        out.lines.extend(generated.lines)
+        out.say(f"not updated — writing {out.name} failed part-way: {why}, so "
+                f"every file it had written was put back: {out.name} is as "
+                f"it was before (and a copy of each is in {folder})")
+        out.say("── what Generate had done before that — all of it undone ──")
+        out.lines.extend(done)
         return
-    out.say(f"writing {out.name} failed part-way, and NOT everything could "
-            f"be put back — the project may be half-updated:")
+    out.say(f"writing {out.name} failed part-way: {why} — and NOT everything "
+            f"could be put back, so the project may be half-updated:")
     out.lines.extend("  " + p for p in problems)
     old_drawing = (f" The old drawing is also in {out.backup.name}."
                    if out.backup is not None and out.backup.exists() else "")
@@ -1230,9 +1770,10 @@ def _put_back(out: ExampleUpdate, restore: RestorePoint, generated: Any,
     out.say(f"To put it back by hand, copy each file in {folder} back over "
             f"the project's ({RESTORE_INDEX} lists them, and the files the "
             f"update made, which were not there before).{old_drawing}"
-            f"{example}")
-    out.say("── Generate ──")
-    out.lines.extend(generated.lines)
+            f"{example} The next Open, Generate or Update tries again to put "
+            f"it back.")
+    out.say("── what Generate had done before that ──")
+    out.lines.extend(done)
 
 
 # ============================================================

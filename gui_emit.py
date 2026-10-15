@@ -3356,7 +3356,6 @@ def emit(spec: Spec, project_path: Any, *,
                              callers=hand_written_callers(root),
                              ai_bodies=ai_bodies)
         if plan.changed:
-            handlers.write_text(plan.source, encoding="utf-8")
             src = plan.source
         res.handlers_upgraded.extend(plan.upgraded)
         res.handlers_rewired.extend(h for h, _was, _now in plan.rewired)
@@ -3364,14 +3363,16 @@ def emit(spec: Spec, project_path: Any, *,
         res.handlers_stale.extend(plan.stale_names)
         res.warnings.extend(plan.lines())
         missing = [h for h in spec.handlers if f"def {h}(" not in src]
+        added = ""
         if missing:
             # APPEND, never rewrite. Existing bodies are untouched.
-            with handlers.open("a", encoding="utf-8") as fh:
-                fh.write("\n    # --- added by regeneration ---\n")
-                for h in missing:
-                    fh.write(handler_stub(h, _script_for(spec, h),
-                                          _title_for(spec, h)))
+            added = "\n    # --- added by regeneration ---\n" + "".join(
+                handler_stub(h, _script_for(spec, h), _title_for(spec, h))
+                for h in missing)
             res.handlers_added.extend(missing)
+        if plan.changed or added:
+            _write_handlers(handlers, plan.source if plan.changed else None,
+                            added)
         res.files_skipped.append(str(handlers))
     else:
         _write(handlers, emit_handlers_py(spec), res)
@@ -3403,6 +3404,30 @@ def emit(spec: Spec, project_path: Any, *,
             f"{len(res.orphaned_regions)} custom region(s) no longer match a "
             f"widget; saved to {out}")
     return res
+
+
+def _write_handlers(handlers: Path, rewritten: Optional[str],
+                    added: str) -> None:
+    """handlers.py with its planned stub edits (``rewritten``: the whole
+    new text, or None for none) and ``added`` appended — in ONE write, whole
+    or not at all (gui_shapes.write_bytes_atomic).
+
+    It holds the user's code. It used to be written in place and then
+    appended to, and a write cut off part-way left it empty — after which
+    the next update wrote a handlers.py without the user's handlers
+    (measured). The bytes are those the two writes made: text mode's line
+    endings for what Generate writes, and, when only stubs are appended,
+    the file's own bytes kept exactly as they were before them."""
+    import os
+
+    from gui_shapes import write_bytes_atomic
+
+    def as_written(text: str) -> bytes:
+        return text.replace("\n", os.linesep).encode("utf-8")
+
+    head = (as_written(rewritten) if rewritten is not None
+            else handlers.read_bytes())
+    write_bytes_atomic(handlers, head + as_written(added))
 
 
 def _toolkit_of_app(root: Path) -> str:

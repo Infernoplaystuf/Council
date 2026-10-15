@@ -176,15 +176,23 @@ class GenerateResult:
     #: What hand-written code still uses that this layout removes: the
     #: gui_projects.Orphan behind each BLOCKED line, a removed port and an
     #: orphaned widget or handler alike, and ALL of them, even when the port
-    #: check refused first and the log names only the ports. Update from
-    #: example names the user's handlers from it. Their line numbers are in
-    #: `planned`'s text where it has the file (handlers.py as Generate would
-    #: leave it), else in the file on disk.
+    #: check refused first and the log names only the ports — and each at
+    #: EVERY line that uses it, where the BLOCKED lines cite only the first
+    #: (_every_use). Update from example names the user's handlers from it.
+    #: Their line numbers are in `planned`'s text where it has the file
+    #: (handlers.py as Generate would leave it), else in the file on disk.
     blockers: List[Any] = field(default_factory=list)
     planned: Dict[str, str] = field(default_factory=dict)
     #: (handler, "file:line") — an untouched stub of a removed widget kept
     #: only because hand-written code calls it there (HandlerPlan.kept).
     kept_stubs: List[Tuple[str, str]] = field(default_factory=list)
+    #: shape id -> widget name, as this layout names its widgets — set once
+    #: the spec is built, so a refusal can still say what a widget that
+    #: changed kind is called now.
+    widget_names: Dict[str, str] = field(default_factory=dict)
+    #: Why a step raised, said so a person can act on it (failure_text):
+    #: "" when nothing did.
+    failure: str = ""
 
     def say(self, line: str) -> None:
         self.lines.append(line)
@@ -337,14 +345,27 @@ def toolkit_label(project_dir: Any) -> str:
 
 
 def open_named(name: str, vault_dir: Any) -> ProjectResult:
+    """Load a project's drawing — after putting back an Update from example
+    that was cut off while it wrote (a closed Council, a power cut), so what
+    opens is the project as it was, not the half-switched one
+    (designer_examples.put_back_interrupted). What that did comes first in
+    the message."""
     import gui_projects
 
+    said: List[str] = []
+    try:
+        from . import designer_examples as dx
+        _back, said = dx.put_back_interrupted(
+            gui_projects.project_path(name, vault_dir), name)
+    except Exception:                                    # noqa: BLE001
+        said = []
     try:
         project = gui_projects.open_project(name, vault_dir=vault_dir)
     except Exception as exc:
-        return ProjectResult(False, str(exc))
+        return ProjectResult(False, "\n".join([*said, str(exc)]))
     return ProjectResult(True,
-                         f"opened {name} ({len(project.shapes)} shape(s))",
+                         "\n".join([*said, f"opened {name} "
+                                           f"({len(project.shapes)} shape(s))"]),
                          name=name, shapes=list(project.shapes),
                          project=project)
 
@@ -485,12 +506,43 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
     example has to run the checks against a layout it has not written yet,
     and could not without running the writes too, so a refusal left the
     project half-switched. GeneratePlan carries those values across.
+
+    An Update from example cut off while it wrote is put back first, and
+    then this Generate stops (_after_interrupted_update).
     """
+    stopped = _after_interrupted_update(name, project_dir)
+    if stopped is not None:
+        return stopped
     out, plan = plan_generate(name, shapes, project_dir, vault_dir,
                               model_call=model_call)
     if plan is None:
         return out
     return write_generate(plan, out)
+
+
+def _after_interrupted_update(name: str,
+                              project_dir: Any) -> Optional[GenerateResult]:
+    """None when no Update from example of this project was cut off while
+    it wrote. Otherwise the project is put back as it was before that
+    update (designer_examples.put_back_interrupted) and Generate refuses:
+    the shapes it was handed may be the half-replaced drawing, and
+    generating them would make a project that matches neither."""
+    if not project_dir:
+        return None
+    from . import designer_examples as dx
+
+    back, said = dx.put_back_interrupted(project_dir, name)
+    if not said:
+        return None
+    out = GenerateResult(blocked=True, lines=list(said))
+    if back:
+        out.say(f"not generated — the canvas may show the drawing that "
+                f"update had half-written: Open {name} again to see the "
+                f"project as it is now, then Generate")
+    else:
+        out.say(f"not generated — nothing was written: see above, then "
+                f"Open {name} and Generate")
+    return out
 
 
 def plan_generate(name: str, shapes: Sequence[Any], project_dir: Any,
@@ -572,6 +624,7 @@ def plan_generate(name: str, shapes: Sequence[Any], project_dir: Any,
             requires=getattr(project, "requires", []) or [])
         for warning in tree.warnings:
             out.say(f"warning: {warning}")
+        out.widget_names = dict(spec.name_registry())
 
         new_ports = (spec.port_registry()
                      if hasattr(spec, "port_registry") else {})
@@ -614,7 +667,8 @@ def plan_generate(name: str, shapes: Sequence[Any], project_dir: Any,
         orphans = gui_projects.find_orphans(project_dir, spec.widget_names,
                                             new_port_names=valid_ports,
                                             sources=sources)
-        out.blockers = _distinct(list(port_plan.removed) + list(orphans))
+        out.blockers = _every_use(list(port_plan.removed) + list(orphans),
+                                  project_dir, sources)
         out.planned = dict(sources)
         out.kept_stubs = list(handler_plan.kept) if handler_plan else []
         if port_plan.removed or port_plan.collisions:
@@ -653,7 +707,8 @@ def plan_generate(name: str, shapes: Sequence[Any], project_dir: Any,
             out.blocked = True
             return out, None
     except Exception as exc:
-        out.say(f"generate failed: {exc!r}")
+        out.failure = failure_text(exc)
+        out.say(f"generate failed: {out.failure}")
         return out, None
     return out, GeneratePlan(
         name=name, project_dir=project_dir, spec=spec, manifest=manifest,
@@ -726,10 +781,29 @@ def write_generate(plan: GeneratePlan, out: GenerateResult) -> GenerateResult:
             if not (v.get("kind") == "handler" and k in gone)}
         gui_projects.save_manifest(project_dir, manifest)
     except Exception as exc:
-        out.say(f"generate failed: {exc!r}")
+        out.failure = failure_text(exc)
+        out.say(f"generate failed: {out.failure}")
         return out
     out.ok = True
     return out
+
+
+def failure_text(exc: BaseException) -> str:
+    """An exception as a person can act on it: its kind and message, and
+    for an OSError the file it was about, written plainly. repr() dropped
+    the file — "PermissionError(13, 'Permission denied')" for a manifest.json
+    another program held open (measured) — and str() quotes it, doubling
+    every backslash of a Windows path. For a failed os.replace — a file
+    written whole, through a temporary one beside it — the file it was
+    replacing, which is the one the user knows."""
+    if isinstance(exc, KeyboardInterrupt):
+        return "interrupted (Ctrl+C)"
+    kind = type(exc).__name__
+    if isinstance(exc, OSError) and exc.filename:
+        said = exc.strerror or str(exc)
+        return f"{kind}: {said}: {exc.filename2 or exc.filename}"
+    said = str(exc)
+    return f"{kind}: {said}" if said else kind
 
 
 def persist_classifications(plan: GeneratePlan, out: GenerateResult,
@@ -749,13 +823,39 @@ def persist_classifications(plan: GeneratePlan, out: GenerateResult,
         plan.unsaved_classifications = []
 
 
-def _distinct(orphans: Sequence[Any]) -> List[Any]:
-    """Each (kind, name, file) once — a removed port that hand-written code
-    uses is both a port-plan removal and an orphan."""
+def _every_use(orphans: Sequence[Any], project_dir: Path,
+               sources: Dict[str, str]) -> List[Any]:
+    """``orphans``, and every OTHER line of app.py and handlers.py (as
+    planned: ``sources``) that uses one of their ports or widgets — each
+    (kind, name, file, line) once, in file and line order.
+
+    find_orphans reports each port once, and each widget once per file: at
+    the first use it meets. That is enough to refuse, not to say what has to
+    change: a second handler using the same removed port went unnamed, and
+    the user was refused again after deleting all the update had named
+    (measured: three rounds for three pieces of code)."""
+    import gui_projects
+
+    found = list(orphans)
+    ports = {o.name for o in orphans if o.kind == "port"}
+    widgets = {o.name for o in orphans if o.kind == "widget"}
+    if ports:
+        found += [gui_projects.Orphan("port", name, fname, line)
+                  for fname, name, line in gui_projects.port_references(
+                      project_dir, sources=sources)
+                  if name in ports]
+    if widgets:
+        for fname in ("app.py", "handlers.py"):
+            text = gui_projects._source(Path(project_dir), fname, sources)
+            if text is None:
+                continue
+            attrs, _handlers = gui_projects._self_attrs_and_handlers(text)
+            found += [gui_projects.Orphan("widget", attr, fname, line)
+                      for attr, line in attrs if attr in widgets]
     seen = set()
     out = []
-    for o in orphans:
-        key = (o.kind, o.name, o.referenced_in)
+    for o in sorted(found, key=lambda o: (o.referenced_in, o.line)):
+        key = (o.kind, o.name, o.referenced_in, o.line)
         if key not in seen:
             seen.add(key)
             out.append(o)
