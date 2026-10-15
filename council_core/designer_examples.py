@@ -218,7 +218,80 @@ def problem(answers: ExampleAnswers, vault_dir: Any) -> str:
     _spec, why = check_python(answers.python)
     if why:
         return f"Run with: {why}"
+    if gx.own_classifier_store(answers.example):
+        why = own_store_problem(vault_dir)
+        if why:
+            return why
     return ""
+
+
+# ============================================================
+# A classifier store of the project's own
+# ============================================================
+
+#: The file beside an app that says where its classifiers are kept
+#: (frame_classes.STORE_CONFIG, restated rather than imported: frame_classes
+#: is a large module and the Designer builds without it).
+CLASSIFIER_STORE_FILE = "classifier_store.json"
+
+
+def own_store_folder(vault_dir: Any) -> Path:
+    """<vault>/classifiers of the vault a project is built into."""
+    import gui_projects as gpj
+
+    return gpj.resolve_vault_root(vault_dir).expanduser().resolve() \
+        / "classifiers"
+
+
+def own_store_problem(vault_dir: Any) -> str:
+    """Why an example whose projects keep a classifier store of their own
+    (gui_examples.OWN_CLASSIFIER_STORE) cannot be built into this vault, or
+    "" when it can.
+
+    Its store is <vault>/classifiers, so built into the Council's own
+    vault (under ~/.council) the "own" store would be the user's real
+    library — which "Typhon (plugins)" must never share or touch (design
+    7.1, question 10). It is built from the Council that
+    run-typhon-plugins.bat starts, on its side vault."""
+    import gui_projects as gpj
+
+    vault = gpj.resolve_vault_root(vault_dir).expanduser().resolve()
+    real = (Path.home() / ".council").resolve()
+    if vault == real or real in vault.parents:
+        return (f"this example keeps its classifiers in a store of its own "
+                f"in the vault it is built in, and {vault} is the Council's "
+                f"own vault, whose classifiers are your library — build it "
+                f"from the Council run-typhon-plugins.bat starts, on its "
+                f"side vault (docs/typhon_plugins_branch.md). Nothing was "
+                f"built.")
+    return ""
+
+
+def pin_classifier_store(project_dir: Any, vault_dir: Any) -> Path:
+    """Write classifier_store.json beside the app, naming <vault>/classifiers
+    of the vault it was built in — so the app finds that one store whether
+    the Council started it or it was double-clicked (frame_classes reads
+    the file before falling back to ~/.council/vault).
+
+    Written home-relative ("~/...") when the vault is inside the home
+    folder, as the plugin design records the plugin home (4.1), so the
+    project still finds it after a move to another account with the same
+    layout; absolute otherwise. Whole and once, never over a file already
+    there (camera_record.write_once)."""
+    from council_core import camera_record
+
+    store = own_store_folder(vault_dir)
+    try:
+        text = "~/" + store.relative_to(Path.home().resolve()).as_posix()
+    except ValueError:
+        text = store.as_posix()
+    return camera_record.write_once(
+        Path(project_dir) / CLASSIFIER_STORE_FILE,
+        {"store": text,
+         "note": ("This app keeps its classifiers in a store of its own, in "
+                  "the vault it was built in. To bring in classifiers from "
+                  "another app, copy them in (docs/typhon_plugins_branch.md); "
+                  "never point this at another app's store.")})
 
 
 # ============================================================
@@ -264,6 +337,11 @@ def build_project(example: str, project: str, vault_dir: Any, *,
         raise ExampleError(str(exc))
     if pdir.exists():
         raise ExampleError(f"project {project!r} already exists at\n  {pdir}")
+    own_store = gx.own_classifier_store(example)
+    if own_store:
+        why = own_store_problem(vault_dir)
+        if why:
+            raise ExampleError(why)
 
     try:
         proj = gs.load_gspec(gx.EXAMPLES_DIR / f"{example}.gspec")
@@ -305,6 +383,8 @@ def build_project(example: str, project: str, vault_dir: Any, *,
         man.python = str(python or "")
         man.example = example
         gpj.save_manifest(pdir, man)
+        if own_store:
+            pin_classifier_store(pdir, vault_dir)
     except Exception as exc:
         moved = ""
         try:
