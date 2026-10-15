@@ -242,10 +242,16 @@ class JobRunner:
             try:
                 self._run_job(job_id)
             except Exception as exc:
-                self._store.set_status(job_id, JobStatus.FAILED.value,
-                                       stopped_reason=repr(exc))
+                reason = repr(exc)
+                try:
+                    self._store.set_status(job_id, JobStatus.FAILED.value,
+                                           stopped_reason=reason)
+                except Exception as store_exc:
+                    # The worker must outlive a store it cannot write: the
+                    # failure still reaches the tab, with both reasons.
+                    reason = f"{reason}; and the job list: {store_exc}"
                 self._post(("job_done", job_id, JobStatus.FAILED.value,
-                            repr(exc)))
+                            reason))
             finally:
                 self._q.task_done()
 
