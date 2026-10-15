@@ -103,7 +103,10 @@ def test_without_a_semantic_index_no_model_is_ever_loaded(vault, monkeypatch):
     monkeypatch.setattr(rag_jobs.RagIndex, "ensure", no)
     b = vc.build("what pump size", vault)
     assert b.backend == "keyword"
-    assert b.sources == ["notes/pumps.md"]           # only the user's file
+    # Only the user's file. The index names it relative to the vault with
+    # this OS's separator (notes\pumps.md on Windows), as every path the app
+    # shows there.
+    assert [Path(s).as_posix() for s in b.sources] == ["notes/pumps.md"]
 
 
 def test_an_existing_semantic_index_is_used(vault, monkeypatch):
