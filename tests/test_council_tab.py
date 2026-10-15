@@ -1042,7 +1042,9 @@ def test_the_qt_tools_work_against_the_vault(tmp_path):
     assert ok and payload["matches"], msg
     ok, msg, payload = tools["run_python"]({"code": "print(6 * 7)"})
     assert ok and payload["rc"] == 0 and "42" in payload["stdout"], msg
-    assert (tmp_path / "vault" / "workspace").is_dir()
+    # run_python runs in the analyst's sandbox and writes nothing: no
+    # <vault>/workspace/scratch.py (tests/test_run_python_fence.py).
+    assert not (tmp_path / "vault" / "workspace").exists()
 
 
 # ============================================================

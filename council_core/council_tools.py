@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from council_core.deliberation import ToolFn
-from council_core.tool_kit import (PathError, SharedNotes, ToolSet,
+from council_core.tool_kit import (PathError, SharedNotes, ToolSet, _clip,
                                    _readable, make_extra_tools, read_text,
                                    resolve_in, tool)
 
@@ -124,19 +124,55 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
     """Every tool, by name, as a ToolSet (see tool_kit.ROLE_TOOLS for who
     gets which).
 
-    `runner` is a council_engine.LocalRunner (run_python) and `librarian` a
-    council_engine.Librarian (vault_save / vault_list / vault_read); each is
-    used only when its tool is called, so a caller that has neither can still
-    list the tools and use the vault search and API lookups. `roots` are
-    extra folders (a code project) the reading tools may look in."""
-    @tool('{"code": "print(1)", "filename": "scratch.py"} — runs Python in '
-          "the workspace; stdout, stderr and exit code")
+    `librarian` is a council_engine.Librarian (vault_save / vault_list /
+    vault_read), used only when its tool is called, so a caller that has
+    none can still list the tools and use the vault search and API lookups.
+    `runner` is no longer used — run_python runs in the analyst's sandbox,
+    not through council_engine.LocalRunner — and is kept so callers need
+    not change. `roots` are extra folders (a code project) the reading
+    tools may look in, and the only places run_tests runs tests."""
+    @tool('{"code": "df = pd.read_csv(\'runs.csv\'); print(df.describe())"}'
+          " — Python in the analyst's sandbox (a child process, at most "
+          "120 s; timeout_s may lower it): pandas, numpy, scipy, math, re, "
+          "json, statistics, collections and pathlib, reading the data "
+          "folder (data_in) only; print() the answer or set result_df. It "
+          "writes no files, starts no processes and has no network")
     def run_python(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """The model's code under the fence data_query and the analyst use
+        (analyst_step.run_script: the sandbox in a child process, the time
+        limit capped at analyst_step.TIME_LIMIT_S, a memory cap, the tree
+        killed at the limit). It ran in a plain child process with the
+        app's environment and full access to the user's files: it could
+        write node_routing.json at the vault root, read anything and start
+        processes. Nothing is written for it — no workspace/scratch.py — and
+        a `filename` argument is ignored."""
         code = str(args.get("code", "")).strip()
         if not code:
             return False, "No code provided.", {}
-        rc, out, err, path = runner.run_code(code, filename_hint=str(args.get("filename", "scratch.py")), timeout_s=int(args.get("timeout_s", 120)))
-        return True, f"rc={rc}\n--- stdout ---\n{out}\n--- stderr ---\n{err}\nfile={path}", {"rc": rc, "stdout": out, "stderr": err, "path": str(path)}
+        from council_core import analyst_step
+        import data_index
+        run = analyst_step.run_script(
+            code, data_index.input_dir(Path(vault_dir)),
+            timeout=analyst_step.time_limit(
+                args.get("timeout_s", analyst_step.TIME_LIMIT_S)),
+            vault=Path(vault_dir))
+        rc = 0 if run.ran else 1
+        err = "\n".join(t for t in (run.stderr.rstrip(), run.error.rstrip(),
+                                    run.note) if t)
+        payload: Dict[str, Any] = {"rc": rc, "stdout": run.stdout,
+                                   "stderr": err}
+        msg = (f"rc={rc}\n--- stdout ---\n{_clip(run.stdout, 4000)}\n"
+               f"--- stderr ---\n{_clip(err, 3000)}")
+        if run.df is not None:
+            import vault_analyst as va
+            table = va.format_result_for_prompt(run.df, max_rows=100,
+                                                max_chars=5000)
+            payload.update(table=table, rows=int(run.df.shape[0]),
+                           cols=int(run.df.shape[1]))
+            msg += f"\n--- result_df ---\n{table}"
+        if run.timed_out:
+            payload["timed_out"] = True
+        return run.ran, msg, payload
 
     @tool('{"name": "note.md", "content": "..."} — saves a NEW vault file '
           "(an existing name gets _2, _3…; nothing is overwritten)")

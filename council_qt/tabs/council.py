@@ -342,11 +342,13 @@ class CouncilActions:
         if self._tools is None:
             import council_engine
             from council_core import council_tools
-            runner = council_engine.LocalRunner(
-                paths.ensure(self.vault_dir / "workspace"))
+            # No LocalRunner and no <vault>/workspace: run_python runs the
+            # model's code in the analyst's sandbox (council_tools), which
+            # writes nothing. The LocalRunner wrote scratch.py there and ran
+            # it with full access to the user's files.
             librarian = council_engine.Librarian(
                 self.vault_dir, self.vault_dir / "logs" / "council.log")
-            tools = council_tools.make_tools(runner, librarian,
+            tools = council_tools.make_tools(None, librarian,
                                              self.vault_dir)
             if not memory_scope.uses_other_sessions(self._scope()):
                 tools.pop("recall_decision", None)

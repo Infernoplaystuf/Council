@@ -40,8 +40,12 @@ WHAT THEY MAY TOUCH
 Reads stay inside the vault (and any extra roots the caller names, such as a
 code folder); dot-folders and the app's protected files are refused. The only
 writes are a NEW chart file in data_out and run_tests' own temporary files;
-diff_preview shows a change and never applies it. Code that runs (data_query,
-run_tests) runs in a child process with a time limit and memory cap.
+diff_preview shows a change and never applies it. A model's code (data_query,
+and council_tools' run_python) runs in the analyst's sandbox in a child
+process (council_core.analyst_step: reads data_in only, writes nothing, at
+most 120 s, a memory cap). run_tests runs pytest in a child process with a
+time limit and memory cap, but only inside a code root the caller names and
+never on a vault file — the Council tab names none.
 
 Every tool is a ToolFn: args dict in, (ok, message for the model, payload)
 out, and carries a one-line `help` the agent's prompt shows.
@@ -445,6 +449,9 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
                      test_timeout: float = 300.0) -> Dict[str, ToolFn]:
     vault_dir = Path(vault_dir)
     read_roots = [vault_dir.resolve()] + [Path(r).resolve() for r in roots]
+    # Where run_tests may run tests: the code roots the caller named, never
+    # the vault (see run_tests).
+    code_roots = [Path(r).resolve() for r in roots]
 
     def data_root() -> Path:
         import data_index
@@ -624,7 +631,8 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
         if "result_df" not in code and re.search(r"^result\s*=", code, re.M):
             code += "\nresult_df = result\n"   # the name models reach for
         from . import analyst_step
-        df, log = analyst_step.run_code(code, data_root())
+        # vault: the sandbox's helpers write only this vault's data_out.
+        df, log = analyst_step.run_code(code, data_root(), vault=vault_dir)
         if df is None:
             return False, _clip(f"The query failed: {log}", 2000), {}
         import vault_analyst as va
@@ -787,9 +795,25 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
                            + "\n".join(problems)), {"problems": problems}
 
     @tool('{"path": "tests/test_report.py", "k": "optional -k filter"} — runs'
-          " pytest on it in a child process (5 min limit); pass/fail summary")
+          " pytest on a test file of the open code project (never a vault "
+          "file) in a child process (5 min limit); pass/fail summary")
     def run_tests(args):
-        p = find(str(args.get("path", "")))
+        # Only inside an explicit code root, and never a file in the vault:
+        # pytest imports what it runs, and vault files include what a model
+        # wrote (vault_save), so run_tests on them ran the model's code
+        # with full permissions — around the fence on run_python (found in
+        # the audit of model-code paths, 2026-10-15). The Council tab names
+        # no code roots, so there it refuses.
+        raw = str(args.get("path", ""))
+        if not code_roots:
+            return False, ("run_tests runs the tests of an open code "
+                           "project, and none is open here; it never runs "
+                           "files in the vault."), {}
+        p = resolve_in(raw, code_roots, vault_dir)
+        import path_contain       # case, 8.3 short names, junctions
+        if path_contain.is_under(p, vault_dir):
+            return False, (f"{raw}: run_tests never runs files in the "
+                           "vault."), {}
         from . import child_proc
         cwd = p if p.is_dir() else p.parent
         for parent in [cwd, *cwd.parents]:
@@ -798,7 +822,7 @@ def make_extra_tools(vault_dir: Path, *, notes: "SharedNotes",
                     ".git")):
                 cwd = parent
                 break
-            if parent in read_roots:
+            if parent in code_roots:
                 break
         argv = [sys.executable, "-m", "pytest", "-q", "-x", "--no-header",
                 "-p", "no:cacheprovider", str(p)]
@@ -1097,7 +1121,7 @@ _B = {"type": "boolean"}
 #: Each tool's arguments as a JSON schema — what a model with NATIVE tool
 #: calling is given (ModelAgent.act), so it cannot invent an argument.
 PARAMS: Dict[str, Dict[str, Any]] = {
-    "run_python": _obj(["code"], code=_S, filename=_S, timeout_s=_I),
+    "run_python": _obj(["code"], code=_S, timeout_s=_I),
     "vault_save": _obj(["name", "content"], name=_S, content=_S),
     "vault_list": _obj(),
     "vault_read": _obj(["name"], name=_S),

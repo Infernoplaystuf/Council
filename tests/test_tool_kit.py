@@ -323,13 +323,27 @@ def test_undefined_names_are_found_without_pyflakes(monkeypatch):
         judge_view.code_check("```python\n" + VALID + "```"))
 
 
-def test_run_tests(tools, vault):
-    ok, msg, p = call(tools, "run_tests", path="proj/test_report.py")
+def test_run_tests(vault, tmp_path):
+    """In a code root the caller names (a copy of the vault's proj/ here):
+    run_tests never runs a file in the vault — that ran model-saved code
+    around run_python's sandbox (tests/test_run_python_fence.py)."""
+    import shutil
+    code = tmp_path / "code"
+    shutil.copytree(vault / "proj", code)
+    tools = council_tools.make_tools(None, None, vault, roots=[code])
+    ok, msg, p = call(tools, "run_tests", path="test_report.py")
     assert ok and p["passed"], msg
-    (vault / "proj" / "test_bad.py").write_text(
+    (code / "test_bad.py").write_text(
         "def test_bad():\n    assert 1 == 2\n", encoding="utf-8")
-    ok, msg, p = call(tools, "run_tests", path="proj/test_bad.py")
+    ok, msg, p = call(tools, "run_tests", path="test_bad.py")
     assert ok and not p["passed"] and "FAILED" in msg
+    # The vault is not a code root: its copy is not found there.
+    ok, msg, p = tools.for_role("coder")["run_tests"](
+        {"path": str(vault / "proj" / "test_report.py")})
+    assert not ok and "not found" in msg, msg
+    no_roots = council_tools.make_tools(None, None, vault)
+    ok, msg, p = call(no_roots, "run_tests", path="proj/test_report.py")
+    assert not ok and "none is open here" in msg, msg
 
 
 def test_diff_preview_never_writes(tools, vault):

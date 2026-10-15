@@ -4162,14 +4162,29 @@ def execute_pandas_code(
     allowed_folders: List[Path],
     *,
     extra_globals: Optional[Dict[str, Any]] = None,
+    report: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[pd.DataFrame], str]:
+    """(result_df or None, log) for model-written code, run under the
+    sandbox described above.
+
+    `report`, when given, is filled in for a caller that wants more than the
+    frame (council_core.analyst_child, for the Council's run_python, where a
+    script that prints its answer has worked): "ran" — the code passed the
+    checks and ran to its end without raising, with or without a result_df;
+    "stdout" / "stderr" — what it printed; "error" — the refusal or the
+    traceback when it did not run; "note" — why a result_df it set could not
+    be used. The checks and the run are the same with or without it."""
+    rep: Dict[str, Any] = report if report is not None else {}
+    rep.update(ran=False, stdout="", stderr="", error="", note="")
     ok, msg = validate_generated_code(code)
     if not ok:
-        return None, f"SAFETY CHECK FAILED: {msg}"
+        rep["error"] = f"SAFETY CHECK FAILED: {msg}"
+        return None, rep["error"]
 
     normalized_folders = normalize_data_folders(allowed_folders)
     if not normalized_folders:
-        return None, "No allowed folders configured for the analyst."
+        rep["error"] = "No allowed folders configured for the analyst."
+        return None, rep["error"]
 
     # Per-execution memory budget for whole-file reads. The proxy below
     # guards `pd`; the import hook hands the SAME proxy back for any
@@ -4556,12 +4571,16 @@ def execute_pandas_code(
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             exec(code, globals_dict)
     except Exception:
-        log = "EXECUTION ERROR:\n" + traceback.format_exc()
+        rep.update(stdout=stdout_buf.getvalue(), stderr=stderr_buf.getvalue(),
+                   error="EXECUTION ERROR:\n" + traceback.format_exc())
+        log = rep["error"]
         if stdout_buf.getvalue():
             log += "\nSTDOUT:\n" + stdout_buf.getvalue()
         if stderr_buf.getvalue():
             log += "\nSTDERR:\n" + stderr_buf.getvalue()
         return None, log
+    rep.update(ran=True, stdout=stdout_buf.getvalue(),
+               stderr=stderr_buf.getvalue())
 
     result_df = globals_dict.get("result_df")
 
@@ -4580,7 +4599,8 @@ def execute_pandas_code(
     if isinstance(result_df, dict):
         result_df = pd.DataFrame([result_df])
     if not isinstance(result_df, pd.DataFrame):
-        log_parts.append(f"result_df is not a DataFrame; got {type(result_df)}")
+        rep["note"] = f"result_df is not a DataFrame; got {type(result_df)}"
+        log_parts.append(rep["note"])
         return None, "\n\n".join(log_parts)
 
     if not log_parts:

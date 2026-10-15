@@ -21,6 +21,16 @@ and the vault's data folder (<vault>/data_in) holds data files, this:
 Every member and the Judge see the block (it is not vault-gated: figures are
 for checking). The transcript gets the table. Nothing is written to the
 vault. COUNCIL_ANALYST=0 turns it off.
+
+THE FENCE FOR MODEL CODE IN A COUNCIL TURN
+run_code (the analyst above, the data_query tool) and run_script (the
+Coder's and the Intern's run_python, council_core.council_tools) are one
+fence: _run_child — the sandbox in council_core.analyst_child, under
+child_proc with at most TIME_LIMIT_S (a caller or a model may ask for less,
+never more: time_limit) and a MEMORY_MB commit cap, the whole process tree
+killed at the limit. They differ only in what counts as an answer: a
+result_df for run_code; for run_script, code that ran to its end, with what
+it printed.
 """
 from __future__ import annotations
 
@@ -57,34 +67,115 @@ def data_folder(vault_dir: Path) -> Path:
     return data_index.input_dir(Path(vault_dir))
 
 
-def run_code(code: str, folder: Path, *, timeout: float = TIME_LIMIT_S,
-             runner: Optional[Callable[..., Any]] = None):
-    """(DataFrame or None, log): the code in a child process under the
-    sandbox, killed at `timeout` seconds."""
-    import pandas as pd
+def time_limit(requested: Any = TIME_LIMIT_S) -> int:
+    """The limit for one run, in whole seconds: what was asked for, but
+    never more than TIME_LIMIT_S and never less than 1 — a model may
+    shorten its own limit, never lengthen it. Anything that is not a number
+    gets TIME_LIMIT_S."""
+    try:
+        t = int(float(requested))
+    except (TypeError, ValueError, OverflowError):
+        return TIME_LIMIT_S
+    return max(1, min(t, TIME_LIMIT_S))
+
+
+def _run_child(code: str, folder: Path, *, timeout: Any,
+               runner: Optional[Callable[..., Any]],
+               vault: Optional[Path] = None, no_data_ok: bool = False):
+    """(the child's report as a dict, or None; why there is none; whether
+    it was stopped at the time limit). The one
+    way model code runs here: council_core.analyst_child — the sandbox — in
+    a child process under child_proc, at most TIME_LIMIT_S (time_limit) and
+    MEMORY_MB, the code written to a temporary folder. `vault`: the vault
+    whose data_out the sandbox's helpers may write (council_core.paths
+    .vault_dir() in the child). `no_data_ok`: a missing `folder` is an
+    empty one (in the temporary folder) rather than a refusal."""
     from . import child_proc
     runner = runner or child_proc.run
+    limit = time_limit(timeout)
+    extra = ({"COUNCIL_VAULT_ROOT": str(Path(vault).resolve())}
+             if vault is not None else None)
     with tempfile.TemporaryDirectory(prefix="council-analyst-") as tmp:
         code_file = Path(tmp) / "code.py"
         out_file = Path(tmp) / "out.json"
         code_file.write_text(code, encoding="utf-8")
+        folder = Path(folder)
+        if no_data_ok and not folder.is_dir():
+            folder = Path(tmp) / "no_data"
+            folder.mkdir()
         res = runner([sys.executable, "-m", "council_core.analyst_child",
                       str(code_file), str(folder), str(out_file)],
-                     cwd=str(APP_ROOT), env=child_proc.child_env(),
-                     timeout=timeout, memory_limit_mb=MEMORY_MB)
+                     cwd=str(APP_ROOT), env=child_proc.child_env(extra),
+                     timeout=limit, memory_limit_mb=MEMORY_MB)
         if getattr(res, "timed_out", False):
-            return None, (f"the code ran longer than {timeout:.0f} s and "
-                          "was stopped")
+            return None, (f"the code ran longer than {limit} s and was "
+                          "stopped"), True
         if not out_file.exists():
             err = (getattr(res, "stderr", "") or getattr(res, "error", "")
                    or "the analysis process ended without a result")
-            return None, str(err)[-2000:]
-        out = json.loads(out_file.read_text(encoding="utf-8"))
+            return None, str(err)[-2000:], False
+        return json.loads(out_file.read_text(encoding="utf-8")), "", False
+
+
+def _frame(table: str):
+    import io
+    import pandas as pd
+    return pd.read_json(io.StringIO(table), orient="split")
+
+
+def run_code(code: str, folder: Path, *, timeout: float = TIME_LIMIT_S,
+             runner: Optional[Callable[..., Any]] = None,
+             vault: Optional[Path] = None):
+    """(DataFrame or None, log): the code in a child process under the
+    sandbox, killed at `timeout` seconds (at most TIME_LIMIT_S)."""
+    out, why, _stopped = _run_child(code, folder, timeout=timeout,
+                                    runner=runner, vault=vault)
+    if out is None:
+        return None, why
     if not out.get("ok") or not out.get("table"):
         return None, str(out.get("log") or "the code produced no table")
-    import io
-    df = pd.read_json(io.StringIO(out["table"]), orient="split")
-    return df, str(out.get("log") or "")
+    return _frame(out["table"]), str(out.get("log") or "")
+
+
+@dataclass
+class ScriptRun:
+    ran: bool = False          # passed the checks and ran to its end
+    stdout: str = ""
+    stderr: str = ""
+    df: Any = None             # its result_df, when it set a usable one
+    error: str = ""            # the refusal, traceback or stop when not ran
+    note: str = ""             # why a result_df it set could not be used
+    timed_out: bool = False
+
+
+def run_script(code: str, folder: Path, *, timeout: Any = TIME_LIMIT_S,
+               runner: Optional[Callable[..., Any]] = None,
+               vault: Optional[Path] = None) -> ScriptRun:
+    """The code as a script, under exactly run_code's fence (the sandbox in
+    a child process, at most TIME_LIMIT_S and MEMORY_MB): for the Council's
+    run_python, where code that prints its answer has worked even without
+    a result_df. A missing data folder is an empty one. Never raises."""
+    try:
+        out, why, stopped = _run_child(code, folder, timeout=timeout,
+                                       runner=runner, vault=vault,
+                                       no_data_ok=True)
+    except Exception as exc:                              # noqa: BLE001
+        return ScriptRun(error=f"the code could not run: {exc}")
+    if out is None:
+        return ScriptRun(error=why, timed_out=stopped)
+    run = ScriptRun(ran=bool(out.get("ran")),
+                    stdout=str(out.get("stdout") or ""),
+                    stderr=str(out.get("stderr") or ""),
+                    error=str(out.get("error") or ""),
+                    note=str(out.get("note") or ""))
+    if not run.ran and not run.error:
+        run.error = str(out.get("log") or "the code did not run")
+    if out.get("ok") and out.get("table"):
+        try:
+            run.df = _frame(out["table"])
+        except Exception as exc:                          # noqa: BLE001
+            run.note = f"the result could not be read: {exc}"
+    return run
 
 
 def run(question: str, vault_dir: Path, *,
@@ -172,4 +263,5 @@ def run(question: str, vault_dir: Path, *,
         note=f"Analyst: computed a {rows}×{cols} table from {folder.name}.")
 
 
-__all__ = ["AnalystResult", "run", "run_code", "data_folder", "enabled"]
+__all__ = ["AnalystResult", "ScriptRun", "run", "run_code", "run_script",
+           "time_limit", "data_folder", "enabled"]
