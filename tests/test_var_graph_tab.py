@@ -242,10 +242,16 @@ def test_export_svg_names_the_variables(tab, tmp_path):
     out = tmp_path / "total.svg"
     page.actions.export_to = str(out)
     page.export()
+    # On Windows the generator held its temp file open, so the rename
+    # failed ("being used by another process") and the temp file stayed.
+    assert out.is_file(), page.status.text()
+    assert not list(tmp_path.glob("total.svg.*")), "a temp file was left"
     text = out.read_text(encoding="utf-8")
     assert text.lstrip().startswith("<?xml") and "<svg" in text
+    assert text.rstrip().endswith("</svg>")         # written whole
     assert "total" in text and "Cart.total" in text
     assert "what feeds it" in text                 # the caption
+    assert str(out) in page.status.text()
 
 
 def test_export_replaces_an_old_image_and_cancel_writes_nothing(tab, tmp_path):

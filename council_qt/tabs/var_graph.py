@@ -302,9 +302,17 @@ def export_graph(view: "GraphView", path: str, caption: str = "") -> Path:
     os.close(fd)
     try:
         if svg:
+            # Drawn into memory, then written here: a QSvgGenerator given a
+            # file name keeps that file open until the generator is
+            # destroyed, and Windows will not rename an open file — every
+            # SVG export failed there ("being used by another process") and
+            # left its temp file behind.
+            from PySide6.QtCore import QBuffer, QIODevice
             from PySide6.QtSvg import QSvgGenerator
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
             gen = QSvgGenerator()
-            gen.setFileName(tmp)
+            gen.setOutputDevice(buffer)
             gen.setSize(QSize(int(w), int(h)))
             gen.setViewBox(QRectF(0, 0, w, h))
             gen.setTitle(caption or "Variable Map")
@@ -312,6 +320,8 @@ def export_graph(view: "GraphView", path: str, caption: str = "") -> Path:
             painter = QPainter(gen)
             paint(painter, 1.0)
             painter.end()
+            buffer.close()
+            Path(tmp).write_bytes(bytes(buffer.data()))
         else:
             image = QImage(int(w * EXPORT_SCALE), int(h * EXPORT_SCALE),
                            QImage.Format.Format_ARGB32)
