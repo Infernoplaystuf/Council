@@ -461,7 +461,31 @@ test that fails on 05bef12 (the coverage-only ones are said).
 - Still true: Qt writes no crash-recovery sentinel and offers no resume (USER_GUIDE's
   Sessions section now says so, with "This conversation only" and Load as Prior).
 
+**Merged again (2026-10-15, branch `merge/council-map-fixed3`).** origin/qt-migration at
+393671b (the Typhon follow-ups; Basler triggered capture and Downsample) merged without
+conflicts; the tab list is origin's lazy (PEP 562) registry, which holds every tab both
+sides list. Four council-map tests that failed on this PC (Windows, Python 3.11) and on
+origin there:
+- `test_judge_view::test_code_check`: pyflakes is not in the app's environment, so
+  `tool_kit.lint` found nothing past the compile check and the Judge's CODE CHECK said "no
+  syntax errors or undefined names" about code that reads an undefined name. Without
+  pyflakes, `tool_kit.undefined_names` (the standard library's symtable, pyflakes' rule)
+  finds them; unused imports still need pyflakes.
+- `test_var_graph_tab::test_export_svg_names_the_variables`: a `QSvgGenerator` given a file
+  name holds it open, so the swap onto the chosen name failed on Windows and the temp file
+  stayed; the SVG is drawn into memory and written by the tab.
+- `test_vault_context::test_without_a_semantic_index_no_model_is_ever_loaded`: the test
+  compared `notes\pumps.md` with `notes/pumps.md`; it compares the posix form now (the code
+  shows the OS's separator, as everywhere else).
+- `test_code_bench.py` and `test_council_core`'s no-toolkit check of `code_bench.py` pass
+  with the merge's f-string fix (a backslash inside an f-string is Python 3.12+).
+
 Open:
+- `run_python` (with Tools on: the Coder and the Intern) runs a model's code in a plain
+  child process with the app's environment — no sandbox. It can write what `vault_save`
+  now refuses: a probe's `open('../node_routing.json', 'w')` from the workspace made
+  `node_routing.route('writer')` a remote host on the next load. It needs the analyst's
+  sandbox, a narrower tool, or a decision that the Coder's code is trusted.
 - The Vault switch turns off council-map's passages only; the matches `prepare_turn` puts
   in front of the question do not read it.
 - A Tk launch and a Qt launch in the same second can share a session id again (the Tk
