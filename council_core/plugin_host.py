@@ -502,6 +502,11 @@ class PluginHost:
 
     @property
     def registry(self) -> Registry:
+        # Once made, read without the host's lock: the watchdog names a
+        # plugin whose hung activate holds that lock (instance()).
+        found = self._registry
+        if found is not None:
+            return found
         with self._lock:
             if self._registry is None:
                 self._registry = discover(self.home.path,
@@ -1154,6 +1159,10 @@ class GuardedGate:
             return dict(FAULT_TAGS)
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            # Its own fields are never forwarded (and asking for one before
+            # __init__ set it must not recurse).
+            raise AttributeError(name)
         target = getattr(self._gate, name)
         if name not in self.RECORDING_CALLS or not callable(target):
             return target

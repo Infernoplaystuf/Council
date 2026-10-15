@@ -98,6 +98,9 @@ PLUGIN_CODE = textwrap.dedent('''
         def activate(self, ctx):
             if MODE.get("activate") == "raise":
                 raise ValueError("activate failed")
+            if MODE.get("activate") == "hang":
+                MODE["started"].set()
+                MODE["release"].wait(10)
             self.ctx = ctx
             self.calls.append("activate")
 
@@ -612,6 +615,42 @@ def test_the_watchdog_switches_off_a_call_that_hangs(builtins_pkg,
     assert host.call("typhon.a", "hook") is None
 
 
+def test_the_watchdog_still_works_while_a_hung_activate_holds_the_host(
+        builtins_pkg, plugin_home, tmp_path):
+    """activate runs while the host makes the instance; a plugin hanging
+    there must not take the watchdog down with it."""
+    name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    host.open_project(proj, create=True)
+    said = []
+    host.say_fn = said.append
+    __import__(f"{name}.a.plugin")
+    mode = module_of(builtins_pkg, "a").MODE
+    mode.update(activate="hang", started=threading.Event(),
+                release=threading.Event())
+    made = []
+    loader = threading.Thread(target=lambda: made.append(
+        host.instance("typhon.a")), daemon=True)
+    loader.start()
+    assert mode["started"].wait(5)
+    switched = []
+    dog = threading.Thread(target=lambda: switched.append(host.watchdog(
+        now=time.monotonic() + ph.WATCHDOG_SECONDS + 1)), daemon=True)
+    dog.start()
+    dog.join(5)
+    alive = dog.is_alive()
+    mode["release"].set()
+    loader.join(5)
+    assert not alive, "the watchdog waited on the hung plugin"
+    assert switched == [["typhon.a"]]
+    assert host.faults["typhon.a"].hook == "activate"
+    assert made == [None], "switched off while it hung: never handed out"
+    assert "typhon.a" in (proj / ph.ERRORS_LOG).read_text(encoding="utf-8")
+
+
 # ======================================================================
 # The recording path (design 3.10): a fault ends the recording cleanly
 # ======================================================================
@@ -801,6 +840,17 @@ def test_ending_a_recording_lets_queued_frames_land(tmp_path):
     assert (end["first_index"], end["last_index"]) == (1, 5)
     assert writer.offered == 4 and writer.lost == 2
     assert len(read_rows(tmp_path / f"{run}_frames.csv")) == 2
+
+
+def test_a_guarded_gate_forwards_the_gates_own_attributes_only():
+    gate = Gate()
+    guarded = ph.GuardedGate(None, "typhon.trig", gate, lambda *a: None)
+    assert guarded.summary == gate.summary and guarded.gate is gate
+    with pytest.raises(AttributeError):
+        guarded.no_such_thing
+    half = ph.GuardedGate.__new__(ph.GuardedGate)   # before __init__ ran
+    with pytest.raises(AttributeError):
+        half._gate
 
 
 def test_ending_a_closed_or_failed_recording_changes_nothing(tmp_path):
