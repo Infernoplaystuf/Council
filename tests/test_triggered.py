@@ -269,6 +269,27 @@ def test_stop_ends_a_burst_at_once_and_says_stop_cut_it(tmp_path):
     assert run.summary()["cut_by_stop"] == 1
 
 
+def test_a_burst_cut_with_a_frame_on_its_way_is_still_stops(tmp_path):
+    """Disconnect stops the books without waiting for frames: a burst cut
+    with its last fired frame still on its way was "no frame: 4 of 300
+    frames" (review probe, Disconnect mid-burst) — it is Stop's cut, and
+    the frame that had not come is said."""
+    device = FakeTrigger(busy_s=0.03)
+    run = run_of(tmp_path, device, mode=tg.MODE_EXACT, per_trigger=300)
+    run.start()
+    run.capture_now()
+    assert wait_for(lambda: len(device.fired) >= 5)
+    run.halt()
+    fired = len(device.fired)
+    for n in range(1, fired):                 # the last one never comes
+        run.tag(frame(n))
+    run.stop()
+    assert rows_of(run.path)[0]["outcome"] == (
+        f"cut short by Stop: {fired} of 300 fired (1 of them had not come "
+        f"when the run stopped)")
+    assert run.counts["stopped"] == 1 and run.missed == 0
+
+
 def test_a_late_frame_is_its_own_triggers_not_the_next(tmp_path,
                                                        monkeypatch):
     """Before: a frame that came after its trigger's deadline was paired

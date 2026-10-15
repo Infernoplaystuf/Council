@@ -623,6 +623,16 @@ class TriggerRun:
                 self._settle(trig, NO_FRAME, note="the run stopped")
             self._held.clear()
             for trig in list(self._pending):
+                if trig.stopped:
+                    # A burst Stop (or Disconnect) cut, a frame it fired
+                    # still on its way: the burst is Stop's, not a miss —
+                    # and the frame that had not come is said.
+                    late = trig.fired - trig.arrived
+                    self._settle(trig, f"{STOPPED}: {trig.fired} of "
+                                       f"{trig.asked} fired",
+                                 note=f"{late} of them had not come when the "
+                                      f"run stopped")
+                    continue
                 self._settle(trig, NO_FRAME if trig.arrived == 0
                              else self._partial(trig), note="the run stopped")
             if self._current is not None and not self._current.done:

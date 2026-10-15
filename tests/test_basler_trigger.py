@@ -664,7 +664,7 @@ def test_disconnect_in_a_long_software_burst_is_prompt(monkeypatch,
     connect(monkeypatch, cam)
     before = cam.triggers()
     set_up(mode=tg.MODE_EXACT, source=tg.SOFTWARE, per=300)
-    frame_camera.start(str(tmp_path))
+    out = frame_camera.start(str(tmp_path))
     session = frame_camera._LIVE.session
     frame_camera.capture_now()
     assert wait_for(lambda: session.stats().grabbed >= 3)
@@ -672,6 +672,12 @@ def test_disconnect_in_a_long_software_burst_is_prompt(monkeypatch,
     frame_camera.disconnect()
     assert time.perf_counter() - began < 0.6
     assert cam.triggers() == before
+    # Cut by Disconnect, not "no frame: 5 of 300" — a frame it had fired
+    # may still have been on its way, and that is said.
+    outcome = rows_of(tmp_path / f"{out['run']}{tg.TRIGGERS_SUFFIX}")[0][
+        "outcome"]
+    assert outcome.startswith("cut short by Stop: "), outcome
+    assert " of 300 fired" in outcome, outcome
 
 
 def test_a_burst_from_a_line_saves_n_frames_per_trigger(monkeypatch,
