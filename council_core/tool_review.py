@@ -177,8 +177,10 @@ def run_tests(name: str, vault_dir: Any,
             out.append((False, f"{call} returned {value!r}, expected "
                                f"{t['equals']!r}"))
             continue
+        # The table's full shape (run.shape): `df` holds only its first
+        # frame_codec.MAX_ROWS rows.
         shown = str(value)[:120] if not hasattr(value, "columns") else \
-            f"a table {getattr(value, 'shape', '')}"
+            f"a table {run.shape or getattr(value, 'shape', '')}"
         out.append((True, f"{call} → {shown}"))
     return out
 
@@ -281,14 +283,17 @@ def approved_tools(vault_dir: Any) -> List[Tuple[str, Callable, List[str]]]:
         meta = abt.get_tool(name, vault_dir) or {}
 
         def fn(args, _n=name):
-            df, msg = abt.run_tool(_n, dict(args or {}), vault_dir=vault_dir)
-            if df is None:
-                return False, msg, {}
-            value = _value(df)
+            run = abt.run_tool_detail(_n, dict(args or {}),
+                                      vault_dir=vault_dir)
+            if run.df is None:
+                return False, abt.LABEL + run.message, {}
+            value = _value(run.df)
             text = value.to_string(max_rows=40) if hasattr(value, "to_string") \
                 else str(value)
-            return True, f"{text[:4000]}\n(app-built tool, approved by you)", \
-                {"tool": _n}
+            # Only the table's first rows come back: say so, with its size.
+            cut = f"\n({run.cut})" if run.cut else ""
+            return True, (f"{text[:4000]}{cut}\n"
+                          "(app-built tool, approved by you)"), {"tool": _n}
         fn.help = (meta.get("description") or name)[:200]
         fn.params = _params(code)
         out.append((f"app_{name}", fn, list(rec.get("roles") or [])))

@@ -210,9 +210,12 @@ def make_tools(runner: Any, librarian: Any, vault_dir: Path, *,
             import vault_analyst as va
             table = va.format_result_for_prompt(run.df, max_rows=100,
                                                 max_chars=5000)
-            payload.update(table=table, rows=int(run.df.shape[0]),
-                           cols=int(run.df.shape[1]))
+            # The table's full size: run.df holds only its first rows.
+            rows, cols = run.shape or run.df.shape
+            payload.update(table=table, rows=int(rows), cols=int(cols))
             msg += f"\n--- result_df ---\n{table}"
+            if run.cut:
+                msg += f"\n({run.cut})"
         if run.timed_out:
             payload["timed_out"] = True
         return run.ran, msg, payload

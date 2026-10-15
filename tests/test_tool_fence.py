@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +56,7 @@ import vault_analyst as va  # noqa: E402
 from council_core import agent_profiles as ap  # noqa: E402
 from council_core import analyst_step  # noqa: E402
 from council_core import forge_jobs  # noqa: E402
+from council_core import frame_codec  # noqa: E402
 from council_core import tool_review as tr  # noqa: E402
 from council_qt.tabs.council import CouncilActions  # noqa: E402
 
@@ -714,6 +716,332 @@ def test_the_sandbox_helpers_still_write_only_the_vault_s_data_out(box):
     written = sorted(p.name for p in (box.vault / "data_out" / "split")
                      .glob("*.csv"))
     assert written == ["runs_A.csv", "runs_B.csv", "runs_C.csv"]
+
+
+# ============================================================
+# What comes back is what the code returned (review of the fence,
+# 2026-10-15): exact floats, the table's real size, the same types, a
+# damaged report as a plain error, a bounded result, a plain memory stop
+# ============================================================
+
+TINY = ("def tiny(n=1):\n"
+        "    return pd.DataFrame({'eps': [1.2345678901234e-12] * n,\n"
+        "                         'third': [1 / 3] * n})\n")
+TINY_SNIPPET = ("result_df = pd.DataFrame({'eps': [1.2345678901234e-12],\n"
+                "                          'third': [1 / 3]})\n")
+EXACT_ROWS = [{"eps": 1.2345678901234e-12, "third": 1 / 3}]
+
+
+def test_a_tool_s_floats_come_back_exactly(box):
+    """Through pandas' JSON a tool's 1.2345678901234e-12 came back as 0.0,
+    1/3 as 0.33333333330000003 and 2.123456789012345 as 2.123456789; in
+    the app's own process they were exact, and are again."""
+    df, msg = abt.run_code(TINY, {}, vault_dir=box.vault)
+    assert df is not None, msg
+    assert df.to_dict(orient="records") == EXACT_ROWS
+    run = analyst_step.run_tool_code(
+        "def d():\n    return {'a': 1, 'b': 2.123456789012345,\n"
+        "            'pi': 3.141592653589793}\n", "d", {}, [box.data])
+    assert run.df.to_dict(orient="records") == [
+        {"a": 1, "b": 2.123456789012345, "pi": 3.141592653589793}]
+
+
+@pytest.mark.parametrize("where", ["council", "forge"])
+def test_a_tiny_value_is_shown_not_zero(box, where):
+    """The Council's approved-tool text and Forge's Run Selected showed
+    the 1e-12 column as 0.0."""
+    text = (council_tool(box, TINY)[1] if where == "council"
+            else forge_run(box, TINY).body)
+    assert "1.234568e-12" in text and "0.333333" in text, text
+
+
+def _obs_agent_pandas(box, code, snippet):
+    return tool_result(agent_run(box, "run_pandas_analysis",
+                                 {"code": snippet}), "run_pandas_analysis")
+
+
+def _obs_agent_attached(box, code, snippet):
+    name = abt.entry_function(code)
+    return tool_result(agent_run(box, name, {}, attach=code), name)
+
+
+def _obs_job_pandas(box, code, snippet):
+    return tool_result(job_agent_run(box, "run_pandas_analysis",
+                                     {"code": snippet}),
+                       "run_pandas_analysis")
+
+
+def _obs_job_app_tool(box, code, snippet):
+    name = abt.entry_function(code)
+    abt.save_tool(name, "probe", code, vault_dir=box.vault)
+    return tool_result(job_agent_run(box, "run_app_tool", {"name": name}),
+                       "run_app_tool")
+
+
+OBS_PATHS = [("agent-run-pandas-analysis", _obs_agent_pandas),
+             ("agent-attached-tool", _obs_agent_attached),
+             ("job-run-pandas-analysis", _obs_job_pandas),
+             ("job-run-app-tool", _obs_job_app_tool)]
+
+
+@pytest.mark.parametrize("pid,path", OBS_PATHS, ids=[p for p, _ in OBS_PATHS])
+def test_agents_and_jobs_get_exact_floats(box, pid, path):
+    """An agent's preview was [{'eps': 0.0, 'third': 0.33333333330000003}]."""
+    result = path(box, TINY, TINY_SNIPPET)
+    assert result["preview"] == EXACT_ROWS, result
+
+
+ROWS = ("def rows(n=10000):\n"
+        "    return pd.DataFrame({'i': range(n), 'x': [0.5] * n})\n")
+ROWS_SNIPPET = ("result_df = pd.DataFrame({'i': range(10000),\n"
+                "                          'x': [0.5] * 10000})\n")
+CUT = "showing the first 5000 of 10000 rows"
+
+
+def test_a_10000_row_table_is_described_as_10000_rows(box):
+    """Only the first frame_codec.MAX_ROWS rows come back; the Council's
+    text, Forge's Run Selected and the tool's tests showed the 5000 as the
+    whole table, and nothing said rows were dropped."""
+    assert frame_codec.MAX_ROWS == 5000
+    ok, text, _p = council_tool(box, ROWS)
+    assert ok and CUT in text, text[-300:]
+    res = forge_run(box, ROWS)
+    assert res.ok and CUT in res.body, res.body[:300]
+    tr.save_tests("rows", [{"args": {}, "expect": "table"}], box.vault)
+    assert tr.run_tests("rows", box.vault) == [
+        (True, "rows(**{}) → a table (10000, 2)")]
+    df, msg = abt.run_tool("rows", {}, vault_dir=box.vault)
+    assert len(df) == 5000 and CUT in msg
+
+
+@pytest.mark.parametrize("pid,path", OBS_PATHS, ids=[p for p, _ in OBS_PATHS])
+def test_agents_and_jobs_are_told_the_table_s_real_size(box, pid, path):
+    result = path(box, ROWS, ROWS_SNIPPET)
+    assert result["shape"] == [10000, 2] and CUT in result["message"], result
+
+
+def test_run_python_reports_the_table_s_real_size(box):
+    ok, text, payload = CouncilActions(vault_dir=box.vault).tools().for_role(
+        "coder")["run_python"]({"code": ROWS_SNIPPET})
+    assert ok and payload["rows"] == 10000 and payload["cols"] == 2
+    assert CUT in text
+
+
+#: What a tool returned in the app's own process (the wrapper
+#: app_built_tools used until 2026-10-15) — the reference for each case.
+def in_process(box, code):
+    call = ("\n\n_ret = f()\nresult_df = _ret if isinstance(_ret, "
+            "(pd.DataFrame, pd.Series, dict)) else "
+            "pd.DataFrame([{'result': _ret}])\n")
+    df, log = va.execute_pandas_code(code + call, [box.data])
+    assert df is not None, log
+    return df
+
+
+RETURNS = {
+    "numeric-text-labels": "return pd.DataFrame({'001': [1], '2024': [2]}, "
+                           "index=['007'])",
+    "timestamp": "return pd.Timestamp('2026-10-15 12:00')",
+    "datetime64": "return np.datetime64('2026-10-15T12:00:00.000000000')",
+    "bytes": "return b'abc'",
+    "tuple": "return (1, 2)",
+    "complex": "return complex(1, 2)",
+    "timedelta-column": "return pd.DataFrame({'d': pd.to_timedelta([1, 2], "
+                        "unit='s')})",
+    "period": "return pd.Period('2026-10', freq='M')",
+    "set": "return {1, 2}",
+    "grouped-columns": "return pd.DataFrame({'g': ['a', 'b'], 'x': [1, 2], "
+                       "'y': [3, 4]}).groupby('g').agg(['sum', 'mean'])",
+    "text-007": "return '007'",
+    "floats": "return [1 / 3, 1.2345678901234e-12]",
+}
+
+
+@pytest.mark.parametrize("case", list(RETURNS))
+def test_a_tool_s_return_comes_back_as_it_was_in_process(box, case):
+    """Columns '001' came back as 1 (df['001'] raised KeyError), a
+    Timestamp or bytes as text, a tuple as a list, complex as
+    {'real', 'imag'}, a timedelta column as ISO text, and a Period not at
+    all ("Maximum recursion level reached")."""
+    code = f"def f():\n    {RETURNS[case]}\n"
+    want = in_process(box, code)
+    df, msg = abt.run_code(code, {}, vault_dir=box.vault)
+    assert df is not None, msg
+    pd.testing.assert_frame_equal(df, want)
+    if list(want.columns) == ["result"]:
+        a, b = want["result"].iloc[0], df["result"].iloc[0]
+        assert type(a) is type(b) and a == b, (a, b)
+
+
+# A damaged report — model code can rewrite what its own process reports.
+
+class _Reporter:
+    """child_proc.run's stand-in: writes `report` as the child's out.json
+    (argv[5]) and exits 0."""
+
+    def __init__(self, report):
+        self.report = report
+
+    def __call__(self, argv, **kw):
+        text = (self.report if isinstance(self.report, str)
+                else json.dumps(self.report))
+        Path(argv[5]).write_text(text, encoding="utf-8")
+        return NS(timed_out=False, returncode=0, stderr="", error="",
+                  infra="", peak_mb=900)
+
+
+DAMAGED_REPORTS = [
+    {"ok": True, "ran": True, "value": 1, "shape": ["many", 1], "log": "ok"},
+    {"ok": True, "ran": True, "shape": [1, 1],
+     "frame": {"format": frame_codec.FORMAT, "index": "x"}},
+    {"ok": True, "ran": "yes", "stdout": ["a"], "error": {"x": 1}, "log": 5,
+     "frame": {"$": "pickle", "v": "gASV"}},
+    {"ok": True, "ran": True, "table": 12345, "shape": [1, -1]},
+    [1, 2, 3],
+    "{ not json",
+]
+
+
+@pytest.mark.parametrize("i", range(len(DAMAGED_REPORTS)))
+def test_a_damaged_report_is_a_plain_error_not_an_exception(box, i):
+    """run_tool_code, run_script and run_code say "Never raises"; a report
+    with a non-numeric shape raised ValueError into the app."""
+    fake = _Reporter(DAMAGED_REPORTS[i])
+    run = analyst_step.run_tool_code("def f():\n    return 1\n", "f", {},
+                                     [box.data], runner=fake)
+    assert run.df is None
+    assert "could not be read" in run.brief() or "could not be read" in \
+        run.message, (run.brief(), run.message)
+    run = analyst_step.run_script("print(1)", box.data, runner=fake,
+                                  exact=True)
+    assert run.df is None
+    df, log = analyst_step.run_code("result_df = 1", box.data, runner=fake)
+    assert df is None and isinstance(log, str)
+
+
+#: Model code that rewrites its own report: json's encoder class (not
+#: json.dumps, which the child keeps) — the review's probe, verbatim.
+FORGER = ("def forge():\n"
+          "    import json\n"
+          "    json.encoder.JSONEncoder.encode = lambda self, o: "
+          + repr(json.dumps({"ok": True, "ran": True, "value": 1,
+                             "shape": ["many", 1], "log": "ok"})) + "\n"
+          "    return 1\n")
+
+
+def test_code_that_rewrites_its_report_gets_a_plain_error_on_every_path(box):
+    assert va.validate_generated_code(FORGER + "\nresult_df = forge()\n")[0]
+    run = analyst_step.run_tool_code(FORGER, "forge", {}, [box.data])
+    assert run.df is None and run.brief() == analyst_step.DAMAGED
+    df, msg = abt.run_code(FORGER, {}, vault_dir=box.vault)
+    assert df is None and analyst_step.DAMAGED in msg
+    abt.save_tool("forge", "probe", FORGER, vault_dir=box.vault)
+    assert tr.run_tests("forge", box.vault) == [
+        (False, f"forge(**{{}}) failed: {analyst_step.DAMAGED}")]
+    res = forge_jobs.run_tool("forge", box.vault)
+    assert not res.ok and res.error is None
+    assert res.status == "⚠ 'forge' failed — see the output."
+    assert analyst_step.DAMAGED in res.body
+
+
+# A huge result: refused in plain words, never read into the app.
+
+def test_a_huge_returned_value_is_refused_and_not_held_by_the_app(box):
+    """An 80 MB return raised the app's peak memory by ~320-400 MB (the
+    report read and parsed several times over). It is refused in the
+    sandbox's process, in plain words."""
+    code = "def big(mb=80):\n    return 'x' * (mb * 1024 * 1024)\n"
+    before = peak_commit_mb()
+    (df, msg), _s = in_worker(lambda: abt.run_code(code, {},
+                                                   vault_dir=box.vault))
+    after = peak_commit_mb()
+    assert df is None
+    assert ("the result was too large to bring back (80 MB; at most "
+            f"{frame_codec.MAX_RESULT_MB} MB)") in msg, msg[:300]
+    if before is not None:
+        assert after - before < 150, f"the app's peak grew {after - before} MB"
+    ok, text, _p = council_tool(box, code)
+    assert not ok and "too large to bring back" in text
+
+
+def test_the_app_does_not_read_a_report_over_the_limit(box, monkeypatch):
+    """Whatever the child wrote: the size is checked before reading."""
+    monkeypatch.setattr(frame_codec, "MAX_RESULT_MB", 1)
+    report = {"ok": True, "ran": True, "log": "x" * (2 * 2 ** 20),
+              "frame": frame_codec.encode(pd.DataFrame({"result": [1]}))}
+    run = analyst_step.run_tool_code("def f():\n    return 1\n", "f", {},
+                                     [box.data], runner=_Reporter(report))
+    assert run.df is None
+    assert run.message.startswith(
+        "the result was too large to bring back (2 MB; at most 1 MB)")
+
+
+def test_a_large_value_under_the_limit_still_comes_back(box):
+    code = ("def big(mb=4):\n"
+            "    return 'x' * (mb * 1024 * 1024) + '\\u00e9'\n")
+    df, msg = abt.run_code(code, {}, vault_dir=box.vault)
+    assert df is not None, msg[:300]
+    assert tr._value(df) == "x" * (4 * 2 ** 20) + "\u00e9"
+
+
+# A memory-cap death inside a C library.
+
+def _dies(returncode, peak_mb, stderr=""):
+    def run(argv, **kw):
+        return NS(timed_out=False, returncode=returncode, stderr=stderr,
+                  error="", infra="", peak_mb=peak_mb)
+    return run
+
+
+MEMORY = ("the code needed more memory than the sandbox allows "
+          f"({analyst_step.MEMORY_MB} MB) and was stopped")
+
+
+def test_a_silent_abort_under_the_cap_reads_as_the_memory_cap(box,
+                                                             monkeypatch):
+    """pandas' to_json failing an allocation under the 2048 MB cap ends the
+    process with 0xC0000409 and nothing on stderr; it read only "the
+    analysis process ended without a result", and Forge said "failed — see
+    the output"."""
+    run = analyst_step.run_tool_code("def f():\n    return 1\n", "f", {},
+                                     [box.data],
+                                     runner=_dies(0xC0000409, 1019))
+    assert run.stopped_by_memory
+    assert run.message == (f"{MEMORY} (the sandbox process ended at 1019 MB, "
+                           "exit 0xC0000409)")
+    # STATUS_NO_MEMORY / STATUS_COMMITMENT_LIMIT, whatever the peak
+    for code in (0xC0000017, 0xC000012D):
+        assert analyst_step.run_script(
+            "print(1)", box.data, runner=_dies(code, 300)).stopped_by_memory
+    # not every crash: a small process, or one that said why
+    for runner in (_dies(0xC0000409, 300), _dies(0xC0000005, 1500),
+                   _dies(0xC0000409, 1500, stderr="Fatal Python error: x")):
+        run = analyst_step.run_script("print(1)", box.data, runner=runner)
+        assert not run.stopped_by_memory, run.message
+    assert "exit 0xC0000005" in analyst_step.run_script(
+        "print(1)", box.data, runner=_dies(0xC0000005, 1500)).message
+    # the Forge tab's status
+    from council_core import child_proc
+    monkeypatch.setattr(child_proc, "run", _dies(0xC0000409, 1019))
+    ok, why, name = abt.save_tool("one", "probe",
+                                  "def one():\n    return 1\n",
+                                  vault_dir=box.vault)
+    assert ok, why
+    res = forge_jobs.run_tool(name, box.vault)
+    assert res.status.startswith(f"⚠ {name}: the code needed more memory"), \
+        res.status
+
+
+def test_a_result_too_big_for_pandas_json_is_a_plain_stop(box):
+    """The real thing, on the run_python / analyst path that still writes
+    pandas' JSON: a 200 MB result_df died in to_json at ~1 GB of the cap
+    with no reason given."""
+    run, _s = in_worker(lambda: analyst_step.run_script(
+        "result_df = pd.DataFrame({'s': ['x' * (200 * 1024 * 1024)]})\n",
+        box.data, vault=box.vault))
+    first = run.message.splitlines()[0]
+    assert "ended without a result" not in run.message, run.message
+    assert first.startswith((MEMORY, "the result was too large")), first
 
 
 # ============================================================
