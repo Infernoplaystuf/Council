@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -332,6 +333,12 @@ def run(files: Sequence[str], *, tree: Path = TREE, python: str = "",
         say(f"FAILED {f} (rc={r['rc']}): {', '.join(r['bad']) or 'see log'}"
             f"  -> {out / (_stem(f) + '.log')}")
     say(f"logs: {out}")
+    if bad:
+        # pytest keeps a failing test's folder; so does the gate, to look in.
+        say(f"temporary folders of the run, kept: {temp_root}")
+    else:
+        # The gate's own folders, made above; nothing else is under them.
+        shutil.rmtree(temp_root, ignore_errors=True)
     return 0 if not bad else 1
 
 
