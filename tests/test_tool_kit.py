@@ -268,6 +268,61 @@ def test_lint_check(tools):
     assert p["problems"] == []
 
 
+#: Code that binds every name it reads, in the ways pyflakes accepts: a
+#: function's `global`, a walrus in a comprehension, an except-as, a dotted
+#: import, a class defined after its use, a method's __class__, the builtins.
+VALID = '''
+from __future__ import annotations
+import os
+import os.path as osp
+import xml.etree.ElementTree
+def f(p: "Later") -> Later:
+    global counter
+    counter = 1
+    total = [i * scale for i in range(3) if (j := i) > 0]
+    return os.sep + osp.sep + str(j) + f"{p!r} {__name__}" + str(xml) + str(total)
+class Cart:
+    tax = 0.2
+    label = f"{tax:.0%} {__qualname__}"
+    def total(self):
+        return super().total() * __class__.tax
+try:
+    import tomllib
+except ImportError as exc:
+    tomllib = exc
+print(counter, Later, len([]), sorted({}))
+scale = 2
+class Later:
+    pass
+'''
+
+
+def test_undefined_names_are_found_without_pyflakes(monkeypatch):
+    """pyflakes is not one of the app's requirements (and not in its own
+    environment), and without it lint found nothing at all — the Judge's code
+    check then told it "no syntax errors or undefined names" about code that
+    reads an undefined name (tests/test_judge_view.py::test_code_check failed
+    on this PC). The standard library's symtable finds them; pyflakes is
+    hidden here so the check is the fallback's wherever pyflakes is
+    installed."""
+    from council_core import judge_view
+    monkeypatch.setitem(sys.modules, "pyflakes", None)
+    bad = ("import os\ndef f():\n    return x + os.sep\nprint(y)\n"
+           "class C:\n    k = 1\n    def m(self):\n        return k\n")
+    assert tool_kit.lint(bad) == [
+        "line 3:12: undefined name 'x'", "line 4:7: undefined name 'y'",
+        "line 8:16: undefined name 'k'"]
+    assert tool_kit.lint(VALID) == []
+    # A star import may bind anything: no guesses.
+    assert tool_kit.lint("from os import *\nprint(sep, nothing)\n") == []
+    assert tool_kit.lint("def f(:\n  pass\n")[0].startswith("line 1: Syntax")
+    check = judge_view.code_check("```python\n" + bad + "```")
+    assert "block 1: line 3:12: undefined name 'x'" in check
+    assert judge_view.has_problems(check)
+    assert not judge_view.has_problems(
+        judge_view.code_check("```python\n" + VALID + "```"))
+
+
 def test_run_tests(tools, vault):
     ok, msg, p = call(tools, "run_tests", path="proj/test_report.py")
     assert ok and p["passed"], msg

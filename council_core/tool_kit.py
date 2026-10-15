@@ -27,7 +27,8 @@ the user put in node_routing.json, and only when asked).
     Code
       code_outline      functions and classes with their signatures
       code_grep         regex search with file:line hits
-      lint_check        compile check plus pyflakes, nothing executed
+      lint_check        compile check plus pyflakes (without it, the
+                        undefined names), nothing executed
       run_tests         pytest in a child process with a time limit
       diff_preview      a proposed change as a diff; never writes
     Coordination
@@ -972,8 +973,68 @@ def _probe(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+#: Names every module has without binding them (and a class body its
+#: __module__ / __qualname__), on top of the builtins — pyflakes' own list.
+_MODULE_NAMES = frozenset({
+    "__name__", "__file__", "__doc__", "__builtins__", "__spec__",
+    "__loader__", "__package__", "__path__", "__cached__", "__annotations__",
+    "__module__", "__qualname__", "__class__", "WindowsError"})
+
+
+def undefined_names(code: str) -> List[str]:
+    """pyflakes' "undefined name" check from the standard library alone
+    (symtable): a name a scope reads as a global that the module never
+    binds — not assigned, imported, defined, or assigned in a function that
+    declares it `global` — and that is not a builtin. One line per name, at
+    its first use, as pyflakes words it ("line 3:12: undefined name 'x'").
+    Nothing when the code has a star import (any name may come from it) or
+    does not parse. Parses only: nothing is imported or executed."""
+    import builtins
+    import symtable
+    try:
+        tree = ast.parse(code)
+        top = symtable.symtable(code, "<code>", "exec")
+    except (SyntaxError, ValueError):
+        return []
+    if any(isinstance(node, ast.ImportFrom)
+           and any(alias.name == "*" for alias in node.names)
+           for node in ast.walk(tree)):
+        return []
+    bound = set(dir(builtins)) | _MODULE_NAMES
+    bound.update(s.get_name() for s in top.get_symbols() if s.is_local())
+    tables, read = [top], set()
+    while tables:
+        table = tables.pop()
+        tables.extend(table.get_children())
+        for sym in table.get_symbols():
+            if table is not top and sym.is_declared_global() and (
+                    sym.is_assigned() or sym.is_imported()
+                    or sym.is_namespace()):
+                bound.add(sym.get_name())
+            if sym.is_referenced() and sym.is_global():
+                read.add(sym.get_name())
+    missing = read - bound
+    if not missing:
+        return []
+    first: Dict[str, Tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in missing and \
+                not isinstance(node.ctx, ast.Store):
+            at = (node.lineno, node.col_offset)
+            if node.id not in first or at < first[node.id]:
+                first[node.id] = at
+    return [f"line {line}:{col + 1}: undefined name '{n}'"
+            for n, (line, col) in sorted(first.items(),
+                                         key=lambda item: item[1])]
+
+
 def lint(code: str, name: str = "<code>") -> List[str]:
-    """Syntax errors, then pyflakes' findings if pyflakes is installed.
+    """Syntax errors, then pyflakes' findings if pyflakes is installed —
+    without it, the undefined names (`undefined_names`, the standard
+    library's symtable): the Judge's code check and the lint tools say
+    "no syntax errors or undefined names", and pyflakes is not one of the
+    app's requirements (it is not in the app's own environment), so that
+    check must not depend on it. Unused imports need pyflakes.
     Parses only: nothing is imported or executed."""
     try:
         compile(code, name, "exec", dont_inherit=True,
@@ -984,7 +1045,7 @@ def lint(code: str, name: str = "<code>") -> List[str]:
         from pyflakes import api as _api
         from pyflakes import reporter as _rep
     except Exception:                                     # noqa: BLE001
-        return []
+        return undefined_names(code)[:60]
     import io
     out, err = io.StringIO(), io.StringIO()
     _api.check(code, name, _rep.Reporter(out, err))
@@ -1235,4 +1296,5 @@ def judge_checks(tools: Dict[str, ToolFn], candidates: Dict[str, Any],
 
 __all__ = ["make_extra_tools", "ToolSet", "SharedNotes", "ROLE_TOOLS",
            "CACHEABLE", "PARAMS", "tool_specs", "judge_checks", "calc", "safe_eval", "convert",
-           "find_quote", "lint", "resolve_in", "PathError", "tool"]
+           "find_quote", "lint", "undefined_names", "resolve_in", "PathError",
+           "tool"]
