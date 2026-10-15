@@ -288,19 +288,28 @@ def test_a_template_may_not_declare_a_name_the_rig_keeps():
         camera_rig.Rig(SlotClash)
 
 
-def test_camera_rig_imports_no_toolkit_and_not_frame_camera():
-    """council_core's rule (no Qt), and the layering: the rig is handed its
-    template, it does not reach up into the linked module."""
-    tree = ast.parse((ROOT / "council_core" / "camera_rig.py")
-                     .read_text(encoding="utf-8"))
+def _imports_of(path):
     imported = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom):
             imported.add((node.module or "").split(".")[0])
+    return imported
+
+
+def test_camera_rig_imports_no_toolkit_and_not_frame_camera():
+    """council_core's rule (no Qt), and the layering: the rig is handed its
+    template, it does not reach up into the linked module. Its one Council
+    import is its plugin host (P1 row 2: the rig IS the plugin host, made on
+    first use), which keeps the same rule."""
+    imported = _imports_of(ROOT / "council_core" / "camera_rig.py")
     assert not imported & {"PySide6", "tkinter", "frame_camera", "council_qt"}
-    assert imported <= {"__future__", "re", "threading", "typing"}
+    assert imported <= {"__future__", "re", "threading", "typing",
+                        "plugin_host"}
+    for name in ("plugin_host", "plugin_lists", "plugin_manifest"):
+        assert not _imports_of(ROOT / "council_core" / f"{name}.py") & {
+            "PySide6", "tkinter", "frame_camera", "council_qt"}, name
 
 
 # ======================================================================

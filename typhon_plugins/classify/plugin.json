@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "typhon.classify",
+  "short": "classify",
+  "name": "Classification",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "feature",
+  "scope": "camera",
+  "entry": "plugin:ClassifyPlugin",
+  "needs": [],
+  "python": [
+    "sklearn"
+  ],
+  "contributes": [],
+  "files": [],
+  "network": "none"
+}

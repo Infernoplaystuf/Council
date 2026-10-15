@@ -846,6 +846,9 @@ class FrameWriter:
         self.offered = 0
         self.first_index: Optional[int] = None
         self.last_index: Optional[int] = None
+        #: The frame end_recording counted, whose own submit a moment later
+        #: must not count it twice; None otherwise.
+        self._ended_frame: Optional[cameras.Frame] = None
         #: Every file written, in GRAB order — append-only, so a viewer can
         #: pick up new frames without rescanning a folder of thousands.
         self.paths: List[Path] = []
@@ -896,6 +899,10 @@ class FrameWriter:
         with self._cond:
             if self._closing:
                 return False
+            if frame is self._ended_frame:
+                # end_recording counted it, offered and NOT saved.
+                self._ended_frame = None
+                return False
             self.offered += 1
             self._saw_index(frame.index)
             if self.failed:
@@ -925,6 +932,34 @@ class FrameWriter:
         """A snapshot frame no trigger asked for went by (not offered)."""
         with self._cond:
             self.passed += 1
+
+    def end_recording(self, reason: str, frame: Any = None) -> bool:
+        """END THIS RECORDING NOW, for `reason`, as the first failed write
+        does: nothing offered from here on is taken, the session stops the
+        recording at its next frame, and `reason` is the end record's
+        recording_failed — "the write that stopped it", here a plugin's
+        fault on the recording path (docs/typhon_plugins_design.md 3.10:
+        carrying on would leave half a run tagged and half not).
+
+        `frame`, the frame being handled when it happened, is counted here,
+        offered and NOT saved, so the end record (written when the writers
+        are done) holds it whatever the threads' timing; its own submit a
+        moment later is not counted twice. Unlike a failed write, frames
+        already queued still land: they were whole before the fault.
+
+        Returns False, changing nothing, when the recording has already
+        failed or is closing."""
+        with self._cond:
+            if self.failed or self._closing:
+                return False
+            if frame is not None:
+                self.offered += 1
+                self._saw_index(getattr(frame, "index", None))
+                self.lost += 1
+                self._ended_frame = frame
+            self.failed = str(reason or "") or "the recording was ended"
+            self._cond.notify_all()
+        return True
 
     def _saw_index(self, index: Any) -> None:
         """Called with the lock held."""

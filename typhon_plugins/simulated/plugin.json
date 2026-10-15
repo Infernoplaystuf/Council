@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "typhon.simulated",
+  "short": "sim",
+  "name": "Simulated cameras",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "camera",
+  "entry": "plugin:SimulatedPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [],
+  "files": [],
+  "network": "none"
+}

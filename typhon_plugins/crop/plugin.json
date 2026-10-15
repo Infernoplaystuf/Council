@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "typhon.crop",
+  "short": "crop",
+  "name": "Cropped export",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "feature",
+  "scope": "camera",
+  "entry": "plugin:CropPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [],
+  "files": [],
+  "network": "none"
+}

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "typhon.timing",
+  "short": "timing",
+  "name": "Timing scan",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "feature",
+  "scope": "camera",
+  "entry": "plugin:TimingPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [],
+  "files": [],
+  "network": "none"
+}

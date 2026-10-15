@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "typhon.basler",
+  "short": "basler",
+  "name": "Basler cameras",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "camera",
+  "entry": "plugin:BaslerPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [],
+  "files": [],
+  "network": "camera-link"
+}

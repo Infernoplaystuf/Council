@@ -37,6 +37,12 @@ an app-level name goes to the Rig; `clear()` clears the active slot. Setting
 a name `_Live` never declared raises, instead of quietly making state that
 nothing reads (a plain object would have accepted it).
 
+THE PLUGIN HOST (stage P1 row 2)
+`rig.plugins` is the rig's plugin host (council_core.plugin_host), made on
+first use; each slot's `plugin_state` is a plugin's per-camera state.
+Nothing in frame_camera calls the host yet: no plugin is wired to a feature
+before stage P2.
+
 NOT YET (later rows of M1 / P1)
 frame_camera still locks with its one module-level `_LOCK`; each slot has a
 `lock` of its own for when the functions take a slot. Start, Stop and
@@ -68,7 +74,7 @@ SLOT_OWN = frozenset({"id", "name", "role", "lock", "plugin_state", "clear",
                       "_reset"})
 RIG_OWN = frozenset({"slots", "active", "slot_fields", "rig_fields",
                      "add_slot", "select", "slot", "remove_slot", "names",
-                     "connected", "_reset", "_lock"})
+                     "connected", "_reset", "_lock", "plugins", "_plugins"})
 
 
 class _Unset:
@@ -151,8 +157,22 @@ class Rig:
         for name in sorted(rig_fields):
             setattr(self, name, getattr(fresh, name))
         self._reset = template.clear
+        self._plugins: Any = None
         self.slots: List[CameraSlot] = []
         self.active: CameraSlot = self.add_slot(first)
+
+    @property
+    def plugins(self) -> Any:
+        """The plugin host (council_core.plugin_host.PluginHost): the rig IS
+        the plugin host (plugin design 5.1). Made on first use, and reading
+        nothing until asked, so a window that never uses a plugin pays
+        nothing for it."""
+        with self._lock:
+            if self._plugins is None:
+                from .plugin_host import PluginHost
+
+                self._plugins = PluginHost(self)
+            return self._plugins
 
     # -- slots ---------------------------------------------------------
     def names(self) -> List[str]:
