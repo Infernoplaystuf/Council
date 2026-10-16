@@ -4084,6 +4084,9 @@ class _ProtectedStoreCheck:
         # functions defined, walked when the scope is done.
         self.scopes: List[dict] = []
         self.seen: List[set] = []
+        # (loop node id, names protected on entry) -> its fixed point
+        # (loop_fixed_point).
+        self.loop_memo: Dict[tuple, tuple] = {}
 
     # ---- protections ------------------------------------------------------
     def live(self, st: _AliasState) -> set:
@@ -4121,18 +4124,19 @@ class _ProtectedStoreCheck:
         line = getattr(node, "lineno", 0)
         if root in self.fixed:
             why = (f"{root!r} is one of the modules and classes the sandbox "
-                   f"provides")
+                   f"provides (a variable of your own needs a different "
+                   f"name)")
         else:
             o_line, o_src = st.prot.get(root) or self.sticky.get(root) or (0, "")
             why = (f"at line {line} {root!r} may still be the module or "
-                   f"class it was bound to on line {o_line} ({o_src})")
-        return (f"Forbidden: cannot {verb} {attr!r} on {root!r} — {why}, and "
-                f"code may not change pandas, numpy, pathlib or the other "
-                f"modules and classes the sandbox provides. If {root!r} is "
-                f"meant to be your own variable, give it a different name "
-                f"(for example {root}_result) or bind it on every path "
-                f"before this line; assign only to your own variables (set "
-                f"pandas display options with pd.set_option(...))")
+                   f"class it was bound to on line {o_line} ({o_src}); if "
+                   f"{root!r} is meant to be your own variable, give it a "
+                   f"different name (for example {root}_result) or bind it "
+                   f"on every path before line {line}")
+        # The general rule LAST: a tool run's brief shows the message's tail
+        # (ScriptRun.brief), and that must still say what is not allowed.
+        return f"Forbidden: cannot {verb} {attr!r} on {root!r} — {why}; " \
+               f"{_REBIND_REFUSAL}"
 
     def is_protected(self, root: str, st: _AliasState) -> bool:
         return root in self.fixed or root in self.sticky or root in st.prot
@@ -4333,7 +4337,12 @@ class _ProtectedStoreCheck:
                 mark = (scope["loop_mark"] if scope["loop_mark"] is not None
                         else len(scope["events"]))
                 scope["pending"].append((n, st.copy(), mark))
-            self.clear(n.name, st)
+            # A plain def binds a new function: never a sandbox module or
+            # class. A DECORATED one binds whatever the decorator returns
+            # (`@(lambda f: Path)` binds Path), so its name keeps the state
+            # it had, as before this check followed rebinding.
+            if not n.decorator_list:
+                self.clear(n.name, st)
         elif isinstance(n, ast.ClassDef):
             for d in n.decorator_list + n.bases + [k.value for k in
                                                    n.keywords]:
@@ -4342,7 +4351,10 @@ class _ProtectedStoreCheck:
             # it; what it binds stays in the class. Its methods are scopes
             # of their own (pending in this scope).
             self.block(n.body, st.copy())
-            self.clear(n.name, st)
+            # A new class — unless a decorator or a metaclass decides what
+            # the name is bound to (as for a decorated def, above).
+            if not n.decorator_list and not n.keywords:
+                self.clear(n.name, st)
         elif type(n).__name__ == "Match":
             self.match(n, st)
         elif isinstance(n, (ast.Global, ast.Nonlocal, ast.Pass, ast.Break,
@@ -4376,6 +4388,57 @@ class _ProtectedStoreCheck:
             self.expr(n.test, b)
         return b
 
+    def loop_fixed_point(self, n, st: _AliasState):
+        """(the state at the head of loop ``n`` entered with ``st``: ``st``
+        and every protection any number of passes over the body can make,
+        converged). Worked out with nothing checked, and REMEMBERED per
+        (loop, names protected on entry): an enclosing loop's passes enter
+        this one again and again with the same state, and redoing it each
+        time — each nested loop redoing its own inner ones — made the time
+        exponential in the nesting depth (16 nested for-loops took ~5 s,
+        20 over a minute). The protections made on the way, which the
+        enclosing blocks' "seen" sets and the scope's events record, are
+        replayed when the answer is remembered."""
+        key = (id(n), frozenset(st.prot), frozenset(st.pda))
+        hit = self.loop_memo.get(key)
+        if hit is not None:
+            head, converged, seen_names, events = hit
+            for s in self.seen:
+                s.update(seen_names)
+            if self.scopes:
+                self.scopes[-1]["events"].extend(events)
+            # The entry's own origins (for the refusal's wording) first.
+            return st.copy().merge(head), converged
+        collector: set = set()
+        self.seen.append(collector)
+        scope_events = self.scopes[-1]["events"] if self.scopes else None
+        first_event = len(scope_events) if scope_events is not None else 0
+        entry = st.copy()
+        converged = True
+        was = self.checking
+        self.checking = False
+        try:
+            for _ in range(64):
+                end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
+                new = self.with_seen(entry, end, seen)
+                if new.same(entry):
+                    break
+                entry = new
+            else:                                   # never seen; be safe
+                converged = False
+                for nm, o in _may_alias_names(
+                        ast.Module(body=[n], type_ignores=[]),
+                        self.fixed).items():
+                    entry.prot.setdefault(nm, o)
+        finally:
+            self.checking = was
+            self.seen.pop()
+        events = (list(scope_events[first_event:])
+                  if scope_events is not None else [])
+        self.loop_memo[key] = (entry.copy(), converged, frozenset(collector),
+                               events)
+        return entry, converged
+
     def loop(self, n, st: _AliasState) -> None:
         if isinstance(n, ast.While):
             self.expr(n.test, st)
@@ -4387,25 +4450,15 @@ class _ProtectedStoreCheck:
             outer_mark = scope["loop_mark"]
             if outer_mark is None:
                 scope["loop_mark"] = len(scope["events"])
-        entry = st.copy()
-        was = self.checking
-        self.checking = False
-        try:
-            for _ in range(64):
-                end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
-                new = self.with_seen(entry, end, seen)
-                if new.same(entry):
-                    break
-                entry = new
-            else:                                   # never seen; be safe
-                for nm, o in _may_alias_names(
-                        ast.Module(body=[n], type_ignores=[]),
-                        self.fixed).items():
-                    entry.prot.setdefault(nm, o)
-        finally:
-            self.checking = was
-        end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
-        head = self.with_seen(entry, end, seen)
+        entry, converged = self.loop_fixed_point(n, st)
+        if self.checking or not converged:
+            end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
+            head = self.with_seen(entry, end, seen)
+        else:
+            # Inside an enclosing loop's own fixed point (nothing is checked
+            # there): at the fixed point a further pass changes nothing, so
+            # the state at the loop's head IS the entry — no pass needed.
+            head = entry
         after = self.block(n.orelse, head.copy())
         out = head.merge(after)
         st.prot, st.pda = out.prot, out.pda
@@ -5348,9 +5401,10 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
         except (TypeError, ValueError):
             # No signature to bind: still convert the return so a path object
             # the helper hands back is the sandbox copy, not the real class.
+            # Nothing says what it returns: the nested look.
             @functools.wraps(fn)
             def convert_only(*a, **k):
-                return desandbox(fn(*a, **k))
+                return desandbox(fn(*a, **k), True)
             return convert_only
         names = set(sig.parameters)
         kinds = {n: ("file" if n in _HELPER_FILE_PARAMS else
@@ -5359,8 +5413,11 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
                      "vault" if n == "vault_dir" else None) for n in names}
         has_path = any(kinds.values())
         # A helper that says it returns paths (List[Path], Optional[Path], …)
-        # gets a nested look; any other only the top-level one.
-        deep = "Path" in str(sig.return_annotation)
+        # — or does not say what it returns — gets a nested look; one that
+        # names a path-free type (read_json_documents' List[Dict[str, Any]],
+        # a DataFrame) only the top-level one.
+        deep = (sig.return_annotation is sig.empty
+                or "Path" in str(sig.return_annotation))
 
         @functools.wraps(fn)
         def contained(*a, **k):

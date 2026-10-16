@@ -392,6 +392,11 @@ def test_a_small_timeout_still_runs_trivial_code(box, t):
      "class definitions are not available in the sandbox"),
     ("import pandas as pd\npd.read_csv = None",
      "the sandbox does not let code change pandas"),
+    # An uncaught df.plot(): matplotlib fails to load as a missing package
+    # would (the fence keeps it out), so pandas' own "matplotlib is required
+    # for plotting" ends the run — said in words, with what to do instead.
+    ("import pandas as pd\npd.DataFrame({'a': [1, 2]}).plot()",
+     "the sandbox makes no charts"),
 ])
 def test_a_refusal_comes_back_in_plain_words(box, code, plain):
     """A refusal reaches the model and the transcript as one plain sentence

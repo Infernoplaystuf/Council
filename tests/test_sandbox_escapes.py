@@ -1142,6 +1142,25 @@ _STILL_REFUSED = {
         "if DATA_FOLDER:\n"
         "    stats = pd.read_csv('ok.csv')\n"
         "stats.name = 'x'"),
+    # The inner loop is entered with a new state on the outer loop's second
+    # pass (x is Path by then), so the alias reaches y.resolve on a later
+    # pass only.
+    "nested_loop_back_edge": (
+        "x = 1\n"
+        "y = 1\n"
+        "for i in range(2):\n"
+        "    for j in range(2):\n"
+        "        y.resolve = lambda self, *a, **k: self\n"
+        "        y = x\n"
+        "    x = Path\n"),
+    # A DECORATED def binds whatever the decorator returns — here Path
+    # itself — so it does not clear the alias the way a plain def does.
+    "decorated_def_may_still_be_the_class": (
+        "P = Path\n"
+        "@(lambda f: P)\n"
+        "def P():\n"
+        "    pass\n"
+        "P.resolve = lambda self, *a, **k: self"),
 }
 
 
@@ -1149,6 +1168,28 @@ _STILL_REFUSED = {
 def test_a_possibly_live_alias_is_still_refused(name):
     ok, msg = va.validate_generated_code(_STILL_REFUSED[name])
     assert not ok and "Forbidden: cannot assign to" in msg, (name, msg)
+
+
+def test_deeply_nested_loops_are_checked_in_reasonable_time():
+    """A loop is analysed to a fixed point. Nested loops redid their inner
+    loops' fixed points on every pass of the outer one, so the time grew
+    exponentially with the depth: 16 nested for-loops took about 5 s, 20
+    over a minute — and the check also runs in the app itself when a tool is
+    saved. A loop's fixed point is now worked out once per state it is
+    entered with."""
+    import time
+    lines, ind = ["df = pd.read_csv('ok.csv')", "acc = 0"], ""
+    for d in range(20):
+        lines.append(f"{ind}for i{d} in range(2):")
+        ind += "    "
+        lines.append(f"{ind}x{d} = df.describe()")
+        lines.append(f"{ind}x{d}.index.name = 'n{d}'")
+    lines.append(f"{ind}acc += 1")
+    t0 = time.perf_counter()
+    ok, msg = va.validate_generated_code("\n".join(lines) + "\n")
+    took = time.perf_counter() - t0
+    assert ok, msg
+    assert took < 2.0, took
 
 
 def test_the_refusal_says_why_the_name_still_counts_and_what_to_do():
@@ -1191,6 +1232,34 @@ def test_the_return_converter_still_converts_paths_it_is_handed():
     assert isinstance(conv(pathlib.Path("x")), sb_path)
     got = conv({"file": pathlib.Path("a"), "n": 1})
     assert isinstance(got["file"], sb_path) and got["n"] == 1
+
+
+def test_a_helper_that_does_not_say_what_it_returns_gets_the_nested_look():
+    """Only the top level of a result is looked at, unless the helper says it
+    returns paths (List[Path] …) — or says nothing: a helper with no return
+    annotation (a future one, say) could hand back paths inside a list of
+    dicts, which would give model code the real class again. A helper that
+    names a path-free type (read_json_documents' List[Dict[str, Any]]) keeps
+    the shallow, copy-free look."""
+    import pathlib
+    from typing import Any, Dict, List
+    proxy, sb_path = va._make_sandbox_pathlib()
+
+    def unannotated(n=1):
+        return [{"file": pathlib.Path("a.csv"), "n": n}]
+
+    def documents(n=1) -> List[Dict[str, Any]]:
+        return docs
+
+    docs = [{"id": i} for i in range(3)]
+    g = {"unannotated": unannotated, "documents": documents}
+    va._contain_helpers(g, None, [], sb_path=sb_path,
+                        sb_copies=proxy._copies)
+    got = g["unannotated"]()
+    assert isinstance(got[0]["file"], sb_path), type(got[0]["file"])
+    assert type(got[0]["file"]) is not type(pathlib.Path())   # not the real
+    assert got[0]["n"] == 1
+    assert g["documents"]() is docs
 
 
 def test_list_helpers_still_hand_back_the_sandbox_path(box):

@@ -61,7 +61,8 @@ refused unresolved (resolving it would ask the network for the host).
 
 Making a folder that already exists (os.mkdir, which Path.mkdir(exist_ok=
 True) calls before it swallows FileExistsError) changes nothing and is
-allowed wherever the folder is.
+allowed wherever the folder is — on a local path, or on the share the roots
+are on.
 
 A refusal raises PermissionError at the call that tried it, with a plain
 reason, and is RECORDED: council_core.analyst_child ends the run with that
@@ -428,8 +429,10 @@ def _on_mkdir(floor: Floor, args: tuple) -> None:
     """Making a folder: refused outside the writable roots — unless it
     already exists, when os.mkdir changes nothing (it fails with
     FileExistsError, which Path.mkdir(exist_ok=True) swallows; the SQL /
-    Mongo bridge's audit append makes the vault folder that way). A network
-    or device spelling is not asked about."""
+    Mongo bridge's audit append makes the vault folder that way). A device,
+    or a share no root is on, is not asked about (that would ask the network
+    for the host); the share the roots are on is — a vault on a network
+    drive makes its folder the same way."""
     path = _arg(args, 0)
     why = floor.why_not(path, True, "making the folder")
     if not why:
@@ -438,7 +441,9 @@ def _on_mkdir(floor: Floor, args: tuple) -> None:
         s = _plain(path)
     except TypeError:
         s = None
-    if s and not network_or_device(s) and _ISDIR(s):
+    if (s and (not network_or_device(s)
+               or unc_share(s) in floor.net_shares)
+            and _ISDIR(s)):
         return
     floor.refuse(why)
 

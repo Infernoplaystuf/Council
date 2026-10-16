@@ -52,6 +52,13 @@ def _plain_run_python_reason(err: str) -> str:
         return ("the sandbox does not allow that import; allowed: pandas, "
                 "numpy, scipy, math, re, json, statistics, collections and "
                 "pathlib")
+    # An uncaught df.plot() / df.hist(): the run's fence keeps matplotlib out
+    # as a missing package would, so pandas says "matplotlib is required for
+    # plotting" — true, but not what to do instead (2026-10-16 review).
+    if ("matplotlib is required for plotting" in low
+            or "charts are not available in the sandbox" in low):
+        return ("the sandbox makes no charts (no matplotlib, so no df.plot() "
+                "or df.hist()): print the numbers or set result_df instead")
     if ("forbidden attribute: savefig" in low or "savefig" in low
             or "print_figure" in low or "writing is blocked" in low
             or "writes a file" in low

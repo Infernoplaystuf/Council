@@ -214,7 +214,7 @@ def test_the_per_open_cost_and_start_up_stay_small(tmp_path, box):
 # The real analyst child, Python containment neutralised
 # ============================================================
 
-def _run_shim(tmp_path, box, code, **env_extra):
+def _run_shim(tmp_path, box, code, data=None, **env_extra):
     # The code and the child's report go in a dir of their OWN, DISJOINT from
     # the vault and the canary — the real child writes its report into a
     # private temp folder, and that folder (not the vault's parent) is what it
@@ -227,10 +227,10 @@ def _run_shim(tmp_path, box, code, **env_extra):
     out_json = run_dir / "shim_out.json"
     shim = ROOT / "tests" / "_floor_shim.py"
     env = dict(os.environ, COUNCIL_VAULT_ROOT=str(box["vault"]),
-               QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
-               **env_extra)
+               QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1")
+    env.update(env_extra)
     subprocess.run([sys.executable, str(shim), str(ROOT), str(code_file),
-                    str(box["data"]), str(out_json)],
+                    str(data or box["data"]), str(out_json)],
                    check=True, capture_output=True, text=True, env=env)
     return json.loads(out_json.read_text(encoding="utf-8"))
 
@@ -541,6 +541,76 @@ def test_a_network_root_does_not_open_other_shares_or_devices(box,
         why = fl.why_not(p, False, "reading")
         assert why and "network share or a device" in why, (p, why)
     assert not any("otherhost" in a or "PhysicalDrive" in a for a in asked)
+
+
+def test_making_an_existing_folder_on_the_vaults_own_share_is_allowed(box):
+    """The SQL / Mongo bridge's audit append makes the vault folder first
+    (mkdir(exist_ok=True) — a no-op when it exists). For a vault on a share
+    that mkdir was refused, and recorded, because a network spelling was
+    never asked whether it exists — so every bridge call on a network vault
+    ended the run. A folder on the roots' own share may be asked about; a
+    new folder there outside the writable roots is still refused."""
+    unc_vault = _unc_or_skip(box["vault"])
+    fl = analyst_floor.Floor(
+        read_only=[unc_vault + "\\data_in"],
+        read_write=[unc_vault + "\\data_out"],
+        never=[unc_vault])
+    fl.audit("os.mkdir", (unc_vault, 0o777, -1))             # exists
+    fl.audit("os.mkdir", (unc_vault + "\\data_in", 0o777, -1))
+    assert fl.refusals == []
+    with pytest.raises(analyst_floor.Refused):
+        fl.audit("os.mkdir", (unc_vault + "\\new_folder", 0o777, -1))
+    assert not (box["vault"] / "new_folder").exists()
+
+
+def test_the_bridge_audit_append_runs_on_a_network_vault(tmp_path, box):
+    """End to end in the real child, the vault reached as \\\\localhost\\C$:
+    the bridge's audit append (mkdir of the vault, then the append) lands
+    and the run completes."""
+    unc_vault = _unc_or_skip(box["vault"])
+    out = _run_shim(tmp_path, box, "print('lines', audit_db())",
+                    data=unc_vault + "\\data_in",
+                    COUNCIL_VAULT_ROOT=unc_vault,
+                    FLOOR_SHIM_EXTRA="audit_db")
+    assert out["ran"] is True, out
+    assert "lines 1" in out["stdout"], out
+    log = (box["vault"] / "db_audit.log").read_text(encoding="utf-8")
+    assert '"sql.query"' in log
+
+
+def test_a_vault_on_a_mapped_network_drive_is_judged_by_its_share(
+        monkeypatch):
+    """A mapped drive letter (Z:\\vault) resolves to the share behind it
+    (\\\\fileserver\\share\\vault) — realpath answers with the UNC form. The
+    roots then sit on that share, so a Z:\\ path inside them is allowed and
+    one outside them refused like any other, and a path on another share is
+    still refused from its spelling. realpath is stood in for here (no drive
+    is mapped on this PC, and no share is asked about): Z:\\ maps to the
+    share, anything else spelled \\\\ must never reach it."""
+    if os.name != "nt":
+        pytest.skip("drive letters are Windows-only")
+
+    def fake_realpath(s):
+        s = str(s)
+        if s.startswith("\\\\"):
+            raise AssertionError(f"a network path was resolved: {s}")
+        if s[:3].upper() == "Z:\\":
+            return "\\\\fileserver\\share\\" + s[3:]
+        return s
+    monkeypatch.setattr(analyst_floor, "_REALPATH", fake_realpath)
+    fl = analyst_floor.Floor(read_only=[r"Z:\vault\data_in"],
+                             read_write=[r"Z:\vault\data_out"],
+                             never=[r"Z:\vault"])
+    assert fl.why_not(r"Z:\vault\data_in\runs.csv", False, "reading") == ""
+    assert fl.why_not(r"Z:\vault\data_out\new.csv", True, "writing") == ""
+    assert "outside the folders" in fl.why_not(
+        r"Z:\vault\node_routing.json", False, "reading")
+    assert "outside the folders" in fl.why_not(
+        r"Z:\elsewhere\secret.txt", False, "reading")
+    assert "read-only" in fl.why_not(
+        r"Z:\vault\data_in\runs.csv", True, "writing")
+    why = fl.why_not(r"\\otherhost\share\x.csv", False, "reading")
+    assert "network share or a device" in why, why
 
 
 def test_a_vault_on_a_network_share_still_runs_code_in_the_real_child(

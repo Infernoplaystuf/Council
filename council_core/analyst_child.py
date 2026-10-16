@@ -209,9 +209,12 @@ def _point_temp_at(folder: str) -> None:
     # of it by STARTING `cmd /c ver` — which the fence refuses (a started
     # program runs outside it). Importing pandas usually asks already; make
     # sure it has, so a library asking for the machine later never spawns.
+    # The processor is worked out lazily, the first time it is asked for
+    # (pd.show_versions asks; off Windows that starts `uname -p`), and then
+    # kept on the cached answer — ask for it now too.
     try:
         import platform
-        platform.uname()
+        _ = platform.uname().processor
     except Exception:                                     # noqa: BLE001
         pass
 
