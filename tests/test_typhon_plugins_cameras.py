@@ -523,13 +523,15 @@ def test_a_real_raw_opens_through_the_review_source(host, tmp_path):
     if sdk is None:
         pytest.skip("the Metavision SDK is not importable here")
     events = fake_rig.random_events(5_000, 1_000_000, 1_200_000, seed=3)
-    path = fake_rig.write_raw(tmp_path / "20261016_101010_events.raw",
-                              events)
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    path = fake_rig.write_raw(runs / "20261016_101010_events.raw", events)
     raw = host.review_sources()["typhon.prophesee"]
+    assert raw.latest(runs) == path
     with raw.open(path, 20_000) as playback:
         assert playback.wait_done(30) and playback.error == ""
         assert playback.events == len(events)
-    assert sorted(os.listdir(tmp_path)) == [path.name]
+    assert sorted(os.listdir(runs)) == [path.name]
 
 
 # ======================================================================
