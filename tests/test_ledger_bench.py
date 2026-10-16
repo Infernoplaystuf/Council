@@ -61,8 +61,7 @@ READ_IN_FULL = ["2041_EC_stacked.xlsx", "2042_EC_side_by_side.xlsx", "2043_EC_by
 @pytest.mark.parametrize("name", READ_IN_FULL)
 def test_layouts_read_in_full(samples, name):
     s = samples[1][name]
-    assert (s.right, s.missed, s.pre_wrong) == (s.truth, 0, 0)
-    assert s.extra <= 3          # inspection dates offered as the part's Date, not pre-accepted
+    assert (s.right, s.missed, s.extra, s.pre_wrong) == (s.truth, 0, 0, 0)
 
 
 @pytest.mark.parametrize("name", ["2041_EC_stacked.xlsx", "2042_EC_side_by_side.xlsx",
@@ -91,35 +90,18 @@ def test_every_inspectors_table_is_found_stacked_side_by_side_or_by_sheet(sample
         assert s.multi_cells and s.multi_all_found == s.multi_cells
 
 
-# ── known gaps (found by these samples, 2026-10-16) ─────────────────────
-@pytest.mark.xfail(strict=True, reason="runs as rows for several parts: part read from "
-                   "the Run # column, runs numbered by row")
-def test_concealment_runs_for_several_parts(samples):
-    s = samples[1]["concealment_runs.xlsx"]
-    assert s.pre_wrong == 0 and s.right == s.truth
+# ── the gaps these samples found (2026-10-16), each now fixed ───────────
+@pytest.mark.parametrize("name", ["concealment_runs.xlsx",      # runs for several parts
+                                  "line3_2048.xlsx",            # numbers typed with units
+                                  "2041_build_record.xlsx",     # settings beside a table
+                                  "EC_log_2044-2045.xlsx"])     # a long reading log
+def test_formerly_missed_layouts_read_in_full(samples, name):
+    s = samples[1][name]
+    assert (s.right, s.extra, s.pre_wrong) == (s.truth, 0, 0)
+    assert s.signed_found == s.signed
 
 
-@pytest.mark.xfail(strict=True, reason="a long log (stage in a column) is not a layout "
-                   "the reader knows")
-def test_a_long_reading_log(samples):
-    s = samples[1]["EC_log_2044-2045.xlsx"]
-    assert s.right == s.truth and s.signed_found == s.signed
-
-
-@pytest.mark.xfail(strict=True, reason="numbers typed with units ('0.245 mm', '45°') "
-                   "are kept as text, and pre-accepted; rows after a blank row are missed")
-def test_numbers_typed_with_units(samples):
-    s = samples[1]["line3_2048.xlsx"]
-    assert s.pre_wrong == 0 and s.right == s.truth
-
-
-@pytest.mark.xfail(strict=True, reason="settings in a label/value column under a merged "
-                   "title, beside a table, are missed")
-def test_build_record_settings(samples):
-    s = samples[1]["2041_build_record.xlsx"]
-    assert s.right == s.truth
-
-
-@pytest.mark.xfail(strict=True, reason="the gaps above, together")
-def test_nothing_wrong_is_pre_accepted(samples):
-    assert samples[1]["ALL (merged)"].pre_wrong == 0
+def test_nothing_wrong_is_pre_accepted_and_nothing_extra(samples):
+    s = samples[1]["ALL (merged)"]
+    assert (s.pre_wrong, s.extra) == (0, 0)
+    assert s.signed and s.signed_found == s.signed

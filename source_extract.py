@@ -316,6 +316,13 @@ _WHO_BY = re.compile(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\
 #: A column / label that holds initials, with the value beside or below it.
 _WHO_HEAD = re.compile(r"(?i)^\s*(?:inspector(?:'?s)?(?:\s+initials)?|initials|operator|"
                        r"technician|tech|analyst|inspected\s+by|by)\s*[:#]?\s*$")
+#: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
+_RUN_HEAD = re.compile(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
+#: The column holding the reading in a long log, beside one naming what it is.
+_VALUE_HEAD = re.compile(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
+                         r"measurement)\s*(?:\([^)]*\))?\s*$")
+#: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
+_NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za-zµμ/]+)\s*$")
 #: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
 _WHO_HEADING = re.compile(r"^\s*(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(]\s*[\d\s\-/.:,)]*)?\s*$")
 
@@ -465,8 +472,13 @@ class _Extractor:
         where = self.g.where(vr or r, vc or c)
         fname = field_name or (match.target.fields[0] if match.target else "")
         note = ""
+        val_unit = ""
+        if isinstance(value, str) and match.target and match.target.unit:
+            nu = _NUM_UNIT.match(txt)
+            if nu and nu.group("u").lower() in UNITS:     # a unit we know, not "2x"
+                txt, val_unit = nu.group("n"), nu.group("u")
         if match.target and match.target.unit:
-            src_unit = split_unit(label)[1]
+            src_unit = val_unit or split_unit(label)[1]
             if src_unit and src_unit.lower() != match.target.unit.lower():
                 f = _unit_factor(src_unit, match.target.unit)
                 num = _num(txt)
@@ -521,6 +533,14 @@ class _Extractor:
             if who:
                 self.markers.append((r, c, who))
                 self.used.add((r, c))
+                # "Inspector: JB   Date: 2026-09-12": when THEY inspected, not
+                # the part's build Date
+                for (r2, c2), x in self.g.cells.items():
+                    if r2 == r and c2 != c and isinstance(x, str) \
+                            and re.match(r"(?i)^\s*date\b", x):
+                        self.used.add((r2, c2))
+                        if not _split_inline(x)[1]:
+                            self.used.add((r2, c2 + 1))
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
             if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
@@ -652,78 +672,166 @@ class _Extractor:
                 by_row[r].append(c)
         for r in sorted(by_row):
             cols = sorted(c for c in by_row[r] if (r, c) not in self.used)
-            if len(cols) < 2:
+            for run in self._header_runs(r, cols):
+                self._table(r, run)
+
+    def _header_runs(self, r, cols) -> List[List[int]]:
+        """A header row splits where a column has nothing in it: settings in
+        B:C beside a flaw table in E:I are two things, not one wide table.
+        (Measured: the build record's 8 settings were read as table columns.)"""
+        runs: List[List[int]] = []
+        for c in cols:
+            if runs and c == runs[-1][-1] + 1:
+                runs[-1].append(c)
+            else:
+                runs.append([c])
+        return runs
+
+    def _table(self, r, cols) -> None:
+        if len(cols) < 2:
+            return
+        ctx = self.context(r)
+        heads = {}
+        item_col = who_col = run_col = value_col = None
+        ids: List[Tuple[float, int]] = []
+        for c in cols:
+            v = self.g.text(r, c)
+            if self.m.is_item_header(v):
+                item_col = c
                 continue
-            ctx = self.context(r)
-            heads = {}
-            item_col = id_col = who_col = None
+            if _WHO_HEAD.match(v):
+                who_col = c
+                continue
+            if _RUN_HEAD.match(v):
+                run_col = c                       # "Run #" is not "Part #"
+                continue
+            if _VALUE_HEAD.match(v):
+                value_col = c
+                continue
+            mt = self.m.match(v, ctx)
+            if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
+                ids.append((mt.score, c))
+                continue
+            heads[c] = (v, mt)
+        # the best Part Number column wins; a weaker one is an ordinary column
+        id_col = max(ids)[1] if ids else None
+        for score, c in ids:
+            if c != id_col:
+                heads[c] = (self.g.text(r, c), Match(None, score, via="none"))
+        if item_col is None:                     # a column of item codes?
             for c in cols:
-                v = self.g.text(r, c)
-                if self.m.is_item_header(v):
+                vals = [self.g.cells.get((rr, c)) for rr in range(r + 1, r + 6)]
+                if sum(1 for v in vals if self.codes.canon(v)) >= 2:
                     item_col = c
-                    continue
-                if _WHO_HEAD.match(v):
-                    who_col = c
-                    continue
-                mt = self.m.match(v, ctx)
-                if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
-                    id_col = c
-                    continue
-                heads[c] = (v, mt)
-            matched = [c for c, (_, mt) in heads.items() if mt.target]
-            if len(matched) + (item_col is not None) + (id_col is not None) < 2:
-                continue
-            if item_col is None:                     # a column of item codes?
-                for c in cols:
-                    vals = [self.g.cells.get((rr, c)) for rr in range(r + 1, r + 6)]
-                    if sum(1 for v in vals if self.codes.canon(v)) >= 2:
-                        item_col = c
-                        heads.pop(c, None)
-                        break
-            data_rows = []
-            rr = r + 1
-            while rr < r + 500:
-                if not any((rr, c) in self.g.cells for c in cols):
+                    heads.pop(c, None)
                     break
-                data_rows.append(rr)
-                rr += 1
-            if not data_rows:
+        per_item = item_col is not None
+        data_rows = self._data_rows(r, cols, item_col)
+        if not data_rows:
+            return
+        stage_col = self._stage_col(heads, data_rows, ctx) \
+            if per_item and value_col is not None else None
+        matched = [c for c, (_, mt) in heads.items() if mt.target]
+        if len(matched) + (item_col is not None) + (id_col is not None) \
+                + (stage_col is not None) < 2:
+            return
+        # values under a header must not be more labels
+        filled = sum(1 for c in heads for d in data_rows[:3] if (d, c) in self.g.cells)
+        if heads and filled == 0 and stage_col is None:
+            return
+        for c in cols:
+            self.used.add((r, c))
+        if stage_col is not None:
+            self._long_rows(r, data_rows, item_col, id_col, who_col, stage_col,
+                            value_col, ctx)
+            return
+        final = {c: (label, self.m.match(label, ctx, per_item=per_item))
+                 for c, (label, _) in heads.items()}
+        runs_seen: Dict[str, int] = defaultdict(int)
+        for d in data_rows:
+            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            item = self.codes.canon(self.g.cells.get((d, item_col))) if per_item else ""
+            if per_item and not item:
                 continue
-            # values under a header must not be more labels
-            filled = sum(1 for c in heads for d in data_rows[:3] if (d, c) in self.g.cells)
-            if heads and filled == 0:
-                continue
-            for c in cols:
-                self.used.add((r, c))
-            per_item = item_col is not None
-            final = {c: (label, self.m.match(label, ctx, per_item=per_item))
-                     for c, (label, _) in heads.items()}
-            for i, d in enumerate(data_rows):
-                part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
-                item = self.codes.canon(self.g.cells.get((d, item_col))) if per_item else ""
-                if per_item and not item:
+            # which run of a repeating block (Concealment 1, 2 ...) this row is:
+            # its Run # when there is one, else its order among this part's rows
+            run_no = _num(self.g.cells.get((d, run_col))) if run_col else None
+            i = int(run_no) - 1 if run_no and run_no >= 1 and run_no == int(run_no) \
+                else runs_seen[part]
+            runs_seen[part] += 1
+            for c, (label, mt) in final.items():
+                if (d, c) not in self.g.cells:
                     continue
-                for c, (label, mt) in final.items():
-                    if (d, c) not in self.g.cells:
+                fname = None
+                if mt.target and len(mt.target.fields) > 1:   # repeat group
+                    if i >= len(mt.target.fields):
                         continue
-                    fname = None
-                    if mt.target and len(mt.target.fields) > 1:   # repeat group
-                        if i >= len(mt.target.fields):
-                            continue
-                        fname = mt.target.fields[i]
-                    o = self.emit(part, item, label, r, c, self.g.cells[(d, c)], mt,
-                                  field_name=fname, vr=d, vc=c,
-                                  who=_initials(self.g.cells.get((d, who_col))) or None
-                                  if who_col else None)
-                    if o is not None and id_col:
-                        o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+                    fname = mt.target.fields[i]
+                o = self.emit(part, item, label, r, c, self.g.cells[(d, c)], mt,
+                              field_name=fname, vr=d, vc=c,
+                              who=_initials(self.g.cells.get((d, who_col))) or None
+                              if who_col else None)
+                if o is not None and id_col:
+                    o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+                self.used.add((d, c))
+            for c in (id_col, item_col, who_col, run_col):
+                if c:
                     self.used.add((d, c))
-                if id_col:
-                    self.used.add((d, id_col))
-                if item_col:
-                    self.used.add((d, item_col))
-                if who_col:
-                    self.used.add((d, who_col))
+
+    def _data_rows(self, r, cols, item_col) -> List[int]:
+        """Rows under a header until an empty one. In a flaw table one blank
+        row is stepped over when the row after it has a flaw code (a gap left
+        while typing), never into a different table."""
+        rows: List[int] = []
+        rr = r + 1
+        while rr < r + 500:
+            if any((rr, c) in self.g.cells for c in cols):
+                rows.append(rr)
+            elif rows and item_col is not None \
+                    and self.codes.canon(self.g.cells.get((rr + 1, item_col))):
+                pass
+            else:
+                break
+            rr += 1
+        return rows
+
+    def _stage_col(self, heads, data_rows, ctx) -> Optional[int]:
+        """A LONG LOG: one row per reading, a column naming what was measured
+        ('Pre-Conceal', 'EC Post') beside a Response / Value column. The column
+        whose entries match per-flaw fields is the one that says which."""
+        best = None
+        for c in heads:
+            vals = [self.g.text(d, c) for d in data_rows[:12]]
+            vals = [v for v in vals if v]
+            if len(vals) < 2:
+                continue
+            hits = sum(1 for v in set(vals)
+                       if self.m.match(v, ctx, per_item=True).score >= SUGGEST_AT)
+            if hits and hits >= len(set(vals)) / 2 and (best is None or hits > best[0]):
+                best = (hits, c)
+        return best[1] if best else None
+
+    def _long_rows(self, r, data_rows, item_col, id_col, who_col, stage_col,
+                   value_col, ctx) -> None:
+        head = self.g.text(r, value_col) or ""
+        for d in data_rows:
+            item = self.codes.canon(self.g.cells.get((d, item_col)))
+            stage = self.g.text(d, stage_col)
+            if not item or not stage or (d, value_col) not in self.g.cells:
+                continue
+            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            label = f"{head} {stage}".strip()
+            mt = self.m.match(label, ctx, per_item=True)
+            o = self.emit(part, item, label, d, stage_col, self.g.cells[(d, value_col)], mt,
+                          vr=d, vc=value_col,
+                          who=_initials(self.g.cells.get((d, who_col))) or None
+                          if who_col else None)
+            if o is not None and id_col:
+                o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+            # the rest of the row (date, inspector, part, flaw) says which reading
+            for (rr, c) in list(self.g.cells):
+                if rr == d:
+                    self.used.add((rr, c))
 
     # LABEL / VALUE
     def forms(self) -> None:
@@ -746,8 +854,11 @@ class _Extractor:
                     x = self.g.cells.get((r, c + dc))
                     if x is None or isinstance(x, _Merged):
                         continue
-                    if isinstance(x, str) and self.m.match(x, per_item=False).target \
-                            and not _num(x):
+                    # another label (of any field, per-flaw ones too) is not a value,
+                    # nor is a lone block letter or flaw code ("B" beside "Date")
+                    if isinstance(x, str) and not _num(x) and (
+                            self.m.match(x).target or self.codes.canon(x)
+                            or re.fullmatch(r"[A-Za-z]", x.strip())):
                         break
                     vr, vc, val = r, c + dc, x
                     break

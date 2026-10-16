@@ -497,3 +497,84 @@ def test_initials_are_never_a_template_word(setup):
     from source_extract import _initials
     assert _initials("j.b.") == "JB" and _initials("Jane Brown") == "Jane Brown"
     assert _initials("12") == "" and _initials("a long sentence about the run") == ""
+
+
+# ── layouts the sample bench found missing (2026-10-16) ─────────────────
+def _decided(schema, wb, tmp, name):
+    wb.save(tmp / name)
+    run = extract(schema, [tmp / name], use_images=False)
+    return run, {(d.obs.part, d.obs.item, d.obs.field): d for d in decide(run, schema)}
+
+
+def test_runs_for_several_parts_are_numbered_by_run(setup):
+    schema, _, _, tmp = setup
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Part", "Run #", "Media", "Amplitude"])
+    for row in ([101, 1, "steel", 40], [102, 1, "ceramic", 30], [101, 2, "plastic", 41]):
+        ws.append(row)
+    _, got = _decided(schema, wb, tmp, "runs.xlsx")
+    assert got[("101", "", "Concealment 2: Media")].obs.value == "plastic"
+    assert got[("102", "", "Concealment 1: Amplitude")].obs.value == "30"
+    assert not any(k[0] in ("1", "2") for k in got)       # "Run #" is not the part
+
+
+def test_numbers_typed_with_units_are_converted(setup):
+    schema, _, _, tmp = setup
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Number: 101"
+    ws.append([])
+    ws.append(["Flaw", "FOD", "Orientation", "Length"])
+    ws.append(["1A", "0.245 mm", "45°", '0.028"'])
+    ws.append([])                                          # a gap left while typing
+    ws.append(["2A", "0.3 mm", "90°", '0.031"'])
+    _, got = _decided(schema, wb, tmp, "typed.xlsx")
+    fod = got[("101", "1A", "Flaw Attributes: Laser Team FOD (um)")]
+    assert fod.obs.value == "245" and "converted mm -> um" in fod.obs.note
+    assert got[("101", "1A", "Flaw Attributes: Flaw Orientation (deg)")].obs.value == "45"
+    assert got[("101", "1A", "Flaw Attributes: Flaw Length (in)")].obs.value == "0.028"
+    assert got[("101", "2A", "Flaw Attributes: Laser Team FOD (um)")].obs.value == "300"
+
+
+def test_settings_beside_a_table_are_read(setup):
+    schema, _, _, tmp = setup
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "P/N: 101"
+    ws["B3"], ws["C3"] = "Freq (kHz)", 50
+    ws["B4"], ws["C4"] = "Laser Power [W]", 285
+    for j, h in enumerate(["Flaw ID", "FOD (um)", "Passes"]):
+        ws.cell(3, 5 + j, h)
+    for i, it in enumerate(["1A", "2A"], start=4):
+        ws.cell(i, 5, it), ws.cell(i, 6, 400 + i), ws.cell(i, 7, 300)
+    _, got = _decided(schema, wb, tmp, "beside.xlsx")
+    assert got[("101", "", "Frequency (kHz)")].obs.value == "50"
+    assert got[("101", "", "Power (W)")].obs.value == "285"
+    assert got[("101", "2A", "Flaw Attributes: Laser Team FOD (um)")].obs.value == "405"
+
+
+def test_a_long_reading_log(setup):
+    schema, _, _, tmp = setup
+    pre = "NDE Inspection: Eddy Current Response Pre-Conceal"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Inspector", "Part No.", "Flaw", "Stage", "Response"])
+    ws.append(["2026-09-25", "JB", 101, "1A", "Pre-Conceal", 70])
+    ws.append(["2026-09-25", "MK", 101, "1A", "Pre-Conceal", 72])
+    ws.append(["2026-09-25", "JB", 101, "1A", "Post-Conceal", 22])
+    run, got = _decided(schema, wb, tmp, "log.xlsx")
+    assert got[("101", "1A", f"{pre} [JB]")].obs.value == "70"
+    assert got[("101", "1A", f"{pre} [MK]")].obs.value == "72"
+    assert got[("101", "1A", "NDE Inspection: Eddy Current Response Post-Conceal")].obs.value == "22"
+    assert not any(o.field.endswith("Date") or o.value in ("JB", "MK") for o in run.obs)
+
+
+def test_an_inspection_date_is_not_the_build_date(setup):
+    schema, _, _, tmp = setup
+    wb = _two_inspectors(tmp / "ec.xlsx")
+    wb = openpyxl.load_workbook(wb)
+    wb.active["D3"] = "Date: 2026-09-12"
+    run, got = _decided(schema, wb, tmp, "ec_dated.xlsx")
+    assert not any(k[2] == "Date" for k in got)
+    assert got[("101", "1A", "NDE Inspection: Eddy Current Response Pre-Conceal [JB]")].accept
