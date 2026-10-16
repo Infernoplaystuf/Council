@@ -740,6 +740,139 @@ def test_terminal_names_stay_honest_as_methods(code):
 
 
 # ============================================================
+# A module route is refused on a module, not on an ordinary object
+# ============================================================
+#
+# The module names above (socket, builtins, modules, ssl, ...) were refused
+# on EVERY receiver, so `self.socket` holding a camera connection,
+# `self.modules` a plugin list and `self.ssl` a checkbox failed the gate with
+# "it reaches the network" about an attribute that reaches nothing. They are
+# now refused only where the receiver is, or may be, a module.
+
+def _passes(code):
+    for toolkit in ("qt", "tk"):
+        good, errs = pol.validate(code, "linked", (), toolkit)
+        assert good, (code, toolkit, errs)
+
+
+@pytest.mark.parametrize("name", sorted(pol.MODULE_ROUTES))
+def test_a_module_name_is_an_ordinary_attribute_on_self_and_cls(name):
+    """Every route name, as a plain attribute: set and read on self, read on
+    cls, by the class's own name and through getattr."""
+    _passes(f"class Thing:\n"
+            f"    {name} = None\n"
+            f"    def __init__(self):\n"
+            f"        self.{name} = None\n"
+            f"    def use(self):\n"
+            f"        return self.{name}, getattr(self, {name!r}, None)\n"
+            f"    @classmethod\n"
+            f"    def make(cls):\n"
+            f"        return cls.{name}\n"
+            f"default = Thing.{name}\n")
+
+
+@pytest.mark.parametrize("name", sorted(pol.MODULE_ROUTES))
+def test_the_same_name_on_a_module_is_still_refused_with_its_reason(name):
+    """...and on a module it is still the module: os.socket, getattr(os,
+    'modules') — every route name, each with its own reason."""
+    _refused(f"import os\nx = os.{name}", pol.MODULE_ROUTE_REASONS[name])
+    _refused(f"import os\nx = getattr(os, {name!r})",
+             pol.MODULE_ROUTE_REASONS[name])
+
+
+@pytest.mark.parametrize("code", [
+    # a camera connection held on the window
+    "class Cam:\n    def __init__(self):\n        self.socket = None\n"
+    "    def close(self):\n        if self.socket is not None:\n"
+    "            self.socket.close()\n",
+    # a plugin list
+    "class Plugins:\n    def __init__(self):\n        self.modules = []\n"
+    "    def add(self, name):\n        self.modules.append(name)\n"
+    "        return len(self.modules)\n",
+    # a checkbox's value
+    "class Opts:\n    def __init__(self):\n        self.ssl = False\n"
+    "    def toggle(self):\n        self.ssl = not self.ssl\n",
+    # through an attribute of self the file never gives a module
+    "class Win:\n    def show(self):\n        return self.ui.ssl, self.ui.socket\n",
+    # in a closure over self
+    "class Win:\n    def later(self):\n        def cb():\n"
+    "            return self.modules\n        return cb\n",
+    # a name like a module's, holding an array
+    "import numpy as np\nclass Win:\n    def __init__(self):\n"
+    "        self.builtins = np.zeros(3)\n    def total(self):\n"
+    "        return self.builtins.sum()\n",
+    # a class used as a namespace
+    "class Cfg:\n    ssl = True\n    modules = ('a', 'b')\n"
+    "use_ssl, names = Cfg.ssl, Cfg.modules\n",
+])
+def test_the_ordinary_attributes_people_name_like_modules_pass(code):
+    _passes(code)
+
+
+@pytest.mark.parametrize("code,reason", [
+    # a module under another name
+    ("import codecs\nm = codecs\nm.builtins.eval('1')", pol.WHY_CODE),
+    ("import sys\nclass A:\n    def f(self):\n        s = sys\n"
+     "        return s.modules['x']", pol.WHY_MODULE_TABLE),
+    ("import codecs\nm = codecs if True else None\nm.builtins", pol.WHY_CODE),
+    ("import codecs\n(m := codecs).builtins", pol.WHY_CODE),
+    ("import codecs\nm = codecs\ngetattr(m, 'builtins').eval('1')",
+     pol.WHY_CODE),
+    # a module kept on self, or on the class, then read through self
+    ("import codecs\nclass A:\n    def __init__(self):\n"
+     "        self.mod = codecs\n    def f(self):\n"
+     "        return self.mod.builtins.eval('1')", pol.WHY_CODE),
+    ("import codecs\nclass A:\n    mod = codecs\n    def f(self):\n"
+     "        return self.mod.builtins.eval('1')", pol.WHY_CODE),
+    ("import codecs\nclass A:\n    def __init__(self):\n"
+     "        setattr(self, 'mod', codecs)\n    def f(self):\n"
+     "        return self.mod.builtins", pol.WHY_CODE),
+    ("import codecs\nclass A:\n    def __init__(self):\n"
+     "        object.__setattr__(self, 'mod', codecs)\n    def f(self):\n"
+     "        return self.mod.builtins", pol.WHY_CODE),
+    # a plain attribute named like a module may hold one too
+    ("import codecs\nclass A:\n    def __init__(self):\n"
+     "        self.socket = codecs\n    def f(self):\n"
+     "        return self.socket.builtins", pol.WHY_CODE),
+    # handed to a function, kept by a setter
+    ("import codecs\ndef f(m):\n    return m.builtins.eval('1')\nf(codecs)",
+     pol.WHY_CODE),
+    ("import codecs\ndef f(m=codecs):\n    return m.builtins", pol.WHY_CODE),
+    ("import codecs\ng = lambda m: m.builtins\ng(codecs)", pol.WHY_CODE),
+    ("import codecs\nclass A:\n    @staticmethod\n    def f(m):\n"
+     "        return m.builtins\nA.f(codecs)", pol.WHY_CODE),
+    ("import codecs\nclass Box:\n    def put(self, m):\n        self.held = m\n"
+     "b = Box()\nb.put(codecs)\nb.held.builtins.eval('1')", pol.WHY_CODE),
+    # out of a container, a call, a with, a pattern
+    ("import codecs\nfor m in (codecs,):\n    m.builtins.eval('1')",
+     pol.WHY_CODE),
+    ("import codecs\nmods = [codecs]\n[m.builtins for m in mods]",
+     pol.WHY_CODE),
+    ("import codecs\nd = {'m': codecs}\nd['m'].builtins.eval('1')",
+     pol.WHY_CODE),
+    ("import codecs\nx = [codecs]\nm, = x\nm.builtins", pol.WHY_CODE),
+    ("import inspect, codecs\n"
+     "inspect.getmodule(codecs.open).builtins.eval('1')", pol.WHY_CODE),
+    ("import contextlib, codecs\n"
+     "with contextlib.nullcontext(codecs) as m:\n    m.builtins",
+     pol.WHY_CODE),
+    ("import codecs\nmatch codecs:\n    case m:\n        m.builtins.eval('1')",
+     pol.WHY_CODE),
+    # a name from a star import may be anything
+    ("from .helpers import *\ncodecs.builtins.eval('1')", pol.WHY_CODE),
+])
+def test_a_module_route_is_refused_wherever_the_receiver_may_be_a_module(
+        code, reason):
+    """The receiver rule follows a module the file can be seen to hand on —
+    renamed, kept on self or the class, passed to a function, put in a
+    container, returned by a call — so only what the file shows is NOT a
+    module gets the word as a plain name."""
+    _refused(code, reason)
+    good, errs = pol.validate(code, "linked", (), "qt")
+    assert any("may be, a module" in e for e in errs), errs
+
+
+# ============================================================
 # Every shipped example still passes
 # ============================================================
 

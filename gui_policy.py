@@ -41,10 +41,11 @@ sandbox against code written to escape it.
 from __future__ import annotations
 
 import ast
+import builtins as _builtins
 import keyword
 import sys
 from pathlib import Path
-from typing import List, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 # The Council's own source directory. A `requires` naming a module here is
 # Council code, not a package — see check_requires.
@@ -256,13 +257,52 @@ def _why(reason: str, *names: str) -> dict:
     return {n: reason for n in names}
 
 
-# Attribute names denied wherever they appear. os and sys are PERMITTED — a
-# real application needs os.path and sys.argv — so the dangerous surface is
-# denied by name instead of by module.
+# A DENIED module's own name, reached as an attribute: refused only where
+# the receiver is, or may be, a module (_Receivers says which). A module that
+# imported a denied one hands it over with no import the gate can see —
+# logging.handlers.socket, frame_camera.ctypes, np.ctypeslib — and several
+# allowed stdlib modules keep one bound as a live attribute: codecs.builtins
+# IS builtins (so codecs.builtins.eval is eval), enum aliases it `bltns`,
+# cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
+# resolve_name load any callable from a dotted string), mimetypes._winreg is
+# winreg, xml.sax.saxutils.urllib and email.utils.urllib are the urllib
+# package (saxutils' own code calls urllib.request.urlopen); sys.modules,
+# meta_path and path_hooks are `import` with no import statement. The route
+# is closed at the module name, one step before the terminal .eval /
+# .locate / .CreateKeyEx, which cannot be denied directly: re.compile,
+# QApplication.exec() and DataFrame.eval are honest.
 #
-# Every name here also stops being a port name (gui_ports renames a "Remove"
-# button's port remove_button), so a word a user would type as a label
-# belongs in DENIED_MODULE_ATTRS instead, keyed on its module.
+# ON AN ORDINARY OBJECT THE SAME WORD IS ONLY A NAME. These were refused on
+# every receiver (2026-10-15), so `self.socket` holding a camera
+# connection, `self.modules` a plugin list and `self.ssl` a checkbox failed
+# the gate with "it reaches the network" about an attribute that reaches
+# nothing. Now they pass on self, cls and anything else the file shows is
+# not a module, and are refused on everything that is or may be one.
+MODULE_ROUTE_REASONS = {
+    **_why(WHY_PROGRAM,
+           "subprocess", "_winapi", "_posixsubprocess", "multiprocessing"),
+    **_why(WHY_NETWORK,
+           "socket", "_socket", "ssl", "socketserver", "xmlrpc",
+           "urllib", "urllib2", "urllib3"),
+    **_why(WHY_ASYNCIO, "asyncio"),
+    **_why(WHY_DESKTOP, "webbrowser"),
+    **_why(WHY_NATIVE, "ctypes", "_ctypes", "ctypeslib"),
+    **_why(WHY_MODULE_TABLE,
+           "modules", "meta_path", "path_hooks", "path_importer_cache"),
+    **_why(WHY_CODE, "importlib", "builtins", "bltns", "pydoc", "pkgutil"),
+    **_why(WHY_REGISTRY, "winreg", "_winreg"),
+}
+MODULE_ROUTES = frozenset(MODULE_ROUTE_REASONS)
+
+# Attribute names the gate refuses: everywhere, except MODULE_ROUTES, which
+# are refused only on a receiver that may be a module. os and sys are
+# PERMITTED — a real application needs os.path and sys.argv — so the
+# dangerous surface is denied by name instead of by module.
+#
+# Every name here — module routes included — also stops being a port name
+# (gui_ports renames a "Remove" button's port remove_button), so a word a
+# user would type as a label belongs in DENIED_MODULE_ATTRS instead, keyed
+# on its module.
 DENIED_ATTR_REASONS = {
     # process / shell escape — os.spawn*/exec*/posix_spawn* in every
     # spelling: the first few were denied and their siblings (spawnvp,
@@ -273,10 +313,8 @@ DENIED_ATTR_REASONS = {
            "execl", "execle", "execlp", "execlpe", "execv", "execve",
            "execvp", "execvpe", "posix_spawn", "posix_spawnp",
            "fork", "forkpty",
-           # subprocess and multiprocessing by an attribute route (a module
-           # that imported them hands them over: logging.handlers.socket,
-           # frame_camera.socket) and their entry points by any receiver
-           "subprocess", "_winapi", "_posixsubprocess", "multiprocessing",
+           # subprocess's and multiprocessing's entry points, by any
+           # receiver (the modules themselves are MODULE_ROUTES)
            "Popen", "getoutput", "getstatusoutput",
            # a ProcessPoolExecutor's worker is a second Python
            "ProcessPoolExecutor",
@@ -291,9 +329,8 @@ DENIED_ATTR_REASONS = {
            # faulthandler's crash helpers
            "_sigsegv", "_sigabrt", "_sigfpe", "_read_null", "_fatal_error",
            "_fatal_error_c_thread", "_stack_overflow"),
-    # the network, by an attribute route and by the calls themselves
+    # the network, by the calls themselves
     **_why(WHY_NETWORK,
-           "socket", "_socket", "ssl", "socketserver", "xmlrpc",
            "open_connection", "start_server", "create_connection",
            "create_server", "create_datagram_endpoint",
            "open_unix_connection", "start_unix_server",
@@ -302,20 +339,15 @@ DENIED_ATTR_REASONS = {
            # logging.handlers' network handlers (its file handlers are fine)
            "SocketHandler", "DatagramHandler", "SysLogHandler",
            "HTTPHandler", "SMTPHandler"),
-    **_why(WHY_ASYNCIO, "asyncio"),
     # the desktop: os.startfile opens any file with its program
-    **_why(WHY_DESKTOP, "startfile", "webbrowser"),
+    **_why(WHY_DESKTOP, "startfile"),
     # native code by another door: `import ctypes` is denied, but numpy hands
     # it over (np.ctypeslib.ctypes.windll...), as does any module that
-    # imported it (frame_camera.ctypes)
+    # imported it (frame_camera.ctypes) — its loaders, by any receiver
     **_why(WHY_NATIVE,
-           "ctypes", "_ctypes", "ctypeslib", "windll", "cdll", "oledll",
+           "windll", "cdll", "oledll",
            "pydll", "pythonapi", "WinDLL", "CDLL", "OleDLL", "PyDLL",
            "LoadLibrary", "add_dll_directory"),
-    # sys.modules['subprocess'] is `import subprocess` with no import
-    # statement; meta_path and path_hooks decide what an import loads
-    **_why(WHY_MODULE_TABLE,
-           "modules", "meta_path", "path_hooks", "path_importer_cache"),
     # destruction
     **_why(WHY_DELETE, "rmtree", "unlink", "remove", "removedirs", "rmdir"),
     # introspection escapes that reach the interpreter's own state
@@ -327,25 +359,10 @@ DENIED_ATTR_REASONS = {
            # sys._getframe().f_builtins['eval'] is eval
            "f_globals", "f_locals", "f_builtins"),
     # loaders
-    **_why(WHY_CODE, "load_module", "import_module", "exec_module",
-           "importlib"),
+    **_why(WHY_CODE, "load_module", "import_module", "exec_module"),
     **_why(WHY_OBJECTS, "loads", "load"),
-    # A DENIED module re-exported as a live attribute of an allowed one IS
-    # that module, reached with no import the gate can see: codecs.builtins is
-    # builtins (so codecs.builtins.eval is eval), and enum aliases it `bltns`;
-    # cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
-    # resolve_name load any callable from a dotted string); mimetypes._winreg
-    # is winreg; xml.sax.saxutils.urllib and email.utils.urllib are the urllib
-    # package (saxutils' own code calls urllib.request.urlopen). Each is
-    # already a DENIED_MODULE by root name — denied as an attribute too, the
-    # route is closed one step before the terminal .eval / .locate /
-    # .CreateKeyEx, which cannot be denied directly: re.compile,
-    # QApplication.exec() and DataFrame.eval are honest. These names also stop
-    # being port names (gui_ports steers clear of DENIED_ATTRS), like the
-    # socket/subprocess/ssl entries above.
-    **_why(WHY_CODE, "builtins", "bltns", "pydoc", "pkgutil"),
-    **_why(WHY_REGISTRY, "winreg", "_winreg"),
-    **_why(WHY_NETWORK, "urllib", "urllib2", "urllib3"),
+    # a denied module's own name: on a module only (see MODULE_ROUTES)
+    **MODULE_ROUTE_REASONS,
 }
 DENIED_ATTRS = frozenset(DENIED_ATTR_REASONS)
 
@@ -525,6 +542,7 @@ def validate(code: str, mode: str = "linked",
 
     allowed = allowed_modules(mode, extra_modules, toolkit)
     aliases = _module_aliases(tree)
+    receivers = _Receivers(tree)
 
     for node in ast.walk(tree):
         # ---- imports ----
@@ -601,11 +619,15 @@ def validate(code: str, mode: str = "linked",
                 recv = _receiver_name(node.value)
                 if node.attr in ("load", "loads") and recv in SAFE_LOAD_RECEIVERS:
                     continue
+                route = node.attr in MODULE_ROUTES
+                if route and not receivers.may_be_module(node.value):
+                    continue       # self.socket: a name on an ordinary object
                 where = f"{recv}." if recv else ""
                 errs.append(
                     f"line {getattr(node, 'lineno', 0)}: {where}{node.attr} is "
                     f"not permitted in a generated app — "
-                    f"{_reason(node.attr)}")
+                    f"{_reason(node.attr)}"
+                    + (_route_note(node.attr) if route else ""))
             else:
                 why = _module_attr_rule(
                     _dotted(node.value, aliases)).get(node.attr)
@@ -630,9 +652,16 @@ def validate(code: str, mode: str = "linked",
 
         # ---- getattr(x, "system") — the string-indirection bypass ----
         elif isinstance(node, ast.Call):
-            _check_lookup(node, aliases, errs)
+            _check_lookup(node, aliases, errs, receivers)
 
     return (not errs), errs
+
+
+def _route_note(name: str) -> str:
+    """What a refused module route says after its reason: where it was
+    reached, and that the same word on an ordinary object is fine."""
+    return (f" (reached through what is, or may be, a module; a plain "
+            f"attribute such as self.{name} is fine)")
 
 
 def _reason(name: str) -> str:
@@ -703,10 +732,262 @@ def _module_attr_rule(path: str) -> dict:
     return {}
 
 
-def _check_lookup(node: ast.Call, aliases: dict, errs: List[str]) -> None:
+# Names a file may use without binding them: the builtins, and the globals
+# every module has. Any OTHER name a file uses and never binds came from a
+# star import (or was injected), and may be anything — a module included.
+_ALWAYS_THERE = frozenset(dir(_builtins)) | frozenset({
+    "__name__", "__file__", "__doc__", "__spec__", "__loader__",
+    "__package__", "__annotations__", "__path__", "__cached__"})
+
+# Pattern captures (3.10+): `case m:` binds the subject, which may be a module.
+_MATCH_CAPTURES = tuple(getattr(ast, n) for n in
+                        ("MatchAs", "MatchStar", "MatchMapping")
+                        if hasattr(ast, n))
+
+
+class _Receivers:
+    """Which receivers in one file are, or may be, a module — the receivers
+    a MODULE_ROUTE is refused on.
+
+    Read from the whole file at once, flow- and scope-insensitive, and
+    erring towards "may be". A receiver may be a module when it is:
+
+      * a name an import binds (`import codecs`, `from xml.sax import
+        saxutils` — an imported name may be a module), or any attribute
+        chain rooted at one (logging.handlers, np.ctypeslib);
+      * a name — or ANY attribute of that name, on anything — that the file
+        assigns, at least once, a value that may be or hold a module:
+        `m = codecs`, `self.mod = codecs`, a class body's `mod = codecs`
+        (read later as self.mod), `setattr(self, 'mod', codecs)`, a walrus,
+        a default — so m.builtins and self.mod.builtins are refused as
+        codecs.builtins is;
+      * a value the gate cannot see: a call's result (inspect.getmodule(f),
+        getattr(codecs, name)), a subscript, an awaited or yielded value,
+        and every name bound by iterating (`for m in mods`), by unpacking
+        anything but a literal, by `with ... as` or by a match pattern — a
+        container may hold a module the file put there;
+      * a parameter, except the first of a method (self, cls): a function
+        can be handed a module, f(codecs);
+      * a name the file uses but never binds, other than a builtin: it came
+        from a star import and may be anything.
+
+    Everything else is an ordinary object, where the same word is only a
+    name: self and cls and their attributes, a class or function the file
+    defines, a literal, and a name only ever assigned values like those.
+
+    Not followed, stated plainly — the limit every spelled-form rule here
+    has: a module handed in AS self (Cls.method(codecs)), and an attribute
+    set through a name built at runtime (setattr(obj, name, codecs))."""
+
+    def __init__(self, tree: ast.AST) -> None:
+        self.tainted: Set[str] = set()      # names that may hold a module
+        self.bound: Set[str] = set()        # every name the file binds
+        self._scopes: Dict[int, Tuple[ast.AST, ...]] = {}
+        self._params: Dict[int, Tuple[frozenset, str]] = {}
+        pairs: List[Tuple[Set[str], object]] = []
+        # Iterative: a generated file can hold an expression thousands of
+        # nodes deep (a long string concatenation), past the recursion limit.
+        stack: List[Tuple[ast.AST, Tuple[ast.AST, ...], bool]] = [
+            (tree, (), False)]
+        while stack:
+            node, funcs, in_class = stack.pop()
+            inner, child_in_class = funcs, False
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.Lambda)):
+                inner = funcs + (node,)
+                self._function(node, in_class, pairs)
+            elif isinstance(node, ast.ClassDef):
+                self.bound.add(node.name)
+                child_in_class = True
+            elif isinstance(node, ast.Name):
+                self._scopes[id(node)] = funcs
+                if not isinstance(node.ctx, ast.Load):
+                    self.bound.add(node.id)
+            else:
+                self._binding(node, pairs)
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inner, child_in_class))
+        # To a fixpoint: a name assigned from a tainted one is tainted too.
+        changed = True
+        while changed:
+            changed = False
+            for names, value in pairs:
+                if names <= self.tainted:
+                    continue
+                if value is None or self._carries(value):
+                    self.tainted |= names
+                    changed = True
+
+    # -- reading the file ---------------------------------------------------
+    def _function(self, node: ast.AST, in_class: bool,
+                  pairs: List[Tuple[Set[str], object]]) -> None:
+        args = node.args
+        positional = [a.arg for a in args.posonlyargs + args.args]
+        names = set(positional) | {a.arg for a in args.kwonlyargs}
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None:
+                names.add(extra.arg)
+        first = ""
+        if (in_class and positional and not isinstance(node, ast.Lambda)
+                and not any(_decorator_name(d) == "staticmethod"
+                            for d in node.decorator_list)):
+            first = positional[0]
+        self._params[id(node)] = (frozenset(names), first)
+        self.bound |= names
+        if not isinstance(node, ast.Lambda):
+            self.bound.add(node.name)
+        # A default is assigned to its parameter.
+        with_defaults = positional[len(positional) - len(args.defaults):] \
+            if args.defaults else []
+        for name, value in zip(with_defaults, args.defaults):
+            pairs.append(({name}, value))
+        for a, value in zip(args.kwonlyargs, args.kw_defaults):
+            if value is not None:
+                pairs.append(({a.arg}, value))
+
+    def _binding(self, node: ast.AST,
+                 pairs: List[Tuple[Set[str], object]]) -> None:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                self._imported(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    self._imported(a.asname or a.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                self._assigned(target, node.value, pairs)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None:
+                self._assigned(node.target, node.value, pairs)
+        elif isinstance(node, ast.NamedExpr):
+            self._assigned(node.target, node.value, pairs)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            pairs.append((_target_names(node.target), None))
+        elif isinstance(node, ast.withitem):
+            if node.optional_vars is not None:
+                pairs.append((_target_names(node.optional_vars), None))
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                self.bound.add(node.name)
+        elif isinstance(node, ast.Call):
+            named = _setattr_literal(node)
+            if named is not None:
+                pairs.append(({named[0]}, named[1]))
+        elif _MATCH_CAPTURES and isinstance(node, _MATCH_CAPTURES):
+            name = getattr(node, "name", None) or getattr(node, "rest", None)
+            if name:
+                self.bound.add(name)
+                pairs.append(({name}, None))
+
+    def _imported(self, name: str) -> None:
+        self.tainted.add(name)
+        self.bound.add(name)
+
+    @staticmethod
+    def _assigned(target: ast.AST, value: ast.AST,
+                  pairs: List[Tuple[Set[str], object]]) -> None:
+        names = _target_names(target)
+        if not names:
+            return
+        if (isinstance(target, (ast.Tuple, ast.List, ast.Starred))
+                and not isinstance(value, (ast.Tuple, ast.List, ast.Set))):
+            pairs.append((names, None))      # elements the gate cannot see
+        else:
+            pairs.append((names, value))
+
+    def _carries(self, value: ast.AST) -> bool:
+        """Whether ``value`` may be, or hold, a module."""
+        return any(self.may_be_module(n) for n in ast.walk(value)
+                   if isinstance(n, ast.expr))
+
+    # -- the question -------------------------------------------------------
+    def may_be_module(self, node: ast.AST) -> bool:
+        """Whether the expression ``node`` is, or may be, a module."""
+        while isinstance(node, ast.Attribute):
+            if node.attr in self.tainted:
+                return True
+            node = node.value
+        if isinstance(node, ast.Name):
+            return self._name(node)
+        if isinstance(node, ast.IfExp):
+            return (self.may_be_module(node.body)
+                    or self.may_be_module(node.orelse))
+        if isinstance(node, ast.BoolOp):
+            return any(self.may_be_module(v) for v in node.values)
+        if isinstance(node, ast.NamedExpr):
+            return self.may_be_module(node.value)
+        return isinstance(node, (ast.Call, ast.Subscript, ast.Await,
+                                 ast.Yield, ast.YieldFrom, ast.Starred))
+
+    def _name(self, node: ast.Name) -> bool:
+        name = node.id
+        if name in self.tainted:
+            return True
+        for func in reversed(self._scopes.get(id(node), ())):
+            params, first = self._params[id(func)]
+            if name in params:
+                return name != first
+        return name not in self.bound and name not in _ALWAYS_THERE
+
+
+def _target_names(target: ast.AST) -> Set[str]:
+    """The names an assignment target binds: a name, an attribute's own name
+    (self.mod -> mod), and each one an unpacking binds. A subscript binds
+    none — what it stores is read back through a subscript, already a
+    "may be"."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Attribute):
+        return {target.attr}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: Set[str] = set()
+        for elt in target.elts:
+            out |= _target_names(elt)
+        return out
+    return set()
+
+
+def _setattr_literal(call: ast.Call):
+    """(name, value) for setattr(obj, 'name', value) and the __setattr__
+    spellings of it, with the name a literal; else None."""
+    fn, args = call.func, call.args
+    if isinstance(fn, ast.Name) and fn.id == "setattr" and len(args) >= 3:
+        name, value = args[1], args[2]
+    elif isinstance(fn, ast.Attribute) and fn.attr == "__setattr__":
+        if len(args) >= 3:                 # object.__setattr__(obj, 'n', v)
+            name, value = args[1], args[2]
+        elif len(args) == 2:               # obj.__setattr__('n', v)
+            name, value = args[0], args[1]
+        else:
+            return None
+    else:
+        return None
+    if isinstance(name, ast.Constant) and isinstance(name.value, str):
+        return name.value, value
+    return None
+
+
+def _decorator_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _check_lookup(node: ast.Call, aliases: dict, errs: List[str],
+                  receivers: "_Receivers") -> None:
     """getattr(os, 'system'), attrgetter('path.system'), methodcaller(
     'system', cmd), inspect.getattr_static(os, 'system'): a denied name by a
-    string literal is the denied name."""
+    string literal is the denied name. A module route by getattr is judged
+    on its receiver, as the attribute is: getattr(codecs, 'builtins') is
+    refused, getattr(self, 'socket', None) is not; attrgetter and
+    methodcaller name no receiver, so theirs are refused."""
     fn = node.func
     name = fn.id if isinstance(fn, ast.Name) else (
         fn.attr if isinstance(fn, ast.Attribute) else "")
@@ -724,9 +1005,14 @@ def _check_lookup(node: ast.Call, aliases: dict, errs: List[str]) -> None:
     for arg in literals:
         if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
             continue
-        for part in arg.value.split("."):
-            if part in (DENIED_ATTRS | DENIED_BUILTINS | DENIED_QT_NAMES):
-                why = _reason(part)
+        parts = arg.value.split(".")
+        for part in parts:
+            if (part in MODULE_ROUTES and recv is not None and len(parts) == 1
+                    and not receivers.may_be_module(recv)):
+                why = None
+            elif part in (DENIED_ATTRS | DENIED_BUILTINS | DENIED_QT_NAMES):
+                why = _reason(part) + (_route_note(part)
+                                       if part in MODULE_ROUTES else "")
             elif recv is not None:
                 why = _module_attr_rule(_dotted(recv, aliases)).get(part)
             else:
