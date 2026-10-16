@@ -1295,9 +1295,16 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             if image_dir:
                 d = Path(image_dir)
                 d.mkdir(parents=True, exist_ok=True)
-                p = d / f"{_safe(src.stem)}_{_safe(img.sheet)}_{img.anchor}_{i + 1}.{img.ext}"
-                p.write_bytes(img.data)
-                img.saved_as = str(p)
+                # every part cleaned: a sheet, anchor or extension may hold
+                # characters Windows refuses in a file name ("?" did)
+                p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
+                         f".{_safe(img.ext) or 'png'}")
+                try:
+                    p.write_bytes(img.data)
+                    img.saved_as = str(p)
+                except OSError as e:          # one picture never stops the run
+                    run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
+                                        f"saved ({e.strerror or e}); it is still read")
             note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
             if reader is not None:
                 note.reader = getattr(reader, "name", "image reader")

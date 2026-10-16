@@ -112,7 +112,10 @@ class _Shape:
     def __init__(self, typ, text="", chart=None):
         self.Type, self.HasChart = typ, chart is not None
         self.Chart = chart
-        self.TopLeftCell = type("c", (), {"Address": lambda self, a, b: "E2"})()
+        # as real Excel: Address is a STRING property; its arguments go to
+        # GetAddress (Address(False, False) raises - the user's "?" anchors)
+        self.TopLeftCell = type("c", (), {"Address": "$E$2",
+                                          "GetAddress": lambda self, a, b: "E2"})()
         tr = type("tr", (), {"Text": text})()
         self.TextFrame2 = type("tf", (), {"HasText": bool(text), "TextRange": tr})()
 
@@ -205,6 +208,33 @@ def test_excel_is_driven_read_only_with_macros_off_and_closed_unsaved(tmp_path):
     assert book.extras[0].cells == {(1, 1): "Spot Size (mm): 0.05"}
 
 
+def test_a_picture_that_cannot_be_saved_is_reported_and_the_run_goes_on(tmp_path, monkeypatch):
+    """The user's run stopped on 'OSError 22 ... Sheet1_?_1.png'. Now the name
+    is cleaned, and a save that still fails is a problem, not a crash."""
+    import source_extract as se
+    from ledger_fixtures import make_template, make_nde_book
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    src = make_nde_book(tmp_path / "NDE results.xlsx")           # has one picture
+    real = se.load_workbook_grids
+
+    def odd_anchor(path, notes=None):
+        grids, images = real(path, notes)
+        for im in images:
+            im.anchor, im.sheet = "?", "Sheet:1"                 # what Excel gave back
+        return grids, images
+    monkeypatch.setattr(se, "load_workbook_grids", odd_anchor)
+    run = se.extract(schema, [src], image_dir=tmp_path / "imgs", use_images=False)
+    assert [Path(n.saved_as).name for n in run.images] == ["NDE_results_Sheet_1___1.png"]
+
+    def refuse(self, data):
+        raise OSError(22, "Invalid argument")
+    monkeypatch.setattr(Path, "write_bytes", refuse)
+    run = se.extract(schema, [src], image_dir=tmp_path / "imgs2", use_images=False)
+    assert any("could not be saved" in p for p in run.problems)
+    assert run.obs                                              # the rest was still read
+
+
 def test_an_excel_failure_says_what_happened(tmp_path):
     f = tmp_path / "x.xls"
     f.write_bytes(OLE_MAGIC)
@@ -243,13 +273,26 @@ def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path):
     wb.active["A1"], wb.active["B1"] = "Power (W)", 285
     wb.save(tmp_path / "s.xlsx")
 
+    from PIL import Image
+    Image.new("RGB", (120, 40), "white").save(tmp_path / "pic.png")
+
     def box_and_chart(sheet):
+        sheet.Shapes.AddPicture(str(tmp_path / "pic.png"), False, True, 150, 60, 120, 40)
         sheet.Shapes.AddTextbox(1, 20, 20, 200, 40).TextFrame2.TextRange.Text = "Spot Size (mm): 0.05"
         ch = sheet.ChartObjects().Add(240, 20, 300, 200).Chart
         ser = ch.SeriesCollection().NewSeries()
         ser.Name, ser.Values, ser.XValues = "EC Pre", (70, 71), ("1A", "2A")
     _excel_save(tmp_path / "s.xlsx", tmp_path / "old.xls", 56, edit=box_and_chart)
-    grids, _ = load_workbook_grids(tmp_path / "old.xls")
+    grids, images = load_workbook_grids(tmp_path / "old.xls")
+    assert [(i.sheet, i.anchor) for i in images] == [("Sheet", "D5")] and images[0].data
+    # the whole run: the picture is saved under a name Windows accepts
+    from sample_ledger import read_template
+    from ledger_fixtures import make_template
+    from source_extract import extract
+    run = extract(read_template(make_template(tmp_path / "t.xlsx")), [tmp_path / "old.xls"],
+                  image_dir=tmp_path / "imgs", use_images=False)
+    assert [Path(n.saved_as).name for n in run.images] == ["old_Sheet_D5_1.png"]
+    assert (tmp_path / "imgs" / "old_Sheet_D5_1.png").exists()
     names = {g.sheet: g.cells for g in grids}
     assert names["Sheet"][(1, 2)] == 285
     assert any("text box" in n and c == {(1, 1): "Spot Size (mm): 0.05"} for n, c in names.items())
