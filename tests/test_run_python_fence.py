@@ -157,6 +157,88 @@ def test_an_escape_fails_through_run_python_as_in_the_analyst(box, i,
     assert rep["error"].strip().splitlines()[-1] in payload["stderr"]
 
 
+# Rebinding a pathlib method the read containment used to rely on
+# (Path.relative_to = lambda self, *a: self never raises) once let model code
+# read any file. Each route, through each read surface, fails through
+# run_python — refused before it reads or prints, no secret leaked.
+REBINDS = [
+    "Path.relative_to = lambda self, *a, **k: self",
+    "Path.resolve = lambda self, *a, **k: self",
+    "Path.is_absolute = lambda self: False",
+    "type(Path('.')).relative_to = lambda self, *a, **k: self",
+    "import pathlib\npathlib.PurePath.relative_to = lambda self, *a, **k: self",
+    "setattr(Path, 'relative_to', lambda self, *a, **k: self)",
+    "del Path.relative_to",
+]
+REBIND_READS = [
+    "print(read_text(r'{private_txt}'))",
+    "print(open(r'{private_txt}').read())",
+    "import pandas as pd\nprint(pd.read_csv(r'{private_csv}'))",
+    "print(open(r'{vault}/manual.md').read())",
+]
+
+
+@pytest.mark.parametrize("rd", range(len(REBIND_READS)))
+@pytest.mark.parametrize("rb", range(len(REBINDS)))
+def test_a_path_rebinding_read_fails_through_run_python(box, rb, rd,
+                                                        monkeypatch):
+    import vault_analyst as va
+    code = fill(REBINDS[rb] + "\n" + REBIND_READS[rd], box)
+    role = ("coder", "intern")[(rb + rd) % 2]
+    ok, msg, payload = member_tool(box, role)({"code": code})
+    assert not leaked(msg) and not leaked(payload), msg
+    assert payload["stdout"] == "", payload["stdout"]
+    assert not ok, msg
+    assert payload["rc"] == 1, msg
+    # The analyst sandbox refuses it directly with the same words.
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(box.vault))
+    rep: dict = {}
+    df, _log = va.execute_pandas_code(code, [box.data], report=rep)
+    assert df is None and not rep["ran"]
+
+
+def test_legitimate_assignments_run_through_run_python(box):
+    """df.columns / df.index.name / df['x'] assignments have a plain local
+    root, not a sandbox module/class/proxy, so they keep working."""
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "df = pd.read_csv('runs.csv')\n"
+        "df.columns = ['p', 'rt']\n"
+        "df.index.name = 'idx'\n"
+        "df['double'] = df['rt'] * 2\n"
+        "print(int(df['double'].sum()))\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "200" in payload["stdout"], payload["stdout"]
+
+
+@pytest.mark.parametrize("role", ["coder", "intern"])
+def test_setting_a_pandas_display_option_runs_through_run_python(box, role):
+    """`pd.options.display.max_columns = None` ran on 43b317e and was refused
+    by the rebinding check (measured 2026-10-15): it changes an option, not
+    pandas itself, and the child process throws it away."""
+    ok, msg, payload = member_tool(box, role)({"code": (
+        "import pandas as pd\n"
+        "pd.options.display.max_columns = None\n"
+        "pd.options.display.width = 200\n"
+        "pd.options.mode.chained_assignment = None\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "print(int(df['runtime'].sum()))\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "100" in payload["stdout"], payload["stdout"]
+
+
+def test_an_imported_name_reused_for_a_series_runs_through_run_python(box):
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "import pandas as pd\n"
+        "from statistics import mean\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "overall = mean(df['runtime'])\n"
+        "mean = df.groupby('pump')['runtime'].mean()\n"
+        "mean.name = 'avg_runtime'\n"
+        "print(overall, mean.name)\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "avg_runtime" in payload["stdout"], payload["stdout"]
+
+
 def test_an_endless_loop_is_stopped_at_the_limit_the_model_asked_for(box):
     t0 = time.monotonic()
     ok, msg, payload = member_tool(box, "coder")(
@@ -308,6 +390,8 @@ def test_a_small_timeout_still_runs_trivial_code(box, t):
      "run_python cannot write files"),
     ("class Pump:\n    pass\nprint(Pump())",
      "class definitions are not available in the sandbox"),
+    ("import pandas as pd\npd.read_csv = None",
+     "the sandbox does not let code change pandas"),
 ])
 def test_a_refusal_comes_back_in_plain_words(box, code, plain):
     """A refusal reaches the model and the transcript as one plain sentence
