@@ -247,21 +247,67 @@ def test_run_parallel_overlaps_and_keeps_order_and_errors():
     assert isinstance(out[2].error, ValueError)
 
 
-def test_two_roles_on_two_machines_really_run_side_by_side(eng, pi):
+#: How long each machine waits for the other's question to arrive. Patience,
+#: not a measurement: side by side the two arrive together; in series the
+#: first never sees the second, whatever this is.
+MEETING_PATIENCE_S = 30.0
+
+
+def _two_roles_side_by_side(eng, pi, patience):
+    """Both machines hold their answer until BOTH have their question.
+    Returns (answers, which models met)."""
     _peasant_on_3b(eng)
     _slots(eng, {"fast": {"path": "ollama:llama3.2:3b"}},
            {"peasant": "fast", "intern": "fast"})
     eng.fake.state.tags.append(_tag("llama3.2:3b"))
     _routing(eng, pi, roles=("peasant",))
+    both = threading.Barrier(2, timeout=patience)
+    met = []
+
+    def hold(body):
+        try:
+            both.wait()
+            met.append(body.get("model"))
+        except threading.BrokenBarrierError:
+            met.append(None)
+        return None                         # then the server's own reply
+
     for srv in (pi, eng.fake):
-        srv.state.first_delay = 0.4
-    t0 = time.monotonic()
+        srv.state.reply_fn = hold
     out = nr.run_parallel([
         lambda: eng.ce.local_chat(MSGS, role="peasant"),
         lambda: eng.ce.local_chat(MSGS, role="intern")])
+    return [o.value for o in out], met
+
+
+def test_two_roles_on_two_machines_really_run_side_by_side(eng, pi):
+    """Shown by a RENDEZVOUS, not a stopwatch. It timed the pair against
+    0.75 s (0.4 s each, 0.8 s in series) and failed whole-suite runs on a
+    busy PC at 0.78 s and once at 11.2 s — side by side all the same: a
+    loopback request on this PC passes through a network filter (the one
+    that rewrites POST /mcp replies, see mcp_client.unmangle), measured at
+    13 ms quiet and up to 430 ms with the CPUs busy. Now each machine
+    holds its answer until both have their question, so the pair can only
+    finish with both questions in flight at once, however slow the PC."""
+    t0 = time.monotonic()
+    answers, met = _two_roles_side_by_side(eng, pi, MEETING_PATIENCE_S)
     took = time.monotonic() - t0
-    assert [o.value for o in out] == ["Answered on the pi.", "Answered here."]
-    assert took < 0.75, took                        # not 0.8 s in series
+    assert answers == ["Answered on the pi.", "Answered here."]
+    assert None not in met and len(met) == 2, (
+        f"the calls did not overlap: a machine waited {MEETING_PATIENCE_S:.0f}"
+        f" s for the other's question ({took:.1f} s in all)")
+    assert len(pi.state.chats) == 1 and len(eng.fake.state.chats) == 1
+
+
+def test_the_rendezvous_fails_two_calls_made_in_series(eng, pi, monkeypatch):
+    """The test above, against calls made one after the other: the first
+    machine waits alone, the meeting never happens, and it says so."""
+    serial = nr.run_parallel
+    monkeypatch.setattr(nr, "run_parallel",
+                        lambda calls, max_workers=None: serial(calls, 1))
+    answers, met = _two_roles_side_by_side(eng, pi, 1.0)
+    assert answers == ["Answered on the pi.", "Answered here."]
+    assert met == [None, None]
 
 
 def test_the_file_never_holds_secrets(tmp_path):

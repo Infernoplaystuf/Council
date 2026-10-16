@@ -40,17 +40,25 @@ PORTS = [
 ]
 HEAD = "from __future__ import annotations\n\nclass HandlerMixin:\n"
 
+#: How long a smoke child may run in a test that is NOT about time —
+#: patience, never a claim: a child that finishes ends the wait at once. It
+#: was 8 s, and a whole-suite run 8 files at a time failed a test about a
+#: TypeError's line with "timed out after 8 s" (2026-10-15): the child
+#: imports matplotlib, which a busy PC can take that long to load. The test
+#: that IS about time (an endless loop) keeps its own 3 s.
+PATIENCE = 60
+
 
 def handler(body: str, **kw) -> gui_smoke.SmokeResult:
     return gui_smoke.smoke_handler(HEAD + body, "on_btn_go", PORTS,
-                                   app_root=ROOT, timeout=kw.pop("timeout", 8),
-                                   **kw)
+                                   app_root=ROOT,
+                                   timeout=kw.pop("timeout", PATIENCE), **kw)
 
 
 def function(src: str, args, expect, name="f", **kw):
     return gui_smoke.smoke_function({"logic.py": src}, name, args, expect,
                                     app_root=ROOT,
-                                    timeout=kw.pop("timeout", 8), **kw)
+                                    timeout=kw.pop("timeout", PATIENCE), **kw)
 
 
 @pytest.fixture
@@ -369,7 +377,7 @@ def test_a_blank_number_box_refused_by_a_catch_all_is_a_refusal():
         except Exception as exc:
             self.clear_ports("fruits", "count")
             self.report_error("Go", exc)
-""", "on_btn_go", ports, app_root=ROOT, timeout=8)
+""", "on_btn_go", ports, app_root=ROOT, timeout=PATIENCE)
     assert r.ok, r.summary()
 
 
@@ -450,7 +458,7 @@ def k2_press(key: str, ports=None) -> gui_smoke.SmokeResult:
                      for ln in recorded_code(key).split("\n"))
     return gui_smoke.smoke_handler(HEAD + body + "\n", "on_btn_filter",
                                    ports or K2_PORTS, app_root=ROOT,
-                                   timeout=8)
+                                   timeout=PATIENCE)
 
 
 @pytest.mark.parametrize("key", ["llama3.1:8b K2 1", "qwen2.5-coder K2 1"])
@@ -516,7 +524,8 @@ def test_a_handler_that_changes_on_every_press_by_design_is_not_failed(label):
     and the random module is seeded alike before every press."""
     for _ in range(3):
         r = gui_smoke.smoke_handler(HEAD + BY_DESIGN[label], "on_btn_filter",
-                                    K2_PORTS, app_root=ROOT, timeout=8)
+                                    K2_PORTS, app_root=ROOT,
+                                    timeout=PATIENCE)
         assert r.ok, (label, r.summary())
 
 
@@ -868,7 +877,8 @@ def test_a_standalone_project_cannot_reach_the_councils_modules():
 def f(folder):
     import frame_timing
     return {"count": 1}
-"""}, "f", ["<FOLDER>"], {"count": "text"}, app_root=None, timeout=8)
+"""}, "f", ["<FOLDER>"], {"count": "text"}, app_root=None,
+                                timeout=PATIENCE)
     assert not r.ok and "No module named 'frame_timing'" in r.error
 
 

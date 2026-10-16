@@ -264,7 +264,14 @@ def test_appending_is_not_quadratic(qapp):
     """The naive translation of insert(END, ...) is
     `setHtml(toHtml() + more)`, which is quadratic and stalls visibly at a few
     hundred entries. This is the measurement that would catch that, rather
-    than a comment asserting it does not happen."""
+    than a comment asserting it does not happen.
+
+    THE FASTEST OF SEVERAL RUNS OF EACH, INTERLEAVED. It timed one run of
+    each size, so a busy moment that fell on the 800 run read as growth:
+    "200 entries 0.026s, 800 entries 0.288s" (11x) failed a whole-suite run
+    of unchanged code (2026-10-15). A busy PC only ever ADDS time, so the
+    fastest run of a size is what it costs; quadratic appending is 16x in
+    every run, the fastest included, and the bound is the same 9x."""
     view = TranscriptView()
 
     def cost(n):
@@ -275,8 +282,13 @@ def test_appending_is_not_quadratic(qapp):
         return time.perf_counter() - start
 
     cost(200)                                  # warm up
-    small = cost(200)
-    large = cost(800)
+    smalls, larges = [], []
+    for _ in range(3):
+        smalls.append(cost(200))
+        larges.append(cost(800))
+    small, large = min(smalls), min(larges)
+    print(f"\nappending: 200 entries {small:.3f}s, 800 entries {large:.3f}s "
+          f"({large / small:.1f}x, fastest of {len(smalls)} each)")
     # Linear would be 4x. Allow generous slack for a noisy machine but not the
     # 16x that quadratic growth would produce.
     assert large < small * 9, (

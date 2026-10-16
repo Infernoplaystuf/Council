@@ -352,7 +352,20 @@ def test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
     sessions run here at once, so a busy machine is real. Each round now
     times the two back to back, in alternating order, and the MEDIAN of
     the rounds' ratios is judged — one lucky or unlucky moment moves one
-    round, not the verdict."""
+    round, not the verdict.
+
+    AND COUNTED, NOT ONLY TIMED. The ratio above lost its grip on the code
+    it was written to stop: since Typhon's .gspec grew the list alone takes
+    twice as long (29 -> 57 ms), so the old Path-per-module code sits at
+    2.5x quiet, and on a PC running the whole suite 8 files at a time the
+    list — 85% file-system stats, measured — slows more than the
+    pure-Python per-module work, and the old code measured 1.34-1.98x: under
+    the 2x bound in 19 whole-suite runs (2026-10-13..16), so the test below
+    that puts it back failed instead. The time bound stays as it was; next
+    to it, the work 3,000 modules elsewhere add is COUNTED — the
+    interpreter's call and return events (sys.setprofile), which no load,
+    machine or list size changes: the warm list adds 54 per module, the old
+    Path and relative_to per module 398 (Python 3.11, measured)."""
     import statistics
 
     elsewhere = ROOT.parent / "elsewhere"
@@ -385,21 +398,54 @@ def test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
         f"3,000 other modules added {extra * 1000:.0f} ms to a "
         f"{base * 1000:.0f} ms warm list ({ratio:.1f}x)")
 
+    def events(modules):
+        """The interpreter's call/return events (Python and C functions)
+        one warm list makes — this thread only, the same on every run."""
+        seen = [0]
+
+        def count(frame, event, arg):
+            seen[0] += 1
+        sys.setprofile(count)
+        try:
+            gst.scripts_in_use(typhon_dir, modules=modules)
+        finally:
+            sys.setprofile(None)
+        return seen[0]
+
+    per_module = (events(fake) - events({})) / len(fake)
+    print(f"each module elsewhere: {per_module:.0f} interpreter events")
+    assert per_module <= MOST_EVENTS_PER_MODULE_ELSEWHERE, (
+        f"3,000 other modules added {per_module:.0f} interpreter events "
+        f"each to a warm list (at most {MOST_EVENTS_PER_MODULE_ELSEWHERE})")
+
 
 #: What 3,000 modules elsewhere may add to a warm list, as a multiple of the
 #: list's own time on the same machine. MEASURED on this PC (best of 9,
 #: three trials, 2026-10-05): a 29 ms list, +15 ms (about 50%) with the
 #: per-module strings, +166 ms (about 550%) with a Path and relative_to per
 #: module, the old code put back in the test below. Twice the list's own
-#: time is far from both, and both scale with the machine.
+#: time is far from both, and both scale with the machine. (Since Typhon
+#: grew: a 57 ms list, +27% and +260% — 2026-10-16.)
 MOST_ADDED_BY_3000_MODULES = 2.0
+
+#: The interpreter events (sys.setprofile: each call and return of a Python
+#: or C function) one module ELSEWHERE may add to a warm list. MEASURED
+#: (Python 3.11, 2026-10-16): 54 for the warm list as it is — a dict read,
+#: an isabs, a normcase and an abspath per module, and one startswith per
+#: root — and 398 for the old Path and relative_to per module (the test
+#: below). 150 is about 2.7x from each; a count, so it is the same on any
+#: machine, under any load, whatever the size of the list.
+MOST_EVENTS_PER_MODULE_ELSEWHERE = 150
 
 
 def test_the_warm_list_test_still_catches_a_path_per_module(
         typhon_dir, monkeypatch):
     """The relative test above, against the code it was written to stop: a
     Path built for every loaded module and compared with each root by
-    Path.relative_to (gui_settings before 1a4a68e). It must fail."""
+    Path.relative_to (gui_settings before 1a4a68e). It must fail — and does
+    on every run now, busy machine or not: the time bound alone let this
+    code through under the whole suite's load (1.34-1.98x of a 2x bound,
+    19 runs), the per-module event count never does (398 of 150)."""
     def old_loaded_files(modules):
         out = {}
         for module in list(modules.values()):
