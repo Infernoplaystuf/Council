@@ -27,15 +27,32 @@ Next to the app, as camera_setup.json. Projects are generated per machine
 (the vault is not in git), so a fresh machine gets a fresh wizard — which is
 the point: the machine is what has or lacks the SDK. And two apps on one
 machine can be set up for different cameras.
+
+SEVERAL CAMERA FAMILIES (typhon-plugins branch, stage P2 rows 3 and 4)
+A "Typhon (plugins)" project ticks camera FAMILIES instead of choosing one
+(docs/typhon_plugins_design.md 2.4 item 15; docs/typhon_multicamera_design.md
+2.2): each family is a camera plugin with a set-up of its own — its guide,
+its checks and, for a Basler, its scan — which the plugin host hands the
+wizard as a `Family`. The same file keeps them, still FORMAT 1, as a
+"cameras" list beside the one "camera" today's reader knows
+(`save_families`), so a file written either way reads either way: a
+single-choice file is a list of one (`load_families`), and today's Typhon
+reads the first family it knows from a list. A project set up today opens
+unchanged and is not asked again.
 """
 from __future__ import annotations
 
+import itertools
 import json
+import os
+import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, List, Mapping, Optional, Sequence,
+                    Tuple)
 
 #: The cameras a capture app can be set up for, in the order offered.
 CHOICES: Tuple[str, ...] = ("basler", "prophesee")
@@ -401,3 +418,157 @@ def save_choice(path: Any, choice: str) -> None:
 def label(choice: Optional[str]) -> str:
     return {"basler": "Basler", "prophesee": "Prophesee EVK4"}.get(
         choice or "", "not set up")
+
+
+# ======================================================================
+# Several camera families (a "Typhon (plugins)" project)
+# ======================================================================
+#: Where camera_setup.json keeps the families a project ticked, in order.
+FAMILIES_KEY = "cameras"
+
+#: A family is its camera plugin's backend name: "basler", "prophesee", or a
+#: third party's dotted one ("acme.thermal", plugin design 3.3).
+FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+#: The most families one set-up may tick (far more than a rig runs).
+MAX_FAMILIES = 32
+
+_TEMP_NUMBERS = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class Family:
+    """One camera family a project can be set up for: a camera plugin with
+    a set-up (plugin design 2.3, 2.4 item 15). The plugin host builds it
+    from the plugin's own guide, checks and scan, each guarded, so none of
+    them raises; the wizard only lays them out.
+
+    `key` is the family as camera_setup.json keeps it (the plugin's
+    backend), `plugin` the plugin's id, `label` the short name said after
+    the wizard ("Set up for Basler."), `title` and `summary` what its check
+    box says. `guide(python)` is the install steps for that interpreter;
+    `check()` asks the installed software (seconds: off the UI thread);
+    `scan(held)`, when the plugin has a scan page (a Basler), lists every
+    camera of the family and whether each will run, told which cameras the
+    app holds open ({key: slot name}) so it never opens them again."""
+    key: str
+    plugin: str
+    label: str
+    title: str
+    summary: str
+    guide: Callable[[str], Guide]
+    check: Callable[[], "Readiness"]
+    scan: Optional[Callable[[Mapping[str, str]], Any]] = None
+    scan_label: str = ""
+    scan_tip: str = ""
+
+
+def _read_setup(path: Any) -> Optional[dict]:
+    """The file's document when it is one this module wrote (FORMAT), else
+    None — ask again."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("format") != FORMAT:
+        return None
+    return data
+
+
+def clean_families(families: Any) -> List[str]:
+    """`families` as a list of family names, in order, each once; ValueError
+    for anything that cannot be one, or for none at all."""
+    if isinstance(families, str) or not isinstance(families, (list, tuple)):
+        raise ValueError("the camera families are a list of names")
+    out: List[str] = []
+    for family in families:
+        if not isinstance(family, str) or not FAMILY_RE.match(family):
+            raise ValueError(f"{family!r} cannot name a camera family "
+                             f"(a camera plugin's backend, such as "
+                             f"{', '.join(CHOICES)})")
+        if family not in out:
+            out.append(family)
+    if not out:
+        raise ValueError("no camera family was ticked")
+    if len(out) > MAX_FAMILIES:
+        raise ValueError(f"{len(out)} camera families; at most "
+                         f"{MAX_FAMILIES}")
+    return out
+
+
+def load_families(path: Any) -> Optional[List[str]]:
+    """The camera families the set-up ticked, in order: the file's
+    "cameras" list, or — a single-choice file, as today's Typhon writes it
+    (FORMAT 1) — its one "camera" as a list of one. None when there is none
+    worth trusting, which means what it means to load_choice: ask again. A
+    "cameras" entry that is not a list of family names is not trusted, even
+    beside a good "camera"."""
+    data = _read_setup(path)
+    if data is None:
+        return None
+    if FAMILIES_KEY in data:
+        try:
+            return clean_families(data[FAMILIES_KEY])
+        except ValueError:
+            return None
+    choice = data.get("camera")
+    return [choice] if choice in CHOICES else None
+
+
+def save_families(path: Any, families: Sequence[str]) -> List[str]:
+    """Save the families a project's set-up ticked; returns them as saved.
+
+    Still FORMAT 1 (multi-camera design 2.2): "cameras" holds every family
+    in order, and "camera" the first one today's single-choice reader knows
+    (load_choice), so the file still reads there; with none it knows, there
+    is no "camera" and that reader asks again. Written whole under a name
+    no other writer uses, flushed, then renamed into place: a crash leaves
+    the old answer or the new one, never half of either."""
+    chosen = clean_families(families)
+    doc: dict = {"format": FORMAT}
+    known = next((f for f in chosen if f in CHOICES), None)
+    if known is not None:
+        doc["camera"] = known
+    doc[FAMILIES_KEY] = chosen
+    doc["saved"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.{os.getpid()}."
+                            f"{threading.get_ident()}."
+                            f"{next(_TEMP_NUMBERS)}.tmp")
+    try:
+        with open(temp, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(doc, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temp, target)
+                break
+            except PermissionError:
+                # Windows: a scanner holding the old file for a moment.
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+    return chosen
+
+
+def families_label(chosen: Optional[Sequence[str]],
+                   families: Sequence[Family] = ()) -> str:
+    """"Basler", "Basler and Prophesee EVK4", "A, B and C": the families
+    `chosen`, each by its Family's label, else by label() for a built-in
+    one, else by its own name. "not set up" for none."""
+    if not chosen:
+        return "not set up"
+    by_key = {f.key: f.label for f in families}
+    words = [by_key.get(k) or (label(k) if k in CHOICES else k)
+             for k in chosen]
+    if len(words) == 1:
+        return words[0]
+    return f"{', '.join(words[:-1])} and {words[-1]}"

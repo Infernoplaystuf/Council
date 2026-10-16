@@ -46,6 +46,14 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "SHARED_TABS": ("council_core.camera_categories", "SHARED_TABS"),
     "TIPS": ("council_core.camera_categories", "TIPS"),
     "MOST_USED": ("council_core.camera_categories", "MOST_USED"),
+    # each brand's set-up guide and checks (council_core/camera_setup.py)
+    # and the Basler scan page (council_core/basler_scan.py), which the
+    # Basler and Prophesee plugins bring into the set-up wizard (design
+    # 2.3, 2.4 item 15)
+    "setup_guide": ("council_core.camera_setup", "guide"),
+    "setup_check": ("council_core.camera_setup", "check"),
+    "setup_label": ("council_core.camera_setup", "label"),
+    "basler_scan": ("council_core.basler_scan", "scan"),
 }
 
 __all__ = sorted(_REEXPORTS)

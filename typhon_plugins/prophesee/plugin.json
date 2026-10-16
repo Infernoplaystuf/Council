@@ -10,7 +10,8 @@
   "needs": [],
   "python": [],
   "contributes": [
-    "review_source"
+    "review_source",
+    "setup"
   ],
   "files": [],
   "network": "none",

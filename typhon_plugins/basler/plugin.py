@@ -7,16 +7,21 @@ council_core/cameras.py (BaslerBackend, BaslerDevice) and
 council_core/camera_settings.py (BaslerSettings, which the device hands out
 as its settings; its other triggers reach the generic stop check through
 the Provider.extra_stops hook) — reached through typhon_plugin_api.builtin,
-so the plugin imports only typhon_plugin_api (design 7.2). The set-up
-guide, its checks and the wizard's scan page join with the wizard's camera
-pages (stage P2 row 4).
+so the plugin imports only typhon_plugin_api (design 7.2).
+
+ITS SET-UP (stage P2 row 4; design 2.3, 2.4 item 15)
+The Basler family's check box in a "Typhon (plugins)" project's set-up
+wizard: its install guide and checks (council_core/camera_setup.py's Basler
+guide and checks, which do not move) and the wizard's scan page
+(council_core/basler_scan.py) — told which cameras the app holds open, and
+as which camera of the rig, so it never opens them again.
 
 pypylon is NOT in the manifest's `python`: a PC without it still runs the
 plugin, whose `available()` says what to install — as the scan always has.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 import typhon_plugin_api as api
 from typhon_plugin_api import builtin
@@ -36,6 +41,16 @@ class BaslerPlugin:
     #: The SDK module to use instead of pypylon's (a test's fake pylon);
     #: None is pypylon itself, imported on first use.
     sdk: Any = None
+
+    #: The scan page's pylon and genicam modules (a test's fakes), or None:
+    #: pypylon's own, imported by the scan.
+    scan_sdk: Optional[Tuple[Any, Any]] = None
+
+    #: The words on the wizard's scan button, and what it does.
+    setup_scan_label = "Scan Basler cameras"
+    setup_scan_tip = ("Every Basler camera this PC can see, and whether each "
+                      "one will run: interface, drivers, link, pixel format, "
+                      "trigger mode, and a short test grab.")
 
     def __init__(self) -> None:
         self.ctx: Optional[api.PluginContext] = None
@@ -108,3 +123,39 @@ class BaslerPlugin:
     def review_source(self) -> Optional[api.ReviewSource]:
         """A Basler's saved frames ARE its data: no file of its own."""
         return None
+
+    # -- its set-up (CameraSetup; design 2.4 item 15) ----------------------
+    @property
+    def setup_label(self) -> str:
+        return builtin.setup_label(self.backend)
+
+    def setup_guide(self, python: str) -> api.Guide:
+        """pylon with CoaXPress, pypylon into THIS app's Python, the pylon
+        Viewer, and the emulator for trying it without hardware."""
+        return builtin.setup_guide(self.backend, python=python)
+
+    def setup_checks(self) -> api.Readiness:
+        """pypylon importable, CoaXPress support, a camera connected."""
+        return builtin.setup_check(self.backend, basler_sdk=self.sdk)
+
+    def setup_scan(self, held: Mapping[str, str]) -> Any:
+        """The scan page: every Basler this PC can see and whether each one
+        will run (council_core.basler_scan.scan). A camera this app holds
+        open — `held` maps its key to its name in the rig — is reported,
+        not opened again, and the report says which camera it is."""
+        names = {str(k): str(v) for k, v in dict(held or {}).items() if k}
+        pylon, genicam = self.scan_sdk or (None, None)
+        report = builtin.basler_scan(pylon, genicam, held_keys=list(names))
+        for cam in getattr(report, "cameras", ()) or ():
+            name = names.get(str(getattr(cam, "key", "")))
+            if not name:
+                continue
+            for check in getattr(cam, "checks", ()) or ():
+                if getattr(check, "label", "") == IN_USE:
+                    check.detail = (f"in use as {name} — connected in Typhon "
+                                    f"right now, not re-opened.")
+        return report
+
+
+#: The scan's line for a camera Typhon holds open (basler_scan).
+IN_USE = "In use by Typhon"

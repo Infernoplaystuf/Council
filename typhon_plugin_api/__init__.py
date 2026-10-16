@@ -37,6 +37,13 @@ they reach of them while the code stays in council_core is in
 `typhon_plugin_api.builtin`, which is not part of the API a plugin from
 someone else may use (design 7.2).
 
+A camera plugin with a SET-UP (`CameraSetup`; its manifest contributes
+"setup") is a camera family the set-up wizard offers as a check box: it
+brings its install guide (`Guide` of `Step`s), its checks (`Readiness` of
+`Check`s) and, optionally, a scan page (`setup_scan`) into the wizard
+(design 2.3, 2.4 item 15). A family nobody ticked is left out of the scan.
+A camera plugin without a set-up (the simulated cameras) is always scanned.
+
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
 reading a manifest, or importing this package, loads no camera code.
@@ -58,10 +65,11 @@ API_VERSION = "0.2"
 #: hook is here only once Typhon calls it: activate and deactivate (the
 #: host), on_frame (the host's live feeds), and a camera plugin's hooks the
 #: host's camera registry calls (0.2: scanning, opening, confirming
-#: capabilities, the settings tabs' rows, the review source).
-#: check_start joins when Start asks it (stage P3), status when the status
-#: strip does (P4), a camera plugin's facet and record_fields at P3 and its
-#: set-up guide with the wizard's camera pages.
+#: capabilities, the settings tabs' rows, the review source; from stage P2
+#: rows 3 and 4 its set-up guide, checks and scan, which the set-up wizard
+#: of a "Typhon (plugins)" project calls). check_start joins when Start
+#: asks it (stage P3), status when the status strip does (P4), a camera
+#: plugin's facet and record_fields at P3.
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
     "context.say", "context.call_in_ui", "context.cameras",
@@ -74,9 +82,13 @@ FEATURES: FrozenSet[str] = frozenset({
     # a camera plugin's hooks Typhon calls (CameraPlugin, 0.2)
     "camera.available", "camera.discover", "camera.open",
     "camera.capabilities", "camera.categories", "camera.review_source",
+    # a camera plugin's set-up, which the set-up wizard calls (CameraSetup)
+    "camera.setup_guide", "camera.setup_checks", "camera.setup_scan",
     # the types
     "type.FrameView", "type.CameraHandle", "type.CropBox",
     "type.CameraPlugin", "type.CategoryHints", "type.ReviewSource",
+    "type.CameraSetup", "type.Guide", "type.Step", "type.Check",
+    "type.Readiness",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -341,6 +353,38 @@ class CameraPlugin(Protocol):
     def review_source(self) -> Optional[ReviewSource]: ...
 
 
+@runtime_checkable
+class CameraSetup(Protocol):
+    """A camera plugin's set-up (design 2.3, 2.4 item 15, 3.3): what makes
+    its family a check box in the set-up wizard. Its manifest lists
+    "setup" among what it contributes.
+
+    `setup_label` is the family's short name ("Basler"), said after the
+    wizard. `setup_guide(python)` is the install steps (`Guide`, its
+    `Step`s) written for the interpreter the app runs under, and must
+    not raise. `setup_checks()` asks the installed software what it can
+    actually do and returns a `Readiness` of `Check`s, each True (done),
+    False (will stop the camera working) or None (could not tell, or only
+    matters for some cameras); it takes seconds, so the wizard runs it
+    off the UI thread, and it must not raise for a missing SDK.
+
+    Optional: `setup_scan(held)` — a scan page (the Basler plugin's): every
+    camera of the family and whether each will run, as a report shaped
+    like council_core.basler_scan.ScanReport (`summary()`, `notes`,
+    `cameras` with `verdict`, `label`, `capabilities` and `checks`), with
+    `setup_scan_label` the words on its button. `held` maps the key of
+    every camera this app holds open to its name in the rig ("cam2"): the
+    scan must not open those again (a second open fails on real hardware)
+    and says they are in use, and as which camera. The report type is
+    settled with the author's kit at stage P5."""
+
+    setup_label: str
+
+    def setup_guide(self, python: str) -> Any: ...
+
+    def setup_checks(self) -> Any: ...
+
+
 # ======================================================================
 # Today's classes, re-exported (design 3.11): their code stays where it is
 # ======================================================================
@@ -374,12 +418,18 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "device_capabilities": ("council_core.camera_capabilities", "of_device"),
     "known_capabilities": ("council_core.camera_capabilities", "known"),
     "missing_capabilities": ("council_core.camera_capabilities", "missing"),
+    # a camera plugin's set-up (CameraSetup): the wizard shell's own types,
+    # which stay core (design 2.1)
+    "Guide": ("council_core.camera_setup", "Guide"),
+    "Step": ("council_core.camera_setup", "Step"),
+    "Check": ("council_core.camera_setup", "Check"),
+    "Readiness": ("council_core.camera_setup", "Readiness"),
 }
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
-                  "FeaturePlugin", "CameraPlugin", "CategoryHints",
-                  "ReviewSource", *_REEXPORTS])
+                  "FeaturePlugin", "CameraPlugin", "CameraSetup",
+                  "CategoryHints", "ReviewSource", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:

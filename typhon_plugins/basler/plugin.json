@@ -9,7 +9,9 @@
   "entry": "plugin:BaslerPlugin",
   "needs": [],
   "python": [],
-  "contributes": [],
+  "contributes": [
+    "setup"
+  ],
   "files": [],
   "network": "camera-link",
   "capabilities": [

@@ -18,6 +18,10 @@ PYLON_CAMEMU set, Basler over pylon's emulated cameras.
   * its category hints give the same tab plan as today's tables;
   * its record fields are plain JSON; its review source, if it has one, is
     one, and the manifest says so;
+  * its set-up, exactly when its manifest says it has one (stage P2 row
+    4): a guide whose install commands name the app's own Python, checks
+    with three answers and, without its SDK, checks and a scan that say
+    what to install and never raise;
   * its code imports neither Qt nor pickle, and reading its manifest
     imports none of it;
   * through the host, opening confirms its capabilities onto the slot.
@@ -484,6 +488,56 @@ def test_its_review_source_is_one_and_its_manifest_says_so(host, case):
         assert not any(core in source.suffix for core in
                        ("_frame_", "_frames.csv", "_camera.json",
                         "_run_end.json")), "never a core file it shows"
+
+
+# ======================================================================
+# Its set-up (stage P2 row 4; design 2.3, 2.4 item 15)
+# ======================================================================
+#: An interpreter that is not the one running the tests: an install command
+#: must name the app's Python, not whichever pip is first on PATH.
+SETUP_PYTHON = r"C:\envs\some app\python.exe"
+
+
+def test_its_set_up_is_a_guide_and_checks_and_its_manifest_says_so(
+        host, case):
+    plugin = plugin_of(host, case)
+    has = "setup" in manifest_of(case).contributes
+    assert isinstance(plugin, api.CameraSetup) == has
+    if not has:
+        return
+    assert isinstance(plugin.setup_label, str) and plugin.setup_label
+    guide = plugin.setup_guide(SETUP_PYTHON)
+    assert isinstance(guide, api.Guide) and guide.key == plugin.backend
+    assert guide.title and guide.summary and guide.steps
+    assert all(isinstance(s, api.Step) and s.text for s in guide.steps)
+    for step in guide.steps:
+        if "pip install" in step.command:
+            assert SETUP_PYTHON in step.command, "into THIS app's Python"
+        assert not step.url or step.url.startswith("https://")
+    ready = plugin.setup_checks()
+    assert isinstance(ready, api.Readiness) and ready.checks
+    assert all(isinstance(c, api.Check) and c.ok in (True, False, None)
+               for c in ready.checks)
+    assert ready.summary()
+
+
+def test_without_its_sdk_its_checks_and_scan_say_so_and_never_raise(
+        case, monkeypatch, host):
+    if "setup" not in manifest_of(case).contributes:
+        return                       # no set-up: nothing to install
+    for name in case.sdk_modules:
+        monkeypatch.setitem(sys.modules, name, None)
+    plugin = host.instance(case.plugin_id)
+    plugin.sdk = None
+    ready = plugin.setup_checks()
+    failed = [c for c in ready.checks if c.ok is False]
+    assert not ready.ready and failed and failed[0].fix, \
+        "it says what fixes it"
+    scan = getattr(plugin, "setup_scan", None)
+    if callable(scan):
+        report = scan({})
+        assert report.summary() and not report.cameras
+        assert any(getattr(n, "fix", "") for n in report.notes)
 
 
 # ======================================================================

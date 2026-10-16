@@ -16,6 +16,13 @@ beside the PNGs, and the slider's PNG / Raw button shows it. That view is
 this plugin's `review_source()`: the run file's name, the button's word, and
 how it is opened (event_playback.open_raw: one pass, nothing written beside
 the file). The slider's live end stays Typhon's.
+
+ITS SET-UP (stage P2 row 4; design 2.3, 2.4 item 15)
+The Prophesee family's check box in a "Typhon (plugins)" project's set-up
+wizard: the Metavision SDK or OpenEB, the Python versions its bindings are
+built for, the EVK4's USB driver, and checks that the SDK imports and finds
+a camera (council_core/camera_setup.py's EVK guide and checks, which do not
+move). It has no scan page.
 """
 from __future__ import annotations
 
@@ -103,3 +110,17 @@ class PropheseePlugin:
 
     def review_source(self) -> Optional[api.ReviewSource]:
         return RAW_VIEW
+
+    # -- its set-up (CameraSetup; design 2.4 item 15) ----------------------
+    @property
+    def setup_label(self) -> str:
+        return builtin.setup_label(self.backend)
+
+    def setup_guide(self, python: str) -> api.Guide:
+        """The Metavision SDK (installer or OpenEB), the Python versions its
+        bindings import under, the EVK4's USB driver, a USB 3 port."""
+        return builtin.setup_guide(self.backend, python=python)
+
+    def setup_checks(self) -> api.Readiness:
+        """metavision_hal importable, a camera found."""
+        return builtin.setup_check(self.backend, evk_sdk=self.sdk)

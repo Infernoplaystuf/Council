@@ -90,11 +90,14 @@ NETWORK = ("none", "camera-link", "internet")
 
 #: The places a plugin may attach to (design 3.7, 3.8, 3.11).
 CONTRIBUTIONS = ("panel", "toolbar", "status", "run_hooks", "analyse",
-                 "review_source", "overlay", "record_gate", "frame_stage")
+                 "review_source", "setup", "overlay", "record_gate",
+                 "frame_stage")
 #: Inside the data-safety rules: built-in plugins only (design 3.11).
 BUILTIN_ONLY = frozenset({"record_gate", "frame_stage"})
-#: Camera plugins only: how the slider shows one of its run files.
-CAMERA_ONLY = frozenset({"review_source"})
+#: Camera plugins only: how the slider shows one of its run files; and a
+#: set-up — the family's check box in the set-up wizard, with its guide,
+#: checks and scan (design 2.3, 2.4 item 15; stage P2 row 4).
+CAMERA_ONLY = frozenset({"review_source", "setup"})
 #: Named now so later plugins fit, not built yet (design 11.5): refused.
 RESERVED = frozenset({"overlay"})
 

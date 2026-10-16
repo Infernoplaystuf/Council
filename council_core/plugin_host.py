@@ -30,8 +30,18 @@ views of a plugin's run files (the Prophesee raw view). A camera's own
 refusal (CameraError) is the camera's answer, never the plugin's fault;
 anything else a camera plugin raises is said and logged, and a built-in
 camera plugin is never switched off without asking (`camera_call`).
-Today's Typhon does not call the registry yet: the set-up's camera
-families become the project's camera plugins at stage P2 rows 3 and 4.
+
+STAGE P2 ROWS 3 AND 4: THE SET-UP'S FAMILIES, AND THE RIG'S NAMES
+A "Typhon (plugins)" project (one with typhon_plugins.json) scans and opens
+its cameras through this registry (frame_camera); today's Typhon never
+does. Its camera_setup.json — the families its set-up wizard ticked, or the
+one camera a single-choice file names — is read as part of its plugin list
+(`setup_choice`): a camera plugin with a set-up whose family was not ticked
+is left out of the scan, and one with no set-up (the simulated cameras) is
+always in it (`camera_plugins`). Each camera plugin with a set-up is a
+check box in the wizard, with its guide, checks and (Basler) scan page,
+guarded (`camera_families`). A camera opened into a slot takes its name in
+the rig from camera_rig.json (`name_camera`).
 
 FINDING PLUGINS READS MANIFESTS ONLY (design 4.1, 4.4)
 Built-in plugins are the folders of typhon_plugins/ that BUILTIN_PLUGINS
@@ -100,6 +110,7 @@ import importlib
 import importlib.util
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -852,10 +863,9 @@ class PluginHost:
         return rec.name if rec is not None else pid
 
     # -- camera plugins (stage P2; design 2.4 item 3, 3.3, 3.4) ---------------
-    def camera_plugins(self) -> List[str]:
-        """The camera plugins this project runs and that can run now, in
-        its list's order — the base set's, which is the built-in list's:
-        Basler, Prophesee, Simulated, the order cameras.backends() has."""
+    def _runnable_cameras(self) -> List[str]:
+        """Every camera plugin this project runs that can run now, in its
+        list's order, whatever the set-up ticked."""
         out = []
         for pid in self.runs():
             m = self.manifest(pid)
@@ -864,6 +874,124 @@ class PluginHost:
             if self.state(pid)[0] in (ON, ACTIVE):
                 out.append(pid)
         return out
+
+    def has_setup(self, pid: str) -> bool:
+        """Whether camera plugin `pid` has a set-up — a family the set-up
+        wizard offers as a check box — as its manifest says ("setup")."""
+        m = self.manifest(pid)
+        return m is not None and m.kind == "camera" \
+            and "setup" in m.contributes
+
+    def setup_choice(self) -> Optional[List[str]]:
+        """The camera families this project's set-up ticked: camera_setup.
+        json beside its plugin list — FORMAT 1, its "cameras" list, or a
+        file of today's single choice read as a list of one (design 2.4
+        item 15) — or None when it was never set up (no file, or one not
+        worth trusting): then every camera plugin is scanned, as today's
+        Typhon scans everything until it is set up. Read at every call: the
+        wizard changes it."""
+        if self.project_dir is None:
+            return None
+        from . import camera_setup
+
+        return camera_setup.load_families(
+            camera_setup.setup_path(self.project_dir))
+
+    def camera_plugins(self) -> List[str]:
+        """The camera plugins this project runs and that can run now, in
+        its list's order — the base set's, which is the built-in list's:
+        Basler, Prophesee, Simulated, the order cameras.backends() has —
+        less the families its set-up did not tick (setup_choice; stage P2
+        row 4: the set-up's choice read as the project's plugin list). A
+        camera plugin with no set-up (the simulated cameras) is always
+        here, as today's simulated cameras are in every list."""
+        out = self._runnable_cameras()
+        ticked = self.setup_choice()
+        if ticked is None:
+            return out
+        return [pid for pid in out if not self.has_setup(pid)
+                or self.camera_backend(pid) in ticked]
+
+    def camera_families(self) -> List[Any]:
+        """Every camera family this project can be set up for, in its list's
+        order — each camera plugin it runs that has a set-up, ticked or not
+        — as council_core.camera_setup.Family, the set-up wizard's check
+        boxes. Each part is guarded: a plugin's guide or check that fails
+        comes back as a guide or a failed check saying so (logged, and a
+        built-in camera plugin stays on), never as an exception in the
+        wizard."""
+        out = []
+        for pid in self._runnable_cameras():
+            if not self.has_setup(pid):
+                continue
+            made = self._family(pid)
+            if made is not None:
+                out.append(made)
+        return out
+
+    def _family(self, pid: str) -> Any:
+        from . import camera_setup as cs
+        from .cameras import CameraError
+
+        key = self.camera_backend(pid)
+        if not key:
+            return None
+        name = self._name(pid)
+
+        def failed_guide(why: str) -> Any:
+            return cs.Guide(key=key, title=name, summary="", steps=(cs.Step(
+                f"The {name} plugin could not give its set-up steps: "
+                f"{why}"),))
+
+        def guide(python: str) -> Any:
+            try:
+                made = self.camera_call(pid, "setup_guide", python)
+            except CameraError as exc:
+                return failed_guide(str(exc))
+            if not isinstance(made, cs.Guide):
+                return failed_guide(f"it gave {type(made).__name__}, not a "
+                                    f"Guide")
+            return made
+
+        def failed_check(why: str) -> Any:
+            return cs.Readiness(key, [cs.Check(
+                "The check itself", False, why,
+                "Try again; if it persists, reinstall the SDK.")])
+
+        def check() -> Any:
+            try:
+                made = self.camera_call(pid, "setup_checks")
+            except CameraError as exc:
+                return failed_check(str(exc))
+            if not isinstance(made, cs.Readiness):
+                return failed_check(f"the {name} plugin gave "
+                                    f"{type(made).__name__}, not a "
+                                    f"Readiness")
+            return made
+
+        def own(attr: str) -> Any:
+            try:
+                return self._camera_run(pid, attr,
+                                        lambda made: getattr(made, attr, None))
+            except CameraError:
+                return None
+
+        label = own("setup_label")
+        scan = None
+        if callable(own("setup_scan")):
+            def scan(held: Mapping[str, str]) -> Any:
+                return self.camera_call(pid, "setup_scan", dict(held or {}))
+        words = guide(sys.executable)
+        scan_label = own("setup_scan_label")
+        scan_tip = own("setup_scan_tip")
+        return cs.Family(
+            key=key, plugin=pid,
+            label=label if isinstance(label, str) and label else name,
+            title=words.title, summary=words.summary, guide=guide,
+            check=check, scan=scan,
+            scan_label=(scan_label if isinstance(scan_label, str)
+                        and scan_label else f"Scan {name}"),
+            scan_tip=scan_tip if isinstance(scan_tip, str) else "")
 
     def camera_call(self, pid: str, hook: str, *args: Any) -> Any:
         """Camera plugin `pid`'s `hook`, for a camera job: a scan, an open,
@@ -1066,6 +1194,51 @@ class PluginHost:
             if isinstance(made, api.ReviewSource):
                 out[pid] = made
         return out
+
+    # -- the rig's camera names (camera_rig.json; stage P2 row 3) ---------
+    def rig_file(self) -> Any:
+        """This project's camera_rig.json (council_core.camera_rig_file.
+        RigFile: its camera names and rig presets), or None with no project
+        open."""
+        if self.project_dir is None:
+            return None
+        from . import camera_rig_file
+
+        return camera_rig_file.RigFile(
+            camera_rig_file.rig_path(self.project_dir))
+
+    def name_camera(self, camera: str, info: Any) -> Tuple[str, str]:
+        """Give the camera just opened in slot `camera` its name in the rig
+        (multi-camera design 2.2): the name it had before in this project
+        (camera_rig.json) — the same camera gets the same name next time —
+        else the slot's own when no other camera has it, else the first
+        free camN; the slot is then called that. Returns (name, note): the
+        note says why the slot kept its name — a rig file that is damaged
+        (left as it is) or cannot be written, or the name taken by another
+        slot — and is "" when all went well. Never raises for those."""
+        rig = self.rig
+        slot = self._slot(camera)
+        if rig is None or slot is None:
+            raise KeyError(f"no camera slot named {camera!r}")
+        store = self.rig_file()
+        if store is None:
+            return slot.name, ""
+        from .camera_rig_file import RigError, RigFileError
+
+        others = [s.name for s in rig if s is not slot]
+        try:
+            name = store.assign(info, prefer=slot.name, taken=others)
+        except (RigError, RigFileError) as exc:
+            return slot.name, (f"the camera keeps the name {slot.name} — "
+                               f"{exc}")
+        if name == slot.name:
+            return name, ""
+        try:
+            rig.rename_slot(slot.name, name)
+        except ValueError as exc:
+            return slot.name, (f"this camera is {name} in the rig, but it "
+                               f"keeps the name {slot.name} here: {exc}")
+        return name, ""
 
     # -- the guard -----------------------------------------------------------
     def _guard(self, pid: str, hook: str, fn: Callable[..., Any],

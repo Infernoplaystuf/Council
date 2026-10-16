@@ -93,10 +93,13 @@ def test_the_api_is_0_2_with_the_camera_plugin_types():
     for name in ("type.CameraPlugin", "type.CategoryHints",
                  "type.ReviewSource", "camera.available", "camera.discover",
                  "camera.open", "camera.capabilities", "camera.categories",
-                 "camera.review_source"):
+                 "camera.review_source",
+                 # P2 rows 3 and 4: the set-up wizard calls these
+                 "camera.setup_guide", "camera.setup_checks",
+                 "camera.setup_scan", "type.CameraSetup", "type.Guide"):
         assert api.has(name), name
     for later in ("camera.facet", "camera.record_fields",
-                  "camera.setup_guide", "hook.check_start"):
+                  "hook.check_start"):
         assert not api.has(later), f"{later}: nothing calls it yet"
     from council_core import camera_capabilities
     assert api.CAPABILITIES is camera_capabilities.CAPABILITIES
@@ -196,7 +199,7 @@ def test_the_three_camera_plugins_declare_the_designs_capabilities():
     assert "restartable" not in got["typhon.prophesee"]
     assert got["typhon.simulated"] >= {"frames", "events"}
     m = pm.read(BUILTIN / "prophesee", builtin=True)
-    assert m.contributes == ("review_source",)
+    assert m.contributes == ("review_source", "setup")
     for pid in CAMERA_PLUGINS:
         m = pm.read(BUILTIN / pid.split(".")[1], builtin=True)
         assert m.python == (), "an SDK is said by available(), not refused"
