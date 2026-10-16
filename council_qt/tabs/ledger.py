@@ -10,7 +10,7 @@ The four steps, top to bottom, are the pipeline's own order:
   4. Apply the saved review -> the parent CSV, and optionally one filled
      template per part.
 
-Every step runs on a worker thread (OCR is ~3 s an image) and the buttons are
+Every step runs on a worker thread (a workbook of many pictures takes a while) and the buttons are
 disabled until it finishes; the summary line and the log say what it found.
 Everything stays on this machine: the work is council_core/ledger_ingest.py,
 and the pipeline itself sample_ledger.py and source_extract.py.
@@ -119,7 +119,7 @@ class LedgerTab(ViewHelpers, QWidget):
         self.part = QLineEdit()
         self.part.setFixedWidth(120)
         row.addWidget(self.part)
-        self.use_images = QCheckBox("Read pasted images (local OCR)")
+        self.use_images = QCheckBox("Read pasted images (Tesseract, local)")
         self.use_images.setChecked(True)
         row.addWidget(self.use_images)
         row.addStretch(1)

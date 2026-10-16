@@ -277,7 +277,7 @@ def test_against_the_real_template(tmp_path):
     assert ("101", "1A", "Flaw Attributes: Laser Team FOD (um)", "400") in dec
 
 
-# ── OCR line repair (what RapidOCR really returned on a "Label: value" image) ─
+# ── OCR line repair (what an OCR engine really returned on a "Label: value" image) ─
 def test_ocr_split_line_is_joined_and_overlap_deduped():
     boxes = [(16, 20, 167, 38, "PartNumber:2041"),
              (16, 54, 129, 73, "LaserPower("), (120, 54, 191, 74, "(W):285"),
@@ -316,11 +316,13 @@ def _table_png(path, rows, widths, lines=True):
 
 def test_real_ocr_reads_pictures_only_workbook(setup):
     """Part number, settings, a run table and flaw values exist only as
-    pictures. Read by RapidOCR, every value lands in the right field, a blank
+    pictures. Read by Tesseract, every value lands in the right field, a blank
     cell stays blank, "0.030" keeps its zero, and nothing is pre-accepted."""
-    pytest.importorskip("rapidocr_onnxruntime")
     from openpyxl.drawing.image import Image as XLImage
-    from source_extract import rapidocr_reader
+    from source_extract import tesseract_reader
+    reader = tesseract_reader()
+    if reader is None:
+        pytest.skip("Tesseract is not installed here")
     schema, _, _, tmp = setup
     pics = {
         "A3": _table_png(tmp / "form.png", [["Part Number: 2041"], ["Laser Power (W): 285"]],
@@ -339,7 +341,7 @@ def test_real_ocr_reads_pictures_only_workbook(setup):
         ws.add_image(XLImage(str(p)), anchor)
     wb.save(tmp / "pictures.xlsx")
 
-    run = extract(schema, [tmp / "pictures.xlsx"], image_reader=rapidocr_reader(),
+    run = extract(schema, [tmp / "pictures.xlsx"], image_reader=reader,
                   image_dir=tmp / "imgs")
     got = {(d.obs.part, d.obs.item, d.obs.field): d.obs.value for d in decide(run, schema)}
     assert got == {
@@ -355,3 +357,72 @@ def test_real_ocr_reads_pictures_only_workbook(setup):
     }
     assert not any(d.accept for d in decide(run, schema))
     assert [n.values for n in run.images] == [1, 5, 3]
+
+
+# ── which image reader is used ──────────────────────────────────────────
+TSV = "\n".join([
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+    "5\t1\t1\t1\t1\t1\t10\t10\t50\t20\t96\tLaser",
+    "5\t1\t1\t1\t1\t2\t66\t10\t60\t20\t95\tPower",
+    "5\t1\t1\t1\t1\t3\t132\t10\t30\t20\t95\t(W)",
+    "5\t1\t2\t1\t1\t1\t300\t10\t40\t20\t91\t285",
+    "4\t1\t2\t1\t1\t0\t300\t10\t40\t20\t-1\t",
+    "5\t1\t3\t1\t1\t1\t10\t50\t60\t20\t93\tMedia",
+    "5\t1\t4\t1\t1\t1\t300\t50\t70\t20\t90\tceramic",
+])
+
+
+def test_tesseract_words_become_phrases_and_columns():
+    from source_extract import tsv_to_boxes
+    boxes = tsv_to_boxes(TSV)
+    assert sorted(b[4] for b in boxes) == ["285", "Laser Power (W)", "Media", "ceramic"]
+    assert boxes_to_rows(boxes) == [["Laser Power (W)", "285"], ["Media", "ceramic"]]
+
+
+def test_no_tesseract_means_no_reader_not_a_vision_model(monkeypatch, tmp_path):
+    import source_extract as se
+    monkeypatch.setenv(se.TESSERACT_ENV, str(tmp_path / "missing.exe"))
+    asked = []
+    monkeypatch.setattr(se, "_ollama", lambda *a, **k: asked.append(a) or {})
+    assert se.find_tesseract() is None and se.default_image_reader() is None
+    assert asked == []                     # Ollama was not even asked
+
+
+def test_a_named_tesseract_is_used(monkeypatch, tmp_path):
+    import source_extract as se
+    exe = tmp_path / "tesseract.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setenv(se.TESSERACT_ENV, str(exe))
+    assert se.find_tesseract() == exe
+    assert se.default_image_reader().name == "Tesseract (local)"
+
+
+def test_only_us_origin_vision_models_are_offered(monkeypatch):
+    import source_extract as se
+    shown = []
+
+    def fake(path, payload=None, timeout=10):
+        if path == "/api/tags":
+            return {"models": [{"name": "qwen2.5vl:7b"}, {"name": "minicpm-v:8b"},
+                               {"name": "llama3.2-vision:11b"}]}
+        shown.append(payload["model"])
+        return {"capabilities": ["completion", "vision"]}
+    monkeypatch.setattr(se, "_ollama", fake)
+    assert se.ollama_vision_model() == "llama3.2-vision:11b"
+    assert shown == ["llama3.2-vision:11b"]
+
+
+def test_table_borders_are_removed_but_a_filled_bar_is_kept():
+    pytest.importorskip("numpy")
+    from PIL import Image, ImageDraw
+    from source_extract import _strip_table_lines
+    im = Image.new("L", (400, 200), 255)
+    d = ImageDraw.Draw(im)
+    d.line([(10, 20), (390, 20)], fill=0, width=2)            # a cell border
+    d.line([(200, 5), (200, 195)], fill=0, width=2)           # a column border
+    d.rectangle([10, 100, 390, 140], fill=0)                  # a dark header bar
+    d.text((20, 60), "412", fill=0)                           # text
+    out = _strip_table_lines(im)
+    assert out.getpixel((100, 20)) == 255 and out.getpixel((200, 60)) == 255
+    assert out.getpixel((100, 120)) == 0                      # the bar is kept
+    assert min(out.crop((18, 58, 60, 75)).getdata()) < 128    # the text is kept

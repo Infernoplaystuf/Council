@@ -108,7 +108,7 @@ class ExtractSummary:
 
 
 def _counting(reader: Optional[ImageReader], progress: Optional[Progress]):
-    """Wrap the image reader so each image (OCR is ~3 s apiece) is reported."""
+    """Wrap the image reader so each image is reported as it is read."""
     if reader is None or progress is None:
         return reader
     n = [0]

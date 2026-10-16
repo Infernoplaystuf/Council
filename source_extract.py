@@ -16,9 +16,10 @@ Step two of the spreadsheet-ingestion pipeline (step one is sample_ledger.py).
 
 EVERYTHING STAYS ON THIS MACHINE
 --------------------------------
-Workbooks are read with openpyxl. Images are read by a local OCR engine or a
-local Ollama vision model at localhost when one is installed, and by nothing
-otherwise — they are then saved for you to read. No source value is sent to
+Workbooks are read with openpyxl. Images are read by Tesseract (local OCR)
+when it is installed, and by nothing otherwise — they are then saved for you
+to read. A local Ollama vision model is used only when asked for, never by
+default, because it can write numbers that are not in the picture. No source value is sent to
 any model: the optional --llm mapping suggestion sends only unmatched LABELS
 to a local Ollama text model.
 
@@ -736,29 +737,164 @@ def boxes_to_rows(boxes: List[Tuple[float, float, float, float, str]]) -> List[L
     return out
 
 
-def rapidocr_reader() -> Optional[ImageReader]:
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception:
-        return None
+# ── Tesseract: the image reader used by default ─────────────────────────
+# Why Tesseract and nothing else by default: it is classic OCR (begun at HP,
+# developed by Google, Apache-2.0 - US origin, as CLAUDE.md requires of
+# models) and it only transcribes the glyphs it sees. It can MISREAD a digit,
+# but it has no language model that could write a plausible number that is
+# not there - a vision model can. Values read from images are never
+# pre-accepted either way; a person checks each one in the review.
+TESSERACT_ENV = "COUNCIL_TESSERACT"
+
+
+def find_tesseract() -> Optional[Path]:
+    """The tesseract executable: $COUNCIL_TESSERACT, PATH, the usual Windows
+    install folders, or a conda env named 'tesseract'. Never downloaded."""
     import os
-    # onnxruntime's default spreads over every core and runs ~2.5x SLOWER for
-    # small images on a many-core machine (measured: 32 s -> 12 s for three
-    # table screenshots on 28 cores). Detection keeps its full size, so small
-    # text in a big screenshot is still found.
-    threads = max(1, min(8, (os.cpu_count() or 4)))
-    engine = RapidOCR(intra_op_num_threads=threads, inter_op_num_threads=1)
+    import shutil
+    env = os.environ.get(TESSERACT_ENV, "").strip()
+    if env:
+        return Path(env) if Path(env).is_file() else None
+    hit = shutil.which("tesseract")
+    if hit:
+        return Path(hit)
+    exe = "tesseract.exe" if os.name == "nt" else "tesseract"
+    for base in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", ""),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        cand = Path(base) / "Tesseract-OCR" / exe
+        if base and cand.is_file():
+            return cand
+    for conda in ("miniconda3", "anaconda3", "miniforge3"):
+        for sub in (("Library", "bin", exe), ("bin", exe)):
+            cand = Path.home().joinpath(conda, "envs", "tesseract", *sub)
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _tessdata_for(exe: Path) -> Optional[Path]:
+    """A conda build's language data sits beside it; its activation script
+    normally says so in TESSDATA_PREFIX, which a direct call does not run."""
+    for d in (exe.parent.parent / "share" / "tessdata", exe.parent / "tessdata"):
+        if (d / "eng.traineddata").is_file():
+            return d
+    return None
+
+
+def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
+    """Tesseract TSV words -> phrase boxes (x0, y0, x1, y1, text).
+
+    Words of one Tesseract line closer than ~0.8 x the text height are one
+    phrase ("Laser Power (W)"); a wider gap is a table column boundary, which
+    boxes_to_rows then aligns across rows."""
+    lines: Dict[Tuple[str, ...], List[Tuple[float, float, float, float, str]]] = {}
+    for row in tsv.splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or f[0] != "5" or not f[11].strip():
+            continue
+        try:
+            x, y, w, h = (float(v) for v in f[6:10])
+        except ValueError:
+            continue
+        lines.setdefault(tuple(f[1:5]), []).append((x, y, x + w, y + h, f[11].strip()))
+    out = []
+    for words in lines.values():
+        words.sort(key=lambda b: b[0])
+        hs = sorted(b[3] - b[1] for b in words)
+        gap_max = hs[len(hs) // 2] * 0.8
+        cur = words[0]
+        for b in words[1:]:
+            if b[0] - cur[2] <= gap_max:
+                cur = (cur[0], min(cur[1], b[1]), b[2], max(cur[3], b[3]), cur[4] + " " + b[4])
+            else:
+                out.append(cur)
+                cur = b
+        out.append(cur)
+    return out
+
+
+def _for_ocr(data: bytes) -> bytes:
+    """Greyscale, and small screenshots enlarged: Tesseract wants text about
+    20-30 px high and misreads the 10-12 px of a pasted screenshot."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data)).convert("L")
+    except Exception:
+        return data
+    if max(img.size) < 1600:
+        k = 3 if max(img.size) < 800 else 2
+        img = img.resize((img.width * k, img.height * k), Image.LANCZOS)
+    img = _strip_table_lines(img)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _long_runs(mask, min_len: int) -> List[Tuple[int, int]]:
+    import numpy as np
+    d = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    return [(int(a), int(b)) for a, b in zip(np.where(d == 1)[0], np.where(d == -1)[0])
+            if b - a >= min_len]
+
+
+def _strip_table_lines(img, max_thick: int = 12):
+    """Whiten a table's cell borders. With them in, Tesseract read a bordered
+    3x3 table as the one word "wom"; without them, every cell (measured on
+    the test pictures). A border is a long straight dark run - text never
+    makes one - and THIN: a run as long but over many neighbouring rows is a
+    filled bar (white text on a dark header), left alone."""
+    try:
+        import numpy as np
+    except Exception:
+        return img
+    from PIL import Image
+    a = np.asarray(img).copy()
+    dark = a < 200
+    h, w = a.shape
+    for axis, length, min_len in ((0, h, max(40, w // 4)), (1, w, max(40, h // 3))):
+        hits: Dict[int, List[Tuple[int, int]]] = {}
+        for i in range(length):
+            line = dark[i] if axis == 0 else dark[:, i]
+            got = _long_runs(line, min_len)
+            if got:
+                hits[i] = got
+        i = 0
+        idx = sorted(hits)
+        while i < len(idx):                    # bands of neighbouring lines
+            j = i
+            while j + 1 < len(idx) and idx[j + 1] == idx[j] + 1:
+                j += 1
+            if idx[j] - idx[i] + 1 <= max_thick:
+                for k in idx[i:j + 1]:
+                    for s, e in hits[k]:
+                        if axis == 0:
+                            a[k, s:e] = 255
+                        else:
+                            a[s:e, k] = 255
+            i = j + 1
+    return Image.fromarray(a)
+
+
+def tesseract_reader(exe: Optional[Path] = None, timeout: float = 60) -> Optional[ImageReader]:
+    exe = Path(exe) if exe else find_tesseract()
+    if exe is None:
+        return None
+    import subprocess
+    cmd = [str(exe), "stdin", "stdout", "--psm", "11"]
+    data_dir = _tessdata_for(exe)
+    if data_dir is not None:
+        cmd += ["--tessdata-dir", str(data_dir)]
+    cmd += ["-l", "eng", "tsv"]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     def read(data: bytes):
-        result, _ = engine(data)
-        if not result:
-            return None
-        boxes = []
-        for pts, text, _score in result:
-            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-            boxes.append((min(xs), min(ys), max(xs), max(ys), text))
-        return boxes_to_rows(boxes)
-    read.name = "RapidOCR (local)"
+        done = subprocess.run(cmd, input=_for_ocr(data), capture_output=True,
+                              timeout=timeout, creationflags=flags)
+        if done.returncode != 0:
+            raise RuntimeError(done.stderr.decode("utf-8", "replace").strip()[-300:]
+                               or f"tesseract exited {done.returncode}")
+        return boxes_to_rows(tsv_to_boxes(done.stdout.decode("utf-8", "replace"))) or None
+    read.name = "Tesseract (local)"
     return read
 
 
@@ -770,13 +906,21 @@ def _ollama(path: str, payload: Optional[dict] = None, timeout=10):
         return json.loads(r.read().decode("utf-8"))
 
 
+#: Model families of US origin (CLAUDE.md: only these may be recommended).
+US_VISION_FAMILIES = ("llama", "gemma", "phi", "granite", "olmo")
+
+
 def ollama_vision_model() -> Optional[str]:
-    """The first installed Ollama model that reports the vision capability."""
+    """The first installed Ollama model of a US-origin family that reports the
+    vision capability. Used only when asked for: a vision model can write a
+    number that is not in the picture, so it is never the default reader."""
     try:
         names = [m["name"] for m in _ollama("/api/tags").get("models", [])]
     except Exception:
         return None
     for n in names:
+        if not n.lower().startswith(US_VISION_FAMILIES):
+            continue
         try:
             caps = _ollama("/api/show", {"model": n}).get("capabilities", [])
         except Exception:
@@ -827,7 +971,9 @@ def ollama_vision_reader(model: Optional[str] = None) -> Optional[ImageReader]:
 
 
 def default_image_reader() -> Optional[ImageReader]:
-    return rapidocr_reader() or ollama_vision_reader()
+    """Tesseract when it is installed, else nothing: the images are saved for
+    a person to read. A vision model is never chosen on its own."""
+    return tesseract_reader()
 
 
 def rows_to_grid(rows: List[List[str]], img: SourceImage) -> Grid:
@@ -898,7 +1044,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                     note.text = "(no text found)"
             else:
                 note.reader = "none installed"
-                note.text = "not read: install a local OCR engine or vision model"
+                note.text = "not read: install Tesseract (local OCR) to read images"
             run.images.append(note)
 
         # pass 1: part numbers per sheet; then a workbook-wide fallback
