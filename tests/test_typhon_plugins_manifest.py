@@ -218,6 +218,30 @@ def test_a_third_party_plugins_run_files_carry_its_short_name():
     assert pm.check(feature(files=["_capture_triggers.csv"]), builtin=True)
 
 
+@pytest.mark.parametrize("suffix", [
+    "_therm_frame_000001.png", "_therm_camera.json", "_therm_frames.csv",
+    "_therm_run_end.json", "_therm_events.raw", "_therm_rig.json",
+    "_therm_capture_triggers.csv"])
+def test_a_run_file_holding_a_core_marker_anywhere_is_refused(suffix):
+    """capture.taken_runs splits a file name at the FIRST core marker in it,
+    so "<run>_therm_frame_000001.png" read as a frame of a run named
+    "<run>_therm" — a phantom run. Before, only a suffix STARTING with a
+    marker was refused."""
+    refused(third(files=[suffix]), False, "files", "Typhon's core")
+
+
+def test_the_core_markers_are_capture_s():
+    from council_core import capture
+    assert set(capture.RUN_MARKERS) <= set(pm.CORE_SUFFIXES) | {
+        pm.TRIGGERS_FILE}
+    assert pm.TRIGGERS_FILE == capture.TRIGGERS_SUFFIX
+    run = "20261016_120000"
+    for suffix in ("_therm_tracks.csv", "_therm_velocity.json"):
+        assert pm.check(third(files=[suffix]), builtin=False)
+        assert all(marker not in run + suffix
+                   for marker in capture.RUN_MARKERS), suffix
+
+
 def test_built_in_and_third_party_ids_are_kept_apart():
     refused(third(id="typhon.thermal"), False, "id", "kept for the plugins")
     refused(feature(id="acme.thermal"), True, "id", "starts 'typhon.'")

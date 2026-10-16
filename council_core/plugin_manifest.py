@@ -96,6 +96,9 @@ RESERVED = frozenset({"overlay"})
 #: over): no plugin may claim one.
 CORE_SUFFIXES = ("_frame_", "_events.raw", "_frames.csv", "_camera.json",
                  "_run_end.json", "_rig.json", "_rig_end.json")
+#: The triggers CSV (capture.TRIGGERS_SUFFIX), a run marker too: the
+#: built-in triggering plugin claims it; no third-party file may hold it.
+TRIGGERS_FILE = "_capture_triggers.csv"
 
 #: Every field of schema 1, and which plugins must give it.
 REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",
@@ -381,10 +384,16 @@ def check(doc: Mapping[str, Any], *, builtin: bool,
         if not SUFFIX_RE.match(suffix):
             raise ManifestError(f"{suffix!r} in files is not a run-file "
                                 f"ending like \"_{short}_tracks.csv\"", "files")
-        if any(suffix == core or suffix.startswith(core)
-               for core in CORE_SUFFIXES):
+        # ANYWHERE in it, not only at its start: capture.taken_runs splits a
+        # file name at the first core marker it holds, so a sidecar
+        # "<run>_ab_frame_1.png" would read as a frame of a run "<run>_ab".
+        markers = CORE_SUFFIXES + (() if builtin else (TRIGGERS_FILE,))
+        held = [core for core in markers if core in suffix]
+        if held:
             raise ManifestError(f"{suffix!r} is a run file Typhon's core "
-                                f"writes itself", "files")
+                                f"writes itself, or holds the ending of one "
+                                f"({held[0]!r}), so Typhon would take it for "
+                                f"a run of its own", "files")
         if not builtin and not suffix.startswith(f"_{short}_"):
             raise ManifestError(f"a third-party plugin's run files are named "
                                 f"<run>_{short}_<what>; {suffix!r} is not",
