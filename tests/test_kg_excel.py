@@ -983,3 +983,81 @@ def test_an_added_folder_that_is_not_there_is_a_note(tmp_path):
     away.rename(out)
     kg.seed()
     assert ("Dana Whitfield", "OWNS", "PN-1") in _rels(kg)
+
+
+# ── progress in the terminal ─────────────────────────────────────────────
+def _capture_progress(monkeypatch, heartbeat=0.0):
+    import progress_report
+    out = io.StringIO()
+    real = progress_report.Progress
+
+    class Captured(real):
+        def __init__(self, task, **kw):
+            kw.update(stream=out, heartbeat=heartbeat, every=0)
+            super().__init__(task, **kw)
+    monkeypatch.setattr(progress_report, "Progress", Captured)
+    return out
+
+
+def test_a_rebuild_prints_its_progress_with_percentages(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    for i in range(4):
+        _book(v / "data_in" / f"t{i}.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
+                                                   "A2": f"PN-{i}", "B2": "Dana Whitfield"}})
+    out = _capture_progress(monkeypatch)
+    _kg(v).seed()
+    lines = out.getvalue().splitlines()
+    assert lines[0] == "[kg rebuild] listing documents · 0:00"
+    assert "[kg rebuild] reading documents: 0/4 files (0%) · 0:00" in lines
+    assert any(ln.startswith("[kg rebuild] reading documents: 2/4 files (50%) · t1.xlsx read")
+               for ln in lines)
+    assert any(ln.startswith("[kg rebuild] building the graph: 4/4 documents (100%)")
+               for ln in lines)
+    assert lines[-1].startswith("[kg rebuild] done in 0:0") and \
+        lines[-1].endswith("4 documents (4 read, 0 unchanged, 0 not read); 4 links, "
+                           "0 suggested, 0 question(s)")
+
+
+def test_a_slow_workbook_shows_a_still_working_line(tmp_path, monkeypatch):
+    import time as _t
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "slow.xlsx", {"S": {"A1": "x"}})
+    out = _capture_progress(monkeypatch, heartbeat=0.05)
+    real = kg_excel.read_workbook
+    monkeypatch.setattr(kg_excel, "read_workbook",
+                        lambda *a, **k: _t.sleep(0.4) or real(*a, **k))
+    _kg(v).seed()
+    assert any("still working, nothing new for" in ln and "reading slow.xlsx" in ln
+               for ln in out.getvalue().splitlines())
+
+
+def test_a_failed_rebuild_says_so_in_the_terminal(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "a.xlsx", {"S": {"A1": "x"}})
+    out = _capture_progress(monkeypatch)
+    kg = _kg(v)
+
+    def stop(n, total):
+        raise KeyboardInterrupt("the app was closed")
+    with pytest.raises(KeyboardInterrupt):
+        kg.seed(on_progress=stop)
+    assert out.getvalue().splitlines()[-1].startswith(
+        "[kg rebuild] stopped after 0:00: KeyboardInterrupt: the app was closed")
+
+
+def test_suggesting_links_prints_its_progress(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    (v / "data_in" / "team.csv").write_text(
+        "Project,Program Lead,Part\nPRJ-0915,Dana Whitfield,PN-1001\n", encoding="utf-8")
+    (v / "data_in" / "memo.txt").write_text(
+        "Dana Whitfield fitted PN-1001 to the rig on Tuesday.\n", encoding="utf-8")
+    kg = _kg(v)
+    kg.seed()
+    out = _capture_progress(monkeypatch)
+    kg.suggest_from_text({"this PC": lambda m, **k: json.dumps({"links": []})},
+                         model="stand-in")
+    lines = out.getvalue().splitlines()
+    assert "[kg suggest links (stand-in)] finding passages: 0/1 documents (0%) · 0:00" in lines
+    assert any(ln.startswith("[kg suggest links (stand-in)] asking the model: 1/1 passages"
+                             " (100%) · memo.txt read by this PC") for ln in lines)
+    assert lines[-1].endswith("1 of 1 passages read, 0 link(s) suggested")

@@ -1061,7 +1061,10 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
     if images and image_reader is None:
         notes.append(f"{len(images)} picture(s) not read: install Tesseract (local OCR) "
                      "to read them")
-    for img in images:
+    prog = kgm.progress_now()
+    for i, img in enumerate(images, start=1):
+        if prog is not None and image_reader is not None:
+            prog.update(f"{rel}: reading picture {i} of {len(images)}", force=i == 1)
         try:
             rows = image_reader(img.data) if image_reader is not None else None
         except Exception as exc:                      # one bad picture is a note

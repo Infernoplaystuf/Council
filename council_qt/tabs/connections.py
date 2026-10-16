@@ -112,9 +112,10 @@ class ConnectionsActions:
     def open_graph(self) -> kgm.KnowledgeGraph:
         return kgm.KnowledgeGraph(self.vault_dir, self.root)
 
-    def rebuild(self, on_progress=None) -> Dict[str, Any]:
+    def rebuild(self, on_progress=None, listener=None) -> Dict[str, Any]:
+        """The rebuild; its progress lines also go to the terminal."""
         with self.open_graph() as kg:
-            return kg.seed(on_progress=on_progress)
+            return kg.seed(on_progress=on_progress, listener=listener)
 
     def label_suggestions(self) -> List[Dict[str, Any]]:
         with self.open_graph() as kg:
@@ -600,21 +601,36 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self._kg.close()
             self._kg = None
 
+        self._rebuild_token = token = object()
+
         def progress(i: int, n: int) -> None:
-            if i % 25 == 0:
-                self._to_ui(self.status.setText, f"Reading the documents… {i} of {n}")
+            pass                     # the progress lines below say more
+
+        def line(text: str, _fraction) -> None:
+            # 'reading documents: 40/200 files (20%) · x.xlsx read · 0:12',
+            # and 'still working …' while nothing moves (the terminal gets
+            # the same lines)
+            self._to_ui(self._progress_line, token, text)
 
         def work() -> None:
             try:
-                stats = self.actions.rebuild(progress)
+                stats = self.actions.rebuild(progress, listener=line)
                 self._to_ui(self._rebuilt, stats, None)
             except Exception as exc:                      # noqa: BLE001
                 self._to_ui(self._rebuilt, None, exc)
 
         threading.Thread(target=work, name="kg-rebuild", daemon=True).start()
 
+    def _progress_line(self, token, text: str) -> None:
+        # Only while THIS rebuild runs: a line that arrives after it ended
+        # (the reporter's heartbeat can fire once more) must not hide the
+        # result.
+        if self._busy and token is getattr(self, "_rebuild_token", None):
+            self.status.setText(f"Rebuilding: {text}")
+
     def _rebuilt(self, stats: Optional[Dict[str, Any]], exc: Optional[BaseException]) -> None:
         self._busy = False
+        self._rebuild_token = None
         self.rebuild_btn.setEnabled(True)
         self._reopen()
         if exc is not None:

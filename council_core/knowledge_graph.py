@@ -576,6 +576,17 @@ def _image_reader_now():
     return _IMAGE_READER.get()
 
 
+#: The terminal progress of the rebuild in progress on this thread
+#: (progress_report.Progress), for the readers to say what they are on.
+_PROGRESS: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "kg_progress", default=None)
+
+
+def progress_now():
+    """The running rebuild's Progress, or None."""
+    return _PROGRESS.get()
+
+
 def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     """What a document says, as records. A workbook or a Ledger (a parent
     CSV with its schema) is read by council_core/kg_excel.py, and its
@@ -1099,9 +1110,12 @@ class KnowledgeGraph:
         from council_core import kg_excel
         out = []
         roots = [self.root] + [base for _rid, base in self._extra_bases()]
+        prog = progress_now()
         for base in roots:
             if not base.is_dir():
                 continue
+            if prog is not None:
+                prog.update(f"listing {base}", force=True)
             out += self._files_under(base, cl, kg_excel)
         return out
 
@@ -1273,7 +1287,30 @@ class KnowledgeGraph:
         return document_lines(p)
 
     def seed(self, *, use_collections: bool = True, gazetteer: bool = True,
-             on_progress=None) -> Dict[str, Any]:
+             on_progress=None, listener=None) -> Dict[str, Any]:
+        """Rebuild, with progress lines in the terminal (progress_report:
+        each stage's count and %, the file being read, a "still working"
+        line while nothing moves) - also handed to ``listener(line,
+        fraction)``, the Connections tab's status line. See _seed."""
+        from progress_report import Progress
+        with Progress("kg rebuild", listener=listener) as prog:
+            token = _PROGRESS.set(prog)
+            try:
+                stats = self._seed(use_collections=use_collections, gazetteer=gazetteer,
+                                   on_progress=on_progress, prog=prog)
+            finally:
+                _PROGRESS.reset(token)
+            rels = stats.get("relations") or {}
+            prog.finish(f"{stats['documents']} documents ({stats['documents_read']} read, "
+                        f"{stats['documents_unchanged']} unchanged, "
+                        f"{len(stats['unreadable'])} not read); "
+                        f"{rels.get('seeded', 0) + rels.get('accepted', 0)} links, "
+                        f"{rels.get('suggested', 0)} suggested, "
+                        f"{stats.get('open_reviews', 0)} question(s)")
+            return stats
+
+    def _seed(self, *, use_collections: bool, gazetteer: bool, on_progress,
+              prog) -> Dict[str, Any]:
         """Rebuild everything that comes from documents, with no model:
         labelled fields (confirmed rules only), Collections, and a gazetteer
         pass. The user's decisions and accepted/rejected statuses survive.
@@ -1296,6 +1333,7 @@ class KnowledgeGraph:
         reader = self._resolve_image_reader()
         sig = _reader_sig(rules, image_reader=getattr(reader, "name", "image reader")
                           if reader is not None else "", excel=_excel_available())
+        prog.stage("listing documents")
         files = self.document_files()
         gone_roots = [r for r in self.extra_roots() if not r["exists"]]
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
@@ -1319,11 +1357,13 @@ class KnowledgeGraph:
         failed_keep: List[str] = []
         last, n_batch = time.time(), 0
         token = _IMAGE_READER.set(reader)
+        prog.stage("reading documents", total=len(files), unit="files")
         try:
             for n, p in enumerate(files):
                 if on_progress:
                     on_progress(n, len(files))
                 rel = self._rel(p)
+                said = "unchanged"
                 try:
                     did, h = self._document(p, run_id)
                     seen_paths.add(rel)
@@ -1344,6 +1384,13 @@ class KnowledgeGraph:
                             stats["documents_unchanged"] += 1
                             readable.append((p, did, h))
                     else:
+                        said = "read"
+                        if p.suffix.lower() in (".xls", ".xlsb"):
+                            # where a wait can start: shown at once
+                            prog.update(f"opening {rel} through Excel (up to 2 min)",
+                                        force=True)
+                        else:
+                            prog.update(f"reading {rel}")
                         try:
                             recs = read_records(p, rel, rules)
                         except kg_excel.Unreadable as exc:
@@ -1377,9 +1424,11 @@ class KnowledgeGraph:
                     stats["unreadable"].append(
                         f"{rel}: {exc}" if isinstance(exc, kg_excel.Unreadable)
                         else f"{rel}: {exc.__class__.__name__}")
+                    said = "not read"
                     seen_paths.add(rel)
                     self.db.execute("UPDATE documents SET status='unreadable' WHERE path=?",
                                     (rel,))
+                prog.advance(what=f"{rel} {said}")
                 n_batch += 1
                 if n_batch >= self.SEED_BATCH or time.time() - last >= self.SEED_BATCH_S:
                     self.db.commit()
@@ -1412,6 +1461,7 @@ class KnowledgeGraph:
                     " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
                     " UNION SELECT subject_id FROM relations WHERE status='accepted'"
                     " UNION SELECT object_id FROM relations WHERE status='accepted'")}
+                prog.stage("building the graph", total=len(readable), unit="documents")
                 records: List[Tuple[Record, str, str]] = []
                 self._people, self._people_all, self._asked = {}, {}, {}
                 clash: set = set()
@@ -1450,6 +1500,7 @@ class KnowledgeGraph:
                         stats["workbooks"] += 1
                         stats["pictures"] += int(summary.get("pictures") or 0)
                         stats["pictures_read"] += int(summary.get("pictures_read") or 0)
+                    prog.advance()
                     for rec in recs:
                         if rec.kind == "skipped":
                             stats["skipped_rows"].append(
@@ -1497,12 +1548,16 @@ class KnowledgeGraph:
                 self.db.execute(
                     "DELETE FROM extraction_docs WHERE document_id NOT IN"
                     " (SELECT id FROM documents WHERE status != 'missing')")
+                prog.update(f"linking {len(records)} records", force=True)
                 self._seed_records(records, run_id)
                 self._finish_initials()
                 if use_collections:
+                    prog.update("Collections")
                     stats["collections"] = self._seed_collections(run_id)
                 if gazetteer:
-                    stats["gazetteer_mentions"] = self._gazetteer(files, run_id)
+                    prog.stage("finding known names in the text", total=len(files),
+                               unit="files")
+                    stats["gazetteer_mentions"] = self._gazetteer(files, run_id, prog)
                 # Still pending: no document gave evidence this run. One a model
                 # proposed (KG2 evidence is kept across runs) is a suggestion; the
                 # rest - the document changed or the rule was withdrawn - go. The
@@ -1853,7 +1908,7 @@ class KnowledgeGraph:
                 pre.add(r["entity_id"])
         return pre.pop() if len(pre) == 1 else None
 
-    def _gazetteer(self, files: Sequence[Path], run_id: str) -> int:
+    def _gazetteer(self, files: Sequence[Path], run_id: str, prog=None) -> int:
         """Plain search of every text document for every known name and code,
         so a person or part is found where no label points at it. Mentions
         only — a link needs a label, a Collection, the user or (KG2) a model.
@@ -1893,6 +1948,8 @@ class KnowledgeGraph:
                     self.resolve(r["id"]))
         n = 0
         for p in files:
+            if prog is not None:
+                prog.advance()
             # A CSV is read by column. A workbook's free text (notes cells,
             # text boxes, pictures) is searched like any document's lines.
             if p.suffix.lower() in _CSV:
@@ -2369,6 +2426,27 @@ class KnowledgeGraph:
                           on_progress=None, should_stop=lambda: False,
                           only_new: bool = True, max_lines: int = 40,
                           overlap: int = 5) -> Dict[str, Any]:
+        """_suggest_from_text, with progress lines in the terminal (finding
+        passages, then each passage a model has read, with %, and a "still
+        working" line while a model is thinking)."""
+        from progress_report import Progress
+        with Progress(f"kg suggest links ({model})") as prog:
+            token = _PROGRESS.set(prog)
+            try:
+                stats = self._suggest_from_text(
+                    workers, model=model, on_progress=on_progress, should_stop=should_stop,
+                    only_new=only_new, max_lines=max_lines, overlap=overlap)
+            finally:
+                _PROGRESS.reset(token)
+            prog.finish(f"{stats['done']} of {stats['chunks']} passages read, "
+                        f"{stats['links']} link(s) suggested"
+                        + (" - stopped, run again to continue" if stats["stopped"] else ""))
+            return stats
+
+    def _suggest_from_text(self, workers: Dict[str, Any], *, model: str,
+                           on_progress=None, should_stop=lambda: False,
+                           only_new: bool = True, max_lines: int = 40,
+                           overlap: int = 5) -> Dict[str, Any]:
         """Ask a model for links in the free text; every surviving link lands
         as SUGGESTED (method 'model', the model's name, the quote, the line
         the Council found). ``workers`` maps a worker name ('this PC',
@@ -2406,8 +2484,14 @@ class KnowledgeGraph:
         index = self._project_index()
         todo = []
         read = skipped = 0
+        prog = progress_now()
+        docs = self._text_documents()
+        if prog is not None:
+            prog.stage("finding passages", total=len(docs), unit="documents")
         with self.db:
-            for d in self._text_documents():
+            for d in docs:
+                if prog is not None:
+                    prog.advance(what=self.display_path(d["path"]))
                 ments, doc_ents = self._doc_context(d)
                 sig = self._doc_sig(d, ments, doc_ents, index["sig"], max_lines, overlap)
                 prev = self.db.execute("SELECT sig, chunks FROM extraction_docs WHERE"
@@ -2436,6 +2520,8 @@ class KnowledgeGraph:
         with self.db:
             self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
                             (run_id, f"extract:{model}", time.time()))
+        if prog is not None:
+            prog.stage("asking the model", total=len(todo), unit="passages")
         jobs: "_queue.Queue" = _queue.Queue()
         for c in todo:
             jobs.put(c)
@@ -2481,6 +2567,8 @@ class KnowledgeGraph:
             stats["rejected"] += len(res.rejected)
             stats["errors"] += bool(res.error)
             stats["by_worker"][name] = stats["by_worker"].get(name, 0) + 1
+            if prog is not None:
+                prog.advance(what=f"{self.display_path(c['path'])} read by {name}")
             if on_progress:
                 on_progress(stats["done"], stats["chunks"], name)
         stats["stopped"] = stats["done"] < stats["chunks"]
