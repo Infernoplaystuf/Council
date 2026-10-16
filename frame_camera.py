@@ -1718,7 +1718,7 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     else:
         line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}
-    if meta.get("kind") == "event" and not quiet:
+    if frame is not None and _can("events") and not quiet:
         line += f" · {meta.get('events', 0)} events/window"
     setup = getattr(session.device, "capture", None)
     if setup is not None and setup.triggered:
@@ -2942,7 +2942,7 @@ def _status_line(stats: Any, frame: Any) -> str:
         head, sep, rest = line.partition(" · ")
         line = f"{head}{note}{sep}{rest}"
     meta = getattr(frame, "meta", None) or {}
-    if meta.get("kind") == "event":
+    if frame is not None and _can("events"):
         # An event camera has no frame rate. What the number above counts is
         # accumulation windows; the event rate is the sensor's own measure.
         line += f" · {meta.get('events', 0)} events/window"
@@ -4430,7 +4430,7 @@ def set_frame_rate(value: Any) -> Dict[str, Any]:
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"frame rate: {exc}") from exc
     said = f"{got:.1f} fps" if got else "the camera's own rate"
-    if getattr(getattr(device, "info", None), "kind", "") == "event" and got:
+    if _can("events") and got:
         said += f" ({1000.0 / got:.1f} ms windows)"
     return _box_written("frame_rate", {"frame_rate": f"{got:.1f}",
                                        "summary": f"Frame rate: {said}."})
@@ -4501,7 +4501,7 @@ def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"frame rate: {exc}") from exc
 
-    event = getattr(getattr(device, "info", None), "kind", "") == "event"
+    event = _can("events")
     if fps <= 0:
         # No number: a camera whose cap was just lifted may still report the
         # old setpoint as its rate (the emulator does), and "own rate (25)"
@@ -4601,3 +4601,12 @@ def _require_session() -> Any:
     if session is None:
         raise RuntimeError("connect a camera first")
     return session
+
+
+def _can(capability: str) -> bool:
+    """Whether the active camera can do `capability` ("events", "frames",
+    "restartable", ...; council_core.camera_capabilities) — the question
+    asked where this module once asked "is it an event camera?" (plugin
+    design 2.4 item 4). Its camera slot answers: what the camera's plugin
+    confirmed when it opened it, else what the camera says of itself."""
+    return capability in _RIG.active.capabilities

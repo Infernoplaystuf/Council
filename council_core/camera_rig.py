@@ -43,6 +43,13 @@ first use; each slot's `plugin_state` is a plugin's per-camera state.
 Nothing in frame_camera calls the host yet: no plugin is wired to a feature
 before stage P2.
 
+CAPABILITIES (stage P2 row 1)
+A slot answers what its camera can do (`capabilities`: frames or events,
+restartable, ...; council_core.camera_capabilities): what the camera plugin
+that opened it confirmed (`confirm`, the host's open_camera), else what the
+camera says of itself. frame_camera asks it where it once asked "is it an
+event camera?".
+
 NOT YET (later rows of M1 / P1)
 frame_camera still locks with its one module-level `_LOCK`; each slot has a
 `lock` of its own for when the functions take a slot. Start, Stop and
@@ -71,7 +78,7 @@ ROLES = ("free", "leader", "follower")
 #: Names the slot and the rig keep for themselves; `_Live` may not declare a
 #: field by any of them (checked when a rig is made).
 SLOT_OWN = frozenset({"id", "name", "role", "lock", "plugin_state", "clear",
-                      "_reset"})
+                      "_reset", "confirmed", "capabilities", "confirm"})
 RIG_OWN = frozenset({"slots", "active", "slot_fields", "rig_fields",
                      "add_slot", "select", "slot", "remove_slot", "names",
                      "connected", "_reset", "_lock", "plugins", "_plugins"})
@@ -121,11 +128,38 @@ class CameraSlot:
         self.role = "free"
         self.lock = threading.RLock()
         self.plugin_state: Dict[str, Dict[str, Any]] = {}
+        #: What the camera plugin that opened this slot's camera confirmed
+        #: it can do, with the device it was confirmed for — (device,
+        #: capabilities) — or None (`capabilities`).
+        self.confirmed: Optional[Tuple[Any, FrozenSet[str]]] = None
         self._reset = reset
         reset(self)
 
     def clear(self) -> None:
         self._reset(self)
+
+    def confirm(self, device: Any, capabilities: Any) -> None:
+        """Keep what the camera plugin that opened `device` for this slot
+        confirmed it can do (plugin design 3.4); asked by `capabilities`
+        while that device is the slot's."""
+        self.confirmed = (device, frozenset(capabilities))
+
+    @property
+    def capabilities(self) -> FrozenSet[str]:
+        """What this slot's camera can do (plugin design 3.4, 5.1): what its
+        camera plugin confirmed when it opened it, else what the camera says
+        of itself (council_core.camera_capabilities.of_device — today's
+        Typhon, which opens cameras without the plugin host). Empty with no
+        camera. Asked where the code once asked "is it an event camera?"."""
+        device = getattr(self, "device", None)
+        if device is None:
+            return frozenset()
+        confirmed = self.confirmed
+        if confirmed is not None and confirmed[0] is device:
+            return confirmed[1]
+        from .camera_capabilities import of_device
+
+        return of_device(device, getattr(self, "info", None))
 
     def __repr__(self) -> str:
         return (f"<CameraSlot {self.name} id={self.id} role={self.role} "

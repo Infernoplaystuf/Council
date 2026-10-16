@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox,
                                QPlainTextEdit, QPushButton, QSplitter,
                                QVBoxLayout, QWidget)
 
-from council_core import cameras, capture, paths
+from council_core import camera_capabilities, cameras, capture, paths
 
 from .. import theme
 from ..view import ViewHelpers, amp
@@ -306,7 +306,9 @@ class CaptureTab(ViewHelpers, QWidget):
         if has_gain:
             self.gain.setRange(limits.gain[0], limits.gain[1])
 
-        is_event = self.device is not None and self.device.info.kind == "event"
+        # A capability question, not "is it an event camera?" (plugin
+        # design 2.4 item 4): the window is what an event stream has.
+        is_event = camera_capabilities.has(self.device, "events")
         for widget in (self.window_ms, self.window_label):
             widget.setVisible(is_event)
 
@@ -395,7 +397,8 @@ class CaptureTab(ViewHelpers, QWidget):
         # line's own): this said "N dropped" for the same number.
         line = stats.line()
         meta = getattr(frame, "meta", None) or {}
-        if meta.get("kind") == "event":
+        if frame is not None and camera_capabilities.has(self.device,
+                                                         "events"):
             rate = meta.get("event_rate_hz") or 0.0
             # Named for what it is. An event camera has no frame rate; what
             # the number above counts is accumulation windows.
