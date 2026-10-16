@@ -3,7 +3,8 @@ tools/typhon_plugins_gate.py — the branch gate of `typhon-plugins`.
 
 The plugin design (docs/typhon_plugins_design.md, 7.2) puts one gate on
 every commit of the branch: every existing Typhon test passes UNCHANGED,
-plus the branch's own tests and, from stage P3, the plugin contract suites.
+plus the branch's own tests and the plugin contract suites (the camera
+kind's from stage P2, the others' from P3).
 This runs exactly that set, one pytest process per file (a file's Qt, its
 camera fakes and its module state never leak into the next one), a few at a
 time, offscreen, each with its own temporary folder.
@@ -123,7 +124,8 @@ TYPHON_FILES = (
 )
 
 #: The branch's own test files: found by name, so a new one is in the gate
-#: the moment it exists. The contract suites (stage P3) join here.
+#: the moment it exists. The contract suites (tests/contracts/: the camera
+#: kind's from stage P2, the others' from P3) are among them.
 BRANCH_GLOBS = (
     "tests/test_typhon_plugins*.py",
     "tests/test_camera_rig*.py",
