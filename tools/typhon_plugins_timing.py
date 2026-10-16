@@ -40,6 +40,15 @@ process: the timer and the switch interval are per process. `timer_ms`
 records how long a 1 ms Event.wait really took (median of 50), which shows
 the timer in force.
 
+THE PC'S LOAD IS PART OF EVERY RESULT. The P1 review re-ran this on the
+same laptop and found a 5 ms plugin at today's settings making 0 of 600
+frames late where the first runs had 512-544: other work on the PC moves
+these numbers a great deal. So each run records how busy the whole PC was
+during its capture (`cpu_busy_pct`, from GetSystemTimes), the logical CPU
+count, how many processes ran, and the busiest other programs then
+(`busiest`, through psutil where it is installed). Compare runs only with
+their load beside them.
+
     python tools/typhon_plugins_timing.py                       # the matrix
     python tools/typhon_plugins_timing.py --repeats 1 --seconds 2
     python tools/typhon_plugins_timing.py --out results.json
@@ -137,6 +146,89 @@ def _event_wait_ms(n: int = 50) -> float:
         event.wait(0.001)
         took.append((time.perf_counter() - started) * 1000.0)
     return round(statistics.median(took), 3)
+
+
+def _system_times() -> Optional[tuple]:
+    """(idle, kernel, user) CPU time of the whole PC so far, in 100 ns
+    units (GetSystemTimes; kernel includes idle), or None off Windows."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    idle, kernel, user = (wintypes.FILETIME(), wintypes.FILETIME(),
+                          wintypes.FILETIME())
+    try:
+        ok = ctypes.WinDLL("kernel32").GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+    except (OSError, AttributeError):
+        return None
+    if not ok:
+        return None
+
+    def value(t: Any) -> int:
+        return (int(t.dwHighDateTime) << 32) | int(t.dwLowDateTime)
+    return value(idle), value(kernel), value(user)
+
+
+def cpu_busy_pct(before: Optional[tuple], after: Optional[tuple]
+                 ) -> Optional[float]:
+    """How busy the whole PC was between two _system_times(), in %."""
+    if not before or not after:
+        return None
+    idle = after[0] - before[0]
+    total = (after[1] - before[1]) + (after[2] - before[2])
+    if total <= 0:
+        return None
+    return round(100.0 * (1.0 - idle / total), 1)
+
+
+class Load:
+    """The PC's load over a capture: whole-PC CPU busy share, and the
+    busiest other programs (psutil, where installed: per-process CPU % over
+    the same window, 100 % = one logical CPU)."""
+
+    def __init__(self) -> None:
+        self._times: Optional[tuple] = None
+        self._procs: List[Any] = []
+        try:
+            import psutil                             # noqa: F401
+            self._psutil: Any = psutil
+        except ImportError:
+            self._psutil = None
+
+    def begin(self) -> None:
+        if self._psutil is not None:
+            self._procs = []
+            for proc in self._psutil.process_iter(["name"]):
+                try:
+                    proc.cpu_percent(None)            # primes its counter
+                    self._procs.append(proc)
+                except Exception:                     # noqa: BLE001
+                    pass
+        self._times = _system_times()
+
+    def end(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "cpu_busy_pct": cpu_busy_pct(self._times, _system_times()),
+            "logical_cpus": os.cpu_count()}
+        if self._psutil is None:
+            return out
+        me = os.getpid()
+        busy = []
+        for proc in self._procs:
+            try:
+                share = proc.cpu_percent(None)
+                # pid 0 is Windows' "System Idle Process": idle time.
+                if proc.pid not in (0, me) and share >= 5.0:
+                    busy.append((round(share, 1), proc.info.get("name")
+                                 or str(proc.pid)))
+            except Exception:                         # noqa: BLE001
+                pass
+        busy.sort(reverse=True)
+        out["processes"] = len(self._procs)
+        out["busiest"] = [f"{name} {share:g}%" for share, name in busy[:6]]
+        return out
 
 
 def _percentile(values: List[float], q: float) -> float:
@@ -268,8 +360,10 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     folder = Path(spec["folder"])
     window.ports.capture_folder.set(str(folder))
+    load = Load()
 
     def begin() -> None:
+        load.begin()
         slot.session.on_frame = on_frame
         window.on_btn_start_capture()
         recording["on"] = True
@@ -279,6 +373,7 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     def finish() -> None:
         recording["on"] = False
+        held["load"] = load.end()
         held["session"] = slot.session
         window.on_btn_stop_capture()
         deadline = time.monotonic() + 30
@@ -314,6 +409,7 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
         "not_saved_storage": stats.skipped,
         "faults": sorted(host.faults),
     })
+    out.update(held.get("load") or {})
     try:
         import PySide6
 
@@ -401,7 +497,10 @@ def row(r: Dict[str, Any]) -> str:
             f"{r['saved']}/{r['grabbed']}  timer {r['timer_resolution_ms']}"
             f" ms, 1ms-wait {r['event_wait_1ms']:.2f} ms  plugin "
             f"{feed.get('delivered', '-')} calls, "
-            f"{feed.get('dropped', '-')} dropped")
+            f"{feed.get('dropped', '-')} dropped  PC busy "
+            f"{r.get('cpu_busy_pct', '?')}%"
+            + (f" ({', '.join(r['busiest'][:3])})" if r.get("busiest")
+               else ""))
 
 
 def main(argv: Optional[List[str]] = None) -> int:

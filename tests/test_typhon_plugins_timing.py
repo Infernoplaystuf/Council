@@ -44,8 +44,14 @@ def test_one_run_measures_a_capture_in_the_built_app(tmp_path):
     assert said["saved"] == said["grabbed"] >= said["frames"]
     assert said["feed"]["delivered"] > 0 and said["faults"] == []
     for key in ("late", "late_2", "median_ms", "p99_ms", "max_ms",
-                "read_late", "event_wait_1ms", "switch_interval_ms"):
+                "read_late", "event_wait_1ms", "switch_interval_ms",
+                "cpu_busy_pct", "logical_cpus"):
         assert key in said, key
+    if os.name == "nt":
+        # The PC's load is part of every result (P1 review: the same 5 ms
+        # plugin made 0 or 512-544 frames late on the same laptop).
+        assert 0.0 <= said["cpu_busy_pct"] <= 100.0
+    assert "PC busy" in timing.row(said)
     assert len(list((tmp_path / "runs").glob("*_frame_*.png"))) == \
         said["saved"]
     assert timing.row(said).split()[:2] == ["default", "noop"]
@@ -56,3 +62,17 @@ def test_the_matrix_names_only_what_it_knows():
     assert timing.PLUGINS["slow20cap"] == (20.0, 0.25)
     assert timing._percentile([1, 2, 3, 4, 5], 0.99) == 5
     assert timing._percentile([], 0.5) == 0.0
+
+
+def test_the_pcs_load_is_read_from_its_cpu_times():
+    # (idle, kernel incl. idle, user): 30 idle of 100 = 70 % busy.
+    assert timing.cpu_busy_pct((0, 0, 0), (30, 60, 40)) == 70.0
+    assert timing.cpu_busy_pct(None, (1, 2, 3)) is None
+    assert timing.cpu_busy_pct((5, 5, 5), (5, 5, 5)) is None
+    load = timing.Load()
+    load.begin()
+    sum(range(200000))
+    said = load.end()
+    assert said["logical_cpus"] == os.cpu_count()
+    if os.name == "nt":
+        assert 0.0 <= said["cpu_busy_pct"] <= 100.0
