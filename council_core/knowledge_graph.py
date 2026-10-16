@@ -604,7 +604,7 @@ def _signed_initials(v: Value) -> bool:
     if v.rule.label != INSPECTOR.label:
         return False
     from council_core import kg_excel
-    return kg_excel.is_initials(v.raw)
+    return kg_excel.is_initials(v.raw, loose=True)
 
 
 def _ledger_people(csv_path: Path) -> Dict[str, str]:

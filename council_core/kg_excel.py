@@ -131,12 +131,27 @@ def _norm(v) -> str:
     return fs._norm_key(_label_text(v))
 
 
-def is_initials(s: Any) -> bool:
-    """'JB', 'jb', 'J.B.', 'JMB' — what an inspector signs with. A short
-    capitalised word ('Bob', 'Ann') is a name, not initials."""
-    raw = str(s or "").strip()
+#: Short words a results column holds that are not anyone's initials.
+_NOT_INITIALS = {"seen", "ok", "okay", "yes", "no", "na", "n a", "tbd", "pass", "fail",
+                 "none", "nil", "good", "bad", "done", "open", "x", "y", "n", "nde", "fpi",
+                 "ec", "date", "flaw", "part", "run", "item", "id"}
+
+
+def is_initials(s: Any, loose: bool = False) -> bool:
+    """'JB', 'J.B.', 'JMB', 'j.b.' — what an inspector signs with: capitals,
+    or letters with dots. ``loose`` (a cell under an 'Inspector' label) also
+    takes 'jb', but never a word a results column holds ('seen', 'ok'). A
+    short capitalised word ('Bob', 'Ann') is a name, not initials."""
+    raw = " ".join(str(s or "").split())
     t = re.sub(r"[.\s]", "", raw)
-    return bool(re.fullmatch(r"[A-Za-z]{1,4}", t)) and not re.fullmatch(r"[A-Z][a-z]{2,}", raw)
+    if not re.fullmatch(r"[A-Za-z]{1,4}", t) or re.fullmatch(r"[A-Z][a-z]{2,}", raw):
+        return False
+    word = t.lower() in _NOT_INITIALS
+    if re.fullmatch(r"(?:[A-Z]\.?\s?){1,4}", raw):          # JB, J.B., J B
+        return not word or loose      # 'EC' signs under an Inspector label
+    if re.fullmatch(r"(?:[A-Za-z]\.\s?){1,4}", raw):        # j.b.
+        return True
+    return loose and raw.islower() and not word            # jb, never 'seen'
 
 
 def initials_key(s: Any) -> str:
@@ -160,17 +175,25 @@ def person_ok(s: Any) -> bool:
 
 
 def split_people(s: Any) -> List[str]:
-    """'JB/MK' (two inspectors who agreed), 'JB, MK', 'JB & MK' -> each one;
-    a name stays whole ('Lee, Carol')."""
+    """Who signed, from a cell under an 'Inspector' / 'Initials' label: 'JB/MK'
+    (two inspectors who agreed), 'JB, MK', 'JB & MK' -> each one, initials in
+    capitals ('jb' -> 'JB'); a name stays whole ('Lee, Carol'). Anything else
+    ('seen', '63', a date) is nobody."""
     raw = " ".join(str(s or "").split())
     if not raw:
         return []
     parts = [p.strip() for p in re.split(r"\s*(?:/|&|;|\band\b)\s*", raw) if p.strip()]
     if len(parts) == 1 and "," in raw:
         bits = [b.strip() for b in raw.split(",") if b.strip()]
-        if bits and all(is_initials(b) for b in bits):
+        if bits and all(is_initials(b, loose=True) for b in bits):
             parts = bits
-    return [p for p in parts if person_ok(p)]
+    out = []
+    for p in parts:
+        if is_initials(p, loose=True):
+            out.append(initials_key(p))
+        elif person_ok(p):
+            out.append(p)
+    return out
 
 
 def _who_head(v) -> bool:
@@ -179,14 +202,14 @@ def _who_head(v) -> bool:
     return isinstance(v, str) and bool(_se()._WHO_HEAD.match(v))
 
 
-def _who_inline(v) -> str:
-    """'Operator: JB', 'Inspected by MK' -> the person, as the Ledger reads it."""
+def _who_inline(v) -> List[str]:
+    """'Operator: JB', 'Inspected by MK', 'Inspector: JB/MK' -> the people,
+    as the Ledger reads them."""
     if not isinstance(v, str):
-        return ""
+        return []
     se = _se()
     m = se._WHO_INLINE.match(v) or se._WHO_BY.match(v)
-    who = m.group("who").strip() if m else ""
-    return who if person_ok(who) else ""
+    return split_people(m.group("who")) if m else []
 
 
 # ── Ledgers ──────────────────────────────────────────────────────────────
@@ -416,8 +439,8 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
 
         def add_person(who: str, col: str, shown: str, src_key: Tuple[str, str]):
             nonlocal located
-            key = initials_key(who) if is_initials(who) else who
-            slot = who_vals.setdefault(key, {"raw": key if is_initials(who) else who,
+            key = initials_key(who) if is_initials(who, loose=True) else who
+            slot = who_vals.setdefault(key, {"raw": key if is_initials(who, loose=True) else who,
                                              "cols": [], "quotes": [], "from": []})
             if col not in slot["cols"]:
                 slot["cols"].append(col)
@@ -508,6 +531,7 @@ class _GridReader:
         self.n_tables = 0
         self.n_forms = 0
         self.taken: set = set()          # cells a form above already used
+        self.lines_dropped = 0
         self._pending: Optional[Tuple[int, Dict[int, Any]]] = None
         self._person_cols: Dict[int, Tuple[str, Dict[str, Any]]] = {}
 
@@ -669,8 +693,11 @@ class _GridReader:
                 continue
             loc = self._loc(r, c, label, header=t.header_row)
             tent = t.tentative or rule is kgm.INSPECTOR
-            ones = [x for x in (split_people(raw) if rule is kgm.INSPECTOR
-                                else _split(raw, rule)) if plausible(rule, x)]
+            # Under a firm header the column says what a cell is (as a CSV's
+            # does); a tentative reading takes only values that read as one.
+            ones = (split_people(raw) if rule is kgm.INSPECTOR else _split(raw, rule))
+            if t.tentative:
+                ones = [x for x in ones if plausible(rule, x)]
             if ones:
                 at.add(c)
             has_person = has_person or (rule.type == "PERSON" and bool(ones))
@@ -705,7 +732,8 @@ class _GridReader:
                 continue
             who = _who_inline(v)
             if who:
-                self._marker(r, c, who, v.strip())
+                for one in who:
+                    self._marker(r, c, one, v.strip())
                 at.add(c)
                 continue
             lab, inline = _se()._split_inline(v)
@@ -792,6 +820,7 @@ class _GridReader:
         loc = self._loc(r, c, "who")
         loc.pop("column", None)
         self.markers.append((r, c, who, loc, snippet))
+        self.n_forms += 1
 
     def _label(self, text) -> None:
         t = _label_text(text)
@@ -807,8 +836,10 @@ class _GridReader:
             s = " ".join(v.split())
             if self.text_all or len(s.split()) >= LONG_TEXT_WORDS:
                 bits.append(s)
-        if bits:
+        if bits and len(self.lines) < MAX_LINES:
             self.lines.append((self.name, r, " | ".join(bits)))
+        elif bits:
+            self.lines_dropped += 1
 
     # -- the sheet's own record --
     def sheet_record(self, sheet_part: str) -> Optional["kgm.Record"]:
@@ -819,11 +850,11 @@ class _GridReader:
         vals = list(self.forms)
         seen = set()
         for _r, _c, who, loc, snip in self.markers:
-            key = initials_key(who) if is_initials(who) else who
+            key = initials_key(who) if is_initials(who, loose=True) else who
             if key in seen:
                 continue
             seen.add(key)
-            vals.append(kgm.Value(kgm.INSPECTOR, key if is_initials(who) else who,
+            vals.append(kgm.Value(kgm.INSPECTOR, key if is_initials(who, loose=True) else who,
                                   loc, snip, True))
         if sheet_part and not any(v.rule.type == "PART" for v in vals) and \
                 any(v.rule.type in ("PERSON", "PROJECT") for v in vals):
@@ -950,57 +981,25 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
     if kind == "password":
         raise Unreadable("has a password to open, so it was not read (open it in Excel "
                          "and save a copy without the password)", permanent=True)
-    if kind == "unknown":
-        raise Unreadable("is not a workbook that Excel or openpyxl can read",
-                         permanent=True)
-    notes: List[str] = []
     suf = p.suffix.lower()
+    # Not a zip and not an Excel container: the Ledger hands such a file to
+    # Excel (an old XML spreadsheet opens there); with no Excel, it is
+    # unreadable for good.
+    if kind == "unknown" and not excel_open.excel_available():
+        raise Unreadable("is not a workbook openpyxl can read (and Excel, which might "
+                         "open it, is not available here)", permanent=True)
+    notes: List[str] = []
     via_excel = kind != "zip" or suf in (".xls", ".xlsb")
     summary: Dict[str, Any] = {"kind": "workbook", "sheets": 0, "text_boxes": 0,
                                "charts": 0, "pictures": 0, "pictures_read": 0,
                                "tables": 0, "rows": 0, "forms": 0, "people": [],
                                "image_reader": getattr(image_reader, "name", "") or ""}
-    sources: List[Tuple[str, Iterable, str]] = []      # (name, rows, image anchor)
-    images = []
-    if not via_excel and _sheet_xml_bytes(p) > STREAM_XML_BYTES:
-        summary["opened_with"] = "openpyxl, one row at a time (a big workbook)"
-        notes.append("a big workbook: read one row at a time, without merged cells "
-                     "or pictures")
-        try:
-            sheets = list(_stream_sheets(p, notes))
-        except Exception as exc:
-            raise Unreadable(f"could not be opened ({exc.__class__.__name__})",
-                             permanent=True) from exc
-        sources = [(name, rows, "") for name, rows in sheets]
-        try:
-            extras = excel_open.zip_extras(p)
-        except Exception:
-            extras = []
-        sources += [(ex.name, _grid_rows(ex.cells), "") for ex in extras]
-    elif via_excel and not excel_open.excel_available() and suf == ".xls":
-        summary["opened_with"] = "xlrd (Excel is not installed: no text boxes, charts "\
-                                 "or pictures)"
-        try:
-            grids = _legacy_grids(p)
-        except Exception as exc:
-            raise Unreadable(f"could not be read ({exc.__class__.__name__})",
-                             permanent=True) from exc
-        sources = [(name, _grid_rows(cells), "") for name, cells in grids]
-    else:
-        summary["opened_with"] = "Excel (hidden, read-only)" if via_excel else "openpyxl"
-        try:
-            grids, images = se.load_workbook_grids(p, notes,
-                                                   want_pictures=image_reader is not None)
-        except se.LedgerError as exc:
-            raise Unreadable(str(exc).replace(f"{p.name} ", "", 1) if str(exc).startswith(p.name)
-                             else str(exc), permanent=not via_excel) from exc
-        sources = [(g.sheet, _grid_rows(g.cells), "") for g in grids]
     readers: List[Tuple[_GridReader, str]] = []
 
     def run(name: str, rows: Iterable, image: str = "", parent: str = "") -> None:
         is_extra = " › " in name and not image
         gr = _GridReader(name, by_norm, rel, tentative=bool(image), image=image,
-                         text_all=is_extra and "text box" in name)
+                         text_all=is_extra and "text box" in name, sheet=parent or name)
         for r, cells in rows:
             gr.feed(r, cells)
         gr.close()
@@ -1014,8 +1013,50 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         else:
             summary["sheets"] += 1
 
-    for name, rows, _img in sources:
-        run(name, rows)
+    images = []
+    if not via_excel and _sheet_xml_bytes(p) > STREAM_XML_BYTES:
+        summary["opened_with"] = "openpyxl, one row at a time (a big workbook)"
+        notes.append("a big workbook: read one row at a time, without merged cells "
+                     "or pictures")
+        try:
+            # read while the workbook is open: _stream_sheets closes it
+            # after its last sheet
+            for name, rows in _stream_sheets(p, notes):
+                run(name, rows)
+        except Exception as exc:
+            raise Unreadable(f"could not be opened ({exc.__class__.__name__})",
+                             permanent=True) from exc
+        try:
+            extras = excel_open.zip_extras(p)
+        except Exception:
+            extras = []
+        for ex in extras:
+            run(ex.name, _grid_rows(ex.cells))
+    elif via_excel and suf == ".xls" and not excel_open.excel_available():
+        summary["opened_with"] = "xlrd (Excel is not installed: no text boxes, charts "\
+                                 "or pictures)"
+        try:
+            grids = _legacy_grids(p)
+        except Exception as exc:
+            raise Unreadable(f"could not be read ({exc.__class__.__name__})",
+                             permanent=True) from exc
+        for name, cells in grids:
+            run(name, _grid_rows(cells))
+    else:
+        summary["opened_with"] = "Excel (hidden, read-only)" if via_excel else "openpyxl"
+        try:
+            # openpyxl lists an .xlsx's pictures for free, so a missing reader
+            # can be named; Excel copies each one through the clipboard, so
+            # it is asked for them only when something can read them.
+            grids, images = se.load_workbook_grids(
+                p, notes, want_pictures=image_reader is not None or not via_excel)
+        except se.LedgerError as exc:
+            # openpyxl refusing the bytes is for good; Excel failing may not be
+            # (busy, asking to sign in), so that is tried again next time.
+            raise Unreadable(str(exc), permanent=not via_excel) from exc
+        for g in grids:
+            run(g.sheet, _grid_rows(g.cells))
+        del grids
     summary["pictures"] = len(images)
     if images and image_reader is None:
         notes.append(f"{len(images)} picture(s) not read: install Tesseract (local OCR) "
@@ -1050,16 +1091,13 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
                 labels.setdefault(k, t)
         summary["tables"] += gr.n_tables
         summary["forms"] += gr.n_forms
-        for rr in gr.records:
-            summary["rows"] += 1
-        for rr in records:
-            pass
+        summary["rows"] += len(gr.records)
     for rec in records:
         for v in rec.values:
             if v.rule.type == "PERSON":
                 people.add(v.raw)
     summary["people"] = sorted(people)
-    if len(lines) >= MAX_LINES:
+    if len(lines) >= MAX_LINES or any(gr.lines_dropped for gr, _p in readers):
         notes.append(f"only the first {MAX_LINES} lines of free text were kept")
     return Reading(records, lines, list(labels.values()), summary, notes)
 
