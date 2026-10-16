@@ -1008,9 +1008,15 @@ class PluginHost:
         and return the Device. With `camera` (a slot's name) the slot keeps
         the capabilities the plugin confirmed (CameraSlot.confirm); the
         caller puts the device in the slot, as Connect does. A camera's
-        refusal is a CameraError, as cameras.open_camera's is."""
+        refusal is a CameraError, as cameras.open_camera's is. A slot name
+        the rig does not have is refused before anything is opened."""
         from .cameras import CameraError
 
+        slot = None
+        if camera is not None:
+            slot = self._slot(camera)
+            if slot is None:
+                raise KeyError(f"no camera slot named {camera!r}")
         backend = str(getattr(info, "backend", "") or "")
         pid = self.camera_plugin_for(backend)
         if pid is None:
@@ -1018,11 +1024,9 @@ class PluginHost:
                               f"{backend!r} cameras")
         device = self.camera_call(pid, "open", info)
         caps = self.camera_capabilities(pid, device)
-        if camera is not None:
-            slot = self._slot(camera)
-            confirm = getattr(slot, "confirm", None)
-            if callable(confirm):
-                confirm(device, caps)
+        confirm = getattr(slot, "confirm", None)
+        if callable(confirm):
+            confirm(device, caps)
         return device
 
     def category_tables(self, pids: Optional[Sequence[str]] = None) -> Any:

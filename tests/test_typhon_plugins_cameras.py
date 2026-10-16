@@ -395,6 +395,14 @@ def test_a_camera_plugin_that_cannot_run_says_why_in_the_scan(host,
     assert "typhon.basler" not in host.camera_plugins()
 
 
+def test_a_slot_the_rig_lacks_is_refused_before_anything_opens(host):
+    hal = fake_rig.FakeHalModule(["00051234"])
+    host.instance("typhon.prophesee").sdk = hal
+    with pytest.raises(KeyError, match="cam9"):
+        host.open_camera(fake_rig.unit_info("00051234"), camera="cam9")
+    assert hal.opened == []
+
+
 def test_no_camera_plugin_for_a_backend_is_a_camera_error(host):
     with pytest.raises(cameras.CameraError, match="no camera plugin"):
         host.open_camera(cameras.CameraInfo("acme.thermal", "t1"))

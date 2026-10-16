@@ -9,13 +9,16 @@ WHAT EACH IS
     settings use) with a SERIAL of its own, and the three facilities a rig
     needs that the fake lacked: Trigger In (I_TriggerIn), the sync mode
     (I_CameraSynchronization) and the external-trigger decoder
-    (I_EventDecoder_EventExtTrigger). Shaped like OpenEB 5.2's bindings,
-    measured in the `pylon` env: TriggerIn.enable/disable/is_enabled take a
+    (I_EventDecoder_EventExtTrigger). Shaped like OpenEB 5.2's bindings, as
+    read from them in the `pylon` env (their names and signatures; the
+    trigger event's dtype): TriggerIn.enable/disable/is_enabled take a
     Channel (MAIN, AUX, LOOPBACK) and return a bool; the sync facility has
     set_mode_standalone/master/slave (bool) and get_mode; a trigger event is
     (p, t, id) in a 24-byte record. get_mode's SyncMode is NOT bound to
-    Python in those bindings (its return type has no binding), so the fake's
-    is its own small enum.
+    Python in those bindings (get_mode is declared to return the C++ enum,
+    and no SyncMode is bound anywhere in metavision_hal — read from the
+    bindings, not called: there is no EVK4), so the fake's is its own small
+    enum.
   * FakeHalModule — a metavision_hal stand-in that LISTS and OPENS several
     units by serial, for cameras.EvkBackend(sdk=...) and the Prophesee
     plugin's `sdk`.
