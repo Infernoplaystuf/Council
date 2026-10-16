@@ -59,6 +59,36 @@ def test_the_gate_holds_the_branchs_own_tests():
     assert files[:len(gate.TYPHON_FILES)] == list(gate.TYPHON_FILES)
 
 
+def test_the_gate_holds_the_policy_test_before_qt_migration_needs_it():
+    """qt-migration's policy-gate fix makes tests/test_gui_policy.py build
+    every example through gui_examples.names() and name frame_camera, so
+    merging it would stop the gate ('names Typhon but is not in the gate')
+    until the file was listed (P1 review, 16 October 2026). It is listed
+    already: it builds and policy-checks every example, typhon_plugins
+    included."""
+    assert "tests/test_gui_policy.py" in gate.TYPHON_FILES
+
+
+def test_todays_typhon_lists_no_plugin_module_among_its_python_scripts(
+        tmp_path):
+    """Settings > Python Scripts follows import statements and constant
+    import_module() names from the app's files. The rig's lazy import of the
+    plugin host put the host, the lists, the manifest reader, the plugin API
+    and python_envs on today's Typhon's list, which never loads them, and
+    made the cold list slower (P1 review: 35 files to 41 for the typhon
+    example). Only the rig itself is new on the list."""
+    import gui_settings
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "app.py").write_text("import frame_camera\n", encoding="utf-8")
+    names = {s.name for s in gui_settings.scripts_in_use(app, ROOT,
+                                                         modules={})}
+    assert "frame_camera" in names and "council_core.camera_rig" in names
+    for gone in ("council_core.plugin_host", "council_core.plugin_lists",
+                 "council_core.plugin_manifest", "typhon_plugin_api"):
+        assert gone not in names, gone
+
+
 def test_a_new_typhon_test_file_left_out_is_named(tmp_path):
     (tmp_path / "tests").mkdir()
     for f in gate.TYPHON_FILES:

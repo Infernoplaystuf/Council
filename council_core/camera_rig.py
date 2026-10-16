@@ -166,12 +166,22 @@ class Rig:
         """The plugin host (council_core.plugin_host.PluginHost): the rig IS
         the plugin host (plugin design 5.1). Made on first use, and reading
         nothing until asked, so a window that never uses a plugin pays
-        nothing for it."""
+        nothing for it.
+
+        Imported by a name built at run time, on purpose: Settings > Python
+        Scripts (gui_settings.scripts_in_use) follows import statements and
+        constant import_module() names, and a plain import here put the
+        host, the plugin lists, the manifest reader, the plugin API and
+        python_envs on the list of every app that links frame_camera —
+        today's Typhon among them, which never loads them — and made that
+        list slower to build (P1 review, 16 October 2026). Once a plugin
+        is loaded, the list shows its modules as loaded ones."""
         with self._lock:
             if self._plugins is None:
-                from .plugin_host import PluginHost
+                import importlib
 
-                self._plugins = PluginHost(self)
+                host = importlib.import_module(f"{__package__}.plugin_host")
+                self._plugins = host.PluginHost(self)
             return self._plugins
 
     # -- slots ---------------------------------------------------------

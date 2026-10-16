@@ -100,6 +100,10 @@ TYPHON_FILES = (
     "tests/test_designer_codebehind.py",
     "tests/test_gui_settings.py",
     "tests/test_gui_smoke.py",
+    # builds and policy-checks every example, typhon_plugins included, once
+    # qt-migration's policy-gate fix (e40d319, 6884069) is merged: listed
+    # before that merge, which would otherwise stop --check-list
+    "tests/test_gui_policy.py",
     "tests/test_gui_examples.py",
     "tests/test_qt_wireframes.py",
     "tests/test_qt_target.py",
