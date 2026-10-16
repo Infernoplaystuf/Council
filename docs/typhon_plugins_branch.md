@@ -210,6 +210,21 @@ capabilities, the registry, the rig fakes and the contract suite), 1,233
 passed, 0 failed, 1 skipped (that same check), in 549 s; the contract suite
 there ran its pylon-emulator cases and the real-`.raw` replays.
 
+The whole suite after P2 rows 1 and 2, on 9a9a2e3, 8 at a time: 237 files,
+8,370 passed, 22 failed, 39 skipped, and `smoke_test.py` passed 1,313 with 0
+failed. Six failures were timing tests under that load, and their files
+passed whole when run alone: `tests/test_frame_camera.py::
+test_the_fps_box_changes_the_recording_rate_mid_capture` (17.9 fps against
+21), three in `tests/test_frame_camera_setup.py`
+(`test_a_frame_camera_preset_restarts_the_live_view_once`,
+`test_a_slow_camera_does_not_hold_the_window`,
+`test_a_slow_read_of_the_camera_at_start_is_not_capture_time`), and one
+each in `tests/test_council_tab.py` and `tests/test_fanout.py`. The other
+16 are `tests/test_pi_remote.py`'s, which fail alone too, and fail the same
+on e073a24 (the last commit of P1): their fakes run through WSL's bash
+(`WindowsApps\bash.EXE`), which did not find the tests' `C:/` temporary
+paths. Neither file touches the camera code.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
