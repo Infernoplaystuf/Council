@@ -507,3 +507,57 @@ def test_run_tests_still_runs_a_code_project_s_tests(box, tmp_path):
     ok, msg, payload = tools.for_role("coder")["run_tests"](
         {"path": "test_calc.py"})
     assert ok and payload["passed"], msg
+
+
+# An ALIAS of a protected root, and store targets other than a plain `=`,
+# were the gaps the review of the Path-rebinding fix found (2026-10-16): the
+# check protected the names pd/np/Path/pathlib, not `P = Path` / `C =
+# type(Path('.'))` / `X = pathlib.Path`, and not a for-loop / comprehension /
+# with-as / unpacking target. Each alias route, through each read surface,
+# fails through run_python — refused before it reads or prints, no secret
+# leaked.
+ALIAS_REBINDS = [
+    "P = Path\nP.relative_to = lambda self, *a, **k: self",
+    "P = Path\nQ = P\nQ.resolve = lambda self, *a, **k: self",
+    "C = type(Path('.'))\nC.relative_to = lambda self, *a, **k: self",
+    "import pathlib\nX = pathlib.PurePath\nX.relative_to = lambda self, *a, **k: self",
+    "from pathlib import Path as P2\nP2.resolve = lambda self, *a, **k: self",
+    "for Path.relative_to in [lambda self, *a, **k: self]:\n    break",
+    "Path.relative_to, _x = (lambda self, *a, **k: self), 1",
+]
+
+
+@pytest.mark.parametrize("rd", range(len(REBIND_READS)))
+@pytest.mark.parametrize("rb", range(len(ALIAS_REBINDS)))
+def test_an_alias_rebinding_read_fails_through_run_python(box, rb, rd,
+                                                          monkeypatch):
+    import vault_analyst as va
+    code = fill(ALIAS_REBINDS[rb] + "\n" + REBIND_READS[rd], box)
+    role = ("coder", "intern")[(rb + rd) % 2]
+    ok, msg, payload = member_tool(box, role)({"code": code})
+    assert not leaked(msg) and not leaked(payload), msg
+    assert payload["stdout"] == "", payload["stdout"]
+    assert not ok, msg
+    assert payload["rc"] == 1, msg
+    # the analyst sandbox refuses it directly too
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(box.vault))
+    rep: dict = {}
+    df, _log = va.execute_pandas_code(code, [box.data], report=rep)
+    assert df is None and not rep["ran"]
+
+
+def test_an_alias_and_target_computation_runs_through_run_python(box):
+    """`df = pd.read_csv(...)` is the model's own frame (a call result, not an
+    alias of pd), and plain for/comprehension/with/unpacking targets keep
+    working behind the fence."""
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "df = pd.read_csv('runs.csv')\n"
+        "df.columns = ['p', 'rt']\n"
+        "total = 0\n"
+        "for v in df['rt']:\n    total += int(v)\n"
+        "doubled = [int(v) * 2 for v in df['rt']]\n"
+        "lo, hi = df['rt'].min(), df['rt'].max()\n"
+        "with open('runs.csv') as f:\n    n_lines = len(f.read().splitlines())\n"
+        "print(total, sum(doubled), int(lo), int(hi), n_lines)\n")})
+    assert ok and payload["rc"] == 0, msg
+    assert "100 200 10 40 5" in payload["stdout"], payload["stdout"]

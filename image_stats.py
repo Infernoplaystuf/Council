@@ -13,6 +13,8 @@ downscaled before analysis so a 100-megapixel scan stays bounded.
 """
 from __future__ import annotations
 
+import io
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +22,63 @@ _IMAGE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
     ".tif", ".tiff", ".ico",
 }
+
+# The analyst sandbox hands these functions a path STRING it has already
+# confirmed is inside the data folders. They work on that string with os
+# functions bound here, at import, before any model code runs — never by
+# building a pathlib object from it — so nothing model code does to the
+# pathlib classes (or to a module attribute) can change which file is opened
+# or which folder is walked (2026-10-16).
+_ISFILE = os.path.isfile
+_ISDIR = os.path.isdir
+_BASENAME = os.path.basename
+_SPLITEXT = os.path.splitext
+_NORMCASE = os.path.normcase
+_REALPATH = os.path.realpath
+_COMMONPATH = os.path.commonpath
+_STAT = os.stat
+_SCANDIR = os.scandir
+_FSPATH = os.fspath
+_OPEN = io.open
+
+
+def _path_str(path: Any) -> str:
+    """``path`` as a plain string, taken once (a str is used as-is)."""
+    if isinstance(path, str):
+        return path
+    s = _FSPATH(path)
+    return s.decode("utf-8", "replace") if isinstance(s, bytes) else s
+
+
+def _walk_files(root: str, recursive: bool) -> List[str]:
+    """Every file under ``root`` as a path string — os.scandir only. A
+    sub-folder is entered only when it is not a link and its real path stays
+    inside ``root`` (a junction or link out of the folder is not followed)."""
+    root_real = _NORMCASE(_REALPATH(root))
+    out: List[str] = []
+    todo = [root]
+    while todo:
+        d = todo.pop()
+        try:
+            with _SCANDIR(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_file():
+                    out.append(e.path)
+                elif (recursive and e.is_dir(follow_symlinks=False)
+                        and not e.is_symlink()):
+                    real = _NORMCASE(_REALPATH(e.path))
+                    try:
+                        if _COMMONPATH([real, root_real]) == root_real:
+                            todo.append(e.path)
+                    except ValueError:
+                        continue
+            except OSError:
+                continue
+    return out
 
 
 def _imports():
@@ -41,12 +100,15 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
     if Image is None:
         return {"error": "Pillow + numpy are required for image stats "
                          "(pip install pillow numpy)."}
-    p = Path(path)
-    if not p.is_file():
+    p = _path_str(path)
+    if not _ISFILE(p):
         return {"error": f"not a file: {p}"}
     try:
-        im = Image.open(p)
-        im.load()
+        # Pillow is given an open file, not the name: it never resolves or
+        # re-opens the path itself.
+        with _OPEN(p, "rb") as fh:
+            im = Image.open(fh)
+            im.load()
     except Exception as exc:
         return {"error": f"could not open image: {exc!r}"}
     fmt, mode = im.format, im.mode
@@ -83,11 +145,11 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
     except Exception as exc:
         return {"error": f"pixel analysis failed: {exc!r}"}
     try:
-        size_kb = round(p.stat().st_size / 1024.0, 1)
+        size_kb = round(_STAT(p).st_size / 1024.0, 1)
     except Exception:
         size_kb = None
     return {
-        "file": p.name, "format": fmt, "mode": mode,
+        "file": _BASENAME(p), "format": fmt, "mode": mode,
         "width": w, "height": h,
         "megapixels": round(w * h / 1e6, 3),
         "aspect_ratio": round(w / h, 3) if h else None,
@@ -103,15 +165,14 @@ def aggregate_image_folder(folder: Any, *, recursive: bool = True,
     distribution, width/height/brightness/contrast summaries, and the brightest
     / darkest files. Bounded to ``max_images``."""
     Image, np = _imports()
-    root = Path(folder)
-    if not root.is_dir():
+    root = _path_str(folder)
+    if not _ISDIR(root):
         return {"error": f"not a folder: {root}"}
-    it = root.rglob("*") if recursive else root.glob("*")
-    imgs = [p for p in it
-            if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES
-            and not p.name.startswith(".")]
+    imgs = [p for p in _walk_files(root, recursive)
+            if _SPLITEXT(p)[1].lower() in _IMAGE_SUFFIXES
+            and not _BASENAME(p).startswith(".")]
     truncated = len(imgs) > max_images
-    imgs = sorted(imgs)[:max_images]
+    imgs = sorted(imgs, key=_NORMCASE)[:max_images]
     if not imgs:
         return {"count": 0, "note": "no images found"}
     if Image is None:

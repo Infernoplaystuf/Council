@@ -481,3 +481,217 @@ def test_the_containment_is_one_module_level_helper(box, tmp_path):
                                       roots, reals) is None
     assert va._sandbox_resolve_within(str(outside / "private.txt"),
                                       roots, reals) is None
+
+
+# ── Alias + every store-target form of the rebind (2026-10-16) ────────────
+# The assignment check protected the NAMES pd/np/Path/pathlib/… but not an
+# ALIAS bound from one (P = Path; P.resolve = ...), nor a store target other
+# than a plain `=` (a for-loop / comprehension / with-as target, or
+# tuple/list/starred unpacking). Each is now refused by validate_generated_code
+# with the same plain wording. Reproduced against 778e401, which let them
+# through.
+_ALIAS_REBINDS = [
+    "P = Path\nP.resolve = lambda self, *a, **k: self",
+    "P = Path\nQ = P\nQ.resolve = lambda self, *a, **k: self",
+    "C = type(Path('.'))\nC.resolve = lambda self, *a, **k: self",
+    "import pathlib\nX = pathlib.Path\nX.relative_to = None",
+    "from pathlib import PurePath as Q\nQ.relative_to = None",
+    "D = pd\nD.read_csv = None",
+    "N = np\nN.save = None",
+]
+
+
+@pytest.mark.parametrize("code", _ALIAS_REBINDS)
+def test_an_alias_of_a_protected_root_cannot_be_rebound(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+    assert "your own variables" in msg, msg
+
+
+_STORE_TARGETS = [
+    # for-loop target
+    "for Path.resolve in [lambda self, *a, **k: self]:\n    pass",
+    "for type(Path('.')).resolve in [lambda self, *a, **k: self]:\n    pass",
+    # comprehension target
+    "[0 for Path.resolve in [lambda self, *a, **k: self]]",
+    # with ... as target
+    "with pd as Path.resolve:\n    pass",
+    # tuple / list unpacking
+    "Path.resolve, x = (lambda self, *a, **k: self), 1",
+    "(pd.read_csv, y) = (None, 1)",
+    # starred unpacking
+    "Path.resolve, *rest = [lambda self, *a, **k: self, 1, 2]",
+    # augmented / annotated
+    "Path.relative_to = Path.relative_to\nPath.relative_to += None",
+]
+
+
+@pytest.mark.parametrize("code", _STORE_TARGETS)
+def test_every_store_target_form_is_checked(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+_ALIAS_READ_REBINDS = [
+    "P = Path\nP.relative_to = lambda self, *a, **k: self",
+    "P = Path\nQ = P\nQ.resolve = lambda self, *a, **k: self",
+    "C = type(Path('.'))\nC.relative_to = lambda self, *a, **k: self",
+    "import pathlib\nX = pathlib.PurePath\nX.relative_to = lambda self, *a, **k: self",
+    "from pathlib import Path as P2\nP2.resolve = lambda self, *a, **k: self",
+]
+
+
+@pytest.mark.parametrize("rebind", _ALIAS_READ_REBINDS,
+                         ids=[r.split("\n")[-1].split("=")[0].strip()[:24]
+                              for r in _ALIAS_READ_REBINDS])
+@pytest.mark.parametrize("surface", _READ_SURFACES,
+                         ids=["read_text", "open", "read_csv", "summarize_csv",
+                              "list_dir"])
+def test_an_alias_rebinding_cannot_read_outside(box, rebind, surface):
+    """Each alias route, through each read/list surface, against a canary
+    outside the data folder: refused at the validator, nothing read, nothing
+    leaked."""
+    data, outside = box
+    code = rebind + "\n" + surface.format(
+        txt=outside / "private.txt", csv=outside / "private.csv", out=outside)
+    df, msg = run(code, data)
+    assert df is None, code
+    assert "TOP-SECRET" not in msg and "Forbidden" in msg, code
+
+
+# ── The per-run copy of pathlib (defence in depth for the libraries) ──────
+def test_make_sandbox_pathlib_isolates_the_real_classes():
+    """_make_sandbox_pathlib hands out per-run SUBCLASSES: a rebind through
+    any of them lands on the copy, the real pathlib classes the helpers,
+    pandas and numpy use are untouched, and the subclasses are closed under
+    construction (so type(Path('.')) is the copy too). Dunder / module routes
+    on the proxy stay blocked."""
+    import pathlib
+    proxy, SbPath = va._make_sandbox_pathlib()
+    assert issubclass(SbPath, pathlib.Path) and SbPath is not pathlib.Path
+    assert proxy.Path is SbPath
+    assert type(SbPath(".")) is SbPath            # closed under construction
+    assert type(SbPath(".") / "x") is SbPath
+    assert type(SbPath(".").parent) is SbPath
+    assert issubclass(proxy.PurePath, pathlib.PurePath)
+    assert proxy.PurePath is not pathlib.PurePath
+    real_resolve = pathlib.Path.resolve
+    SbPath.resolve = lambda self, *a, **k: "HACK"
+    assert pathlib.Path.resolve is real_resolve   # real class untouched
+    pathlib.PurePath.relative_to  # sanity: attr still present
+    # pathlib.os / pathlib.sys are real module attributes (the classic
+    # pathlib.sys.modules / pathlib.os.environ routes); the proxy's getattr
+    # refuses them. (_real and the dunders are the AST validator's job, as on
+    # the pandas/numpy proxies.)
+    for blocked in ("sys", "os", "modules", "subprocess", "socket"):
+        with pytest.raises(AttributeError):
+            getattr(proxy, blocked)
+
+
+def test_the_sandbox_hands_model_code_a_copy_of_pathlib(box, monkeypatch):
+    """Defence (3) in isolation: with the AST rebind check turned OFF, a model
+    that rebinds a pathlib method through `import pathlib`, through `Path`, and
+    through `type(Path('.'))` changes only the per-run copy — the real
+    pathlib.Path in THIS process is untouched, the read still never leaves the
+    data folder (captured-os containment), and inside reads keep working."""
+    import pathlib
+    data, outside = box
+    monkeypatch.setattr(va, "validate_generated_code", lambda code: (True, "ok"))
+    real_resolve = pathlib.Path.resolve
+    real_rel = pathlib.PurePath.relative_to
+    code = (
+        "import pathlib\n"
+        "pathlib.Path.resolve = lambda self, *a, **k: self\n"
+        "pathlib.PurePath.relative_to = lambda self, *a, **k: self\n"
+        "Path.is_absolute = lambda self: False\n"
+        "type(Path('.')).resolve = lambda self, *a, **k: self\n"
+        f"result_df = pd.DataFrame([read_text(r'{outside / 'private.txt'}')])\n")
+    df, msg = run(code, data)
+    assert refused(df, msg)
+    assert pathlib.Path.resolve is real_resolve
+    assert pathlib.PurePath.relative_to is real_rel
+    # inside reads still work, through the real pathlib
+    df2, msg2 = run("result_df = pd.read_csv('ok.csv')", data)
+    assert df2 is not None, msg2
+
+
+# ── listing + image/feature helpers hold under a rebound path method ──────
+def test_listing_and_image_helpers_given_an_outside_path_are_refused(box):
+    data, outside = box
+    for code in (
+        f"result_df = pd.DataFrame([count_files(r'{outside}')])",
+        f"result_df = pd.DataFrame([count_folders(r'{outside}')])",
+        f"result_df = pd.DataFrame(list_dir(r'{outside}'))",
+        f"result_df = pd.DataFrame([image_pixel_stats(r'{outside / 'private.txt'}')])",
+        f"result_df = pd.DataFrame([aggregate_image_folder(r'{outside}')])",
+        f"result_df = pd.DataFrame([detect_and_count_features(r'{outside / 'private.txt'}')])",
+    ):
+        df, msg = run(code, data)
+        assert df is None, code
+        assert "TOP-SECRET" not in msg, code
+
+
+def test_listing_holds_even_if_a_path_method_is_rebound(box, monkeypatch):
+    """count/list work on the validated string with captured os.scandir, so
+    even with the Path methods the old code relied on already rebound in the
+    process they refuse an outside folder and still list inside correctly."""
+    import pathlib
+    data, outside = box
+    monkeypatch.setattr(pathlib.Path, "resolve",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "relative_to",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "is_absolute",
+                        lambda self: False, raising=False)
+    for code in (f"result_df = pd.DataFrame([count_files(r'{outside}')])",
+                 f"result_df = pd.DataFrame(list_dir(r'{outside}'))"):
+        df, msg = run(code, data)
+        assert df is None and "TOP-SECRET" not in msg, code
+    # listing inside still returns the folder's own names
+    df, msg = run("result_df = pd.DataFrame({'n': list_dir()})", data)
+    assert df is not None and "ok.csv" in df.to_string(), msg
+    df, msg = run("result_df = pd.DataFrame([count_files()])", data)
+    assert df is not None and int(df.iloc[0, 0]) >= 2, msg
+
+
+def test_image_stats_reads_an_inside_image_through_a_string(box, tmp_path):
+    """image_pixel_stats, handed the sandbox's validated string, opens the
+    file through its own captured io.open and returns stats — no pathlib
+    object is built from the path."""
+    pytest.importorskip("PIL")
+    import numpy as _np
+    from PIL import Image
+    data, _ = box
+    arr = (_np.arange(16 * 16 * 3, dtype="uint8") % 255).reshape(16, 16, 3)
+    Image.fromarray(arr, "RGB").save(data / "pic.png")
+    df, msg = run("result_df = pd.DataFrame([image_pixel_stats('pic.png')])", data)
+    assert df is not None and "pic.png" in df.to_string(), msg
+    assert "brightness" in df.columns, df.columns.tolist()
+
+
+# ── legitimate alias + target code must keep working ──────────────────────
+@pytest.mark.parametrize("code", [
+    # df bound from pd.read_csv(...) is the model's own frame, not an alias
+    "df = pd.read_csv('ok.csv')\ndf.columns = ['x', 'y']\nresult_df = df",
+    # for-loop + comprehension targets that are plain names
+    ("df = pd.read_csv('ok.csv')\ntot = 0\n"
+     "for v in df['a']:\n    tot += v\nresult_df = pd.DataFrame([tot])"),
+    ("df = pd.read_csv('ok.csv')\n"
+     "vals = [v * 2 for v in df['a']]\nresult_df = pd.DataFrame({'v': vals})"),
+    # with ... as f, reading inside the data folder
+    ("with open('notes.txt') as f:\n    txt = f.read()\n"
+     "result_df = pd.DataFrame([txt])"),
+    # tuple unpacking of the model's OWN values
+    ("df = pd.read_csv('ok.csv')\n"
+     "lo, hi = df['a'].min(), df['a'].max()\n"
+     "result_df = pd.DataFrame([{'lo': lo, 'hi': hi}])"),
+    # a Path instance (not the class) used only for reading
+    "p = Path(DATA_FOLDER)\nresult_df = pd.read_csv(p / 'ok.csv')",
+    # a name reused: first a frame, then unpacked
+    ("rows = [(1, 2), (3, 4)]\n"
+     "for a, b in rows:\n    pass\nresult_df = pd.DataFrame(rows)"),
+])
+def test_legitimate_alias_and_target_code_still_works(box, code):
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg

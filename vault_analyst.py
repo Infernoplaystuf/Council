@@ -3856,6 +3856,25 @@ def _attr_chain(node: "ast.Attribute") -> Optional[Tuple[str, List[str]]]:
     return cur.id, names[::-1]
 
 
+def _expr_yields_protected(node: "ast.AST", roots) -> bool:
+    """Does ``node`` evaluate to a sandbox module/class/proxy ITSELF (not a
+    value computed from one), so that binding a name to it makes that name a
+    protected alias? True for a bare protected Name (`P = Path`), a pure
+    attribute chain rooted at one (`X = pathlib.Path`, no call/subscript), and
+    a `type(...)` call (`C = type(Path('.'))` → the class). A call that returns
+    data (`df = pd.read_csv(...)`) is NOT an alias — its root is `pd` but it
+    yields a frame, so df stays the model's own object."""
+    if isinstance(node, ast.Name):
+        return node.id in roots
+    if isinstance(node, ast.Attribute):
+        chain = _attr_chain(node)
+        return chain is not None and chain[0] in roots
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "type" and "type" in roots):
+        return True
+    return False
+
+
 def _is_pandas_option_assignment(node: "ast.Attribute", pandas_names,
                                  options_names) -> bool:
     """Is the target ``node`` `<pandas>.options.<group>[.<more>].<name>` (or
@@ -3925,6 +3944,25 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                 if bound not in rebound_names:
                     protected_roots.add(bound)
 
+    # Aliases bound from a protected root in the SAME code — `P = Path`,
+    # `X = pathlib.Path`, `C = type(Path('.'))` — are protected roots too, so
+    # a later `P.resolve = ...` / `C.resolve = ...` is refused like
+    # `Path.resolve = ...`. Simple name tracking to a fixpoint (`P = Path;
+    # Q = P` both count). Only a bind whose value IS a module/class/proxy
+    # counts; `df = pd.read_csv(...)` yields a frame, so df stays the model's
+    # own object and df.columns = ... keeps working.
+    _simple_assigns = [(n.targets[0].id, n.value) for n in ast.walk(tree)
+                       if isinstance(n, ast.Assign) and len(n.targets) == 1
+                       and isinstance(n.targets[0], ast.Name)]
+    _changed = True
+    while _changed:
+        _changed = False
+        for _name, _rhs in _simple_assigns:
+            if _name not in protected_roots and _expr_yields_protected(
+                    _rhs, protected_roots):
+                protected_roots.add(_name)
+                _changed = True
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -3935,30 +3973,44 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
-        # No ASSIGNING TO or DELETING an attribute of a sandbox module, class
-        # or proxy — the Path-rebinding read escape (Path.relative_to =
+        # No BINDING TO or DELETING an attribute of a sandbox module, class or
+        # proxy — the Path-rebinding read escape (Path.relative_to =
         # lambda self, *a: self; type(Path('.')).resolve = ...;
-        # pathlib.PurePath.relative_to = ...). The model's OWN objects are
-        # untouched: df.columns = [...], df.index.name = ..., obj.attr = ...
-        # all have a plain local-variable root, not a protected one.
+        # pathlib.PurePath.relative_to = ...). Every store target is covered,
+        # not just `=`: augmented/annotated assignment, delete, and the binding
+        # forms a rebind can also hide in — a for-loop target
+        # (`for Path.resolve in [...]`), a comprehension target, a `with ... as`
+        # target, and tuple/list/starred unpacking (handled by
+        # _iter_attr_targets). The model's OWN objects are untouched:
+        # df.columns = [...], df.index.name = ..., obj.attr = ... all have a
+        # plain local-variable root, not a protected one.
         _targets = None
+        _is_delete = isinstance(node, ast.Delete)
         if isinstance(node, ast.Assign):
             _targets = node.targets
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
             _targets = [node.target]
-        elif isinstance(node, ast.Delete):
+        elif _is_delete:
             _targets = node.targets
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            _targets = [node.target]
+        elif isinstance(node, ast.comprehension):
+            _targets = [node.target]
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            _targets = [it.optional_vars for it in node.items
+                        if it.optional_vars is not None]
         if _targets is not None:
             for _tgt in _targets:
                 for _attr in _iter_attr_targets(_tgt):
                     _root = _assign_target_root_name(_attr)
                     if _root in protected_roots:
-                        if (not isinstance(node, ast.Delete)
+                        # The only allowed assignment under a protected root:
+                        # a pandas display/compute option by attribute.
+                        if (isinstance(node, ast.Assign)
                                 and _is_pandas_option_assignment(
                                     _attr, pandas_names, options_names)):
                             continue
-                        _verb = ("delete" if isinstance(node, ast.Delete)
-                                 else "assign to")
+                        _verb = "delete" if _is_delete else "assign to"
                         return False, (
                             f"Forbidden: cannot {_verb} {_attr.attr!r} on "
                             f"{_root!r} — {_REBIND_REFUSAL}")
@@ -4036,6 +4088,72 @@ class _SandboxModule:
 
     def __repr__(self):
         return f"<sandboxed {self._real!r}>"
+
+
+# Names the sandbox pathlib copy exposes as per-run subclasses.
+_PATHLIB_CLASS_NAMES = ("PurePath", "PurePosixPath", "PureWindowsPath",
+                        "Path", "PosixPath", "WindowsPath")
+
+
+class _SandboxPathlib:
+    """The ``pathlib`` module as the sandbox hands it out.
+
+    `Path` (and everything `import pathlib` / `from pathlib import ...` gives)
+    is a per-RUN subclass of the real pathlib class, built fresh for this
+    execution. Model code runs with these copies, so a rebind made through any
+    alias (`P = Path`, `C = type(Path('.'))`, `X = pathlib.Path`, `from pathlib
+    import PurePath as Q`, `pathlib.PurePath.relative_to = ...`) lands on the
+    copy and dies with the run — it never reaches the real pathlib classes the
+    sandbox helpers, pandas, numpy and the other libraries use. The subclasses
+    are closed under path operations (`/`, `.parent`, `.resolve`, … all return
+    the subclass in CPython's pathlib), so `type(Path('.'))` is always the copy
+    too. Other attributes pass through to real pathlib, except the forbidden /
+    escape names (sys, os, the proxy internals, dunders), which raise — as on
+    _SandboxModule. The module is read-only (a rebind must land on a class, not
+    swap a class out)."""
+
+    def __init__(self, real, classes) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_classes", classes)
+
+    def __getattr__(self, name):
+        if (name in _SANDBOX_FORBIDDEN_ANY_ATTR
+                or name in _SANDBOX_FORBIDDEN_SUBMODULES):
+            raise AttributeError(f"sandbox: pathlib.{name} is blocked")
+        classes = object.__getattribute__(self, "_classes")
+        if name in classes:
+            return classes[name]
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("sandbox: pathlib is read-only — assign to your "
+                             "own variables, not to pathlib or its classes")
+
+    def __delattr__(self, name):
+        raise AttributeError("sandbox: pathlib is read-only")
+
+    def __repr__(self):
+        return "<sandboxed pathlib>"
+
+
+def _make_sandbox_pathlib():
+    """(proxy module, Path subclass) for one run. Each pathlib class becomes a
+    fresh subclass of its real counterpart (Path/PurePath map to the concrete
+    class for this OS, since the abstract Path is not directly subclassable).
+    On failure, falls back to the real module and class — the AST validator and
+    the captured-os containment still hold without the copy."""
+    import pathlib as _real_pathlib
+    try:
+        concrete = type(_real_pathlib.Path())          # WindowsPath / PosixPath
+        pure_concrete = type(_real_pathlib.PurePath())  # Pure{Windows,Posix}Path
+        bases = {"Path": concrete, "PurePath": pure_concrete}
+        classes = {}
+        for nm in _PATHLIB_CLASS_NAMES:
+            base = bases.get(nm) or getattr(_real_pathlib, nm)
+            classes[nm] = type(nm, (base,), {})
+        return _SandboxPathlib(_real_pathlib, classes), classes["Path"]
+    except Exception:
+        return _real_pathlib, _real_pathlib.Path
 
 
 def _check_sandbox_import(name: str, fromlist) -> None:
@@ -4140,6 +4258,50 @@ _OS_COMMONPATH = os.path.commonpath
 _OS_EXISTS = os.path.exists
 _OS_EXPANDUSER = os.path.expanduser
 _OS_FSPATH = os.fspath
+# The read/list helpers below work entirely through these, on the validated
+# string — never through a pathlib object built from it — so a model that
+# rebinds a pathlib class (through the sandbox copy, or through any name it
+# can reach) can change neither which file is opened nor which folder is
+# walked (2026-10-16). Captured at import, before any model code runs.
+_OS_ISFILE = os.path.isfile
+_OS_ISDIR = os.path.isdir
+_OS_BASENAME = os.path.basename
+_OS_SCANDIR = os.scandir
+_OS_STAT = os.stat
+_IO_OPEN = io.open
+
+
+def _sandbox_walk(root: str, recursive: bool):
+    """Yield (path_str, is_dir) for the entries under ``root`` using
+    os.scandir only — no pathlib. A sub-folder is descended only when it is a
+    real directory whose real path stays inside ``root`` (a link or junction
+    out of the folder is listed but not followed), so a walk cannot be steered
+    outside the folder it was given."""
+    root_real = _OS_NORMCASE(_OS_REALPATH(root))
+    todo = [root]
+    while todo:
+        d = todo.pop()
+        try:
+            with _OS_SCANDIR(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                is_dir = e.is_dir()
+            except OSError:
+                is_dir = False
+            yield e.path, is_dir
+            if not (recursive and is_dir):
+                continue
+            try:
+                if e.is_symlink():
+                    continue
+                real = _OS_NORMCASE(_OS_REALPATH(e.path))
+                if _OS_COMMONPATH([real, root_real]) == root_real:
+                    todo.append(e.path)
+            except (OSError, ValueError):
+                continue
 
 
 def _sandbox_path_str(value) -> str:
@@ -4513,6 +4675,14 @@ def execute_pandas_code(
     _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state,
                                    roots=normalized_folders)
 
+    # A per-run copy of pathlib: model code gets subclasses of the real
+    # pathlib classes, so any rebind it makes (through Path, an alias,
+    # type(Path('.')), `import pathlib`, or `from pathlib import ...`) lands on
+    # the copy and never reaches the real classes the sandbox helpers, pandas,
+    # numpy and the other libraries use. `_sb_pathlib` is returned by the
+    # import hook; `_sb_Path` is put in the namespace as `Path`.
+    _sb_pathlib, _sb_Path = _make_sandbox_pathlib()
+
     # Root strings + their normcased realpaths, captured HERE — before any
     # model code runs — so the read/list containment below never resolves or
     # compares a path by calling a Path method (resolve / is_absolute /
@@ -4530,49 +4700,58 @@ def execute_pandas_code(
     # os.walk to count files/folders used to fail with "Forbidden import:
     # os". These closures give the same answer without any dangerous surface:
     # they only iterate + stat (no open/read/write/delete) and are bounded to
-    # the allowed data folders.
-    def _sb_resolve_dir(folder=None) -> Path:
+    # the allowed data folders. They work on the validated path STRING with
+    # os functions captured at import (_OS_ISDIR/_sandbox_walk, _IO_OPEN) —
+    # never a pathlib object built from it — so a rebound pathlib class cannot
+    # change which folder is walked or which file is read.
+    def _sb_resolve_dir(folder=None) -> str:
         if folder is None:
-            return Path(_root_strs[0])
+            return _root_strs[0]
         real = _sb_resolve_within(folder)
         if real is None:
             raise PermissionError(
                 f"list/count is limited to the data folders; {folder!r} is "
                 "outside them")
-        return Path(real)
+        return real
 
     def _sb_count_files(folder=None, recursive=True) -> int:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return 0
-        it = d.rglob("*") if recursive else d.glob("*")
-        return sum(1 for x in it if x.is_file())
+        return sum(1 for _p, is_dir in _sandbox_walk(d, bool(recursive))
+                   if not is_dir)
 
     def _sb_count_folders(folder=None, recursive=False) -> int:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return 0
-        it = d.rglob("*") if recursive else d.glob("*")
-        return sum(1 for x in it if x.is_dir())
+        return sum(1 for _p, is_dir in _sandbox_walk(d, bool(recursive))
+                   if is_dir)
 
     def _sb_list_dir(folder=None) -> list:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return []
-        return sorted(x.name for x in d.iterdir())
+        try:
+            with _OS_SCANDIR(d) as it:
+                return sorted(e.name for e in it)
+        except OSError:
+            return []
 
     # ── Safe, READ-ONLY file reading ─────────────────────────────────────
     # Model-written tools reach for `open(path)` and manual decoding, which
     # used to fail with "name 'open' is not defined" (no builtin) and
     # UnicodeDecodeError (wrong encoding). These give a bounded, encoding-safe,
-    # path-contained way to read files WITHOUT any write/delete surface.
-    def _sb_resolve_file(path) -> Path:
+    # path-contained way to read files WITHOUT any write/delete surface. The
+    # returned value is the validated path STRING, and reads go through the
+    # captured io.open on that string.
+    def _sb_resolve_file(path) -> str:
         real = _sb_resolve_within(path)
         if real is None:
             raise PermissionError(
                 f"file access is blocked outside the data folders; {path!r} is "
                 "outside them")
-        return Path(real)
+        return real
 
     def _sb_column_stats(folder=None):
         """column_stats(folder=None): one row per (file, column), from the
@@ -4580,23 +4759,26 @@ def execute_pandas_code(
         if folder is None:
             scope = [str(p) for p in normalized_folders]
         elif isinstance(folder, (list, tuple)):
-            scope = [str(_sb_resolve_dir(f)) for f in folder]
+            scope = [_sb_resolve_dir(f) for f in folder]
         else:
-            scope = str(_sb_resolve_dir(folder))
+            scope = _sb_resolve_dir(folder)
         return folder_column_stats(None, scope)
 
     def _sb_file_stats(path):
-        """file_stats(path): the cached stats of one CSV in the data folders."""
-        return cached_column_stats(None, str(_sb_resolve_file(path)))
+        """file_stats(path): the cached stats of one CSV in the data folders.
+        The stats cache is handed the validated string; it reads only that
+        file (through pandas / the real pathlib, which model code cannot
+        touch)."""
+        return cached_column_stats(None, _sb_resolve_file(path))
 
     def _sb_read_text(path, max_chars=200000, encoding="utf-8") -> str:
         """Read a text file: encoding-robust (never raises UnicodeDecodeError),
         size-bounded, read-only, within the data folders."""
         p = _sb_resolve_file(path)
-        if not p.is_file():
+        if not _OS_ISFILE(p):
             return ""
         try:
-            with p.open("rb") as _f:
+            with _IO_OPEN(p, "rb") as _f:
                 data = _f.read(int(max_chars) + 1)
         except Exception:
             return ""
@@ -4611,7 +4793,9 @@ def execute_pandas_code(
                  newline=None):
         """Read-ONLY replacement for the builtin open(): writing/appending is
         blocked, reads are contained to the data folders, and text mode defaults
-        to encoding-robust decoding so tools don't hit UnicodeDecodeError."""
+        to encoding-robust decoding so tools don't hit UnicodeDecodeError. The
+        validated string is opened through the captured io.open, never a Path
+        method."""
         m = str(mode)
         if any(c in m for c in ("w", "a", "x", "+")):
             raise PermissionError(
@@ -4619,12 +4803,14 @@ def execute_pandas_code(
                 "are allowed")
         p = _sb_resolve_file(path)
         if "b" in m:
-            return p.open("rb")
-        return p.open("r", encoding=(encoding or "utf-8"),
-                      errors=(errors or "replace"), newline=newline)
+            return _IO_OPEN(p, "rb")
+        return _IO_OPEN(p, "r", encoding=(encoding or "utf-8"),
+                        errors=(errors or "replace"), newline=newline)
 
     def _sb_image_stats(path):
-        """Per-image pixel statistics (read-only, path-contained)."""
+        """Per-image pixel statistics (read-only, path-contained). image_stats
+        is handed the validated string and opens it with its own captured os/io
+        functions."""
         try:
             import image_stats as _ims
         except Exception as _e:
@@ -4651,8 +4837,15 @@ def execute_pandas_code(
             expected=expected, annotate=False)
 
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name.split(".")[0] == "pandas":
+        root = name.split(".")[0]
+        if root == "pandas":
             return _budgeted_pd
+        if root == "pathlib":
+            # The per-run pathlib copy: `import pathlib` and `from pathlib
+            # import Path/PurePath/...` both reach the sandbox subclasses, so a
+            # rebind lands on the copy, never on the real classes the helpers
+            # and libraries use.
+            return _sb_pathlib
         return _safe_import(name, globals, locals, fromlist, level)
 
     def _guarded_getattr(obj, name, *default):
@@ -4719,7 +4912,7 @@ def execute_pandas_code(
         # A plain string; it adds no capability.
         "__name__": "__main__",
         "pd": _budgeted_pd,
-        "Path": Path,
+        "Path": _sb_Path,
         "DATA_FOLDERS": [str(p) for p in normalized_folders],
         "DATA_FOLDER": str(normalized_folders[0]),
         # Read-only directory helpers (no os needed to count files/folders).
