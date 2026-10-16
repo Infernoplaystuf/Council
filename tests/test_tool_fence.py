@@ -481,13 +481,30 @@ def test_code_cannot_rebind_the_app_s_own_modules(box, app_state, pid, path):
     fence they die with the sandbox's process (and the code's own result
     still comes back: the report is written with json as it was)."""
     real_home = Path.home()
-    text = path(box, TAMPER, TAMPER_SNIPPET)
+    try:
+        text = path(box, TAMPER, TAMPER_SNIPPET)
+    except AssertionError as refused:
+        # council_tool / forge_run assert that saving the tool worked; the
+        # save is refused now, with the sandbox's reason.
+        text = str(refused)
     assert json.dumps({"a": 1}) == '{"a": 1}'
     assert Path.home() == real_home
-    # what the code returned or printed (Forge's generation says it saved
-    # the tool 'tamper', whose test run passed)
-    assert ("tamper" if pid == "forge-generate-test-run" else "tampered") \
-        in text, text
+    # Since the Path-rebinding fix the sandbox refuses this code before it
+    # runs ("code may not change pandas, numpy, pathlib or the other modules
+    # and classes the sandbox provides"): the paths that run it say so, and
+    # the paths that save a tool first never get one to run ("not found").
+    # A path that ran it anyway must have returned the code's own result
+    # (Forge's generation names the tool 'tamper'). Either way the app's
+    # own json and Path are untouched, above.
+    assert ("may not change" in text or "not found" in text
+            or ("tamper" if pid == "forge-generate-test-run"
+                else "tampered") in text), text
+
+
+def test_the_sandbox_refuses_the_rebinding_tool_before_it_runs():
+    for code in (TAMPER + "\nresult_df = tamper()\n", TAMPER_SNIPPET):
+        ok, why = va.validate_generated_code(code)
+        assert not ok and "may not change" in why, why
 
 
 # ============================================================
@@ -929,19 +946,19 @@ FORGER = ("def forge():\n"
           "    return 1\n")
 
 
-def test_code_that_rewrites_its_report_gets_a_plain_error_on_every_path(box):
-    assert va.validate_generated_code(FORGER + "\nresult_df = forge()\n")[0]
+def test_code_that_rewrites_its_report_is_refused_on_every_path(box):
+    """FORGER rewrites json's encoder so the child's report would lie.
+    Since the Path-rebinding fix the sandbox refuses it before it runs;
+    no path reports it as a success."""
+    ok, why = va.validate_generated_code(FORGER + "\nresult_df = forge()\n")
+    assert not ok and "may not change" in why, why
     run = analyst_step.run_tool_code(FORGER, "forge", {}, [box.data])
-    assert run.df is None and run.brief() == analyst_step.DAMAGED
+    assert run.df is None and "may not change" in run.brief(), run.brief()
     df, msg = abt.run_code(FORGER, {}, vault_dir=box.vault)
-    assert df is None and analyst_step.DAMAGED in msg
+    assert df is None and "may not change" in msg, msg
     abt.save_tool("forge", "probe", FORGER, vault_dir=box.vault)
-    assert tr.run_tests("forge", box.vault) == [
-        (False, f"forge(**{{}}) failed: {analyst_step.DAMAGED}")]
     res = forge_jobs.run_tool("forge", box.vault)
-    assert not res.ok and res.error is None
-    assert res.status == "⚠ 'forge' failed — see the output."
-    assert analyst_step.DAMAGED in res.body
+    assert not res.ok
 
 
 # A huge result: refused in plain words, never read into the app.

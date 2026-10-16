@@ -240,3 +240,244 @@ def test_refusal_points_at_the_contained_helper(box):
     df, msg = run("result_df = pd.DataFrame([Path(DATA_FOLDER + '/notes.txt').read_text()])",
                   data)
     assert df is None and "read_text(path)" in msg
+
+
+# ── Path-rebinding read escape (2026-10-15) ───────────────────────────────
+# Model code runs with the real pathlib.Path in scope. The read containment
+# USED to refuse an outside path only because Path.relative_to RAISED, so
+# rebinding it to a no-op made every outside path pass the check and read any
+# file:
+#     Path.relative_to = lambda self, *a, **k: self
+#     print(read_text(r'<file outside the data folder>'))
+# Two defences close it: (1) the AST validator refuses assigning to or
+# deleting an attribute of a sandbox module/class/proxy; (2) the containment
+# resolves and compares with captured os.path functions, never a Path method
+# model code can rebind. The first set of tests exercises (1); the monkeypatch
+# test exercises (2) in isolation.
+
+_REBINDS = [
+    "Path.relative_to = lambda self, *a, **k: self",
+    "Path.resolve = lambda self, *a, **k: self",
+    "Path.is_absolute = lambda self: False",
+    "type(Path('.')).relative_to = lambda self, *a, **k: self",
+    "import pathlib\npathlib.PurePath.relative_to = lambda self, *a, **k: self",
+    "setattr(Path, 'relative_to', lambda self, *a, **k: self)",
+    "del Path.relative_to",
+]
+
+_READ_SURFACES = [
+    "result_df = pd.DataFrame([read_text(r'{txt}')])",
+    "result_df = pd.DataFrame([open(r'{txt}').read()])",
+    "result_df = pd.read_csv(r'{csv}')",
+    "result_df = summarize_csv(r'{csv}')",
+    "result_df = pd.DataFrame(list_dir(r'{out}'))",
+]
+
+
+@pytest.mark.parametrize("rebind", _REBINDS,
+                         ids=[r.split("=")[0].split("\n")[-1].strip()[:28]
+                              for r in _REBINDS])
+@pytest.mark.parametrize("surface", _READ_SURFACES,
+                         ids=["read_text", "open", "read_csv", "summarize_csv",
+                              "list_dir"])
+def test_rebinding_a_path_method_cannot_read_outside(box, rebind, surface):
+    data, outside = box
+    code = rebind + "\n" + surface.format(
+        txt=outside / "private.txt", csv=outside / "private.csv", out=outside)
+    df, msg = run(code, data)
+    # Refused at the AST validator — nothing read, nothing leaked.
+    assert df is None, code
+    assert "TOP-SECRET" not in msg and "Forbidden" in msg, code
+
+
+def test_containment_holds_even_if_a_path_method_is_rebound(box, monkeypatch):
+    """Defence (2) in isolation: with the Path methods the old check relied on
+    ALREADY rebound in the process (as if a rebind slipped past the AST), the
+    containment still refuses outside reads and still allows inside ones,
+    because it resolves/compares with captured os.path functions."""
+    import pathlib
+    data, outside = box
+    monkeypatch.setattr(pathlib.Path, "relative_to",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "resolve",
+                        lambda self, *a, **k: self, raising=False)
+    monkeypatch.setattr(pathlib.Path, "is_absolute",
+                        lambda self: False, raising=False)
+    monkeypatch.setattr(pathlib.PurePath, "relative_to",
+                        lambda self, *a, **k: self, raising=False)
+    for code in (
+        f"result_df = pd.DataFrame([read_text(r'{outside / 'private.txt'}')])",
+        f"result_df = pd.DataFrame([open(r'{outside / 'private.txt'}').read()])",
+        f"result_df = pd.read_csv(r'{outside / 'private.csv'}')",
+        f"result_df = summarize_csv(r'{outside / 'private.csv'}')",
+    ):
+        df, msg = run(code, data)
+        assert refused(df, msg), code
+    # ...while reads inside the data folder keep working.
+    df, msg = run("result_df = pd.read_csv('ok.csv')", data)
+    assert df is not None, msg
+    df, msg = run("result_df = pd.DataFrame([read_text('notes.txt')])", data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    "Path.relative_to = lambda self, *a, **k: self",
+    "Path.resolve = None",
+    "type(Path('.')).relative_to = None",
+    "import pathlib\npathlib.PurePath.relative_to = None",
+    "pd.read_csv = None",
+    "pd.contain = lambda self, v: v",
+    "import numpy as _n\n_n.save = None",
+    "del Path.relative_to",
+    "import json as _j\n_j.loads = None",
+])
+def test_rebinding_a_sandbox_module_class_or_proxy_is_refused(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    "df = pd.read_csv('ok.csv')\ndf.columns = ['x', 'y']\nresult_df = df",
+    "df = pd.read_csv('ok.csv')\ndf.index.name = 'idx'\nresult_df = df.reset_index()",
+    "df = pd.read_csv('ok.csv')\ndf['c'] = df['a'] + df['b']\nresult_df = df",
+    "s = pd.read_csv('ok.csv')['a']\ns.name = 'renamed'\nresult_df = s.reset_index()",
+    "df = pd.read_csv('ok.csv')\ndf.attrs['note'] = 'ok'\nresult_df = df",
+])
+def test_legitimate_attribute_assignments_still_work(box, code):
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg
+
+
+# ── legitimate code the rebinding refusal must not catch ─────────────────
+# Measured 2026-10-15 on 430fdb0 with a 40-snippet battery through
+# run_python / data_query / validate_generated_code: these ran on 43b317e and
+# were refused by the new assignment check.
+_PD_OPTION_KEYS = ("display.max_columns", "display.width",
+                   "mode.chained_assignment", "display.float_format")
+
+
+@pytest.fixture
+def pd_options_restored():
+    """execute_pandas_code runs in THIS process here, so an option the code
+    sets would outlive the test: put back every one it may touch."""
+    saved = {k: va.pd.get_option(k) for k in _PD_OPTION_KEYS}
+    yield
+    for k, v in saved.items():
+        va.pd.set_option(k, v)
+
+
+@pytest.mark.parametrize("code", [
+    "pd.options.display.max_columns = None\npd.options.display.width = 200",
+    "pd.options.mode.chained_assignment = None",
+    "pd.options.display.float_format = '{:,.2f}'.format",
+    "import pandas as p2\np2.options.display.max_columns = 50",
+])
+def test_setting_a_pandas_option_by_attribute_still_works(
+        box, pd_options_restored, code):
+    """`pd.options.display.max_columns = None` is everyday LLM pandas; it
+    changes an option pandas checks itself, not a module or class."""
+    data, _ = box
+    df, msg = run(code + "\nresult_df = pd.read_csv('ok.csv')", data)
+    assert df is not None, msg
+
+
+def test_tool_code_that_sets_a_pandas_option_passes_the_check():
+    """validate_generated_code is the gate a Forge / Agent Creator tool is
+    approved through, so the same line must pass there too."""
+    ok, msg = va.validate_generated_code(
+        "def summarise():\n"
+        "    pd.options.display.max_columns = None\n"
+        "    return pd.read_csv('ok.csv').describe()\n")
+    assert ok, msg
+
+
+@pytest.mark.parametrize("code", [
+    "pd.options = None",
+    "pd.options.plotting.backend = 'x'",
+    "pd.options.io.excel.xlsx.writer = 'x'",
+    "pd.options.display = None",
+    "del pd.options.display.max_columns",
+    "pd.options.display.__class__ = None",
+    "pd.read_csv.options.display.x = None",
+    "pd.options['display'].max_columns = None",
+])
+def test_only_display_style_pandas_options_are_let_through(code):
+    """The exception is `pd.options.<group>.<name> = value` for the groups
+    that only change how pandas shows or computes; anything else on pd is
+    still refused."""
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    ("from scipy import stats\n"
+     "df = pd.read_csv('ok.csv')\n"
+     "t = stats.ttest_1samp(df['a'], 0)\n"
+     "stats = df.groupby('a')['b'].describe()\n"
+     "stats.index.name = 'a'\n"
+     "result_df = stats.reset_index()"),
+    ("from statistics import mean\n"
+     "df = pd.read_csv('ok.csv')\n"
+     "overall = mean(df['b'])\n"
+     "mean = df.groupby('a')['b'].mean()\n"
+     "mean.name = 'avg_b'\n"
+     "result_df = mean.reset_index()"),
+])
+def test_an_imported_name_reused_for_the_model_s_own_frame_can_be_changed(
+        box, code):
+    """`stats` / `mean` are imported, then rebound to the model's own
+    frame/Series; setting .name on THAT is not changing a module."""
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    "from scipy import stats\nstats.ttest_1samp = None",
+    "import json\njson.loads = None",
+    "from pathlib import Path as P\nP.resolve = None",
+])
+def test_an_imported_module_the_code_does_not_rebind_stays_protected(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+@pytest.mark.parametrize("code", [
+    "pd.read_csv = None",
+    "del Path.relative_to",
+    "setattr(Path, 'resolve', None)",
+])
+def test_the_rebinding_refusal_says_what_to_do_instead(code):
+    """No sandbox jargon ("proxy", "rebound") and a way forward."""
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+    assert "proxy" not in msg and "rebound" not in msg, msg
+    assert "your own variables" in msg, msg
+    assert "pd.set_option" in msg, msg
+
+
+# ── the containment is one helper ─────────────────────────────────────────
+def test_the_containment_is_one_module_level_helper(box, tmp_path):
+    """_contain_helpers no longer takes the resolve_dir it stopped using,
+    _BudgetedPandas.contain (no caller) is gone, and the one resolver every
+    read surface uses keeps a prefix-sharing sibling (data vs data_old) and
+    a `..` route outside."""
+    import inspect
+    assert "resolve_dir" not in inspect.signature(
+        va._contain_helpers).parameters
+    assert not hasattr(va._BudgetedPandas, "contain")
+    data, outside = box
+    sibling = tmp_path / "data_old"
+    sibling.mkdir()
+    (sibling / "x.csv").write_text("x\n1\n", encoding="utf-8")
+    roots = [str(data)]
+    reals = [va._sandbox_real_norm(r) for r in roots]
+    inside = va._sandbox_resolve_within("ok.csv", roots, reals)
+    assert inside is not None and inside.endswith("ok.csv")
+    assert va._sandbox_resolve_within(str(sibling / "x.csv"),
+                                      roots, reals) is None
+    assert va._sandbox_resolve_within("../outside/private.txt",
+                                      roots, reals) is None
+    assert va._sandbox_resolve_within(str(outside / "private.txt"),
+                                      roots, reals) is None

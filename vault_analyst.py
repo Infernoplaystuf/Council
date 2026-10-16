@@ -3724,6 +3724,7 @@ _SANDBOX_FORBIDDEN_ATTRS = frozenset({
 # model's validated code or its getattr().
 _SANDBOX_FORBIDDEN_PROXY_ATTRS = frozenset({
     "_real", "_budget", "_state", "_roots", "_extra",
+    "_root_strs", "_root_reals",
 })
 # Methods that RETURN a string with no target but WRITE a file when given one
 # (df.to_json('C:/x') wrote anywhere). Allowed only with no positional
@@ -3770,6 +3771,109 @@ _SANDBOX_FORBIDDEN_ANY_ATTR = (_SANDBOX_FORBIDDEN_ATTRS
                                | _SANDBOX_FORBIDDEN_MODULE_ATTRS
                                | _SANDBOX_FORBIDDEN_PROXY_ATTRS)
 
+# Names that stand for a sandbox module, class or proxy whose attributes model
+# code must not ASSIGN TO or DELETE. The read escape rebound a pathlib method
+# the containment relied on — `Path.relative_to = lambda self, *a: self`,
+# `type(Path('.')).resolve = ...`, `pathlib.PurePath.relative_to = ...` — so
+# that every outside path passed the check (reproduced 2026-10-15). An
+# assignment whose target attribute hangs off one of these roots (directly, or
+# through an attribute/subscript chain, or a `type(...)` call) is refused.
+# Names a model binds with `import`/`from … import …` are added per-call. The
+# containment no longer depends on any of these (it uses captured os.path
+# functions), so this is defence in depth; it also keeps a rebind from
+# polluting the process when execute_pandas_code runs in-process.
+_SANDBOX_PROTECTED_ASSIGN_ROOTS = frozenset({
+    "pd", "np", "Path", "pandas", "numpy", "pathlib", "PurePath",
+    "PurePosixPath", "PureWindowsPath", "PosixPath", "WindowsPath",
+    "math", "re", "json", "statistics", "collections", "scipy",
+    "builtins", "type", "object", "super", "getattr", "setattr", "vars",
+})
+
+
+def _assign_target_root_name(node: "ast.AST") -> Optional[str]:
+    """Walk an assignment/delete target's base down through Attribute /
+    Subscript / Call to the root, and return that root's Name id (for a
+    `type(x).attr` target the root is the `type` call → 'type'), else None.
+    Used to decide whether an attribute assignment/deletion lands on a
+    sandbox module, class or proxy rather than the model's own object."""
+    cur = node.value if isinstance(node, ast.Attribute) else node
+    while True:
+        if isinstance(cur, ast.Attribute):
+            cur = cur.value
+        elif isinstance(cur, ast.Subscript):
+            cur = cur.value
+        elif isinstance(cur, ast.Call):
+            cur = cur.func
+        else:
+            break
+    return cur.id if isinstance(cur, ast.Name) else None
+
+
+def _iter_attr_targets(target: "ast.AST"):
+    """Yield every ast.Attribute among an assignment target (unwrapping
+    tuple/list unpacking and starred targets)."""
+    if isinstance(target, ast.Attribute):
+        yield target
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _iter_attr_targets(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _iter_attr_targets(target.value)
+
+
+# `pd.options.<group>.<name> = value` is everyday LLM pandas
+# (pd.options.display.max_columns = None, pd.options.mode.chained_assignment =
+# None) and ran before the rebinding check refused every assignment under
+# `pd` (measured 2026-10-15: run_python, data_query and the tool gate). It
+# sets an OPTION: pandas' options object only accepts names of existing
+# options and checks their values itself, and it changes no module, class or
+# path check. Only these groups are let through — they change how pandas shows
+# or computes; `plotting` (whose backend names a module pandas imports) and
+# `io` stay refused, as does assigning or deleting `pd.options` itself or a
+# whole group.
+_PD_OPTION_GROUPS_ASSIGNABLE = frozenset({
+    "display", "mode", "future", "styler", "compute",
+})
+
+# The refusal's tail: what is not allowed, in words, and what to do instead.
+_REBIND_REFUSAL = ("code may not change pandas, numpy, pathlib or the other "
+                   "modules and classes the sandbox provides; assign only to "
+                   "your own variables (set pandas display options with "
+                   "pd.set_option(...))")
+
+
+def _attr_chain(node: "ast.Attribute") -> Optional[Tuple[str, List[str]]]:
+    """(root name, [attribute names from the root down to node.attr]) when
+    ``node`` is a pure Name.attr.attr... chain, else None (a Subscript or Call
+    anywhere in it)."""
+    names = [node.attr]
+    cur = node.value
+    while isinstance(cur, ast.Attribute):
+        names.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    return cur.id, names[::-1]
+
+
+def _is_pandas_option_assignment(node: "ast.Attribute", pandas_names,
+                                 options_names) -> bool:
+    """Is the target ``node`` `<pandas>.options.<group>[.<more>].<name>` (or
+    `<options>.<group>...<name>` for `from pandas import options`) with
+    ``group`` in _PD_OPTION_GROUPS_ASSIGNABLE and no private name in it?"""
+    chain = _attr_chain(node)
+    if chain is None:
+        return False
+    root, names = chain
+    if root in pandas_names and names[:1] == ["options"]:
+        names = names[1:]
+    elif root not in options_names:
+        return False
+    # names is now [group, ..., option]: at least a group and an option.
+    if len(names) < 2 or names[0] not in _PD_OPTION_GROUPS_ASSIGNABLE:
+        return False
+    return not any(n.startswith("_") for n in names)
+
 
 def validate_generated_code(code: str) -> Tuple[bool, str]:
     if not code.strip():
@@ -3791,6 +3895,36 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
     # `__import__("pathlib").Path(p).unlink()` is a classic sandbox-escape
     # vector, so refuse the raw builtin call.
     forbidden_calls = {"eval", "exec", "compile", "input", "__import__"}
+
+    # Names the code binds via import — `import json as j` / `from pathlib
+    # import Path` — are protected assignment roots too, so `j.loads = ...`
+    # or a rebind of a freshly-imported module/class is refused like pd/np.
+    # EXCEPT a name the code also rebinds to its own value: `from scipy
+    # import stats` then `stats = df.groupby(...).describe(); stats.index.name
+    # = ...` is the model's frame, not scipy.stats (both ran before the
+    # check and were refused by it, measured 2026-10-15). The fixed sandbox
+    # names (pd, np, Path, ...) stay protected whatever the code does.
+    protected_roots = set(_SANDBOX_PROTECTED_ASSIGN_ROOTS)
+    rebound_names = {n.id for n in ast.walk(tree)
+                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    pandas_names = {"pd", "pandas"}
+    options_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = (alias.asname or alias.name).split(".")[0]
+                if alias.name == "pandas":
+                    pandas_names.add(bound)
+                if bound not in rebound_names:
+                    protected_roots.add(bound)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if node.module == "pandas" and alias.name == "options":
+                    options_names.add(bound)
+                if bound not in rebound_names:
+                    protected_roots.add(bound)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -3801,6 +3935,33 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
+        # No ASSIGNING TO or DELETING an attribute of a sandbox module, class
+        # or proxy — the Path-rebinding read escape (Path.relative_to =
+        # lambda self, *a: self; type(Path('.')).resolve = ...;
+        # pathlib.PurePath.relative_to = ...). The model's OWN objects are
+        # untouched: df.columns = [...], df.index.name = ..., obj.attr = ...
+        # all have a plain local-variable root, not a protected one.
+        _targets = None
+        if isinstance(node, ast.Assign):
+            _targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            _targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            _targets = node.targets
+        if _targets is not None:
+            for _tgt in _targets:
+                for _attr in _iter_attr_targets(_tgt):
+                    _root = _assign_target_root_name(_attr)
+                    if _root in protected_roots:
+                        if (not isinstance(node, ast.Delete)
+                                and _is_pandas_option_assignment(
+                                    _attr, pandas_names, options_names)):
+                            continue
+                        _verb = ("delete" if isinstance(node, ast.Delete)
+                                 else "assign to")
+                        return False, (
+                            f"Forbidden: cannot {_verb} {_attr.attr!r} on "
+                            f"{_root!r} — {_REBIND_REFUSAL}")
         # ANY attribute access to a forbidden name — called or not. Checking
         # only calls let `fn = p.unlink; fn()` and `w = p.write_text; w(...)`
         # through (a bound-method reference is an Attribute, not a Call), which
@@ -3835,6 +3996,19 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                     and node.args[1].value in _SANDBOX_FORBIDDEN_ANY_ATTR):
                 return False, (f"Forbidden {node.func.id} of "
                                f"{node.args[1].value!r}")
+            # setattr/delattr that rebind an attribute on a sandbox module,
+            # class or proxy — the string route around the assignment check
+            # above (setattr(Path, 'relative_to', ...)). setattr/delattr are
+            # not even in the sandbox builtins, but refuse here for a clear
+            # message instead of a bare NameError.
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id in ("setattr", "delattr")
+                    and node.args
+                    and _assign_target_root_name(node.args[0]) in protected_roots):
+                return False, (
+                    f"Forbidden: {node.func.id} on "
+                    f"{_assign_target_root_name(node.args[0])!r} — "
+                    f"{_REBIND_REFUSAL}")
     return True, "ok"
 
 
@@ -3938,6 +4112,101 @@ def _analyst_read_budget_bytes() -> int:
     return cap
 
 
+# ── Path containment immune to model rebinding ───────────────────────────
+# The sandbox's read containment USED to resolve and compare paths by calling
+# methods on Path objects — p.resolve(), p.is_absolute(),
+# cand.relative_to(root) — and relied on relative_to RAISING to refuse an
+# outside path. Model code runs with the REAL pathlib.Path in scope, so it
+# could rebind those methods and make every outside path pass:
+#     Path.relative_to = lambda self, *a, **k: self   # never raises
+#     print(read_text(r'C:\\...outside...'))
+# (reproduced 2026-10-15, through run_python and execute_pandas_code; also via
+# Path.resolve, Path.is_absolute, type(Path('.')).relative_to and
+# pathlib.PurePath.relative_to).
+#
+# These module globals bind os.path functions at import. `os` is unreachable
+# from model code (the import is refused, sys.modules is blocked), and these
+# are our own module names — NOT attributes on pd/np/Path or any object the
+# sandbox hands the model — so nothing model code can assign to changes what
+# they do. The sandbox's containment now runs entirely through them, on plain
+# strings, never touching a rebindable Path method. The AST validator also
+# refuses rebinding Path/module/proxy attributes (defence in depth), but this
+# layer holds even if a rebind somehow slips through.
+_OS_REALPATH = os.path.realpath
+_OS_NORMCASE = os.path.normcase
+_OS_ISABS = os.path.isabs
+_OS_JOIN = os.path.join
+_OS_COMMONPATH = os.path.commonpath
+_OS_EXISTS = os.path.exists
+_OS_EXPANDUSER = os.path.expanduser
+_OS_FSPATH = os.fspath
+
+
+def _sandbox_path_str(value) -> str:
+    """`value` as a plain path string, taken exactly ONCE. A str is used
+    as-is (str methods are builtin and cannot be rebound); anything else is
+    converted once. A lying __fspath__/__str__ can only change WHICH path is
+    then validated — and the caller opens exactly the realpath this
+    validated, so it can never open an unvalidated path."""
+    if isinstance(value, str):
+        return value
+    try:
+        s = _OS_FSPATH(value)
+    except TypeError:
+        s = str(value)
+    if isinstance(s, bytes):
+        return s.decode("utf-8", "replace")
+    return s if isinstance(s, str) else str(s)
+
+
+def _sandbox_real_norm(s: str) -> str:
+    """Normalised real absolute path of `s` — captured realpath + normcase,
+    so symlinks and `..` are resolved and case/separators are canonical."""
+    return _OS_NORMCASE(_OS_REALPATH(s))
+
+
+def _sandbox_inside(child_real_norm: str, root_reals_norm) -> bool:
+    """True iff `child_real_norm` is one of the roots or lies within it,
+    compared with os.path.commonpath on normcased realpaths — never
+    Path.relative_to. A sibling whose name merely shares a prefix (…/data vs
+    …/database) is correctly OUTSIDE."""
+    for r in root_reals_norm:
+        try:
+            if _OS_COMMONPATH([child_real_norm, r]) == r:
+                return True
+        except (ValueError, OSError):
+            continue          # different drives, or an unusable path
+    return False
+
+
+def _sandbox_resolve_within(value, root_strs, root_reals) -> Optional[str]:
+    """The realpath string of ``value``, confirmed inside one of
+    ``root_reals``, or None. ``root_strs`` / ``root_reals`` are the root
+    strings and their _sandbox_real_norm forms, captured before any model
+    code runs. A relative name joins the first root that has it (else the
+    first root); an absolute name must already be inside. Pure os.path on
+    strings through the captured functions above — no Path method — so a
+    rebound Path cannot change the answer. The ONE resolver every read
+    surface uses (pd readers, read_text/open, list/count, the helpers)."""
+    s = _OS_EXPANDUSER(_sandbox_path_str(value))
+    if _OS_ISABS(s):
+        real = _OS_REALPATH(s)
+    else:
+        real = None
+        for root in root_strs:
+            c = _OS_REALPATH(_OS_JOIN(root, s))
+            if _OS_EXISTS(c):
+                real = c
+                break
+        if real is None:
+            if not root_strs:
+                return None
+            real = _OS_REALPATH(_OS_JOIN(root_strs[0], s))
+    if _sandbox_inside(_OS_NORMCASE(real), root_reals):
+        return real
+    return None
+
+
 class _BudgetedPandas:
     """Proxy around the real pandas module for the analyst sandbox.
 
@@ -3951,10 +4220,26 @@ class _BudgetedPandas:
 
     def __init__(self, real, budget_bytes: int, state: dict,
                  roots: Iterable[Path] = ()) -> None:
-        self._real = real
-        self._budget = int(budget_bytes)
-        self._state = state          # {"used": int}
-        self._roots = [Path(str(r)) for r in roots]
+        # object.__setattr__ for the internals so model code cannot rebind
+        # them through the proxy (self.contain = ...): __setattr__ below
+        # refuses every other assignment. Root strings + their normcased
+        # realpaths are captured HERE, before any model code runs, so the
+        # containment check never calls str()/resolve() on a Path the model
+        # might have rebound.
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_budget", int(budget_bytes))
+        object.__setattr__(self, "_state", state)          # {"used": int}
+        root_strs = [str(r) for r in roots]
+        object.__setattr__(self, "_roots", [Path(s) for s in root_strs])
+        object.__setattr__(self, "_root_strs", root_strs)
+        object.__setattr__(self, "_root_reals",
+                           [_sandbox_real_norm(s) for s in root_strs])
+
+    def __setattr__(self, name, value):
+        raise AttributeError("sandbox: pandas is read-only")
+
+    def __delattr__(self, name):
+        raise AttributeError("sandbox: pandas is read-only")
 
     def _resolve(self, a: tuple, k: dict):
         """Point a RELATIVE file path at the data folder.
@@ -3979,41 +4264,40 @@ class _BudgetedPandas:
                     break
         if value is None:
             return a, k          # a buffer / file object: nothing to resolve
-        cand = self.contain(value)
+        # Pass the validated realpath STRING straight to pandas — never
+        # str(Path), whose __str__ model code could rebind to a different
+        # file than the one we validated.
+        cand = self._contain_str(value)
         if key is None:
-            return (str(cand),) + tuple(a[1:]), k
-        return a, {**k, key: str(cand)}
+            return (cand,) + tuple(a[1:]), k
+        return a, {**k, key: cand}
 
-    def contain(self, value) -> Path:
-        """The real file ``value`` names, INSIDE a data folder, or
-        PermissionError. Relative names resolve against each data folder
-        (first that exists, else the first folder); absolute paths must
-        already be inside one; URLs and UNC paths are refused outright.
+    def _contain_str(self, value) -> str:
+        """The real file ``value`` names, INSIDE a data folder, as a plain
+        validated path string, or PermissionError. Relative names resolve
+        against each data folder (first that exists, else the first folder);
+        absolute paths must already be inside one; URLs and UNC paths are
+        refused outright.
 
         This used to pass absolute paths and URLs through untouched, so
         pd.read_csv('C:/anything') read any file on the PC (reproduced
         2026-10-05), and a relative name that did not exist under the data
-        folder fell back to the app's working directory."""
-        s = str(value)
+        folder fell back to the app's working directory.
+
+        Resolution and the inside-a-root test run through captured os.path
+        functions on strings — never Path.resolve / Path.is_absolute /
+        Path.relative_to, which model code can rebind (2026-10-15). The
+        caller opens exactly this returned string."""
+        s = _sandbox_path_str(value)
         if "://" in s or s.startswith(("\\\\", "//")):
             raise PermissionError(f"sandbox: reading {s!r} is blocked — only "
                                   "files inside the data folders can be read")
-        p = Path(s).expanduser()
-        if p.is_absolute():
-            cands = [p.resolve()]
-        else:
-            cands = [(r / p).resolve() for r in self._roots]
-            existing = [c for c in cands if c.exists()]
-            cands = existing[:1] or cands[:1]
-        for cand in cands:
-            for root in self._roots:
-                try:
-                    cand.relative_to(root.resolve())
-                    return cand
-                except (OSError, ValueError):
-                    continue
-        raise PermissionError(f"sandbox: {s!r} is outside the data folders; "
-                              "only files inside them can be read")
+        real = _sandbox_resolve_within(s, self._root_strs, self._root_reals)
+        if real is None:
+            raise PermissionError(f"sandbox: {s!r} is outside the data "
+                                  "folders; only files inside them can be "
+                                  "read")
+        return real
 
     def _account(self, df):
         try:
@@ -4045,7 +4329,7 @@ class _BudgetedPandas:
         if name == "ExcelFile" and self._roots:
             def _excel_file(path, *a, **k):
                 if isinstance(path, (str, Path)):
-                    path = str(self.contain(path))
+                    path = self._contain_str(path)
                 return real_attr(path, *a, **k)
             return _excel_file
         if name in _BUDGETED_READERS and callable(real_attr):
@@ -4070,7 +4354,7 @@ def _sandbox_vault_dir() -> Optional[Path]:
         return None
 
 
-def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd, resolve_dir,
+def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
                      roots: List[Path]) -> None:
     """Wrap every helper the sandbox exposes so a path it is GIVEN stays
     inside the data folders.
@@ -4079,8 +4363,9 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd, resolve_dir,
     handed: summarize_csv('C:/anything') and list_csv_files('C:/') read and
     listed outside the data folders (reproduced 2026-10-05). Wrapping by
     PARAMETER NAME covers the ~80 helpers and any added later:
-      file params (path, a, b, left, …) -> budgeted_pd.contain
-      folder params (data_folder, …)    -> resolve_dir
+      file params (path, a, b, left, …) -> budgeted_pd._contain_str
+      folder params (data_folder, …)    -> must be inside a data folder
+                                           (_sandbox_resolve_within)
       output_dir                        -> must be inside the vault's data_out
       vault_dir                         -> always the real vault
     A DataFrame or None passes through untouched. duckdb_query also gets its
@@ -4098,26 +4383,39 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd, resolve_dir,
         except Exception:
             out_root = vault / "data_out"
 
+    # Root strings + their normcased realpaths, captured BEFORE any model code
+    # runs, so the "dir"/"out" containment never calls str()/resolve()/
+    # relative_to() on a Path whose methods model code may have rebound.
+    _dir_root_strs = [str(r) for r in roots]
+    _dir_root_reals = [_sandbox_real_norm(s) for s in _dir_root_strs]
+    _out_root_str = str(out_root) if out_root is not None else None
+    _out_root_reals = ([_sandbox_real_norm(_out_root_str)]
+                       if _out_root_str is not None else [])
+
     def contain(value, kind):
         if isinstance(value, (list, tuple)):
             return type(value)(contain(v, kind) for v in value)
         if not isinstance(value, (str, Path)):
             return value
         if kind == "dir":
-            return str(resolve_dir(value))
-        if kind == "out":
-            if out_root is None:
-                raise PermissionError("sandbox: no output folder is configured")
-            p = Path(str(value)).expanduser()
-            p = (p if p.is_absolute() else out_root / p).resolve()
-            try:
-                p.relative_to(out_root.resolve())
-            except ValueError:
+            real = _sandbox_resolve_within(value, _dir_root_strs,
+                                           _dir_root_reals)
+            if real is None:
                 raise PermissionError(
-                    f"sandbox: output_dir {str(value)!r} is outside the output "
-                    f"folder ({out_root}); write results there") from None
-            return str(p)
-        return str(budgeted_pd.contain(value))
+                    f"list/count is limited to the data folders; {value!r} is "
+                    "outside them")
+            return real
+        if kind == "out":
+            if _out_root_str is None:
+                raise PermissionError("sandbox: no output folder is configured")
+            real = _sandbox_resolve_within(value, [_out_root_str],
+                                           _out_root_reals)
+            if real is None:
+                raise PermissionError(
+                    f"sandbox: output_dir {value!r} is outside the output "
+                    f"folder ({out_root}); write results there")
+            return real
+        return budgeted_pd._contain_str(value)
 
     def wrap(fn):
         try:
@@ -4163,7 +4461,7 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd, resolve_dir,
             """duckdb_query with DuckDB's own file access limited to the data
             folders (or switched off when this DuckDB cannot do that)."""
             duckdb = _import_duckdb()
-            p = str(budgeted_pd.contain(path))
+            p = budgeted_pd._contain_str(path)
             cfg = {"enable_external_access": False,
                    "allowed_directories": [str(r) for r in roots]}
             try:
@@ -4215,6 +4513,18 @@ def execute_pandas_code(
     _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state,
                                    roots=normalized_folders)
 
+    # Root strings + their normcased realpaths, captured HERE — before any
+    # model code runs — so the read/list containment below never resolves or
+    # compares a path by calling a Path method (resolve / is_absolute /
+    # relative_to) that model code could rebind. See _sandbox_inside et al.
+    _root_strs = [str(r) for r in normalized_folders]
+    _root_reals = [_sandbox_real_norm(s) for s in _root_strs]
+
+    def _sb_resolve_within(value) -> Optional[str]:
+        """The realpath string of `value`, confirmed inside a data folder, or
+        None (_sandbox_resolve_within on this run's captured roots)."""
+        return _sandbox_resolve_within(value, _root_strs, _root_reals)
+
     # ── Safe, READ-ONLY directory helpers ───────────────────────────────
     # The sandbox blocks `import os`, so model code that tried os.listdir /
     # os.walk to count files/folders used to fail with "Forbidden import:
@@ -4222,28 +4532,14 @@ def execute_pandas_code(
     # they only iterate + stat (no open/read/write/delete) and are bounded to
     # the allowed data folders.
     def _sb_resolve_dir(folder=None) -> Path:
-        base = Path(str(normalized_folders[0]))
         if folder is None:
-            return base
-        p = Path(str(folder)).expanduser()
-        if not p.is_absolute():
-            for root in normalized_folders:
-                cand = Path(str(root)) / p
-                if cand.exists():
-                    p = cand
-                    break
-            else:
-                p = base / p
-        p = p.resolve()
-        for root in normalized_folders:
-            try:
-                p.relative_to(Path(str(root)).resolve())
-                return p
-            except ValueError:
-                continue
-        raise PermissionError(
-            f"list/count is limited to the data folders; {folder!r} is "
-            "outside them")
+            return Path(_root_strs[0])
+        real = _sb_resolve_within(folder)
+        if real is None:
+            raise PermissionError(
+                f"list/count is limited to the data folders; {folder!r} is "
+                "outside them")
+        return Path(real)
 
     def _sb_count_files(folder=None, recursive=True) -> int:
         d = _sb_resolve_dir(folder)
@@ -4271,25 +4567,12 @@ def execute_pandas_code(
     # UnicodeDecodeError (wrong encoding). These give a bounded, encoding-safe,
     # path-contained way to read files WITHOUT any write/delete surface.
     def _sb_resolve_file(path) -> Path:
-        p = Path(str(path)).expanduser()
-        if not p.is_absolute():
-            for root in normalized_folders:
-                cand = Path(str(root)) / p
-                if cand.exists():
-                    p = cand
-                    break
-            else:
-                p = Path(str(normalized_folders[0])) / p
-        p = p.resolve()
-        for root in normalized_folders:
-            try:
-                p.relative_to(Path(str(root)).resolve())
-                return p
-            except ValueError:
-                continue
-        raise PermissionError(
-            f"file access is blocked outside the data folders; {path!r} is "
-            "outside them")
+        real = _sb_resolve_within(path)
+        if real is None:
+            raise PermissionError(
+                f"file access is blocked outside the data folders; {path!r} is "
+                "outside them")
+        return Path(real)
 
     def _sb_column_stats(folder=None):
         """column_stats(folder=None): one row per (file, column), from the
@@ -4566,7 +4849,7 @@ def execute_pandas_code(
 
     if "np" in globals_dict:
         globals_dict["np"] = _SandboxModule(globals_dict["np"], _NUMPY_EXTRA_BLOCKED)
-    _contain_helpers(globals_dict, _budgeted_pd, _sb_resolve_dir, normalized_folders)
+    _contain_helpers(globals_dict, _budgeted_pd, normalized_folders)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python
