@@ -402,14 +402,25 @@ def list_cameras() -> Dict[str, Any]:
     """
     from council_core import cameras
 
-    found = cameras.discover(_backends_for(current_choice()))
+    host = _plugin_host()
+    if host is None:
+        found = cameras.discover(_backends_for(current_choice()))
+    else:
+        # A "Typhon (plugins)" project: the camera plugins it runs, less
+        # the families its set-up did not tick — the same scan, the same
+        # notes (plugin design 2.4 items 3 and 15).
+        found = host.discover_cameras()
     _LIVE.found = found
     rows = [_row(i, c) for i, c in enumerate(found.cameras)]
+    if host is not None:
+        rows = _in_use(rows, found.cameras)
     # A LIST, not a joined string. These go to a listbox port, whose
     # set() iterates what it is given -- a string becomes one row PER
     # CHARACTER, which is exactly what it did the first time this ran
     # against a real camera: the panel showed "p", "r", "o", ...
-    notes = list(found.notes) or ["Every backend was searched."]
+    notes = list(found.notes) + (list(host.notes) if host is not None
+                                 else [])
+    notes = notes or ["Every backend was searched."]
     if found.cameras:
         summary = f"{len(found.cameras)} camera(s) found."
     else:
@@ -432,6 +443,96 @@ def _backends_for(choice: Optional[str]):
     if choice == "prophesee":
         return [cameras.EvkBackend(), cameras.SyntheticBackend()]
     return None
+
+
+# ======================================================================
+# A "Typhon (plugins)" project (typhon-plugins branch, stage P2 rows 3-4)
+# ======================================================================
+#: A "Typhon (plugins)" project keeps its plugin list in this file beside
+#: camera_setup.json (council_core.plugin_lists.PROJECT_FILE; a test checks
+#: they agree). Named here, never imported: today's Typhon must not import
+#: the plugin system, nor list it among its Python Scripts.
+_PLUGIN_LIST_FILE = "typhon_plugins.json"
+
+
+def _plugin_project() -> Optional[Path]:
+    """The attached app's project folder when it is a "Typhon (plugins)"
+    project — one whose folder holds its plugin list — else None (today's
+    Typhon, and every app that never attached)."""
+    path = _LIVE.setup_path
+    if path is None:
+        return None
+    project = Path(path).parent
+    try:
+        return project if (project / _PLUGIN_LIST_FILE).is_file() else None
+    except OSError:
+        return None
+
+
+def _plugin_host() -> Any:
+    """The rig's plugin host with this app's project open, for a "Typhon
+    (plugins)" project: its cameras are scanned, opened and set up through
+    the camera plugins it runs (plugin design 2.4 items 3 and 15). None for
+    today's Typhon, which never makes the host."""
+    project = _plugin_project()
+    if project is None:
+        return None
+    host = _RIG.plugins
+    have = host.project_dir
+    if have is None or Path(have).resolve() != project.resolve():
+        host.open_project(project)
+    return host
+
+
+def _in_use(rows: List[str], infos: List[Any]) -> List[str]:
+    """The scan's rows, a camera this window has open marked "in use as
+    cam2" (multi-camera design 2.2) — once the rig has a second camera
+    slot. A one-camera window's rows read as they always have."""
+    if len(_RIG) < 2:
+        return rows
+    out = []
+    for row, info in zip(rows, infos):
+        slot = _RIG.holding(info)
+        out.append(f"{row} · in use as {slot.name}" if slot is not None
+                   else row)
+    return out
+
+
+def _name_in_rig(host: Any, info: Any) -> str:
+    """Give the camera just connected in the active slot its name in the
+    rig (the plugin host's name_camera); "" when all went well, else what
+    to say. Never in the way of the camera: whatever goes wrong is said."""
+    try:
+        return host.name_camera(_RIG.active.name, info)[1]
+    except Exception as exc:                              # noqa: BLE001
+        return f"the camera keeps the name {_RIG.active.name} — " \
+               f"{type(exc).__name__}: {exc}"
+
+
+def _held_names() -> Dict[str, str]:
+    """Every camera this window has open, by the key it was found by: its
+    name in the rig (the families wizard's scans: "in use as cam2")."""
+    return {slot.info.key: slot.name for slot in _RIG
+            if getattr(slot, "info", None) is not None}
+
+
+def current_families() -> Optional[List[str]]:
+    """The camera families this app is set up for (camera_setup.json:
+    a "Typhon (plugins)" project's ticked families, or the one camera of a
+    single-choice file), or None when it was never set up."""
+    from council_core import camera_setup
+
+    path = _LIVE.setup_path
+    return camera_setup.load_families(path) if path is not None else None
+
+
+def _needs_setup() -> bool:
+    """Whether the attached app has never been set up: a "Typhon (plugins)"
+    project asks for its families, today's Typhon for its one camera. A
+    project set up with today's single choice is set up for both."""
+    if _plugin_project() is not None:
+        return current_families() is None
+    return current_choice() is None
 
 
 def _picked(selection: Any) -> str:
@@ -491,11 +592,26 @@ def connect(which: Any) -> Dict[str, Any]:
     # An app that never attached (no live view, a script) warms here; one
     # that did is warm already, and this costs nothing.
     capture.warm_in_background()
+    host = _plugin_host()
+    named = ""
     with _LOCK:
         if _LIVE.device is not None:
             raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
-        device = cameras.open_camera(info)
+        if host is None:
+            device = cameras.open_camera(info)
+        else:
+            # A "Typhon (plugins)" project opens through the camera plugin
+            # of the camera's family, which confirms onto the slot what the
+            # camera can do (plugin design 3.4). A camera another slot of
+            # this window holds is refused before anything opens: a second
+            # open fails on real hardware (the emulator allows it).
+            slot = _RIG.active
+            other = _RIG.holding(info)
+            if other is not None and other is not slot:
+                raise RuntimeError(f"that camera is in use as {other.name} — "
+                                   f"disconnect it there first")
+            device = host.open_camera(info, camera=slot.name)
         # What the camera says it is once open (an event camera's sensor is
         # read then, never at discovery — cameras.identify): the identity
         # presets and the run's camera record use.
@@ -506,6 +622,11 @@ def connect(which: Any) -> Dict[str, Any]:
         _LIVE.info = info
         _LIVE.session = capture.CaptureSession(device)
         _LIVE.reported = True
+    if host is not None:
+        # Its name in the rig (camera_rig.json): the same camera gets the
+        # same name next time (multi-camera design 2.2). Outside the lock:
+        # another window may hold the file's for a moment.
+        named = _name_in_rig(host, info)
 
     limits = device.limits()
     area = device.roi()
@@ -530,6 +651,10 @@ def connect(which: Any) -> Dict[str, Any]:
         # earlier session left) sends smaller frames with Downsample Off:
         # said here, where the user looks first, not found in the files.
         said += f" Note: {binned}."
+    if named:
+        # Its name in the rig could not be kept (camera_rig.json damaged,
+        # or not writable): said, never in the way of the camera.
+        said += f" Note: {named}."
     return {
         "summary": said,
         "area": _area_text(area),
@@ -2193,7 +2318,7 @@ def attach(app: Any, view: str = "live_view",
         _LIVE.tabs.close()             # an earlier window's, now replaced
     _LIVE.tabs = settings_tabs
     app._settings_tabs = settings_tabs
-    if first_run and current_choice() is None and not _dialogs_disabled():
+    if first_run and _needs_setup() and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
         # to sit over.
@@ -2852,28 +2977,50 @@ def setup(parent: Any = None) -> Dict[str, Any]:
 
         window = parent or QApplication.activeWindow()
         title = window.windowTitle() if window is not None else ""
+        host = _plugin_host()
         try:
-            chosen = camera_wizard.run_wizard(window, path, app_name=title)
+            if host is None:
+                chosen = camera_wizard.run_wizard(window, path,
+                                                  app_name=title)
+            else:
+                # A "Typhon (plugins)" project ticks camera families: one
+                # check box per camera plugin with a set-up, each bringing
+                # its guide, checks and scan (plugin design 2.4 item 15).
+                families = host.camera_families()
+                ticked = camera_wizard.run_families_wizard(
+                    window, path, families, app_name=title,
+                    held=_held_names)
         except getattr(camera_wizard, "NoQtApplication", ()) as exc:
             chosen = None
             said = f"Camera setup skipped — {exc}."
         else:
-            said = (f"Set up for {camera_setup.label(chosen)}." if chosen
-                    else "Camera setup cancelled — nothing changed.")
+            if host is None:
+                said = (f"Set up for {camera_setup.label(chosen)}." if chosen
+                        else "Camera setup cancelled — nothing changed.")
+            else:
+                said = (f"Set up for "
+                        f"{camera_setup.families_label(ticked, families)}."
+                        if ticked else
+                        "Camera setup cancelled — nothing changed.")
     listed = list_cameras()
     listed["summary"] = f"{said} {listed['summary']}"
     return listed
 
 
 def _tell_the_scan_what_is_open() -> None:
-    """The wizard's Basler scan must not open the camera this app already has
-    open: a second open fails on real hardware (the emulator allows it)."""
+    """The wizard's Basler scan must not open a camera this app already has
+    open: a second open fails on real hardware (the emulator allows it). It
+    is told about every camera slot (multi-camera design 2.2) — with one
+    camera, the one camera as before — and, for a "Typhon (plugins)"
+    project's scans, the name each goes by in the rig."""
     try:
         from council_qt.widgets import camera_wizard
     except Exception:                                     # noqa: BLE001
         return
     camera_wizard.held_keys = (
-        lambda: [_LIVE.info.key] if _LIVE.info is not None else [])
+        lambda: [slot.info.key for slot in _RIG
+                 if getattr(slot, "info", None) is not None])
+    camera_wizard.held_names = _held_names
 
 
 def _first_run(app: Any) -> None:
