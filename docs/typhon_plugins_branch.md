@@ -119,6 +119,11 @@ python tools\typhon_plugins_gate.py --check-list
   example. Plus the branch's own files (`tests/test_camera_rig.py`,
   `tests/test_typhon_plugins_*.py`; the plugin contract suites join from
   stage P3). One pytest process per file, offscreen, in temporary folders.
+- `tests/test_gui_policy.py` is in the gate ahead of the next merge from
+  `qt-migration`: that branch's policy-gate fix (e40d319, 6884069) makes
+  it build and policy-check every example, `typhon_plugins` included, and
+  name `frame_camera`, so `--check-list` would stop the gate after the
+  merge until the file was listed.
 - `--check-list` fails when a test file that names Typhon's modules or
   examples is missing from the list, so one added later cannot be left out
   silently.
@@ -129,7 +134,13 @@ python tools\typhon_plugins_gate.py --check-list
   and not left red: its name goes on `RETIRED` in
   `tests/test_retired_tests.py` and in CLAUDE.md's "Retired tests" list with
   the reason, and the test is deleted. A test shared with Typhon loses only
-  its Barbie parameters.
+  its Barbie parameters. The rule holds in the `pylon` environment too.
+  Retired so far: `tests/test_barbie_v4.py::
+  test_connect_accepts_a_listbox_selection` (16 October 2026). It took row
+  1 of the camera list to be the simulated event camera, which is wrong
+  whenever `PYLON_CAMEMU` lists pylon's emulated Baslers first, and failed
+  in the `pylon` environment on `qt-migration` (43b317e) and on the branch
+  alike.
 
 At the branch point (43b317e) the gate was 51 files, 2,676 passed, 0 failed,
 27 skipped (`tests/test_basler_real.py` collects nothing outside the `pylon`
@@ -144,7 +155,10 @@ with pylon's emulated Baslers (`PYLON_CAMEMU=2`) and OpenEB on the path:
 14 files, 608 passed, 0 failed. That includes `tests/test_basler_real.py`
 with 47 tests. The gate now passes `--timeout` only to an interpreter that
 has pytest-timeout. That environment has not, and before this fix every
-file there ran nothing.
+file there ran nothing. Those 14 files left out `tests/test_barbie_v4.py`.
+The P1 review ran 21 camera files in one `pylon` process and found one
+failure there, on the branch point and on the branch alike; that test is
+now retired (above).
 
 The whole suite, on 31e0e1e, 8 at a time: 234 files, 8,276 passed, 2
 failed, 36 skipped, and `smoke_test.py` passed 1,313 with 0 failed. Both
@@ -163,13 +177,26 @@ At `--jobs 6` it was not clean. Two timing tests in
 - `test_the_list_is_quick_and_a_second_look_is_quicker`, whose cold
   Python Scripts list took 3.4 s against its 3.0 s limit.
 
-The plugin host's modules are 5 more files on Typhon's Python Scripts list
-(36 to 41). That makes a cold list about 10-20 % slower: 0.96-1.0 s against
-0.77-0.92 s on a quiet PC. Both tests passed when run alone, and so did the
-whole file at 4 jobs. On 15 October 2026 the known-flaky test also failed
-when run alone on an untouched copy of the P1 row 1 commit (710c87f), with
-a ratio of 1.84 against the 2.0 it checks for. So it is this PC on that day,
-not the plugin host.
+The plugin host's modules were 5 more files on Typhon's Python Scripts list
+(36 to 41), and made a cold list about 10-20 % slower. Both tests passed
+when run alone, and so did the whole file at 4 jobs. On 15 October 2026 the
+known-flaky test also failed when run alone on an untouched copy of the P1
+row 1 commit (710c87f), with a ratio of 1.84 against the 2.0 it checks for.
+
+The P1 review found that the extra files also cut that test's margin: its
+ratio fell from a median of about 2.50 at the branch point to about 2.29
+on the branch, against the 2.0 it needs, and it failed in a whole-suite
+run. The cause was the rig's import of the host, which the list's static
+scan followed although today's Typhon never loads the host. The rig now
+imports the host by a name built at run time, so today's Typhon lists 36
+files again: the 35 of the branch point and `council_core.camera_rig`.
+Measured on 16 October 2026, four alternating pairs, each a fresh pytest
+process on `tests/test_gui_settings.py`:
+
+| | Files | Cold list | Known-flaky ratio (must stay above 2.0) |
+|---|---|---|---|
+| branch point (43b317e) | 35 | 695-722 ms | 2.56-2.67 |
+| branch, after the review | 36 | 703-736 ms | 2.80-2.89 |
 
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
@@ -243,35 +270,69 @@ reached the end of the grab thread's step more than one frame period
 In the table, "timer 1 ms" means `timeBeginPeriod(1)`, together with the
 Windows 11 request to honour it with no visible window.
 
-**What it says.**
+**Measured again in the P1 review (16 October 2026).** The review re-ran
+the bench on the same laptop and could not reproduce the 5 ms rows: today's
+settings with a 5 ms plugin made 0 of 600 frames late. The load on the PC
+was not recorded on 15 October, when two gates ran the same day. So the
+bench now records it in every run (`cpu_busy_pct` from GetSystemTimes, the
+busiest other programs through psutil), and it was run again: 2 runs per
+row, 4 s at 150 fps, the whole PC 5.6-30.9 % busy during the captures
+(about 10 % in most; antivirus and indexing in the busiest), Windows' timer
+at 1.0 ms in every run.
 
-- **Inside the real Typhon, a live plugin hurts far more than the design's
-  benchmark process showed.** That benchmark found a 5 ms plugin harmless
-  (0-2 late), but here a 5 ms plugin, busy 75 % of the time at 150 fps,
-  made 86-92 % of the frames late. A 20 ms plugin, which is always busy,
-  starved the grab thread so badly that it read only 215-233 of the 600
-  frames due in the 4 s, up to 2.6 s behind. On a real camera with a buffer
-  of a few frames, the rest would have been lost. With no plugin, or with
-  an empty one, the numbers are those of today's Typhon (0-4 late), so the
-  host and the feed cost nothing visible.
-- **P3 row 5 is warranted, and it must set both.** A 1 ms switch interval
-  together with a 1 ms process timer took the 5 ms plugin from 86-92 % late
-  to 0-2 frames. Either one alone did not: 75-99 % were still late. This
-  agrees with the design's research, which set both.
-- **It is not enough by itself for a plugin that is always busy.** At
-  20 ms a frame, 25-37 % of the frames were still late (p99 29-138 ms).
-  With the 25 % duty cap as well, 3-4 % were late, with p99 under 10 ms.
-  So the cap should be on by default for live plugins (design 10.2,
-  second line), and heavy work stays off the live path. Classification
-  after Stop is the default (question 5).
-- **What this PC could not show.** Other programs on this laptop already
-  hold Windows' timer at 1 ms (`NtQueryTimerResolution` said 1.0 ms in
-  every run), and a 1 ms wait took about 1.0-1.9 ms even with "today's"
-  settings. On a PC where nothing asks for a finer timer, today's settings
-  may be worse than shown here. That needs checking on the bench PC.
+| Settings | Plugin per frame | Late frames | More than 2 periods late | p99 lateness | Frames read in the 4 s |
+|---|---|---|---|---|---|
+| today's | none | 0 of 602-603 | 0 | 1.3-1.6 ms | all |
+| today's | 5 ms | **0** of 602 (PC 14-31 % busy) | 0 | 3.6-4.7 ms | all |
+| today's | 20 ms | **all** of 400-439 | 399-439 | 1.1-1.3 s | **400-439 of 600** |
+| today's | 20 ms, capped at 25 % | 80-89 of 599-601 | 19-20 | 14.6-14.7 ms | all |
+| switch interval 1 ms only | 5 ms | 0 of 600-603 | 0 | 1.4-1.5 ms | all |
+| switch interval 1 ms only | 20 ms | 103-121 of 601-602 | 9 | 14.3-15.0 ms | all |
+| switch interval 1 ms only | 20 ms, capped | **14-17** of 601-602 | 0-1 | 7.6-8.0 ms | all |
+| timer 1 ms only | 5 ms | 0-7 of 600 | 0 | 1.8-6.9 ms | all |
+| timer 1 ms only | 20 ms | **all** of 383-395 | 382-394 | 1.4-1.5 s | **383-395 of 600** |
+| timer 1 ms only | 20 ms, capped | 81-87 of 600-602 | 15-16 | 14.6 ms | all |
+| both at 1 ms | none | 0 of 599 | 0 | 1.5-1.6 ms | all |
+| both at 1 ms | 5 ms | 0 of 599-602 | 0 | 1.3-1.5 ms | all |
+| both at 1 ms | 20 ms | 104-112 of 598-603 | 6-10 | 12.7-14.7 ms | all |
+| both at 1 ms | 20 ms, capped | **9-17** of 599-601 | 0-1 | 7.7-8.1 ms | all |
 
-To measure again (about 4 minutes), with `--timers default,1ms,switch,period`
-for the full table:
+**What it says, taking both days together.**
+
+- **A plugin that is always busy starves the grab thread at today's
+  settings.** At 20 ms a frame it read only 215-233 (15 October) or
+  400-439 (16 October) of the 600 frames due, up to 1-2.6 s behind; on a
+  real camera with a buffer of a few frames, the rest would have been
+  lost. This held on both days.
+- **The 1 ms switch interval is what prevents that, on this PC.** With it,
+  every frame was read and 17-20 % of them were late (p99 under 15 ms) on
+  16 October. The 1 ms timer request alone did nothing visible: the
+  20 ms plugin starved the grab thread just as at today's settings, and
+  with both set the numbers were those of the switch interval alone. But
+  other programs already hold this laptop's timer at 1 ms, so the timer's
+  own effect is still unmeasured. "P3 row 5 must set both" is not
+  established.
+- **The 25 % duty cap is the second half.** With the switch interval it
+  left 9-17 of 600 late on 16 October (p99 about 8 ms). On 15 October it
+  left 17-23 with both settings, but 90-116 with the switch interval
+  alone. At today's settings it still left 80-106 late. So the cap is now on by
+  default for live plugins (design 3.11), and heavy work stays off the
+  live path: classification after Stop is the default (question 5).
+- **A plugin busy 5 ms of every 6.7 ms depends on what else the PC does.**
+  On 15 October it made 86-92 % of frames late at today's settings and
+  75-99 % with either setting alone; on 16 October, with the PC 6-31 %
+  busy, it made 0-7 late with any setting. Read the 5 ms rows of the first
+  table with that in mind.
+- **Still to measure before P3 row 5:** a quiet PC where nothing holds the
+  timer at 1 ms (the bench PC), with the spread between runs and the load
+  beside each, to tell whether the timer request matters at all.
+
+With no plugin, or with an empty one, the numbers are those of today's
+Typhon on both days (0-4 late), so the host and the feed cost nothing
+visible.
+
+To measure again (about 5 minutes), with `--timers default,1ms,switch,period`
+for the full table; each row printed says how busy the PC was:
 
 ```
 python tools\typhon_plugins_timing.py --out timing.json
@@ -285,5 +346,6 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P0 row 2: Update from example writes nothing until it can finish | a bug fix for `qt-migration`, merged in when it lands |
 | P1 row 1: `Rig`, `CameraSlot`, `_LIVE` as a view | first step: `council_core/camera_rig.py`; `frame_camera._LIVE` is a view over the rig (per-connection fields on the active slot, app fields on the rig); functions still lock with the module's `_LOCK` and act on the active slot |
 | P1 row 2: the plugin host on the rig | done (`docs/typhon_plugin_api_notes.md`): manifest reader, built-in list and registry, third-party folders listed (loaded from P5), lazy loading, guarded calls and the three fault endings, the watchdog, contexts, events, the UI queue, live feeds, the base set and project lists (Q1, Q14), `TYPHON_PLUGIN_HOME`, `typhon_plugin_api` 0.1; seven empty built-in adapters; nothing wired to a feature |
-| P1 row 3: frame timing inside the real Qt Typhon | done (above): P3 row 5 is warranted (both the switch interval and the timer), plus a duty cap on by default |
+| P1 row 3: frame timing inside the real Qt Typhon | done (above), measured twice: a 1 ms switch interval and the duty cap (now on by default) keep an always-busy plugin from starving the grab thread; whether the 1 ms timer request matters is still to measure on a PC where nothing else holds it, before P3 row 5 |
 | P1 row 4: `typhon_plugins.gspec` registered | done: typhon's wireframe under the new name |
+| P1 review (16 October 2026) | fixed: a gate bound to its own run's writer (a late fault no longer ends the next run; a `confirm_saves` fault ends its run with the reason); the frame at a gate fault saved and marked; loading outside the host's lock; hook lookups guarded; any exception counted; the watchdog starting itself; a damaged project list running only the built-in cameras; nothing written under `~\.council`; run-file names holding a core ending refused; too many files said as such; frames a plugin cannot unlock; the duty cap on by default; `has()` only for hooks Typhon calls; the host off today's Python Scripts list; `tests/test_gui_policy.py` in the gate; a Barbie test retired. Two decisions to confirm are in `docs/typhon_plugin_api_notes.md` ("Decisions") |
