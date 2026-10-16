@@ -846,9 +846,10 @@ class FrameWriter:
         self.offered = 0
         self.first_index: Optional[int] = None
         self.last_index: Optional[int] = None
-        #: The frame end_recording counted, whose own submit a moment later
-        #: must not count it twice; None otherwise.
-        self._ended_frame: Optional[cameras.Frame] = None
+        #: (frame, reason) from end_recording: that frame is the last one
+        #: this recording takes, and the recording ends with it; None
+        #: otherwise.
+        self._end_after: Optional[Tuple[Any, str]] = None
         #: Every file written, in GRAB order — append-only, so a viewer can
         #: pick up new frames without rescanning a folder of thousands.
         self.paths: List[Path] = []
@@ -899,10 +900,12 @@ class FrameWriter:
         with self._cond:
             if self._closing:
                 return False
-            if frame is self._ended_frame:
-                # end_recording counted it, offered and NOT saved.
-                self._ended_frame = None
-                return False
+            last = self._end_after is not None and \
+                frame is self._end_after[0]
+            if self._end_after is not None and not last:
+                # end_recording named a last frame that never came: the
+                # recording ends before this one.
+                self._end_now()
             self.offered += 1
             self._saw_index(frame.index)
             if self.failed:
@@ -914,10 +917,16 @@ class FrameWriter:
             # save anything at all.
             if self._queue and self._queued_bytes + size > self.budget:
                 self.skipped += 1
+                if last:
+                    self._end_now()
                 return False
             self._queue.append((self._submitted, frame))
             self._submitted += 1
             self._queued_bytes += size
+            if last:
+                # Queued first, so a writer still takes it: the recording
+                # ends WITH this frame (end_recording).
+                self._end_now()
             self._cond.notify()
         return True
 
@@ -934,32 +943,41 @@ class FrameWriter:
             self.passed += 1
 
     def end_recording(self, reason: str, frame: Any = None) -> bool:
-        """END THIS RECORDING NOW, for `reason`, as the first failed write
-        does: nothing offered from here on is taken, the session stops the
+        """END THIS RECORDING, for `reason`, as the first failed write
+        does: nothing offered after it is taken, the session stops the
         recording at its next frame, and `reason` is the end record's
         recording_failed — "the write that stopped it", here a plugin's
         fault on the recording path (docs/typhon_plugins_design.md 3.10:
         carrying on would leave half a run tagged and half not).
 
-        `frame`, the frame being handled when it happened, is counted here,
-        offered and NOT saved, so the end record (written when the writers
-        are done) holds it whatever the threads' timing; its own submit a
-        moment later is not counted twice. Unlike a failed write, frames
-        already queued still land: they were whole before the fault.
+        `frame`, the frame being handled when it happened (a record gate
+        that raised on it), is the LAST frame taken: its own submit a moment
+        later still queues it, and the recording ends with it — so it is
+        saved, marked by the tags the gate's guard gave it, as a gate that
+        raises has always been (design 3.6). Without a frame, it ends now.
+        Unlike a failed write, frames already queued still land: they were
+        whole before the fault.
 
         Returns False, changing nothing, when the recording has already
-        failed or is closing."""
+        failed, been ended, or is closing."""
         with self._cond:
-            if self.failed or self._closing:
+            if self.failed or self._closing or self._end_after is not None:
                 return False
+            reason = str(reason or "") or "the recording was ended"
             if frame is not None:
-                self.offered += 1
-                self._saw_index(getattr(frame, "index", None))
-                self.lost += 1
-                self._ended_frame = frame
-            self.failed = str(reason or "") or "the recording was ended"
-            self._cond.notify_all()
+                self._end_after = (frame, reason)
+            else:
+                self.failed = reason
+                self._cond.notify_all()
         return True
+
+    def _end_now(self) -> None:
+        """The end end_recording set for after a frame, now. Lock held."""
+        if self._end_after is not None:
+            if not self.failed:
+                self.failed = self._end_after[1]
+            self._end_after = None
+            self._cond.notify_all()
 
     def _saw_index(self, index: Any) -> None:
         """Called with the lock held."""
@@ -1132,6 +1150,7 @@ class FrameWriter:
         caller should say so rather than claim the run is saved.
         """
         with self._cond:
+            self._end_now()     # an end_recording whose frame never came
             self._closing = True
             self._cond.notify_all()
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -1318,6 +1337,12 @@ class CaptureSession:
             old = self.writer
             broken, self._broken = self._broken, None
             self.gate = gate if writer is not None else None
+            bind = getattr(self.gate, "bind_writer", None)
+            if writer is not None and callable(bind):
+                # A plugin's guarded gate (typhon-plugins branch,
+                # council_core.plugin_host) ends ITS run's writer on a
+                # fault, never a later run's: it is told which, first.
+                bind(writer)
             confirm = getattr(self.gate, "confirm_saves", None)
             told = getattr(self.gate, "saved", None)
             if writer is not None and callable(confirm) and callable(told):

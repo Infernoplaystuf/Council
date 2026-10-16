@@ -113,6 +113,8 @@ PLUGIN_CODE = textwrap.dedent('''
                 raise ValueError("bad value " + repr(value))
             if MODE.get("hook") == "exit":
                 raise SystemExit(3)
+            if MODE.get("hook") == "interrupt":
+                raise KeyboardInterrupt("a library's own interrupt")
             self.calls.append(("hook", value))
             return "hooked"
 
@@ -427,7 +429,7 @@ def test_switching_a_plugin_off_deactivates_it_now(builtins_pkg, plugin_home,
     assert host.loaded() == []
 
 
-def test_a_damaged_project_list_runs_the_base_set_and_is_left_alone(
+def test_a_damaged_project_list_is_left_alone(
         builtins_pkg, plugin_home, tmp_path):
     _name, _pkg, add = builtins_pkg
     add("a", manifest_doc("typhon.a", "aa"))
@@ -436,8 +438,8 @@ def test_a_damaged_project_list_runs_the_base_set_and_is_left_alone(
     proj.mkdir()
     (proj / pl.PROJECT_FILE).write_text("{damaged", encoding="utf-8")
     notes = host.open_project(proj, create=True)
-    assert notes and "damaged" in notes[0] and "base set" in notes[0]
-    assert host.runs() == ["typhon.a"]
+    assert notes and "damaged" in notes[0]
+    assert host.runs() == [], "no camera plugin among them: none runs"
     with pytest.raises(pl.PluginListError):
         host.save_settings("typhon.a", {"x": 1})
     assert (proj / pl.PROJECT_FILE).read_text(encoding="utf-8") == "{damaged"
@@ -675,8 +677,9 @@ class Gate:
     """A plugin's record gate, as triggered.TriggerRun is one: tags each
     frame, hears whether it was saved; fails at frame `bad`."""
 
-    def __init__(self, bad=None):
+    def __init__(self, bad=None, bad_saved=None):
         self.bad = bad
+        self.bad_saved = bad_saved
         self.tagged = []
         self.told = []
         self.summary = "the gate's own attribute"
@@ -691,6 +694,9 @@ class Gate:
         pass
 
     def saved(self, tags, ok, why):
+        if self.bad_saved is not None and \
+                tags.get("trigger") == str(self.bad_saved):
+            raise ValueError("the trigger books lost a frame")
         self.told.append((tags.get("trigger"), ok, why))
 
 
@@ -718,9 +724,10 @@ def gate_host(builtins_pkg, tmp_path):
 def test_a_fault_in_a_record_gate_ends_the_recording_with_its_reason(
         builtins_pkg, plugin_home, tmp_path):
     """Carrying on after a fault on the recording path would leave half a
-    run tagged and half not: the recording ends at that frame, the frames
-    before it are whole, and <run>_run_end.json says why — as a failed
-    write does since M0."""
+    run tagged and half not: the recording ends with that frame — saved and
+    marked "error: plugin fault", as a gate that raises always was (design
+    3.6) — the frames before it are whole, and <run>_run_end.json says why,
+    as a failed write does since M0."""
     capture.warm_imports()
     host = gate_host(builtins_pkg, tmp_path)
     out = tmp_path / "run_folder"
@@ -741,10 +748,11 @@ def test_a_fault_in_a_record_gate_ends_the_recording_with_its_reason(
     rows = read_rows(out / f"{run}_frames.csv")
     pngs = sorted(p.name for p in out.glob(f"{run}_frame_*.png"))
     assert [r["file"] for r in rows] == pngs == [
-        f"{run}_frame_{i:06d}.png" for i in (1, 2, 3)]
-    assert [r["trigger"] for r in rows] == ["1", "2", "3"]
-    assert end["frames_saved"] == 3 == len(rows)
-    assert end["frames_not_saved"]["write_failed"] == 1, "frame 4"
+        f"{run}_frame_{i:06d}.png" for i in (1, 2, 3, 4)]
+    assert [r["trigger"] for r in rows] == ["1", "2", "3", ""]
+    assert rows[3]["trigger_source"] == "error: plugin fault"
+    assert end["frames_saved"] == 4 == len(rows)
+    assert end["frames_not_saved"]["write_failed"] == 0
     assert (end["first_index"], end["last_index"]) == (1, 4)
     said = end["recording_failed"]
     assert said.startswith("recording ended by plugin Trig (typhon.trig): "
@@ -758,30 +766,6 @@ def test_a_fault_in_a_record_gate_ends_the_recording_with_its_reason(
     assert host.state("typhon.trig")[0] == ph.FAULTED
     assert host.faults["typhon.trig"].kind == ph.RECORDING
     assert guarded.ended == said
-
-
-def test_a_gate_of_a_plugin_switched_off_elsewhere_ends_the_recording(
-        builtins_pkg, plugin_home, tmp_path):
-    capture.warm_imports()
-    host = gate_host(builtins_pkg, tmp_path)
-    out = tmp_path / "run_folder"
-    run, claim = capture.claim_run(out, "run")
-    session = capture.CaptureSession(cameras.Device())
-    session.record_to(capture.run_recorder(out, run, claim), reset=True,
-                      gate=host.record_gate("typhon.trig", Gate(), session))
-    session._took(frame(1))
-    session.flush(5)
-    host.instance("typhon.trig")
-    module_of(builtins_pkg, "trig").MODE["hook"] = "raise"
-    host.call("typhon.trig", "hook")             # a best-effort fault
-    session._took(frame(2))
-    session.flush(5)
-    session.record_to(None)
-    end = json.loads((out / f"{run}_run_end.json").read_text(
-        encoding="utf-8"))
-    assert end["frames_saved"] == 1
-    assert "was switched off" in end["recording_failed"]
-    assert "ValueError: bad value None" in end["recording_failed"]
 
 
 def test_a_best_effort_fault_never_stops_a_recording(builtins_pkg,
@@ -827,8 +811,8 @@ def test_a_best_effort_fault_never_stops_a_recording(builtins_pkg,
 
 def test_ending_a_recording_lets_queued_frames_land(tmp_path):
     """FrameWriter.end_recording: what was queued before the fault is whole
-    and lands; the frame at the fault is counted, offered and NOT saved,
-    once; nothing after is taken."""
+    and lands; the frame at the fault is the last one taken, and saved;
+    nothing after it is taken."""
     capture.warm_imports()
     run, claim = capture.claim_run(tmp_path, "run")
     rec = capture.run_recorder(tmp_path, run, claim)
@@ -845,23 +829,50 @@ def test_ending_a_recording_lets_queued_frames_land(tmp_path):
     assert writer.submit(frame(1)) and writer.submit(frame(2))
     third = frame(3)
     assert writer.end_recording("a plugin failed", third)
-    assert writer.submit(third) is False
-    assert writer.submit(frame(5)) is False
     assert not writer.end_recording("again"), "once"
+    assert writer.failed == "", "not before its last frame is queued"
+    assert writer.submit(third) is True
+    assert writer.failed == "a plugin failed"
+    assert writer.submit(frame(5)) is False
     hold.set()
     assert writer.close(10)
     end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
         encoding="utf-8"))
-    assert end["frames_saved"] == 2
+    assert end["frames_saved"] == 3
     assert end["recording_failed"] == "a plugin failed"
     assert (end["first_index"], end["last_index"]) == (1, 5)
-    assert writer.offered == 4 and writer.lost == 2
-    assert len(read_rows(tmp_path / f"{run}_frames.csv")) == 2
+    assert writer.offered == 4 and writer.lost == 1
+    assert len(read_rows(tmp_path / f"{run}_frames.csv")) == 3
+
+
+def test_an_end_whose_last_frame_never_comes_still_ends_the_recording(
+        tmp_path):
+    capture.warm_imports()
+    run, claim = capture.claim_run(tmp_path, "run")
+    rec = capture.run_recorder(tmp_path, run, claim)
+    rec.open()
+    writer = capture.FrameWriter(rec)
+    assert writer.submit(frame(1))
+    assert writer.end_recording("a plugin failed", frame(2))
+    assert writer.submit(frame(3)) is False, "not the frame named: ended"
+    assert writer.close(10)
+    end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+    assert end["frames_saved"] == 1
+    assert end["recording_failed"] == "a plugin failed"
+    other, claim2 = capture.claim_run(tmp_path, "other")
+    rec2 = capture.run_recorder(tmp_path, other, claim2)
+    rec2.open()
+    writer = capture.FrameWriter(rec2)
+    assert writer.end_recording("ended at Stop", frame(1))
+    assert writer.close(10)
+    assert json.loads((tmp_path / f"{other}_run_end.json").read_text(
+        encoding="utf-8"))["recording_failed"] == "ended at Stop"
 
 
 def test_a_guarded_gate_forwards_the_gates_own_attributes_only():
     gate = Gate()
-    guarded = ph.GuardedGate(None, "typhon.trig", gate, lambda *a: None)
+    guarded = ph.GuardedGate(None, "typhon.trig", gate)
     assert guarded.summary == gate.summary and guarded.gate is gate
     with pytest.raises(AttributeError):
         guarded.no_such_thing
@@ -1242,3 +1253,713 @@ def test_closing_deactivates_every_instance(builtins_pkg, plugin_home):
     assert a.calls[-1] == "deactivate"
     assert b.calls[-1] == "deactivate", "a faulted plugin still lets go"
     assert not feed.running and host.loaded() == []
+
+
+# ======================================================================
+# The P1 review (16 October 2026). Each test here failed before its fix.
+# ======================================================================
+def run_end(out, run):
+    return json.loads((out / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+
+
+def wait_for(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_a_late_fault_of_one_runs_gate_never_ends_the_next_run(
+        builtins_pkg, plugin_home, tmp_path):
+    """A gate belongs to the writer of ITS run. Run 1 is stopped while its
+    frame 3 is still being saved; run 2 starts with no gate; then run 1's
+    gate fails as frame 3 lands. Run 2 must not hear of it: before, the
+    fault ended whatever the session was recording by then — run 2."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    session = capture.CaptureSession(cameras.Device())
+    one, claim1 = capture.claim_run(out, "one")
+    rec1 = capture.run_recorder(out, one, claim1)
+    hold = threading.Event()
+    original = rec1.save
+
+    def slow_save(f, path):
+        if f.index == 3:
+            hold.wait(10)
+        original(f, path)
+    rec1.save = slow_save
+    gate = Gate(bad_saved=3)
+    session.record_to(rec1, reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    for i in (1, 2, 3):
+        session._took(frame(i))
+    assert session.record_to(None, drain_timeout=0.2) is False, \
+        "frame 3 is still being saved"
+    first_writer = session._writers[0]
+    two, claim2 = capture.claim_run(out, "two")
+    session.record_to(capture.run_recorder(out, two, claim2), reset=True)
+    session._took(frame(10))
+    session.flush(5)
+    hold.set()                      # run 1's frame 3 lands; its gate fails
+    assert wait_for(lambda: "typhon.trig" in host.faults)
+    assert first_writer.close(5)
+    for i in (11, 12, 13):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end2 = run_end(out, two)
+    assert end2["frames_saved"] == 4, end2
+    assert end2["recording_failed"] == ""
+    end1 = run_end(out, one)
+    assert end1["frames_saved"] == 3 and end1["recording_failed"] == "", \
+        "run 1 had already ended: the late fault changes nothing"
+    assert host.faults["typhon.trig"].kind == ph.RECORDING, "but it is kept"
+    assert "record gate (saved)" in \
+        (tmp_path / "proj" / ph.ERRORS_LOG).read_text(encoding="utf-8")
+
+
+class ConfirmFails(Gate):
+    def confirm_saves(self):
+        raise RuntimeError("cannot confirm")
+
+
+class GrabBooksFail(Gate):
+    def failed_grab(self, index):
+        raise RuntimeError(f"lost grab {index}")
+
+
+def test_a_fault_in_confirm_saves_ends_the_recording_with_its_reason(
+        builtins_pkg, plugin_home, tmp_path):
+    """record_to asks the gate to confirm saves before the session holds the
+    new writer. Before, that fault ended nothing, and every frame was saved
+    tagged 'error: plugin fault' with no reason in the end record."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = ConfirmFails()
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    for i in range(1, 5):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end = run_end(out, run)
+    assert end["frames_saved"] == 0 and \
+        read_rows(out / f"{run}_frames.csv") == []
+    said = end["recording_failed"]
+    assert "record gate (confirm_saves)" in said, said
+    assert "RuntimeError: cannot confirm" in said
+    assert gate.tagged == [], "nothing is asked of a gate that failed"
+    assert host.faults["typhon.trig"].kind == ph.RECORDING
+
+
+def test_a_fault_in_failed_grab_ends_the_recording_with_its_reason(
+        builtins_pkg, plugin_home, tmp_path):
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = GrabBooksFail()
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    session._took(frame(1))
+    session.flush(5)
+    session._count_failed_grab(cameras.GrabFailed("incomplete", index=2))
+    for i in (3, 4):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end = run_end(out, run)
+    assert end["frames_saved"] == 1
+    assert "record gate (failed_grab)" in end["recording_failed"]
+    assert "RuntimeError: lost grab 2" in end["recording_failed"]
+    assert gate.tagged == [1]
+
+
+def test_a_fault_on_a_writer_thread_stops_the_gate_before_anything_else(
+        builtins_pkg, plugin_home, tmp_path):
+    """The gate is marked ended BEFORE the host switches the plugin off and
+    logs it, so the grab thread asks it nothing more from that moment; and
+    the run ends on the writer that reported the fault."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = Gate(bad_saved=3)
+    guarded = host.record_gate("typhon.trig", gate, session)
+    ended_when_faulted = []
+    real_fault = host.fault
+
+    def spy(pid, hook, exc, kind=ph.BEST_EFFORT):
+        ended_when_faulted.append(guarded.ended)
+        return real_fault(pid, hook, exc, kind)
+    host.fault = spy
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=guarded)
+    for i in range(1, 7):
+        session._took(frame(i))
+        session.flush(5)
+        # The writer tells the gate of a frame just AFTER it is counted:
+        # wait for that, so the next frame comes after it, as on a camera
+        # slower than the disk.
+        assert wait_for(lambda: guarded.ended or len(gate.told) >= i)
+    session.record_to(None)
+    assert ended_when_faulted and ended_when_faulted[0], \
+        "the gate was still open while the host faulted the plugin"
+    end = run_end(out, run)
+    assert gate.tagged == [1, 2, 3]
+    assert [t for t in gate.told if t[1]] == [("1", True, ""), ("2", True, "")]
+    assert end["frames_saved"] == 3
+    assert "record gate (saved)" in end["recording_failed"]
+
+
+def test_the_frame_at_a_gate_fault_is_saved_and_marked_then_the_run_ends(
+        builtins_pkg, plugin_home, tmp_path):
+    """Design 3.6 and 3.10 together: a gate that raises still saves the
+    frame and marks it, as today's capture does; and on the recording path
+    the run ends there. Before, that frame was dropped and counted as a
+    failed write."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", Gate(bad=3),
+                                            session))
+    for i in range(1, 6):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end = run_end(out, run)
+    rows = read_rows(out / f"{run}_frames.csv")
+    assert [r["file"] for r in rows] == [f"{run}_frame_{i:06d}.png"
+                                         for i in (1, 2, 3)]
+    assert rows[2]["trigger_source"] == "error: plugin fault"
+    assert rows[2]["trigger"] == ""
+    assert end["frames_saved"] == 3
+    assert end["frames_not_saved"]["write_failed"] == 0
+    assert "its record gate failed at frame 3" in end["recording_failed"]
+
+
+def test_a_best_effort_fault_of_the_gates_plugin_lets_the_run_finish(
+        builtins_pkg, plugin_home, tmp_path):
+    """Design 3.10: a fault in a best-effort hook never stops a capture. The
+    plugin is switched off for everything else, and its gate serves out the
+    run in progress, so the run stays tagged whole."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = Gate()
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    session._took(frame(1))
+    session.flush(5)
+    host.instance("typhon.trig")
+    module_of(builtins_pkg, "trig").MODE["hook"] = "raise"
+    host.call("typhon.trig", "hook")             # a best-effort fault
+    assert host.faults["typhon.trig"].kind == ph.BEST_EFFORT
+    for i in (2, 3):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end = run_end(out, run)
+    assert end["frames_saved"] == 3 and end["recording_failed"] == ""
+    assert gate.tagged == [1, 2, 3]
+    assert [r["trigger"] for r in read_rows(out / f"{run}_frames.csv")] == \
+        ["1", "2", "3"]
+    assert host.call("typhon.trig", "hook", default="off") == "off", \
+        "off for everything else"
+
+
+def test_a_hang_of_the_gates_plugin_ends_the_run_at_the_next_frame(
+        builtins_pkg, plugin_home, tmp_path):
+    """A plugin hung elsewhere may hold what its gate needs: the gate is not
+    called again; the next frame is saved and marked, and the run ends."""
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = Gate()
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    session._took(frame(1))
+    session.flush(5)
+    host.fault("typhon.trig", "status", ph.PluginHung("status has run 2.5 s"),
+               ph.HANG)
+    for i in (2, 3):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    end = run_end(out, run)
+    rows = read_rows(out / f"{run}_frames.csv")
+    assert [r["trigger_source"] for r in rows] == ["Software",
+                                                  "error: plugin fault"]
+    assert gate.tagged == [1]
+    assert "was switched off" in end["recording_failed"]
+    assert "status has run 2.5 s" in end["recording_failed"]
+
+
+def test_a_gate_made_for_a_plugin_already_off_ends_the_run_at_once(
+        builtins_pkg, plugin_home, tmp_path):
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    host.instance("typhon.trig")
+    module_of(builtins_pkg, "trig").MODE["hook"] = "raise"
+    host.call("typhon.trig", "hook")
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    gate = Gate()
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", gate, session))
+    session._took(frame(1))
+    session.flush(5)
+    session.record_to(None)
+    assert gate.tagged == []
+    assert "was switched off" in run_end(out, run)["recording_failed"]
+
+
+def test_any_exception_from_a_record_gate_ends_the_run_keyboard_interrupt_too(
+        builtins_pkg, plugin_home, tmp_path):
+    """Design 3.10: any exception. A KeyboardInterrupt raised inside a
+    library on the grab thread escaped into the grab loop before."""
+    class Interrupting(Gate):
+        def tag(self, frame):
+            if frame.index == 2:
+                raise KeyboardInterrupt("a library's own interrupt")
+            return super().tag(frame)
+
+    capture.warm_imports()
+    host = gate_host(builtins_pkg, tmp_path)
+    out = tmp_path / "runs"
+    run, claim = capture.claim_run(out, "run")
+    session = capture.CaptureSession(cameras.Device())
+    session.record_to(capture.run_recorder(out, run, claim), reset=True,
+                      gate=host.record_gate("typhon.trig", Interrupting(),
+                                            session))
+    for i in (1, 2, 3):
+        session._took(frame(i))
+        session.flush(5)
+    session.record_to(None)
+    assert host.faults["typhon.trig"].kind == ph.RECORDING
+    assert "KeyboardInterrupt" in run_end(out, run)["recording_failed"]
+
+
+def test_a_keyboard_interrupt_off_the_main_thread_switches_the_plugin_off(
+        builtins_pkg, plugin_home):
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    host.instance("typhon.a")
+    module_of(builtins_pkg, "a").MODE["hook"] = "interrupt"
+    got = []
+    worker = threading.Thread(target=lambda: got.append(
+        host.call("typhon.a", "hook", default="carried on")))
+    worker.start()
+    worker.join(5)
+    assert got == ["carried on"]
+    assert host.faults["typhon.a"].error.startswith("KeyboardInterrupt")
+
+
+def test_on_the_main_thread_a_keyboard_interrupt_is_the_users(
+        builtins_pkg, plugin_home):
+    """Ctrl+C in the console reaches the main thread wherever it runs; a
+    plugin that happened to be running then is not blamed for it."""
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    host.instance("typhon.a")
+    module_of(builtins_pkg, "a").MODE["hook"] = "interrupt"
+    with pytest.raises(KeyboardInterrupt):
+        host.call("typhon.a", "hook")
+    assert "typhon.a" not in host.faults
+
+
+def test_a_plugin_hung_in_activate_holds_up_no_other_plugin(builtins_pkg,
+                                                            plugin_home):
+    """Loading and activating a plugin happen outside the host's lock: a
+    plugin that hangs there (or imports sklearn for 5 s) holds up callers of
+    that plugin only, and the watchdog lets them go."""
+    name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    add("b", manifest_doc("typhon.b", "bb", contributes=["run_hooks"]))
+    host = make_host(builtins_pkg, [("typhon.a", "a"), ("typhon.b", "b")])
+    __import__(f"{name}.a.plugin")
+    mode = module_of(builtins_pkg, "a").MODE
+    mode.update(activate="hang", started=threading.Event(),
+                release=threading.Event())
+    try:
+        loader = threading.Thread(target=lambda: host.instance("typhon.a"),
+                                  daemon=True)
+        loader.start()
+        assert mode["started"].wait(5)
+        got = []
+
+        def other_plugin():
+            got.append(host.call("typhon.b", "hook", 1))
+            got.append(host.check_start({}))
+            got.append(host.state("typhon.b")[0])
+        other = threading.Thread(target=other_plugin, daemon=True)
+        other.start()
+        other.join(2)
+        assert got == ["hooked", [], ph.ACTIVE], \
+            "plugin b waited on plugin a's activate"
+        second = []
+        waiter = threading.Thread(target=lambda: second.append(
+            host.instance("typhon.a")), daemon=True)
+        waiter.start()
+        waiter.join(0.3)
+        assert waiter.is_alive(), "a second caller of a waits for a's load"
+        host.watchdog(now=time.monotonic() + ph.WATCHDOG_SECONDS + 1)
+        waiter.join(2)
+        assert second == [None], "the watchdog let it go"
+    finally:
+        mode["release"].set()
+    loader.join(5)
+    assert host.loaded() == ["typhon.b"]
+
+
+def test_a_plugin_loaded_on_two_threads_at_once_is_made_once(builtins_pkg,
+                                                             plugin_home):
+    name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    __import__(f"{name}.a.plugin")
+    mod = module_of(builtins_pkg, "a")
+    mod.MODE.update(activate="hang", started=threading.Event(),
+                    release=threading.Event())
+    made = []
+    threads = [threading.Thread(target=lambda: made.append(
+        host.instance("typhon.a")), daemon=True) for _ in range(3)]
+    for t in threads:
+        t.start()
+    assert mod.MODE["started"].wait(5)
+    time.sleep(0.1)
+    mod.MODE["release"].set()
+    for t in threads:
+        t.join(5)
+    assert len(made) == 3 and made[0] is not None
+    assert made.count(made[0]) == 3, "one instance"
+    assert [e for e in mod.LOG if e[0] == "made"] == [("made", id(made[0]))]
+
+
+def test_a_plugin_loading_while_its_project_changes_is_let_go(
+        builtins_pkg, plugin_home, tmp_path):
+    """open_project lets go of the last project's plugins; one still being
+    activated meanwhile is deactivated rather than kept for the new one."""
+    name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    host.open_project(first, create=True)
+    __import__(f"{name}.a.plugin")
+    mod = module_of(builtins_pkg, "a")
+    mod.MODE.update(activate="hang", started=threading.Event(),
+                    release=threading.Event())
+    made = []
+    loader = threading.Thread(target=lambda: made.append(
+        host.instance("typhon.a")), daemon=True)
+    loader.start()
+    assert mod.MODE["started"].wait(5)
+    opened = threading.Thread(target=lambda: host.open_project(
+        second, create=True), daemon=True)
+    opened.start()
+    opened.join(2)
+    alive = opened.is_alive()
+    mod.MODE["release"].set()
+    loader.join(5)
+    opened.join(5)
+    assert not alive, "open_project waited on the hung activate"
+    assert made == [None] and host.loaded() == []
+    made_id = [e for e in mod.LOG if e[0] == "made"][0][1]
+    assert ("deactivated", made_id) in mod.LOG
+
+
+#: A plugin whose hooks are PROPERTIES: looking one up runs plugin code.
+PROPERTY_CODE = textwrap.dedent('''
+    MODE = {}
+
+
+    class P:
+        def __init__(self):
+            self.calls = []
+
+        @property
+        def activate(self):
+            if MODE.get("activate"):
+                raise RuntimeError("activate lookup")
+            return lambda ctx: self.calls.append("activate")
+
+        @property
+        def deactivate(self):
+            if MODE.get("deactivate"):
+                raise RuntimeError("deactivate lookup")
+            return lambda: self.calls.append("deactivate")
+
+        @property
+        def status(self):
+            raise KeyError("status lookup")
+
+        @property
+        def check_start(self):
+            raise RuntimeError("check_start lookup")
+
+        @property
+        def on_frame(self):
+            raise RuntimeError("on_frame lookup")
+''')
+
+
+def property_host(builtins_pkg, *folders, run_hooks=False):
+    _name, _pkg, add = builtins_pkg
+    over = {"contributes": ["run_hooks"]} if run_hooks else {}
+    for folder in folders:
+        add(folder, manifest_doc(f"typhon.{folder}", folder * 2, **over),
+            code=PROPERTY_CODE)
+    return make_host(builtins_pkg, [(f"typhon.{f}", f) for f in folders])
+
+
+def test_looking_up_a_hook_is_guarded_like_calling_it(builtins_pkg,
+                                                      plugin_home):
+    """getattr runs plugin code (a property, __getattr__). Before, its error
+    escaped: call() raised, and check_start() raised into Start."""
+    host = property_host(builtins_pkg, "p", "q", run_hooks=True)
+    assert host.call("typhon.p", "status", default="-") == "-"
+    assert host.faults["typhon.p"].hook == "status"
+    reasons = host.check_start({})
+    assert reasons == ["Qq failed its start check and was switched off: "
+                       "RuntimeError: check_start lookup"]
+    assert host.faults["typhon.q"].kind == ph.START_CHECK
+
+
+def test_a_live_feed_whose_on_frame_lookup_fails_is_no_feed(builtins_pkg,
+                                                            plugin_home):
+    host = property_host(builtins_pkg, "p")
+    assert host.feed("typhon.p") is None
+    assert host.faults["typhon.p"].hook == "on_frame"
+
+
+def test_an_activate_lookup_that_fails_hands_out_nothing(builtins_pkg,
+                                                         plugin_home):
+    name, _pkg, _add = builtins_pkg
+    host = property_host(builtins_pkg, "p")
+    __import__(f"{name}.p.plugin")
+    module_of(builtins_pkg, "p").MODE["activate"] = True
+    assert host.instance("typhon.p") is None
+    assert host.faults["typhon.p"].hook == "activate"
+    assert host.instance("typhon.p") is None, "not the half-made object"
+    assert host.loaded() == []
+
+
+def test_a_deactivate_lookup_that_fails_never_stops_closing(builtins_pkg,
+                                                            plugin_home):
+    host = property_host(builtins_pkg, "p", "q")
+    host.instance("typhon.p")
+    q = host.instance("typhon.q")
+    temp = host.temp_dir("typhon.q")
+    module_of(builtins_pkg, "p").MODE["deactivate"] = True
+    host.close()
+    assert q.calls == ["activate", "deactivate"]
+    assert not temp.exists()
+    assert host.loaded() == []
+
+
+def test_a_plugin_cannot_make_a_live_frame_writeable(builtins_pkg,
+                                                     plugin_home):
+    """Design 3.8, 10.3: a plugin is handed a view it cannot unlock by
+    accident. Before, `view.image.flags.writeable = True` worked on any
+    frame whose own array was writeable, and the saved pixels changed."""
+    host = feed_host(builtins_pkg)
+    tried = []
+    done = threading.Event()
+
+    def on_frame(view):
+        outcome = []
+        for unlock in (lambda: setattr(view.image.flags, "writeable", True),
+                       lambda: view.image.setflags(write=True)):
+            try:
+                unlock()
+                outcome.append("unlocked")
+            except ValueError:
+                outcome.append("refused")
+        try:
+            view.image[...] = 255
+            outcome.append("wrote")
+        except ValueError:
+            outcome.append("refused")
+        tried.append((view.index, outcome, view.image.dtype.name,
+                      view.image.shape, int(view.image.sum())))
+        if len(tried) == 2:
+            done.set()
+
+    feed = host.feed("typhon.live", on_frame)
+    shot = cameras.Frame(image=np.arange(15, dtype=np.uint16).reshape(3, 5),
+                         index=1)
+    strided = cameras.Frame(image=np.arange(60, dtype=np.uint8).reshape(
+        6, 10)[::2, ::3], index=2)
+    assert shot.image.flags.writeable and strided.image.base is not None
+    feed.offer(shot)
+    assert wait_for(lambda: feed.delivered == 1)
+    feed.offer(strided)
+    assert done.wait(5)
+    feed.stop()
+    assert tried == [
+        (1, ["refused"] * 3, "uint16", (3, 5), int(shot.image.sum())),
+        (2, ["refused"] * 3, "uint8", (3, 4), int(strided.image.sum()))]
+    assert (shot.image == np.arange(15).reshape(3, 5)).all()
+    assert shot.image.flags.writeable, "the core's own array is as it was"
+
+
+def test_the_watchdog_runs_by_itself_once_a_plugin_is_loaded(
+        builtins_pkg, plugin_home, monkeypatch):
+    """Before, only tests started it: a live plugin hung in on_frame stayed
+    on."""
+    monkeypatch.setattr(ph, "WATCHDOG_SECONDS", 0.3)
+    monkeypatch.setattr(ph, "WATCHDOG_EVERY", 0.05, raising=False)
+    host = feed_host(builtins_pkg)
+    release = threading.Event()
+    try:
+        feed = host.feed("typhon.live", lambda view: release.wait(10))
+        feed.offer(frame(1))
+        assert wait_for(lambda: "typhon.live" in host.faults, 5)
+        assert host.faults["typhon.live"].kind == ph.HANG
+    finally:
+        release.set()
+        host.close()
+    assert wait_for(lambda: not host._watchdog.is_alive(), 2), \
+        "close() stops it"
+
+
+def test_a_host_that_loads_no_plugin_starts_no_thread(builtins_pkg,
+                                                      plugin_home):
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    host.states()
+    assert host._watchdog is None
+
+
+@pytest.mark.parametrize("count", [3, ph.MAX_FILES + 1])
+def test_a_third_party_folder_with_too_many_files_says_so(
+        builtins_pkg, plugin_home, count):
+    """Before, a folder of 2001 data files was refused as 'compiled code'."""
+    where = third_party(plugin_home, "acme_big", manifest_doc(
+        "acme.big", "big", builtin=False))
+    data = where / "data"
+    data.mkdir()
+    for i in range(count):
+        (data / f"{i}.txt").write_text("x", encoding="utf-8")
+    host = make_host(builtins_pkg, [])
+    state, why = host.state("acme.big")
+    if count <= ph.MAX_FILES:
+        assert state == ph.NEEDS_APPROVAL, why
+    else:
+        assert state == ph.INCOMPATIBLE
+        assert "compiled" not in why and f"more than {ph.MAX_FILES} files" \
+            in why, why
+
+
+def test_a_damaged_project_list_runs_only_the_built_in_cameras(
+        builtins_pkg, plugin_home, tmp_path):
+    """Before, a damaged list ran the CURRENT base set: plugins the project
+    had switched off ran again, and plugins added to the base set after the
+    project was made reached it (against question 1)."""
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    add("b", manifest_doc("typhon.b", "bb"))
+    add("cam", manifest_doc("typhon.cam", "cam", kind="camera"))
+    plugins = [("typhon.a", "a"), ("typhon.b", "b"), ("typhon.cam", "cam")]
+    host = make_host(builtins_pkg, plugins)
+    host.set_base_plugins(["typhon.a", "typhon.cam"])
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    host.open_project(proj, create=True)
+    host.switch_off("typhon.a")
+    assert host.runs() == ["typhon.cam"]
+    host.set_base_plugins(["typhon.a", "typhon.b", "typhon.cam"])
+    text = (proj / pl.PROJECT_FILE).read_text(encoding="utf-8")
+    (proj / pl.PROJECT_FILE).write_text(text[:40], encoding="utf-8")
+    again = make_host(builtins_pkg, plugins)
+    notes = again.open_project(proj)
+    assert notes and "damaged" in notes[0] and "camera" in notes[0], notes
+    assert again.runs() == ["typhon.cam"]
+    assert again.state("typhon.a")[0] == ph.OFF
+    assert again.state("typhon.b")[0] == ph.OFF
+    assert again.instance("typhon.b") is None
+    assert (proj / pl.PROJECT_FILE).read_text(encoding="utf-8") == text[:40]
+
+
+def test_the_host_never_writes_under_council_beside_todays_typhon(
+        builtins_pkg, tmp_path, monkeypatch):
+    """A double-clicked app whose recorded plugin home is gone falls back to
+    ~/.council/typhon (design 4.1). While the plugin Typhon runs beside
+    today's, the host refuses to write there, as the build does."""
+    user = tmp_path / "user"
+    user.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(user))
+    monkeypatch.setenv("HOME", str(user))
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    side = user / "Typhon-plugins-app" / "typhon"
+    side.mkdir(parents=True)
+    monkeypatch.setenv(pl.HOME_ENV, str(side))      # the launcher's window
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    host.open_project(proj, create=True)
+    monkeypatch.delenv(pl.HOME_ENV)                 # double-clicked later
+    side.rename(user / "moved_away")
+    again = make_host(builtins_pkg, [("typhon.a", "a")])
+    notes = again.open_project(proj)
+    assert again.home.path == user / ".council" / "typhon"
+    assert any("not on this PC" in n for n in notes)
+    with pytest.raises(pl.PluginListError, match=r"\.council"):
+        again.set_base_plugins(["typhon.a"])
+    again.save_settings("typhon.a", {"x": 1})      # the project's own file
+    with pytest.raises(pl.PluginListError, match=r"\.council"):
+        again.make_default("typhon.a")
+    assert again.settings("typhon.a") == {"x": 1}
+    other = tmp_path / "other"
+    other.mkdir()
+    notes = again.open_project(other, create=True)
+    assert not (other / pl.PROJECT_FILE).exists()
+    assert any(".council" in n for n in notes), notes
+    assert not (user / ".council").exists()
+
+
+def test_a_live_feed_is_capped_by_default(builtins_pkg, plugin_home):
+    """Design 3.11's hook table puts on_frame under a 25 % duty cap, and the
+    P1 timing bench showed why; feed() was uncapped unless asked."""
+    host = feed_host(builtins_pkg)
+    capped = host.feed("typhon.live", lambda view: None)
+    assert capped.duty == ph.DUTY_CAP == 0.25
+    capped.stop()
+    host2 = ph.PluginHost(camera_rig.Rig(Template), builtin_dir=builtins_pkg[1],
+                          builtins=[("typhon.live", "live")],
+                          package=builtins_pkg[0])
+    free = host2.feed("typhon.live", lambda view: None, duty=None)
+    assert free.duty is None, "None: uncapped, as the timing bench asks"
+    free.stop()
+    host.close()
+    host2.close()
+
+
+def test_the_api_has_only_the_hooks_typhon_calls():
+    """has() answered True for check_start and status, which nothing in
+    Typhon 0.1 calls (Start asks check_start from P3; status from P4)."""
+    assert api.has("hook.activate") and api.has("hook.deactivate")
+    assert api.has("hook.on_frame"), "the host's live feeds call it"
+    assert not api.has("hook.check_start")
+    assert not api.has("hook.status")

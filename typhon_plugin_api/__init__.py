@@ -41,7 +41,10 @@ from typing import (Any, Callable, Dict, FrozenSet, Mapping, Optional,
 #: This API's version: 0.x until it is frozen as 1.0 at stage P5.
 API_VERSION = "0.1"
 
-#: The features of this API version, by name, for `has` (design 3.11).
+#: The features of this API version, by name, for `has` (design 3.11). A
+#: hook is here only once Typhon calls it: activate and deactivate (the
+#: host), on_frame (the host's live feeds). check_start joins when Start
+#: asks it (stage P3), status when the status strip does (P4).
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
     "context.say", "context.call_in_ui", "context.cameras",
@@ -50,8 +53,7 @@ FEATURES: FrozenSet[str] = frozenset({
     "context.settings", "context.save_settings", "context.state",
     "context.temp_dir",
     # the hooks Typhon calls (FeaturePlugin)
-    "hook.activate", "hook.deactivate", "hook.on_frame", "hook.status",
-    "hook.check_start",
+    "hook.activate", "hook.deactivate", "hook.on_frame",
     # the types
     "type.FrameView", "type.CameraHandle", "type.CropBox",
 })
@@ -112,7 +114,9 @@ class FrameView:
     (design 3.8).
 
     `image` is a READ-ONLY view of the frame's pixels — the array the
-    writer saves moments later — so writing to it raises. `timestamp` is the
+    writer saves moments later — so writing to it raises, and so does
+    making it writeable (`flags.writeable = True`, `setflags`): it is an
+    array over a read-only buffer, and nothing is copied. `timestamp` is the
     camera's own clock and NOT always microseconds (a Basler gives its tick
     count, a boA5320 gives 0); `host_us` is when Typhon offered it to the
     plugin (this PC's monotonic clock, µs). `meta` is read-only: `aoi` (the
