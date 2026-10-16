@@ -93,3 +93,19 @@ def test_quiet_switch_and_null_progress(monkeypatch):
     n.advance()
     n.finish()
     assert n._beater is None
+
+
+def test_no_still_working_line_after_done():
+    """The heartbeat can be past its wait when the run ends; holding the lock
+    while finish() writes 'done', it must then stay quiet."""
+    out = io.StringIO()
+    p = Progress("kg rebuild", stream=out, heartbeat=0.05, every=0)
+    p.stage("documents", total=1)
+    p.last_activity -= 10                       # long quiet: a beat is due
+    with p._lock:                               # the heartbeat waits here...
+        time.sleep(0.12)
+        p._stop.set()                           # ...while the run ends
+        p._write("[kg rebuild] done", 1.0)
+    time.sleep(0.15)
+    lines = _lines(out)
+    assert lines[-1] == "[kg rebuild] done"
