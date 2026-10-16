@@ -3,13 +3,20 @@
   "id": "typhon.prophesee",
   "short": "evk",
   "name": "Prophesee event cameras",
-  "version": "0.1.0",
-  "api": "0.1",
+  "version": "0.2.0",
+  "api": "0.2",
   "kind": "camera",
   "entry": "plugin:PropheseePlugin",
   "needs": [],
   "python": [],
-  "contributes": [],
+  "contributes": [
+    "review_source"
+  ],
   "files": [],
-  "network": "none"
+  "network": "none",
+  "capabilities": [
+    "events",
+    "area_live",
+    "raw_recording"
+  ]
 }

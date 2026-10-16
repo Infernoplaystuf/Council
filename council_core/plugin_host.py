@@ -17,6 +17,22 @@ FOUND and listed now — one folder each, copied into the plugin home's
 plugins folder (question 7) — but never loaded before stage P5 brings
 approval and the hash-then-compile loader (design 4.5, 4.6).
 
+STAGE P2: THE CAMERA-PLUGIN REGISTRY (design 2.4 items 3 and 9, 3.3, 3.4)
+The camera plugins this project runs are scanned and opened through the
+host: `backends()` gives them as today's cameras.Backend, so cameras.discover
+and cameras.open_camera — the code that stays in council_core, which the
+Council's Capture tab keeps calling through cameras.backends() — run on top
+of the registry with the same order and the same notes; `open_camera`
+confirms what the opened camera can do onto its slot (the manifest's
+capabilities, within what Typhon knows); `category_tables` merges each
+plugin's rows for the settings tabs; `review_sources` gives the slider's
+views of a plugin's run files (the Prophesee raw view). A camera's own
+refusal (CameraError) is the camera's answer, never the plugin's fault;
+anything else a camera plugin raises is said and logged, and a built-in
+camera plugin is never switched off without asking (`camera_call`).
+Today's Typhon does not call the registry yet: the set-up's camera
+families become the project's camera plugins at stage P2 rows 3 and 4.
+
 FINDING PLUGINS READS MANIFESTS ONLY (design 4.1, 4.4)
 Built-in plugins are the folders of typhon_plugins/ that BUILTIN_PLUGINS
 names. A plugin is built in because it is on that list, never because of
@@ -96,6 +112,7 @@ from typing import (Any, Callable, Deque, Dict, Iterable, List, Mapping,
 
 import typhon_plugin_api as api
 
+from . import camera_capabilities as cc
 from . import plugin_lists as pl
 from . import plugin_manifest as pm
 
@@ -438,20 +455,10 @@ class Fault:
 
 def capabilities_of(device: Any, info: Any) -> frozenset:
     """What an open camera can do, from what today's Device says of itself
-    (design 3.4). The trigger and binning capabilities arrive with their
-    facets at stage P3; a camera plugin declares and confirms them at P2."""
-    if device is None:
-        return frozenset()
-    caps = {"events" if getattr(info, "kind", "") == "event" else "frames"}
-    if getattr(device, "restartable", True):
-        caps.add("restartable")
-    if getattr(device, "area_live", False):
-        caps.add("area_live")
-    if getattr(device, "counts_grab_failures", False):
-        caps.add("grab_failures")
-    if getattr(device, "records_raw", False):
-        caps.add("raw_recording")
-    return frozenset(caps)
+    (design 3.4; council_core.camera_capabilities.of_device, the one rule).
+    The trigger and binning capabilities are confirmed by the camera's
+    plugin when it opens the camera (stage P2), their facets come at P3."""
+    return cc.of_device(device, info)
 
 
 # ======================================================================
@@ -688,11 +695,15 @@ class PluginHost:
         for slot in (list(rig) if rig is not None else []):
             info = getattr(slot, "info", None)
             device = getattr(slot, "device", None)
+            # The slot's answer: what its camera plugin confirmed, else what
+            # the camera says of itself (camera_rig.CameraSlot.capabilities).
+            caps = getattr(slot, "capabilities", None)
             out[slot.name] = api.CameraHandle(
                 name=slot.name, info=info if device is not None else None,
                 kind=str(getattr(info, "kind", "") or "") if device is not None
                 else "",
-                capabilities=capabilities_of(device, info))
+                capabilities=(frozenset(caps) if caps is not None
+                              else capabilities_of(device, info)))
         return MappingProxyType(out)
 
     # -- loading -------------------------------------------------------------
@@ -839,6 +850,218 @@ class PluginHost:
     def _name(self, pid: str) -> str:
         rec = self.record(pid)
         return rec.name if rec is not None else pid
+
+    # -- camera plugins (stage P2; design 2.4 item 3, 3.3, 3.4) ---------------
+    def camera_plugins(self) -> List[str]:
+        """The camera plugins this project runs and that can run now, in
+        its list's order — the base set's, which is the built-in list's:
+        Basler, Prophesee, Simulated, the order cameras.backends() has."""
+        out = []
+        for pid in self.runs():
+            m = self.manifest(pid)
+            if m is None or m.kind != "camera":
+                continue
+            if self.state(pid)[0] in (ON, ACTIVE):
+                out.append(pid)
+        return out
+
+    def camera_call(self, pid: str, hook: str, *args: Any) -> Any:
+        """Camera plugin `pid`'s `hook`, for a camera job: a scan, an open,
+        a confirmation (loading the plugin first if need be).
+
+        THE CAMERA'S OWN REFUSAL — a CameraError (NeedsStop, GrabFailed,
+        SettingError ...) — reaches the caller as it is: the camera said no
+        (it is busy, gone, cannot take that area), which is never the
+        plugin's fault. ANYTHING ELSE is the plugin's: logged and said, and
+        the caller gets a CameraError naming the plugin, so the code that
+        handles a camera's refusal handles it too. A plugin from someone
+        else is then switched off for the session; a built-in camera plugin
+        is not (design 3.10: never switched off without asking).
+
+        NOT WATCHED BY THE WATCHDOG: these wait on an SDK and a camera, for
+        seconds (pypylon's import alone took 0.6-2.0 s, design 3.3), and
+        switching the plugin off would free neither."""
+        def call(made: Any) -> Any:
+            fn = getattr(made, hook, None)
+            if not callable(fn):
+                raise AttributeError(f"the camera plugin has no {hook}()")
+            return fn(*args)
+        return self._camera_run(pid, hook, call)
+
+    def _camera_run(self, pid: str, hook: str,
+                    fn: Callable[[Any], Any]) -> Any:
+        """`fn(plugin)` on camera plugin `pid`, guarded as camera_call says
+        (the lookup of the hook inside the guard: getattr runs plugin
+        code)."""
+        from .cameras import CameraError
+
+        made = self.instance(pid)
+        if made is None:
+            raise CameraError(f"{self._name(pid)} cannot run here: "
+                              f"{self.state(pid)[1]}")
+        try:
+            return fn(made)
+        except CameraError:
+            raise
+        except BaseException as exc:                    # noqa: BLE001
+            if not _ours(exc):
+                raise
+            self._camera_fault(pid, hook, exc)
+            raise CameraError(f"{self._name(pid)} failed in {hook}: "
+                              f"{type(exc).__name__}: {exc}") from exc
+
+    def _camera_fault(self, pid: str, hook: str, exc: BaseException) -> None:
+        """A camera plugin's own error (camera_call): a plugin from someone
+        else is switched off; a built-in camera plugin is only logged and
+        said, and stays on."""
+        rec = self.record(pid)
+        if rec is None or not rec.builtin:
+            self.fault(pid, hook, exc)
+            return
+        made = Fault(plugin=pid, hook=hook, kind=BEST_EFFORT,
+                     error=f"{type(exc).__name__}: {exc}",
+                     trace="".join(traceback.format_exception(
+                         type(exc), exc, exc.__traceback__)),
+                     at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        self._log(made)
+        self._announce(f"Plugin {self._name(pid)} failed in {hook}: "
+                       f"{made.error} — it stays on (a built-in camera "
+                       f"plugin is never switched off without asking)")
+
+    def camera_backend(self, pid: str) -> str:
+        """Camera plugin `pid`'s backend name — its cameras' CameraInfo.
+        backend ("basler") — or "" when it cannot run or names none. A
+        plugin from someone else must name one with a dot ("acme.thermal",
+        design 3.3), so it can never claim a built-in's preset keys."""
+        from .cameras import CameraError
+
+        try:
+            name = self._camera_run(pid, "backend",
+                                    lambda made: getattr(made, "backend", ""))
+        except CameraError:
+            return ""
+        name = name if isinstance(name, str) else ""
+        rec = self.record(pid)
+        if name and rec is not None and not rec.builtin and "." not in name:
+            return ""
+        return name
+
+    def camera_plugin_for(self, backend: str) -> Optional[str]:
+        """The camera plugin this project runs whose cameras carry
+        `backend`, or None. The first in the list's order wins."""
+        for pid in self.camera_plugins():
+            if self.camera_backend(pid) == backend:
+                return pid
+        return None
+
+    def camera_available(self, pid: str) -> Tuple[bool, str]:
+        """(ready?, what to install) of camera plugin `pid`; a plugin that
+        cannot say is not ready, and says why."""
+        from .cameras import CameraError
+
+        try:
+            said = self.camera_call(pid, "available")
+        except CameraError as exc:
+            return False, str(exc)
+        if isinstance(said, tuple) and len(said) == 2:
+            return bool(said[0]), str(said[1] or "")
+        return bool(said), ""
+
+    def backends(self, pids: Optional[Sequence[str]] = None
+                 ) -> List["PluginBackend"]:
+        """The camera plugins (this project's, or `pids`) as today's
+        cameras.Backend: what cameras.discover(known=) and cameras.
+        open_camera(known=) take, so a scan through the camera plugins is
+        today's scan — the same order, the same notes — and the code that
+        stays in council_core works on top of the registry (design 2.4
+        item 3). cameras.backends() itself is unchanged: the Council's
+        Capture tab keeps it."""
+        chosen = list(pids) if pids is not None else self.camera_plugins()
+        return [PluginBackend(self, pid) for pid in chosen]
+
+    def discover_cameras(self, pids: Optional[Sequence[str]] = None) -> Any:
+        """Every camera the camera plugins find, and why any was skipped
+        (cameras.Discovery), through cameras.discover."""
+        from . import cameras
+
+        return cameras.discover(self.backends(pids))
+
+    def camera_capabilities(self, pid: str, device: Any) -> frozenset:
+        """What camera plugin `pid` confirms the opened `device` can do,
+        within what its manifest declares and Typhon knows (design 3.4: the
+        manifest's list, confirmed by the opened camera; an unknown name is
+        ignored). A confirmation that fails is the device's own
+        description, within the same bounds."""
+        from .cameras import CameraError
+
+        m = self.manifest(pid)
+        declared = cc.known(m.capabilities if m is not None else ())
+        try:
+            confirmed = frozenset(self.camera_call(pid, "capabilities",
+                                                   device) or ())
+        except CameraError:
+            confirmed = cc.of_device(device)
+        return frozenset(confirmed & declared)
+
+    def open_camera(self, info: Any, camera: Optional[str] = None) -> Any:
+        """Open `info`'s camera through the camera plugin of its backend
+        and return the Device. With `camera` (a slot's name) the slot keeps
+        the capabilities the plugin confirmed (CameraSlot.confirm); the
+        caller puts the device in the slot, as Connect does. A camera's
+        refusal is a CameraError, as cameras.open_camera's is."""
+        from .cameras import CameraError
+
+        backend = str(getattr(info, "backend", "") or "")
+        pid = self.camera_plugin_for(backend)
+        if pid is None:
+            raise CameraError(f"no camera plugin this project runs opens "
+                              f"{backend!r} cameras")
+        device = self.camera_call(pid, "open", info)
+        caps = self.camera_capabilities(pid, device)
+        if camera is not None:
+            slot = self._slot(camera)
+            confirm = getattr(slot, "confirm", None)
+            if callable(confirm):
+                confirm(device, caps)
+        return device
+
+    def category_tables(self, pids: Optional[Sequence[str]] = None) -> Any:
+        """The settings tabs' tables merged from every camera plugin's
+        hints (design 2.4 item 9; council_core.camera_categories.merge), for
+        camera_categories.plan(..., tables=). A plugin whose hints cannot be
+        read adds none: its groups still get tabs of their own."""
+        from . import camera_categories
+        from .cameras import CameraError
+
+        hints = []
+        for pid in (list(pids) if pids is not None
+                    else self.camera_plugins()):
+            try:
+                made = self.camera_call(pid, "categories")
+            except CameraError:
+                continue
+            if isinstance(made, api.CategoryHints):
+                hints.append(made)
+        return camera_categories.merge(hints)
+
+    def review_sources(self) -> Dict[str, api.ReviewSource]:
+        """The review sources of the camera plugins this project runs, by
+        plugin id (design 3.7: the slider's views of a camera plugin's run
+        files) — asked only of those whose manifest lists review_source."""
+        from .cameras import CameraError
+
+        out: Dict[str, api.ReviewSource] = {}
+        for pid in self.camera_plugins():
+            m = self.manifest(pid)
+            if m is None or "review_source" not in m.contributes:
+                continue
+            try:
+                made = self.camera_call(pid, "review_source")
+            except CameraError:
+                continue
+            if isinstance(made, api.ReviewSource):
+                out[pid] = made
+        return out
 
     # -- the guard -----------------------------------------------------------
     def _guard(self, pid: str, hook: str, fn: Callable[..., Any],
@@ -1613,6 +1836,49 @@ def locked_pixels(image: Any) -> Any:
     except (AttributeError, ValueError):
         pass
     return view
+
+
+class PluginBackend:
+    """A camera plugin as today's cameras.Backend (`name`, `kind`,
+    `install_hint`, `available`, `discover`, `open`) — what cameras.discover
+    and cameras.open_camera take as `known`, so the scan and the open that
+    stay in council_core run on top of the registry (design 2.4 item 3).
+    Every call goes through the host's camera guard (PluginHost.
+    camera_call): a camera's refusal is its own, any other error the
+    plugin's."""
+
+    def __init__(self, host: PluginHost, pid: str) -> None:
+        self.host = host
+        self.plugin = pid
+        #: What to install, as the last `available()` said.
+        self.install_hint = ""
+
+    @property
+    def name(self) -> str:
+        return self.host.camera_backend(self.plugin) or self.plugin
+
+    @property
+    def kind(self) -> str:
+        """"event" for a plugin whose cameras can only be event cameras,
+        else "frame" (Backend.kind)."""
+        m = self.host.manifest(self.plugin)
+        caps = set(m.capabilities) if m is not None else set()
+        return "event" if "events" in caps and "frames" not in caps \
+            else "frame"
+
+    def available(self) -> bool:
+        ok, hint = self.host.camera_available(self.plugin)
+        self.install_hint = hint
+        return ok
+
+    def discover(self) -> List[Any]:
+        return list(self.host.camera_call(self.plugin, "discover") or [])
+
+    def open(self, info: Any) -> Any:
+        return self.host.camera_call(self.plugin, "open", info)
+
+    def __repr__(self) -> str:
+        return f"<PluginBackend {self.plugin}>"
 
 
 def frame_view(frame: Any, camera: str, host_us: int = 0) -> api.FrameView:

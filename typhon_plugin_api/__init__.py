@@ -1,5 +1,5 @@
 """
-typhon_plugin_api — the one Typhon module a plugin imports: plugin API 0.1,
+typhon_plugin_api — the one Typhon module a plugin imports: plugin API 0.2,
 the working version of the API that is frozen as 1.0 at stage P5.
 
 WHAT THIS IS (docs/typhon_plugins_design.md 3.2, 3.5, 3.11)
@@ -26,25 +26,42 @@ ASK, DO NOT COMPARE VERSIONS
 `has("name")` says whether this Typhon offers a feature of the API; a plugin
 asks it rather than comparing version strings (design 3.11).
 
+CAMERA PLUGINS (0.2, stage P2)
+A camera plugin finds, opens and describes one family of cameras
+(`CameraPlugin`, design 3.3): it declares the capabilities its cameras can
+have in its manifest and confirms them on each camera it opens (3.4), gives
+the settings tabs its rows (`CategoryHints`), and a review source for a run
+file of its own (`ReviewSource`: the Prophesee raw view). The built-in camera
+plugins are adapters over today's Backend, Device and Provider classes; what
+they reach of them while the code stays in council_core is in
+`typhon_plugin_api.builtin`, which is not part of the API a plugin from
+someone else may use (design 7.2).
+
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
 reading a manifest, or importing this package, loads no camera code.
 """
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import (Any, Callable, Dict, FrozenSet, Mapping, Optional,
-                    Protocol, Tuple, runtime_checkable)
+from typing import (Any, Callable, Dict, FrozenSet, List, Mapping, Optional,
+                    Protocol, Sequence, Tuple, runtime_checkable)
 
 #: This API's version: 0.x until it is frozen as 1.0 at stage P5.
-API_VERSION = "0.1"
+API_VERSION = "0.2"
 
 #: The features of this API version, by name, for `has` (design 3.11). A
 #: hook is here only once Typhon calls it: activate and deactivate (the
-#: host), on_frame (the host's live feeds). check_start joins when Start
-#: asks it (stage P3), status when the status strip does (P4).
+#: host), on_frame (the host's live feeds), and a camera plugin's hooks the
+#: host's camera registry calls (0.2: scanning, opening, confirming
+#: capabilities, the settings tabs' rows, the review source).
+#: check_start joins when Start asks it (stage P3), status when the status
+#: strip does (P4), a camera plugin's facet and record_fields at P3 and its
+#: set-up guide with the wizard's camera pages.
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
     "context.say", "context.call_in_ui", "context.cameras",
@@ -54,8 +71,12 @@ FEATURES: FrozenSet[str] = frozenset({
     "context.temp_dir",
     # the hooks Typhon calls (FeaturePlugin)
     "hook.activate", "hook.deactivate", "hook.on_frame",
+    # a camera plugin's hooks Typhon calls (CameraPlugin, 0.2)
+    "camera.available", "camera.discover", "camera.open",
+    "camera.capabilities", "camera.categories", "camera.review_source",
     # the types
     "type.FrameView", "type.CameraHandle", "type.CropBox",
+    "type.CameraPlugin", "type.CategoryHints", "type.ReviewSource",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -82,7 +103,8 @@ class CameraHandle:
     the slot has no camera), "frame" or "event", and its capabilities. Never
     the Device: what a feature does to a camera goes through a facet.
 
-    0.1: the capabilities are what today's Device says of itself (frames or
+    0.2: the capabilities are what the camera's plugin confirmed when it
+    opened the camera, else what today's Device says of itself (frames or
     events, restartable, area_live, grab_failures, raw_recording); `facet`
     answers None until the facets arrive at stage P3."""
     name: str
@@ -202,6 +224,124 @@ class FeaturePlugin(Protocol):
 
 
 # ======================================================================
+# Camera plugins (0.2, design 3.3, 3.4)
+# ======================================================================
+@dataclass(frozen=True)
+class CategoryHints:
+    """Where a camera plugin's settings groups go in the settings tabs
+    (design 2.4 item 9, 3.3), as rows for the core's tables: `shared_tabs`
+    (a tab's title, the groups it holds in the order it shows them, its
+    tooltip), `tips` (the tooltip of a tab a group has to itself) and
+    `most_used` (a group's keys a tab shows first). Typhon merges every
+    camera plugin's hints (council_core.camera_categories.merge) and plans
+    the tabs from them; a group no plugin names still gets a tab of its own,
+    so a camera works without hints — the limit is the tab strip's width."""
+    shared_tabs: Tuple[Tuple[str, Tuple[str, ...], str], ...] = ()
+    tips: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}))
+    most_used: Mapping[str, Tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({}))
+
+    def groups(self) -> Tuple[str, ...]:
+        """Every group these hints name, in the order they name them."""
+        out: List[str] = []
+        for _title, groups, _tip in self.shared_tabs:
+            out += [g for g in groups if g not in out]
+        out += [g for g in list(self.tips) + list(self.most_used)
+                if g not in out]
+        return tuple(out)
+
+
+def _natural(name: str) -> List[Any]:
+    """frame_9 before frame_10 (the slider's own order)."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t.lower())
+            for t in re.split("([0-9]+)", name)]
+
+
+@dataclass(frozen=True)
+class ReviewSource:
+    """How the slider shows one of a camera plugin's run files (design 3.3,
+    3.7, 3.11): the Prophesee plugin's raw view of `<run>_events.raw`.
+
+    `name` is the view's name ("raw"), `label` the word on the slider's
+    view button ("Raw"), `suffix` the run file it shows (`<run><suffix>`).
+    `open(path, window_us, **extra)` opens one for review and returns a
+    playback the slider polls on its own timer — `count` (windows ready),
+    `done`, `error`, `window_us`, `frame(k)` and `close()`, as
+    council_core.event_playback.RawPlayback has them; `extra` may carry the
+    run's `origin_us` and `area`. A file still being recorded is not opened
+    unless `opens_while_recording`. The slider's live end stays Typhon's."""
+    name: str
+    label: str
+    suffix: str
+    open: Callable[..., Any]
+    opens_while_recording: bool = False
+
+    def run_of(self, path: Any) -> str:
+        """The run a file of this source belongs to ("<run><suffix>" ->
+        "<run>"), or ""."""
+        name = os.path.basename(str(path or ""))
+        if not self.suffix or not name.lower().endswith(self.suffix.lower()):
+            return ""
+        return name[:-len(self.suffix)]
+
+    def file_for(self, folder: Any, run: str) -> Optional[Path]:
+        """`run`'s file of this source in `folder`, if there is one."""
+        if not run or not folder:
+            return None
+        path = Path(str(folder)) / f"{run}{self.suffix}"
+        return path if path.is_file() else None
+
+    def latest(self, folder: Any) -> Optional[Path]:
+        """The newest file of this source in `folder`, by run name."""
+        try:
+            names = [e.name for e in os.scandir(str(folder))
+                     if e.is_file() and self.run_of(e.name)]
+        except OSError:
+            return None
+        if not names:
+            return None
+        return Path(str(folder)) / sorted(names, key=_natural)[-1]
+
+
+@runtime_checkable
+class CameraPlugin(Protocol):
+    """A camera plugin (design 3.3): one family of cameras. Typhon makes one
+    per window and opens a Device per camera slot through it.
+
+    `backend` is its cameras' CameraInfo.backend ("basler"; a third party's
+    carries a dot, "acme.thermal", so it can never claim another's preset
+    keys). `available()` is (ready?, what to install when not) and must not
+    raise for a missing SDK; `discover()` lists its cameras without opening
+    any; `open(info)` returns today's Device. A camera's own refusal is a
+    CameraError (or NeedsStop) and reaches the user as the camera's answer,
+    never as the plugin's fault. `capabilities(device)` confirms, on the
+    opened camera, the capabilities the manifest declares — never more
+    (design 3.4). `facet(device, name)` is None until the facets arrive at
+    stage P3. `categories()` gives the settings tabs its rows;
+    `record_fields(device)` plain JSON for the run's record (wired at P3);
+    `review_source()` a ReviewSource, or None."""
+
+    backend: str
+
+    def available(self) -> Tuple[bool, str]: ...
+
+    def discover(self) -> List[Any]: ...
+
+    def open(self, info: Any) -> Any: ...
+
+    def capabilities(self, device: Any) -> FrozenSet[str]: ...
+
+    def facet(self, device: Any, name: str) -> Any: ...
+
+    def categories(self) -> CategoryHints: ...
+
+    def record_fields(self, device: Any) -> Dict[str, Any]: ...
+
+    def review_source(self) -> Optional[ReviewSource]: ...
+
+
+# ======================================================================
 # Today's classes, re-exported (design 3.11): their code stays where it is
 # ======================================================================
 _REEXPORTS: Dict[str, Tuple[str, str]] = {
@@ -228,11 +368,18 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
                           "split_trigger_key"),
     # coordinates (3.12)
     "sensor_position": ("council_core.reduce", "sensor_position"),
+    # capabilities (3.4): every name Typhon knows, and the one rule that
+    # reads them off an open camera
+    "CAPABILITIES": ("council_core.camera_capabilities", "CAPABILITIES"),
+    "device_capabilities": ("council_core.camera_capabilities", "of_device"),
+    "known_capabilities": ("council_core.camera_capabilities", "known"),
+    "missing_capabilities": ("council_core.camera_capabilities", "missing"),
 }
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
-                  "FeaturePlugin", *_REEXPORTS])
+                  "FeaturePlugin", "CameraPlugin", "CategoryHints",
+                  "ReviewSource", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:
