@@ -3724,7 +3724,7 @@ _SANDBOX_FORBIDDEN_ATTRS = frozenset({
 # model's validated code or its getattr().
 _SANDBOX_FORBIDDEN_PROXY_ATTRS = frozenset({
     "_real", "_budget", "_state", "_roots", "_extra",
-    "_root_strs", "_root_reals",
+    "_root_strs", "_root_reals", "_classes", "_copies",
 })
 # Methods that RETURN a string with no target but WRITE a file when given one
 # (df.to_json('C:/x') wrote anywhere). Allowed only with no positional
@@ -3842,6 +3842,220 @@ _REBIND_REFUSAL = ("code may not change pandas, numpy, pathlib or the other "
                    "pd.set_option(...))")
 
 
+def _is_dunder(name: str) -> bool:
+    """A dunder attribute name (``__x__``). Model code never has a reason to
+    STORE one — ``obj.__fspath__ = ...`` makes an object lie about its path,
+    ``obj.__class__ = ...`` re-types it — and these slipped past the
+    protected-root check because the object's own name is not protected."""
+    return len(name) >= 5 and name.startswith("__") and name.endswith("__")
+
+
+# Control-flow nodes that make the statements inside them NOT straight-line:
+# a body under one may run zero times, more than once, or be interrupted, so
+# an alias CLEARED there is not reliably cleared. A PROTECT inside one still
+# protects (conservative). With/ClassDef run once in order, so they are NOT
+# here.
+_CONDITIONAL_PARENTS = (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While,
+                        ast.Try, ast.ExceptHandler, ast.comprehension,
+                        ast.BoolOp, ast.Lambda, ast.FunctionDef,
+                        ast.AsyncFunctionDef)
+
+
+def _name_target_ids(target: "ast.AST"):
+    """Yield the Name ids a binding target binds (through tuple/list/starred
+    unpacking). Attribute / Subscript targets bind no name."""
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _name_target_ids(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _name_target_ids(target.value)
+
+
+class _StopCheck(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+
+
+def _check_protected_stores(tree, pandas_names, options_names
+                            ) -> Tuple[bool, str]:
+    """Refuse every store that lands on a sandbox module / class / proxy — a
+    FIXED name (pd, np, Path, pathlib, …) always, and an ALIAS of one
+    (`P = Path`) while it is an alias — and every store to a dunder attribute
+    on any object. Order-sensitive: a name later bound to an ordinary value is
+    no longer an alias (`summary = np.nan` … `summary = df.groupby(...)` …
+    `summary.columns = [...]` runs), handled per straight-line order and
+    conservatively for branches (a PROTECT in any branch protects; a CLEAR in
+    a branch does not clear). The pandas display/compute option assignment is
+    the one allowed store under a protected root — through pandas or an alias
+    of it, as plain / augmented / annotated assignment."""
+    fixed = _SANDBOX_PROTECTED_ASSIGN_ROOTS
+    prot: Dict[str, bool] = {}        # name -> is a module/class/proxy alias now
+    pdalias = set()                   # names aliasing pandas now (for options)
+
+    def live_roots():
+        return fixed | {n for n, v in prot.items() if v}
+
+    def yields_pandas(rhs) -> bool:
+        return (isinstance(rhs, ast.Name)
+                and (rhs.id in pandas_names or rhs.id in pdalias))
+
+    def bind(name, rhs, cond):
+        if _expr_yields_protected(rhs, live_roots()):
+            prot[name] = True                      # PROTECT (even in a branch)
+        elif not cond:
+            prot[name] = False                     # unconditional CLEAR
+        if yields_pandas(rhs):
+            pdalias.add(name)
+        elif not cond:
+            pdalias.discard(name)
+
+    def bind_value(name, cond):
+        """A loop / with-as / unpacked target: a value, never an alias."""
+        if not cond:
+            prot[name] = False
+            pdalias.discard(name)
+
+    def check_store(attr_node, node, is_delete):
+        verb = "delete" if is_delete else "assign to"
+        if _is_dunder(attr_node.attr):
+            raise _StopCheck(
+                f"Forbidden: cannot {verb} the dunder attribute "
+                f"{attr_node.attr!r} — {_REBIND_REFUSAL}")
+        root = _assign_target_root_name(attr_node)
+        if root is None:
+            return
+        if root in fixed or prot.get(root, False):
+            if (isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                    and _is_pandas_option_assignment(
+                        attr_node, pandas_names | pdalias, options_names)):
+                return
+            raise _StopCheck(
+                f"Forbidden: cannot {verb} {attr_node.attr!r} on {root!r} — "
+                f"{_REBIND_REFUSAL}")
+
+    def check_targets(targets, node, is_delete=False):
+        for tgt in targets:
+            for attr in _iter_attr_targets(tgt):
+                check_store(attr, node, is_delete)
+
+    def bind_targets(targets, value, cond):
+        for tgt in targets:
+            _bind_one(tgt, value, cond)
+
+    def _bind_one(tgt, value, cond):
+        if isinstance(tgt, ast.Name):
+            bind(tgt.id, value, cond)
+        elif isinstance(tgt, (ast.Tuple, ast.List)):
+            elts = tgt.elts
+            if (isinstance(value, (ast.Tuple, ast.List))
+                    and len(value.elts) == len(elts)
+                    and not any(isinstance(e, ast.Starred) for e in elts)):
+                for e, v in zip(elts, value.elts):
+                    _bind_one(e, v, cond)
+            else:
+                for nm in _name_target_ids(tgt):
+                    bind_value(nm, cond)
+        elif isinstance(tgt, ast.Starred):
+            for nm in _name_target_ids(tgt.value):
+                bind_value(nm, cond)
+
+    def scan_expr(expr, cond):
+        """Catch stores and binds hidden inside an expression: comprehension
+        targets (`[0 for Path.resolve in …]`), walrus binds (`(P := Path)`),
+        and setattr/delattr on a protected root."""
+        for n in ast.walk(expr):
+            if isinstance(n, ast.comprehension):
+                check_targets([n.target], n)
+                for nm in _name_target_ids(n.target):
+                    bind_value(nm, True)
+            elif isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
+                bind(n.target.id, n.value, cond)
+            elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id in ("setattr", "delattr") and n.args):
+                root = _assign_target_root_name(n.args[0])
+                if root in fixed or (root is not None and prot.get(root)):
+                    raise _StopCheck(
+                        f"Forbidden: {n.func.id} on {root!r} — "
+                        f"{_REBIND_REFUSAL}")
+
+    def visit(stmts, cond):
+        for s in stmts:
+            _visit_stmt(s, cond)
+
+    def _visit_stmt(node, cond):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                prot[(alias.asname or alias.name).split(".")[0]] = True
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                prot[alias.asname or alias.name] = True
+        elif isinstance(node, ast.Assign):
+            check_targets(node.targets, node)
+            bind_targets(node.targets, node.value, cond)
+            scan_expr(node.value, cond)
+        elif isinstance(node, ast.AnnAssign):
+            check_targets([node.target], node)
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                bind(node.target.id, node.value, cond)
+            if node.value is not None:
+                scan_expr(node.value, cond)
+        elif isinstance(node, ast.AugAssign):
+            check_targets([node.target], node)
+            if isinstance(node.target, ast.Name):
+                bind_value(node.target.id, cond)   # a computed value, not an alias
+            scan_expr(node.value, cond)
+        elif isinstance(node, ast.Delete):
+            check_targets(node.targets, node, is_delete=True)
+            for t in node.targets:
+                if isinstance(t, ast.Name) and not cond:
+                    prot.pop(t.id, None)
+                    pdalias.discard(t.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            check_targets([node.target], node)
+            for nm in _name_target_ids(node.target):
+                bind_value(nm, True)
+            scan_expr(node.iter, cond)
+            visit(node.body, True)
+            visit(node.orelse, True)
+        elif isinstance(node, (ast.While, ast.If)):
+            scan_expr(node.test, cond)
+            visit(node.body, True)
+            visit(node.orelse, True)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                scan_expr(item.context_expr, cond)
+                if item.optional_vars is not None:
+                    check_targets([item.optional_vars], node)
+                    for nm in _name_target_ids(item.optional_vars):
+                        bind_value(nm, cond)
+            visit(node.body, cond)
+        elif isinstance(node, ast.Try):
+            visit(node.body, True)
+            for h in node.handlers:
+                visit(h.body, True)
+            visit(node.orelse, True)
+            visit(node.finalbody, True)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            for d in getattr(node, "decorator_list", []):
+                scan_expr(d, cond)
+            visit(node.body, True)
+        else:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.stmt):
+                    _visit_stmt(child, cond)
+                elif isinstance(child, ast.expr):
+                    scan_expr(child, cond)
+
+    try:
+        visit(tree.body, False)
+    except _StopCheck as stop:
+        return False, stop.msg
+    return True, "ok"
+
+
 def _attr_chain(node: "ast.Attribute") -> Optional[Tuple[str, List[str]]]:
     """(root name, [attribute names from the root down to node.attr]) when
     ``node`` is a pure Name.attr.attr... chain, else None (a Subscript or Call
@@ -3915,53 +4129,31 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
     # vector, so refuse the raw builtin call.
     forbidden_calls = {"eval", "exec", "compile", "input", "__import__"}
 
-    # Names the code binds via import — `import json as j` / `from pathlib
-    # import Path` — are protected assignment roots too, so `j.loads = ...`
-    # or a rebind of a freshly-imported module/class is refused like pd/np.
-    # EXCEPT a name the code also rebinds to its own value: `from scipy
-    # import stats` then `stats = df.groupby(...).describe(); stats.index.name
-    # = ...` is the model's frame, not scipy.stats (both ran before the
-    # check and were refused by it, measured 2026-10-15). The fixed sandbox
-    # names (pd, np, Path, ...) stay protected whatever the code does.
-    protected_roots = set(_SANDBOX_PROTECTED_ASSIGN_ROOTS)
-    rebound_names = {n.id for n in ast.walk(tree)
-                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    # Which names mean pandas (import aliases) and `from pandas import options`
+    # — for the pandas display/compute OPTION assignment, the one store allowed
+    # under a protected root.
     pandas_names = {"pd", "pandas"}
     options_names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                bound = (alias.asname or alias.name).split(".")[0]
                 if alias.name == "pandas":
-                    pandas_names.add(bound)
-                if bound not in rebound_names:
-                    protected_roots.add(bound)
+                    pandas_names.add((alias.asname or alias.name).split(".")[0])
         elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                bound = alias.asname or alias.name
-                if node.module == "pandas" and alias.name == "options":
-                    options_names.add(bound)
-                if bound not in rebound_names:
-                    protected_roots.add(bound)
+            if node.module == "pandas":
+                for alias in node.names:
+                    if alias.name == "options":
+                        options_names.add(alias.asname or alias.name)
 
-    # Aliases bound from a protected root in the SAME code — `P = Path`,
-    # `X = pathlib.Path`, `C = type(Path('.'))` — are protected roots too, so
-    # a later `P.resolve = ...` / `C.resolve = ...` is refused like
-    # `Path.resolve = ...`. Simple name tracking to a fixpoint (`P = Path;
-    # Q = P` both count). Only a bind whose value IS a module/class/proxy
-    # counts; `df = pd.read_csv(...)` yields a frame, so df stays the model's
-    # own object and df.columns = ... keeps working.
-    _simple_assigns = [(n.targets[0].id, n.value) for n in ast.walk(tree)
-                       if isinstance(n, ast.Assign) and len(n.targets) == 1
-                       and isinstance(n.targets[0], ast.Name)]
-    _changed = True
-    while _changed:
-        _changed = False
-        for _name, _rhs in _simple_assigns:
-            if _name not in protected_roots and _expr_yields_protected(
-                    _rhs, protected_roots):
-                protected_roots.add(_name)
-                _changed = True
+    # Rebinding a sandbox module / class / proxy (or an alias of one), and any
+    # dunder-attribute store — the Path-rebinding read escape and the
+    # __fspath__/__class__ routes — refused in straight-line order so a name
+    # later bound to a value is no longer an alias. (council_core.analyst_floor
+    # is the floor under this: a file never leaves the data folders whatever a
+    # rebind does.)
+    ok, msg = _check_protected_stores(tree, pandas_names, options_names)
+    if not ok:
+        return False, msg
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -3973,47 +4165,6 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
-        # No BINDING TO or DELETING an attribute of a sandbox module, class or
-        # proxy — the Path-rebinding read escape (Path.relative_to =
-        # lambda self, *a: self; type(Path('.')).resolve = ...;
-        # pathlib.PurePath.relative_to = ...). Every store target is covered,
-        # not just `=`: augmented/annotated assignment, delete, and the binding
-        # forms a rebind can also hide in — a for-loop target
-        # (`for Path.resolve in [...]`), a comprehension target, a `with ... as`
-        # target, and tuple/list/starred unpacking (handled by
-        # _iter_attr_targets). The model's OWN objects are untouched:
-        # df.columns = [...], df.index.name = ..., obj.attr = ... all have a
-        # plain local-variable root, not a protected one.
-        _targets = None
-        _is_delete = isinstance(node, ast.Delete)
-        if isinstance(node, ast.Assign):
-            _targets = node.targets
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            _targets = [node.target]
-        elif _is_delete:
-            _targets = node.targets
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
-            _targets = [node.target]
-        elif isinstance(node, ast.comprehension):
-            _targets = [node.target]
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
-            _targets = [it.optional_vars for it in node.items
-                        if it.optional_vars is not None]
-        if _targets is not None:
-            for _tgt in _targets:
-                for _attr in _iter_attr_targets(_tgt):
-                    _root = _assign_target_root_name(_attr)
-                    if _root in protected_roots:
-                        # The only allowed assignment under a protected root:
-                        # a pandas display/compute option by attribute.
-                        if (isinstance(node, ast.Assign)
-                                and _is_pandas_option_assignment(
-                                    _attr, pandas_names, options_names)):
-                            continue
-                        _verb = "delete" if _is_delete else "assign to"
-                        return False, (
-                            f"Forbidden: cannot {_verb} {_attr.attr!r} on "
-                            f"{_root!r} — {_REBIND_REFUSAL}")
         # ANY attribute access to a forbidden name — called or not. Checking
         # only calls let `fn = p.unlink; fn()` and `w = p.write_text; w(...)`
         # through (a bound-method reference is an Attribute, not a Call), which
@@ -4048,19 +4199,21 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                     and node.args[1].value in _SANDBOX_FORBIDDEN_ANY_ATTR):
                 return False, (f"Forbidden {node.func.id} of "
                                f"{node.args[1].value!r}")
-            # setattr/delattr that rebind an attribute on a sandbox module,
-            # class or proxy — the string route around the assignment check
-            # above (setattr(Path, 'relative_to', ...)). setattr/delattr are
-            # not even in the sandbox builtins, but refuse here for a clear
-            # message instead of a bare NameError.
+            # getattr/setattr/delattr with a constant DUNDER name — the string
+            # route to the dunder stores/reads refused by name above
+            # (getattr(x, "__class__"), setattr(x, "__fspath__", ...)).
             if (isinstance(node.func, ast.Name)
-                    and node.func.id in ("setattr", "delattr")
-                    and node.args
-                    and _assign_target_root_name(node.args[0]) in protected_roots):
-                return False, (
-                    f"Forbidden: {node.func.id} on "
-                    f"{_assign_target_root_name(node.args[0])!r} — "
-                    f"{_REBIND_REFUSAL}")
+                    and node.func.id in ("getattr", "setattr", "delattr")
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    and _is_dunder(node.args[1].value)):
+                return False, (f"Forbidden {node.func.id} of "
+                               f"{node.args[1].value!r} (dunder attribute)")
+    # setattr/delattr that rebind an attribute on a sandbox module, class or
+    # proxy — the string route around the assignment check, refused in
+    # straight-line order with the rest (setattr(Path, 'relative_to', ...),
+    # setattr(P, ...) for an alias P). Done inside _check_protected_stores.
     return True, "ok"
 
 
@@ -4112,9 +4265,12 @@ class _SandboxPathlib:
     _SandboxModule. The module is read-only (a rebind must land on a class, not
     swap a class out)."""
 
-    def __init__(self, real, classes) -> None:
+    def __init__(self, real, classes, copies=None) -> None:
         object.__setattr__(self, "_real", real)
         object.__setattr__(self, "_classes", classes)
+        # The full parallel lattice {name: copy}, for converting a real path a
+        # helper returns into the matching copy.
+        object.__setattr__(self, "_copies", copies or classes)
 
     def __getattr__(self, name):
         if (name in _SANDBOX_FORBIDDEN_ANY_ATTR
@@ -4136,22 +4292,62 @@ class _SandboxPathlib:
         return "<sandboxed pathlib>"
 
 
+# The real pathlib lattice, child -> its real parents, so each copy can be
+# built as a subclass of (its copied parents + its own real class). A copy is
+# then an instance/subclass of BOTH the real class AND the parallel copies —
+# so isinstance(Path('x'), PurePath / PureWindowsPath / WindowsPath) and the
+# issubclass answers ordinary code relies on all hold, with real pathlib and
+# with the copies, while a rebind still lands on the copy (2026-10-16).
+_PATHLIB_PARENTS = {
+    "PurePath": (),
+    "PurePosixPath": ("PurePath",),
+    "PureWindowsPath": ("PurePath",),
+    "Path": ("PurePath",),
+    "PosixPath": ("Path", "PurePosixPath"),
+    "WindowsPath": ("Path", "PureWindowsPath"),
+}
+# Build order: a class after its parents.
+_PATHLIB_BUILD_ORDER = ("PurePath", "PurePosixPath", "PureWindowsPath",
+                        "Path", "PosixPath", "WindowsPath")
+
+
 def _make_sandbox_pathlib():
-    """(proxy module, Path subclass) for one run. Each pathlib class becomes a
-    fresh subclass of its real counterpart (Path/PurePath map to the concrete
-    class for this OS, since the abstract Path is not directly subclassable).
-    On failure, falls back to the real module and class — the AST validator and
-    the captured-os containment still hold without the copy."""
+    """(proxy module, concrete Path copy) for one run.
+
+    Each pathlib class becomes a fresh copy that subclasses its copied parents
+    AND its own real class, so the parallel lattice mirrors the real one: a
+    copy is an instance of the real class (isinstance against real pathlib
+    holds) and of the sibling copies (isinstance/issubclass among the copies
+    holds), and it keeps its real name and repr ('WindowsPath(...)', not
+    'Path(...)'). The copies are closed under path operations (`/`, `.parent`,
+    `.resolve`, … return `type(self)` in CPython), so `type(Path('.'))` is the
+    copy too. Model code runs with these; a rebind made through any alias
+    (`P = Path`, `C = type(Path('.'))`, `X = pathlib.Path`, `from pathlib import
+    PurePath as Q`) lands on the copy and dies with the run — it never reaches
+    the real classes the helpers, pandas, numpy and the other libraries use
+    (the floor in council_core.analyst_floor is the guarantee a file never
+    leaves the data folders; this keeps the libraries' own path handling
+    intact). `Path` and `WindowsPath` (on this OS) are the same concrete copy,
+    so `Path('x')` builds a filesystem-capable path. On failure, falls back to
+    the real module and class.
+    """
     import pathlib as _real_pathlib
     try:
-        concrete = type(_real_pathlib.Path())          # WindowsPath / PosixPath
-        pure_concrete = type(_real_pathlib.PurePath())  # Pure{Windows,Posix}Path
-        bases = {"Path": concrete, "PurePath": pure_concrete}
-        classes = {}
-        for nm in _PATHLIB_CLASS_NAMES:
-            base = bases.get(nm) or getattr(_real_pathlib, nm)
-            classes[nm] = type(nm, (base,), {})
-        return _SandboxPathlib(_real_pathlib, classes), classes["Path"]
+        concrete_name = type(_real_pathlib.Path()).__name__   # WindowsPath/...
+        copies = {}
+        for nm in _PATHLIB_BUILD_ORDER:
+            real_cls = getattr(_real_pathlib, nm)
+            bases = tuple(copies[p] for p in _PATHLIB_PARENTS[nm]) + (real_cls,)
+            copies[nm] = type(nm, bases, {"__module__": "pathlib",
+                                          "__qualname__": nm})
+        concrete = copies[concrete_name]
+        # `Path`/`PurePath` resolve to the concrete copies for THIS OS, so
+        # Path('x') and PurePath('x') build usable paths (as real pathlib's
+        # Path()/PurePath() dispatch to the concrete class).
+        classes = dict(copies)
+        classes["Path"] = concrete
+        classes["PurePath"] = copies["Pure" + concrete_name]
+        return _SandboxPathlib(_real_pathlib, classes, copies), concrete
     except Exception:
         return _real_pathlib, _real_pathlib.Path
 
@@ -4516,10 +4712,47 @@ def _sandbox_vault_dir() -> Optional[Path]:
         return None
 
 
+def _desandbox_path_factory(sb_path):
+    """A converter that turns any REAL pathlib object a helper RETURNS into an
+    instance of the sandbox's own Path copy (``sb_path``), recursively through
+    lists / tuples / sets / dicts. A helper that handed back a real
+    pathlib.Path (list_csv_files → List[Path]) gave model code the REAL class
+    through `type(returned)`, which it could then rebind — the escape the
+    AST check and the pathlib copy aim at. Returning the copy closes that: a
+    rebind through a returned path lands on the copy, and the copy keeps the
+    real class's isinstance/repr (2026-10-16). Strings and everything else
+    pass through untouched; conversion is skipped when there is no copy (the
+    fallback in _make_sandbox_pathlib)."""
+    import pathlib as _pl
+    _PurePath = _pl.PurePath
+    if sb_path is None:
+        return lambda v: v
+
+    def convert(v, depth=0):
+        if isinstance(v, _PurePath):
+            # A copy instance already (it subclasses the real class) is left
+            # as-is; only a bare real path is re-wrapped.
+            if isinstance(v, sb_path):
+                return v
+            try:
+                return sb_path(str(v))
+            except Exception:                             # noqa: BLE001
+                return v
+        if depth >= 4:
+            return v
+        if isinstance(v, (list, tuple, set, frozenset)):
+            return type(v)(convert(x, depth + 1) for x in v)
+        if isinstance(v, dict):
+            return {k: convert(x, depth + 1) for k, x in v.items()}
+        return v
+    return convert
+
+
 def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
-                     roots: List[Path]) -> None:
+                     roots: List[Path], sb_path=None) -> None:
     """Wrap every helper the sandbox exposes so a path it is GIVEN stays
-    inside the data folders.
+    inside the data folders, and so a real pathlib object it RETURNS comes back
+    as the sandbox's own Path copy, never the real class.
 
     The helpers are trusted code, but they open whatever path they are
     handed: summarize_csv('C:/anything') and list_csv_files('C:/') read and
@@ -4530,11 +4763,16 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
                                            (_sandbox_resolve_within)
       output_dir                        -> must be inside the vault's data_out
       vault_dir                         -> always the real vault
+    The return value is passed through _desandbox_path_factory, so a helper
+    that returns pathlib.Path objects (list_csv_files, …) hands model code the
+    sandbox copy, not the real class it could rebind through `type(returned)`.
     A DataFrame or None passes through untouched. duckdb_query also gets its
     SQL's file access limited to the data folders (DuckDB's read_csv('C:/x')
     would otherwise read anywhere)."""
     import functools
     import inspect as _inspect
+
+    desandbox = _desandbox_path_factory(sb_path)
 
     vault = _sandbox_vault_dir()
     out_root = None
@@ -4583,28 +4821,34 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
         try:
             sig = _inspect.signature(fn)
         except (TypeError, ValueError):
-            return fn
+            # No signature to bind: still convert the return so a path object
+            # the helper hands back is the sandbox copy, not the real class.
+            @functools.wraps(fn)
+            def convert_only(*a, **k):
+                return desandbox(fn(*a, **k))
+            return convert_only
         names = set(sig.parameters)
         kinds = {n: ("file" if n in _HELPER_FILE_PARAMS else
                      "dir" if n in _HELPER_DIR_PARAMS else
                      "out" if n == "output_dir" else
                      "vault" if n == "vault_dir" else None) for n in names}
-        if not any(kinds.values()):
-            return fn
+        has_path = any(kinds.values())
 
         @functools.wraps(fn)
         def contained(*a, **k):
+            if not has_path:
+                return desandbox(fn(*a, **k))
             try:
                 bound = sig.bind_partial(*a, **k)
             except TypeError:
-                return fn(*a, **k)       # let the helper raise its own error
+                return desandbox(fn(*a, **k))  # let the helper raise its own
             for n, v in list(bound.arguments.items()):
                 kind = kinds.get(n)
                 if kind == "vault":
                     bound.arguments[n] = str(vault) if vault is not None else v
                 elif kind and v is not None:
                     bound.arguments[n] = contain(v, kind)
-            return fn(*bound.args, **bound.kwargs)
+            return desandbox(fn(*bound.args, **bound.kwargs))
         return contained
 
     skip = {"pd", "np", "Path", "__builtins__"}
@@ -5042,7 +5286,8 @@ def execute_pandas_code(
 
     if "np" in globals_dict:
         globals_dict["np"] = _SandboxModule(globals_dict["np"], _NUMPY_EXTRA_BLOCKED)
-    _contain_helpers(globals_dict, _budgeted_pd, normalized_folders)
+    _contain_helpers(globals_dict, _budgeted_pd, normalized_folders,
+                     sb_path=_sb_Path)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python

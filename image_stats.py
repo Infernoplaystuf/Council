@@ -110,7 +110,12 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
             im = Image.open(fh)
             im.load()
     except Exception as exc:
-        return {"error": f"could not open image: {exc!r}"}
+        # Name the file and the error KIND, not the exception's repr: Pillow's
+        # UnidentifiedImageError embeds the open file object's repr
+        # (<_io.BufferedReader name=...>), an internal object with no meaning
+        # for the model (2026-10-16).
+        return {"error": f"could not open image {_BASENAME(p)} "
+                         f"({type(exc).__name__})"}
     fmt, mode = im.format, im.mode
     w, h = im.size
     try:
@@ -143,7 +148,8 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
         except Exception:
             pass
     except Exception as exc:
-        return {"error": f"pixel analysis failed: {exc!r}"}
+        return {"error": f"pixel analysis of {_BASENAME(p)} failed "
+                         f"({type(exc).__name__})"}
     try:
         size_kb = round(_STAT(p).st_size / 1024.0, 1)
     except Exception:

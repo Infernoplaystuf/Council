@@ -695,3 +695,196 @@ def test_legitimate_alias_and_target_code_still_works(box, code):
     data, _ = box
     df, msg = run(code, data)
     assert df is not None, msg
+
+
+# ── Helpers return the sandbox Path copy, not the real class (2026-10-16) ──
+# A helper that handed back a real pathlib.Path (list_csv_files → List[Path])
+# gave model code the REAL class through type(returned): a route to rebind
+# pathlib.WindowsPath.resolve that the AST check and the per-run copy aim at.
+# The wrapped helpers now convert every path they return to the sandbox's own
+# Path copy.
+def test_the_desandbox_converter_returns_the_sandbox_path(box):
+    import pathlib
+    _proxy, SbPath = va._make_sandbox_pathlib()
+    convert = va._desandbox_path_factory(SbPath)
+    got = convert([pathlib.Path("a"), pathlib.PurePath("b"),
+                   {"k": pathlib.Path("c")}, "plain", 7])
+    assert isinstance(got[0], SbPath) and type(got[0]) is SbPath
+    assert isinstance(got[1], SbPath)
+    assert isinstance(got[2]["k"], SbPath)
+    assert got[3] == "plain" and got[4] == 7
+    # none of them is the REAL class model code could rebind
+    assert all(type(x) is not pathlib.WindowsPath
+               for x in (got[0], got[1], got[2]["k"]))
+
+
+def test_a_list_helper_hands_model_code_the_sandbox_path(box):
+    """list_csv_files returns paths; in the sandbox they come back as the
+    sandbox Path copy — isinstance of `Path`, and NOT the real class (so a
+    rebind through type(returned) lands on the copy, which dies with the
+    run)."""
+    data, _ = box
+    df, msg = run(
+        "files = list_csv_files(DATA_FOLDER)\n"
+        "c = type(files[0])\n"
+        "result_df = pd.DataFrame([{'name': c.__name__, "
+        "'inst': bool(isinstance(files[0], Path)), "
+        "'is_copy': bool(c is type(Path('.')))}])", data)
+    assert df is not None, msg
+    row = df.iloc[0]
+    assert bool(row["inst"]) is True, msg
+    assert bool(row["is_copy"]) is True, msg
+    assert row["name"] in ("WindowsPath", "PosixPath"), row["name"]
+
+
+# ── The per-run pathlib copy keeps the relationships ordinary code needs ──
+def test_the_pathlib_copy_keeps_isinstance_issubclass_name_and_repr():
+    """The regressions the copy introduced (2026-10-16): the printed type name
+    and repr became 'Path' not 'WindowsPath', and isinstance/issubclass among
+    the copies and against real pathlib stopped holding. All restored."""
+    import pathlib
+    proxy, SbPath = va._make_sandbox_pathlib()
+    p = SbPath(".")
+    # name + repr as the real concrete class
+    real_name = type(pathlib.Path()).__name__
+    assert type(p).__name__ == real_name
+    assert repr(p).startswith(real_name + "(")
+    # isinstance against the REAL hierarchy
+    assert isinstance(p, pathlib.PurePath)
+    assert isinstance(p, pathlib.Path)
+    assert isinstance(p, type(pathlib.Path()))            # WindowsPath / PosixPath
+    assert isinstance(p, type(pathlib.PurePath()))        # Pure{Windows,Posix}Path
+    # isinstance / issubclass against the COPIES model code actually gets
+    assert isinstance(p, proxy.PurePath)
+    assert isinstance(p, proxy.PureWindowsPath if real_name == "WindowsPath"
+                      else proxy.PurePosixPath)
+    assert issubclass(SbPath, proxy.PurePath)
+    assert issubclass(SbPath, pathlib.PurePath)
+    # closed under path operations
+    assert type(p / "x") is SbPath
+    assert type(p.parent) is SbPath
+
+
+def test_pathlib_relationships_hold_for_model_code(box):
+    """The same, as a model writes it: isinstance(Path('x'), PurePath /
+    PureWindowsPath) through `from pathlib import ...`, and the repr."""
+    data, _ = box
+    df, msg = run(
+        "from pathlib import PurePath, PureWindowsPath, WindowsPath\n"
+        "p = Path(DATA_FOLDER)\n"
+        "result_df = pd.DataFrame([{\n"
+        "  'pure': bool(isinstance(p, PurePath)),\n"
+        "  'purewin': bool(isinstance(p, PureWindowsPath)),\n"
+        "  'win': bool(isinstance(p, WindowsPath)),\n"
+        "  'repr': repr(Path('x')),\n"
+        "}])", data)
+    assert df is not None, msg
+    row = df.iloc[0]
+    assert bool(row["pure"]) and bool(row["purewin"]) and bool(row["win"]), msg
+    assert row["repr"] == "WindowsPath('x')", row["repr"]
+
+
+# ── Dunder-attribute stores are refused (2026-10-16) ──────────────────────
+# A dunder store on ANY object (model's own included) is refused: __fspath__
+# makes an object lie about its path, __class__ re-types it, and the object's
+# own name is not a protected root, so these slipped past the rebinding check.
+@pytest.mark.parametrize("code", [
+    "df = pd.read_csv('ok.csv')\ndf.__class__ = int",
+    "df = pd.read_csv('ok.csv')\ndf.__fspath__ = lambda: 'x'",
+    "class X:\n    pass\nx = X()\nx.__fspath__ = lambda: r'C:\\x'",
+    "df = pd.read_csv('ok.csv')\nsetattr(df, '__fspath__', lambda: 'x')",
+    "o = object()\ng = getattr(o, '__class__')",
+])
+def test_dunder_attribute_stores_and_reads_are_refused(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+# ── Alias tracking follows rebinding (the MEDIUM regression) ──────────────
+@pytest.mark.parametrize("code", [
+    # np.nan makes `summary` look like an alias; the later groupby rebinds it
+    # to the model's own frame, so summary.columns = ... must run.
+    ("summary = np.nan\n"
+     "df = pd.read_csv('ok.csv')\n"
+     "summary = df.groupby('a').agg({'b': 'mean'})\n"
+     "summary.columns = ['avg_b']\n"
+     "result_df = summary.reset_index()"),
+    # an alias, then rebound to a value, then a plain attribute store
+    ("P = Path\n"
+     "P = pd.read_csv('ok.csv')\n"
+     "P.columns = ['x', 'y']\n"
+     "result_df = P"),
+    # an alias of np, then rebound to the model's own frame
+    ("x = np\n"
+     "x = pd.read_csv('ok.csv')\n"
+     "x.index.name = 'i'\n"
+     "result_df = x.reset_index()"),
+])
+def test_alias_tracking_follows_a_later_rebind_to_a_value(box, code):
+    data, _ = box
+    df, msg = run(code, data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    # a branch must not CLEAR an alias: conservatively still refused
+    ("P = Path\n"
+     "if DATA_FOLDER:\n"
+     "    P = 5\n"
+     "P.resolve = lambda self, *a, **k: self"),
+    # the alias is set in a branch; a store after it is refused
+    ("if DATA_FOLDER:\n"
+     "    Q = Path\n"
+     "Q.resolve = lambda self, *a, **k: self"),
+])
+def test_alias_tracking_is_conservative_for_branches(code):
+    ok, msg = va.validate_generated_code(code)
+    assert not ok and "Forbidden" in msg, msg
+
+
+# ── pandas option: through an alias, augmented, annotated (LOW-MEDIUM) ────
+@pytest.fixture
+def _pd_opts_restored2():
+    keys = ("display.max_columns", "display.width", "display.max_rows")
+    saved = {k: va.pd.get_option(k) for k in keys}
+    yield
+    for k, v in saved.items():
+        va.pd.set_option(k, v)
+
+
+@pytest.mark.parametrize("code", [
+    "p = pd\np.options.display.max_columns = None",      # through an alias
+    "pd.options.display.max_rows: int = 10",             # annotated
+])
+def test_pandas_option_through_alias_or_annotation_runs(box, _pd_opts_restored2,
+                                                        code):
+    data, _ = box
+    df, msg = run(code + "\nresult_df = pd.read_csv('ok.csv')", data)
+    assert df is not None, msg
+
+
+@pytest.mark.parametrize("code", [
+    "p = pd\np.options.display.max_columns = None",
+    "pd.options.display.max_rows: int = 10",
+    "pd.options.display.width += 0",
+])
+def test_pandas_option_alias_and_aug_ann_pass_the_check(code):
+    ok, msg = va.validate_generated_code(code)
+    assert ok, msg
+
+
+# ── image_stats / feature_detect error text is plain (2026-10-16) ─────────
+def test_image_helpers_error_text_names_the_file_not_an_object_repr(box):
+    """A non-image file: the error names the file and the error KIND, never
+    the open file object's repr (<_io.BufferedReader ...>)."""
+    data, _ = box
+    (data / "bad.png").write_text("not an image", encoding="utf-8")
+    for helper in ("image_pixel_stats", "detect_and_count_features"):
+        df, msg = run(
+            f"r = {helper}('bad.png')\n"
+            "result_df = pd.DataFrame([{'err': r.get('error', '')}])", data)
+        assert df is not None, msg
+        err = df.iloc[0]["err"]
+        assert "bad.png" in err, err
+        assert "BufferedReader" not in err and "_io." not in err, err
+        assert "<" not in err, err

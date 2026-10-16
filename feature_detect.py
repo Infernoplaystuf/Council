@@ -140,7 +140,10 @@ def detect_and_count_features(path: Any, *,
             im = Image.open(fh)
             im.load()
     except Exception as exc:
-        return {"error": f"could not open image: {exc!r}"}
+        # Name the file and the error KIND, not the exception's repr: Pillow's
+        # UnidentifiedImageError embeds the open file object's repr
+        # (<_io.BufferedReader name=...>), an internal object (2026-10-16).
+        return {"error": f"could not open image {name} ({type(exc).__name__})"}
 
     w0, h0 = im.size
     gray_im = im.convert("L")
