@@ -23,6 +23,11 @@ same list.
   (`tests/test_council_qt_foundation.py`): compared the Qt `StandaloneHost` with
   the Tk one and needed tkinter. Its Qt-only checks are now
   `test_the_standalone_host_surface`.
+- `test_connect_accepts_a_listbox_selection` (`tests/test_barbie_v4.py`), retired on
+  branch `typhon-plugins`, where a failing Barbie test is retired rather than fixed
+  (`docs/typhon_plugins_design.md` 7.2): it hard-coded row 1 of the camera list as
+  the simulated event camera and failed whenever `PYLON_CAMEMU` lists pylon's
+  emulated Baslers first (the `pylon` env), on `qt-migration` too.
 
 ## Standing rules (all branches)
 

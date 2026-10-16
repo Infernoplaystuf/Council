@@ -23,6 +23,14 @@ RETIRED = {
         "compared council_qt.host.StandaloneHost with the Tk "
         "council_modules.StandaloneHost; needs tkinter. Its Qt-only checks "
         "live on as test_the_standalone_host_surface.",
+    # Branch typhon-plugins: a Barbie test that fails there is retired, not
+    # fixed (docs/typhon_plugins_design.md 7.2).
+    "test_connect_accepts_a_listbox_selection":
+        "tests/test_barbie_v4.py (Barbie v4). It hard-coded row 1 of the "
+        "camera list as the simulated event camera, and failed whenever "
+        "PYLON_CAMEMU lists pylon's emulated Baslers first (the pylon env), "
+        "on qt-migration too. Retired on branch typhon-plugins (P1 review, "
+        "16 October 2026); Barbie v4 is retired at the switch-over (8.3).",
 }
 
 
