@@ -369,13 +369,35 @@ class SourceImage:
     saved_as: str = ""
 
 
-def load_workbook_grids(path) -> Tuple[List[Grid], List[SourceImage]]:
+#: Workbook files the reader takes: openpyxl reads .xlsx/.xlsm; the installed
+#: Excel opens .xls, .xlsb and rights-protected files (excel_open.py).
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+
+
+def workbook_files(folder) -> List[Path]:
+    """The workbooks in a folder, not Excel's ~$ lock files."""
+    return sorted(x for x in Path(folder).iterdir()
+                  if x.suffix.lower() in WORKBOOK_SUFFIXES and not x.name.startswith("~$"))
+
+
+def load_workbook_grids(path, notes: Optional[List[str]] = None
+                        ) -> Tuple[List[Grid], List[SourceImage]]:
+    """Every sheet as a Grid, every text box and chart as a small Grid of its
+    own, and the pictures. openpyxl when it can open the file; the installed
+    Excel when it cannot (.xls, .xlsb, rights-protected). `notes` collects
+    what could not be read (a picture Excel would not copy out)."""
     import openpyxl
     from openpyxl.utils import get_column_letter
+    import excel_open
     path = Path(path)
-    if path.suffix.lower() == ".xls":
-        raise LedgerError(f"{path.name} is the old .xls format; open it in Excel and "
-                          "Save As .xlsx, then add that file")
+    kind = excel_open.kind_of(path) if path.exists() else "unknown"
+    if not path.exists():
+        raise LedgerError(f"{path.name} not found")
+    if kind == "password":
+        raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
+                          "copy without the password, and add that copy")
+    if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
+        return _grids_from_excel(path, notes)
     try:
         wb = openpyxl.load_workbook(path, data_only=True)
     except Exception as e:
@@ -411,6 +433,30 @@ def load_workbook_grids(path) -> Tuple[List[Grid], List[SourceImage]]:
             images.append(SourceImage(path.name, ws.title, anchor, data,
                                       (getattr(img, "format", None) or "png").lower()))
     wb.close()
+    for ex in excel_open.zip_extras(path):                # text boxes and charts
+        grids.append(Grid(path.name, ex.name, ex.cells))
+    return grids, images
+
+
+def _grids_from_excel(path: Path, notes: Optional[List[str]]):
+    import excel_open
+    try:
+        book = excel_open.read_with_excel(path)
+    except excel_open.ExcelOpenError as e:
+        raise LedgerError(str(e)) from e
+    grids: List[Grid] = []
+    for name, cells in book.sheets:
+        fixed = {k: (_Merged(v[1]) if isinstance(v, tuple) and v and v[0] == "__merged__"
+                     else v) for k, v in cells.items()}
+        fixed = {k: v for k, v in fixed.items()
+                 if not (isinstance(v, str) and v.strip().upper() in _EXCEL_ERRORS)}
+        grids.append(Grid(path.name, name, fixed))
+    for ex in book.extras:
+        grids.append(Grid(path.name, ex.name, ex.cells))
+    images = [SourceImage(path.name, pic.sheet, pic.anchor, pic.data, pic.ext)
+              for pic in book.pictures]
+    if notes is not None:
+        notes.extend(book.notes)
     return grids, images
 
 
@@ -1241,7 +1287,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     for src in sources:
         src = Path(src)
         try:
-            grids, images = load_workbook_grids(src)
+            grids, images = load_workbook_grids(src, run.problems)
         except LedgerError as e:
             run.problems.append(str(e))
             continue
@@ -1729,8 +1775,7 @@ def main(argv=None) -> int:
             files = []
             for s in args.sources:
                 p = Path(s)
-                files += sorted(x for x in p.glob("*.xlsx") if not x.name.startswith("~$")) \
-                    if p.is_dir() else [p]
+                files += workbook_files(p) if p.is_dir() else [p]
             out = Path(args.out) if args.out else Path(args.csv).with_name(
                 f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
             mapping, ignore = load_aliases(args.csv)

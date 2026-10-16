@@ -37,6 +37,14 @@ PySide6>=6.6
 numpy>=1.24
 pandas>=2.0
 openpyxl>=3.1            # XLSX support
+pywin32>=306; sys_platform == "win32"
+                         # Ledger tab: opens .xls, .xlsb and rights-protected
+                         # workbooks through the installed Excel (hidden,
+                         # read-only, macros off). Optional: without it those
+                         # files are reported, not read. Install with pip -
+                         # conda-forge's build also replaces openssl.
+                         # Pictures are read by Tesseract (not a pip package):
+                         # a conda env named 'tesseract' or Program Files.
 xlrd>=2.0                # legacy XLS support
 pyarrow>=15.0            # fast parquet/feather (optional but recommended)
 

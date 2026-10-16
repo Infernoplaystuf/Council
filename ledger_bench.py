@@ -453,6 +453,131 @@ BUILDERS = [build_record, ec_stacked, ec_side_by_side, ec_by_sheet, ec_long_log,
             concealment, visual, summary, pictures, messy]
 
 
+# ── workbooks only Excel makes (and only Excel opens): .xls, .xlsb, a text
+#    box, a chart, a password. Built when Excel automation is available. ──
+def _excel_save(src: Path, out: Path, fmt: int, password: str = "", edit=None):
+    """Open an openpyxl-made workbook in a hidden Excel, optionally edit it
+    (add a text box / chart), and save it as `fmt` (56 xls, 50 xlsb, 52 xlsm,
+    51 xlsx)."""
+    import pythoncom
+    from win32com.client import DispatchEx
+    pythoncom.CoInitialize()
+    app = DispatchEx("Excel.Application")
+    try:
+        app.Visible = False
+        app.DisplayAlerts = False
+        app.AutomationSecurity = 3
+        wb = app.Workbooks.Open(str(src.resolve()))
+        if edit:
+            edit(wb.Worksheets(1))
+        if out.exists():
+            out.unlink()
+        if password:
+            wb.SaveAs(str(out.resolve()), FileFormat=fmt, Password=password)
+        else:
+            wb.SaveAs(str(out.resolve()), FileFormat=fmt)
+        wb.Close(SaveChanges=False)
+    finally:
+        app.Quit()
+        pythoncom.CoUninitialize()
+    src.unlink()
+
+
+def part_2049_split(out: Path, P: Parts, T: Truth, part="2049"):
+    """One part, one file per discipline, named the way the ChatGPT studio's
+    'group by filename prefix' expects: 2049_Laser.xls, 2049_NDE.xlsb,
+    2049_Visual.xlsm, 2049_Process.xlsx (values only in a text box and a
+    chart); and locked_2049.xlsx, which has a password to open."""
+    d = P.p["2041"]                                   # reuse one part's made-up values
+    tmp = out / "_tmp_build.xlsx"
+
+    f = f"{part}_Laser.xls"                           # old binary format
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Laser"
+    for i, (lab, fld) in enumerate([("Frequency (kHz)", "Frequency (kHz)"),
+                                    ("Laser Power (W)", "Power (W)")], start=1):
+        ws.cell(i, 1, lab)
+        ws.cell(i, 2, d[fld])
+        T.add(f, part, "", fld, d[fld])
+    for j, h in enumerate(["Flaw", "FOD (um)", "Length (in)"], start=1):
+        ws.cell(4, j, h)
+    for i, it in enumerate(ITEMS[:10], start=5):
+        fl = d["flaws"][it]
+        ws.cell(i, 1, it)
+        ws.cell(i, 2, fl[FA + "Laser Team FOD (um)"])
+        ws.cell(i, 3, fl[FA + "Flaw Length (in)"])
+        T.add(f, part, it, FA + "Laser Team FOD (um)", fl[FA + "Laser Team FOD (um)"])
+        T.add(f, part, it, FA + "Flaw Length (in)", fl[FA + "Flaw Length (in)"])
+    wb.save(tmp)
+    _excel_save(tmp, out / f, 56)
+
+    f = f"{part}_NDE.xlsb"                            # binary workbook, two inspectors
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    for k, ins in enumerate(["JB", "MK"]):
+        left = 1 + k * 5
+        ws.cell(1, left, f"Inspector: {ins}")
+        for j, h in enumerate(["Flaw", "EC Pre", "EC Post"]):
+            ws.cell(2, left + j, h)
+        for i, it in enumerate(ITEMS[:10], start=3):
+            ws.cell(i, left, it)
+            for j, st in enumerate(["Pre", "Post"], start=1):
+                v = P.ec("2041", it, ins, st)
+                ws.cell(i, left + j, v)
+                T.add(f, part, it, EC[st], v, ins)
+    wb.save(tmp)
+    _excel_save(tmp, out / f, 50)
+
+    f = f"{part}_Visual.xlsm"                         # macro-enabled type, no macros
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Flaw", "Inspector 1", "Inspector 2"])
+    for it in ITEMS[:10]:
+        vis = d["flaws"][it]["_vis"][:2]
+        ws.append([it] + vis)
+        for k, v in enumerate(vis, start=1):
+            T.add(f, part, it, f"Visual Inspection: Inspector {k}", v)
+    wb.save(tmp)
+    _excel_save(tmp, out / f, 52)
+
+    f = f"{part}_Process.xlsx"                        # only a text box and a chart
+    mid = {ins: [P.ec("2041", it, ins, "Mid") for it in ITEMS[:10]] for ins in ("JB", "MK")}
+
+    def add_box_and_chart(sheet):
+        box = sheet.Shapes.AddTextbox(1, 20, 20, 220, 70)
+        box.TextFrame2.TextRange.Text = (f"Scan Speed (mm/s): {d['Scan Speed (mm/s)']}\r"
+                                         f"Spot Size (mm): {d['Spot Size (mm)']}")
+        ch = sheet.ChartObjects().Add(260, 20, 360, 220).Chart
+        ch.ChartType = 51                             # clustered column
+        for ins in ("JB", "MK"):
+            ser = ch.SeriesCollection().NewSeries()
+            ser.Name = ins
+            ser.Values = tuple(mid[ins])
+            ser.XValues = tuple(ITEMS[:10])
+        ch.HasTitle = True
+        ch.ChartTitle.Text = "EC Mid-Conceal"
+    T.add(f, part, "", "Scan Speed (mm/s)", d["Scan Speed (mm/s)"])
+    T.add(f, part, "", "Spot Size (mm)", d["Spot Size (mm)"])
+    for ins in ("JB", "MK"):
+        for it, v in zip(ITEMS[:10], mid[ins]):
+            T.add(f, part, it, EC["Mid"], v, ins)
+    wb = openpyxl.Workbook()
+    wb.active["A30"] = "process sheet"
+    wb.save(tmp)
+    _excel_save(tmp, out / f, 51, edit=add_box_and_chart)
+
+    wb = openpyxl.Workbook()                          # a password to open
+    wb.active["A1"], wb.active["B1"] = "Power (W)", 999
+    wb.save(tmp)
+    _excel_save(tmp, out / "locked_2049.xlsx", 51, password="secret")
+
+
+EXCEL_BUILT = ["2049_Laser.xls", "2049_NDE.xlsb", "2049_Visual.xlsm", "2049_Process.xlsx"]
+PROBLEM_FILES = ["locked_2049.xlsx"]
+
+
 def make(template, out_dir) -> Truth:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -461,6 +586,9 @@ def make(template, out_dir) -> Truth:
     for b in BUILDERS:
         b(out, P, T)
     filled_template(out, P, T, schema)
+    import excel_open
+    if excel_open.excel_available():
+        part_2049_split(out, P, T)
     for t in T.rows:
         t["value"] = _norm(t["value"])
     (out / "truth.json").write_text(json.dumps({"template": str(Path(template).resolve()),
@@ -492,6 +620,7 @@ class Score:
     multi_all_found: int = 0      # ... where every inspector's value was found
     disagree: int = 0             # ... where they logged different values
     disagree_pre: int = 0         # ... and one of them was pre-accepted anyway
+    problems: List[str] = field(default_factory=list)   # what was reported, not read
     signed: int = 0               # readings with initials: each in its own column
     signed_found: int = 0         # ... found there, under the right initials
     examples: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
@@ -502,6 +631,8 @@ class Score:
              f"{self.missed:6} {self.extra:5} {self.pre_ok:6} {self.pre_wrong:7}")
         if self.signed:
             s += f"   by initials {self.signed_found}/{self.signed}"
+        if self.problems:
+            s += f"   reported: {self.problems[0][:80]}"
         if self.multi_cells:
             s += (f"   inspectors: {self.multi_all_found}/{self.multi_cells} cells all found;"
                   f" {self.disagree_pre} of {self.disagree} disagreeing pre-accepted")
@@ -521,6 +652,8 @@ def score(out_dir, files: Optional[Sequence[str]] = None, image_reader=None,
     schema = read_template(data["template"])
     truth = data["rows"]
     names = list(files) if files else sorted({t["file"] for t in truth})
+    if not files:
+        names += [n for n in PROBLEM_FILES if (out / n).exists()]
     scores = []
     for name in names + ["ALL (merged)"]:
         group = names if name.startswith("ALL") else [name]
@@ -528,7 +661,9 @@ def score(out_dir, files: Optional[Sequence[str]] = None, image_reader=None,
         run = extract(schema, [out / g for g in group], image_reader=image_reader,
                       use_images=use_images)
         decisions = decide(run, schema)
-        scores.append(_score(name, rows, decisions))
+        sc = _score(name, rows, decisions)
+        sc.problems = list(run.problems)
+        scores.append(sc)
     return scores
 
 

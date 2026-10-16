@@ -38,9 +38,15 @@ def samples(tmp_path_factory):
 def test_the_samples_and_their_answers(samples):
     out, _, _ = samples
     truth = json.loads((out / "truth.json").read_text(encoding="utf-8"))["rows"]
-    files = sorted(p.name for p in out.glob("*.xlsx"))
-    assert len(files) == 11 and files == sorted({t["file"] for t in truth})
-    assert len(truth) == 1297
+    import excel_open
+    files = sorted(p.name for p in out.iterdir() if p.suffix.startswith(".xls"))
+    plain = [t for t in truth if t["file"] not in ledger_bench.EXCEL_BUILT]
+    assert len(plain) == 1297
+    if excel_open.excel_available():          # .xls, .xlsb, .xlsm, text box + chart, password
+        assert len(files) == 16 and len(truth) == 1401
+        assert sorted({t["file"] for t in truth} | set(ledger_bench.PROBLEM_FILES)) == files
+    else:
+        assert len(files) == 11 and files == sorted({t["file"] for t in truth})
     # several people's EC readings for one flaw, in one workbook
     ec = [t for t in truth if t["file"] == "2041_EC_stacked.xlsx"
           and t["item"] == "1A" and "Pre-Conceal" in t["field"]]
@@ -105,3 +111,15 @@ def test_nothing_wrong_is_pre_accepted_and_nothing_extra(samples):
     s = samples[1]["ALL (merged)"]
     assert (s.pre_wrong, s.extra) == (0, 0)
     assert s.signed and s.signed_found == s.signed
+
+
+def test_files_only_excel_opens_read_in_full(samples):
+    import excel_open
+    if not excel_open.excel_available():
+        pytest.skip("no Excel automation here")
+    for name in ledger_bench.EXCEL_BUILT:
+        s = samples[1][name]
+        assert (s.right, s.extra, s.pre_wrong) == (s.truth, 0, 0), name
+        assert s.signed_found == s.signed
+    locked = samples[1]["locked_2049.xlsx"]
+    assert locked.problems and "password to open" in locked.problems[0]

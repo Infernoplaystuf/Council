@@ -34,7 +34,8 @@ from sample_ledger import LedgerError
 from .. import theme
 from ..view import ViewHelpers, amp
 
-XLSX = "Excel workbooks (*.xlsx)"
+XLSX = "Excel workbooks (*.xlsx *.xlsm *.xls *.xlsb)"
+TEMPLATE = "Excel workbook (*.xlsx)"
 
 
 class LedgerActions:
@@ -326,7 +327,7 @@ class LedgerTab(ViewHelpers, QWidget):
 
     def browse_template(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Template workbook",
-                                           self._start_dir(self.template), XLSX)
+                                           self._start_dir(self.template), TEMPLATE)
         if p:
             self.template.setText(p)
 
@@ -349,7 +350,7 @@ class LedgerTab(ViewHelpers, QWidget):
 
     def browse_review(self) -> None:
         p, _ = QFileDialog.getOpenFileName(self, "Review workbook",
-                                           self._start_dir(self.review), XLSX)
+                                           self._start_dir(self.review), TEMPLATE)
         if p:
             self.review.setText(p)
 

@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (ImageReader, apply_review, decide, default_image_reader,
-                            extract, load_aliases, write_review)
+                            extract, load_aliases, workbook_files, write_review)
 
 #: progress(message) — called from the worker thread; the caller hops to its UI.
 Progress = Callable[[str], None]
@@ -46,13 +46,12 @@ def default_review_for(csv_path) -> Path:
 
 
 def collect_sources(paths: Sequence) -> List[Path]:
-    """Files as given; a folder means every .xlsx in it (not Excel's ~$ lock
-    files). Duplicates dropped, order kept."""
+    """Files as given; a folder means every workbook in it (.xlsx, .xlsm,
+    .xls, .xlsb; not Excel's ~$ lock files). Duplicates dropped, order kept."""
     out: List[Path] = []
     for s in paths:
         p = Path(s)
-        found = sorted(x for x in p.glob("*.xlsx") if not x.name.startswith("~$")) \
-            if p.is_dir() else [p]
+        found = workbook_files(p) if p.is_dir() else [p]
         for x in found:
             if x not in out:
                 out.append(x)
