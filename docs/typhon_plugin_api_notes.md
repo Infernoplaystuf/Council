@@ -7,24 +7,31 @@ still allowed. It is frozen as 1.0 at stage P5, together with the author's
 guide of design 3.11, and only then are plugins from other people loaded.
 Until then these notes are the record of what exists.
 
-**Version now: 0.1** (stage P1 row 2, 15 October 2026).
+**Version now: 0.2** (stage P2 rows 1 and 2, 16 October 2026). 0.1 was
+stage P1 row 2 (15 October 2026); 0.2 adds the camera plugins.
 
 ## The pieces
 
 | Piece | Where | What it is |
 |---|---|---|
-| The API a plugin imports | `typhon_plugin_api/__init__.py` | `API_VERSION`, `has()`, `EVENTS`, the types (`CameraHandle`, `FrameView`, `CropBox`), the protocols (`PluginContext`, `FeaturePlugin`), and today's classes re-exported (below) |
+| The API a plugin imports | `typhon_plugin_api/__init__.py` | `API_VERSION`, `has()`, `EVENTS`, the types (`CameraHandle`, `FrameView`, `CropBox`, `CategoryHints`, `ReviewSource`), the protocols (`PluginContext`, `FeaturePlugin`, `CameraPlugin`), the capability names and rule, and today's classes re-exported (below) |
+| The built-in adapters' reach | `typhon_plugin_api/builtin.py` | What the built-in camera plugins reach of the code that stays in `council_core` (BaslerBackend, EvkBackend, SyntheticBackend and their devices, the raw view's `open_raw`, the settings tabs' tables). Not part of the API a plugin from someone else may use; it goes at stage P7 |
+| Capabilities | `council_core/camera_capabilities.py` | The names of design 3.4 and the one rule that reads them off an open camera's own flags |
 | The manifest reader | `council_core/plugin_manifest.py` | Reads and checks `plugin.json` as data and imports nothing |
 | The base set and project lists | `council_core/plugin_lists.py` | `<plugin home>/base_set.json` and `<project>/typhon_plugins.json`, and the plugin home itself |
-| The host | `council_core/plugin_host.py` | The built-in list, discovery, lazy loading, the guard and faults, contexts, events, the UI queue, live-frame feeds and the watchdog |
-| The rig | `council_core/camera_rig.py` | `rig.plugins` is the host, made on first use. Each slot's `plugin_state` holds a plugin's per-camera state |
-| The built-in plugins | `typhon_plugins/<name>/` | Seven adapters, each a manifest plus an empty `plugin.py` at this stage |
+| The host | `council_core/plugin_host.py` | The built-in list, discovery, lazy loading, the guard and faults, contexts, events, the UI queue, live-frame feeds and the watchdog; from 0.2 the camera-plugin registry |
+| The rig | `council_core/camera_rig.py` | `rig.plugins` is the host, made on first use. Each slot's `plugin_state` holds a plugin's per-camera state; its `capabilities` say what its camera can do |
+| The built-in plugins | `typhon_plugins/<name>/` | Seven adapters. The three camera plugins (Basler, Prophesee, Simulated) are adapters over today's classes from 0.2; the four feature plugins are still a manifest and an empty `plugin.py` |
+| The camera contract | `tests/contracts/test_camera_plugins.py` | What every camera plugin must do (design 9.1), run against every built-in camera plugin |
 
 ## The rules that already hold
 
 - **A plugin imports only `typhon_plugin_api`**, plus the standard library
   and its own files. The built-in plugins obey this too, and a test checks
-  every import in `typhon_plugins/`.
+  every import in `typhon_plugins/`. A built-in adapter reaches the code
+  that stays in `council_core` through `typhon_plugin_api.builtin`, whose
+  names are looked up at every use and never kept, so an adapter always
+  reaches the code as its module has it.
 - **Built-in means on the list.** `plugin_host.BUILTIN_PLUGINS` names the
   seven built-in plugins. Any other folder in `typhon_plugins/` is refused
   and never loaded.
@@ -51,7 +58,10 @@ The fields are those of design 3.11: `schema`, `id`, `short`, `name`,
 `version`, `api`, `kind`, `entry` (all required), plus `author`,
 `description` and `licence`, which third-party plugins must also give. The
 optional fields are `scope`, `needs`, `python`, `contributes`, `files`,
-`uses`, `network` and `budget_ms`. The reader is strict:
+`uses`, `network`, `budget_ms` and, from 0.2, `capabilities`: what a camera
+plugin's cameras can have (design 3.4), read before any of its code runs.
+Only a camera plugin gives it; a name Typhon does not know is kept as
+written and ignored. The reader is strict:
 
 - an unknown field, a duplicate key, NaN or Infinity, a file over 64 KB,
   text that is not UTF-8, or anything but one JSON object is refused, with
@@ -138,7 +148,7 @@ with the crash marker at stage P4.
 | `ctx.plugin_id` | the plugin's id |
 | `say(text)` | Puts a line in the status line, named as the plugin's. From a thread other than the UI thread, the line goes through the UI queue |
 | `call_in_ui(fn)` | Runs `fn` on the UI thread: through the window's `ui_caller` once it is wired (stage P4), and through `host.pump_ui()` until then |
-| `cameras()` | Every slot as a `CameraHandle`. Capabilities come from what today's `Device` says of itself (`frames` or `events`, `restartable`, `area_live`, `grab_failures`, `raw_recording`). `facet()` answers `None` until stage P3 |
+| `cameras()` | Every slot as a `CameraHandle`. Its capabilities are the slot's: what the camera plugin that opened it confirmed (0.2), else what today's `Device` says of itself (`frames` or `events`, `restartable`, `area_live`, `grab_failures`, `raw_recording`). `facet()` answers `None` until stage P3 |
 | `active_camera()` | the active slot's name |
 | `capture_folder(camera=None)` | The slot's folder: the plugin's own slot for a camera-scoped feature, otherwise the active slot |
 | `current_frame()`, `crop_box()` | `None` until the window wires them (stage P4) |
@@ -156,6 +166,103 @@ The two file services of design 3.9 (`create_file`, `write_new`) and
 `hook.check_start` joins when Start asks it (P3) and `hook.status` when
 the status strip does (P4); both answered True in 0.1 before the P1
 review, although nothing called them.
+
+## Camera plugins (0.2, stage P2 rows 1 and 2)
+
+**What a camera plugin is** (`CameraPlugin`, design 3.3): `backend` (its
+cameras' `CameraInfo.backend`; a plugin from someone else's carries a dot,
+so it can never claim a built-in's preset keys), `available()` (ready?,
+what to install), `discover()`, `open(info)` (today's `Device`),
+`capabilities(device)`, `facet(device, name)` (None until P3),
+`categories()` (`CategoryHints`), `record_fields(device)` (plain JSON;
+wired at P3) and `review_source()` (`ReviewSource` or None). Its set-up
+guide and checks join with the wizard's camera pages (P2 row 4). `has()`
+names the hooks the host calls: `camera.available`, `camera.discover`,
+`camera.open`, `camera.capabilities`, `camera.categories`,
+`camera.review_source`.
+
+**The built-in camera plugins are adapters** over code that does not move
+(design 7.2): `typhon.basler` over `BaslerBackend`, `BaslerDevice` and
+`BaslerSettings`; `typhon.prophesee` over `EvkBackend`, `EvkDevice`,
+`identify`, `EvkSettings` and `event_playback`; `typhon.simulated` over
+`SyntheticBackend`, `SyntheticDevice` and `SyntheticSettings`. An SDK
+plugin's `sdk` attribute takes a stand-in for pypylon or `metavision_hal`
+(the contract suite's fakes); None is the real SDK, imported on first use.
+
+**Capabilities, in two steps** (design 3.4). The manifest says what the
+plugin's cameras can have; the opened camera confirms its own:
+
+| Plugin | Manifest | Confirmed on the opened camera |
+|---|---|---|
+| Basler | `frames`, `restartable`, `grab_failures`, `software_trigger`, `hardware_trigger`, `binning` | the camera's own flags; `software_trigger` when an exact Software run can be armed (`trigger_problem` says nothing); `hardware_trigger` when its trigger sources list an input (`capture_options().hardware`); `binning` when `can_bin(2)` (pylon's emulator accepts binning and does nothing, so the run record still says what was done) |
+| Prophesee | `events`, `area_live`, `raw_recording` | the camera's own flags (never `restartable`); Trigger In, sync and the event stream come later |
+| Simulated | `frames`, `events`, `restartable`, `area_live`, `software_trigger` | the camera's own flags, and `software_trigger` for the frame camera, which has the capture set-up a trigger is fired through |
+
+The host keeps only what the manifest declares and Typhon knows
+(`camera_capabilities.known`), so a plugin can never claim more. The one
+rule for an open camera's own flags is `camera_capabilities.of_device`.
+**A camera slot answers** what its camera can do
+(`CameraSlot.capabilities`): what its plugin confirmed when it opened it
+(`CameraSlot.confirm`, done by `host.open_camera(info, camera=...)`), else
+the rule. `frame_camera`'s four "is it an event camera?" checks, the
+simulated camera's settings and the Council's Capture tab now ask for
+`events`; what they say is unchanged.
+
+**The registry** (`PluginHost`): `camera_plugins()` (this project's, in its
+list's order: Basler, Prophesee, Simulated, as `cameras.backends()` has
+them); `backends()` (each camera plugin as today's `cameras.Backend`,
+`PluginBackend`, so `cameras.discover(known=)` and
+`cameras.open_camera(known=)` run on top of the registry with the same
+order and the same notes — a test compares the two scans);
+`discover_cameras()`; `open_camera(info, camera=)`;
+`camera_capabilities(pid, device)`; `category_tables()`;
+`review_sources()`. `cameras.backends()` and `discover()` themselves are
+unchanged: the Council's Capture tab keeps them.
+
+**Errors in a camera job** (`camera_call`). A camera's own refusal, a
+`CameraError` (`NeedsStop`, `GrabFailed`, `SettingError`), reaches the
+caller as it is: the camera said no, which is never the plugin's fault.
+Anything else is the plugin's: logged in `plugin_errors.log` and said, and
+the caller gets a `CameraError` naming the plugin, so the code that handles
+a camera's refusal handles it too. A plugin from someone else is then
+switched off for the session; a built-in camera plugin is not (design 3.10:
+never switched off without asking). Camera calls are not watched by the
+watchdog: they wait on an SDK and a camera for seconds (pypylon's import
+alone took 0.6-2.0 s, design 3.3).
+
+**Category hints** (design 2.4 item 9). Each built-in camera plugin names
+the settings groups that are its own, and `typhon_plugin_api.builtin.
+hints_for` gives it those groups' rows of today's tables (one table while
+the branch lives). `camera_categories.merge` merges every plugin's hints:
+a shared tab two plugins name holds both plugins' groups, each plugin's
+own order kept; a tooltip or a group's most-used keys come from the first
+plugin that gives them. The three built-ins' hints merge into today's
+tables exactly, and `plan(..., tables=)` plans the same tabs for every
+built-in camera from the merged hints and from each plugin's own alone. A
+group no plugin names still gets a tab of its own. The settings tabs still
+plan from today's tables until the slot's `api` hands them the merged ones
+(P4).
+
+**The Prophesee raw view is a review source** (design 2.4 item 13, 3.7):
+name `raw`, label `Raw`, suffix `_events.raw`, opened with
+`event_playback.open_raw` exactly as the slider's default opener calls it,
+and not while the file is being recorded. `ReviewSource` also finds a
+run's file and the newest one, as the slider does. The slider keeps its
+own code until P4.
+
+**N simulated cameras** (row 2; multi-camera design 2.10):
+`COUNCIL_SIM_CAMERAS=frame,frame,event` makes the Simulated plugin list that
+many: the first of each kind keeps today's key (`sim-frame`, `sim-event`),
+the next ones are `sim-frame-2`, ...; serials number them in order,
+`SIM-1`, `SIM-2`, ... At most 8. Unset or blank, today's two exactly. A value
+Typhon cannot read is said in the scan's notes, never guessed at.
+
+**Test fakes for a rig** (row 2): `tests/fake_rig.py` — fake EVK4 units with
+serials of their own behind one fake HAL (several at once, in
+`frame_camera`'s scan too), Trigger In, the sync facility and the
+external-trigger decoder shaped like OpenEB 5.2's bindings (checked where
+they are importable), a trigger line, a sync clock, and replay rigs (recorded
+events, or real `.raw` files where the Metavision SDK is).
 
 ## Calls into a plugin, and faults (design 3.10)
 
@@ -274,7 +381,10 @@ bench PC.
 
 Nothing in `frame_camera` calls the host yet, so today's Typhon behaves
 exactly as before, and a test runs a whole capture and finds the host never
-made or imported. The recording code has two additions, and neither does
+made or imported. From 0.2 `frame_camera` asks its camera slot what the
+camera can do; without a host the slot answers from the camera's own flags,
+which is what the old checks read. The camera registry is called by the set-
+up's camera families from P2 rows 3 and 4. The recording code has two additions, and neither does
 anything for today's Typhon: `FrameWriter.end_recording`, which only the
 host calls, and `record_to` handing a gate its run's writer
 (`bind_writer`), which today's `TriggerRun` does not have. The rig reaches
@@ -284,7 +394,7 @@ found 6 extra files there, 35 to 41, and a slower cold list).
 
 | Stage | Adds to the API |
 |---|---|
-| P2 | The camera plugins (`CameraPlugin`: `available`, `discover`, `open`, `capabilities`, `categories`, `setup_guide`, `record_fields`, `review_source`) over today's Backend, Device and Provider classes. Capabilities declared in the manifest and confirmed by the opened camera. `camera_setup.json`'s choice read as the project's plugin list |
+| P2 | Rows 1 and 2 are done (0.2, above): the camera plugins over today's Backend, Device and Provider classes, capabilities declared in the manifest and confirmed by the opened camera, the registry, category hints, the raw view as a review source, `Provider.extra_stops`, N simulated cameras and the rig's test fakes. Rows 3 and 4 add `camera_rig.json`, several camera families in the set-up (the enabled camera plugins) with each plugin's `setup_guide`, checks and (Basler) scan page, and `camera_setup.json`'s choice read as the project's plugin list |
 | P3 | The run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start, and `has("hook.check_start")`). `RunPlan` and `RunInfo`. The facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) and `CaptureOptions` and `CaptureSetup` in the API. The record gate wired through `record_gate`. The run-file suffix registry. Record blocks, and the run records' `plugins` block. The two file services, and `<project>/plugin_data/<id>/` for a plugin's own data in a project (design 4.1; nothing makes it in 0.1). `FrameView.to_sensor` and its coordinate fields, and `saved`. The finer timer while recording (row 5), decided on a quiet PC and on the bench PC. Whether plugins need the frame's own array read-only from `read()` (design 3.8), if they get frames any other way than a `FrameView` |
 | P4 | The screen: pop-out panels, toolbar and status strips, the Plugins window (base set, additions, switch-offs, settings, approval states, each plugin's over-budget and dropped-frame counts), `current_frame` and `crop_box` wired. `status()` asked by the status strip and held to its limits, 80 characters and 5 ms (design 3.5, 3.11), with `has("hook.status")`. The crash marker and "asked after a crash". A plugin's Python packages checked in the project's own interpreter (`python_envs`) when the Council lists a project's plugins; inside the app the running interpreter is the project's |
 | P5 | The hardened loader for third-party plugins (approval, `approvals.json`, the hash-then-compile importer, the `typhon_thirdparty.<folder>` package, `read_data`), the network field and its audit hook, the manifest's `uses` acted on (11.5), the API frozen as 1.0, and the author's guide and `python -m typhon_plugin_api.check` |
@@ -321,3 +431,45 @@ hooks Typhon calls, and frames a plugin cannot unlock by accident.
   watchdog are what act on a slow live plugin.
 - **A damaged project list runs only the built-in camera plugins** (above),
   not the base set as it is now.
+
+Taken at stage P2 (rows 1 and 2, 16 October 2026):
+
+- **The manifest gains `capabilities`** (camera plugins only). Design 3.4
+  says the manifest's list lets the screen offer features before anything
+  is imported, but 3.11's field table has no field for it.
+- **A built-in camera plugin's SDK is not in its `python`.** With pypylon
+  there, a PC without pypylon would show the Basler plugin "incompatible"
+  and its scan note would go; `available()` says what to install, as the
+  scan always has.
+- **`cameras.backends()` and `discover()` stay as they are** for the
+  Council's Capture tab; the registry gives its plugins to
+  `cameras.discover(known=)` as `PluginBackend`s rather than
+  `backends()` being built from the registry. Building `backends()` from
+  the plugins would have put the plugin host under the Capture tab and on
+  today's Typhon's Python Scripts list, and changed `cameras.py`.
+- **A camera's `CameraError` is the camera's answer; any other error of a
+  built-in camera plugin is logged and said, and it stays on** (design
+  3.10's "never switched off without asking"); a third-party camera
+  plugin's is a fault. Camera calls are not watched by the watchdog.
+- **The capability question goes to the slot**: the plugin-confirmed set
+  when a plugin opened the camera, else the camera's own flags. The host
+  keeps a plugin's answer within its manifest and what Typhon knows.
+  `frame_camera` asks `events` only where a frame is shown with it, as the
+  frame's meta check did ("no frame, no event count").
+- **`Provider.extra_stops` is asked only about a set's keys that no
+  described row has**, so a settings window's one-key writes make no
+  provider for it. Design 2.1 gave it `(values, described)`; that is kept.
+- **The built-in adapters' reach is a submodule**,
+  `typhon_plugin_api.builtin`, looked up at every use, rather than more
+  names on the API itself: they are brand code that goes at P7, and the
+  1.0 API should not carry them.
+- **Category hints are cut from today's tables**: each built-in plugin
+  names its groups; the rows stay in `camera_categories` until P7.
+- **`COUNCIL_SIM_CAMERAS`**: the first camera of each kind keeps today's
+  key and the serials number the list in order, so the default
+  `frame,event` is today's two exactly; at most 8; anything else is said.
+- **The fake EVK4's sync mode is its own enum**: in OpenEB 5.2's Python
+  bindings `get_mode()` is declared to return the C++
+  `I_CameraSynchronization::SyncMode`, and no `SyncMode` is bound anywhere
+  in `metavision_hal` (read from the bindings in the `pylon` env; not
+  called, there being no EVK4), so there is no real value to compare.
