@@ -765,7 +765,8 @@ TAB_WORKERS = (
     "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog",
     "code-", "collection-", "council-command", "council-map-", "council-turn",
     "designer-", "diagnostics", "docs-", "dream3d-", "fanout-", "forge",
-    "grapher-", "ide-", "jobs-", "keyword-index", "kg-", "lens-",
+    "grapher-", "ide-", "jobs-", "keyword-index", "kg-", "ledger-",
+    "lens-",
     "librarian-", "model-", "mongo-convert", "nodes-", "pi-setup", "quant-",
     "sessions-", "tts-", "var-graph", "vault-",
     # capture.warm_in_background: Pillow's plugins imported off the UI
