@@ -211,3 +211,42 @@ def test_a_workbook_cell_is_previewed_off_the_gui_thread(qapp, tmp_path, monkeyp
         assert seen and not any(seen)
     finally:
         _close(qapp, tab)
+
+
+def test_folders_are_added_and_removed_in_the_tab(qapp, tmp_path):
+    from test_kg_excel import _outside
+    v = _vault(tmp_path)
+    out = _outside(tmp_path)
+    tab = ConnectionsTab(actions=Actions(v), ask_folder=lambda: str(out))
+    try:
+        assert tab.add_folder(str(v)) == f"{v.resolve()} overlaps the vault, which the " \
+                                         "graph reads already"
+        from council_qt.tabs.connections_dialogs import FoldersDialog
+        dlg = FoldersDialog(str(tab.actions.root), tab._kg.extra_roots(), tab.add_folder,
+                            tab.remove_folder, tab.ask_folder, tab)
+        dlg.on_add()
+        assert dlg.changed and dlg.list.count() == 2
+        assert dlg.message.text() == f"Added {out}. Rebuild to read it."
+        tab.apply_fields({r.label: True for r, _s in tab._kg.field_rules()}, [])
+        tab.on_rebuild()
+        _wait(qapp, tab)
+        tab.search.setText("Dana Whitfield")
+        tab.results.setCurrentRow(0)
+        ev = next(i for d, t, s, w, i in _items(tab.tree) if d == 2)
+        assert ev.text(2) == "Q3 Ledgers/tracker.xlsx · sheet T, row 3 (Owner, Part Number)"
+        tab.tree.setCurrentItem(ev)
+        _wait(qapp, tab)
+        assert "▶ B3 │ Owner: Dana Whitfield" in tab.preview.toPlainText()
+        # remove it again
+        dlg2 = FoldersDialog(str(tab.actions.root), tab._kg.extra_roots(), tab.add_folder,
+                             tab.remove_folder, tab.ask_folder, tab)
+        dlg2.list.setCurrentRow(1)
+        dlg2.on_remove()
+        assert dlg2.list.count() == 1 and tab._kg.extra_roots() == []
+        dlg2.list.setCurrentRow(0)
+        dlg2.on_remove()                    # the vault cannot be removed
+        assert dlg2.list.count() == 1 and "the vault always stays" in dlg2.message.text()
+        dlg.deleteLater()
+        dlg2.deleteLater()
+    finally:
+        _close(qapp, tab)

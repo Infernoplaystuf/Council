@@ -41,7 +41,7 @@ from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers, amp
-from .connections_dialogs import FieldsDialog
+from .connections_dialogs import FieldsDialog, FoldersDialog
 
 TYPE_FILTERS = (("Everything", None), ("People", "PERSON"),
                 ("Parts", "PART"), ("Projects", "PROJECT"))
@@ -194,7 +194,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
                  auto_refresh: bool = True, ask_string=None, ask_yes_no=None,
-                 ask_choice=None):
+                 ask_choice=None, ask_folder=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -209,6 +209,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.ask_string = ask_string or _dialogs.askstring
         self.ask_yes_no = ask_yes_no or _dialogs.askyesno
         self.ask_choice = ask_choice or _dialogs.askchoice
+        # askdirectory itself does not look at COUNCIL_NO_DIALOGS: offscreen
+        # it would wait on a file dialog nobody can see.
+        self.ask_folder = ask_folder or (lambda: None if _dialogs.disabled() else
+                                         _dialogs.askdirectory(
+                                             "Add a folder for the graph to read",
+                                             parent=self))
         self._build()
         if auto_refresh:
             self._reopen()
@@ -235,6 +241,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         self.answers_btn = self._button(row, "Your answers", self.on_answers)
         self.sources_btn = self._button(row, "Spreadsheets", self.on_sources)
+        self.folders_btn = self._button(row, "Folders…", self.on_folders)
         outer.addLayout(row)
 
         srow = QHBoxLayout()
@@ -442,7 +449,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             for ev in n["evidence"]:
                 e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"])
                                           + (" (changed since)" if ev["stale"] else ""),
-                                          f"{ev['path']} · {ev['where']}"])
+                                          f"{ev.get('file', ev['path'])} · {ev['where']}"])
                 e_item.setToolTip(0, ev["quote"])
                 e_item.setData(0, ROLE_KIND, "evidence")
                 e_item.setData(0, ROLE_DATA, ev)
@@ -462,7 +469,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.tree.addTopLevelItem(g)
             for m in mentions:
                 m_item = QTreeWidgetItem([m["snippet"], method_words(m["method"]),
-                                          f"{m['path']} · {m['where']}"])
+                                          f"{m.get('file', m['path'])} · {m['where']}"])
                 m_item.setToolTip(0, m["snippet"])
                 m_item.setData(0, ROLE_KIND, "mention")
                 m_item.setData(0, ROLE_DATA, m)
@@ -510,17 +517,19 @@ class ConnectionsTab(ViewHelpers, QWidget):
     def _preview(self, rel_path: str, locator: Any, where: str, quote: str = "") -> None:
         if not rel_path:
             return
-        self.preview_title.setText(f"{rel_path} · {where}")
+        shown = self._kg.display_path(rel_path) if self._kg is not None else rel_path
+        self.preview_title.setText(f"{shown} · {where}")
         self._preview_path = rel_path
         self._preview_token = token = object()
+        disk = self._disk(rel_path)
         if Path(rel_path).suffix.lower() not in self._WORKBOOK_SUFFIXES:
-            self._show_preview(token, self.actions.context(rel_path, locator, quote))
+            self._show_preview(token, self.actions.context(disk, locator, quote))
             return
         self.preview.setPlainText("Reading the workbook…")
 
         def work() -> None:
             try:
-                lines = self.actions.context(rel_path, locator, quote)
+                lines = self.actions.context(disk, locator, quote)
             except Exception:                             # noqa: BLE001
                 lines = []
             self._to_ui(self._show_preview, token, lines)
@@ -540,7 +549,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
     def _show_source(self, data: Dict[str, Any]) -> None:
         self._preview_path = data.get("path")
         self._preview_token = None
-        self.preview_title.setText(data.get("path", ""))
+        self.preview_title.setText(data.get("file") or data.get("path", ""))
         body = [data.get("text", "")]
         if data.get("notes"):
             body += ["", "Notes:"] + [f"  • {n}" for n in data["notes"]]
@@ -565,7 +574,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if not path:
             return
         try:
-            self.actions.open_file(path)
+            self.actions.open_file(self._disk(path))
         except Exception as exc:                          # noqa: BLE001
             self.status.setText(f"Could not open {path}: {exc}")
 
@@ -764,12 +773,52 @@ class ConnectionsTab(ViewHelpers, QWidget):
             else:
                 q = f"'{r['surface']}' was read as {names} — right?"
             item = QTreeWidgetItem([q, r["kind"].replace("_", " "),
-                                    f"{r['path']} · {r['where']}"])
+                                    f"{r.get('file') or r['path']} · {r['where']}"])
             item.setToolTip(0, q)
             item.setData(0, ROLE_KIND, "question")
             item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
                                         "where": r["where"], "review": r})
             self.tree.addTopLevelItem(item)
+
+    def on_folders(self) -> None:
+        """Folders outside the vault for the graph to read as well (read
+        only), kept per vault in the graph's store."""
+        if self._kg is None or self._busy:
+            return
+        dlg = FoldersDialog(str(self.actions.root), self._kg.extra_roots(),
+                            self.add_folder, self.remove_folder, self.ask_folder, self)
+        self._folders_dialog = dlg          # tests reach it here
+        dlg.exec()
+        if dlg.changed:
+            self.status.setText("Folders changed. Rebuild to read them.")
+
+    def add_folder(self, path: str) -> str:
+        """'' when added, else why not (in words)."""
+        if self._kg is None:
+            return "The graph is not open."
+        try:
+            self._kg.add_root(path)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    def remove_folder(self, rid: str) -> str:
+        if self._kg is None:
+            return "The graph is not open."
+        try:
+            self._kg.remove_root(rid)
+        except KeyError:
+            return "That folder is not in the list."
+        return ""
+
+    def _disk(self, rel: str) -> str:
+        """What actions.context / open_file get for a document: its path
+        relative to data_in, or, for an added folder's document, where it
+        is on disk (they resolve it against data_in, and an absolute path
+        wins)."""
+        if self._kg is not None and str(rel or "").startswith("<"):
+            return str(self._kg.abs_path(rel))
+        return rel
 
     def on_sources(self) -> None:
         """The spreadsheets the graph read - each Ledger (parent CSV) and
@@ -794,7 +843,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             groups[key] = g
         for s in sources:
             key = "bad" if s["status"] != "ok" else s["kind"]
-            item = QTreeWidgetItem([s["text"], s["kind"], s["path"]])
+            item = QTreeWidgetItem([s["text"], s["kind"], s.get("file", s["path"])])
             item.setToolTip(0, s["text"])
             item.setData(0, ROLE_KIND, "source")
             item.setData(0, ROLE_DATA, s)

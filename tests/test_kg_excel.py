@@ -883,3 +883,103 @@ def test_initials_are_never_a_name_and_names_are_not_initials():
     assert kg_excel.split_people("JB/MK") == ["JB", "MK"]
     assert kg_excel.split_people("Lee, Carol") == ["Lee, Carol"]
     assert kg_excel.split_people("JB, MK") == ["JB", "MK"]
+
+
+# ── folders outside the vault (read only) ───────────────────────────────
+def _outside(tmp_path, schema_people=None):
+    """A folder outside the vault: a Ledger and a workbook, plus a dot-folder."""
+    out = tmp_path / "Q3 Ledgers"
+    schema = _schema(tmp_path)
+    ec = _ec(schema)
+    _ledger(tmp_path, out, [_row(schema, "101", "1A", **{f"{ec} [JB]": "63"})],
+            people={"JB": "Jordan Blake"})
+    _book(out / "tracker.xlsx", {"T": {"A2": "Part Number", "B2": "Owner",
+                                       "A3": "PN-1", "B3": "Dana Whitfield"}})
+    _book(out / ".hidden" / "skip.xlsx", {"T": {"A1": "Part Number", "B1": "Owner",
+                                                "A2": "PN-X", "B2": "Nobody Here"}})
+    return out
+
+
+def test_an_added_folder_is_read_and_never_written(tmp_path):
+    v = _vault(tmp_path)
+    out = _outside(tmp_path)
+    before = _hashes(out)
+    kg = _kg(v)
+    entry = kg.add_root(out)
+    assert entry["name"] == "Q3 Ledgers" and entry["exists"]
+    kg.seed()
+    rels = _rels(kg)
+    assert rels == {("Jordan Blake", "INSPECTED", "101"): "seeded",
+                    ("Dana Whitfield", "OWNS", "PN-1"): "seeded"}
+    paths = sorted(r[0] for r in kg.db.execute("SELECT path FROM documents"))
+    rid = entry["id"]
+    assert paths == [f"<{rid}>/lmm_parent.csv", f"<{rid}>/tracker.xlsx"]
+    dana = kg.search("Dana Whitfield", "PERSON")[0]
+    (ev,) = kg.neighbors(dana["id"])[0]["evidence"]
+    assert ev["file"] == "Q3 Ledgers/tracker.xlsx"
+    assert kg.abs_path(ev["path"]) == out.resolve() / "tracker.xlsx"
+    ctx = kgm.source_context(kg.root, str(kg.abs_path(ev["path"])), ev["locator"])
+    assert ("B3", "Owner: Dana Whitfield", True) in ctx
+    assert [s["file"] for s in kg.sources()] == ["Q3 Ledgers/lmm_parent.csv",
+                                                 "Q3 Ledgers/tracker.xlsx"]
+    kg.write_exports()
+    assert _hashes(out) == before                     # read, never written
+    # kept per vault, in the store
+    kg.close()
+    again = kgm.KnowledgeGraph(v, image_reader=None)
+    assert [r["path"] for r in again.extra_roots()] == [str(out.resolve())]
+    assert kgm.KnowledgeGraph(_vault(tmp_path, "other"), image_reader=None).extra_roots() == []
+
+
+def test_folders_that_overlap_are_refused(tmp_path):
+    v = _vault(tmp_path)
+    out = _outside(tmp_path)
+    kg = _kg(v)
+    for bad, why in ((v, "overlaps the vault"), (v / "data_in", "overlaps the vault"),
+                     (tmp_path, "overlaps the vault"),
+                     (tmp_path / "nope", "is not a folder")):
+        with pytest.raises(ValueError, match=why):
+            kg.add_root(bad)
+    kg.add_root(out)
+    for bad in (out, out / ".hidden"):
+        with pytest.raises(ValueError, match="overlaps a folder already added"):
+            kg.add_root(bad)
+    assert len(kg.extra_roots()) == 1
+    assert [d["action"] for d in kg.decisions() if "folder" in d["action"]] == ["add_folder"]
+
+
+def test_a_removed_folder_leaves_the_graph_at_the_next_rebuild(tmp_path):
+    v = _vault(tmp_path)
+    out = _outside(tmp_path)
+    before = _hashes(out)
+    kg = _kg(v)
+    rid = kg.add_root(out)["id"]
+    kg.seed()
+    assert _rels(kg)
+    kg.remove_root(rid)
+    assert _rels(kg)                                   # until the rebuild
+    kg.seed()
+    assert _rels(kg) == {}
+    assert {r[0] for r in kg.db.execute("SELECT status FROM documents")} == {"missing"}
+    assert kg.db.execute("SELECT COUNT(*) FROM doc_cache").fetchone()[0] == 0
+    assert _names(kg, "PERSON") == []
+    assert _hashes(out) == before
+    with pytest.raises(KeyError):
+        kg.remove_root(rid)
+
+
+def test_an_added_folder_that_is_not_there_is_a_note(tmp_path):
+    v = _vault(tmp_path)
+    out = _outside(tmp_path)
+    kg = _kg(v)
+    kg.add_root(out)
+    kg.seed()
+    away = tmp_path / "unplugged"
+    out.rename(away)
+    stats = kg.seed()
+    assert stats["notes"] == [f"{out.resolve()}: this added folder is not there now; its "
+                              "documents count as gone until it is back"]
+    assert _rels(kg) == {}
+    away.rename(out)
+    kg.seed()
+    assert ("Dana Whitfield", "OWNS", "PN-1") in _rels(kg)

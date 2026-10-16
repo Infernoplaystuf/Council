@@ -961,6 +961,116 @@ class KnowledgeGraph:
                 continue
         return [v for k, v in seen.items() if k]
 
+    # ── folders outside the vault (read only) ──
+    #: meta key: the extra folders the user added, as JSON
+    #: [{"id", "path", "added_ts"}]. Kept in the store, so per vault.
+    EXTRA_ROOTS_KEY = "extra_roots"
+    _EXTRA_RE = re.compile(r"^<([0-9a-f]{10})>/(.*)$")
+
+    @staticmethod
+    def root_id(folder: Any) -> str:
+        """A short stable id for a folder (its resolved, case-folded path):
+        the prefix of its documents' paths in the store, '<id>/rel/path'.
+        '<' and '>' cannot be in a Windows file name, so no path under
+        data_in can look like one."""
+        import os
+        norm = os.path.normcase(str(Path(folder).expanduser().resolve()))
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
+
+    def extra_roots(self) -> List[Dict[str, Any]]:
+        """The folders outside the vault the graph also reads, as the user
+        added them: id, path, name, and whether the folder is there now."""
+        raw = self.meta(self.EXTRA_ROOTS_KEY)
+        try:
+            items = json.loads(raw) if raw else []
+        except Exception:
+            items = []
+        out = []
+        for d in items if isinstance(items, list) else []:
+            if isinstance(d, dict) and d.get("id") and d.get("path"):
+                p = Path(str(d["path"]))
+                out.append({"id": str(d["id"]), "path": str(p), "name": p.name or str(p),
+                            "exists": p.is_dir(), "added_ts": d.get("added_ts")})
+        return out
+
+    def _extra_bases(self) -> List[Tuple[str, Path]]:
+        if getattr(self, "_bases", None) is None:
+            self._bases = [(r["id"], Path(r["path"])) for r in self.extra_roots()]
+        return self._bases
+
+    def add_root(self, folder: Any) -> Dict[str, Any]:
+        """Also read the documents of ``folder`` - a folder outside the vault,
+        only ever READ: nothing in it is written, moved or copied into the
+        vault. Refused when it is not a folder, or overlaps the vault (its
+        data_in, its store) or a folder already added - the same file would
+        be two documents. Rebuild to read it."""
+        p = Path(folder).expanduser()
+        if not p.is_dir():
+            raise ValueError(f"{folder} is not a folder")
+        p = p.resolve()
+
+        def overlaps(a: Path, b: Path) -> bool:
+            for x, y in ((a, b), (b, a)):
+                try:
+                    x.relative_to(y)
+                    return True
+                except ValueError:
+                    pass
+            return False
+        if overlaps(p, self.vault.resolve()) or overlaps(p, self.root.resolve()):
+            raise ValueError(f"{p} overlaps the vault, which the graph reads already")
+        current = self.extra_roots()
+        for r in current:
+            if overlaps(p, Path(r["path"]).resolve() if Path(r["path"]).exists()
+                        else Path(r["path"])):
+                raise ValueError(f"{p} overlaps a folder already added ({r['path']})")
+        entry = {"id": self.root_id(p), "path": str(p), "added_ts": time.time()}
+        items = [{"id": r["id"], "path": r["path"], "added_ts": r.get("added_ts")}
+                 for r in current] + [entry]
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.EXTRA_ROOTS_KEY, json.dumps(items, ensure_ascii=False)))
+            self._decide("add_folder", {"id": entry["id"], "path": entry["path"]})
+        self._bases = None
+        return dict(entry, name=p.name or str(p), exists=True)
+
+    def remove_root(self, rid: str) -> None:
+        """Stop reading an added folder. Its documents leave the graph at the
+        next rebuild (they count as gone: their links and cached text go);
+        the folder itself is not touched."""
+        current = self.extra_roots()
+        if not any(r["id"] == rid for r in current):
+            raise KeyError(rid)
+        items = [{"id": r["id"], "path": r["path"], "added_ts": r.get("added_ts")}
+                 for r in current if r["id"] != rid]
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.EXTRA_ROOTS_KEY, json.dumps(items, ensure_ascii=False)))
+            self._decide("remove_folder", {"id": rid})
+        self._bases = None
+
+    def abs_path(self, rel: str) -> Path:
+        """Where a document of the store is on disk: under data_in, or under
+        the added folder its '<id>/' names (a removed folder's documents
+        resolve to a path that does not exist)."""
+        m = self._EXTRA_RE.match(str(rel or ""))
+        if m:
+            for rid, base in self._extra_bases():
+                if rid == m.group(1):
+                    return base / m.group(2)
+            return self.vault / STORE_DIR / "removed-folder" / m.group(2)
+        return self.root / rel
+
+    def display_path(self, rel: str) -> str:
+        """A document's path as a person reads it: 'trackers/x.xlsx' for the
+        vault's, 'Q3 Ledgers/lmm_parent.csv' for an added folder's."""
+        m = self._EXTRA_RE.match(str(rel or ""))
+        if not m:
+            return rel
+        name = next((base.name or str(base) for rid, base in self._extra_bases()
+                     if rid == m.group(1)), "(a removed folder)")
+        return f"{name}/{m.group(2)}"
+
     def _workbook_labels(self, p: Path) -> List[str]:
         try:
             rel = self._rel(p)
@@ -978,20 +1088,29 @@ class KnowledgeGraph:
 
     # ── documents ──
     def document_files(self) -> List[Path]:
-        """Supported files under ``root``, skipping dot-folders and the
-        protected app folders."""
-        if not self.root.exists():
-            return []
+        """Supported files under ``root`` and under every folder the user
+        added (add_root), skipping dot-folders and the protected app
+        folders. An added folder that is not there now (a drive unplugged)
+        gives nothing: its documents count as gone until it is back."""
         try:
             import conversation_logger as cl
         except Exception:
             cl = None
         from council_core import kg_excel
         out = []
-        for p in sorted(self.root.rglob("*")):
+        roots = [self.root] + [base for _rid, base in self._extra_bases()]
+        for base in roots:
+            if not base.is_dir():
+                continue
+            out += self._files_under(base, cl, kg_excel)
+        return out
+
+    def _files_under(self, base: Path, cl, kg_excel) -> List[Path]:
+        out = []
+        for p in sorted(base.rglob("*")):
             if not p.is_file() or p.suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue
-            rel = p.relative_to(self.root)
+            rel = p.relative_to(base)
             if any(part.startswith(".") for part in rel.parts):
                 continue
             if cl is not None and cl.is_protected_path(p, self.vault):
@@ -1008,7 +1127,18 @@ class KnowledgeGraph:
         return out
 
     def _rel(self, p: Path) -> str:
-        return p.relative_to(self.root).as_posix()
+        """A document's path in the store: relative to data_in, or
+        '<folder id>/relative' for an added folder's."""
+        try:
+            return p.relative_to(self.root).as_posix()
+        except ValueError:
+            pass
+        for rid, base in self._extra_bases():
+            try:
+                return f"<{rid}>/" + p.relative_to(base).as_posix()
+            except ValueError:
+                continue
+        raise ValueError(f"{p} is in none of the folders the graph reads")
 
     @staticmethod
     def _content_hash(p: Path) -> str:
@@ -1167,12 +1297,16 @@ class KnowledgeGraph:
         sig = _reader_sig(rules, image_reader=getattr(reader, "name", "image reader")
                           if reader is not None else "", excel=_excel_available())
         files = self.document_files()
+        gone_roots = [r for r in self.extra_roots() if not r["exists"]]
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
                                  "unreadable": [], "skipped_rows": [],
                                  "rules": len(rules), "documents_read": 0,
                                  "documents_unchanged": 0, "notes": [],
                                  "ledgers": 0, "workbooks": 0, "pictures": 0,
                                  "pictures_read": 0}
+        for r in gone_roots:
+            stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
+                                  "documents count as gone until it is back")
         with self.db:
             self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
                             (run_id, "seed", t0))
@@ -2084,7 +2218,7 @@ class KnowledgeGraph:
 
     def _doc_lines(self, d) -> Optional[List[Tuple[Optional[int], int, str]]]:
         try:
-            return self._cached_lines(d["id"], d["content_hash"], self.root / d["path"])
+            return self._cached_lines(d["id"], d["content_hash"], self.abs_path(d["path"]))
         except Exception:
             return None
 
@@ -2439,7 +2573,8 @@ class KnowledgeGraph:
         if limit is not None:
             q += " LIMIT ?"
             args += (int(limit),)
-        return [{"path": e["path"], "document_id": e["document_id"],
+        return [{"path": e["path"], "file": self.display_path(e["path"]),
+                 "document_id": e["document_id"],
                  "locator": json.loads(e["locator"]),
                  "where": locator_text(e["locator"]), "quote": e["quote"],
                  "method": e["method"], "model": e["model"],
@@ -2453,7 +2588,8 @@ class KnowledgeGraph:
         if limit is not None:
             q += " LIMIT ?"
             args += (int(limit),)
-        return [{"path": m["path"], "where": locator_text(m["locator"]),
+        return [{"path": m["path"], "file": self.display_path(m["path"]),
+                 "where": locator_text(m["locator"]),
                  "locator": json.loads(m["locator"]), "surface": m["surface"],
                  "snippet": m["snippet"], "method": m["method"]}
                 for m in self.db.execute(q, args)]
@@ -2487,14 +2623,15 @@ class KnowledgeGraph:
             reading = _reading_load(d["records"])
             summary = reading.get("summary") or {}
             if suf not in _WORKBOOK and summary.get("kind") != "ledger" and not (
-                    suf == ".csv" and kg_excel.is_ledger_csv(self.root / d["path"])):
+                    suf == ".csv" and kg_excel.is_ledger_csv(self.abs_path(d["path"]))):
                 continue
             kind = summary.get("kind") or ("workbook" if suf in _WORKBOOK else "ledger")
             if d["status"] != "ok":
                 text = f"Not read: {why.get(d['path']) or reading.get('error') or 'unreadable'}"
             else:
                 text = kg_excel.describe(summary)
-            out.append({"path": d["path"], "kind": kind, "status": d["status"],
+            out.append({"path": d["path"], "file": self.display_path(d["path"]),
+                        "kind": kind, "status": d["status"],
                         "summary": summary, "text": text,
                         "notes": notes.get(d["path"], reading.get("notes") or [])})
         return out
@@ -2506,7 +2643,8 @@ class KnowledgeGraph:
                 " d.id=rv.document_id WHERE rv.status=? ORDER BY rv.id", (status,)):
             out.append({"id": r["id"], "kind": r["kind"], "surface": r["surface"],
                         "candidates": [self.entity(c) for c in json.loads(r["candidates"])],
-                        "path": r["path"], "where": locator_text(r["locator"]),
+                        "path": r["path"], "file": self.display_path(r["path"] or ""),
+                        "where": locator_text(r["locator"]),
                         "locator": json.loads(r["locator"] or "{}"),
                         "snippet": r["snippet"]})
         return out
