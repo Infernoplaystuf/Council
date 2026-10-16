@@ -3724,7 +3724,7 @@ _SANDBOX_FORBIDDEN_ATTRS = frozenset({
 # model's validated code or its getattr().
 _SANDBOX_FORBIDDEN_PROXY_ATTRS = frozenset({
     "_real", "_budget", "_state", "_roots", "_extra",
-    "_root_strs", "_root_reals",
+    "_root_strs", "_root_reals", "_classes", "_copies",
 })
 # Methods that RETURN a string with no target but WRITE a file when given one
 # (df.to_json('C:/x') wrote anywhere). Allowed only with no positional
@@ -3842,6 +3842,725 @@ _REBIND_REFUSAL = ("code may not change pandas, numpy, pathlib or the other "
                    "pd.set_option(...))")
 
 
+def _is_dunder(name: str) -> bool:
+    """A dunder attribute name (``__x__``). Model code never has a reason to
+    STORE one — ``obj.__fspath__ = ...`` makes an object lie about its path,
+    ``obj.__class__ = ...`` re-types it — and these slipped past the
+    protected-root check because the object's own name is not protected."""
+    return len(name) >= 5 and name.startswith("__") and name.endswith("__")
+
+
+def _name_target_ids(target: "ast.AST"):
+    """Yield the Name ids a binding target binds (through tuple/list/starred
+    unpacking). Attribute / Subscript targets bind no name."""
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _name_target_ids(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _name_target_ids(target.value)
+
+
+class _StopCheck(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+
+
+# Attribute names that are plain VALUES in every module the sandbox offers —
+# np.nan, pd.NA, math.pi, np.newaxis. `summary = np.nan` is a placeholder the
+# code later replaces with its own frame, not an alias of numpy: counting it
+# as one refused `summary.columns = [...]` (2026-10-16 review). A chain that
+# ends in any other name (np.random, pd.DataFrame, pathlib.Path) still counts.
+_PLAIN_VALUE_ATTRS = frozenset({
+    "nan", "NaN", "NAN", "inf", "Inf", "Infinity", "infty", "PINF", "NINF",
+    "PZERO", "NZERO", "pi", "e", "tau", "euler_gamma", "NA", "NaT", "newaxis",
+})
+
+# Scope nodes: a binding inside one belongs to that scope, not the one around
+# it.
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                ast.ClassDef)
+
+
+def _origin(node: "ast.AST") -> Tuple[int, str]:
+    """(line, short source) of the statement that made a name an alias, for
+    the refusal message."""
+    try:
+        src = ast.unparse(node).splitlines()[0]
+    except Exception:                                     # noqa: BLE001
+        src = type(node).__name__
+    return (getattr(node, "lineno", 0) or 0,
+            src if len(src) <= 80 else src[:77] + "...")
+
+
+def _function_locals(fn: "ast.AST") -> set:
+    """The names local to function ``fn``: its parameters and every name its
+    body binds (outside nested functions / lambdas / classes, whose bindings
+    are their own — but the nested def's or class's own NAME is bound here),
+    minus the names it declares global or nonlocal. As in Python itself: a
+    local is unbound until the function binds it, so it can never be the
+    module-level object of the same name."""
+    names: set = set()
+    a = fn.args
+    for arg in a.posonlyargs + a.args + a.kwonlyargs:
+        names.add(arg.arg)
+    for arg in (a.vararg, a.kwarg):
+        if arg is not None:
+            names.add(arg.arg)
+    declared: set = set()
+    todo = list(fn.body) if isinstance(fn.body, list) else [fn.body]
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef)):
+            names.add(n.name)
+            todo.extend(getattr(n, "decorator_list", []))
+            if isinstance(n, ast.ClassDef):
+                todo.extend(n.bases)
+                todo.extend(k.value for k in n.keywords)
+            else:
+                todo.extend(d for d in n.args.defaults + n.args.kw_defaults
+                            if d is not None)
+            continue
+        if isinstance(n, ast.Lambda):
+            todo.extend(d for d in n.args.defaults + n.args.kw_defaults
+                        if d is not None)
+            continue
+        if isinstance(n, (ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                          ast.DictComp)):
+            # The comprehension's own variables are its own; only a walrus
+            # inside binds here, and the first iterable is evaluated here.
+            for sub in ast.walk(n):
+                if (isinstance(sub, ast.NamedExpr)
+                        and isinstance(sub.target, ast.Name)):
+                    names.add(sub.target.id)
+            todo.append(n.generators[0].iter)
+            continue
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            declared.update(n.names)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store,
+                                                            ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                names.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            names.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            names.add(n.rest)
+        todo.extend(ast.iter_child_nodes(n))
+    return names - declared
+
+
+def _literal_elements(node: "ast.AST"):
+    """The elements of a tuple / list / set literal, through nested
+    literals (`[(Path, 1)]` yields Path and 1); nothing for anything else."""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        for elt in node.elts:
+            if isinstance(elt, (ast.Tuple, ast.List, ast.Set)):
+                yield from _literal_elements(elt)
+            else:
+                yield elt
+
+
+def _may_alias_names(tree, fixed) -> Dict[str, Tuple[int, str]]:
+    """Every name that is bound to a sandbox module / class / proxy ANYWHERE
+    in the code, in any scope, whatever the order — {name: origin}. Only
+    used for names a function declares global / nonlocal (below): they can
+    be rebound from inside any call, so they are protected throughout."""
+    may: Dict[str, Tuple[int, str]] = {}
+    binds = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                may.setdefault((al.asname or al.name).split(".")[0],
+                               _origin(node))
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                for n in _name_target_ids(t):
+                    binds.append((n, node.value, node))
+                if isinstance(t, (ast.Tuple, ast.List)):
+                    for e in _literal_elements(node.value):
+                        for n in _name_target_ids(t):
+                            binds.append((n, e, node))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            for n in _name_target_ids(node.target):
+                binds.append((n, node.value, node))
+        elif isinstance(node, ast.NamedExpr):
+            binds.append((node.target.id, node.value, node))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            for e in _literal_elements(node.iter):
+                for n in _name_target_ids(node.target):
+                    binds.append((n, e, node))
+    changed = True
+    while changed:
+        changed = False
+        roots = set(fixed) | set(may)
+        for n, rhs, node in binds:
+            if n not in may and _expr_yields_protected(rhs, roots):
+                may[n] = _origin(node)
+                changed = True
+    return may
+
+
+class _AliasState:
+    """Which names may hold a sandbox module / class / proxy at a point in
+    the code (``prot``: name -> the binding that made it one), and which
+    may hold pandas itself (``pda``, for the pandas option assignment)."""
+
+    __slots__ = ("prot", "pda")
+
+    def __init__(self, prot=None, pda=None) -> None:
+        self.prot: Dict[str, Tuple[int, str]] = dict(prot or {})
+        self.pda: set = set(pda or ())
+
+    def copy(self) -> "_AliasState":
+        return _AliasState(self.prot, self.pda)
+
+    def merge(self, *others: "_AliasState") -> "_AliasState":
+        """In place: a name is protected after a join when it is on ANY path
+        into it (the union)."""
+        for o in others:
+            for k, v in o.prot.items():
+                self.prot.setdefault(k, v)
+            self.pda |= o.pda
+        return self
+
+    def same(self, other: "_AliasState") -> bool:
+        return (set(self.prot) == set(other.prot)
+                and self.pda == other.pda)
+
+
+class _ProtectedStoreCheck:
+    """The order-sensitive check behind _check_protected_stores.
+
+    Each statement block is walked in order with its own copy of the alias
+    state, so a rebind earlier in a block clears the alias for the
+    statements after it in that block; where blocks join (after an if, a
+    loop, a try) the protections are the UNION of the paths in. A loop's
+    body starts from the union of the state before it and every protection
+    made anywhere in its body (the next iteration, a `continue`), to a fixed
+    point. A try's handlers start from every state its body may have
+    reached; a `with` whose manager could swallow an exception (anything but
+    the sandbox's own `open(...)`) is treated the same way. A walrus inside
+    a short-circuit / conditional / comprehension can protect but never
+    clear.
+
+    Each function body is its own scope, walked after the scope around it:
+    its locals (parameters, names it binds) start unbound — a local can
+    never be the module-level object of the same name — and the names it
+    reads from outside start protected when the outer scope protects them
+    where the function is defined OR anywhere after (the function may be
+    called later). The sandbox's fixed names (pd, np, Path, math, …) are
+    protected everywhere, as are names a function declares global /
+    nonlocal that are ever bound to a module or class (any call may rebind
+    them).
+    """
+
+    def __init__(self, tree, pandas_names, options_names) -> None:
+        self.fixed = _SANDBOX_PROTECTED_ASSIGN_ROOTS
+        self.pandas_names = set(pandas_names)
+        self.options_names = set(options_names)
+        may = _may_alias_names(tree, self.fixed)
+        declared = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Global, ast.Nonlocal)):
+                declared.update(n.names)
+        self.sticky = {n: may[n] for n in declared if n in may}
+        # A rebound `open` could be any context manager; only the sandbox's
+        # own open() is known never to swallow an exception.
+        self.open_rebound = any(
+            isinstance(n, ast.Name) and n.id == "open"
+            and isinstance(n.ctx, (ast.Store, ast.Del))
+            for n in ast.walk(tree)) or any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                           ast.ClassDef)) and n.name == "open"
+            for n in ast.walk(tree))
+        self.checking = True
+        # Per scope (a stack): the protections made so far, in order, and the
+        # functions defined, walked when the scope is done.
+        self.scopes: List[dict] = []
+        self.seen: List[set] = []
+        # (loop node id, names protected on entry) -> its fixed point
+        # (loop_fixed_point).
+        self.loop_memo: Dict[tuple, tuple] = {}
+
+    # ---- protections ------------------------------------------------------
+    def live(self, st: _AliasState) -> set:
+        return set(self.fixed) | set(self.sticky) | set(st.prot)
+
+    def protect(self, name: str, origin, st: _AliasState) -> None:
+        st.prot.setdefault(name, origin)
+        if self.scopes:
+            self.scopes[-1]["events"].append((name, st.prot[name]))
+        for s in self.seen:
+            s.add(name)
+
+    def clear(self, name: str, st: _AliasState) -> None:
+        st.prot.pop(name, None)
+        st.pda.discard(name)
+
+    def yields_protected(self, rhs, st: _AliasState) -> bool:
+        return _expr_yields_protected(rhs, self.live(st))
+
+    def bind(self, name: str, rhs, node, st: _AliasState,
+             may_clear: bool = True) -> None:
+        if rhs is not None and self.yields_protected(rhs, st):
+            self.protect(name, _origin(node), st)
+            if (isinstance(rhs, ast.Name)
+                    and (rhs.id in self.pandas_names or rhs.id in st.pda)):
+                st.pda.add(name)
+            elif may_clear:
+                st.pda.discard(name)
+        elif may_clear:
+            self.clear(name, st)
+
+    # ---- the store check --------------------------------------------------
+    def refusal(self, verb: str, attr: str, root: str, node,
+                st: _AliasState) -> str:
+        line = getattr(node, "lineno", 0)
+        if root in self.fixed:
+            why = (f"{root!r} is one of the modules and classes the sandbox "
+                   f"provides (a variable of your own needs a different "
+                   f"name)")
+        else:
+            o_line, o_src = st.prot.get(root) or self.sticky.get(root) or (0, "")
+            why = (f"at line {line} {root!r} may still be the module or "
+                   f"class it was bound to on line {o_line} ({o_src}); if "
+                   f"{root!r} is meant to be your own variable, give it a "
+                   f"different name (for example {root}_result) or bind it "
+                   f"on every path before line {line}")
+        # The general rule LAST: a tool run's brief shows the message's tail
+        # (ScriptRun.brief), and that must still say what is not allowed.
+        return f"Forbidden: cannot {verb} {attr!r} on {root!r} — {why}; " \
+               f"{_REBIND_REFUSAL}"
+
+    def is_protected(self, root: str, st: _AliasState) -> bool:
+        return root in self.fixed or root in self.sticky or root in st.prot
+
+    def check_store(self, attr_node, node, st: _AliasState,
+                    is_delete: bool = False) -> None:
+        if not self.checking:
+            return
+        verb = "delete" if is_delete else "assign to"
+        if _is_dunder(attr_node.attr):
+            raise _StopCheck(
+                f"Forbidden: cannot {verb} the dunder attribute "
+                f"{attr_node.attr!r} — {_REBIND_REFUSAL}")
+        root = _assign_target_root_name(attr_node)
+        if root is None or not self.is_protected(root, st):
+            return
+        if (isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                and _is_pandas_option_assignment(
+                    attr_node, self.pandas_names | st.pda,
+                    self.options_names)):
+            return
+        raise _StopCheck(self.refusal(verb, attr_node.attr, root, node, st))
+
+    def check_targets(self, targets, node, st, is_delete=False) -> None:
+        for tgt in targets:
+            for attr in _iter_attr_targets(tgt):
+                self.check_store(attr, node, st, is_delete)
+
+    def assign_target(self, tgt, value, node, st) -> None:
+        """One target of an assignment, left to right as Python does it:
+        stores in it checked, names in it bound."""
+        if isinstance(tgt, ast.Name):
+            self.bind(tgt.id, value, node, st)
+        elif isinstance(tgt, (ast.Tuple, ast.List)):
+            elts = tgt.elts
+            if (isinstance(value, (ast.Tuple, ast.List))
+                    and len(value.elts) == len(elts)
+                    and not any(isinstance(e, ast.Starred)
+                                for e in elts + value.elts)):
+                for e, v in zip(elts, value.elts):
+                    self.assign_target(e, v, node, st)
+            else:
+                for e in elts:
+                    self.assign_target(e, None, node, st)
+        elif isinstance(tgt, ast.Starred):
+            self.assign_target(tgt.value, None, node, st)
+        else:
+            for attr in _iter_attr_targets(tgt):
+                self.check_store(attr, node, st)
+
+    # ---- expressions ------------------------------------------------------
+    def expr(self, e, st: _AliasState, cond: bool = False) -> None:
+        """Stores and binds hidden inside an expression: comprehension
+        targets (`[0 for Path.resolve in …]`), walrus binds (`(P := Path)`),
+        and setattr / delattr on a protected root. ``cond``: under a
+        short-circuit, a conditional, a comprehension or a lambda — a walrus
+        there may not run, so it can protect but not clear."""
+        if e is None:
+            return
+        if isinstance(e, ast.NamedExpr):
+            self.expr(e.value, st, cond)
+            self.bind(e.target.id, e.value, e, st, may_clear=not cond)
+            return
+        if isinstance(e, ast.BoolOp):
+            self.expr(e.values[0], st, cond)
+            for v in e.values[1:]:
+                self.expr(v, st, True)
+            return
+        if isinstance(e, ast.IfExp):
+            self.expr(e.test, st, cond)
+            self.expr(e.body, st, True)
+            self.expr(e.orelse, st, True)
+            return
+        if isinstance(e, (ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                          ast.DictComp)):
+            for i, gen in enumerate(e.generators):
+                self.expr(gen.iter, st, cond if i == 0 else True)
+                self.check_targets([gen.target], e, st)
+                for c in gen.ifs:
+                    self.expr(c, st, True)
+            for part in ((e.key, e.value) if isinstance(e, ast.DictComp)
+                         else (e.elt,)):
+                self.expr(part, st, True)
+            return
+        if isinstance(e, ast.Lambda):
+            for d in e.args.defaults + e.args.kw_defaults:
+                self.expr(d, st, cond)
+            self.expr(e.body, st, True)
+            return
+        if (self.checking and isinstance(e, ast.Call)
+                and isinstance(e.func, ast.Name)
+                and e.func.id in ("setattr", "delattr") and e.args):
+            root = _assign_target_root_name(e.args[0])
+            if root is not None and self.is_protected(root, st):
+                raise _StopCheck(
+                    f"Forbidden: {e.func.id} on {root!r} — "
+                    f"{_REBIND_REFUSAL}")
+        for child in ast.iter_child_nodes(e):
+            if isinstance(child, ast.expr):
+                self.expr(child, st, cond)
+
+    # ---- statements -------------------------------------------------------
+    def block(self, stmts, st: _AliasState) -> _AliasState:
+        for s in stmts:
+            self.stmt(s, st)
+        return st
+
+    def block_seen(self, stmts, st: _AliasState):
+        """(state at the end, names protected at ANY point inside)."""
+        seen: set = set()
+        self.seen.append(seen)
+        try:
+            end = self.block(stmts, st)
+        finally:
+            self.seen.pop()
+        return end, seen
+
+    def with_seen(self, base: _AliasState, end: _AliasState,
+                  seen: set) -> _AliasState:
+        """``base`` ∪ ``end`` ∪ every protection made in between: any state
+        the block may have been left in."""
+        out = base.copy().merge(end)
+        for n in seen:
+            if n in end.prot:
+                out.prot.setdefault(n, end.prot[n])
+            elif n not in out.prot:
+                out.prot[n] = self.origin_of(n)
+        return out
+
+    def origin_of(self, name: str):
+        for scope in reversed(self.scopes):
+            for n, o in reversed(scope["events"]):
+                if n == name:
+                    return o
+        return (0, "")
+
+    def stmt(self, n, st: _AliasState) -> None:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                bound = (al.asname or al.name).split(".")[0]
+                self.protect(bound, _origin(n), st)
+                if isinstance(n, ast.Import) and al.name == "pandas":
+                    st.pda.add(bound)
+        elif isinstance(n, ast.Assign):
+            self.expr(n.value, st)
+            for tgt in n.targets:
+                self.assign_target(tgt, n.value, n, st)
+        elif isinstance(n, ast.AnnAssign):
+            if n.value is not None:
+                self.expr(n.value, st)
+            self.check_targets([n.target], n, st)
+            if isinstance(n.target, ast.Name) and n.value is not None:
+                self.bind(n.target.id, n.value, n, st)
+        elif isinstance(n, ast.AugAssign):
+            self.expr(n.value, st)
+            self.check_targets([n.target], n, st)
+            if isinstance(n.target, ast.Name):
+                self.clear(n.target.id, st)       # a computed value
+        elif isinstance(n, ast.Delete):
+            self.check_targets(n.targets, n, st, is_delete=True)
+            for t in n.targets:
+                for nm in _name_target_ids(t):
+                    self.clear(nm, st)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
+            self.loop(n, st)
+        elif isinstance(n, ast.If):
+            self.expr(n.test, st)
+            a = self.block(n.body, st.copy())
+            b = self.block(n.orelse, st.copy())
+            st.prot, st.pda = a.merge(b).prot, a.pda
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            straight = not self.open_rebound
+            for item in n.items:
+                self.expr(item.context_expr, st)
+                ce = item.context_expr
+                if not (isinstance(ce, ast.Call)
+                        and isinstance(ce.func, ast.Name)
+                        and ce.func.id == "open"):
+                    straight = False
+                if item.optional_vars is not None:
+                    self.assign_target(item.optional_vars, None, n, st)
+            if straight:
+                self.block(n.body, st)
+            else:
+                base = st.copy()
+                end, seen = self.block_seen(n.body, st.copy())
+                out = self.with_seen(base, end, seen)
+                st.prot, st.pda = out.prot, out.pda
+        elif isinstance(n, ast.Try) or type(n).__name__ == "TryStar":
+            self.try_(n, st)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in n.decorator_list:
+                self.expr(d, st)
+            for d in n.args.defaults + n.args.kw_defaults:
+                self.expr(d, st)
+            if self.checking and self.scopes:
+                scope = self.scopes[-1]
+                mark = (scope["loop_mark"] if scope["loop_mark"] is not None
+                        else len(scope["events"]))
+                scope["pending"].append((n, st.copy(), mark))
+            # A plain def binds a new function: never a sandbox module or
+            # class. A DECORATED one binds whatever the decorator returns
+            # (`@(lambda f: Path)` binds Path), so its name keeps the state
+            # it had, as before this check followed rebinding.
+            if not n.decorator_list:
+                self.clear(n.name, st)
+        elif isinstance(n, ast.ClassDef):
+            for d in n.decorator_list + n.bases + [k.value for k in
+                                                   n.keywords]:
+                self.expr(d, st)
+            # The class body runs once, in order, reading the names around
+            # it; what it binds stays in the class. Its methods are scopes
+            # of their own (pending in this scope).
+            self.block(n.body, st.copy())
+            # A new class — unless a decorator or a metaclass decides what
+            # the name is bound to (as for a decorated def, above).
+            if not n.decorator_list and not n.keywords:
+                self.clear(n.name, st)
+        elif type(n).__name__ == "Match":
+            self.match(n, st)
+        elif isinstance(n, (ast.Global, ast.Nonlocal, ast.Pass, ast.Break,
+                            ast.Continue)):
+            pass
+        else:
+            for child in ast.iter_child_nodes(n):
+                if isinstance(child, ast.expr):
+                    self.expr(child, st)
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                sub = getattr(n, field, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0],
+                                                                ast.stmt):
+                    end, seen = self.block_seen(sub, st.copy())
+                    out = self.with_seen(st, end, seen)
+                    st.prot, st.pda = out.prot, out.pda
+
+    def loop_entry(self, n, base: _AliasState) -> _AliasState:
+        b = base.copy()
+        target = getattr(n, "target", None)
+        if target is not None:
+            self.check_targets([target], n, b)
+            elts = list(_literal_elements(n.iter))
+            hit = next((e for e in elts if self.yields_protected(e, b)), None)
+            for nm in _name_target_ids(target):
+                if hit is not None:
+                    self.protect(nm, _origin(n), b)
+                else:
+                    self.clear(nm, b)
+        if isinstance(n, ast.While):
+            self.expr(n.test, b)
+        return b
+
+    def loop_fixed_point(self, n, st: _AliasState):
+        """(the state at the head of loop ``n`` entered with ``st``: ``st``
+        and every protection any number of passes over the body can make,
+        converged). Worked out with nothing checked, and REMEMBERED per
+        (loop, names protected on entry): an enclosing loop's passes enter
+        this one again and again with the same state, and redoing it each
+        time — each nested loop redoing its own inner ones — made the time
+        exponential in the nesting depth (16 nested for-loops took ~5 s,
+        20 over a minute). The protections made on the way, which the
+        enclosing blocks' "seen" sets and the scope's events record, are
+        replayed when the answer is remembered."""
+        key = (id(n), frozenset(st.prot), frozenset(st.pda))
+        hit = self.loop_memo.get(key)
+        if hit is not None:
+            head, converged, seen_names, events = hit
+            for s in self.seen:
+                s.update(seen_names)
+            if self.scopes:
+                self.scopes[-1]["events"].extend(events)
+            # The entry's own origins (for the refusal's wording) first.
+            return st.copy().merge(head), converged
+        collector: set = set()
+        self.seen.append(collector)
+        scope_events = self.scopes[-1]["events"] if self.scopes else None
+        first_event = len(scope_events) if scope_events is not None else 0
+        entry = st.copy()
+        converged = True
+        was = self.checking
+        self.checking = False
+        try:
+            for _ in range(64):
+                end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
+                new = self.with_seen(entry, end, seen)
+                if new.same(entry):
+                    break
+                entry = new
+            else:                                   # never seen; be safe
+                converged = False
+                for nm, o in _may_alias_names(
+                        ast.Module(body=[n], type_ignores=[]),
+                        self.fixed).items():
+                    entry.prot.setdefault(nm, o)
+        finally:
+            self.checking = was
+            self.seen.pop()
+        events = (list(scope_events[first_event:])
+                  if scope_events is not None else [])
+        self.loop_memo[key] = (entry.copy(), converged, frozenset(collector),
+                               events)
+        return entry, converged
+
+    def loop(self, n, st: _AliasState) -> None:
+        if isinstance(n, ast.While):
+            self.expr(n.test, st)
+        else:
+            self.expr(n.iter, st)
+        scope = self.scopes[-1] if self.scopes else None
+        outer_mark = None
+        if scope is not None:
+            outer_mark = scope["loop_mark"]
+            if outer_mark is None:
+                scope["loop_mark"] = len(scope["events"])
+        entry, converged = self.loop_fixed_point(n, st)
+        if self.checking or not converged:
+            end, seen = self.block_seen(n.body, self.loop_entry(n, entry))
+            head = self.with_seen(entry, end, seen)
+        else:
+            # Inside an enclosing loop's own fixed point (nothing is checked
+            # there): at the fixed point a further pass changes nothing, so
+            # the state at the loop's head IS the entry — no pass needed.
+            head = entry
+        after = self.block(n.orelse, head.copy())
+        out = head.merge(after)
+        st.prot, st.pda = out.prot, out.pda
+        if scope is not None:
+            scope["loop_mark"] = outer_mark
+
+    def try_(self, n, st: _AliasState) -> None:
+        pre = st.copy()
+        body_end, body_seen = self.block_seen(n.body, pre.copy())
+        # A handler may start from any point of the body.
+        h_entry = self.with_seen(pre, body_end, body_seen)
+        anywhere = h_entry.copy()
+        ends = []
+        for h in n.handlers:
+            self.expr(h.type, h_entry)
+            hs = h_entry.copy()
+            if h.name:
+                self.clear(h.name, hs)
+            h_end, h_seen = self.block_seen(h.body, hs)
+            ends.append(h_end)
+            anywhere = self.with_seen(anywhere, h_end, h_seen)
+        else_end, else_seen = self.block_seen(n.orelse, body_end.copy())
+        anywhere = self.with_seen(anywhere, else_end, else_seen)
+        normal = else_end.copy().merge(*ends)
+        if n.finalbody:
+            # finally runs after any of it, an exception included.
+            out = self.block(n.finalbody, anywhere.merge(normal))
+        else:
+            out = normal
+        st.prot, st.pda = out.prot, out.pda
+
+    def match(self, n, st: _AliasState) -> None:
+        self.expr(n.subject, st)
+        subject_protected = self.yields_protected(n.subject, st)
+        ends = [st.copy()]                 # no case matched
+        for case in n.cases:
+            cs = st.copy()
+            for p in ast.walk(case.pattern):
+                names = []
+                if isinstance(p, (ast.MatchAs, ast.MatchStar)) and p.name:
+                    names.append(p.name)
+                elif isinstance(p, ast.MatchMapping) and p.rest:
+                    names.append(p.rest)
+                for nm in names:
+                    if subject_protected:
+                        self.protect(nm, _origin(n), cs)
+                    else:
+                        self.clear(nm, cs)
+            if case.guard is not None:
+                self.expr(case.guard, cs)
+            ends.append(self.block(case.body, cs))
+        out = ends[0].merge(*ends[1:])
+        st.prot, st.pda = out.prot, out.pda
+
+    # ---- scopes -----------------------------------------------------------
+    def scope(self, body, st: _AliasState) -> None:
+        """Walk one scope (the module, or one function body) in order, then
+        the functions it defined, each with the names it reads from here
+        protected as they may be when it is CALLED: as at its definition, or
+        made an alias anywhere after it (in a loop: anywhere in the loop)."""
+        self.scopes.append({"events": [], "pending": [], "loop_mark": None})
+        try:
+            self.block(body, st)
+            scope = self.scopes[-1]
+            pending = list(scope["pending"])
+        finally:
+            done = self.scopes.pop()
+        for fn, at_def, mark in pending:
+            local = _function_locals(fn)
+            view = at_def.copy()
+            for name, origin in done["events"][mark:]:
+                view.prot.setdefault(name, origin)
+            init = _AliasState(
+                {k: v for k, v in view.prot.items() if k not in local},
+                {k for k in view.pda if k not in local})
+            # A function scope's own events are recorded in its own frame;
+            # the module's late events above are what reach into it.
+            self.scope(fn.body, init)
+
+
+def _check_protected_stores(tree, pandas_names, options_names
+                            ) -> Tuple[bool, str]:
+    """Refuse every store that lands on a sandbox module / class / proxy — a
+    FIXED name (pd, np, Path, pathlib, …) always, and an ALIAS of one
+    (`P = Path`, `from scipy import stats`) wherever it may still be one —
+    and every store to a dunder attribute on any object. Order- and
+    scope-sensitive (_ProtectedStoreCheck): a name later bound to an
+    ordinary value is no longer an alias in the rest of its block, a
+    function's own locals are its own, and a placeholder such as np.nan is
+    a value, not an alias. The pandas display/compute option assignment is
+    the one allowed store under a protected root — through pandas or an
+    alias of it, as plain / augmented / annotated assignment."""
+    check = _ProtectedStoreCheck(tree, pandas_names, options_names)
+    try:
+        check.scope(tree.body, _AliasState())
+    except _StopCheck as stop:
+        return False, stop.msg
+    except RecursionError:
+        return False, "Forbidden: the code is nested too deeply to check"
+    return True, "ok"
+
+
 def _attr_chain(node: "ast.Attribute") -> Optional[Tuple[str, List[str]]]:
     """(root name, [attribute names from the root down to node.attr]) when
     ``node`` is a pure Name.attr.attr... chain, else None (a Subscript or Call
@@ -3854,6 +4573,30 @@ def _attr_chain(node: "ast.Attribute") -> Optional[Tuple[str, List[str]]]:
     if not isinstance(cur, ast.Name):
         return None
     return cur.id, names[::-1]
+
+
+def _expr_yields_protected(node: "ast.AST", roots) -> bool:
+    """Does ``node`` evaluate to a sandbox module/class/proxy ITSELF (not a
+    value computed from one), so that binding a name to it makes that name a
+    protected alias? True for a bare protected Name (`P = Path`), a pure
+    attribute chain rooted at one (`X = pathlib.Path`, no call/subscript), and
+    a `type(...)` call (`C = type(Path('.'))` → the class). A call that returns
+    data (`df = pd.read_csv(...)`) is NOT an alias — its root is `pd` but it
+    yields a frame, so df stays the model's own object — and neither is a
+    chain ending in a plain value (`np.nan`, `pd.NA`, `math.pi`:
+    _PLAIN_VALUE_ATTRS), the placeholder a model writes before it builds its
+    own result."""
+    if isinstance(node, ast.Name):
+        return node.id in roots
+    if isinstance(node, ast.Attribute):
+        if node.attr in _PLAIN_VALUE_ATTRS:
+            return False
+        chain = _attr_chain(node)
+        return chain is not None and chain[0] in roots
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "type" and "type" in roots):
+        return True
+    return False
 
 
 def _is_pandas_option_assignment(node: "ast.Attribute", pandas_names,
@@ -3896,34 +4639,32 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
     # vector, so refuse the raw builtin call.
     forbidden_calls = {"eval", "exec", "compile", "input", "__import__"}
 
-    # Names the code binds via import — `import json as j` / `from pathlib
-    # import Path` — are protected assignment roots too, so `j.loads = ...`
-    # or a rebind of a freshly-imported module/class is refused like pd/np.
-    # EXCEPT a name the code also rebinds to its own value: `from scipy
-    # import stats` then `stats = df.groupby(...).describe(); stats.index.name
-    # = ...` is the model's frame, not scipy.stats (both ran before the
-    # check and were refused by it, measured 2026-10-15). The fixed sandbox
-    # names (pd, np, Path, ...) stay protected whatever the code does.
-    protected_roots = set(_SANDBOX_PROTECTED_ASSIGN_ROOTS)
-    rebound_names = {n.id for n in ast.walk(tree)
-                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    # Which names mean pandas (import aliases) and `from pandas import options`
+    # — for the pandas display/compute OPTION assignment, the one store allowed
+    # under a protected root.
     pandas_names = {"pd", "pandas"}
     options_names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                bound = (alias.asname or alias.name).split(".")[0]
                 if alias.name == "pandas":
-                    pandas_names.add(bound)
-                if bound not in rebound_names:
-                    protected_roots.add(bound)
+                    pandas_names.add((alias.asname or alias.name).split(".")[0])
         elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                bound = alias.asname or alias.name
-                if node.module == "pandas" and alias.name == "options":
-                    options_names.add(bound)
-                if bound not in rebound_names:
-                    protected_roots.add(bound)
+            if node.module == "pandas":
+                for alias in node.names:
+                    if alias.name == "options":
+                        options_names.add(alias.asname or alias.name)
+
+    # Rebinding a sandbox module / class / proxy (or an alias of one), and any
+    # dunder-attribute store — the Path-rebinding read escape and the
+    # __fspath__/__class__ routes — refused block by block, each function its
+    # own scope, so a name later bound to a value is no longer an alias where
+    # that rebind has run (_ProtectedStoreCheck). (council_core.analyst_floor
+    # is the floor under this: a file never leaves the data folders whatever a
+    # rebind does.)
+    ok, msg = _check_protected_stores(tree, pandas_names, options_names)
+    if not ok:
+        return False, msg
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -3935,33 +4676,6 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
-        # No ASSIGNING TO or DELETING an attribute of a sandbox module, class
-        # or proxy — the Path-rebinding read escape (Path.relative_to =
-        # lambda self, *a: self; type(Path('.')).resolve = ...;
-        # pathlib.PurePath.relative_to = ...). The model's OWN objects are
-        # untouched: df.columns = [...], df.index.name = ..., obj.attr = ...
-        # all have a plain local-variable root, not a protected one.
-        _targets = None
-        if isinstance(node, ast.Assign):
-            _targets = node.targets
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            _targets = [node.target]
-        elif isinstance(node, ast.Delete):
-            _targets = node.targets
-        if _targets is not None:
-            for _tgt in _targets:
-                for _attr in _iter_attr_targets(_tgt):
-                    _root = _assign_target_root_name(_attr)
-                    if _root in protected_roots:
-                        if (not isinstance(node, ast.Delete)
-                                and _is_pandas_option_assignment(
-                                    _attr, pandas_names, options_names)):
-                            continue
-                        _verb = ("delete" if isinstance(node, ast.Delete)
-                                 else "assign to")
-                        return False, (
-                            f"Forbidden: cannot {_verb} {_attr.attr!r} on "
-                            f"{_root!r} — {_REBIND_REFUSAL}")
         # ANY attribute access to a forbidden name — called or not. Checking
         # only calls let `fn = p.unlink; fn()` and `w = p.write_text; w(...)`
         # through (a bound-method reference is an Attribute, not a Call), which
@@ -3996,19 +4710,21 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                     and node.args[1].value in _SANDBOX_FORBIDDEN_ANY_ATTR):
                 return False, (f"Forbidden {node.func.id} of "
                                f"{node.args[1].value!r}")
-            # setattr/delattr that rebind an attribute on a sandbox module,
-            # class or proxy — the string route around the assignment check
-            # above (setattr(Path, 'relative_to', ...)). setattr/delattr are
-            # not even in the sandbox builtins, but refuse here for a clear
-            # message instead of a bare NameError.
+            # getattr/setattr/delattr with a constant DUNDER name — the string
+            # route to the dunder stores/reads refused by name above
+            # (getattr(x, "__class__"), setattr(x, "__fspath__", ...)).
             if (isinstance(node.func, ast.Name)
-                    and node.func.id in ("setattr", "delattr")
-                    and node.args
-                    and _assign_target_root_name(node.args[0]) in protected_roots):
-                return False, (
-                    f"Forbidden: {node.func.id} on "
-                    f"{_assign_target_root_name(node.args[0])!r} — "
-                    f"{_REBIND_REFUSAL}")
+                    and node.func.id in ("getattr", "setattr", "delattr")
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    and _is_dunder(node.args[1].value)):
+                return False, (f"Forbidden {node.func.id} of "
+                               f"{node.args[1].value!r} (dunder attribute)")
+    # setattr/delattr that rebind an attribute on a sandbox module, class or
+    # proxy — the string route around the assignment check, refused in
+    # straight-line order with the rest (setattr(Path, 'relative_to', ...),
+    # setattr(P, ...) for an alias P). Done inside _check_protected_stores.
     return True, "ok"
 
 
@@ -4036,6 +4752,129 @@ class _SandboxModule:
 
     def __repr__(self):
         return f"<sandboxed {self._real!r}>"
+
+
+# Names the sandbox pathlib copy exposes as per-run subclasses.
+_PATHLIB_CLASS_NAMES = ("PurePath", "PurePosixPath", "PureWindowsPath",
+                        "Path", "PosixPath", "WindowsPath")
+
+
+class _SandboxPathlib:
+    """The ``pathlib`` module as the sandbox hands it out.
+
+    `Path` (and everything `import pathlib` / `from pathlib import ...` gives)
+    is a per-RUN subclass of the real pathlib class, built fresh for this
+    execution. Model code runs with these copies, so a rebind made through any
+    alias (`P = Path`, `C = type(Path('.'))`, `X = pathlib.Path`, `from pathlib
+    import PurePath as Q`, `pathlib.PurePath.relative_to = ...`) lands on the
+    copy and dies with the run — it never reaches the real pathlib classes the
+    sandbox helpers, pandas, numpy and the other libraries use. The subclasses
+    are closed under path operations (`/`, `.parent`, `.resolve`, … all return
+    the subclass in CPython's pathlib), so `type(Path('.'))` is always the copy
+    too. Other attributes pass through to real pathlib, except the forbidden /
+    escape names (sys, os, the proxy internals, dunders), which raise — as on
+    _SandboxModule. The module is read-only (a rebind must land on a class, not
+    swap a class out)."""
+
+    def __init__(self, real, classes, copies=None) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_classes", classes)
+        # The full parallel lattice {name: copy}, for converting a real path a
+        # helper returns into the matching copy.
+        object.__setattr__(self, "_copies", copies or classes)
+
+    def __getattr__(self, name):
+        if (name in _SANDBOX_FORBIDDEN_ANY_ATTR
+                or name in _SANDBOX_FORBIDDEN_SUBMODULES):
+            raise AttributeError(f"sandbox: pathlib.{name} is blocked")
+        classes = object.__getattribute__(self, "_classes")
+        if name in classes:
+            return classes[name]
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("sandbox: pathlib is read-only — assign to your "
+                             "own variables, not to pathlib or its classes")
+
+    def __delattr__(self, name):
+        raise AttributeError("sandbox: pathlib is read-only")
+
+    def __repr__(self):
+        return "<sandboxed pathlib>"
+
+
+# The real pathlib lattice, child -> its real parents, so each copy can be
+# built as a subclass of (its copied parents + its own real class). A copy is
+# then an instance/subclass of BOTH the real class AND the parallel copies —
+# so isinstance(Path('x'), PurePath / PureWindowsPath / WindowsPath) and the
+# issubclass answers ordinary code relies on all hold, with real pathlib and
+# with the copies, while a rebind still lands on the copy (2026-10-16).
+_PATHLIB_PARENTS = {
+    "PurePath": (),
+    "PurePosixPath": ("PurePath",),
+    "PureWindowsPath": ("PurePath",),
+    "Path": ("PurePath",),
+    "PosixPath": ("Path", "PurePosixPath"),
+    "WindowsPath": ("Path", "PureWindowsPath"),
+}
+# Build order: a class after its parents.
+_PATHLIB_BUILD_ORDER = ("PurePath", "PurePosixPath", "PureWindowsPath",
+                        "Path", "PosixPath", "WindowsPath")
+
+
+def _dispatching_new(name: str, concrete_name: str, real_cls, copies):
+    """``__new__`` for the copy of an abstract pathlib class (Path,
+    PurePath): building one builds the concrete copy for THIS OS, as real
+    pathlib's Path('x') builds a WindowsPath / PosixPath. A subclass (the
+    concrete copy itself) is built as asked."""
+    def __new__(cls, *args, **kwargs):
+        if cls is copies[name]:
+            cls = copies[concrete_name]
+        return real_cls.__new__(cls, *args, **kwargs)
+    return __new__
+
+
+def _make_sandbox_pathlib():
+    """(proxy module, Path copy) for one run.
+
+    Each pathlib class becomes a fresh copy that subclasses its copied parents
+    AND its own real class, so the parallel lattice mirrors the real one: a
+    copy is an instance of the real class (isinstance against real pathlib
+    holds) and of the sibling copies (isinstance/issubclass among the copies
+    holds), and every copy keeps its own real name and repr — `Path` is
+    "<class 'pathlib.Path'>", `PurePath` "<class 'pathlib.PurePath'>", and
+    Path('x') is "WindowsPath('x')" — exactly as real pathlib answers
+    (2026-10-16 review: `Path`/`PurePath` used to BE the concrete copies, so
+    their names were the concrete ones and PurePosixPath('a') was not a
+    PurePath). `Path` / `PurePath` build the concrete copy for this OS
+    (_dispatching_new); the concrete copies are closed under path operations
+    (`/`, `.parent`, `.resolve`, … return `type(self)` in CPython), so
+    `type(Path('.'))` is the copy too. Model code runs with these; a rebind
+    made through any alias (`P = Path`, `C = type(Path('.'))`, `X =
+    pathlib.Path`, `from pathlib import PurePath as Q`) lands on a copy and
+    dies with the run — it never reaches the real classes the helpers,
+    pandas, numpy and the other libraries use (the floor in
+    council_core.analyst_floor is the guarantee a file never leaves the data
+    folders; this keeps the libraries' own path handling intact). On failure,
+    falls back to the real module and class.
+    """
+    import pathlib as _real_pathlib
+    try:
+        concrete = {"Path": type(_real_pathlib.Path()).__name__,
+                    "PurePath": type(_real_pathlib.PurePath()).__name__}
+        copies: Dict[str, Any] = {}
+        for nm in _PATHLIB_BUILD_ORDER:
+            real_cls = getattr(_real_pathlib, nm)
+            bases = tuple(copies[p] for p in _PATHLIB_PARENTS[nm]) + (real_cls,)
+            ns: Dict[str, Any] = {"__module__": "pathlib", "__qualname__": nm}
+            if nm in concrete:
+                ns["__new__"] = _dispatching_new(nm, concrete[nm], real_cls,
+                                                 copies)
+            copies[nm] = type(nm, bases, ns)
+        return _SandboxPathlib(_real_pathlib, dict(copies), copies), \
+            copies["Path"]
+    except Exception:
+        return _real_pathlib, _real_pathlib.Path
 
 
 def _check_sandbox_import(name: str, fromlist) -> None:
@@ -4140,6 +4979,50 @@ _OS_COMMONPATH = os.path.commonpath
 _OS_EXISTS = os.path.exists
 _OS_EXPANDUSER = os.path.expanduser
 _OS_FSPATH = os.fspath
+# The read/list helpers below work entirely through these, on the validated
+# string — never through a pathlib object built from it — so a model that
+# rebinds a pathlib class (through the sandbox copy, or through any name it
+# can reach) can change neither which file is opened nor which folder is
+# walked (2026-10-16). Captured at import, before any model code runs.
+_OS_ISFILE = os.path.isfile
+_OS_ISDIR = os.path.isdir
+_OS_BASENAME = os.path.basename
+_OS_SCANDIR = os.scandir
+_OS_STAT = os.stat
+_IO_OPEN = io.open
+
+
+def _sandbox_walk(root: str, recursive: bool):
+    """Yield (path_str, is_dir) for the entries under ``root`` using
+    os.scandir only — no pathlib. A sub-folder is descended only when it is a
+    real directory whose real path stays inside ``root`` (a link or junction
+    out of the folder is listed but not followed), so a walk cannot be steered
+    outside the folder it was given."""
+    root_real = _OS_NORMCASE(_OS_REALPATH(root))
+    todo = [root]
+    while todo:
+        d = todo.pop()
+        try:
+            with _OS_SCANDIR(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                is_dir = e.is_dir()
+            except OSError:
+                is_dir = False
+            yield e.path, is_dir
+            if not (recursive and is_dir):
+                continue
+            try:
+                if e.is_symlink():
+                    continue
+                real = _OS_NORMCASE(_OS_REALPATH(e.path))
+                if _OS_COMMONPATH([real, root_real]) == root_real:
+                    todo.append(e.path)
+            except (OSError, ValueError):
+                continue
 
 
 def _sandbox_path_str(value) -> str:
@@ -4354,10 +5237,97 @@ def _sandbox_vault_dir() -> Optional[Path]:
         return None
 
 
+def _desandbox_path_factory(sb_path, copies=None):
+    """A converter that turns a REAL pathlib object a helper RETURNS into the
+    sandbox's own copy of its class (``copies`` by class name, else
+    ``sb_path``). A helper that handed back a real pathlib.Path
+    (list_csv_files → List[Path]) gave model code the REAL class through
+    `type(returned)`, which it could then rebind — the escape the AST check
+    and the pathlib copy aim at. Returning the copy closes that: a rebind
+    through a returned path lands on the copy, and the copy keeps the real
+    class's isinstance/repr (2026-10-16).
+
+    convert(value) looks only at the value itself and the items of a
+    top-level list / tuple / set / dict, and only at their TYPES, in one
+    C-level pass: a result with no path in it (a frame, a number, 900k JSON
+    documents from read_json_documents) is handed back as the very same
+    object, never walked element by element or copied — the first version
+    rebuilt every container down to depth 4, doubling a big document read's
+    time and holding a second copy of it in memory (2026-10-16 review). A
+    container is rebuilt only when it holds a path. convert(value,
+    deep=True), for the helpers whose return annotation names Path (the
+    listers), also looks inside nested containers (to depth 4), still
+    rebuilding only what holds a path. Conversion is skipped when there is
+    no copy (the fallback in _make_sandbox_pathlib)."""
+    import pathlib as _pl
+    _PurePath = _pl.PurePath
+    if sb_path is None:
+        return lambda v, deep=False: v
+    copies = dict(copies or {})
+    copy_types = frozenset(copies.values()) | {sb_path}
+    _containers = (list, tuple, set, frozenset)
+
+    def one(p):
+        if type(p) in copy_types or isinstance(p, sb_path):
+            return p                       # already the sandbox's own copy
+        cls = copies.get(type(p).__name__, sb_path)
+        try:
+            return cls(str(p))
+        except Exception:                                 # noqa: BLE001
+            return p
+
+    def holds_path(items) -> bool:
+        return any(issubclass(t, _PurePath) for t in set(map(type, items)))
+
+    def shallow(v):
+        t = type(v)
+        if t is dict:
+            if not holds_path(v.values()):
+                return v
+            return {k: (one(x) if isinstance(x, _PurePath) else x)
+                    for k, x in v.items()}
+        if t in _containers:
+            if not holds_path(v):
+                return v
+            return t(one(x) if isinstance(x, _PurePath) else x for x in v)
+        return v
+
+    def deep_convert(v, depth):
+        if isinstance(v, _PurePath):
+            return one(v)
+        if depth >= 4:
+            return v
+        t = type(v)
+        if t is dict:
+            out = None
+            for k, x in v.items():
+                y = deep_convert(x, depth + 1)
+                if y is not x:
+                    if out is None:
+                        out = dict(v)
+                    out[k] = y
+            return v if out is None else out
+        if t in _containers:
+            items = list(v)
+            ys = [deep_convert(x, depth + 1) for x in items]
+            if all(y is x for x, y in zip(items, ys)):
+                return v
+            return t(ys)
+        return v
+
+    def convert(v, deep=False):
+        if isinstance(v, _PurePath):
+            return one(v)
+        return deep_convert(v, 0) if deep else shallow(v)
+    return convert
+
+
 def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
-                     roots: List[Path]) -> None:
+                     roots: List[Path], sb_path=None,
+                     sb_copies=None) -> None:
     """Wrap every helper the sandbox exposes so a path it is GIVEN stays
-    inside the data folders.
+    inside the data folders, and so a real pathlib object it RETURNS comes back
+    as the sandbox's own Path copy, never the real class.
 
     The helpers are trusted code, but they open whatever path they are
     handed: summarize_csv('C:/anything') and list_csv_files('C:/') read and
@@ -4368,11 +5338,19 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
                                            (_sandbox_resolve_within)
       output_dir                        -> must be inside the vault's data_out
       vault_dir                         -> always the real vault
-    A DataFrame or None passes through untouched. duckdb_query also gets its
+    The return value is passed through _desandbox_path_factory, so a helper
+    that returns pathlib.Path objects (list_csv_files, …) hands model code the
+    sandbox copy, not the real class it could rebind through `type(returned)`
+    — looking inside nested containers only for the helpers whose return
+    annotation names Path, and otherwise only at the top level, by type, so a
+    big result is never walked or copied. A DataFrame or None passes through
+    untouched. duckdb_query also gets its
     SQL's file access limited to the data folders (DuckDB's read_csv('C:/x')
     would otherwise read anywhere)."""
     import functools
     import inspect as _inspect
+
+    desandbox = _desandbox_path_factory(sb_path, sb_copies)
 
     vault = _sandbox_vault_dir()
     out_root = None
@@ -4421,28 +5399,42 @@ def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd,
         try:
             sig = _inspect.signature(fn)
         except (TypeError, ValueError):
-            return fn
+            # No signature to bind: still convert the return so a path object
+            # the helper hands back is the sandbox copy, not the real class.
+            # Nothing says what it returns: the nested look.
+            @functools.wraps(fn)
+            def convert_only(*a, **k):
+                return desandbox(fn(*a, **k), True)
+            return convert_only
         names = set(sig.parameters)
         kinds = {n: ("file" if n in _HELPER_FILE_PARAMS else
                      "dir" if n in _HELPER_DIR_PARAMS else
                      "out" if n == "output_dir" else
                      "vault" if n == "vault_dir" else None) for n in names}
-        if not any(kinds.values()):
-            return fn
+        has_path = any(kinds.values())
+        # A helper that says it returns paths (List[Path], Optional[Path], …)
+        # — or does not say what it returns — gets a nested look; one that
+        # names a path-free type (read_json_documents' List[Dict[str, Any]],
+        # a DataFrame) only the top-level one.
+        deep = (sig.return_annotation is sig.empty
+                or "Path" in str(sig.return_annotation))
 
         @functools.wraps(fn)
         def contained(*a, **k):
+            if not has_path:
+                return desandbox(fn(*a, **k), deep)
             try:
                 bound = sig.bind_partial(*a, **k)
             except TypeError:
-                return fn(*a, **k)       # let the helper raise its own error
+                # let the helper raise its own error
+                return desandbox(fn(*a, **k), deep)
             for n, v in list(bound.arguments.items()):
                 kind = kinds.get(n)
                 if kind == "vault":
                     bound.arguments[n] = str(vault) if vault is not None else v
                 elif kind and v is not None:
                     bound.arguments[n] = contain(v, kind)
-            return fn(*bound.args, **bound.kwargs)
+            return desandbox(fn(*bound.args, **bound.kwargs), deep)
         return contained
 
     skip = {"pd", "np", "Path", "__builtins__"}
@@ -4513,6 +5505,14 @@ def execute_pandas_code(
     _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state,
                                    roots=normalized_folders)
 
+    # A per-run copy of pathlib: model code gets subclasses of the real
+    # pathlib classes, so any rebind it makes (through Path, an alias,
+    # type(Path('.')), `import pathlib`, or `from pathlib import ...`) lands on
+    # the copy and never reaches the real classes the sandbox helpers, pandas,
+    # numpy and the other libraries use. `_sb_pathlib` is returned by the
+    # import hook; `_sb_Path` is put in the namespace as `Path`.
+    _sb_pathlib, _sb_Path = _make_sandbox_pathlib()
+
     # Root strings + their normcased realpaths, captured HERE — before any
     # model code runs — so the read/list containment below never resolves or
     # compares a path by calling a Path method (resolve / is_absolute /
@@ -4530,49 +5530,58 @@ def execute_pandas_code(
     # os.walk to count files/folders used to fail with "Forbidden import:
     # os". These closures give the same answer without any dangerous surface:
     # they only iterate + stat (no open/read/write/delete) and are bounded to
-    # the allowed data folders.
-    def _sb_resolve_dir(folder=None) -> Path:
+    # the allowed data folders. They work on the validated path STRING with
+    # os functions captured at import (_OS_ISDIR/_sandbox_walk, _IO_OPEN) —
+    # never a pathlib object built from it — so a rebound pathlib class cannot
+    # change which folder is walked or which file is read.
+    def _sb_resolve_dir(folder=None) -> str:
         if folder is None:
-            return Path(_root_strs[0])
+            return _root_strs[0]
         real = _sb_resolve_within(folder)
         if real is None:
             raise PermissionError(
                 f"list/count is limited to the data folders; {folder!r} is "
                 "outside them")
-        return Path(real)
+        return real
 
     def _sb_count_files(folder=None, recursive=True) -> int:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return 0
-        it = d.rglob("*") if recursive else d.glob("*")
-        return sum(1 for x in it if x.is_file())
+        return sum(1 for _p, is_dir in _sandbox_walk(d, bool(recursive))
+                   if not is_dir)
 
     def _sb_count_folders(folder=None, recursive=False) -> int:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return 0
-        it = d.rglob("*") if recursive else d.glob("*")
-        return sum(1 for x in it if x.is_dir())
+        return sum(1 for _p, is_dir in _sandbox_walk(d, bool(recursive))
+                   if is_dir)
 
     def _sb_list_dir(folder=None) -> list:
         d = _sb_resolve_dir(folder)
-        if not d.is_dir():
+        if not _OS_ISDIR(d):
             return []
-        return sorted(x.name for x in d.iterdir())
+        try:
+            with _OS_SCANDIR(d) as it:
+                return sorted(e.name for e in it)
+        except OSError:
+            return []
 
     # ── Safe, READ-ONLY file reading ─────────────────────────────────────
     # Model-written tools reach for `open(path)` and manual decoding, which
     # used to fail with "name 'open' is not defined" (no builtin) and
     # UnicodeDecodeError (wrong encoding). These give a bounded, encoding-safe,
-    # path-contained way to read files WITHOUT any write/delete surface.
-    def _sb_resolve_file(path) -> Path:
+    # path-contained way to read files WITHOUT any write/delete surface. The
+    # returned value is the validated path STRING, and reads go through the
+    # captured io.open on that string.
+    def _sb_resolve_file(path) -> str:
         real = _sb_resolve_within(path)
         if real is None:
             raise PermissionError(
                 f"file access is blocked outside the data folders; {path!r} is "
                 "outside them")
-        return Path(real)
+        return real
 
     def _sb_column_stats(folder=None):
         """column_stats(folder=None): one row per (file, column), from the
@@ -4580,23 +5589,26 @@ def execute_pandas_code(
         if folder is None:
             scope = [str(p) for p in normalized_folders]
         elif isinstance(folder, (list, tuple)):
-            scope = [str(_sb_resolve_dir(f)) for f in folder]
+            scope = [_sb_resolve_dir(f) for f in folder]
         else:
-            scope = str(_sb_resolve_dir(folder))
+            scope = _sb_resolve_dir(folder)
         return folder_column_stats(None, scope)
 
     def _sb_file_stats(path):
-        """file_stats(path): the cached stats of one CSV in the data folders."""
-        return cached_column_stats(None, str(_sb_resolve_file(path)))
+        """file_stats(path): the cached stats of one CSV in the data folders.
+        The stats cache is handed the validated string; it reads only that
+        file (through pandas / the real pathlib, which model code cannot
+        touch)."""
+        return cached_column_stats(None, _sb_resolve_file(path))
 
     def _sb_read_text(path, max_chars=200000, encoding="utf-8") -> str:
         """Read a text file: encoding-robust (never raises UnicodeDecodeError),
         size-bounded, read-only, within the data folders."""
         p = _sb_resolve_file(path)
-        if not p.is_file():
+        if not _OS_ISFILE(p):
             return ""
         try:
-            with p.open("rb") as _f:
+            with _IO_OPEN(p, "rb") as _f:
                 data = _f.read(int(max_chars) + 1)
         except Exception:
             return ""
@@ -4611,7 +5623,9 @@ def execute_pandas_code(
                  newline=None):
         """Read-ONLY replacement for the builtin open(): writing/appending is
         blocked, reads are contained to the data folders, and text mode defaults
-        to encoding-robust decoding so tools don't hit UnicodeDecodeError."""
+        to encoding-robust decoding so tools don't hit UnicodeDecodeError. The
+        validated string is opened through the captured io.open, never a Path
+        method."""
         m = str(mode)
         if any(c in m for c in ("w", "a", "x", "+")):
             raise PermissionError(
@@ -4619,12 +5633,14 @@ def execute_pandas_code(
                 "are allowed")
         p = _sb_resolve_file(path)
         if "b" in m:
-            return p.open("rb")
-        return p.open("r", encoding=(encoding or "utf-8"),
-                      errors=(errors or "replace"), newline=newline)
+            return _IO_OPEN(p, "rb")
+        return _IO_OPEN(p, "r", encoding=(encoding or "utf-8"),
+                        errors=(errors or "replace"), newline=newline)
 
     def _sb_image_stats(path):
-        """Per-image pixel statistics (read-only, path-contained)."""
+        """Per-image pixel statistics (read-only, path-contained). image_stats
+        is handed the validated string and opens it with its own captured os/io
+        functions."""
         try:
             import image_stats as _ims
         except Exception as _e:
@@ -4651,8 +5667,15 @@ def execute_pandas_code(
             expected=expected, annotate=False)
 
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name.split(".")[0] == "pandas":
+        root = name.split(".")[0]
+        if root == "pandas":
             return _budgeted_pd
+        if root == "pathlib":
+            # The per-run pathlib copy: `import pathlib` and `from pathlib
+            # import Path/PurePath/...` both reach the sandbox subclasses, so a
+            # rebind lands on the copy, never on the real classes the helpers
+            # and libraries use.
+            return _sb_pathlib
         return _safe_import(name, globals, locals, fromlist, level)
 
     def _guarded_getattr(obj, name, *default):
@@ -4709,6 +5732,12 @@ def execute_pandas_code(
         "StopIteration": StopIteration, "OverflowError": OverflowError,
         "LookupError": LookupError, "ArithmeticError": ArithmeticError,
         "RuntimeError": RuntimeError, "NotImplementedError": NotImplementedError,
+        # `try: import x / except ImportError:` — the sandbox refuses an
+        # import with ImportError, and the analyst child's fence refuses
+        # matplotlib as a missing package (ModuleNotFoundError) so a
+        # df.plot() made in passing can be caught (2026-10-16 review);
+        # without the name the except clause itself raised NameError.
+        "ImportError": ImportError, "ModuleNotFoundError": ModuleNotFoundError,
     }
 
     globals_dict: dict[str, Any] = {
@@ -4719,7 +5748,7 @@ def execute_pandas_code(
         # A plain string; it adds no capability.
         "__name__": "__main__",
         "pd": _budgeted_pd,
-        "Path": Path,
+        "Path": _sb_Path,
         "DATA_FOLDERS": [str(p) for p in normalized_folders],
         "DATA_FOLDER": str(normalized_folders[0]),
         # Read-only directory helpers (no os needed to count files/folders).
@@ -4849,7 +5878,12 @@ def execute_pandas_code(
 
     if "np" in globals_dict:
         globals_dict["np"] = _SandboxModule(globals_dict["np"], _NUMPY_EXTRA_BLOCKED)
-    _contain_helpers(globals_dict, _budgeted_pd, normalized_folders)
+    try:
+        _sb_copies = object.__getattribute__(_sb_pathlib, "_copies")
+    except AttributeError:                  # the real-pathlib fallback
+        _sb_copies = None
+    _contain_helpers(globals_dict, _budgeted_pd, normalized_folders,
+                     sb_path=_sb_Path, sb_copies=_sb_copies)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python
