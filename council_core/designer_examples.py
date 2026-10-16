@@ -314,8 +314,8 @@ def plugin_home_problem() -> str:
     from council_core import plugin_lists as pl
 
     home = pl.resolve_home().path.expanduser().resolve()
-    real = (Path.home() / ".council").resolve()
-    if home == real or real in home.parents:
+    # The same rule the plugin host keeps at run time (pl.side_problem).
+    if pl.BESIDE_TODAYS_TYPHON and pl.inside_council(home):
         return (f"this example records the plugin home it is made with, and "
                 f"{home} is inside the Council's own app folder, where the "
                 f"plugin Typhon never writes while it runs beside today's "

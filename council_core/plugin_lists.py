@@ -178,6 +178,39 @@ def resolve_home(recorded: Optional[str] = None) -> Home:
     return Home(default_home(), "default")
 
 
+#: While the plugin Typhon runs BESIDE today's Typhon (branch typhon-plugins,
+#: until the switch-over at stage P7), it never writes under ~/.council,
+#: today's app folder (docs/typhon_plugins_branch.md): a base set there is
+#: refused, and so is a project recording a plugin home there. The build
+#: refuses it too (designer_examples.plugin_home_problem). This matters for
+#: a double-clicked app whose recorded plugin home is gone: the home falls
+#: back to ~/.council/typhon (design 4.1). False at the switch-over.
+BESIDE_TODAYS_TYPHON = True
+
+
+def inside_council(path: Any) -> bool:
+    """Whether `path` is ~/.council or inside it."""
+    try:
+        target = Path(path).expanduser().resolve()
+        real = (Path.home() / ".council").resolve()
+    except OSError:
+        return False
+    return target == real or real in target.parents
+
+
+def side_problem(path: Any, what: str) -> str:
+    """Why `what` at `path` may not be written while the plugin Typhon runs
+    beside today's (BESIDE_TODAYS_TYPHON), or ""."""
+    if not BESIDE_TODAYS_TYPHON or not inside_council(path):
+        return ""
+    return (f"{what} would be {Path(path).expanduser()}, inside "
+            f"{Path.home() / '.council'}, today's Typhon's own folder, where "
+            f"the plugin Typhon never writes while it runs beside it — start "
+            f"it from run-typhon-plugins.bat, which sets {HOME_ENV} to a "
+            f"side plugin home (docs/typhon_plugins_branch.md). Nothing was "
+            f"written")
+
+
 def plugins_folder(home: Any) -> Path:
     """Where third-party plugins live: one folder each, copied in by the
     user and approved once per plugin (question 7)."""
@@ -523,8 +556,13 @@ def _drop(temp: Path) -> None:
 def change_base_set(home: Any, default_plugins: Sequence[str],
                     change: Callable[[BaseSet], None]) -> BaseSet:
     """Re-read the base set under the lock, let `change` alter it, write it
-    whole. A damaged or newer file is refused and left as it is."""
+    whole. A damaged or newer file is refused and left as it is, and so is
+    a base set under ~/.council beside today's Typhon (side_problem) —
+    before anything, its lock file included, is made there."""
     path = Path(home) / BASE_SET_FILE
+    problem = side_problem(path, "the app-wide base set")
+    if problem:
+        raise PluginListError(problem, path)
     with _locked(path):
         base = read_base_set(home, default_plugins)
         change(base)
@@ -540,8 +578,12 @@ def make_project(project_dir: Any, base: BaseSet, home: Any) -> ProjectList:
     """Create a project's list: a COPY of the base set as it is now (Q1), no
     additions, nothing off, no overrides, and the plugin home it was made
     with, home-relative. Created exclusively: an existing file is never
-    replaced (PluginListError)."""
+    replaced (PluginListError). Beside today's Typhon, a plugin home under
+    ~/.council is refused (side_problem), as the build refuses it."""
     path = project_path(project_dir)
+    problem = side_problem(home, "this project's plugin home")
+    if problem:
+        raise PluginListError(problem, path)
     made = ProjectList(path=path, plugin_home=home_text(home),
                        base_set=list(base.plugins),
                        made=time.strftime("%Y-%m-%d %H:%M:%S"))
