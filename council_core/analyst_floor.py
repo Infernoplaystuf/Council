@@ -25,15 +25,25 @@ once installed, and it sees the operation, not the code that asked for it:
   "sqlite3.connect"               SQLite opens its file in C (no "open")
   "os.link", "os.symlink",        refused outright: a link would make one
   "_winapi.CreateJunction"        place look like another
+  "os.system", "os.exec",         refused outright: a program started from
+  "os.spawn", "os.posix_spawn",   the run is a fresh process WITHOUT this
+  "os.fork", "os.forkpty",        hook, which could then read and write any
+  "subprocess.Popen",             file — the one route the rule below could
+  "_winapi.CreateProcess",        not otherwise hold for. The layers above
+  "os.startfile", "pty.spawn"     refuse `import subprocess` / `os` first;
+                                  this keeps a regression there contained.
 
 Each path is checked against an allow-list fixed at install time:
 
   READ-ONLY   the run's data folders; Python's own installation (sys.prefix,
               sys.base_prefix, site-packages, the standard library); the
-              app's code folder
+              app's code folder; single files the sandbox's own helpers read
+              (the SQL / Mongo bridge's connection registries)
   READ-WRITE  the vault's data_out and .stats_cache; the run's own temporary
               folders (the code, call.json and report folder, and the
-              working folder the child runs in)
+              working folder the child runs in, which is also its temp
+              folder); single files the helpers append to (the bridge's
+              db_audit.log and its rotations)
   NEVER       the rest of the vault (even when it lies inside a read-only
               root such as the app folder), and everything not listed
 
@@ -42,17 +52,34 @@ the vault around it is not readable at all). Paths are resolved and compared
 the way path_contain does it — realpath (symlinks, junctions, `..` and 8.3
 short names), the \\\\?\\ prefix dropped, case folded — with os.path
 functions captured when this module is imported, before any model code
-exists; network shares and devices (\\\\server\\share, \\\\.\\PhysicalDrive0,
-NUL, CON, ...) are refused from their spelling, without a lookup.
+exists. Devices (\\\\.\\PhysicalDrive0, NUL, CON, ...) are refused from their
+spelling. A network share (\\\\server\\share) is refused from its spelling,
+without a lookup, UNLESS a root is on that same share — a vault on a network
+drive (nx_guard does the same): then a path on that share is resolved and
+judged by the roots like any other, and a path on any other share is still
+refused unresolved (resolving it would ask the network for the host).
+
+Making a folder that already exists (os.mkdir, which Path.mkdir(exist_ok=
+True) calls before it swallows FileExistsError) changes nothing and is
+allowed wherever the folder is.
 
 A refusal raises PermissionError at the call that tried it, with a plain
 reason, and is RECORDED: council_core.analyst_child ends the run with that
 reason as its error even when the code caught the exception, so swallowing a
-refusal never turns it into a result.
+refusal never turns it into a result. An import the run may not make
+(refused_imports: matplotlib, whose start-up writes into the user's home) is
+different: it touched no file, so it fails as a missing package would — a
+ModuleNotFoundError with the plain reason, which the code (or a library's
+optional-dependency probe) may catch — and is not recorded.
 
-What it does not see: file I/O done inside native code without an audit
-event (a C library opening a file itself). The sandbox's import allowlist
-and its contained helpers stay the guard there.
+What it does not see:
+  - os.stat / os.path.exists / os.path.getsize / os.path.isdir and the
+    other stat calls: CPython raises no audit event for them, so code can
+    ask whether a guessed path exists and how big it is — metadata, not
+    content. Listing a folder (the probe that finds names) is refused.
+  - file I/O done inside native code without an audit event (a C library
+    opening a file itself). The sandbox's import allowlist and its contained
+    helpers stay the guard there.
 """
 from __future__ import annotations
 
@@ -66,6 +93,8 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # module attributes afterwards changes these.
 _REALPATH = os.path.realpath
 _NORMCASE = os.path.normcase
+_NORMPATH = os.path.normpath
+_ISDIR = os.path.isdir
 _SPLITDRIVE = os.path.splitdrive
 _BASENAME = os.path.basename
 _FSPATH = os.fspath
@@ -124,6 +153,30 @@ def network_or_device(s: str) -> bool:
                     and drive[5] == ":")
     base = _BASENAME(s.rstrip("\\/")).split(".")[0].strip().upper()
     return base in _DEVICE_NAMES
+
+
+def unc_share(s: str) -> Optional[str]:
+    """The share a UNC spelling names — ``\\\\server\\share``, case-folded,
+    from \\\\server\\share\\..., //server/share/... or \\\\?\\UNC\\server\\
+    share\\... — read from the spelling alone; None for a local path or a
+    device (\\\\.\\PhysicalDrive0, \\\\?\\GLOBALROOT\\..., NUL)."""
+    if not _NT:
+        return None
+    t = s.replace("/", "\\")
+    head = t[:8].upper()
+    if head in ("\\\\?\\UNC\\", "\\\\.\\UNC\\"):
+        t = "\\\\" + t[8:]
+    elif t[:4] in ("\\\\?\\", "\\\\.\\"):
+        return None                         # a device, or \\?\C: (local)
+    if not t.startswith("\\\\"):
+        return None
+    drive = _SPLITDRIVE(t)[0]
+    if drive.count("\\") < 3 or drive.endswith("\\"):
+        return None                         # \\server alone: not a share
+    base = _BASENAME(t.rstrip("\\/")).split(".")[0].strip().upper()
+    if base in _DEVICE_NAMES:
+        return None
+    return _NORMCASE(drive)
 
 
 def canonical(s: str) -> str:
@@ -186,14 +239,25 @@ class Floor:
                  never: Iterable[Any] = (),
                  refused_imports: Optional[dict] = None) -> None:
         roots: List[Tuple[str, int]] = []
+        #: The network shares roots are on (a vault on a network drive):
+        #: a path on one of THESE shares is resolved and judged by the roots;
+        #: any other network path is refused from its spelling.
+        self.net_shares: set = set()
         for paths, level in ((never, NEVER), (read_only, READ),
                              (read_write, WRITE)):
             for p in paths or ():
                 try:
                     s = _plain(p)
-                    if not s or network_or_device(s):
+                    if not s:
                         continue
-                    roots.append((canonical(s), level))
+                    share = unc_share(s)
+                    if network_or_device(s) and share is None:
+                        continue                # a device is never a root
+                    c = canonical(s)
+                    for sh in (share, unc_share(c)):
+                        if sh:
+                            self.net_shares.add(sh)
+                    roots.append((c, level))
                 except (OSError, ValueError, TypeError):
                     continue
         # Deepest first; at the same folder the higher grant first.
@@ -253,16 +317,18 @@ class Floor:
         shown = s if len(s) <= 300 else s[:300] + "..."
         if not s.strip():
             return f"{verb} an empty path is not allowed"
-        if network_or_device(s):
+        if network_or_device(s) and unc_share(s) not in self.net_shares:
+            # Refused from the spelling: resolving it would ask the network
+            # for the host first. A share a root is on is resolved below.
             return (f"{verb} {shown} is not allowed: it is a network share or "
-                    f"a device, and the sandbox uses local folders only")
+                    f"a device, and {self._net_words()}")
         c, err = self._canonical(s)
         if err:
             return f"{verb} {shown} is not allowed: it cannot be resolved ({err})"
-        if _NT and c.startswith("\\\\"):
+        if (_NT and c.startswith("\\\\")
+                and unc_share(c) not in self.net_shares):
             return (f"{verb} {shown} is not allowed: it leads to a network "
-                    f"share or a device, and the sandbox uses local folders "
-                    f"only")
+                    f"share or a device, and {self._net_words()}")
         lvl = self.level(c)
         if lvl == WRITE or (lvl == READ and not write):
             return ""
@@ -272,6 +338,11 @@ class Floor:
                     f"cache")
         return (f"{verb} {shown} is not allowed: it is outside the folders "
                 f"the sandbox may use ({_ALLOWED_SHORT})")
+
+    def _net_words(self) -> str:
+        if self.net_shares:
+            return ("the sandbox uses only the share its own folders are on")
+        return "the sandbox uses local folders only"
 
     def refuse(self, why: str, head: str = "the sandbox's file fence "
                                           "refused") -> None:
@@ -353,11 +424,36 @@ def _never(what: str):
     return handler
 
 
+def _on_mkdir(floor: Floor, args: tuple) -> None:
+    """Making a folder: refused outside the writable roots — unless it
+    already exists, when os.mkdir changes nothing (it fails with
+    FileExistsError, which Path.mkdir(exist_ok=True) swallows; the SQL /
+    Mongo bridge's audit append makes the vault folder that way). A network
+    or device spelling is not asked about."""
+    path = _arg(args, 0)
+    why = floor.why_not(path, True, "making the folder")
+    if not why:
+        return
+    try:
+        s = _plain(path)
+    except TypeError:
+        s = None
+    if s and not network_or_device(s) and _ISDIR(s):
+        return
+    floor.refuse(why)
+
+
 def _on_import(floor: Floor, args: tuple) -> None:
+    """An import the run may not make fails as a MISSING package would: a
+    ModuleNotFoundError with the plain reason, which the code — or a
+    library's optional-dependency probe (pd.show_versions, pandas' plotting
+    backend) — may catch. Not recorded: no file was touched, so it does not
+    end a run that caught it (2026-10-16 review: a df.plot() made in passing,
+    or pd.show_versions(), failed runs that had their answer)."""
     root = str(_arg(args, 0) or "").split(".")[0]
     why = floor.refused_imports.get(root)
     if why:
-        floor.refuse(why, "the sandbox refused")
+        raise ModuleNotFoundError(f"the sandbox refused: {why}", name=root)
 
 
 def _on_sqlite(floor: Floor, args: tuple) -> None:
@@ -385,7 +481,7 @@ _EVENTS = {
     "os.scandir": _on_list,
     "os.remove": _writes((0, "deleting")),
     "os.rmdir": _writes((0, "deleting")),
-    "os.mkdir": _writes((0, "making the folder")),
+    "os.mkdir": _on_mkdir,
     "os.rename": _writes((0, "moving"), (1, "moving onto")),
     "os.replace": _writes((0, "moving"), (1, "moving onto")),
     "os.chmod": _writes((0, "changing")),
@@ -399,6 +495,20 @@ _EVENTS = {
     "os.link": _never("making a link"),
     "os.symlink": _never("making a link"),
     "_winapi.CreateJunction": _never("making a link"),
+    # A started program is a new process without this hook: it could reach
+    # any file. Refused outright (the layers above refuse the imports that
+    # reach these first; this holds if they ever regress).
+    "os.system": _never("starting a program"),
+    "os.exec": _never("starting a program"),
+    "os.spawn": _never("starting a program"),
+    "os.posix_spawn": _never("starting a program"),
+    "os.fork": _never("starting a program"),
+    "os.forkpty": _never("starting a program"),
+    "os.startfile": _never("starting a program"),
+    "os.startfile/2": _never("starting a program"),
+    "subprocess.Popen": _never("starting a program"),
+    "_winapi.CreateProcess": _never("starting a program"),
+    "pty.spawn": _never("starting a program"),
     "shutil.rmtree": _writes((0, "deleting")),
     "shutil.move": _writes((0, "moving"), (1, "moving onto")),
     "shutil.copyfile": _copies(0, 1),
@@ -421,4 +531,4 @@ def install(read_only: Iterable[Any] = (), read_write: Iterable[Any] = (),
 
 
 __all__ = ["Floor", "Refused", "install", "canonical", "network_or_device",
-           "python_roots", "NEVER", "READ", "WRITE"]
+           "unc_share", "python_roots", "NEVER", "READ", "WRITE"]

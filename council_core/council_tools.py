@@ -37,10 +37,16 @@ def _plain_run_python_reason(err: str) -> str:
     # would otherwise take for a write.
     if ("may not change pandas" in low or "cannot be rebound" in low
             or re.search(r"forbidden: (setattr|delattr) on", low)):
+        # A name imported (or set to a module or class) is still one where
+        # the code has not rebound it on every path — "assign only to your
+        # own variables" alone misled when the name WAS the model's own
+        # variable on one path (2026-10-16 review).
         return ("the sandbox does not let code change pandas, numpy, pathlib "
-                "or the other modules and classes it provides; assign only "
-                "to your own variables, and set pandas display options with "
-                "pd.set_option(...)")
+                "or the other modules and classes it provides; a name "
+                "imported or set to one of them still counts as one until "
+                "the code rebinds it on every path, so give your own "
+                "variables names of their own, and set pandas display "
+                "options with pd.set_option(...)")
     if ("import blocked by sandbox" in low or "forbidden import" in low
             or ("blocked unsafe pattern" in low and "import" in low)):
         return ("the sandbox does not allow that import; allowed: pandas, "

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,33 @@ _STAT = os.stat
 _SCANDIR = os.scandir
 _FSPATH = os.fspath
 _OPEN = io.open
+
+
+def plain_error(exc: BaseException, path: str, fh: Any = None) -> str:
+    """Why an image could not be read, in the library's own words, with the
+    open file object's repr (Pillow's "cannot identify image file
+    <_io.BufferedReader name=...>") and the full path replaced by the file's
+    name, and any other object repr ``<...>`` likewise. The reason
+    stays — "image file is truncated (12 bytes not processed)", the
+    decompression-bomb size limit — only the internals go (2026-10-16
+    review: naming just the exception class dropped the reason)."""
+    name = _BASENAME(path)
+    msg = str(exc) or type(exc).__name__
+    spellings = [path, repr(path)[1:-1]]
+    if fh is not None:
+        try:
+            spellings.insert(0, repr(fh))
+        except Exception:                                 # noqa: BLE001
+            pass
+    for s in spellings:
+        if s:
+            msg = msg.replace(s, name)
+    msg = _OBJECT_REPR.sub(name, msg)
+    msg = " ".join(msg.split())
+    return msg if len(msg) <= 240 else msg[:237] + "..."
+
+
+_OBJECT_REPR = re.compile(r"<[^<>]{1,400}>")
 
 
 def _path_str(path: Any) -> str:
@@ -103,6 +131,7 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
     p = _path_str(path)
     if not _ISFILE(p):
         return {"error": f"not a file: {p}"}
+    fh = None
     try:
         # Pillow is given an open file, not the name: it never resolves or
         # re-opens the path itself.
@@ -110,12 +139,10 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
             im = Image.open(fh)
             im.load()
     except Exception as exc:
-        # Name the file and the error KIND, not the exception's repr: Pillow's
-        # UnidentifiedImageError embeds the open file object's repr
-        # (<_io.BufferedReader name=...>), an internal object with no meaning
-        # for the model (2026-10-16).
-        return {"error": f"could not open image {_BASENAME(p)} "
-                         f"({type(exc).__name__})"}
+        # The reason in words, with the file's name for Pillow's open-file
+        # repr (<_io.BufferedReader name=...>) and the full path.
+        return {"error": f"could not open image {_BASENAME(p)}: "
+                         f"{plain_error(exc, p, fh)}"}
     fmt, mode = im.format, im.mode
     w, h = im.size
     try:
@@ -148,8 +175,8 @@ def image_pixel_stats(path: Any, *, max_side: int = 1024,
         except Exception:
             pass
     except Exception as exc:
-        return {"error": f"pixel analysis of {_BASENAME(p)} failed "
-                         f"({type(exc).__name__})"}
+        return {"error": f"pixel analysis of {_BASENAME(p)} failed: "
+                         f"{plain_error(exc, p)}"}
     try:
         size_kb = round(_STAT(p).st_size / 1024.0, 1)
     except Exception:

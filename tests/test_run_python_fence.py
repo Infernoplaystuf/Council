@@ -402,6 +402,34 @@ def test_a_refusal_comes_back_in_plain_words(box, code, plain):
     assert plain in msg
 
 
+def test_an_alias_refusal_says_why_the_name_still_counts(box):
+    """`stats` is the model's own variable on one path and scipy.stats on
+    the other, so "assign only to your own variables" alone misled (2026-10-16
+    review): the plain sentence says an imported name counts until it is
+    rebound on every path, and the sandbox's line names the import."""
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "if len(df) > 2:\n"
+        "    stats = df.describe()\n"
+        "stats.index.name = 's'\n"
+        "print(stats)\n")})
+    assert not ok
+    err = payload["stderr"]
+    assert "the sandbox does not let code change pandas" in err, err
+    assert "rebinds it on every path" in err, err
+    assert "line 1" in err and "from scipy import stats" in err, err
+    # and the ordinary form — rebound before the store — runs
+    ok, msg, payload = member_tool(box, "coder")({"code": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('runs.csv')\n"
+        "if len(df) > 2:\n"
+        "    stats = df.describe()\n"
+        "    stats.index.name = 's'\n"
+        "    print(stats.index.name)\n")})
+    assert ok and payload["rc"] == 0, msg
+
+
 def test_run_code_writes_only_the_vault_it_is_given(box, tmp_path,
                                                     monkeypatch):
     """analyst_step.run_code(..., vault=V) — the data_query and analyst

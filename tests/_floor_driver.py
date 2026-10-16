@@ -13,12 +13,19 @@ output file would itself be outside the allow-list.
 job.json: {"read_only": [...], "read_write": [...], "never": [...],
            "ops": [["read", path], ["write", path], ["listdir", path],
                    ["scandir", path], ["remove", path],
-                   ["rename", path, path2], ["mkdir", path]]}
+                   ["rename", path, path2], ["mkdir", path],
+                   ["system", command], ["popen", [argv...]],
+                   ["spawnv", [argv...]], ["exists", path], ["stat", path],
+                   ["audit", event, [args...]]]}
+"audit" raises the audit event itself (sys.audit) without doing the
+operation, for the events a test must not really perform (os.exec would
+replace the process, os.startfile would open a window).
 printed: {"<i>": "OK" | "REFUSED: <reason>" | "ERR <type>: <msg>",
           "per_open_cached_us": float, "build_install_ms": float}
 """
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -54,14 +61,25 @@ def main(argv):
             os.rename(op[1], op[2])
         elif kind == "mkdir":
             os.mkdir(op[1])
+        elif kind == "system":
+            os.system(op[1])
+        elif kind == "popen":
+            subprocess.Popen(op[1]).wait(60)
+        elif kind == "spawnv":
+            os.spawnv(os.P_WAIT, op[1][0], op[1])
+        elif kind == "exists":
+            return "OK" if os.path.exists(op[1]) else "OK-absent"
+        elif kind == "stat":
+            os.stat(op[1])
+        elif kind == "audit":
+            sys.audit(op[1], *op[2])
         else:
             raise ValueError(f"unknown op {kind!r}")
 
     out = {}
     for i, op in enumerate(job.get("ops") or []):
         try:
-            do(op)
-            out[str(i)] = "OK"
+            out[str(i)] = do(op) or "OK"
         except analyst_floor.Refused as e:
             out[str(i)] = "REFUSED: " + str(e)
         except Exception as e:                            # noqa: BLE001

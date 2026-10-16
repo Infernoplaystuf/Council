@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from image_stats import plain_error as _plain_error
+
 # The analyst sandbox hands detect_and_count_features a path STRING it has
 # already confirmed is inside the data folders. The input is checked and
 # opened with os/io functions bound here, at import, before any model code
@@ -133,6 +135,7 @@ def detect_and_count_features(path: Any, *,
     if not _ISFILE(p):
         return {"error": f"not a file: {p}"}
     name = _BASENAME(p)
+    fh = None
     try:
         # Pillow is given an open file, not the name: it never resolves or
         # re-opens the path itself.
@@ -140,10 +143,11 @@ def detect_and_count_features(path: Any, *,
             im = Image.open(fh)
             im.load()
     except Exception as exc:
-        # Name the file and the error KIND, not the exception's repr: Pillow's
-        # UnidentifiedImageError embeds the open file object's repr
-        # (<_io.BufferedReader name=...>), an internal object (2026-10-16).
-        return {"error": f"could not open image {name} ({type(exc).__name__})"}
+        # The reason in words, with the file's name for Pillow's open-file
+        # repr (<_io.BufferedReader name=...>) and the full path
+        # (image_stats.plain_error).
+        return {"error": f"could not open image {name}: "
+                         f"{_plain_error(exc, p, fh)}"}
 
     w0, h0 = im.size
     gray_im = im.convert("L")

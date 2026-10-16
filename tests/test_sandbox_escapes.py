@@ -570,9 +570,14 @@ def test_make_sandbox_pathlib_isolates_the_real_classes():
     proxy, SbPath = va._make_sandbox_pathlib()
     assert issubclass(SbPath, pathlib.Path) and SbPath is not pathlib.Path
     assert proxy.Path is SbPath
-    assert type(SbPath(".")) is SbPath            # closed under construction
-    assert type(SbPath(".") / "x") is SbPath
-    assert type(SbPath(".").parent) is SbPath
+    # Path('.') builds the concrete copy for this OS (as real pathlib builds
+    # a WindowsPath / PosixPath), and the concrete copy is closed under
+    # construction (2026-10-16: Path itself is no longer the concrete copy).
+    Concrete = type(SbPath("."))
+    assert issubclass(Concrete, SbPath) and Concrete is not SbPath
+    assert Concrete is getattr(proxy, type(pathlib.Path()).__name__)
+    assert type(SbPath(".") / "x") is Concrete
+    assert type(SbPath(".").parent) is Concrete
     assert issubclass(proxy.PurePath, pathlib.PurePath)
     assert proxy.PurePath is not pathlib.PurePath
     real_resolve = pathlib.Path.resolve
@@ -705,12 +710,15 @@ def test_legitimate_alias_and_target_code_still_works(box, code):
 # Path copy.
 def test_the_desandbox_converter_returns_the_sandbox_path(box):
     import pathlib
-    _proxy, SbPath = va._make_sandbox_pathlib()
-    convert = va._desandbox_path_factory(SbPath)
+    proxy, SbPath = va._make_sandbox_pathlib()
+    convert = va._desandbox_path_factory(SbPath, proxy._copies)
+    # deep=True: what a helper annotated as returning paths gets (nested);
+    # each real class becomes its own copy (a pure path stays pure)
     got = convert([pathlib.Path("a"), pathlib.PurePath("b"),
-                   {"k": pathlib.Path("c")}, "plain", 7])
-    assert isinstance(got[0], SbPath) and type(got[0]) is SbPath
-    assert isinstance(got[1], SbPath)
+                   {"k": pathlib.Path("c")}, "plain", 7], deep=True)
+    assert isinstance(got[0], SbPath) and type(got[0]) is type(SbPath("."))
+    assert type(got[1]) is type(proxy.PurePath("b"))
+    assert isinstance(got[1], proxy.PurePath)
     assert isinstance(got[2]["k"], SbPath)
     assert got[3] == "plain" and got[4] == 7
     # none of them is the REAL class model code could rebind
@@ -761,8 +769,8 @@ def test_the_pathlib_copy_keeps_isinstance_issubclass_name_and_repr():
     assert issubclass(SbPath, proxy.PurePath)
     assert issubclass(SbPath, pathlib.PurePath)
     # closed under path operations
-    assert type(p / "x") is SbPath
-    assert type(p.parent) is SbPath
+    assert type(p / "x") is type(p)
+    assert type(p.parent) is type(p)
 
 
 def test_pathlib_relationships_hold_for_model_code(box):
@@ -888,3 +896,407 @@ def test_image_helpers_error_text_names_the_file_not_an_object_repr(box):
         assert "bad.png" in err, err
         assert "BufferedReader" not in err and "_io." not in err, err
         assert "<" not in err, err
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Review of the floor branch (2026-10-16)
+# ════════════════════════════════════════════════════════════════════════
+
+# ── Alias tracking: block by block, a function body its own scope ─────────
+# The order-sensitive check handled only top-level straight-line code: every
+# function body, loop, if, try and `if __name__ == '__main__':` was
+# "conditional", so a later rebind there never cleared an alias, and np.nan /
+# pd.NA placeholders counted as aliases. Approved/Forge tools are always
+# functions, so the review's own example was still refused inside a tool.
+# Each of these ran on the base (778e401).
+_LEGIT_REBINDS = {
+    "import_name_in_function": (
+        "from scipy import stats\n"
+        "def describe(d):\n"
+        "    stats = d.describe()\n"
+        "    stats.index.name = 'stat'\n"
+        "    return stats\n"
+        "result_df = describe(pd.read_csv('ok.csv'))"),
+    "import_name_in_loop": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('ok.csv')\n"
+        "for col in ['a', 'b']:\n"
+        "    stats = df[col].describe()\n"
+        "    stats.name = col + '_stats'\n"
+        "result_df = stats.to_frame()"),
+    "nan_placeholder_in_if": (
+        "df = pd.read_csv('ok.csv')\n"
+        "table = np.nan\n"
+        "if len(df):\n"
+        "    table = df.pivot_table(index='a', values='b', aggfunc='sum')\n"
+        "    table.columns = ['total']\n"
+        "result_df = table"),
+    "nan_placeholder_in_loop": (
+        "best = np.nan\n"
+        "df = pd.read_csv('ok.csv')\n"
+        "for k, g in df.groupby('a'):\n"
+        "    if g['b'].sum() > 1:\n"
+        "        best = g.copy()\n"
+        "best.index.name = 'row'\n"
+        "result_df = best"),
+    "import_name_in_try": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('ok.csv')\n"
+        "try:\n"
+        "    stats = df[['a']].describe()\n"
+        "    stats.index.name = 's'\n"
+        "except Exception:\n"
+        "    pass\n"
+        "result_df = stats"),
+    "import_name_under_main_guard": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('ok.csv')\n"
+        "if __name__ == '__main__':\n"
+        "    stats = df[['a']].describe()\n"
+        "    stats.columns = ['rt']\n"
+        "    result_df = stats"),
+    "pd_na_placeholder_in_if": (
+        "df = pd.read_csv('ok.csv')\n"
+        "top = pd.NA\n"
+        "if not df.empty:\n"
+        "    top = df.nlargest(2, 'a')\n"
+        "    top.index = ['first', 'second']\n"
+        "result_df = top"),
+    "nan_placeholder_in_function": (
+        "def build(df):\n"
+        "    summary = np.nan\n"
+        "    summary = df.groupby('a')['b'].agg(['mean', 'sum'])\n"
+        "    summary.columns = ['avg', 'tot']\n"
+        "    return summary\n"
+        "result_df = build(pd.read_csv('ok.csv'))"),
+    "import_name_in_while": (
+        "from scipy import stats\n"
+        "df = pd.read_csv('ok.csv')\n"
+        "n = 0\n"
+        "while n < 2:\n"
+        "    stats = df.describe()\n"
+        "    stats.index.name = 's'\n"
+        "    n += 1\n"
+        "result_df = df"),
+    "nested_function": (
+        "from scipy import stats\n"
+        "def outer(d):\n"
+        "    def inner(x):\n"
+        "        stats = x.describe()\n"
+        "        stats.index.name = 'i'\n"
+        "        return stats\n"
+        "    return inner(d)\n"
+        "result_df = outer(pd.read_csv('ok.csv'))"),
+    # the controls the review found unchanged, kept that way
+    "with_block": (
+        "from scipy import stats\n"
+        "with open('ok.csv') as f:\n"
+        "    stats = pd.read_csv(f).describe()\n"
+        "    stats.index.name = 'stat'\n"
+        "result_df = stats"),
+    # a parameter is a local: it can never be the module-level import
+    "param_shadows_import": (
+        "from scipy import stats\n"
+        "def label(stats):\n"
+        "    stats.name = 'x'\n"
+        "    return stats\n"
+        "result_df = label(pd.read_csv('ok.csv')['a']).to_frame()"),
+}
+
+
+def test_the_sandbox_s_own_names_stay_protected_even_as_locals():
+    """pd, np, Path, math, … are protected everywhere — a local of the same
+    name included, as on the base — and the message says it is the name."""
+    ok, msg = va.validate_generated_code(
+        "import math\n"
+        "def summarize(d):\n"
+        "    math = d.agg(['sum', 'mean'])\n"
+        "    math.name = 'agg'\n"
+        "    return math\n")
+    assert not ok and "Forbidden: cannot assign to 'name' on 'math'" in msg
+    assert "one of the modules and classes the sandbox provides" in msg, msg
+    assert "different name" in msg, msg
+
+
+@pytest.mark.parametrize("name", sorted(_LEGIT_REBINDS))
+def test_a_rebind_in_a_block_or_function_clears_the_alias(box, name):
+    data, _ = box
+    code = _LEGIT_REBINDS[name]
+    ok, why = va.validate_generated_code(code)
+    assert ok, why
+    df, msg = run(code, data)
+    assert df is not None, msg
+
+
+_TOOL_REBINDS = {
+    "tool_build": ("def tool_build(by='a'):\n"
+                   "    summary = np.nan\n"
+                   "    df = pd.read_csv('ok.csv')\n"
+                   "    summary = df.groupby(by)['b'].agg(['mean', 'sum'])\n"
+                   "    summary.columns = ['avg', 'tot']\n"
+                   "    return summary.reset_index()\n", {"by": "a"},
+                   ["a", "avg", "tot"]),
+    "tool_desc": ("from scipy import stats\n"
+                  "def tool_desc(column='a'):\n"
+                  "    stats = pd.read_csv('ok.csv')[column].describe()\n"
+                  "    stats.name = column\n"
+                  "    return stats.to_frame()\n", {"column": "b"}, ["b"]),
+}
+
+
+@pytest.mark.parametrize("entry", sorted(_TOOL_REBINDS))
+def test_an_approved_tool_with_a_rebind_saves_and_runs(box, entry):
+    """Every approved/Forge tool is a function: a rebind inside it is
+    accepted at save time (app_built_tools.check_tool, the validator
+    save_tool uses) and runs in the analyst child."""
+    import app_built_tools as abt
+    from council_core import analyst_step
+    data, _ = box
+    code, args, cols = _TOOL_REBINDS[entry]
+    ok, why, _slug, got_entry = abt.check_tool(entry, code)
+    assert ok and got_entry == entry, why
+    res = analyst_step.run_tool_code(code, entry, args, [data])
+    assert res.ran and res.df is not None, res.message
+    assert list(res.df.columns) == cols, res.df.columns.tolist()
+
+
+# What a block / scope walk must STILL refuse — an alias that may be live
+# at the store on SOME path.
+_STILL_REFUSED = {
+    "free_name_in_function": (
+        "P = Path\n"
+        "def f():\n"
+        "    P.resolve = lambda self, *a, **k: self\n"
+        "f()"),
+    "alias_made_after_the_def": (
+        "P = 1\n"
+        "def f():\n"
+        "    P.resolve = lambda self, *a, **k: self\n"
+        "P = Path\n"
+        "f()"),
+    "loop_back_edge": (
+        "x = 1\n"
+        "for i in range(2):\n"
+        "    x.resolve = lambda self, *a, **k: self\n"
+        "    x = Path"),
+    "loop_continue_path": (
+        "x = 1\n"
+        "for i in range(3):\n"
+        "    x.resolve = lambda self, *a, **k: self\n"
+        "    x = Path\n"
+        "    if i < 5:\n"
+        "        continue\n"
+        "    x = 2"),
+    "while_back_edge": (
+        "x = 1\n"
+        "n = 0\n"
+        "while n < 2:\n"
+        "    x.resolve = lambda self, *a, **k: self\n"
+        "    x = Path\n"
+        "    n += 1"),
+    "try_clear_skipped_by_an_exception": (
+        "P = Path\n"
+        "try:\n"
+        "    1 / 0\n"
+        "    P = 1\n"
+        "except Exception:\n"
+        "    pass\n"
+        "P.resolve = lambda self, *a, **k: self"),
+    "with_clear_skipped_by_a_suppressing_manager": (
+        "class S:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *a):\n"
+        "        return True\n"
+        "P = Path\n"
+        "with S():\n"
+        "    1 / 0\n"
+        "    P = 1\n"
+        "P.resolve = lambda self, *a, **k: self"),
+    "global_from_a_function": (
+        "P = 1\n"
+        "def g():\n"
+        "    global P\n"
+        "    P = Path\n"
+        "g()\n"
+        "P.resolve = lambda self, *a, **k: self"),
+    "enclosing_function_alias": (
+        "def outer():\n"
+        "    P = Path\n"
+        "    def inner():\n"
+        "        P.resolve = lambda self, *a, **k: self\n"
+        "    inner()\n"
+        "outer()"),
+    "walrus_in_a_short_circuit_does_not_clear": (
+        "P = Path\n"
+        "z = 0 and (P := 1)\n"
+        "P.resolve = lambda self, *a, **k: self"),
+    "loop_target_from_a_literal": (
+        "for P in [Path]:\n"
+        "    P.resolve = lambda self, *a, **k: self"),
+    "module_attribute_is_still_an_alias": (
+        "R = np.random\n"
+        "R.seed = None"),
+    "import_rebound_only_in_a_branch": (
+        "from scipy import stats\n"
+        "if DATA_FOLDER:\n"
+        "    stats = pd.read_csv('ok.csv')\n"
+        "stats.name = 'x'"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_STILL_REFUSED))
+def test_a_possibly_live_alias_is_still_refused(name):
+    ok, msg = va.validate_generated_code(_STILL_REFUSED[name])
+    assert not ok and "Forbidden: cannot assign to" in msg, (name, msg)
+
+
+def test_the_refusal_says_why_the_name_still_counts_and_what_to_do():
+    """`stats` IS the model's own variable on one path, so 'assign only to
+    your own variables' alone misled: the message names the line that made
+    it an alias and suggests a name of its own."""
+    ok, msg = va.validate_generated_code(
+        _STILL_REFUSED["import_rebound_only_in_a_branch"])
+    assert not ok
+    assert "'stats'" in msg and "line 1" in msg, msg
+    assert "from scipy import stats" in msg, msg
+    assert "different name" in msg, msg
+
+
+# ── The return converter does not walk or copy what helpers return ───────
+def test_the_return_converter_leaves_documents_alone_and_fast():
+    """It walked and COPIED every list/dict a helper returned (depth 4), so a
+    big read_json_documents result took about twice as long and could pass
+    the memory cap. A result with no path in it is now handed back as the
+    very same object."""
+    import time
+    _proxy, sb_path = va._make_sandbox_pathlib()
+    conv = va._desandbox_path_factory(sb_path)
+    docs = [{"id": i, "m": {"y": [i, i + 1]}} for i in range(200_000)]
+    t0 = time.perf_counter()
+    out = conv(docs)
+    took = time.perf_counter() - t0
+    assert out is docs                       # no second copy
+    assert took < 0.5, took
+    ints = list(range(1_000_000))
+    assert conv(ints) is ints
+
+
+def test_the_return_converter_still_converts_paths_it_is_handed():
+    import pathlib
+    _proxy, sb_path = va._make_sandbox_pathlib()
+    conv = va._desandbox_path_factory(sb_path)
+    got = conv([pathlib.Path("a"), "b"])
+    assert isinstance(got[0], sb_path) and got[1] == "b"
+    assert isinstance(conv(pathlib.Path("x")), sb_path)
+    got = conv({"file": pathlib.Path("a"), "n": 1})
+    assert isinstance(got["file"], sb_path) and got["n"] == 1
+
+
+def test_list_helpers_still_hand_back_the_sandbox_path(box):
+    data, _ = box
+    for lister in ("list_csv_files", "list_data_files"):
+        df, msg = run(
+            f"files = {lister}(DATA_FOLDER)\n"
+            "result_df = pd.DataFrame([{'copy': all(type(f) is "
+            "type(Path('.')) for f in files), 'n': len(files)}])", data)
+        assert df is not None, msg
+        assert bool(df.iloc[0]["copy"]) and int(df.iloc[0]["n"]) >= 1, lister
+
+
+# ── The pathlib copy answers as real pathlib does ─────────────────────────
+_PATHLIB_PROBE = (
+    "import pathlib\n"
+    "from pathlib import (PurePath, PureWindowsPath, PurePosixPath,\n"
+    "                     WindowsPath, PosixPath)\n"
+    "x = Path('x.csv')\n"
+    "rows = [\n"
+    "  isinstance(x, PurePath), isinstance(x, pathlib.PurePath),\n"
+    "  isinstance(x, PureWindowsPath), isinstance(x, WindowsPath),\n"
+    "  isinstance(x, pathlib.Path), isinstance(x, Path),\n"
+    "  issubclass(Path, PurePath), issubclass(type(x), pathlib.PurePath),\n"
+    "  issubclass(WindowsPath, pathlib.Path), issubclass(PosixPath, Path),\n"
+    "  type(x).__name__, repr(x), str(x),\n"
+    "  isinstance(PurePosixPath('a/b'), PurePath),\n"
+    "  isinstance(PureWindowsPath('a/b'), PurePath),\n"
+    "  isinstance(PurePath('a'), PurePath), isinstance(PurePath('a'), Path),\n"
+    "  PurePath('a/b').parts, PurePosixPath('a/b').as_posix(),\n"
+    "  Path.__name__, repr(Path), PurePath.__name__, repr(PurePath),\n"
+    "  pathlib.PurePath.__name__, WindowsPath.__name__,\n"
+    "  type(Path('a')) is Path, type(Path('a')).__qualname__,\n"
+    "  type(PurePath('a')).__name__, type(Path('a') / 'b').__name__,\n"
+    "  Path is pathlib.Path, PurePath is pathlib.PurePath,\n"
+    "  Path('a') == Path('a'), Path('A') == Path('a'),\n"
+    "  sorted([Path('b'), Path('a')]) == [Path('a'), Path('b')],\n"
+    "  {Path('a'): 1}[Path('a')],\n"
+    "]\n"
+    "result_df = pd.DataFrame({'v': [repr(r) for r in rows]})\n")
+
+
+def test_the_pathlib_copy_answers_like_real_pathlib(box):
+    """The copy's class names were the concrete ones ('WindowsPath' for
+    Path, 'PureWindowsPath' for PurePath) and PurePosixPath('a/b') was not a
+    PurePath. Every answer here now matches real pathlib."""
+    import os as _os
+    import pathlib
+    if _os.name != "nt":
+        pytest.skip("the probe names the Windows classes")
+    data, _ = box
+    df, msg = run(_PATHLIB_PROBE, data)
+    assert df is not None, msg
+    got = df["v"].tolist()
+    import pandas as _pd
+    ns = {"Path": pathlib.Path, "pd": _pd}
+    exec(_PATHLIB_PROBE, ns)                    # real pathlib, outside
+    want = ns["result_df"]["v"].tolist()
+    assert got == want, [(i, g, w) for i, (g, w) in
+                         enumerate(zip(got, want)) if g != w]
+
+
+def test_the_pathlib_copy_is_still_a_copy():
+    """…while every class model code gets is still the per-run copy, so a
+    rebind lands there and not on real pathlib."""
+    import pathlib
+    proxy, sb_path = va._make_sandbox_pathlib()
+    for nm in ("Path", "PurePath", "WindowsPath", "PureWindowsPath",
+               "PurePosixPath", "PosixPath"):
+        assert getattr(proxy, nm) is not getattr(pathlib, nm), nm
+        assert issubclass(getattr(proxy, nm), getattr(pathlib, nm)), nm
+    assert proxy.Path is sb_path
+    p = sb_path("x")
+    assert isinstance(p, sb_path)
+    assert type(p) is getattr(proxy, type(pathlib.Path()).__name__)
+    assert type(p / "y") is type(p) and type(p.parent) is type(p)
+    real = pathlib.Path.resolve
+    sb_path.resolve = lambda self, *a, **k: "HACK"
+    assert pathlib.Path.resolve is real
+    assert p.resolve() == "HACK"            # the copy's own instances see it
+
+
+# ── Image helper errors say what went wrong ───────────────────────────────
+def test_image_helper_errors_keep_the_reason_without_the_object_repr(box):
+    """'could not open image bad.png (UnidentifiedImageError)' dropped the
+    reason. The reason stays — with the open file's repr and the full path
+    replaced by the file's name."""
+    pytest.importorskip("PIL")
+    import io as _io
+    import numpy as _np
+    from PIL import Image
+    data, _ = box
+    (data / "bad.png").write_text("not an image", encoding="utf-8")
+    buf = _io.BytesIO()
+    Image.fromarray((_np.arange(64 * 64 * 3) % 251).astype("uint8")
+                    .reshape(64, 64, 3), "RGB").save(buf, "PNG")
+    (data / "cut.png").write_bytes(buf.getvalue()[: len(buf.getvalue()) // 2])
+    for helper in ("image_pixel_stats", "detect_and_count_features"):
+        df, msg = run(
+            f"a = {helper}('bad.png')\nb = {helper}('cut.png')\n"
+            "result_df = pd.DataFrame([{'a': a.get('error', ''), "
+            "'b': b.get('error', '')}])", data)
+        assert df is not None, msg
+        a, b = df.iloc[0]["a"], df.iloc[0]["b"]
+        assert "bad.png" in a and "cannot identify image file" in a, a
+        assert "cut.png" in b and "truncated" in b, b
+        for err in (a, b):
+            assert "<" not in err and "BufferedReader" not in err, err
+            assert str(data) not in err, err
