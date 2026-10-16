@@ -57,6 +57,7 @@ reported (KnowledgeGraphDamaged), never silently replaced.
 """
 from __future__ import annotations
 
+import contextvars
 import csv
 import hashlib
 import io
@@ -75,8 +76,11 @@ STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
 ENTITY_TYPES = ("PERSON", "PART", "PROJECT", "DOCUMENT")
+#: INSPECTED (person -> part) comes only from the Ledger's columns and
+#: reader (council_core/kg_excel.py): who signed a part's readings. A model
+#: is never asked for it (kg_extract.SIGNATURES does not list it).
 PREDICATES = ("LEADS", "CONTACT_FOR", "WORKS_ON", "OWNS", "USES_PART",
-              "SUPERSEDES", "DOCUMENTED_IN")
+              "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED")
 STATUSES = ("seeded", "suggested", "accepted", "rejected")
 #: Inside one seed() transaction only: a derived link not yet re-supported by
 #: this run's evidence. Never committed (seed resolves or deletes every one).
@@ -249,6 +253,17 @@ DEFAULT_FIELD_RULES: Tuple[FieldRule, ...] = (
     FieldRule("Attendees", "PERSON", (("PROJECT", "WORKS_ON"),)),
 )
 
+#: Built-in readings, not rules the user ticks: what a Ledger's schema, or
+#: the Ledger's own reader, says a column holds (council_core/kg_excel.py).
+#: Bracketed labels can never be a label in a document, so no document's
+#: column is read by them by accident; they are never stored in field_rules.
+LEDGER_PART = FieldRule("[Ledger sample ID]", "PART")
+INSPECTOR = FieldRule("[inspector]", "PERSON",
+                      (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON")))
+SHEET_PART = FieldRule("[part named by its sheet]", "PART")
+BUILTIN_RULES: Dict[str, FieldRule] = {r.label: r for r in
+                                       (LEDGER_PART, INSPECTOR, SHEET_PART)}
+
 
 # ── normalisation and ids ────────────────────────────────────────────────
 _SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "phd", "pe", "md", "esq"}
@@ -327,15 +342,23 @@ def _file_hash(p: Path) -> str:
     return h.hexdigest()
 
 
+#: What a locator may say. A workbook adds the cell ('B7'), the cells a row's
+#: link rests on, the table's header row and a picture's anchor; a Ledger row
+#: adds its flaw ('item') and where the Ledger says the value came from
+#: ('from': 'nde.xlsx › Part 101!C4', or 'sources': the row's workbooks).
+_LOC_KEYS = ("sheet", "row", "column", "columns", "page", "line", "cell", "cells",
+             "header", "image", "item", "from", "sources")
+
+
 def _loc_json(loc: Dict[str, Any]) -> str:
-    keep = {k: loc[k] for k in ("sheet", "row", "column", "columns", "page", "line")
-            if loc.get(k) is not None}
+    keep = {k: loc[k] for k in _LOC_KEYS if loc.get(k) is not None}
     return json.dumps(keep, sort_keys=True, ensure_ascii=False)
 
 
 def locator_text(loc: Any) -> str:
     """A locator as a person reads it: 'sheet Projects, row 2 (Program Lead)',
-    'page 1, line 5', 'line 4'."""
+    'page 1, line 5', 'line 4', 'sheet Build, cell B4 (Freq (kHz))',
+    'row 5, Flaw # 1A (EC Pre [JB]) — from nde.xlsx › Part 101!C4'."""
     if isinstance(loc, str):
         try:
             loc = json.loads(loc)
@@ -343,18 +366,30 @@ def locator_text(loc: Any) -> str:
             return loc
     loc = loc or {}
     bits = []
+    # A workbook's free-text line: its "page" is the sheet, its "line" the row.
+    sheet_page = isinstance(loc.get("page"), str)
     if loc.get("sheet"):
         bits.append(f"sheet {loc['sheet']}")
     if loc.get("page"):
-        bits.append(f"page {loc['page']}")
+        bits.append(f"sheet {loc['page']}" if sheet_page else f"page {loc['page']}")
+    if loc.get("image"):
+        bits.append(f"picture at {loc['image']}")
     if loc.get("row"):
         bits.append(f"row {loc['row']}")
+    elif loc.get("cell"):
+        bits.append(f"cell {loc['cell']}")
+    if loc.get("item"):
+        bits.append(str(loc["item"]))
     if loc.get("line"):
-        bits.append(f"line {loc['line']}")
+        bits.append(f"row {loc['line']}" if sheet_page else f"line {loc['line']}")
     s = ", ".join(bits) or "whole document"
     cols = loc.get("columns") or ([loc["column"]] if loc.get("column") else [])
     if cols:
         s += f" ({', '.join(cols)})"
+    if loc.get("from"):
+        s += f" — from {loc['from']}"
+    elif loc.get("sources"):
+        s += f" — source workbook(s): {loc['sources']}"
     return s
 
 
@@ -365,23 +400,39 @@ class Value:
     raw: str
     locator: Dict[str, Any]
     snippet: str
+    #: Only the Ledger's reading says it (an 'Inspector' column, a part
+    #: named by its sheet, a picture read by OCR): its links stay suggested.
+    tentative: bool = False
 
 
 @dataclass
 class Record:
     path: str                    # relative to the scanned root
-    kind: str                    # row | record | document | skipped
+    kind: str                    # row | record | document | skipped |
+    #                              ledger (a parent-CSV row) | sheet (a sheet's
+    #                              labelled cells) | picture (a table read by
+    #                              OCR) | reading (see below)
     values: List[Value] = field(default_factory=list)
     #: kind 'skipped': a table row that could not be read (more cells than
     #: the header), reported in the run's coverage instead of vanishing.
     skipped_row: int = 0
+    #: kind 'reading', last in what read_records gives for a workbook or a
+    #: Ledger: the kg_excel.Reading (its text lines, labels, summary, notes),
+    #: so one read gives both. seed() takes it off; it is never a record.
+    reading: Any = None
 
 
-_TABULAR = {".csv", ".tsv", ".xlsx", ".xlsm", ".xls"}
+#: Tables read as rows: a CSV by its header; a workbook by the Ledger's
+#: reader (council_core/kg_excel.py), which also gives its text lines.
+_CSV = {".csv", ".tsv"}
+_WORKBOOK = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+_TABULAR = _CSV | _WORKBOOK
 _TEXT = {".txt", ".md", ".markdown", ".rst", ".log", ".pdf", ".docx",
          ".html", ".htm", ".xml", ".yaml", ".yml", ".ini", ".cfg"}
 _JSON = {".json"}
 SUPPORTED_SUFFIXES = _TABULAR | _TEXT | _JSON
+#: Kinds of record whose links rest on one row's cells.
+_ROW_KINDS = ("row", "picture", "ledger")
 
 
 def _rule_index(rules: Sequence[FieldRule]):
@@ -504,15 +555,38 @@ def missing_reader(p: Path) -> str:
     env has no openpyxl or pypdf)."""
     import importlib.util as iu
     suf = p.suffix.lower()
-    need = {".xlsx": "openpyxl", ".xlsm": "openpyxl", ".pdf": "pypdf",
-            ".xls": "xlrd"}.get(suf)
+    if suf in _WORKBOOK:
+        from council_core import kg_excel
+        return kg_excel.missing_reader(p)
+    need = {".pdf": "pypdf"}.get(suf)
     if need and iu.find_spec(need) is None:
         return f"needs the {need} package, which is not installed"
     return ""
 
 
+#: The image reader for the workbook being read, set by seed() for its own
+#: thread (a context variable: the Connections tab's rebuild worker and a
+#: label harvest on another thread never see each other's), so read_records
+#: keeps its three-argument call.
+_IMAGE_READER: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "kg_image_reader", default=None)
+
+
+def _image_reader_now():
+    return _IMAGE_READER.get()
+
+
 def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
+    """What a document says, as records. A workbook or a Ledger (a parent
+    CSV with its schema) is read by council_core/kg_excel.py, and its
+    Record(kind='reading') comes last: the text lines, labels and summary
+    of the same read."""
     suf = p.suffix.lower()
+    if suf in _WORKBOOK or (suf == ".csv" and _is_ledger(p)):
+        from council_core import kg_excel
+        reading = (kg_excel.read_workbook(p, rel, rules, _image_reader_now())
+                   if suf in _WORKBOOK else kg_excel.read_ledger(p, rel, rules))
+        return list(reading.records) + [Record(rel, "reading", reading=reading)]
     if suf in _TABULAR:
         return _table_records(p, rel, rules)
     if suf in _JSON:
@@ -520,31 +594,69 @@ def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     return _text_records(p, rel, rules)
 
 
+def _is_ledger(p: Path) -> bool:
+    from council_core import kg_excel
+    return kg_excel.is_ledger_csv(p)
+
+
+def _signed_initials(v: Value) -> bool:
+    """An inspector's bare initials ('JB'), not a written name."""
+    if v.rule.label != INSPECTOR.label:
+        return False
+    from council_core import kg_excel
+    return kg_excel.is_initials(v.raw)
+
+
+def _ledger_people(csv_path: Path) -> Dict[str, str]:
+    """The Ledger's people list beside a parent CSV: {'JB': 'Jordan Blake'}."""
+    try:
+        import source_extract
+        return source_extract.load_people(csv_path)
+    except Exception:
+        return {}
+
+
+def _excel_available() -> bool:
+    try:
+        import excel_open
+        return bool(excel_open.excel_available())
+    except Exception:
+        return False
+
+
 #: Part of every doc_cache signature. The reading code's own bytes are in the
 #: signature too (see _reader_sig), so this needs bumping only for a change
 #: elsewhere that alters what a document reads as.
-READER_VERSION = 1
+READER_VERSION = 2
+
+#: The modules whose code decides what a document reads as.
+_READER_MODULES = ("field_search", "vault_rag", "source_extract", "excel_open",
+                   "sample_ledger", "council_core.kg_excel")
 
 
-def _reader_sig(rules: Sequence[FieldRule]) -> str:
+def _reader_sig(rules: Sequence[FieldRule], *, image_reader: str = "",
+                excel: bool = False) -> str:
     """What a cached reading depends on besides the document's bytes: the
-    confirmed rules, the reading code (this module, field_search, vault_rag)
-    and the reader libraries' versions. Any change = read again: a cache
-    that outlived a parser fix would keep the old answers for good."""
+    confirmed rules, the reading code (this module, field_search, vault_rag
+    and the Ledger's readers), the reader libraries' versions, and what this
+    PC can read pictures and Excel-only workbooks with. Any change = read
+    again: a cache that outlived a parser fix would keep the old answers for
+    good, and a picture first seen without Tesseract would never be read."""
     import importlib.util as iu
     h = hashlib.sha256(f"reader {READER_VERSION}".encode("utf-8"))
     for r in sorted(rules, key=lambda r: r.label):
         h.update(r.to_json().encode("utf-8"))
-    for mod in ("field_search", "vault_rag"):
+    for mod in _READER_MODULES:
         try:
             spec = iu.find_spec(mod)
             h.update(Path(spec.origin).read_bytes() if spec and spec.origin else b"-")
         except Exception:
             h.update(b"?")
     h.update(Path(__file__).read_bytes())
+    h.update(f"images={image_reader}|excel={bool(excel)}".encode("utf-8"))
     try:
         from importlib import metadata as md
-        for lib in ("pandas", "openpyxl", "pypdf", "python-docx", "xlrd"):
+        for lib in ("pandas", "openpyxl", "pypdf", "python-docx", "xlrd", "pywin32"):
             try:
                 h.update(f"{lib}={md.version(lib)}".encode("utf-8"))
             except md.PackageNotFoundError:
@@ -554,10 +666,24 @@ def _reader_sig(rules: Sequence[FieldRule]) -> str:
     return h.hexdigest()
 
 
-def _records_json(records: Sequence[Record]) -> str:
-    return json.dumps([{"kind": r.kind, "skipped_row": r.skipped_row,
-                        "values": [[v.rule.label, v.raw, v.locator, v.snippet]
-                                   for v in r.values]} for r in records],
+def _values_json(r: Record) -> List[list]:
+    return [[v.rule.label, v.raw, v.locator, v.snippet] + ([1] if v.tentative else [])
+            for v in r.values]
+
+
+def _records_json(records: Sequence[Record], reading: Any = None,
+                  error: str = "") -> str:
+    """A document's records for doc_cache. A workbook or Ledger also keeps
+    its reading's labels, summary and notes (a dict, not a list), and a
+    workbook that can never be read keeps why (``error``)."""
+    recs = [{"kind": r.kind, "skipped_row": r.skipped_row, "values": _values_json(r)}
+            for r in records if r.kind != "reading"]
+    if reading is None and not error:
+        return json.dumps(recs, ensure_ascii=False)
+    return json.dumps({"v": 2, "records": recs, "error": error,
+                       "labels": list(getattr(reading, "labels", []) or []),
+                       "summary": dict(getattr(reading, "summary", {}) or {}),
+                       "notes": list(getattr(reading, "notes", []) or [])},
                       ensure_ascii=False)
 
 
@@ -565,15 +691,29 @@ def _records_load(text: str, rel: str, rules_by_label: Dict[str, FieldRule]
                   ) -> List[Record]:
     """Records from doc_cache. A label no confirmed rule has raises KeyError
     (the caller reads the document instead)."""
-    return [Record(rel, d["kind"], [Value(rules_by_label[lab], raw, loc, snip)
-                                    for lab, raw, loc, snip in d["values"]],
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = data.get("records", [])
+    return [Record(rel, d["kind"], [Value(rules_by_label[v[0]], v[1], v[2], v[3],
+                                          bool(v[4]) if len(v) > 4 else False)
+                                    for v in d["values"]],
                    skipped_row=int(d.get("skipped_row") or 0))
-            for d in json.loads(text)]
+            for d in data]
+
+
+def _reading_load(text: Optional[str]) -> Dict[str, Any]:
+    """The reading part of a cached workbook / Ledger ({} for others)."""
+    try:
+        data = json.loads(text or "[]")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
     """Every text line of a document as ``(page or None, line, text)`` —
-    for the gazetteer pass. Tables give one line per row ('row' = line)."""
+    for the gazetteer pass. A workbook's free text (notes cells, text
+    boxes, pictures) is ``(sheet name, row, text)``; a CSV has none."""
     import field_search as fs
     suf = p.suffix.lower()
     out: List[Tuple[Optional[int], int, str]] = []
@@ -582,6 +722,12 @@ def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
             for i, ln in enumerate(text.splitlines(), start=1):
                 out.append((pno, i, ln))
         return out
+    if suf in _WORKBOOK:
+        from council_core import kg_excel
+        try:
+            return list(kg_excel.read_workbook(p, "", [], _image_reader_now()).lines)
+        except Exception:
+            return []
     if suf in _TABULAR:
         return []          # tables are read by column, not by free text
     text = fs._read_text(p, max_chars=5_000_000)
@@ -600,12 +746,24 @@ class KnowledgeGraph:
     read (default ``<vault>/data_in``, the folder Collections are relative to);
     paths in the store are relative to it."""
 
-    def __init__(self, vault: Any, root: Any = None) -> None:
+    #: ``image_reader``: how pictures in workbooks are read. The default is
+    #: the Ledger's (source_extract.default_image_reader: Tesseract when it is
+    #: installed, else nothing - never a vision model). None reads none.
+    DEFAULT_IMAGE_READER = "default"
+
+    def __init__(self, vault: Any, root: Any = None,
+                 image_reader: Any = DEFAULT_IMAGE_READER) -> None:
         self.vault = Path(vault)
         self.root = Path(root) if root is not None else self.vault / "data_in"
         self.path = store_path(self.vault)
+        self._image_reader_arg = image_reader
         #: During seed(): the entities this run supports (see seed).
         self._live: Optional[set] = None
+        #: During seed(): each Ledger's people list (initials -> name), by
+        #: document id, and the initials asked about this run.
+        self._people: Dict[str, Dict[str, str]] = {}
+        self._people_all: Dict[str, str] = {}
+        self._asked: Dict[str, Dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             self._check_before_writing()
@@ -770,7 +928,14 @@ class KnowledgeGraph:
         for p in (files if files is not None else self.document_files()):
             suf = p.suffix.lower()
             try:
-                if suf in _TABULAR:
+                if suf in _WORKBOOK:
+                    # The labels the Ledger's reader found (headers on any
+                    # row, labelled cells, text boxes): from the last
+                    # rebuild's reading when it is current - re-reading
+                    # would start Excel for every .xls - else read now.
+                    for lab in self._workbook_labels(p):
+                        seen.setdefault(fs._norm_key(lab), lab)
+                elif suf in _TABULAR:
                     for _s, fr in fs._table_frames(p):
                         for c in fr.columns:
                             # A sentence in row 1 (a 'Read Me' sheet) is
@@ -796,6 +961,21 @@ class KnowledgeGraph:
                 continue
         return [v for k, v in seen.items() if k]
 
+    def _workbook_labels(self, p: Path) -> List[str]:
+        try:
+            rel = self._rel(p)
+        except ValueError:
+            rel = ""
+        row = self.db.execute(
+            "SELECT c.records, c.content_hash FROM doc_cache c JOIN documents d ON"
+            " d.id=c.document_id WHERE d.path=?", (rel,)).fetchone() if rel else None
+        if row is not None and row["content_hash"] == self._content_hash(p):
+            got = _reading_load(row["records"])
+            if "labels" in got:
+                return list(got["labels"])
+        from council_core import kg_excel
+        return list(kg_excel.read_workbook(p, rel, []).labels)
+
     # ── documents ──
     def document_files(self) -> List[Path]:
         """Supported files under ``root``, skipping dot-folders and the
@@ -806,6 +986,7 @@ class KnowledgeGraph:
             import conversation_logger as cl
         except Exception:
             cl = None
+        from council_core import kg_excel
         out = []
         for p in sorted(self.root.rglob("*")):
             if not p.is_file() or p.suffix.lower() not in SUPPORTED_SUFFIXES:
@@ -815,15 +996,37 @@ class KnowledgeGraph:
                 continue
             if cl is not None and cl.is_protected_path(p, self.vault):
                 continue
+            # Excel's '~$' lock files, the Ledger's own settings beside a
+            # parent CSV (its schema and aliases: the Ledger reads them, they
+            # say nothing about people or parts) and its review workbooks
+            # (values still WAITING for a person's decision - only the parent
+            # CSV holds accepted ones) are not documents.
+            if p.name.startswith("~$") or kg_excel.is_ledger_sidecar(p) \
+                    or kg_excel.is_review_workbook(p):
+                continue
             out.append(p)
         return out
 
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.root).as_posix()
 
+    @staticmethod
+    def _content_hash(p: Path) -> str:
+        """The file's sha256 - for a Ledger, of its CSV, its schema and its
+        review workbooks together: the same CSV reads differently under a
+        changed schema, and a newly saved review says where more values came
+        from."""
+        if p.suffix.lower() == ".csv":
+            from council_core import kg_excel
+            if kg_excel.is_ledger_csv(p):
+                h = hashlib.sha256(_file_hash(p).encode("ascii"))
+                h.update(kg_excel.ledger_fingerprint(p))
+                return h.hexdigest()
+        return _file_hash(p)
+
     def _document(self, p: Path, run_id: str) -> Tuple[str, str]:
         rel = self._rel(p)
-        h = _file_hash(p)
+        h = self._content_hash(p)
         st = p.stat()
         row = self.db.execute("SELECT id FROM documents WHERE path=?", (rel,)).fetchone()
         did = row["id"] if row else str(uuid.uuid4())
@@ -954,23 +1157,34 @@ class KnowledgeGraph:
         for 3,100 files in ONE transaction - stopped, it kept nothing. THE
         GRAPH: worked out from the cached readings in one transaction, as
         before - never half-built, and the same as a fresh build."""
+        from council_core import kg_excel
         run_id = str(uuid.uuid4())
         t0 = time.time()
         rules = [r for r, _s in self.field_rules("confirmed")]
         by_label = {r.label: r for r in rules}
-        sig = _reader_sig(rules)
+        by_label.update(BUILTIN_RULES)
+        reader = self._resolve_image_reader()
+        sig = _reader_sig(rules, image_reader=getattr(reader, "name", "image reader")
+                          if reader is not None else "", excel=_excel_available())
         files = self.document_files()
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
                                  "unreadable": [], "skipped_rows": [],
                                  "rules": len(rules), "documents_read": 0,
-                                 "documents_unchanged": 0}
+                                 "documents_unchanged": 0, "notes": [],
+                                 "ledgers": 0, "workbooks": 0, "pictures": 0,
+                                 "pictures_read": 0}
         with self.db:
             self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
                             (run_id, "seed", t0))
         # ── 1. reading (batched commits) ──
         seen_paths = set()
         readable: List[Tuple[Path, str, str]] = []
+        #: Workbooks that can never be read as they are (a password, not a
+        #: workbook at all): their cached reason is kept, so Excel is not
+        #: started for them again on every rebuild.
+        failed_keep: List[str] = []
         last, n_batch = time.time(), 0
+        token = _IMAGE_READER.set(reader)
         try:
             for n, p in enumerate(files):
                 if on_progress:
@@ -980,19 +1194,42 @@ class KnowledgeGraph:
                     did, h = self._document(p, run_id)
                     seen_paths.add(rel)
                     why = missing_reader(p)
+                    cached = None if why else self._cached(did, h, sig)
                     if why:
                         stats["unreadable"].append(f"{rel}: {why}")
                         self.db.execute("UPDATE documents SET status='unreadable'"
                                         " WHERE id=?", (did,))
-                    elif self._cached(did, h, sig) is not None:
-                        stats["documents_unchanged"] += 1
-                        readable.append((p, did, h))
+                    elif cached is not None:
+                        err = _reading_load(cached["records"]).get("error")
+                        if err:
+                            stats["unreadable"].append(f"{rel}: {err}")
+                            self.db.execute("UPDATE documents SET status='unreadable'"
+                                            " WHERE id=?", (did,))
+                            failed_keep.append(did)
+                        else:
+                            stats["documents_unchanged"] += 1
+                            readable.append((p, did, h))
                     else:
-                        recs = read_records(p, rel, rules)
-                        lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
+                        try:
+                            recs = read_records(p, rel, rules)
+                        except kg_excel.Unreadable as exc:
+                            if exc.permanent:
+                                self.db.execute(
+                                    "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
+                                    (did, h, sig, _records_json([], error=str(exc)), "[]",
+                                     time.time()))
+                                failed_keep.append(did)
+                            raise
+                        reading = next((r.reading for r in recs if r.kind == "reading"),
+                                       None)
+                        recs = [r for r in recs if r.kind != "reading"]
+                        if reading is not None:
+                            lines = list(reading.lines)
+                        else:
+                            lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
                         self.db.execute(
                             "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
-                            (did, h, sig, _records_json(recs),
+                            (did, h, sig, _records_json(recs, reading),
                              json.dumps(lines, ensure_ascii=False), time.time()))
                         stats["documents_read"] += 1
                         readable.append((p, did, h))
@@ -1002,8 +1239,10 @@ class KnowledgeGraph:
                     # with what it had - not 'missing'. It never reached
                     # seen_paths, so it was marked missing and its model links
                     # were deleted (review, 2026-10-07: locked once, its links
-                    # were gone for good).
-                    stats["unreadable"].append(f"{rel}: {exc.__class__.__name__}")
+                    # were gone for good). A workbook says why in words.
+                    stats["unreadable"].append(
+                        f"{rel}: {exc}" if isinstance(exc, kg_excel.Unreadable)
+                        else f"{rel}: {exc.__class__.__name__}")
                     seen_paths.add(rel)
                     self.db.execute("UPDATE documents SET status='unreadable' WHERE path=?",
                                     (rel,))
@@ -1015,6 +1254,8 @@ class KnowledgeGraph:
         except BaseException:
             self.db.rollback()          # the batch in progress; earlier ones stay
             raise
+        finally:
+            _IMAGE_READER.reset(token)
         # ── 2. the graph (one transaction) ──
         try:
             with self.db:
@@ -1038,6 +1279,8 @@ class KnowledgeGraph:
                     " UNION SELECT subject_id FROM relations WHERE status='accepted'"
                     " UNION SELECT object_id FROM relations WHERE status='accepted'")}
                 records: List[Tuple[Record, str, str]] = []
+                self._people, self._people_all, self._asked = {}, {}, {}
+                clash: set = set()
                 for p, did, h in readable:
                     row = self._cached(did, h, sig)
                     try:
@@ -1047,11 +1290,32 @@ class KnowledgeGraph:
                         recs = None
                     if recs is None:            # not expected: read it after all
                         try:
-                            recs = read_records(p, self._rel(p), rules)
+                            token = _IMAGE_READER.set(reader)
+                            try:
+                                recs = [r for r in read_records(p, self._rel(p), rules)
+                                        if r.kind != "reading"]
+                            finally:
+                                _IMAGE_READER.reset(token)
                         except Exception as exc:
                             stats["unreadable"].append(
                                 f"{self._rel(p)}: {exc.__class__.__name__}")
                             continue
+                    reading = _reading_load(row["records"] if row is not None else None)
+                    summary = reading.get("summary") or {}
+                    for note in reading.get("notes") or []:
+                        if len(stats["notes"]) < 200:
+                            stats["notes"].append(f"{self._rel(p)}: {note}")
+                    if summary.get("kind") == "ledger":
+                        stats["ledgers"] += 1
+                        # Its people list: 'JB' is Jordan Blake in THIS ledger.
+                        self._people[did] = _ledger_people(p)
+                        for k, name in self._people[did].items():
+                            if self._people_all.setdefault(k, name) != name:
+                                clash.add(k)
+                    elif summary.get("kind") == "workbook":
+                        stats["workbooks"] += 1
+                        stats["pictures"] += int(summary.get("pictures") or 0)
+                        stats["pictures_read"] += int(summary.get("pictures_read") or 0)
                     for rec in recs:
                         if rec.kind == "skipped":
                             stats["skipped_rows"].append(
@@ -1059,6 +1323,10 @@ class KnowledgeGraph:
                                 "than the header")
                             continue
                         records.append((rec, did, h))
+                # Initials two Ledgers give to different people are nobody's
+                # outside those Ledgers: asked, not picked.
+                for k in clash:
+                    self._people_all.pop(k, None)
                 # Gone since the last run: kept (decisions may cite them), marked.
                 for r in self.db.execute("SELECT id, path FROM documents").fetchall():
                     if r["path"] not in seen_paths:
@@ -1066,7 +1334,7 @@ class KnowledgeGraph:
                                         (r["id"],))
                 # The cache holds a document's text: none is kept for a file
                 # that was deleted or can no longer be read.
-                keep = [did for _p, did, _h in readable]
+                keep = [did for _p, did, _h in readable] + failed_keep
                 self.db.execute("CREATE TEMP TABLE IF NOT EXISTS _kg_keep (id TEXT PRIMARY KEY)")
                 self.db.execute("DELETE FROM _kg_keep")
                 self.db.executemany("INSERT OR IGNORE INTO _kg_keep VALUES (?)",
@@ -1096,6 +1364,7 @@ class KnowledgeGraph:
                     "DELETE FROM extraction_docs WHERE document_id NOT IN"
                     " (SELECT id FROM documents WHERE status != 'missing')")
                 self._seed_records(records, run_id)
+                self._finish_initials()
                 if use_collections:
                     stats["collections"] = self._seed_collections(run_id)
                 if gazetteer:
@@ -1128,8 +1397,19 @@ class KnowledgeGraph:
                                 (time.time(), json.dumps(stats), run_id))
         finally:
             self._live = None
+            self._people, self._people_all, self._asked = {}, {}, {}
         stats["seconds"] = round(time.time() - t0, 3)
         return stats
+
+    def _resolve_image_reader(self):
+        arg = self._image_reader_arg
+        if arg != self.DEFAULT_IMAGE_READER:
+            return arg
+        try:
+            import source_extract
+            return source_extract.default_image_reader()
+        except Exception:
+            return None
 
     def _seed_records(self, records, run_id: str) -> None:
         # 1. Aliases first: 'Project Name' beside 'Project ID' ties the name
@@ -1152,11 +1432,14 @@ class KnowledgeGraph:
             return self._entity(etype, raw, alias_source=source)
 
         # 2. Full person names before initials, so 'M. Oyelaran' can find
-        #    Marcus Oyelaran no matter which file was read first.
+        #    Marcus Oyelaran no matter which file was read first. An
+        #    inspector's bare initials ('JB') are not a name: they are
+        #    resolved (or asked about) in _person.
         persons_full: Dict[str, str] = {}
         for rec, _d, _h in records:
             for v in rec.values:
-                if v.rule.type == "PERSON" and not is_initial_form(person_key(v.raw)):
+                if v.rule.type == "PERSON" and not is_initial_form(person_key(v.raw)) \
+                        and not _signed_initials(v):
                     persons_full[person_key(v.raw)] = self._entity("PERSON", v.raw)
 
         for rec, did, h in records:
@@ -1176,7 +1459,10 @@ class KnowledgeGraph:
         """(entity id or None, inferred). An initial form that fits exactly
         one known person is linked to them but flagged as inferred (its links
         stay suggested and a review asks the user); one that fits several is
-        left unlinked with a review."""
+        left unlinked with a review. An inspector's bare initials ('JB') go
+        to _initials_person: never guessed."""
+        if _signed_initials(v):
+            return self._initials_person(v, did, run_id), False
         key = person_key(v.raw)
         if not is_initial_form(key):
             return self._entity("PERSON", v.raw), False
@@ -1196,6 +1482,88 @@ class KnowledgeGraph:
             self._review("ambiguous_name", v.raw, cands, did, v.locator, v.snippet, run_id)
             return None, False
         return self._entity("PERSON", v.raw), False
+
+    def _initials_person(self, v: Value, did: str, run_id: str) -> Optional[str]:
+        """Who signed with these initials, or None (then asked once).
+
+        In order: the user's answer (for this document, else everywhere -
+        "a different person" keeps 'JB' as a person of its own); the Ledger's
+        people list (this Ledger's own for its rows; for a workbook, the list
+        every Ledger in the vault agrees on); a name the user confirmed. Not
+        found = no person and no link, and ONE question for these initials
+        however many rows they signed: never a guess, not even when exactly
+        one known person has those initials (they are offered as answers)."""
+        from council_core import kg_excel
+        surface = kg_excel.initials_key(v.raw)
+        dec = self.decided_name(surface, did)
+        if dec is not None:
+            return self.resolve(dec) if dec else self._entity("PERSON", surface)
+        people = self._people.get(did)
+        name = (people if people is not None else self._people_all).get(surface)
+        if name:
+            eid = self._entity("PERSON", name)
+            self._alias(eid, surface, "ledger")
+            return eid
+        confirmed = self._confirmed_alias(surface)
+        if confirmed:
+            return confirmed
+        self._ask_initials(surface, did, v, run_id)
+        return None
+
+    def _ask_initials(self, surface: str, did: str, v: Value, run_id: str) -> None:
+        q = self._asked.get(surface)
+        if q is None:
+            self._review("initials", surface, [], did, v.locator, v.snippet, run_id)
+            row = self.db.execute("SELECT id FROM review WHERE kind='initials' AND surface=?"
+                                  " AND document_id IS ? AND locator=?",
+                                  (surface, did, _loc_json(v.locator))).fetchone()
+            if row is not None:
+                # Answered here once, but that answer no longer stands (its
+                # person is gone): the question is open again, not hidden.
+                self.db.execute("UPDATE review SET status='open', run_id=? WHERE id=?",
+                                (run_id, row["id"]))
+            q = self._asked[surface] = {"id": row["id"] if row else None, "n": 0,
+                                        "docs": set(), "first": locator_text(v.locator)}
+        q["n"] += 1
+        q["docs"].add(did)
+
+    def _finish_initials(self) -> None:
+        """Each initials question, once every record is read: the people
+        whose initials these are (to choose from, never chosen), and how
+        often the initials were seen."""
+        if not self._asked:
+            return
+        people = []
+        for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"
+                                 " AND merged_into IS NULL"):
+            if self._live is not None and r["id"] not in self._live:
+                continue
+            toks = r["key"].split()
+            if len(toks) >= 2:
+                people.append((r["id"], "".join(t[0] for t in toks), toks[0][0] + toks[-1][0]))
+        for surface, q in self._asked.items():
+            if q["id"] is None:
+                continue
+            want = surface.lower()
+            cands = sorted({self.resolve(eid) for eid, every, ends in people
+                            if want in (every, ends)})
+            n_docs = len(q["docs"])
+            snippet = (f"'{surface}' signed {q['n']} value(s) in {n_docs} "
+                       f"document{'s' if n_docs != 1 else ''}; first at {q['first']}")
+            self.db.execute("UPDATE review SET candidates=?, snippet=? WHERE id=?"
+                            " AND status='open'", (json.dumps(cands), snippet, q["id"]))
+
+    def add_person(self, name: str) -> str:
+        """A person the user named ('JB is Jordan Blake', someone no document
+        names in full). Kept across rebuilds (a name of the user's own), so a
+        name answer can point at them."""
+        name = " ".join(str(name or "").split())
+        if not person_key(name):
+            raise ValueError("a person needs a name")
+        with self.db:
+            eid = self._entity("PERSON", name, alias_source="user")
+            self._decide("add_person", {"entity_id": eid, "name": name})
+        return eid
 
     def _confirmed_alias(self, surface: str) -> Optional[str]:
         """The entity the user said ``surface`` means, if they did."""
@@ -1253,9 +1621,10 @@ class KnowledgeGraph:
                 main.setdefault(v.rule.type, []).append((v, eid))
         method = rec.kind
         # Whole-document co-occurrence is only firm when the document is
-        # about one project; otherwise the user decides.
+        # about one project; otherwise the user decides. A Ledger row is a
+        # table row the user accepted.
         n_proj = len({e for _v, e in main.get("PROJECT", [])})
-        firm = rec.kind in ("row", "record") or n_proj <= 1
+        firm = rec.kind in ("row", "record", "ledger") or n_proj <= 1
         status = "seeded" if firm else "suggested"
 
         def rel(s, pred, o, v_s: Value, v_o: Value, at: Value):
@@ -1263,14 +1632,27 @@ class KnowledgeGraph:
             # the 'Supersedes' field, the part's field), so the citation
             # points at the line that says it.
             loc = at.locator
-            if rec.kind == "row":
+            if rec.kind in _ROW_KINDS:
                 # The row, and the two cells the link rests on.
                 loc = {k: v_s.locator.get(k) for k in ("sheet", "row")}
                 loc["columns"] = list(dict.fromkeys(
-                    [v_s.locator.get("column"), v_o.locator.get("column")]))
+                    c for v in (v_s, v_o)
+                    for c in (v.locator.get("columns") or [v.locator.get("column")]) if c))
+                # A workbook's cells and header row, a picture, a Ledger
+                # row's flaw and where its values came from.
+                cells = [v.locator["cell"] for v in (v_s, v_o) if v.locator.get("cell")]
+                if cells:
+                    loc["cells"] = list(dict.fromkeys(cells))
+                for k in ("header", "image", "item"):
+                    loc[k] = v_s.locator.get(k) or v_o.locator.get(k)
+                for k in ("from", "sources"):
+                    got = [v.locator[k] for v in (v_s, v_o) if v.locator.get(k)]
+                    if got:
+                        loc[k] = "; ".join(dict.fromkeys(got))
             quote = v_s.snippet if v_s.snippet == v_o.snippet else \
                 f"{v_s.snippet} | {v_o.snippet}"
-            st = "suggested" if (s in inferred_ids or o in inferred_ids) else status
+            st = "suggested" if (s in inferred_ids or o in inferred_ids
+                                 or v_s.tentative or v_o.tentative) else status
             self._relate(s, pred, o, st, doc_id=did, content_hash=h,
                          locator=loc, quote=quote, method=method, run_id=run_id)
 
@@ -1377,7 +1759,9 @@ class KnowledgeGraph:
                     self.resolve(r["id"]))
         n = 0
         for p in files:
-            if p.suffix.lower() in _TABULAR:
+            # A CSV is read by column. A workbook's free text (notes cells,
+            # text boxes, pictures) is searched like any document's lines.
+            if p.suffix.lower() in _CSV:
                 continue
             # Not a file this install cannot read (no pypdf): it has no
             # lines to search, and reading it again only to find that out
@@ -1690,12 +2074,13 @@ class KnowledgeGraph:
 
     # ── free-text extraction (KG2) ──
     def _text_documents(self) -> List[sqlite3.Row]:
-        """The readable documents whose free text may hold links (tables and
-        JSON give theirs through labelled fields)."""
+        """The readable documents whose free text may hold links (CSV tables
+        and JSON give theirs through labelled fields; a workbook's notes,
+        text boxes and pictures are free text)."""
         return [d for d in self.db.execute(
                     "SELECT id, path, content_hash FROM documents WHERE status='ok'"
                     " ORDER BY path").fetchall()
-                if Path(d["path"]).suffix.lower() not in _TABULAR | _JSON]
+                if Path(d["path"]).suffix.lower() not in _CSV | _JSON]
 
     def _doc_lines(self, d) -> Optional[List[Tuple[Optional[int], int, str]]]:
         try:
@@ -1754,6 +2139,10 @@ class KnowledgeGraph:
                     out.append({"document_id": d["id"], "path": d["path"],
                                 "content_hash": d["content_hash"], "chunk": n,
                                 "page": page, "first_line": window[0][0],
+                                # A workbook's text lines are rows that need
+                                # not be next to each other (row 3, then 9):
+                                # the passage's Nth line is row line_nos[N-1].
+                                "line_nos": [ln for ln, _t in window],
                                 "text": wtext,
                                 # the chunk's own entities first
                                 "entities": (sorted(ents) + sorted(doc_ents - ents))[:60]})
@@ -1938,7 +2327,9 @@ class KnowledgeGraph:
                 continue
             with self.db:
                 for link in res.links:
-                    line = (c["first_line"] + (link.line or 1) - 1)
+                    nos = c.get("line_nos") or []
+                    k = (link.line or 1) - 1
+                    line = nos[k] if 0 <= k < len(nos) else (c["first_line"] + k)
                     loc = {"line": line}
                     if c["page"] is not None:
                         loc["page"] = c["page"]
@@ -2016,42 +2407,97 @@ class KnowledgeGraph:
         ranked = sorted(best.values(), key=lambda x: (x[0], x[1]["name"].lower()))
         return [d for _s, d in ranked[:limit]]
 
-    def neighbors(self, eid: str, *, include_rejected: bool = False
-                  ) -> List[Dict[str, Any]]:
+    def neighbors(self, eid: str, *, include_rejected: bool = False,
+                  evidence_limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Every relation touching ``eid``, each with its evidence: what a
-        person needs to see WHY two things are linked."""
+        person needs to see WHY two things are linked. ``evidence_limit``
+        keeps the first N pieces of each (``evidence_total`` is the count):
+        an inspector who signed 30 flaws on 3,000 parts has 90,000, and the
+        Connections tab drew every one on the GUI thread."""
         eid = self.resolve(eid)
         q = ("SELECT * FROM relations WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
         out = []
-        for r in self.db.execute(q + " ORDER BY predicate", (eid, eid)):
+        for r in self.db.execute(q + " ORDER BY predicate", (eid, eid)).fetchall():
             other = r["object_id"] if r["subject_id"] == eid else r["subject_id"]
+            ev = self.evidence(r["id"], limit=evidence_limit)
+            total = len(ev) if evidence_limit is None or len(ev) < evidence_limit else \
+                self.db.execute("SELECT COUNT(*) FROM evidence WHERE relation_id=?",
+                                (r["id"],)).fetchone()[0]
             out.append({"relation_id": r["id"], "predicate": r["predicate"],
                         "direction": "out" if r["subject_id"] == eid else "in",
                         "status": r["status"], "other": self.entity(other),
-                        "evidence": self.evidence(r["id"])})
+                        "evidence": ev, "evidence_total": total})
         return out
 
-    def evidence(self, rid: str) -> List[Dict[str, Any]]:
+    def evidence(self, rid: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        q = ("SELECT ev.*, d.path, d.content_hash AS doc_hash FROM evidence ev"
+             " JOIN documents d ON d.id=ev.document_id WHERE ev.relation_id=?"
+             " ORDER BY d.path, ev.locator")
+        args: tuple = (rid,)
+        if limit is not None:
+            q += " LIMIT ?"
+            args += (int(limit),)
         return [{"path": e["path"], "document_id": e["document_id"],
                  "locator": json.loads(e["locator"]),
                  "where": locator_text(e["locator"]), "quote": e["quote"],
                  "method": e["method"], "model": e["model"],
                  "stale": e["content_hash"] != e["doc_hash"]}
-                for e in self.db.execute(
-                    "SELECT ev.*, d.path, d.content_hash AS doc_hash FROM evidence ev"
-                    " JOIN documents d ON d.id=ev.document_id WHERE ev.relation_id=?"
-                    " ORDER BY d.path, ev.locator", (rid,))]
+                for e in self.db.execute(q, args)]
 
-    def mentions(self, eid: str) -> List[Dict[str, Any]]:
+    def mentions(self, eid: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        q = ("SELECT m.*, d.path FROM mentions m JOIN documents d ON"
+             " d.id=m.document_id WHERE m.entity_id=? ORDER BY d.path, m.locator")
+        args: tuple = (self.resolve(eid),)
+        if limit is not None:
+            q += " LIMIT ?"
+            args += (int(limit),)
         return [{"path": m["path"], "where": locator_text(m["locator"]),
                  "locator": json.loads(m["locator"]), "surface": m["surface"],
                  "snippet": m["snippet"], "method": m["method"]}
-                for m in self.db.execute(
-                    "SELECT m.*, d.path FROM mentions m JOIN documents d ON"
-                    " d.id=m.document_id WHERE m.entity_id=? ORDER BY d.path, m.locator",
-                    (self.resolve(eid),))]
+                for m in self.db.execute(q, args)]
+
+    def mention_count(self, eid: str) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM mentions WHERE entity_id=?",
+                               (self.resolve(eid),)).fetchone()[0]
+
+    def sources(self) -> List[Dict[str, Any]]:
+        """The spreadsheets the graph read, in plain words: each Ledger
+        (parent CSV) and workbook with what reading it gave, and the ones it
+        could not read with why - for the Connections tab's Sources list."""
+        from council_core import kg_excel
+        last = self.db.execute("SELECT stats FROM runs WHERE kind='seed' AND finished_ts"
+                               " IS NOT NULL ORDER BY finished_ts DESC LIMIT 1").fetchone()
+        st = json.loads(last["stats"]) if last and last["stats"] else {}
+        why = {}
+        for u in st.get("unreadable", []):
+            path, _sep, reason = u.partition(": ")
+            why[path] = reason
+        notes: Dict[str, List[str]] = {}
+        for n in st.get("notes", []):
+            path, _sep, note = n.partition(": ")
+            notes.setdefault(path, []).append(note)
+        out = []
+        for d in self.db.execute(
+                "SELECT d.id, d.path, d.status, c.records FROM documents d LEFT JOIN"
+                " doc_cache c ON c.document_id=d.id WHERE d.status != 'missing'"
+                " ORDER BY d.path").fetchall():
+            suf = Path(d["path"]).suffix.lower()
+            reading = _reading_load(d["records"])
+            summary = reading.get("summary") or {}
+            if suf not in _WORKBOOK and summary.get("kind") != "ledger" and not (
+                    suf == ".csv" and kg_excel.is_ledger_csv(self.root / d["path"])):
+                continue
+            kind = summary.get("kind") or ("workbook" if suf in _WORKBOOK else "ledger")
+            if d["status"] != "ok":
+                text = f"Not read: {why.get(d['path']) or reading.get('error') or 'unreadable'}"
+            else:
+                text = kg_excel.describe(summary)
+            out.append({"path": d["path"], "kind": kind, "status": d["status"],
+                        "summary": summary, "text": text,
+                        "notes": notes.get(d["path"], reading.get("notes") or [])})
+        return out
 
     def reviews(self, status: str = "open") -> List[Dict[str, Any]]:
         out = []
@@ -2079,6 +2525,10 @@ class KnowledgeGraph:
                 "with_mentions": with_mention,
                 "unreadable": st.get("unreadable", []),
                 "skipped_rows": st.get("skipped_rows", []),
+                "notes": st.get("notes", []),
+                "ledgers": st.get("ledgers", 0), "workbooks": st.get("workbooks", 0),
+                "pictures": st.get("pictures", 0),
+                "pictures_read": st.get("pictures_read", 0),
                 "last_run": last["finished_ts"] if last else None}
 
     def all_relations(self, include_rejected: bool = False) -> List[Dict[str, Any]]:
@@ -2142,8 +2592,8 @@ class KnowledgeGraph:
         return pj, pc
 
 
-def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
-                   ) -> List[Tuple[str, str, bool]]:
+def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3,
+                   quote: str = "") -> List[Tuple[str, str, bool]]:
     """The part of a document a citation points at, for an in-app preview:
     ``[(gutter label, text, is_the_cited_line)]``.
 
@@ -2160,6 +2610,15 @@ def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
             locator = {}
     locator = locator or {}
     p = Path(root) / rel_path
+    if p.suffix.lower() in _WORKBOOK:
+        # The Ledger's reader's places (sheet, cell, header row, a text box,
+        # a picture), read back with openpyxl - never through Excel, which
+        # the preview does not start (it runs when evidence is clicked).
+        from council_core import kg_excel
+        try:
+            return kg_excel.preview(p, locator, quote)
+        except Exception:
+            return []
     try:
         if p.suffix.lower() in _TABULAR and locator.get("row"):
             for sheet, frame in fs._table_frames(p):
@@ -2178,6 +2637,11 @@ def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
                     if val is None or (isinstance(val, float) and val != val):
                         val = ""
                     out.append((str(col), str(val), str(col) in marked))
+                # A Ledger row: where the Ledger says its values came from.
+                if locator.get("from"):
+                    out.append(("from", str(locator["from"]), False))
+                elif locator.get("sources"):
+                    out.append(("sources", str(locator["sources"]), False))
                 return out
             return []
         if p.suffix.lower() == ".pdf":
