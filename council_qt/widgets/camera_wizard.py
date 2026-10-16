@@ -45,9 +45,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
-                               QPushButton, QRadioButton, QTextBrowser,
-                               QVBoxLayout, QWidget, QWizard, QWizardPage)
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFrame, QHBoxLayout,
+                               QLabel, QPushButton, QRadioButton, QScrollArea,
+                               QTextBrowser, QVBoxLayout, QWidget, QWizard,
+                               QWizardPage)
 
 from council_core import camera_setup as cs
 
@@ -412,6 +413,26 @@ class FamiliesPage(QWizardPage):
         return bool(self.chosen())
 
 
+def _scrolled(widget: QWidget) -> QScrollArea:
+    """`widget` in a scroll area that looks like none: no frame, the page's
+    own background, scrolling only up and down."""
+    holder = widget
+    if isinstance(widget, QLabel):
+        holder = QWidget()
+        inner = QVBoxLayout(holder)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.addWidget(widget)
+        inner.addStretch(1)
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(holder)
+    area.viewport().setAutoFillBackground(False)
+    holder.setAutoFillBackground(False)
+    return area
+
+
 class FamiliesInstallPage(InstallPage):
     """Page 2: the install steps of every family ticked — rebuilt on every
     visit. One family reads exactly as the single-choice wizard's page;
@@ -421,8 +442,18 @@ class FamiliesInstallPage(InstallPage):
 
     def __init__(self, python: str):
         super().__init__(python)
+        layout = self.layout()
+        # THE STEPS SCROLL. Two families' steps are longer than the page:
+        # drawn at the wizard's size, a Basler's and an EVK4's left the
+        # EVK4's driver commands below the bottom edge, out of reach.
+        layout.removeWidget(self.steps)
+        last = layout.itemAt(layout.count() - 1)
+        if last is not None and last.spacerItem() is not None:
+            layout.takeAt(layout.count() - 1)
+        self.steps_area = _scrolled(self.steps)
+        layout.insertWidget(0, self.steps_area, 1)
         self._family_row = QHBoxLayout()
-        self.layout().insertLayout(2, self._family_row)
+        layout.insertLayout(2, self._family_row)
         self.copy_buttons: Dict[str, QPushButton] = {}
         self._family_commands: Dict[str, List[str]] = {}
 
@@ -491,11 +522,19 @@ class FamiliesCheckPage(QWizardPage):
         self.results.setTextFormat(Qt.TextFormat.RichText)
         self.results.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.results)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.summary)
+        # Several families' checks, each with its fix, can be longer than
+        # the room left beside a scan: they scroll rather than be cut off.
+        holder = QWidget()
+        inner = QVBoxLayout(holder)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.addWidget(self.results)
+        inner.addWidget(self.summary)
+        inner.addStretch(1)
+        self.results_area = _scrolled(holder)
+        layout.addWidget(self.results_area, 1)
         self._row = QHBoxLayout()
         self.again_btn = QPushButton("Check again")
         self.again_btn.clicked.connect(self.run_check)

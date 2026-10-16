@@ -478,6 +478,31 @@ def test_several_families_each_get_their_steps_and_a_copy_button(qapp):
         f'"{PYTHON}" -m pip install pypylon'
 
 
+def test_every_step_of_several_families_can_be_scrolled_to(qapp):
+    """Drawn at the wizard's size, a Basler's and an EVK4's steps are longer
+    than the page: before they scrolled, the EVK4's driver commands were
+    below the bottom edge and out of reach (seen in an offscreen render)."""
+    if qapp.platformName() != "offscreen":
+        pytest.skip("drawn only on the offscreen platform, never on a screen")
+    w = families_wizard(qapp, "basler", "prophesee")
+    w.resize(760, 640)
+    w.show()                       # offscreen: drawn in memory only
+    try:
+        w.next()
+        for _ in range(20):
+            QApplication.processEvents()
+            time.sleep(0.01)
+        area = w.install.steps_area
+        bar = area.verticalScrollBar()
+        assert "wdi-simple" in w.install.steps.text()
+        assert bar.maximum() > 0, "longer than the page, so it scrolls"
+        assert w.install.steps.height() <= \
+            area.viewport().height() + bar.maximum(), "every line reachable"
+    finally:
+        w.hide()
+        w.deleteLater()
+
+
 def test_going_back_and_unticking_replaces_the_steps(qapp):
     w = families_wizard(qapp, "basler", "prophesee")
     w.next()

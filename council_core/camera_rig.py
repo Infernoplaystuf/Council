@@ -40,8 +40,8 @@ nothing reads (a plain object would have accepted it).
 THE PLUGIN HOST (stage P1 row 2)
 `rig.plugins` is the rig's plugin host (council_core.plugin_host), made on
 first use; each slot's `plugin_state` is a plugin's per-camera state.
-Nothing in frame_camera calls the host yet: no plugin is wired to a feature
-before stage P2.
+Today's Typhon never makes it. A "Typhon (plugins)" project (stage P2 rows
+3 and 4) scans, opens and sets up its cameras through it.
 
 CAPABILITIES (stage P2 row 1)
 A slot answers what its camera can do (`capabilities`: frames or events,
@@ -49,6 +49,12 @@ restartable, ...; council_core.camera_capabilities): what the camera plugin
 that opened it confirmed (`confirm`, the host's open_camera), else what the
 camera says of itself. frame_camera asks it where it once asked "is it an
 event camera?".
+
+NAMES (stage P2 row 3)
+A slot is called by its camera's name in the rig (cam1, cam2, ...; kept in
+camera_rig.json by council_core.camera_rig_file): `rename_slot` gives it
+that name when the camera connects, and `holding` says which slot has a
+camera open ("in use as cam2" in the scan).
 
 NOT YET (later rows of M1 / P1)
 frame_camera still locks with its one module-level `_LOCK`; each slot has a
