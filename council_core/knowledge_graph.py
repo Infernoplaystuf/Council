@@ -52,6 +52,18 @@ only share a document are seeded when the document names one project and
 suggested when it names several. Everything is cited: no fact without a file
 and a place in it.
 
+Spreadsheets (council_core/kg_excel.py, with the Ledger's own readers): a
+Ledger's parent CSV gives firm links by its schema's column roles (who
+INSPECTED which part, and the project when a confirmed rule names its
+column), cited at the CSV row and the source cell the Ledger's review kept;
+a workbook is read sheet by sheet (headers on any row, several tables,
+labelled cells, text boxes, charts, pictures through Tesseract, Excel-only
+files through Excel), and what only the Ledger's reading says stays
+suggested. An inspector's initials are resolved through the Ledger's people
+list, the user's answers and confirmed names - never guessed; others are
+asked once. Folders outside the vault may be added (add_root): only read,
+their documents stored as '<root id>/path'.
+
 No pickle. Writes are SQLite transactions (atomic). A damaged store is
 reported (KnowledgeGraphDamaged), never silently replaced.
 """

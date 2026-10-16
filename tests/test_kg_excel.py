@@ -1061,3 +1061,10 @@ def test_suggesting_links_prints_its_progress(tmp_path, monkeypatch):
     assert any(ln.startswith("[kg suggest links (stand-in)] asking the model: 1/1 passages"
                              " (100%) · memo.txt read by this PC") for ln in lines)
     assert lines[-1].endswith("1 of 1 passages read, 0 link(s) suggested")
+
+
+def test_the_readers_are_toolkit_free_and_offline():
+    src = (Path(__file__).resolve().parent.parent / "council_core" / "kg_excel.py").read_text(
+        encoding="utf-8")
+    for word in ("tkinter", "PySide6", "PyQt5", "urllib", "requests", "socket", "http"):
+        assert word not in src, word

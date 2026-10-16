@@ -164,6 +164,10 @@ class Progress:
     def _beat(self) -> None:
         while not self._stop.wait(min(1.0, max(0.02, self.heartbeat / 4))):
             with self._lock:
+                # the run may have ended while this thread waited for the lock:
+                # never a "still working" line after "done" (found in review)
+                if self._stop.is_set():
+                    return
                 now = time.monotonic()
                 quiet = now - self.last_activity
                 if quiet >= self.heartbeat and now - self.last_beat >= self.heartbeat:

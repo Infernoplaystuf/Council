@@ -306,3 +306,12 @@ round; SUPERSEDES by revision letters; quote must be in the text.
 8506f88 / 925b467 / 92699e0 found and changed, the user's decisions a-g of 2026-10-07
 (Pi setup and faster rebuilds), and what is still open. **Merge `origin/qt-migration`
 into `knowledge-graph` after the laptop pushes, before working on those files again.**
+
+## 10. Excel, Ledgers and outside folders (2026-10-16) — read before continuing
+
+`docs/handoff/kg_excel_2026-10-16.md`: the graph now reads the Ledger tab's parent CSVs
+and any workbook through the Ledger's readers, resolves inspector initials through the
+Ledger's people list (asking about unknown ones once), reads folders outside the vault
+the user adds, and prints its progress in the terminal. It changed `knowledge_graph.py`,
+the Connections tab and three small seams in `source_extract.py`; the store schema is
+still v3. Merge `origin/qt-migration` first.
