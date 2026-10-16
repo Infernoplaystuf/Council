@@ -440,10 +440,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     typ = int(sh.Type)
                 except Exception:
                     continue
-                try:
-                    anchor = str(sh.TopLeftCell.Address(False, False))
-                except Exception:
-                    anchor = "?"
+                anchor = _cell_of(sh)
                 has_chart = False
                 try:
                     has_chart = bool(sh.HasChart)
@@ -509,6 +506,27 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             _clip_restore(clip)
         if com is not None:
             com.CoUninitialize()
+
+
+def _cell_of(shape) -> str:
+    """The cell under a shape's top-left corner, as 'D5'.
+
+    Range.Address is a property WITH arguments: from Python it is
+    GetAddress(False, False); Address(False, False) calls the string '$D$5'
+    and fails (measured on a user's workbook: every picture was at '?', and
+    '?' in the saved picture's file name stopped the whole extraction)."""
+    try:
+        tl = shape.TopLeftCell
+    except Exception:
+        return "unknown"
+    try:
+        return str(tl.GetAddress(False, False))
+    except Exception:
+        pass
+    try:
+        return str(tl.Address).replace("$", "")
+    except Exception:
+        return "unknown"
 
 
 def _watchdog(app, timeout: float, stopped: list):
