@@ -31,7 +31,9 @@ rewrites, and the two most expensive to lose.
 gives an EXISTING project the example's current layout instead, keeping its
 app.py and handlers.py (the old project.gspec is backed up beside the new
 one) and generating it — what the GUI Designer's "Update from example…" does.
-Nothing is deleted.
+Nothing is deleted. An update finishes or changes nothing: when code you
+edited still uses a widget the example removes, the project is left as it
+was and that code is named; Ctrl+C while it writes puts every file back.
 """
 from __future__ import annotations
 
@@ -116,9 +118,20 @@ def update(name: str, *, project: str = "", vault_dir=None,
             f"there is no project {project!r} to update at\n  {pdir}\n"
             f"Build it first (the same command without --update), or name "
             f"the one to update with --project NAME.")
-    res = dx.update_from_example(project, name, vault_dir)
+    try:
+        res = dx.update_from_example(project, name, vault_dir)
+    except KeyboardInterrupt as stopped:
+        # Ctrl+C while it wrote: every file was put back first; say so, then
+        # stop as Ctrl+C does.
+        said = getattr(stopped, "example_update", None)
+        for line in (said.lines if said is not None else []):
+            print(line)
+        raise
     for line in res.lines:
         print(line)
+    if res.blocked:
+        raise SystemExit(f"{project!r} was not updated — nothing in it was "
+                         f"changed; see above.")
     if not res.ok:
         raise SystemExit(f"{project!r} was not updated and generated — see "
                          f"above.")

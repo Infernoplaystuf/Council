@@ -139,9 +139,13 @@ def test_regenerating_cannot_switch_a_built_project_to_another_toolkit(tmp_path)
     gpj.save_manifest(pdir, manifest)
 
     project = gpj.open_project("flip", vault_dir=tmp_path)
+    backups = sorted((pdir / gpj.BACKUPS_DIRNAME).iterdir())
     out = dp.generate("flip", project.shapes, pdir, tmp_path)
     assert out.blocked, "a toolkit switch was emitted instead of refused"
     assert any("app.py is written in tk" in line for line in out.lines), out.lines
+    # A refusal writes nothing: this one used to come after the backup, and
+    # left a .backups/<stamp>/ behind every time.
+    assert sorted((pdir / gpj.BACKUPS_DIRNAME).iterdir()) == backups
 
 
 # ======================================================================

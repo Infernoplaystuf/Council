@@ -151,18 +151,26 @@ def run_tool(name: str, vault_dir: Any) -> ForgeResult:
     """Run a saved tool against the vault's input folder.
 
     Blocking. The tool goes through the analyst sandbox, so it can read and
-    compute and cannot delete, write, reach the network or shell out.
+    compute and cannot delete, write, reach the network or shell out — and
+    behind the analyst's fence, so one that never returns or grabs too much
+    memory is stopped (app_built_tools.run_tool) and the status says why.
     """
     if not name:
         return ForgeResult(False, "Select a tool in the list to run.")
     try:
         import app_built_tools
-        frame, message = app_built_tools.run_tool(name,
-                                                  vault_dir=Path(vault_dir))
+        run = app_built_tools.run_tool_detail(name, vault_dir=Path(vault_dir))
+        frame, message = run.df, app_built_tools.LABEL + run.message
     except Exception as exc:                              # noqa: BLE001
         return ForgeResult(False, f"⚠ {name}: {exc!r}"[:80], body=repr(exc),
                            error=exc)
 
+    if frame is None:
+        stopped = run.timed_out or run.stopped_by_memory
+        return ForgeResult(
+            False, (f"⚠ {name}: {run.brief(100)}" if stopped
+                    else f"⚠ '{name}' failed — see the output.")[:120],
+            body=message, name=name)
     body = str(message)
     if frame is not None:
         try:

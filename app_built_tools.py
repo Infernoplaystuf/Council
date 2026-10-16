@@ -12,7 +12,12 @@ A model may CREATE a tool, but it can never gain new powers by doing so:
     outside the output folder, use the network, shell out, or reach
     os/sys/subprocess. The "never delete" rule holds structurally.
   * Tools RUN only through ``vault_analyst.execute_pandas_code`` — the existing
-    sandbox. No new execution surface is created in this module.
+    sandbox — behind the analyst's fence (council_core.analyst_step
+    .run_tool_code: a child process with a time limit and a memory cap, the
+    arguments passed as JSON). In the app's own process, as they ran until
+    2026-10-15, a tool's ``while True:`` hung its caller for good, a huge
+    allocation took the app's memory, and a tool could replace the app's
+    json.dumps or Path.home. No new execution surface is created here.
   * Tools are stored under ``<vault>/App_Built_tools/`` and flagged
     APP-BUILT · UNREVIEWED · may be inaccurate. Every result a tool produces is
     labelled UNVERIFIED so it is never mistaken for a human-reviewed answer.
@@ -267,55 +272,96 @@ def get_tool_code(name: str, vault_dir: Optional[Any] = None) -> Optional[str]:
         return None
 
 
-def run_tool(name: str, args: Optional[Dict[str, Any]] = None, *,
-             allowed_folders: Optional[List[Any]] = None,
-             vault_dir: Optional[Any] = None) -> Tuple[Any, str]:
-    """Run an app-built tool through the analyst sandbox. Returns
-    ``(result_df_or_None, message)`` where the message is prefixed
-    ``[app-built tool — UNVERIFIED]``. args must be a JSON-ish dict; it is
-    embedded as a literal into the call so no extra namespace is injected."""
-    it = get_tool(name, vault_dir)
-    if not it:
-        return None, f"[app-built tool — UNVERIFIED] tool '{name}' not found"
-    code = get_tool_code(name, vault_dir)
-    if code is None:
-        return None, f"[app-built tool — UNVERIFIED] tool '{name}' file missing"
-    entry = it.get("entry") or entry_function(code)
-    if not entry:
-        return None, f"[app-built tool — UNVERIFIED] tool '{name}' has no entry function"
-    return run_code(code, args, entry=entry, allowed_folders=allowed_folders,
-                    vault_dir=vault_dir)
+#: What every tool message starts with.
+LABEL = "[app-built tool — UNVERIFIED] "
 
 
-def run_code(code: str, args: Optional[Dict[str, Any]] = None, *,
-             entry: Optional[str] = None,
-             allowed_folders: Optional[List[Any]] = None,
-             vault_dir: Optional[Any] = None) -> Tuple[Any, str]:
-    """Run tool code held in memory (not a saved tool) through the analyst
-    sandbox, exactly as run_tool runs a saved one."""
+def _fence_vault(vault_dir: Optional[Any]) -> Optional[Path]:
+    """The vault whose data_out the sandbox's helpers may write for a tool
+    run: the one named, else the app's (council_core.paths.vault_dir(), what
+    the sandbox used when tools ran in the app's own process)."""
+    if vault_dir:
+        return resolve_vault_root(vault_dir)
+    try:
+        from council_core import paths
+        return Path(paths.vault_dir())
+    except Exception:
+        return None
+
+
+def run_code_detail(code: str, args: Optional[Dict[str, Any]] = None, *,
+                    entry: Optional[str] = None,
+                    allowed_folders: Optional[List[Any]] = None,
+                    vault_dir: Optional[Any] = None,
+                    timeout: Optional[Any] = None):
+    """Run tool code held in memory (not a saved tool) behind the analyst's
+    fence — council_core.analyst_step.run_tool_code: the sandbox in a child
+    process, stopped at the time limit (`timeout` seconds, at most
+    analyst_step.TIME_LIMIT_S, which is also the default) and the memory
+    cap. ``args`` reach the code as JSON. Returns an analyst_step.ScriptRun
+    (``ran``, ``df``, ``message``, ``timed_out`` …). Never raises."""
+    from council_core import analyst_step
     entry = entry or entry_function(code or "")
     if not entry:
-        return None, "[app-built tool — UNVERIFIED] the code has no single entry function"
+        return analyst_step.ScriptRun(
+            error="the code has no single entry function")
     args = args or {}
     if not isinstance(args, dict):
-        return None, "[app-built tool — UNVERIFIED] args must be a dict"
-    # Build a call that assigns `result_df` (what execute_pandas_code returns).
-    # Non-frame returns are wrapped into a 1-cell frame so scalars/strings work.
-    call = (
-        f"\n\n_ret = {entry}(**{args!r})\n"
-        "result_df = _ret if isinstance(_ret, (pd.DataFrame, pd.Series, dict)) "
-        "else pd.DataFrame([{'result': _ret}])\n"
-    )
-    script = code + call
+        return analyst_step.ScriptRun(error="args must be a dict")
     if allowed_folders is None:
         try:
             import data_index
             allowed_folders = [data_index.input_dir(resolve_vault_root(vault_dir))]
         except Exception:
             allowed_folders = [resolve_vault_root(vault_dir)]
-    try:
-        from vault_analyst import execute_pandas_code
-    except Exception as exc:
-        return None, f"[app-built tool — UNVERIFIED] sandbox unavailable: {exc!r}"
-    df, msg = execute_pandas_code(script, allowed_folders)
-    return df, "[app-built tool — UNVERIFIED] " + msg
+    return analyst_step.run_tool_code(
+        code, entry, args, list(allowed_folders),
+        timeout=analyst_step.TIME_LIMIT_S if timeout is None else timeout,
+        vault=_fence_vault(vault_dir))
+
+
+def run_tool_detail(name: str, args: Optional[Dict[str, Any]] = None, *,
+                    allowed_folders: Optional[List[Any]] = None,
+                    vault_dir: Optional[Any] = None,
+                    timeout: Optional[Any] = None):
+    """run_code_detail for a saved tool, by name."""
+    from council_core import analyst_step
+    it = get_tool(name, vault_dir)
+    if not it:
+        return analyst_step.ScriptRun(error=f"tool '{name}' not found")
+    code = get_tool_code(name, vault_dir)
+    if code is None:
+        return analyst_step.ScriptRun(error=f"tool '{name}' file missing")
+    entry = it.get("entry") or entry_function(code)
+    if not entry:
+        return analyst_step.ScriptRun(
+            error=f"tool '{name}' has no entry function")
+    return run_code_detail(code, args, entry=entry,
+                           allowed_folders=allowed_folders,
+                           vault_dir=vault_dir, timeout=timeout)
+
+
+def run_tool(name: str, args: Optional[Dict[str, Any]] = None, *,
+             allowed_folders: Optional[List[Any]] = None,
+             vault_dir: Optional[Any] = None,
+             timeout: Optional[Any] = None) -> Tuple[Any, str]:
+    """Run an app-built tool behind the analyst's fence (run_code_detail).
+    Returns ``(result_df_or_None, message)`` where the message is prefixed
+    ``[app-built tool — UNVERIFIED]``. args must be a JSON-ish dict; it
+    reaches the code as JSON, so nothing is pasted into its source."""
+    run = run_tool_detail(name, args, allowed_folders=allowed_folders,
+                          vault_dir=vault_dir, timeout=timeout)
+    return run.df, LABEL + run.message
+
+
+def run_code(code: str, args: Optional[Dict[str, Any]] = None, *,
+             entry: Optional[str] = None,
+             allowed_folders: Optional[List[Any]] = None,
+             vault_dir: Optional[Any] = None,
+             timeout: Optional[Any] = None) -> Tuple[Any, str]:
+    """Run tool code held in memory (not a saved tool) behind the analyst's
+    fence, exactly as run_tool runs a saved one."""
+    run = run_code_detail(code, args, entry=entry,
+                          allowed_folders=allowed_folders,
+                          vault_dir=vault_dir, timeout=timeout)
+    return run.df, LABEL + run.message

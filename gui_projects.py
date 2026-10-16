@@ -40,7 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from gui_shapes import GSPEC_VERSION, Project, load_gspec, save_gspec
+from gui_shapes import (GSPEC_VERSION, Project, load_gspec, save_gspec,
+                        write_text_atomic)
 
 PROJECTS_DIRNAME = "GUI_Projects"
 MANIFEST_NAME = "manifest.json"
@@ -281,12 +282,15 @@ def toolkit_of(pdir: Any) -> str:
 
 
 def save_manifest(pdir: Any, m: Manifest) -> None:
+    """Whole or not at all (gui_shapes.write_text_atomic): a manifest cut
+    off part-way was left empty, and the project then would not open in an
+    update ("manifest.json is not valid JSON" — measured)."""
     m.updated = _now_stamp()
     d = Path(pdir)
     d.mkdir(parents=True, exist_ok=True)
-    _manifest_path(d).write_text(
-        json.dumps(m.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8")
+    write_text_atomic(
+        _manifest_path(d),
+        json.dumps(m.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
 # ============================================================

@@ -12,7 +12,14 @@ cancel signal is a threading.Event held on the in-RAM runner, never here — thi
 module only stores serialisable state.
 
 Storage mirrors deferred_tasks.py / derived_results.py: a single JSON list,
-written atomically via a temp file + replace, guarded by a module lock.
+written atomically via a temp file + replace. Every read AND write holds the
+module lock: on Windows a file another thread is reading cannot be replaced,
+and the write used to drop that update in silence (measured: 14 of 150 steps
+kept while the Jobs tab polled). A failed read is never taken for an empty
+list on the write path, which used to save only the job being changed and
+lose every other one. A busy file is waited for (another Council may hold it);
+a write that still cannot land raises JobStoreError instead of vanishing; a
+file that no longer parses is moved aside, never overwritten.
 """
 from __future__ import annotations
 
@@ -26,7 +33,27 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 _STORE_NAME = "agent_jobs.json"
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
+#: How long a busy file (open in another program) is waited for, and how
+#: often it is tried again.
+_RETRY_SECONDS = 2.0
+_RETRY_PAUSE_S = 0.02
+
+
+class JobStoreError(RuntimeError):
+    """The job list could not be read or saved - said, never dropped."""
+
+
+def _retrying(action: Any) -> Any:
+    """`action()`, tried again while Windows says the file is in use."""
+    deadline = time.monotonic() + _RETRY_SECONDS
+    while True:
+        try:
+            return action()
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_RETRY_PAUSE_S)
 
 
 class JobStatus(str, Enum):
@@ -108,24 +135,69 @@ class JobStore:
     def __init__(self, vault_dir: Optional[Any] = None) -> None:
         self.path = _vault_root(vault_dir) / _STORE_NAME
 
-    def _read(self) -> List[Dict[str, Any]]:
-        try:
-            if self.path.exists():
-                d = json.loads(self.path.read_text(encoding="utf-8"))
-                return d if isinstance(d, list) else []
-        except Exception:
-            pass
-        return []
+    def _read(self, strict: bool = False) -> List[Dict[str, Any]]:
+        """The stored list. `strict` (the write path): a file that cannot be
+        read raises JobStoreError rather than reading as empty, and a file
+        that does not parse is moved aside first. A display read falls back
+        to an empty list."""
+        with _LOCK:
+            if not self.path.exists():
+                return []
+            try:
+                text = _retrying(
+                    lambda: self.path.read_text(encoding="utf-8"))
+            except OSError as exc:
+                if strict:
+                    raise JobStoreError(
+                        f"could not read the job list {self.path}: {exc}")                         from exc
+                return []
+            try:
+                d = json.loads(text)
+            except ValueError:
+                d = None
+            if isinstance(d, list):
+                return d
+            if strict:
+                self._set_aside()
+            return []
+
+    def _set_aside(self) -> None:
+        """A job list that no longer parses is kept as
+        agent_jobs.json.damaged-<when>, never replaced."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for n in range(1, 1000):
+            name = f"{_STORE_NAME}.damaged-{stamp}" + (f"-{n}" if n > 1 else "")
+            target = self.path.with_name(name)
+            if target.exists():
+                continue
+            try:
+                _retrying(lambda: self.path.rename(target))
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise JobStoreError(
+                    f"the job list {self.path} is damaged and could not be "
+                    f"moved aside: {exc}") from exc
+            return
+        raise JobStoreError(f"the job list {self.path} is damaged and could "
+                            "not be moved aside")
 
     def _write(self, items: List[Dict[str, Any]]) -> None:
-        try:
+        with _LOCK:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".json.tmp")
+            tmp = self.path.with_name(
+                f".{_STORE_NAME}.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False),
                            encoding="utf-8")
-            tmp.replace(self.path)
-        except Exception:
-            pass
+            try:
+                _retrying(lambda: tmp.replace(self.path))
+            except OSError as exc:
+                try:
+                    tmp.unlink()        # our own temp file, never the list
+                except OSError:
+                    pass
+                raise JobStoreError(
+                    f"could not save the job list {self.path}: {exc}") from exc
 
     def all(self) -> List[AgentJob]:
         return [AgentJob.from_dict(d) for d in self._read()]
@@ -150,7 +222,7 @@ class JobStore:
 
     def upsert(self, job: AgentJob) -> None:
         with _LOCK:
-            items = self._read()
+            items = self._read(strict=True)
             job.updated_ts = time.time()
             out = [it for it in items if it.get("job_id") != job.job_id]
             out.append(job.to_dict())
@@ -159,7 +231,7 @@ class JobStore:
     def set_status(self, job_id: str, status: str,
                    stopped_reason: Optional[str] = None) -> None:
         with _LOCK:
-            items = self._read()
+            items = self._read(strict=True)
             for it in items:
                 if it.get("job_id") == job_id:
                     it["status"] = status
@@ -170,7 +242,7 @@ class JobStore:
 
     def append_step(self, job_id: str, step: JobStep) -> None:
         with _LOCK:
-            items = self._read()
+            items = self._read(strict=True)
             for it in items:
                 if it.get("job_id") == job_id:
                     it.setdefault("steps", []).append(step.to_dict())
@@ -182,7 +254,7 @@ class JobStore:
 
     def delete(self, job_id: str) -> bool:
         with _LOCK:
-            items = self._read()
+            items = self._read(strict=True)
             new = [it for it in items if it.get("job_id") != job_id]
             if len(new) != len(items):
                 self._write(new)

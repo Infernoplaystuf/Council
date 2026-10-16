@@ -604,14 +604,59 @@ def save_gspec(path: Any, project: Project, *,
     it is what the Designer's Export uses: with the default, an unchanged
     Typhon exported back over examples/gui/typhon.gspec came out as a
     four-line diff that changed nothing. Both spellings load identically; the
-    vault's own files keep the default."""
+    vault's own files keep the default.
+
+    Whole or not at all (write_text_atomic): it is the user's drawing."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
+    write_text_atomic(
+        p,
         json.dumps(_project_to_dict(project), indent=2, sort_keys=True,
                    ensure_ascii=ascii_only) + "\n",
-        encoding="utf-8",
     )
+
+
+#: What write_bytes_atomic adds to a file's name for the copy it writes
+#: first: a name nobody gives a file of their own (".tmp" might be).
+ATOMIC_SUFFIX = ".partial"
+
+
+def write_text_atomic(path: Any, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` whole or not at all (write_bytes_atomic).
+
+    The bytes Path.write_text would have written: each "\\n" as the
+    platform's line ending (text mode's translation), then encoded."""
+    import os
+
+    write_bytes_atomic(path, text.replace("\n", os.linesep).encode(encoding))
+
+
+def write_bytes_atomic(path: Any, data: bytes) -> None:
+    """Write ``data`` to ``path`` whole or not at all.
+
+    It goes into ``<name>.partial`` beside the file, flushed to the disk, and
+    then os.replace puts that over the file in one step. A write cut off
+    part-way — a full disk, a killed process, a closed Council, a power cut
+    — leaves the file as it was, never empty or half-written (measured
+    before, for project.gspec, manifest.json and handlers.py: each was left
+    empty). At worst a stray <name>.partial is left beside it.
+    """
+    import os
+
+    p = Path(path)
+    tmp = p.with_name(p.name + ATOMIC_SUFFIX)
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def load_gspec(path: Any) -> Project:

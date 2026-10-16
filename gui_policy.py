@@ -115,17 +115,130 @@ DENIED_QT_NAMES = frozenset({
 PROJECT_MODULES = frozenset({"ui", "app", "handlers", "launch", "main",
                              "widgets", "main_ui"})
 
-# Denied in BOTH modes. Each escapes the process, executes arbitrary text, or
-# deserialises into live objects.
-DENIED_MODULES = frozenset({
-    "subprocess", "socket", "requests", "urllib", "urllib2", "urllib3",
-    "http", "ftplib", "telnetlib", "smtplib", "ctypes", "cffi",
-    "pickle", "cPickle", "marshal", "shelve", "dill",
-    "importlib", "imp", "runpy", "code", "codeop", "pty", "multiprocessing",
+# ---- why a name is refused, in words a user can act on -----------------
+# Every refusal says which of these it is. A bare "not permitted" is the
+# message people learn to work around; a reason is the one they can judge.
+WHY_PROGRAM = "it starts another program or Python process, outside the app"
+WHY_NETWORK = ("it reaches the network, and nothing leaves this PC unless the "
+               "user opts in")
+WHY_ASYNCIO = ("its subprocess and connection calls start programs and reach "
+               "the network")
+WHY_DESKTOP = "it opens a browser or another program on the desktop"
+WHY_EXIT = ("it ends the app at once, with no file closed and no recording "
+            "finished; return, or close the window, instead")
+WHY_NATIVE = "it calls native code directly, past every rule here"
+WHY_OBJECTS = "it turns data back into live objects, which runs code"
+WHY_CODE = ("it runs text as code, or imports a module by a name built at "
+            "runtime")
+WHY_MODULE_TABLE = ("it hands back any loaded module by a string key, past "
+                    "the import rules; import what the app uses instead")
+WHY_ALL_OBJECTS = ("it hands back every live object, loaded modules "
+                   "included, past the import rules")
+WHY_REGISTRY = "it writes the Windows registry"
+WHY_SIGNAL = "it signals or ends a process — this app's or another's"
+WHY_ENV = "it changes the environment the programs the app starts inherit"
+WHY_DELETE = "it deletes files or folders"
+WHY_INTERPRETER = "it reaches the interpreter's own state, past every rule here"
+
+# Denied in BOTH modes, by ROOT name — `import asyncio.subprocess` and
+# `from xmlrpc.client import ServerProxy` are both their root. Each escapes
+# the process, reaches the network, executes arbitrary text, or deserialises
+# into live objects.
+#
+# The second half was measured passing this gate on 2026-10-15 (the Typhon
+# plugin research found the first few; the rest are their relatives): asyncio
+# started a child Python and served on a socket, socketserver + xmlrpc
+# answered a call, and each was admitted as "stdlib" because the allowlist is
+# sys.stdlib_module_names. The private halves (_socket, _ssl, _winapi,
+# _posixsubprocess, _overlapped, _ctypes, _imp) are the same capability under
+# a name nobody thinks to deny.
+DENIED_MODULE_REASONS = {
+    # starts programs
+    "subprocess": WHY_PROGRAM, "pty": WHY_PROGRAM,
+    "multiprocessing": WHY_PROGRAM, "_multiprocessing": WHY_PROGRAM,
+    "_winapi": WHY_PROGRAM, "_posixsubprocess": WHY_PROGRAM,
+    "pipes": WHY_PROGRAM,                    # Template runs /bin/sh
+    "distutils": WHY_PROGRAM,                # distutils.spawn, ccompiler
+    "ensurepip": WHY_PROGRAM,                # runs pip, which downloads
+    "venv": WHY_PROGRAM,                     # runs ensurepip
+    "idlelib": WHY_PROGRAM,                  # its shell is a subprocess + rpc
+    # the network
+    "socket": WHY_NETWORK, "_socket": WHY_NETWORK,
+    "ssl": WHY_NETWORK, "_ssl": WHY_NETWORK,
+    "requests": WHY_NETWORK, "urllib": WHY_NETWORK, "urllib2": WHY_NETWORK,
+    "urllib3": WHY_NETWORK, "http": WHY_NETWORK,
+    "ftplib": WHY_NETWORK, "telnetlib": WHY_NETWORK, "smtplib": WHY_NETWORK,
+    "poplib": WHY_NETWORK, "imaplib": WHY_NETWORK, "nntplib": WHY_NETWORK,
+    "smtpd": WHY_NETWORK, "asyncore": WHY_NETWORK, "asynchat": WHY_NETWORK,
+    "socketserver": WHY_NETWORK, "xmlrpc": WHY_NETWORK,
+    "wsgiref": WHY_NETWORK,                  # simple_server is http.server
+    "_overlapped": WHY_NETWORK,              # asyncio's Windows connect/send
+    "asyncio": WHY_ASYNCIO, "_asyncio": WHY_ASYNCIO,
+    # the desktop
+    "webbrowser": WHY_DESKTOP,
+    "antigravity": WHY_DESKTOP,              # importing it opens a browser
+    # native code
+    "ctypes": WHY_NATIVE, "_ctypes": WHY_NATIVE, "cffi": WHY_NATIVE,
+    # data into objects
+    "pickle": WHY_OBJECTS, "cPickle": WHY_OBJECTS, "marshal": WHY_OBJECTS,
+    "shelve": WHY_OBJECTS, "dill": WHY_OBJECTS,
+    # text into code, and imports by a computed name
+    "importlib": WHY_CODE, "imp": WHY_CODE, "_imp": WHY_CODE,
+    "_frozen_importlib": WHY_CODE, "_frozen_importlib_external": WHY_CODE,
+    "runpy": WHY_CODE, "code": WHY_CODE, "codeop": WHY_CODE,
+    "pkgutil": WHY_CODE,                     # resolve_name('subprocess:Popen')
+    "pydoc": WHY_CODE,                       # locate('subprocess.Popen')
+    "zipimport": WHY_CODE, "site": WHY_CODE,  # addsitedir runs .pth lines
+    "cProfile": WHY_CODE, "profile": WHY_CODE, "trace": WHY_CODE,
+    "pdb": WHY_CODE, "bdb": WHY_CODE, "doctest": WHY_CODE,
+    "rlcompleter": WHY_CODE,
+    # Not stdlib on 3.11 (so refused anyway), named so a newer Python that
+    # ships them cannot admit them: each runs a string in a subinterpreter.
+    "_xxsubinterpreters": WHY_CODE, "_interpreters": WHY_CODE,
     # `builtins.exec(...)` is exec — and `compile` cannot be denied as an
     # attribute, because re.compile is everywhere.
-    "builtins",
-})
+    "builtins": WHY_CODE,
+    # the registry — QSettings is denied for the same reason
+    "winreg": WHY_REGISTRY, "_winreg": WHY_REGISTRY,
+}
+DENIED_MODULES = frozenset(DENIED_MODULE_REASONS)
+
+# Denied by their FULL dotted name, under a root that stays permitted:
+# concurrent.futures' ThreadPoolExecutor is ordinary, its process half is a
+# second Python (measured: a ProcessPoolExecutor worker wrote a file the gate
+# never saw). Matched on the module path and on any name imported from it.
+DENIED_SUBMODULES = {
+    "concurrent.futures.process": WHY_PROGRAM,
+    "concurrent.interpreters": WHY_CODE,     # 3.14+
+}
+
+# Attribute names denied only on ONE module, because the same word is
+# ordinary on everything else: Job().abort() is a method, os.abort() ends the
+# process; threading.Timer is a thread, timeit.Timer('...') runs a string.
+# The receiver is resolved through the file's own imports (`import os as o`,
+# `from logging import config`) and matched on its last component, so
+# shutil.os.abort is os.abort too. A module bound to a plain variable is not
+# followed — that is a name assembled at runtime, which no static gate reads.
+DENIED_MODULE_ATTRS = {
+    "os": {"abort": WHY_EXIT},
+    "nt": {"abort": WHY_EXIT},
+    "posix": {"abort": WHY_EXIT},
+    "signal": {"alarm": WHY_EXIT,            # SIGALRM's default ends it
+               "setitimer": WHY_EXIT},
+    "logging.config": {"listen": WHY_NETWORK,       # a socket server for config
+                       # socketserver is re-exported INTO logging.config, so
+                       # the TCP server and handler listen() builds are
+                       # reachable directly (logging.config.ThreadingTCPServer
+                       # IS socketserver.ThreadingTCPServer).
+                       "ThreadingTCPServer": WHY_NETWORK,
+                       "StreamRequestHandler": WHY_NETWORK},
+    "timeit": {"timeit": WHY_CODE, "repeat": WHY_CODE, "Timer": WHY_CODE,
+               "main": WHY_CODE},
+    # every live object, loaded modules included — sys.modules without the
+    # name; gc.collect() stays ordinary
+    "gc": {"get_objects": WHY_ALL_OBJECTS, "get_referents": WHY_ALL_OBJECTS,
+           "get_referrers": WHY_ALL_OBJECTS},
+}
 
 # Builtins that turn data into code, and the namespace dicts that hand any
 # denied name back through a string key: vars(os)["system"],
@@ -138,22 +251,111 @@ DENIED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__",
 # documentation teaches star imports, and it exports nothing on the deny list.
 STAR_IMPORT_OK = frozenset({"tkinter"})
 
+
+def _why(reason: str, *names: str) -> dict:
+    return {n: reason for n in names}
+
+
 # Attribute names denied wherever they appear. os and sys are PERMITTED — a
 # real application needs os.path and sys.argv — so the dangerous surface is
 # denied by name instead of by module.
-DENIED_ATTRS = frozenset({
-    # process / shell escape
-    "system", "popen", "spawn", "spawnl", "spawnv", "execv", "execl", "execve",
-    "fork", "forkpty", "kill", "killpg", "putenv",
+#
+# Every name here also stops being a port name (gui_ports renames a "Remove"
+# button's port remove_button), so a word a user would type as a label
+# belongs in DENIED_MODULE_ATTRS instead, keyed on its module.
+DENIED_ATTR_REASONS = {
+    # process / shell escape — os.spawn*/exec*/posix_spawn* in every
+    # spelling: the first few were denied and their siblings (spawnvp,
+    # execvpe, posix_spawn ...) passed, which is no denial at all.
+    **_why(WHY_PROGRAM,
+           "system", "popen", "spawn", "spawnl", "spawnle", "spawnlp",
+           "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+           "execl", "execle", "execlp", "execlpe", "execv", "execve",
+           "execvp", "execvpe", "posix_spawn", "posix_spawnp",
+           "fork", "forkpty",
+           # subprocess and multiprocessing by an attribute route (a module
+           # that imported them hands them over: logging.handlers.socket,
+           # frame_camera.socket) and their entry points by any receiver
+           "subprocess", "_winapi", "_posixsubprocess", "multiprocessing",
+           "Popen", "getoutput", "getstatusoutput",
+           # a ProcessPoolExecutor's worker is a second Python
+           "ProcessPoolExecutor",
+           # asyncio's subprocess calls, on a loop from anywhere
+           "create_subprocess_exec", "create_subprocess_shell",
+           "subprocess_exec", "subprocess_shell"),
+    **_why(WHY_SIGNAL, "kill", "killpg"),
+    **_why(WHY_ENV, "putenv"),
+    # ends the process with nothing cleaned up
+    **_why(WHY_EXIT,
+           "_exit", "raise_signal", "pthread_kill",
+           # faulthandler's crash helpers
+           "_sigsegv", "_sigabrt", "_sigfpe", "_read_null", "_fatal_error",
+           "_fatal_error_c_thread", "_stack_overflow"),
+    # the network, by an attribute route and by the calls themselves
+    **_why(WHY_NETWORK,
+           "socket", "_socket", "ssl", "socketserver", "xmlrpc",
+           "open_connection", "start_server", "create_connection",
+           "create_server", "create_datagram_endpoint",
+           "open_unix_connection", "start_unix_server",
+           "create_unix_connection", "create_unix_server", "sock_connect",
+           "connect_accepted_socket",
+           # logging.handlers' network handlers (its file handlers are fine)
+           "SocketHandler", "DatagramHandler", "SysLogHandler",
+           "HTTPHandler", "SMTPHandler"),
+    **_why(WHY_ASYNCIO, "asyncio"),
+    # the desktop: os.startfile opens any file with its program
+    **_why(WHY_DESKTOP, "startfile", "webbrowser"),
+    # native code by another door: `import ctypes` is denied, but numpy hands
+    # it over (np.ctypeslib.ctypes.windll...), as does any module that
+    # imported it (frame_camera.ctypes)
+    **_why(WHY_NATIVE,
+           "ctypes", "_ctypes", "ctypeslib", "windll", "cdll", "oledll",
+           "pydll", "pythonapi", "WinDLL", "CDLL", "OleDLL", "PyDLL",
+           "LoadLibrary", "add_dll_directory"),
+    # sys.modules['subprocess'] is `import subprocess` with no import
+    # statement; meta_path and path_hooks decide what an import loads
+    **_why(WHY_MODULE_TABLE,
+           "modules", "meta_path", "path_hooks", "path_importer_cache"),
     # destruction
-    "rmtree", "unlink", "remove", "removedirs", "rmdir",
+    **_why(WHY_DELETE, "rmtree", "unlink", "remove", "removedirs", "rmdir"),
     # introspection escapes that reach the interpreter's own state
-    "__subclasses__", "__bases__", "__mro__", "__globals__", "__code__",
-    "__closure__", "__builtins__", "__import__", "__reduce__",
-    "__reduce_ex__", "__getattribute__", "__dict__",
+    **_why(WHY_INTERPRETER,
+           "__subclasses__", "__bases__", "__mro__", "__globals__",
+           "__code__", "__closure__", "__builtins__", "__import__",
+           "__reduce__", "__reduce_ex__", "__getattribute__", "__dict__",
+           # a frame's namespaces are globals()/vars() by another name:
+           # sys._getframe().f_builtins['eval'] is eval
+           "f_globals", "f_locals", "f_builtins"),
     # loaders
-    "load_module", "import_module", "exec_module", "loads", "load",
-})
+    **_why(WHY_CODE, "load_module", "import_module", "exec_module",
+           "importlib"),
+    **_why(WHY_OBJECTS, "loads", "load"),
+    # A DENIED module re-exported as a live attribute of an allowed one IS
+    # that module, reached with no import the gate can see: codecs.builtins is
+    # builtins (so codecs.builtins.eval is eval), and enum aliases it `bltns`;
+    # cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
+    # resolve_name load any callable from a dotted string); mimetypes._winreg
+    # is winreg; xml.sax.saxutils.urllib and email.utils.urllib are the urllib
+    # package (saxutils' own code calls urllib.request.urlopen). Each is
+    # already a DENIED_MODULE by root name — denied as an attribute too, the
+    # route is closed one step before the terminal .eval / .locate /
+    # .CreateKeyEx, which cannot be denied directly: re.compile,
+    # QApplication.exec() and DataFrame.eval are honest. These names also stop
+    # being port names (gui_ports steers clear of DENIED_ATTRS), like the
+    # socket/subprocess/ssl entries above.
+    **_why(WHY_CODE, "builtins", "bltns", "pydoc", "pkgutil"),
+    **_why(WHY_REGISTRY, "winreg", "_winreg"),
+    **_why(WHY_NETWORK, "urllib", "urllib2", "urllib3"),
+}
+DENIED_ATTRS = frozenset(DENIED_ATTR_REASONS)
+
+# Calls that look an attribute up by a STRING: getattr(os, 'system') is
+# os.system. operator.attrgetter('system')(os) and methodcaller('system',
+# cmd)(os) are the same lookup spelled through operator, and
+# inspect.getattr_static through inspect; each literal is checked like
+# getattr's (attrgetter's dotted 'path.system' part by part).
+LOOKUP_CALLS = frozenset({"getattr", "attrgetter", "methodcaller",
+                          "getattr_static"})
 
 # `loads`/`load` are denied above because pickle.loads is the risk, but json
 # and PIL use the same spelling harmlessly. These receivers are exempted so a
@@ -268,9 +470,14 @@ def check_requires(names: Sequence[str], mode: str = "linked") -> List[str]:
                         f"not Pillow; no 'as')")
             continue
         root = parts[0]
+        sub = _denied_submodule(name)
         if root in DENIED_MODULES:
             errs.append(f"requires {name!r}: {root!r} is never permitted in a "
-                        f"generated app, declared or not")
+                        f"generated app, declared or not — "
+                        f"{DENIED_MODULE_REASONS[root]}")
+        elif sub:
+            errs.append(f"requires {name!r}: {sub[0]!r} is never permitted in "
+                        f"a generated app, declared or not — {sub[1]}")
         elif root in FOREIGN_QT:
             errs.append(f"requires {name!r}: the Qt target is PySide6, and two "
                         f"Qt bindings cannot share one process")
@@ -317,6 +524,7 @@ def validate(code: str, mode: str = "linked",
         return False, [f"does not parse: line {exc.lineno}: {exc.msg}"]
 
     allowed = allowed_modules(mode, extra_modules, toolkit)
+    aliases = _module_aliases(tree)
 
     for node in ast.walk(tree):
         # ---- imports ----
@@ -324,17 +532,34 @@ def validate(code: str, mode: str = "linked",
             for a in node.names:
                 root = a.name.split(".")[0]
                 _check_import(root, node, mode, allowed, errs)
+                if root not in DENIED_MODULES:
+                    _check_submodule(a.name, node, errs)
                 _check_qt(a.name, node, errs)
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if root and not node.level:     # relative: inside the project
                 _check_import(root, node, mode, allowed, errs)
+                if root not in DENIED_MODULES:
+                    _check_submodule(node.module or "", node, errs)
                 _check_qt(node.module or "", node, errs)
             # `from os import system` binds the denied attribute to a plain
             # name, and a plain name is never checked again — so the IMPORTED
             # NAMES are checked here, relative imports included.
             line = getattr(node, "lineno", 0)
+            only_here = ({} if node.level else
+                         _module_attr_rule(node.module or ""))
             for a in node.names:
+                if (root and not node.level and root not in DENIED_MODULES
+                        and a.name != "*"
+                        and not _denied_submodule(node.module or "")):
+                    # `from concurrent.futures import process` — a submodule
+                    # arriving as a NAME, which the module path never shows.
+                    _check_submodule(f"{node.module}.{a.name}", node, errs)
+                if a.name in only_here:
+                    errs.append(f"line {line}: importing {a.name!r} from "
+                                f"{node.module} is not permitted in a "
+                                f"generated app — {only_here[a.name]}")
+                    continue
                 if a.name == "*":
                     if node.level or root in STAR_IMPORT_OK:
                         continue
@@ -362,7 +587,7 @@ def validate(code: str, mode: str = "linked",
                                  and root in SAFE_LOAD_RECEIVERS)):
                     errs.append(f"line {line}: importing {a.name!r} from "
                                 f"{node.module or '.'} is not permitted in a "
-                                f"generated app")
+                                f"generated app — {_reason(a.name)}")
 
         # ---- attribute access: CALLED OR NOT ----
         elif isinstance(node, ast.Attribute):
@@ -379,7 +604,17 @@ def validate(code: str, mode: str = "linked",
                 where = f"{recv}." if recv else ""
                 errs.append(
                     f"line {getattr(node, 'lineno', 0)}: {where}{node.attr} is "
-                    f"not permitted in a generated app")
+                    f"not permitted in a generated app — "
+                    f"{_reason(node.attr)}")
+            else:
+                why = _module_attr_rule(
+                    _dotted(node.value, aliases)).get(node.attr)
+                if why:
+                    recv = _receiver_name(node.value)
+                    errs.append(
+                        f"line {getattr(node, 'lineno', 0)}: {recv}."
+                        f"{node.attr} is not permitted in a generated app — "
+                        f"{why}")
 
         # ---- name-level ----
         elif isinstance(node, ast.Name):
@@ -395,19 +630,115 @@ def validate(code: str, mode: str = "linked",
 
         # ---- getattr(x, "system") — the string-indirection bypass ----
         elif isinstance(node, ast.Call):
-            fn = node.func
-            if isinstance(fn, ast.Name) and fn.id == "getattr" \
-                    and len(node.args) >= 2:
-                arg = node.args[1]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
-                        and arg.value in (DENIED_ATTRS | DENIED_BUILTINS
-                                          | DENIED_QT_NAMES):
-                    errs.append(
-                        f"line {getattr(node, 'lineno', 0)}: "
-                        f"getattr(..., {arg.value!r}) reaches a denied "
-                        f"attribute by name")
+            _check_lookup(node, aliases, errs)
 
     return (not errs), errs
+
+
+def _reason(name: str) -> str:
+    """Why ``name`` (an attribute, imported name or builtin) is refused."""
+    if name in DENIED_ATTR_REASONS:
+        return DENIED_ATTR_REASONS[name]
+    if name in DENIED_BUILTINS:
+        return WHY_CODE
+    return "it escapes the process, reaches the network, or loads native code"
+
+
+def _denied_submodule(full: str):
+    """(the denied dotted name, why) when ``full`` is or is under one."""
+    for name, why in DENIED_SUBMODULES.items():
+        if full == name or full.startswith(name + "."):
+            return name, why
+    return None
+
+
+def _check_submodule(full: str, node: ast.AST, errs: List[str]) -> None:
+    hit = _denied_submodule(full)
+    if hit:
+        errs.append(f"line {getattr(node, 'lineno', 0)}: importing "
+                    f"{hit[0]!r} is not permitted in a generated app — "
+                    f"{hit[1]}")
+
+
+def _module_aliases(tree: ast.AST) -> dict:
+    """Local name -> the dotted module path it was imported as, from every
+    import in the file: `import os as o` gives o -> os, `from logging import
+    config` gives config -> logging.config. What an imported name really is
+    (module or function) is not known statically and does not need to be:
+    it is only ever compared against DENIED_MODULE_ATTRS' module names."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    out[a.asname] = a.name
+                else:
+                    root = a.name.split(".")[0]
+                    out[root] = root
+        elif isinstance(node, ast.ImportFrom) and not node.level \
+                and node.module:
+            for a in node.names:
+                if a.name != "*":
+                    out[a.asname or a.name] = f"{node.module}.{a.name}"
+    return out
+
+
+def _dotted(node: ast.AST, aliases: dict) -> str:
+    """The module path an attribute's receiver names, or "" when it is not
+    a plain dotted name (a call, a subscript)."""
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        head = _dotted(node.value, aliases)
+        return f"{head}.{node.attr}" if head else ""
+    return ""
+
+
+def _module_attr_rule(path: str) -> dict:
+    """DENIED_MODULE_ATTRS' entry for a receiver path: the module itself, or
+    a path that ENDS in it (shutil.os is os)."""
+    for name, rule in DENIED_MODULE_ATTRS.items():
+        if path == name or path.endswith("." + name):
+            return rule
+    return {}
+
+
+def _check_lookup(node: ast.Call, aliases: dict, errs: List[str]) -> None:
+    """getattr(os, 'system'), attrgetter('path.system'), methodcaller(
+    'system', cmd), inspect.getattr_static(os, 'system'): a denied name by a
+    string literal is the denied name."""
+    fn = node.func
+    name = fn.id if isinstance(fn, ast.Name) else (
+        fn.attr if isinstance(fn, ast.Attribute) else "")
+    if name not in LOOKUP_CALLS:
+        return
+    recv = None
+    if name in ("getattr", "getattr_static"):
+        if len(node.args) < 2:
+            return
+        literals, recv = node.args[1:2], node.args[0]
+    elif name == "methodcaller":
+        literals = node.args[:1]
+    else:
+        literals = node.args
+    for arg in literals:
+        if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+            continue
+        for part in arg.value.split("."):
+            if part in (DENIED_ATTRS | DENIED_BUILTINS | DENIED_QT_NAMES):
+                why = _reason(part)
+            elif recv is not None:
+                why = _module_attr_rule(_dotted(recv, aliases)).get(part)
+            else:
+                why = None
+            if why:
+                spelled = ("getattr(..., " if name == "getattr"
+                           else f"{name}(")
+                errs.append(
+                    f"line {getattr(node, 'lineno', 0)}: "
+                    f"{spelled}{arg.value!r}) reaches a denied attribute by "
+                    f"name — {why}")
+                break
 
 
 def _check_import(root: str, node: ast.AST, mode: str, allowed: Set[str],
@@ -415,7 +746,7 @@ def _check_import(root: str, node: ast.AST, mode: str, allowed: Set[str],
     line = getattr(node, "lineno", 0)
     if root in DENIED_MODULES:
         errs.append(f"line {line}: importing {root!r} is not permitted "
-                    f"in a generated app")
+                    f"in a generated app — {DENIED_MODULE_REASONS[root]}")
         return
     if root == "council_engine":
         errs.append(
