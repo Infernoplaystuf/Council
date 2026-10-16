@@ -66,8 +66,10 @@ import threading
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 #: A camera's name: short and safe in a folder name (multi-camera design
-#: 2.2): at most 16 characters, a-z, 0-9 and "-".
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,15}$")
+#: 2.2): at most 16 characters, a-z, 0-9 and "-". Ended by \Z, not $: "$"
+#: also matches before a final newline, which let a name ending in a
+#: newline through (found at P2 row 3).
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,15}\Z")
 
 #: The most cameras one window runs (multi-camera design: 2-4).
 MAX_SLOTS = 4
@@ -81,7 +83,8 @@ SLOT_OWN = frozenset({"id", "name", "role", "lock", "plugin_state", "clear",
                       "_reset", "confirmed", "capabilities", "confirm"})
 RIG_OWN = frozenset({"slots", "active", "slot_fields", "rig_fields",
                      "add_slot", "select", "slot", "remove_slot", "names",
-                     "connected", "_reset", "_lock", "plugins", "_plugins"})
+                     "connected", "_reset", "_lock", "plugins", "_plugins",
+                     "rename_slot", "holding"})
 
 
 class _Unset:
@@ -280,10 +283,42 @@ class Rig:
                                  f"first")
             self.slots.remove(target)
 
+    def rename_slot(self, old: str, new: str) -> CameraSlot:
+        """Call slot `old` `new` (a camera keeps its name in the rig from one
+        session to the next: council_core.camera_rig_file). Refused when
+        `new` is not a safe name or another slot has it; who the slot is
+        otherwise — its id, its camera, its plugins' state — is unchanged."""
+        with self._lock:
+            target = self.slot(old)
+            if new == old:
+                return target
+            if not NAME_RE.match(new or ""):
+                raise ValueError(
+                    f"{new!r} cannot name a camera: use at most 16 "
+                    f"characters, a-z, 0-9 and '-', starting with a letter "
+                    f"or digit")
+            if new in self.names():
+                raise ValueError(f"a camera is already named {new!r}")
+            target.name = new
+            return target
+
     def connected(self) -> List[CameraSlot]:
         """The slots with a camera open, in order."""
         return [s for s in self.slots
                 if getattr(s, "device", None) is not None]
+
+    def holding(self, info: Any) -> Optional[CameraSlot]:
+        """The slot that has camera `info` open — the same backend and the
+        key it was found by — or None ("in use as cam2" in the scan)."""
+        backend = str(getattr(info, "backend", "") or "")
+        key = str(getattr(info, "key", "") or "")
+        for s in self.connected():
+            held = getattr(s, "info", None)
+            if held is not None and key \
+                    and str(getattr(held, "backend", "") or "") == backend \
+                    and str(getattr(held, "key", "") or "") == key:
+                return s
+        return None
 
     def __repr__(self) -> str:
         return (f"<Rig {len(self.slots)} slot(s), active "
