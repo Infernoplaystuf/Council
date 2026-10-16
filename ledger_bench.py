@@ -356,9 +356,18 @@ def filled_template(out: Path, P: Parts, T: Truth, schema, part="2046"):
             T.add(f, part, it, fld, fl[fld])
         for s in ("Pre", "Post"):
             row[EC[s]] = P.ec(part, it, "JB", s)
+            row[EC[s] + " — Inspector Initials"] = "JB"
             T.add(f, part, it, EC[s], row[EC[s]], "JB")
         rows.append(row)
     fill_template(schema, rows, out / f)
+    # the template's own pre-filled values stay where nothing was written
+    written = set(rows[0])
+    for fld in schema.fields:
+        if fld.name in written:
+            continue
+        for it, v in (fld.defaults or {}).items():
+            if v not in (None, ""):
+                T.add(f, part, it, fld.name, v)
 
 
 def summary(out: Path, P: Parts, T: Truth):
@@ -395,8 +404,8 @@ def pictures(out: Path, P: Parts, T: Truth, part="2047"):
     for it in items:
         pre, post = P.ec(part, it, "MK", "Pre"), P.ec(part, it, "MK", "Post")
         table.append([it, pre, post])
-        T.add(f, part, it, EC["Pre"], pre, "MK")
-        T.add(f, part, it, EC["Post"], post, "MK")
+        T.add(f, part, it, EC["Pre"], pre)          # no initials in the picture
+        T.add(f, part, it, EC["Post"], post)
     ws.add_image(XLImage(io.BytesIO(_png(form, [320], lines=False))), "A3")
     ws.add_image(XLImage(io.BytesIO(_png(table, [80, 100, 100]))), "A12")
     wb.save(out / f)
@@ -429,7 +438,7 @@ def messy(out: Path, P: Parts, T: Truth, part="2048"):
         T.add(f, part, it, FA + "Laser Team FOD (um)", fod)
         T.add(f, part, it, FA + "Flaw Orientation (deg)", fl[FA + "Flaw Orientation (deg)"])
         T.add(f, part, it, FA + "Flaw Length (in)", fl[FA + "Flaw Length (in)"])
-        T.add(f, part, it, EC["Pre"], pre, "RT")
+        T.add(f, part, it, EC["Pre"], pre)          # nobody's initials on the sheet
         r += 1
     notes = wb.create_sheet("Notes")
     for line in ["Re-ran 3 on 9/14 because amplitude read 45 not 40",
@@ -483,12 +492,16 @@ class Score:
     multi_all_found: int = 0      # ... where every inspector's value was found
     disagree: int = 0             # ... where they logged different values
     disagree_pre: int = 0         # ... and one of them was pre-accepted anyway
+    signed: int = 0               # readings with initials: each in its own column
+    signed_found: int = 0         # ... found there, under the right initials
     examples: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
 
     def line(self) -> str:
         pct = 100 * self.right / self.truth if self.truth else 0
         s = (f"{self.name:30} {self.truth:5} {self.right:5} {pct:5.0f}% {self.wrong_field:5} "
              f"{self.missed:6} {self.extra:5} {self.pre_ok:6} {self.pre_wrong:7}")
+        if self.signed:
+            s += f"   by initials {self.signed_found}/{self.signed}"
         if self.multi_cells:
             s += (f"   inspectors: {self.multi_all_found}/{self.multi_cells} cells all found;"
                   f" {self.disagree_pre} of {self.disagree} disagreeing pre-accepted")
@@ -521,9 +534,15 @@ def score(out_dir, files: Optional[Sequence[str]] = None, image_reader=None,
 
 def _score(name, rows, decisions) -> Score:
     sc = Score(name)
+    from sample_ledger import inspector_column
     want: Dict[Tuple[str, str, str], Dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    own = set()
     for t in rows:
         want[(t["part"], t["item"], t["field"])][t["value"]].add(t["inspector"])
+        if t["inspector"]:
+            key = (t["part"], t["item"], inspector_column(t["field"], t["inspector"]))
+            want[key][t["value"]].add(t["inspector"])
+            own.add(key)
     got = defaultdict(set)
     for d in decisions:
         o = d.obs
@@ -554,6 +573,10 @@ def _score(name, rows, decisions) -> Score:
             else:
                 sc.missed += 1
                 sc.examples["missed"].append(f"{key} = {v}")
+        if key in own:
+            sc.signed += len(values)
+            sc.signed_found += sum(v in got.get(key, ()) for v in values)
+            continue
         inspectors = set().union(*values.values()) - {""}
         if len(inspectors) > 1:
             sc.multi_cells += 1

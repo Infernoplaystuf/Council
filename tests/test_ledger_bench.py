@@ -40,7 +40,7 @@ def test_the_samples_and_their_answers(samples):
     truth = json.loads((out / "truth.json").read_text(encoding="utf-8"))["rows"]
     files = sorted(p.name for p in out.glob("*.xlsx"))
     assert len(files) == 11 and files == sorted({t["file"] for t in truth})
-    assert len(truth) == 1255
+    assert len(truth) == 1297
     # several people's EC readings for one flaw, in one workbook
     ec = [t for t in truth if t["file"] == "2041_EC_stacked.xlsx"
           and t["item"] == "1A" and "Pre-Conceal" in t["field"]]
@@ -54,14 +54,22 @@ def test_the_samples_are_the_same_every_time(samples, tmp_path):
         (out / "truth.json").read_text(encoding="utf-8")
 
 
-READ_IN_FULL = ["2042_EC_side_by_side.xlsx", "2043_EC_by_sheet.xlsx", "2045_visual.xlsx",
-                "parts_summary.xlsx"]
+READ_IN_FULL = ["2041_EC_stacked.xlsx", "2042_EC_side_by_side.xlsx", "2043_EC_by_sheet.xlsx",
+                "2045_visual.xlsx", "2046_filled_template.xlsx", "parts_summary.xlsx"]
 
 
 @pytest.mark.parametrize("name", READ_IN_FULL)
 def test_layouts_read_in_full(samples, name):
     s = samples[1][name]
-    assert (s.right, s.missed, s.extra, s.pre_wrong) == (s.truth, 0, 0, 0)
+    assert (s.right, s.missed, s.pre_wrong) == (s.truth, 0, 0)
+    assert s.extra <= 3          # inspection dates offered as the part's Date, not pre-accepted
+
+
+@pytest.mark.parametrize("name", ["2041_EC_stacked.xlsx", "2042_EC_side_by_side.xlsx",
+                                  "2043_EC_by_sheet.xlsx", "2046_filled_template.xlsx"])
+def test_every_reading_is_kept_under_its_inspectors_initials(samples, name):
+    s = samples[1][name]
+    assert s.signed and s.signed_found == s.signed
 
 
 def test_pictures_read_in_full_by_tesseract(samples):
@@ -77,26 +85,13 @@ def test_disagreeing_inspectors_are_never_pre_accepted(samples):
     assert s.disagree > 200 and s.disagree_pre == 0
 
 
-def test_every_inspectors_table_is_found_side_by_side_or_by_sheet(samples):
-    for name in ("2042_EC_side_by_side.xlsx", "2043_EC_by_sheet.xlsx"):
+def test_every_inspectors_table_is_found_stacked_side_by_side_or_by_sheet(samples):
+    for name in ("2041_EC_stacked.xlsx", "2042_EC_side_by_side.xlsx", "2043_EC_by_sheet.xlsx"):
         s = samples[1][name]
         assert s.multi_cells and s.multi_all_found == s.multi_cells
 
 
 # ── known gaps (found by these samples, 2026-10-16) ─────────────────────
-@pytest.mark.xfail(strict=True, reason="the part number is taken from the 'Flaw #' "
-                   "row: every value lands on part '1A'")
-def test_a_filled_template_reads_in_full(samples):
-    s = samples[1]["2046_filled_template.xlsx"]
-    assert s.pre_wrong == 0 and s.right == s.truth
-
-
-@pytest.mark.xfail(strict=True, reason="stacked per-inspector grids: part read as '1A'")
-def test_stacked_inspector_grids_are_found(samples):
-    s = samples[1]["2041_EC_stacked.xlsx"]
-    assert s.multi_all_found == s.multi_cells and s.pre_wrong == 0
-
-
 @pytest.mark.xfail(strict=True, reason="runs as rows for several parts: part read from "
                    "the Run # column, runs numbered by row")
 def test_concealment_runs_for_several_parts(samples):
@@ -108,7 +103,7 @@ def test_concealment_runs_for_several_parts(samples):
                    "the reader knows")
 def test_a_long_reading_log(samples):
     s = samples[1]["EC_log_2044-2045.xlsx"]
-    assert s.right == s.truth
+    assert s.right == s.truth and s.signed_found == s.signed
 
 
 @pytest.mark.xfail(strict=True, reason="numbers typed with units ('0.245 mm', '45°') "

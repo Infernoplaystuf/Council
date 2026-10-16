@@ -78,6 +78,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 SOURCE_COL = "source_file"
 UPDATED_COL = "updated_at"
 META_COLS = (SOURCE_COL, UPDATED_COL)
+#: the template's own name for a grid row's initials cell
+INITIALS_SUFFIX = " — Inspector Initials"
+#: one inspector's own reading of a field, kept beside the template's one value
+INSPECTOR_COL = re.compile(r"^(?P<field>.+) \[(?P<who>[^\[\]]{1,32})\]$")
+
+
+def inspector_column(field_name: str, who: str) -> str:
+    return f"{field_name} [{who}]"
 
 MAX_LABEL_LEN = 60          # longer text is an instruction, not a field
 MIN_RUN = 3                 # adjacent header cells / item codes that make a table
@@ -135,6 +143,22 @@ class TemplateSchema:
 
     def field(self, name: str) -> TemplateField:
         return next(f for f in self.fields if f.name == name)
+
+    def takes_inspectors(self, name: str) -> bool:
+        """A per-flaw reading the template records ONE of, with an Inspector
+        Initials cell beside it (the EC responses, FPI, NDE Team FOD): when
+        several people log their own, the parent CSV keeps each one in its own
+        column, "<field> [initials]". Not the Visual Inspector 1..4 slots,
+        which are per-person already."""
+        names = {f.name for f in self.fields}
+        return (name in names and f"{name}{INITIALS_SUFFIX}" in names
+                and self.field(name).layout == "grid"
+                and not re.search(r"\bInspector \d+$", name))
+
+    def inspector_base(self, column: str) -> Optional[str]:
+        """'X [JB]' -> 'X' when X takes inspectors, else None."""
+        m = INSPECTOR_COL.match(column)
+        return m.group("field") if m and self.takes_inspectors(m.group("field")) else None
 
     def save(self, path) -> None:
         data = asdict(self)
@@ -733,7 +757,9 @@ class ParentCSV:
         Row keys may be the CSV header or any spelling that normalizes the
         same ('laser power' for 'Laser Power (W)')."""
         res = AddResult()
-        by_name = {normalize_label(c): c for c in self.columns}
+        # a fuzzy spelling finds a template column, never one person's copy of it
+        by_name = {normalize_label(c): c for c in self.columns
+                   if not (self.schema and self.schema.inspector_base(c))}
         by_name.update({c.lower(): c for c in self.columns})
         now = datetime.now().isoformat(timespec="seconds")
         index = {self._key(r): r for r in self.rows}
@@ -741,7 +767,15 @@ class ParentCSV:
         for incoming in rows:
             mapped: Dict[str, str] = {}
             for k, v in incoming.items():
-                col = by_name.get(str(k).lower()) or by_name.get(normalize_label(k))
+                if self.schema and self.schema.inspector_base(str(k)):
+                    # exact only: normalize_label reads "[JB]" as a unit and
+                    # would put JB's reading in the template's own column
+                    col = by_name.get(str(k).lower())
+                    if col is None:
+                        col = self._add_inspector_column(str(k))
+                        by_name[col.lower()] = col
+                else:
+                    col = by_name.get(str(k).lower()) or by_name.get(normalize_label(k))
                 if col is None:
                     if str(k) not in res.unknown_columns:
                         res.unknown_columns.append(str(k))
@@ -780,6 +814,22 @@ class ParentCSV:
 
         self.save()
         return res
+
+    def _add_inspector_column(self, col: str) -> str:
+        """'<field> [JB]' joins the CSV right after <field> and the other
+        inspectors' columns for it, in initials order."""
+        base = self.schema.inspector_base(col)
+        mine = [c for c in self.columns if c == base or self.schema.inspector_base(c) == base]
+        at = self.columns.index(mine[-1]) + 1 if mine else len(
+            [c for c in self.columns if c not in META_COLS])
+        for i, c in enumerate(mine[1:], start=self.columns.index(mine[0]) + 1):
+            if c.lower() > col.lower():
+                at = i
+                break
+        self.columns.insert(at, col)
+        for r in self.rows:
+            r.setdefault(col, "")
+        return col
 
     def _sort_key(self, row) -> tuple:
         key = (sample_sort_key(row.get(self.id_field, "")),)

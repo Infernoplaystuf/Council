@@ -61,14 +61,14 @@ import json
 import re
 import urllib.request
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sample_ledger import (LedgerError, ParentCSV, TemplateField, TemplateSchema,
-                           _text, fill_template, normalize_label, sample_sort_key,
-                           schema_path_for)
+from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateField,
+                           TemplateSchema, _text, fill_template, inspector_column,
+                           normalize_label, sample_sort_key, schema_path_for)
 
 ACCEPT_AT = 0.85
 SUGGEST_AT = 0.6
@@ -307,6 +307,30 @@ def _strip_unit(label: str) -> str:
     return re.sub(r"\s*[:*]+\s*$", "", split_unit(label)[0])
 
 
+# ── who logged a reading ────────────────────────────────────────────────
+#: A label that introduces a person: "Inspector: JB", "Operator - MK".
+_WHO_INLINE = re.compile(
+    r"(?i)^\s*(?:inspector(?:\s+initials)?|initials|operator|technician|tech|analyst|"
+    r"inspected\s+by|checked\s+by|logged\s+by)\s*(?:[:=\-–—]\s*|\s+by\s+)(?P<who>.+?)\s*$")
+_WHO_BY = re.compile(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
+#: A column / label that holds initials, with the value beside or below it.
+_WHO_HEAD = re.compile(r"(?i)^\s*(?:inspector(?:'?s)?(?:\s+initials)?|initials|operator|"
+                       r"technician|tech|analyst|inspected\s+by|by)\s*[:#]?\s*$")
+#: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
+_WHO_HEADING = re.compile(r"^\s*(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(]\s*[\d\s\-/.:,)]*)?\s*$")
+
+
+def _initials(v) -> str:
+    """'jb' / 'J.B.' -> 'JB'; a written name is kept as written; anything
+    else (a number, a long sentence) is not a person."""
+    s = re.sub(r"\.", "", str(v or "")).strip()
+    if re.fullmatch(r"[A-Za-z]{1,4}", s):
+        return s.upper()
+    if re.fullmatch(r"[A-Za-z][A-Za-z '\-]{2,30}", s) and len(s.split()) <= 3:
+        return " ".join(w.capitalize() for w in s.split())
+    return ""
+
+
 # ── source grids ────────────────────────────────────────────────────────
 @dataclass
 class Grid:
@@ -405,6 +429,7 @@ class Obs:
     guesses: List[Tuple[str, float]] = field(default_factory=list)
     part_how: str = ""         # how the part number was decided
     from_image: bool = False
+    inspector: str = ""        # who logged it (EC readings and the like)
 
     @property
     def key(self) -> Tuple[str, str, str, str]:
@@ -418,18 +443,22 @@ class _Extractor:
         self.used = set()
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
+        self.markers: List[Tuple[int, int, str]] = []   # (row, col, who)
 
     # context = sheet name + heading-like rows above
     def context(self, r: int) -> List[str]:
         ctx = [self.g.sheet]
+        people = {mr for mr, _mc, _ in self.markers}   # "Inspector: JB  Date: ..." rows
         for rr in range(max(1, r - 25), r):
+            if rr in people:
+                continue                                  # say who, not what
             row = [(c, v) for (r2, c), v in self.g.cells.items() if r2 == rr]
             if len(row) == 1 and isinstance(row[0][1], str):
                 ctx.append(row[0][1])
         return ctx
 
     def emit(self, part, item, label, r, c, value, match: Match, field_name=None,
-             vr=None, vc=None):
+             vr=None, vc=None, who=None):
         txt = _text(value)
         if txt == "" or isinstance(value, _Merged):
             return None
@@ -452,8 +481,77 @@ class _Extractor:
                 via="image" if self.g.from_image and match.target else match.via,
                 label=str(label), where=where, note=note, guesses=match.guesses,
                 from_image=bool(self.g.from_image))
+        if o.field and self.m.schema.takes_inspectors(o.field):
+            o.inspector = who or self.inspector_for(vr or r, vc or c)
         (self.out if match.target else self.unmatched).append(o)
         return o
+
+    # who logged what: markers found before the values are read
+    def find_inspectors(self) -> None:
+        """'Inspector: JB' cells, an initials label with the initials beside
+        it, and a table heading that is only initials ('JB — 2026-09-18').
+        They are taken as markers - not values - so they are not offered as
+        values of some field."""
+        known = set()
+        for t in self.m.targets:
+            known.update(self.m._tok[t.name])
+            known.update(self.m._sec[t.name])
+        for (r, c), v in sorted(self.g.cells.items()):
+            if not isinstance(v, str) or isinstance(v, _Merged) or (r, c) in self.used:
+                continue
+            def person(text) -> str:
+                """Initials or a name - never a word of the template ('Date')."""
+                w = _initials(text)
+                return w if w and not set(tokens(w)) & known else ""
+            m = _WHO_INLINE.match(v) or _WHO_BY.match(v)
+            who = person(m.group("who")) if m else ""
+            if not who and _WHO_HEAD.match(v):
+                for dc in (1, 2):
+                    x = self.g.cells.get((r, c + dc))
+                    if x is not None:
+                        who = person(x) if isinstance(x, str) else ""
+                        if who:
+                            self.used.add((r, c + dc))
+                        break
+            if not who:
+                h = _WHO_HEADING.match(v)
+                if h and person(h.group("who")) and not self.codes.canon(v) \
+                        and self._heads_a_table(r, c):
+                    who = h.group("who")
+            if who:
+                self.markers.append((r, c, who))
+                self.used.add((r, c))
+        if not self.markers:
+            h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
+            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
+                self.markers.append((0, 0, h.group(1)))
+
+    def _heads_a_table(self, r, c) -> bool:
+        """A heading, not a value: no numbers on its row, and right under it a
+        header row of 2+ labels that starts at its column. (Initials typed in
+        an 'Inspector Initials' column sit on a row of readings - not this.)"""
+        if any(r2 == r and not isinstance(v, str) for (r2, _c), v in self.g.cells.items()):
+            return False
+        below = sorted(cc for (r2, cc), v in self.g.cells.items()
+                       if r2 == r + 1 and isinstance(v, str) and c - 1 <= cc <= c + 8)
+        return len(below) >= 2 and below[0] <= c + 1
+
+    def inspector_for(self, r, c) -> str:
+        """The nearest marker above the value (the lowest row above it), and of
+        two at that row the one at or left of its column."""
+        above = [m for m in self.markers if m[0] < r or (m[0] == r and m[1] < c)]
+        if not above:
+            return ""
+        top = max(m[0] for m in above)
+        row = [m for m in above if m[0] == top]
+        left = [m for m in row if m[1] <= c]
+        return (max(left, key=lambda m: m[1]) if left
+                else min(row, key=lambda m: abs(m[1] - c)))[2]
+
+    def _who_columns(self, r, skip) -> Dict[int, bool]:
+        """Columns of header row r that hold initials ('Inspector Initials')."""
+        return {c: True for (r2, c), v in self.g.cells.items()
+                if r2 == r and c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
 
     def run(self) -> None:
         self.find_part()
@@ -467,9 +565,13 @@ class _Extractor:
             if not isinstance(v, str):
                 continue
             label, inline = _split_inline(v)
+            if self.m.is_item_header(label):
+                continue                       # "Flaw #" is not "Part #"
             mt = self.m.match(label, per_item=False)
             if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
                 val = inline if inline else self._value_near(r, c)
+                if val and self.codes.canon(val):
+                    continue                   # a flaw code is never a part number
                 if val and not self.m.match(val).target:
                     if not self._is_table_header(r, c):
                         self.part = _text(val)
@@ -518,6 +620,7 @@ class _Extractor:
             for c, _ in hits:
                 self.used.add((r, c))
             self.used.add((r, label_col))            # the grid's own "Flaw #" cell
+            who_cols = self._who_columns(r, {c for c, _ in hits} | {label_col})
             ctx = self.context(r)
             rr = r + 1
             blanks = 0
@@ -532,10 +635,12 @@ class _Extractor:
                 blanks = 0
                 self.used.add((rr, label_col))
                 mt = self.m.match(label, ctx, per_item=True)
+                who = next((w for w in (_initials(self.g.cells.get((rr, wc)))
+                                        for wc in who_cols) if w), None)
                 for c, it in hits:
                     if (rr, c) in self.g.cells:
                         self.emit(self.part, it, label, rr, label_col,
-                                  self.g.cells[(rr, c)], mt, vr=rr, vc=c)
+                                  self.g.cells[(rr, c)], mt, vr=rr, vc=c, who=who)
                         self.used.add((rr, c))
                 rr += 1
 
@@ -551,11 +656,14 @@ class _Extractor:
                 continue
             ctx = self.context(r)
             heads = {}
-            item_col = id_col = None
+            item_col = id_col = who_col = None
             for c in cols:
                 v = self.g.text(r, c)
                 if self.m.is_item_header(v):
                     item_col = c
+                    continue
+                if _WHO_HEAD.match(v):
+                    who_col = c
                     continue
                 mt = self.m.match(v, ctx)
                 if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
@@ -604,7 +712,9 @@ class _Extractor:
                             continue
                         fname = mt.target.fields[i]
                     o = self.emit(part, item, label, r, c, self.g.cells[(d, c)], mt,
-                                  field_name=fname, vr=d, vc=c)
+                                  field_name=fname, vr=d, vc=c,
+                                  who=_initials(self.g.cells.get((d, who_col))) or None
+                                  if who_col else None)
                     if o is not None and id_col:
                         o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
                     self.used.add((d, c))
@@ -612,6 +722,8 @@ class _Extractor:
                     self.used.add((d, id_col))
                 if item_col:
                     self.used.add((d, item_col))
+                if who_col:
+                    self.used.add((d, who_col))
 
     # LABEL / VALUE
     def forms(self) -> None:
@@ -1051,6 +1163,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         exs = [_Extractor(g, m, codes, "") for g in grids]
         for ex in exs:
             ex.find_part()
+            ex.find_inspectors()
         found = {ex.part for ex in exs if ex.part}
         if part:
             book_part, how = part, "given on the command line"
@@ -1108,24 +1221,39 @@ class Decision:
 
 def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     """Pick one value per (part, item, field); a clash between sources is never
-    pre-accepted."""
+    pre-accepted.
+
+    A reading someone signed (an EC response with initials) is offered twice:
+    in that person's own column, "<field> [JB]", where it is the only value
+    and can be pre-accepted; and as a candidate for the template's single
+    cell, where readings that disagree clash - the reviewer accepts one."""
     groups: Dict[Tuple[str, str, str], List[Obs]] = defaultdict(list)
     for o in run.obs:
         groups[(o.part, o.item, o.field)].append(o)
+        if o.inspector:
+            own = replace(o, field=inspector_column(o.field, o.inspector))
+            groups[(o.part, o.item, own.field)].append(own)
     out = []
     for (part, item, fname), obs in groups.items():
         obs.sort(key=lambda o: -o.score)
         values = Counter(o.value for o in obs)
         clash = len(values) > 1
         firsts: Dict[str, Obs] = {}
+        who: Dict[str, List[str]] = defaultdict(list)
         for o in obs:                     # the same value found twice: one row
+            if o.inspector and o.inspector not in who[o.value]:
+                who[o.value].append(o.inspector)
             if o.value in firsts:
                 firsts[o.value].note = _join(firsts[o.value].note, f"also at {o.where}")
                 continue
-            firsts[o.value] = o
+            firsts[o.value] = o = replace(o)
+        for v, o in firsts.items():        # agreeing inspectors share one row
+            if len(who[v]) > 1:
+                o.inspector = "/".join(sorted(who[v]))
         obs = list(firsts.values())
         for o in obs:
-            others = sorted(v for v in values if v != o.value)
+            others = sorted(f"{v} ({'/'.join(who[v])})" if who[v] else v
+                            for v in values if v != o.value)
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
                   and "not converted" not in o.note)
@@ -1152,6 +1280,9 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dic
         f = d.obs
         target = item_vals[(f.part, f.item)] if f.item else part_vals[f.part]
         target.setdefault(f.field, f.value)
+        initials = f.field + INITIALS_SUFFIX
+        if f.inspector and f.item and schema.takes_inspectors(f.field):
+            target.setdefault(initials, f.inspector)    # whose value went in
     rows = []
     parts = sorted(set(part_vals) | {p for p, _ in item_vals}, key=sample_sort_key)
     for p in parts:
@@ -1167,7 +1298,8 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dic
 
 # ── the review workbook ─────────────────────────────────────────────────
 VAL_HEAD = ["Accept", "Part", "Item", "Field", "Value", "Confidence", "Matched by",
-            "Source label", "Source", "Other values offered", "Note", "Part from"]
+            "Source label", "Source", "Other values offered", "Note", "Part from",
+            "Inspector"]
 LAB_HEAD = ["Map to field", "Ignore", "Source label", "Example value", "Count",
             "Best guess", "Source", "Part", "Item"]
 
@@ -1215,7 +1347,7 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     for d in decisions:
         o = d.obs
         ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
-                   o.via, o.label, o.where, d.conflict, o.note, o.part_how])
+                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
         if d.conflict:
             for c in ws[ws.max_row]:
                 c.fill = red
@@ -1228,7 +1360,7 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     fdv = DataValidation(type="list", formula1=field_list, allow_blank=True)
     ws.add_data_validation(fdv)
     fdv.add(f"D2:D{max(ws.max_row, 2) + 200}")
-    _style(ws, bold, [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28])
+    _style(ws, bold, [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28, 10])
 
     lab = wb.create_sheet("Labels to map", 2)
     lab.append(LAB_HEAD)
@@ -1351,6 +1483,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     if schema is None:
         raise LedgerError(f"{csv_path} has no schema beside it; run sample_ledger.py first")
     valid = {f.name for f in schema.fields}
+
+    def placeable(fname) -> bool:      # a template field, or one person's column of one
+        return fname in valid or bool(fname and schema.inspector_base(str(fname)))
     mapping, ignore = load_aliases(csv_path)
     judge = Matcher(schema)
 
@@ -1408,7 +1543,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     # Part typed in by hand) are taken as typed
     seen = {(d.obs.where, d.obs.field, d.obs.item) for d in decisions}
     for (where, fname, item), (acc, part, value, _) in choice.items():
-        if acc and (where, fname, item) not in seen and fname in valid and part:
+        if acc and (where, fname, item) not in seen and placeable(fname) and part:
             decisions.append(Decision(Obs(part, item, fname, value, 1.0, "review",
                                           "", where), True))
             accepted += 1

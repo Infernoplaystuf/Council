@@ -139,8 +139,9 @@ def test_no_reader_means_images_are_saved_not_read(setup):
 def test_unknown_labels_and_problems(setup):
     schema, _, sources, tmp = setup
     run = _run(schema, sources, tmp)
-    assert {o.label for o in run.unmatched} == {"Operator"}
-    assert run.problems == []
+    # "Operator: JB" says who logged the sheet: not a value, not a label to map
+    assert run.unmatched == [] and run.problems == []
+    assert not any(o.value == "JB" for o in run.obs)
 
 
 def test_missing_part_number_is_reported(setup):
@@ -205,7 +206,7 @@ def test_review_then_apply_fills_csv_and_template(setup):
     mapping, ignore = load_aliases(csv)
     assert mapping["fod"] == "Flaw Attributes: Laser Team FOD (um)"
     assert "orientation" not in mapping          # it was a sure match: nothing to learn
-    assert "date" not in mapping and "operator" in ignore
+    assert "date" not in mapping and ignore == []       # nothing left to ignore
 
     # the filled template has the values in the template's own cells
     assert sorted(Path(p).name for p in res.filled) == ["tmpl_101.xlsx", "tmpl_102.xlsx"]
@@ -426,3 +427,73 @@ def test_table_borders_are_removed_but_a_filled_bar_is_kept():
     assert out.getpixel((100, 20)) == 255 and out.getpixel((200, 60)) == 255
     assert out.getpixel((100, 120)) == 0                      # the bar is kept
     assert min(out.crop((18, 58, 60, 75)).getdata()) < 128    # the text is kept
+
+
+# ── several inspectors' readings of one flaw ────────────────────────────
+def _two_inspectors(path):
+    """JB and MK each logged EC Pre-Conceal for part 101 on one sheet, in the
+    template's grid shape; they agree on 1A and disagree on 2A."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"] = "Part Number: 101"
+    r = 3
+    for who, pre in (("JB", [60, 61, 62]), ("MK", [60, 66, 62])):
+        ws.cell(r, 1, f"Inspector: {who}")
+        ws.cell(r + 1, 2, "Flaw #")
+        for j, it in enumerate(["1A", "2A", "3A"]):
+            ws.cell(r + 1, 3 + j, it)
+            ws.cell(r + 2, 3 + j, pre[j])
+        ws.cell(r + 2, 2, "Eddy Current Response Pre-Conceal")
+        r += 5
+    wb.save(path)
+    return path
+
+
+def test_each_inspectors_reading_is_kept_under_their_initials(setup):
+    schema, csv, _, tmp = setup
+    pre = "NDE Inspection: Eddy Current Response Pre-Conceal"
+    assert schema.takes_inspectors(pre)
+    assert not schema.takes_inspectors("Visual Inspection: Inspector 1")
+    run = extract(schema, [_two_inspectors(tmp / "ec.xlsx")], use_images=False)
+    dec = decide(run, schema)
+    got = {(d.obs.item, d.obs.field, d.obs.value): d for d in dec}
+    # each person's own column: their value, pre-accepted
+    for who, vals in (("JB", ["60", "61", "62"]), ("MK", ["60", "66", "62"])):
+        for it, v in zip(["1A", "2A", "3A"], vals):
+            assert got[(it, f"{pre} [{who}]", v)].accept
+    # the template's one cell: agreed values in, a disagreement left to the reviewer
+    assert got[("1A", pre, "60")].accept and got[("1A", pre, "60")].obs.inspector == "JB/MK"
+    jb, mk = got[("2A", pre, "61")], got[("2A", pre, "66")]
+    assert not jb.accept and not mk.accept
+    assert jb.conflict == "66 (MK)" and mk.conflict == "61 (JB)"
+    assert not any(d.obs.field.startswith("%pec") or d.obs.value in ("JB", "MK") for d in dec)
+
+    review = tmp / "review.xlsx"
+    write_review(review, run, dec, schema, str(csv))
+    _edit_review(review, accept=[("101", "2A", pre, "66")])     # MK's reading goes in
+    res = apply_review(review, fill_dir=tmp / "filled", use_images=False)
+    ledger = ParentCSV(csv)
+    cols = ledger.columns
+    at = cols.index(pre)
+    assert cols[at + 1:at + 3] == [f"{pre} [JB]", f"{pre} [MK]"]
+    r2 = ledger.get("101", "2A")
+    assert (r2[pre], r2[f"{pre} [JB]"], r2[f"{pre} [MK]"]) == ("66", "61", "66")
+    assert r2[pre + " — Inspector Initials"] == "MK"
+    assert ledger.get("101", "1A")[pre + " — Inspector Initials"] == "JB/MK"
+    # the filled template gets the one value; the per-person columns stay in the CSV
+    out = openpyxl.load_workbook(tmp / "filled" / "tmpl_101.xlsx").active
+    assert out[schema.field(pre).cells["2A"]].value == 66
+    assert "rows added" in res.csv_result
+    again = apply_review(review, use_images=False)
+    assert "0 rows added, 0 updated" in again.csv_result
+    # a loosely spelt template column still means the template column
+    res = ParentCSV(csv).add_samples([{"Part Number": "101", "Flaw #": "3A",
+                                       "NDE inspection - eddy current response pre conceal": "63"}])
+    assert res.conflicts == [("101 / 3A", pre, "62", "63")] and not res.unknown_columns
+
+
+def test_initials_are_never_a_template_word(setup):
+    from source_extract import _initials
+    assert _initials("j.b.") == "JB" and _initials("Jane Brown") == "Jane Brown"
+    assert _initials("12") == "" and _initials("a long sentence about the run") == ""
