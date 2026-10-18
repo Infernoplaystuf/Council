@@ -576,3 +576,52 @@ def test_a_stopped_recording_has_no_stream_ended(tmp_path):
     device.close()
 
 
+# ======================================================================
+# What the Basler plugin confirms (a guard: coverage the review asked for)
+# ======================================================================
+BASLER_ALL = {"frames", "restartable", "grab_failures", "software_trigger",
+              "hardware_trigger", "binning"}
+
+
+def test_the_basler_plugin_confirms_its_six_on_the_fake_basler(host):
+    from tests.test_basler_trigger import FakeBasler, FakePylon
+    plugin = host.instance("typhon.basler")
+    plugin.sdk = FakePylon(FakeBasler(user_set=True))
+    info = plugin.discover()[0]
+    device = host.open_camera(info, camera="cam1")
+    slot = host.rig.slot("cam1")
+    slot.device, slot.info = device, info
+    assert set(plugin.capabilities(device)) == BASLER_ALL
+    assert host.camera_capabilities("typhon.basler", device) == BASLER_ALL
+    assert slot.capabilities == BASLER_ALL
+
+
+@pytest.mark.skipif(not os.environ.get("PYLON_CAMEMU"),
+                    reason="pylon's emulator runs where PYLON_CAMEMU is set")
+def test_the_basler_plugin_confirms_its_six_on_pylons_emulator(host):
+    pytest.importorskip("pypylon")
+    plugin = host.instance("typhon.basler")
+    found = [i for i in plugin.discover()
+             if "Emulat" in (i.model + i.label) or i.serial.startswith("0815")]
+    if not found:
+        pytest.skip("no emulated Basler listed")
+    device = host.open_camera(found[0])
+    try:
+        assert host.camera_capabilities("typhon.basler", device) == \
+            BASLER_ALL
+    finally:
+        device.close()
+
+
+def test_only_the_simulated_frame_camera_confirms_a_software_trigger(host):
+    infos = {i.kind: i for i in host.discover_cameras(
+        ["typhon.simulated"]).cameras}
+    for kind, want in (("frame", True), ("event", False)):
+        device = host.open_camera(infos[kind])
+        try:
+            got = host.camera_capabilities("typhon.simulated", device)
+            assert ("software_trigger" in got) is want, (kind, got)
+        finally:
+            device.close()
+
+
