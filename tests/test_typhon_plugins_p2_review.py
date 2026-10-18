@@ -284,3 +284,27 @@ def test_more_simulated_cameras_leave_todays_presets_and_names_alone(
     assert [(c.name, c.key) for c in cams] == [(name, "sim-event")]
 
 
+# ======================================================================
+# A slot forgets the device its plugin confirmed
+# ======================================================================
+def test_disconnect_lets_go_of_the_confirmed_device(plugin_project):
+    connect_sim("frame")
+    slot = frame_camera._RIG.active
+    assert slot.confirmed is not None and slot.confirmed[0] is slot.device
+    held = weakref.ref(slot.device)
+    frame_camera.disconnect()
+    gc.collect()
+    assert slot.confirmed is None
+    assert held() is None, "the closed device is freed"
+    assert slot.capabilities == frozenset()
+
+
+def test_clearing_a_slot_forgets_what_was_confirmed():
+    rig = camera_rig.Rig(Template)
+    slot = rig.active
+    slot.device = object()
+    slot.confirm(slot.device, {"frames"})
+    slot.clear()
+    assert slot.confirmed is None
+
+

@@ -145,7 +145,11 @@ class CameraSlot:
         reset(self)
 
     def clear(self) -> None:
+        """The per-connection fields back as Disconnect leaves them — and
+        what the camera's plugin confirmed, which held the closed device
+        and everything it holds until the next Connect (P2 review)."""
         self._reset(self)
+        self.confirmed = None
 
     def confirm(self, device: Any, capabilities: Any) -> None:
         """Keep what the camera plugin that opened `device` for this slot
