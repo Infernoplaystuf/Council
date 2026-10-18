@@ -1563,6 +1563,63 @@ def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
     assert switches == [True], f"the run began before the read ended: {switches}"
 
 
+def test_frames_sent_while_start_writes_the_record_are_the_runs(
+        tmp_path, monkeypatch):
+    """The other side of the test above — and why its old count failed in
+    the pylon env and on busy PCs while Typhon was right. Start WRITES the
+    run's record after the switch, on purpose (a refused Start leaves no
+    record of a run that never happened), and the write is atomic: a
+    temporary file, fsync, rename. With the stream left running, every
+    frame the camera sends meanwhile is the run's — counted, and handed to
+    the run's writer — not a frame of the read and not lost. The old test
+    ("at most 2 frames grabbed when Start returned") counted these too, so
+    it really bounded the record's write at two frame times: measured
+    5-36 ms beside 20 ms frames on a quiet PC, and every frame it counted
+    came after the switch (2026-10-18, both envs) — no frame of the read
+    was ever among them, yet it failed 1 run in 8 in the pylon env ("3
+    frames of a slow read counted"). Here the write is held until the
+    camera has sent 3 frames, the stand-in for a slow disk: the old count
+    fails on this every time (3 of 3), Typhon's run keeps every one."""
+    connected("event")
+    monkeypatch.setattr(device(), "restartable", False, raising=False)
+    ticks(Viewer(), 0.3)
+    session = frame_camera._LIVE.session
+    writing = threading.Event()
+    during = []               # per frame sent while the record is written
+    real_record = session._record
+
+    def record(frame):
+        # Under the session's lock, in the step that counts the frame.
+        if writing.is_set():
+            during.append(session.writer is not None)
+        return real_record(frame)
+
+    monkeypatch.setattr(session, "_record", record)
+    real_save = frame_camera._save_camera_record
+
+    def slow_save(*args, **kwargs):
+        writing.set()
+        try:
+            deadline = time.monotonic() + 30
+            while len(during) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return real_save(*args, **kwargs)
+        finally:
+            writing.clear()
+
+    monkeypatch.setattr(frame_camera, "_save_camera_record", slow_save)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    grabbed = session.stats().grabbed
+    frame_camera.stop()
+    assert len(during) >= 3, "the camera sent nothing while Start wrote"
+    assert all(during), (f"{during.count(False)} of the {len(during)} frames "
+                         f"sent while Start wrote the record were not the run's")
+    assert grabbed >= len(during), (
+        f"{grabbed} grabbed: the {len(during)} frames sent while Start wrote "
+        f"the record were not counted in the run")
+    assert out["record"] and Path(out["record"]).is_file()
+
+
 def test_a_record_is_never_written_over_and_its_name_is_never_reused(
         tmp_path):
     from council_core import camera_record
