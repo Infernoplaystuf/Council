@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,7 +72,13 @@ def test_the_pcs_load_is_read_from_its_cpu_times():
     assert timing.cpu_busy_pct((5, 5, 5), (5, 5, 5)) is None
     load = timing.Load()
     load.begin()
-    sum(range(200000))
+    # Busy for 0.2 s, not for a fixed amount of work: Windows moves its
+    # CPU times on at its clock tick (about 15.6 ms), and a few ms of work
+    # inside one tick read the same times twice, which is "cannot tell"
+    # (None) — it failed that way once in the gate.
+    deadline = time.perf_counter() + 0.2
+    while time.perf_counter() < deadline:
+        sum(range(1000))
     said = load.end()
     assert said["logical_cpus"] == os.cpu_count()
     if os.name == "nt":
