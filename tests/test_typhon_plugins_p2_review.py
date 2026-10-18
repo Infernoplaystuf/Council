@@ -202,3 +202,85 @@ def test_frame_camera_offers_the_designer_no_function_of_the_branch():
     assert callable(frame_camera._current_families)
 
 
+# ======================================================================
+# Simulated serials do not depend on position (COUNCIL_SIM_CAMERAS)
+# ======================================================================
+def sim_plugin():
+    from typhon_plugins.simulated import plugin
+    return plugin
+
+
+@pytest.mark.parametrize("spec", ["frame,frame,event", "event,frame",
+                                  "event,frame,frame,event"])
+def test_todays_two_simulated_cameras_keep_their_serials(spec):
+    """Today's frame camera is SIM-1 and today's event camera SIM-2 in every
+    list; the extra ones are numbered from their key, never from their
+    place in the list."""
+    listed = sim_plugin().sim_cameras(spec)
+    serials = {i.key: i.serial for i in listed}
+    assert serials["sim-frame"] == "SIM-1"
+    assert serials["sim-event"] == "SIM-2"
+    for info in listed:
+        if info.key not in ("sim-frame", "sim-event"):
+            assert info.serial == info.key.upper(), info
+    assert len(set(serials.values())) == len(listed)
+
+
+def test_a_simulated_cameras_rig_name_follows_it_whatever_the_list(
+        tmp_path, monkeypatch):
+    store = rf.RigFile(rf.rig_path(tmp_path))
+    monkeypatch.delenv("COUNCIL_SIM_CAMERAS", raising=False)
+    for info in sim_plugin().sim_cameras():
+        store.assign(info)
+    assert {c.key: c.name for c in store.cameras()} == {
+        "sim-frame": "cam1", "sim-event": "cam2"}
+    for spec in ("frame,frame,event", "event,frame", "event,event,frame"):
+        for info in sim_plugin().sim_cameras(spec):
+            want = {"sim-frame": "cam1", "sim-event": "cam2"}.get(info.key)
+            assert store.name_of(info) == want, (spec, info)
+    entry = json.loads(store.path.read_text(encoding="utf-8"))["cameras"]
+    assert (entry["cam2"]["key"], entry["cam2"]["kind"]) == ("sim-event",
+                                                             "event")
+
+
+def test_a_camera_of_another_kind_is_another_camera(tmp_path):
+    """camera_rig.json knew a camera by backend and serial alone: a frame
+    camera that came with the event camera's serial took its name, and
+    assign() rewrote that entry's kind as a "fuller read"."""
+    store = rf.RigFile(rf.rig_path(tmp_path))
+    event = cameras.CameraInfo("simulated", "sim-event",
+                               "Simulated event camera", "SIM-2",
+                               "simulated", "event")
+    frame = cameras.CameraInfo("simulated", "sim-frame-2",
+                               "Simulated frame camera 2", "SIM-2",
+                               "simulated", "frame")
+    assert store.assign(event) == "cam1"
+    assert store.name_of(frame) is None
+    assert store.assign(frame) == "cam2"
+    cams = json.loads(store.path.read_text(encoding="utf-8"))["cameras"]
+    assert cams["cam1"]["kind"] == "event" and cams["cam1"]["key"] == \
+        "sim-event", "its kind is never rewritten"
+    found = cameras.CameraInfo("simulated", "sim-event", "", "SIM-2", "", "")
+    assert store.name_of(found) == "cam1", "a kind not read yet still matches"
+
+
+def test_more_simulated_cameras_leave_todays_presets_and_names_alone(
+        plugin_project, monkeypatch):
+    """The review's probe: the event camera's preset read as "saved on
+    another Simulated event camera" once the list had more cameras, and
+    camera_rig.json gave it a second name."""
+    connect_sim("event")
+    name = frame_camera._RIG.active.name
+    frame_camera.save_preset("mine")
+    frame_camera.disconnect()
+    monkeypatch.setenv("COUNCIL_SIM_CAMERAS", "frame,frame,event")
+    connect_sim("event")
+    assert frame_camera._RIG.active.name == name
+    assert frame_camera._RIG.active.info.serial == "SIM-2"
+    listed = frame_camera.list_presets()
+    assert listed["presets"] == ["mine"]
+    assert "another" not in listed["summary"], listed["summary"]
+    cams = rf.RigFile(rf.rig_path(plugin_project)).cameras()
+    assert [(c.name, c.key) for c in cams] == [(name, "sim-event")]
+
+

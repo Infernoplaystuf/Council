@@ -567,8 +567,10 @@ def test_n_simulated_cameras_have_names_and_serials_of_their_own(
     monkeypatch.setenv("COUNCIL_SIM_CAMERAS", "frame, Frame ,event,frame")
     listed = sim_plugin().SimulatedPlugin().discover()
     assert [(i.key, i.serial, i.kind) for i in listed] == [
-        ("sim-frame", "SIM-1", "frame"), ("sim-frame-2", "SIM-2", "frame"),
-        ("sim-event", "SIM-3", "event"), ("sim-frame-3", "SIM-4", "frame")]
+        ("sim-frame", "SIM-1", "frame"),
+        ("sim-frame-2", "SIM-FRAME-2", "frame"),
+        ("sim-event", "SIM-2", "event"),
+        ("sim-frame-3", "SIM-FRAME-3", "frame")],         "today's two keep today's serials; the others' come from their key"
     assert len({i.label for i in listed}) == 4
     assert all("Simulated" in i.label for i in listed), \
         "tests/sim_cameras picks a simulated camera by that word"
@@ -607,4 +609,5 @@ def test_n_simulated_cameras_stream_at_once_in_one_rig(host, monkeypatch):
             slot.device.stop()
     for name, frames in got.items():
         assert all(f is not None for f in frames), name
-    assert {s.device.info.serial for s in rig} == {"SIM-1", "SIM-2", "SIM-3"}
+    assert {s.device.info.serial for s in rig} == {"SIM-1", "SIM-FRAME-2",
+                                                   "SIM-2"}

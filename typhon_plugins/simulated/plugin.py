@@ -12,11 +12,15 @@ plugin imports only typhon_plugin_api (design 7.2).
 N SIMULATED CAMERAS (multi-camera design 2.10; plugin design 2.3)
 `COUNCIL_SIM_CAMERAS=frame,frame,event` lists that many simulated cameras,
 each with a name and serial of its own: the first of each kind keeps today's
-key (sim-frame, sim-event), the next ones are sim-frame-2, sim-frame-3, ...,
-and serials number them in order, SIM-1, SIM-2, ... Unset, the plugin lists
-today's two exactly as SyntheticBackend lists them (sim-frame SIM-1,
-sim-event SIM-2). A value Typhon cannot read is said, never guessed at: the
-scan lists no simulated camera and says why.
+key and serial (sim-frame SIM-1, sim-event SIM-2), and the next ones are
+sim-frame-2, sim-frame-3, ... with a serial made from the key (SIM-FRAME-2).
+A serial never depends on the camera's place in the list: camera_rig.json
+and the presets know a camera by its serial, so numbering them in order
+made today's event camera another unit (SIM-3) once a second frame camera
+came before it, and gave its rig name to that frame camera (P2 review).
+Unset, the plugin lists today's two exactly as SyntheticBackend lists them.
+A value Typhon cannot read is said, never guessed at: the scan lists no
+simulated camera and says why.
 """
 from __future__ import annotations
 
@@ -119,13 +123,17 @@ def sim_cameras(spec: Optional[str] = None) -> List[Any]:
     if len(kinds) > MAX_SIM_CAMERAS:
         raise api.CameraError(f"{SIM_ENV}={spec!r} lists {len(kinds)} cameras;"
                               f" at most {MAX_SIM_CAMERAS}")
+    # Today's two keep today's serials (SyntheticBackend's own); every other
+    # serial is made from its key, so none depends on where it is listed.
+    todays = {i.key: i.serial for i in builtin.SyntheticBackend().discover()}
     out = []
     seen: Dict[str, int] = {}
-    for position, kind in enumerate(kinds, start=1):
+    for kind in kinds:
         n = seen[kind] = seen.get(kind, 0) + 1
         key = f"sim-{kind}" if n == 1 else f"sim-{kind}-{n}"
         model = (f"Simulated {kind} camera" if n == 1
                  else f"Simulated {kind} camera {n}")
-        out.append(api.CameraInfo("simulated", key, model, f"SIM-{position}",
+        out.append(api.CameraInfo("simulated", key, model,
+                                  todays.get(key) or key.upper(),
                                   "simulated", kind))
     return out

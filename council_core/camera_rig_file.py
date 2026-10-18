@@ -16,9 +16,10 @@ cam1-cam4 by default, renameable, short and safe in a folder name (at most
 name stands for one camera, by its backend and serial — the serial is what
 stays the same: an EVK4's model is read only once it is open
 (cameras.identify) — or, for a camera with no serial, by its backend and
-the key it is found by. The same camera gets the same name next time
-(`assign`), and a new camera gets the name it is offered when no other
-camera has it, else the first free camN.
+the key it is found by — and never across kinds: a frame camera is not an
+event camera, whatever its serial says (`Named.is_camera`). The same camera
+gets the same name next time (`assign`), and a new camera gets the name it
+is offered when no other camera has it, else the first free camN.
 
 RIG PRESETS
 Which preset goes on which camera: {rig preset: {camera name: preset
@@ -121,8 +122,14 @@ class Named:
     def is_camera(self, info: Any) -> bool:
         """Whether `info` (a cameras.CameraInfo, or anything shaped like
         one) is this camera: the same backend and serial, or — with no
-        serial on either side — the same backend and key."""
+        serial on either side — the same backend and key. A camera of
+        another kind (a frame camera, where this one is an event camera)
+        is never this one, whatever its serial: a kind not read yet on
+        either side does not count against it."""
         if _text(info, "backend") != self.backend:
+            return False
+        kind = _text(info, "kind")
+        if self.kind and kind and kind != self.kind:
             return False
         serial = _text(info, "serial")
         if self.serial and serial:
@@ -276,8 +283,10 @@ class RigFile:
         camera gets the same name next time — else `prefer` when no other
         camera has it and it is not `taken` (names in use in the rig right
         now), else the first free camN. A new camera, or a known one whose
-        model or kind is now read more fully (an EVK4's sensor), is written
-        down; nothing else in the file changes."""
+        model is now read more fully (an EVK4's sensor) or whose kind was
+        not known, is written down; nothing else in the file changes. A
+        known kind is never rewritten: a camera of another kind is another
+        camera (Named.is_camera)."""
         if prefer is not None:
             check_name(prefer)
         busy = set(taken)
@@ -293,10 +302,12 @@ class RigFile:
             if have is not None:
                 chosen.append(have)
                 entry = cams[have]
-                fresh = {k: _text(info, k) for k in ("model", "kind")
-                         if _text(info, k) and _text(info, k) != entry.get(k)}
-                if _text(info, "serial") and not entry.get("serial"):
-                    fresh["serial"] = _text(info, "serial")
+                fresh = {}
+                if _text(info, "model") and                         _text(info, "model") != entry.get("model"):
+                    fresh["model"] = _text(info, "model")
+                for k in ("kind", "serial"):
+                    if _text(info, k) and not entry.get(k):
+                        fresh[k] = _text(info, k)
                 entry.update(fresh)
                 return bool(fresh)
             if len(cams) >= MAX_CAMERAS:
