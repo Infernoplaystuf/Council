@@ -1661,12 +1661,22 @@ def test_a_rebuild_takes_records_as_cache_lines_not_objects(tmp_path, monkeypatc
 # the data from the images be 100% trusted unless we are positive that the
 # data pulled from the images is accurate."
 def _conf_reader(rows, words):
-    """A stand-in OCR that also says how sure it is of each word."""
+    """A stand-in OCR that also says how sure it is of each cell (by
+    position, as source_extract's Tesseract reader does): a cell's least
+    sure word, 0 for a word not in ``words``."""
     def read(_data):
         return [list(r) for r in rows]
+
+    def matrix():
+        return [[min((words.get(t, 0) for t in str(c).split()), default=0) for c in r]
+                for r in rows]
     read.name = "test OCR"
-    read.with_confidence = lambda _data: ([list(r) for r in rows], dict(words))
+    read.with_confidence = lambda _data: ([list(r) for r in rows], matrix())
     return read
+
+
+#: The header words, read sure.
+HEAD = {"Part": 99, "Number": 99, "Owner": 99}
 
 
 def _picture_book(path, sheet="Visual", anchor="F2"):
@@ -1721,9 +1731,9 @@ def test_a_picture_link_is_firm_only_when_ocr_was_sure_and_every_name_is_known(t
 
 
 @pytest.mark.parametrize("words, known, why", [
-    ({"PN-77": 97, "Dana": 95, "Whitfield": 62}, True, "62% sure"),       # OCR unsure
-    ({"PN-77": 97, "Dana": 95, "Whitfield": 93}, False, "93% sure"),      # PN-77 unknown
-    ({}, True, "how sure unknown"),                                       # no confidence
+    ({"PN-77": 97, "Dana": 95, "Whitfield": 62, **HEAD}, True, "62% sure"),    # OCR unsure
+    ({"PN-77": 97, "Dana": 95, "Whitfield": 93, **HEAD}, False, "93% sure"),   # PN-77 unknown
+    ({}, True, "how sure unknown"),                                            # no confidence
 ])
 def test_a_picture_link_otherwise_waits_for_the_user(tmp_path, words, known, why):
     v = _vault(tmp_path)
@@ -1782,14 +1792,15 @@ def test_pictures_in_an_excel_only_workbook_are_read_when_the_clipboard_is_safe(
     sheet = _xls_with_picture(v)
     asked = _excel_with_pictures(monkeypatch, sheet)
     monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (True, ""))
-    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 97, "Dana": 95, "Whitfield": 93}))
+    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 97, "Dana": 95, "Whitfield": 93,
+                                           **HEAD}))
     stats = kg.seed()
     assert asked == [True] and stats["pictures_read"] == 1
     assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
 
 
 @pytest.mark.parametrize("why", [
-    "the clipboard holds a picture or files that copying would replace",
+    "the clipboard holds something besides plain text, which copying would replace",
     "Windows syncs this PC's clipboard to your other devices",
 ])
 def test_pictures_in_an_excel_only_workbook_wait_when_the_clipboard_is_not_safe(
@@ -1821,10 +1832,13 @@ def test_the_clipboard_check_names_what_would_be_lost(monkeypatch):
         pytest.skip("the Windows clipboard")
     monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: {13, 1, 16})
     monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: False)
+    monkeypatch.setattr(excel_open, "_remote_session", lambda: False)
     assert excel_open.clipboard_safe() == (True, "")
-    monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: {13, 8})      # text + a DIB
-    assert excel_open.clipboard_safe() == (
-        False, "the clipboard holds a picture or files that copying would replace")
+    for held in ({13, 8}, {13, "html format"}, {"rich text format"}, {"image/jpeg"}, {12}):
+        monkeypatch.setattr(excel_open, "_clipboard_formats", lambda held=held: held)
+        assert excel_open.clipboard_safe() == (
+            False, "the clipboard holds something besides plain text, which copying "
+                   "would replace"), held
     monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: set())
     monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: True)
     assert excel_open.clipboard_safe() == (
@@ -1859,3 +1873,163 @@ def test_a_name_known_only_from_a_picture_does_not_confirm_another_picture(tmp_p
     kg = _kg(v, reader=read)
     kg.seed()
     assert _rels(kg)[("Jordan Blake", "OWNS", "PN-5")] == "suggested"
+
+
+# ── review (iii), 2026-10-18: the picture rule, each failing before ───────
+def _picture_with(v, name, rows, sheet="Visual"):
+    from openpyxl.drawing.image import Image as XLImage
+    png = lf._png([[name]])
+    wb = openpyxl.Workbook()
+    wb.active.title = sheet
+    wb.active.add_image(XLImage(io.BytesIO(png)), "F2")
+    wb.save(v / "data_in" / name)
+    return png
+
+
+def _by_picture(pics, confs):
+    """A stand-in OCR that reads each picture (by its bytes) as its rows, with
+    the confidence matrix given for it."""
+    def read(data):
+        return [list(r) for r in pics.get(data, [])] or None
+    read.name = "test OCR"
+    read.with_confidence = lambda data: (read(data), confs.get(data))
+    return read
+
+
+def test_r3_a_pictures_id_and_name_row_never_renames_other_sources(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "leads.csv").write_text("Project,Program Lead\nHelios,Dana Whitfield\n",
+                                             encoding="utf-8")
+    rows = [["Project ID", "Project Name"], ["PRJ-9", "Helios"]]
+    png = _picture_with(v, "p.xlsx", rows)
+    kg = _kg(v, reader=_by_picture({png: rows}, {png: [[40, 40], [40, 40]]}))
+    kg.seed()
+    assert _rels(kg) == {("Dana Whitfield", "LEADS", "Helios"): "seeded"}
+
+
+@pytest.mark.parametrize("rows, confs", [
+    ([["Part Number", "Owner"], ["PN-77", "Dana Whitfield"]], [[99, 12], [97, 95]]),
+    ([["Owner", "Dana Whitfield"], ["Part Number", "PN-77"]], [[12, 95], [99, 97]]),
+])
+def test_r3_the_title_or_label_a_picture_value_hangs_on_must_be_read_sure_too(
+        tmp_path, rows, confs):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    png = _picture_with(v, "p.xlsx", rows)
+    kg = _kg(v, reader=_by_picture({png: rows}, {png: confs}))
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "suggested"
+
+
+def test_r3_an_initial_guessed_from_a_picture_name_confirms_nothing(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "parts.csv").write_text("Part,Project\nPN-77,PRJ-1\n", encoding="utf-8")
+    (v / "data_in" / "leads.csv").write_text("Project,Program Lead\nPRJ-1,D. Whitfield\n",
+                                             encoding="utf-8")
+    png = _picture_with(v, "p.xlsx", ROWS)
+    kg = _kg(v, reader=_by_picture({png: ROWS}, {png: [[99, 99], [97, 95]]}))
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "suggested"
+
+
+def test_r3_a_picture_link_suggested_for_any_reason_is_worded_check_it(tmp_path):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    rows = [["Part Number", "Owner"], ["PN-77", "D. Whitfield"]]
+    png = _picture_with(v, "p.xlsx", rows)
+    kg = _kg(v, reader=_by_picture({png: rows}, {png: [[99, 99], [97, 93]]}))
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "suggested"
+    dana = kg.search("Dana Whitfield", "PERSON")[0]
+    (ev,) = [e for n in kg.neighbors(dana["id"]) if n["predicate"] == "OWNS"
+             for e in n["evidence"]]
+    assert ev["where"].endswith("— read from a picture, 93% sure — check it")
+
+
+def test_r3_a_merge_the_user_made_counts_as_known(tmp_path):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    rows = [["Part Number", "Owner"], ["PN-77", "Dana Ross"]]
+    png = _picture_with(v, "p.xlsx", rows)
+    kg = _kg(v, reader=_by_picture({png: rows}, {png: [[99, 99], [97, 95]]}))
+    kg.seed()
+    assert _rels(kg)[("Dana Ross", "OWNS", "PN-77")] == "suggested"
+    kg.merge(kg.search("Dana Whitfield", "PERSON")[0]["id"],
+             kg.search("Dana Ross", "PERSON")[0]["id"])
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
+
+
+def test_r3_ocr_confidence_follows_each_box_not_the_word(tmp_path):
+    head = ("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth"
+            "\theight\tconf\ttext\n")
+    tsv = head + ("5\t1\t1\t1\t1\t1\t10\t10\t40\t12\t35\tPN-7\n"     # glued to the next
+                  "5\t1\t1\t1\t2\t1\t50\t10\t10\t12\t30\t7\n"
+                  "5\t1\t1\t1\t3\t1\t10\t60\t50\t12\t97\tPN-77\n")   # elsewhere, sure
+    rows, confs = se.rows_with_confidence(tsv)
+    assert rows == [["PN-77"], ["PN-77"]]
+    assert confs == [[30], [97]]
+
+
+def test_r3_pictures_not_copied_are_read_at_a_later_rebuild(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    sheet = _xls_with_picture(v)
+    asked = _excel_with_pictures(monkeypatch, sheet)
+    state = {"safe": (False, "Windows syncs this PC's clipboard to your other devices")}
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: state["safe"])
+    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 97, "Dana": 95, "Whitfield": 93,
+                                           **HEAD}))
+    kg.seed()
+    state["safe"] = (True, "")
+    stats = kg.seed()
+    assert asked == [False, True] and stats["pictures_read"] == 1
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
+
+
+def test_r3_a_remote_desktop_session_never_copies_pictures(monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Windows")
+    monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: False)
+    monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: set())
+    monkeypatch.setattr(excel_open, "_remote_session", lambda: True)
+    assert excel_open.clipboard_safe() == (
+        False, "this is a Remote Desktop session, whose clipboard is shared with the "
+               "other computer")
+
+
+def _careful_read(monkeypatch, seqs, copies):
+    """read_with_excel in careful mode over a sheet with a picture; the
+    clipboard's change counter gives ``seqs`` in turn."""
+    seq = iter(seqs)
+    restored = []
+    monkeypatch.setattr(excel_open, "_clip_seq", lambda: next(seq))
+    monkeypatch.setattr(excel_open, "_clip_text", lambda: "the user's text")
+    monkeypatch.setattr(excel_open, "_clip_restore", lambda text: restored.append(text))
+    monkeypatch.setattr(excel_open, "_copy_picture",
+                        lambda shape: copies.append(excel_open._CLIPBOARD_LOCK.locked())
+                        or lf._png([["x"]]))
+    sheet = _Sheet("Visual", [("Inspection",)])
+    sheet.Shapes = _Coll([_PicShape()])
+    book = excel_open.read_with_excel(Path(__file__), want_pictures=True, careful=True,
+                                      app_factory=lambda: _App([], [sheet]))
+    return book, restored
+
+
+def test_r3_a_clipboard_the_user_changed_meanwhile_is_left_alone(monkeypatch):
+    copies = []
+    book, restored = _careful_read(monkeypatch, [5, 9], copies)    # 5 at the start, 9 later
+    assert copies == [] and restored == []
+    assert [p.data for p in book.pictures] == [b""]
+    assert book.notes == ["Part 101: picture(s) not copied: the clipboard changed while the "
+                          "workbook was being read"] or any(
+        "the clipboard changed while the workbook was being read" in n for n in book.notes)
+
+
+def test_r3_pictures_are_copied_one_reader_at_a_time(monkeypatch):
+    copies = []
+    book, restored = _careful_read(monkeypatch, [5, 5, 6, 6], copies)
+    assert copies == [True]                       # under the lock
+    assert len(book.pictures) == 1 and book.pictures[0].data
+    assert restored == ["the user's text"]
+
