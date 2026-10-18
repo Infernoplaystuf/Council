@@ -206,6 +206,14 @@ plugin's cameras can have; the opened camera confirms its own:
 The host keeps only what the manifest declares and Typhon knows
 (`camera_capabilities.known`), so a plugin can never claim more. The one
 rule for an open camera's own flags is `camera_capabilities.of_device`.
+The core still acts on those flags (frame_camera restarts a stream when
+`restartable` says so, records raw by `records_raw`, sets the area live by
+`area_live`), so a camera of a plugin from someone else whose flags
+disagree with what its plugin confirmed is closed again and refused at
+open, naming each capability (P2 review); the built-ins are held to the
+same by the contract suite. A slot forgets what was confirmed when
+Disconnect empties it (before the review it held the closed device until
+the next Connect).
 **A camera slot answers** what its camera can do
 (`CameraSlot.capabilities`): what its plugin confirmed when it opened it
 (`CameraSlot.confirm`, done by `host.open_camera(info, camera=...)`), else
@@ -233,7 +241,33 @@ a camera's refusal handles it too. A plugin from someone else is then
 switched off for the session; a built-in camera plugin is not (design 3.10:
 never switched off without asking). Camera calls are not watched by the
 watchdog: they wait on an SDK and a camera for seconds (pypylon's import
-alone took 0.6-2.0 s, design 3.3).
+alone took 0.6-2.0 s, design 3.3). The same holds when a built-in camera
+plugin fails to **load or activate** (P2 review): it is logged and said,
+shows as faulted with "tried again at the next scan", and a scan or the
+set-up wizard's families try it again (`host.retry_cameras()`). Before the
+review the generic guard switched it off for the session, and its cameras
+dropped out of the next scan with no note. A hang in `activate` is still
+the watchdog's, and switches it off.
+
+**What a scan says** (P2 review). The project's scan
+(`host.discover_cameras()`) gives today's notes and, beyond them, one note
+for each camera plugin the project runs that cannot run now (faulted,
+failed to load, incompatible, waiting for approval), unless it is a family
+the set-up did not tick, and one for each ticked family no camera plugin
+the project runs opens now ("Prophesee EVK4: ticked in Camera setup…, but
+no camera plugin this project runs can open its cameras now ..."): such a
+scan said "Every backend was searched.". With every camera plugin running
+nothing is added, so the scan stays today's, note for note (a test).
+
+**What a plugin may list and be called** (P2 review). A camera plugin's
+backend name is the family `camera_setup.json` saves: `camera_setup.
+FAMILY_RE` (lower case, at most 64 characters, so never the "|" preset
+keys are split at), with a dot for a plugin from someone else's
+(`plugin_host.backend_problem`); such a plugin naming another is switched
+off with the reason, where "Acme.Thermal" used to be offered as a check box
+whose Finish raised ValueError. `discover()` keeps only `CameraInfo`s of the
+plugin's own backend, with a key and the kind `frame` or `event`; each one
+left out is a note of the scan.
 
 **Category hints** (design 2.4 item 9). Each built-in camera plugin names
 the settings groups that are its own, and `typhon_plugin_api.builtin.
@@ -241,7 +275,9 @@ hints_for` gives it those groups' rows of today's tables (one table while
 the branch lives). `camera_categories.merge` merges every plugin's hints:
 a shared tab two plugins name holds both plugins' groups, each plugin's
 own order kept; a tooltip or a group's most-used keys come from the first
-plugin that gives them. The three built-ins' hints merge into today's
+plugin that gives them. A group stays in the first shared tab that names
+it, and `plan` puts a shared tab's groups where `tab_of` does (P2 review:
+a third party's `("Thermal", ("Thermal", "Status"))` planned Status twice). The three built-ins' hints merge into today's
 tables exactly, and `plan(..., tables=)` plans the same tabs for every
 built-in camera from the merged hints and from each plugin's own alone. A
 group no plugin names still gets a tab of its own. The settings tabs still
@@ -257,10 +293,15 @@ own code until P4.
 
 **N simulated cameras** (row 2; multi-camera design 2.10):
 `COUNCIL_SIM_CAMERAS=frame,frame,event` makes the Simulated plugin list that
-many: the first of each kind keeps today's key (`sim-frame`, `sim-event`),
-the next ones are `sim-frame-2`, ...; serials number them in order,
-`SIM-1`, `SIM-2`, ... At most 8. Unset or blank, today's two exactly. A value
-Typhon cannot read is said in the scan's notes, never guessed at.
+many: the first of each kind keeps today's key and serial (`sim-frame`
+`SIM-1`, `sim-event` `SIM-2`) in every list, and the next ones are
+`sim-frame-2`, ... with a serial made from the key (`SIM-FRAME-2`). At most
+8. Unset or blank, today's two exactly. A value Typhon cannot read is said
+in the scan's notes, never guessed at. Until the P2 review the serials
+numbered the list in order, so `frame,frame,event` made today's event
+camera `SIM-3`: its presets read as saved on another unit, and
+`camera_rig.json` gave it a second name and its old name to the frame camera
+listed second.
 
 **Test fakes for a rig** (row 2): `tests/fake_rig.py` — fake EVK4 units with
 serials of their own behind one fake HAL (several at once, in
@@ -331,13 +372,20 @@ keeps its single-choice `CameraSetupWizard`, unchanged.
 design 2.2, 2.5): the name each camera goes by in the rig, cam1, cam2, ...
 by default, renameable, safe in a folder name; a camera is known by its
 backend and serial (an EVK4's model is read only once it is open), or by
-its key with no serial, and keeps its name from one session to the next.
+its key with no serial, never across kinds (a frame camera is not an event
+camera whatever its serial; a known kind is never rewritten, P2 review),
+and keeps its name from one session to the next.
 And rig presets: which preset goes on which camera; `plan()` says what
 putting one on the open cameras would do (applying one is M1 row 5, stage
 P6). The file follows `camera_presets.json`'s rules: JSON only, an OS lock
 on a sidecar, written whole under a temporary name of its own, flushed and
 renamed; a damaged or newer file is refused and left as it is; reading
-never writes. It is additive: what it does not know (a later block such as
+never writes. Connect's note on a damaged one says how to mend it (by hand,
+or move it aside and the next Connect starts a new one), and
+`RigFile.set_aside()` moves a damaged one aside byte for byte, to
+`camera_rig.damaged-<time>.json`, for the rig controls' window to offer
+when the user asks (P6; multi-camera design 4.12, as `camera_presets`'
+repair does); a newer Typhon's file is not damage and is never moved. It is additive: what it does not know (a later block such as
 the triggering plugin's rig-wide set-up, design 3.6, or a field of an
 entry) is kept when it rewrites.
 
@@ -486,14 +534,35 @@ host calls, and `record_to` handing a gate its run's writer
 (`bind_writer`), which today's `TriggerRun` does not have. The rig reaches
 the host by a name built at run time, so the host's modules are not on
 today's Typhon's Settings > Python Scripts list either (the P1 review
-found 6 extra files there, 35 to 41, and a slower cold list).
+found 6 extra files there, 35 to 41, and a slower cold list). The list
+does hold `council_core.camera_capabilities` from P2 row 1 (37 files on
+the typhon example), because today's Typhon uses it: `frame_camera._can()`,
+`CameraSlot.capabilities` and `SyntheticSettings` ask it. A test holds the
+branch's modules on that list to the rig and the capabilities, and
+frame_camera's Designer link list gains no function (the plugins path's
+`_current_families` is private, P2 review).
+
+**The grab loop** (P2 review, `council_core/capture.py`, core code both
+Typhons run): `CaptureSession._loop` catches `BaseException`, so a
+camera plugin's `read()` raising `SystemExit` ends the loop with a note, as
+any unexpected error does, where it used to end the thread without a word
+(design 3.10 counts SystemExit as a plugin fault). When the loop stops by
+itself (the camera gone, its recording over, a run of failed reads, an
+unexpected error), the recording's `<run>_run_end.json` says why in a
+`stream_ended` key; a run ended by Stop has none, so today's end records
+are unchanged. This is a bug fix for today's Typhon too.
+
+**The settings tabs' words** (P2 review): the box beside Start that is
+off, its "n/a", the capture boxes' tip and the Basic note name an event
+camera only when the camera's kind is `event`; for any other camera they
+say what is missing.
 
 | Stage | Adds to the API |
 |---|---|
 | P2 | Done (0.2, above). Rows 1 and 2: the camera plugins over today's Backend, Device and Provider classes, capabilities declared in the manifest and confirmed by the opened camera, the registry, category hints, the raw view as a review source, `Provider.extra_stops`, N simulated cameras and the rig's test fakes. Rows 3 and 4: `camera_rig.json` (names, rig presets), several camera families in the set-up as the enabled camera plugins, the wizard's check boxes, "in use as cam2" in the scan, each camera plugin's guide, checks and (Basler) scan page in the wizard, and `camera_setup.json`'s choice read as the project's plugin list |
-| P3 | The run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start, and `has("hook.check_start")`). `RunPlan` and `RunInfo`. The facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) and `CaptureOptions` and `CaptureSetup` in the API. The record gate wired through `record_gate`. The run-file suffix registry. Record blocks, and the run records' `plugins` block. The two file services, and `<project>/plugin_data/<id>/` for a plugin's own data in a project (design 4.1; nothing makes it in 0.1). `FrameView.to_sensor` and its coordinate fields, and `saved`. The finer timer while recording (row 5), decided on a quiet PC and on the bench PC. Whether plugins need the frame's own array read-only from `read()` (design 3.8), if they get frames any other way than a `FrameView` |
-| P4 | The screen: pop-out panels, toolbar and status strips, the Plugins window (base set, additions, switch-offs, settings, approval states, each plugin's over-budget and dropped-frame counts), `current_frame` and `crop_box` wired. `status()` asked by the status strip and held to its limits, 80 characters and 5 ms (design 3.5, 3.11), with `has("hook.status")`. The crash marker and "asked after a crash". A plugin's Python packages checked in the project's own interpreter (`python_envs`) when the Council lists a project's plugins; inside the app the running interpreter is the project's |
-| P5 | The hardened loader for third-party plugins (approval, `approvals.json`, the hash-then-compile importer, the `typhon_thirdparty.<folder>` package, `read_data`), the network field and its audit hook, the manifest's `uses` acted on (11.5), the API frozen as 1.0, and the author's guide and `python -m typhon_plugin_api.check` |
+| P3 | The run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start, and `has("hook.check_start")`). `RunPlan` and `RunInfo`. The facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) and `CaptureOptions` and `CaptureSetup` in the API. The record gate wired through `record_gate`. The run-file suffix registry. Record blocks, and the run records' `plugins` block. The two file services, and `<project>/plugin_data/<id>/` for a plugin's own data in a project (design 4.1; nothing makes it in 0.1). `FrameView.to_sensor` and its coordinate fields, and `saved`. The finer timer while recording (row 5), decided on a quiet PC and on the bench PC. Whether plugins need the frame's own array read-only from `read()` (design 3.8), if they get frames any other way than a `FrameView`. With the registry, the Prophesee manifest declares `_events.raw` in `files` (the manifest reader refuses that core ending today), and the contract suite's allowance for it goes: a review source's suffix must then be among its manifest's files (P2 review). Whether the core asks the slot's capabilities for restarting, raw recording and the live area rather than the Device's own flags (meanwhile a third-party camera whose flags disagree is refused at open) |
+| P4 | The screen: pop-out panels, toolbar and status strips, the Plugins window (base set, additions, switch-offs, settings, approval states, each plugin's over-budget and dropped-frame counts), `current_frame` and `crop_box` wired. `status()` asked by the status strip and held to its limits, 80 characters and 5 ms (design 3.5, 3.11), with `has("hook.status")`. The crash marker and "asked after a crash". A plugin's Python packages checked in the project's own interpreter (`python_envs`) when the Council lists a project's plugins; inside the app the running interpreter is the project's. The settings tabs planned from `host.category_tables()` (they plan from today's tables until then, so a third party's own shared tab is not yet shown as planned) |
+| P5 | The hardened loader for third-party plugins (approval, `approvals.json`, the hash-then-compile importer, the `typhon_thirdparty.<folder>` package, `read_data`), the network field and its audit hook, the manifest's `uses` acted on (11.5), the API frozen as 1.0, and the author's guide and `python -m typhon_plugin_api.check`. An import of `typhon_plugin_api.builtin` (the built-in adapters' reach: brand classes, `CaptureSetup`, the Basler scan) refused to a plugin from someone else: it is a submodule of the one module a plugin may import, and nothing refuses it yet (P2 review) |
 
 Done in the P1 review (16 October 2026), so not on the table: the
 watchdog starting by itself, the duty cap as the default, `has()` only for
@@ -562,7 +631,8 @@ Taken at stage P2 (rows 1 and 2, 16 October 2026):
 - **Category hints are cut from today's tables**: each built-in plugin
   names its groups; the rows stay in `camera_categories` until P7.
 - **`COUNCIL_SIM_CAMERAS`**: the first camera of each kind keeps today's
-  key and the serials number the list in order, so the default
+  key and serial, and every other serial comes from its key (changed in
+  the P2 review: they numbered the list in order), so the default
   `frame,event` is today's two exactly; at most 8; anything else is said.
 - **The fake EVK4's sync mode is its own enum**: in OpenEB 5.2's Python
   bindings `get_mode()` is declared to return the C++
@@ -614,3 +684,35 @@ Taken at stage P2 (rows 3 and 4, 16-18 October 2026):
 - **`NAME_RE` ends in `\Z`**: "$" also matches before a final newline,
   so a camera name ending in a newline passed (found while testing
   `camera_rig.json`).
+
+Taken in the P2 review (18 October 2026):
+
+- **A ticked family switched off is said, not asked again.** The review
+  offered two ways: ask the set-up again when no ticked family is offered,
+  or say it in the scan. Asking would bring the wizard back at every start
+  for a project whose user switched that plugin off on purpose and has no
+  other camera, which is what "nothing to tick, nothing asked" avoids; so
+  the scan says it, and `_needs_setup` is unchanged.
+- **A built-in camera plugin that fails to load is tried again at the next
+  scan**, not at every call: one scan makes one attempt and gives one note,
+  and the next scan (or the set-up wizard) tries again. Between scans its
+  state reads "faulted ... tried again at the next scan".
+- **A third-party backend name that the set-up cannot save switches the
+  plugin off**, with the reason in its state (it can never work here),
+  rather than being dropped in silence as one without a dot was before.
+- **The flags check at open is for plugins from someone else only.** The
+  built-ins' confirmed set is computed from the same flags and the
+  contract suite checks they agree, so a refusal there could only come
+  from a bug, and would take today's cameras away in a "Typhon (plugins)"
+  project.
+- **`stream_ended` is a new key of the end record, written only when the
+  stream ended by itself**, not `recording_failed` (which is "the write
+  that ended the recording") and not a key on every record, so a run ended
+  by Stop writes exactly today's record.
+- **Today's Python Scripts list keeps `camera_capabilities`**: today's
+  Typhon uses it, so hiding it by a name built at run time (as the rig does
+  for the host, which today's Typhon never loads) would make the list
+  wrong. The record says 37 files.
+- **A damaged camera_rig.json is moved aside only when asked**
+  (`set_aside`); Connect, which runs without asking, only says how to mend
+  it. Nothing moves user data on its own.

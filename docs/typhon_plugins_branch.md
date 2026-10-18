@@ -199,6 +199,20 @@ process on `tests/test_gui_settings.py`:
 | branch point (43b317e) | 35 | 695-722 ms | 2.56-2.67 |
 | branch, after the review | 36 | 703-736 ms | 2.80-2.89 |
 
+P2 row 1 added one more file, `council_core.camera_capabilities`, so today's
+Typhon lists **37** on the typhon example: the 35 of the branch point,
+`council_core.camera_rig` and `council_core.camera_capabilities`. Unlike the
+host, it is on the list because today's Typhon uses it: `frame_camera._can()`,
+`CameraSlot.capabilities` and `SyntheticSettings` ask it what a camera can do.
+Nothing else was added and nothing removed. The P2 review measured the cost
+on 18 October 2026, in detached copies of e073a24 (P1's end) and 6faf45b
+(P2's): a cold list took 717-806 ms against 726-829 ms over five runs each,
+and the known-flaky test's ratio was 2.31-2.50 against 2.35-2.95 over four
+fresh processes each, alternating, every run passing: no measurable loss of
+margin. Counted again after the review's fixes (3688e9e): 37, the same two.
+`tests/test_typhon_plugins_p2_review.py` holds the branch's modules on that
+list to these two.
+
 After P2 rows 1 and 2 (16 October 2026), the gate on 595f5f3, 6 at a time:
 63 files, 3,166 passed, 0 failed, 47 skipped, no rerun. 17 of the skips are
 the camera contract suite's: its pylon-emulator cases outside the `pylon`
@@ -251,6 +265,16 @@ run alone, and then passed three runs of the file in a row and one run on
 its own. It does not touch the camera code. `tests/test_pi_remote.py`
 passed all 46 this time.
 
+After the P2 review (18 October 2026), the gate on 3688e9e, 6 at a time:
+66 files, 3,322 passed, 0 failed, 50 skipped, in 218 s, with no rerun. In
+the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on 3688e9e: the 23 camera and Barbie v4 files of the gate and the
+branch's eight camera files (the seven above and
+`tests/test_typhon_plugins_p2_review.py`), 1,392 passed, 0 failed, 1
+skipped (the check a simulated event camera cannot be put to), in 439 s.
+That run put the Basler plugin's confirmed capabilities to pylon's
+emulated Baslers too: all six.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
@@ -280,7 +304,8 @@ side by side, these things matter:
 - **`camera_rig.json`** appears beside `app.py` at the first Connect: the
   name each camera goes by in the rig (cam1, cam2, ...), kept from one
   session to the next, and later the rig presets. A damaged one is said
-  in Connect's line and left as it is; the camera still connects.
+  in Connect's line, with how to mend it, and left as it is; the camera
+  still connects.
 - **A new "Typhon (plugins)" project gets `typhon_plugins.json`** beside its
   `app.py`. The file holds the app-wide base set copied as it is when the
   project is made (question 1), and the plugin home it was made with,
@@ -420,3 +445,4 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P2 contract suite for camera plugins | done: `tests/contracts/test_camera_plugins.py`, passed by every built-in camera plugin (with pylon's emulated Baslers in the `pylon` env) |
 | P2 row 3: `camera_rig.json`, several camera families in the set-up, the wizard's check boxes, "in use as cam2" | done (`docs/typhon_plugin_api_notes.md`, "The set-up, and the rig's names"): `council_core/camera_rig_file.py` (names, rig presets stored and planned; additive; `camera_presets.json`'s rules); the set-up's families are the enabled camera plugins; `CameraFamiliesWizard` with a check box per family, for "Typhon (plugins)" projects only (today's Typhon keeps its wizard); a camera takes its name in the rig at Connect, and is renamed in the file and its slot together (`host.rename_camera`; the window that asks comes at P6); "in use as cam2" in the scan once the rig has a second slot, and Connect refuses that camera in another slot; the wizard's scan is told about every open slot. Putting a rig preset on several open cameras is M1 row 5 (P6) |
 | P2 row 4: set-up guides and checks through the plugins; `camera_setup.json`'s choice as the project's plugin list | done: `CameraSetup` in plugin API 0.2 (`setup_guide`, `setup_checks`, the Basler `setup_scan`) and the manifest's `setup`; the Basler and Prophesee plugins reach today's guides, checks and scan page, which do not move; `camera_setup.json` gains a `cameras` list, still `FORMAT` 1, a single-choice file read as a list of one; the host scans only the families ticked (a family ticked before whose plugin is switched off stays ticked; with no family to tick, a project is not asked); the contract suite checks each plugin's set-up |
+| P2 review (18 October 2026) | fixed (`tests/test_typhon_plugins_p2_review.py`, a test per finding): simulated serials no longer depend on their place in `COUNCIL_SIM_CAMERAS` (today's two keep SIM-1 and SIM-2, so their presets and rig names stay theirs), and `camera_rig.json` never gives a camera's name to one of another kind; a slot forgets the device its plugin confirmed at Disconnect; a built-in camera plugin that fails to load or activate stays on and is tried again at the next scan; the scan says why it has no cameras of a camera plugin that cannot run, and of a ticked family switched off (it said "Every backend was searched."); a backend name the set-up cannot save is refused, and a camera listed under another family's backend is left out; merged category hints put a group in one tab; the grab loop catches `SystemExit` and the end record says why a stream ended by itself (`stream_ended`; core code, a fix for today's Typhon too); a third-party camera whose flags contradict its plugin is refused at open; the settings tabs name an event camera only for one; Connect says how to mend a damaged `camera_rig.json`, and `RigFile.set_aside()` moves one aside when asked; frame_camera's Designer link list is as before (`_current_families`); today's Python Scripts list is 37 files (above). Guards added: the Basler and Simulated plugins' confirmed capabilities, a review source's suffix among its manifest's files. Left for later stages: P3 the Prophesee manifest's `_events.raw`, P4 the settings tabs on the merged hints, P5 refusing `typhon_plugin_api.builtin` to third-party plugins (`docs/typhon_plugin_api_notes.md`) |
