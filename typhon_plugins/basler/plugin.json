@@ -4,7 +4,7 @@
   "short": "basler",
   "name": "Basler cameras",
   "version": "0.2.0",
-  "api": "0.2",
+  "api": "0.3",
   "kind": "camera",
   "entry": "plugin:BaslerPlugin",
   "needs": [],

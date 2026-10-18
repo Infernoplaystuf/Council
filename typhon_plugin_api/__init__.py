@@ -1,5 +1,5 @@
 """
-typhon_plugin_api — the one Typhon module a plugin imports: plugin API 0.2,
+typhon_plugin_api — the one Typhon module a plugin imports: plugin API 0.3,
 the working version of the API that is frozen as 1.0 at stage P5.
 
 WHAT THIS IS (docs/typhon_plugins_design.md 3.2, 3.5, 3.11)
@@ -103,8 +103,10 @@ from types import MappingProxyType
 from typing import (Any, Callable, Dict, FrozenSet, List, Mapping, Optional,
                     Protocol, Sequence, Tuple, runtime_checkable)
 
-#: This API's version: 0.x until it is frozen as 1.0 at stage P5.
-API_VERSION = "0.2"
+#: This API's version: 0.x until it is frozen as 1.0 at stage P5 — 0.1 at
+#: stage P1, 0.2 at P2 (the camera plugins), 0.3 at P3 (runs, presets, the
+#: facets, triggering).
+API_VERSION = "0.3"
 
 #: The features of this API version, by name, for `has` (design 3.11). A
 #: hook is here only once Typhon calls it: activate and deactivate (the

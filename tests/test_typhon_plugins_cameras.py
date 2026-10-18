@@ -86,10 +86,11 @@ def sim_infos(host):
 
 
 # ======================================================================
-# Plugin API 0.2
+# Plugin API 0.2's camera plugin types (0.3 from stage P3)
 # ======================================================================
 def test_the_api_is_0_2_with_the_camera_plugin_types():
-    assert api.API_VERSION == pm.API_VERSION == "0.2"
+    assert api.API_VERSION == pm.API_VERSION == "0.3", \
+        "0.2 was P2's; P3 is 0.3, and the camera plugin types stay"
     for name in ("type.CameraPlugin", "type.CategoryHints",
                  "type.ReviewSource", "camera.available", "camera.discover",
                  "camera.open", "camera.capabilities", "camera.categories",

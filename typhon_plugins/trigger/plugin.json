@@ -4,7 +4,7 @@
   "short": "trig",
   "name": "Triggering",
   "version": "0.2.0",
-  "api": "0.2",
+  "api": "0.3",
   "kind": "feature",
   "scope": "rig",
   "entry": "plugin:TriggerPlugin",

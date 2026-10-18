@@ -4,7 +4,7 @@
   "short": "crop",
   "name": "Cropped export",
   "version": "0.1.0",
-  "api": "0.2",
+  "api": "0.3",
   "kind": "feature",
   "scope": "camera",
   "entry": "plugin:CropPlugin",

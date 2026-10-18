@@ -60,7 +60,7 @@ MAX_MANIFEST_BYTES = 64 * 1024
 #: The plugin API this Typhon offers (typhon_plugin_api.API_VERSION, restated
 #: so reading a manifest imports nothing else). 0.x on the branch: any
 #: change is allowed until it is frozen as 1.0 at stage P5 (design 3.2).
-API_VERSION = "0.2"
+API_VERSION = "0.3"
 
 #: Ids: reverse-domain, lower case, at least one dot ("acme.thermal").
 ID_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
