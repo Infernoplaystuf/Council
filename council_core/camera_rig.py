@@ -40,8 +40,21 @@ nothing reads (a plain object would have accepted it).
 THE PLUGIN HOST (stage P1 row 2)
 `rig.plugins` is the rig's plugin host (council_core.plugin_host), made on
 first use; each slot's `plugin_state` is a plugin's per-camera state.
-Nothing in frame_camera calls the host yet: no plugin is wired to a feature
-before stage P2.
+Today's Typhon never makes it. A "Typhon (plugins)" project (stage P2 rows
+3 and 4) scans, opens and sets up its cameras through it.
+
+CAPABILITIES (stage P2 row 1)
+A slot answers what its camera can do (`capabilities`: frames or events,
+restartable, ...; council_core.camera_capabilities): what the camera plugin
+that opened it confirmed (`confirm`, the host's open_camera), else what the
+camera says of itself. frame_camera asks it where it once asked "is it an
+event camera?".
+
+NAMES (stage P2 row 3)
+A slot is called by its camera's name in the rig (cam1, cam2, ...; kept in
+camera_rig.json by council_core.camera_rig_file): `rename_slot` gives it
+that name when the camera connects, and `holding` says which slot has a
+camera open ("in use as cam2" in the scan).
 
 NOT YET (later rows of M1 / P1)
 frame_camera still locks with its one module-level `_LOCK`; each slot has a
@@ -59,8 +72,10 @@ import threading
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 #: A camera's name: short and safe in a folder name (multi-camera design
-#: 2.2): at most 16 characters, a-z, 0-9 and "-".
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,15}$")
+#: 2.2): at most 16 characters, a-z, 0-9 and "-". Ended by \Z, not $: "$"
+#: also matches before a final newline, which let a name ending in a
+#: newline through (found at P2 row 3).
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,15}\Z")
 
 #: The most cameras one window runs (multi-camera design: 2-4).
 MAX_SLOTS = 4
@@ -71,10 +86,11 @@ ROLES = ("free", "leader", "follower")
 #: Names the slot and the rig keep for themselves; `_Live` may not declare a
 #: field by any of them (checked when a rig is made).
 SLOT_OWN = frozenset({"id", "name", "role", "lock", "plugin_state", "clear",
-                      "_reset"})
+                      "_reset", "confirmed", "capabilities", "confirm"})
 RIG_OWN = frozenset({"slots", "active", "slot_fields", "rig_fields",
                      "add_slot", "select", "slot", "remove_slot", "names",
-                     "connected", "_reset", "_lock", "plugins", "_plugins"})
+                     "connected", "_reset", "_lock", "plugins", "_plugins",
+                     "rename_slot", "holding"})
 
 
 class _Unset:
@@ -121,11 +137,42 @@ class CameraSlot:
         self.role = "free"
         self.lock = threading.RLock()
         self.plugin_state: Dict[str, Dict[str, Any]] = {}
+        #: What the camera plugin that opened this slot's camera confirmed
+        #: it can do, with the device it was confirmed for — (device,
+        #: capabilities) — or None (`capabilities`).
+        self.confirmed: Optional[Tuple[Any, FrozenSet[str]]] = None
         self._reset = reset
         reset(self)
 
     def clear(self) -> None:
+        """The per-connection fields back as Disconnect leaves them — and
+        what the camera's plugin confirmed, which held the closed device
+        and everything it holds until the next Connect (P2 review)."""
         self._reset(self)
+        self.confirmed = None
+
+    def confirm(self, device: Any, capabilities: Any) -> None:
+        """Keep what the camera plugin that opened `device` for this slot
+        confirmed it can do (plugin design 3.4); asked by `capabilities`
+        while that device is the slot's."""
+        self.confirmed = (device, frozenset(capabilities))
+
+    @property
+    def capabilities(self) -> FrozenSet[str]:
+        """What this slot's camera can do (plugin design 3.4, 5.1): what its
+        camera plugin confirmed when it opened it, else what the camera says
+        of itself (council_core.camera_capabilities.of_device — today's
+        Typhon, which opens cameras without the plugin host). Empty with no
+        camera. Asked where the code once asked "is it an event camera?"."""
+        device = getattr(self, "device", None)
+        if device is None:
+            return frozenset()
+        confirmed = self.confirmed
+        if confirmed is not None and confirmed[0] is device:
+            return confirmed[1]
+        from .camera_capabilities import of_device
+
+        return of_device(device, getattr(self, "info", None))
 
     def __repr__(self) -> str:
         return (f"<CameraSlot {self.name} id={self.id} role={self.role} "
@@ -246,10 +293,42 @@ class Rig:
                                  f"first")
             self.slots.remove(target)
 
+    def rename_slot(self, old: str, new: str) -> CameraSlot:
+        """Call slot `old` `new` (a camera keeps its name in the rig from one
+        session to the next: council_core.camera_rig_file). Refused when
+        `new` is not a safe name or another slot has it; who the slot is
+        otherwise — its id, its camera, its plugins' state — is unchanged."""
+        with self._lock:
+            target = self.slot(old)
+            if new == old:
+                return target
+            if not NAME_RE.match(new or ""):
+                raise ValueError(
+                    f"{new!r} cannot name a camera: use at most 16 "
+                    f"characters, a-z, 0-9 and '-', starting with a letter "
+                    f"or digit")
+            if new in self.names():
+                raise ValueError(f"a camera is already named {new!r}")
+            target.name = new
+            return target
+
     def connected(self) -> List[CameraSlot]:
         """The slots with a camera open, in order."""
         return [s for s in self.slots
                 if getattr(s, "device", None) is not None]
+
+    def holding(self, info: Any) -> Optional[CameraSlot]:
+        """The slot that has camera `info` open — the same backend and the
+        key it was found by — or None ("in use as cam2" in the scan)."""
+        backend = str(getattr(info, "backend", "") or "")
+        key = str(getattr(info, "key", "") or "")
+        for s in self.connected():
+            held = getattr(s, "info", None)
+            if held is not None and key \
+                    and str(getattr(held, "backend", "") or "") == backend \
+                    and str(getattr(held, "key", "") or "") == key:
+                return s
+        return None
 
     def __repr__(self) -> str:
         return (f"<Rig {len(self.slots)} slot(s), active "

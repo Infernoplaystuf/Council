@@ -69,6 +69,10 @@ NOTE_NO_CAMERA = ("Connect a camera to see its settings — they fill the tabs "
 NOTE_FRAME = "More settings in the tabs beside Basic — Pop out opens one."
 NOTE_EVENT = ("Event camera — no exposure, gain or trigger. FPS: its picture "
               "window.")
+#: The same note for a camera with neither box that is NOT an event camera
+#: (a camera plugin's: plugin design 3.3), which NOTE_EVENT would misname.
+NOTE_NO_BOXES = ("No exposure or gain on this camera — more settings in the "
+                 "tabs beside Basic.")
 
 
 def _quietly_set(port: Any, value: Any) -> None:
@@ -561,23 +565,40 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
         self._basic_capture()
         self._basic_note()
 
+    def _event_camera(self) -> bool:
+        """Whether the connected camera is an event camera (its kind, as
+        camera_state says it): the words that name an event camera are for
+        one only. A camera plugin's frame camera with no exposure is not one
+        (P2 review); with no kind said, today's words stand."""
+        return str(getattr(self, "camera_kind", "") or "") in ("event", "")
+
     def _basic_boxes(self) -> None:
         """Grey the boxes beside Start that this camera cannot honour (an
-        event camera has no exposure and no gain) — and say so."""
+        event camera has no exposure and no gain) — and say so: for an
+        event camera as always, for any other camera by what it lacks."""
+        event = self._event_camera()
         for name, has in (("exposure", self.has_exposure),
                           ("gain", self.has_gain)):
             widget = getattr(self.boxes.get(name), "widget", None)
             if widget is None:
                 continue
             widget.setEnabled(has)
-            widget.setToolTip("" if has else
-                              f"This camera has no {name} — an event camera "
-                              f"collects events, not light")
-            self._look_off(widget, not has)
+            if has:
+                tip = ""
+            elif event:
+                tip = (f"This camera has no {name} — an event camera "
+                       f"collects events, not light")
+            else:
+                tip = f"This camera has no {name} setting"
+            widget.setToolTip(tip)
+            self._look_off(widget, not has,
+                           special=self.NOT_HERE if event
+                           else self.NOT_HERE_OTHER)
 
     #: What a box beside Start says for its 0 while this camera has no such
-    #: setting.
+    #: setting: an event camera's, and any other camera's.
     NOT_HERE = "n/a — event camera"
+    NOT_HERE_OTHER = "n/a"
 
     def _look_off(self, widget: Any, off: bool,
                   special: Optional[str] = NOT_HERE) -> None:
@@ -713,7 +734,10 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
                 tip = "Connect a camera first"
             elif not self.has_capture:
                 tip = ("An event camera is not triggered or downsampled "
-                       "here — its .raw keeps every event")
+                       "here — its .raw keeps every event"
+                       if self._event_camera() else
+                       "This camera has no capture set-up here: it is not "
+                       "triggered or downsampled")
             elif self.capturing:
                 tip = ("Stop the capture to change this — one run keeps one "
                        "set-up")
@@ -841,7 +865,7 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             # camera's, two lines, was cut at 1400 x 820. The camera's name
             # is said by Connect and the camera list; its tabs are in view.
             if not self.has_exposure and not self.has_gain:
-                text = NOTE_EVENT
+                text = NOTE_EVENT if self._event_camera() else NOTE_NO_BOXES
             else:
                 text = NOTE_FRAME
         try:

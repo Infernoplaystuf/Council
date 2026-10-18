@@ -117,8 +117,9 @@ python tools\typhon_plugins_gate.py --check-list
   settings, presets, set-up, Basler, the classifier, timing and crop
   libraries, Barbie v4, and the Designer files that build Typhon or every
   example. Plus the branch's own files (`tests/test_camera_rig.py`,
-  `tests/test_typhon_plugins_*.py`; the plugin contract suites join from
-  stage P3). One pytest process per file, offscreen, in temporary folders.
+  `tests/test_typhon_plugins_*.py`, and the plugin contract suites in
+  `tests/contracts/`: the camera kind's from stage P2, the others' from
+  P3). One pytest process per file, offscreen, in temporary folders.
 - `tests/test_gui_policy.py` is in the gate ahead of the next merge from
   `qt-migration`: that branch's policy-gate fix (e40d319, 6884069) makes
   it build and policy-check every example, `typhon_plugins` included, and
@@ -198,6 +199,91 @@ process on `tests/test_gui_settings.py`:
 | branch point (43b317e) | 35 | 695-722 ms | 2.56-2.67 |
 | branch, after the review | 36 | 703-736 ms | 2.80-2.89 |
 
+P2 row 1 added one more file, `council_core.camera_capabilities`, so today's
+Typhon lists **37** on the typhon example: the 35 of the branch point,
+`council_core.camera_rig` and `council_core.camera_capabilities`. Unlike the
+host, it is on the list because today's Typhon uses it: `frame_camera._can()`,
+`CameraSlot.capabilities` and `SyntheticSettings` ask it what a camera can do.
+Nothing else was added and nothing removed. The P2 review measured the cost
+on 18 October 2026, in detached copies of e073a24 (P1's end) and 6faf45b
+(P2's): a cold list took 717-806 ms against 726-829 ms over five runs each,
+and the known-flaky test's ratio was 2.31-2.50 against 2.35-2.95 over four
+fresh processes each, alternating, every run passing: no measurable loss of
+margin. Counted again after the review's fixes (3688e9e): 37, the same two.
+`tests/test_typhon_plugins_p2_review.py` holds the branch's modules on that
+list to these two.
+
+After P2 rows 1 and 2 (16 October 2026), the gate on 595f5f3, 6 at a time:
+63 files, 3,166 passed, 0 failed, 47 skipped, no rerun. 17 of the skips are
+the camera contract suite's: its pylon-emulator cases outside the `pylon`
+environment, and the one check a simulated event camera cannot be put to
+(it always has something to send). In the `pylon` environment, one process
+with `PYLON_CAMEMU=2` and OpenEB on the path, on a300ff2: the 23 camera and
+Barbie v4 files of the gate and the branch's five camera files (the rig,
+capabilities, the registry, the rig fakes and the contract suite), 1,233
+passed, 0 failed, 1 skipped (that same check), in 549 s; the contract suite
+there ran its pylon-emulator cases and the real-`.raw` replays.
+
+The whole suite after P2 rows 1 and 2, on 9a9a2e3, 8 at a time: 237 files,
+8,370 passed, 22 failed, 39 skipped, and `smoke_test.py` passed 1,313 with 0
+failed. Six failures were timing tests under that load, and their files
+passed whole when run alone: `tests/test_frame_camera.py::
+test_the_fps_box_changes_the_recording_rate_mid_capture` (17.9 fps against
+21), three in `tests/test_frame_camera_setup.py`
+(`test_a_frame_camera_preset_restarts_the_live_view_once`,
+`test_a_slow_camera_does_not_hold_the_window`,
+`test_a_slow_read_of_the_camera_at_start_is_not_capture_time`), and one
+each in `tests/test_council_tab.py` and `tests/test_fanout.py`. The other
+16 are `tests/test_pi_remote.py`'s, which fail alone too, and fail the same
+on e073a24 (the last commit of P1): their fakes run through WSL's bash
+(`WindowsApps\bash.EXE`), which did not find the tests' `C:/` temporary
+paths. Neither file touches the camera code.
+
+After P2 rows 3 and 4 (18 October 2026), the gate on f767554, 6 at a time:
+65 files, 3,287 passed, 0 failed, 49 skipped, in 199 s, with no rerun. The
+run before it, on 44e7507, had one failure:
+`tests/test_typhon_plugins_timing.py::test_the_pcs_load_is_read_from_its_cpu_times`.
+That test did a few ms of work between two reads of Windows' CPU times,
+which move on only at the clock tick (about 15.6 ms). When both reads fell
+in one tick they were equal, and the load came back as "cannot tell"
+(None). In a measurement, 8 of 200 such reads came back None. The test now
+stays busy for 0.2 s (f767554), and 0 of 20 such reads came back None. The
+bench itself is unchanged.
+
+In the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on f767554, were run the 23 camera and Barbie v4 files of the
+gate and the branch's seven camera files. Those seven are the rig, the rig
+file, capabilities, the registry, the rig fakes, the set-up and the
+contract suite. The result: 1,356 passed, 0 failed, 1 skipped, in 470 s.
+
+The whole suite on f767554, 8 at a time: 239 files, 8,505 passed, 1
+failed, 39 skipped, and `smoke_test.py` passed 1,313 with 0 failed. The
+one failure was `tests/test_node_routing.py::
+test_two_roles_on_two_machines_really_run_side_by_side`, a timing test
+(0.97 s against its 0.75 s limit). It failed once more when its file was
+run alone, and then passed three runs of the file in a row and one run on
+its own. It does not touch the camera code. `tests/test_pi_remote.py`
+passed all 46 this time.
+
+After the P2 review (18 October 2026), the gate on 3688e9e, 6 at a time:
+66 files, 3,322 passed, 0 failed, 50 skipped, in 218 s, with no rerun. In
+the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on 3688e9e: the 23 camera and Barbie v4 files of the gate and the
+branch's eight camera files (the seven above and
+`tests/test_typhon_plugins_p2_review.py`), 1,392 passed, 0 failed, 1
+skipped (the check a simulated event camera cannot be put to), in 439 s.
+That run put the Basler plugin's confirmed capabilities to pylon's
+emulated Baslers too: all six.
+
+The whole suite after the P2 review, on 6fab4eb, 8 at a time: 240 files,
+8,540 passed, 1 failed, 40 skipped, and `smoke_test.py` passed 1,313 with 0
+failed. The one failure was `tests/test_data_index_sidecars.py::
+test_a_second_refresh_with_nothing_changed_changes_nothing`: a second
+refresh profiled two files again (`data_index` compares a profile's
+`time.time()` with the file's mtime). Its file passed three runs alone;
+neither it nor `data_index.py` has changed on the branch, and neither
+touches the camera code.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
@@ -210,11 +296,25 @@ it may have been counted ("3 triggers · 2 ok").
 The rig is the plugin host: `frame_camera._RIG.plugins`, made on first use.
 What it does, the API it offers plugins (0.1) and what each later stage
 adds are in `docs/typhon_plugin_api_notes.md`. For running the two Typhons
-side by side, three things matter:
+side by side, these things matter:
 
-- **Nothing is wired yet.** Today's camera code never calls the host, so
-  "Typhon (plugins)" still behaves exactly like today's Typhon. A test runs
-  a whole capture and finds the host never made or imported.
+- **Only the cameras are wired, and only in "Typhon (plugins)"** (stage P2
+  rows 3 and 4). Its scan, Connect and Camera setup… go through the
+  camera plugins; the cameras, rows and notes are those of today's Typhon
+  for the same set-up. Today's camera code never calls the host: a test
+  runs a whole capture and finds the host never made or imported.
+- **Its Camera setup… ticks camera families** instead of choosing one:
+  Basler, Prophesee EVK4, or both. Each brings its own install steps,
+  checks and (Basler) scan, as today's wizard does for one. The simulated
+  cameras need no set-up and are always listed. A project set up with
+  today's single choice is not asked again: that one camera is ticked.
+  `camera_setup.json` stays readable by today's Typhon, which takes the
+  first family it knows.
+- **`camera_rig.json`** appears beside `app.py` at the first Connect: the
+  name each camera goes by in the rig (cam1, cam2, ...), kept from one
+  session to the next, and later the rig presets. A damaged one is said
+  in Connect's line, with how to mend it, and left as it is; the camera
+  still connects.
 - **A new "Typhon (plugins)" project gets `typhon_plugins.json`** beside its
   `app.py`. The file holds the app-wide base set copied as it is when the
   project is made (question 1), and the plugin home it was made with,
@@ -349,3 +449,9 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P1 row 3: frame timing inside the real Qt Typhon | done (above), measured twice: a 1 ms switch interval and the duty cap (now on by default) keep an always-busy plugin from starving the grab thread; whether the 1 ms timer request matters is still to measure on a PC where nothing else holds it, before P3 row 5 |
 | P1 row 4: `typhon_plugins.gspec` registered | done: typhon's wireframe under the new name |
 | P1 review (16 October 2026) | fixed: a gate bound to its own run's writer (a late fault no longer ends the next run; a `confirm_saves` fault ends its run with the reason); the frame at a gate fault saved and marked; loading outside the host's lock; hook lookups guarded; any exception counted; the watchdog starting itself; a damaged project list running only the built-in cameras; nothing written under `~\.council`; run-file names holding a core ending refused; too many files said as such; frames a plugin cannot unlock; the duty cap on by default; `has()` only for hooks Typhon calls; the host off today's Python Scripts list; `tests/test_gui_policy.py` in the gate; a Barbie test retired. Two decisions to confirm are in `docs/typhon_plugin_api_notes.md` ("Decisions") |
+| P2 row 1: Basler, Prophesee and Simulated as adapter camera plugins | done (plugin API 0.2, `docs/typhon_plugin_api_notes.md` "Camera plugins"): adapters over today's Backend, Device and Provider classes, which do not move; capabilities in the manifest, confirmed by the opened camera and kept by its slot; `frame_camera`'s four event-camera checks, the simulated camera's settings and the Capture tab ask capabilities; `Provider.extra_stops` (a Basler's other triggers); the host's camera registry (the scan through the plugins is today's scan); category hints that merge into today's tables; the raw view as the Prophesee plugin's review source; `cameras.backends()` and `discover()` unchanged. Today's Typhon still opens cameras as before: the registry is called from rows 3 and 4 |
+| P2 row 2: N simulated cameras and the rig's test fakes | done: `COUNCIL_SIM_CAMERAS`; `tests/fake_rig.py` (fake EVK4 units with serials, several at once; Trigger In, sync and the trigger decoder; a trigger line; a sync clock; replay rigs, of real `.raw` files where the Metavision SDK is) |
+| P2 contract suite for camera plugins | done: `tests/contracts/test_camera_plugins.py`, passed by every built-in camera plugin (with pylon's emulated Baslers in the `pylon` env) |
+| P2 row 3: `camera_rig.json`, several camera families in the set-up, the wizard's check boxes, "in use as cam2" | done (`docs/typhon_plugin_api_notes.md`, "The set-up, and the rig's names"): `council_core/camera_rig_file.py` (names, rig presets stored and planned; additive; `camera_presets.json`'s rules); the set-up's families are the enabled camera plugins; `CameraFamiliesWizard` with a check box per family, for "Typhon (plugins)" projects only (today's Typhon keeps its wizard); a camera takes its name in the rig at Connect, and is renamed in the file and its slot together (`host.rename_camera`; the window that asks comes at P6); "in use as cam2" in the scan once the rig has a second slot, and Connect refuses that camera in another slot; the wizard's scan is told about every open slot. Putting a rig preset on several open cameras is M1 row 5 (P6) |
+| P2 row 4: set-up guides and checks through the plugins; `camera_setup.json`'s choice as the project's plugin list | done: `CameraSetup` in plugin API 0.2 (`setup_guide`, `setup_checks`, the Basler `setup_scan`) and the manifest's `setup`; the Basler and Prophesee plugins reach today's guides, checks and scan page, which do not move; `camera_setup.json` gains a `cameras` list, still `FORMAT` 1, a single-choice file read as a list of one; the host scans only the families ticked (a family ticked before whose plugin is switched off stays ticked; with no family to tick, a project is not asked); the contract suite checks each plugin's set-up |
+| P2 review (18 October 2026) | fixed (`tests/test_typhon_plugins_p2_review.py`, a test per finding): simulated serials no longer depend on their place in `COUNCIL_SIM_CAMERAS` (today's two keep SIM-1 and SIM-2, so their presets and rig names stay theirs), and `camera_rig.json` never gives a camera's name to one of another kind; a slot forgets the device its plugin confirmed at Disconnect; a built-in camera plugin that fails to load or activate stays on and is tried again at the next scan; the scan says why it has no cameras of a camera plugin that cannot run, and of a ticked family switched off (it said "Every backend was searched."); a backend name the set-up cannot save is refused, and a camera listed under another family's backend is left out; merged category hints put a group in one tab; the grab loop catches `SystemExit` and the end record says why a stream ended by itself (`stream_ended`; core code, a fix for today's Typhon too); a third-party camera whose flags contradict its plugin is refused at open; the settings tabs name an event camera only for one; Connect says how to mend a damaged `camera_rig.json`, and `RigFile.set_aside()` moves one aside when asked; frame_camera's Designer link list is as before (`_current_families`); today's Python Scripts list is 37 files (above). Guards added: the Basler and Simulated plugins' confirmed capabilities, a review source's suffix among its manifest's files. Left for later stages: P3 the Prophesee manifest's `_events.raw`, P4 the settings tabs on the merged hints, P5 refusing `typhon_plugin_api.builtin` to third-party plugins (`docs/typhon_plugin_api_notes.md`) |

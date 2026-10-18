@@ -12,9 +12,12 @@ ADAPTERS OVER TODAY'S CODE (design 7.2)
 While the typhon-plugins branch lives, each plugin is a thin adapter: its
 manifest, and a layer that reaches the code that stays where it is in
 council_core and frame_camera through re-exports in typhon_plugin_api — the
-only Typhon module a plugin imports, built-in or not (a test checks). The
-code moves into these folders only at stage P7. At stage P1 every adapter
-is empty: the host finds, loads and activates it, and it does nothing yet.
+only Typhon module a plugin imports, built-in or not (a test checks); what
+a built-in adapter reaches of that code is in typhon_plugin_api.builtin.
+The code moves into these folders only at stage P7. From stage P2 the
+three camera plugins (basler, prophesee, simulated) are adapters over
+today's Backend, Device and Provider classes; the four feature plugins are
+still empty (triggering is wired at P3, the panels at P4).
 
 Nothing here is imported to list the plugins: the host reads plugin.json.
 """

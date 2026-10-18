@@ -300,18 +300,22 @@ def _imports_of(path):
 
 def test_camera_rig_imports_no_toolkit_and_not_frame_camera():
     """council_core's rule (no Qt), and the layering: the rig is handed its
-    template, it does not reach up into the linked module. Its one Council
-    module is its plugin host (P1 row 2: the rig IS the plugin host, made on
-    first use), which keeps the same rule — imported by a name built at run
-    time, so the host is not on the Python Scripts list of every app that
-    links frame_camera (P1 review)."""
+    template, it does not reach up into the linked module. Its Council
+    modules are its plugin host (P1 row 2: the rig IS the plugin host, made
+    on first use), which keeps the same rule — imported by a name built at
+    run time, so the host is not on the Python Scripts list of every app
+    that links frame_camera (P1 review) — and, from stage P2, the one rule
+    of a camera's capabilities (camera_capabilities: a slot answers what its
+    camera can do), a small module with no imports of its own."""
     imported = _imports_of(ROOT / "council_core" / "camera_rig.py")
     assert not imported & {"PySide6", "tkinter", "frame_camera", "council_qt"}
     assert imported <= {"__future__", "re", "threading", "typing",
-                        "importlib"}
+                        "importlib", "camera_capabilities"}
     source = (ROOT / "council_core" / "camera_rig.py").read_text(
         encoding="utf-8")
     assert 'import_module(f"{__package__}.plugin_host")' in source
+    assert _imports_of(ROOT / "council_core" / "camera_capabilities.py") <= {
+        "__future__", "typing"}
     for name in ("plugin_host", "plugin_lists", "plugin_manifest"):
         assert not _imports_of(ROOT / "council_core" / f"{name}.py") & {
             "PySide6", "tkinter", "frame_camera", "council_qt"}, name

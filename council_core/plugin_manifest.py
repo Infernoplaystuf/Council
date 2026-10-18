@@ -15,6 +15,13 @@ Every other Typhon file is JSON. Entry points would let any package installed
 into a shared conda environment register itself without approval; one folder
 the user can see is the whole of a plugin (design 3.1, question 7).
 
+A CAMERA PLUGIN SAYS WHAT ITS CAMERAS CAN HAVE (`capabilities`, API 0.2)
+Its capabilities (design 3.4: frames, events, software_trigger, ...) are
+in the manifest, so the screen can offer features before any of its code
+runs; each camera it opens confirms its own. Only a camera plugin declares
+them (a feature says what it `needs`); a name Typhon does not know is kept
+as written and ignored, as an offered capability Typhon does not know is.
+
 STRICT, BECAUSE A MANIFEST IS A PROMISE
 A field this schema does not know is refused, not ignored — a misspelt
 "contributes" would otherwise quietly attach nothing. So are duplicate keys
@@ -53,7 +60,7 @@ MAX_MANIFEST_BYTES = 64 * 1024
 #: The plugin API this Typhon offers (typhon_plugin_api.API_VERSION, restated
 #: so reading a manifest imports nothing else). 0.x on the branch: any
 #: change is allowed until it is frozen as 1.0 at stage P5 (design 3.2).
-API_VERSION = "0.1"
+API_VERSION = "0.2"
 
 #: Ids: reverse-domain, lower case, at least one dot ("acme.thermal").
 ID_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
@@ -83,11 +90,14 @@ NETWORK = ("none", "camera-link", "internet")
 
 #: The places a plugin may attach to (design 3.7, 3.8, 3.11).
 CONTRIBUTIONS = ("panel", "toolbar", "status", "run_hooks", "analyse",
-                 "review_source", "overlay", "record_gate", "frame_stage")
+                 "review_source", "setup", "overlay", "record_gate",
+                 "frame_stage")
 #: Inside the data-safety rules: built-in plugins only (design 3.11).
 BUILTIN_ONLY = frozenset({"record_gate", "frame_stage"})
-#: Camera plugins only: how the slider shows one of its run files.
-CAMERA_ONLY = frozenset({"review_source"})
+#: Camera plugins only: how the slider shows one of its run files; and a
+#: set-up — the family's check box in the set-up wizard, with its guide,
+#: checks and scan (design 2.3, 2.4 item 15; stage P2 row 4).
+CAMERA_ONLY = frozenset({"review_source", "setup"})
 #: Named now so later plugins fit, not built yet (design 11.5): refused.
 RESERVED = frozenset({"overlay"})
 
@@ -105,7 +115,8 @@ REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",
             "entry")
 THIRD_PARTY_REQUIRED = ("author", "description", "licence")
 OPTIONAL = ("scope", "needs", "python", "contributes", "files", "uses",
-            "network", "budget_ms", "author", "description", "licence")
+            "network", "budget_ms", "author", "description", "licence",
+            "capabilities")
 FIELDS = frozenset(REQUIRED) | frozenset(OPTIONAL)
 
 #: Live calls' default time budget (design 3.11).
@@ -155,6 +166,9 @@ class Manifest:
     author: str = ""
     description: str = ""
     licence: str = ""
+    #: A camera plugin's: what its cameras can have (design 3.4), read
+    #: before any of its code runs; each opened camera confirms its own.
+    capabilities: Tuple[str, ...] = ()
     schema: int = SCHEMA
     #: Where it was read from, and whether it was read as a built-in.
     folder: Optional[Path] = field(default=None, compare=False)
@@ -181,6 +195,8 @@ class Manifest:
             "contributes": list(self.contributes), "files": list(self.files),
             "uses": [{"id": u.id, "required": u.required} for u in self.uses],
             "network": self.network, "budget_ms": self.budget_ms}
+        if self.capabilities:
+            out["capabilities"] = list(self.capabilities)
         for name in THIRD_PARTY_REQUIRED:
             value = getattr(self, name)
             if value:
@@ -401,6 +417,18 @@ def check(doc: Mapping[str, Any], *, builtin: bool,
     if len(set(files)) != len(files):
         raise ManifestError("a run file is named twice in files", "files")
     uses = _uses(doc)
+    capabilities = _strings(doc, "capabilities")
+    for capability in capabilities:
+        if not CAPABILITY_RE.match(capability):
+            raise ManifestError(f"{capability!r} in capabilities is not a "
+                                f"capability name", "capabilities")
+    if capabilities and kind != "camera":
+        raise ManifestError("only a camera plugin says what its cameras can "
+                            "do (capabilities); a feature says what it "
+                            "needs", "capabilities")
+    if len(set(capabilities)) != len(capabilities):
+        raise ManifestError("a capability is named twice in capabilities",
+                            "capabilities")
     network = _text(doc, "network") if "network" in doc else "none"
     if network not in NETWORK:
         raise ManifestError(f"its network {network!r} is not one of "
@@ -423,8 +451,8 @@ def check(doc: Mapping[str, Any], *, builtin: bool,
         kind=kind, entry=entry, scope=scope, needs=tuple(needs),
         python=tuple(python), contributes=tuple(contributes),
         files=tuple(files), uses=uses, network=network,
-        budget_ms=float(budget), schema=SCHEMA, folder=folder,
-        builtin=builtin, **texts)
+        budget_ms=float(budget), capabilities=tuple(capabilities),
+        schema=SCHEMA, folder=folder, builtin=builtin, **texts)
 
 
 def _whole(value: Any) -> bool:
