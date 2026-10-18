@@ -55,18 +55,12 @@ RESERVED_PORT_NAMES: FrozenSet[str] = frozenset({"read", "apply"})
 
 
 def _policy_denied() -> FrozenSet[str]:
-    """Names the policy gate refuses as an attribute — `remove`, `load`,
-    `kill`, `system`, ... A port is emitted as `self.<name> = ...` in
+    """Names the policy gate refuses as an attribute ANYWHERE — `remove`,
+    `load`, `kill`, `system`, ... A port is emitted as `self.<name> = ...` in
     ui/ports.py, so a port with one of these names makes the gate refuse the
     whole app. Measured: a button labelled "Remove" produced
         ports.py: line 809: self.remove is not permitted in a generated app
-    and, now the gate is enforced at Run, the app would not start.
-
-    The module names (socket, modules, ...) are refused only on a receiver
-    that may be a module, so `self.socket` itself passes; they are still
-    kept off port names, because app code reaches a port through whatever
-    holds the Ports object, and the gate cannot always tell that is not a
-    module."""
+    and, now the gate is enforced at Run, the app would not start."""
     try:
         import gui_policy as _pol
         return frozenset(_pol.DENIED_ATTRS) | frozenset(_pol.DENIED_BUILTINS)

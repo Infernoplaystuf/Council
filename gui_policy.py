@@ -41,11 +41,10 @@ sandbox against code written to escape it.
 from __future__ import annotations
 
 import ast
-import builtins as _builtins
 import keyword
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Set, Tuple
+from typing import List, Sequence, Set, Tuple
 
 # The Council's own source directory. A `requires` naming a module here is
 # Council code, not a package — see check_requires.
@@ -257,52 +256,13 @@ def _why(reason: str, *names: str) -> dict:
     return {n: reason for n in names}
 
 
-# A DENIED module's own name, reached as an attribute: refused only where
-# the receiver is, or may be, a module (_Receivers says which). A module that
-# imported a denied one hands it over with no import the gate can see —
-# logging.handlers.socket, frame_camera.ctypes, np.ctypeslib — and several
-# allowed stdlib modules keep one bound as a live attribute: codecs.builtins
-# IS builtins (so codecs.builtins.eval is eval), enum aliases it `bltns`,
-# cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
-# resolve_name load any callable from a dotted string), mimetypes._winreg is
-# winreg, xml.sax.saxutils.urllib and email.utils.urllib are the urllib
-# package (saxutils' own code calls urllib.request.urlopen); sys.modules,
-# meta_path and path_hooks are `import` with no import statement. The route
-# is closed at the module name, one step before the terminal .eval /
-# .locate / .CreateKeyEx, which cannot be denied directly: re.compile,
-# QApplication.exec() and DataFrame.eval are honest.
+# Attribute names denied wherever they appear. os and sys are PERMITTED — a
+# real application needs os.path and sys.argv — so the dangerous surface is
+# denied by name instead of by module.
 #
-# ON AN ORDINARY OBJECT THE SAME WORD IS ONLY A NAME. These were refused on
-# every receiver (2026-10-15), so `self.socket` holding a camera
-# connection, `self.modules` a plugin list and `self.ssl` a checkbox failed
-# the gate with "it reaches the network" about an attribute that reaches
-# nothing. Now they pass on self, cls and anything else the file shows is
-# not a module, and are refused on everything that is or may be one.
-MODULE_ROUTE_REASONS = {
-    **_why(WHY_PROGRAM,
-           "subprocess", "_winapi", "_posixsubprocess", "multiprocessing"),
-    **_why(WHY_NETWORK,
-           "socket", "_socket", "ssl", "socketserver", "xmlrpc",
-           "urllib", "urllib2", "urllib3"),
-    **_why(WHY_ASYNCIO, "asyncio"),
-    **_why(WHY_DESKTOP, "webbrowser"),
-    **_why(WHY_NATIVE, "ctypes", "_ctypes", "ctypeslib"),
-    **_why(WHY_MODULE_TABLE,
-           "modules", "meta_path", "path_hooks", "path_importer_cache"),
-    **_why(WHY_CODE, "importlib", "builtins", "bltns", "pydoc", "pkgutil"),
-    **_why(WHY_REGISTRY, "winreg", "_winreg"),
-}
-MODULE_ROUTES = frozenset(MODULE_ROUTE_REASONS)
-
-# Attribute names the gate refuses: everywhere, except MODULE_ROUTES, which
-# are refused only on a receiver that may be a module. os and sys are
-# PERMITTED — a real application needs os.path and sys.argv — so the
-# dangerous surface is denied by name instead of by module.
-#
-# Every name here — module routes included — also stops being a port name
-# (gui_ports renames a "Remove" button's port remove_button), so a word a
-# user would type as a label belongs in DENIED_MODULE_ATTRS instead, keyed
-# on its module.
+# Every name here also stops being a port name (gui_ports renames a "Remove"
+# button's port remove_button), so a word a user would type as a label
+# belongs in DENIED_MODULE_ATTRS instead, keyed on its module.
 DENIED_ATTR_REASONS = {
     # process / shell escape — os.spawn*/exec*/posix_spawn* in every
     # spelling: the first few were denied and their siblings (spawnvp,
@@ -313,8 +273,10 @@ DENIED_ATTR_REASONS = {
            "execl", "execle", "execlp", "execlpe", "execv", "execve",
            "execvp", "execvpe", "posix_spawn", "posix_spawnp",
            "fork", "forkpty",
-           # subprocess's and multiprocessing's entry points, by any
-           # receiver (the modules themselves are MODULE_ROUTES)
+           # subprocess and multiprocessing by an attribute route (a module
+           # that imported them hands them over: logging.handlers.socket,
+           # frame_camera.socket) and their entry points by any receiver
+           "subprocess", "_winapi", "_posixsubprocess", "multiprocessing",
            "Popen", "getoutput", "getstatusoutput",
            # a ProcessPoolExecutor's worker is a second Python
            "ProcessPoolExecutor",
@@ -329,8 +291,9 @@ DENIED_ATTR_REASONS = {
            # faulthandler's crash helpers
            "_sigsegv", "_sigabrt", "_sigfpe", "_read_null", "_fatal_error",
            "_fatal_error_c_thread", "_stack_overflow"),
-    # the network, by the calls themselves
+    # the network, by an attribute route and by the calls themselves
     **_why(WHY_NETWORK,
+           "socket", "_socket", "ssl", "socketserver", "xmlrpc",
            "open_connection", "start_server", "create_connection",
            "create_server", "create_datagram_endpoint",
            "open_unix_connection", "start_unix_server",
@@ -339,15 +302,20 @@ DENIED_ATTR_REASONS = {
            # logging.handlers' network handlers (its file handlers are fine)
            "SocketHandler", "DatagramHandler", "SysLogHandler",
            "HTTPHandler", "SMTPHandler"),
+    **_why(WHY_ASYNCIO, "asyncio"),
     # the desktop: os.startfile opens any file with its program
-    **_why(WHY_DESKTOP, "startfile"),
+    **_why(WHY_DESKTOP, "startfile", "webbrowser"),
     # native code by another door: `import ctypes` is denied, but numpy hands
     # it over (np.ctypeslib.ctypes.windll...), as does any module that
-    # imported it (frame_camera.ctypes) — its loaders, by any receiver
+    # imported it (frame_camera.ctypes)
     **_why(WHY_NATIVE,
-           "windll", "cdll", "oledll",
+           "ctypes", "_ctypes", "ctypeslib", "windll", "cdll", "oledll",
            "pydll", "pythonapi", "WinDLL", "CDLL", "OleDLL", "PyDLL",
            "LoadLibrary", "add_dll_directory"),
+    # sys.modules['subprocess'] is `import subprocess` with no import
+    # statement; meta_path and path_hooks decide what an import loads
+    **_why(WHY_MODULE_TABLE,
+           "modules", "meta_path", "path_hooks", "path_importer_cache"),
     # destruction
     **_why(WHY_DELETE, "rmtree", "unlink", "remove", "removedirs", "rmdir"),
     # introspection escapes that reach the interpreter's own state
@@ -359,10 +327,25 @@ DENIED_ATTR_REASONS = {
            # sys._getframe().f_builtins['eval'] is eval
            "f_globals", "f_locals", "f_builtins"),
     # loaders
-    **_why(WHY_CODE, "load_module", "import_module", "exec_module"),
+    **_why(WHY_CODE, "load_module", "import_module", "exec_module",
+           "importlib"),
     **_why(WHY_OBJECTS, "loads", "load"),
-    # a denied module's own name: on a module only (see MODULE_ROUTES)
-    **MODULE_ROUTE_REASONS,
+    # A DENIED module re-exported as a live attribute of an allowed one IS
+    # that module, reached with no import the gate can see: codecs.builtins is
+    # builtins (so codecs.builtins.eval is eval), and enum aliases it `bltns`;
+    # cgitb.pydoc is pydoc and unittest.mock.pkgutil is pkgutil (locate /
+    # resolve_name load any callable from a dotted string); mimetypes._winreg
+    # is winreg; xml.sax.saxutils.urllib and email.utils.urllib are the urllib
+    # package (saxutils' own code calls urllib.request.urlopen). Each is
+    # already a DENIED_MODULE by root name — denied as an attribute too, the
+    # route is closed one step before the terminal .eval / .locate /
+    # .CreateKeyEx, which cannot be denied directly: re.compile,
+    # QApplication.exec() and DataFrame.eval are honest. These names also stop
+    # being port names (gui_ports steers clear of DENIED_ATTRS), like the
+    # socket/subprocess/ssl entries above.
+    **_why(WHY_CODE, "builtins", "bltns", "pydoc", "pkgutil"),
+    **_why(WHY_REGISTRY, "winreg", "_winreg"),
+    **_why(WHY_NETWORK, "urllib", "urllib2", "urllib3"),
 }
 DENIED_ATTRS = frozenset(DENIED_ATTR_REASONS)
 
@@ -542,7 +525,6 @@ def validate(code: str, mode: str = "linked",
 
     allowed = allowed_modules(mode, extra_modules, toolkit)
     aliases = _module_aliases(tree)
-    receivers = _Receivers(tree)
 
     for node in ast.walk(tree):
         # ---- imports ----
@@ -619,15 +601,11 @@ def validate(code: str, mode: str = "linked",
                 recv = _receiver_name(node.value)
                 if node.attr in ("load", "loads") and recv in SAFE_LOAD_RECEIVERS:
                     continue
-                route = node.attr in MODULE_ROUTES
-                if route and not receivers.may_be_module(node.value):
-                    continue       # self.socket: a name on an ordinary object
                 where = f"{recv}." if recv else ""
                 errs.append(
                     f"line {getattr(node, 'lineno', 0)}: {where}{node.attr} is "
                     f"not permitted in a generated app — "
-                    f"{_reason(node.attr)}"
-                    + (_route_note(node.attr) if route else ""))
+                    f"{_reason(node.attr)}")
             else:
                 why = _module_attr_rule(
                     _dotted(node.value, aliases)).get(node.attr)
@@ -652,16 +630,9 @@ def validate(code: str, mode: str = "linked",
 
         # ---- getattr(x, "system") — the string-indirection bypass ----
         elif isinstance(node, ast.Call):
-            _check_lookup(node, aliases, errs, receivers)
+            _check_lookup(node, aliases, errs)
 
     return (not errs), errs
-
-
-def _route_note(name: str) -> str:
-    """What a refused module route says after its reason: where it was
-    reached, and that the same word on an ordinary object is fine."""
-    return (f" (reached through what is, or may be, a module; a plain "
-            f"attribute such as self.{name} is fine)")
 
 
 def _reason(name: str) -> str:
@@ -732,560 +703,10 @@ def _module_attr_rule(path: str) -> dict:
     return {}
 
 
-# Names a file may use without binding them: the builtins, and the globals
-# every module has. Any OTHER name a file uses and never binds came from a
-# star import (or was injected), and may be anything — a module included.
-_ALWAYS_THERE = frozenset(dir(_builtins)) | frozenset({
-    "__name__", "__file__", "__doc__", "__spec__", "__loader__",
-    "__package__", "__annotations__", "__path__", "__cached__"})
-
-# Pattern captures (3.10+): `case m:` binds the subject, which may be a module.
-_MATCH_CAPTURES = tuple(getattr(ast, n) for n in
-                        ("MatchAs", "MatchStar", "MatchMapping")
-                        if hasattr(ast, n))
-
-
-class _FuncInfo:
-    """One function's shape, for the parameter rule below."""
-    __slots__ = ("name", "positional", "params", "first", "static",
-                 "is_method")
-
-    def __init__(self, name, positional, params, first, static, is_method):
-        self.name = name                 # a def's name, a lambda's bound name
-        self.positional = positional     # ordered positional parameter names
-        self.params = params             # every parameter name (frozenset)
-        self.first = first               # self/cls, or "" when there is none
-        self.static = static
-        self.is_method = is_method
-
-
-class _Receivers:
-    """Which receivers in one file are, or may be, a module — the receivers
-    a MODULE_ROUTE is refused on.
-
-    Read from the whole file at once, flow-insensitive but SCOPE-AWARE where
-    scope decides it (a default and an annotation are read in the ENCLOSING
-    scope, not the function's own), and erring towards "may be". A receiver
-    may be a module when it is:
-
-      * a name an import binds (`import codecs`, `from xml.sax import
-        saxutils` — an imported name may be a module), or any attribute
-        chain rooted at one (logging.handlers, np.ctypeslib);
-      * a name — or ANY attribute of that name, on anything — that the file
-        assigns, at least once, a value that may be or hold a module:
-        `m = codecs`, `self.mod = codecs`, a class body's `mod = codecs`
-        (read later as self.mod), `setattr(self, 'mod', codecs)`, a walrus,
-        a default — so m.builtins and self.mod.builtins are refused as
-        codecs.builtins is;
-      * a value the gate cannot see: a call's result (inspect.getmodule(f),
-        getattr(codecs, name)), a subscript, an awaited or yielded value,
-        and every name bound by iterating an iterable that may carry a
-        module, by unpacking one, by `with ... as` or by a match pattern.
-        A CALL TO A CLASS THE FILE DEFINES is an ordinary instance, not a
-        value the gate cannot see — `opts = Opts()`, `self.cam = Cam()` —
-        so a plain attribute of it keeps the word as a name;
-      * a parameter a call in the file hands a module (f(codecs), the
-        default m=codecs, b.put(codecs) binding self.held = m), or EVERY
-        non-first parameter of a function whose name is used anywhere but
-        as the thing a call calls — stored, aliased, decorated, passed on —
-        because then the gate cannot see how it is called (a function only
-        ever called in plain sight, or never referenced, is read exactly:
-        `def f(opts): return opts.ssl` is ordinary);
-      * `self` in a class whose instances answer an attribute with a value
-        the gate cannot pin to a name: a @dataclass / NamedTuple /
-        SimpleNamespace (the constructor sets any field, H(codecs)), or a
-        class that defines __getattr__ / __getattribute__; and the name a
-        property or cached_property returns, from its return values;
-      * a name the file uses but never binds, other than a builtin: it came
-        from a star import and may be anything.
-
-    Everything else is an ordinary object, where the same word is only a
-    name: self and cls and their attributes (outside the class shapes
-    above), an instance of a class the file defines, a literal, and a name
-    only ever assigned values like those.
-
-    Not followed, stated plainly: a module handed in AS self
-    (Cls.method(codecs)); an attribute set through a name built at runtime
-    (setattr(obj, name, codecs)); and a function reached only by a string
-    (getattr(self, 'f')(codecs)) — its name is not written anywhere, so the
-    gate cannot see that a module reaches its parameters."""
-
-    def __init__(self, tree: ast.AST) -> None:
-        self.tainted: Set[str] = set()      # names that may hold a module
-        self.bound: Set[str] = set()        # every name the file binds
-        self._classes: Set[str] = set()     # ClassDef names the file defines
-        self._scopes: Dict[int, Tuple[ast.AST, ...]] = {}
-        self._info: Dict[int, _FuncInfo] = {}
-        self._by_name: Dict[str, List[int]] = {}
-        self._module_self: Set[int] = set()  # funcs whose first param may be one
-        self._tainted_params: Dict[int, Set[str]] = {}
-        self._moduleish: Dict[int, bool] = {}
-        self._class_init: Dict[str, int] = {}   # class name -> its __init__ id
-        flat: List[Tuple[Set[str], object]] = []
-        param_pairs: List[Tuple[int, str, ast.AST]] = []
-        calls: List[ast.Call] = []
-        uses: List[Tuple[str, int]] = []    # (name, id) of every Load name/attr
-        call_funcs: Set[int] = set()        # id of every Call.func node
-        lambda_names: List[Tuple[str, int]] = []
-        # Iterative: a generated file can hold an expression thousands of
-        # nodes deep (a long string concatenation), past the recursion limit.
-        stack: List[Tuple[ast.AST, Tuple[ast.AST, ...], Any]] = [
-            (tree, (), None)]
-        while stack:
-            node, funcs, cls = stack.pop()
-            inner = funcs
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                 ast.Lambda)):
-                inner = funcs + (node,)
-                self._function(node, cls, flat, param_pairs)
-                self._push_function(node, funcs, inner, stack)
-                continue
-            if isinstance(node, ast.ClassDef):
-                self.bound.add(node.name)
-                self._classes.add(node.name)
-                for child in ast.iter_child_nodes(node):
-                    stack.append((child, funcs, node))
-                continue
-            if isinstance(node, ast.Name):
-                self._scopes[id(node)] = funcs
-                if isinstance(node.ctx, ast.Load):
-                    uses.append((node.id, id(node)))
-                else:
-                    self.bound.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                if isinstance(node.ctx, ast.Load):
-                    uses.append((node.attr, id(node)))
-                self._binding(node, flat, lambda_names)
-            else:
-                self._binding(node, flat, lambda_names)
-            if isinstance(node, ast.Call):
-                call_funcs.add(id(node.func))
-                calls.append(node)
-            for child in ast.iter_child_nodes(node):
-                stack.append((child, inner, None))
-
-        # A lambda bound to a name is called by that name: g = lambda m: ...
-        for name, lid in lambda_names:
-            self._by_name.setdefault(name, []).append(lid)
-            if self._info[lid].name is None:
-                self._info[lid].name = name
-        # A function whose name is used anywhere but as what a call calls is
-        # out of the gate's sight (stored, aliased, decorated, passed on):
-        # every non-first parameter of it may be a module. (Attribute uses
-        # share this name space, erring only towards "may be".)
-        leaked = {name for name, nid in uses if nid not in call_funcs}
-        for fid, info in self._info.items():
-            if info.name in leaked:
-                for p in info.params:
-                    if p != info.first:
-                        self._tainted_params[fid].add(p)
-        # A call in plain sight hands its arguments to a function's
-        # parameters: map them, so f(codecs) taints f's m.
-        for call in calls:
-            for fid, pname, value in self._map_call(call, call_funcs):
-                param_pairs.append((fid, pname, value))
-
-        # To a fixpoint, by a WORKLIST rather than re-walking every pair each
-        # pass: a name assigned from a tainted one is tainted too. Each pair
-        # is indexed by the names its value reads; tainting a name revisits
-        # only the pairs that read it, so a long `x0 = x1 ... xn = codecs`
-        # chain resolves in one sweep down it, not one pass per link.
-        entries: List[Tuple[str, object, object]] = (
-            [("flat", frozenset(ns), v) for ns, v in flat]
-            + [("param", (fid, pn), v) for fid, pn, v in param_pairs])
-        index: Dict[str, List[int]] = {}
-        for i, (_kind, _sink, value) in enumerate(entries):
-            if value is None:
-                continue
-            for node in ast.walk(value):
-                if isinstance(node, ast.Name):
-                    index.setdefault(node.id, []).append(i)
-                elif isinstance(node, ast.Attribute):
-                    index.setdefault(node.attr, []).append(i)
-        done = [False] * len(entries)
-        queue: List[str] = [p for tp in self._tainted_params.values()
-                            for p in tp]   # leaked parameters, already set
-
-        def fire(i: int) -> None:
-            kind, sink, value = entries[i]
-            if done[i] or (value is not None and not self._carries(value)):
-                return
-            done[i] = True
-            if kind == "flat":
-                for name in sink:
-                    if name not in self.tainted:
-                        self.tainted.add(name)
-                        queue.append(name)
-            else:
-                fid, pname = sink
-                tp = self._tainted_params[fid]
-                if pname not in tp:
-                    tp.add(pname)
-                    queue.append(pname)
-
-        for i in range(len(entries)):       # the pairs that fire on an
-            fire(i)                          # import or a value in plain sight
-        while queue:                         # then down the chains they start
-            for i in index.get(queue.pop(), ()):
-                if not done[i]:
-                    fire(i)
-
-    # -- reading the file ---------------------------------------------------
-    def _push_function(self, node, funcs, inner, stack) -> None:
-        """A function's decorators, defaults and annotations are read in the
-        ENCLOSING scope (``funcs``); only its body is its own (``inner``). A
-        default `e=self.builtins.eval` on an inner method reads the OUTER
-        self, so it must not be given the inner method's scope — where self
-        is that method's first parameter and so looks ordinary."""
-        args = node.args
-        for value in list(args.defaults) + list(args.kw_defaults):
-            if value is not None:
-                stack.append((value, funcs, None))
-        for a in (args.posonlyargs + args.args + args.kwonlyargs
-                  + [x for x in (args.vararg, args.kwarg) if x is not None]):
-            if a.annotation is not None:
-                stack.append((a.annotation, funcs, None))
-        if isinstance(node, ast.Lambda):
-            stack.append((node.body, inner, None))
-            return
-        for deco in node.decorator_list:
-            stack.append((deco, funcs, None))
-        if node.returns is not None:
-            stack.append((node.returns, funcs, None))
-        for stmt in node.body:
-            stack.append((stmt, inner, None))
-
-    def _function(self, node: ast.AST, cls, flat, param_pairs) -> None:
-        args = node.args
-        positional = [a.arg for a in args.posonlyargs + args.args]
-        names = set(positional) | {a.arg for a in args.kwonlyargs}
-        for extra in (args.vararg, args.kwarg):
-            if extra is not None:
-                names.add(extra.arg)
-        lam = isinstance(node, ast.Lambda)
-        static = (not lam and any(_decorator_name(d) == "staticmethod"
-                                  for d in node.decorator_list))
-        is_method = cls is not None and not lam and not static
-        first = positional[0] if (is_method and positional) else ""
-        info = _FuncInfo(None if lam else node.name, positional,
-                         frozenset(names), first, static, is_method)
-        self._info[id(node)] = info
-        self._tainted_params[id(node)] = set()
-        self.bound |= names
-        if not lam:
-            self.bound.add(node.name)
-            self._by_name.setdefault(node.name, []).append(id(node))
-        # self is a module in a class whose instances answer any attribute
-        # with a value the gate cannot pin to a name.
-        if is_method and positional and self._is_moduleish(cls):
-            self._module_self.add(id(node))
-        # Building the instance runs __init__: A(codecs) hands codecs to it.
-        if is_method and node.name == "__init__":
-            self._class_init[cls.name] = id(node)
-        # A property/cached_property names an attribute: taint that name
-        # from what it returns (self.mod.builtins, with mod a @property that
-        # returns codecs).
-        if (cls is not None and not lam
-                and any(_decorator_name(d) in ("property", "cached_property")
-                        for d in node.decorator_list)):
-            for ret in _returns_in(node):
-                if ret.value is not None:
-                    flat.append(({node.name}, ret.value))
-        # A default is assigned to its parameter, in THIS function's scope.
-        with_defaults = positional[len(positional) - len(args.defaults):] \
-            if args.defaults else []
-        for name, value in zip(with_defaults, args.defaults):
-            param_pairs.append((id(node), name, value))
-        for a, value in zip(args.kwonlyargs, args.kw_defaults):
-            if value is not None:
-                param_pairs.append((id(node), a.arg, value))
-
-    def _is_moduleish(self, cls: ast.ClassDef) -> bool:
-        cached = self._moduleish.get(id(cls))
-        if cached is not None:
-            return cached
-        result = False
-        for deco in cls.decorator_list:
-            if _decorator_name(deco) == "dataclass":
-                result = True
-        for base in cls.bases:
-            name = (base.attr if isinstance(base, ast.Attribute)
-                    else base.id if isinstance(base, ast.Name) else "")
-            if name in ("NamedTuple", "SimpleNamespace"):
-                result = True
-        for stmt in cls.body:
-            if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and stmt.name in ("__getattr__", "__getattribute__")):
-                result = True
-        self._moduleish[id(cls)] = result
-        return result
-
-    def _map_call(self, call: ast.Call, call_funcs: Set[int]):
-        """Which parameters of which functions this call hands an argument:
-        f(x) to f's parameters, obj.meth(x) to meth's after self, A.f(x) to
-        a staticmethod's from the first. Only calls whose target the file
-        names in plain sight — the laundering routes it cannot see taint
-        every non-first parameter already (``leaked``)."""
-        fn = call.func
-        targets: List[Tuple[_FuncInfo, int, int]] = []   # info, id, skip
-        if isinstance(fn, ast.Name):
-            for fid in self._by_name.get(fn.id, ()):
-                info = self._info[fid]
-                if not info.is_method:          # a plain function or lambda
-                    targets.append((info, fid, 0))
-            init = self._class_init.get(fn.id)  # A(codecs) -> A.__init__
-            if init is not None:
-                targets.append((self._info[init], init, 1))
-        elif isinstance(fn, ast.Attribute):
-            on_class = (isinstance(fn.value, ast.Name)
-                        and fn.value.id in self._classes)
-            for fid in self._by_name.get(fn.attr, ()):
-                info = self._info[fid]
-                if not info.is_method and not info.static:
-                    continue
-                if info.static:
-                    targets.append((info, fid, 0))   # A.f(x) -> f's own
-                elif not on_class:
-                    targets.append((info, fid, 1))   # obj.meth(x) -> after self
-                # A.meth(x) on a non-static method hands x AS self: a limit.
-        out = []
-        for info, fid, skip in targets:
-            params = info.positional[skip:]
-            for value, name in zip(call.args, params):
-                if isinstance(value, ast.Starred):
-                    break                    # *args: positions unknown
-                out.append((fid, name, value))
-            for kw in call.keywords:
-                if kw.arg and kw.arg in info.params:
-                    out.append((fid, kw.arg, kw.value))
-        return out
-
-    def _binding(self, node: ast.AST, pairs, lambda_names) -> None:
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                self._imported(a.asname or a.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            for a in node.names:
-                if a.name != "*":
-                    self._imported(a.asname or a.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                self._assigned(target, node.value, pairs)
-                if (isinstance(node.value, ast.Lambda)
-                        and isinstance(target, ast.Name)):
-                    lambda_names.append((target.id, id(node.value)))
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            if node.value is not None:
-                self._assigned(node.target, node.value, pairs)
-                if (isinstance(node.value, ast.Lambda)
-                        and isinstance(node.target, ast.Name)):
-                    lambda_names.append((node.target.id, id(node.value)))
-        elif isinstance(node, ast.NamedExpr):
-            self._assigned(node.target, node.value, pairs)
-        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
-            # Only an iterable that may carry a module taints what it yields:
-            # `for m in (codecs,)` does, `for o in self.items` does not.
-            pairs.append((_target_names(node.target), node.iter))
-        elif isinstance(node, ast.withitem):
-            if node.optional_vars is not None:
-                pairs.append((_target_names(node.optional_vars),
-                              node.context_expr))
-        elif isinstance(node, ast.ExceptHandler):
-            if node.name:
-                self.bound.add(node.name)
-        elif isinstance(node, ast.Call):
-            named = _setattr_literal(node)
-            if named is not None:
-                pairs.append(({named[0]}, named[1]))
-        elif _MATCH_CAPTURES and isinstance(node, _MATCH_CAPTURES):
-            name = getattr(node, "name", None) or getattr(node, "rest", None)
-            if name:
-                self.bound.add(name)
-                pairs.append(({name}, None))
-
-    def _imported(self, name: str) -> None:
-        self.tainted.add(name)
-        self.bound.add(name)
-
-    @staticmethod
-    def _assigned(target: ast.AST, value: ast.AST, pairs) -> None:
-        names = _target_names(target)
-        if not names:
-            return
-        if (isinstance(target, (ast.Tuple, ast.List, ast.Starred))
-                and not isinstance(value, (ast.Tuple, ast.List, ast.Set))):
-            pairs.append((names, None))      # elements the gate cannot see
-        else:
-            pairs.append((names, value))
-
-    def _carries(self, value: ast.AST) -> bool:
-        """Whether ``value`` may be, or hold, a module.
-
-        Walks the value's own parts and asks the NARROW question of each node
-        (``fail_safe=False``): is THIS node, by itself, a module source? The
-        structural nodes a value is built from — a list/tuple/dict literal, a
-        comprehension, an operator, an f-string — read as not-a-module here,
-        because their children are walked separately and carry the signal;
-        only a module named inside (`[codecs]`, `(a, codecs)`) or a sub-value
-        the gate cannot see into (a call result, a subscript) makes the value
-        carry one. Were this the fail-safe reading instead, assigning `[]`,
-        `a + b` or `not x` would taint the target — a receiver is the only
-        place the fail-safe default belongs."""
-        return any(self.may_be_module(n, fail_safe=False)
-                   for n in ast.walk(value) if isinstance(n, ast.expr))
-
-    # -- the question -------------------------------------------------------
-    def may_be_module(self, node: ast.AST, *, fail_safe: bool = True) -> bool:
-        """Whether the expression ``node`` is, or may be, a module.
-
-        FAIL-SAFE as a RECEIVER check (``fail_safe=True``, the default, how
-        ``validate`` and ``_check_lookup`` call it): an expression kind not
-        reasoned about below is treated as "may be a module", so the route is
-        refused exactly as it was on EVERY receiver before 10733a8. An
-        operator result (``(A() + 1).socket`` — a __add__/__eq__/__neg__ may
-        return anything), a lambda or comprehension stored and read later, and
-        every kind added to the grammar in a future Python all fall through to
-        refused rather than silently passing. ``_carries`` asks the narrow
-        question with ``fail_safe=False`` (see there).
-
-        The cases decided WITHOUT the fallthrough, each because a module
-        provably cannot be the receiver there — or, where it can, it is caught:
-
-          * an ATTRIBUTE CHAIN whose peeled attribute name is tainted
-            (``m.builtins`` with ``m`` a module alias, ``self.mod.socket``
-            with ``mod`` assigned a module): refused. Otherwise the chain is
-            judged by its ROOT below — a plain ``self.socket`` is the root
-            ``self``, an ordinary object.
-          * a NAME: ``_name`` is sound — it reads the name against the file's
-            bindings, its enclosing scopes' parameters (self/cls answer the
-            module-self question, other parameters the tainted-parameter one)
-            and the never-bound/star-import case. A module cannot hide from it.
-          * an IFEXP / BOOLOP / walrus: the value is one of the operands, so
-            recursing into them (carrying ``fail_safe``) is exact.
-          * a CONSTANT: a literal — str, bytes, number, bool, None, Ellipsis —
-            is never a module.
-          * a CALL that BUILDS an instance of a class the file defines and
-            never taints (``opts = Opts()``, ``self.cam = Cam()``): the result
-            is that ordinary instance. Any OTHER call's result — a factory, a
-            method, ``getattr`` — is a value the gate cannot see, so refused.
-          * a SUBSCRIPT / AWAIT / YIELD / YIELDFROM / STARRED: a value the gate
-            cannot see into, so refused (True) in either mode.
-        """
-        while isinstance(node, ast.Attribute):
-            if node.attr in self.tainted:
-                return True
-            node = node.value
-        if isinstance(node, ast.Name):
-            return self._name(node)
-        if isinstance(node, ast.IfExp):
-            return (self.may_be_module(node.body, fail_safe=fail_safe)
-                    or self.may_be_module(node.orelse, fail_safe=fail_safe))
-        if isinstance(node, ast.BoolOp):
-            return any(self.may_be_module(v, fail_safe=fail_safe)
-                       for v in node.values)
-        if isinstance(node, ast.NamedExpr):
-            return self.may_be_module(node.value, fail_safe=fail_safe)
-        if isinstance(node, ast.Constant):
-            return False
-        if isinstance(node, ast.Call):
-            # Building an instance of a class the file defines is an ordinary
-            # object; any other call's result is a value the gate cannot see.
-            fn = node.func
-            if (isinstance(fn, ast.Name) and fn.id in self._classes
-                    and fn.id not in self.tainted):
-                return False
-            return True
-        if isinstance(node, (ast.Subscript, ast.Await,
-                             ast.Yield, ast.YieldFrom, ast.Starred)):
-            return True
-        return fail_safe
-
-    def _name(self, node: ast.Name) -> bool:
-        name = node.id
-        if name in self.tainted:
-            return True
-        for func in reversed(self._scopes.get(id(node), ())):
-            info = self._info[id(func)]
-            if name in info.params:
-                if name == info.first:
-                    return id(func) in self._module_self
-                return name in self._tainted_params[id(func)]
-        return name not in self.bound and name not in _ALWAYS_THERE
-
-
-def _target_names(target: ast.AST) -> Set[str]:
-    """The names an assignment target binds: a name, an attribute's own name
-    (self.mod -> mod), and each one an unpacking binds. A subscript binds
-    none — what it stores is read back through a subscript, already a
-    "may be"."""
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, ast.Attribute):
-        return {target.attr}
-    if isinstance(target, ast.Starred):
-        return _target_names(target.value)
-    if isinstance(target, (ast.Tuple, ast.List)):
-        out: Set[str] = set()
-        for elt in target.elts:
-            out |= _target_names(elt)
-        return out
-    return set()
-
-
-def _setattr_literal(call: ast.Call):
-    """(name, value) for setattr(obj, 'name', value) and the __setattr__
-    spellings of it, with the name a literal; else None."""
-    fn, args = call.func, call.args
-    if isinstance(fn, ast.Name) and fn.id == "setattr" and len(args) >= 3:
-        name, value = args[1], args[2]
-    elif isinstance(fn, ast.Attribute) and fn.attr == "__setattr__":
-        if len(args) >= 3:                 # object.__setattr__(obj, 'n', v)
-            name, value = args[1], args[2]
-        elif len(args) == 2:               # obj.__setattr__('n', v)
-            name, value = args[0], args[1]
-        else:
-            return None
-    else:
-        return None
-    if isinstance(name, ast.Constant) and isinstance(name.value, str):
-        return name.value, value
-    return None
-
-
-def _decorator_name(node: ast.AST) -> str:
-    if isinstance(node, ast.Call):
-        node = node.func
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    if isinstance(node, ast.Name):
-        return node.id
-    return ""
-
-
-def _returns_in(node: ast.AST) -> List[ast.Return]:
-    """Every ``return`` in a function's own body — not a nested function's or
-    class's. A property's returns say what reading its attribute gives."""
-    out: List[ast.Return] = []
-    stack = list(getattr(node, "body", []))
-    while stack:
-        n = stack.pop()
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
-                          ast.Lambda, ast.ClassDef)):
-            continue
-        if isinstance(n, ast.Return):
-            out.append(n)
-        stack.extend(ast.iter_child_nodes(n))
-    return out
-
-
-def _check_lookup(node: ast.Call, aliases: dict, errs: List[str],
-                  receivers: "_Receivers") -> None:
+def _check_lookup(node: ast.Call, aliases: dict, errs: List[str]) -> None:
     """getattr(os, 'system'), attrgetter('path.system'), methodcaller(
     'system', cmd), inspect.getattr_static(os, 'system'): a denied name by a
-    string literal is the denied name. A module route by getattr is judged
-    on its receiver, as the attribute is: getattr(codecs, 'builtins') is
-    refused, getattr(self, 'socket', None) is not; attrgetter and
-    methodcaller name no receiver, so theirs are refused."""
+    string literal is the denied name."""
     fn = node.func
     name = fn.id if isinstance(fn, ast.Name) else (
         fn.attr if isinstance(fn, ast.Attribute) else "")
@@ -1303,14 +724,9 @@ def _check_lookup(node: ast.Call, aliases: dict, errs: List[str],
     for arg in literals:
         if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
             continue
-        parts = arg.value.split(".")
-        for part in parts:
-            if (part in MODULE_ROUTES and recv is not None and len(parts) == 1
-                    and not receivers.may_be_module(recv)):
-                why = None
-            elif part in (DENIED_ATTRS | DENIED_BUILTINS | DENIED_QT_NAMES):
-                why = _reason(part) + (_route_note(part)
-                                       if part in MODULE_ROUTES else "")
+        for part in arg.value.split("."):
+            if part in (DENIED_ATTRS | DENIED_BUILTINS | DENIED_QT_NAMES):
+                why = _reason(part)
             elif recv is not None:
                 why = _module_attr_rule(_dotted(recv, aliases)).get(part)
             else:
