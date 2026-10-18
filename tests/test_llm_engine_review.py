@@ -257,14 +257,41 @@ def test_a_cold_model_load_is_not_a_stall(eng):
     assert len(eng.fake.state.chats) == 1
 
 
-def test_a_stall_after_the_first_byte_still_times_out(eng):
+def _timed_streams(eng, monkeypatch) -> list:
+    """How long each _ollama_stream call — the one that waits on the
+    answer — took: local_chat does more than wait (see below)."""
+    real, waits = eng.ce._ollama_stream, []
+
+    def timed(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return real(*args, **kwargs)
+        finally:
+            waits.append(time.perf_counter() - t0)
+
+    monkeypatch.setattr(eng.ce, "_ollama_stream", timed)
+    return waits
+
+
+def test_a_stall_after_the_first_byte_still_times_out(eng, monkeypatch):
+    """Stuck mid-answer (1.5 s between tokens), the 0.4 s stall limit ends
+    the wait: under 1.4 s, so before the next token could come.
+
+    TIMED ON THE WAIT ITSELF, as the cold-start test below is, and for the
+    same reason: the whole local_chat also asks the server for its models
+    first (loopback requests through this PC's network filter, up to 430 ms
+    each with the CPUs busy), and a whole-suite run measured 10.5 s for it
+    (2026-10-18) with the stall still the error and the partial answer
+    still "abcd". The bound is the same, on the one call that waits — made
+    once, so a retry cannot hide inside it."""
     _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
     eng.fake.state.reply = "abcd" * 3
     eng.fake.state.token_delay = 1.5               # stuck mid-answer
-    t0 = time.perf_counter()
+    waits = _timed_streams(eng, monkeypatch)
     with pytest.raises(TimeoutError) as info:
         eng.ce.local_chat(MSGS, role="coder", timeout=0.4)
-    assert time.perf_counter() - t0 < 1.4
+    assert len(waits) == 1, waits
+    assert waits[0] < 1.4, waits
     assert info.value.partial == "abcd"
     assert len(eng.fake.state.chats) == 1          # never re-sent
 
@@ -285,16 +312,7 @@ def test_the_cold_start_allowance_is_bounded(eng, monkeypatch):
     _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
     monkeypatch.setenv("COUNCIL_OLLAMA_LOAD_TIMEOUT", "0.6")
     eng.fake.state.first_delay = 3.0               # a hung server
-    real, waits = eng.ce._ollama_stream, []
-
-    def timed(*args, **kwargs):
-        t0 = time.perf_counter()
-        try:
-            return real(*args, **kwargs)
-        finally:
-            waits.append(time.perf_counter() - t0)
-
-    monkeypatch.setattr(eng.ce, "_ollama_stream", timed)
+    waits = _timed_streams(eng, monkeypatch)
     with pytest.raises(TimeoutError, match="did not start answering"):
         eng.ce.local_chat(MSGS, role="coder", timeout=0.2)
     assert len(waits) == 1, waits
