@@ -669,3 +669,63 @@ def test_a_camera_whose_flags_contradict_its_plugin_is_refused(
     assert opened[-1] == "closed", "it was opened, then closed"
 
 
+# ======================================================================
+# The settings tabs name an event camera only for one
+# ======================================================================
+@pytest.fixture(scope="module")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+    yield QApplication.instance() or QApplication([])
+
+
+class Port:
+    def __init__(self, widget):
+        self.widget = widget
+        self.text = ""
+
+    def get(self):
+        return self.text
+
+    def set(self, text):
+        self.text = text
+
+
+def _tabs(kind):
+    from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QTabWidget
+    from council_qt.widgets import settings_tabs as st
+    book = QTabWidget()
+    boxes = {"exposure": Port(QDoubleSpinBox()), "gain": Port(QDoubleSpinBox())}
+    tabs = st.SettingsTabs(frame_camera, book, note=Port(None), boxes=boxes,
+                           capture={"capture_mode": Port(QComboBox())})
+    tabs.connected = True
+    tabs.camera_kind = kind
+    tabs.has_exposure = tabs.has_gain = tabs.has_capture = False
+    tabs.apply_state()
+    return tabs, boxes, book
+
+
+def test_a_frame_camera_without_exposure_is_not_called_an_event_camera(qapp):
+    tabs, boxes, _book = _tabs("frame")
+    exposure = boxes["exposure"].widget
+    assert "event" not in exposure.toolTip().lower(), exposure.toolTip()
+    assert "no exposure" in exposure.toolTip()
+    assert "event" not in exposure.specialValueText().lower()
+    assert "event" not in tabs.note_port.get().lower(), tabs.note_port.get()
+    capture_box = tabs.capture_ports["capture_mode"].widget
+    assert "event" not in capture_box.toolTip().lower(), \
+        capture_box.toolTip()
+
+
+def test_an_event_cameras_words_are_todays(qapp):
+    from council_qt.widgets import settings_tabs as st
+    tabs, boxes, _book = _tabs("event")
+    exposure = boxes["exposure"].widget
+    assert exposure.toolTip() == ("This camera has no exposure — an event "
+                                  "camera collects events, not light")
+    assert exposure.specialValueText() == st.SettingsTabs.NOT_HERE
+    assert tabs.note_port.get() == st.NOTE_EVENT
+    assert tabs.capture_ports["capture_mode"].widget.toolTip() == (
+        "An event camera is not triggered or downsampled here — its .raw "
+        "keeps every event")
+
+
