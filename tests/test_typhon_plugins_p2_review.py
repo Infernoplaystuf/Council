@@ -454,3 +454,32 @@ def test_a_camera_listed_under_another_familys_backend_is_dropped(host):
     assert "40099999" in dropped[0] and "basler" in dropped[0]
 
 
+# ======================================================================
+# Merged category hints: one tab per group
+# ======================================================================
+def test_merged_hints_never_put_a_group_in_two_tabs(host):
+    builtin = [host.camera_call(pid, "categories")
+               for pid in ("typhon.basler", "typhon.prophesee",
+                           "typhon.simulated")]
+    thermal = api.CategoryHints(
+        shared_tabs=(("Thermal", ("Thermal", "Status"), "hot"),),
+        tips={}, most_used={})
+    tables = categories.merge(builtin + [thermal])
+    holding = [t for t, groups, _tip in tables.shared_tabs
+               if "Status" in groups]
+    assert holding == ["Camera"], "the first tab that names a group keeps it"
+    rows = [{"key": "palette", "group": "Thermal"},
+            {"key": "status.temperature", "group": "Status"}]
+    planned = [(t.title, t.groups) for t in
+               categories.plan(rows, ["Thermal", "Status"], tables)]
+    assert planned == [("Thermal", ("Thermal",)), ("Camera", ("Status",))]
+    shared_tables = categories.Tables(
+        (("Thermal", ("Thermal", "Status"), "hot"),) +
+        categories.SHARED_TABS, {}, {})
+    planned = [(t.title, t.groups) for t in
+               categories.plan(rows, ["Thermal", "Status"], shared_tables)]
+    groups = [g for _t, gs in planned for g in gs]
+    assert sorted(groups) == ["Status", "Thermal"], \
+        "plan() puts a group where tab_of() does, even from tables unmerged"
+
+

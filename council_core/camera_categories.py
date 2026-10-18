@@ -147,22 +147,32 @@ def merge(hints: Iterable[Any]) -> Tables:
     groups of both, each plugin's own order kept (a group new to the tab
     goes after the one it follows in that plugin's row); a tooltip or a
     group's most-used keys come from the first plugin that gives them.
-    The built-in camera plugins' hints merge into today's tables."""
+    A group stays in the FIRST shared tab that names it: a later plugin
+    naming it in a tab of its own does not put it there too (before the
+    P2 review a third party's ("Thermal", ("Thermal", "Status")) put Status
+    in two tabs, and plan() showed its settings twice). A shared tab left
+    with no group of its own is dropped. The built-in camera plugins' hints
+    merge into today's tables."""
     shared: Dict[str, List[str]] = {}
     shared_tips: Dict[str, str] = {}
     tips: Dict[str, str] = {}
     most: Dict[str, Tuple[str, ...]] = {}
+    placed: Dict[str, str] = {}                 # group -> the tab it is in
     for hint in hints:
         for title, groups, tip in getattr(hint, "shared_tabs", ()) or ():
-            row = shared.setdefault(str(title), [])
-            shared_tips.setdefault(str(title), str(tip))
+            title = str(title)
+            row = shared.setdefault(title, [])
+            shared_tips.setdefault(title, str(tip))
             before = -1
             for group in groups:
                 group = str(group)
                 if group in row:
                     before = row.index(group)
                     continue
+                if placed.get(group, title) != title:
+                    continue                    # another tab has it already
                 row.insert(before + 1, group)
+                placed[group] = title
                 before += 1
         for title, tip in dict(getattr(hint, "tips", {}) or {}).items():
             tips.setdefault(str(title), str(tip))
@@ -170,7 +180,7 @@ def merge(hints: Iterable[Any]) -> Tables:
                                 {}).items():
             most.setdefault(str(group), tuple(str(k) for k in keys))
     return Tables(tuple((t, tuple(g), shared_tips[t])
-                        for t, g in shared.items()), tips, most)
+                        for t, g in shared.items() if g), tips, most)
 
 
 def tab_of(group: str, tables: Optional[Tables] = None) -> str:
@@ -219,7 +229,11 @@ def plan(settings: Iterable[Mapping[str, Any]],
     out: List[Tab] = []
     for title in titles:
         shared = next((t for t in tables.shared_tabs if t[0] == title), None)
-        members = ([g for g in shared[1] if g in by_group] if shared
+        # A shared tab's sections in its own order — but only the groups
+        # whose tab it is (tab_of): tables that name a group in two tabs
+        # still put it in one (P2 review).
+        members = ([g for g in shared[1] if g in by_group
+                    and tab_of(g, tables) == title] if shared
                    else [g for g in order if tab_of(g, tables) == title])
         limit = ROWS_ALONE if len(members) <= 1 else ROWS_SHARED
         sections = []
