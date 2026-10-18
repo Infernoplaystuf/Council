@@ -35,10 +35,27 @@ on_frame on its own thread — and busies Python for `slow_ms` per frame
 
 "1ms" runs ask Windows for a 1 ms timer (winmm timeBeginPeriod(1), and
 SetProcessInformation so Windows 11 honours it even with no visible window)
-and set Python's switch interval to 1 ms (default 5 ms). Each run is its own
-process: the timer and the switch interval are per process. `timer_ms`
-records how long a 1 ms Event.wait really took (median of 50), which shows
-the timer in force.
+and set Python's switch interval to 1 ms (default 5 ms); "switch" and
+"period" each of the two alone. Each run is its own process: the timer and
+the switch interval are per process. `event_wait_1ms` records how long a
+1 ms Event.wait really took (median of 50) once the window is up, which
+shows the timer in force; `event_wait_1ms_bare` the same at the child's
+start, before Qt (a running Qt timer of 20 ms or less gives the process
+Windows' 1 ms timer by itself: measured, 15.5-15.8 ms bare, 1.1-1.4 ms
+with a 15 ms QTimer running, 15.7 ms with a 40 ms one).
+
+STAGE P3 ROW 5. The plugin Typhon now holds Python's switch interval at
+1 ms itself while a run records (council_core.plugin_host.
+RECORDING_SWITCH_S). So that every row above still means what it says,
+the bench switches that off for them ("default" is today's settings), and
+"typhon" is the plugin Typhon as it is: the bench sets nothing, and its own
+hold is in force while it records. `switch_interval_ms_recording` is the
+interval read during the capture.
+
+`--window minimized` shows the window, minimized, instead of offscreen:
+Windows 11 may not honour a minimized window's process's timer requests
+(design 10.2), which an offscreen window cannot tell. It puts a window on
+the screen; for the bench PC, run by hand.
 
 THE PC'S LOAD IS PART OF EVERY RESULT. The P1 review re-ran this on the
 same laptop and found a 5 ms plugin at today's settings making 0 of 600
@@ -82,9 +99,12 @@ PLUGINS = {
     "slow20cap": (20.0, 0.25),
 }
 #: default: as today. 1ms: Python's switch interval AND Windows' timer at
-#: 1 ms (what P3 row 5 would set). switch / period: each of the two alone,
-#: to tell which one matters.
-TIMERS = ("default", "1ms", "switch", "period")
+#: 1 ms. switch / period: each of the two alone, to tell which one
+#: matters. typhon: what the plugin Typhon sets by itself while it records
+#: (P3 row 5: the switch interval; the bench sets nothing).
+TIMERS = ("default", "1ms", "switch", "period", "typhon")
+#: Where the window is: offscreen (never shown), or shown minimized.
+WINDOWS = ("offscreen", "minimized")
 
 
 # ======================================================================
@@ -241,7 +261,9 @@ def _percentile(values: List[float], q: float) -> float:
 
 def child(spec: Dict[str, Any]) -> Dict[str, Any]:
     """One measured capture; returns the numbers."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    window_place = spec.get("window", "offscreen")
+    if window_place == "offscreen":
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
     timer = spec["timer"]
     slow_ms, duty = PLUGINS[spec["plugin"]]
@@ -249,9 +271,11 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
     period = 1.0 / fps
     out: Dict[str, Any] = {"timer": timer, "plugin": spec["plugin"],
                            "fps": fps, "seconds": spec["seconds"],
+                           "window": window_place,
                            "switch_interval_ms_before":
-                               sys.getswitchinterval() * 1000.0}
-    if timer != "default":
+                               sys.getswitchinterval() * 1000.0,
+                           "event_wait_1ms_bare": _event_wait_ms()}
+    if timer not in ("default", "typhon"):
         out.update(_set_fine_timer(switch=timer in ("1ms", "switch"),
                                    period=timer in ("1ms", "period")))
     pdir = Path(spec["project"])
@@ -263,7 +287,13 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     import frame_camera
     from council_core import cameras, capture
+    from council_core import plugin_host as ph
     from council_core import plugin_manifest as pm
+
+    if timer != "typhon":
+        # Every other row means what it always meant: the plugin Typhon's
+        # own finer switch interval while recording (P3 row 5) held off.
+        ph.RECORDING_SWITCH_S = None
 
     np = cameras._numpy()
 
@@ -309,6 +339,9 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     window = generated.App()
     window.resize(1504, 1016)
+    if window_place == "minimized":
+        window.showMinimized()          # a real window, on the screen
+        qapp.processEvents()
     window.on_btn_scan_for_cameras()
     rows = window.ports.cameras.items()
     index = next(i for i, r in enumerate(rows)
@@ -374,6 +407,8 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
     def finish() -> None:
         recording["on"] = False
         held["load"] = load.end()
+        held["switch_rec"] = sys.getswitchinterval() * 1000.0
+        held["wait_rec"] = _event_wait_ms(20)
         held["session"] = slot.session
         window.on_btn_stop_capture()
         deadline = time.monotonic() + 30
@@ -408,6 +443,9 @@ def child(spec: Dict[str, Any]) -> Dict[str, Any]:
         "grabbed": stats.grabbed, "saved": stats.recorded,
         "not_saved_storage": stats.skipped,
         "faults": sorted(host.faults),
+        "switch_interval_ms_recording": round(held.get("switch_rec", 0.0),
+                                              3),
+        "event_wait_1ms_recording": held.get("wait_rec"),
     })
     out.update(held.get("load") or {})
     try:
@@ -432,7 +470,7 @@ def build_app(where: Path) -> Path:
                      vault_dir=where / "vault", target="qt")
 
 
-def sandbox_env(where: Path) -> Dict[str, str]:
+def sandbox_env(where: Path, window: str = "offscreen") -> Dict[str, str]:
     env = dict(os.environ)
     env.update({
         "QT_QPA_PLATFORM": "offscreen", "COUNCIL_NO_DIALOGS": "1",
@@ -442,17 +480,24 @@ def sandbox_env(where: Path) -> Dict[str, str]:
         "COUNCIL_SKIP_PATH_MIGRATION": "1",
         "PYTHONIOENCODING": "utf-8",
     })
+    if window != "offscreen":
+        env.pop("QT_QPA_PLATFORM", None)        # a real window (--window)
     env.pop("FRAME_CLASSES_STORE", None)
     return env
 
 
+def _say(text: str) -> None:
+    print(text, flush=True)
+
+
 def run_matrix(plugins: List[str], timers: List[str], repeats: int,
                seconds: float, fps: float, python: str,
-               keep: bool = False, say=print) -> List[Dict[str, Any]]:
+               keep: bool = False, say=_say, window: str = "offscreen"
+               ) -> List[Dict[str, Any]]:
     where = Path(tempfile.mkdtemp(prefix="tptiming_"))
     results: List[Dict[str, Any]] = []
     try:
-        env = sandbox_env(where)
+        env = sandbox_env(where, window)
         os.environ.update({k: env[k] for k in (
             "COUNCIL_VAULT_ROOT", "COUNCIL_APP_DIR", "TYPHON_PLUGIN_HOME",
             "COUNCIL_SKIP_PATH_MIGRATION")})
@@ -463,7 +508,8 @@ def run_matrix(plugins: List[str], timers: List[str], repeats: int,
                     folder = where / f"runs_{rep}_{timer}_{plugin}"
                     spec = {"timer": timer, "plugin": plugin,
                             "seconds": seconds, "fps": fps,
-                            "project": str(pdir), "folder": str(folder)}
+                            "project": str(pdir), "folder": str(folder),
+                            "window": window}
                     proc = subprocess.run(
                         [python, str(Path(__file__).resolve()), "--child",
                          json.dumps(spec)], capture_output=True, text=True,
@@ -495,7 +541,10 @@ def row(r: Dict[str, Any]) -> str:
             f"{r['median_ms']:6.2f} ms  p99 {r['p99_ms']:6.2f} ms  max "
             f"{r['max_ms']:6.1f} ms  read-late {r['read_late']:>3}  saved "
             f"{r['saved']}/{r['grabbed']}  timer {r['timer_resolution_ms']}"
-            f" ms, 1ms-wait {r['event_wait_1ms']:.2f} ms  plugin "
+            f" ms, 1ms-wait {r['event_wait_1ms']:.2f} ms (bare "
+            f"{r.get('event_wait_1ms_bare', 0) or 0:.2f})  switch while "
+            f"recording {r.get('switch_interval_ms_recording', '?')} ms  "
+            f"plugin "
             f"{feed.get('delivered', '-')} calls, "
             f"{feed.get('dropped', '-')} dropped  PC busy "
             f"{r.get('cpu_busy_pct', '?')}%"
@@ -515,6 +564,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", help="write every run's numbers here (JSON)")
     ap.add_argument("--keep", action="store_true",
                     help="keep the temporary folders")
+    ap.add_argument("--window", choices=WINDOWS, default="offscreen",
+                    help="offscreen (never shown), or minimized: a real "
+                         "window on the screen, minimized (Windows 11 may "
+                         "not honour a minimized window's timer requests)")
     args = ap.parse_args(argv)
     if args.child:
         print(json.dumps(child(json.loads(args.child))))
@@ -527,9 +580,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     for t in timers:
         if t not in TIMERS:
             ap.error(f"unknown timer {t!r}: {', '.join(TIMERS)}")
+    if args.window != "offscreen":
+        _say("Each run shows the app's window, minimized, on this screen.")
     started = time.time()
     results = run_matrix(plugins, timers, args.repeats, args.seconds,
-                         args.fps, args.python, keep=args.keep)
+                         args.fps, args.python, keep=args.keep,
+                         window=args.window)
     print(f"{len(results)} runs in {time.time() - started:.0f} s")
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=2) + "\n",

@@ -213,6 +213,70 @@ MAX_FILES = 2000
 #: for a gate that raises).
 FAULT_TAGS = {"trigger": "", "trigger_source": "error: plugin fault"}
 
+#: PYTHON'S SWITCH INTERVAL WHILE A RUN RECORDS (design 10.2; stage P3 row
+#: 5), in seconds — None leaves it as it is (today's: Python's 5 ms). A live
+#: plugin on its own thread shares Python's lock with the grab thread, and
+#: at 5 ms one busy 20 ms a frame starved it: 344-430 of 600 frames due were
+#: read in 4 s at 150 fps; at 1 ms all were (113-169 a period late, 16-23
+#: with the duty cap; with no plugin 0-1 late either way). Measured inside
+#: the real Qt Typhon (tools/typhon_plugins_timing.py, docs/
+#: typhon_plugins_branch.md "Frame timing"). Windows' 1 ms timer is NOT
+#: asked for: there the window's own Qt timers already give the process
+#: one, and asking changed nothing measured.
+RECORDING_SWITCH_S: Optional[float] = 0.001
+
+
+class SwitchInterval:
+    """Python's switch interval at RECORDING_SWITCH_S while any run holds
+    it (`hold(run)` as its recording begins, `release(run)` once it is
+    over), and put back as it was when the last one lets go. Process-wide,
+    as the interval is: several runs (cameras) share one hold.
+
+    Never coarser than it was: an interval already finer is left alone. A
+    change someone else made meanwhile is theirs, and is left as it is
+    when the hold ends."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._holders: List[Any] = []
+        #: The interval before the first hold, and the one set — None when
+        #: nothing was changed.
+        self._before: Optional[float] = None
+        self._set: Optional[float] = None
+
+    @property
+    def held(self) -> bool:
+        return bool(self._holders)
+
+    def hold(self, owner: Any) -> None:
+        wanted = RECORDING_SWITCH_S
+        with self._lock:
+            if any(h is owner for h in self._holders):
+                return
+            if not self._holders and wanted is not None:
+                before = sys.getswitchinterval()
+                if float(wanted) < before:
+                    sys.setswitchinterval(float(wanted))
+                    self._before, self._set = before, sys.getswitchinterval()
+            self._holders.append(owner)
+
+    def release(self, owner: Any) -> None:
+        with self._lock:
+            kept = [h for h in self._holders if h is not owner]
+            if len(kept) == len(self._holders):
+                return
+            self._holders = kept
+            if kept or self._set is None:
+                return
+            before, made = self._before, self._set
+            self._before = self._set = None
+            if abs(sys.getswitchinterval() - made) < 1e-9:
+                sys.setswitchinterval(before)
+
+
+#: The one hold of this process (the switch interval is the process's).
+SWITCH = SwitchInterval()
+
 
 class PluginHung(RuntimeError):
     """What the watchdog records for a call that ran too long."""
@@ -1120,6 +1184,9 @@ class PluginHost:
                 return []
             active.state = pr.RECORDING
             active.told_started = True
+        # While it records: Python's finer switch interval (stage P3 row 5),
+        # until Stop, or its end record when the recording ends by itself.
+        SWITCH.hold(active)
         info = active.info()
         notes: List[str] = []
         for pid, camera in self._run_plugins(active):
@@ -1149,6 +1216,7 @@ class PluginHost:
             active = self.current_run(camera)
         if active is None:
             return
+        SWITCH.release(active)
         with active.lock:
             started = active.told_started
             if active.state in (pr.RESERVED, pr.RECORDING):
@@ -1176,6 +1244,7 @@ class PluginHost:
         plugins were never told it started, so they are told nothing."""
         with active.lock:
             active.state = pr.ABANDONED
+        SWITCH.release(active)
         active.close_files()
         self._forget(active, current=True)
 
@@ -1203,6 +1272,8 @@ class PluginHost:
             if active.state in (pr.RESERVED, pr.RECORDING):
                 active.state = pr.STOPPED
             active.ended = time.time()
+        # Its recording is over (a failed write may end it before Stop).
+        SWITCH.release(active)
         info = active.info()
         blocks: Dict[str, Any] = {}
         for pid, cam in list(active.hooked):
@@ -2488,6 +2559,9 @@ class PluginHost:
         with self._lock:
             self._feeds.clear()
             temp, self._temp = dict(self._temp), {}
+            runs = list(self._runs) + list(self._current.values())
+        for active in runs:
+            SWITCH.release(active)          # a run this host never ended
         for folder in temp.values():
             # Only folders this host made with mkdtemp, under the system's
             # temporary folder: never anything of the user's.
