@@ -158,6 +158,9 @@ FEATURES: FrozenSet[str] = frozenset({
     "type.TriggerSource", "type.TriggerEvent", "type.Action",
     "frame.to_sensor", "frame.saved", "context.capture_setup",
     "hook.trigger_slot", "hook.capture_now",
+    # P3 row 6: a built-in plugin's frame stage for a run, which Start asks
+    # (after the core's Downsample, guarded on the recording path)
+    "hook.frame_stage",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -532,7 +535,11 @@ class ReviewSource:
         return path if path.is_file() else None
 
     def latest(self, folder: Any) -> Optional[Path]:
-        """The newest file of this source in `folder`, by run name."""
+        """The newest file of this source in `folder`, by run name — in
+        the slider's own order (council_qt.widgets.capture_review.
+        latest_raw: file names, naturally sorted), which it keeps until P4.
+        That order puts "<run>_events.raw" after "<run>_2_events.raw", two
+        runs started in one second: today's slider's, to be fixed there."""
         try:
             names = [e.name for e in os.scandir(str(folder))
                      if e.is_file() and self.run_of(e.name)]

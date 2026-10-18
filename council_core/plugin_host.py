@@ -1403,6 +1403,47 @@ class PluginHost:
         <run>_run_end.json."""
         return GuardedStage(self, pid, stage, session)
 
+    def frame_stages(self, camera: str, session: Any = None
+                     ) -> Optional[StagedAfterDownsample]:
+        """What the run about to start on `camera` saves through when a
+        built-in plugin gives it a frame stage (design 2.1, 3.8, 3.11;
+        P3 row 6): every built-in plugin this project runs whose manifest
+        contributes "frame_stage" is asked `frame_stage(camera)` — a stage
+        for this run, or None for none — and each one given is guarded on
+        the recording path (GuardedStage) and runs after the core's
+        Downsample (StagedAfterDownsample). None when no plugin gives one:
+        the recorder saves through Downsample alone, as today.
+
+        Asked at Start before anything stops: what a plugin raises then
+        switches it off and refuses this Start (RuntimeError, its words),
+        as the trigger slot's gate does — a run without the stage asked for
+        would not be the run asked for; the next Start runs without it."""
+        stages: List[GuardedStage] = []
+        for pid in self.with_hook("frame_stage"):
+            rec = self.record(pid)
+            if rec is None or not rec.builtin:
+                continue
+            made = self.instance(pid)
+            if made is None:
+                continue
+            given = self._guard(pid, "frame_stage", _hook(made, "frame_stage"),
+                                (str(camera),), {}, None)
+            if pid in self.faults:
+                fault = self.faults[pid]
+                raise RuntimeError(f"Start refused — {self._name(pid)}: its "
+                                   f"frame stage could not be had, and it "
+                                   f"was switched off — {fault.error}")
+            if given is None or given is _NO_HOOK:
+                continue
+            if not callable(given):
+                exc = TypeError(f"frame_stage gave {type(given).__name__}, "
+                                f"not a stage(image, meta)")
+                self.fault(pid, "frame_stage", exc)
+                raise RuntimeError(f"Start refused — {self._name(pid)}: "
+                                   f"{exc}; it was switched off")
+            stages.append(GuardedStage(self, pid, given, session))
+        return StagedAfterDownsample(stages) if stages else None
+
     # -- the trigger slot (stage P3 row 2; design 3.6) ----------------------
     def trigger_plugin(self) -> Optional[str]:
         """The built-in plugin this project runs that fills the record
@@ -2698,6 +2739,12 @@ class GuardedGate:
     a fault after its run's writer has closed is logged, the plugin is
     switched off, and nothing else changes.
 
+    IT IS HANDED A FRAME IT CANNOT CHANGE (P3 row 6): `tag` gets the
+    frame's index and time stamp, its pixels behind a read-only buffer and
+    its meta read-only (read_only_frame) — a gate reads a frame and gives
+    its tags, which the session puts on the frame itself; a gate that
+    writes into a frame fails, a fault like any other below.
+
     WHEN IT FAILS — any exception, on any thread, KeyboardInterrupt
     included — the gate is marked ended FIRST, so the grab thread asks the
     plugin nothing more from that moment; then its writer's recording ends;
@@ -2831,7 +2878,9 @@ class GuardedGate:
         if self._stop_if_off(frame):
             return dict(FAULT_TAGS)
         try:
-            return self._gate.tag(frame)
+            # A frame it can read and not change (P3 row 6): its pixels and
+            # meta are what is saved and recorded.
+            return self._gate.tag(read_only_frame(frame))
         except BaseException as exc:                    # noqa: BLE001
             self._fail("record gate", exc, frame)
             return dict(FAULT_TAGS)
@@ -2869,11 +2918,73 @@ class GuardedGate:
         return guarded
 
 
+def read_only(meta: Any) -> Mapping[str, Any]:
+    """A frame's meta as a plugin on the recording path is handed it: a
+    read-only view of the frame's own dict (nothing copied), so a write
+    raises — the frames CSV row is made from that dict after the picture is
+    saved (capture.Recorder.write)."""
+    if isinstance(meta, MappingProxyType):
+        return meta
+    if isinstance(meta, dict):
+        return MappingProxyType(meta)
+    return MappingProxyType(dict(meta or {}))
+
+
+#: The dtypes a saved picture has (design 3.11: uint8 or uint16).
+PICTURE_DTYPES = ("uint8", "uint16")
+
+
+def picture_problem(picture: Any) -> str:
+    """Why `picture` is not a picture a recording can save — a numpy array,
+    uint8 or uint16, (h, w) or (h, w, 3), not empty — or ""."""
+    shape = getattr(picture, "shape", None)
+    dtype = getattr(picture, "dtype", None)
+    if shape is None or dtype is None or not hasattr(picture, "ndim"):
+        return f"{type(picture).__name__}, not a picture (a numpy array)"
+    if str(dtype) not in PICTURE_DTYPES:
+        return (f"a {dtype} array, not a picture: a picture is uint8 or "
+                f"uint16")
+    if not (len(shape) == 2 or (len(shape) == 3 and shape[2] == 3)):
+        return (f"an array of shape {tuple(shape)}, not a picture: (h, w) or "
+                f"(h, w, 3)")
+    if not all(int(n) > 0 for n in shape):
+        return f"an empty picture, of shape {tuple(shape)}"
+    return ""
+
+
+_FRAME_TYPE: Any = None
+
+
+def read_only_frame(frame: Any) -> Any:
+    """`frame` as a record gate is handed it (design 3.6, 3.8, 10.3): its
+    index and time stamp, its pixels behind a read-only buffer (locked_
+    pixels) and its meta read-only (read_only) — a gate reads a frame and
+    gives its tags; what is saved is never its to change. Only the small
+    Frame is new: nothing of the picture is copied."""
+    global _FRAME_TYPE
+    if _FRAME_TYPE is None:
+        from .cameras import Frame
+        _FRAME_TYPE = Frame
+    if not isinstance(frame, _FRAME_TYPE):
+        return frame
+    return _FRAME_TYPE(image=locked_pixels(frame.image), index=frame.index,
+                       timestamp_us=frame.timestamp_us,
+                       meta=read_only(frame.meta))
+
+
 class GuardedStage:
     """A plugin's FRAME STAGE for one run (`stage(image, meta) -> image`,
     the picture to save), guarded on the RECORDING PATH (design 3.8, 3.10):
     what the run's capture.Recorder is given as `frame_stage`. It runs on
     the writer threads.
+
+    IT IS HANDED READ-ONLY ONES (P3 row 6): the picture behind a read-only
+    buffer (locked_pixels: the array may be the frame's own, which the live
+    view and the frame's other readers share) and the meta as a read-only
+    view (read_only: its CSV row is made from it after the save), so a
+    stage that writes into either fails — a fault, below — instead of
+    changing what is shown or recorded. What it gives back must be a
+    picture (picture_problem), or that is its fault too.
 
     WHEN IT FAILS — any exception, SystemExit and KeyboardInterrupt
     included — the frame it was making is not saved, the recording ends
@@ -2920,7 +3031,11 @@ class GuardedStage:
                 f"recording ended: plugin {name} ({self._pid}) was switched "
                 f"off — {fault.reason}"))
         try:
-            return self._stage(image, meta)
+            made = self._stage(locked_pixels(image), read_only(meta))
+            problem = picture_problem(made)
+            if problem:
+                raise TypeError(f"it gave {problem}")
+            return made
         except BaseException as exc:                    # noqa: BLE001
             reason = (host.recording_reason(self._pid, "frame stage", exc)
                       if host is not None else
@@ -2930,6 +3045,26 @@ class GuardedStage:
             if host is not None:
                 host.fault(self._pid, "frame stage", exc, RECORDING)
             raise RecordingEnded(reason) from exc
+
+
+class StagedAfterDownsample:
+    """What a run's recorder saves through when built-in plugins give
+    frame stages (PluginHost.frame_stages): the core's own, Downsample
+    (cameras.frame_stage, looked up at each frame), then each plugin's
+    guarded stage on the picture Downsample made, in the project list's
+    order. Downsample is never skipped: a plugin's stage comes after it,
+    so the records' Downsample is always what was done (design 2.1)."""
+
+    def __init__(self, stages: Sequence[GuardedStage]) -> None:
+        self.stages = tuple(stages)
+
+    def __call__(self, image: Any, meta: Any) -> Any:
+        from . import cameras
+
+        picture = cameras.frame_stage(image, meta)
+        for stage in self.stages:
+            picture = stage(picture, meta)
+        return picture
 
 
 class TriggerSlot:

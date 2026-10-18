@@ -921,6 +921,13 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                 raise RuntimeError(f"a {setup.short()} run needs the "
                                    f"Triggering plugin (typhon.trigger), "
                                    f"which could not be had now")
+        if host is not None:
+            # A built-in plugin's frame stage, after the core's Downsample,
+            # guarded on the recording path (plugin design 3.8): asked
+            # before anything stops; a stage that cannot be had refuses.
+            staged = host.frame_stages(_RIG.active.name, session)
+            if staged is not None:
+                recorder.frame_stage = staged
         recorder.open()
         if session.running and restartable:
             _stop_preview(session)
