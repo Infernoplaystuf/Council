@@ -873,7 +873,8 @@ def _reading_load(text: Optional[str]) -> Dict[str, Any]:
     first line of the line-per-record form is enough."""
     text = text or "[]"
     if text.startswith(_JSONL_HEAD):
-        text = text.split("\n", 1)[0]
+        nl = text.find("\n")          # not split: that copied the whole rest
+        text = text[:nl] if nl >= 0 else text
     try:
         data = json.loads(text)
     except Exception:
