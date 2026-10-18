@@ -889,7 +889,9 @@ class _GridReader:
                                             from_image=self.from_image))
         if t.marker and not has_person and any(v.rule.type == "PART" for v in rec.values):
             who, mloc, msnip = t.marker
-            rec.values.append(kgm.Value(kgm.INSPECTOR, who, mloc, msnip, True))
+            # a marker read from a picture is picture data like any other
+            rec.values.append(kgm.Value(kgm.INSPECTOR, who, mloc, msnip, True,
+                                        from_image=self.from_image))
         if rec.values and not any(v.rule.type != "PERSON" for v in rec.values):
             # People only (a chart's 'Inspector' column): they signed for
             # what the sheet is about, like 'Inspector: JB' above it.
@@ -1057,7 +1059,7 @@ class _GridReader:
                 continue
             seen.add(key)
             vals.append(kgm.Value(kgm.INSPECTOR, key if is_initials(who, loose=True) else who,
-                                  loc, snip, True))
+                                  loc, snip, True, from_image=self.from_image))
         if sheet_part and not any(v.rule.type == "PART" for v in vals) and \
                 any(v.rule.type in ("PERSON", "PROJECT") for v in vals):
             vals.append(kgm.Value(kgm.SHEET_PART, sheet_part, {"sheet": self.sheet},

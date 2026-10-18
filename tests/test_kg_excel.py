@@ -1829,3 +1829,33 @@ def test_the_clipboard_check_names_what_would_be_lost(monkeypatch):
     monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: True)
     assert excel_open.clipboard_safe() == (
         False, "Windows syncs this PC's clipboard to your other devices")
+
+
+def test_a_name_known_only_from_a_picture_does_not_confirm_another_picture(tmp_path):
+    """'Inspector: JB' read from one picture made Jordan Blake 'known from a
+    source that is not a picture' (the marker was not marked as picture
+    data), so a second picture's link to him was taken as firm."""
+    from openpyxl.drawing.image import Image as XLImage
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    _ledger(tmp_path, v / "data_in" / "led", [_row(schema, "999", "1A")],
+            people={"JB": "Jordan Blake"})
+    (v / "data_in" / "parts.csv").write_text("Part,Project\nPN-5,PRJ-1\n", encoding="utf-8")
+    pics = {}
+    for name, rows in (("a.xlsx", [["Inspector: JB"]]),
+                       ("b.xlsx", [["Part Number", "Owner"], ["PN-5", "Jordan Blake"]])):
+        png = lf._png([[name]])
+        pics[png] = rows
+        wb = openpyxl.Workbook()
+        wb.active.title = "Visual"
+        wb.active.add_image(XLImage(io.BytesIO(png)), "F2")
+        wb.save(v / "data_in" / name)
+    words = {w: 99 for rows in pics.values() for r in rows for c in r for w in c.split()}
+
+    def read(data):
+        return [list(r) for r in pics.get(data, [])] or None
+    read.name = "test OCR"
+    read.with_confidence = lambda data: (read(data), dict(words))
+    kg = _kg(v, reader=read)
+    kg.seed()
+    assert _rels(kg)[("Jordan Blake", "OWNS", "PN-5")] == "suggested"
