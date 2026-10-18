@@ -237,14 +237,63 @@ def test_its_records_are_format_1s_and_its_file_the_runs_own(fake):
 # ======================================================================
 # Triggering on a frame camera with no trigger facet at all (design 3.6)
 # ======================================================================
+class PlainCameras:
+    """A camera plugin whose frame cameras offer no trigger and no binning
+    at all — no facet, and only `frames` and `restartable` confirmed (a
+    third party's simple camera, design 3.6). Its cameras are the simulated
+    frame camera under a family of its own; until stage P7 the camera's
+    set-up is still kept on the Device (design 2.5), which the simulated
+    one has."""
+
+    backend = "plain"
+
+    def activate(self, ctx):
+        self.ctx = ctx
+
+    def deactivate(self):
+        pass
+
+    def available(self):
+        return True, ""
+
+    def discover(self):
+        from council_core import cameras
+        return [cameras.CameraInfo("plain", "plain-frame",
+                                   "Plain frame camera", "P-1", "Acme",
+                                   "frame")]
+
+    def open(self, info):
+        from council_core import cameras
+        return cameras.SyntheticDevice(info)
+
+    def capabilities(self, device):
+        return frozenset({"frames", "restartable"})
+
+    def facet(self, device, name):
+        return None
+
+    def categories(self):
+        return api.CategoryHints()
+
+    def record_fields(self, device):
+        return {}
+
+    def review_source(self):
+        return None
+
+
 @pytest.fixture
-def no_trigger_camera(fake, monkeypatch):
-    fake.connect()
-    monkeypatch.setattr(ph.PluginHost, "camera_facet",
-                        lambda self, camera, name: None)
-    slot = fake._fc._RIG.active
-    monkeypatch.setattr(type(slot), "capabilities", property(
-        lambda self: frozenset({"frames", "restartable"})))
+def no_trigger_camera(fake):
+    """A frame camera with no trigger facet, from a camera plugin of its
+    own (before P3c: a stand-in that patched the host's facets away)."""
+    fake.adopt({"schema": 1, "id": "typhon.plaincam", "short": "plaincam",
+                "name": "Plain cameras", "version": "1.0.0",
+                "api": pm.API_VERSION, "kind": "camera", "entry": "plugin:P",
+                "capabilities": ["frames", "restartable"]}, PlainCameras())
+    fake.connect("frame", label="Plain")
+    assert fake._fc._RIG.active.capabilities == {"frames", "restartable"}
+    handle = fake.host.camera_handles()[fake.camera]
+    assert all(handle.facet(n) is None for n in api.FACETS), "no facet"
     return fake
 
 

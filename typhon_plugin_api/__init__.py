@@ -450,7 +450,10 @@ class FeaturePlugin(Protocol):
     or None lets it go), `on_run_started(run)` and `on_run_finished(run) ->
     dict | None` (its block in the run's end record); with "presets",
     `preset_values(camera) -> dict` and `apply_preset_values(camera,
-    values)`. The screen points come at stage P4.
+    values)`; with "frame_stage" (built-in plugins only), `frame_stage(
+    camera)` -> `stage(image, meta) -> picture` for the run about to
+    start, or None — run after the core's Downsample, handed a read-only
+    picture and meta. The screen points come at stage P4.
 
     THE FAULT RULE (design 3.10). Every call is guarded: whatever it
     raises switches the plugin off for the session, said and logged. The
