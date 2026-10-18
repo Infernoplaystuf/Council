@@ -516,10 +516,14 @@ def _held_names() -> Dict[str, str]:
             if getattr(slot, "info", None) is not None}
 
 
-def current_families() -> Optional[List[str]]:
+def _current_families() -> Optional[List[str]]:
     """The camera families this app is set up for (camera_setup.json:
     a "Typhon (plugins)" project's ticked families, or the one camera of a
-    single-choice file), or None when it was never set up."""
+    single-choice file), or None when it was never set up.
+
+    Private on purpose: the Designer offers a linked button every public
+    function of this module, and this one, used by the plugins path only,
+    made today's Typhon's link list one longer (P2 review)."""
     from council_core import camera_setup
 
     path = _LIVE.setup_path
@@ -534,7 +538,7 @@ def _needs_setup() -> bool:
     switched off has nothing to tick (only the simulated cameras, which
     need none), so it is not asked at every start."""
     if _plugin_project() is not None:
-        if current_families() is not None:
+        if _current_families() is not None:
             return False
         try:
             host = _plugin_host()

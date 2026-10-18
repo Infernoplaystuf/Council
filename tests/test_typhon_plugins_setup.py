@@ -756,7 +756,7 @@ def test_a_project_set_up_today_opens_unchanged(plugin_project):
     """Not asked its set-up questions again; scans that one family."""
     cs.save_choice(cs.setup_path(plugin_project), "basler")
     assert not frame_camera._needs_setup()
-    assert frame_camera.current_families() == ["basler"]
+    assert frame_camera._current_families() == ["basler"]
     notes = " ".join(frame_camera.list_cameras()["notes"]).lower()
     assert "pypylon" in notes and "metavision" not in notes
 
@@ -962,7 +962,7 @@ def test_setup_runs_the_families_wizard_and_says_what_was_ticked(
     assert seen["held"] is frame_camera._held_names
     assert out["summary"].startswith(
         "Set up for Basler and Prophesee EVK4.")
-    assert frame_camera.current_families() == ["basler", "prophesee"]
+    assert frame_camera._current_families() == ["basler", "prophesee"]
     assert out["rows"]
 
 
