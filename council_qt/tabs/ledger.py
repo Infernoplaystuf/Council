@@ -212,10 +212,20 @@ class LedgerTab(ViewHelpers, QWidget):
             return
         self.status.setText(f"{title}…")
         self._say(f"── {title}")
+        self.progress.setRange(0, 0)               # busy until a percentage is known
         self.progress.setVisible(True)
 
-        def progress(msg: str) -> None:
-            self._to_ui(lambda: self.status.setText(f"{title}: {msg}"))
+        def progress(msg: str, fraction: Optional[float] = None) -> None:
+            """Every progress line (the terminal shows them too); a known
+            fraction turns the busy bar into a percentage."""
+            def show() -> None:
+                self.status.setText(f"{title}: {msg}")
+                if fraction is None:
+                    self.progress.setRange(0, 0)
+                else:
+                    self.progress.setRange(0, 100)
+                    self.progress.setValue(int(100 * fraction))
+            self._to_ui(show)
 
         def work() -> None:
             try:
