@@ -568,7 +568,8 @@ def test_pictures_are_read_by_ocr_and_their_links_are_suggested(tmp_path):
     dana = kg.search("Dana Whitfield", "PERSON")[0]
     ev = kg.neighbors(dana["id"])[0]["evidence"][0]
     assert ev["method"] == "picture" and ev["locator"]["image"] == "F2"
-    assert ev["where"] == "sheet Visual, picture at F2, row 2 (Owner, Part Number)"
+    assert ev["where"] == ("sheet Visual, picture at F2, row 2 (Owner, Part Number) — read "
+                           "from a picture, how sure unknown — check it")
     assert stats["pictures_read"] == 1
     assert kgm.source_context(kg.root, "vis.xlsx", ev["locator"], quote=ev["quote"])[0][1] \
         == "a picture at F2 on sheet Visual, read by OCR"

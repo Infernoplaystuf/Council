@@ -1094,6 +1094,24 @@ def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
     return out
 
 
+def word_confidences(tsv: str) -> Dict[str, float]:
+    """How sure Tesseract was of each word it read (its TSV 'conf', 0-100),
+    the lowest when a word was read more than once. The knowledge graph
+    trusts a value read from a picture only when the OCR was sure of it."""
+    out: Dict[str, float] = {}
+    for row in tsv.splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or f[0] != "5" or not f[11].strip():
+            continue
+        try:
+            conf = float(f[10])
+        except ValueError:
+            continue
+        word = f[11].strip()
+        out[word] = min(conf, out.get(word, conf))
+    return out
+
+
 def _for_ocr(data: bytes) -> bytes:
     """Greyscale, and small screenshots enlarged: Tesseract wants text about
     20-30 px high and misreads the 10-12 px of a pasted screenshot."""
@@ -1168,14 +1186,23 @@ def tesseract_reader(exe: Optional[Path] = None, timeout: float = 60) -> Optiona
     cmd += ["-l", "eng", "tsv"]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-    def read(data: bytes):
+    def tsv(data: bytes) -> str:
         done = subprocess.run(cmd, input=_for_ocr(data), capture_output=True,
                               timeout=timeout, creationflags=flags)
         if done.returncode != 0:
             raise RuntimeError(done.stderr.decode("utf-8", "replace").strip()[-300:]
                                or f"tesseract exited {done.returncode}")
-        return boxes_to_rows(tsv_to_boxes(done.stdout.decode("utf-8", "replace"))) or None
+        return done.stdout.decode("utf-8", "replace")
+
+    def read(data: bytes):
+        return boxes_to_rows(tsv_to_boxes(tsv(data))) or None
+
+    def with_confidence(data: bytes):
+        """(rows, {word: confidence}) from one Tesseract run."""
+        text = tsv(data)
+        return boxes_to_rows(tsv_to_boxes(text)) or None, word_confidences(text)
     read.name = "Tesseract (local)"
+    read.with_confidence = with_confidence
     return read
 
 

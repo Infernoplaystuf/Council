@@ -374,7 +374,14 @@ def _file_hash(p: Path) -> str:
 #: adds its flaw ('item') and where the Ledger says the value came from
 #: ('from': 'nde.xlsx › Part 101!C4', or 'sources': the row's workbooks).
 _LOC_KEYS = ("sheet", "row", "column", "columns", "page", "line", "cell", "cells",
-             "header", "image", "item", "from", "sources")
+             "header", "image", "item", "from", "sources", "ocr", "checked")
+
+#: How sure (0-100, Tesseract's own word confidence) the OCR must be of every
+#: value a link rests on before a link read from a picture is firm - with
+#: every one of those values known from a source that is not a picture. The
+#: user, 2026-10-18: images read, "not ... 100% trusted unless we are positive
+#: that the data pulled from the images is accurate".
+PICTURE_SURE = 90
 
 
 def _loc_json(loc: Dict[str, Any]) -> str:
@@ -417,6 +424,10 @@ def locator_text(loc: Any) -> str:
         s += f" — from {loc['from']}"
     elif loc.get("sources"):
         s += f" — source workbook(s): {loc['sources']}"
+    if "checked" in loc:
+        sure = (f"{loc['ocr']}% sure" if loc.get("ocr") is not None else "how sure unknown")
+        s += (f" — read from a picture, {sure}, every name found elsewhere" if loc["checked"]
+              else f" — read from a picture, {sure} — check it")
     return s
 
 
@@ -435,6 +446,10 @@ class Value:
     #: the column ('Owner' as much as 'Inspector'). A CSV's or a text
     #: document's people are read as they always were.
     signed: bool = False
+    #: Read from a picture by OCR. Its links are firm only when confirmed:
+    #: the OCR was sure of it (locator 'ocr' >= PICTURE_SURE) and the vault
+    #: knows it from a source that is not a picture (see _record_relations).
+    from_image: bool = False
 
 
 @dataclass(slots=True)
@@ -776,10 +791,12 @@ def _reader_sig(rules: Sequence[FieldRule], *, image_reader: str = "",
 
 
 def _values_json(r: Record) -> List[list]:
-    """[label, raw, locator, snippet] + flags when any: 1 tentative, 2 signed."""
+    """[label, raw, locator, snippet] + flags when any: 1 tentative, 2 signed,
+    4 read from a picture."""
     out = []
     for v in r.values:
-        flags = (1 if v.tentative else 0) | (2 if v.signed else 0)
+        flags = (1 if v.tentative else 0) | (2 if v.signed else 0) | \
+            (4 if v.from_image else 0)
         out.append([v.rule.label, v.raw, v.locator, v.snippet] + ([flags] if flags else []))
     return out
 
@@ -819,7 +836,8 @@ def _records_json(records: Sequence[Record], reading: Any = None,
 def _record_load(d: Dict[str, Any], rel: str, rules_by_label: Dict[str, FieldRule]) -> Record:
     return Record(rel, d["kind"], [Value(rules_by_label[v[0]], v[1], v[2], v[3],
                                          bool(int(v[4]) & 1) if len(v) > 4 else False,
-                                         bool(int(v[4]) & 2) if len(v) > 4 else False)
+                                         bool(int(v[4]) & 2) if len(v) > 4 else False,
+                                         bool(int(v[4]) & 4) if len(v) > 4 else False)
                                    for v in d["values"]],
                   skipped_row=int(d.get("skipped_row") or 0))
 
@@ -1959,7 +1977,8 @@ class KnowledgeGraph:
                     persons_full[person_key(v.raw)] = self._entity("PERSON", v.raw)
 
         memo = self._memo
-        for rec, did, h in records():
+
+        def link(rec: Record, did: str, h: str) -> List[Tuple[Value, Optional[str], bool]]:
             buf = memo.get("buffer") if memo is not None else None
             if buf and len(buf["evidence"]) + len(buf["mentions"]) >= self.FLUSH_EVERY:
                 self._flush()
@@ -1974,6 +1993,21 @@ class KnowledgeGraph:
                 if eid:
                     self._mention(eid, did, v.locator, v.raw, v.snippet, "field", run_id)
             self._record_relations(rec, ents, did, h, run_id)
+            return ents
+
+        # Records that rest on a picture come last, so that "known from a
+        # source that is not a picture" is checked against the whole vault,
+        # in whatever order the files were read.
+        self._known_elsewhere = set()
+        for rec, did, h in records():
+            if any(v.from_image for v in rec.values):
+                continue
+            for _v, eid, _inf in link(rec, did, h):
+                if eid:
+                    self._known_elsewhere.add(eid)
+        for rec, did, h in records():
+            if any(v.from_image for v in rec.values):
+                link(rec, did, h)
 
     def _person(self, v: Value, did: str, run_id: str) -> Tuple[Optional[str], bool]:
         """(entity id or None, inferred). An initial form that fits exactly
@@ -2173,6 +2207,14 @@ class KnowledgeGraph:
         firm = rec.kind in ("row", "record", "ledger") or n_proj <= 1
         status = "seeded" if firm else "suggested"
 
+        known = getattr(self, "_known_elsewhere", set())
+
+        def sure(v: Value, eid: str) -> bool:
+            """A picture's value counts as certain when the OCR was sure of
+            it and the vault knows it from a source that is not a picture."""
+            return (not v.from_image) or (int(v.locator.get("ocr") or 0) >= PICTURE_SURE
+                                          and eid in known)
+
         def rel(s, pred, o, v_s: Value, v_o: Value, at: Value):
             # ``at`` is the field that DEFINES the link (the person's field,
             # the 'Supersedes' field, the part's field), so the citation
@@ -2199,8 +2241,15 @@ class KnowledgeGraph:
                         loc[k] = "; ".join(dict.fromkeys(got))
             quote = v_s.snippet if v_s.snippet == v_o.snippet else \
                 f"{v_s.snippet} | {v_o.snippet}"
+            pictured = [v for v in (v_s, v_o) if v.from_image]
+            checked = sure(v_s, s) and sure(v_o, o)
+            if pictured:
+                loc = dict(loc)
+                confs = [v.locator.get("ocr") for v in pictured]
+                loc["ocr"] = None if any(c is None for c in confs) else min(confs)
+                loc["checked"] = checked
             st = "suggested" if (s in inferred_ids or o in inferred_ids
-                                 or v_s.tentative or v_o.tentative) else status
+                                 or v_s.tentative or v_o.tentative or not checked) else status
             self._relate(s, pred, o, st, doc_id=did, content_hash=h,
                          locator=loc, quote=quote, method=method, run_id=run_id)
 

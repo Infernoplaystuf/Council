@@ -324,6 +324,75 @@ def _clip_text() -> Optional[str]:
     return None
 
 
+#: Clipboard formats that copying a picture out would destroy for good:
+#: _clip_restore puts back text only. CF_BITMAP, CF_METAFILEPICT, CF_TIFF,
+#: CF_DIB, CF_ENHMETAFILE, CF_HDROP (copied files), CF_DIBV5.
+_NOT_TEXT_FORMATS = {2, 3, 6, 8, 14, 15, 17}
+_NOT_TEXT_NAMES = ("png", "jfif", "gif", "filename", "shell idlist", "filegroupdescriptor")
+
+
+def _clipboard_formats() -> set:
+    """What the clipboard holds now: its format numbers (registered formats
+    as their lower-cased names)."""
+    import win32clipboard
+    out: set = set()
+    win32clipboard.OpenClipboard()
+    try:
+        fmt = win32clipboard.EnumClipboardFormats(0)
+        while fmt:
+            if fmt >= 0xC000:
+                try:
+                    out.add(win32clipboard.GetClipboardFormatName(fmt).lower())
+                except Exception:
+                    out.add(fmt)
+            else:
+                out.add(fmt)
+            fmt = win32clipboard.EnumClipboardFormats(fmt)
+    finally:
+        win32clipboard.CloseClipboard()
+    return out
+
+
+def cloud_clipboard_on() -> bool:
+    """Windows' 'Sync across your devices' for the clipboard (Settings ›
+    System › Clipboard), unless a policy turns it off."""
+    try:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Policies\Microsoft\Windows\System") as k:
+                if int(winreg.QueryValueEx(k, "AllowCrossDeviceClipboard")[0]) == 0:
+                    return False
+        except OSError:
+            pass
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Clipboard") as k:
+            return int(winreg.QueryValueEx(k, "EnableCloudClipboard")[0]) == 1
+    except Exception:
+        return False
+
+
+def clipboard_safe() -> Tuple[bool, str]:
+    """(True, '') when pictures may be copied out through the clipboard now;
+    else (False, why). Not when Windows syncs the clipboard to other devices
+    (a picture could leave the PC), nor when the clipboard holds a picture or
+    files the copy would replace (only text is put back afterwards). Used by
+    the knowledge graph's background rebuild, which the user is not
+    watching; the Ledger's own reads decide for themselves."""
+    if os.name != "nt":
+        return False, "the pictures come out through the clipboard only on Windows"
+    if cloud_clipboard_on():
+        return False, "Windows syncs this PC's clipboard to your other devices"
+    try:
+        held = _clipboard_formats()
+    except Exception:
+        return False, "the clipboard could not be checked"
+    for f in held:
+        if (isinstance(f, int) and f in _NOT_TEXT_FORMATS) or (
+                isinstance(f, str) and any(n in f for n in _NOT_TEXT_NAMES)):
+            return False, "the clipboard holds a picture or files that copying would replace"
+    return True, ""
+
+
 def _clip_restore(text: Optional[str]) -> None:
     try:
         import win32clipboard
