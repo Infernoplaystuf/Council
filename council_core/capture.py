@@ -643,6 +643,14 @@ class Recorder:
                               it were not offered to the recording and are
                               not counted here (the app's Stop line counts
                               them "NOT saved (recording stopped)").
+            stream_ended      ONLY WHEN THE CAMERA'S STREAM ENDED BY ITSELF
+                              while this was the recording (added in
+                              version 1, so a reader of version 1 may meet
+                              it): why the grab loop stopped — the camera
+                              gone or its recording over, a run of failed
+                              reads, or an error it did not expect. A run
+                              ended by Stop has no such key; before it, a
+                              stream that died read as a normal stop.
             capture           A TRIGGERED RUN ONLY (added in version 1, so a
                               reader of version 1 may meet it): its mode,
                               source, frames per trigger, and what came of
@@ -688,6 +696,8 @@ class Recorder:
             "last_index": totals.get("last_index"),
             "recording_failed": str(totals.get("recording_failed") or ""),
         }
+        if totals.get("stream_ended"):
+            doc["stream_ended"] = str(totals["stream_ended"])
         info = self.capture_info
         if callable(info):
             try:
@@ -835,6 +845,9 @@ class FrameWriter:
         #: Snapshot frames that came between triggers (note_passed): the
         #: camera's, never asked for, so not offered — for the end record.
         self.passed = 0
+        #: Why the camera's stream ended by itself while this was the
+        #: recording (note_stream_ended), or "" — for the end record.
+        self.stream_ended = ""
         #: Told of every frame it accepted, once it is known: (the frame's
         #: meta, saved?, why not) — on a writer thread, in grab order. A
         #: triggered run's books settle a trigger only then (CaptureSession.
@@ -926,6 +939,14 @@ class FrameWriter:
         with self._cond:
             self.passed += 1
 
+    def note_stream_ended(self, why: str) -> None:
+        """The camera's stream ended by itself while this was the recording
+        (CaptureSession's grab loop stopped on an error, not on Stop): `why`
+        goes in the end record as stream_ended. The first one said stays."""
+        with self._cond:
+            if not self.stream_ended:
+                self.stream_ended = str(why or "") or "the stream ended"
+
     def _saw_index(self, index: Any) -> None:
         """Called with the lock held."""
         try:
@@ -950,6 +971,7 @@ class FrameWriter:
                 "last_index": self.last_index,
                 "recording_failed": self.failed,
                 "passed": self.passed,
+                "stream_ended": self.stream_ended,
             }
 
     def _run(self) -> None:
@@ -1398,12 +1420,14 @@ class CaptureSession:
     # ------------------------------------------------------------------
     def _loop(self) -> None:
         misses = 0
+        ended = ""
         while not self._stopping.is_set():
             try:
                 frame = self.device.read(self.timeout_ms)
             except cameras.CameraEnded as exc:
                 # NOT recoverable. The camera is gone or the recording is
                 # over, so every further read raises the same thing.
+                ended = str(exc) or type(exc).__name__
                 self._note_error(str(exc))
                 break
             except cameras.CameraError as exc:
@@ -1424,20 +1448,33 @@ class CaptureSession:
                 else:
                     self._note_error(str(exc))
                 if misses >= MAX_CONSECUTIVE_ERRORS:
-                    self._note_error(
-                        f"giving up after {misses} failed reads in a row: "
-                        f"{exc}")
+                    ended = (f"giving up after {misses} failed reads in a "
+                             f"row: {exc}")
+                    self._note_error(ended)
                     break
                 continue
-            except Exception as exc:                        # noqa: BLE001
-                # An SDK raising something unexpected ends the loop rather
-                # than spinning on it forever, but it says so first.
-                self._note_error(f"{type(exc).__name__}: {exc}")
+            except BaseException as exc:                    # noqa: BLE001
+                # An SDK — or a camera plugin's Device — raising something
+                # unexpected ends the loop rather than spinning on it
+                # forever, but it says so first. BaseException, not
+                # Exception: this is never the main thread (no Ctrl+C lands
+                # here), and a SystemExit used to end the thread without a
+                # word — the app still "capturing", 0 errors, and the run
+                # recorded as a normal stop (P2 review; design 3.10 counts
+                # SystemExit as a plugin fault).
+                ended = f"{type(exc).__name__}: {exc}"
+                self._note_error(ended)
                 break
             if frame is None:
                 continue
             misses = 0
             self._took(frame)
+        if ended:
+            # The stream ended by itself, not by Stop: the recording's end
+            # record says why (stream_ended).
+            writer = self.writer
+            if writer is not None:
+                writer.note_stream_ended(ended)
 
     def _took(self, frame: cameras.Frame) -> None:
         now, last = self._clock(), self._last_frame_at
