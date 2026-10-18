@@ -16,7 +16,7 @@ the user has looked — registers with eager=True.
 from __future__ import annotations
 
 import collections
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QLabel, QMainWindow, QStatusBar, QTabWidget,
@@ -63,16 +63,49 @@ class CouncilWindow(QMainWindow):
         self._status = QLabel("")
         self.statusBar().addWidget(self._status, 1)
 
+        # Which group a given tab title/tab_id belongs to, once a grouped
+        # layout is installed. Each entry says both the group page it lives
+        # in and the inner QTabWidget the lazy-swap targets.
+        self._tab_group: Dict[str, Any] = {}
+        self._tab_group_for_title: Dict[str, Any] = {}
+        self._tab_id_for_title: Dict[str, str] = {}
+        self.grouped: Any = None     # a group_tabs.GroupedTabsController
+
     # -- tabs ----------------------------------------------------------
+    def install_grouped_layout(self, controller: Any) -> None:
+        """Wire up the GroupedTabsController, created once per launch.
+
+        Called from the entry point AFTER the window exists and BEFORE any
+        tab is registered. Nothing fatal if it fails: the shell falls back
+        to the flat layout, which is what the tests exercise.
+        """
+        self.grouped = controller
+        # Wire inner lazy-build for each group page up front — a group may
+        # be the current top-level tab before its inner tabs are added, in
+        # which case the top-level currentChanged has already fired and will
+        # not fire again when a tab registers into the group.
+        for page in controller.groups.values():
+            page.inner.currentChanged.connect(
+                lambda i, gp=page: self._on_inner_tab_changed(gp, i))
+
     def add_tab(self, title: str, factory: Callable[[], QWidget], *,
-                eager: bool = False) -> None:
+                eager: bool = False, tab_id: Optional[str] = None) -> None:
         """Register a tab. ``factory`` builds it, on first show unless eager.
 
         The factory takes no arguments and returns a QWidget; it gets at the
         shell through the window it is constructed with, the same way the Tk
-        builders reach `self`."""
+        builders reach `self`.
+
+        ``tab_id`` is the stable identifier the group layout keys off. When
+        the window has a grouped layout installed and the id belongs to one
+        of the groups, the tab lives inside that group's inner QTabWidget;
+        otherwise the tab is added flat (the behaviour the Tk-era tests
+        depend on).
+        """
         self._factories[title] = factory
         self._order.append(title)
+        if tab_id is not None:
+            self._tab_id_for_title[title] = tab_id
         if eager:
             page = self._build(title)
         else:
@@ -80,6 +113,14 @@ class CouncilWindow(QMainWindow):
             page.setProperty("council_placeholder", True)
             layout = QVBoxLayout(page)
             layout.setContentsMargins(0, 0, 0, 0)
+
+        if (self.grouped is not None and tab_id is not None
+                and tab_id in self.grouped._id_to_group):      # noqa: SLF001
+            group_page = self.grouped.register_tab(tab_id, title, page)
+            if group_page is not None:
+                self._tab_group[tab_id] = group_page
+                self._tab_group_for_title[title] = group_page
+                return
         self.tabs.addTab(page, title)
 
     def _build(self, title: str) -> QWidget:
@@ -103,6 +144,10 @@ class CouncilWindow(QMainWindow):
             return
         title = self.tabs.tabText(index)
         if title in self._built or title not in self._factories:
+            # Could be a top-level group page: when a group becomes the
+            # current tab, make sure its first-visible inner tab's lazy
+            # content is built too.
+            self._build_current_inner()
             return
         current = self.tabs.widget(index)
         if not current.property("council_placeholder"):
@@ -115,6 +160,42 @@ class CouncilWindow(QMainWindow):
             self.tabs.setCurrentIndex(index)
         finally:
             self._swapping = False
+        self._build_current_inner()
+
+    def _build_current_inner(self) -> None:
+        """Build whichever inner tab the current group page shows now."""
+        if self.grouped is None:
+            return
+        idx = self.tabs.currentIndex()
+        if idx < 0:
+            return
+        page = self.tabs.widget(idx)
+        if page not in self.grouped.groups.values():
+            return
+        inner = page.inner
+        i = inner.currentIndex()
+        if i < 0:
+            return
+        self._maybe_build_inner(page, i, inner.tabText(i))
+
+    def _on_inner_tab_changed(self, group_page, index: int) -> None:
+        if index < 0:
+            return
+        title = group_page.inner.tabText(index)
+        self._maybe_build_inner(group_page, index, title)
+
+    def _maybe_build_inner(self, group_page, index: int, title: str) -> None:
+        if title in self._built or title not in self._factories:
+            return
+        current = group_page.inner.widget(index)
+        if not current.property("council_placeholder"):
+            return
+        page = self._build(title)
+        group_page.inner.removeTab(index)
+        group_page.inner.insertTab(index, page, title)
+        group_page.inner.setCurrentIndex(index)
+        # Keep the group's tab-id → widget mapping in sync (the id order is
+        # stable since nothing is reordered).
 
     def show_tab(self, title: str) -> None:
         """Bring a tab to the front by name.
@@ -122,6 +203,16 @@ class CouncilWindow(QMainWindow):
         The Tk shell does `self.nb.select(self.tab_models)` at 7 cross-tab
         sites — the error coach sending the user to Models, for instance. Those
         become this, and stop depending on a widget attribute existing."""
+        group_page = self._tab_group_for_title.get(title)
+        if group_page is not None:
+            idx = self.tabs.indexOf(group_page)
+            if idx >= 0:
+                self.tabs.setCurrentIndex(idx)
+            inner = group_page.inner
+            for i in range(inner.count()):
+                if inner.tabText(i) == title:
+                    inner.setCurrentIndex(i)
+                    return
         for i in range(self.tabs.count()):
             if self.tabs.tabText(i) == title:
                 self.tabs.setCurrentIndex(i)
@@ -135,6 +226,8 @@ class CouncilWindow(QMainWindow):
         apart to say "that tab is not in this build" rather than failing
         silently on a tab the user simply has not opened.
         """
+        if title in self._tab_group_for_title:
+            return True
         return any(self.tabs.tabText(i) == title
                    for i in range(self.tabs.count()))
 
