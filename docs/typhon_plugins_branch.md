@@ -275,6 +275,15 @@ skipped (the check a simulated event camera cannot be put to), in 439 s.
 That run put the Basler plugin's confirmed capabilities to pylon's
 emulated Baslers too: all six.
 
+The whole suite after the P2 review, on 6fab4eb, 8 at a time: 240 files,
+8,540 passed, 1 failed, 40 skipped, and `smoke_test.py` passed 1,313 with 0
+failed. The one failure was `tests/test_data_index_sidecars.py::
+test_a_second_refresh_with_nothing_changed_changes_nothing`: a second
+refresh profiled two files again (`data_index` compares a profile's
+`time.time()` with the file's mtime). Its file passed three runs alone;
+neither it nor `data_index.py` has changed on the branch, and neither
+touches the camera code.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
