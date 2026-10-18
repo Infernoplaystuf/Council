@@ -683,6 +683,11 @@ def connect(which: Any) -> Dict[str, Any]:
 
 def disconnect() -> Dict[str, Any]:
     """Stop grabbing, release the camera, forget it."""
+    host = _plugin_host() if _LIVE.capturing else None
+    if host is not None:
+        # Disconnected in the middle of a "Typhon (plugins)" run: it is
+        # over for its plugins, before its recording ends (see stop).
+        host.run_stopped(camera=_RIG.active.name)
     with _LOCK:
         session = _LIVE.session
         job = _LIVE.job
@@ -818,6 +823,17 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     problem = _capture_problem(session.device, setup)
     if problem:
         raise RuntimeError(problem)
+    # A "Typhon (plugins)" project (plugin design 3.6): every run-hook
+    # plugin's check_start, before anything is changed, stopped or
+    # reserved — a reason refuses this Start. Today's Typhon makes no host.
+    host = _plugin_host()
+    base = time.strftime("%Y%m%d_%H%M%S")
+    if host is not None:
+        host.register_run_files()
+        refused = host.check_start(_run_plan(host, base, out, session.device,
+                                             setup))
+        if refused:
+            raise RuntimeError("Start refused — " + "; ".join(refused))
     waits_for = _waits_for_trigger(session.device, setup)
 
     for box, value in (("exposure", exposure), ("gain", gain),
@@ -859,12 +875,20 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # again, a program that briefly took the new file without sharing made
     # Start fail after the live view had stopped (measured).
     try:
-        run, claim = _claim_run(out)
+        run, claim = (_claim_run(out) if host is None else
+                      _claim_run(out, base))
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
     recorder = capture.run_recorder(out, run, claim)
     armed = None
     trig = None
+    active = None
+    plugin_notes: List[str] = []
+    if host is not None:
+        # The run in progress, as its plugins see it: its end record
+        # carries their blocks and faults (plugin design 3.9, 3.10).
+        active = host.begin_run(run, {_RIG.active.name: out})
+        recorder.end_blocks = host.end_blocks(active)
     try:
         recorder.open()
         if session.running and restartable:
@@ -897,10 +921,15 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             # waits in short reads, so Stop is not held up to a second by
             # one (it notices Stop between reads).
             session.timeout_ms = ARMED_READ_MS
+        made_by = None
+        if host is not None:
+            # What made the run: the camera record's "plugins" block.
+            made_by, said_of = host.record_plugins(_RIG.active.name, device)
+            plugin_notes.extend(said_of)
         content, record_note = _camera_record(
             run, device, listing,
             setup if getattr(device, "capture", None) is not None else None,
-            armed)
+            armed, plugins=made_by)
         if setup.triggered:
             trig = _trigger_run(setup, device, out, run, listing, rate)
             recorder.capture_info = trig.summary
@@ -915,6 +944,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # an armed trigger back.
         _undo_arming(device, trig, armed)
         recorder.close()
+        if active is not None:
+            host.abandon_run(active)
         if isinstance(exc, OSError):
             raise RuntimeError(
                 f"cannot save frames into {out}: {exc}") from exc
@@ -927,6 +958,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         except Exception as exc:                          # noqa: BLE001
             session.record_to(None)
             _undo_arming(device, trig, armed)
+            if active is not None:
+                host.abandon_run(active)
             raise RuntimeError(f"cannot record the raw file: {exc}") from exc
     _LIVE.folder = out
     _LIVE.run = run
@@ -945,6 +978,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                     pass
             session.record_to(None)
             _undo_arming(device, trig, armed)
+            if active is not None:
+                host.abandon_run(active)
             raise
         _started_stream(session)
     if trig is not None and armed is not None and not trig.typhon_fires:
@@ -952,6 +987,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # edges before that (arming, the record read, the stream starting)
         # triggered nothing.
         _count_from_ready(device, armed)
+    if active is not None:
+        # The recording has begun: each run-hook plugin's on_run_started,
+        # best effort — a fault is said below, the capture carries on
+        # (plugin design 3.6, 3.10) — before the trigger source starts.
+        plugin_notes.extend(host.run_started(active))
     if trig is not None:
         # After the stream: the first trigger waits for the camera to say
         # it is ready (a trigger fired before that is lost — measured).
@@ -988,6 +1028,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "skipped.")
     if waits_for:
         said += f" The camera waits for {waits_for} before each frame."
+    if plugin_notes:
+        said += " " + " ".join(note if note.endswith(".") else note + "."
+                               for note in plugin_notes)
     _capture_button_state()
     # A settings window greys out what a capture refuses (the area, a
     # preset, a setting the stream is in the way of) from this.
@@ -1037,6 +1080,13 @@ def stop() -> Dict[str, Any]:
                 pass
             if isinstance(armed, dict) and armed.get("counter"):
                 _let_frames_land(session, device, trig)
+    host = _plugin_host()
+    if host is not None:
+        # The run is over for its plugins (plugin design 3.6): no new
+        # streamed file in it, and "run_stopped" told — before its
+        # recording ends, so before each one's on_run_finished, which
+        # comes with the run's end record once its last frame is on disk.
+        host.run_stopped(camera=_RIG.active.name)
     if getattr(device, "restartable", True):
         ended = session.stop()
         session.timeout_ms = FREE_READ_MS
@@ -2664,13 +2714,38 @@ def _unique_run(out: Path) -> str:
     return capture.reserve_run(out, time.strftime("%Y%m%d_%H%M%S"))
 
 
-def _claim_run(out: Path) -> tuple:
+def _claim_run(out: Path, base: Optional[str] = None) -> tuple:
     """_unique_run, with the reserved CSV still OPEN: (the run's name, the
     handle), for capture.run_recorder — never closed and opened again, so
-    no other program can take the file in between (capture.claim_run)."""
+    no other program can take the file in between (capture.claim_run).
+    `base`: the name to start from (a "Typhon (plugins)" Start's, the one
+    its plugins' start check was told); the time now otherwise."""
     from council_core import capture
 
-    return capture.claim_run(out, time.strftime("%Y%m%d_%H%M%S"))
+    return capture.claim_run(out, base or time.strftime("%Y%m%d_%H%M%S"))
+
+
+def _run_plan(host: Any, base: str, out: Path, device: Any,
+              setup: Any) -> Any:
+    """The run Start is about to make, for its plugins' start check (the
+    plugin host's RunPlan; plugin design 3.6, 3.11): the active camera
+    with its folder, area, Downsample and capture set-up. Read only."""
+    slot = _RIG.active
+    info = _LIVE.info
+    try:
+        area = tuple(device.roi().as_tuple())
+    except Exception:                                     # noqa: BLE001
+        area = (0, 0, 0, 0)
+    factor = int(getattr(setup, "downsample", 1) or 1)
+    method = (str(_downsample_state(device).get("method") or "")
+              if factor > 1 else "")
+    return host.plan_run(base, {slot.name: {
+        "kind": str(getattr(info, "kind", "") or ""), "info": info,
+        "capabilities": slot.capabilities, "folder": out, "area": area,
+        "downsample": factor, "downsample_method": method,
+        "capture": (dict(setup.as_record())
+                    if getattr(device, "capture", None) is not None
+                    else {})}})
 
 
 def _on_network_share(path: Path) -> bool:
@@ -2720,7 +2795,8 @@ def _camera_listing(device: Any) -> Dict[str, Any]:
 
 def _camera_record(run: str, device: Any,
                    listing: Optional[Dict[str, Any]] = None,
-                   setup: Any = None, armed: Any = None
+                   setup: Any = None, armed: Any = None,
+                   plugins: Optional[Dict[str, Any]] = None
                    ) -> "tuple[Optional[Dict[str, Any]], str]":
     """The run's camera record as it is now; (the record, "") or (None, why
     it could not be made).
@@ -2734,7 +2810,9 @@ def _camera_record(run: str, device: Any,
     `listing` is _camera_listing's, read before an exact run armed the
     trigger; the Trigger rows are read AGAIN after arming, so the record
     shows the trigger as the run had it. The capture set-up and Downsample
-    are their own blocks (`capture`, `downsample`)."""
+    are their own blocks (`capture`, `downsample`); `plugins`, for a
+    "Typhon (plugins)" run, what made it (the plugin host's
+    record_plugins), its `plugins` block."""
     from council_core import camera_record
 
     if listing is None:
@@ -2761,7 +2839,8 @@ def _camera_record(run: str, device: Any,
             preset_changed=listing.get("changed"), app=_app_identity(),
             software=_software(), host=_host_name(),
             capture=_capture_record(run, setup, armed),
-            downsample=_downsample_record(device, area)), ""
+            downsample=_downsample_record(device, area),
+            plugins=plugins), ""
     except Exception as exc:                              # noqa: BLE001
         return None, _not_recorded(run, exc)
 

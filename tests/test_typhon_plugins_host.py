@@ -1195,7 +1195,8 @@ def test_the_api_says_what_it_has_and_reexports_todays_classes():
     from council_core import camera_settings, reduce
     assert api.API_VERSION == pm.API_VERSION
     assert api.has("context.say") and api.has("hook.on_frame")
-    assert not api.has("context.write_new"), "the file services are P3"
+    # Stage P3 row 1 brought the file services (before it: not offered).
+    assert api.has("context.write_new") and api.has("context.create_file")
     assert not api.has("nonsense")
     assert api.Device is cameras.Device and api.Frame is cameras.Frame
     assert api.Provider is camera_settings.Provider
@@ -1961,5 +1962,7 @@ def test_the_api_has_only_the_hooks_typhon_calls():
     Typhon 0.1 calls (Start asks check_start from P3; status from P4)."""
     assert api.has("hook.activate") and api.has("hook.deactivate")
     assert api.has("hook.on_frame"), "the host's live feeds call it"
-    assert not api.has("hook.check_start")
+    # Start asks check_start from stage P3 row 1 (frame_camera.start, in a
+    # "Typhon (plugins)" project); the status strip asks status from P4.
+    assert api.has("hook.check_start")
     assert not api.has("hook.status")

@@ -44,6 +44,26 @@ brings its install guide (`Guide` of `Step`s), its checks (`Readiness` of
 (design 2.3, 2.4 item 15). A family nobody ticked is left out of the scan.
 A camera plugin without a set-up (the simulated cameras) is always scanned.
 
+A RUN, AS A PLUGIN SEES IT (stage P3 rows 1 and 4)
+A plugin whose manifest contributes "run_hooks" is asked `check_start(plan)`
+(a RunPlan: the cameras of the run to be, each with its folder, area,
+Downsample and capture set-up) before anything stops — a reason refuses
+Start — then `on_run_started(run)` (a RunInfo) once the recording has begun,
+and `on_run_finished(run)` once its last frame is on disk, with the end
+record's counts; the mapping it returns is its block in that end record
+(`<run>_run_end.json`'s "plugins"), cleaned and size-checked. A camera
+plugin's `record_fields(device)` goes in its entry of the camera record's
+"plugins" block, which says what made the run (design 3.9, 4.2).
+The context's two FILE SERVICES are the only way a plugin writes a run
+file, and neither ever writes over anything (design 3.9, 10.3):
+`create_file` streams a new file, made exclusively, in a folder of the run
+in progress; `write_new` writes a whole file under a temporary name and
+renames it into a name that must not exist ("_2", "_3" ... on a rerun),
+beside any run, past ones included, or in the plugin's own `data_dir()`
+(`<project>/plugin_data/<id>/`). A run file's name is the run's and one of
+the endings the manifest's "files" declares; Typhon registers every one, so
+a run name is never used twice.
+
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
 reading a manifest, or importing this package, loads no camera code.
@@ -67,9 +87,11 @@ API_VERSION = "0.2"
 #: host's camera registry calls (0.2: scanning, opening, confirming
 #: capabilities, the settings tabs' rows, the review source; from stage P2
 #: rows 3 and 4 its set-up guide, checks and scan, which the set-up wizard
-#: of a "Typhon (plugins)" project calls). check_start joins when Start
-#: asks it (stage P3), status when the status strip does (P4), a camera
-#: plugin's facet and record_fields at P3.
+#: of a "Typhon (plugins)" project calls). From stage P3 rows 1 and 4 the
+#: run hooks (Start asks check_start, before anything stops), a camera
+#: plugin's record_fields (the camera record at Start), and the context's
+#: two file services and data folder. status joins when
+#: the status strip asks it (P4), a camera plugin's facet with the facets.
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
     "context.say", "context.call_in_ui", "context.cameras",
@@ -77,18 +99,23 @@ FEATURES: FrozenSet[str] = frozenset({
     "context.current_frame", "context.crop_box", "context.on",
     "context.settings", "context.save_settings", "context.state",
     "context.temp_dir",
+    # the two file services and the plugin's data folder (P3 row 1)
+    "context.create_file", "context.write_new", "context.data_dir",
     # the hooks Typhon calls (FeaturePlugin)
     "hook.activate", "hook.deactivate", "hook.on_frame",
+    # a run's hooks (P3 row 1)
+    "hook.check_start", "hook.on_run_started", "hook.on_run_finished",
     # a camera plugin's hooks Typhon calls (CameraPlugin, 0.2)
     "camera.available", "camera.discover", "camera.open",
     "camera.capabilities", "camera.categories", "camera.review_source",
+    "camera.record_fields",
     # a camera plugin's set-up, which the set-up wizard calls (CameraSetup)
     "camera.setup_guide", "camera.setup_checks", "camera.setup_scan",
     # the types
     "type.FrameView", "type.CameraHandle", "type.CropBox",
     "type.CameraPlugin", "type.CategoryHints", "type.ReviewSource",
     "type.CameraSetup", "type.Guide", "type.Step", "type.Check",
-    "type.Readiness",
+    "type.Readiness", "type.RunPlan", "type.RunInfo", "type.RunCamera",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -171,6 +198,64 @@ class FrameView:
                                     MappingProxyType({}))
 
 
+@dataclass(frozen=True)
+class RunCamera:
+    """One camera of a run to be, as a RunPlan names it (design 3.6, 3.11):
+    its slot's name, "frame" or "event", what it is (`info`, a CameraInfo)
+    and can do, the folder its run saves into, its area (x, y, w, h, sensor
+    pixels), Downsample's factor (1: off) and method ("typhon_block_mean",
+    "camera_binning_average", or "" for off), and its capture set-up as
+    plain values ({} for a camera with none: an event camera)."""
+    name: str
+    kind: str = ""
+    info: Any = None
+    capabilities: FrozenSet[str] = frozenset()
+    folder: Optional[Path] = None
+    area: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    downsample: int = 1
+    downsample_method: str = ""
+    capture: Mapping[str, Any] = field(default_factory=lambda:
+                                       MappingProxyType({}))
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """The run Start is about to make, as `check_start(plan)` sees it
+    (design 3.6, 3.11), before anything stops or is reserved: `base`, the
+    name it will have — "_2", "_3" ... added when a run of that name is
+    already in its folder — and each camera of it (RunCamera, by name)."""
+    base: str
+    cameras: Mapping[str, RunCamera] = field(default_factory=lambda:
+                                             MappingProxyType({}))
+
+    @property
+    def folders(self) -> Mapping[str, Optional[Path]]:
+        """Each camera's capture folder, by camera name."""
+        return MappingProxyType({name: cam.folder
+                                 for name, cam in self.cameras.items()})
+
+
+@dataclass(frozen=True)
+class RunInfo:
+    """A run, as on_run_started and on_run_finished see it (design 3.5,
+    3.11): its reserved name, its folders by camera name, when it started
+    (seconds since 1970) and — at on_run_finished only — when its
+    recording ended and each camera's counts from its end record
+    (`<run>_run_end.json`: frames_saved, frames_not_saved, grab_failures,
+    grab_attempts, first_index, last_index, recording_failed, ...)."""
+    run: str
+    folders: Mapping[str, Path] = field(default_factory=lambda:
+                                        MappingProxyType({}))
+    started: float = 0.0
+    ended: Optional[float] = None
+    counts: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({}))
+
+    @property
+    def cameras(self) -> Tuple[str, ...]:
+        return tuple(self.folders)
+
+
 @runtime_checkable
 class PluginContext(Protocol):
     """What Typhon hands a plugin in `activate(ctx)` (design 3.5). A
@@ -222,13 +307,48 @@ class PluginContext(Protocol):
         """A folder of this plugin's own for temporary files; Typhon removes
         it when the window closes."""
 
+    def create_file(self, folder: Path, name: str, *,
+                    binary: bool = False) -> Any:
+        """(a) STREAMED, during a run: a new file `name` in `folder`, one
+        of the run in progress's folders, opened for writing — text
+        (UTF-8, newline="") or `binary` — and made EXCLUSIVELY: a file of
+        that name already there is refused (PluginFileError), never
+        opened. `name` is "<run><ending>", the run in progress's name and
+        an ending this plugin's manifest declares in "files". Close it by
+        on_run_finished; Typhon closes what is left open then."""
+
+    def write_new(self, folder: Path, name: str, data: bytes) -> Path:
+        """(b) WHOLE, at any time: `data` written under a temporary name of
+        its own beside it, then renamed to `name` with a rename that
+        REFUSES an existing name — "<stem>_2<ext>", "_3" ... on a rerun —
+        so nothing is ever written over. Returns the path written. `folder`
+        holds the run `name` belongs to (`name` is "<run><ending>", an
+        ending the manifest declares), past runs included, or is this
+        plugin's data_dir(), where any plain file name but code goes."""
+
+    def data_dir(self) -> Path:
+        """This plugin's own data folder in this project,
+        `<project>/plugin_data/<id>/`, made on first ask; files go in it
+        through write_new (design 4.1)."""
+
 
 @runtime_checkable
 class FeaturePlugin(Protocol):
     """A feature plugin (design 3.5). Every method is optional; Typhon calls
-    the ones a plugin has. In 0.1 Typhon calls `activate` and `deactivate`
-    and, where it is fed live frames, `on_frame`; the run hooks are wired at
-    stage P3 and the screen points at stage P4."""
+    the ones a plugin has: `activate` and `deactivate`; where it is fed live
+    frames, `on_frame`; with "run_hooks" in its manifest's contributes
+    (stage P3), `check_start(plan) -> str` (a reason refuses Start; ""
+    or None lets it go), `on_run_started(run)` and `on_run_finished(run) ->
+    dict | None` (its block in the run's end record). The screen points
+    come at stage P4.
+
+    THE FAULT RULE (design 3.10). Every call is guarded: whatever it
+    raises switches the plugin off for the session, said and logged. The
+    run hooks and record_fields are BEST EFFORT — the
+    fault is said in Start's summary or the run's end record and the
+    capture carries on; only check_start refuses a Start. On the RECORDING
+    PATH (a record gate, a frame stage: built-in plugins only) a fault ends
+    the recording, with the reason in the end record."""
 
     def activate(self, ctx: PluginContext) -> None: ...
 
@@ -331,8 +451,9 @@ class CameraPlugin(Protocol):
     opened camera, the capabilities the manifest declares — never more
     (design 3.4). `facet(device, name)` is None until the facets arrive at
     stage P3. `categories()` gives the settings tabs its rows;
-    `record_fields(device)` plain JSON for the run's record (wired at P3);
-    `review_source()` a ReviewSource, or None."""
+    `record_fields(device)` plain JSON for its entry of the run's camera
+    record (stage P3: asked at Start, cleaned and size-checked, best
+    effort); `review_source()` a ReviewSource, or None."""
 
     backend: str
 
@@ -424,12 +545,15 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "Step": ("council_core.camera_setup", "Step"),
     "Check": ("council_core.camera_setup", "Check"),
     "Readiness": ("council_core.camera_setup", "Readiness"),
+    # what the two file services refuse with (stage P3 row 1)
+    "PluginFileError": ("council_core.plugin_runs", "PluginFileError"),
 }
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
                   "FeaturePlugin", "CameraPlugin", "CameraSetup",
-                  "CategoryHints", "ReviewSource", *_REEXPORTS])
+                  "CategoryHints", "ReviewSource", "RunCamera", "RunPlan",
+                  "RunInfo", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:

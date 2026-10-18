@@ -93,6 +93,22 @@ A plugin is imported and activated outside the host's lock: one that is
 slow (sklearn takes 3-5 s to import) or hangs there holds up only callers
 of that same plugin, who wait for it — and the watchdog lets them go.
 
+STAGE P3 ROW 1: A RUN, AS THE PLUGINS SEE IT (design 3.5, 3.6, 3.9, 3.10)
+The core owns the order; the host fills it in. Start: `check_start(plan)`
+(a RunPlan, before anything stops or is reserved) → the run name reserved
+→ `begin_run` → recording → `run_started` (each run-hook plugin's
+on_run_started, best effort; "run_started" told) → the trigger source. Stop:
+`run_stopped` ("run_stopped" told) → the recording over → when its last
+frame is on disk, `end_blocks` (each plugin's on_run_finished with the end
+record's counts, bounded in time, its block cleaned and size-checked into
+the end record's "plugins"; the run's best-effort faults into its
+"plugin_faults"). `record_plugins` is the camera record's "plugins" block:
+what made the run. Every plugin's declared run files are registered as run
+markers (capture.register_run_files), so a run name is never used twice.
+The two file services and a plugin's data folder are council_core.
+plugin_runs'. A frame stage (`frame_stage`) is guarded on the recording
+path, as a record gate is.
+
 LIVE FRAMES ON THE PLUGIN'S OWN THREAD (design 3.8, 10.2)
 `feed()` gives a plugin a LiveFeed: the grab thread drops each frame into a
 two-slot queue that throws away the oldest and counts it, and the plugin's
@@ -127,8 +143,10 @@ from typing import (Any, Callable, Deque, Dict, Iterable, List, Mapping,
 import typhon_plugin_api as api
 
 from . import camera_capabilities as cc
+from . import camera_record
 from . import plugin_lists as pl
 from . import plugin_manifest as pm
+from . import plugin_runs as pr
 
 #: THE BUILT-IN LIST: (id, folder in typhon_plugins/). Only these load as
 #: built-in plugins, trusted like the rest of the Council's code (design
@@ -165,6 +183,10 @@ LOAD = "load"
 
 #: A call into a plugin that runs longer than this is switched off.
 WATCHDOG_SECONDS = 2.0
+#: How long the end of a run waits for one plugin's on_run_finished before
+#: the end record is written without its block (design 3.10: the end
+#: record is never held up by a plugin; the watchdog's limit).
+RUN_HOOK_SECONDS = 2.0
 #: How often the watchdog looks (seconds).
 WATCHDOG_EVERY = 0.5
 #: A live feed's queue: the newest frames, the oldest thrown away.
@@ -185,6 +207,12 @@ FAULT_TAGS = {"trigger": "", "trigger_source": "error: plugin fault"}
 
 class PluginHung(RuntimeError):
     """What the watchdog records for a call that ran too long."""
+
+
+class RecordingEnded(RuntimeError):
+    """A plugin's frame stage failed, or its plugin was switched off: the
+    frame is not saved and the recording ends, with this reason (a failed
+    write, to the recorder: design 3.10)."""
 
 
 def _ours(exc: BaseException) -> bool:
@@ -314,6 +342,14 @@ def discover(home: Any, *, builtin_dir: Any = None,
                                   f"built-in list has {pid!r} in {name}/")
             else:
                 record.problem = pm.api_problem(m.api, api_version)
+            if not record.problem:
+                # One run file, one plugin — built-ins too (stage P3: the
+                # registry marks each one a run's; before, only a third
+                # party's claim was checked).
+                clash = [s for s in m.files if s in suffixes]
+                if clash:
+                    record.problem = (f"its run file {clash[0]!r} is "
+                                      f"{suffixes[clash[0]]}'s already")
             if not record.problem:
                 shorts.setdefault(m.short, pid)
                 for suffix in m.files:
@@ -554,6 +590,14 @@ class PluginHost:
         self.crop_box_fn: Optional[Callable[[Optional[str]],
                                             Optional[api.CropBox]]] = None
         self.ui_thread = threading.main_thread().ident
+        #: Runs from their name's reservation to their end record (stage
+        #: P3; council_core.plugin_runs.ActiveRun), and each camera's own.
+        self._runs: List[pr.ActiveRun] = []
+        self._current: Dict[str, pr.ActiveRun] = {}
+        #: Whose run files this host registered as run markers
+        #: (capture.register_run_files), forgotten at close().
+        self._token = object()
+        self._registered: set = set()
 
     # -- the project and its lists ------------------------------------
     def builtin_ids(self) -> List[str]:
@@ -649,11 +693,56 @@ class PluginHost:
         if found is not None:
             return found
         with self._lock:
-            if self._registry is None:
+            made = self._registry is None
+            if made:
                 self._registry = discover(self.home.path,
                                           builtin_dir=self.builtin_dir,
                                           builtins=self.builtins)
-            return self._registry
+            found = self._registry
+        if made:
+            self._register_files(only_if_loaded=True)
+        return found
+
+    # -- the run-file suffix registry (stage P3; design 2.4 item 7, 3.9) --
+    def _register_files(self, only_if_loaded: bool = False) -> None:
+        """Every plugin's declared run files — each found plugin's, on or
+        off, approved or not, and each adopted one's — as run markers
+        (capture.register_run_files), so a run whose only file left is a
+        plugin's keeps its name. `only_if_loaded`: only when the capture
+        code is loaded already — the host itself loads no camera code — and
+        register_run_files does it before a run's name is reserved."""
+        if only_if_loaded and "council_core.capture" not in sys.modules:
+            return
+        from . import capture
+
+        registry = self._registry
+        records = dict(registry.records) if registry is not None else {}
+        records.update(self._adopted)
+        for pid, rec in records.items():
+            m = rec.manifest
+            if m is None or not m.files:
+                continue
+            owner = (self._token, pid)
+            try:
+                capture.register_run_files(owner, m.files)
+            except ValueError:
+                continue
+            self._registered.add(owner)
+
+    def register_run_files(self) -> None:
+        """Register every plugin's run files now (see _register_files):
+        before a run's name is reserved."""
+        self.registry               # found first
+        self._register_files()
+
+    def _unregister_files(self) -> None:
+        if not self._registered:
+            return
+        from . import capture
+
+        for owner in list(self._registered):
+            capture.unregister_run_files(owner)
+        self._registered.clear()
 
     def record(self, pid: str) -> Optional[PluginRecord]:
         return self._adopted.get(pid) or self.registry.records.get(pid)
@@ -759,6 +848,7 @@ class PluginHost:
             self._adopted[manifest.id] = PluginRecord(
                 id=manifest.id, folder=Path("."), builtin=manifest.builtin,
                 manifest=manifest, factory=factory)
+        self._register_files(only_if_loaded=True)
 
     def instance(self, pid: str, camera: Optional[str] = None) -> Any:
         """Plugin `pid`'s instance (for a camera-scoped feature, the one of
@@ -895,6 +985,319 @@ class PluginHost:
     def _name(self, pid: str) -> str:
         rec = self.record(pid)
         return rec.name if rec is not None else pid
+
+    # -- a run (stage P3 row 1; design 3.5, 3.6, 3.9, 3.10) -----------------
+    def plan_run(self, base: str,
+                 cameras: Mapping[str, Mapping[str, Any]]) -> api.RunPlan:
+        """The RunPlan check_start is asked with: `base`, the run's name to
+        be, and each camera of it from plain data — kind, info,
+        capabilities, folder, area, downsample, downsample_method, capture
+        (the capture set-up as plain values) — read-only."""
+        made: Dict[str, api.RunCamera] = {}
+        for name, about in dict(cameras or {}).items():
+            about = dict(about or {})
+            folder = about.get("folder")
+            area = tuple(int(v) for v in (about.get("area") or (0, 0, 0, 0)))
+            made[str(name)] = api.RunCamera(
+                name=str(name), kind=str(about.get("kind") or ""),
+                info=about.get("info"),
+                capabilities=frozenset(about.get("capabilities") or ()),
+                folder=Path(str(folder)) if folder is not None else None,
+                area=area if len(area) == 4 else (0, 0, 0, 0),
+                downsample=int(about.get("downsample") or 1),
+                downsample_method=str(about.get("downsample_method") or ""),
+                capture=MappingProxyType(dict(about.get("capture") or {})))
+        return api.RunPlan(base=str(base), cameras=MappingProxyType(made))
+
+    def begin_run(self, run: str, folders: Mapping[str, Any]
+                  ) -> pr.ActiveRun:
+        """A run whose name was just reserved (capture.claim_run), with its
+        folders by camera: the run in progress for those cameras from now
+        until its end record. Its plugins hear of it at run_started."""
+        self.register_run_files()
+        active = pr.ActiveRun(run=str(run), folders={
+            str(k): Path(str(v)) for k, v in dict(folders).items()})
+        with self._lock:
+            self._runs = [r for r in self._runs if not r.over]
+            self._runs.append(active)
+            for camera in active.folders:
+                self._current[camera] = active
+        return active
+
+    def current_run(self, camera: Optional[str] = None
+                    ) -> Optional[pr.ActiveRun]:
+        """`camera`'s run (the active camera's) from its name's reservation
+        until Stop (run_stopped) — its recording may have ended by itself
+        meanwhile — or None."""
+        if camera is None:
+            camera = getattr(self._slot(None), "name", None)
+        return self._current.get(str(camera)) if camera else None
+
+    def _forget(self, active: pr.ActiveRun, current: bool = False) -> None:
+        """Drop runs that are over from the runs kept, and with `current`
+        `active` as its cameras' run too (Stop, or a Start abandoned)."""
+        with self._lock:
+            if current:
+                for camera, run in list(self._current.items()):
+                    if run is active:
+                        del self._current[camera]
+            self._runs = [r for r in self._runs if not r.over]
+
+    def _run_plugins(self, active: pr.ActiveRun
+                     ) -> List[Tuple[str, Optional[str]]]:
+        """(plugin, camera) to ask a run's hooks: every run-hook plugin this
+        project runs — a camera-scoped one once for each camera of the run,
+        a rig one once (camera None)."""
+        out: List[Tuple[str, Optional[str]]] = []
+        for pid in self.with_hook("run_hooks"):
+            m = self.manifest(pid)
+            if m is not None and m.kind == "feature" and m.scope == "camera":
+                out += [(pid, camera) for camera in active.folders]
+            else:
+                out.append((pid, None))
+        return out
+
+    def run_started(self, active: pr.ActiveRun) -> List[str]:
+        """The run's recording has begun: each run-hook plugin's
+        on_run_started(RunInfo), best effort (design 3.10: a fault is said
+        — the words returned, for Start's summary — the plugin is switched
+        off, and the capture carries on); then "run_started" is told. A
+        run whose recording already ended by itself (its end record is
+        written: a failed write) is not started: its plugins are told
+        nothing, as for a Start that failed."""
+        with active.lock:
+            if active.state != pr.RESERVED:
+                return []
+            active.state = pr.RECORDING
+            active.told_started = True
+        info = active.info()
+        notes: List[str] = []
+        for pid, camera in self._run_plugins(active):
+            made = self.instance(pid, camera)
+            if made is None:
+                continue
+            active.hooked.append((pid, camera))
+            self._guard(pid, "on_run_started", _hook(made, "on_run_started"),
+                        (info,), {}, None)
+            fault = self.faults.get(pid)
+            if fault is not None and fault.hook == "on_run_started":
+                notes.append(f"{self._name(pid)} failed as the run started "
+                             f"and was switched off — {fault.error}; the "
+                             f"capture carries on")
+        self.emit("run_started", run=active.run, folders={
+            k: str(v) for k, v in active.folders.items()})
+        return notes
+
+    def run_stopped(self, active: Optional[pr.ActiveRun] = None,
+                    camera: Optional[str] = None) -> None:
+        """Stop was pressed (or the camera disconnected), before the
+        recording is ended: no streamed file is made in the run from now
+        on; "run_stopped" is told, once, to a run that was started — also
+        when its recording had already ended by itself. Its plugins'
+        on_run_finished comes with its end record (end_blocks), after."""
+        if active is None:
+            active = self.current_run(camera)
+        if active is None:
+            return
+        with active.lock:
+            started = active.told_started
+            if active.state in (pr.RESERVED, pr.RECORDING):
+                active.state = pr.STOPPED
+            told, active.told_stopped = active.told_stopped, True
+        self._forget(active, current=True)
+        if started and not told:
+            self.emit("run_stopped", run=active.run, folders={
+                k: str(v) for k, v in active.folders.items()})
+
+    def abandon_run(self, active: pr.ActiveRun) -> None:
+        """A Start that failed after the run's name was reserved: its
+        plugins were never told it started, so they are told nothing."""
+        with active.lock:
+            active.state = pr.ABANDONED
+        active.close_files()
+        self._forget(active, current=True)
+
+    def end_blocks(self, active: pr.ActiveRun
+                   ) -> Callable[[Mapping[str, Any]], Dict[str, Any]]:
+        """What the run's Recorder asks once its last frame is on disk
+        (capture.Recorder.end_blocks): the end record's "plugins" and
+        "plugin_faults" (see _end_of_run). Bound to `active`, so a run
+        whose last frames land after the next Start still ends as its
+        own."""
+        return lambda doc: self._end_of_run(active, doc)
+
+    def _end_of_run(self, active: pr.ActiveRun, doc: Mapping[str, Any]
+                    ) -> Dict[str, Any]:
+        """Each plugin asked on_run_started is asked on_run_finished(RunInfo
+        with the end record's counts) — best effort, and BOUNDED: one that
+        does not return in RUN_HOOK_SECONDS is switched off and the record
+        written without it. Each block is cleaned and size-checked (one
+        that cannot go in is a fault of its plugin); the files the plugins
+        left open in the run are closed; the faults of the run are listed.
+        Runs on the thread that writes the end record."""
+        camera = next(iter(active.folders), "")
+        with active.lock:
+            active.counts[camera] = pr.counts_of(dict(doc))
+            if active.state in (pr.RESERVED, pr.RECORDING):
+                active.state = pr.STOPPED
+            active.ended = time.time()
+        info = active.info()
+        blocks: Dict[str, Any] = {}
+        for pid, cam in list(active.hooked):
+            if pid in self.faults:
+                continue
+            made = self.instance(pid, cam)
+            if made is None:
+                continue
+            out = self._bounded(pid, "on_run_finished", made, (info,))
+            if out is None or out is _NO_HOOK or pid in self.faults:
+                continue
+            try:
+                blocks[pid] = camera_record.clean_block(out)
+            except camera_record.BlockError as exc:
+                self.fault(pid, "on_run_finished", exc)
+        kept, refused = camera_record.plugins_block(blocks)
+        for pid, why in refused.items():
+            if pid not in self.faults:
+                self.fault(pid, "on_run_finished",
+                           camera_record.BlockError(why))
+        active.close_files()
+        with active.lock:
+            active.state = pr.ENDED
+            faults = dict(active.faults)
+        self._forget(active)
+        return {"plugins": kept, "plugin_faults": faults}
+
+    def _bounded(self, pid: str, hook: str, made: Any,
+                 args: Sequence[Any]) -> Any:
+        """`made.hook(*args)`, guarded as best effort, on a thread of its
+        own: None when it has not returned within RUN_HOOK_SECONDS, and the
+        plugin is then switched off (a hang). The call itself cannot be
+        stopped (Python has no way to); nothing waits for it."""
+        wait = RUN_HOOK_SECONDS
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["out"] = self._guard(pid, hook, _hook(made, hook), args,
+                                         {}, None)
+            finally:
+                done.set()
+        threading.Thread(target=run, daemon=True,
+                         name=f"plugin-{hook}-{pid}").start()
+        if not done.wait(wait):
+            self.fault(pid, hook, PluginHung(
+                f"{hook} did not return within {wait:g} s; the run's end "
+                f"record was written without it"), HANG)
+            return None
+        return box.get("out")
+
+    def record_plugins(self, camera: Optional[str], device: Any = None
+                       ) -> Tuple[Dict[str, Any], List[str]]:
+        """The camera record's "plugins" block for a run of `camera`'s (the
+        active camera's): what made the run (design 3.9, 4.2) — each plugin
+        this project runs that is on, loaded or switched off after a fault,
+        by id: its name, version, short name (an old run's sidecar is never
+        put down to a later plugin of that short name) and kind, why it is
+        switched off, and for the camera plugin that opened the camera its
+        record_fields(device), cleaned and size-checked. With the words for
+        Start's summary of any record field that could not go in."""
+        slot = self._slot(camera)
+        info = getattr(slot, "info", None)
+        backend = str(getattr(info, "backend", "") or "")
+        source = self.camera_plugin_for(backend) if backend else None
+        out: Dict[str, Any] = {}
+        notes: List[str] = []
+        for pid in self.runs():
+            state, why = self.state(pid)
+            m = self.manifest(pid)
+            if state not in (ON, ACTIVE, FAULTED) or m is None:
+                continue
+            entry: Dict[str, Any] = {"name": m.name, "version": m.version,
+                                     "short": m.short, "kind": m.kind}
+            if state == FAULTED:
+                entry["faulted"] = why
+            if pid == source and device is not None:
+                fields, note = self._record_fields(pid, device)
+                if fields:
+                    entry["fields"] = fields
+                if note:
+                    notes.append(note)
+            out[pid] = entry
+        return out, notes
+
+    def _record_fields(self, pid: str, device: Any
+                       ) -> Tuple[Dict[str, Any], str]:
+        """Camera plugin `pid`'s record_fields(device), cleaned, best effort
+        (design 3.10): ({}, why) when they could not be had or kept."""
+        from .cameras import CameraError
+
+        try:
+            fn = self._camera_run(pid, "record_fields",
+                                  lambda made: getattr(made, "record_fields",
+                                                       None))
+        except CameraError:
+            return {}, ""
+        if not callable(fn):
+            return {}, ""
+        try:
+            fields = self.camera_call(pid, "record_fields", device)
+        except CameraError as exc:
+            return {}, (f"{self._name(pid)}: its fields in the run's camera "
+                        f"record were not written — {exc}.")
+        if not fields:
+            return {}, ""
+        try:
+            return camera_record.clean_block(fields), ""
+        except camera_record.BlockError as exc:
+            self._camera_fault(pid, "record_fields", exc)
+            return {}, (f"{self._name(pid)}: its fields in the run's camera "
+                        f"record were not written — {exc}.")
+
+    def frame_stage(self, pid: str, stage: Callable[[Any, Any], Any],
+                    session: Any = None) -> "GuardedStage":
+        """Plugin `pid`'s frame stage for one run, guarded on the RECORDING
+        PATH (design 3.8, 3.10): set it as the run's capture.Recorder.
+        frame_stage. A fault in it ends that run's recording, its reason in
+        <run>_run_end.json."""
+        return GuardedStage(self, pid, stage, session)
+
+    # -- the two file services and a plugin's data (design 3.9, 4.1) --------
+    def _files_of(self, pid: str) -> Tuple[str, ...]:
+        m = self.manifest(pid)
+        return tuple(m.files) if m is not None else ()
+
+    def create_file(self, pid: str, folder: Any, name: Any, *,
+                    binary: bool = False) -> Any:
+        """(a) plugin `pid`'s streamed run file (plugin_runs.create_file),
+        in the run in progress that `folder` is a folder of."""
+        with self._lock:
+            runs = [r for r in reversed(self._runs) if r.open]
+        active = next((r for r in runs if r.camera_of(folder)),
+                      runs[0] if runs else None)
+        return pr.create_file(active, folder, name, self._files_of(pid),
+                              binary=binary)
+
+    def write_new(self, pid: str, folder: Any, name: Any, data: Any) -> Path:
+        """(b) plugin `pid`'s whole file (plugin_runs.write_new): beside a
+        run in `folder`, or in its own data folder."""
+        own = (pr.data_dir(self.project_dir, pid, make=False)
+               if self.project_dir is not None else None)
+
+        def runs(where: Path) -> List[str]:
+            with self._lock:
+                return [r.run for r in self._runs
+                        if not r.over and r.camera_of(where)]
+        return pr.write_new(folder, name, data, suffixes=self._files_of(pid),
+                            own=own, runs=runs)
+
+    def data_dir(self, pid: str) -> Path:
+        """Plugin `pid`'s data folder in this project (design 4.1)."""
+        if self.project_dir is None:
+            raise pr.PluginFileError("no project is open, so there is no "
+                                     "project folder for a plugin's data")
+        return pr.data_dir(self.project_dir, pid)
 
     # -- camera plugins (stage P2; design 2.4 item 3, 3.3, 3.4) ---------------
     def _runnable_cameras(self) -> List[str]:
@@ -1094,6 +1497,8 @@ class PluginHost:
                          type(exc), exc, exc.__traceback__)),
                      at=time.strftime("%Y-%m-%d %H:%M:%S"))
         self._log(made)
+        self._note_in_runs(pid, f"{made.reason} — a built-in camera plugin "
+                                f"stays on")
         self._announce(f"Plugin {self._name(pid)} failed in {hook}: "
                        f"{made.error} — it stays on (a built-in camera "
                        f"plugin is never switched off without asking)")
@@ -1488,6 +1893,8 @@ class PluginHost:
         with self._fault_lock:
             self._load_failures[pid] = made
         self._log(made)
+        self._note_in_runs(pid, f"{made.reason} — a built-in camera plugin "
+                                f"stays on")
         self._announce(f"Plugin {self._name(pid)} failed in {hook}: "
                        f"{made.error} — it stays on (a built-in camera "
                        f"plugin is never switched off without asking) and is "
@@ -1511,6 +1918,7 @@ class PluginHost:
             if first:
                 self.faults[pid] = made
         self._log(made)
+        self._note_in_runs(pid, made.reason)
         if first:
             for feed in list(self._feeds):
                 if feed.plugin == pid:
@@ -1518,6 +1926,12 @@ class PluginHost:
             self._announce(f"Plugin {self._name(pid)} was switched off after "
                            f"an error in {hook}: {made.error}")
         return self.faults[pid]
+
+    def _note_in_runs(self, pid: str, reason: str) -> None:
+        """A plugin's fault goes in the end record of every run not over
+        yet (design 3.10: a best-effort fault is said there)."""
+        for active in list(self._runs):
+            active.note_fault(pid, reason)
 
     def _log(self, fault: Fault) -> None:
         if self.project_dir is None:
@@ -1811,6 +2225,7 @@ class PluginHost:
         for feed in list(self._feeds):
             feed.stop()
         self._deactivate(lambda key: True)
+        self._unregister_files()
         with self._lock:
             self._feeds.clear()
             temp, self._temp = dict(self._temp), {}
@@ -1897,6 +2312,17 @@ class Context:
 
     def temp_dir(self) -> Path:
         return self._host.temp_dir(self.plugin_id)
+
+    def create_file(self, folder: Any, name: str, *,
+                    binary: bool = False) -> Any:
+        return self._host.create_file(self.plugin_id, folder, name,
+                                      binary=binary)
+
+    def write_new(self, folder: Any, name: str, data: Any) -> Path:
+        return self._host.write_new(self.plugin_id, folder, name, data)
+
+    def data_dir(self) -> Path:
+        return self._host.data_dir(self.plugin_id)
 
     def __repr__(self) -> str:
         return f"<plugin context {self.plugin_id}>"
@@ -2092,6 +2518,69 @@ class GuardedGate:
                 return None
         self.__dict__[name] = guarded
         return guarded
+
+
+class GuardedStage:
+    """A plugin's FRAME STAGE for one run (`stage(image, meta) -> image`,
+    the picture to save), guarded on the RECORDING PATH (design 3.8, 3.10):
+    what the run's capture.Recorder is given as `frame_stage`. It runs on
+    the writer threads.
+
+    WHEN IT FAILS — any exception, SystemExit and KeyboardInterrupt
+    included — the frame it was making is not saved, the recording ends
+    there as at a failed write (the frames queued behind it are not saved
+    either: they were not yet made, and saving them as they came would
+    leave half a run staged and half not), the end record's
+    recording_failed names the plugin, and the plugin is switched off.
+
+    WHEN ITS PLUGIN IS SWITCHED OFF ELSEWHERE, the rule is the record
+    gate's (GuardedGate): a best-effort fault lets the stage serve out the
+    run; a hang, a fault on the recording path, a failed load, or a fault it
+    had before this run began end the run at the next frame, without
+    asking the plugin anything."""
+
+    STOPPING = GuardedGate.STOPPING
+
+    def __init__(self, host: Optional[PluginHost], pid: str,
+                 stage: Callable[[Any, Any], Any], session: Any = None
+                 ) -> None:
+        self._host = host
+        self._pid = pid
+        self._stage = stage
+        self._session = session
+        self._lock = threading.Lock()
+        self._off_from_start = host is not None and pid in host.faults
+        #: Why the recording was ended by this stage, or "".
+        self.ended = ""
+
+    def _finish(self, reason: str) -> str:
+        with self._lock:
+            if not self.ended:
+                self.ended = reason
+            return self.ended
+
+    def __call__(self, image: Any, meta: Any) -> Any:
+        if self.ended:
+            raise RecordingEnded(self.ended)
+        host = self._host
+        fault = host.faults.get(self._pid) if host is not None else None
+        if fault is not None and (self._off_from_start
+                                  or fault.kind in self.STOPPING):
+            name = host._name(self._pid)
+            raise RecordingEnded(self._finish(
+                f"recording ended: plugin {name} ({self._pid}) was switched "
+                f"off — {fault.reason}"))
+        try:
+            return self._stage(image, meta)
+        except BaseException as exc:                    # noqa: BLE001
+            reason = (host.recording_reason(self._pid, "frame stage", exc)
+                      if host is not None else
+                      f"recording ended: the frame stage failed — "
+                      f"{type(exc).__name__}: {exc}")
+            reason = self._finish(reason)
+            if host is not None:
+                host.fault(self._pid, "frame stage", exc, RECORDING)
+            raise RecordingEnded(reason) from exc
 
 
 # ======================================================================
