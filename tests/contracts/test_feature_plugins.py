@@ -24,7 +24,16 @@ Typhon's own Start and Stop, simulated cameras, a temporary project).
     pixels or its meta, a sleeping hang, a slow plugin, a write outside the
     run, making one file twice — each ends with the frames saved, the
     frames CSV's rows and the end record's count equal, the pixels as the
-    camera sent them, and the capture carried on.
+    camera sent them, and the capture carried on;
+  * (P3 row 6, part C) its blocks in a run's records are plain JSON under
+    the size limit; its preset keys round-trip through a preset under
+    their own names; its settings saves take the lock (many at once, from
+    several plugins, lose none); its screen points — panel, toolbar,
+    status, rows — are built offscreen, the panel fits the smallest
+    window, a shortcut is claimed once, and the status keeps to its 80
+    characters, idle and during a run. (That each lands only in its host
+    and leaves the main window's widgets as they were is P4's: the window
+    asks none of them before then.)
 
 Offscreen, temporary folders only.
 """
@@ -61,7 +70,8 @@ FEATURE_IDS = [pid for pid, _ in FEATURES]
 
 #: The hooks each contribution names (design 3.5, 3.7, 3.9).
 HOOKS = {"run_hooks": ("check_start", "on_run_started", "on_run_finished"),
-         "record_gate": ("trigger_slot",), "panel": ("panel",),
+         "record_gate": ("trigger_slot",), "frame_stage": ("frame_stage",),
+         "panel": ("panel",),
          "toolbar": ("toolbar",), "status": ("status",),
          "presets": ("preset_values", "apply_preset_values"),
          "analyse": ("analyse",)}
@@ -370,3 +380,194 @@ def test_a_misbehaving_plugin_never_costs_a_frame(fake, how):
     if how == "twice":
         made = run.folder / f"{run.run}_bad_marks.csv"
         assert made.is_file(), "made once"
+
+
+# ======================================================================
+# Its records, presets and settings (design 3.9; P3 row 6, part C)
+# ======================================================================
+#: A record block's limit (camera_record: 256 KB a block).
+BLOCK_LIMIT = 256 * 1024
+
+
+def _run_hook_plugins():
+    return [(pid, folder) for pid, folder in FEATURES
+            if "run_hooks" in pm.read(BUILTIN / folder,
+                                      builtin=True).contributes]
+
+
+@pytest.mark.parametrize("pid, folder", FEATURES, ids=FEATURE_IDS)
+def test_its_blocks_in_a_runs_records_are_plain_and_under_the_limit(
+        fake, pid, folder):
+    import json
+
+    fake.connect()
+    run = fake.capture(frames=2)
+    assert run.problems() == []
+    m = pm.read(BUILTIN / folder, builtin=True)
+    for record, where in ((run.record, "camera record"),
+                          (run.end, "end record")):
+        block = (record.get("plugins") or {}).get(pid)
+        if block is None:
+            continue
+        text = json.dumps(block, allow_nan=False)
+        assert json.loads(text) == block, where
+        assert len(text.encode("utf-8")) <= BLOCK_LIMIT, where
+    entry = run.record["plugins"].get(pid)
+    if entry is None:
+        # Only a plugin that is on, loaded or faulted made the run (one
+        # whose Python package is missing here does not run at all).
+        assert fake.host.state(pid)[0] not in (ph.ON, ph.ACTIVE, ph.FAULTED)
+        return
+    assert {k: entry[k] for k in ("name", "version", "short", "kind")} == {
+        "name": m.name, "version": m.version, "short": m.short,
+        "kind": m.kind}, "the camera record says what made the run"
+
+
+def test_its_preset_keys_round_trip_under_their_own_names(fake):
+    """The triggering plugin's keys are today's capture.* (design 2.5,
+    3.9): saved into a camera's preset as the camera has them, and a
+    preset applied puts them back — in today's Typhon's file format, so
+    either Typhon reads the other's presets."""
+    import json
+
+    import frame_camera
+    fake.connect()
+    want = {tg.MODE_KEY: tg.MODE_SNAPSHOT, tg.SOURCE_KEY: tg.TIMER,
+            tg.PER_KEY: 3, tg.EVERY_KEY: 0.4}
+    for key, value in want.items():
+        fake.set(key, value)
+    frame_camera.save_preset("contract")
+    fake.set(tg.MODE_KEY, tg.MODE_CONTINUOUS)
+    fake.set(tg.PER_KEY, 1)
+    out = frame_camera.apply_preset("contract")
+    assert out.get("ok", True), out
+    setup = fake.device.capture
+    assert (setup.mode, setup.source, setup.per_trigger, setup.every_s) == (
+        tg.MODE_SNAPSHOT, tg.TIMER, 3, 0.4)
+    stored = json.loads((fake.project / "camera_presets.json").read_text(
+        encoding="utf-8"))
+    text = json.dumps(stored)
+    for key in want:
+        assert f'"{key}"' in text, key
+    assert "typhon.trigger/" not in text, "today's names, not namespaced"
+
+
+def test_its_settings_saves_take_the_lock(fake):
+    """Every feature plugin saving its settings at once, many times over:
+    none is lost (the project list is changed under an OS lock, under a
+    temporary name of each writer's own, design 3.9)."""
+    import threading
+
+    contexts = {}
+    for pid, _folder in FEATURES:
+        if fake.instance(pid) is None:   # cannot run here (a package)
+            continue
+        contexts[pid] = next(c for key, c in fake.host._contexts.items()
+                             if key[0] == pid)
+    assert "typhon.trigger" in contexts
+    errors = []
+
+    def save(pid, ctx):
+        try:
+            for n in range(15):
+                ctx.save_settings({"n": n, "who": pid})
+        except Exception as exc:                           # noqa: BLE001
+            errors.append(f"{pid}: {exc}")
+    threads = [threading.Thread(target=save, args=item)
+               for item in contexts.items()]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    for pid, ctx in contexts.items():
+        assert ctx.settings().get("n") == 14 and \
+            ctx.settings().get("who") == pid, pid
+
+
+# ======================================================================
+# Its screen points, built offscreen (design 3.5, 3.7, 3.11)
+# ======================================================================
+#: The smallest window a pop-out must fit (the wireframe's minimum).
+SMALLEST = (1400, 820)
+
+
+def _contributing(point):
+    return [(pid, folder) for pid, folder in FEATURES
+            if point in pm.read(BUILTIN / folder, builtin=True).contributes]
+
+
+@pytest.fixture
+def qt_app():
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.mark.parametrize("pid, folder", _contributing("panel"),
+                         ids=[p for p, _ in _contributing("panel")])
+def test_its_panel_is_built_offscreen_and_fits_the_smallest_window(
+        fake, qt_app, pid, folder):
+    from PySide6.QtWidgets import QWidget
+
+    fake.connect()
+    plugin = fake.instance(pid)
+    parent = QWidget()
+    try:
+        panel = plugin.panel(parent)
+        assert isinstance(panel, QWidget) and panel.parent() is parent
+        hint = panel.sizeHint()
+        assert hint.width() <= SMALLEST[0] and hint.height() <= SMALLEST[1], \
+            (hint.width(), hint.height())
+        assert not panel.isVisible(), "built, not shown (the window, P4)"
+    finally:
+        parent.deleteLater()
+        qt_app.processEvents()
+
+
+def test_every_toolbar_action_is_whole_and_a_shortcut_is_claimed_once(fake):
+    shortcuts = {}
+    for pid, _folder in _contributing("toolbar"):
+        actions = fake.instance(pid).toolbar()
+        assert actions and all(isinstance(a, api.Action) for a in actions)
+        for action in actions:
+            assert action.text.strip() and callable(action.callback)
+            if action.shortcut:
+                assert action.shortcut not in shortcuts, \
+                    (action.shortcut, shortcuts.get(action.shortcut))
+                shortcuts[action.shortcut] = pid
+    assert shortcuts.get("F9") == "typhon.trigger", "Capture now's key"
+
+
+@pytest.mark.parametrize("pid, folder", _contributing("status"),
+                         ids=[p for p, _ in _contributing("status")])
+def test_its_status_keeps_to_80_characters_idle_and_during_a_run(
+        fake, pid, folder):
+    fake.connect()
+    plugin = fake.instance(pid)
+    assert isinstance(plugin.status(), str)
+    assert len(plugin.status()) <= api.STATUS_MAX
+    fake.set(tg.MODE_KEY, tg.MODE_EXACT)
+    seen = []
+
+    def during():
+        for _ in range(3):
+            fake.capture_now()
+            seen.append(plugin.status())
+    fake.capture(frames=2, during=during)
+    assert seen and all(isinstance(s, str) and len(s) <= api.STATUS_MAX
+                        for s in seen), seen
+    assert any(seen), "it says something while its run lasts"
+
+
+def test_its_settings_rows_are_settings_read_in_place(fake):
+    from council_core import camera_settings as cs
+
+    fake.connect()
+    plugin = fake.instance("typhon.trigger")
+    rows = plugin.settings_rows()
+    assert rows and all(isinstance(r, cs.Setting) for r in rows)
+    keys = {r.key for r in rows}
+    assert tg.MODE_KEY in keys and tg.DOWNSAMPLE_KEY not in keys, \
+        "the trigger rows; Downsample is the core's"
+    fake.set(tg.PER_KEY, 4)
+    assert {r.key: r.value for r in plugin.settings_rows()}[tg.PER_KEY] == 4

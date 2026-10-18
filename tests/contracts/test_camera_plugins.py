@@ -573,3 +573,118 @@ def test_through_the_host_opening_confirms_onto_the_slot(host, case):
     want = set(plugin.capabilities(device)) & set(m.capabilities)
     assert slot.capabilities == want
     assert host.camera_handles()["cam1"].capabilities == want
+
+
+# ======================================================================
+# Faults, for the camera kind too (design 3.10, 9.1; P3 row 6, part C)
+# ======================================================================
+class Faulty:
+    """A camera plugin made to misbehave (`how`): its camera's read raises
+    (RuntimeError, SystemExit) from its `at`-th frame of a run, or its
+    scan raises. Its cameras are the simulated frame camera, under a
+    family of their own."""
+
+    backend = "faulty"
+
+    def __init__(self, how, at=4):
+        self.how = how
+        self.at = at
+
+    def activate(self, ctx):
+        self.ctx = ctx
+
+    def deactivate(self):
+        pass
+
+    def available(self):
+        return True, ""
+
+    def discover(self):
+        if self.how == "discover":
+            raise RuntimeError("the scan fell over")
+        return [cameras.CameraInfo("faulty", "faulty-frame",
+                                   "Faulty frame camera", "F-1", "Acme",
+                                   "frame")]
+
+    def open(self, info):
+        how, at = self.how, self.at
+
+        class Device(cameras.SyntheticDevice):
+            def start(self):
+                self._contract_n = 0
+                super().start()
+
+            def read(self, timeout_ms=1000):
+                frame = super().read(timeout_ms)
+                if frame is not None:
+                    self._contract_n += 1
+                    if self._contract_n >= at and how == "raise":
+                        raise RuntimeError("the camera's driver fell over")
+                    if self._contract_n >= at and how == "systemexit":
+                        raise SystemExit("the camera's driver left")
+                return frame
+        return Device(info)
+
+    def capabilities(self, device):
+        return frozenset({"frames", "restartable"})
+
+    def facet(self, device, name):
+        return None
+
+    def categories(self):
+        return api.CategoryHints()
+
+    def record_fields(self, device):
+        return {}
+
+    def review_source(self):
+        return None
+
+
+def faulty_manifest():
+    return {"schema": 1, "id": "typhon.faulty", "short": "faulty",
+            "name": "Faulty cameras", "version": "1.0.0",
+            "api": pm.API_VERSION, "kind": "camera", "entry": "plugin:F",
+            "capabilities": ["frames", "restartable"]}
+
+
+@pytest.fixture
+def fake(tmp_path, monkeypatch):
+    from tests.sim_cameras import without_camera_sdks
+    from typhon_plugin_api.fake_host import FakeHost
+
+    without_camera_sdks(monkeypatch)
+    made = FakeHost(tmp_path / "fake")
+    yield made
+    made.close()
+
+
+@pytest.mark.parametrize("how", ["raise", "systemexit"])
+def test_a_camera_that_fails_mid_run_costs_no_frame_the_run_says_it_saved(
+        fake, how):
+    """The grab loop ends with a note, the recording's end record says why
+    the stream ended (stream_ended), and frames saved = frames CSV rows =
+    the end record's count."""
+    from typhon_plugin_api.fake_host import Run, wait_for
+
+    fake.adopt(faulty_manifest(), Faulty(how))
+    fake.connect("frame", label="Faulty")
+    started = fake.start()
+    session = fake.session
+    assert wait_for(lambda: not session.running, 15), "the stream ended"
+    fake.stop()
+    end = fake.runs / f"{started['run']}_run_end.json"
+    assert wait_for(end.is_file, 15), "Stop ended the recording"
+    run = Run(fake.runs, started["run"])
+    assert run.problems() == []
+    said = run.end.get("stream_ended", "")
+    assert ("RuntimeError" if how == "raise" else "SystemExit") in said, said
+    assert run.end["frames_saved"] >= 1
+
+
+def test_a_camera_plugin_whose_scan_fails_is_said_and_the_rest_scan(fake):
+    fake.adopt(faulty_manifest(), Faulty("discover"))
+    found = fake._fc.list_cameras()
+    assert any("Simulated" in r for r in found["rows"]), "the others scan"
+    assert any("Faulty cameras" in n or "faulty" in n.lower()
+               for n in found["notes"]), found["notes"]

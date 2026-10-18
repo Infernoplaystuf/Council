@@ -374,13 +374,16 @@ class FakeHost:
         return self.host.instance(pid)
 
     # -- a camera, and a run ----------------------------------------------
-    def connect(self, kind: str = "frame") -> Dict[str, Any]:
-        """Connect the simulated `kind` camera, as the window's Connect."""
+    def connect(self, kind: str = "frame", label: str = SIMULATED
+                ) -> Dict[str, Any]:
+        """Connect the `kind` camera whose row in the scan holds `label`
+        (the simulated one by default; a camera plugin's own by its
+        label), as the window's Connect."""
         rows = self._fc.list_cameras()["rows"]
-        row = next((r for r in rows if SIMULATED in str(r)
+        row = next((r for r in rows if label in str(r)
                     and str(r).endswith(kind)), None)
         if row is None:
-            raise RuntimeError(f"no simulated {kind} camera in {rows}")
+            raise RuntimeError(f"no {label} {kind} camera in {rows}")
         return self._fc.connect(row)
 
     def live_view(self, seconds: float = 5.0) -> bool:
