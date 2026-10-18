@@ -74,6 +74,10 @@ RELATIONS_SHOWN = 300
 MENTIONS_SHOWN = 200
 #: The answer that means "a person not listed: type their name".
 NEW_PERSON = "__new_person__"
+#: A file at least this big is previewed on a worker thread, as every
+#: workbook is: the preview of row 59,990 of a Ledger took 2.4 s on the GUI
+#: thread (review, 2026-10-16).
+PREVIEW_ASYNC_BYTES = 1 << 20
 
 
 def method_words(method: str) -> str:
@@ -328,6 +332,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self._kg = None
         try:
             self._kg = self.actions.open_graph()
+        except kgm.KnowledgeGraphBusy as exc:
+            # held by a rebuild elsewhere (the agent's tools, another
+            # window): not damage - the buttons stay, try again shortly
+            self.status.setText(f"{str(exc)[0].upper()}{str(exc)[1:]}.")
+            return
         except kgm.KnowledgeGraphDamaged as exc:
             self.status.setText(str(exc))
             self.rebuild_btn.setEnabled(False)
@@ -526,10 +535,14 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._preview_path = rel_path
         self._preview_token = token = object()
         disk = self._disk(rel_path)
-        if Path(rel_path).suffix.lower() not in self._WORKBOOK_SUFFIXES:
+        try:
+            big = (Path(self.actions.root) / disk).stat().st_size >= PREVIEW_ASYNC_BYTES
+        except OSError:
+            big = False
+        if Path(rel_path).suffix.lower() not in self._WORKBOOK_SUFFIXES and not big:
             self._show_preview(token, self.actions.context(disk, locator, quote))
             return
-        self.preview.setPlainText("Reading the workbook…")
+        self.preview.setPlainText("Reading the file…")
 
         def work() -> None:
             try:

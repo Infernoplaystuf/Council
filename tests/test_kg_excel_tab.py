@@ -267,3 +267,46 @@ def test_only_the_links_drawn_are_looked_up(qapp, tmp_path, monkeypatch):
         assert owns.childCount() == 3 and owns.child(2).text(0) == "… and 4 more"
     finally:
         _close(qapp, tab)
+
+
+def test_a_graph_busy_elsewhere_is_said_not_a_crash(qapp, tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    (v / "data_in" / "t.csv").write_text("Part,Owner\nPN-1,Dana Whitfield\n", encoding="utf-8")
+    holder = kgm.KnowledgeGraph(v, image_reader=None)
+    monkeypatch.setattr(kgm.KnowledgeGraph, "BUSY_TIMEOUT_S", 0.2)
+    holder.db.execute("BEGIN EXCLUSIVE")
+    try:
+        tab = ConnectionsTab(actions=Actions(v))
+        try:
+            assert "being rebuilt" in tab.status.text()
+            assert tab.rebuild_btn.isEnabled()
+        finally:
+            _close(qapp, tab)
+    finally:
+        holder.db.rollback()
+        holder.close()
+
+
+def test_a_big_csv_is_previewed_off_the_gui_thread(qapp, tmp_path, monkeypatch):
+    import council_qt.tabs.connections as cmod
+    v = _vault(tmp_path)
+    (v / "data_in" / "t.csv").write_text("Part,Owner\nPN-1,Dana Whitfield\n", encoding="utf-8")
+    tab = _tab(qapp, v)
+    try:
+        monkeypatch.setattr(cmod, "PREVIEW_ASYNC_BYTES", 0)
+        seen = []
+        real = tab.actions.context
+
+        def spy(*a, **k):
+            seen.append(threading.current_thread() is threading.main_thread())
+            return real(*a, **k)
+        monkeypatch.setattr(tab.actions, "context", spy)
+        tab.search.setText("Dana Whitfield")
+        tab.results.setCurrentRow(0)
+        ev = next(i for d, t, s, w, i in _items(tab.tree) if d == 2)
+        tab.tree.setCurrentItem(ev)
+        _wait(qapp, tab)
+        assert seen == [False]
+        assert "Owner │ Dana Whitfield" in tab.preview.toPlainText()
+    finally:
+        _close(qapp, tab)
