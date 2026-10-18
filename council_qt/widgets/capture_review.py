@@ -270,6 +270,11 @@ class CaptureReviewer(QObject):
         #: Just back from the raw view: stay on the PNG it landed on rather
         #: than jumping to live when the live view comes back.
         self._stay_on_png = False
+        #: A capture has ended and the live view has not come back since.
+        self._run_ended = False
+        #: The user picked a saved frame in that gap: the live view coming
+        #: back keeps it (see _moved).
+        self._keep_pick = False
         self.playing = False
         self.raw: Any = None
         self.raw_file: Optional[Path] = None
@@ -450,6 +455,8 @@ class CaptureReviewer(QObject):
         if capturing and not self._capturing:
             self._began()
         self._capturing = capturing
+        if was_capturing and not capturing:
+            self._run_ended = True
         if growing:
             self._take_new()
         if self._growing and not growing:
@@ -489,11 +496,14 @@ class CaptureReviewer(QObject):
     def _go_live(self) -> None:
         """The live view (re)started: connected, or back after Stop. The
         slider gains its live end, and goes there — unless the user has just
-        come back from the raw view to a particular PNG."""
+        come back from the raw view to a particular PNG, or picked a saved
+        frame after the capture ended and before this (_moved)."""
         if self.mode != PNG or self._capturing:
             return
         self._set_range()
-        if self._stay_on_png:
+        after_run, self._run_ended = self._run_ended, False
+        picked, self._keep_pick = self._keep_pick, False
+        if self._stay_on_png or (after_run and picked):
             self._stay_on_png = False
             return
         self._stop_playing()
@@ -537,6 +547,7 @@ class CaptureReviewer(QObject):
         # frame (it is live), not a position of its own.
         self._capturing = True
         self._stay_on_png = False
+        self._run_ended = self._keep_pick = False
         self._stop_playing()
         self._end_after_save = False
         if self.mode == RAW:
@@ -568,6 +579,14 @@ class CaptureReviewer(QObject):
         self.live = self.live and self._live_slot()
         self._end_after_save = False
         keep = self._shown[2] if self._shown and self._shown[0] == PNG else None
+        if self.mode == PNG and not to_end and self._show.isActive():
+            # The user has just picked a frame and its show is still due
+            # (SHOW_MS): THAT is the place to keep. Read from what was shown
+            # before, the pick was lost — to the end — whenever the last
+            # frame landed inside those few milliseconds.
+            at = int(self.scrubber.get())
+            if 0 <= at < len(self.files):
+                keep = self.files[at]
         if self.mode == PNG:
             self.reload(keep=None if to_end else keep,
                         at_end=to_end or keep is None)
@@ -596,6 +615,7 @@ class CaptureReviewer(QObject):
             return
         self._end_after_save = False            # the user chose a place
         self._stay_on_png = False
+        self._keep_pick = False
         if self.playing:
             # Playback carries on from where the user put it, rather than
             # snapping back to where the play clock thinks it should be.
@@ -611,6 +631,16 @@ class CaptureReviewer(QObject):
             if live:
                 self._say()
                 return
+        if self.mode == PNG and (self._run_ended or (
+                self._capturing and not self.feed.capturing())):
+            # A SAVED FRAME PICKED AFTER STOP, before the live view is back
+            # (the run's last frames still landing, the camera restarting):
+            # kept when it comes back, as one picked a moment later is.
+            # _go_live took it away, so whether a pick right after Stop
+            # held depended on which came first, it or the restart — tens
+            # of milliseconds (a built Typhon's test lost it under a
+            # whole-suite run's load).
+            self._keep_pick = True
         self._show.start(SHOW_MS)
 
     def _show_now(self) -> None:

@@ -253,6 +253,42 @@ def test_after_stop_the_slider_covers_every_saved_frame(ui, tmp_path):
     assert ui.ports.current_frame.get() == os.path.basename(rv.files[-1])
 
 
+@pytest.mark.parametrize("show_ms", [cr.SHOW_MS, 400],
+                         ids=["as-built", "restart-first"])
+def test_a_frame_picked_right_after_stop_is_kept_when_the_live_view_is_back(
+        ui, tmp_path, monkeypatch, show_ms):
+    """Picked after Stop and before the live view is back — the run's last
+    frames landing, a frame camera restarting its stream — a saved frame
+    stays on screen when the live view returns, with live at the slider's
+    end, as one picked a moment later does. Before, the restart took it
+    away (_go_live went live), and so did the last frame landing while the
+    pick's show was still due (_finished kept what was shown BEFORE it): a
+    built Typhon's test lost the pick under a whole-suite run's load. The
+    show's delay (SHOW_MS) at 400 ms puts the restart first every time."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    frame_camera.stop()
+    frame_camera._LIVE.session.flush(30)
+    assert not frame_camera._LIVE.previewing
+    monkeypatch.setattr(cr, "SHOW_MS", show_ms)
+    drag(rv, 0)                       # before any tick has seen the Stop
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    assert pump_until(rv.showing_saved), (rv.live, rv.scrubber.get())
+    pump(0.3)
+    assert rv.showing_saved() and not rv.live, "the pick was taken away"
+    assert rv.scrubber.get() == 0, rv.scrubber.get()
+    assert ui.ports.current_frame.get() == os.path.basename(rv.files[0])
+    assert rv.scrubber._hi == len(rv.files), "live is at the end"
+    drag(rv, len(rv.files))
+    pump(0.1)
+    assert rv.live, "dragging to the end is live again"
+
+
 class StillCapturing:
     """A capture that is running but, for the moment, saving nothing new —
     so playback can catch up with it. (At a steady 50 windows a second a
