@@ -570,7 +570,8 @@ def test_n_simulated_cameras_have_names_and_serials_of_their_own(
         ("sim-frame", "SIM-1", "frame"),
         ("sim-frame-2", "SIM-FRAME-2", "frame"),
         ("sim-event", "SIM-2", "event"),
-        ("sim-frame-3", "SIM-FRAME-3", "frame")],         "today's two keep today's serials; the others' come from their key"
+        ("sim-frame-3", "SIM-FRAME-3", "frame")], \
+        "today's two keep today's serials; the others' come from their key"
     assert len({i.label for i in listed}) == 4
     assert all("Simulated" in i.label for i in listed), \
         "tests/sim_cameras picks a simulated camera by that word"

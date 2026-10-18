@@ -1377,8 +1377,13 @@ class PluginHost:
         try:
             name = store.assign(info, prefer=slot.name, taken=others)
         except (RigError, RigFileError) as exc:
-            return slot.name, (f"the camera keeps the name {slot.name} — "
-                               f"{exc}")
+            said = f"the camera keeps the name {slot.name} — {exc}"
+            if getattr(exc, "damaged", False):
+                # How to mend it (P2 review): the file is never moved or
+                # written over unasked, so the user is told what to do.
+                said += (" — mend it by hand, or move it aside (rename "
+                         "the file), and the next Connect starts a new one")
+            return slot.name, said
         if name == slot.name:
             return name, ""
         try:

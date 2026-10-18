@@ -42,7 +42,11 @@ a sidecar file (.camera_rig.json.lock), changes it, and writes it whole
 under a temporary name no other writer uses, flushed to disk, then renamed
 into place. A file that is damaged, is not one of these, or was written by
 a newer Typhon raises RigFileError and is left exactly as it is: no change
-writes over it, and reading never writes anything.
+writes over it, and reading never writes anything. A damaged one is moved
+aside only when asked (`set_aside`, for the rig controls' window of stage
+P6; multi-camera design 4.12): renamed, byte for byte, to
+camera_rig.damaged-<time>.json, so the next change starts a new file. A
+newer Typhon's file is not damage and is never moved.
 
 No Qt, no device and no frame_camera here.
 """
@@ -87,14 +91,17 @@ _TEMP_NUMBERS = itertools.count(1)
 
 class RigFileError(Exception):
     """camera_rig.json exists but is not one this module can trust, or it
-    cannot be written. It is left exactly as it is; `path` names it.
-    `newer`: a newer Typhon wrote it — not damage."""
+    cannot be read or written. It is left exactly as it is; `path` names
+    it. `newer`: a newer Typhon wrote it — not damage. `damaged`: what it
+    holds is not a rig file this module can read (`set_aside` may move it
+    aside); False for a file that cannot be read or written at all."""
 
     def __init__(self, message: str, path: Optional[Path] = None,
-                 newer: bool = False):
+                 newer: bool = False, damaged: bool = False):
         super().__init__(message)
         self.path = path
         self.newer = newer
+        self.damaged = damaged
 
 
 class RigError(ValueError):
@@ -195,32 +202,34 @@ def _checked(doc: Any, path: Path) -> Dict[str, Any]:
     """`doc` as a rig document, or RigFileError naming what is wrong."""
     if not isinstance(doc, dict) or doc.get("format") != FORMAT_NAME:
         raise RigFileError(f"{path} is not a camera rig file; it is left as "
-                           f"it is", path)
+                           f"it is", path, damaged=True)
     version = doc.get("format_version")
     if not isinstance(version, int) or isinstance(version, bool) \
             or version < 1:
         raise RigFileError(f"{path} has no format_version; it is left as "
-                           f"it is", path)
+                           f"it is", path, damaged=True)
     if version > FORMAT_VERSION:
         raise RigFileError(f"{path} was written by a newer Typhon "
                            f"(format_version {version}); it is left as it "
-                           f"is", path, newer=True)
+                           f"is", path, newer=True)  # not damage
     cams = doc.setdefault("cameras", {})
     if not isinstance(cams, dict):
-        raise RigFileError(f"{path}: cameras is not name: camera", path)
+        raise RigFileError(f"{path}: cameras is not name: camera", path,
+                           damaged=True)
     for name, entry in cams.items():
         if not isinstance(name, str) or not NAME_RE.match(name):
             raise RigFileError(f"{path}: {name!r} is not a camera name; the "
-                               f"file is left as it is", path)
+                               f"file is left as it is", path, damaged=True)
         if not isinstance(entry, dict) or not all(
                 isinstance(entry.get(k, ""), str) for k in ENTRY_FIELDS) \
                 or not entry.get("backend") or not entry.get("key"):
             raise RigFileError(f"{path}: camera {name}'s entry is damaged "
                                f"(it needs a backend and a key); the file "
-                               f"is left as it is", path)
+                               f"is left as it is", path, damaged=True)
     presets = doc.setdefault("rig_presets", {})
     if not isinstance(presets, dict):
-        raise RigFileError(f"{path}: rig_presets is not name: preset", path)
+        raise RigFileError(f"{path}: rig_presets is not name: preset", path,
+                           damaged=True)
     for name, entry in presets.items():
         on = entry.get("cameras") if isinstance(entry, dict) else None
         if not isinstance(name, str) or not _tidy(name) \
@@ -229,7 +238,7 @@ def _checked(doc: Any, path: Path) -> Dict[str, Any]:
                     and isinstance(p, str) and _tidy(p)
                     for c, p in on.items()):
             raise RigFileError(f"{path}: rig preset {name!r} is damaged; the "
-                               f"file is left as it is", path)
+                               f"file is left as it is", path, damaged=True)
     return doc
 
 
@@ -257,14 +266,20 @@ class RigFile:
             raise RigFileError(f"cannot read {path}: {exc}", path) from exc
         if size > MAX_FILE_BYTES:
             raise RigFileError(f"{path} is {size:,} bytes — not a camera rig "
-                               f"file; it is left as it is", path)
+                               f"file; it is left as it is", path,
+                               damaged=True)
         try:
             text = path.read_text(encoding="utf-8-sig")
-            doc = json.loads(text, parse_constant=_no_constant)
-        except (OSError, UnicodeDecodeError, ValueError,
-                RecursionError) as exc:
+        except UnicodeDecodeError as exc:
             raise RigFileError(f"{path} is damaged ({str(exc)[:120]}); it is "
-                               f"left as it is", path) from exc
+                               f"left as it is", path, damaged=True) from exc
+        except OSError as exc:
+            raise RigFileError(f"cannot read {path}: {exc}", path) from exc
+        try:
+            doc = json.loads(text, parse_constant=_no_constant)
+        except (ValueError, RecursionError) as exc:
+            raise RigFileError(f"{path} is damaged ({str(exc)[:120]}); it is "
+                               f"left as it is", path, damaged=True) from exc
         return _checked(doc, path)
 
     def cameras(self) -> List[Named]:
@@ -303,7 +318,8 @@ class RigFile:
                 chosen.append(have)
                 entry = cams[have]
                 fresh = {}
-                if _text(info, "model") and                         _text(info, "model") != entry.get("model"):
+                if _text(info, "model") and \
+                        _text(info, "model") != entry.get("model"):
                     fresh["model"] = _text(info, "model")
                 for k in ("kind", "serial"):
                     if _text(info, k) and not entry.get(k):
@@ -454,6 +470,31 @@ class RigFile:
                        missing=[c for c in on if c not in opened],
                        untouched=[c for c in opened if c not in on])
 
+    # -- a damaged file ----------------------------------------------------
+    def set_aside(self) -> Path:
+        """Move a DAMAGED camera_rig.json aside, when the user asks (the rig
+        controls' window, stage P6; multi-camera design 4.12: moved aside
+        rather than overwritten, as camera_presets' repair does): renamed,
+        byte for byte, to camera_rig.damaged-<time>.json beside it — a name
+        no file has, so nothing is written over — and the next change
+        starts a new file. Returns where it went.
+
+        Refused, changing nothing: with no file, or a file that is not
+        damaged (RigError); for a file a newer Typhon wrote, which is not
+        damage, or one that cannot be read at all (RigFileError)."""
+        with _locked(self.path):
+            if not self.path.exists():
+                raise RigError(f"there is no {RIG_FILE} to set aside")
+            try:
+                self.read()
+            except RigFileError as exc:
+                if exc.newer or not exc.damaged:
+                    raise
+            else:
+                raise RigError(f"{self.path.name} is not damaged; it is left "
+                               f"as it is")
+            return _move_to_new_name(self.path, _aside_name(self.path))
+
     # -- writing ---------------------------------------------------------------
     def _change(self, change: Callable[[Dict[str, Any]], bool]) -> None:
         """Re-read the file under the lock, let `change` alter it, and write
@@ -552,6 +593,34 @@ def _locked(path: Path, timeout: float = LOCK_SECONDS) -> Iterator[None]:
                 _unlock(handle)
         finally:
             handle.close()
+
+
+def _aside_name(path: Path) -> Path:
+    """camera_rig.damaged-<time>.json beside `path`, numbered on when that
+    is taken."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    target = path.with_name(f"{path.stem}.damaged-{stamp}.json")
+    n = 1
+    while target.exists():
+        n += 1
+        target = path.with_name(f"{path.stem}.damaged-{stamp}_{n}.json")
+    return target
+
+
+def _move_to_new_name(path: Path, target: Path) -> Path:
+    """Rename `path` to `target`, which must not exist: never over a file
+    (Windows' rename refuses an existing name; elsewhere a hard link does,
+    and only then is the old name removed)."""
+    try:
+        if os.name == "nt":
+            os.rename(path, target)
+        else:
+            os.link(path, target)
+            os.remove(path)
+    except OSError as exc:
+        raise RigFileError(f"cannot set {path} aside: {exc}; it is left as "
+                           f"it is", path) from exc
+    return target
 
 
 def _temp_name(path: Path) -> Path:

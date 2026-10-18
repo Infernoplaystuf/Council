@@ -161,7 +161,8 @@ def connect_sim(kind="frame"):
 # Today's Typhon: its Python Scripts list and its Designer link list
 # ======================================================================
 #: Modules the branch added that a module of today's Typhon could import.
-BRANCH_MODULES = ("council_core.camera_rig", "council_core.camera_capabilities",
+BRANCH_MODULES = ("council_core.camera_rig",
+                  "council_core.camera_capabilities",
                   "council_core.camera_rig_file", "council_core.plugin_host",
                   "council_core.plugin_lists", "council_core.plugin_manifest",
                   "typhon_plugin_api", "typhon_plugin_api.builtin",
@@ -345,7 +346,8 @@ def test_a_builtin_camera_plugin_that_fails_to_load_stays_on(
         return real(name, *args, **kwargs)
     monkeypatch.setattr(importlib, "import_module", imported)
     found = host.discover_cameras()
-    assert any("no module named numpy_extra" in n for n in found.notes),         found.notes
+    assert any("no module named numpy_extra" in n for n in found.notes), \
+        found.notes
     assert "typhon.simulated" not in host.faults
     monkeypatch.setattr(importlib, "import_module", real)
     found = host.discover_cameras(["typhon.simulated"])
@@ -694,7 +696,8 @@ def _tabs(kind):
     from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QTabWidget
     from council_qt.widgets import settings_tabs as st
     book = QTabWidget()
-    boxes = {"exposure": Port(QDoubleSpinBox()), "gain": Port(QDoubleSpinBox())}
+    boxes = {"exposure": Port(QDoubleSpinBox()),
+             "gain": Port(QDoubleSpinBox())}
     tabs = st.SettingsTabs(frame_camera, book, note=Port(None), boxes=boxes,
                            capture={"capture_mode": Port(QComboBox())})
     tabs.connected = True
@@ -729,3 +732,51 @@ def test_an_event_cameras_words_are_todays(qapp):
         "keeps every event")
 
 
+# ======================================================================
+# A damaged camera_rig.json: how to mend it, and set_aside()
+# ======================================================================
+DAMAGED = b'{"format": "typhon-camera-rig", "format_version": 1, "cam'
+
+
+def test_connects_note_says_how_to_mend_a_damaged_rig_file(plugin_project):
+    path = rf.rig_path(plugin_project)
+    path.write_bytes(DAMAGED)
+    said = connect_sim("frame")["summary"]
+    assert "damaged" in said and "move it aside" in said, said
+    assert path.read_bytes() == DAMAGED, "left as it is"
+
+
+def test_set_aside_moves_a_damaged_rig_file_byte_for_byte(tmp_path):
+    store = rf.RigFile(rf.rig_path(tmp_path))
+    store.path.write_bytes(DAMAGED)
+    moved = store.set_aside()
+    assert not store.path.exists()
+    assert moved.parent == tmp_path and moved.name.startswith(
+        "camera_rig.damaged-") and moved.suffix == ".json"
+    assert moved.read_bytes() == DAMAGED
+    assert store.assign(THERMAL) == "cam1", "a new file starts"
+    store.path.write_bytes(DAMAGED)
+    again = store.set_aside()
+    assert again != moved and again.read_bytes() == DAMAGED
+    assert moved.read_bytes() == DAMAGED, "an earlier one is never written over"
+
+
+def test_set_aside_refuses_a_good_newer_or_missing_file(tmp_path):
+    store = rf.RigFile(rf.rig_path(tmp_path))
+    with pytest.raises(rf.RigError, match="no camera_rig.json"):
+        store.set_aside()
+    store.assign(THERMAL)
+    before = store.path.read_bytes()
+    with pytest.raises(rf.RigError, match="not damaged"):
+        store.set_aside()
+    store.path.write_text(json.dumps({"format": rf.FORMAT_NAME,
+                                      "format_version": 9}),
+                          encoding="utf-8")
+    newer = store.path.read_bytes()
+    with pytest.raises(rf.RigFileError) as caught:
+        store.set_aside()
+    assert caught.value.newer
+    assert store.path.read_bytes() == newer
+    assert sorted(p.name for p in tmp_path.iterdir()
+                  if not p.name.startswith(".")) == [rf.RIG_FILE]
+    assert before != newer
