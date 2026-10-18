@@ -88,10 +88,13 @@ KINDS = ("camera", "source", "feature")
 SCOPES = ("camera", "rig")
 NETWORK = ("none", "camera-link", "internet")
 
-#: The places a plugin may attach to (design 3.7, 3.8, 3.11).
+#: The places a plugin may attach to (design 3.7, 3.8, 3.11). "presets"
+#: (stage P3 row 4): values of its own in each camera's presets, as
+#: "<id>/<key>" (design 3.9) — asked with preset_values, given back with
+#: apply_preset_values.
 CONTRIBUTIONS = ("panel", "toolbar", "status", "run_hooks", "analyse",
                  "review_source", "setup", "overlay", "record_gate",
-                 "frame_stage")
+                 "frame_stage", "presets")
 #: Inside the data-safety rules: built-in plugins only (design 3.11).
 BUILTIN_ONLY = frozenset({"record_gate", "frame_stage"})
 #: Camera plugins only: how the slider shows one of its run files; and a
@@ -102,13 +105,22 @@ CAMERA_ONLY = frozenset({"review_source", "setup"})
 RESERVED = frozenset({"overlay"})
 
 #: Run-file endings the core writes itself (council_core.capture's
-#: RUN_MARKERS, less the triggers CSV, which the triggering plugin takes
-#: over): no plugin may claim one.
-CORE_SUFFIXES = ("_frame_", "_events.raw", "_frames.csv", "_camera.json",
+#: RUN_MARKERS, less the run files of today's features that built-in
+#: plugins take over, BUILTIN_FILES): no plugin may claim one.
+CORE_SUFFIXES = ("_frame_", "_frames.csv", "_camera.json",
                  "_run_end.json", "_rig.json", "_rig_end.json")
 #: The triggers CSV (capture.TRIGGERS_SUFFIX), a run marker too: the
 #: built-in triggering plugin claims it; no third-party file may hold it.
 TRIGGERS_FILE = "_capture_triggers.csv"
+#: The raw file an event camera records beside its PNGs, a run marker too:
+#: the built-in Prophesee plugin claims it (stage P3: with the run-file
+#: suffix registry it moved from the core's endings to that plugin's).
+RAW_FILE = "_events.raw"
+#: Run files of today's Typhon that built-in plugins claim, each the name
+#: its design fixed (design 3.9): no third-party file may hold one, as no
+#: plugin may hold a core ending (the registry also refuses a second claim
+#: of any run file, council_core.plugin_host.discover).
+BUILTIN_FILES = (RAW_FILE, TRIGGERS_FILE)
 
 #: Every field of schema 1, and which plugins must give it.
 REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",
@@ -403,7 +415,7 @@ def check(doc: Mapping[str, Any], *, builtin: bool,
         # ANYWHERE in it, not only at its start: capture.taken_runs splits a
         # file name at the first core marker it holds, so a sidecar
         # "<run>_ab_frame_1.png" would read as a frame of a run "<run>_ab".
-        markers = CORE_SUFFIXES + (() if builtin else (TRIGGERS_FILE,))
+        markers = CORE_SUFFIXES + (() if builtin else BUILTIN_FILES)
         held = [core for core in markers if core in suffix]
         if held:
             raise ManifestError(f"{suffix!r} is a run file Typhon's core "

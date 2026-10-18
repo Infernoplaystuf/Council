@@ -13,7 +13,9 @@
     "review_source",
     "setup"
   ],
-  "files": [],
+  "files": [
+    "_events.raw"
+  ],
   "network": "none",
   "capabilities": [
     "events",

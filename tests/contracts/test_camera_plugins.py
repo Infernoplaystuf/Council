@@ -17,7 +17,8 @@ PYLON_CAMEMU set, Basler over pylon's emulated cameras.
     knows, and agrees with the camera's own flags; no facet before P3;
   * its category hints give the same tab plan as today's tables;
   * its record fields are plain JSON; its review source, if it has one, is
-    one, and the manifest says so;
+    one, the manifest says so, and its run file is one the manifest
+    declares (from stage P3: the Prophesee raw file too);
   * its set-up, exactly when its manifest says it has one (stage P2 row
     4): a guide whose install commands name the app's own Python, checks
     with three answers and, without its SDK, checks and a scan that say
@@ -57,11 +58,6 @@ from council_core import plugin_manifest as pm  # noqa: E402
 from tests import fake_rig  # noqa: E402
 
 BUILTIN = ROOT / "typhon_plugins"
-#: A review source's run file the core still writes and names (capture.
-#: RUN_MARKERS, plugin_manifest.CORE_SUFFIXES): the Prophesee plugin's
-#: "_events.raw", which its manifest declares once stage P3's run-file suffix
-#: registry moves it from the core to the plugin.
-RAW_UNTIL_THE_SUFFIX_REGISTRY = ("_events.raw",)
 
 
 # ======================================================================
@@ -493,11 +489,9 @@ def test_its_review_source_is_one_and_its_manifest_says_so(host, case):
         assert not any(core in source.suffix for core in
                        ("_frame_", "_frames.csv", "_camera.json",
                         "_run_end.json")), "never a core file it shows"
-        # Its run file is one its manifest declares — or, until stage P3's
-        # run-file suffix registry takes it from the core, the core's own
-        # raw file, which the manifest may not claim yet (P2 review).
-        assert source.suffix in m.files or \
-            source.suffix in RAW_UNTIL_THE_SUFFIX_REGISTRY, source.suffix
+        # Its run file is one its manifest declares (from stage P3, with
+        # the run-file suffix registry: the Prophesee raw file too).
+        assert source.suffix in m.files, source.suffix
 
 
 # ======================================================================

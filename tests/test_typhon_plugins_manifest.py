@@ -173,7 +173,9 @@ def test_a_third_party_plugin_says_who_wrote_it_and_its_licence(name):
     ({"files": ["_frames.csv"]}, "files", "core writes itself"),
     ({"files": ["_camera.json"]}, "files", "core writes itself"),
     ({"files": ["_run_end.json"]}, "files", "core writes itself"),
-    ({"files": ["_events.raw"]}, "files", "core writes itself"),
+    # (_events.raw left this list at stage P3: the Prophesee plugin claims
+    # it; a third party still may not, test_a_run_file_holding_...)
+    ({"files": ["_rig_end.json"]}, "files", "core writes itself"),
     ({"files": ["_x.csv", "_x.csv"]}, "files", "twice"),
     ({"uses": [{"id": "acme.x", "required": "yes"}]}, "uses", "each entry"),
     ({"uses": [{"id": "acme.x", "why": "no"}]}, "uses", "each entry"),
@@ -232,8 +234,11 @@ def test_a_run_file_holding_a_core_marker_anywhere_is_refused(suffix):
 
 def test_the_core_markers_are_capture_s():
     from council_core import capture
-    assert set(capture.RUN_MARKERS) <= set(pm.CORE_SUFFIXES) | {
-        pm.TRIGGERS_FILE}
+    # Today's markers are the core's endings and the run files of today's
+    # features that built-in plugins claim (the raw file joined them at
+    # stage P3, with the run-file suffix registry).
+    assert set(capture.RUN_MARKERS) <= set(pm.CORE_SUFFIXES) | set(
+        pm.BUILTIN_FILES)
     assert pm.TRIGGERS_FILE == capture.TRIGGERS_SUFFIX
     run = "20261016_120000"
     for suffix in ("_therm_tracks.csv", "_therm_velocity.json"):

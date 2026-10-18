@@ -380,22 +380,73 @@ TRIGGERS_SUFFIX = triggered.TRIGGERS_SUFFIX
 RUN_END_SUFFIX = "_run_end.json"
 RUN_END_FORMAT = "typhon-run-end"
 RUN_END_VERSION = 1
+#: The only keys a plugin host adds to an end record (Recorder.end_blocks):
+#: each plugin's block, by id, and which plugins faulted during the run.
+#: Never one of the record's own keys (docs/typhon_plugins_design.md 3.9).
+END_BLOCK_KEYS = ("plugins", "plugin_faults")
 
 #: The endings that put a run's name on a file in a capture folder. A run
 #: with any file of these there is taken, and so is a FOLDER of the run's
 #: name (a run of several cameras is a folder; the multi-camera design 2.6).
+#: Today's Typhon's own list, whatever plugins are on: the raw file and the
+#: triggers CSV among them, which the plugin Typhon's built-in Prophesee and
+#: triggering plugins also declare (register_run_files).
 RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json",
                RUN_END_SUFFIX, TRIGGERS_SUFFIX)
 
 #: How many names reserve_run tries (base, base_2, ...) before giving up.
 RESERVE_TRIES = 1000
 
+#: THE RUN-FILE SUFFIX REGISTRY (docs/typhon_plugins_design.md 2.4 item 7,
+#: 3.9): run files a plugin writes beside a run's own ("_therm_tracks.csv"),
+#: by who registered them. Each marks a run's name as taken, as RUN_MARKERS
+#: do, so a new run never takes the name of a run whose only file left is a
+#: plugin's. Additive: it only ever makes MORE names taken. Creating the
+#: run's frames CSV exclusively stays the real reservation (claim_run).
+_REGISTERED: Dict[Any, Tuple[str, ...]] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def register_run_files(owner: Any, suffixes: Any) -> None:
+    """Mark run files ending in each of `suffixes` as a run's (the plugin
+    host registers every plugin's manifest `files`); `owner` is whatever
+    registers them, and registering again replaces its suffixes. A suffix
+    is a run-file ending: it starts with "_" and names no folder."""
+    kept: List[str] = []
+    for suffix in suffixes:
+        text = str(suffix)
+        if (not text.startswith("_") or len(text) < 2 or "/" in text
+                or "\\" in text or ":" in text):
+            raise ValueError(f"{text!r} is not a run-file ending like "
+                             f"\"_therm_tracks.csv\"")
+        if text not in kept:
+            kept.append(text)
+    with _REGISTRY_LOCK:
+        _REGISTERED[owner] = tuple(kept)
+
+
+def unregister_run_files(owner: Any) -> None:
+    """Forget what `owner` registered (nothing when it registered none)."""
+    with _REGISTRY_LOCK:
+        _REGISTERED.pop(owner, None)
+
+
+def run_markers() -> Tuple[str, ...]:
+    """Every ending that marks a run's name as taken: RUN_MARKERS, then each
+    registered run file, each once."""
+    with _REGISTRY_LOCK:
+        registered = [s for suffixes in _REGISTERED.values()
+                      for s in suffixes]
+    return tuple(dict.fromkeys(RUN_MARKERS + tuple(registered)))
+
 
 def taken_runs(folder: Any) -> set:
     """The run names already used in `folder`: every name a file of a run
-    starts with (RUN_MARKERS), and every sub-folder's name. Empty for a
-    folder that does not exist or cannot be listed."""
+    starts with (run_markers: today's RUN_MARKERS and every registered run
+    file), and every sub-folder's name. Empty for a folder that does not
+    exist or cannot be listed."""
     names: set = set()
+    markers = run_markers()
     try:
         with os.scandir(str(folder)) as found:
             for entry in found:
@@ -404,7 +455,7 @@ def taken_runs(folder: Any) -> set:
                         names.add(entry.name)
                 except OSError:
                     pass
-                for marker in RUN_MARKERS:
+                for marker in markers:
                     head, hit, _ = entry.name.partition(marker)
                     if hit:
                         names.add(head)
@@ -529,6 +580,18 @@ class Recorder:
         self.capture_info: Optional[Callable[[], Dict[str, Any]]] = None
         #: The run's Downsample block for the end record, or None for Off.
         self.downsample_info: Optional[Dict[str, Any]] = None
+        #: THE FRAME STAGE (docs/typhon_plugins_design.md 3.8, 3.10): the
+        #: one step that changes a picture before it is saved,
+        #: `stage(image, meta) -> image`, on the writer threads — None for
+        #: today's (council_core.reduce.prepared: Downsample). A stage that
+        #: raises is a failed write: that frame and those queued behind it
+        #: are not saved, and the recording ends with its reason.
+        self.frame_stage: Optional[Callable[[Any, Any], Any]] = None
+        #: The plugins' part of the end record (typhon-plugins branch): a
+        #: function of the record so far, asked once when the recording
+        #: ends, giving its END_BLOCK_KEYS — or None (today's Typhon).
+        self.end_blocks: Optional[Callable[[Dict[str, Any]],
+                                           Mapping[str, Any]]] = None
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -569,8 +632,14 @@ class Recorder:
         DOWNSAMPLED HERE, on the writer threads, when the camera that took
         it says Typhon reduces it (Frame.meta "reduce";
         council_core.reduce.prepared) — never on the grab thread, whose
-        budget at 150 fps is 6.7 ms against 22-34 ms for a full frame."""
-        self._writer(reduce.prepared(frame.image, frame.meta), path)
+        budget at 150 fps is 6.7 ms against 22-34 ms for a full frame.
+        A frame stage set on the recorder (`frame_stage`) takes Downsample's
+        place there."""
+        stage = self.frame_stage
+        if stage is None:
+            self._writer(reduce.prepared(frame.image, frame.meta), path)
+        else:
+            self._writer(stage(frame.image, frame.meta), path)
 
     def log(self, frame: cameras.Frame, path: Path) -> None:
         """Count a saved frame and give it its index row. NOT thread-safe:
@@ -666,10 +735,19 @@ class Recorder:
                               (council_core.reduce), the picture's size, and
                               the right and bottom pixels a block could not
                               hold.
+            plugins           A "TYPHON (PLUGINS)" RUN ONLY (added in version
+                              1): each plugin's own block from its
+                              on_run_finished, by plugin id, cleaned and
+                              size-checked (typhon-plugins branch,
+                              council_core.plugin_host; design 3.9)
+            plugin_faults     likewise, only when a plugin faulted during the
+                              run: plugin id -> why (design 3.10)
 
         NEVER OVER ANYTHING: written whole to a temporary name and renamed
         into a name that must not exist (camera_record.write_once). A record
         that cannot be written is kept in `end_note`; the frames come first.
+        A plugins' block that cannot be written leaves the record written
+        without it, saying why in plugin_faults.
         """
         if self.end_path is None or self._finished:
             return None
@@ -708,7 +786,37 @@ class Recorder:
                 totals.get("passed", 0) or 0)
         if self.downsample_info:
             doc["downsample"] = dict(self.downsample_info)
+        extra = self.end_blocks
+        if callable(extra):
+            # The plugin host's part (its plugins' on_run_finished, bounded
+            # in time there), asked with the record so far — its counts —
+            # and allowed to add END_BLOCK_KEYS only.
+            try:
+                more = dict(extra(dict(doc)) or {})
+            except Exception as exc:                        # noqa: BLE001
+                more = {"plugin_faults": {
+                    "": f"the plugins' end of the run failed — "
+                        f"{type(exc).__name__}: {exc}"}}
+            for key in END_BLOCK_KEYS:
+                if more.get(key):
+                    doc[key] = more[key]
         from . import camera_record
+        try:
+            return camera_record.write_once(self.end_path, doc)
+        except (ValueError, TypeError) as exc:
+            # Not JSON: only the plugins' part can be (the record's own
+            # fields are plain), so the record is written without it.
+            if "plugins" not in doc:
+                self.end_note = f"{type(exc).__name__}: {exc}"
+                return None
+            doc.pop("plugins")
+            faults = dict(doc.get("plugin_faults") or {})
+            faults[""] = (f"the plugins' blocks could not be written — "
+                          f"{type(exc).__name__}: {exc}")
+            doc["plugin_faults"] = faults
+        except Exception as exc:                            # noqa: BLE001
+            self.end_note = f"{type(exc).__name__}: {exc}"
+            return None
         try:
             return camera_record.write_once(self.end_path, doc)
         except Exception as exc:                            # noqa: BLE001

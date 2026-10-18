@@ -31,6 +31,20 @@ WHAT IT SAYS (format "typhon-camera-record", version 1)
     software   the Council version and the source commit (when the Council
                runs from a git checkout), and this record's format
     host, written, at   which PC, and when (local time, and seconds since 1970)
+    plugins    A "TYPHON (PLUGINS)" RUN ONLY (added in version 1): what made
+               the run — each plugin's id, name, version and short name, a
+               camera plugin's own record fields — by plugin id
+               (docs/typhon_plugins_design.md 3.9, 4.2)
+
+PLUGIN DATA, ONE RULE (docs/typhon_plugins_design.md 3.9)
+Keys format 1 already has stay where they are (`capture`, `downsample`);
+everything new a plugin adds is in `plugins`, under its id, and nowhere
+else, so no fact is ever kept in two places across old and new runs. Each
+block is CLEANED (clean_block: NaN and infinities become null, tuples lists,
+numbers plain numbers) and SIZE-CHECKED (BLOCK_BYTES each, PLUGINS_BYTES in
+all), so a plugin can never make a record unwritable or unreadable: in the
+plugin design's prototype a NaN stopped the record being written, and a
+14.3 MB block made it unreadable, over MAX_RECORD_BYTES.
 
 The run's area never changes mid-run: frame_camera refuses an area, a preset
 or a setting the stream is in the way of while capturing ("one set-up per
@@ -59,6 +73,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 import os
 import time
 from pathlib import Path
@@ -73,9 +88,20 @@ FORMAT_VERSION = 1
 #: Far bigger than any record (a few KB); something else has this name.
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 
+#: One plugin's block in a record, as JSON, at most; and all of them
+#: together — far under MAX_RECORD_BYTES, so the record stays readable.
+BLOCK_BYTES = 256 * 1024
+PLUGINS_BYTES = 1024 * 1024
+#: A block's nesting, at most (a cycle is refused as too deep).
+MAX_DEPTH = 32
+
 
 class RecordExists(FileExistsError):
     """A record for this run is already there; it is never replaced."""
+
+
+class BlockError(ValueError):
+    """A plugin's block that cannot go in a record, and why."""
 
 
 def record_path(folder: Any, run: str) -> Path:
@@ -109,7 +135,8 @@ def build(*, run: str, camera: Mapping[str, Any], sensor: Tuple[int, int],
           software: Optional[Mapping[str, Any]] = None,
           host: str = "",
           capture: Optional[Mapping[str, Any]] = None,
-          downsample: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+          downsample: Optional[Mapping[str, Any]] = None,
+          plugins: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The record, as a dict ready for `write`.
 
     `settings` is what frame_camera.settings_list returns under "settings"
@@ -132,7 +159,10 @@ def build(*, run: str, camera: Mapping[str, Any], sensor: Tuple[int, int],
                   `area` above are in BINNED pixels, as the camera counts
                   them; with Typhon's averaging they are the camera's own,
                   and a saved pixel x covers camera pixels x*f .. x*f+f-1
-                  from the area's origin (reduce.sensor_position)."""
+                  from the area's origin (reduce.sensor_position)
+      plugins     a "Typhon (plugins)" run's: plugin id -> its block, each
+                  cleaned and size-checked here (plugins_block); a block
+                  that cannot go in is left out (the caller said why)."""
     values: Dict[str, Any] = {}
     units: Dict[str, str] = {}
     readings: List[str] = []
@@ -172,6 +202,8 @@ def build(*, run: str, camera: Mapping[str, Any], sensor: Tuple[int, int],
         out["capture"] = _plain_tree(capture)
     if downsample:
         out["downsample"] = _plain_tree(downsample)
+    if plugins is not None:
+        out["plugins"] = plugins_block(plugins)[0]
     return out
 
 
@@ -182,6 +214,85 @@ def _plain_tree(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_plain_tree(v) for v in value]
     return _plain(value)
+
+
+# ======================================================================
+# Plugins' blocks: cleaned and size-checked (plugin design 3.9)
+# ======================================================================
+def _clean(value: Any, where: str, depth: int) -> Any:
+    if depth > MAX_DEPTH:
+        raise BlockError(f"{where} is nested more than {MAX_DEPTH} deep")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return str(value)               # a subclass of str as plain text
+    if type(value).__name__ == "bool_":
+        return bool(value)              # numpy's true and false
+    if isinstance(value, Mapping):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise BlockError(f"{where} has the key {key!r}, which is not "
+                                 f"text — a record's keys are text")
+            out[str(key)] = _clean(item, f"{where}.{key}", depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_clean(item, f"{where}[{i}]", depth + 1)
+                for i, item in enumerate(value)]
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    raise BlockError(f"{where} is a {type(value).__name__}, which is not "
+                     f"JSON (text, a number, true or false, null, a list or "
+                     f"a mapping)")
+
+
+def clean_block(block: Any, limit: int = BLOCK_BYTES) -> Dict[str, Any]:
+    """A plugin's block as plain JSON, or BlockError saying why it cannot
+    be one: a mapping with text keys, of text, numbers, true or false,
+    null, lists and mappings, at most MAX_DEPTH deep and `limit` bytes as
+    JSON. CLEANED, not refused: NaN and the infinities become null (JSON
+    has none: a NaN stopped a record being written), tuples lists, any
+    number type a plain number (numpy's included)."""
+    if not isinstance(block, Mapping):
+        raise BlockError(f"a block is a mapping of names to values, not a "
+                         f"{type(block).__name__}")
+    clean = _clean(block, "the block", 0)
+    size = len(json.dumps(clean, ensure_ascii=False, allow_nan=False)
+               .encode("utf-8"))
+    if size > limit:
+        raise BlockError(f"the block is {size:,} bytes as JSON — over the "
+                         f"{limit:,} bytes a plugin's block may be")
+    return clean
+
+
+def plugins_block(blocks: Mapping[str, Any]) -> Tuple[Dict[str, Any],
+                                                      Dict[str, str]]:
+    """(the blocks that go in a record, by plugin id; why each other one
+    does not): each cleaned and size-checked (clean_block), and all of them
+    at most PLUGINS_BYTES together — the ones past it, in order, left out
+    — so a record holding them stays under MAX_RECORD_BYTES."""
+    kept: Dict[str, Any] = {}
+    refused: Dict[str, str] = {}
+    total = 2
+    for pid, block in dict(blocks or {}).items():
+        try:
+            clean = clean_block(block)
+        except BlockError as exc:
+            refused[str(pid)] = str(exc)
+            continue
+        size = len(json.dumps({str(pid): clean}, ensure_ascii=False)
+                   .encode("utf-8"))
+        if total + size > PLUGINS_BYTES:
+            refused[str(pid)] = (f"the block is {size:,} bytes as JSON, and "
+                                 f"the plugins' blocks may be "
+                                 f"{PLUGINS_BYTES:,} bytes in all")
+            continue
+        kept[str(pid)] = clean
+        total += size
+    return kept, refused
 
 
 # ======================================================================
