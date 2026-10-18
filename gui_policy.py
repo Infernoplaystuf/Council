@@ -745,12 +745,28 @@ _MATCH_CAPTURES = tuple(getattr(ast, n) for n in
                         if hasattr(ast, n))
 
 
+class _FuncInfo:
+    """One function's shape, for the parameter rule below."""
+    __slots__ = ("name", "positional", "params", "first", "static",
+                 "is_method")
+
+    def __init__(self, name, positional, params, first, static, is_method):
+        self.name = name                 # a def's name, a lambda's bound name
+        self.positional = positional     # ordered positional parameter names
+        self.params = params             # every parameter name (frozenset)
+        self.first = first               # self/cls, or "" when there is none
+        self.static = static
+        self.is_method = is_method
+
+
 class _Receivers:
     """Which receivers in one file are, or may be, a module — the receivers
     a MODULE_ROUTE is refused on.
 
-    Read from the whole file at once, flow- and scope-insensitive, and
-    erring towards "may be". A receiver may be a module when it is:
+    Read from the whole file at once, flow-insensitive but SCOPE-AWARE where
+    scope decides it (a default and an annotation are read in the ENCLOSING
+    scope, not the function's own), and erring towards "may be". A receiver
+    may be a module when it is:
 
       * a name an import binds (`import codecs`, `from xml.sax import
         saxutils` — an imported name may be a module), or any attribute
@@ -763,90 +779,288 @@ class _Receivers:
         codecs.builtins is;
       * a value the gate cannot see: a call's result (inspect.getmodule(f),
         getattr(codecs, name)), a subscript, an awaited or yielded value,
-        and every name bound by iterating (`for m in mods`), by unpacking
-        anything but a literal, by `with ... as` or by a match pattern — a
-        container may hold a module the file put there;
-      * a parameter, except the first of a method (self, cls): a function
-        can be handed a module, f(codecs);
+        and every name bound by iterating an iterable that may carry a
+        module, by unpacking one, by `with ... as` or by a match pattern.
+        A CALL TO A CLASS THE FILE DEFINES is an ordinary instance, not a
+        value the gate cannot see — `opts = Opts()`, `self.cam = Cam()` —
+        so a plain attribute of it keeps the word as a name;
+      * a parameter a call in the file hands a module (f(codecs), the
+        default m=codecs, b.put(codecs) binding self.held = m), or EVERY
+        non-first parameter of a function whose name is used anywhere but
+        as the thing a call calls — stored, aliased, decorated, passed on —
+        because then the gate cannot see how it is called (a function only
+        ever called in plain sight, or never referenced, is read exactly:
+        `def f(opts): return opts.ssl` is ordinary);
+      * `self` in a class whose instances answer an attribute with a value
+        the gate cannot pin to a name: a @dataclass / NamedTuple /
+        SimpleNamespace (the constructor sets any field, H(codecs)), or a
+        class that defines __getattr__ / __getattribute__; and the name a
+        property or cached_property returns, from its return values;
       * a name the file uses but never binds, other than a builtin: it came
         from a star import and may be anything.
 
     Everything else is an ordinary object, where the same word is only a
-    name: self and cls and their attributes, a class or function the file
-    defines, a literal, and a name only ever assigned values like those.
+    name: self and cls and their attributes (outside the class shapes
+    above), an instance of a class the file defines, a literal, and a name
+    only ever assigned values like those.
 
-    Not followed, stated plainly — the limit every spelled-form rule here
-    has: a module handed in AS self (Cls.method(codecs)), and an attribute
-    set through a name built at runtime (setattr(obj, name, codecs))."""
+    Not followed, stated plainly: a module handed in AS self
+    (Cls.method(codecs)); an attribute set through a name built at runtime
+    (setattr(obj, name, codecs)); and a function reached only by a string
+    (getattr(self, 'f')(codecs)) — its name is not written anywhere, so the
+    gate cannot see that a module reaches its parameters."""
 
     def __init__(self, tree: ast.AST) -> None:
         self.tainted: Set[str] = set()      # names that may hold a module
         self.bound: Set[str] = set()        # every name the file binds
+        self._classes: Set[str] = set()     # ClassDef names the file defines
         self._scopes: Dict[int, Tuple[ast.AST, ...]] = {}
-        self._params: Dict[int, Tuple[frozenset, str]] = {}
-        pairs: List[Tuple[Set[str], object]] = []
+        self._info: Dict[int, _FuncInfo] = {}
+        self._by_name: Dict[str, List[int]] = {}
+        self._module_self: Set[int] = set()  # funcs whose first param may be one
+        self._tainted_params: Dict[int, Set[str]] = {}
+        self._moduleish: Dict[int, bool] = {}
+        self._class_init: Dict[str, int] = {}   # class name -> its __init__ id
+        flat: List[Tuple[Set[str], object]] = []
+        param_pairs: List[Tuple[int, str, ast.AST]] = []
+        calls: List[ast.Call] = []
+        uses: List[Tuple[str, int]] = []    # (name, id) of every Load name/attr
+        call_funcs: Set[int] = set()        # id of every Call.func node
+        lambda_names: List[Tuple[str, int]] = []
         # Iterative: a generated file can hold an expression thousands of
         # nodes deep (a long string concatenation), past the recursion limit.
-        stack: List[Tuple[ast.AST, Tuple[ast.AST, ...], bool]] = [
-            (tree, (), False)]
+        stack: List[Tuple[ast.AST, Tuple[ast.AST, ...], Any]] = [
+            (tree, (), None)]
         while stack:
-            node, funcs, in_class = stack.pop()
-            inner, child_in_class = funcs, False
+            node, funcs, cls = stack.pop()
+            inner = funcs
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                                  ast.Lambda)):
                 inner = funcs + (node,)
-                self._function(node, in_class, pairs)
-            elif isinstance(node, ast.ClassDef):
+                self._function(node, cls, flat, param_pairs)
+                self._push_function(node, funcs, inner, stack)
+                continue
+            if isinstance(node, ast.ClassDef):
                 self.bound.add(node.name)
-                child_in_class = True
-            elif isinstance(node, ast.Name):
+                self._classes.add(node.name)
+                for child in ast.iter_child_nodes(node):
+                    stack.append((child, funcs, node))
+                continue
+            if isinstance(node, ast.Name):
                 self._scopes[id(node)] = funcs
-                if not isinstance(node.ctx, ast.Load):
+                if isinstance(node.ctx, ast.Load):
+                    uses.append((node.id, id(node)))
+                else:
                     self.bound.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                if isinstance(node.ctx, ast.Load):
+                    uses.append((node.attr, id(node)))
+                self._binding(node, flat, lambda_names)
             else:
-                self._binding(node, pairs)
+                self._binding(node, flat, lambda_names)
+            if isinstance(node, ast.Call):
+                call_funcs.add(id(node.func))
+                calls.append(node)
             for child in ast.iter_child_nodes(node):
-                stack.append((child, inner, child_in_class))
-        # To a fixpoint: a name assigned from a tainted one is tainted too.
-        changed = True
-        while changed:
-            changed = False
-            for names, value in pairs:
-                if names <= self.tainted:
-                    continue
-                if value is None or self._carries(value):
-                    self.tainted |= names
-                    changed = True
+                stack.append((child, inner, None))
+
+        # A lambda bound to a name is called by that name: g = lambda m: ...
+        for name, lid in lambda_names:
+            self._by_name.setdefault(name, []).append(lid)
+            if self._info[lid].name is None:
+                self._info[lid].name = name
+        # A function whose name is used anywhere but as what a call calls is
+        # out of the gate's sight (stored, aliased, decorated, passed on):
+        # every non-first parameter of it may be a module. (Attribute uses
+        # share this name space, erring only towards "may be".)
+        leaked = {name for name, nid in uses if nid not in call_funcs}
+        for fid, info in self._info.items():
+            if info.name in leaked:
+                for p in info.params:
+                    if p != info.first:
+                        self._tainted_params[fid].add(p)
+        # A call in plain sight hands its arguments to a function's
+        # parameters: map them, so f(codecs) taints f's m.
+        for call in calls:
+            for fid, pname, value in self._map_call(call, call_funcs):
+                param_pairs.append((fid, pname, value))
+
+        # To a fixpoint, by a WORKLIST rather than re-walking every pair each
+        # pass: a name assigned from a tainted one is tainted too. Each pair
+        # is indexed by the names its value reads; tainting a name revisits
+        # only the pairs that read it, so a long `x0 = x1 ... xn = codecs`
+        # chain resolves in one sweep down it, not one pass per link.
+        entries: List[Tuple[str, object, object]] = (
+            [("flat", frozenset(ns), v) for ns, v in flat]
+            + [("param", (fid, pn), v) for fid, pn, v in param_pairs])
+        index: Dict[str, List[int]] = {}
+        for i, (_kind, _sink, value) in enumerate(entries):
+            if value is None:
+                continue
+            for node in ast.walk(value):
+                if isinstance(node, ast.Name):
+                    index.setdefault(node.id, []).append(i)
+                elif isinstance(node, ast.Attribute):
+                    index.setdefault(node.attr, []).append(i)
+        done = [False] * len(entries)
+        queue: List[str] = [p for tp in self._tainted_params.values()
+                            for p in tp]   # leaked parameters, already set
+
+        def fire(i: int) -> None:
+            kind, sink, value = entries[i]
+            if done[i] or (value is not None and not self._carries(value)):
+                return
+            done[i] = True
+            if kind == "flat":
+                for name in sink:
+                    if name not in self.tainted:
+                        self.tainted.add(name)
+                        queue.append(name)
+            else:
+                fid, pname = sink
+                tp = self._tainted_params[fid]
+                if pname not in tp:
+                    tp.add(pname)
+                    queue.append(pname)
+
+        for i in range(len(entries)):       # the pairs that fire on an
+            fire(i)                          # import or a value in plain sight
+        while queue:                         # then down the chains they start
+            for i in index.get(queue.pop(), ()):
+                if not done[i]:
+                    fire(i)
 
     # -- reading the file ---------------------------------------------------
-    def _function(self, node: ast.AST, in_class: bool,
-                  pairs: List[Tuple[Set[str], object]]) -> None:
+    def _push_function(self, node, funcs, inner, stack) -> None:
+        """A function's decorators, defaults and annotations are read in the
+        ENCLOSING scope (``funcs``); only its body is its own (``inner``). A
+        default `e=self.builtins.eval` on an inner method reads the OUTER
+        self, so it must not be given the inner method's scope — where self
+        is that method's first parameter and so looks ordinary."""
+        args = node.args
+        for value in list(args.defaults) + list(args.kw_defaults):
+            if value is not None:
+                stack.append((value, funcs, None))
+        for a in (args.posonlyargs + args.args + args.kwonlyargs
+                  + [x for x in (args.vararg, args.kwarg) if x is not None]):
+            if a.annotation is not None:
+                stack.append((a.annotation, funcs, None))
+        if isinstance(node, ast.Lambda):
+            stack.append((node.body, inner, None))
+            return
+        for deco in node.decorator_list:
+            stack.append((deco, funcs, None))
+        if node.returns is not None:
+            stack.append((node.returns, funcs, None))
+        for stmt in node.body:
+            stack.append((stmt, inner, None))
+
+    def _function(self, node: ast.AST, cls, flat, param_pairs) -> None:
         args = node.args
         positional = [a.arg for a in args.posonlyargs + args.args]
         names = set(positional) | {a.arg for a in args.kwonlyargs}
         for extra in (args.vararg, args.kwarg):
             if extra is not None:
                 names.add(extra.arg)
-        first = ""
-        if (in_class and positional and not isinstance(node, ast.Lambda)
-                and not any(_decorator_name(d) == "staticmethod"
-                            for d in node.decorator_list)):
-            first = positional[0]
-        self._params[id(node)] = (frozenset(names), first)
+        lam = isinstance(node, ast.Lambda)
+        static = (not lam and any(_decorator_name(d) == "staticmethod"
+                                  for d in node.decorator_list))
+        is_method = cls is not None and not lam and not static
+        first = positional[0] if (is_method and positional) else ""
+        info = _FuncInfo(None if lam else node.name, positional,
+                         frozenset(names), first, static, is_method)
+        self._info[id(node)] = info
+        self._tainted_params[id(node)] = set()
         self.bound |= names
-        if not isinstance(node, ast.Lambda):
+        if not lam:
             self.bound.add(node.name)
-        # A default is assigned to its parameter.
+            self._by_name.setdefault(node.name, []).append(id(node))
+        # self is a module in a class whose instances answer any attribute
+        # with a value the gate cannot pin to a name.
+        if is_method and positional and self._is_moduleish(cls):
+            self._module_self.add(id(node))
+        # Building the instance runs __init__: A(codecs) hands codecs to it.
+        if is_method and node.name == "__init__":
+            self._class_init[cls.name] = id(node)
+        # A property/cached_property names an attribute: taint that name
+        # from what it returns (self.mod.builtins, with mod a @property that
+        # returns codecs).
+        if (cls is not None and not lam
+                and any(_decorator_name(d) in ("property", "cached_property")
+                        for d in node.decorator_list)):
+            for ret in _returns_in(node):
+                if ret.value is not None:
+                    flat.append(({node.name}, ret.value))
+        # A default is assigned to its parameter, in THIS function's scope.
         with_defaults = positional[len(positional) - len(args.defaults):] \
             if args.defaults else []
         for name, value in zip(with_defaults, args.defaults):
-            pairs.append(({name}, value))
+            param_pairs.append((id(node), name, value))
         for a, value in zip(args.kwonlyargs, args.kw_defaults):
             if value is not None:
-                pairs.append(({a.arg}, value))
+                param_pairs.append((id(node), a.arg, value))
 
-    def _binding(self, node: ast.AST,
-                 pairs: List[Tuple[Set[str], object]]) -> None:
+    def _is_moduleish(self, cls: ast.ClassDef) -> bool:
+        cached = self._moduleish.get(id(cls))
+        if cached is not None:
+            return cached
+        result = False
+        for deco in cls.decorator_list:
+            if _decorator_name(deco) == "dataclass":
+                result = True
+        for base in cls.bases:
+            name = (base.attr if isinstance(base, ast.Attribute)
+                    else base.id if isinstance(base, ast.Name) else "")
+            if name in ("NamedTuple", "SimpleNamespace"):
+                result = True
+        for stmt in cls.body:
+            if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and stmt.name in ("__getattr__", "__getattribute__")):
+                result = True
+        self._moduleish[id(cls)] = result
+        return result
+
+    def _map_call(self, call: ast.Call, call_funcs: Set[int]):
+        """Which parameters of which functions this call hands an argument:
+        f(x) to f's parameters, obj.meth(x) to meth's after self, A.f(x) to
+        a staticmethod's from the first. Only calls whose target the file
+        names in plain sight — the laundering routes it cannot see taint
+        every non-first parameter already (``leaked``)."""
+        fn = call.func
+        targets: List[Tuple[_FuncInfo, int, int]] = []   # info, id, skip
+        if isinstance(fn, ast.Name):
+            for fid in self._by_name.get(fn.id, ()):
+                info = self._info[fid]
+                if not info.is_method:          # a plain function or lambda
+                    targets.append((info, fid, 0))
+            init = self._class_init.get(fn.id)  # A(codecs) -> A.__init__
+            if init is not None:
+                targets.append((self._info[init], init, 1))
+        elif isinstance(fn, ast.Attribute):
+            on_class = (isinstance(fn.value, ast.Name)
+                        and fn.value.id in self._classes)
+            for fid in self._by_name.get(fn.attr, ()):
+                info = self._info[fid]
+                if not info.is_method and not info.static:
+                    continue
+                if info.static:
+                    targets.append((info, fid, 0))   # A.f(x) -> f's own
+                elif not on_class:
+                    targets.append((info, fid, 1))   # obj.meth(x) -> after self
+                # A.meth(x) on a non-static method hands x AS self: a limit.
+        out = []
+        for info, fid, skip in targets:
+            params = info.positional[skip:]
+            for value, name in zip(call.args, params):
+                if isinstance(value, ast.Starred):
+                    break                    # *args: positions unknown
+                out.append((fid, name, value))
+            for kw in call.keywords:
+                if kw.arg and kw.arg in info.params:
+                    out.append((fid, kw.arg, kw.value))
+        return out
+
+    def _binding(self, node: ast.AST, pairs, lambda_names) -> None:
         if isinstance(node, ast.Import):
             for a in node.names:
                 self._imported(a.asname or a.name.split(".")[0])
@@ -857,16 +1071,25 @@ class _Receivers:
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 self._assigned(target, node.value, pairs)
+                if (isinstance(node.value, ast.Lambda)
+                        and isinstance(target, ast.Name)):
+                    lambda_names.append((target.id, id(node.value)))
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if node.value is not None:
                 self._assigned(node.target, node.value, pairs)
+                if (isinstance(node.value, ast.Lambda)
+                        and isinstance(node.target, ast.Name)):
+                    lambda_names.append((node.target.id, id(node.value)))
         elif isinstance(node, ast.NamedExpr):
             self._assigned(node.target, node.value, pairs)
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
-            pairs.append((_target_names(node.target), None))
+            # Only an iterable that may carry a module taints what it yields:
+            # `for m in (codecs,)` does, `for o in self.items` does not.
+            pairs.append((_target_names(node.target), node.iter))
         elif isinstance(node, ast.withitem):
             if node.optional_vars is not None:
-                pairs.append((_target_names(node.optional_vars), None))
+                pairs.append((_target_names(node.optional_vars),
+                              node.context_expr))
         elif isinstance(node, ast.ExceptHandler):
             if node.name:
                 self.bound.add(node.name)
@@ -885,8 +1108,7 @@ class _Receivers:
         self.bound.add(name)
 
     @staticmethod
-    def _assigned(target: ast.AST, value: ast.AST,
-                  pairs: List[Tuple[Set[str], object]]) -> None:
+    def _assigned(target: ast.AST, value: ast.AST, pairs) -> None:
         names = _target_names(target)
         if not names:
             return
@@ -917,7 +1139,15 @@ class _Receivers:
             return any(self.may_be_module(v) for v in node.values)
         if isinstance(node, ast.NamedExpr):
             return self.may_be_module(node.value)
-        return isinstance(node, (ast.Call, ast.Subscript, ast.Await,
+        if isinstance(node, ast.Call):
+            # Building an instance of a class the file defines is an ordinary
+            # object; any other call's result is a value the gate cannot see.
+            fn = node.func
+            if (isinstance(fn, ast.Name) and fn.id in self._classes
+                    and fn.id not in self.tainted):
+                return False
+            return True
+        return isinstance(node, (ast.Subscript, ast.Await,
                                  ast.Yield, ast.YieldFrom, ast.Starred))
 
     def _name(self, node: ast.Name) -> bool:
@@ -925,9 +1155,11 @@ class _Receivers:
         if name in self.tainted:
             return True
         for func in reversed(self._scopes.get(id(node), ())):
-            params, first = self._params[id(func)]
-            if name in params:
-                return name != first
+            info = self._info[id(func)]
+            if name in info.params:
+                if name == info.first:
+                    return id(func) in self._module_self
+                return name in self._tainted_params[id(func)]
         return name not in self.bound and name not in _ALWAYS_THERE
 
 
@@ -978,6 +1210,22 @@ def _decorator_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
     return ""
+
+
+def _returns_in(node: ast.AST) -> List[ast.Return]:
+    """Every ``return`` in a function's own body — not a nested function's or
+    class's. A property's returns say what reading its attribute gives."""
+    out: List[ast.Return] = []
+    stack = list(getattr(node, "body", []))
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(n, ast.Return):
+            out.append(n)
+        stack.extend(ast.iter_child_nodes(n))
+    return out
 
 
 def _check_lookup(node: ast.Call, aliases: dict, errs: List[str],

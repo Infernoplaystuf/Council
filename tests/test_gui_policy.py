@@ -792,8 +792,12 @@ def test_the_same_name_on_a_module_is_still_refused_with_its_reason(name):
     # a checkbox's value
     "class Opts:\n    def __init__(self):\n        self.ssl = False\n"
     "    def toggle(self):\n        self.ssl = not self.ssl\n",
-    # through an attribute of self the file never gives a module
-    "class Win:\n    def show(self):\n        return self.ui.ssl, self.ui.socket\n",
+    # through an attribute of self that holds an instance of a class the
+    # file defines (the real pattern: self.ui = Ui_Form())
+    "class Ui_Form:\n    def __init__(self):\n        self.ssl = None\n"
+    "        self.socket = None\n"
+    "class Win:\n    def __init__(self):\n        self.ui = Ui_Form()\n"
+    "    def show(self):\n        return self.ui.ssl, self.ui.socket\n",
     # in a closure over self
     "class Win:\n    def later(self):\n        def cb():\n"
     "            return self.modules\n        return cb\n",
@@ -870,6 +874,123 @@ def test_a_module_route_is_refused_wherever_the_receiver_may_be_a_module(
     _refused(code, reason)
     good, errs = pol.validate(code, "linked", (), "qt")
     assert any("may be, a module" in e for e in errs), errs
+
+
+# ============================================================
+# The shapes a module reaches a receiver through that the first cut missed
+# (adversarial re-review of 10733a8)
+# ============================================================
+#
+# _Receivers read `self` as never a module and every non-first parameter as
+# maybe one. Both were wrong at the edges: a class can answer `self.x` with a
+# module it was handed (a @dataclass / NamedTuple / SimpleNamespace field, a
+# property's return, a __getattr__), and the defaults and annotations of an
+# inner method are read in the ENCLOSING scope, where `self` may be a module
+# a call passed in. Each snippet below reaches codecs.builtins.eval at run
+# time on the branch before this fix.
+
+@pytest.mark.parametrize("code", [
+    # a property / cached_property that returns a module, read as self.mod.*
+    "import codecs\nclass A:\n    @property\n    def mod(self):\n"
+    "        return codecs\n    def f(self):\n"
+    "        return self.mod.builtins.eval('1')\n",
+    "import codecs, functools\nclass A:\n    @functools.cached_property\n"
+    "    def mod(self):\n        return codecs\n    def f(self):\n"
+    "        return self.mod.builtins.eval('1')\n",
+    # a @dataclass field the constructor sets: H(codecs).m is codecs
+    "import codecs\nfrom dataclasses import dataclass\n@dataclass\nclass H:\n"
+    "    m: object = None\n    def run(self):\n"
+    "        return self.m.builtins.eval('1')\nH(codecs).run()\n",
+    # a NamedTuple field, the same way
+    "import codecs\nfrom typing import NamedTuple\nclass H(NamedTuple):\n"
+    "    m: object\n    def run(self):\n"
+    "        return self.m.builtins.eval('1')\nH(codecs).run()\n",
+    # a SimpleNamespace subclass: H(m=codecs).m is codecs
+    "import codecs\nfrom types import SimpleNamespace\n"
+    "class H(SimpleNamespace):\n    def run(self):\n"
+    "        return self.m.builtins.eval('1')\nH(m=codecs).run()\n",
+    # a class whose __getattr__ hands back a module for any attribute
+    "import codecs\nclass A:\n    def __getattr__(self, name):\n"
+    "        return codecs\n    def f(self):\n"
+    "        return self.anything.builtins.eval('1')\n",
+    # a default / annotation of an inner method, read in the OUTER scope
+    # where self is the module outer(codecs) was given
+    "import codecs\ndef outer(self):\n    class B:\n"
+    "        def m(self, e=self.builtins.eval):\n            return e\n"
+    "    return B\nouter(codecs)().m()\n",
+    "import codecs\ndef outer(self):\n    class B:\n"
+    "        def m(self: self.builtins.eval('1')):\n            pass\n"
+    "    return B\nouter(codecs)\n",
+    # a module stored on an instance through its own __init__
+    "import codecs\nclass Keep:\n    def __init__(self, m):\n"
+    "        self.mod = m\n    def f(self):\n"
+    "        return self.mod.builtins.eval('1')\nKeep(codecs).f()\n",
+    # a module reaching a parameter through a function the file hands around
+    # (stored in a list, aliased): the gate cannot see the call, so every
+    # non-first parameter of such a function may be a module
+    "import codecs\ndef f(m):\n    return m.builtins.eval('1')\n"
+    "funcs = [f]\nfuncs[0](codecs)\n",
+    "import codecs\ndef f(m):\n    return m.builtins.eval('1')\ng = f\ng(codecs)\n",
+])
+def test_a_module_route_is_refused_through_these_shapes_too(code):
+    """Each one reached builtins.eval before this fix; each is refused with
+    WHY_CODE now, and still allows the ordinary case of its shape below."""
+    _refused(code, pol.WHY_CODE)
+
+
+@pytest.mark.parametrize("code", [
+    # a property that returns an ORDINARY value named like a module route is
+    # still a plain attribute
+    "class A:\n    @property\n    def socket(self):\n        return None\n"
+    "    def f(self):\n        return self.socket\n",
+    # a plain parameter the file never hands a module: opts.ssl is a name
+    "class O:\n    pass\ndef configure(opts):\n    return opts.ssl\n",
+    # an instance of a class the file defines, built by a call, holds plain
+    # attributes — not a value the gate must treat as maybe-a-module
+    "class Opts:\n    def __init__(self):\n        self.ssl = False\n"
+    "opts = Opts()\nuse = opts.ssl\n",
+    "class Cam:\n    def __init__(self):\n        self.socket = None\n"
+    "class W:\n    def __init__(self):\n        self.cam = Cam()\n"
+    "    def close(self):\n        self.cam.socket = None\n",
+    # a loop over a container the file never puts a module in
+    "class W:\n    def __init__(self):\n        self.items = []\n"
+    "    def f(self):\n        for conn in self.items:\n"
+    "            conn.socket = None\n",
+    # a class that stores its __init__ argument, never built with a module:
+    # reading a module-named attribute of it is a name, not a route
+    "class A:\n    def __init__(self, m):\n        self.mod = m\n"
+    "    def f(self):\n        return self.mod.ssl\n",
+])
+def test_the_ordinary_cases_of_those_shapes_still_pass(code):
+    """The tightening above must not refuse an honest property, parameter,
+    local-class instance or loop variable that merely shares a word with a
+    module."""
+    _passes(code)
+
+
+def test_the_taint_fixpoint_walks_a_long_chain_once_not_once_per_link():
+    """A file can rename a module down a long chain of plain assignments
+    (`x0 = x1` ... `xn = codecs`), and the one order that forced the old
+    fixpoint to re-walk every pair per link made validate O(n**2): a 2,000
+    link chain took ~10 s, and a worse one could stall the gate for minutes.
+    The worklist revisits only the pairs that read a name as it is tainted,
+    so the chain resolves in a single sweep. The chain is still refused
+    (x0.builtins is codecs.builtins), so nothing is weakened.
+
+    Robust to a busy PC: the bound is ~20x the measured time and the test
+    takes the best of three, so a load spike cannot trip it, but a return
+    to O(n**2) (seconds, not milliseconds) still does."""
+    n = 2500
+    links = [f"x{i} = x{i + 1}" for i in range(n - 1)] + [f"x{n - 1} = codecs"]
+    links.reverse()                      # the order that converged slowest
+    code = "import codecs\n" + "\n".join(links) + "\nx0.builtins.eval('1')\n"
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.perf_counter()
+        good, errs = pol.validate(code, "linked", (), "qt")
+        best = min(best, time.perf_counter() - t0)
+        assert not good and any(pol.WHY_CODE in e for e in errs), errs
+    assert best < 2.0, f"{best:.2f}s to validate a {n}-link chain (was O(n^2))"
 
 
 # ============================================================
