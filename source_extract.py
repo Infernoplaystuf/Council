@@ -381,7 +381,7 @@ def workbook_files(folder) -> List[Path]:
 
 
 def load_workbook_grids(path, notes: Optional[List[str]] = None,
-                        want_pictures: bool = True
+                        want_pictures: bool = True, data: Optional[bytes] = None
                         ) -> Tuple[List[Grid], List[SourceImage]]:
     """Every sheet as a Grid, every text box and chart as a small Grid of its
     own, and the pictures. openpyxl when it can open the file; the installed
@@ -389,9 +389,13 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     what could not be read (a picture Excel would not copy out).
 
     want_pictures=False leaves the pictures out: Excel copies each one out
-    through the clipboard, which a caller with no image reader (the
-    knowledge graph's rebuild, when Tesseract is not installed) has no
-    reason to touch."""
+    through the clipboard, which the knowledge graph's background rebuild
+    does not touch (Excel then lists each picture with no data, so it can
+    be counted).
+
+    data: the workbook's bytes, already read (an .xlsx / .xlsm): it is
+    parsed from them, so the file is not held open while openpyxl works -
+    Excel could not save it meanwhile."""
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
@@ -405,7 +409,8 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
         return _grids_from_excel(path, notes, want_pictures)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(data) if data is not None else path,
+                                    data_only=True)
     except Exception as e:
         raise LedgerError(f"could not open {path.name}: {e}") from e
     grids, images = [], []
@@ -439,7 +444,8 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
             images.append(SourceImage(path.name, ws.title, anchor, data,
                                       (getattr(img, "format", None) or "png").lower()))
     wb.close()
-    for ex in excel_open.zip_extras(path):                # text boxes and charts
+    for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
+        # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
     return grids, images
 

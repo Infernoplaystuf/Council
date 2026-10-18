@@ -73,8 +73,15 @@ STREAM_XML_BYTES = 12 << 20
 #: otherwise put every one of them in the store's cache).
 MAX_LINES = 20_000
 MAX_LABELS = 5_000
+#: ...and characters of it, as a text document's are capped (5 M): one
+#: notes workbook kept 20,000 lines = 15.9 M characters (review, 2026-10-16).
+MAX_TEXT_CHARS = 5_000_000
 #: A cell is free text (for the gazetteer and the model) from this many words.
 LONG_TEXT_WORDS = 4
+#: Bigger workbooks are parsed from their file, smaller ones from a copy in
+#: memory: openpyxl holds the file open while it parses (8.7 s for 20,000
+#: rows), and Excel could not save the workbook meanwhile (review, 2026-10-16).
+IN_MEMORY_BYTES = 64 << 20
 
 
 class Unreadable(Exception):
@@ -131,10 +138,14 @@ def _norm(v) -> str:
     return fs._norm_key(_label_text(v))
 
 
-#: Short words a results column holds that are not anyone's initials.
-_NOT_INITIALS = {"seen", "ok", "okay", "yes", "no", "na", "n a", "tbd", "pass", "fail",
-                 "none", "nil", "good", "bad", "done", "open", "x", "y", "n", "nde", "fpi",
-                 "ec", "date", "flaw", "part", "run", "item", "id"}
+#: Short words a results or initials column holds that are not anyone's
+#: initials, however they are typed ('TBD', 'OK', 'NA'). Not 'EC': Eva Chen
+#: signs as EC.
+_NOT_INITIALS = {"seen", "ok", "okay", "yes", "no", "na", "n a", "tbd", "tba", "pass",
+                 "fail", "none", "nil", "good", "bad", "done", "open", "x", "y", "n", "nde",
+                 "fpi", "date", "flaw", "part", "run", "item", "id", "all", "any", "nd"}
+#: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?'.
+_NOBODY = re.compile(r"(?i)\s*(?:n\s*/\s*a|n\.?\s*a\.?|-+|\?+|tbd|tba|none|nil|unknown)\s*")
 
 
 def is_initials(s: Any, loose: bool = False) -> bool:
@@ -146,12 +157,13 @@ def is_initials(s: Any, loose: bool = False) -> bool:
     t = re.sub(r"[.\s]", "", raw)
     if not re.fullmatch(r"[A-Za-z]{1,4}", t) or re.fullmatch(r"[A-Z][a-z]{2,}", raw):
         return False
-    word = t.lower() in _NOT_INITIALS
+    if t.lower() in _NOT_INITIALS:          # 'TBD', 'OK', 'NA', 'seen'
+        return False
     if re.fullmatch(r"(?:[A-Z]\.?\s?){1,4}", raw):          # JB, J.B., J B
-        return not word or loose      # 'EC' signs under an Inspector label
+        return True
     if re.fullmatch(r"(?:[A-Za-z]\.\s?){1,4}", raw):        # j.b.
         return True
-    return loose and raw.islower() and not word            # jb, never 'seen'
+    return loose and raw.islower()                         # jb
 
 
 def initials_key(s: Any) -> str:
@@ -180,7 +192,7 @@ def split_people(s: Any) -> List[str]:
     capitals ('jb' -> 'JB'); a name stays whole ('Lee, Carol'). Anything else
     ('seen', '63', a date) is nobody."""
     raw = " ".join(str(s or "").split())
-    if not raw:
+    if not raw or _NOBODY.fullmatch(raw):
         return []
     parts = [p.strip() for p in re.split(r"\s*(?:/|&|;|\band\b)\s*", raw) if p.strip()]
     if len(parts) == 1 and "," in raw:
@@ -218,10 +230,45 @@ def schema_path(csv_path: Path) -> Path:
     return schema_path_for(csv_path)
 
 
+#: What the Ledger's schema file always holds (sample_ledger.TemplateSchema).
+_LEDGER_SCHEMA_KEYS = {"template_path", "fields", "id_field"}
+
+
 def is_ledger_csv(p: Path) -> bool:
-    """A parent CSV: a .csv with the Ledger's schema beside it."""
+    """A parent CSV: a .csv with the Ledger's own schema beside it. A
+    '<name>.schema.json' is also how JSON Table Schema / Frictionless
+    describe a plain CSV, so the file must BE a Ledger schema; one that
+    cannot be parsed counts when the CSV ends with the Ledger's own columns
+    (source_file, updated_at) - then it is a Ledger whose schema is damaged,
+    reported as such. It used to be enough for the file to exist: a plain
+    team.csv beside a Table Schema was refused as a broken Ledger (review,
+    2026-10-16)."""
     p = Path(p)
-    return p.suffix.lower() == ".csv" and schema_path(p).is_file()
+    if p.suffix.lower() != ".csv":
+        return False
+    sp = schema_path(p)
+    if not sp.is_file():
+        return False
+    try:
+        data = json.loads(sp.read_text(encoding="utf-8"))
+    except Exception:
+        return _ends_with_ledger_columns(p)
+    return (isinstance(data, dict) and _LEDGER_SCHEMA_KEYS <= set(data)
+            and isinstance(data.get("fields"), list))
+
+
+def _ends_with_ledger_columns(p: Path) -> bool:
+    import sample_ledger as sl
+    try:
+        with open(p, "rb") as fh:
+            head = _decode(fh.read(1 << 16)).splitlines()
+    except OSError:
+        return False
+    for line in head:
+        if line.strip():
+            cols = [c.strip() for c in next(csv.reader([line]))]
+            return tuple(cols[-len(sl.META_COLS):]) == tuple(sl.META_COLS)
+    return False
 
 
 def is_ledger_sidecar(p: Path) -> bool:
@@ -230,7 +277,7 @@ def is_ledger_sidecar(p: Path) -> bool:
     name = Path(p).name.lower()
     for suf in (".schema.json", ".aliases.json"):
         if name.endswith(suf):
-            return Path(p).with_name(Path(p).name[:-len(suf)] + ".csv").is_file()
+            return is_ledger_csv(Path(p).with_name(Path(p).name[:-len(suf)] + ".csv"))
     return False
 
 
@@ -303,19 +350,55 @@ def _decode(raw: bytes) -> str:
     return raw.decode("latin-1", "replace")
 
 
-def _provenance(csv_path: Path) -> Tuple[Dict[Tuple[str, str, str, str], str], int, List[str]]:
-    """(part, item, field, value) -> 'nde.xlsx › Part 101!C4' for every value
-    a person ACCEPTED (Accept = Y) in this Ledger's review workbooks, newest
-    review first. Only a place for a value already in the CSV is looked up
-    here: nothing in a review is read as a fact."""
-    import openpyxl
-    index: Dict[Tuple[str, str, str, str], str] = {}
+#: (the review's sources as the CSV's source_file says them, part, item,
+#: field, value) -> 'nde.xlsx › Part 101!C4'
+Provenance = Dict[Tuple[str, str, str, str, str], str]
+
+
+def _applied_as(meta: Dict[str, Any]) -> str:
+    """What apply_review writes in the CSV's source_file for this review's
+    rows: its sources' names, joined, cut at 200 characters."""
+    return ", ".join(Path(str(s)).name for s in meta.get("sources", []))[:200]
+
+
+def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
+    """Where each value a person ACCEPTED (Accept = Y) in this Ledger's
+    review workbooks came from, keyed by the review's sources as the CSV's
+    source_file column names them - so a row cites only the review that was
+    APPLIED to it, never a newer one saved and not applied (review,
+    2026-10-16: a resent workbook was cited for a value it did not give).
+    A review belongs to this CSV by its resolved path (by name only when that
+    path is gone: the folder was moved). Only a place for a value already in
+    the CSV is looked up here: nothing in a review is read as a fact."""
+    index: Provenance = {}
     notes: List[str] = []
+    reviews = _reviews_of(csv_path)
+    if not reviews:
+        return index, 0, notes
+    try:
+        import openpyxl
+    except ImportError:
+        return index, 0, ["review workbooks were not read (they need the openpyxl package, "
+                          "which is not installed): no workbook cells for these values"]
+    try:
+        me = csv_path.resolve()
+    except OSError:
+        me = csv_path
     n = 0
-    for x in _reviews_of(csv_path):
+    for x in reviews:
         meta = _review_meta(x)
-        if not meta or Path(str(meta.get("csv", ""))).name.lower() != csv_path.name.lower():
+        if not meta:
             continue
+        theirs = Path(str(meta.get("csv", "")))
+        if theirs.exists():
+            try:
+                if theirs.resolve() != me:
+                    continue
+            except OSError:
+                continue
+        elif theirs.name.lower() != csv_path.name.lower():
+            continue
+        applied = _applied_as(meta)
         try:
             wb = openpyxl.load_workbook(x, read_only=True, data_only=True)
         except Exception as exc:                      # held open, damaged
@@ -328,7 +411,8 @@ def _provenance(csv_path: Path) -> Tuple[Dict[Tuple[str, str, str, str], str], i
             for row in wb["Values"].iter_rows(min_row=2, values_only=True):
                 if len(row) < 9 or str(row[0] or "").strip().upper() != "Y" or not row[8]:
                     continue
-                key = (_text(row[1]).lower(), _text(row[2]), str(row[3] or ""), _text(row[4]))
+                key = (applied, _text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
+                       _text(row[4]))
                 index.setdefault(key, str(row[8]))
         finally:
             wb.close()
@@ -437,6 +521,12 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                                     {**base, "column": schema.id_field}, where_part))
         who_vals: Dict[str, Dict[str, Any]] = {}
 
+        def where(field: str, value: str) -> str:
+            # a part-level value sits on every flaw row of its part, but the
+            # review lists it once, under no flaw
+            return (prov.get((sources, part.lower(), item, field, value))
+                    or prov.get((sources, part.lower(), "", field, value)) or "")
+
         def add_person(who: str, col: str, shown: str, src_key: Tuple[str, str]):
             nonlocal located
             key = initials_key(who) if is_initials(who, loose=True) else who
@@ -445,7 +535,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
             if col not in slot["cols"]:
                 slot["cols"].append(col)
                 slot["quotes"].append(shown)
-            w = prov.get((part.lower(), item, src_key[0], src_key[1]))
+            w = where(*src_key)
             if w and w not in slot["from"]:
                 slot["from"].append(w)
                 located += 1
@@ -459,8 +549,15 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                 add_person(x, col, f"{col} = {v}", (col, v))
             elif role == "initials":
                 for who in split_people(v):
-                    add_person(who, col, f"{col} = {v}", (x, cell(header.index(x))
-                                                          if x in header else ""))
+                    # each inspector's own reading, '<field> [MK]', says where
+                    # MK's value came from; the template's one cell holds only
+                    # the first agreeing inspector's (review, 2026-10-16)
+                    own = sl.inspector_column(x, initials_key(who) if
+                                              is_initials(who, loose=True) else who)
+                    src_key = (own, cell(header.index(own))) if own in header and \
+                        cell(header.index(own)) else (x, cell(header.index(x))
+                                                      if x in header else "")
+                    add_person(who, col, f"{col} = {v}", src_key)
             elif role == "person":
                 for who in split_people(v):
                     add_person(who, col, f"{col} = {v}", (col, v))
@@ -469,10 +566,13 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                 import field_search as fs
                 for one in (fs._split_values(v, r.label, r.type) or [v]):
                     loc = {**base, "column": col}
-                    w = prov.get((part.lower(), item, col, v))
+                    w = where(col, v)
                     if w:
                         loc["from"] = w
-                    rec.values.append(kgm.Value(r, one, loc, f"{col} = {v}"))
+                    elif sources:
+                        loc["sources"] = sources
+                    rec.values.append(kgm.Value(r, one, loc, f"{col} = {v}",
+                                                signed=r.type == "PERSON"))
         for slot in who_vals.values():
             loc = {**base, "columns": slot["cols"]}
             if slot["from"]:
@@ -515,7 +615,7 @@ class _GridReader:
 
     def __init__(self, name: str, by_norm: Dict[str, "kgm.FieldRule"], rel: str, *,
                  tentative: bool = False, image: str = "", text_all: bool = False,
-                 sheet: str = ""):
+                 sheet: str = "", budget: Optional[Dict[str, Any]] = None):
         #: ``name`` heads this grid's text lines ('Visual › picture F2');
         #: ``sheet`` is what a citation names ('Visual', with the picture).
         self.name, self.by_norm, self.rel = name, by_norm, rel
@@ -531,7 +631,11 @@ class _GridReader:
         self.n_tables = 0
         self.n_forms = 0
         self.taken: set = set()          # cells a form above already used
-        self.lines_dropped = 0
+        #: The free text the whole workbook may keep, shared by its sheets:
+        #: lines and characters kept so far, and why any was dropped.
+        self.budget = budget if budget is not None else {"lines": 0, "chars": 0,
+                                                         "dropped": ""}
+        self._last_r: Optional[int] = None
         self._pending: Optional[Tuple[int, Dict[int, Any]]] = None
         self._person_cols: Dict[int, Tuple[str, Dict[str, Any]]] = {}
 
@@ -614,8 +718,6 @@ class _GridReader:
         Helios | Program Lead | Dana' is a row of two labelled values as
         often as it is a header) when the next row fills every titled one.
         A label followed by a code ('P/N | PN-1234') is a labelled value."""
-        if any(not isinstance(cells[c], str) for c in run):
-            return None
         real = [c for c in run if not self._merged(cells[c])]
         if len(real) < 2:
             return None
@@ -623,9 +725,15 @@ class _GridReader:
         cols = {c: (t, rule) for c, (t, rule) in cols.items() if rule is not None}
         if not cols:
             return None
+        nexts = {real[i]: real[i + 1] for i in range(len(real) - 1)}
         for c in cols:
-            nx = cells.get(c + 1)
-            if isinstance(nx, str) and c + 1 not in cols and kgm.looks_like_code(nx.strip()):
+            # 'P/N | PN-1234' with nothing under the code is a labelled value;
+            # a code-like TITLE ('Q1', 'Lot 3') has its column's data under it
+            # (it used to lose the whole table - review, 2026-10-16)
+            nc = nexts.get(c)
+            nx = cells.get(nc) if nc is not None else None
+            if isinstance(nx, str) and nc not in cols and kgm.looks_like_code(nx.strip()) \
+                    and nxt.get(nc) is None:
                 return None
         hits = 0
         for c in cols:
@@ -636,7 +744,7 @@ class _GridReader:
                 return None
             hits += 1
         filled = sum(1 for c in real if nxt.get(c) is not None and not self._labelish(nxt[c]))
-        adjacent = any(c + 1 in cols for c in cols)
+        adjacent = any(nexts.get(c) in cols for c in cols)
         if len(cols) >= 2 and adjacent and hits:
             tentative = self.tentative
         elif len(real) >= 3 and hits == len(cols) and 2 * filled >= len(real):
@@ -653,14 +761,35 @@ class _GridReader:
         return t
 
     def _row(self, r: int, cells: Dict[int, Any], nxt: Dict[int, Any]) -> None:
+        # A blank row ends every table and column of initials: a second table
+        # stacked under the first was read as its rows (review, 2026-10-16).
+        # Blank rows are never fed, so it shows as a jump in the row number.
+        if self._last_r is not None and r > self._last_r + 1:
+            self.tables = []
+            self._person_cols = {}
+        self._last_r = r
         used: set = {c for c in cells if (r, c) in self.taken}
         values_at: set = set()
+        runs = self._runs(cells, used)
+        for run in runs:
+            self._harvest(run, cells, nxt)
         # new headers first: one overlapping a running table ends it
         cand = []
-        for run in self._runs(cells, used):
+        i = 0
+        while i < len(runs):
+            run = runs[i]
             t = self._header(r, run, cells, nxt)
+            # A title cell left empty ('Part Number | | Owner') splits a run;
+            # the two halves are one header when neither is one alone (two
+            # tables one empty column apart each are, and stay apart).
+            if t is None and i + 1 < len(runs) and runs[i + 1][0] == run[-1] + 2 \
+                    and self._header(r, runs[i + 1], cells, nxt) is None:
+                t = self._header(r, run + runs[i + 1], cells, nxt)
+                if t is not None:
+                    i += 1
             if t is not None:
                 cand.append(t)
+            i += 1
         still = []
         for t in self.tables:
             if any(not (n.c1 < t.c0 or n.c0 > t.c1) for n in cand):
@@ -679,6 +808,20 @@ class _GridReader:
                     self._label(cells[c])
         values_at |= self._forms(r, cells, used, nxt)
         self._free_text(r, cells, values_at)
+
+    def _harvest(self, run: List[int], cells, nxt) -> None:
+        """Every title of a header-shaped row (two or more text cells with
+        values under most of them), so Fields… can suggest a drifted label
+        ('POC') that no rule reads yet: the old reader harvested row 1's
+        titles, this one only rule labels (review, 2026-10-16)."""
+        texts = [c for c in run if isinstance(cells[c], str) and not self._merged(cells[c])]
+        if len(texts) < 2:
+            return
+        under = sum(1 for c in texts if nxt.get(c) is not None)
+        if 2 * under >= len(texts):
+            for c in texts:
+                if not any(ch.isdigit() for ch in cells[c]):
+                    self._label(cells[c])
 
     def _table_row(self, t: _Table, r: int, cells) -> set:
         rec = kgm.Record(self.rel, self.kind)
@@ -702,7 +845,8 @@ class _GridReader:
                 at.add(c)
             has_person = has_person or (rule.type == "PERSON" and bool(ones))
             for one in ones:
-                rec.values.append(kgm.Value(rule, one, loc, f"{label}: {raw}", tent))
+                rec.values.append(kgm.Value(rule, one, loc, f"{label}: {raw}", tent,
+                                            signed=rule.type == "PERSON"))
         if t.marker and not has_person and any(v.rule.type == "PART" for v in rec.values):
             who, mloc, msnip = t.marker
             rec.values.append(kgm.Value(kgm.INSPECTOR, who, mloc, msnip, True))
@@ -738,6 +882,10 @@ class _GridReader:
                 continue
             lab, inline = _se()._split_inline(v)
             rule = self._rule(lab) if inline else self._rule(v)
+            if inline and len(lab.split()) <= 5:
+                self._label(lab)                   # for Fields…, rule or not
+            elif not inline and v.strip().endswith(":"):
+                self._label(v)
             if rule is None:
                 continue
             label = _label_text(lab if inline else v)
@@ -812,7 +960,8 @@ class _GridReader:
     def _form(self, rule, raw: str, loc, snippet: str, *, tentative: bool = False) -> None:
         ones = [x for x in _split(raw, rule) if plausible(rule, x)]
         for one in ones:
-            self.forms.append(kgm.Value(rule, one, loc, snippet, tentative or self.tentative))
+            self.forms.append(kgm.Value(rule, one, loc, snippet, tentative or self.tentative,
+                                        signed=rule.type == "PERSON"))
         if ones:
             self.n_forms += 1
 
@@ -836,10 +985,18 @@ class _GridReader:
             s = " ".join(v.split())
             if self.text_all or len(s.split()) >= LONG_TEXT_WORDS:
                 bits.append(s)
-        if bits and len(self.lines) < MAX_LINES:
-            self.lines.append((self.name, r, " | ".join(bits)))
-        elif bits:
-            self.lines_dropped += 1
+        if not bits:
+            return
+        line = " | ".join(bits)
+        b = self.budget
+        if b["lines"] >= MAX_LINES:
+            b["dropped"] = b["dropped"] or "lines"
+        elif b["chars"] + len(line) > MAX_TEXT_CHARS:
+            b["dropped"] = b["dropped"] or "chars"
+        else:
+            self.lines.append((self.name, r, line))
+            b["lines"] += 1
+            b["chars"] += len(line)
 
     # -- the sheet's own record --
     def sheet_record(self, sheet_part: str) -> Optional["kgm.Record"]:
@@ -863,6 +1020,18 @@ class _GridReader:
         if not vals:
             return None
         return kgm.Record(self.rel, "sheet", vals)
+
+
+def sheet_part(name: str) -> str:
+    """The part a sheet is named for, the Ledger's way ('Part 101' -> 101,
+    '101' -> 101) - but a year is not a part ('2025'), and 'PN-1001' is the
+    part PN-1001, not '1001' (review, 2026-10-16)."""
+    n = " ".join(str(name or "").split())
+    if re.fullmatch(r"(?:19|20)\d\d", n):
+        return ""
+    if re.fullmatch(r"(?i)p/?n-?\d[\w\-/.]*", n):
+        return n.upper()
+    return _se()._part_from_name(n)
 
 
 def _split(raw: str, rule) -> List[str]:
@@ -905,12 +1074,15 @@ def _grid_rows(cells: Dict[Tuple[int, int], Any]) -> Iterator[Tuple[int, Dict[in
         yield r, by_row[r]
 
 
-def _stream_sheets(p: Path, notes: List[str]) -> Iterator[Tuple[str, Iterator]]:
+def _stream_sheets(p: Path, notes: List[str], data: Optional[bytes] = None
+                   ) -> Iterator[Tuple[str, Iterator]]:
     """A big .xlsx / .xlsm one sheet at a time, one row at a time (openpyxl
-    read-only: no merged ranges, no pictures). The workbook is closed when
-    the last sheet is done or the reader stops early."""
+    read-only: no merged ranges, no pictures), from its bytes when given.
+    The workbook is closed when the last sheet is done or the reader stops
+    early."""
     import openpyxl
-    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(io.BytesIO(data) if data is not None else p,
+                                read_only=True, data_only=True)
     try:
         for ws in wb.worksheets:
             def rows(ws=ws):
@@ -995,11 +1167,13 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
                                "tables": 0, "rows": 0, "forms": 0, "people": [],
                                "image_reader": getattr(image_reader, "name", "") or ""}
     readers: List[Tuple[_GridReader, str]] = []
+    budget: Dict[str, Any] = {"lines": 0, "chars": 0, "dropped": ""}
 
     def run(name: str, rows: Iterable, image: str = "", parent: str = "") -> None:
         is_extra = " › " in name and not image
         gr = _GridReader(name, by_norm, rel, tentative=bool(image), image=image,
-                         text_all=is_extra and "text box" in name, sheet=parent or name)
+                         text_all=is_extra and "text box" in name, sheet=parent or name,
+                         budget=budget)
         for r, cells in rows:
             gr.feed(r, cells)
         gr.close()
@@ -1014,6 +1188,17 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
             summary["sheets"] += 1
 
     images = []
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    data = None
+    if not via_excel and size <= IN_MEMORY_BYTES:
+        try:
+            data = p.read_bytes()
+        except OSError as exc:
+            raise Unreadable(f"could not be opened ({exc.__class__.__name__}: it may be "
+                             "open in another program)") from exc
     if not via_excel and _sheet_xml_bytes(p) > STREAM_XML_BYTES:
         summary["opened_with"] = "openpyxl, one row at a time (a big workbook)"
         notes.append("a big workbook: read one row at a time, without merged cells "
@@ -1021,13 +1206,13 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         try:
             # read while the workbook is open: _stream_sheets closes it
             # after its last sheet
-            for name, rows in _stream_sheets(p, notes):
+            for name, rows in _stream_sheets(p, notes, data):
                 run(name, rows)
         except Exception as exc:
             raise Unreadable(f"could not be opened ({exc.__class__.__name__})",
                              permanent=True) from exc
         try:
-            extras = excel_open.zip_extras(p)
+            extras = excel_open.zip_extras(io.BytesIO(data) if data is not None else p)
         except Exception:
             extras = []
         for ex in extras:
@@ -1045,19 +1230,36 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
     else:
         summary["opened_with"] = "Excel (hidden, read-only)" if via_excel else "openpyxl"
         try:
-            # openpyxl lists an .xlsx's pictures for free, so a missing reader
-            # can be named; Excel copies each one through the clipboard, so
-            # it is asked for them only when something can read them.
+            # openpyxl lists an .xlsx's pictures for free. Excel gives a
+            # picture only through the Windows clipboard: a background
+            # rebuild would replace what the user copied, and clipboard
+            # history may keep the picture - so the graph never asks Excel
+            # for them; it lists them and says so (the Ledger tab reads them).
             grids, images = se.load_workbook_grids(
-                p, notes, want_pictures=image_reader is not None or not via_excel)
+                p, notes, want_pictures=not via_excel, data=data)
         except se.LedgerError as exc:
-            # openpyxl refusing the bytes is for good; Excel failing may not be
-            # (busy, asking to sign in), so that is tried again next time.
-            raise Unreadable(str(exc), permanent=not via_excel) from exc
+            # openpyxl refusing the bytes is for good, and so is a password;
+            # Excel failing otherwise may not be (busy, asking to sign in),
+            # so that is tried again next time.
+            raise Unreadable(str(exc), permanent=not via_excel or bool(
+                re.search(r"(?i)password", str(exc)))) from exc
+        except Exception as exc:
+            if not via_excel:
+                raise
+            # Excel itself stopped (RPC server unavailable, a COM error):
+            # in words, and tried again next time.
+            raise Unreadable(f"Excel stopped while it was being read ({exc.__class__.__name__}"
+                             f": {str(exc)[:200]})") from exc
         for g in grids:
             run(g.sheet, _grid_rows(g.cells))
         del grids
     summary["pictures"] = len(images)
+    uncopied = [i for i in images if not i.data]
+    images = [i for i in images if i.data]
+    if uncopied:
+        notes.append(f"{len(uncopied)} picture(s) not read: in a workbook only Excel opens "
+                     "they come out only through the Windows clipboard, which the graph "
+                     "does not use (the Ledger tab reads them)")
     if images and image_reader is None:
         notes.append(f"{len(images)} picture(s) not read: install Tesseract (local OCR) "
                      "to read them")
@@ -1083,12 +1285,10 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
     people = set()
     for gr, parent in readers:
         records += gr.records
-        rec = gr.sheet_record(se._part_from_name(parent))
+        rec = gr.sheet_record(sheet_part(parent))
         if rec is not None:
             records.append(rec)
-        for line in gr.lines:
-            if len(lines) < MAX_LINES:
-                lines.append(line)
+        lines += gr.lines
         for k, t in gr.labels.items():
             if len(labels) < MAX_LABELS:
                 labels.setdefault(k, t)
@@ -1100,7 +1300,9 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
             if v.rule.type == "PERSON":
                 people.add(v.raw)
     summary["people"] = sorted(people)
-    if len(lines) >= MAX_LINES or any(gr.lines_dropped for gr, _p in readers):
+    if budget["dropped"] == "chars":
+        notes.append(f"only the first {MAX_TEXT_CHARS} characters of free text were kept")
+    elif budget["dropped"] == "lines":
         notes.append(f"only the first {MAX_LINES} lines of free text were kept")
     return Reading(records, lines, list(labels.values()), summary, notes)
 
@@ -1157,6 +1359,9 @@ def preview(p: Path, locator: Dict[str, Any], quote: str = "") -> List[Tuple[str
     p = Path(p)
     sheet = str(locator.get("sheet") or locator.get("page") or "")
     out: List[Tuple[str, str, bool]] = []
+    if not locator.get("image") and " › picture " in sheet:
+        # a picture's text line: its "page" names the sheet and the picture
+        locator = dict(locator, image=sheet.split(" › picture ", 1)[1])
     if locator.get("image"):
         out.append(("", f"a picture at {locator['image']} on sheet "
                         f"{sheet.split(' › ')[0]}, read by OCR", False))

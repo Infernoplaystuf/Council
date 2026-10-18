@@ -518,7 +518,9 @@ def test_text_boxes_and_charts_are_read(tmp_path, monkeypatch):
     real = excel_open.zip_extras
 
     def extras(path):
-        if Path(path) != book:
+        # the workbook is parsed from its bytes (a BytesIO) or, in the
+        # preview, its path
+        if isinstance(path, (str, Path)) and Path(path) != book:
             return real(path)
         return [excel_open.Extra("Part 101", "Part 101 › text box 1", excel_open.text_cells(
                     "Program Lead: Dana Whitfield\nProject: PRJ-0915\n"
@@ -1378,7 +1380,8 @@ def test_r2_a_hidden_excel_is_tied_to_the_council_and_dies_with_it(tmp_path):
         "import subprocess, sys\n"
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
         "import excel_open\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
         "print(child.pid, excel_open.tie_to_this_process(child.pid), flush=True)\n",
         encoding="utf-8")
     out = subprocess.run([sys.executable, str(parent)], capture_output=True, text=True,
