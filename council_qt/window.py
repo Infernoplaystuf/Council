@@ -194,8 +194,9 @@ class CouncilWindow(QMainWindow):
         group_page.inner.removeTab(index)
         group_page.inner.insertTab(index, page, title)
         group_page.inner.setCurrentIndex(index)
-        # Keep the group's tab-id → widget mapping in sync (the id order is
-        # stable since nothing is reordered).
+        # No mapping update needed: the group's tab-id order is stable
+        # since nothing is reordered — removeTab/insertTab at the same
+        # index keeps every id at the same position.
 
     def show_tab(self, title: str) -> None:
         """Bring a tab to the front by name.
