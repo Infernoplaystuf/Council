@@ -1278,26 +1278,44 @@ class Extraction:
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
-            part: str = "", use_images: bool = True) -> Extraction:
+            part: str = "", use_images: bool = True, progress=None) -> Extraction:
+    """`progress`: a progress_report.Progress; each workbook is one step, and
+    what it is doing (opening through Excel, reading picture 3 of 7) is shown."""
+    from progress_report import NullProgress
+    prog = progress or NullProgress()
     m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
     run = Extraction([str(s) for s in sources])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
+    prog.stage("reading workbooks", total=len(sources), unit="workbooks")
     for src in sources:
         src = Path(src)
+        via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
+            src.exists() and __import__("excel_open").kind_of(src) == "rights")
+        prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
+                    force=via_excel)
         try:
             grids, images = load_workbook_grids(src, run.problems)
         except LedgerError as e:
             run.problems.append(str(e))
+            prog.advance(what=f"{src.name}: not read")
             continue
         for i, img in enumerate(images):
+            prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
             if image_dir:
                 d = Path(image_dir)
                 d.mkdir(parents=True, exist_ok=True)
-                p = d / f"{_safe(src.stem)}_{_safe(img.sheet)}_{img.anchor}_{i + 1}.{img.ext}"
-                p.write_bytes(img.data)
-                img.saved_as = str(p)
+                # every part cleaned: a sheet, anchor or extension may hold
+                # characters Windows refuses in a file name ("?" did)
+                p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
+                         f".{_safe(img.ext) or 'png'}")
+                try:
+                    p.write_bytes(img.data)
+                    img.saved_as = str(p)
+                except OSError as e:          # one picture never stops the run
+                    run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
+                                        f"saved ({e.strerror or e}); it is still read")
             note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
             if reader is not None:
                 note.reader = getattr(reader, "name", "image reader")
@@ -1316,6 +1334,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                 note.text = "not read: install Tesseract (local OCR) to read images"
             run.images.append(note)
 
+        prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
         # pass 1: part numbers per sheet; then a workbook-wide fallback
         exs = [_Extractor(g, m, codes, "") for g in grids]
         for ex in exs:
@@ -1349,6 +1368,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                     if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
                                            note.anchor):
                         note.values += n
+        prog.advance(what=f"{src.name} read")
         orphans = sum(1 for ex in exs for o in ex.out if not o.part)
         if orphans:
             run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
@@ -1625,8 +1645,11 @@ class ApplyResult:
 
 
 def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader] = None,
-                 use_images: bool = True) -> ApplyResult:
+                 use_images: bool = True, progress=None) -> ApplyResult:
     import openpyxl
+    from progress_report import NullProgress
+    prog = progress or NullProgress()
+    prog.stage("reading the review workbook")
     review_path = Path(review_path)
     wb = openpyxl.load_workbook(review_path, data_only=True)
     try:
@@ -1681,7 +1704,8 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         save_aliases(csv_path, mapping, ignore)
 
     run = extract(schema, meta["sources"], mapping, ignore, image_reader=image_reader,
-                  use_images=use_images)
+                  use_images=use_images, progress=prog)
+    prog.stage("matching your choices")
     decisions = decide(run, schema)
     accepted = 0
     for d in decisions:
@@ -1706,16 +1730,22 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             accepted += 1
 
     rows = rows_from(decisions, schema)
+    prog.stage("writing the parent CSV", total=len(rows), unit="rows")
     res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in meta["sources"])[:200])
+    prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:
         d = Path(fill_dir)
         d.mkdir(parents=True, exist_ok=True)
         stem = Path(schema.template_path).stem
-        for p in sorted({r[schema.id_field] for r in rows}, key=sample_sort_key):
+        parts = sorted({r[schema.id_field] for r in rows}, key=sample_sort_key)
+        prog.stage("filling templates", total=len(parts), unit="parts")
+        for p in parts:
             out = d / f"{_safe(stem)}_{_safe(p)}.xlsx"
+            prog.update(f"part {p}")
             warnings += fill_template(schema, ledger.rows_for(p), out)
             filled.append(str(out))
+            prog.advance(what=f"{out.name} written")
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
                        warnings + [f"conflict kept: {c}" for c in res.conflicts])
 
@@ -1779,9 +1809,11 @@ def main(argv=None) -> int:
             out = Path(args.out) if args.out else Path(args.csv).with_name(
                 f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
             mapping, ignore = load_aliases(args.csv)
-            run = extract(ledger.schema, files, mapping, ignore,
-                          image_dir=out.with_name(out.stem + "_images"),
-                          part=args.part, use_images=not args.no_images)
+            from progress_report import Progress
+            with Progress("ledger extract") as prog:
+                run = extract(ledger.schema, files, mapping, ignore,
+                              image_dir=out.with_name(out.stem + "_images"),
+                              part=args.part, use_images=not args.no_images, progress=prog)
             if args.llm:
                 suggest_with_llm(run, ledger.schema, args.llm)
             dec = decide(run, ledger.schema)
@@ -1794,7 +1826,10 @@ def main(argv=None) -> int:
                 print(f"  ! {p}")
             print(f"review: {out}")
         else:
-            r = apply_review(args.review, args.fill_dir, use_images=not args.no_images)
+            from progress_report import Progress
+            with Progress("ledger apply") as prog:
+                r = apply_review(args.review, args.fill_dir, use_images=not args.no_images,
+                                 progress=prog)
             if r.learned:
                 print(f"learned {len(r.learned)} label mappings")
             print(f"{r.accepted} values accepted -> {r.rows} rows: {r.csv_result}")

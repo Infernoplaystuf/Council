@@ -38,8 +38,24 @@ plain values (no pickle, and nothing is pasted into the code as source).
 A report bigger than frame_codec.MAX_RESULT_MB comes back without its
 result, saying so: the app would hold it several times over while reading
 it.
+
+THE FILE FENCE (council_core.analyst_floor). Before the code runs, an audit
+hook is installed that checks the real path of every file open, directory
+listing and file-changing call the process makes, whatever route the code
+took to it: the data folders and Python's own libraries and the app's code
+may be read (and the SQL / Mongo bridge's connection registries); data_out,
+the stats cache, this run's temporary folders and the bridge's audit log
+may be written; nothing else, and no program may be started. It cannot be
+removed. A refusal ends the run with its plain reason as the error — even
+when the code caught it — and no result. The run's working folder is also
+its temp folder, so a library that spills to a temporary file stays inside
+the fence.
 """
 from __future__ import annotations
+
+# FIRST: the fence captures the os.path functions it resolves paths with
+# before anything else is imported or run.
+from council_core import analyst_floor
 
 import json
 import keyword
@@ -103,7 +119,114 @@ def _read_call(call_file: str):
     return _CALL.format(entry=entry), {TOOL_ARGS: args}, folders, True, ""
 
 
+#: The SQL / Mongo bridge's connection registries (db_connections): read.
+_BRIDGE_REGISTRIES = ("sql_connections.json", "mongo_connections.json")
+
+
+def _bridge_audit_files():
+    """db_audit.log and the rotations db_connections keeps (db_audit.log.1 …
+    .N, N = COUNCIL_DB_AUDIT_KEEP, default 5): appended to, and shifted
+    along when the log passes its size cap."""
+    try:
+        import db_connections
+        name = db_connections._AUDIT_LOG_FILENAME
+        keep = db_connections._audit_keep_count()
+    except Exception:                                     # noqa: BLE001
+        name, keep = "db_audit.log", 5
+    return [name] + [f"{name}.{i}" for i in range(1, keep + 1)]
+
+
+def _fence_roots(folders, code_file: str, out_json: str, call_file: str,
+                 cwd: str):
+    """(read-only, read-write, never) roots for this run's file fence
+    (analyst_floor). Read-only: the data folders, Python's own installation
+    and the app's code. Read-write: the vault's data_out and .stats_cache
+    (where the sandbox's helpers write) and this run's own temporary folders
+    (the one holding the code, call.json and the report, and the working
+    folder). Never: the rest of the vault, even inside the app folder."""
+    read_only = list(folders) + analyst_floor.python_roots() + [str(_APP_ROOT)]
+    read_write = [cwd, os.path.dirname(out_json)]
+    never = []
+    try:
+        from council_core import paths as _paths
+        import data_index
+        vault = Path(_paths.vault_dir())
+        never.append(str(vault))
+        read_write += [str(data_index.output_dir(vault)),
+                       str(vault / ".stats_cache")]
+        # The SQL / Mongo bridge (db_connections, behind list_sql_connections,
+        # sql_query, read_mongo_collection, …) reads its connection registries
+        # and appends to its audit log in the vault ROOT — single files, so
+        # the rest of the vault root stays closed (2026-10-16 review: every
+        # bridge call ended the run).
+        read_only += [str(vault / n) for n in _BRIDGE_REGISTRIES]
+        read_write += [str(vault / n) for n in _bridge_audit_files()]
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        # stats_cache finds the vault by itself (COUNCIL_VAULT_ROOT, else
+        # ~/.council/vault); its folder is the one it will write.
+        import stats_cache
+        read_write.append(str(stats_cache.StatsCache(None).dir))
+    except Exception:                                     # noqa: BLE001
+        pass
+    # The code and the call are inputs: readable wherever the caller put
+    # them.
+    read_only += [p for p in (code_file, call_file) if p]
+    return read_only, read_write, never
+
+
+#: Packages the fence keeps from loading while the code runs, and why.
+#: matplotlib (which pandas' df.plot() imports) makes and reads its config
+#: folder in the user's home on start-up — outside the fence, which then
+#: refused it with a path the model could not act on. The sandbox makes no
+#: charts (run_python's own help says so). The import fails as a missing
+#: package would (ModuleNotFoundError with this reason), so a df.plot() the
+#: code catches, or an optional-dependency probe, does not end the run.
+_REFUSED_IMPORTS = {
+    "matplotlib": ("charts are not available in the sandbox (no matplotlib, "
+                   "so no df.plot(); the Artist makes charts) - print the "
+                   "numbers or set result_df instead"),
+}
+
+
+def _point_temp_at(folder: str) -> None:
+    """Make ``folder`` (the run's own throwaway working folder, read-write
+    under the fence) this process's temp folder, before the fence goes in.
+
+    A library that spills to a temporary file in the DEFAULT temp folder —
+    tempfile.TemporaryFile / NamedTemporaryFile / mkstemp, as openpyxl's
+    writer, pyxlsb's reader and some compression paths do — wrote into the
+    user's %TEMP%, outside the fence, and the refusal ended the run with a
+    path the model could not act on (2026-10-16 review). tempfile caches its
+    answer (this module already asked it, for the folder itself), so the
+    cache is set as well as the environment a library may read directly.
+    The folder is removed with the run."""
+    for var in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[var] = folder
+    tempfile.tempdir = folder
+    # platform.uname() caches what it learns, and on Windows it learns part
+    # of it by STARTING `cmd /c ver` — which the fence refuses (a started
+    # program runs outside it). Importing pandas usually asks already; make
+    # sure it has, so a library asking for the machine later never spawns.
+    # The processor is worked out lazily, the first time it is asked for
+    # (pd.show_versions asks; off Windows that starts `uname -p`), and then
+    # kept on the cached answer — ask for it now too.
+    try:
+        import platform
+        _ = platform.uname().processor
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
 def main(argv) -> int:
+    # No .pyc is written for a module first imported while the code runs:
+    # the app's code folder and Python's own are read-only under the fence,
+    # so a .pyc write there would be refused and end the run. pandas and
+    # numpy are already imported (vault_analyst, below, imports them before
+    # the fence); scipy and the rest read their .py from site-packages,
+    # which is readable. (nx_guard does the same for the same reason.)
+    sys.dont_write_bytecode = True
     # Resolve everything to absolute BEFORE chdir, and pin the app root on
     # sys.path so imports survive the chdir.
     code_file = str(Path(argv[1]).resolve())
@@ -123,13 +246,21 @@ def main(argv) -> int:
     # path) then lands here and is discarded, not in the app's code folder
     # (reproduced 2026-10-15: a relative savefig wrote into the app root).
     report: dict = {}
+    fence = None
     if refusal:
         df, log = None, refusal
         report = {"error": refusal}
     else:
         with tempfile.TemporaryDirectory(prefix="council-analyst-cwd-") as _cwd:
             os.chdir(_cwd)
+            _point_temp_at(_cwd)
             try:
+                # The file fence, last thing before the code: from here to
+                # the end of the process every open, listing and file change
+                # is checked (analyst_floor).
+                fence = analyst_floor.install(*_fence_roots(
+                    [folder] + folders, code_file, out_json, call_file,
+                    _cwd), refused_imports=_REFUSED_IMPORTS)
                 df, log = vault_analyst.execute_pandas_code(
                     code, [Path(folder)] + [Path(f) for f in folders],
                     extra_globals=extra or None, report=report)
@@ -137,6 +268,12 @@ def main(argv) -> int:
                 # Leave the throwaway cwd before it is removed (on Windows a
                 # directory cannot be deleted while it is the cwd).
                 os.chdir(_APP_ROOT)
+    if fence is not None and fence.refusals:
+        # A refusal ends the run, even one the code caught and carried on
+        # past: no result, and the fence's plain reason as the error.
+        why = fence.first_refusal
+        df, log = None, why
+        report.update(ran=False, error=why, note="")
     out = {"ok": df is not None, "log": str(log or "")[-4000:],
            "table": None, "ran": bool(report.get("ran")),
            "stdout": _cut(report.get("stdout")),

@@ -31,8 +31,9 @@ from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (ImageReader, apply_review, decide, default_image_reader,
                             extract, load_aliases, workbook_files, write_review)
 
-#: progress(message) — called from the worker thread; the caller hops to its UI.
-Progress = Callable[[str], None]
+#: listener(line, fraction or None) - called from the worker thread with every
+#: progress line (also printed in the terminal); the caller hops to its UI.
+Listener = Callable[[str, Optional[float]], None]
 
 
 def default_csv_for(template) -> Path:
@@ -106,20 +107,6 @@ class ExtractSummary:
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
-def _counting(reader: Optional[ImageReader], progress: Optional[Progress]):
-    """Wrap the image reader so each image is reported as it is read."""
-    if reader is None or progress is None:
-        return reader
-    n = [0]
-
-    def read(data: bytes):
-        n[0] += 1
-        progress(f"reading image {n[0]}…")
-        return reader(data)
-    read.name = getattr(reader, "name", "image reader")
-    return read
-
-
 def _images_read(notes) -> int:
     return sum(1 for n in notes if n.reader not in ("", "none installed")
                and not n.text.startswith(("reader failed", "(no text found)")))
@@ -127,8 +114,18 @@ def _images_read(notes) -> int:
 
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
-                progress: Optional[Progress] = None) -> ExtractSummary:
-    say = progress or (lambda _m: None)
+                progress: Optional[Listener] = None) -> ExtractSummary:
+    from progress_report import Progress
+    with Progress("ledger extract", listener=progress) as prog:
+        s = _extract(csv_path, sources, review_path, part, use_images, image_reader, prog)
+        prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
+                    f"review, {len(s.problems)} problems")
+        return s
+
+
+def _extract(csv_path, sources, review_path, part, use_images, image_reader,
+             prog) -> ExtractSummary:
+    say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
         raise LedgerError(f"{Path(csv_path).name} has no schema beside it; "
@@ -147,10 +144,10 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     say(f"reading {len(files)} workbooks…")
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
-                  image_reader=_counting(image_reader, progress), part=part,
-                  use_images=use_images)
+                  image_reader=image_reader, part=part, use_images=use_images,
+                  progress=prog)
+    prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
-    say("writing the review workbook…")
     write_review(out, run, dec, ledger.schema, str(csv_path))
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
@@ -180,16 +177,17 @@ class ApplySummary:
 
 def run_apply(review_path, fill_dir=None, use_images: bool = True,
               image_reader: Optional[ImageReader] = None,
-              progress: Optional[Progress] = None) -> ApplySummary:
-    say = progress or (lambda _m: None)
-    if use_images and image_reader is None:
-        say("starting the local image reader…")
-        image_reader = default_image_reader()
-    say("applying the review…")
-    r = apply_review(review_path, fill_dir or None,
-                     image_reader=_counting(image_reader, progress), use_images=use_images)
-    return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
-                        list(r.ignored), list(r.filled), list(r.warnings))
+              progress: Optional[Listener] = None) -> ApplySummary:
+    from progress_report import Progress
+    with Progress("ledger apply", listener=progress) as prog:
+        if use_images and image_reader is None:
+            prog.update("starting the local image reader…")
+            image_reader = default_image_reader()
+        r = apply_review(review_path, fill_dir or None, image_reader=image_reader,
+                         use_images=use_images, progress=prog)
+        prog.finish(f"{r.accepted} values accepted -> {r.rows} rows: {r.csv_result}")
+        return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
+                            list(r.ignored), list(r.filled), list(r.warnings))
 
 
 def open_path(path) -> None:

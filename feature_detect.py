@@ -16,8 +16,31 @@ return ``{"error": ...}`` instead of raising if a dependency is missing.
 """
 from __future__ import annotations
 
+import io
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from image_stats import plain_error as _plain_error
+
+# The analyst sandbox hands detect_and_count_features a path STRING it has
+# already confirmed is inside the data folders. The input is checked and
+# opened with os/io functions bound here, at import, before any model code
+# runs — never through a pathlib object built from it — so nothing model code
+# does to the pathlib classes can change which file is read (2026-10-16).
+_ISFILE = os.path.isfile
+_BASENAME = os.path.basename
+_SPLITEXT = os.path.splitext
+_FSPATH = os.fspath
+_OPEN = io.open
+
+
+def _path_str(path: Any) -> str:
+    """``path`` as a plain string, taken once (a str is used as-is)."""
+    if isinstance(path, str):
+        return path
+    s = _FSPATH(path)
+    return s.decode("utf-8", "replace") if isinstance(s, bytes) else s
 
 _IMAGE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff",
@@ -108,14 +131,23 @@ def detect_and_count_features(path: Any, *,
     if Image is None:
         return {"error": "numpy + scipy + Pillow are required for feature "
                          "detection (pip install numpy scipy pillow)."}
-    p = Path(path)
-    if not p.is_file():
+    p = _path_str(path)
+    if not _ISFILE(p):
         return {"error": f"not a file: {p}"}
+    name = _BASENAME(p)
+    fh = None
     try:
-        im = Image.open(p)
-        im.load()
+        # Pillow is given an open file, not the name: it never resolves or
+        # re-opens the path itself.
+        with _OPEN(p, "rb") as fh:
+            im = Image.open(fh)
+            im.load()
     except Exception as exc:
-        return {"error": f"could not open image: {exc!r}"}
+        # The reason in words, with the file's name for Pillow's open-file
+        # repr (<_io.BufferedReader name=...>) and the full path
+        # (image_stats.plain_error).
+        return {"error": f"could not open image {name}: "
+                         f"{_plain_error(exc, p, fh)}"}
 
     w0, h0 = im.size
     gray_im = im.convert("L")
@@ -212,7 +244,7 @@ def detect_and_count_features(path: Any, *,
                           fill=(255, 235, 0))
             d = _default_out_dir(out_dir)
             if d is not None:
-                stem = re_safe(p.stem)
+                stem = re_safe(_SPLITEXT(name)[0])
                 outp = d / f"{stem}_detected_{count}.png"
                 base.save(outp)
                 annotated_path = str(outp)
@@ -220,7 +252,7 @@ def detect_and_count_features(path: Any, *,
             annotated_path = None
 
     result: Dict[str, Any] = {
-        "file": p.name,
+        "file": name,
         "count": count,
         "polarity": pol,
         "threshold": int(t),
