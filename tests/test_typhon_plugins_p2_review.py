@@ -393,3 +393,64 @@ def test_a_scan_with_every_camera_plugin_running_adds_no_note(host):
     assert host.discover_cameras().notes == today.notes
 
 
+# ======================================================================
+# Backend names the set-up can save; cameras of the plugin's own family
+# ======================================================================
+@pytest.mark.parametrize("name", ["Acme.Thermal", "acme|thermal",
+                                  "acme." + "x" * 70, ".acme"])
+def test_a_backend_name_the_set_up_cannot_save_is_refused(host, name):
+    class Thermal:
+        backend = name
+        setup_label = "Thermal"
+
+        def available(self):
+            return True, ""
+
+        def discover(self):
+            return []
+
+        def setup_guide(self, python):
+            return api.Guide(key=name, title="T", summary="s",
+                             steps=(api.Step("x"),))
+
+        def setup_checks(self):
+            return api.Readiness(name, [api.Check("c", True, "", "")])
+    third_party(host, Thermal, contributes=["setup"])
+    assert host.camera_backend("acme.thermal") == ""
+    state, why = host.state("acme.thermal")
+    assert state == ph.FAULTED and "camera family" in why, why
+    assert [f.plugin for f in host.camera_families()] == [
+        "typhon.basler", "typhon.prophesee"]
+
+
+def test_a_backend_name_the_set_up_can_save_is_kept(host):
+    class Thermal:
+        backend = "acme.thermal"
+    third_party(host, Thermal)
+    assert host.camera_backend("acme.thermal") == "acme.thermal"
+    cs.save_families(cs.setup_path(host.project_dir), ["acme.thermal"])
+
+
+def test_a_camera_listed_under_another_familys_backend_is_dropped(host):
+    class Thermal:
+        backend = "acme.thermal"
+
+        def available(self):
+            return True, ""
+
+        def discover(self):
+            return [cameras.CameraInfo("basler", "40099999", "boA",
+                                       "40099999", "Basler", "frame"),
+                    THERMAL,
+                    cameras.CameraInfo("acme.thermal", "t2", "T", "T2",
+                                       "Acme", "infrared"),
+                    "not a camera"]
+    third_party(host, Thermal)
+    found = host.discover_cameras(["acme.thermal"])
+    assert [(c.backend, c.key) for c in found.cameras] == [
+        ("acme.thermal", "t1")]
+    dropped = [n for n in found.notes if "left out" in n]
+    assert len(dropped) == 3, found.notes
+    assert "40099999" in dropped[0] and "basler" in dropped[0]
+
+

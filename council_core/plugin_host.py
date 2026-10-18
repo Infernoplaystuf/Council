@@ -467,6 +467,24 @@ class Fault:
         return f"{self.error} (in {self.hook}; {self.kind})"
 
 
+def backend_problem(name: str, builtin: bool = False) -> str:
+    """Why `name` cannot be a camera plugin's backend name, or "": it is the
+    camera family camera_setup.json saves (camera_setup.FAMILY_RE: lower
+    case, at most 64 characters, no "|", which preset keys are split at),
+    and a plugin from someone else's carries a dot (design 3.3)."""
+    from .camera_setup import FAMILY_RE
+
+    if not FAMILY_RE.match(name):
+        return (f"its backend name {name!r} cannot name a camera family: "
+                f"use at most 64 characters, a-z, 0-9, '.', '_' and '-', "
+                f"starting with a letter or digit")
+    if not builtin and "." not in name:
+        return (f"its backend name {name!r} has no dot: a plugin from "
+                f"someone else names its cameras' family with one "
+                f"('acme.thermal'), so it can never take a built-in's")
+    return ""
+
+
 def capabilities_of(device: Any, info: Any) -> frozenset:
     """What an open camera can do, from what today's Device says of itself
     (design 3.4; council_core.camera_capabilities.of_device, the one rule).
@@ -1082,9 +1100,16 @@ class PluginHost:
 
     def camera_backend(self, pid: str) -> str:
         """Camera plugin `pid`'s backend name — its cameras' CameraInfo.
-        backend ("basler") — or "" when it cannot run or names none. A
-        plugin from someone else must name one with a dot ("acme.thermal",
-        design 3.3), so it can never claim a built-in's preset keys."""
+        backend ("basler") — or "" when it cannot run or names none.
+
+        The name is the camera family the set-up saves (camera_setup.
+        FAMILY_RE: lower case, at most 64 characters, so never the "|" that
+        preset keys are split at), and a plugin from someone else must name
+        one with a dot ("acme.thermal", design 3.3), so it can never claim a
+        built-in's preset keys. A plugin from someone else that names one
+        that is not is switched off with the reason (backend_problem):
+        before the P2 review "Acme.Thermal" was offered as a check box, and
+        finishing the wizard raised ValueError in the window."""
         from .cameras import CameraError
 
         try:
@@ -1093,11 +1118,16 @@ class PluginHost:
         except CameraError:
             return ""
         name = name if isinstance(name, str) else ""
-        rec = self.record(pid)
-        if name and rec is not None and not rec.builtin and "." not in name:
+        if not name:
             return ""
-        if name:
-            self._backend_names[pid] = name
+        rec = self.record(pid)
+        builtin = rec is not None and rec.builtin
+        problem = backend_problem(name, builtin=builtin)
+        if problem:
+            if rec is not None and not builtin:
+                self.fault(pid, "backend", ValueError(problem))
+            return ""
+        self._backend_names[pid] = name
         return name
 
     def camera_plugin_for(self, backend: str) -> Optional[str]:
@@ -1147,7 +1177,10 @@ class PluginHost:
 
         self.retry_cameras()
         chosen = list(pids) if pids is not None else self.camera_plugins()
-        found = cameras.discover(self.backends(chosen))
+        backends = self.backends(chosen)
+        found = cameras.discover(backends)
+        for backend in backends:
+            found.notes.extend(backend.dropped)
         if pids is None:
             found.notes.extend(self._unscanned(chosen))
         return found
@@ -2191,6 +2224,8 @@ class PluginBackend:
         self.plugin = pid
         #: What to install, as the last `available()` said.
         self.install_hint = ""
+        #: What the last `discover()` left out, and why (the scan's notes).
+        self.dropped: List[str] = []
 
     @property
     def name(self) -> str:
@@ -2211,7 +2246,37 @@ class PluginBackend:
         return ok
 
     def discover(self) -> List[Any]:
-        return list(self.host.camera_call(self.plugin, "discover") or [])
+        """The cameras the plugin lists — only those of its own family: a
+        CameraInfo carrying its backend, a key, and the kind "frame" or
+        "event". Any other is left out, and why is kept in `dropped` for the
+        scan's notes: before the P2 review a plugin could list a camera
+        under another family's backend, which open_camera then sent to that
+        family's plugin, its presets keyed as that family's."""
+        from .cameras import CameraInfo
+
+        listed = list(self.host.camera_call(self.plugin, "discover") or [])
+        own = self.name
+        who = self.host._name(self.plugin)
+        kept: List[Any] = []
+        self.dropped = []
+        for info in listed:
+            if not isinstance(info, CameraInfo):
+                why = (f"it listed {type(info).__name__} {str(info)[:40]!r}, "
+                       f"which is not a camera (CameraInfo)")
+            elif info.backend != own:
+                why = (f"{info.label} carries the {info.backend!r} backend; a "
+                       f"camera plugin lists only cameras of its own family "
+                       f"({own!r})")
+            elif not info.key:
+                why = f"{info.label} has no key to be opened by"
+            elif info.kind not in ("frame", "event"):
+                why = (f"{info.label} is a {info.kind!r} camera; a camera is "
+                       f"a frame or an event camera")
+            else:
+                kept.append(info)
+                continue
+            self.dropped.append(f"{who}: a camera is left out — {why}")
+        return kept
 
     def open(self, info: Any) -> Any:
         return self.host.camera_call(self.plugin, "open", info)
