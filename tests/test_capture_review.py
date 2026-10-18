@@ -289,6 +289,64 @@ def test_a_frame_picked_right_after_stop_is_kept_when_the_live_view_is_back(
     assert rv.live, "dragging to the end is live again"
 
 
+def _stopped_with_the_live_view_not_back(ui, tmp_path):
+    """Connected, a few frames captured, Stop, the run landed — and a tick
+    has seen the Stop while the live view is still to come back: where a
+    user's pick almost always falls (the slider ticks 30 times a second)."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    # The restart waits for a moment the test chooses (_manage_preview
+    # leaves a stopped stream alone until preview_retry_at), so the tick
+    # below sees the Stop with the live view certainly not back yet.
+    frame_camera._LIVE.preview_retry_at = time.monotonic() + 3600
+    frame_camera.stop()
+    frame_camera._LIVE.session.flush(30)
+    rv.tick(None)
+    assert not rv._capturing and rv._run_ended, "a tick has seen the Stop"
+    assert not frame_camera._LIVE.previewing and not rv._previewing
+    return rv
+
+
+def test_a_frame_picked_after_a_tick_has_seen_stop_is_kept_too(ui, tmp_path):
+    """The same pick as above, made after a tick has seen the Stop (the
+    usual case: the case above drags before any tick has, so it never
+    reaches this branch) — still kept when the live view comes back."""
+    rv = _stopped_with_the_live_view_not_back(ui, tmp_path)
+    drag(rv, 0)
+    assert rv._keep_pick
+    frame_camera._LIVE.preview_retry_at = 0.0        # let it come back
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    pump(0.3)
+    assert rv.showing_saved() and not rv.live, "the pick was taken away"
+    assert rv.scrubber.get() == 0, rv.scrubber.get()
+    assert ui.ports.current_frame.get() == os.path.basename(rv.files[0])
+    assert rv.scrubber._hi == len(rv.files), "live is at the end"
+
+
+def test_a_pick_after_stop_does_not_outlive_a_disconnect(ui, tmp_path):
+    """Picked after Stop, then Disconnect before the live view is back: the
+    pick belonged to that connection. The next Connect is live ("connected
+    means live"), as it is with no pick — not the old saved frame."""
+    rv = _stopped_with_the_live_view_not_back(ui, tmp_path)
+    drag(rv, 0)
+    assert pump_until(rv.showing_saved)
+    frame_camera.disconnect()
+    pump(0.2)
+    assert not rv._run_ended and not rv._keep_pick, \
+        "the Disconnect ended the after-Stop gap"
+    connect_frame_camera()
+    assert pump_until(lambda: rv._previewing), "the live view did not start"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    assert not rv.showing_saved()
+    assert rv.scrubber.get() == len(rv.files), "at the live end"
+
+
 class StillCapturing:
     """A capture that is running but, for the moment, saving nothing new —
     so playback can catch up with it. (At a steady 50 windows a second a

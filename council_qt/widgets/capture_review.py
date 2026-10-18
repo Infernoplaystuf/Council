@@ -451,6 +451,12 @@ class CaptureReviewer(QObject):
             # A new run means a new writer, whose list starts empty.
             self._run = run
             self._seen = 0
+            # ...and the after-Stop gap (_moved) is over: the run changes
+            # at a Start, and at a Disconnect (frame_camera clears it), which
+            # comes with no previewing change to tell _live_lost — the live
+            # view was not back yet. A pick kept past it made the next
+            # Connect show that saved frame, not live.
+            self._run_ended = self._keep_pick = False
         was_capturing = self._capturing
         if capturing and not self._capturing:
             self._began()
@@ -519,6 +525,10 @@ class CaptureReviewer(QObject):
         frame, or nothing."""
         if self._capturing:
             return
+        # The live view going ends the after-Stop gap too (a failed camera,
+        # the raw view): the next time it comes back is not "back after
+        # Stop". (In the gap itself it is not running, so cannot stop.)
+        self._run_ended = self._keep_pick = False
         was_live = self.live
         self.live = False
         # The next camera (or the same one reconnected) may use other bits.
