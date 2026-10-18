@@ -393,6 +393,33 @@ def trigger_warning(source: str) -> str:
 
 
 # ======================================================================
+# Downsample: the core's row in every frame camera's "Capture" group
+# ======================================================================
+def downsample_setting(factor: Any, options: Any = None) -> Setting:
+    """THE CORE'S DOWNSAMPLE ROW (docs/typhon_plugins_design.md 2.1, 2.5):
+    Downsample, "save.downsample" (Off, 2x, 3x, 4x), in the "Capture" group
+    of every frame camera with a capture set-up, chosen before a run and
+    fixed while capturing. Downsample is the core's, not the triggering
+    plugin's: this row is Typhon's whatever the camera, and the camera's
+    `options` (CaptureOptions) say only whether it can change while the
+    stream runs (camera binning needs it stopped) and how it is made there
+    (downsample_live, downsample_help).
+
+    The key, its choices and its words stay in council_core.triggered,
+    where today's set-up has them, until the files move at stage P7
+    (design 7.2); today's providers build their Capture group with this
+    row (triggered.capture_settings), so both Typhons describe it alike."""
+    from . import triggered
+
+    live = getattr(options, "downsample_live", True)
+    words = str(getattr(options, "downsample_help", "") or "")
+    return Setting(triggered.DOWNSAMPLE_KEY, "Downsample", triggered.GROUP,
+                   CHOICE, triggered.downsample_text(factor),
+                   choices=triggered.DOWNSAMPLES, live=bool(live),
+                   per_run=True, help=words or triggered.DOWNSAMPLE_HELP)
+
+
+# ======================================================================
 # Turning what was typed or saved into what the setting takes
 # ======================================================================
 _TRUE = {"1", "true", "yes", "on", "enabled"}

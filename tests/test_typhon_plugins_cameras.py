@@ -99,11 +99,10 @@ def test_the_api_is_0_2_with_the_camera_plugin_types():
                  "camera.setup_scan", "type.CameraSetup", "type.Guide"):
         assert api.has(name), name
     # Stage P3 row 1: Start asks check_start and a camera plugin's
-    # record_fields (the camera record); the facets come with P3's rows 2-3.
-    for now in ("camera.record_fields", "hook.check_start"):
+    # record_fields (the camera record); rows 2-3: a camera handle asks its
+    # camera plugin's facets.
+    for now in ("camera.record_fields", "hook.check_start", "camera.facet"):
         assert api.has(now), now
-    for later in ("camera.facet",):
-        assert not api.has(later), f"{later}: nothing calls it yet"
     from council_core import camera_capabilities
     assert api.CAPABILITIES is camera_capabilities.CAPABILITIES
     assert api.device_capabilities is camera_capabilities.of_device

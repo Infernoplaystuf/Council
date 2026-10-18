@@ -69,6 +69,26 @@ and handed them in `apply_preset_values(camera, values)` when it is
 applied. The keys of a plugin that is not running are never handed to the
 camera, never lost, and said as kept (design 3.9).
 
+THE CAPTURE SET-UP AND THE FACETS (stage P3 rows 2 and 3)
+A feature plugin never gets a camera's Device: it gets a `CameraHandle`,
+whose `facet(name)` gives what the camera's plugin offers by capability
+name (design 3.4) — `SoftwareTrigger` (Typhon fires it), `HardwareTrigger`
+(the camera waits for an input), `Binning` (the camera averages its own
+pixels), or None. The types they take and give — `CaptureSetup` (a run's
+trigger mode, source, frames per trigger, timer, edge, delay, debounce and
+Downsample), `CaptureOptions` (what the camera offers it), the modes and
+Typhon's own sources — are here, so a camera plugin implements a facet
+against this API alone and never imports the triggering plugin (design
+2.5). While the code stays where it is (design 7.2) they are today's
+classes, re-exported; the camera's set-up stays the storage today's code
+reads (`device.capture`), read by a plugin through `ctx.capture_setup()`.
+Downsample is the core's: its key (save.downsample), its row in every frame
+camera's "Capture" group and the one frame stage that makes the saved
+picture smaller are Typhon's, not a plugin's (design 2.1). A `FrameView`
+carries every term that turns a picture's pixel into a sensor pixel, and
+`to_sensor()` does it (design 3.12). A `TriggerSource` says "capture now"
+(design 3.6): Typhon's own are the triggering plugin's Software and Timer.
+
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
 reading a manifest, or importing this package, loads no camera code.
@@ -95,8 +115,13 @@ API_VERSION = "0.2"
 #: of a "Typhon (plugins)" project calls). From stage P3 rows 1 and 4 the
 #: run hooks (Start asks check_start, before anything stops), a camera
 #: plugin's record_fields (the camera record at Start), the preset hooks,
-#: and the context's two file services and data folder. status joins when
-#: the status strip asks it (P4), a camera plugin's facet with the facets.
+#: and the context's two file services and data folder. From P3 rows 2 and
+#: 3: a camera plugin's facets (a camera handle asks them), the types of
+#: the capture set-up and the facets, a FrameView's coordinates and the
+#: file it was saved as, the context's view of the camera's set-up, and the
+#: triggering plugin's trigger slot and Capture now (F9), which Start, Stop
+#: and the F9 key call. status, panel, toolbar and settings_rows join when
+#: the window asks them (P4).
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
     "context.say", "context.call_in_ui", "context.cameras",
@@ -122,6 +147,15 @@ FEATURES: FrozenSet[str] = frozenset({
     "type.CameraPlugin", "type.CategoryHints", "type.ReviewSource",
     "type.CameraSetup", "type.Guide", "type.Step", "type.Check",
     "type.Readiness", "type.RunPlan", "type.RunInfo", "type.RunCamera",
+    # P3 rows 2 and 3: the facets a camera handle gives, the capture
+    # set-up's types, a frame's coordinates, the camera's set-up read in
+    # place, the trigger sources, and the triggering plugin's trigger slot
+    # and Capture now (built-in: the record gate's)
+    "camera.facet", "type.CaptureSetup", "type.CaptureOptions",
+    "type.SoftwareTrigger", "type.HardwareTrigger", "type.Binning",
+    "type.TriggerSource", "type.TriggerEvent", "type.Action",
+    "frame.to_sensor", "frame.saved", "context.capture_setup",
+    "hook.trigger_slot", "hook.capture_now",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -150,21 +184,30 @@ class CameraHandle:
 
     0.2: the capabilities are what the camera's plugin confirmed when it
     opened the camera, else what today's Device says of itself (frames or
-    events, restartable, area_live, grab_failures, raw_recording); `facet`
-    answers None until the facets arrive at stage P3."""
+    events, restartable, area_live, grab_failures, raw_recording). From P3:
+    `facet(name)` is what the camera's plugin gives for a capability name
+    (FACETS), asked when it is called; `lookup` is how the handle asks
+    (Typhon's, never compared)."""
     name: str
     info: Any = None
     kind: str = ""
     capabilities: FrozenSet[str] = frozenset()
+    lookup: Optional[Callable[[str], Any]] = field(default=None,
+                                                   compare=False, repr=False)
 
     @property
     def connected(self) -> bool:
         return self.info is not None
 
     def facet(self, name: str) -> Any:
-        """The facet `name` ("software_trigger", "binning", ...), or None
-        when the camera has none. None for every name in 0.1."""
-        return None
+        """The facet `name` ("software_trigger", "hardware_trigger",
+        "binning"), or None when the camera has none — or no camera is
+        open. A facet whose capability the camera did not confirm may still
+        be given: its `problem()` then says why it cannot (design 3.6: the
+        facet's own check runs at Start)."""
+        if self.lookup is None or self.info is None:
+            return None
+        return self.lookup(str(name))
 
 
 @dataclass(frozen=True)
@@ -189,11 +232,21 @@ class FrameView:
     plugin (this PC's monotonic clock, µs). `meta` is read-only: `aoi` (the
     camera's area the frame was taken with), `format`, and Downsample's
     `reduce` / `downsample` when on. `saved` is the frame's file name, or
-    None: in 0.1 Typhon does not yet tell a plugin which frames were saved
-    (stage P3).
+    None for a frame not saved (a snapshot run passes over the frames
+    between its triggers; the live view saves nothing).
 
-    0.1 has no `to_sensor` yet: the coordinate fields of design 3.12
-    (binning, decimation, mirroring) arrive at stage P3."""
+    THE PICTURE'S COORDINATES (design 3.12, from P3). A plugin sees the
+    full-size frame, while the saved PNG, the live view and the boxes may be
+    reduced; everything a plugin stores or draws is in full-sensor, unbinned
+    pixels (pixel (x, y) centred at index (x, y)). The terms: `area`, the
+    camera's area the frame was taken with (x, y, w, h, in the camera's own
+    pixels — binned ones on a binned camera); `binning`, sensor pixels per
+    camera pixel (h, v) — with the camera's binning as Downsample, the
+    Downsample factor; `decimation` and `mirror`, as the camera reports
+    them; and Downsample's `downsample` factor and `downsample_method`
+    ("typhon_block_mean": Typhon averages the saved picture's blocks;
+    "camera_binning_average": the camera bins; "" for off). `to_sensor(x,
+    y)` turns a pixel of the SAVED picture into sensor pixels."""
     camera: str
     index: int
     image: Any
@@ -202,6 +255,42 @@ class FrameView:
     saved: Optional[str] = None
     meta: Mapping[str, Any] = field(default_factory=lambda:
                                     MappingProxyType({}))
+    area: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    binning: Tuple[int, int] = (1, 1)
+    decimation: Tuple[int, int] = (1, 1)
+    mirror: Tuple[bool, bool] = (False, False)
+    downsample: int = 1
+    downsample_method: str = ""
+
+    def to_sensor(self, x: float, y: float) -> Tuple[float, float]:
+        """The saved picture's pixel (x, y) in sensor pixels (design 3.12):
+        Typhon's Downsample factor first, then the area's origin, then the
+        camera's binning — council_core.reduce.sensor_position on each
+        axis. A mirrored or decimated picture raises ValueError: those
+        conversions need terms no camera reports yet, and a position is
+        never guessed."""
+        if any(bool(m) for m in self.mirror):
+            raise ValueError("this picture is mirrored (the camera's "
+                             "ReverseX / ReverseY): to_sensor needs the "
+                             "sensor's size to undo it, which a FrameView "
+                             "does not carry yet — no position is guessed")
+        if tuple(int(d) for d in self.decimation) != (1, 1):
+            raise ValueError("this picture is decimated: to_sensor does not "
+                             "convert a decimated picture yet — no position "
+                             "is guessed")
+        place = __getattr__("sensor_position")
+        factor = (max(1, int(self.downsample or 1))
+                  if self.downsample_method == TYPHON_DOWNSAMPLE else 1)
+        bx, by = (max(1, int(b)) for b in self.binning)
+        ax, ay = (float(a) for a in tuple(self.area)[:2])
+        return (place(float(x), factor, ax, bx),
+                place(float(y), factor, ay, by))
+
+
+#: Downsample's two methods, as the frames CSV and the records say them
+#: (council_core.reduce: TYPHON_MEAN and CAMERA_AVERAGE).
+TYPHON_DOWNSAMPLE = "typhon_block_mean"
+CAMERA_DOWNSAMPLE = "camera_binning_average"
 
 
 @dataclass(frozen=True)
@@ -337,6 +426,15 @@ class PluginContext(Protocol):
         `<project>/plugin_data/<id>/`, made on first ask; files go in it
         through write_new (design 4.1)."""
 
+    def capture_setup(self, camera: Optional[str] = None) -> Any:
+        """A copy of the camera's capture set-up (a CaptureSetup: trigger
+        mode, source, frames per trigger, timer, edge, delay, debounce,
+        Downsample) as the camera has it now — this plugin's camera, or the
+        active one — or None for a camera with none (an event camera) or no
+        camera. Read in place: the camera's set-up is the storage while the
+        code stays where it is (design 2.5); a change goes through the
+        camera's settings (its "capture.*" keys), never through this copy."""
+
 
 @runtime_checkable
 class FeaturePlugin(Protocol):
@@ -456,8 +554,11 @@ class CameraPlugin(Protocol):
     CameraError (or NeedsStop) and reaches the user as the camera's answer,
     never as the plugin's fault. `capabilities(device)` confirms, on the
     opened camera, the capabilities the manifest declares — never more
-    (design 3.4). `facet(device, name)` is None until the facets arrive at
-    stage P3. `categories()` gives the settings tabs its rows;
+    (design 3.4). `facet(device, name)` gives the camera's facet for a
+    capability name (FACETS: SoftwareTrigger, HardwareTrigger, Binning) —
+    the interface, even when this camera cannot do it (its `problem()`
+    says why) — or None when the camera has none (from stage P3).
+    `categories()` gives the settings tabs its rows;
     `record_fields(device)` plain JSON for its entry of the run's camera
     record (stage P3: asked at Start, cleaned and size-checked, best
     effort); `review_source()` a ReviewSource, or None."""
@@ -514,6 +615,150 @@ class CameraSetup(Protocol):
 
 
 # ======================================================================
+# The facets (stage P3 rows 2 and 3; design 3.4, 3.11)
+# ======================================================================
+@runtime_checkable
+class SoftwareTrigger(Protocol):
+    """A camera Typhon can fire (capability `software_trigger`), for an
+    exact run from Software or the Timer (design 3.6). Today's Device
+    methods (cameras.Device: trigger_problem, arm_trigger, trigger_ready,
+    fire_trigger, disarm_trigger) regrouped:
+
+      problem(setup)     why the camera cannot be armed for `setup` (a
+                         CaptureSetup), in words, or "" — asked at Start
+                         before anything stops, as today
+      arm(setup)         arm the camera's own trigger for an exact run (the
+                         stream stopped); what disarm puts back
+      ready(timeout_s)   is the camera waiting for its next trigger? Waits
+                         up to `timeout_s`; None when it cannot say
+      fire()             one software trigger
+      disarm(armed)      put back what arm changed; what changed, in words
+
+    A camera's own refusal is a CameraError (raised by arm, fire)."""
+
+    def problem(self, setup: Any) -> str: ...
+
+    def arm(self, setup: Any) -> Dict[str, Any]: ...
+
+    def ready(self, timeout_s: float) -> Optional[bool]: ...
+
+    def fire(self) -> None: ...
+
+    def disarm(self, armed: Any) -> List[str]: ...
+
+
+@runtime_checkable
+class HardwareTrigger(Protocol):
+    """A camera that waits for an input line (capability
+    `hardware_trigger`), for an exact run from a camera line (design 3.6):
+
+      inputs()                 what the camera offers: a CaptureOptions
+                               (its hardware sources, edges, delay and
+                               debounce ranges, and Downsample's own words)
+      problem(setup), arm(setup), ready(timeout_s), disarm(armed)
+                               as SoftwareTrigger's
+      count_edges(armed, seen) the camera's own count of edges on the armed
+                               input between count_from_now and
+                               count_to_now: (count, "") or (None, why not)
+                               — also when it cannot cover the `seen`
+                               triggers Typhon saw
+      count_from_now(armed)    start the count (the stream runs, the camera
+                               ready)
+      count_to_now(armed)      end it, before the stream stops; the camera
+                               takes no more hardware triggers"""
+
+    def inputs(self) -> Any: ...
+
+    def problem(self, setup: Any) -> str: ...
+
+    def arm(self, setup: Any) -> Dict[str, Any]: ...
+
+    def ready(self, timeout_s: float) -> Optional[bool]: ...
+
+    def disarm(self, armed: Any) -> List[str]: ...
+
+    def count_edges(self, armed: Any, seen: Optional[int] = None
+                    ) -> Tuple[Optional[int], str]: ...
+
+    def count_from_now(self, armed: Any) -> None: ...
+
+    def count_to_now(self, armed: Any) -> None: ...
+
+
+@runtime_checkable
+class Binning(Protocol):
+    """A camera that averages its own pixels (capability `binning`): the
+    camera half of Downsample (design 2.1). Downsample itself is the
+    core's; the core hands its factor to this facet or to its own frame
+    stage.
+
+      can_bin(factor)  does the camera bin `factor` x `factor` in AVERAGE
+                       mode (never Sum, which clips)?
+      apply(factor)    Downsample `factor` — the camera's binning where it
+                       can, else Typhon's averaging — and what was done
+      check(rebin)     the binning checked against Downsample: "" when it
+                       is as Typhon left it, else what was done about it
+      info()           how Downsample is made now: factor, method, note"""
+
+    def can_bin(self, factor: int) -> bool: ...
+
+    def apply(self, factor: int) -> str: ...
+
+    def check(self, rebin: bool = False) -> str: ...
+
+    def info(self) -> Dict[str, Any]: ...
+
+
+#: Each facet by the capability it serves (design 3.4's table).
+FACETS: Dict[str, Any] = {"software_trigger": SoftwareTrigger,
+                          "hardware_trigger": HardwareTrigger,
+                          "binning": Binning}
+
+
+# ======================================================================
+# Trigger sources and toolbar actions (design 3.6, 3.7, 3.11)
+# ======================================================================
+@dataclass(frozen=True)
+class TriggerEvent:
+    """One trigger a source made: its source's name, a running number (1,
+    2, ... in the order made) and the host time (seconds since 1970)."""
+    source: str
+    number: int
+    at: float
+
+
+@runtime_checkable
+class TriggerSource(Protocol):
+    """What says "capture now" (design 3.6). `camera_line`: True for a
+    source wired to the camera, which Typhon has nothing to fire for.
+    `needs(mode)` is what a run of that mode needs of the camera: a
+    snapshot from Typhon's own sources needs frames only, an exact run a
+    trigger facet. `start(fire)`: from now on each trigger the source makes
+    is told to `fire` (a TriggerEvent; it must return at once); `stop()`
+    returns within a moment, and nothing is fired after it."""
+
+    name: str
+    camera_line: bool
+
+    def needs(self, mode: str = "Triggered: snapshot") -> FrozenSet[str]: ...
+
+    def start(self, fire: Callable[[TriggerEvent], None]) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class Action:
+    """A toolbar button (design 3.7, 3.11): its text, its callback (called
+    on the UI thread), a tooltip, and an optional application-wide
+    shortcut ("F9")."""
+    text: str
+    callback: Callable[[], Any]
+    tooltip: str = ""
+    shortcut: str = ""
+
+
+# ======================================================================
 # Today's classes, re-exported (design 3.11): their code stays where it is
 # ======================================================================
 _REEXPORTS: Dict[str, Tuple[str, str]] = {
@@ -554,13 +799,27 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "Readiness": ("council_core.camera_setup", "Readiness"),
     # what the two file services refuse with (stage P3 row 1)
     "PluginFileError": ("council_core.plugin_runs", "PluginFileError"),
+    # the capture set-up's types, the trigger modes and Typhon's own
+    # sources (stage P3 rows 2 and 3; design 2.5): today's, in
+    # council_core/triggered.py until the files move at P7
+    "CaptureSetup": ("council_core.triggered", "CaptureSetup"),
+    "CaptureOptions": ("council_core.triggered", "CaptureOptions"),
+    "MODE_CONTINUOUS": ("council_core.triggered", "MODE_CONTINUOUS"),
+    "MODE_EXACT": ("council_core.triggered", "MODE_EXACT"),
+    "MODE_SNAPSHOT": ("council_core.triggered", "MODE_SNAPSHOT"),
+    "MODES": ("council_core.triggered", "MODES"),
+    "SOFTWARE": ("council_core.triggered", "SOFTWARE"),
+    "TIMER": ("council_core.triggered", "TIMER"),
+    "TYPHON_SOURCES": ("council_core.triggered", "TYPHON_SOURCES"),
 }
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
                   "FeaturePlugin", "CameraPlugin", "CameraSetup",
                   "CategoryHints", "ReviewSource", "RunCamera", "RunPlan",
-                  "RunInfo", *_REEXPORTS])
+                  "RunInfo", "SoftwareTrigger", "HardwareTrigger", "Binning",
+                  "FACETS", "TriggerEvent", "TriggerSource", "Action",
+                  "TYPHON_DOWNSAMPLE", "CAMERA_DOWNSAMPLE", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:

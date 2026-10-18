@@ -3,7 +3,7 @@
   "id": "typhon.trigger",
   "short": "trig",
   "name": "Triggering",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api": "0.2",
   "kind": "feature",
   "scope": "rig",
@@ -12,7 +12,13 @@
     "frames"
   ],
   "python": [],
-  "contributes": [],
+  "contributes": [
+    "run_hooks",
+    "record_gate",
+    "panel",
+    "toolbar",
+    "status"
+  ],
   "files": [
     "_capture_triggers.csv"
   ],

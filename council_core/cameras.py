@@ -267,6 +267,22 @@ def downsample_meta(setup: Any, method: str) -> Dict[str, Any]:
             "reduce": factor}
 
 
+def frame_stage(image: Any, meta: Optional[Dict[str, Any]],
+                pool: Any = None) -> Any:
+    """THE CORE'S ONE FRAME STAGE (docs/typhon_plugins_design.md 2.1, 3.8):
+    a frame's picture as it is saved — Downsample by Typhon, averaging the
+    blocks its meta asks for ("reduce", downsample_meta;
+    council_core.reduce.prepared), else the picture as it came.
+
+    What capture.Recorder saves through when it has no stage of its own:
+    the recording asks the camera layer, whose frames carry the request,
+    and knows no feature itself. On the writer threads only, never the
+    grab thread."""
+    from . import reduce as red
+
+    return red.prepared(image, meta, pool=pool)
+
+
 # ======================================================================
 # AOI arithmetic — the part that is wrong everywhere else
 # ======================================================================

@@ -89,8 +89,8 @@ class BaslerPlugin:
         what was done, design 3.4)."""
         caps = set(api.device_capabilities(device))
         try:
-            setup = builtin.CaptureSetup(mode=builtin.MODE_EXACT,
-                                         source=builtin.SOFTWARE)
+            setup = api.CaptureSetup(mode=api.MODE_EXACT,
+                                     source=api.SOFTWARE)
             if not device.trigger_problem(setup):
                 caps.add("software_trigger")
         except Exception:                                   # noqa: BLE001
@@ -110,7 +110,17 @@ class BaslerPlugin:
         return frozenset(caps)
 
     def facet(self, device: Any, name: str) -> Any:
-        """None until the facets arrive at stage P3."""
+        """A Basler's three facets, each today's BaslerDevice methods
+        (typhon_plugin_api.builtin.device_facet): its software trigger
+        (TriggerSoftware on the entry the run armed), its hardware trigger
+        (its input lines and CoaXPress triggers, the edge counter) and its
+        binning (Average only: Downsample's camera half, design 2.1). Given
+        for every Basler: whether this camera can do each is its confirmed
+        capabilities, and the facet's own check says why not (`problem`,
+        `can_bin`), as today's camera code says it."""
+        if device is not None and name in ("software_trigger",
+                                           "hardware_trigger", "binning"):
+            return builtin.device_facet(device, name)
         return None
 
     def categories(self) -> api.CategoryHints:

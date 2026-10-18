@@ -88,7 +88,14 @@ class SimulatedPlugin:
         return frozenset(caps)
 
     def facet(self, device: Any, name: str) -> Any:
-        """None until the facets arrive at stage P3."""
+        """The simulated FRAME camera's software trigger — SyntheticDevice's
+        own (armed, it sends a frame only when one is fired, and ignores one
+        fired while it is busy, as a Basler does) — through today's methods
+        (typhon_plugin_api.builtin.device_facet). It has no hardware input
+        and no binning: its Downsample is Typhon's averaging. An event
+        camera has no facet."""
+        if name == "software_trigger" and                 getattr(device, "capture", None) is not None and                 callable(getattr(device, "fire_trigger", None)):
+            return builtin.device_facet(device, name)
         return None
 
     def categories(self) -> api.CategoryHints:

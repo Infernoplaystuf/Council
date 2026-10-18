@@ -336,6 +336,11 @@ class _Live:
         self.capture_key: Any = None
         #: What Stop could not put back after an exact run, or "".
         self.disarm_note = ""
+        #: A "Typhon (plugins)" run's triggering slot (the plugin host's
+        #: TriggerSlot: the triggering plugin's part of Start and Stop,
+        #: plugin design 3.6) while the run lasts, else None. Today's
+        #: Typhon never has one.
+        self.trigger_slot: Any = None
 
     def clear(self) -> None:
         self.device = None
@@ -373,6 +378,7 @@ class _Live:
         self.armed = None
         self.shown_reduce = 1
         self.disarm_note = ""
+        self.trigger_slot = None
 
 
 #: Every camera this window runs (council_core.camera_rig): a slot per camera
@@ -692,6 +698,7 @@ def disconnect() -> Dict[str, Any]:
         session = _LIVE.session
         job = _LIVE.job
         trig, armed = _LIVE.trigger_run, _LIVE.armed
+        plug = _LIVE.trigger_slot
         _LIVE.clear()
     if job is not None:
         # A change still stopping or restarting the stream owns it until it
@@ -699,6 +706,11 @@ def disconnect() -> Dict[str, Any]:
         # so it does not start a stream that is about to be closed.
         job.cancelled = True
         job.done.wait(JOB_JOIN_SECONDS)
+    if plug is not None:
+        # A "Typhon (plugins)" run: its triggering plugin stops the books
+        # and puts the camera's triggers back, before the camera closes.
+        plug.abort()
+        trig = armed = None
     if trig is not None:
         # Its thread fires the camera: stopped before the camera closes.
         trig.stop()
@@ -820,16 +832,24 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     if out.exists() and not out.is_dir():
         raise RuntimeError(f"{out} is a file, not a folder")
     setup = _capture_setup(session.device)
-    problem = _capture_problem(session.device, setup)
+    # A "Typhon (plugins)" project (plugin design 3.6): the trigger set-up
+    # is its triggering plugin's to check (its start check, below); the
+    # core checks Downsample, its own. Today's Typhon makes no host.
+    host = _plugin_host()
+    problem = (_capture_problem(session.device, setup) if host is None
+               else _downsample_problem(session.device, setup))
     if problem:
         raise RuntimeError(problem)
-    # A "Typhon (plugins)" project (plugin design 3.6): every run-hook
-    # plugin's check_start, before anything is changed, stopped or
-    # reserved — a reason refuses this Start. Today's Typhon makes no host.
-    host = _plugin_host()
+    # Every run-hook plugin's check_start, before anything is changed,
+    # stopped or reserved — a reason refuses this Start.
     base = time.strftime("%Y%m%d_%H%M%S")
     if host is not None:
         host.register_run_files()
+        if setup.triggered and host.trigger_plugin() is None:
+            raise RuntimeError(f"a {setup.short()} run needs the Triggering "
+                               f"plugin (typhon.trigger), which this project "
+                               f"does not run now — switch it on, or choose "
+                               f"Capture: Continuous")
         refused = host.check_start(_run_plan(host, base, out, session.device,
                                              setup))
         if refused:
@@ -883,6 +903,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     armed = None
     trig = None
     active = None
+    plug = None
     plugin_notes: List[str] = []
     if host is not None:
         # The run in progress, as its plugins see it: its end record
@@ -890,6 +911,16 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         active = host.begin_run(run, {_RIG.active.name: out})
         recorder.end_blocks = host.end_blocks(active)
     try:
+        if host is not None and getattr(device, "capture", None) is not None:
+            # The triggering plugin's part of this run (plugin design 3.6):
+            # each trigger step below is its, in the core's order —
+            # TriggerRun's books driven by the rig, the camera reached
+            # through its facets.
+            plug = host.trigger_slot(_RIG.active.name)
+            if plug is None and setup.triggered:
+                raise RuntimeError(f"a {setup.short()} run needs the "
+                                   f"Triggering plugin (typhon.trigger), "
+                                   f"which could not be had now")
         recorder.open()
         if session.running and restartable:
             _stop_preview(session)
@@ -898,7 +929,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # Downsample made by the camera's binning, checked against the
         # binning the camera has now (BaslerDevice.check_downsample): a run
         # is never recorded as binned while the camera sends full frames.
-        downsample_note = _check_downsample(device)
+        # A "Typhon (plugins)" project asks the camera's Binning facet.
+        downsample_note = (_check_downsample(device) if host is None
+                           else _check_binning(host, device))
         if downsample_note:
             setup.downsample = int(getattr(getattr(device, "capture", None),
                                            "downsample", 1) or 1)
@@ -916,7 +949,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # changed".
         listing = _camera_listing(device)
         if setup.exact:
-            armed = _arm(device, setup)
+            armed = _arm(device, setup) if plug is None else plug.arm(setup)
             # An armed camera sends nothing between triggers: the grab loop
             # waits in short reads, so Stop is not held up to a second by
             # one (it notices Stop between reads).
@@ -929,9 +962,17 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         content, record_note = _camera_record(
             run, device, listing,
             setup if getattr(device, "capture", None) is not None else None,
-            armed, plugins=made_by)
+            armed, plugins=made_by,
+            capture=(plug.record(run, setup, armed) if plug is not None
+                     else None))
         if setup.triggered:
-            trig = _trigger_run(setup, device, out, run, listing, rate)
+            if plug is None:
+                trig = _trigger_run(setup, device, out, run, listing, rate)
+            else:
+                # The record gate: the plugin's books, guarded on the
+                # recording path (plugin design 3.10).
+                trig = plug.make_gate(run, out, setup,
+                                      _listed_values(listing), rate, session)
             recorder.capture_info = trig.summary
         recorder.downsample_info = _downsample_record(device)
         # reset: this run's numbers only — frames the preview showed were
@@ -942,7 +983,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # Refused before the recording began: let go of the reservation's
         # CSV (it stays, header only, and keeps the name taken), and put
         # an armed trigger back.
-        _undo_arming(device, trig, armed)
+        _undo_start(device, plug, trig, armed)
         recorder.close()
         if active is not None:
             host.abandon_run(active)
@@ -957,7 +998,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             raw = device.start_raw(out / f"{run}_events.raw")
         except Exception as exc:                          # noqa: BLE001
             session.record_to(None)
-            _undo_arming(device, trig, armed)
+            _undo_start(device, plug, trig, armed)
             if active is not None:
                 host.abandon_run(active)
             raise RuntimeError(f"cannot record the raw file: {exc}") from exc
@@ -977,12 +1018,16 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                 except Exception:                         # noqa: BLE001
                     pass
             session.record_to(None)
-            _undo_arming(device, trig, armed)
+            _undo_start(device, plug, trig, armed)
             if active is not None:
                 host.abandon_run(active)
             raise
         _started_stream(session)
-    if trig is not None and armed is not None and not trig.typhon_fires:
+    if plug is not None:
+        # The triggering plugin's step: the camera's edge count once it can
+        # take a trigger (on the recording path: a fault ends the run).
+        plugin_notes.extend(plug.ready())
+    elif trig is not None and armed is not None and not trig.typhon_fires:
         # The camera's edge count starts once it can take a trigger: the
         # edges before that (arming, the record read, the stream starting)
         # triggered nothing.
@@ -995,10 +1040,14 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     if trig is not None:
         # After the stream: the first trigger waits for the camera to say
         # it is ready (a trigger fired before that is lost — measured).
-        trig.start()
+        if plug is None:
+            trig.start()
+        else:
+            plugin_notes.extend(plug.start())
     _LIVE.trigger_run = trig
     _LIVE.last_trigger_run = trig
     _LIVE.armed = armed
+    _LIVE.trigger_slot = plug
     _LIVE.capturing = True
     _LIVE.previewing = False
     # The run's own silence, if any, is asked about afresh: a reason left
@@ -1011,7 +1060,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     _LIVE.record_path = record
 
     said = f"Capturing into {out}."
-    said += _capture_words(setup, armed, device)
+    if plug is None:
+        said += _capture_words(setup, armed, device)
+    else:
+        said += plug.words(setup, armed) + _downsample_start_words(device)
     if downsample_note:
         said += f" {downsample_note[0].upper()}{downsample_note[1:]}."
     if raw is not None:
@@ -1062,9 +1114,16 @@ def stop() -> Dict[str, Any]:
     _LIVE.idle = "stopped"
     device = session.device
     trig, armed = _LIVE.trigger_run, _LIVE.armed
+    plug = _LIVE.trigger_slot
     _LIVE.trigger_run = None
     _LIVE.armed = None
-    if trig is not None:
+    _LIVE.trigger_slot = None
+    if plug is not None:
+        # A "Typhon (plugins)" run: its triggering plugin's step — the
+        # source stopped, the last frames given their moment, an input
+        # line's count ended before the stream (plugin design 3.6).
+        plug.halt(lambda: session.stats().grabbed)
+    elif trig is not None:
         # Fire nothing more, and give a trigger fired a moment ago its
         # frame before the stream ends (a Timer tick at the press of Stop
         # was "no frame" otherwise).
@@ -1092,11 +1151,11 @@ def stop() -> Dict[str, Any]:
         session.timeout_ms = FREE_READ_MS
         # The run's books closed before its recording ends, so its end
         # record (written as the last frame lands) has every trigger.
-        _end_triggers(device, trig, armed)
+        _close_books(device, plug, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
     else:
         ended = True
-        _end_triggers(device, trig, armed)
+        _close_books(device, plug, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
         finish = getattr(device, "finish_raw", None)
         if callable(finish):
@@ -1106,7 +1165,11 @@ def stop() -> Dict[str, Any]:
                 _LIVE.idle = (f"Stopped, but the raw file did not close "
                               f"cleanly: {exc}")
     _LIVE.disarm_note = ""
-    if armed is not None:
+    if plug is not None:
+        # The plugin's step: every trigger back as before Start (served out
+        # even after a fault of its elsewhere, plugin design 3.10).
+        _LIVE.disarm_note = plug.disarm()
+    elif armed is not None:
         # Every trigger back as it was before Start: the live view runs
         # free again. What could not be put back is said with the result.
         _LIVE.disarm_note = _disarm(device, armed)
@@ -1135,6 +1198,15 @@ def stop() -> Dict[str, Any]:
 RUN_NOTE_SECONDS = 10.0
 
 
+def _close_books(device: Any, plug: Any, trig: Any, armed: Any) -> None:
+    """A triggered run's books closed before its recording ends: today's
+    (_end_triggers), or a "Typhon (plugins)" run's triggering plugin's."""
+    if plug is not None:
+        plug.close()
+    else:
+        _end_triggers(device, trig, armed)
+
+
 # ======================================================================
 # Capture now, and the Basic tab's capture boxes
 # ======================================================================
@@ -1157,31 +1229,51 @@ def capture_now() -> Dict[str, Any]:
     if session is None:
         return {"summary": "Connect a camera first — Capture now fires the "
                            "trigger of a triggered capture."}
+    host = _plugin_host()
+    if host is not None:
+        # A "Typhon (plugins)" project: Capture now is the triggering
+        # plugin's (its toolbar button and F9, plugin design 3.7) — the run
+        # in progress's slot serves its run out.
+        said = host.capture_now(_RIG.active.name)
+        if said is None:
+            return {"summary": _NEEDS_TRIGGERING}
+        return {"summary": said}
     trig = _LIVE.trigger_run
     if not _LIVE.capturing or trig is None:
-        setup = getattr(session.device, "capture", None)
-        if setup is None:
-            return {"summary": "An event camera is not triggered here — "
-                               "its .raw keeps every event."}
-        if setup.triggered and setup.exact:
-            return {"summary": f"Not capturing — Start first: it arms the "
-                               f"trigger ({setup.short()}); then Capture "
-                               f"now ({CAPTURE_KEY}) takes each picture."}
-        if setup.triggered:
-            # A snapshot run arms nothing: the live view runs, and each
-            # press saves the next frame(s).
-            frames = ("frame" if setup.per_trigger <= 1
-                      else f"{setup.per_trigger} frames")
-            return {"summary": f"Not capturing — Start first ("
-                               f"{setup.short()}); then Capture now "
-                               f"({CAPTURE_KEY}) saves the next {frames}."}
-        # Not "Basic tab": every app with a camera hears F9 — the capture
-        # set-up is in its camera's Capture settings wherever it shows them.
-        return {"summary": "Capture now is for a triggered capture — choose "
-                           "Capture: Triggered: exact or Triggered: "
-                           "snapshot, then Start."}
+        return {"summary": _capture_now_idle(getattr(session.device,
+                                                     "capture", None))}
     said = trig.capture_now()
     return {"summary": f"Capture now: {said}."}
+
+
+#: What a "Typhon (plugins)" project says of a triggered capture, and of
+#: Capture now, when its triggering plugin does not run there.
+_NEEDS_TRIGGERING = ("Triggered capture and Capture now need the Triggering "
+                     "plugin (typhon.trigger), which this project does not "
+                     "run now — switch it on, or choose Capture: Continuous")
+
+
+def _capture_now_idle(setup: Any) -> str:
+    """What Capture now says while no triggered run is in progress, for a
+    camera with the capture set-up `setup` (None: an event camera)."""
+    if setup is None:
+        return ("An event camera is not triggered here — its .raw keeps "
+                "every event.")
+    if setup.triggered and setup.exact:
+        return (f"Not capturing — Start first: it arms the trigger "
+                f"({setup.short()}); then Capture now ({CAPTURE_KEY}) takes "
+                f"each picture.")
+    if setup.triggered:
+        # A snapshot run arms nothing: the live view runs, and each press
+        # saves the next frame(s).
+        frames = ("frame" if setup.per_trigger <= 1
+                  else f"{setup.per_trigger} frames")
+        return (f"Not capturing — Start first ({setup.short()}); then "
+                f"Capture now ({CAPTURE_KEY}) saves the next {frames}.")
+    # Not "Basic tab": every app with a camera hears F9 — the capture set-up
+    # is in its camera's Capture settings wherever it shows them.
+    return ("Capture now is for a triggered capture — choose Capture: "
+            "Triggered: exact or Triggered: snapshot, then Start.")
 
 
 def _set_capture(key: str, value: Any) -> Dict[str, Any]:
@@ -1496,8 +1588,6 @@ def _capture_setup(device: Any) -> Any:
 def _capture_problem(device: Any, setup: Any) -> str:
     """Why this run's capture set-up cannot run on this camera, in words —
     "" when it can. Asked at Start BEFORE anything stops."""
-    from council_core import reduce
-
     if setup.triggered:
         try:
             problem = device.trigger_problem(setup)
@@ -1508,6 +1598,15 @@ def _capture_problem(device: Any, setup: Any) -> str:
             return f"cannot start a {setup.short()} run: {problem}"
         if setup.source == "Timer" and setup.every_s <= 0:
             return "the timer's interval must be more than 0 s"
+    return _downsample_problem(device, setup)
+
+
+def _downsample_problem(device: Any, setup: Any) -> str:
+    """Why this run's Downsample cannot be made on this camera — the
+    core's part of _capture_problem (a "Typhon (plugins)" run's triggers
+    are its triggering plugin's start check): "" when it can."""
+    from council_core import reduce
+
     if int(getattr(setup, "downsample", 1) or 1) > 1:
         info = _downsample_state(device)
         if info.get("method") in ("", reduce.TYPHON_MEAN):
@@ -1572,6 +1671,37 @@ def _disarm(device: Any, armed: Any) -> str:
         return f"the camera's triggers were NOT put back: {_said(exc)}"
     failed = [line for line in said if "NOT" in line]
     return "; ".join(failed)
+
+
+def _check_binning(host: Any, device: Any) -> str:
+    """_check_downsample through the camera's Binning facet, in a "Typhon
+    (plugins)" project (plugin design 2.1: binning is a camera facet,
+    Downsample the core's): "" for a camera with none — as today's check
+    says of a camera that cannot bin."""
+    try:
+        facet = host.camera_facet(_RIG.active.name, "binning")
+    except Exception:                                     # noqa: BLE001
+        facet = None
+    if facet is None:
+        return ""
+    try:
+        return str(facet.check(False) or "")
+    except Exception as exc:                              # noqa: BLE001
+        return f"Downsample could not be checked: {_said(exc)}"
+
+
+def _undo_start(device: Any, plug: Any, trig: Any, armed: Any) -> None:
+    """A Start that failed after the run's name was reserved: today's
+    undo (_undo_arming), or — a "Typhon (plugins)" run — its triggering
+    plugin's (its slot's undo: the triggers CSV closed, the camera put
+    back), with the grab loop's reads as long as before."""
+    if plug is None:
+        _undo_arming(device, trig, armed)
+        return
+    session = _LIVE.session
+    if session is not None:
+        session.timeout_ms = FREE_READ_MS
+    plug.undo()
 
 
 def _undo_arming(device: Any, trig: Any, armed: Any) -> None:
@@ -1675,8 +1805,25 @@ def _trigger_run(setup: Any, device: Any, out: Path, run: str,
     a file)."""
     from council_core import triggered
 
-    values = {str(r.get("key")): r.get("value")
-              for r in listing.get("listed") or []}
+    exposure_s, period_s = _trigger_timing(_listed_values(listing), rate)
+    trig = triggered.TriggerRun(
+        setup, device, out / f"{run}{triggered.TRIGGERS_SUFFIX}",
+        exposure_s=exposure_s, frame_period_s=period_s)
+    trig.open()
+    return trig
+
+
+def _listed_values(listing: Dict[str, Any]) -> Dict[str, Any]:
+    """Every setting's value as the camera had it at Start, by key."""
+    return {str(r.get("key")): r.get("value")
+            for r in listing.get("listed") or []}
+
+
+def _trigger_timing(values: Mapping[str, Any], rate: float) -> tuple:
+    """(exposure in seconds, frame period in seconds — 0 when not known) of
+    a run's books, from the camera's settings at Start and the live view's
+    measured `rate` (the rate the camera says it runs at when no live view
+    measured one)."""
     try:
         exposure_s = float(values.get("ExposureTime") or 0.0) / 1e6
     except (TypeError, ValueError):
@@ -1690,12 +1837,7 @@ def _trigger_run(setup: Any, device: Any, out: Path, run: str,
                 rate = 0.0
             if rate > 0:
                 break
-    trig = triggered.TriggerRun(
-        setup, device, out / f"{run}{triggered.TRIGGERS_SUFFIX}",
-        exposure_s=exposure_s,
-        frame_period_s=(1.0 / rate) if rate > 0 else 0.0)
-    trig.open()
-    return trig
+    return exposure_s, (1.0 / rate) if rate > 0 else 0.0
 
 
 def _downsample_record(device: Any, area: Any = None) -> Optional[Dict[str,
@@ -1753,6 +1895,14 @@ def _downsample_words(device: Any) -> str:
 def _capture_words(setup: Any, armed: Any, device: Any) -> str:
     """What Start says of the capture set-up: " Armed: exact, Line1 — the
     camera waits for it." "" for a Continuous run at full size."""
+    return _trigger_start_words(setup, armed) + _downsample_start_words(
+        device)
+
+
+def _trigger_start_words(setup: Any, armed: Any) -> str:
+    """What Start says of the TRIGGER set-up (_capture_words' first part;
+    a "Typhon (plugins)" run's triggering plugin says it): "" for a
+    Continuous run."""
     from council_core import triggered
 
     said = ""
@@ -1772,6 +1922,13 @@ def _capture_words(setup: Any, armed: Any, device: Any) -> str:
     elif setup.snapshot:
         said += (f" Snapshot ({setup.source_words()}) — the live view runs "
                  f"and only the frames each trigger asks for are saved.")
+    return said
+
+
+def _downsample_start_words(device: Any) -> str:
+    """What Start says of Downsample (_capture_words' second part: the
+    core's in both Typhons): "" at full size."""
+    said = ""
     info = _downsample_state(device)
     factor = int(info.get("factor") or 1)
     if factor > 1:
@@ -1974,14 +2131,25 @@ def _watch_capture() -> None:
     except Exception:                                     # noqa: BLE001
         pass
     trig, armed = _LIVE.trigger_run, _LIVE.armed
+    plug = _LIVE.trigger_slot
     _LIVE.trigger_run = None
     _LIVE.armed = None
+    _LIVE.trigger_slot = None
+    host = _plugin_host()
+    if host is not None:
+        # Over for its plugins too (plugin design 3.6), as at Stop.
+        try:
+            host.run_stopped(camera=_RIG.active.name)
+        except Exception:                                 # noqa: BLE001
+            pass
     try:
-        _end_triggers(session.device, trig, armed)
+        _close_books(session.device, plug, trig, armed)
     except Exception:                                     # noqa: BLE001
         pass
     session.record_to(None, drain_timeout=0)
-    if armed is not None:
+    if plug is not None:
+        _LIVE.disarm_note = plug.disarm()
+    elif armed is not None:
         _LIVE.disarm_note = _disarm(session.device, armed)
     if not getattr(session.device, "restartable", True):
         reason += " — Disconnect and Connect again"
@@ -2796,7 +2964,8 @@ def _camera_listing(device: Any) -> Dict[str, Any]:
 def _camera_record(run: str, device: Any,
                    listing: Optional[Dict[str, Any]] = None,
                    setup: Any = None, armed: Any = None,
-                   plugins: Optional[Dict[str, Any]] = None
+                   plugins: Optional[Dict[str, Any]] = None,
+                   capture: Optional[Dict[str, Any]] = None
                    ) -> "tuple[Optional[Dict[str, Any]], str]":
     """The run's camera record as it is now; (the record, "") or (None, why
     it could not be made).
@@ -2812,7 +2981,9 @@ def _camera_record(run: str, device: Any,
     shows the trigger as the run had it. The capture set-up and Downsample
     are their own blocks (`capture`, `downsample`); `plugins`, for a
     "Typhon (plugins)" run, what made it (the plugin host's
-    record_plugins), its `plugins` block."""
+    record_plugins), its `plugins` block; `capture`, for such a run, the
+    capture block its triggering plugin made (the same block: today's
+    _capture_record, plugin design 2.4 item 8), else it is made here."""
     from council_core import camera_record
 
     if listing is None:
@@ -2838,7 +3009,8 @@ def _camera_record(run: str, device: Any,
             preset=str(listing.get("preset") or ""),
             preset_changed=listing.get("changed"), app=_app_identity(),
             software=_software(), host=_host_name(),
-            capture=_capture_record(run, setup, armed),
+            capture=(capture if capture is not None
+                     else _capture_record(run, setup, armed)),
             downsample=_downsample_record(device, area),
             plugins=plugins), ""
     except Exception as exc:                              # noqa: BLE001

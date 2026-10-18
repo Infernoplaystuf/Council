@@ -252,7 +252,24 @@ DEBOUNCE_HELP = ("Ignore pulses on the input line shorter than this (the "
 def capture_settings(setup: CaptureSetup,
                      options: CaptureOptions) -> List[Any]:
     """The set-up as camera_settings.Setting rows, group GROUP: every one
-    is chosen before a run and fixed while capturing (per_run)."""
+    is chosen before a run and fixed while capturing (per_run). The
+    Downsample row is the core's (camera_settings.downsample_setting:
+    Downsample is Typhon's, not the triggering plugin's, typhon-plugins
+    design 2.5), in its place among them; the rest are the trigger rows
+    (trigger_settings)."""
+    from . import camera_settings
+
+    out = trigger_settings(setup, options)
+    out.insert(4, camera_settings.downsample_setting(setup.downsample,
+                                                     options))
+    return out
+
+
+def trigger_settings(setup: CaptureSetup,
+                     options: CaptureOptions) -> List[Any]:
+    """The TRIGGER rows of the set-up — capture_settings less the core's
+    Downsample row, in the same order: the triggering plugin's rows
+    (typhon-plugins design 2.5: its pop-out shows them from stage P4)."""
     from .camera_settings import CHOICE, FLOAT, INT, Setting
 
     sources = TYPHON_SOURCES + tuple(options.hardware)
@@ -271,10 +288,6 @@ def capture_settings(setup: CaptureSetup,
         Setting(EVERY_KEY, "Timer every", GROUP, FLOAT, float(setup.every_s),
                 minimum=EVERY_RANGE[0], maximum=EVERY_RANGE[1], unit="s",
                 help=EVERY_HELP, per_run=True),
-        Setting(DOWNSAMPLE_KEY, "Downsample", GROUP, CHOICE,
-                downsample_text(setup.downsample), choices=DOWNSAMPLES,
-                live=options.downsample_live, per_run=True,
-                help=options.downsample_help or DOWNSAMPLE_HELP),
     ]
     if options.edges:
         edges = tuple(options.edges)
@@ -501,14 +514,22 @@ class TriggerRun:
         self.edges_note = ""
         #: Between which moments the camera counted them, in words.
         self.edges_window = ""
+        #: Told each trigger Typhon's own sources make (Software, Timer) —
+        #: on_trigger(source, number, at: seconds since 1970) — missed ones
+        #: too; never on the grab thread. None (today's Typhon): nobody.
+        #: The typhon-plugins branch's TriggerSource tells its `fire`.
+        self.on_trigger: Optional[Callable[[str, int, float], Any]] = None
 
     # -- the triggers CSV ------------------------------------------------
-    def open(self) -> Optional[Path]:
+    def open(self, handle: Any = None) -> Optional[Path]:
         """Create the triggers CSV — EXCLUSIVELY (never over a file) — with
-        its header. Raises OSError when it cannot be made."""
-        if self.path is None:
-            return None
-        handle = open(self.path, "x", newline="", encoding="utf-8")
+        its header. Raises OSError when it cannot be made. `handle`: a text
+        file already created exclusively for it (the typhon-plugins
+        branch's file service, ctx.create_file), written through instead."""
+        if handle is None:
+            if self.path is None:
+                return None
+            handle = open(self.path, "x", newline="", encoding="utf-8")
         self._file = handle
         self._writer = csv.writer(handle)
         self._writer.writerow(TRIGGER_COLUMNS)
@@ -693,6 +714,7 @@ class TriggerRun:
                 self._settle(trig, MISSED_BUSY,
                              note="the timer's tick came while the last was "
                                   "still being fired")
+            self._told(TIMER, number)
             self._tick += 1
         self._tick += 1
         self._trigger(TIMER)
@@ -702,6 +724,18 @@ class TriggerRun:
             self._number += 1
             self.counts["triggers"] += 1
             return self._number
+
+    def _told(self, source: str, number: int) -> None:
+        """Tell on_trigger of a trigger of Typhon's own source (the
+        worker's thread; never the grab thread). Its fault is not the
+        run's: the books go on."""
+        tell = self.on_trigger
+        if tell is None:
+            return
+        try:
+            tell(source, number, self._wall())
+        except Exception:                                 # noqa: BLE001
+            pass
 
     # -- firing ---------------------------------------------------------
     def _ready(self, timeout: float) -> Optional[bool]:
@@ -752,6 +786,7 @@ class TriggerRun:
     def _trigger(self, source: str) -> None:
         number = self._next_number()
         trig = _Trigger(number, source, self.per)
+        self._told(source, number)
         if not self.exact:
             now = self._clock()
             with self._lock:

@@ -195,9 +195,13 @@ def test_the_built_in_list_is_exactly_the_built_in_folders():
 
 def test_built_in_plugins_import_only_the_plugin_api():
     """The rule third parties will follow (design 3.2): a built-in plugin
-    imports typhon_plugin_api, the standard library, and its own files."""
+    imports typhon_plugin_api, the standard library, and its own files —
+    and a panel, Qt's QtCore, QtGui and QtWidgets (design 3.11), never in
+    the plugin's entry module (its panel is built on first open, stage P3
+    row 2's triggering panel)."""
     allowed = set(sys.stdlib_module_names) | {"__future__",
                                                "typhon_plugin_api"}
+    panels = {"PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"}
     bad = []
     for path in sorted(BUILTIN_FOLDER.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -209,6 +213,8 @@ def test_built_in_plugins_import_only_the_plugin_api():
             else:
                 continue
             for name in names:
+                if name in panels and path.name != "plugin.py":
+                    continue
                 if name.split(".")[0] not in allowed:
                     bad.append(f"{path.relative_to(ROOT)}: {name}")
     assert bad == []
@@ -917,7 +923,7 @@ def test_the_context_sees_the_rig(builtins_pkg, plugin_home, tmp_path):
     assert handles["cam2"].capabilities == {"events", "restartable",
                                             "area_live"}
     assert handles["cam1"].kind == "frame" and handles["cam1"].connected
-    assert handles["cam1"].facet("software_trigger") is None, "P3"
+    assert handles["cam1"].facet("software_trigger") is None,         "no camera plugin of this project opened it: no facet"
     with pytest.raises(TypeError):
         handles["cam3"] = None
     assert ctx.active_camera() == "cam1"

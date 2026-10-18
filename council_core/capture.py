@@ -28,6 +28,17 @@ frames into a closing window is the standard way to get a crash on exit.
 NOTHING HERE IMPORTS A TOOLKIT
 The session hands frames to a callback. Who marshals them onto a UI thread is
 the view's problem, not this module's.
+
+NOR ANY FEATURE (docs/typhon_plugins_design.md 2.4 item 6; typhon-plugins
+branch, stage P3)
+The recording knows the camera layer and nothing above it: what a frame
+becomes before it is saved is the core's ONE FRAME STAGE, Downsample
+(cameras.frame_stage, or a recorder's own `frame_stage`); which frames a
+triggered run keeps is the RECORD GATE handed in with the recorder
+(record_to's `gate`); the end record's capture block is the recorder's
+`capture_info`; and the run files of the features are run markers by name
+(RUN_MARKERS, run_markers). So council_core.reduce and council_core.
+triggered are not imported here.
 """
 from __future__ import annotations
 
@@ -40,7 +51,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from . import cameras, reduce, triggered
+from . import cameras
 
 #: How long a stop() waits for the grab loop before reporting failure.
 STOP_TIMEOUT = 3.0
@@ -370,8 +381,10 @@ INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
 #: reserves the run's name (reserve_run).
 INDEX_SUFFIX = "_frames.csv"
 
-#: A triggered run's "<run>_capture_triggers.csv" (council_core.triggered).
-TRIGGERS_SUFFIX = triggered.TRIGGERS_SUFFIX
+#: A triggered run's "<run>_capture_triggers.csv" (council_core.triggered's
+#: TRIGGERS_SUFFIX, written by its books): a run marker by name, so the
+#: recording imports no feature (a test holds the two names together).
+TRIGGERS_SUFFIX = "_capture_triggers.csv"
 
 #: A run's end record, "<run>_run_end.json": what only the end of a
 #: recording knows (Recorder.finish) — above all the failed grabs, which
@@ -580,12 +593,13 @@ class Recorder:
         self.capture_info: Optional[Callable[[], Dict[str, Any]]] = None
         #: The run's Downsample block for the end record, or None for Off.
         self.downsample_info: Optional[Dict[str, Any]] = None
-        #: THE FRAME STAGE (docs/typhon_plugins_design.md 3.8, 3.10): the
-        #: one step that changes a picture before it is saved,
+        #: THE FRAME STAGE (docs/typhon_plugins_design.md 2.1, 3.8, 3.10):
+        #: the one step that changes a picture before it is saved,
         #: `stage(image, meta) -> image`, on the writer threads — None for
-        #: today's (council_core.reduce.prepared: Downsample). A stage that
-        #: raises is a failed write: that frame and those queued behind it
-        #: are not saved, and the recording ends with its reason.
+        #: the core's own, Downsample (cameras.frame_stage: Typhon averages
+        #: the blocks a frame's meta asks for). A stage that raises is a
+        #: failed write: that frame and those queued behind it are not
+        #: saved, and the recording ends with its reason.
         self.frame_stage: Optional[Callable[[Any, Any], Any]] = None
         #: The plugins' part of the end record (typhon-plugins branch): a
         #: function of the record so far, asked once when the recording
@@ -630,16 +644,15 @@ class Recorder:
         once: it touches nothing but its own file.
 
         DOWNSAMPLED HERE, on the writer threads, when the camera that took
-        it says Typhon reduces it (Frame.meta "reduce";
-        council_core.reduce.prepared) — never on the grab thread, whose
+        it says Typhon reduces it (Frame.meta "reduce"; the core's frame
+        stage, cameras.frame_stage) — never on the grab thread, whose
         budget at 150 fps is 6.7 ms against 22-34 ms for a full frame.
         A frame stage set on the recorder (`frame_stage`) takes Downsample's
         place there."""
         stage = self.frame_stage
         if stage is None:
-            self._writer(reduce.prepared(frame.image, frame.meta), path)
-        else:
-            self._writer(stage(frame.image, frame.meta), path)
+            stage = cameras.frame_stage
+        self._writer(stage(frame.image, frame.meta), path)
 
     def log(self, frame: cameras.Frame, path: Path) -> None:
         """Count a saved frame and give it its index row. NOT thread-safe:

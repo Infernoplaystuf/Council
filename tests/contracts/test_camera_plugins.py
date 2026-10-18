@@ -14,7 +14,9 @@ PYLON_CAMEMU set, Basler over pylon's emulated cameras.
   * its settings come from the camera with their ranges, and a set returns
     a Change saying what the camera took;
   * every capability it confirms is one its manifest declares and Typhon
-    knows, and agrees with the camera's own flags; no facet before P3;
+    knows, and agrees with the camera's own flags; from stage P3 a facet
+    for each confirmed capability that has one (design 3.4), answering,
+    and none for a name with no facet;
   * its category hints give the same tab plan as today's tables;
   * its record fields are plain JSON; its review source, if it has one, is
     one, the manifest says so, and its run file is one the manifest
@@ -453,7 +455,21 @@ def test_every_capability_it_confirms_is_declared_and_known(opened, case):
         if flag in m.capabilities:
             assert (flag in confirmed) == (flag in own), flag
     for name in caps_rule.CAPABILITIES:
-        assert plugin.facet(device, name) is None, "no facet before P3"
+        facet = plugin.facet(device, name)
+        proto = api.FACETS.get(name)
+        if proto is None:
+            assert facet is None, f"{name}: no facet in this API"
+            continue
+        if name in confirmed:
+            assert facet is not None, f"{name} confirmed, and no facet"
+        if facet is None:
+            continue
+        assert isinstance(facet, proto), name
+        # It answers, and changes nothing: the camera's own checks.
+        if name == "binning":
+            assert facet.can_bin(1) is False
+        else:
+            assert isinstance(facet.problem(api.CaptureSetup()), str)
 
 
 def test_its_category_hints_plan_todays_tabs(opened):
