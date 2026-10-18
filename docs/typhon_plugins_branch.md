@@ -118,9 +118,10 @@ python tools\typhon_plugins_gate.py --check-list
   libraries, Barbie v4, and the Designer files that build Typhon or every
   example. Plus the branch's own files (`tests/test_camera_rig.py`,
   `tests/test_typhon_plugins_*.py`, and the plugin contract suites in
-  `tests/contracts/`: the camera kind's from stage P2, the trigger
-  sources' and the feature plugins' from P3 row 6). One pytest process per
-  file, offscreen, in temporary folders.
+  `tests/contracts/`: the camera kind's from stage P2, and from P3 row 6
+  the trigger sources', the feature plugins', the frame stages', the
+  record gates', the review sources', the file services' and the fake
+  host's). One pytest process per file, offscreen, in temporary folders.
 - `tests/test_gui_policy.py` is in the gate ahead of the next merge from
   `qt-migration`: that branch's policy-gate fix (e40d319, 6884069) makes
   it build and policy-check every example, `typhon_plugins` included, and
@@ -360,6 +361,51 @@ the known-flaky one above (twice in a row) and
 which reads the trigger line as soon as the third frame is grabbed, before
 it may have been counted ("3 triggers · 2 ok").
 
+After P3 rows 5 and 6 (18 October 2026, branch `plugins/p3c`), the gate
+on af5b9af, 6 at a time: 77 files, 3,862 passed, 0 failed, 51 skipped, in
+199 s, with no rerun; `--check-list` said the list is complete. The five
+new files (`tests/contracts/test_frame_stages.py`,
+`test_record_gates.py`, `test_review_sources.py`, `test_file_services.py`
+and `test_fake_host.py`) are in it by the contract suites' glob. The
+commit after it (de198ca) changed one test of the feature suite and a
+docstring; that file passed on its own (37 passed). No Typhon test file
+from qt-migration was changed and no test was retired. The branch's own
+`tests/test_typhon_plugins_timing.py` changed where it pinned the bench's
+four timer names (now five, with `typhon`) and gained the row 5 tests.
+
+In the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on af5b9af: the 23 camera and Barbie v4 files of the gate and the
+branch's 19 camera files (the 14 above and the five new contract files),
+1,651 passed, 1 failed, 1 skipped, in 517 s. The failure was
+`tests/test_capture_review.py::
+test_drawing_on_the_live_view_sets_that_part_of_the_sensor`, a test of
+today's Typhon (no plugin host) that waits a few seconds for the live view
+to show its first picture after Connect, and it did not come. It ran before
+any of the branch's files in that process, and the branch changed nothing
+on today's path in this part (frame_camera gained seven lines inside
+"Typhon (plugins)"'s branch of Start). Run again on de198ca, the file
+passed whole on its own (49 passed), and so did the first eight files of
+the run in one process, in the same order (510 passed). The whole
+one-process run again, on de198ca (a detached copy, after the whole suite
+below): 1,652 passed, 0 failed, 1 skipped (the check a simulated event
+camera cannot be put to), in 511 s. That run put the review-source suite to
+a real `.raw` written with OpenEB's own writer, and the camera suite to
+pylon's emulated Baslers.
+
+Today's Typhon's Settings > Python Scripts list did not grow: counted again
+on plugins/p3c, an app that imports `frame_camera` lists 27 names and the
+typhon example 37.
+
+The whole suite on de198ca (a detached copy), 8 at a time: 254 files,
+9,525 passed, 2 failed, 40 skipped, in 756 s, and `smoke_test.py` passed
+1,313 with 0 failed. Both failures passed when their files were run alone
+(35 and 11 passed), and neither file touches the camera code or changed on
+the branch: the known-flaky `tests/test_gui_settings.py::
+test_the_warm_list_test_still_catches_a_path_per_module`, and
+`tests/test_excel_open.py::test_real_excel_xls_xlsb_text_box_chart_and_password`,
+which counts Excel processes before and after it and found two more (as at
+P3a, most likely another job's Excel while eight ran at once).
+
 ## The plugin host (stage P1 row 2)
 
 The rig is the plugin host: `frame_camera._RIG.plugins`, made on first use.
@@ -379,6 +425,10 @@ side by side, these things matter:
   after a fault, a triggered set-up refuses Start with that reason, and
   Capture now says so; a Continuous run goes ahead. A refusal of the
   camera's own reads as today's after "Start refused — Triggering: ".
+- **While a run records, Python's switch interval is 1 ms** (stage P3 row
+  5), and it goes back to Python's 5 ms when the run is over. Nothing
+  changes on the screen or in the files; it keeps a live plugin (from P4)
+  from starving the camera's grab thread. Today's Typhon does not do this.
 - **Its Camera setup… ticks camera families** instead of choosing one:
   Basler, Prophesee EVK4, or both. Each brings its own install steps,
   checks and (Basler) scan, as today's wizard does for one. The simulated
@@ -501,13 +551,115 @@ at 1.0 ms in every run.
   table with that in mind.
 - **Still to measure before P3 row 5:** a quiet PC where nothing holds the
   timer at 1 ms (the bench PC), with the spread between runs and the load
-  beside each, to tell whether the timer request matters at all.
+  beside each, to tell whether the timer request matters at all. (Measured
+  again for P3 row 5, below: inside the real Qt Typhon it is Qt itself that
+  holds the 1 ms timer, so the request cannot matter there while the
+  window's timers run; a minimized window and the bench PC are left.)
 
 With no plugin, or with an empty one, the numbers are those of today's
 Typhon on both days (0-4 late), so the host and the feed cost nothing
 visible.
 
-To measure again (about 5 minutes), with `--timers default,1ms,switch,period`
+**Measured again for P3 row 5 (18 October 2026, 17:40-17:49), on the same
+laptop.** 3 runs per row, 4 s at 150 fps, each setting alone. The PC was
+**not quiet**: Spotify, Discord, Steam, Edge, Norton and OneDrive were
+running, the search indexer was busy, and from 17:44 another job's
+whole-suite run (eight pytest processes) ran beside it. The whole PC was
+7.9-41.6 % busy during the captures: 8-15 % for the first rows, 22-42 % for
+most of the rest. Windows' timer resolution read 1.0 ms in every run.
+
+| Settings | Plugin per frame | Late frames | More than 2 periods late | p99 lateness | Frames read in the 4 s |
+|---|---|---|---|---|---|
+| today's | none | 0 of 599-600 | 0 | 1.4-1.5 ms | all |
+| today's | 5 ms | 0 of 600-601 | 0 | 2.0-2.7 ms | all |
+| today's | 20 ms | **all** of 344-430 | 342-429 | 1.2-1.7 s | **344-430 of 600** |
+| today's | 20 ms, capped at 25 % | 82-95 of 598-602 | 17-28 | 14.5-14.9 ms | all |
+| switch interval 1 ms only | none | 0 of 600-601 | 0 | 1.4-1.5 ms | all |
+| switch interval 1 ms only | 5 ms | 0 of 600-601 | 0 | 1.4-1.8 ms | all |
+| switch interval 1 ms only | 20 ms | 113-127 of 600-604 | 2-20 | 11.6-18.2 ms | all |
+| switch interval 1 ms only | 20 ms, capped | **17-23** of 598-601 | 0-1 | 7.7-8.1 ms | all |
+| timer 1 ms only | none | 0 of 600-601 | 0 | 1.2-1.4 ms | all |
+| timer 1 ms only | 5 ms | 0 of 601-603 | 0 | 2.1-4.5 ms | all |
+| timer 1 ms only | 20 ms | **all** of 340-367 | 339-367 | 1.6-1.7 s | **340-367 of 600** |
+| timer 1 ms only | 20 ms, capped | 90-97 of 600-601 | 22-25 | 14.7-15.1 ms | all |
+| both at 1 ms | none | 0-1 of 599-600 | 0 | 1.2-2.3 ms | all |
+| both at 1 ms | 5 ms | 0 of 600-601 | 0 | 1.5-1.8 ms | all |
+| both at 1 ms | 20 ms | 120-169 of 600-601 | 6-22 | 13.2-16.1 ms | all |
+| both at 1 ms | 20 ms, capped | **16-21** of 599-601 | 0 | 7.8-7.9 ms | all |
+
+**Why the timer request does nothing here: Qt already asks for it.** A
+1 ms `Event.wait` took 1.0-1.9 ms in every run, today's settings included,
+although nothing in the bench asked Windows for a finer timer. The bench's
+own probe, outside the app, says where that comes from (measured twice): in
+a bare Python process a 1 ms wait takes 15.5-15.8 ms; with a `QApplication`
+made, 15.5-15.6 ms; with a running Qt timer of 15 ms, 1.1-1.4 ms; with one
+of 40 ms, 15.7 ms. Qt on Windows gives a timer of 20 ms or less Windows'
+1 ms timer, and the real Typhon window runs such timers (its live view). So
+inside the real Qt Typhon the process has the fine timer already, and
+asking for it again changed nothing measured, on any of the three days.
+That "other programs hold this laptop's timer at 1 ms" (above) was the wrong
+reason: the system-wide resolution read 1.0 ms, but on Windows 11 a
+process that does not ask is not given it (the bare process's 15.5 ms).
+
+**What P3 row 5 built from this.** The plugin Typhon holds Python's switch
+interval at 1 ms while a run records, and puts back what was there when the
+run is over (`council_core.plugin_host.SwitchInterval`,
+`RECORDING_SWITCH_S`): from the recording's start to Stop, or to its end
+record when the recording ends by itself; a Disconnect or a Start that fails
+puts it back; an interval already finer, or one someone else set meanwhile,
+is left alone. That is what the measurements support: with a plugin busy
+20 ms a frame the grab thread read every frame instead of 344-430 of 600,
+and with the duty cap 16-23 frames were late instead of 82-97; with no
+plugin it changes nothing (0-1 late either way). It does not ask Windows
+for the 1 ms timer: the window's own Qt timers already do. Today's Typhon
+makes no host, so its switch interval is Python's 5 ms as before (a test).
+The bench keeps every row's meaning (it holds the plugin Typhon's own
+interval off for them) and has a `typhon` row: the plugin Typhon as it is,
+the bench setting nothing.
+
+**The plugin Typhon as built, measured the same evening (18:26-18:28).**
+2 runs per row, 4 s at 150 fps, the PC quieter this time: 5.3-16.8 % busy,
+no other test job running (the usual background programs, as above). The
+interval read during each capture was 5.0 ms in the `default` rows and
+1.0 ms in the `typhon` rows; a 1 ms wait took 15.4-15.9 ms in each child
+before Qt and 1.1-1.9 ms with the window up.
+
+| Settings | Plugin per frame | Late frames | More than 2 periods late | p99 lateness | Frames read in the 4 s |
+|---|---|---|---|---|---|
+| today's | none | 0 of 599-603 | 0 | 1.5-1.8 ms | all |
+| today's | 20 ms | **all** of 422-434 | 420-434 | 1.2 s | **422-434 of 600** |
+| today's | 20 ms, capped at 25 % | 76-84 of 600 | 14-16 | 14.5 ms | all |
+| **typhon** (P3 row 5) | none | 0 of 599-600 | 0 | 1.3-1.5 ms | all |
+| **typhon** (P3 row 5) | 20 ms | 98-114 of 602 | 7-14 | 13.5-14.7 ms | all |
+| **typhon** (P3 row 5) | 20 ms, capped at 25 % | **7-10** of 601 | 0 | 6.7-7.4 ms | all |
+
+**Still to measure, on the bench PC (the user's to run; it cannot be done
+from here).** Whether a minimized window keeps the fine timer: Windows 11
+may stop honouring a process's timer requests while its window is
+minimized or hidden, which an offscreen window cannot show; if it does, the
+switch interval alone may not hold in a minimized Typhon, and the timer
+request with Windows 11's "honour it anyway" flag would be the fix. On the
+bench PC, with the camera's other programs closed and nothing else running
+(note what is open), in a checkout of the branch that has this part
+(`plugins/p3c`, or `typhon-plugins` once it is merged in), with the Python
+the Council runs under there (PySide6 6.10, as the `council` environment
+has it):
+
+```
+python tools\typhon_plugins_timing.py --timers default,typhon,period,1ms --plugins none,slow5,slow20,slow20cap --repeats 3 --out bench_offscreen.json
+python tools\typhon_plugins_timing.py --window minimized --timers default,typhon,period,1ms --plugins none,slow20,slow20cap --repeats 3 --out bench_minimized.json
+```
+
+The first runs offscreen (about 10 minutes); the second shows the app's
+window minimized for each run (about 8 minutes; do not use the PC
+meanwhile). Each printed row says how busy the PC was, the 1 ms wait before
+and after Qt, and the switch interval while recording. What to look for:
+`typhon` should read every frame with the 20 ms plugin, as `1ms` does; if
+in the minimized runs the 1 ms wait is near 15.6 ms and `typhon` starves
+where `1ms` does not, the core should also ask for the timer while it
+records. Send the two JSON files back.
+
+To measure again (about 5 minutes), with `--timers default,1ms,switch,period,typhon`
 for the full table; each row printed says how busy the PC was:
 
 ```
@@ -535,5 +687,6 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P3 row 4: preset and record namespacing; keys of a missing plugin kept untouched | done on branch `plugins/p3a` (notes, "Presets and records by namespace"; `tests/test_typhon_plugins_presets.py`): `<id>/<key>` is a plugin's, `capture.*` the triggering plugin's, `save.downsample` the core's; applying a preset in a "Typhon (plugins)" project gives the camera its own keys, a running plugin its own values, and keeps and lists a missing plugin's keys (never handed to the camera, which said "refused"); saving keeps them from the preset it replaces, exactly; with triggering off its `capture.*` too. Today's Typhon applies and saves presets as before |
 | P3 row 2: the triggering plugin | done on branch `plugins/p3b` (`docs/typhon_plugin_api_notes.md`, "Triggering"; `tests/test_typhon_plugins_trigger.py`): `typhon.trigger` is an adapter over today's trigger code (`triggered.py`'s TriggerRun and frame_camera's trigger functions, which do not move), called with a camera made of its facets; in a "Typhon (plugins)" project Start and Stop call its trigger slot at each of today's steps — arm, the camera record's capture block, the record gate (the books, guarded; the triggers CSV through the file service), the edge count, the source; halt, close, disarm; abort at Disconnect — and a fault after the recording began ends it with its reason, while Stop's steps serve the run out so the camera is always put back; check_start checks what each run needs per mode and source, in the camera's own words where it has a trigger facet; Typhon's Software and Timer sources; Capture now (F9) is the plugin's; its status segment, trigger rows (read and written in place), toolbar action and panel are built (the window shows today's boxes until P4). A triggered set-up whose triggering plugin does not run refuses Start. Today's Typhon runs today's code: a probe of eleven runs gives the same files, CSV columns and records as typhon-plugins (7ec6bc4) |
 | P3 row 3: Downsample the core's frame stage; binning a Basler facet; the capture set-up split | done on branch `plugins/p3b` (notes, "The capture set-up, the facets and Downsample"; `tests/test_typhon_plugins_capture_setup.py`): `CaptureOptions`, `CaptureSetup`, the modes and sources, and the facets' protocols (SoftwareTrigger, HardwareTrigger, Binning) in `typhon_plugin_api`; the Basler plugin gives all three, the simulated frame camera a software trigger; `cameras.frame_stage` is the one frame stage a recorder saves through, and `capture.py` imports neither reduce nor triggered; the Downsample row of every frame camera's Capture group is the core's; `FrameView` carries area, binning, decimation, mirroring and Downsample, `to_sensor()` and `saved`. The rows still show where they do today (P4 moves the trigger rows to the pop-out) |
-| P3 row 5: the finer timer while recording | not built: P1 row 3 did not confirm it (above, "Frame timing with a slow plugin": whether the 1 ms timer request matters is still to measure on a quiet PC and on the bench PC) |
-| P3 row 6: contract suites for every kind, and the fake host | done on branch `plugins/p3b`: `typhon_plugin_api.fake_host` (simulated cameras, a temporary project, no window, Typhon's own Start and Stop); `tests/contracts/test_trigger_sources.py` and `tests/contracts/test_feature_plugins.py` beside the camera kind's, which now checks the facets |
+| P3 row 5: the finer timer while recording | done on branch `plugins/p3c`, as far as this laptop could measure it (above, "Measured again for P3 row 5"): the plugin Typhon holds Python's switch interval at 1 ms while a run records and puts it back after (`plugin_host.SwitchInterval`); Windows' 1 ms timer is not asked for, because inside the real Qt Typhon the window's own Qt timers already give the process one. Measured on a PC that was not quiet; the bench PC, and a minimized window, are still to measure (the instructions above). Today's Typhon unchanged |
+| P3 row 6: contract suites for every kind, and the fake host | done: on branch `plugins/p3b` the fake host and the trigger-source and feature suites; on `plugins/p3c` the rest (`docs/typhon_plugin_api_notes.md`, "The fake host and the contract suites"): `tests/contracts/test_frame_stages.py` (the core's Downsample, and a built-in plugin's stage after it, now asked at Start), `test_record_gates.py` (the triggering plugin's books in four modes), `test_review_sources.py` (the Prophesee raw view), `test_file_services.py` (both services, through a plugin loaded from its folder), and the fault cases the feature and camera suites lacked; the fake host loads a plugin's folder as an author has it (`FakeHost.load`), scans only the simulated cameras, and checks a run's sums (`Run.problems`). Every built-in plugin passes its kind's suites. The recording path now hands a frame stage and a record gate read-only frames |
+| P3 closed (18 October 2026) | rows 1-6 on `plugins/p3a`, `plugins/p3b` and `plugins/p3c`, not yet merged into `typhon-plugins`. From P2's open list: the core keeps asking the Device's own flags for restarting, raw recording and the live area (no P3 row moves them; the open-time check and the camera suite hold them equal to the slot's capabilities; they move with M1's per-slot functions, P6), and the frame's own array is not made read-only at `read()` — instead every way a plugin is handed a frame is read-only (a FrameView since P1, a frame stage's input and a record gate's frame since P3c). What is left of P3 for later stages: the bench-PC timing (above), the third-party `sha256` in the camera record (P5), the screen points shown (P4) |
