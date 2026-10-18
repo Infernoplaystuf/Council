@@ -44,3 +44,5 @@ same list.
 - The knowledge graph (Connections tab), agent profiles (Agent Creator tab) and the
   "Set up a Pi" wizard: `docs/handoff/knowledge_graph_desktop.md` (decisions, plan and
   progress; it was written for the desktop's `knowledge-graph` branch).
+- The graph's Excel / Ledger sources, inspector initials and outside folders:
+  `docs/handoff/kg_excel_2026-10-16.md`.

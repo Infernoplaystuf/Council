@@ -373,6 +373,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     stopped = []
     try:
         app = app_factory()
+        _tie_excel(app)
         watchdog = _watchdog(app, timeout, stopped) if com is not None else None
         for attr, val in (("Visible", False), ("DisplayAlerts", False),
                           ("AskToUpdateLinks", False), ("EnableEvents", False),
@@ -479,7 +480,10 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     n += 1
                     out.extras.append(Extra(name, f"{name} › text box {n}", text_cells(text)))
                     continue
-                if typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and want_pictures:
+                if typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and not want_pictures:
+                    # listed, never copied: no clipboard (the caller counts them)
+                    out.pictures.append(Picture(name, anchor, b""))
+                elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and want_pictures:
                     data_png = _copy_picture(sh)
                     used_clip = True
                     if data_png:
@@ -527,6 +531,50 @@ def _cell_of(shape) -> str:
         return str(tl.Address).replace("$", "")
     except Exception:
         return "unknown"
+
+
+#: Windows job objects holding every hidden Excel this process started.
+#: Closing the last handle - this process ending, in any way - ends them.
+_JOBS: list = []
+
+
+def tie_to_this_process(pid: int) -> bool:
+    """Put process `pid` in a job that Windows closes when THIS process ends,
+    killing it. A rebuild's worker is a daemon thread: when the Council quits
+    while it is inside Excel, read_with_excel's finally (Close, Quit) never
+    runs and the hidden Excel stayed, with the workbook open (review,
+    2026-10-16). True when tied; False where it cannot be (not Windows, no
+    pywin32, already in a job that forbids it)."""
+    if os.name != "nt":
+        return False
+    try:
+        import win32api
+        import win32con
+        import win32job
+        job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+        info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+        handle = win32api.OpenProcess(win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE,
+                                      False, int(pid))
+        try:
+            win32job.AssignProcessToJobObject(job, handle)
+        finally:
+            win32api.CloseHandle(handle)
+    except Exception:
+        return False
+    _JOBS.append(job)
+    return True
+
+
+def _tie_excel(app) -> None:
+    """The hidden Excel `app` dies with this process (tie_to_this_process)."""
+    try:
+        import win32process
+        pid = win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]
+    except Exception:
+        return
+    tie_to_this_process(pid)
 
 
 def _watchdog(app, timeout: float, stopped: list):
