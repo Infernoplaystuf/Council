@@ -225,6 +225,32 @@ on e073a24 (the last commit of P1): their fakes run through WSL's bash
 (`WindowsApps\bash.EXE`), which did not find the tests' `C:/` temporary
 paths. Neither file touches the camera code.
 
+After P2 rows 3 and 4 (18 October 2026), the gate on f767554, 6 at a time:
+65 files, 3,287 passed, 0 failed, 49 skipped, in 199 s, with no rerun. The
+run before it, on 44e7507, had one failure:
+`tests/test_typhon_plugins_timing.py::test_the_pcs_load_is_read_from_its_cpu_times`.
+That test did a few ms of work between two reads of Windows' CPU times,
+which move on only at the clock tick (about 15.6 ms). When both reads fell
+in one tick they were equal, and the load came back as "cannot tell"
+(None). In a measurement, 8 of 200 such reads came back None. The test now
+stays busy for 0.2 s (f767554), and 0 of 20 such reads came back None. The
+bench itself is unchanged.
+
+In the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on f767554, were run the 23 camera and Barbie v4 files of the
+gate and the branch's seven camera files. Those seven are the rig, the rig
+file, capabilities, the registry, the rig fakes, the set-up and the
+contract suite. The result: 1,356 passed, 0 failed, 1 skipped, in 470 s.
+
+The whole suite on f767554, 8 at a time: 239 files, 8,505 passed, 1
+failed, 39 skipped, and `smoke_test.py` passed 1,313 with 0 failed. The
+one failure was `tests/test_node_routing.py::
+test_two_roles_on_two_machines_really_run_side_by_side`, a timing test
+(0.97 s against its 0.75 s limit). It failed once more when its file was
+run alone, and then passed three runs of the file in a row and one run on
+its own. It does not touch the camera code. `tests/test_pi_remote.py`
+passed all 46 this time.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
@@ -237,11 +263,24 @@ it may have been counted ("3 triggers · 2 ok").
 The rig is the plugin host: `frame_camera._RIG.plugins`, made on first use.
 What it does, the API it offers plugins (0.1) and what each later stage
 adds are in `docs/typhon_plugin_api_notes.md`. For running the two Typhons
-side by side, three things matter:
+side by side, these things matter:
 
-- **Nothing is wired yet.** Today's camera code never calls the host, so
-  "Typhon (plugins)" still behaves exactly like today's Typhon. A test runs
-  a whole capture and finds the host never made or imported.
+- **Only the cameras are wired, and only in "Typhon (plugins)"** (stage P2
+  rows 3 and 4). Its scan, Connect and Camera setup… go through the
+  camera plugins; the cameras, rows and notes are those of today's Typhon
+  for the same set-up. Today's camera code never calls the host: a test
+  runs a whole capture and finds the host never made or imported.
+- **Its Camera setup… ticks camera families** instead of choosing one:
+  Basler, Prophesee EVK4, or both. Each brings its own install steps,
+  checks and (Basler) scan, as today's wizard does for one. The simulated
+  cameras need no set-up and are always listed. A project set up with
+  today's single choice is not asked again: that one camera is ticked.
+  `camera_setup.json` stays readable by today's Typhon, which takes the
+  first family it knows.
+- **`camera_rig.json`** appears beside `app.py` at the first Connect: the
+  name each camera goes by in the rig (cam1, cam2, ...), kept from one
+  session to the next, and later the rig presets. A damaged one is said
+  in Connect's line and left as it is; the camera still connects.
 - **A new "Typhon (plugins)" project gets `typhon_plugins.json`** beside its
   `app.py`. The file holds the app-wide base set copied as it is when the
   project is made (question 1), and the plugin home it was made with,
@@ -379,4 +418,5 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P2 row 1: Basler, Prophesee and Simulated as adapter camera plugins | done (plugin API 0.2, `docs/typhon_plugin_api_notes.md` "Camera plugins"): adapters over today's Backend, Device and Provider classes, which do not move; capabilities in the manifest, confirmed by the opened camera and kept by its slot; `frame_camera`'s four event-camera checks, the simulated camera's settings and the Capture tab ask capabilities; `Provider.extra_stops` (a Basler's other triggers); the host's camera registry (the scan through the plugins is today's scan); category hints that merge into today's tables; the raw view as the Prophesee plugin's review source; `cameras.backends()` and `discover()` unchanged. Today's Typhon still opens cameras as before: the registry is called from rows 3 and 4 |
 | P2 row 2: N simulated cameras and the rig's test fakes | done: `COUNCIL_SIM_CAMERAS`; `tests/fake_rig.py` (fake EVK4 units with serials, several at once; Trigger In, sync and the trigger decoder; a trigger line; a sync clock; replay rigs, of real `.raw` files where the Metavision SDK is) |
 | P2 contract suite for camera plugins | done: `tests/contracts/test_camera_plugins.py`, passed by every built-in camera plugin (with pylon's emulated Baslers in the `pylon` env) |
-| P2 rows 3 and 4 | not started on this branch: `camera_rig.json`, the set-up's camera families as the enabled camera plugins, the wizard's check boxes and each plugin's guide, checks and scan page, `camera_setup.json`'s choice as the project's plugin list |
+| P2 row 3: `camera_rig.json`, several camera families in the set-up, the wizard's check boxes, "in use as cam2" | done (`docs/typhon_plugin_api_notes.md`, "The set-up, and the rig's names"): `council_core/camera_rig_file.py` (names, rig presets stored and planned; additive; `camera_presets.json`'s rules); the set-up's families are the enabled camera plugins; `CameraFamiliesWizard` with a check box per family, for "Typhon (plugins)" projects only (today's Typhon keeps its wizard); a camera takes its name in the rig at Connect, and is renamed in the file and its slot together (`host.rename_camera`; the window that asks comes at P6); "in use as cam2" in the scan once the rig has a second slot, and Connect refuses that camera in another slot; the wizard's scan is told about every open slot. Putting a rig preset on several open cameras is M1 row 5 (P6) |
+| P2 row 4: set-up guides and checks through the plugins; `camera_setup.json`'s choice as the project's plugin list | done: `CameraSetup` in plugin API 0.2 (`setup_guide`, `setup_checks`, the Basler `setup_scan`) and the manifest's `setup`; the Basler and Prophesee plugins reach today's guides, checks and scan page, which do not move; `camera_setup.json` gains a `cameras` list, still `FORMAT` 1, a single-choice file read as a list of one; the host scans only the families ticked (a family ticked before whose plugin is switched off stays ticked; with no family to tick, a project is not asked); the contract suite checks each plugin's set-up |

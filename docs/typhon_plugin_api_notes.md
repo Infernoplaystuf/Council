@@ -7,20 +7,24 @@ still allowed. It is frozen as 1.0 at stage P5, together with the author's
 guide of design 3.11, and only then are plugins from other people loaded.
 Until then these notes are the record of what exists.
 
-**Version now: 0.2** (stage P2 rows 1 and 2, 16 October 2026). 0.1 was
-stage P1 row 2 (15 October 2026); 0.2 adds the camera plugins.
+**Version now: 0.2** (stage P2: rows 1 and 2 on 16 October 2026, rows 3
+and 4 on 16-18 October). 0.1 was stage P1 row 2 (15 October 2026); 0.2 adds the camera
+plugins and, with rows 3 and 4, their set-up.
 
 ## The pieces
 
 | Piece | Where | What it is |
 |---|---|---|
-| The API a plugin imports | `typhon_plugin_api/__init__.py` | `API_VERSION`, `has()`, `EVENTS`, the types (`CameraHandle`, `FrameView`, `CropBox`, `CategoryHints`, `ReviewSource`), the protocols (`PluginContext`, `FeaturePlugin`, `CameraPlugin`), the capability names and rule, and today's classes re-exported (below) |
+| The API a plugin imports | `typhon_plugin_api/__init__.py` | `API_VERSION`, `has()`, `EVENTS`, the types (`CameraHandle`, `FrameView`, `CropBox`, `CategoryHints`, `ReviewSource`), the protocols (`PluginContext`, `FeaturePlugin`, `CameraPlugin`, `CameraSetup`), the capability names and rule, the set-up types (`Guide`, `Step`, `Check`, `Readiness`), and today's classes re-exported (below) |
 | The built-in adapters' reach | `typhon_plugin_api/builtin.py` | What the built-in camera plugins reach of the code that stays in `council_core` (BaslerBackend, EvkBackend, SyntheticBackend and their devices, the raw view's `open_raw`, the settings tabs' tables). Not part of the API a plugin from someone else may use; it goes at stage P7 |
 | Capabilities | `council_core/camera_capabilities.py` | The names of design 3.4 and the one rule that reads them off an open camera's own flags |
 | The manifest reader | `council_core/plugin_manifest.py` | Reads and checks `plugin.json` as data and imports nothing |
 | The base set and project lists | `council_core/plugin_lists.py` | `<plugin home>/base_set.json` and `<project>/typhon_plugins.json`, and the plugin home itself |
 | The host | `council_core/plugin_host.py` | The built-in list, discovery, lazy loading, the guard and faults, contexts, events, the UI queue, live-frame feeds and the watchdog; from 0.2 the camera-plugin registry |
-| The rig | `council_core/camera_rig.py` | `rig.plugins` is the host, made on first use. Each slot's `plugin_state` holds a plugin's per-camera state; its `capabilities` say what its camera can do |
+| The rig | `council_core/camera_rig.py` | `rig.plugins` is the host, made on first use. Each slot's `plugin_state` holds a plugin's per-camera state; its `capabilities` say what its camera can do; its name is its camera's name in the rig (`rename_slot`), and `holding` says which slot has a camera open |
+| The rig's names and rig presets | `council_core/camera_rig_file.py` | `<project>/camera_rig.json` (P2 row 3) |
+| The set-up's families | `council_core/camera_setup.py` | `camera_setup.json`'s families (`load_families`, `save_families`, still FORMAT 1) and `Family`, one family as the wizard gets it (P2 row 4) |
+| The families wizard | `council_qt/widgets/camera_wizard.py` | `CameraFamiliesWizard`, `run_families_wizard`: check boxes, each family's steps, checks and scan (P2 rows 3 and 4); today's `CameraSetupWizard` unchanged |
 | The built-in plugins | `typhon_plugins/<name>/` | Seven adapters. The three camera plugins (Basler, Prophesee, Simulated) are adapters over today's classes from 0.2; the four feature plugins are still a manifest and an empty `plugin.py` |
 | The camera contract | `tests/contracts/test_camera_plugins.py` | What every camera plugin must do (design 9.1), run against every built-in camera plugin |
 
@@ -179,7 +183,8 @@ wired at P3) and `review_source()` (`ReviewSource` or None). Its set-up
 guide and checks join with the wizard's camera pages (P2 row 4). `has()`
 names the hooks the host calls: `camera.available`, `camera.discover`,
 `camera.open`, `camera.capabilities`, `camera.categories`,
-`camera.review_source`.
+`camera.review_source`, and, from rows 3 and 4, `camera.setup_guide`,
+`camera.setup_checks` and `camera.setup_scan` (below).
 
 **The built-in camera plugins are adapters** over code that does not move
 (design 7.2): `typhon.basler` over `BaslerBackend`, `BaslerDevice` and
@@ -263,6 +268,94 @@ serials of their own behind one fake HAL (several at once, in
 external-trigger decoder shaped like OpenEB 5.2's bindings (checked where
 they are importable), a trigger line, a sync clock, and replay rigs (recorded
 events, or real `.raw` files where the Metavision SDK is).
+
+## The set-up, and the rig's names (0.2, stage P2 rows 3 and 4)
+
+**A camera plugin's set-up** (`CameraSetup`, design 2.3, 2.4 item 15). A
+camera plugin whose manifest contributes `setup` (camera plugins only) is
+a camera FAMILY: a check box in the set-up wizard of a "Typhon (plugins)"
+project. It gives `setup_label` (the family's short name, "Basler"),
+`setup_guide(python)` (a `Guide` of `Step`s, its install commands written
+for the interpreter the app runs under), `setup_checks()` (a `Readiness` of
+`Check`s, each True, False or None; it takes seconds and runs off the UI
+thread; it must not raise for a missing SDK) and, optionally,
+`setup_scan(held)` with `setup_scan_label` (a scan page: every camera of the
+family and whether each will run, shaped like `basler_scan.ScanReport`;
+`held` maps the key of every camera this window holds open to its name in
+the rig, and the scan must not open those again). The types are the wizard
+shell's, which stays core (design 2.1), re-exported. The Basler and
+Prophesee plugins reach today's guides and checks in
+`council_core/camera_setup.py`, and the Basler one the scan page in
+`council_core/basler_scan.py`, through `typhon_plugin_api.builtin`: the
+code does not move (design 7.2). The Basler scan says which camera of the
+rig it found in use ("in use as cam2"). The simulated cameras have no
+set-up and are always listed. The contract suite checks every camera
+plugin's set-up.
+
+**The families a project ticked** are kept in its `camera_setup.json`,
+still `FORMAT` 1: a `cameras` list, in the order offered, beside the one
+`camera` today's reader knows (the first family it knows; none when it
+knows none, and that reader then asks again). A file written by today's
+single-choice wizard is read as a list of one (`load_families`), so a
+project set up today opens unchanged and is not asked again; today's
+Typhon reads a families file's first family it knows (`load_choice`).
+
+**The set-up read as the project's plugin list.** `host.setup_choice()`
+reads those families (None: never set up). `camera_plugins()` is then the
+camera plugins the project runs, less those with a set-up whose family was
+not ticked; never set up, it is every one of them, as today's Typhon scans
+everything until it is set up. So for the same set-up the scan through the
+plugins is today's scan, row for row and note for note (a test compares
+the two). `camera_families()` gives the wizard every family the project
+runs, ticked or not, as `camera_setup.Family`; each part is guarded, so a
+plugin's guide or check that fails comes back as a guide or a failed check
+saying so (logged; a built-in camera plugin stays on). A family switched
+off in `typhon_plugins.json` is not offered. `family_plugins()` names the
+families offered from the manifests alone, loading nothing; with none (every
+camera plugin with a set-up switched off, so only the simulated cameras
+are left) a project never set up is not asked at every start.
+
+**The wizard** (`CameraFamiliesWizard`): a check box per family, then the
+install steps of every family ticked (with several, each under its own
+heading with a copy button of its own: a pip command and an EVK4's
+administrator commands do not go into one prompt), then each family's
+checks and, for a family with a scan page, its scan, each off the UI
+thread. A check or scan from an earlier visit is never shown on a later
+one. With one family ticked, the pages read exactly as today's wizard.
+`run_families_wizard` saves what was ticked, and keeps after it a family
+ticked before that has no check box now (its plugin switched off): the
+wizard did not ask about it, so the answer is not lost. Today's Typhon
+keeps its single-choice `CameraSetupWizard`, unchanged.
+
+**`camera_rig.json`** (`council_core/camera_rig_file.py`; multi-camera
+design 2.2, 2.5): the name each camera goes by in the rig, cam1, cam2, ...
+by default, renameable, safe in a folder name; a camera is known by its
+backend and serial (an EVK4's model is read only once it is open), or by
+its key with no serial, and keeps its name from one session to the next.
+And rig presets: which preset goes on which camera; `plan()` says what
+putting one on the open cameras would do (applying one is M1 row 5, stage
+P6). The file follows `camera_presets.json`'s rules: JSON only, an OS lock
+on a sidecar, written whole under a temporary name of its own, flushed and
+renamed; a damaged or newer file is refused and left as it is; reading
+never writes. It is additive: what it does not know (a later block such as
+the triggering plugin's rig-wide set-up, design 3.6, or a field of an
+entry) is kept when it rewrites.
+
+**In a "Typhon (plugins)" project** `frame_camera` scans through the host,
+opens through the plugin of the camera's family (which confirms its
+capabilities onto the slot), and names the camera from `camera_rig.json`
+(`host.name_camera`: the slot takes the camera's name; a damaged or
+unwritable file is said in Connect's line and left alone, and the camera
+still connects). `host.rename_camera` renames the camera open in a slot,
+in the file (its rig presets follow) and in the slot together, and refuses
+an unsafe or taken name, or a slot with no camera, before anything
+changes; the window that asks for a name comes with the rig controls
+(stage P6). With a second camera slot the scan marks a camera the
+window holds "· in use as cam2", and Connect refuses it in another slot
+before anything opens; a one-camera window's rows read as they always
+have. The wizard's scan is told about every open slot. Today's Typhon
+keeps its scan, its wizard and its first-run question, and never makes the
+host.
 
 ## Calls into a plugin, and faults (design 3.10)
 
@@ -379,12 +472,15 @@ bench PC.
 
 ## What is wired, and what comes when
 
-Nothing in `frame_camera` calls the host yet, so today's Typhon behaves
-exactly as before, and a test runs a whole capture and finds the host never
-made or imported. From 0.2 `frame_camera` asks its camera slot what the
-camera can do; without a host the slot answers from the camera's own flags,
-which is what the old checks read. The camera registry is called by the set-
-up's camera families from P2 rows 3 and 4. The recording code has two additions, and neither does
+Today's Typhon never calls the host, so it behaves exactly as before, and a
+test runs a whole capture and finds the host never made or imported. From
+0.2 `frame_camera` asks its camera slot what the camera can do; without a
+host the slot answers from the camera's own flags, which is what the old
+checks read. From P2 rows 3 and 4 a "Typhon (plugins)" project — one whose
+folder holds `typhon_plugins.json` — scans, opens and sets up its cameras
+through the host's camera registry (above, "The set-up, and the rig's
+names"); `frame_camera` names that file rather than importing the plugin
+lists. The recording code has two additions, and neither does
 anything for today's Typhon: `FrameWriter.end_recording`, which only the
 host calls, and `record_to` handing a gate its run's writer
 (`bind_writer`), which today's `TriggerRun` does not have. The rig reaches
@@ -394,7 +490,7 @@ found 6 extra files there, 35 to 41, and a slower cold list).
 
 | Stage | Adds to the API |
 |---|---|
-| P2 | Rows 1 and 2 are done (0.2, above): the camera plugins over today's Backend, Device and Provider classes, capabilities declared in the manifest and confirmed by the opened camera, the registry, category hints, the raw view as a review source, `Provider.extra_stops`, N simulated cameras and the rig's test fakes. Rows 3 and 4 add `camera_rig.json`, several camera families in the set-up (the enabled camera plugins) with each plugin's `setup_guide`, checks and (Basler) scan page, and `camera_setup.json`'s choice read as the project's plugin list |
+| P2 | Done (0.2, above). Rows 1 and 2: the camera plugins over today's Backend, Device and Provider classes, capabilities declared in the manifest and confirmed by the opened camera, the registry, category hints, the raw view as a review source, `Provider.extra_stops`, N simulated cameras and the rig's test fakes. Rows 3 and 4: `camera_rig.json` (names, rig presets), several camera families in the set-up as the enabled camera plugins, the wizard's check boxes, "in use as cam2" in the scan, each camera plugin's guide, checks and (Basler) scan page in the wizard, and `camera_setup.json`'s choice read as the project's plugin list |
 | P3 | The run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start, and `has("hook.check_start")`). `RunPlan` and `RunInfo`. The facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) and `CaptureOptions` and `CaptureSetup` in the API. The record gate wired through `record_gate`. The run-file suffix registry. Record blocks, and the run records' `plugins` block. The two file services, and `<project>/plugin_data/<id>/` for a plugin's own data in a project (design 4.1; nothing makes it in 0.1). `FrameView.to_sensor` and its coordinate fields, and `saved`. The finer timer while recording (row 5), decided on a quiet PC and on the bench PC. Whether plugins need the frame's own array read-only from `read()` (design 3.8), if they get frames any other way than a `FrameView` |
 | P4 | The screen: pop-out panels, toolbar and status strips, the Plugins window (base set, additions, switch-offs, settings, approval states, each plugin's over-budget and dropped-frame counts), `current_frame` and `crop_box` wired. `status()` asked by the status strip and held to its limits, 80 characters and 5 ms (design 3.5, 3.11), with `has("hook.status")`. The crash marker and "asked after a crash". A plugin's Python packages checked in the project's own interpreter (`python_envs`) when the Council lists a project's plugins; inside the app the running interpreter is the project's |
 | P5 | The hardened loader for third-party plugins (approval, `approvals.json`, the hash-then-compile importer, the `typhon_thirdparty.<folder>` package, `read_data`), the network field and its audit hook, the manifest's `uses` acted on (11.5), the API frozen as 1.0, and the author's guide and `python -m typhon_plugin_api.check` |
@@ -473,3 +569,48 @@ Taken at stage P2 (rows 1 and 2, 16 October 2026):
   `I_CameraSynchronization::SyncMode`, and no `SyncMode` is bound anywhere
   in `metavision_hal` (read from the bindings in the `pylon` env; not
   called, there being no EVK4), so there is no real value to compare.
+
+Taken at stage P2 (rows 3 and 4, 16-18 October 2026):
+
+- **Today's Typhon keeps its single-choice wizard; only a "Typhon
+  (plugins)" project gets the check boxes.** "What you see" after P2 is
+  the same Typhon with a wizard that ticks camera families. Giving today's
+  Typhon check boxes too would have changed its wizard's tests (ticking a
+  second family leaves the first ticked), which the gate keeps unchanged.
+  A project is a "Typhon (plugins)" one when its folder holds
+  `typhon_plugins.json`.
+- **A family is its camera plugin's backend name** (`basler`, `prophesee`,
+  a third party's dotted one), the word today's `camera` already holds.
+- **The families stay in `camera_setup.json`**, not in
+  `typhon_plugins.json`'s `added` and `off`: the set-up's choice is read as
+  part of the plugin list, so today's file needs no rewrite, and a family
+  switched off in the plugin list is off whatever the set-up says.
+- **The manifest says whether a camera plugin has a set-up** (`setup` in
+  `contributes`), so the scan knows which plugins the set-up narrows
+  without loading any for that.
+- **The API stays 0.2.** The set-up hooks are additions within stage P2's
+  version: nothing outside the branch names 0.2 (third-party plugins load
+  from P5), and `has()` names each hook.
+- **"In use as cam2" only once the rig has a second camera slot**, so a
+  one-camera window's rows read as they always have (multi-camera design
+  2.9: a project that never adds a second camera never shows rig
+  controls). Until stage P6 adds cameras from the window, a second slot is
+  made by code only (the tests).
+- **A camera's name is given at Connect, and the slot takes it.** A
+  one-camera window's slot can therefore be called cam2 when its camera is
+  cam2 in the rig. Nothing on today's screen shows the name.
+- **Rig presets are stored and planned, not yet applied.** Putting a rig
+  preset on several open cameras needs the slot's own settings `api` (M1
+  row 5, stage P6).
+- **A name belongs to a camera**, so `rename_camera` needs one open in the
+  slot: an empty slot has no camera for camera_rig.json to give the name
+  to.
+- **A family the wizard cannot offer stays ticked** (18 October 2026).
+  Dropping it would have changed an answer the wizard never asked about;
+  the plugin list, not the set-up, says whether it runs.
+- **Nothing to tick, nothing asked** (18 October 2026). With every camera
+  plugin with a set-up switched off, the first-run wizard could only be
+  cancelled, and would have come back at every start.
+- **`NAME_RE` ends in `\Z`**: "$" also matches before a final newline,
+  so a camera name ending in a newline passed (found while testing
+  `camera_rig.json`).
