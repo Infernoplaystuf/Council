@@ -574,9 +574,11 @@ def test_disconnect_mid_run_puts_the_trigger_back(plugin_project, tmp_path):
     out = frame_camera.start(str(tmp_path / "runs"))
     device = frame_camera._LIVE.device
     press_and_wait(1)
-    books = frame_camera._RIG.active.plugin_state[TRIGGER]["run"].books
+    state = frame_camera._RIG.active.plugin_state[TRIGGER]
+    books = state["run"].books
     frame_camera.disconnect()
     assert not device._armed and not books.running
+    assert "run" not in state, "the plugin keeps nothing of a camera gone"
     files = run_files(tmp_path / "runs", out["run"])
     assert [r["outcome"] for r in files["triggers"]] == ["ok"]
 

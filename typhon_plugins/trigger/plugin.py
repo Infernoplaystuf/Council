@@ -399,6 +399,10 @@ class RunTriggers:
                 self._camera().disarm_trigger(armed)
             except Exception:                             # noqa: BLE001
                 pass
+        # The camera is going: the plugin keeps nothing of it.
+        state = self.plugin._state(self.camera)
+        if state.get("run") is self:
+            del state["run"]
 
     def capture_now(self) -> str:
         """A Capture now press during the run: today's words."""
