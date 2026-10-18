@@ -421,7 +421,7 @@ def locator_text(loc: Any) -> str:
 
 
 # ── reading records out of documents ─────────────────────────────────────
-@dataclass
+@dataclass(slots=True)        # a 100k-row workbook holds ~300,000 of these
 class Value:
     rule: FieldRule
     raw: str
@@ -437,7 +437,7 @@ class Value:
     signed: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class Record:
     path: str                    # relative to the scanned root
     kind: str                    # row | record | document | skipped |
@@ -1654,27 +1654,6 @@ class KnowledgeGraph:
         # ── 2. the graph (one transaction) ──
         try:
             with self.db:
-                # Derived rows are rebuilt; decisions and user statuses are kept.
-                self.db.execute("DELETE FROM evidence WHERE method != 'model'")
-                self.db.execute("DELETE FROM mentions")
-                self.db.execute("DELETE FROM review WHERE status='open'")
-                self.db.execute("DELETE FROM aliases WHERE source != 'user'")
-                # Every derived status is worked out again from THIS run's
-                # evidence: a link once 'seeded' stayed seeded after its document
-                # came to name several projects, so the user was never asked.
-                self.db.execute(f"UPDATE relations SET status='{_PENDING}'"
-                                " WHERE status IN ('seeded','suggested')")
-                # Only entities this run supports (plus the user's: merged,
-                # aliased by hand, in an accepted link) may explain an initial or
-                # give the gazetteer a name. A stale 'Dana Whitfield' otherwise
-                # gave herself a mention for 'D. Whitfield' and never went away.
-                self._memo = {"resolve": {}, "names": {}, "aliases": set(), "rels": {},
-                              "buffer": None}
-                self._live = {r[0] for r in self.db.execute(
-                    "SELECT entity_id FROM aliases WHERE source='user'"
-                    " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
-                    " UNION SELECT subject_id FROM relations WHERE status='accepted'"
-                    " UNION SELECT object_id FROM relations WHERE status='accepted'")}
                 prog.stage("building the graph", total=len(readable), unit="documents")
                 self._people, self._people_all, self._asked = {}, {}, {}
                 clash: set = set()
@@ -1738,13 +1717,6 @@ class KnowledgeGraph:
                         for rec in recs:
                             yield rec, did, h
 
-                n_records = 0
-                for rec, _did, _h in records():
-                    if rec.kind == "skipped":
-                        stats["skipped_rows"].append(
-                            f"{rec.path}: row {rec.skipped_row} has more cells than the header")
-                    else:
-                        n_records += 1
 
                 def kept():
                     for rec, did, h in records():
@@ -1764,7 +1736,6 @@ class KnowledgeGraph:
                                     [(d,) for d in keep])
                 self.db.execute("DELETE FROM doc_cache WHERE document_id NOT IN"
                                 " (SELECT id FROM _kg_keep)")
-                stats["records"] = n_records
                 # Nothing the graph is worked out from changed (each document's
                 # content and reading, the user's answers, merges, decisions,
                 # names, Collections, the Ledgers' people lists): the graph
@@ -1775,6 +1746,38 @@ class KnowledgeGraph:
                                        gazetteer)
                 if gsig == self.meta("graph_sig") and not fallback:
                     raise _GraphUnchanged()
+                # From here on the graph is worked out again (the check above
+                # comes first: clearing 500,000 derived rows to roll them back
+                # was most of an unchanged rebuild).
+                n_records = 0
+                for rec, _did, _h in records():
+                    if rec.kind == "skipped":
+                        stats["skipped_rows"].append(
+                            f"{rec.path}: row {rec.skipped_row} has more cells than the header")
+                    else:
+                        n_records += 1
+                stats["records"] = n_records
+                # Derived rows are rebuilt; decisions and user statuses are kept.
+                self.db.execute("DELETE FROM evidence WHERE method != 'model'")
+                self.db.execute("DELETE FROM mentions")
+                self.db.execute("DELETE FROM review WHERE status='open'")
+                self.db.execute("DELETE FROM aliases WHERE source != 'user'")
+                # Every derived status is worked out again from THIS run's
+                # evidence: a link once 'seeded' stayed seeded after its document
+                # came to name several projects, so the user was never asked.
+                self.db.execute(f"UPDATE relations SET status='{_PENDING}'"
+                                " WHERE status IN ('seeded','suggested')")
+                # Only entities this run supports (plus the user's: merged,
+                # aliased by hand, in an accepted link) may explain an initial or
+                # give the gazetteer a name. A stale 'Dana Whitfield' otherwise
+                # gave herself a mention for 'D. Whitfield' and never went away.
+                self._memo = {"resolve": {}, "names": {}, "aliases": set(), "rels": {},
+                              "buffer": None}
+                self._live = {r[0] for r in self.db.execute(
+                    "SELECT entity_id FROM aliases WHERE source='user'"
+                    " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
+                    " UNION SELECT subject_id FROM relations WHERE status='accepted'"
+                    " UNION SELECT object_id FROM relations WHERE status='accepted'")}
                 # A model's evidence stays across rebuilds (it cost GPU time) -
                 # unless its document changed since, or is gone: then it is
                 # stale and goes. A deleted file kept its last content hash,
@@ -1848,7 +1851,7 @@ class KnowledgeGraph:
             last = self.db.execute("SELECT stats FROM runs WHERE kind='seed' AND finished_ts"
                                    " IS NOT NULL ORDER BY finished_ts DESC LIMIT 1").fetchone()
             before = json.loads(last["stats"]) if last and last["stats"] else {}
-            for k in ("collections", "gazetteer_mentions"):
+            for k in ("collections", "gazetteer_mentions", "records", "skipped_rows"):
                 if k in before:
                     stats[k] = before[k]
             stats.update(self.counts())
