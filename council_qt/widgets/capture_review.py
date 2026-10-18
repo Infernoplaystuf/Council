@@ -344,6 +344,10 @@ class CaptureReviewer(QObject):
             if self.mode == RAW:
                 self._close_raw()
             keep = None
+            # A pick after Stop (_moved) was a frame of the OLD folder, and
+            # this shows the new one's first frame instead: the live view
+            # coming back is live, not that frame.
+            self._keep_pick = False
         self.root = folder
         self._root_key = _key(folder)
         self.files = list_images(folder) if folder else []

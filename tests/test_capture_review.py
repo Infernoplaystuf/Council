@@ -347,6 +347,35 @@ def test_a_pick_after_stop_does_not_outlive_a_disconnect(ui, tmp_path):
     assert rv.scrubber.get() == len(rv.files), "at the live end"
 
 
+def test_a_pick_after_stop_does_not_outlive_another_folder(ui, tmp_path):
+    """Picked after Stop, then another folder chosen before the live view is
+    back: the pick was a frame of the old folder, and choosing the new one
+    showed its first frame instead. The live view coming back is live, as it
+    is in a folder chosen with no pick — not that first frame. Before, the
+    folder change reset the frame on screen but left the pick set, and
+    _go_live kept it."""
+    other = tmp_path / "other"
+    saved_run(other)
+    run = tmp_path / "run"
+    run.mkdir()
+    rv = _stopped_with_the_live_view_not_back(ui, run)
+    drag(rv, 0)
+    assert rv._keep_pick
+    ui.ports.capture_folder.set(str(other))
+    assert pump_until(lambda: rv._root_key == cr._key(other)
+                      and len(rv.files) == 10), (rv.root, len(rv.files))
+    assert not rv._previewing, "the live view is still to come back"
+    frame_camera._LIVE.preview_retry_at = 0.0        # let it come back
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    pump(0.3)
+    assert rv.live and not rv.showing_saved(), "the old pick was kept"
+    assert rv.scrubber.get() == len(rv.files) == rv.scrubber._hi, \
+        "at the live end"
+    assert ui.ports.current_frame.get() == "", "live is not a file"
+
+
 @pytest.mark.parametrize("wait", [0.0, 1.5], ids=["at-once", "after-1.5s"])
 def test_a_disconnect_during_a_capture_then_a_pick_still_connects_live(
         ui, tmp_path, wait):
