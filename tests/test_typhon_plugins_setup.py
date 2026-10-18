@@ -667,6 +667,29 @@ def test_a_project_set_up_today_starts_from_its_one_choice(qapp, tmp_path):
     assert cs.load_choice(path) == "prophesee", "cancelled: unchanged"
 
 
+def test_a_family_ticked_before_and_not_offered_now_stays_ticked(
+        qapp, tmp_path):
+    """Its camera plugin is switched off in the project's list, so the
+    wizard has no check box for it: the answer it never asked about is not
+    lost, and the family is scanned again once its plugin is back on."""
+    path = cs.setup_path(tmp_path)
+    cs.save_families(path, ["acme.thermal", "prophesee"])
+
+    def basler_only(wizard):
+        assert list(wizard.choose.buttons) == ["basler", "prophesee"]
+        assert wizard.chosen() == ["prophesee"]
+        wizard.choose.buttons["prophesee"].setChecked(False)
+        wizard.choose.buttons["basler"].setChecked(True)
+        return 1
+
+    got = cw.run_families_wizard(None, path, [family("basler"),
+                                              family("prophesee")],
+                                 execute=basler_only)
+    assert got == ["basler"], "what was ticked in the wizard"
+    assert cs.load_families(path) == ["basler", "acme.thermal"]
+    assert cs.load_choice(path) == "basler", "today's reader"
+
+
 # ======================================================================
 # frame_camera in a "Typhon (plugins)" project
 # ======================================================================
@@ -745,6 +768,22 @@ def test_a_project_never_set_up_is_asked_and_searches_everything(
     assert "pypylon" in notes and "metavision" in notes
 
 
+def test_a_project_with_no_family_to_tick_is_not_asked(plugin_project):
+    """Every camera plugin with a set-up switched off: only the simulated
+    cameras are left, which need none, so the first-run question would
+    have nothing to tick, and is not asked at every start."""
+    for pid in ("typhon.basler", "typhon.prophesee"):
+        pl.switch_off(plugin_project, pid)
+    assert not frame_camera._needs_setup()
+    assert frame_camera._RIG.plugins.family_plugins() == []
+    assert not cs.setup_path(plugin_project).exists(), "nothing written"
+    rows = frame_camera.list_cameras()["rows"]
+    assert rows and all("Simulated" in r for r in rows)
+    pl.switch_on(plugin_project, "typhon.basler")
+    frame_camera._RIG.plugins.open_project(plugin_project)
+    assert frame_camera._needs_setup(), "a family to tick: asked"
+
+
 def test_several_families_are_all_scanned(plugin_project):
     cs.save_families(cs.setup_path(plugin_project), ["prophesee", "basler"])
     assert not frame_camera._needs_setup()
@@ -803,6 +842,53 @@ def test_the_same_camera_gets_the_same_name_next_time(plugin_project):
     names = {c.name: c.key for c in
              rf.RigFile(rf.rig_path(plugin_project)).cameras()}
     assert names == {"cam1": "sim-frame", "cam2": "sim-event"}
+
+
+def test_a_camera_is_renamed_in_the_rig_and_keeps_it_next_time(
+        plugin_project):
+    connect_sim("frame")
+    host = frame_camera._RIG.plugins
+    store = rf.RigFile(rf.rig_path(plugin_project))
+    store.save_rig_preset("Bright", {"cam1": "Daylight"})
+    assert host.rename_camera("cam1", "left") == "left"
+    assert frame_camera._RIG.active.name == "left"
+    assert store.name_of(frame_camera._RIG.active.info) == "left"
+    assert store.rig_presets() == {"Bright": {"left": "Daylight"}}, \
+        "its rig presets follow it"
+    frame_camera.disconnect()
+    connect_sim("event")
+    assert frame_camera._RIG.active.name == "cam1", "a new camera: cam1"
+    frame_camera.disconnect()
+    connect_sim("frame")
+    assert frame_camera._RIG.active.name == "left", "the same name next time"
+
+
+def test_a_rename_that_cannot_be_is_refused_and_changes_nothing(
+        plugin_project):
+    connect_sim("frame")
+    frame_camera.disconnect()
+    connect_sim("event")                              # cam2 in the rig file
+    host = frame_camera._RIG.plugins
+    path = rf.rig_path(plugin_project)
+    before = path.read_bytes()
+    for bad, words in (("Left Cam", "cannot name a camera"),
+                       ("cam1", "another camera of this rig")):
+        with pytest.raises(rf.RigError, match=words):
+            host.rename_camera("cam2", bad)
+        assert frame_camera._RIG.active.name == "cam2"
+        assert path.read_bytes() == before
+    frame_camera._RIG.add_slot("right")
+    with pytest.raises(rf.RigError, match="already named 'right'"):
+        host.rename_camera("cam2", "right")
+    with pytest.raises(rf.RigError, match="no camera open"):
+        host.rename_camera("right", "far")
+    path.write_text("{damaged", encoding="utf-8")
+    with pytest.raises(rf.RigFileError):
+        host.rename_camera("cam2", "near")
+    assert frame_camera._RIG.active.name == "cam2"
+    assert path.read_text(encoding="utf-8") == "{damaged", "left as it is"
+    with pytest.raises(KeyError):
+        host.rename_camera("nobody", "near")
 
 
 def test_a_damaged_rig_file_is_said_left_alone_and_never_in_the_way(
@@ -912,7 +998,7 @@ print("HOST", frame_camera._RIG._plugins is not None, flush=True)
 """
 
 
-def test_a_tk_build_of_a_plugins_project_says_so_instead_of_dying(
+def test_a_plugins_project_with_no_qt_application_says_so_instead_of_dying(
         tmp_path, home):
     project = make_plugin_project(tmp_path / "project", home)
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")

@@ -769,21 +769,30 @@ def run_families_wizard(parent: Optional[QWidget], path,
     FORMAT 1, so today's Typhon reads the first family it knows). None when
     it was cancelled: nothing is saved, and it is asked again next time.
     Raises NoQtApplication in a process with no QApplication, as
-    run_wizard does."""
+    run_wizard does.
+
+    A family ticked before that is not offered now — its camera plugin is
+    switched off in the project's list — stays ticked in the file, after
+    those ticked now: the wizard did not ask about it, so the answer is
+    not lost, and it is scanned again when its plugin is switched back on.
+    What is returned is what was ticked in the wizard."""
     from PySide6.QtWidgets import QApplication
 
     if QApplication.instance() is None:
         raise NoQtApplication("the camera setup wizard is part of the Qt "
                               "build of this app (run_example_gui.py "
                               "<example> --target qt)")
+    before = cs.load_families(path) or []
     wizard = CameraFamiliesWizard(families, parent, app_name=app_name,
-                                  current=cs.load_families(path),
-                                  python=python, held=held)
+                                  current=before, python=python, held=held)
     accepted = (execute or (lambda w: w.exec()))(wizard)
     chosen = wizard.chosen() if accepted else []
     if not chosen:
         return None
-    return cs.save_families(path, chosen)
+    offered = {f.key for f in wizard.families}
+    kept = [k for k in before if k not in offered and k not in chosen]
+    saved = cs.save_families(path, chosen + kept)
+    return [k for k in saved if k in chosen]
 
 
 # ======================================================================

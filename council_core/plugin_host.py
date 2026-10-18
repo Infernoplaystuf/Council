@@ -912,6 +912,15 @@ class PluginHost:
         return [pid for pid in out if not self.has_setup(pid)
                 or self.camera_backend(pid) in ticked]
 
+    def family_plugins(self) -> List[str]:
+        """The camera plugins this project runs that have a set-up — the
+        families its set-up wizard offers, ticked or not — in its list's
+        order, by their manifests alone: nothing is loaded. None of them
+        (every one switched off) leaves only the simulated cameras, which
+        need no set-up, so a project never set up is not asked then."""
+        return [pid for pid in self._runnable_cameras()
+                if self.has_setup(pid)]
+
     def camera_families(self) -> List[Any]:
         """Every camera family this project can be set up for, in its list's
         order — each camera plugin it runs that has a set-up, ticked or not
@@ -921,9 +930,7 @@ class PluginHost:
         built-in camera plugin stays on), never as an exception in the
         wizard."""
         out = []
-        for pid in self._runnable_cameras():
-            if not self.has_setup(pid):
-                continue
+        for pid in self.family_plugins():
             made = self._family(pid)
             if made is not None:
                 out.append(made)
@@ -1239,6 +1246,49 @@ class PluginHost:
             return slot.name, (f"this camera is {name} in the rig, but it "
                                f"keeps the name {slot.name} here: {exc}")
         return name, ""
+
+    def rename_camera(self, camera: str, new: str) -> str:
+        """Call the camera open in slot `camera` `new` from now on (multi-
+        camera design 2.2: renameable): in camera_rig.json, every rig
+        preset that names it included, so it keeps the new name next time,
+        and the slot. Returns the new name.
+
+        Refused before anything changes — camera_rig_file.RigError, a
+        ValueError — when `new` is not a safe name, when another slot or
+        another camera of the rig has it, or when the slot has no camera
+        open (a name belongs to a camera); RigFileError when the file is
+        damaged, newer or cannot be written, and it is left as it is. The
+        name window that asks for it comes with the rig controls (stage P6);
+        nothing on today's screen calls this."""
+        from .camera_rig_file import RigError, check_name
+
+        rig = self.rig
+        slot = self._slot(camera)
+        if rig is None or slot is None:
+            raise KeyError(f"no camera slot named {camera!r}")
+        check_name(new)
+        info = getattr(slot, "info", None)
+        if getattr(slot, "device", None) is None or info is None:
+            raise RigError(f"{slot.name} has no camera open: connect one "
+                           f"first (a name belongs to a camera)")
+        others = [s.name for s in rig if s is not slot]
+        if new in others:
+            raise RigError(f"a camera is already named {new!r}")
+        store = self.rig_file()
+        if store is not None:
+            have = store.name_of(info)
+            if have != new:
+                if any(c.name == new for c in store.cameras()):
+                    raise RigError(f"another camera of this rig is named "
+                                   f"{new!r}")
+                if have is None:
+                    # Not written down yet (its file was damaged at
+                    # Connect, and mended since): it is now, as `new`.
+                    store.assign(info, prefer=new, taken=others)
+                else:
+                    store.rename(have, new)
+        rig.rename_slot(slot.name, new)
+        return new
 
     # -- the guard -----------------------------------------------------------
     def _guard(self, pid: str, hook: str, fn: Callable[..., Any],

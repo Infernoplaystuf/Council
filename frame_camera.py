@@ -529,9 +529,18 @@ def current_families() -> Optional[List[str]]:
 def _needs_setup() -> bool:
     """Whether the attached app has never been set up: a "Typhon (plugins)"
     project asks for its families, today's Typhon for its one camera. A
-    project set up with today's single choice is set up for both."""
+    project set up with today's single choice is set up for both. A
+    "Typhon (plugins)" project whose camera plugins with a set-up are all
+    switched off has nothing to tick (only the simulated cameras, which
+    need none), so it is not asked at every start."""
     if _plugin_project() is not None:
-        return current_families() is None
+        if current_families() is not None:
+            return False
+        try:
+            host = _plugin_host()
+            return host is None or bool(host.family_plugins())
+        except Exception:                                 # noqa: BLE001
+            return True              # cannot tell: ask, as a new app is
     return current_choice() is None
 
 
