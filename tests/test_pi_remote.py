@@ -251,10 +251,29 @@ def test_provision_first_takes_the_first_boot_secrets_off_the_card(pi, keys):
 
 
 def _git_bash():
+    """Git Bash — never WSL's launcher, which cannot see C:/ paths.
+
+    WSL's bash.exe is in System32 OR in WindowsApps, and on PATH ahead of
+    Git's in a PowerShell or cmd session on this PC: a whole-suite run
+    started from PowerShell ran 15 of these tests in WSL ("mktemp: failed
+    to create directory via template 'C:/Users/...'", 2026-10-18). Then the
+    bash beside git.exe is used, as from Git Bash."""
     import shutil
     import sys
+    from pathlib import Path
     b = shutil.which("bash")
-    if not b or (sys.platform == "win32" and "system32" in b.lower()):
+    if sys.platform == "win32" and (
+            not b or any(part in b.lower() for part in ("system32", "windowsapps"))):
+        b = None
+        git = shutil.which("git")
+        for root in (Path(git).resolve().parents[:3] if git else ()):
+            found = next((p for p in (root / "bin" / "bash.exe",
+                                      root / "usr" / "bin" / "bash.exe")
+                          if p.is_file()), None)
+            if found is not None:
+                b = str(found)
+                break
+    if not b:
         pytest.skip("needs a POSIX bash (Git Bash), not WSL's launcher")
     return b
 
