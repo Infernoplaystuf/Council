@@ -461,7 +461,14 @@ class CaptureReviewer(QObject):
         if capturing and not self._capturing:
             self._began()
         self._capturing = capturing
-        if was_capturing and not capturing:
+        if was_capturing and not capturing and run:
+            # A Stop ends the run and leaves it set: the after-Stop gap
+            # (_moved) opens. A Disconnect clears the run in the same moment
+            # (frame_camera._LIVE.clear), so the tick that sees it sees both
+            # — the run's change above closed the gap, and this must not
+            # open it again: the live view was not running during the
+            # capture, so _live_lost would never close it, and the next
+            # Connect kept a pick made in between, on a saved frame.
             self._run_ended = True
         if growing:
             self._take_new()

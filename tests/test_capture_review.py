@@ -347,6 +347,41 @@ def test_a_pick_after_stop_does_not_outlive_a_disconnect(ui, tmp_path):
     assert rv.scrubber.get() == len(rv.files), "at the live end"
 
 
+@pytest.mark.parametrize("wait", [0.0, 1.5], ids=["at-once", "after-1.5s"])
+def test_a_disconnect_during_a_capture_then_a_pick_still_connects_live(
+        ui, tmp_path, wait):
+    """Disconnect in the middle of a capture (no Stop), move the slider —
+    straight away or a while later — and Connect: live, as it always was.
+    Before, the one tick that saw the Disconnect cleared the after-Stop gap
+    on the run's change (frame_camera clears the run) and then opened it
+    again because capturing went False in the same tick; the live view had
+    not been running during the capture, so _live_lost never closed it, and
+    the pick was kept past the Connect, on a saved frame."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    frame_camera.disconnect()                 # no Stop
+    pump(0.2)
+    assert not rv._capturing and not rv._previewing
+    assert not rv._run_ended, "a Disconnect is not a Stop"
+    if wait:
+        pump(wait)
+    drag(rv, 0)
+    assert not rv._keep_pick, "a pick after a Disconnect is not kept"
+    pump(0.2)
+    connect_frame_camera()
+    assert pump_until(lambda: rv._previewing), "the live view did not start"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    pump(0.3)
+    assert rv.live and not rv.showing_saved()
+    assert rv.scrubber.get() == len(rv.files), "at the live end"
+
+
 class StillCapturing:
     """A capture that is running but, for the moment, saving nothing new —
     so playback can catch up with it. (At a steady 50 windows a second a
