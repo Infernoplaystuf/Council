@@ -92,7 +92,17 @@ class GroupPage(QWidget):
                            widget: QWidget) -> None:
         self._inner_tab_ids.append(tab_id)
         self._inner_tab_titles[tab_id] = title
-        self.inner.addTab(widget, title)
+        # Signals are blocked around addTab: the first add makes the tab
+        # current and fires inner.currentChanged, which lazy-builds the page.
+        # That is wrong at REGISTRATION time (the profile may hide this very
+        # tab, and the user has not visited the group yet). The build is
+        # triggered when the group becomes current, through the window's
+        # top-level currentChanged.
+        self.inner.blockSignals(True)
+        try:
+            self.inner.addTab(widget, title)
+        finally:
+            self.inner.blockSignals(False)
 
     def index_of(self, tab_id: str) -> int:
         try:
@@ -107,27 +117,38 @@ class GroupPage(QWidget):
         return self._inner_tab_titles.get(tab_id, tab_id)
 
     def set_inner_visibility(self, visible_ids: set) -> int:
-        """Show/hide inner tabs; return the number currently visible."""
+        """Show/hide inner tabs; return the number currently visible.
+
+        The whole operation is run with signals blocked: setTabVisible on the
+        current tab makes Qt shift the current index to the next visible tab,
+        each shift firing currentChanged, each firing running the lazy build
+        for whichever tab Qt happened to land on. The build we DO want runs
+        once at the end of ``_apply``, through the window's own top-level
+        currentChanged.
+        """
         count = 0
-        bar = self.inner.tabBar()
-        for pos, tab_id in enumerate(self._inner_tab_ids):
-            show = tab_id in visible_ids
-            try:
-                bar.setTabVisible(pos, show)
-            except Exception:                             # noqa: BLE001
-                # A bar from an older Qt without setTabVisible would raise;
-                # a missing feature here is a visible defect, not fatal.
-                pass
-            if show:
-                count += 1
-        if count and self.inner.currentIndex() >= 0:
-            if not bar.isTabVisible(self.inner.currentIndex()):
-                # Land on the first visible inner tab so the user does not
-                # see an empty page.
-                for pos in range(self.inner.count()):
-                    if bar.isTabVisible(pos):
-                        self.inner.setCurrentIndex(pos)
-                        break
+        self.inner.blockSignals(True)
+        try:
+            bar = self.inner.tabBar()
+            for pos, tab_id in enumerate(self._inner_tab_ids):
+                show = tab_id in visible_ids
+                try:
+                    bar.setTabVisible(pos, show)
+                except Exception:                         # noqa: BLE001
+                    # A bar from an older Qt without setTabVisible would
+                    # raise; a missing feature here is a visible defect,
+                    # not fatal.
+                    pass
+                if show:
+                    count += 1
+            if count and self.inner.currentIndex() >= 0:
+                if not bar.isTabVisible(self.inner.currentIndex()):
+                    for pos in range(self.inner.count()):
+                        if bar.isTabVisible(pos):
+                            self.inner.setCurrentIndex(pos)
+                            break
+        finally:
+            self.inner.blockSignals(False)
         return count
 
     def rebuild_show_tabs_menu(self, visible_ids: set,
@@ -267,6 +288,17 @@ class GroupedTabsController:
                 if bar.isTabVisible(i):
                     self.top_tabs.setCurrentIndex(i)
                     break
+
+        # Lazy-build whatever inner tab is now in front: set_inner_visibility
+        # ran with signals blocked, so no currentChanged reached the window
+        # during the sweep. The one build we DO want is the current group's
+        # visible inner tab; running it here is what makes the Council tab
+        # pay its construction cost on launch and nothing else does.
+        try:
+            self.window._build_current_inner()           # noqa: SLF001
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[group_tabs] lazy build after profile apply "
+                  f"failed: {exc!r}", flush=True)
 
     # -- toggling -----------------------------------------------------
     def _on_toggle(self, tab_id: str, visible: bool) -> None:
