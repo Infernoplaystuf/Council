@@ -109,6 +109,14 @@ The two file services and a plugin's data folder are council_core.
 plugin_runs'. A frame stage (`frame_stage`) is guarded on the recording
 path, as a record gate is.
 
+STAGE P3 ROW 4: PRESETS AND RECORDS BY NAMESPACE (design 3.9)
+A preset is split by owner before camera_settings.apply (`split_preset`;
+council_core.plugin_keys): "<id>/<key>" goes to its plugin when it runs and
+takes presets (`apply_preset_values`), and every key of a plugin that is
+not running is kept untouched — never applied, never lost on a save over it
+(`preset_settings`), said as kept (`kept_words`). Records keep plugin data
+under their "plugins" block, by id, only.
+
 LIVE FRAMES ON THE PLUGIN'S OWN THREAD (design 3.8, 10.2)
 `feed()` gives a plugin a LiveFeed: the grab thread drops each frame into a
 two-slot queue that throws away the oldest and counts it, and the plugin's
@@ -144,6 +152,7 @@ import typhon_plugin_api as api
 
 from . import camera_capabilities as cc
 from . import camera_record
+from . import plugin_keys as pk
 from . import plugin_lists as pl
 from . import plugin_manifest as pm
 from . import plugin_runs as pr
@@ -228,6 +237,20 @@ def _ours(exc: BaseException) -> bool:
 
 #: What `_hook` returns for a hook the plugin does not have.
 _NO_HOOK = object()
+
+#: The widest whole number a preset holds (camera_presets.WIDEST_INT).
+_WIDEST = 2 ** 63
+
+
+def _plain_value(value: Any) -> bool:
+    """A value a preset holds (camera_presets' rule): true or false, text,
+    a 64-bit whole number, a finite number."""
+    if isinstance(value, (bool, str)):
+        return True
+    if isinstance(value, int):
+        return -_WIDEST <= value < _WIDEST
+    return isinstance(value, float) and value == value and \
+        value not in (float("inf"), float("-inf"))
 
 
 def _hook(obj: Any, name: str) -> Callable[..., Any]:
@@ -1298,6 +1321,141 @@ class PluginHost:
             raise pr.PluginFileError("no project is open, so there is no "
                                      "project folder for a plugin's data")
         return pr.data_dir(self.project_dir, pid)
+
+    # -- presets by namespace (stage P3 row 4; design 2.5, 3.9) -------------
+    def _running(self) -> set:
+        """The plugins running in this window: on or loaded."""
+        return {pid for pid in self.runs()
+                if self.state(pid)[0] in (ON, ACTIVE)}
+
+    def _takes_presets(self, pid: str) -> bool:
+        m = self.manifest(pid)
+        return m is not None and "presets" in m.contributes
+
+    def split_preset(self, settings: Mapping[str, Any],
+                     given: Optional[Mapping[str, Any]] = None) -> pk.Split:
+        """`settings` (a preset's) split by owner (plugin_keys.split): what
+        the camera is given, what each running plugin that takes presets is
+        handed, and what is kept untouched for plugins not running."""
+        running = self._running()
+        return pk.split(settings, running=lambda pid: pid in running,
+                        takes=self._takes_presets, given=given)
+
+    def _for_camera(self, pid: str, camera: Optional[str]) -> Any:
+        m = self.manifest(pid)
+        scoped = m is not None and m.kind == "feature" and m.scope == "camera"
+        return self.instance(pid, camera if scoped else None)
+
+    def apply_preset_values(self, camera: Optional[str],
+                            values: Mapping[str, Mapping[str, Any]]
+                            ) -> List[str]:
+        """Each running plugin's own values of the preset applied
+        (`apply_preset_values(camera, values)`, best effort: a fault is
+        said — the words returned — and the plugin switched off)."""
+        notes: List[str] = []
+        for pid, mine in dict(values or {}).items():
+            made = self._for_camera(pid, camera)
+            if made is None:
+                notes.append(f"{self._name(pid)} is not running here: its "
+                             f"{len(mine)} setting{'s' if len(mine) != 1 else ''}"
+                             f" kept, not applied")
+                continue
+            self._guard(pid, "apply_preset_values",
+                        _hook(made, "apply_preset_values"),
+                        (camera, MappingProxyType(dict(mine))), {}, None)
+            fault = self.faults.get(pid)
+            if fault is not None and fault.hook == "apply_preset_values":
+                notes.append(f"{self._name(pid)} could not take its values "
+                             f"from the preset and was switched off — "
+                             f"{fault.error}")
+        return notes
+
+    def preset_settings(self, camera: Optional[str],
+                        settings: Mapping[str, Any],
+                        old: Optional[Mapping[str, Any]] = None
+                        ) -> Tuple[Dict[str, Any], List[str]]:
+        """The preset to save for `camera`: `settings` (the camera's, as
+        camera_presets.capture read them) with each running plugin's own
+        values as "<id>/<key>" (preset_values(camera); plain values only),
+        and — from `old`, the preset of that name it replaces — the keys of
+        every plugin not running, and of a running one that gave nothing,
+        exactly as they were (plugin_keys.merged). With the words to say."""
+        running = self._running()
+        new = dict(settings)
+        gave: set = set()
+        notes: List[str] = []
+        for pid in self.with_hook("presets"):
+            if pid not in running:
+                continue
+            made = self._for_camera(pid, camera)
+            if made is None:
+                continue
+            got = self._guard(pid, "preset_values",
+                              _hook(made, "preset_values"), (camera,), {},
+                              None)
+            if pid in self.faults:
+                fault = self.faults[pid]
+                if fault.hook == "preset_values":
+                    notes.append(f"{self._name(pid)} could not give its "
+                                 f"values for the preset and was switched off "
+                                 f"— {fault.error}; its keys are kept as "
+                                 f"they were")
+                continue
+            if got is None or got is _NO_HOOK:
+                continue
+            if not isinstance(got, Mapping):
+                notes.append(f"{self._name(pid)} gave its preset values as "
+                             f"{type(got).__name__}, not a mapping — kept "
+                             f"as they were")
+                continue
+            gave.add(pid)
+            bad: List[str] = []
+            for key, value in got.items():
+                if not isinstance(key, str) or not _plain_value(value):
+                    bad.append(str(key))
+                    continue
+                try:
+                    new[pk.namespaced(pid, key)] = value
+                except ValueError:
+                    bad.append(str(key))
+            if bad:
+                notes.append(f"{self._name(pid)}: {', '.join(bad)} not saved "
+                             f"— a preset holds plain values only (true or "
+                             f"false, text, a whole number, a finite "
+                             f"number)")
+        saved = pk.merged(new, dict(old or {}),
+                          running=lambda pid: pid in running,
+                          gives=lambda pid: pid in gave)
+        kept: Dict[str, Dict[str, Any]] = {}
+        for key, value in dict(old or {}).items():
+            pid = pk.owner(key)
+            if pid is not None and key in saved and saved[key] is value and (
+                    pid not in running or (pk.is_namespaced(key)
+                                           and pid not in gave)):
+                kept.setdefault(pid, {})[key] = value
+        words = self.kept_words(kept, applied=False)
+        if words:
+            notes.append(words)
+        return saved, notes
+
+    def kept_words(self, kept: Mapping[str, Mapping[str, Any]],
+                   applied: bool = True) -> str:
+        """The words for keys kept untouched for plugins not running here:
+        "Kept for plugins not running here, not applied: Acme thermal
+        (acme.thermal): 2 settings." — "" for none."""
+        parts = []
+        for pid, keys in dict(kept or {}).items():
+            count = len(keys)
+            label = self._name(pid)
+            label = label if label == pid else f"{label} ({pid})"
+            parts.append(f"{label}: {count} "
+                         f"setting{'s' if count != 1 else ''}")
+        if not parts:
+            return ""
+        how = ("not applied" if applied else "kept in the preset as they "
+               "were")
+        return (f"Kept for plugins not running here, {how}: "
+                f"{'; '.join(parts)}.")
 
     # -- camera plugins (stage P2; design 2.4 item 3, 3.3, 3.4) ---------------
     def _runnable_cameras(self) -> List[str]:

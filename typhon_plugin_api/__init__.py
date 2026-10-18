@@ -63,6 +63,11 @@ beside any run, past ones included, or in the plugin's own `data_dir()`
 (`<project>/plugin_data/<id>/`). A run file's name is the run's and one of
 the endings the manifest's "files" declares; Typhon registers every one, so
 a run name is never used twice.
+A plugin contributing "presets" keeps values of its own in each camera's
+presets as "<id>/<key>": asked `preset_values(camera)` when one is saved,
+and handed them in `apply_preset_values(camera, values)` when it is
+applied. The keys of a plugin that is not running are never handed to the
+camera, never lost, and said as kept (design 3.9).
 
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
@@ -89,8 +94,8 @@ API_VERSION = "0.2"
 #: rows 3 and 4 its set-up guide, checks and scan, which the set-up wizard
 #: of a "Typhon (plugins)" project calls). From stage P3 rows 1 and 4 the
 #: run hooks (Start asks check_start, before anything stops), a camera
-#: plugin's record_fields (the camera record at Start), and the context's
-#: two file services and data folder. status joins when
+#: plugin's record_fields (the camera record at Start), the preset hooks,
+#: and the context's two file services and data folder. status joins when
 #: the status strip asks it (P4), a camera plugin's facet with the facets.
 FEATURES: FrozenSet[str] = frozenset({
     # what a plugin's context offers (PluginContext)
@@ -103,8 +108,9 @@ FEATURES: FrozenSet[str] = frozenset({
     "context.create_file", "context.write_new", "context.data_dir",
     # the hooks Typhon calls (FeaturePlugin)
     "hook.activate", "hook.deactivate", "hook.on_frame",
-    # a run's hooks (P3 row 1)
+    # a run's hooks (P3 row 1) and a camera's presets (P3 row 4)
     "hook.check_start", "hook.on_run_started", "hook.on_run_finished",
+    "hook.preset_values", "hook.apply_preset_values",
     # a camera plugin's hooks Typhon calls (CameraPlugin, 0.2)
     "camera.available", "camera.discover", "camera.open",
     "camera.capabilities", "camera.categories", "camera.review_source",
@@ -339,12 +345,13 @@ class FeaturePlugin(Protocol):
     frames, `on_frame`; with "run_hooks" in its manifest's contributes
     (stage P3), `check_start(plan) -> str` (a reason refuses Start; ""
     or None lets it go), `on_run_started(run)` and `on_run_finished(run) ->
-    dict | None` (its block in the run's end record). The screen points
-    come at stage P4.
+    dict | None` (its block in the run's end record); with "presets",
+    `preset_values(camera) -> dict` and `apply_preset_values(camera,
+    values)`. The screen points come at stage P4.
 
     THE FAULT RULE (design 3.10). Every call is guarded: whatever it
     raises switches the plugin off for the session, said and logged. The
-    run hooks and record_fields are BEST EFFORT — the
+    run hooks, record_fields and the preset hooks are BEST EFFORT — the
     fault is said in Start's summary or the run's end record and the
     capture carries on; only check_start refuses a Start. On the RECORDING
     PATH (a record gate, a frame stage: built-in plugins only) a fault ends

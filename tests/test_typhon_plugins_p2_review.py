@@ -166,7 +166,7 @@ BRANCH_MODULES = ("council_core.camera_rig",
                   "council_core.camera_rig_file", "council_core.plugin_host",
                   "council_core.plugin_lists", "council_core.plugin_manifest",
                   # stage P3 rows 1 and 4
-                  "council_core.plugin_runs",
+                  "council_core.plugin_runs", "council_core.plugin_keys",
                   "typhon_plugin_api", "typhon_plugin_api.builtin",
                   "typhon_plugins")
 

@@ -3907,8 +3907,8 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                name: str, live_ok: bool = False,
-               triggers: Optional[Dict[str, Any]] = None
-               ) -> Dict[str, Any]:
+               triggers: Optional[Dict[str, Any]] = None,
+               plugins: Any = None) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
     put back as connected are then the same as changing each live, which
@@ -3923,6 +3923,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     the worker with it, when the stream is stopped for it — a change among
     them that the stream is in the way of stops it too), and what that
     changed is said one line per trigger — a reset's.
+
+    `plugins`, a "Typhon (plugins)" preset's split by owner (the plugin
+    host's split_preset; `values` is its camera part): once the set is
+    applied, each running plugin is handed its own values, and the keys
+    kept for plugins not running are said.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -4014,6 +4019,14 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                      f"{'it' if len(restarted) == 1 else 'them'}).")
         elif getattr(device, "streaming", False):
             said += " Applied live."
+        host = _plugin_host() if plugins is not None else None
+        if host is not None:
+            words = host.apply_preset_values(_RIG.active.name,
+                                             plugins.plugins)
+            words.append(host.kept_words(plugins.kept))
+            words = [w if w.endswith(".") else w + "." for w in words if w]
+            if words:
+                said += " " + " ".join(words)
         return {"applied": applied.as_dict(), "ok": applied.ok,
                 "area": _area_text(device.roi()),
                 "crop": "" if moved else _current_crop(),
@@ -4256,16 +4269,27 @@ def save_preset(name: Any, include_roi: Any = True,
     camera = _identity()
     with_area = _truthy(include_roi)
     store = _preset_store()
+    host = _plugin_host()
+    plugin_notes: List[str] = []
     try:
         settings, roi = camera_presets.capture(device, with_area)
         settings = _as_before_arming(settings)
+        in_use = settings
+        if host is not None:
+            # A "Typhon (plugins)" project (plugin design 3.9): each
+            # running plugin's own values as "<id>/<key>", and the keys of
+            # a plugin not running kept from the preset this replaces.
+            settings, plugin_notes = _plugin_preset(host, store, camera,
+                                                    _picked(name), settings)
+            in_use = host.split_preset(settings).camera
         preset, replaced, moved = store.save(
             camera, _picked(name), settings, roi, note=str(note or ""),
             repair=True)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
-    # Saved FROM the camera as it is: the camera is that preset now.
-    _preset_now_in_use(preset.name, settings, roi)
+    # Saved FROM the camera as it is: the camera is that preset now — as
+    # far as the camera's own keys go (a plugin's are not the camera's).
+    _preset_now_in_use(preset.name, in_use, roi)
     said = (f"{'Replaced' if replaced else 'Saved'} preset {preset.name!r}: "
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
@@ -4286,7 +4310,24 @@ def save_preset(name: Any, include_roi: Any = True,
     elif moved is not None:
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
+    if plugin_notes:
+        said += " " + " ".join(plugin_notes)
     return _presets_changed(preset.name, said)
+
+
+def _plugin_preset(host: Any, store: Any, camera: Any, name: str,
+                   settings: Dict[str, Any]) -> tuple:
+    """The preset a "Typhon (plugins)" project saves as `name` (the plugin
+    host's preset_settings): (settings, words to say). The preset it
+    replaces, if any, is read first: the keys of a plugin not running are
+    kept from it exactly as they were."""
+    from council_core import camera_presets
+
+    try:
+        old = dict(store.get(camera, name).settings)
+    except camera_presets.PresetError:
+        old = {}
+    return host.preset_settings(_RIG.active.name, settings, old)
 
 
 def _as_before_arming(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -4365,9 +4406,18 @@ def apply_preset(name: Any) -> Dict[str, Any]:
         preset = _preset_store().get(_identity(), chosen)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
-    return _apply_set(_with_capture_defaults(preset.settings), preset.roi,
+    values = _with_capture_defaults(preset.settings)
+    host = _plugin_host()
+    split = None
+    if host is not None:
+        # A "Typhon (plugins)" project (plugin design 3.9): the camera is
+        # given its own keys; a running plugin its own, once the set is
+        # applied; a plugin's that is not running are kept, and said.
+        split = host.split_preset(values, given=preset.settings)
+        values = split.camera
+    return _apply_set(values, preset.roi,
                       f"Applying preset {preset.name!r}", "preset",
-                      preset.name)
+                      preset.name, plugins=split)
 
 
 def _with_capture_defaults(settings: Dict[str, Any]) -> Dict[str, Any]:
