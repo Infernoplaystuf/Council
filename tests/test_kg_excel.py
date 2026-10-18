@@ -1068,3 +1068,22 @@ def test_the_readers_are_toolkit_free_and_offline():
         encoding="utf-8")
     for word in ("tkinter", "PySide6", "PyQt5", "urllib", "requests", "socket", "http"):
         assert word not in src, word
+
+
+def test_a_huge_neighbourhood_is_read_in_part(tmp_path, monkeypatch):
+    """MEASURED (review, 2026-10-16): neighbors() of a person with 4,000
+    links took 3.4 s on the GUI thread, though the tab draws 300 of them. Now
+    only the links drawn are looked up; the rest are counted."""
+    v = _vault(tmp_path)
+    rows = "\n".join(f"PN-{i},Dana Whitfield" for i in range(600))
+    (v / "data_in" / "t.csv").write_text("Part,Owner\n" + rows + "\n", encoding="utf-8")
+    kg = _kg(v)
+    kg.seed()
+    dana = kg.search("Dana Whitfield", "PERSON")[0]["id"]
+    calls = []
+    real = kg.evidence
+    monkeypatch.setattr(kg, "evidence", lambda rid, limit=None: calls.append(rid)
+                        or real(rid, limit))
+    ns = kg.neighbors(dana, evidence_limit=5, relation_limit=300)
+    assert len(ns) == 300 and len(calls) == 300
+    assert kg.neighbor_counts(dana) == {("OWNS", "out"): 600}

@@ -420,7 +420,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         groups: Dict[str, QTreeWidgetItem] = {}
         shown: Dict[str, int] = {}
         hidden: Dict[str, int] = {}
-        for n in kg.neighbors(eid, evidence_limit=EVIDENCE_SHOWN):
+        # Only what is drawn is looked up; the rest of each kind is counted.
+        for (pred, direction), k in kg.neighbor_counts(eid).items():
+            if k > RELATIONS_SHOWN:
+                label = phrase(pred, direction)
+                hidden[label] = hidden.get(label, 0) + k - RELATIONS_SHOWN
+        for n in kg.neighbors(eid, evidence_limit=EVIDENCE_SHOWN,
+                              relation_limit=RELATIONS_SHOWN):
             label = phrase(n["predicate"], n["direction"])
             g = groups.get(label)
             if g is None:
@@ -431,9 +437,6 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 g.setFont(0, f)
                 self.tree.addTopLevelItem(g)
                 groups[label] = g
-            if shown.get(label, 0) >= RELATIONS_SHOWN:
-                hidden[label] = hidden.get(label, 0) + 1
-                continue
             shown[label] = shown.get(label, 0) + 1
             other = n["other"] or {}
             icon = TYPE_ICON.get(other.get("type", ""), "")

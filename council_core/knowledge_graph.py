@@ -787,6 +787,13 @@ class KnowledgeGraph:
         self._people: Dict[str, Dict[str, str]] = {}
         self._people_all: Dict[str, str] = {}
         self._asked: Dict[str, Dict[str, Any]] = {}
+        #: During seed()'s graph phase only: what this rebuild already looked
+        #: up (merges followed, entity names, aliases written, link
+        #: statuses) and the evidence / mentions it gathered to write at
+        #: once. Nothing merges during a rebuild, so these stay true for its
+        #: length. MEASURED (review, 2026-10-16): 560,000 SQLite calls, 18 of
+        #: 40 s, for a 20,000-row workbook rebuilt unchanged.
+        self._memo: Optional[Dict[str, Any]] = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             self._check_before_writing()
@@ -1207,13 +1214,21 @@ class KnowledgeGraph:
         if self._live is not None:
             self._live.add(eid)
         name = display or (person_display(raw) if etype == "PERSON" else str(raw).strip())
-        row = self.db.execute("SELECT name FROM entities WHERE id=?", (eid,)).fetchone()
-        if row is None:
+        memo = self._memo
+        known = memo["names"].get(eid) if memo is not None else None
+        if known is None:
+            row = self.db.execute("SELECT name FROM entities WHERE id=?", (eid,)).fetchone()
+            known = row["name"] if row is not None else None
+        if known is None:
             self.db.execute("INSERT INTO entities (id, type, key, name, created_ts)"
                             " VALUES (?,?,?,?,?)", (eid, etype, key, name, time.time()))
-        elif etype == "PERSON" and len(name) > len(row["name"]):
+            known = name
+        elif etype == "PERSON" and len(name) > len(known):
             # 'Bob Smith' then 'Bob Smith, Jr.': keep the fullest form.
             self.db.execute("UPDATE entities SET name=? WHERE id=?", (name, eid))
+            known = name
+        if memo is not None:
+            memo["names"][eid] = known
         if etype != "DOCUMENT":
             self._alias(eid, raw, alias_source)
         return eid
@@ -1222,19 +1237,32 @@ class KnowledgeGraph:
         eid = self.resolve(eid)          # a merged entity's names live on its survivor
         alias = " ".join(str(alias).split())
         if alias:
+            memo = self._memo
+            if memo is not None:
+                if (eid, alias) in memo["aliases"]:
+                    return
+                memo["aliases"].add((eid, alias))
             self.db.execute("INSERT OR IGNORE INTO aliases VALUES (?,?,?,?)",
                             (eid, alias, fold(alias), source))
 
     def resolve(self, eid: str) -> str:
         """Follow user merges to the surviving entity."""
+        memo = self._memo
+        if memo is not None:
+            got = memo["resolve"].get(eid)
+            if got is not None:
+                return got
+        start = eid
         seen = set()
         while eid and eid not in seen:
             seen.add(eid)
             row = self.db.execute("SELECT merged_into FROM entities WHERE id=?",
                                   (eid,)).fetchone()
             if not row or not row["merged_into"]:
-                return eid
+                break
             eid = row["merged_into"]
+        if memo is not None and start:
+            memo["resolve"][start] = eid
         return eid
 
     # ── relations ──
@@ -1248,21 +1276,30 @@ class KnowledgeGraph:
             return ""
         rid = relation_id(s, pred, o)
         now = time.time()
-        row = self.db.execute("SELECT status FROM relations WHERE id=?", (rid,)).fetchone()
-        if row is None:
+        memo = self._memo
+        cur = memo["rels"].get(rid) if memo is not None else None
+        if cur is None:
+            row = self.db.execute("SELECT status FROM relations WHERE id=?",
+                                  (rid,)).fetchone()
+            cur = row["status"] if row is not None else None
+        if cur is None:
             self.db.execute("INSERT INTO relations VALUES (?,?,?,?,?,?,?)",
                             (rid, s, pred, o, status, now, now))
-        elif row["status"] == _PENDING or (row["status"] == "suggested"
-                                           and status == "seeded"):
+            cur = status
+        elif cur == _PENDING or (cur == "suggested" and status == "seeded"):
             # First evidence this run (seed() marked every derived status
             # pending), or firmer evidence; the user's accept/reject is never
             # touched.
             self.db.execute("UPDATE relations SET status=?, updated_ts=? "
                             "WHERE id=?", (status, now, rid))
-        self.db.execute(
-            "INSERT OR IGNORE INTO evidence (relation_id, document_id, content_hash,"
-            " locator, quote, method, model, run_id) VALUES (?,?,?,?,?,?,?,?)",
-            (rid, doc_id, content_hash, _loc_json(locator), quote, method, model, run_id))
+            cur = status
+        if memo is not None:
+            memo["rels"][rid] = cur
+        row = (rid, doc_id, content_hash, _loc_json(locator), quote, method, model, run_id)
+        if memo is not None and memo.get("buffer") is not None:
+            memo["buffer"]["evidence"].append(row)
+        else:
+            self.db.execute(_EVIDENCE_INSERT, row)
         return rid
 
     def set_relation_status(self, rid: str, status: str, *, note: str = "") -> None:
@@ -1468,6 +1505,8 @@ class KnowledgeGraph:
                 # aliased by hand, in an accepted link) may explain an initial or
                 # give the gazetteer a name. A stale 'Dana Whitfield' otherwise
                 # gave herself a mention for 'D. Whitfield' and never went away.
+                self._memo = {"resolve": {}, "names": {}, "aliases": set(), "rels": {},
+                              "buffer": None}
                 self._live = {r[0] for r in self.db.execute(
                     "SELECT entity_id FROM aliases WHERE source='user'"
                     " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
@@ -1561,11 +1600,17 @@ class KnowledgeGraph:
                     "DELETE FROM extraction_docs WHERE document_id NOT IN"
                     " (SELECT id FROM documents WHERE status != 'missing')")
                 prog.update(f"linking {len(records)} records", force=True)
+                # Evidence and mentions are gathered, then written at once;
+                # nothing reads them until the gazetteer (which checks the
+                # field mentions) - flushed before it.
+                self._memo["buffer"] = {"evidence": [], "mentions": []}
                 self._seed_records(records, run_id)
                 self._finish_initials()
                 if use_collections:
                     prog.update("Collections")
                     stats["collections"] = self._seed_collections(run_id)
+                self._flush()
+                self._memo["buffer"] = None
                 if gazetteer:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
@@ -1598,6 +1643,7 @@ class KnowledgeGraph:
                                 (time.time(), json.dumps(stats), run_id))
         finally:
             self._live = None
+            self._memo = None
             self._people, self._people_all, self._asked = {}, {}, {}
         stats["seconds"] = round(time.time() - t0, 3)
         return stats
@@ -1807,10 +1853,26 @@ class KnowledgeGraph:
 
     def _mention(self, eid, did, loc, surface, snippet, method, run_id) -> None:
         eid = self.resolve(eid)
-        self.db.execute(
-            "INSERT OR IGNORE INTO mentions (entity_id, document_id, locator, surface,"
-            " snippet, method, run_id) VALUES (?,?,?,?,?,?,?)",
-            (eid, did, _loc_json(loc), surface, snippet, method, run_id))
+        row = (eid, did, _loc_json(loc), surface, snippet, method, run_id)
+        memo = self._memo
+        if memo is not None and memo.get("buffer") is not None:
+            memo["buffer"]["mentions"].append(row)
+        else:
+            self.db.execute(_MENTION_INSERT, row)
+
+    def _flush(self) -> None:
+        """Write the evidence and mentions a rebuild's linking pass gathered
+        (in the order they were found, so INSERT OR IGNORE keeps the same
+        first one), with executemany: one statement per row was a third of
+        a 100k-row workbook's rebuild."""
+        memo = self._memo
+        buf = memo.get("buffer") if memo is not None else None
+        if not buf:
+            return
+        self.db.executemany(_EVIDENCE_INSERT, buf["evidence"])
+        self.db.executemany(_MENTION_INSERT, buf["mentions"])
+        buf["evidence"].clear()
+        buf["mentions"].clear()
 
     def _record_relations(self, rec: Record, ents, did, h, run_id) -> None:
         main = {}
@@ -1933,7 +1995,7 @@ class KnowledgeGraph:
             alias = r["alias"]
             if len(alias) < 4 or len(alias.split()) == 1 and not looks_like_code(alias):
                 continue        # single bare words are too noisy to search
-            terms.append((_term_re(alias), r["entity_id"], alias))
+            terms.append((None, r["entity_id"], alias))
         # Index the terms by their first token. A term can match a line only
         # where that token is a whole token of the line (the term's own
         # boundaries guarantee it), so each line is tested against the few
@@ -1985,6 +2047,12 @@ class KnowledgeGraph:
                     cand.update(by_token.get(tok.lower(), ()))
                 for i in sorted(cand):
                     rx, eid, alias = terms[i]
+                    if rx is None:
+                        # compiled the first time a line holds its first
+                        # word: 20,000 part numbers were 20,000 compiles
+                        # (6.4 s) per rebuild, nearly all never used
+                        rx = _term_re(alias)
+                        terms[i] = (rx, eid, alias)
                     if rx.search(text) and not self._has_mention(eid, did, loc):
                         self._mention(eid, did, loc, alias, _snip(text), "gazetteer", run_id)
                         n += 1
@@ -2642,18 +2710,27 @@ class KnowledgeGraph:
         return [d for _s, d in ranked[:limit]]
 
     def neighbors(self, eid: str, *, include_rejected: bool = False,
-                  evidence_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                  evidence_limit: Optional[int] = None,
+                  relation_limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Every relation touching ``eid``, each with its evidence: what a
         person needs to see WHY two things are linked. ``evidence_limit``
         keeps the first N pieces of each (``evidence_total`` is the count):
         an inspector who signed 30 flaws on 3,000 parts has 90,000, and the
-        Connections tab drew every one on the GUI thread."""
+        Connections tab drew every one on the GUI thread. ``relation_limit``
+        keeps the first N links of each kind (predicate and direction);
+        neighbor_counts() counts them all. MEASURED (review, 2026-10-16): a
+        person with 4,000 links took 3.4 s here while the tab drew 300."""
         eid = self.resolve(eid)
         q = ("SELECT * FROM relations WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
         out = []
+        per_kind: Dict[Tuple[str, str], int] = {}
         for r in self.db.execute(q + " ORDER BY predicate", (eid, eid)).fetchall():
+            kind = (r["predicate"], "out" if r["subject_id"] == eid else "in")
+            per_kind[kind] = per_kind.get(kind, 0) + 1
+            if relation_limit is not None and per_kind[kind] > relation_limit:
+                continue
             other = r["object_id"] if r["subject_id"] == eid else r["subject_id"]
             ev = self.evidence(r["id"], limit=evidence_limit)
             total = len(ev) if evidence_limit is None or len(ev) < evidence_limit else \
@@ -2664,6 +2741,17 @@ class KnowledgeGraph:
                         "status": r["status"], "other": self.entity(other),
                         "evidence": ev, "evidence_total": total})
         return out
+
+    def neighbor_counts(self, eid: str, *, include_rejected: bool = False
+                        ) -> Dict[Tuple[str, str], int]:
+        """How many links ``eid`` has of each kind: {(predicate, 'out'|'in'): n}."""
+        eid = self.resolve(eid)
+        q = ("SELECT predicate, subject_id=? AS outward, COUNT(*) FROM relations"
+             " WHERE (subject_id=? OR object_id=?)")
+        if not include_rejected:
+            q += " AND status != 'rejected'"
+        return {(r[0], "out" if r[1] else "in"): r[2]
+                for r in self.db.execute(q + " GROUP BY predicate, outward", (eid, eid, eid))}
 
     def evidence(self, rid: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         q = ("SELECT ev.*, d.path, d.content_hash AS doc_hash FROM evidence ev"
@@ -2899,6 +2987,11 @@ def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3,
         lo, hi = 1, min(len(lines), 2 * radius + 1)
     return [(f"{prefix}L{i}", lines[i - 1], i == target) for i in range(lo, hi + 1)]
 
+
+_EVIDENCE_INSERT = ("INSERT OR IGNORE INTO evidence (relation_id, document_id, content_hash,"
+                    " locator, quote, method, model, run_id) VALUES (?,?,?,?,?,?,?,?)")
+_MENTION_INSERT = ("INSERT OR IGNORE INTO mentions (entity_id, document_id, locator, surface,"
+                   " snippet, method, run_id) VALUES (?,?,?,?,?,?,?)")
 
 _INITIAL_NAME_RE = re.compile(r"\b([A-Z])\.\s+([A-Z][A-Za-zÀ-ÿ'’\-]+)")
 #: A run of the characters _term_re treats as part of a token.

@@ -250,3 +250,20 @@ def test_folders_are_added_and_removed_in_the_tab(qapp, tmp_path):
         dlg2.deleteLater()
     finally:
         _close(qapp, tab)
+
+
+def test_only_the_links_drawn_are_looked_up(qapp, tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    rows = "\n".join(f"PN-{i},Dana Whitfield" for i in range(6))
+    (v / "data_in" / "t.csv").write_text("Part,Owner\n" + rows + "\n", encoding="utf-8")
+    tab = _tab(qapp, v)
+    try:
+        import council_qt.tabs.connections as cmod
+        monkeypatch.setattr(cmod, "RELATIONS_SHOWN", 2)
+        tab.search.setText("Dana Whitfield")
+        tab.results.setCurrentRow(0)
+        rows_ = _items(tab.tree)
+        owns = next(i for d, t, s, w, i in rows_ if d == 0 and t == "owns")
+        assert owns.childCount() == 3 and owns.child(2).text(0) == "… and 4 more"
+    finally:
+        _close(qapp, tab)
