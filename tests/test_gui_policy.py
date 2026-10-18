@@ -994,6 +994,97 @@ def test_the_taint_fixpoint_walks_a_long_chain_once_not_once_per_link():
 
 
 # ============================================================
+# The receiver rule is fail-safe: a kind it does not reason about is refused
+# ============================================================
+#
+# 10733a8's may_be_module returned False (ordinary) for self/cls, a call to a
+# file-defined class, a loop variable over an untainted iterable and a plain
+# parameter — AND, by default, for any receiver EXPRESSION KIND it did not
+# list (an operator result, a lambda or comprehension body, anything a future
+# Python adds). A module reaching one of those read as a plain name, so the
+# route passed. The default is now inverted: a kind the gate has not reasoned
+# about is "may be a module", refused as every receiver was before 10733a8.
+# The ordinary cases that remain are the ones whose analysis is sound.
+
+@pytest.mark.parametrize("recv", [
+    "(a + b)",                 # BinOp: __add__ may return anything
+    "(-a)",                    # UnaryOp: __neg__ may return anything
+    "(a == b)",                # Compare: __eq__ may return anything
+    "(a @ b)",                 # BinOp (matmul), the same
+    "(a | b)",                 # BinOp (or), the same
+    "[c for c in a]",          # a comprehension kept and read
+    "{k: v for k, v in a}",    # a dict comprehension
+    "(lambda: a)",             # a bare lambda object
+])
+def test_an_operator_or_other_unreasoned_receiver_may_be_a_module(recv):
+    """A route attribute on a receiver whose KIND the gate does not reason
+    about is refused — an operator result (a dunder may return a module), a
+    comprehension or lambda stored and read later. Before, every one of
+    these fell through to 'ordinary' and the route passed."""
+    _refused(f"a = b = 1\n{recv}.socket", pol.WHY_NETWORK)
+    good, errs = pol.validate(f"a = b = 1\n{recv}.socket", "linked", (), "qt")
+    assert any("may be, a module" in e for e in errs), errs
+
+
+def test_a_dunder_that_returns_a_module_is_refused_through_an_operator():
+    """The concrete escape the fallthrough closed: a class the file defines
+    whose operator dunder returns a module, read straight off the operator
+    result. codecs.builtins.eval ran here before; it is refused now."""
+    _refused("import codecs\n"
+             "class A:\n    def __add__(self, o):\n        return codecs\n"
+             "(A() + 1).builtins.eval('1')\n", pol.WHY_CODE)
+
+
+@pytest.mark.parametrize("code", [
+    # keeping the operator result on a NAME first is still ordinary: a value
+    # assigned a BinOp does not taint its target (a stated _carries limit,
+    # unchanged) — pinned so a later tightening there is a deliberate choice
+    "a = b = 1\nx = a + b\nx.socket\n",
+    # a literal receiver is never a module
+    "(None).socket\n",
+    "''.socket\n",
+    "(1).socket\n",
+])
+def test_the_receivers_that_stay_ordinary_here_still_pass(code):
+    """A Constant receiver is soundly never a module, and an operator result
+    bound to a name before use is the existing _carries limit — both pass, so
+    the inversion did not start refusing ordinary code."""
+    _passes(code)
+
+
+@pytest.mark.parametrize("ordinary,refused,reason", [
+    # self is ordinary; a module imported under the same word is not
+    ("class A:\n    def f(self):\n        return self.socket\n",
+     "import socket\nsocket.create_connection(('x', 1))\n", pol.WHY_NETWORK),
+    # an instance of a file class built by a call is ordinary; any OTHER
+    # call's result is a value the gate cannot see
+    ("class Cam:\n    def __init__(self):\n        self.socket = None\n"
+     "c = Cam()\nx = c.socket\n",
+     "import codecs\nmake = lambda: codecs\nmake().socket\n", pol.WHY_NETWORK),
+    # a Constant is ordinary; a subscript is opaque
+    ("(None).socket\n",
+     "import codecs\nmods = [codecs]\nmods[0].socket\n", pol.WHY_NETWORK),
+    # a plain parameter is ordinary; the same name tainted by a leaked
+    # function is refused
+    ("def f(opts):\n    return opts.ssl\n",
+     "import codecs\ndef f(m):\n    return m.ssl\ng = f\ng(codecs)\n",
+     pol.WHY_NETWORK),
+    # a loop over an untainted iterable is ordinary; over a module one, not
+    ("class W:\n    def __init__(self):\n        self.items = []\n"
+     "    def f(self):\n        for c in self.items:\n"
+     "            c.socket\n",
+     "import codecs\nfor m in (codecs,):\n    m.socket\n", pol.WHY_NETWORK),
+])
+def test_each_ordinary_case_pins_the_nearest_shape_that_is_refused(
+        ordinary, refused, reason):
+    """For every receiver may_be_module still calls ordinary, the nearest
+    shape that IS a module — the soundness note's dividing line — is refused,
+    so a future edit cannot quietly widen 'ordinary' past where it is sound."""
+    _passes(ordinary)
+    _refused(refused, reason)
+
+
+# ============================================================
 # Every shipped example still passes
 # ============================================================
 

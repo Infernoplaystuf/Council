@@ -45,7 +45,7 @@ import builtins as _builtins
 import keyword
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
 # The Council's own source directory. A `requires` naming a module here is
 # Council code, not a package — see check_requires.
@@ -1119,13 +1119,58 @@ class _Receivers:
             pairs.append((names, value))
 
     def _carries(self, value: ast.AST) -> bool:
-        """Whether ``value`` may be, or hold, a module."""
-        return any(self.may_be_module(n) for n in ast.walk(value)
-                   if isinstance(n, ast.expr))
+        """Whether ``value`` may be, or hold, a module.
+
+        Walks the value's own parts and asks the NARROW question of each node
+        (``fail_safe=False``): is THIS node, by itself, a module source? The
+        structural nodes a value is built from — a list/tuple/dict literal, a
+        comprehension, an operator, an f-string — read as not-a-module here,
+        because their children are walked separately and carry the signal;
+        only a module named inside (`[codecs]`, `(a, codecs)`) or a sub-value
+        the gate cannot see into (a call result, a subscript) makes the value
+        carry one. Were this the fail-safe reading instead, assigning `[]`,
+        `a + b` or `not x` would taint the target — a receiver is the only
+        place the fail-safe default belongs."""
+        return any(self.may_be_module(n, fail_safe=False)
+                   for n in ast.walk(value) if isinstance(n, ast.expr))
 
     # -- the question -------------------------------------------------------
-    def may_be_module(self, node: ast.AST) -> bool:
-        """Whether the expression ``node`` is, or may be, a module."""
+    def may_be_module(self, node: ast.AST, *, fail_safe: bool = True) -> bool:
+        """Whether the expression ``node`` is, or may be, a module.
+
+        FAIL-SAFE as a RECEIVER check (``fail_safe=True``, the default, how
+        ``validate`` and ``_check_lookup`` call it): an expression kind not
+        reasoned about below is treated as "may be a module", so the route is
+        refused exactly as it was on EVERY receiver before 10733a8. An
+        operator result (``(A() + 1).socket`` — a __add__/__eq__/__neg__ may
+        return anything), a lambda or comprehension stored and read later, and
+        every kind added to the grammar in a future Python all fall through to
+        refused rather than silently passing. ``_carries`` asks the narrow
+        question with ``fail_safe=False`` (see there).
+
+        The cases decided WITHOUT the fallthrough, each because a module
+        provably cannot be the receiver there — or, where it can, it is caught:
+
+          * an ATTRIBUTE CHAIN whose peeled attribute name is tainted
+            (``m.builtins`` with ``m`` a module alias, ``self.mod.socket``
+            with ``mod`` assigned a module): refused. Otherwise the chain is
+            judged by its ROOT below — a plain ``self.socket`` is the root
+            ``self``, an ordinary object.
+          * a NAME: ``_name`` is sound — it reads the name against the file's
+            bindings, its enclosing scopes' parameters (self/cls answer the
+            module-self question, other parameters the tainted-parameter one)
+            and the never-bound/star-import case. A module cannot hide from it.
+          * an IFEXP / BOOLOP / walrus: the value is one of the operands, so
+            recursing into them (carrying ``fail_safe``) is exact.
+          * a CONSTANT: a literal — str, bytes, number, bool, None, Ellipsis —
+            is never a module.
+          * a CALL that BUILDS an instance of a class the file defines and
+            never taints (``opts = Opts()``, ``self.cam = Cam()``): the result
+            is that ordinary instance. Any OTHER call's result — a factory, a
+            method, ``getattr`` — is a value the gate cannot see, so refused.
+          * a SUBSCRIPT / AWAIT / YIELD / YIELDFROM / STARRED: a value the gate
+            cannot see into, so refused (True) in either mode.
+        """
         while isinstance(node, ast.Attribute):
             if node.attr in self.tainted:
                 return True
@@ -1133,12 +1178,15 @@ class _Receivers:
         if isinstance(node, ast.Name):
             return self._name(node)
         if isinstance(node, ast.IfExp):
-            return (self.may_be_module(node.body)
-                    or self.may_be_module(node.orelse))
+            return (self.may_be_module(node.body, fail_safe=fail_safe)
+                    or self.may_be_module(node.orelse, fail_safe=fail_safe))
         if isinstance(node, ast.BoolOp):
-            return any(self.may_be_module(v) for v in node.values)
+            return any(self.may_be_module(v, fail_safe=fail_safe)
+                       for v in node.values)
         if isinstance(node, ast.NamedExpr):
-            return self.may_be_module(node.value)
+            return self.may_be_module(node.value, fail_safe=fail_safe)
+        if isinstance(node, ast.Constant):
+            return False
         if isinstance(node, ast.Call):
             # Building an instance of a class the file defines is an ordinary
             # object; any other call's result is a value the gate cannot see.
@@ -1147,8 +1195,10 @@ class _Receivers:
                     and fn.id not in self.tainted):
                 return False
             return True
-        return isinstance(node, (ast.Subscript, ast.Await,
-                                 ast.Yield, ast.YieldFrom, ast.Starred))
+        if isinstance(node, (ast.Subscript, ast.Await,
+                             ast.Yield, ast.YieldFrom, ast.Starred)):
+            return True
+        return fail_safe
 
     def _name(self, node: ast.Name) -> bool:
         name = node.id
