@@ -334,10 +334,32 @@ def test_the_qt_app_imports_neither_tk_module(tmp_path):
             "        window.tab(t).destroyed.disconnect(slots[t])\n"
             "window.request_close()\n"
             "app.processEvents()\n"
+            # SHUT DOWN CLEANLY. request_close stops the bridge's pump and
+            # timers, so no new worker starts; but a tab's constructor-time
+            # worker (agents-status, a model assess) may still be running, and
+            # a daemon thread the interpreter kills mid-Qt-call while the main
+            # thread tears QApplication down is an access violation (0xC0000005
+            # once under an 8-way whole-suite run, 2026-10-16). So JOIN every
+            # worker before exit, pumping events so its last call_on_ui lands
+            # on the GUI thread here (where the bridge's guards drop it if its
+            # widget is gone) rather than on the dying worker. A worker still
+            # alive after a generous wait is reported, not left to race exit.
+            "import time as _time\n"
+            "_deadline = _time.monotonic() + 30\n"
+            "for _w in list(threading.enumerate()):\n"
+            "    if _w is threading.main_thread():\n"
+            "        continue\n"
+            "    _w.join(timeout=max(0.0, _deadline - _time.monotonic()))\n"
+            "    app.processEvents()\n"
+            "app.processEvents()\n"
+            "stragglers = sorted(w.name for w in threading.enumerate()\n"
+            "                    if w is not threading.main_thread()"
+            " and w.is_alive())\n"
             "from council_core import memory_scope\n"
             "print('BUILT', built, len(tabs.registry(advanced=True)))\n"
             "print('FAILED', failed)\n"
             "print('OFFTHREAD', off_thread)\n"
+            "print('STRAGGLERS', stragglers)\n"
             "print('UNOWNED', unowned)\n"
             "print('LOADED', sorted(m for m in ('council_gui_engine', "
             "'council_modules') if m in sys.modules))\n"
@@ -357,11 +379,16 @@ def test_the_qt_app_imports_neither_tk_module(tmp_path):
     assert out.returncode == 0, out.stderr[-2000:]
     lines = dict(line.split(" ", 1) for line in out.stdout.splitlines()
                  if line.split(" ", 1)[0] in ("BUILT", "FAILED", "OFFTHREAD",
-                                              "UNOWNED", "LOADED", "SCOPE"))
+                                              "STRAGGLERS", "UNOWNED", "LOADED",
+                                              "SCOPE"))
     built, total = map(int, lines["BUILT"].split())
     assert built == total, lines["FAILED"]
     assert lines["OFFTHREAD"] == "[]", (
         f"tabs destroyed on a worker thread: {lines['OFFTHREAD']}")
+    assert lines["STRAGGLERS"] == "[]", (
+        f"a tab's worker was still running at the child's exit, so the "
+        f"interpreter could kill it mid-Qt-call while QApplication is torn "
+        f"down (0xC0000005): {lines['STRAGGLERS']}")
     assert lines["UNOWNED"] == "[]", (
         f"tabs the window does not hold: {lines['UNOWNED']}")
     assert lines["LOADED"] == "[]", out.stdout[-2000:]

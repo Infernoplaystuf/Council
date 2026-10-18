@@ -194,6 +194,16 @@ class ApothecaryTab(ViewHelpers, QWidget):
             _monitor.stop()
 
         self.destroyed.connect(teardown)
+        # The WINDOW CLOSING must stop the poller too, not only the widget
+        # being destroyed. A tab whose window is closed while a Python
+        # reference keeps it alive (every test; the all-tabs import check) is
+        # never `destroyed`, so its 60-second poller ran on — and its next
+        # callback, landing after QApplication is torn down at exit, is an
+        # access violation (0xC0000005, seen once under a whole-suite run).
+        # request_close runs close_hooks first thing, so stop() happens there.
+        hooks = getattr(window, "close_hooks", None)
+        if isinstance(hooks, list):
+            hooks.append(teardown)
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
