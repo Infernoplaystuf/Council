@@ -1258,7 +1258,15 @@ class PluginHost:
         the capabilities the plugin confirmed (CameraSlot.confirm); the
         caller puts the device in the slot, as Connect does. A camera's
         refusal is a CameraError, as cameras.open_camera's is. A slot name
-        the rig does not have is refused before anything is opened."""
+        the rig does not have is refused before anything is opened.
+
+        A camera from a plugin of someone else's whose own flags (restartable,
+        area_live, raw_recording, grab_failures, frames or events) disagree
+        with what its plugin confirmed is closed again and refused: the core
+        still acts on those flags (frame_camera restarts a stream when
+        `restartable` says so) while every feature asks the slot, so the two
+        must agree (P2 review). The built-in plugins are held to the same by
+        the contract suite."""
         from .cameras import CameraError
 
         slot = None
@@ -1273,6 +1281,25 @@ class PluginHost:
                               f"{backend!r} cameras")
         device = self.camera_call(pid, "open", info)
         caps = self.camera_capabilities(pid, device)
+        rec = self.record(pid)
+        if rec is not None and not rec.builtin:
+            own = cc.of_device(device, info)
+            odd = [name for name in cc.FROM_FLAGS
+                   if (name in own) != (name in caps)]
+            if odd:
+                try:
+                    device.close()
+                except Exception:                         # noqa: BLE001
+                    pass
+                said = ", ".join(
+                    f"{name} (" + ("the camera has it, its plugin does not "
+                                   "say so" if name in own else
+                                   "its plugin says so, the camera does "
+                                   "not") + ")" for name in odd)
+                raise CameraError(f"{self._name(pid)} opened "
+                                  f"{getattr(info, 'label', info)}, but the "
+                                  f"camera and its plugin disagree on what it "
+                                  f"can do: {said} — the camera is not used")
         confirm = getattr(slot, "confirm", None)
         if callable(confirm):
             confirm(device, caps)

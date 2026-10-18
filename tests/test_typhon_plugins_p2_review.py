@@ -625,3 +625,47 @@ def test_only_the_simulated_frame_camera_confirms_a_software_trigger(host):
             device.close()
 
 
+# ======================================================================
+# A third-party camera whose flags contradict its plugin
+# ======================================================================
+@pytest.mark.parametrize("declared, refused", [
+    (["frames"], "restartable"),
+    (["frames", "restartable", "area_live"], "area_live"),
+    (["frames", "restartable"], ""),
+])
+def test_a_camera_whose_flags_contradict_its_plugin_is_refused(
+        host, declared, refused):
+    opened = []
+
+    class Thermal:
+        backend = "acme.thermal"
+
+        def available(self):
+            return True, ""
+
+        def discover(self):
+            return [THERMAL]
+
+        def open(self, info):
+            device = cameras.SyntheticDevice(info)     # restartable, frames
+            real_close = device.close
+
+            def close():
+                opened.append("closed")
+                real_close()
+            device.close = close
+            opened.append(device)
+            return device
+
+        def capabilities(self, device):
+            return frozenset(declared)
+    third_party(host, Thermal, capabilities=declared)
+    if not refused:
+        device = host.open_camera(THERMAL)
+        device.close()
+        return
+    with pytest.raises(cameras.CameraError, match=refused):
+        host.open_camera(THERMAL)
+    assert opened[-1] == "closed", "it was opened, then closed"
+
+
