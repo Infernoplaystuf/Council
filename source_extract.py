@@ -380,12 +380,22 @@ def workbook_files(folder) -> List[Path]:
                   if x.suffix.lower() in WORKBOOK_SUFFIXES and not x.name.startswith("~$"))
 
 
-def load_workbook_grids(path, notes: Optional[List[str]] = None
+def load_workbook_grids(path, notes: Optional[List[str]] = None,
+                        want_pictures: bool = True, data: Optional[bytes] = None
                         ) -> Tuple[List[Grid], List[SourceImage]]:
     """Every sheet as a Grid, every text box and chart as a small Grid of its
     own, and the pictures. openpyxl when it can open the file; the installed
     Excel when it cannot (.xls, .xlsb, rights-protected). `notes` collects
-    what could not be read (a picture Excel would not copy out)."""
+    what could not be read (a picture Excel would not copy out).
+
+    want_pictures=False leaves the pictures out: Excel copies each one out
+    through the clipboard, which the knowledge graph's background rebuild
+    does not touch (Excel then lists each picture with no data, so it can
+    be counted).
+
+    data: the workbook's bytes, already read (an .xlsx / .xlsm): it is
+    parsed from them, so the file is not held open while openpyxl works -
+    Excel could not save it meanwhile."""
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
@@ -397,9 +407,10 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
         raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
                           "copy without the password, and add that copy")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
-        return _grids_from_excel(path, notes)
+        return _grids_from_excel(path, notes, want_pictures)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(data) if data is not None else path,
+                                    data_only=True)
     except Exception as e:
         raise LedgerError(f"could not open {path.name}: {e}") from e
     grids, images = [], []
@@ -423,7 +434,7 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
                     if (r, cc) != (rng.min_row, rng.min_col) and isinstance(top, str):
                         cells.setdefault((r, cc), _Merged(top))
         grids.append(Grid(path.name, ws.title, cells))
-        for img in getattr(ws, "_images", []):
+        for img in (getattr(ws, "_images", []) if want_pictures else []):
             try:
                 data = img._data()
                 fr = img.anchor._from
@@ -433,15 +444,16 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
             images.append(SourceImage(path.name, ws.title, anchor, data,
                                       (getattr(img, "format", None) or "png").lower()))
     wb.close()
-    for ex in excel_open.zip_extras(path):                # text boxes and charts
+    for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
+        # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
     return grids, images
 
 
-def _grids_from_excel(path: Path, notes: Optional[List[str]]):
+def _grids_from_excel(path: Path, notes: Optional[List[str]], want_pictures: bool = True):
     import excel_open
     try:
-        book = excel_open.read_with_excel(path)
+        book = excel_open.read_with_excel(path, want_pictures=want_pictures)
     except excel_open.ExcelOpenError as e:
         raise LedgerError(str(e)) from e
     grids: List[Grid] = []
@@ -1624,11 +1636,46 @@ def load_aliases(csv_path) -> Tuple[Dict[str, str], List[str]]:
     return data.get("map", {}), data.get("ignore", [])
 
 
-def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
+def load_people(csv_path) -> Dict[str, str]:
+    """Who each inspector's initials stand for: the "people" section of the
+    same aliases file, {"JB": "Jordan Blake"}, written by a person. The
+    knowledge graph (council_core/kg_excel.py) reads it so that 'JB' in the
+    parent CSV is linked to Jordan Blake without a guess. Keys are the
+    initials as the Ledger reads them (upper case, no dots); a damaged or
+    missing section is {}."""
     p = aliases_path_for(csv_path)
+    if not p.exists():
+        return {}
+    try:
+        people = json.loads(p.read_text(encoding="utf-8")).get("people", {})
+    except Exception:
+        return {}
+    if not isinstance(people, dict):
+        return {}
+    out = {}
+    for k, v in people.items():
+        key = _initials(k)
+        if key and isinstance(v, str) and v.strip():
+            out[key] = " ".join(v.split())
+    return out
+
+
+def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
+    """The label mappings and ignores, written atomically. Any other section
+    of the file (the "people" list of initials) is kept as it was: it used to
+    be dropped by the first save."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, object] = {"map": dict(sorted(mapping.items())),
+                               "ignore": sorted(set(ignore))}
+    if p.exists():
+        try:
+            old = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        if isinstance(old, dict):
+            data.update({k: v for k, v in old.items() if k not in ("map", "ignore")})
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"map": dict(sorted(mapping.items())),
-                               "ignore": sorted(set(ignore))}, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(p)
 
 

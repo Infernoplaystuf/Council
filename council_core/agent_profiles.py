@@ -516,7 +516,8 @@ def _graph_tools(vault: Path):
             if not hits:
                 return {"error": "no such person, part or project in the graph"}
             out = []
-            for n in kg.neighbors(hits[0]["id"]):
+            # bounded: a person may have thousands of links (review, 2026-10-16)
+            for n in kg.neighbors(hits[0]["id"], evidence_limit=3, relation_limit=50):
                 other = n["other"] or {}
                 out.append({"link": n["predicate"], "direction": n["direction"],
                             "status": n["status"], "other": other.get("name"),
