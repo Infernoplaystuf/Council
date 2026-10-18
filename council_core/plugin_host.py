@@ -29,7 +29,10 @@ plugin's rows for the settings tabs; `review_sources` gives the slider's
 views of a plugin's run files (the Prophesee raw view). A camera's own
 refusal (CameraError) is the camera's answer, never the plugin's fault;
 anything else a camera plugin raises is said and logged, and a built-in
-camera plugin is never switched off without asking (`camera_call`).
+camera plugin is never switched off without asking (`camera_call`) — not
+even when it fails to load or activate: it is tried again at the next scan
+(`retry_cameras`). A scan says why it has no cameras of a camera plugin
+that cannot run, and of a ticked family no plugin it runs opens.
 
 STAGE P2 ROWS 3 AND 4: THE SET-UP'S FAMILIES, AND THE RIG'S NAMES
 A "Typhon (plugins)" project (one with typhon_plugins.json) scans and opens
@@ -507,6 +510,12 @@ class PluginHost:
         self._loading: Dict[Tuple[str, Optional[int]], "_Loading"] = {}
         #: Plugins switched off for this session, with why (design 3.10).
         self.faults: Dict[str, Fault] = {}
+        #: Built-in camera plugins whose last load or activate failed, with
+        #: why. Never switched off (design 3.10: not without asking): tried
+        #: again at the next scan (retry_cameras).
+        self._load_failures: Dict[str, Fault] = {}
+        #: Each camera plugin's backend name, once read (the scan's notes).
+        self._backend_names: Dict[str, str] = {}
         self._subs: Dict[str, List[Tuple[str, Callable[..., Any]]]] = {
             e: [] for e in api.EVENTS}
         self._ui: Deque[Tuple[Optional[str], Callable[[], Any]]] = \
@@ -552,6 +561,7 @@ class PluginHost:
             self.project_dir = Path(project_dir)
             self.project = None
             self.project_problem = ""
+            self._load_failures.clear()
             self.notes = []
             self._registry = None
             self._base = None
@@ -646,6 +656,11 @@ class PluginHost:
             return NEEDS_APPROVAL, rec.approval
         if pid in self.faults:
             return FAULTED, self.faults[pid].reason
+        failed = self._load_failures.get(pid)
+        if failed is not None:
+            return FAULTED, (f"{failed.error} (in {failed.hook}; a built-in "
+                             f"camera plugin stays on: it is tried again at "
+                             f"the next scan)")
         problem = self._python_problem(rec)
         if problem:
             return INCOMPATIBLE, problem
@@ -776,20 +791,21 @@ class PluginHost:
         here, and None is returned."""
         self.start_watchdog()
         made = self._load(rec)
-        if made is None or pid in self.faults:
+        if made is None or pid in self.faults or pid in self._load_failures:
             return None
         loading.made = made
         ctx = Context(self, pid, key[1])
         self._guard(pid, "activate", _hook(made, "activate"), (ctx,), {},
                     None)
         with self._lock:
-            keep = pid not in self.faults and not loading.cancelled
+            keep = pid not in self.faults and pid not in self._load_failures \
+                and not loading.cancelled
             if keep:
                 self._contexts[key] = ctx
                 self._instances[key] = made
         if keep:
             return made
-        if pid not in self.faults:
+        if pid not in self.faults and pid not in self._load_failures:
             self._let_go(pid, made)
         return None
 
@@ -929,6 +945,7 @@ class PluginHost:
         comes back as a guide or a failed check saying so (logged, and a
         built-in camera plugin stays on), never as an exception in the
         wizard."""
+        self.retry_cameras()
         out = []
         for pid in self.family_plugins():
             made = self._family(pid)
@@ -1079,6 +1096,8 @@ class PluginHost:
         rec = self.record(pid)
         if name and rec is not None and not rec.builtin and "." not in name:
             return ""
+        if name:
+            self._backend_names[pid] = name
         return name
 
     def camera_plugin_for(self, backend: str) -> Optional[str]:
@@ -1116,10 +1135,72 @@ class PluginHost:
 
     def discover_cameras(self, pids: Optional[Sequence[str]] = None) -> Any:
         """Every camera the camera plugins find, and why any was skipped
-        (cameras.Discovery), through cameras.discover."""
+        (cameras.Discovery), through cameras.discover. A scan is where a
+        built-in camera plugin that failed to load is tried again
+        (retry_cameras). The project's own scan (no `pids`) also says why
+        it has no cameras of a camera plugin it runs that cannot run now,
+        and of a family the set-up ticked that no camera plugin it runs
+        opens now (`_unscanned`): before the P2 review such a plugin's
+        cameras dropped out of the second scan with no word, and a ticked
+        family switched off left "Every backend was searched."."""
         from . import cameras
 
-        return cameras.discover(self.backends(pids))
+        self.retry_cameras()
+        chosen = list(pids) if pids is not None else self.camera_plugins()
+        found = cameras.discover(self.backends(chosen))
+        if pids is None:
+            found.notes.extend(self._unscanned(chosen))
+        return found
+
+    def retry_cameras(self) -> None:
+        """Let every built-in camera plugin whose load or activate failed be
+        tried again at its next use: a built-in camera plugin is never
+        switched off without asking (design 3.10). Asked by a scan and by
+        the set-up wizard's families; a load that fails again is logged and
+        said again."""
+        with self._fault_lock:
+            self._load_failures.clear()
+
+    def _unscanned(self, scanned: Sequence[str]) -> List[str]:
+        """The notes for what the project's scan could not look at, beyond
+        what cameras.discover says of the plugins it scanned: one for each
+        camera plugin this project runs that cannot run now (faulted,
+        failed to load, incompatible, waiting for approval) — unless it is
+        a family the set-up did not tick, which is not looked for, as today
+        — and one for each ticked family that no camera plugin this project
+        runs opens now (its plugin switched off, or not on this PC). None
+        when every camera plugin runs: the scan is today's, note for
+        note."""
+        from . import camera_setup
+
+        ticked = self.setup_choice()
+        notes: List[str] = []
+        said: set = set()
+        for pid in self.runs():
+            m = self.manifest(pid)
+            if m is None or m.kind != "camera" or pid in scanned:
+                continue
+            state, why = self.state(pid)
+            if state in (ON, ACTIVE):
+                continue                # a family not ticked: not looked for
+            backend = self._backend_names.get(pid, "")
+            if ticked is not None and backend and self.has_setup(pid) \
+                    and backend not in ticked:
+                continue
+            if backend:
+                said.add(backend)
+            notes.append(f"{self._name(pid)}: not available — {why}")
+        opened = {self._backend_names.get(pid, "") for pid in scanned}
+        for family in ticked or ():
+            if family in said or family in opened:
+                continue
+            label = (camera_setup.label(family)
+                     if family in camera_setup.CHOICES else family)
+            notes.append(f"{label}: ticked in Camera setup…, but no "
+                         f"camera plugin this project runs can open its "
+                         f"cameras now (switched off in its plugin list, or "
+                         f"not on this PC), so none were looked for")
+        return notes
 
     def camera_capabilities(self, pid: str, device: Any) -> frozenset:
         """What camera plugin `pid` confirms the opened `device` can do,
@@ -1308,13 +1389,44 @@ class PluginHost:
         except BaseException as exc:                    # noqa: BLE001
             if not _ours(exc):
                 raise
-            self.fault(pid, hook, exc, kind)
+            if hook in ("loading", "activate") and self._keeps_on(pid):
+                self._load_failed(pid, hook, exc, kind)
+            else:
+                self.fault(pid, hook, exc, kind)
             return default
         finally:
             if before is None:
                 self._busy.pop(key, None)
             else:
                 self._busy[key] = before
+
+    def _keeps_on(self, pid: str) -> bool:
+        """Whether plugin `pid` is a built-in camera plugin: never switched
+        off without asking (design 3.10)."""
+        rec = self.record(pid)
+        return rec is not None and rec.builtin and rec.manifest is not None \
+            and rec.manifest.kind == "camera"
+
+    def _load_failed(self, pid: str, hook: str, exc: BaseException,
+                     kind: str) -> None:
+        """A built-in camera plugin failed to load or activate: logged and
+        said, NOT switched off. It cannot run until it is tried again —
+        the next scan (retry_cameras) — so a scan still says why it has no
+        cameras, every time (camera_call's rule for its other calls; before
+        the P2 review a failed load switched it off for the session, and
+        its cameras dropped out of the next scan with no word)."""
+        made = Fault(plugin=pid, hook=hook, kind=kind,
+                     error=f"{type(exc).__name__}: {exc}",
+                     trace="".join(traceback.format_exception(
+                         type(exc), exc, exc.__traceback__)),
+                     at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        with self._fault_lock:
+            self._load_failures[pid] = made
+        self._log(made)
+        self._announce(f"Plugin {self._name(pid)} failed in {hook}: "
+                       f"{made.error} — it stays on (a built-in camera "
+                       f"plugin is never switched off without asking) and is "
+                       f"tried again at the next scan")
 
     def fault(self, pid: str, hook: str, exc: BaseException,
               kind: str = BEST_EFFORT) -> Fault:

@@ -308,3 +308,88 @@ def test_clearing_a_slot_forgets_what_was_confirmed():
     assert slot.confirmed is None
 
 
+# ======================================================================
+# A built-in camera plugin that fails to load stays on; the scan says why
+# ======================================================================
+def test_a_builtin_camera_plugin_that_fails_to_activate_stays_on(
+        host, monkeypatch):
+    from typhon_plugins.simulated import plugin as sim
+
+    def broken(self, ctx):
+        raise RuntimeError("activate broke")
+    real = sim.SimulatedPlugin.activate
+    monkeypatch.setattr(sim.SimulatedPlugin, "activate", broken)
+    for attempt in (1, 2):
+        found = host.discover_cameras()
+        assert not [c for c in found.cameras if c.backend == "simulated"]
+        said = [n for n in found.notes if "activate broke" in n]
+        assert said, (attempt, found.notes)
+    assert "typhon.simulated" not in host.faults, \
+        "a built-in camera plugin is never switched off without asking"
+    assert "tried again" in host.state("typhon.simulated")[1]
+    assert any("stays on" in s for s in host.said)
+    monkeypatch.setattr(sim.SimulatedPlugin, "activate", real)
+    found = host.discover_cameras(["typhon.simulated"])
+    assert [c.key for c in found.cameras] == ["sim-frame", "sim-event"], \
+        "tried again at the next scan, and it works"
+
+
+def test_a_builtin_camera_plugin_that_fails_to_load_stays_on(
+        host, monkeypatch):
+    import importlib
+    real = importlib.import_module
+
+    def imported(name, *args, **kwargs):
+        if name == "typhon_plugins.simulated.plugin":
+            raise ImportError("no module named numpy_extra")
+        return real(name, *args, **kwargs)
+    monkeypatch.setattr(importlib, "import_module", imported)
+    found = host.discover_cameras()
+    assert any("no module named numpy_extra" in n for n in found.notes),         found.notes
+    assert "typhon.simulated" not in host.faults
+    monkeypatch.setattr(importlib, "import_module", real)
+    found = host.discover_cameras(["typhon.simulated"])
+    assert [c.key for c in found.cameras] == ["sim-frame", "sim-event"]
+
+
+def test_a_faulted_third_party_camera_plugin_is_still_said_in_the_scan(
+        host):
+    class Thermal:
+        backend = "acme.thermal"
+
+        def available(self):
+            return True, ""
+
+        def discover(self):
+            raise ValueError("bad firmware table")
+    third_party(host, Thermal)
+    first = host.discover_cameras()
+    assert any("bad firmware table" in n for n in first.notes), first.notes
+    assert host.state("acme.thermal")[0] == ph.FAULTED
+    second = host.discover_cameras()
+    assert any(n.startswith("Acme thermal: not available")
+               and "bad firmware table" in n for n in second.notes), \
+        second.notes
+
+
+def test_a_ticked_family_switched_off_is_said_in_the_scan(plugin_project):
+    """The review's probe: Prophesee ticked, then switched off: the scan
+    listed the simulated cameras and said "Every backend was searched."."""
+    cs.save_families(cs.setup_path(plugin_project), ["prophesee"])
+    pl.switch_off(plugin_project, "typhon.prophesee")
+    assert not frame_camera._needs_setup()
+    listed = frame_camera.list_cameras()
+    assert "Every backend was searched." not in listed["notes"]
+    said = [n for n in listed["notes"] if n.startswith("Prophesee EVK4")]
+    assert said and "ticked" in said[0], listed["notes"]
+    assert all("Simulated" in r for r in listed["rows"])
+
+
+def test_a_scan_with_every_camera_plugin_running_adds_no_note(host):
+    """A GUARD: the notes above come only when something cannot run, so a
+    scan through the plugins stays today's scan, note for note."""
+    from council_core import cameras as cams
+    today = cams.discover(cams.backends())
+    assert host.discover_cameras().notes == today.notes
+
+
