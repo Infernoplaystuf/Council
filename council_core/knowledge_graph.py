@@ -374,7 +374,14 @@ def _file_hash(p: Path) -> str:
 #: adds its flaw ('item') and where the Ledger says the value came from
 #: ('from': 'nde.xlsx › Part 101!C4', or 'sources': the row's workbooks).
 _LOC_KEYS = ("sheet", "row", "column", "columns", "page", "line", "cell", "cells",
-             "header", "image", "item", "from", "sources")
+             "header", "image", "item", "from", "sources", "ocr", "checked")
+
+#: How sure (0-100, Tesseract's own word confidence) the OCR must be of every
+#: value a link rests on before a link read from a picture is firm - with
+#: every one of those values known from a source that is not a picture. The
+#: user, 2026-10-18: images read, "not ... 100% trusted unless we are positive
+#: that the data pulled from the images is accurate".
+PICTURE_SURE = 90
 
 
 def _loc_json(loc: Dict[str, Any]) -> str:
@@ -417,6 +424,10 @@ def locator_text(loc: Any) -> str:
         s += f" — from {loc['from']}"
     elif loc.get("sources"):
         s += f" — source workbook(s): {loc['sources']}"
+    if "checked" in loc:
+        sure = (f"{loc['ocr']}% sure" if loc.get("ocr") is not None else "how sure unknown")
+        s += (f" — read from a picture, {sure}, every name found elsewhere" if loc["checked"]
+              else f" — read from a picture, {sure} — check it")
     return s
 
 
@@ -435,6 +446,10 @@ class Value:
     #: the column ('Owner' as much as 'Inspector'). A CSV's or a text
     #: document's people are read as they always were.
     signed: bool = False
+    #: Read from a picture by OCR. Its links are firm only when confirmed:
+    #: the OCR was sure of it (locator 'ocr' >= PICTURE_SURE) and the vault
+    #: knows it from a source that is not a picture (see _record_relations).
+    from_image: bool = False
 
 
 @dataclass(slots=True)
@@ -776,10 +791,12 @@ def _reader_sig(rules: Sequence[FieldRule], *, image_reader: str = "",
 
 
 def _values_json(r: Record) -> List[list]:
-    """[label, raw, locator, snippet] + flags when any: 1 tentative, 2 signed."""
+    """[label, raw, locator, snippet] + flags when any: 1 tentative, 2 signed,
+    4 read from a picture."""
     out = []
     for v in r.values:
-        flags = (1 if v.tentative else 0) | (2 if v.signed else 0)
+        flags = (1 if v.tentative else 0) | (2 if v.signed else 0) | \
+            (4 if v.from_image else 0)
         out.append([v.rule.label, v.raw, v.locator, v.snippet] + ([flags] if flags else []))
     return out
 
@@ -819,7 +836,8 @@ def _records_json(records: Sequence[Record], reading: Any = None,
 def _record_load(d: Dict[str, Any], rel: str, rules_by_label: Dict[str, FieldRule]) -> Record:
     return Record(rel, d["kind"], [Value(rules_by_label[v[0]], v[1], v[2], v[3],
                                          bool(int(v[4]) & 1) if len(v) > 4 else False,
-                                         bool(int(v[4]) & 2) if len(v) > 4 else False)
+                                         bool(int(v[4]) & 2) if len(v) > 4 else False,
+                                         bool(int(v[4]) & 4) if len(v) > 4 else False)
                                    for v in d["values"]],
                   skipped_row=int(d.get("skipped_row") or 0))
 
@@ -855,7 +873,8 @@ def _reading_load(text: Optional[str]) -> Dict[str, Any]:
     first line of the line-per-record form is enough."""
     text = text or "[]"
     if text.startswith(_JSONL_HEAD):
-        text = text.split("\n", 1)[0]
+        nl = text.find("\n")          # not split: that copied the whole rest
+        text = text[:nl] if nl >= 0 else text
     try:
         data = json.loads(text)
     except Exception:
@@ -1579,6 +1598,22 @@ class KnowledgeGraph:
         #: workbook at all): their cached reason is kept, so Excel is not
         #: started for them again on every rebuild.
         failed_keep: List[str] = []
+        clip: Dict[str, bool] = {}
+
+        def pictures_wait(cached: sqlite3.Row) -> bool:
+            """An unchanged workbook whose pictures an earlier rebuild could
+            not copy out (the clipboard was not safe then) is read again
+            when it is safe now. Asked once per rebuild, and only then:
+            Excel is not started for nothing."""
+            if reader is None:
+                return False
+            summary = _reading_load(cached["records"]).get("summary") or {}
+            if not int(summary.get("pictures_pending") or 0):
+                return False
+            if "ok" not in clip:
+                import excel_open
+                clip["ok"] = bool(excel_open.clipboard_safe()[0])
+            return clip["ok"]
         last, n_batch = time.time(), 0
         token = _IMAGE_READER.set(reader)
         as_lines = _AS_LINES.set(True)
@@ -1595,6 +1630,8 @@ class KnowledgeGraph:
                     why = missing_reader(p)
                     sig = sig_for(p)
                     cached = None if why else self._cached(did, h, sig)
+                    if cached is not None and pictures_wait(cached):
+                        cached = None
                     if why:
                         stats["unreadable"].append(f"{rel}: {why}")
                         self.db.execute("UPDATE documents SET status='unreadable'"
@@ -1759,7 +1796,10 @@ class KnowledgeGraph:
                 # it working the same graph out again.
                 gsig = self._graph_sig(usable, failed_keep, sig_for, use_collections,
                                        gazetteer)
-                if gsig == self.meta("graph_sig") and not fallback:
+                # (A document read again with the same bytes and reader -
+                # pictures copied out at last - changes no signature.)
+                if gsig == self.meta("graph_sig") and not fallback \
+                        and not stats["documents_read"]:
                     raise _GraphUnchanged()
                 # From here on the graph is worked out again (the check above
                 # comes first: clearing 500,000 derived rows to roll them back
@@ -1930,8 +1970,12 @@ class KnowledgeGraph:
         each time it is called: read three times, held never."""
         # 1. Aliases first: 'Project Name' beside 'Project ID' ties the name
         #    to the code, so 'Helios Turbine Upgrade' elsewhere is PRJ-0915.
+        #    A picture's 'Project ID | Project Name' does not count: read at
+        #    40%, it renamed another source's firm link (review, 2026-10-18).
         name_to_code: Dict[Tuple[str, str], str] = {}
         for rec, _d, _h in records():
+            if any(v.from_image for v in rec.values):
+                continue
             for v in rec.values:
                 if v.rule.alias_of:
                     codes = [w for w in rec.values if w.rule.type == v.rule.type
@@ -1951,15 +1995,19 @@ class KnowledgeGraph:
         #    Marcus Oyelaran no matter which file was read first. An
         #    inspector's bare initials ('JB') are not a name: they are
         #    resolved (or asked about) in _person.
+        #    A name read from a picture explains no initial elsewhere: a CSV's
+        #    'D. Whitfield' was guessed to be the picture's Dana Whitfield,
+        #    and that guess then confirmed the picture (review, 2026-10-18).
         persons_full: Dict[str, str] = {}
         for rec, _d, _h in records():
             for v in rec.values:
                 if v.rule.type == "PERSON" and not is_initial_form(person_key(v.raw)) \
-                        and not _signed_initials(v):
+                        and not _signed_initials(v) and not v.from_image:
                     persons_full[person_key(v.raw)] = self._entity("PERSON", v.raw)
 
         memo = self._memo
-        for rec, did, h in records():
+
+        def link(rec: Record, did: str, h: str) -> List[Tuple[Value, Optional[str], bool]]:
             buf = memo.get("buffer") if memo is not None else None
             if buf and len(buf["evidence"]) + len(buf["mentions"]) >= self.FLUSH_EVERY:
                 self._flush()
@@ -1974,6 +2022,23 @@ class KnowledgeGraph:
                 if eid:
                     self._mention(eid, did, v.locator, v.raw, v.snippet, "field", run_id)
             self._record_relations(rec, ents, did, h, run_id)
+            return ents
+
+        # Records that rest on a picture come last, so that "known from a
+        # source that is not a picture" is checked against the whole vault,
+        # in whatever order the files were read.
+        self._known_elsewhere = set()
+        for rec, did, h in records():
+            if any(v.from_image for v in rec.values):
+                continue
+            for _v, eid, inferred in link(rec, did, h):
+                # a guessed initial is not knowing the person (review iii #3);
+                # a merge the user made is (#9): compared as merged
+                if eid and not inferred:
+                    self._known_elsewhere.add(self.resolve(eid))
+        for rec, did, h in records():
+            if any(v.from_image for v in rec.values):
+                link(rec, did, h)
 
     def _person(self, v: Value, did: str, run_id: str) -> Tuple[Optional[str], bool]:
         """(entity id or None, inferred). An initial form that fits exactly
@@ -2173,6 +2238,14 @@ class KnowledgeGraph:
         firm = rec.kind in ("row", "record", "ledger") or n_proj <= 1
         status = "seeded" if firm else "suggested"
 
+        known = getattr(self, "_known_elsewhere", set())
+
+        def sure(v: Value, eid: str) -> bool:
+            """A picture's value counts as certain when the OCR was sure of
+            it and the vault knows it from a source that is not a picture."""
+            return (not v.from_image) or (int(v.locator.get("ocr") or 0) >= PICTURE_SURE
+                                          and self.resolve(eid) in known)
+
         def rel(s, pred, o, v_s: Value, v_o: Value, at: Value):
             # ``at`` is the field that DEFINES the link (the person's field,
             # the 'Supersedes' field, the part's field), so the citation
@@ -2199,8 +2272,17 @@ class KnowledgeGraph:
                         loc[k] = "; ".join(dict.fromkeys(got))
             quote = v_s.snippet if v_s.snippet == v_o.snippet else \
                 f"{v_s.snippet} | {v_o.snippet}"
+            pictured = [v for v in (v_s, v_o) if v.from_image]
+            checked = sure(v_s, s) and sure(v_o, o)
             st = "suggested" if (s in inferred_ids or o in inferred_ids
-                                 or v_s.tentative or v_o.tentative) else status
+                                 or v_s.tentative or v_o.tentative or not checked) else status
+            if pictured:
+                loc = dict(loc)
+                confs = [v.locator.get("ocr") for v in pictured]
+                loc["ocr"] = None if any(c is None for c in confs) else min(confs)
+                # worded from what the link IS: "every name found elsewhere"
+                # was said of a link left suggested (review, 2026-10-18)
+                loc["checked"] = checked and st != "suggested"
             self._relate(s, pred, o, st, doc_id=did, content_hash=h,
                          locator=loc, quote=quote, method=method, run_id=run_id)
 

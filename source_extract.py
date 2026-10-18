@@ -381,8 +381,8 @@ def workbook_files(folder) -> List[Path]:
 
 
 def load_workbook_grids(path, notes: Optional[List[str]] = None,
-                        want_pictures: bool = True, data: Optional[bytes] = None
-                        ) -> Tuple[List[Grid], List[SourceImage]]:
+                        want_pictures: bool = True, data: Optional[bytes] = None,
+                        careful: bool = False) -> Tuple[List[Grid], List[SourceImage]]:
     """Every sheet as a Grid, every text box and chart as a small Grid of its
     own, and the pictures. openpyxl when it can open the file; the installed
     Excel when it cannot (.xls, .xlsb, rights-protected). `notes` collects
@@ -395,7 +395,10 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
 
     data: the workbook's bytes, already read (an .xlsx / .xlsm): it is
     parsed from them, so the file is not held open while openpyxl works -
-    Excel could not save it meanwhile."""
+    Excel could not save it meanwhile.
+
+    careful: Excel copies pictures only while nothing else uses the clipboard
+    (excel_open.read_with_excel; the knowledge graph's background rebuild)."""
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
@@ -407,7 +410,7 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
         raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
                           "copy without the password, and add that copy")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
-        return _grids_from_excel(path, notes, want_pictures)
+        return _grids_from_excel(path, notes, want_pictures, careful)
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data) if data is not None else path,
                                     data_only=True)
@@ -450,10 +453,12 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     return grids, images
 
 
-def _grids_from_excel(path: Path, notes: Optional[List[str]], want_pictures: bool = True):
+def _grids_from_excel(path: Path, notes: Optional[List[str]], want_pictures: bool = True,
+                      careful: bool = False):
     import excel_open
     try:
-        book = excel_open.read_with_excel(path, want_pictures=want_pictures)
+        book = excel_open.read_with_excel(path, want_pictures=want_pictures,
+                                          **({"careful": True} if careful else {}))
     except excel_open.ExcelOpenError as e:
         raise LedgerError(str(e)) from e
     grids: List[Grid] = []
@@ -1062,13 +1067,15 @@ def _tessdata_for(exe: Path) -> Optional[Path]:
     return None
 
 
-def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
+def tsv_to_boxes(tsv: str, confs: Optional[List[float]] = None
+                 ) -> List[Tuple[float, float, float, float, str]]:
     """Tesseract TSV words -> phrase boxes (x0, y0, x1, y1, text).
 
     Words of one Tesseract line closer than ~0.8 x the text height are one
     phrase ("Laser Power (W)"); a wider gap is a table column boundary, which
-    boxes_to_rows then aligns across rows."""
-    lines: Dict[Tuple[str, ...], List[Tuple[float, float, float, float, str]]] = {}
+    boxes_to_rows then aligns across rows. ``confs``, when given, gets each
+    box's confidence (its least sure word's TSV 'conf'), in the same order."""
+    lines: Dict[Tuple[str, ...], List[Tuple[float, float, float, float, str, float]]] = {}
     for row in tsv.splitlines()[1:]:
         f = row.split("\t")
         if len(f) < 12 or f[0] != "5" or not f[11].strip():
@@ -1077,7 +1084,11 @@ def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
             x, y, w, h = (float(v) for v in f[6:10])
         except ValueError:
             continue
-        lines.setdefault(tuple(f[1:5]), []).append((x, y, x + w, y + h, f[11].strip()))
+        try:
+            conf = max(float(f[10]), 0.0)
+        except ValueError:
+            conf = 0.0
+        lines.setdefault(tuple(f[1:5]), []).append((x, y, x + w, y + h, f[11].strip(), conf))
     out = []
     for words in lines.values():
         words.sort(key=lambda b: b[0])
@@ -1086,11 +1097,50 @@ def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
         cur = words[0]
         for b in words[1:]:
             if b[0] - cur[2] <= gap_max:
-                cur = (cur[0], min(cur[1], b[1]), b[2], max(cur[3], b[3]), cur[4] + " " + b[4])
+                cur = (cur[0], min(cur[1], b[1]), b[2], max(cur[3], b[3]),
+                       cur[4] + " " + b[4], min(cur[5], b[5]))
             else:
                 out.append(cur)
                 cur = b
         out.append(cur)
+    if confs is not None:
+        confs.extend(b[5] for b in out)
+    return [b[:5] for b in out]
+
+
+def rows_with_confidence(tsv: str) -> Tuple[List[List[str]], List[List[float]]]:
+    """Tesseract TSV -> (rows, confidences): boxes_to_rows' rows, and beside
+    each cell how sure Tesseract was of it (its least sure word; 0 for an
+    empty cell). By position, not by word: the knowledge graph trusted a
+    misread 'PN-7'+'7' because 'PN-77' was read sure in another cell (review,
+    2026-10-18)."""
+    confs: List[float] = []
+    boxes = tsv_to_boxes(tsv, confs)
+    rows = boxes_to_rows(boxes)
+    # the same boxes once more with their numbers for text: boxes_to_rows
+    # places a box by its position only, so each cell's numbers say which
+    # boxes it was made of
+    marked = boxes_to_rows([b[:4] + (f"<{i}>",) for i, b in enumerate(boxes)])
+    sure = [[min((confs[int(i)] for i in re.findall(r"<(\d+)>", cell)), default=0.0)
+             for cell in row] for row in marked]
+    return rows, sure
+
+
+def word_confidences(tsv: str) -> Dict[str, float]:
+    """How sure Tesseract was of each word it read (its TSV 'conf', 0-100),
+    the lowest when a word was read more than once. The knowledge graph
+    trusts a value read from a picture only when the OCR was sure of it."""
+    out: Dict[str, float] = {}
+    for row in tsv.splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or f[0] != "5" or not f[11].strip():
+            continue
+        try:
+            conf = float(f[10])
+        except ValueError:
+            continue
+        word = f[11].strip()
+        out[word] = min(conf, out.get(word, conf))
     return out
 
 
@@ -1168,14 +1218,24 @@ def tesseract_reader(exe: Optional[Path] = None, timeout: float = 60) -> Optiona
     cmd += ["-l", "eng", "tsv"]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-    def read(data: bytes):
+    def tsv(data: bytes) -> str:
         done = subprocess.run(cmd, input=_for_ocr(data), capture_output=True,
                               timeout=timeout, creationflags=flags)
         if done.returncode != 0:
             raise RuntimeError(done.stderr.decode("utf-8", "replace").strip()[-300:]
                                or f"tesseract exited {done.returncode}")
-        return boxes_to_rows(tsv_to_boxes(done.stdout.decode("utf-8", "replace"))) or None
+        return done.stdout.decode("utf-8", "replace")
+
+    def read(data: bytes):
+        return boxes_to_rows(tsv_to_boxes(tsv(data))) or None
+
+    def with_confidence(data: bytes):
+        """(rows, confidences) from one Tesseract run: beside each cell of
+        rows, how sure it was of that cell (rows_with_confidence)."""
+        rows, sure = rows_with_confidence(tsv(data))
+        return (rows or None), sure
     read.name = "Tesseract (local)"
+    read.with_confidence = with_confidence
     return read
 
 
