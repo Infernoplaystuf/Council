@@ -619,6 +619,16 @@ def progress_now():
     return _PROGRESS.get()
 
 
+#: Set by seed()'s reading phase: workbook and Ledger readers then give
+#: their records as cache lines, not objects (kg_excel.Reading).
+_AS_LINES: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "kg_records_as_lines", default=False)
+
+
+def records_as_lines_now() -> bool:
+    return _AS_LINES.get()
+
+
 def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     """What a document says, as records. A workbook or a Ledger (a parent
     CSV with its schema) is read by council_core/kg_excel.py, and its
@@ -795,11 +805,14 @@ def _records_json(records: Sequence[Record], reading: Any = None,
     recs = [r for r in records if r.kind != "reading"]
     if reading is None and not error:
         return "[" + ",".join(_record_json(r) for r in recs) + "]"
+    body = getattr(reading, "record_lines", None)
     head = json.dumps({"v": 3, "error": error,
                        "labels": list(getattr(reading, "labels", []) or []),
                        "summary": dict(getattr(reading, "summary", {}) or {}),
                        "notes": list(getattr(reading, "notes", []) or [])},
                       ensure_ascii=False)
+    if body is not None:              # written as they were found
+        return "\n".join([head] + list(body) + [_record_json(r) for r in recs])
     return "\n".join([head] + [_record_json(r) for r in recs])
 
 
@@ -1568,6 +1581,7 @@ class KnowledgeGraph:
         failed_keep: List[str] = []
         last, n_batch = time.time(), 0
         token = _IMAGE_READER.set(reader)
+        as_lines = _AS_LINES.set(True)
         prog.stage("reading documents", total=len(files), unit="files")
         try:
             for n, p in enumerate(files):
@@ -1651,6 +1665,7 @@ class KnowledgeGraph:
             raise
         finally:
             _IMAGE_READER.reset(token)
+            _AS_LINES.reset(as_lines)
         # ── 2. the graph (one transaction) ──
         try:
             with self.db:

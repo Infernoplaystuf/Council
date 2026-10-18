@@ -1660,3 +1660,22 @@ def test_r2_free_text_is_capped_by_characters_too(tmp_path, monkeypatch):
     lines = json.loads(kg.db.execute("SELECT lines FROM doc_cache").fetchone()[0])
     assert sum(len(t) for _p, _l, t in lines) <= 1000
     assert "n.xlsx: only the first 1000 characters of free text were kept" in stats["notes"]
+
+
+def test_a_rebuild_takes_records_as_cache_lines_not_objects(tmp_path, monkeypatch):
+    """MEASURED (2026-10-18): a 100k-row workbook's records, held as objects
+    and then turned into text, peaked at 274 MB; their lines are 46 MB."""
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "w.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
+                                           "A2": "PN-9", "B2": "Carol Lee"}})
+    got = []
+    real = kg_excel.read_workbook
+    monkeypatch.setattr(kg_excel, "read_workbook",
+                        lambda *a, **k: got.append(real(*a, **k)) or got[-1])
+    kg = _kg(v)
+    kg.seed()
+    (reading,) = got
+    assert reading.records == [] and len(reading.record_lines) == 1
+    assert _rels(kg) == {("Carol Lee", "OWNS", "PN-9"): "seeded"}
+    direct = real(v / "data_in" / "w.xlsx", "w.xlsx", [r for r, _s in kg.field_rules()])
+    assert direct.record_lines is None and len(direct.records) == 1

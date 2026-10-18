@@ -97,12 +97,42 @@ class Unreadable(Exception):
 
 @dataclass
 class Reading:
-    """What reading one workbook or Ledger gave."""
+    """What reading one workbook or Ledger gave. Inside a rebuild the records
+    come as their cache lines (``record_lines``, kgm._record_json), written as
+    each is found and ``records`` left empty: a 100k-row workbook's 100,000
+    records held as objects, then turned into text, peaked at 274 MB
+    (measured 2026-10-18); its cache lines are 46 MB."""
     records: List["kgm.Record"]
     lines: List[Tuple[Optional[str], int, str]] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    record_lines: Optional[List[str]] = None
+
+
+class _Sink:
+    """Where a reader puts its records: objects, or (in a rebuild) their
+    cache lines, with the people they name counted either way."""
+
+    def __init__(self):
+        self.as_lines = kgm.records_as_lines_now()
+        self.records: List["kgm.Record"] = []
+        self.lines: List[str] = []
+        self.people: set = set()
+        self.n = 0
+
+    def add(self, rec: "kgm.Record") -> None:
+        self.n += 1
+        for v in rec.values:
+            if v.rule.type == "PERSON":
+                self.people.add(v.raw)
+        if self.as_lines:
+            self.lines.append(kgm._record_json(rec))
+        else:
+            self.records.append(rec)
+
+    def reading(self, **kw) -> Reading:
+        return Reading(self.records, record_lines=self.lines if self.as_lines else None, **kw)
 
 
 # ── small helpers ────────────────────────────────────────────────────────
@@ -440,6 +470,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     by_norm = kgm._rule_index(rules)
     fields = {f.name: f for f in schema.fields}
     prov, n_reviews, notes = _provenance(p)
+    sink = _Sink()
     try:
         text = _decode(p.read_bytes())
     except OSError as exc:
@@ -449,7 +480,6 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     roles: Dict[int, Tuple[str, Any]] = {}
     id_i = item_i = src_i = None
     part_rule = kgm.LEDGER_PART
-    recs: List[kgm.Record] = []
     parts, people = set(), set()
     n_rows = skipped = located = 0
     person_cols: List[str] = []
@@ -582,7 +612,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
             people.add(slot["raw"])
             rec.values.append(kgm.Value(kgm.INSPECTOR, slot["raw"], loc,
                                         "; ".join(slot["quotes"])))
-        recs.append(rec)
+        sink.add(rec)
     if header is None:
         raise Unreadable("is empty", permanent=True)
     if skipped:
@@ -592,7 +622,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                "rule_columns": rule_cols, "reviews": n_reviews, "located": located,
                "id_field": schema.id_field, "item_field": schema.item_field,
                "skipped": skipped, "schema": schema_path(p).name}
-    return Reading(recs, [], list(header), summary, notes)
+    return sink.reading(labels=list(header), summary=summary, notes=notes)
 
 
 # ── workbooks: the grid reader ──────────────────────────────────────────
@@ -622,7 +652,9 @@ class _GridReader:
         self.sheet = sheet or name
         self.tentative, self.image, self.text_all = tentative, image, text_all
         self.kind = "picture" if image else "row"
+        self.sink: Optional[_Sink] = None       # set by read_workbook
         self.records: List[kgm.Record] = []
+        self.n_records = 0
         self.forms: List[kgm.Value] = []
         self.markers: List[Tuple[int, int, str, Dict[str, Any], str]] = []
         self.lines: List[Tuple[Optional[str], int, str]] = []
@@ -859,7 +891,11 @@ class _GridReader:
             return at
         if rec.values:
             t.rows += 1
-            self.records.append(rec)
+            self.n_records += 1
+            if self.sink is not None:
+                self.sink.add(rec)
+            else:
+                self.records.append(rec)
         return at
 
     def _forms(self, r: int, cells, used: set, nxt) -> set:
@@ -1168,12 +1204,14 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
                                "image_reader": getattr(image_reader, "name", "") or ""}
     readers: List[Tuple[_GridReader, str]] = []
     budget: Dict[str, Any] = {"lines": 0, "chars": 0, "dropped": ""}
+    sink = _Sink()
 
     def run(name: str, rows: Iterable, image: str = "", parent: str = "") -> None:
         is_extra = " › " in name and not image
         gr = _GridReader(name, by_norm, rel, tentative=bool(image), image=image,
                          text_all=is_extra and "text box" in name, sheet=parent or name,
                          budget=budget)
+        gr.sink = sink
         for r, cells in rows:
             gr.feed(r, cells)
         gr.close()
@@ -1279,32 +1317,26 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         g = se.rows_to_grid(rows, img)
         run(f"{img.sheet} › picture {img.anchor}", _grid_rows(g.cells), image=img.anchor,
             parent=img.sheet)
-    records: List[kgm.Record] = []
     lines: List[Tuple[Optional[str], int, str]] = []
     labels: Dict[str, str] = {}
-    people = set()
     for gr, parent in readers:
-        records += gr.records
         rec = gr.sheet_record(sheet_part(parent))
         if rec is not None:
-            records.append(rec)
+            sink.add(rec)
         lines += gr.lines
         for k, t in gr.labels.items():
             if len(labels) < MAX_LABELS:
                 labels.setdefault(k, t)
         summary["tables"] += gr.n_tables
         summary["forms"] += gr.n_forms
-        summary["rows"] += len(gr.records)
-    for rec in records:
-        for v in rec.values:
-            if v.rule.type == "PERSON":
-                people.add(v.raw)
-    summary["people"] = sorted(people)
+        summary["rows"] += gr.n_records
+    summary["people"] = sorted(sink.people)
     if budget["dropped"] == "chars":
         notes.append(f"only the first {MAX_TEXT_CHARS} characters of free text were kept")
     elif budget["dropped"] == "lines":
         notes.append(f"only the first {MAX_LINES} lines of free text were kept")
-    return Reading(records, lines, list(labels.values()), summary, notes)
+    return sink.reading(lines=lines, labels=list(labels.values()), summary=summary,
+                        notes=notes)
 
 
 # ── plain words for the Connections tab ─────────────────────────────────
