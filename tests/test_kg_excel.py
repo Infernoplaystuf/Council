@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1087,3 +1088,572 @@ def test_a_huge_neighbourhood_is_read_in_part(tmp_path, monkeypatch):
     ns = kg.neighbors(dana, evidence_limit=5, relation_limit=300)
     assert len(ns) == 300 and len(calls) == 300
     assert kg.neighbor_counts(dana) == {("OWNS", "out"): 600}
+
+
+# ── review (i), 2026-10-16: correctness findings, each failing before ────
+def test_r1_an_everywhere_answer_never_overrides_a_ledgers_own_list(tmp_path):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    ec = _ec(schema)
+    _ledger(tmp_path, v / "data_in" / "a", [_row(schema, "101", "1A", **{f"{ec} [JB]": "1"})],
+            people={"JB": "Jordan Blake"})
+    _ledger(tmp_path, v / "data_in" / "b", [_row(schema, "202", "1A", **{f"{ec} [JB]": "2"})])
+    (v / "data_in" / "team.csv").write_text("Project,Owner\nPRJ-1,Jill Brown\n", encoding="utf-8")
+    kg = _kg(v)
+    kg.seed()
+    (q,) = [r for r in kg.reviews() if r["kind"] == "initials"]
+    assert q["path"] == "b/lmm_parent.csv"
+    kg.answer_review(q["id"], kg.search("Jill Brown", "PERSON")[0]["id"], everywhere=True)
+    kg.seed()
+    rels = {k: s for k, s in _rels(kg).items() if k[1] == "INSPECTED"}
+    assert rels == {("Jordan Blake", "INSPECTED", "101"): "seeded",
+                    ("Jill Brown", "INSPECTED", "202"): "seeded"}
+
+
+@pytest.mark.parametrize("heads", [
+    ["Part Number", "Owner", "Q1", "Q2"],          # titles that look like codes
+    ["Part Number", "Owner", 2025, 2026],          # titles that are numbers
+    ["Part Number", None, "Owner"],                # a title cell left empty
+    ["Part Number", "Owner", "Lot 3"],
+])
+def test_r1_a_header_with_code_number_or_empty_titles_is_still_a_header(tmp_path, heads):
+    v = _vault(tmp_path)
+    cells = {}
+    for i, h in enumerate(heads):
+        if h is not None:
+            cells[f"{openpyxl.utils.get_column_letter(i + 1)}1"] = h
+    oc = openpyxl.utils.get_column_letter(heads.index("Owner") + 1)
+    for r, (pn, who) in enumerate((("PN-1001", "Dana Whitfield"), ("PN-1002", "Carol Lee"),
+                                   ("PN-1003", "Hana Sato")), start=2):
+        cells[f"A{r}"], cells[f"{oc}{r}"] = pn, who
+        for i in range(len(heads)):
+            col = openpyxl.utils.get_column_letter(i + 1)
+            if heads[i] not in ("Part Number", "Owner", None):
+                cells[f"{col}{r}"] = r
+    _book(v / "data_in" / "plan.xlsx", {"Plan": cells})
+    kg = _kg(v)
+    kg.seed()
+    assert _rels(kg) == {("Dana Whitfield", "OWNS", "PN-1001"): "seeded",
+                         ("Carol Lee", "OWNS", "PN-1002"): "seeded",
+                         ("Hana Sato", "OWNS", "PN-1003"): "seeded"}
+
+
+def test_r1_side_by_side_tables_one_empty_column_apart_stay_apart(tmp_path):
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "t.xlsx", {"S": {
+        "A1": "Part Number", "B1": "Owner", "D1": "Project", "E1": "Program Lead",
+        "A2": "PN-1", "B2": "Dana Whitfield", "D2": "PRJ-9", "E2": "Hana Sato"}})
+    kg = _kg(v)
+    kg.seed()
+    assert _rels(kg) == {("Dana Whitfield", "OWNS", "PN-1"): "seeded",
+                         ("Hana Sato", "LEADS", "PRJ-9"): "seeded"}
+
+
+def test_r1_a_csv_beside_a_json_table_schema_is_a_plain_table(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "team.csv").write_text("Project,Program Lead\nPRJ-1,Mary King\n",
+                                            encoding="utf-8")
+    (v / "data_in" / "team.schema.json").write_text(json.dumps(
+        {"fields": [{"name": "Project", "type": "string"},
+                    {"name": "Program Lead", "type": "string"}]}), encoding="utf-8")
+    kg = _kg(v)
+    stats = kg.seed()
+    assert stats["unreadable"] == []
+    assert _rels(kg) == {("Mary King", "LEADS", "PRJ-1"): "seeded"}
+    assert sorted(p.name for p in kg.document_files()) == ["team.csv", "team.schema.json"]
+
+
+def test_r1_label_synonyms_are_still_found_in_workbooks(tmp_path):
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "p.xlsx", {"S": {"A1": "Proj Code", "B1": "POC", "C1": "Qty",
+                                           "A2": "PRJ-1", "B2": "Dana Whitfield", "C2": 3}})
+    kg = _kg(v)
+    kg.seed()
+    assert {"Proj Code", "POC", "Qty"} <= set(kg.harvest_labels())
+    assert ("POC", "Point of Contact") in {(s["label"], s["means"])
+                                           for s in kg.suggest_label_synonyms()}
+
+
+def test_r1_initials_under_any_person_column_go_through_the_list(tmp_path):
+    t = tmp_path / "templates" / "own.xlsx"
+    t.parent.mkdir(parents=True)
+    wb = openpyxl.Workbook()
+    for c, h in enumerate(["Part Number", "Owner", "Notes"], start=1):
+        wb.active.cell(1, c, h)
+    wb.save(t)
+    schema = read_template(t)
+    v = _vault(tmp_path)
+    led = ParentCSV.create(v / "data_in" / "own_parent.csv", schema)
+    led.add_samples([{"Part Number": "2041", "Owner": "JB"}])
+    p = se.aliases_path_for(v / "data_in" / "own_parent.csv")
+    p.write_text(json.dumps({"map": {}, "ignore": [], "people": {"JB": "Jordan Blake"}}),
+                 encoding="utf-8")
+    _book(v / "data_in" / "w.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
+                                           "A2": "PN-9", "B2": "MK"}})
+    kg = _kg(v)
+    kg.seed()
+    rels = _rels(kg)
+    assert rels[("Jordan Blake", "OWNS", "2041")] == "seeded"
+    assert not [k for k in rels if k[0] in ("JB", "MK")]
+    assert [r["surface"] for r in kg.reviews()] == ["MK"]
+
+
+def test_r1_placeholders_are_nobody():
+    for v in ("N/A", "n/a", "TBD", "OK", "NA", "tbd", "n.a.", "-", "?"):
+        assert kg_excel.split_people(v) == [], v
+    assert kg_excel.split_people("EC") == ["EC"]        # Eva Chen signs as EC
+    assert kg_excel.split_people("JB/MK") == ["JB", "MK"]
+
+
+def test_r1_a_blank_row_ends_a_table(tmp_path):
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "tracker.xlsx", {"Tracker": {
+        "A1": "Part Number", "B1": "Owner",
+        "A2": "PN-1001", "B2": "Dana Whitfield",
+        "A3": "PN-1002", "B3": "Carol Lee",
+        "A5": "Name", "B5": "Role",
+        "A6": "Hana Sato", "B6": "Engineer",
+        "A7": "Tomas Reyes", "B7": "Technician",
+        "A9": "Note: values from the Q3 audit"}})
+    kg = _kg(v)
+    kg.seed()
+    assert _rels(kg) == {("Dana Whitfield", "OWNS", "PN-1001"): "seeded",
+                         ("Carol Lee", "OWNS", "PN-1002"): "seeded"}
+    assert _names(kg, "PART") == ["PN-1001", "PN-1002"]
+
+
+def test_r1_a_marker_above_a_table_is_cited_at_the_row(tmp_path):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    _ledger(tmp_path, v / "data_in" / "led", [_row(schema, "999", "1A")],
+            people={"JB": "Jordan Blake"})
+    _book(v / "data_in" / "insp.xlsx", {"Results": {
+        "A1": "Inspector: JB",
+        "A3": "Part Number", "B3": "Description", "C3": "Qty",
+        "A4": "PN-1001", "B4": "bracket", "C4": 2,
+        "A5": "PN-1002", "B5": "shim", "C5": 4}})
+    kg = _kg(v)
+    kg.seed()
+    jb = kg.search("Jordan Blake", "PERSON")[0]
+    wheres = sorted(e["where"] for n in kg.neighbors(jb["id"]) for e in n["evidence"]
+                    if e["path"] == "insp.xlsx")
+    assert wheres == ["sheet Results, row 4 (Part Number)", "sheet Results, row 5 (Part Number)"]
+
+
+def _src_who(folder, name, who):
+    return _src_with_inspector(folder / name, who=who)
+
+
+def test_r1_from_cites_only_the_review_that_was_applied(tmp_path):
+    import time as _t
+    from council_core.ledger_ingest import run_apply, run_extract
+    v = _vault(tmp_path)
+    folder = v / "data_in" / "ledger"
+    csv, _ = _ledger(tmp_path, folder, [], people={"JB": "Jordan Blake"})
+    a = _src_who(folder, "nde_first.xlsx", "JB")
+    r1 = folder / "review_1.xlsx"
+    run_extract(csv, [a], r1, use_images=False)
+    _accept_all(r1)
+    run_apply(r1, use_images=False)
+    _t.sleep(1.1)
+    b = _src_who(folder, "nde_resend.xlsx", "JB")
+    r2 = folder / "review_2.xlsx"
+    run_extract(csv, [b], r2, use_images=False)
+    _accept_all(r2)                                     # saved, never applied
+    kg = _kg(v)
+    kg.seed()
+    jb = kg.search("Jordan Blake", "PERSON")[0]["id"]
+    froms = {e["locator"].get("from") for n in kg.neighbors(jb) for e in n["evidence"]
+             if e["method"] == "ledger" and e["locator"].get("item") == "Flaw # 1A"}
+    assert froms == {"nde_first.xlsx › Part 101!C4"}
+
+
+def test_r1_agreeing_inspectors_are_each_cited_at_their_own_cell(tmp_path):
+    from council_core.ledger_ingest import run_apply, run_extract
+    v = _vault(tmp_path)
+    folder = v / "data_in" / "ledger"
+    csv, _ = _ledger(tmp_path, folder, [], people={"JB": "Jordan Blake", "MK": "Mary King"})
+    a = _src_who(folder, "nde_jb.xlsx", "JB")
+    b = _src_who(folder, "nde_mk.xlsx", "MK")
+    review = folder / "review_1.xlsx"
+    run_extract(csv, [a, b], review, use_images=False)
+    _accept_all(review)
+    run_apply(review, use_images=False)
+    kg = _kg(v)
+    kg.seed()
+    for who, book in (("Mary King", "nde_mk.xlsx"), ("Jordan Blake", "nde_jb.xlsx")):
+        eid = kg.search(who, "PERSON")[0]["id"]
+        froms = {e["locator"].get("from") for n in kg.neighbors(eid) for e in n["evidence"]
+                 if e["method"] == "ledger" and e["locator"].get("item") == "Flaw # 1A"}
+        assert froms == {f"{book} › Part 101!C4"}, (who, froms)
+
+
+def test_r1_part_level_values_are_traced_too(tmp_path):
+    from sample_ledger import TemplateField, TemplateSchema
+    from source_extract import Decision, Extraction, Obs, rows_from, write_review
+    v = _vault(tmp_path)
+    base = _schema(tmp_path)
+    fields = list(base.fields)
+    fields.insert(1, TemplateField(name="Project", label="Project", sheet="Sheet",
+                                   section="Part Attributes", layout="table", cells={"": "F3"}))
+    schema = TemplateSchema(base.template_path, fields, base.id_field, base.item_field, base.items)
+    ec = _ec(schema)
+    folder = v / "data_in" / "led"
+    folder.mkdir(parents=True)
+    csv = folder / "lmm_parent.csv"
+    led = ParentCSV.create(csv, schema)
+    obs = [Obs("101", "", "Project", "PRJ-7", 1.0, "alias", "Project", "src.xlsx › Part 101!B2"),
+           Obs("101", "1A", f"{ec} [JB]", "63", 1.0, "alias", "EC Pre",
+               "src.xlsx › Part 101!C4", inspector="JB")]
+    decs = [Decision(o, True) for o in obs]
+    run = Extraction(["src.xlsx"], obs=obs)
+    write_review(folder / "review_1.xlsx", run, decs, schema, str(csv))
+    led.add_samples(rows_from(decs, schema), source="src.xlsx")
+    reading = kg_excel.read_ledger(csv, "led/lmm_parent.csv", list(kgm.DEFAULT_FIELD_RULES))
+    projects = [val for rec in reading.records for val in rec.values
+                if val.rule.label == "Project"]
+    assert projects and all(val.locator.get("from") == "src.xlsx › Part 101!B2"
+                            for val in projects)
+
+
+def test_r1_a_picture_text_line_previews(tmp_path):
+    from openpyxl.drawing.image import Image as XLImage
+    v = _vault(tmp_path)
+    wb = openpyxl.Workbook()
+    wb.active.title = "Visual"
+    wb.active.add_image(XLImage(io.BytesIO(lf._png([["x"]]))), "F2")
+    wb.save(v / "data_in" / "vis.xlsx")
+    kg = _kg(v, reader=lf.fake_reader([["Dana Whitfield checked the shim stack today"]]))
+    kg.seed()
+    (line,) = json.loads(kg.db.execute("SELECT lines FROM doc_cache").fetchone()[0])
+    loc = {"page": line[0], "line": line[1]}
+    ctx = kgm.source_context(kg.root, "vis.xlsx", loc, quote=line[2])
+    assert ctx and ctx[0][1] == "a picture at F2 on sheet Visual, read by OCR"
+    assert kgm.locator_text(loc) == "sheet Visual › picture F2, row 1"
+
+
+def test_r1_sheet_names_that_are_years_or_codes(tmp_path):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    _ledger(tmp_path, v / "data_in" / "led", [_row(schema, "999", "1A")],
+            people={"JB": "Jordan Blake"})
+    _book(v / "data_in" / "y.xlsx", {"2025": {"A1": "Inspector: JB"},
+                                     "PN-1001": {"A1": "Inspector: JB"},
+                                     "Part 101": {"A1": "Inspector: JB"}})
+    kg = _kg(v)
+    kg.seed()
+    assert {k[2] for k in _rels(kg) if k[1] == "INSPECTED"} == {"PN-1001", "101"}
+
+
+# ── review (ii), 2026-10-16: safety and scale findings, each failing before ──
+def _owner_rows(v, n, who="Dana Whitfield", name="t.csv"):
+    rows = "\n".join(f"PN-{i},{who}" for i in range(n))
+    (v / "data_in" / name).write_text("Part,Owner\n" + rows + "\n", encoding="utf-8")
+
+
+def test_r2_the_agent_tool_asks_for_a_bounded_neighbourhood(tmp_path, monkeypatch):
+    from council_core import agent_profiles
+    v = _vault(tmp_path)
+    _owner_rows(v, 5)
+    _kg(v).seed()
+    seen = []
+    real = kgm.KnowledgeGraph.neighbors
+    monkeypatch.setattr(kgm.KnowledgeGraph, "neighbors",
+                        lambda self, eid, **k: seen.append(k) or real(self, eid, **k))
+    out = agent_profiles._graph_tools(v)["graph_neighbors"].fn({"name": "Dana Whitfield"}, None)
+    assert len(out["links"]) == 5
+    assert seen and seen[0].get("evidence_limit") and seen[0].get("relation_limit")
+
+
+def test_r2_a_hidden_excel_is_tied_to_the_council_and_dies_with_it(tmp_path):
+    """Quitting the Council while a rebuild's daemon worker is inside Excel
+    never ran read_with_excel's finally: the hidden Excel stayed. Now every
+    Excel the Council starts is in a Windows job that closes with it."""
+    import subprocess
+    if os.name != "nt":
+        pytest.skip("Windows job objects")
+    pytest.importorskip("win32job")
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+        "import excel_open\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print(child.pid, excel_open.tie_to_this_process(child.pid), flush=True)\n",
+        encoding="utf-8")
+    out = subprocess.run([sys.executable, str(parent)], capture_output=True, text=True,
+                         timeout=60)
+    pid, tied = out.stdout.split()
+    assert tied == "True", out.stderr
+    import time as _t
+    import psutil
+    for _ in range(50):
+        if not psutil.pid_exists(int(pid)):
+            break
+        _t.sleep(0.1)
+    assert not psutil.pid_exists(int(pid))
+
+
+def test_r2_read_with_excel_ties_the_excel_it_starts(tmp_path, monkeypatch):
+    tied = []
+    monkeypatch.setattr(excel_open, "_tie_excel", lambda app: tied.append(app))
+    f = tmp_path / "x.xls"
+    f.write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    log = []
+    excel_open.read_with_excel(f, want_pictures=False,
+                               app_factory=lambda: _App(log, [_Sheet("S", [("a",)])]))
+    assert len(tied) == 1
+
+
+def test_r2_a_password_xls_is_not_retried_nor_harvested(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    (v / "data_in" / "locked.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    log = _fake_excel(monkeypatch, [], fail="The password you supplied is not correct. "
+                                            "Verify that the CAPS LOCK key is off")
+    kg = _kg(v)
+    for _ in range(3):
+        stats = kg.seed()
+    assert sum(1 for e in log if e[0] == "open") == 1
+    assert len(stats["unreadable"]) == 1 and "password" in stats["unreadable"][0]
+    kg.suggest_label_synonyms()
+    assert sum(1 for e in log if e[0] == "open") == 1
+
+
+def test_r2_the_harvest_does_not_reopen_a_workbook_that_failed(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    (v / "data_in" / "busy.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    log = _fake_excel(monkeypatch, [], fail="Excel is busy")
+    kg = _kg(v)
+    kg.seed()
+    n = sum(1 for e in log if e[0] == "open")
+    kg.suggest_label_synonyms()
+    assert sum(1 for e in log if e[0] == "open") == n
+
+
+def test_r2_folder_overlaps_cannot_be_spelt_around(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "sub").mkdir()
+    kg = _kg(v)
+    with pytest.raises(ValueError, match="overlaps the vault"):
+        kg.add_root("\\\\?\\" + str((v / "data_in" / "sub").resolve()))
+    assert kg.extra_roots() == []
+
+
+def test_r2_a_junction_in_an_added_folder_is_not_followed(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows junctions")
+    import _winapi
+    v = _vault(tmp_path)
+    (v / "data_out").mkdir()
+    (v / "data_in" / "team.csv").write_text("Project,Program Lead\nPRJ-1,Dana Whitfield\n",
+                                            encoding="utf-8")
+    (v / "data_out" / "answer.txt").write_text("Program Lead: Secret Person\nProject: PRJ-9\n",
+                                               encoding="utf-8")
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / "own.txt").write_text("Program Lead: Lee Carol\nProject: PRJ-2\n", encoding="utf-8")
+    _winapi.CreateJunction(str(v), str(out / "j_vault"))
+    try:
+        kg = _kg(v)
+        kg.add_root(out)
+        kg.seed()
+        docs = sorted(kg.display_path(kg._rel(p)) for p in kg.document_files())
+        assert docs == ["outside/own.txt", "team.csv"]
+        assert "Secret Person" not in _names(kg, "PERSON")
+    finally:
+        os.rmdir(out / "j_vault")
+
+
+def test_r2_system_folders_of_an_added_drive_are_skipped(tmp_path):
+    v = _vault(tmp_path)
+    out = tmp_path / "drive"
+    for sub in ("$RECYCLE.BIN/S-1-5", "System Volume Information", "work"):
+        (out / sub).mkdir(parents=True)
+    (out / "$RECYCLE.BIN" / "S-1-5" / "$R4XK2.txt").write_text(
+        "Program Lead: Deleted Person\nProject: PRJ-DEL\n", encoding="utf-8")
+    (out / "System Volume Information" / "x.txt").write_text("Project: PRJ-SYS\n",
+                                                             encoding="utf-8")
+    (out / "work" / "a.txt").write_text("Program Lead: Dana Whitfield\nProject: PRJ-1\n",
+                                        encoding="utf-8")
+    kg = _kg(v)
+    kg.add_root(out)
+    assert [p.name for p in kg.document_files()] == ["a.txt"]
+
+
+def test_r2_the_spreadsheets_list_reads_only_each_readings_summary(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    ec = _ec(schema)
+    _ledger(tmp_path, v / "data_in", [_row(schema, str(1000 + i), "1A", **{f"{ec} [JB]": "1"})
+                                      for i in range(400)], people={"JB": "Jordan Blake"})
+    kg = _kg(v)
+    kg.seed()
+    full = kg.db.execute("SELECT length(records) FROM doc_cache").fetchone()[0]
+    assert full > 100_000
+    sizes = []
+    real = kgm._reading_load
+    monkeypatch.setattr(kgm, "_reading_load",
+                        lambda text: sizes.append(len(text or "")) or real(text))
+    (src,) = kg.sources()
+    assert src["summary"]["rows"] == 400
+    assert sizes and max(sizes) < 10_000
+
+
+def test_r2_an_unchanged_rebuild_does_not_rebuild_the_graph(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    ec = _ec(schema)
+    _ledger(tmp_path, v / "data_in", [_row(schema, "101", "1A", **{f"{ec} [MK]": "1"})])
+    _owner_rows(v, 3)
+    kg = _kg(v)
+    kg.seed()
+    before = _rels(kg), [r["surface"] for r in kg.reviews()]
+    calls = []
+    real = kg._seed_records
+    monkeypatch.setattr(kg, "_seed_records", lambda *a, **k: calls.append(1) or real(*a, **k))
+    stats = kg.seed()
+    assert calls == [] and stats["graph_unchanged"] is True
+    assert (_rels(kg), [r["surface"] for r in kg.reviews()]) == before
+    # ... but anything the graph is worked out from makes it build again:
+    (q,) = kg.reviews()
+    kg.answer_review(q["id"], kg.add_person("Mary King"), everywhere=True)
+    kg.seed()
+    assert calls == [1] and ("Mary King", "INSPECTED", "101") in _rels(kg)
+    p = se.aliases_path_for(v / "data_in" / "lmm_parent.csv")
+    p.write_text(json.dumps({"map": {}, "ignore": [], "people": {"MK": "Mike Kent"}}),
+                 encoding="utf-8")
+    kg.seed()
+    assert calls == [1, 1]
+    dana = kg.search("Dana Whitfield", "PERSON")[0]["id"]
+    kg.merge(kg.search("Mary King", "PERSON")[0]["id"], dana)
+    kg.seed()
+    assert calls == [1, 1, 1]
+    kg.set_rule_status("Owner", "rejected")
+    kg.seed()
+    assert calls == [1, 1, 1, 1]
+
+
+def test_r2_a_graph_being_rebuilt_is_busy_not_damaged(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _owner_rows(v, 3)
+    kg = _kg(v)
+    kg.seed()
+    monkeypatch.setattr(kgm.KnowledgeGraph, "BUSY_TIMEOUT_S", 0.2)
+    kg.db.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(kgm.KnowledgeGraphBusy, match="being rebuilt"):
+            kgm.KnowledgeGraph(v, image_reader=None)
+        assert not issubclass(kgm.KnowledgeGraphBusy, kgm.KnowledgeGraphDamaged)
+    finally:
+        kg.db.rollback()
+    kgm.KnowledgeGraph(v, image_reader=None).close()       # free again
+
+
+def test_r2_a_ledger_reads_with_no_openpyxl(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    schema = _schema(tmp_path)
+    ec = _ec(schema)
+    csv, _ = _ledger(tmp_path, v / "data_in", [_row(schema, "101", "1A",
+                                                    **{f"{ec} [JB]": "1"})],
+                     people={"JB": "Jordan Blake"})
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+    reading = kg_excel.read_ledger(csv, "lmm_parent.csv", [])
+    assert reading.summary["rows"] == 1 and reading.notes == []
+    (csv.parent / "review_1.xlsx").write_bytes(b"PK")                 # a review is there
+    monkeypatch.setattr(kg_excel, "_reviews_of", lambda p: [csv.parent / "review_1.xlsx"])
+    reading = kg_excel.read_ledger(csv, "lmm_parent.csv", [])
+    assert reading.notes == ["review workbooks were not read (they need the openpyxl "
+                             "package, which is not installed): no workbook cells for "
+                             "these values"]
+
+
+def test_r2_a_new_picture_reader_re_reads_only_workbooks(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _owner_rows(v, 2)
+    (v / "data_in" / "memo.txt").write_text("Program Lead: Dana Whitfield\nProject: P-1\n",
+                                            encoding="utf-8")
+    _book(v / "data_in" / "w.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
+                                           "A2": "PN-9", "B2": "Carol Lee"}})
+    kgm.KnowledgeGraph(v, image_reader=None).seed()
+    import collections
+    calls = collections.Counter()
+    real = kgm.read_records
+    monkeypatch.setattr(kgm, "read_records",
+                        lambda p, rel, rules: calls.update([Path(p).name]) or
+                        real(p, rel, rules))
+    kg = kgm.KnowledgeGraph(v, image_reader=lf.fake_reader([["x"]]))
+    stats = kg.seed()
+    assert set(calls) == {"w.xlsx"} and stats["documents_read"] == 1
+
+
+def test_r2_excel_failing_half_way_is_said_in_words(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    (v / "data_in" / "half.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+
+    class Bad:
+        def __iter__(self):
+            raise RuntimeError("the RPC server is unavailable")
+    log = _fake_excel(monkeypatch, Bad())
+    stats = _kg(v).seed()
+    assert stats["unreadable"] == ["half.xls: Excel stopped while it was being read "
+                                   "(RuntimeError: the RPC server is unavailable)"]
+    assert ("close", False) in log and log[-1] == ("quit",)
+
+
+class _PicShape:
+    Type, HasChart = 13, False
+    TopLeftCell = type("c", (), {"Address": lambda self, a=False, b=False: "E2",
+                                 "GetAddress": lambda self, a=False, b=False: "E2"})()
+    TextFrame2 = type("tf", (), {"HasText": False})()
+
+
+def test_r2_pictures_in_an_excel_only_workbook_are_counted_not_copied(tmp_path, monkeypatch):
+    """The graph never puts a workbook's pictures on the Windows clipboard (a
+    background rebuild would replace what the user copied, and clipboard
+    history may keep them); it says how many it did not read."""
+    v = _vault(tmp_path)
+    (v / "data_in" / "pics.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    sheet = _Sheet("Visual", [("Part Number", "Owner"), ("PN-2", "Dana Whitfield")])
+    sheet.Shapes = _Coll([_PicShape()])
+    asked = []
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "excel_available", lambda: True)
+    log = []
+    monkeypatch.setattr(excel_open, "read_with_excel",
+                        lambda path, want_pictures=True, **kw: asked.append(want_pictures)
+                        or real(path, want_pictures=want_pictures,
+                                app_factory=lambda: _App(log, [sheet])))
+    for reader in (None, lf.fake_reader([["x"]])):
+        v2 = _vault(tmp_path, f"v{len(asked)}")
+        (v2 / "data_in" / "pics.xls").write_bytes((v / "data_in" / "pics.xls").read_bytes())
+        stats = _kg(v2, reader=reader).seed()
+        assert stats["notes"] == ["pics.xls: 1 picture(s) not read: in a workbook only Excel "
+                                  "opens they come out only through the Windows clipboard, "
+                                  "which the graph does not use (the Ledger tab reads them)"]
+    assert asked == [False, False]
+
+
+def test_r2_a_workbook_is_read_from_memory_not_held_open(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _book(v / "data_in" / "w.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
+                                           "A2": "PN-9", "B2": "Carol Lee"}})
+    seen = []
+    real = openpyxl.load_workbook
+    monkeypatch.setattr(openpyxl, "load_workbook",
+                        lambda f, *a, **k: seen.append(type(f).__name__) or real(f, *a, **k))
+    _kg(v).seed()
+    assert seen and set(seen) == {"BytesIO"}
+    assert _rels(_kg(v)) == {("Carol Lee", "OWNS", "PN-9"): "seeded"}
+
+
+def test_r2_free_text_is_capped_by_characters_too(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    cells = {f"A{r}": "a long note about the shim stack and the bracket " * 4
+             for r in range(1, 60)}
+    _book(v / "data_in" / "n.xlsx", {"S": cells})
+    monkeypatch.setattr(kg_excel, "MAX_TEXT_CHARS", 1000)
+    kg = _kg(v)
+    stats = kg.seed()
+    lines = json.loads(kg.db.execute("SELECT lines FROM doc_cache").fetchone()[0])
+    assert sum(len(t) for _p, _l, t in lines) <= 1000
+    assert "n.xlsx: only the first 1000 characters of free text were kept" in stats["notes"]
