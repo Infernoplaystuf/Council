@@ -284,6 +284,32 @@ refresh profiled two files again (`data_index` compares a profile's
 neither it nor `data_index.py` has changed on the branch, and neither
 touches the camera code.
 
+After P3 rows 1 and 4 (18 October 2026, branch `plugins/p3a`), the gate
+on d27d63a, 6 at a time: 68 files, 3,661 passed, 0 failed, 50 skipped, in
+209 s, with no rerun; `--check-list` said the list is complete (the two
+new files, `tests/test_typhon_plugins_runs.py` and
+`tests/test_typhon_plugins_presets.py`, are in it by name). The row 1
+commit 9ed8454 was gated on its own too: 67 files, 3,634 passed, 0 failed,
+50 skipped; the first commit, aa75743 (the core's points and the
+manifests), was not run on its own. In the `pylon` environment, one process with
+`PYLON_CAMEMU=2` and OpenEB on the path, on d27d63a: the 23 camera and
+Barbie v4 files of the gate and the branch's ten camera files (the eight
+above and the two new ones), 1,459 passed, 0 failed, 1 skipped (the check
+a simulated event camera cannot be put to), in 469 s. Today's Typhon's
+Settings > Python Scripts list did not grow: an app that imports
+`frame_camera` lists the same 27 names before (7ec6bc4) and after, so the
+typhon example's stays 37.
+
+The whole suite on d27d63a, 8 at a time: 252 files, 9,453 passed, 2
+failed, 40 skipped, in 944 s, and `smoke_test.py` passed 1,313 with 0
+failed. Both failures passed when their files were run alone (11 and 35
+passed), and neither file touches the camera code or changed on the
+branch: the known-flaky `tests/test_gui_settings.py::
+test_the_warm_list_test_still_catches_a_path_per_module`, and
+`tests/test_excel_open.py::test_real_excel_xls_xlsb_text_box_chart_and_password`,
+which counts Excel processes before and after it and found one more, most
+likely another job's Excel while eight ran at once.
+
 Run it on a quiet PC. With two gates and a `pylon`-environment run going at
 once, two timing-sensitive tests failed and then passed on every run alone:
 the known-flaky one above (twice in a row) and
@@ -455,3 +481,6 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P2 row 3: `camera_rig.json`, several camera families in the set-up, the wizard's check boxes, "in use as cam2" | done (`docs/typhon_plugin_api_notes.md`, "The set-up, and the rig's names"): `council_core/camera_rig_file.py` (names, rig presets stored and planned; additive; `camera_presets.json`'s rules); the set-up's families are the enabled camera plugins; `CameraFamiliesWizard` with a check box per family, for "Typhon (plugins)" projects only (today's Typhon keeps its wizard); a camera takes its name in the rig at Connect, and is renamed in the file and its slot together (`host.rename_camera`; the window that asks comes at P6); "in use as cam2" in the scan once the rig has a second slot, and Connect refuses that camera in another slot; the wizard's scan is told about every open slot. Putting a rig preset on several open cameras is M1 row 5 (P6) |
 | P2 row 4: set-up guides and checks through the plugins; `camera_setup.json`'s choice as the project's plugin list | done: `CameraSetup` in plugin API 0.2 (`setup_guide`, `setup_checks`, the Basler `setup_scan`) and the manifest's `setup`; the Basler and Prophesee plugins reach today's guides, checks and scan page, which do not move; `camera_setup.json` gains a `cameras` list, still `FORMAT` 1, a single-choice file read as a list of one; the host scans only the families ticked (a family ticked before whose plugin is switched off stays ticked; with no family to tick, a project is not asked); the contract suite checks each plugin's set-up |
 | P2 review (18 October 2026) | fixed (`tests/test_typhon_plugins_p2_review.py`, a test per finding): simulated serials no longer depend on their place in `COUNCIL_SIM_CAMERAS` (today's two keep SIM-1 and SIM-2, so their presets and rig names stay theirs), and `camera_rig.json` never gives a camera's name to one of another kind; a slot forgets the device its plugin confirmed at Disconnect; a built-in camera plugin that fails to load or activate stays on and is tried again at the next scan; the scan says why it has no cameras of a camera plugin that cannot run, and of a ticked family switched off (it said "Every backend was searched."); a backend name the set-up cannot save is refused, and a camera listed under another family's backend is left out; merged category hints put a group in one tab; the grab loop catches `SystemExit` and the end record says why a stream ended by itself (`stream_ended`; core code, a fix for today's Typhon too); a third-party camera whose flags contradict its plugin is refused at open; the settings tabs name an event camera only for one; Connect says how to mend a damaged `camera_rig.json`, and `RigFile.set_aside()` moves one aside when asked; frame_camera's Designer link list is as before (`_current_families`); today's Python Scripts list is 37 files (above). Guards added: the Basler and Simulated plugins' confirmed capabilities, a review source's suffix among its manifest's files. Left for later stages: P3 the Prophesee manifest's `_events.raw`, P4 the settings tabs on the merged hints, P5 refusing `typhon_plugin_api.builtin` to third-party plugins (`docs/typhon_plugin_api_notes.md`) |
+| P3 row 1: run lifecycle hooks, the record-gate and frame-stage points, the run-file suffix registry, record blocks, the two file services, the fault rule | done on branch `plugins/p3a` (`docs/typhon_plugin_api_notes.md`, "A run, as the plugins see it"; `tests/test_typhon_plugins_runs.py`): in a "Typhon (plugins)" project Start asks every run-hook plugin's `check_start` before anything is changed, stopped or reserved, `on_run_started` follows the recording's start, "run_stopped" is told as Stop ends the run, and `on_run_finished` comes with the end record, bounded in time, its block in the end record's `plugins`; the camera record's `plugins` block says what made the run; every plugin's run files are registered as run markers (today's `RUN_MARKERS` unchanged), and the Prophesee manifest declares `_events.raw` (the contract suite's allowance for it is gone); blocks cleaned and size-checked (design 3.9's one rule); `create_file` and `write_new` (never over anything) and `<project>/plugin_data/<id>/`; a frame stage that fails ends the recording with its reason, the run hooks are best effort. The record gate is P1's; the triggering plugin fills it in row 2, and Downsample becomes the frame stage in row 3. Today's Typhon: the same records, run names and calls |
+| P3 row 4: preset and record namespacing; keys of a missing plugin kept untouched | done on branch `plugins/p3a` (notes, "Presets and records by namespace"; `tests/test_typhon_plugins_presets.py`): `<id>/<key>` is a plugin's, `capture.*` the triggering plugin's, `save.downsample` the core's; applying a preset in a "Typhon (plugins)" project gives the camera its own keys, a running plugin its own values, and keeps and lists a missing plugin's keys (never handed to the camera, which said "refused"); saving keeps them from the preset it replaces, exactly; with triggering off its `capture.*` too. Today's Typhon applies and saves presets as before |
+| P3 rows 2, 3, 5, 6 | not in `plugins/p3a`: the triggering plugin, Downsample as the frame stage and the capture set-up's split, the finer timer, the other contract suites and the fake host |
