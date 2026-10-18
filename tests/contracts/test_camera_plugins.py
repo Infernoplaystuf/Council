@@ -57,6 +57,11 @@ from council_core import plugin_manifest as pm  # noqa: E402
 from tests import fake_rig  # noqa: E402
 
 BUILTIN = ROOT / "typhon_plugins"
+#: A review source's run file the core still writes and names (capture.
+#: RUN_MARKERS, plugin_manifest.CORE_SUFFIXES): the Prophesee plugin's
+#: "_events.raw", which its manifest declares once stage P3's run-file suffix
+#: registry moves it from the core to the plugin.
+RAW_UNTIL_THE_SUFFIX_REGISTRY = ("_events.raw",)
 
 
 # ======================================================================
@@ -488,6 +493,11 @@ def test_its_review_source_is_one_and_its_manifest_says_so(host, case):
         assert not any(core in source.suffix for core in
                        ("_frame_", "_frames.csv", "_camera.json",
                         "_run_end.json")), "never a core file it shows"
+        # Its run file is one its manifest declares — or, until stage P3's
+        # run-file suffix registry takes it from the core, the core's own
+        # raw file, which the manifest may not claim yet (P2 review).
+        assert source.suffix in m.files or \
+            source.suffix in RAW_UNTIL_THE_SUFFIX_REGISTRY, source.suffix
 
 
 # ======================================================================
