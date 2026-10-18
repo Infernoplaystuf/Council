@@ -229,6 +229,92 @@ def test_a_v2_gspec_round_trips_the_port_dict(tmp_path):
     assert back.shapes[0].port == {"name": "mode", "default": "fast"}
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the lock-retry only engages on Windows")
+def test_an_atomic_write_waits_out_a_busy_replace(tmp_path, monkeypatch):
+    """On Windows another process can hold a file open for a moment, so
+    os.replace raises PermissionError though the lock clears on its own.
+    The atomic write tries it again for a bounded time rather than failing
+    the whole save (measured: the Designer's update rolled back on a
+    transient lock under load). A replace busy a few times still writes."""
+    import os
+    import time
+
+    target = tmp_path / "out.bin"
+    target.write_bytes(b"old")
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def busy_a_few_times(src, dst, *a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(13, "busy (test)")
+        return real_replace(src, dst, *a, **k)
+
+    slept = []
+    monkeypatch.setattr(os, "replace", busy_a_few_times)
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    gs.write_bytes_atomic(target, b"new")
+    assert target.read_bytes() == b"new"
+    assert calls["n"] == 4, "it did not try the replace again"
+    assert slept and all(0 < s <= 0.05 for s in slept), slept
+    assert not target.with_name(target.name + gs.ATOMIC_SUFFIX).exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the lock-retry only engages on Windows")
+def test_an_atomic_write_gives_up_on_a_replace_that_stays_busy(
+        tmp_path, monkeypatch):
+    """A replace that never clears still fails, as it did before the retry —
+    after the bounded wait, with the original file untouched and no stray
+    .partial left behind."""
+    import os
+    import time
+
+    monkeypatch.setattr(gs, "_LOCK_RETRY_SECONDS", 0.1)
+    target = tmp_path / "out.bin"
+    target.write_bytes(b"old")
+
+    def always_busy(src, dst, *a, **k):
+        raise PermissionError(13, "held open (test)")
+
+    monkeypatch.setattr(os, "replace", always_busy)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(PermissionError):
+        gs.write_bytes_atomic(target, b"new")
+    assert target.read_bytes() == b"old"
+    assert not target.with_name(target.name + gs.ATOMIC_SUFFIX).exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the lock-retry only engages on Windows")
+def test_an_atomic_write_waits_out_a_busy_open(tmp_path, monkeypatch):
+    """The same lock can fall on opening the .partial to write it; that is
+    tried again too."""
+    import builtins
+    import time
+
+    target = tmp_path / "out.bin"
+    target.write_bytes(b"old")
+    real_open = builtins.open
+    calls = {"n": 0}
+
+    def busy_open(file, mode="r", *a, **k):
+        if (isinstance(file, (str, os.PathLike)) and any(c in mode for c in "wa+")
+                and str(file).endswith(gs.ATOMIC_SUFFIX)):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "busy (test)")
+        return real_open(file, mode, *a, **k)
+
+    import os
+    monkeypatch.setattr(builtins, "open", busy_open)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    gs.write_bytes_atomic(target, b"new")
+    assert target.read_bytes() == b"new"
+    assert calls["n"] == 3, "it did not try the open again"
+
+
 def test_shapes_module_is_pure():
     """No Tk, no engine, no vault imports — the model layer stays loadable
     with nothing else present."""
