@@ -1597,6 +1597,22 @@ class KnowledgeGraph:
         #: workbook at all): their cached reason is kept, so Excel is not
         #: started for them again on every rebuild.
         failed_keep: List[str] = []
+        clip: Dict[str, bool] = {}
+
+        def pictures_wait(cached: sqlite3.Row) -> bool:
+            """An unchanged workbook whose pictures an earlier rebuild could
+            not copy out (the clipboard was not safe then) is read again
+            when it is safe now. Asked once per rebuild, and only then:
+            Excel is not started for nothing."""
+            if reader is None:
+                return False
+            summary = _reading_load(cached["records"]).get("summary") or {}
+            if not int(summary.get("pictures_pending") or 0):
+                return False
+            if "ok" not in clip:
+                import excel_open
+                clip["ok"] = bool(excel_open.clipboard_safe()[0])
+            return clip["ok"]
         last, n_batch = time.time(), 0
         token = _IMAGE_READER.set(reader)
         as_lines = _AS_LINES.set(True)
@@ -1613,6 +1629,8 @@ class KnowledgeGraph:
                     why = missing_reader(p)
                     sig = sig_for(p)
                     cached = None if why else self._cached(did, h, sig)
+                    if cached is not None and pictures_wait(cached):
+                        cached = None
                     if why:
                         stats["unreadable"].append(f"{rel}: {why}")
                         self.db.execute("UPDATE documents SET status='unreadable'"
@@ -1777,7 +1795,10 @@ class KnowledgeGraph:
                 # it working the same graph out again.
                 gsig = self._graph_sig(usable, failed_keep, sig_for, use_collections,
                                        gazetteer)
-                if gsig == self.meta("graph_sig") and not fallback:
+                # (A document read again with the same bytes and reader -
+                # pictures copied out at last - changes no signature.)
+                if gsig == self.meta("graph_sig") and not fallback \
+                        and not stats["documents_read"]:
                     raise _GraphUnchanged()
                 # From here on the graph is worked out again (the check above
                 # comes first: clearing 500,000 derived rows to roll them back
@@ -1948,8 +1969,12 @@ class KnowledgeGraph:
         each time it is called: read three times, held never."""
         # 1. Aliases first: 'Project Name' beside 'Project ID' ties the name
         #    to the code, so 'Helios Turbine Upgrade' elsewhere is PRJ-0915.
+        #    A picture's 'Project ID | Project Name' does not count: read at
+        #    40%, it renamed another source's firm link (review, 2026-10-18).
         name_to_code: Dict[Tuple[str, str], str] = {}
         for rec, _d, _h in records():
+            if any(v.from_image for v in rec.values):
+                continue
             for v in rec.values:
                 if v.rule.alias_of:
                     codes = [w for w in rec.values if w.rule.type == v.rule.type
@@ -1969,11 +1994,14 @@ class KnowledgeGraph:
         #    Marcus Oyelaran no matter which file was read first. An
         #    inspector's bare initials ('JB') are not a name: they are
         #    resolved (or asked about) in _person.
+        #    A name read from a picture explains no initial elsewhere: a CSV's
+        #    'D. Whitfield' was guessed to be the picture's Dana Whitfield,
+        #    and that guess then confirmed the picture (review, 2026-10-18).
         persons_full: Dict[str, str] = {}
         for rec, _d, _h in records():
             for v in rec.values:
                 if v.rule.type == "PERSON" and not is_initial_form(person_key(v.raw)) \
-                        and not _signed_initials(v):
+                        and not _signed_initials(v) and not v.from_image:
                     persons_full[person_key(v.raw)] = self._entity("PERSON", v.raw)
 
         memo = self._memo
@@ -2002,9 +2030,11 @@ class KnowledgeGraph:
         for rec, did, h in records():
             if any(v.from_image for v in rec.values):
                 continue
-            for _v, eid, _inf in link(rec, did, h):
-                if eid:
-                    self._known_elsewhere.add(eid)
+            for _v, eid, inferred in link(rec, did, h):
+                # a guessed initial is not knowing the person (review iii #3);
+                # a merge the user made is (#9): compared as merged
+                if eid and not inferred:
+                    self._known_elsewhere.add(self.resolve(eid))
         for rec, did, h in records():
             if any(v.from_image for v in rec.values):
                 link(rec, did, h)
@@ -2213,7 +2243,7 @@ class KnowledgeGraph:
             """A picture's value counts as certain when the OCR was sure of
             it and the vault knows it from a source that is not a picture."""
             return (not v.from_image) or (int(v.locator.get("ocr") or 0) >= PICTURE_SURE
-                                          and eid in known)
+                                          and self.resolve(eid) in known)
 
         def rel(s, pred, o, v_s: Value, v_o: Value, at: Value):
             # ``at`` is the field that DEFINES the link (the person's field,
@@ -2243,13 +2273,15 @@ class KnowledgeGraph:
                 f"{v_s.snippet} | {v_o.snippet}"
             pictured = [v for v in (v_s, v_o) if v.from_image]
             checked = sure(v_s, s) and sure(v_o, o)
+            st = "suggested" if (s in inferred_ids or o in inferred_ids
+                                 or v_s.tentative or v_o.tentative or not checked) else status
             if pictured:
                 loc = dict(loc)
                 confs = [v.locator.get("ocr") for v in pictured]
                 loc["ocr"] = None if any(c is None for c in confs) else min(confs)
-                loc["checked"] = checked
-            st = "suggested" if (s in inferred_ids or o in inferred_ids
-                                 or v_s.tentative or v_o.tentative or not checked) else status
+                # worded from what the link IS: "every name found elsewhere"
+                # was said of a link left suggested (review, 2026-10-18)
+                loc["checked"] = checked and st != "suggested"
             self._relate(s, pred, o, st, doc_id=did, content_hash=h,
                          locator=loc, quote=quote, method=method, run_id=run_id)
 

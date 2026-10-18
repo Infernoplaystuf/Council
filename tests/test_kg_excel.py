@@ -1778,10 +1778,13 @@ def _excel_with_pictures(monkeypatch, sheet):
     monkeypatch.setattr(excel_open, "_copy_picture", lambda shape: lf._png([["x"]]))
     monkeypatch.setattr(excel_open, "_clip_text", lambda: None)
     monkeypatch.setattr(excel_open, "_clip_restore", lambda text: None)
+    monkeypatch.setattr(excel_open, "_clip_seq", lambda: 1)
     monkeypatch.setattr(excel_open, "read_with_excel",
-                        lambda path, want_pictures=True, **kw: asked.append(want_pictures)
-                        or real(path, want_pictures=want_pictures,
-                                app_factory=lambda: _App([], [sheet])))
+                        lambda path, want_pictures=True, careful=False, **kw:
+                        asked.append(want_pictures) or (want_pictures and not careful and
+                                                        pytest.fail("not careful")) or
+                        real(path, want_pictures=want_pictures, careful=careful,
+                             app_factory=lambda: _App([], [sheet])))
     return asked
 
 
@@ -1864,12 +1867,10 @@ def test_a_name_known_only_from_a_picture_does_not_confirm_another_picture(tmp_p
         wb.active.title = "Visual"
         wb.active.add_image(XLImage(io.BytesIO(png)), "F2")
         wb.save(v / "data_in" / name)
-    words = {w: 99 for rows in pics.values() for r in rows for c in r for w in c.split()}
-
     def read(data):
         return [list(r) for r in pics.get(data, [])] or None
     read.name = "test OCR"
-    read.with_confidence = lambda data: (read(data), dict(words))
+    read.with_confidence = lambda data: (read(data), [[99] * len(r) for r in read(data)])
     kg = _kg(v, reader=read)
     kg.seed()
     assert _rels(kg)[("Jordan Blake", "OWNS", "PN-5")] == "suggested"
@@ -2033,3 +2034,27 @@ def test_r3_pictures_are_copied_one_reader_at_a_time(monkeypatch):
     assert len(book.pictures) == 1 and book.pictures[0].data
     assert restored == ["the user's text"]
 
+
+
+def test_r3_a_careful_read_does_not_wait_for_another_reading(monkeypatch):
+    copies = []
+    assert excel_open._CLIPBOARD_LOCK.acquire(timeout=5)
+    try:
+        book, restored = _careful_read(monkeypatch, [5], copies)
+    finally:
+        excel_open._CLIPBOARD_LOCK.release()
+    assert copies == [] and restored == [] and [p.data for p in book.pictures] == [b""]
+    assert any(n.endswith("another reading was using the clipboard") for n in book.notes)
+
+
+def test_r3_pictures_left_uncopied_by_a_changed_clipboard_say_so_once(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    sheet = _xls_with_picture(v)
+    _excel_with_pictures(monkeypatch, sheet)
+    seq = iter(range(1, 100))
+    monkeypatch.setattr(excel_open, "_clip_seq", lambda: next(seq))     # the user copying
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (True, ""))
+    stats = _kg(v, reader=_conf_reader(ROWS, {})).seed()
+    assert stats["pictures_read"] == 0
+    assert stats["notes"] == ["pics.xls: Visual: picture(s) not copied: the clipboard "
+                              "changed while the workbook was being read"]

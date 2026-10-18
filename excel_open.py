@@ -32,6 +32,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -324,11 +325,21 @@ def _clip_text() -> Optional[str]:
     return None
 
 
-#: Clipboard formats that copying a picture out would destroy for good:
-#: _clip_restore puts back text only. CF_BITMAP, CF_METAFILEPICT, CF_TIFF,
-#: CF_DIB, CF_ENHMETAFILE, CF_HDROP (copied files), CF_DIBV5.
-_NOT_TEXT_FORMATS = {2, 3, 6, 8, 14, 15, 17}
-_NOT_TEXT_NAMES = ("png", "jfif", "gif", "filename", "shell idlist", "filegroupdescriptor")
+#: What _clip_restore can put back after a picture is copied out: plain text
+#: (CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE). Anything else on the
+#: clipboard - a picture, files, formatted text (HTML, RTF), a password
+#: manager's "keep out of history" marks, an app's own formats - would be
+#: lost or changed, so the knowledge graph does not copy then. An allow-list:
+#: a list of what to refuse missed HTML, RTF, JPEG and CF_ENHMETAFILE's
+#: neighbours (review, 2026-10-18).
+_TEXT_ONLY_FORMATS = {1, 7, 13, 16}
+
+#: One picture copy through the clipboard at a time in this process: the
+#: Ledger and the knowledge graph's rebuild could both read a workbook with
+#: pictures at once, and one put back the other's picture as "the user's
+#: text" (review, 2026-10-18). Held from the first picture of a workbook
+#: until its clipboard is put back.
+_CLIPBOARD_LOCK = threading.Lock()
 
 
 def _clipboard_formats() -> set:
@@ -353,6 +364,33 @@ def _clipboard_formats() -> set:
     return out
 
 
+def _clip_seq() -> Optional[int]:
+    """Windows' clipboard change counter (it goes up whenever anything is put
+    on the clipboard), or None when it cannot be read."""
+    try:
+        import win32clipboard
+        return int(win32clipboard.GetClipboardSequenceNumber())
+    except Exception:
+        pass
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+    except Exception:
+        return None
+
+
+def _remote_session() -> bool:
+    """This is a Remote Desktop session: its clipboard is shared with the
+    computer the user connects from (SM_REMOTESESSION)."""
+    if os.environ.get("SESSIONNAME", "").upper().startswith("RDP-"):
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetSystemMetrics(0x1000))
+    except Exception:
+        return False
+
+
 def cloud_clipboard_on() -> bool:
     """Windows' 'Sync across your devices' for the clipboard (Settings ›
     System › Clipboard), unless a policy turns it off."""
@@ -374,22 +412,24 @@ def cloud_clipboard_on() -> bool:
 def clipboard_safe() -> Tuple[bool, str]:
     """(True, '') when pictures may be copied out through the clipboard now;
     else (False, why). Not when Windows syncs the clipboard to other devices
-    (a picture could leave the PC), nor when the clipboard holds a picture or
-    files the copy would replace (only text is put back afterwards). Used by
-    the knowledge graph's background rebuild, which the user is not
-    watching; the Ledger's own reads decide for themselves."""
+    or this is a Remote Desktop session (a picture could leave the PC), nor
+    when the clipboard holds anything but plain text (only text is put back
+    afterwards). Used by the knowledge graph's background rebuild, which the
+    user is not watching; the Ledger's own reads decide for themselves."""
     if os.name != "nt":
         return False, "the pictures come out through the clipboard only on Windows"
     if cloud_clipboard_on():
         return False, "Windows syncs this PC's clipboard to your other devices"
+    if _remote_session():
+        return False, ("this is a Remote Desktop session, whose clipboard is shared with "
+                       "the other computer")
     try:
         held = _clipboard_formats()
     except Exception:
         return False, "the clipboard could not be checked"
-    for f in held:
-        if (isinstance(f, int) and f in _NOT_TEXT_FORMATS) or (
-                isinstance(f, str) and any(n in f for n in _NOT_TEXT_NAMES)):
-            return False, "the clipboard holds a picture or files that copying would replace"
+    if any(f not in _TEXT_ONLY_FORMATS for f in held):
+        return False, "the clipboard holds something besides plain text, which copying would " \
+                      "replace"
     return True, ""
 
 
@@ -414,10 +454,18 @@ OPEN_TIMEOUT_S = 120
 
 
 def read_with_excel(path, want_pictures: bool = True, app_factory=None,
-                    timeout: float = OPEN_TIMEOUT_S) -> ExcelBook:
+                    timeout: float = OPEN_TIMEOUT_S, careful: bool = False) -> ExcelBook:
     """Open `path` read-only in a hidden, macro-disabled Excel and copy out its
     cells, text boxes, charts and (optionally) pictures. app_factory is for
-    tests: it returns an object shaped like Excel.Application."""
+    tests: it returns an object shaped like Excel.Application.
+
+    careful (the knowledge graph's background rebuild, which the user is not
+    watching): the clipboard's change counter is noted when the read starts
+    (just after clipboard_safe said yes) and after each copy. When anything
+    else put something on the clipboard meanwhile - the user copying while
+    the rebuild ran - no more pictures are copied (each is listed with no
+    data, and a note says why) and the clipboard is left as it is, not put
+    back over what the user copied."""
     path = Path(path).resolve()
     if kind_of(path) == "password":
         raise ExcelOpenError(f"{path.name} has a password to open; open it in Excel, save "
@@ -436,8 +484,15 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         def app_factory():
             return DispatchEx("Excel.Application")
     app = book = None
-    clip = _clip_text() if want_pictures and com is not None else None
-    used_clip = False
+    clip = None
+    seq = None                      # careful: the clipboard's counter as last seen
+    clip_why = ""                   # careful: why no more pictures are copied
+    if careful and want_pictures:
+        seq = _clip_seq()
+        clip = _clip_text()
+        if seq is None:
+            clip_why = "the clipboard could not be checked"
+    locked = used_clip = False
     watchdog = None
     stopped = []
     try:
@@ -553,8 +608,26 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     # listed, never copied: no clipboard (the caller counts them)
                     out.pictures.append(Picture(name, anchor, b""))
                 elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and want_pictures:
+                    if not locked and not clip_why:
+                        # careful does not wait: the other reading changes
+                        # the clipboard anyway, and its pictures wait
+                        locked = _CLIPBOARD_LOCK.acquire(blocking=not careful)
+                        if not locked:
+                            clip_why = "another reading was using the clipboard"
+                        elif not careful:
+                            clip = _clip_text() if com is not None else None
+                    if careful and not clip_why and _clip_seq() != seq:
+                        clip_why = "the clipboard changed while the workbook was being read"
+                    if clip_why:
+                        if not any(n.endswith(clip_why) for n in out.notes):
+                            out.notes.append(f"{path.name} › {name}: picture(s) not copied: "
+                                             f"{clip_why}")
+                        out.pictures.append(Picture(name, anchor, b""))
+                        continue
                     data_png = _copy_picture(sh)
                     used_clip = True
+                    if careful:
+                        seq = _clip_seq()
                     if data_png:
                         out.pictures.append(Picture(name, anchor, data_png))
                     else:
@@ -575,8 +648,14 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             except Exception:
                 pass
         book = app = None
-        if used_clip:
-            _clip_restore(clip)
+        try:
+            # careful: only when nothing else was put there since the last
+            # copy (that would be the user's, and stays)
+            if used_clip and (not careful or (seq is not None and _clip_seq() == seq)):
+                _clip_restore(clip)
+        finally:
+            if locked:
+                _CLIPBOARD_LOCK.release()
         if com is not None:
             com.CoUninitialize()
 

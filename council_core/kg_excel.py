@@ -677,13 +677,19 @@ class _GridReader:
         self._person_cols: Dict[int, Tuple[str, Dict[str, Any]]] = {}
 
     # -- cells --
-    def _loc(self, r: int, c: int, label: str = "", header: int = 0) -> Dict[str, Any]:
+    def _loc(self, r: int, c: int, label: str = "", header: int = 0,
+             title: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
+        """Where a value is. A picture's value carries how sure the OCR was
+        of it AND of the title or label it hangs on (``title``): a column
+        title read at 12% decided which person a link was about (review,
+        2026-10-18)."""
         loc: Dict[str, Any] = {"sheet": self.sheet}
         if self.image:
             loc["image"] = self.image
             loc["row"] = r
             if self.sure is not None:
-                loc["ocr"] = int(self.sure.get((r, c), 0))
+                loc["ocr"] = min(int(self.sure.get((r, c), 0)),
+                                 int(self.sure.get(title, 100)) if title else 100)
         else:
             loc["cell"] = f"{_col_letter(c)}{r}"
         if label:
@@ -873,7 +879,7 @@ class _GridReader:
             raw = _text(v)
             if not raw or self._labelish(v):
                 continue
-            loc = self._loc(r, c, label, header=t.header_row)
+            loc = self._loc(r, c, label, header=t.header_row, title=(t.header_row, c))
             tent = t.tentative or rule is kgm.INSPECTOR
             # Under a firm header the column says what a cell is (as a CSV's
             # does); a tentative reading takes only values that read as one.
@@ -974,8 +980,8 @@ class _GridReader:
                 if gr == r + 1:             # a column of initials under its label
                     self._person_cols[c] = (label, self._loc(r, c, label))
             else:
-                self._form(rule, raw, self._loc(gr, gc, label), f"{label}: {raw}",
-                           tentative=gr != r)
+                self._form(rule, raw, self._loc(gr, gc, label, title=(r, c)),
+                           f"{label}: {raw}", tentative=gr != r)
             at.add(c)
             if gr == r:
                 at.add(gc)
@@ -1069,16 +1075,21 @@ class _GridReader:
         return kgm.Record(self.rel, "sheet", vals)
 
 
-def _cell_confidence(cells: Dict[Tuple[int, int], Any], words: Optional[Dict[str, float]]
+def _cell_confidence(cells: Dict[Tuple[int, int], Any], confs: Optional[List[List[float]]]
                      ) -> Optional[Dict[Tuple[int, int], int]]:
-    """How sure the OCR was of each cell: its least sure word (a word it did
-    not report counts as 0). None when the reader says nothing about it."""
-    if words is None:
+    """How sure the OCR was of each cell, by position (row r, column c of
+    the reader's rows - source_extract.rows_with_confidence; a cell it gave
+    no number for counts as 0). None when the reader says nothing. By word
+    text, a glued 'PN-7'+'7' took 97 from a sure 'PN-77' elsewhere (review,
+    2026-10-18)."""
+    if confs is None:
         return None
     out = {}
-    for rc, v in cells.items():
-        toks = str(v).split()
-        out[rc] = int(min((words.get(t, 0.0) for t in toks), default=0.0))
+    for (r, c) in cells:
+        try:
+            out[(r, c)] = int(confs[r - 1][c - 1])
+        except (LookupError, TypeError, ValueError):
+            out[(r, c)] = 0
     return out
 
 
@@ -1304,7 +1315,8 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
             copy_ok, copy_why = excel_open.clipboard_safe()
         try:
             grids, images = se.load_workbook_grids(
-                p, notes, want_pictures=not via_excel or copy_ok, data=data)
+                p, notes, want_pictures=not via_excel or copy_ok, data=data,
+                careful=via_excel and copy_ok)
         except se.LedgerError as exc:
             # openpyxl refusing the bytes is for good, and so is a password;
             # Excel failing otherwise may not be (busy, asking to sign in),
@@ -1321,6 +1333,8 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         for g in grids:
             run(g.sheet, _grid_rows(g.cells))
         del grids
+        # Excel's notes name the file, and the graph names it too
+        notes[:] = [n[len(p.name) + 3:] if n.startswith(f"{p.name} › ") else n for n in notes]
     summary["pictures"] = len(images)
     uncopied = [i for i in images if not i.data]
     images = [i for i in images if i.data]
@@ -1328,18 +1342,23 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         notes.append(f"{len(images) + len(uncopied)} picture(s) not read: install Tesseract "
                      "(local OCR) to read them")
     elif uncopied:
-        notes.append(f"{len(uncopied)} picture(s) not read: {copy_why} (rebuild again later "
-                     "to read them)")
+        # Read again at a later rebuild once the clipboard is safe (the
+        # graph looks at this): an unchanged workbook was never read again,
+        # so "rebuild again later" did not come true (review, 2026-10-18).
+        summary["pictures_pending"] = len(uncopied)
+        if copy_why:                  # else excel_open's own note says why
+            notes.append(f"{len(uncopied)} picture(s) not read: {copy_why} (rebuild again "
+                         "later to read them)")
     prog = kgm.progress_now()
     for i, img in enumerate(images, start=1):
         if prog is not None and image_reader is not None:
             prog.update(f"{rel}: reading picture {i} of {len(images)}", force=i == 1)
-        words: Optional[Dict[str, float]] = None
+        confs: Optional[List[List[float]]] = None
         try:
             if image_reader is None:
                 rows = None
             elif callable(getattr(image_reader, "with_confidence", None)):
-                rows, words = image_reader.with_confidence(img.data)
+                rows, confs = image_reader.with_confidence(img.data)
             else:
                 rows = image_reader(img.data)
         except Exception as exc:                      # one bad picture is a note
@@ -1351,7 +1370,7 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         summary["pictures_read"] += 1
         g = se.rows_to_grid(rows, img)
         run(f"{img.sheet} › picture {img.anchor}", _grid_rows(g.cells), image=img.anchor,
-            parent=img.sheet, sure=_cell_confidence(g.cells, words))
+            parent=img.sheet, sure=_cell_confidence(g.cells, confs))
     lines: List[Tuple[Optional[str], int, str]] = []
     labels: Dict[str, str] = {}
     for gr, parent in readers:
