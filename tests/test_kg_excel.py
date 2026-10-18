@@ -1610,32 +1610,6 @@ class _PicShape:
     TextFrame2 = type("tf", (), {"HasText": False})()
 
 
-def test_r2_pictures_in_an_excel_only_workbook_are_counted_not_copied(tmp_path, monkeypatch):
-    """The graph never puts a workbook's pictures on the Windows clipboard (a
-    background rebuild would replace what the user copied, and clipboard
-    history may keep them); it says how many it did not read."""
-    v = _vault(tmp_path)
-    (v / "data_in" / "pics.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
-    sheet = _Sheet("Visual", [("Part Number", "Owner"), ("PN-2", "Dana Whitfield")])
-    sheet.Shapes = _Coll([_PicShape()])
-    asked = []
-    real = excel_open.read_with_excel
-    monkeypatch.setattr(excel_open, "excel_available", lambda: True)
-    log = []
-    monkeypatch.setattr(excel_open, "read_with_excel",
-                        lambda path, want_pictures=True, **kw: asked.append(want_pictures)
-                        or real(path, want_pictures=want_pictures,
-                                app_factory=lambda: _App(log, [sheet])))
-    for reader in (None, lf.fake_reader([["x"]])):
-        v2 = _vault(tmp_path, f"v{len(asked)}")
-        (v2 / "data_in" / "pics.xls").write_bytes((v / "data_in" / "pics.xls").read_bytes())
-        stats = _kg(v2, reader=reader).seed()
-        assert stats["notes"] == ["pics.xls: 1 picture(s) not read: in a workbook only Excel "
-                                  "opens they come out only through the Windows clipboard, "
-                                  "which the graph does not use (the Ledger tab reads them)"]
-    assert asked == [False, False]
-
-
 def test_r2_a_workbook_is_read_from_memory_not_held_open(tmp_path, monkeypatch):
     v = _vault(tmp_path)
     _book(v / "data_in" / "w.xlsx", {"S": {"A1": "Part Number", "B1": "Owner",
@@ -1679,3 +1653,178 @@ def test_a_rebuild_takes_records_as_cache_lines_not_objects(tmp_path, monkeypatc
     assert _rels(kg) == {("Carol Lee", "OWNS", "PN-9"): "seeded"}
     direct = real(v / "data_in" / "w.xlsx", "w.xlsx", [r for r, _s in kg.field_rules()])
     assert direct.record_lines is None and len(direct.records) == 1
+
+
+# ── pictures: read, but trusted only when confirmed (user, 2026-10-18) ──
+# "Lets have the knowledge graphs try to read the images but maybe not have
+# the data from the images be 100% trusted unless we are positive that the
+# data pulled from the images is accurate."
+def _conf_reader(rows, words):
+    """A stand-in OCR that also says how sure it is of each word."""
+    def read(_data):
+        return [list(r) for r in rows]
+    read.name = "test OCR"
+    read.with_confidence = lambda _data: ([list(r) for r in rows], dict(words))
+    return read
+
+
+def _picture_book(path, sheet="Visual", anchor="F2"):
+    from openpyxl.drawing.image import Image as XLImage
+    wb = openpyxl.Workbook()
+    wb.active.title = sheet
+    wb.active["A1"] = "Visual inspection"
+    wb.active.add_image(XLImage(io.BytesIO(lf._png([["x"]]))), anchor)
+    wb.save(path)
+    return path
+
+
+def _known_elsewhere(v):
+    """PN-77 and Dana Whitfield are known from tables - but nothing says Dana
+    owns PN-77 except the picture."""
+    (v / "data_in" / "parts.csv").write_text("Part,Project\nPN-77,PRJ-1\n", encoding="utf-8")
+    (v / "data_in" / "leads.csv").write_text("Project,Program Lead\nPRJ-1,Dana Whitfield\n",
+                                             encoding="utf-8")
+
+
+ROWS = [["Part Number", "Owner"], ["PN-77", "Dana Whitfield"]]
+
+
+def test_word_confidences_come_from_tesseracts_tsv():
+    tsv = ("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight"
+           "\tconf\ttext\n"
+           "5\t1\t1\t1\t1\t1\t10\t10\t40\t12\t96.5\tPN-77\n"
+           "5\t1\t1\t1\t1\t2\t80\t10\t40\t12\t91\tDana\n"
+           "5\t1\t1\t1\t1\t3\t125\t10\t60\t12\t88.2\tWhitfield\n"
+           "5\t1\t1\t1\t2\t1\t80\t30\t40\t12\t99\tDana\n"
+           "4\t1\t1\t1\t1\t0\t10\t10\t200\t12\t-1\t\n")
+    assert se.word_confidences(tsv) == {"PN-77": 96.5, "Dana": 91.0, "Whitfield": 88.2}
+    reader = se.tesseract_reader(exe=Path(sys.executable))
+    assert callable(reader.with_confidence)          # built, not run
+
+
+def test_a_picture_link_is_firm_only_when_ocr_was_sure_and_every_name_is_known(tmp_path):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    _picture_book(v / "data_in" / "vis.xlsx")
+    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 97, "Dana": 95, "Whitfield": 93,
+                                           "Part": 99, "Number": 99, "Owner": 99}))
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
+    dana = kg.search("Dana Whitfield", "PERSON")[0]
+    (ev,) = [e for n in kg.neighbors(dana["id"]) if n["predicate"] == "OWNS"
+             for e in n["evidence"]]
+    assert ev["method"] == "picture"
+    assert ev["locator"]["ocr"] == 93 and ev["locator"]["checked"] is True
+    assert ev["where"] == ("sheet Visual, picture at F2, row 2 (Owner, Part Number) — read "
+                           "from a picture, 93% sure, every name found elsewhere")
+
+
+@pytest.mark.parametrize("words, known, why", [
+    ({"PN-77": 97, "Dana": 95, "Whitfield": 62}, True, "62% sure"),       # OCR unsure
+    ({"PN-77": 97, "Dana": 95, "Whitfield": 93}, False, "93% sure"),      # PN-77 unknown
+    ({}, True, "how sure unknown"),                                       # no confidence
+])
+def test_a_picture_link_otherwise_waits_for_the_user(tmp_path, words, known, why):
+    v = _vault(tmp_path)
+    if known:
+        _known_elsewhere(v)
+    else:
+        (v / "data_in" / "leads.csv").write_text("Project,Program Lead\nPRJ-1,Dana Whitfield\n",
+                                                 encoding="utf-8")
+    _picture_book(v / "data_in" / "vis.xlsx")
+    reader = _conf_reader(ROWS, words) if words else lf.fake_reader(ROWS)
+    kg = _kg(v, reader=reader)
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "suggested"
+    dana = kg.search("Dana Whitfield", "PERSON")[0]
+    (ev,) = [e for n in kg.neighbors(dana["id"]) if n["predicate"] == "OWNS"
+             for e in n["evidence"]]
+    assert ev["locator"]["checked"] is False
+    assert ev["where"].endswith(f"— read from a picture, {why} — check it")
+
+
+def test_a_link_another_source_states_is_firm_whatever_the_picture(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "own.csv").write_text("Part,Owner\nPN-77,Dana Whitfield\n", encoding="utf-8")
+    _picture_book(v / "data_in" / "vis.xlsx")
+    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 40, "Dana": 40, "Whitfield": 40}))
+    kg.seed()
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
+
+
+def _xls_with_picture(v):
+    (v / "data_in" / "pics.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    sheet = _Sheet("Visual", [("Inspection",)])
+    sheet.Shapes = _Coll([_PicShape()])
+    return sheet
+
+
+def _excel_with_pictures(monkeypatch, sheet):
+    asked = []
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "excel_available", lambda: True)
+    # the stand-in never touches the real clipboard
+    monkeypatch.setattr(excel_open, "_copy_picture", lambda shape: lf._png([["x"]]))
+    monkeypatch.setattr(excel_open, "_clip_text", lambda: None)
+    monkeypatch.setattr(excel_open, "_clip_restore", lambda text: None)
+    monkeypatch.setattr(excel_open, "read_with_excel",
+                        lambda path, want_pictures=True, **kw: asked.append(want_pictures)
+                        or real(path, want_pictures=want_pictures,
+                                app_factory=lambda: _App([], [sheet])))
+    return asked
+
+
+def test_pictures_in_an_excel_only_workbook_are_read_when_the_clipboard_is_safe(
+        tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    _known_elsewhere(v)
+    sheet = _xls_with_picture(v)
+    asked = _excel_with_pictures(monkeypatch, sheet)
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (True, ""))
+    kg = _kg(v, reader=_conf_reader(ROWS, {"PN-77": 97, "Dana": 95, "Whitfield": 93}))
+    stats = kg.seed()
+    assert asked == [True] and stats["pictures_read"] == 1
+    assert _rels(kg)[("Dana Whitfield", "OWNS", "PN-77")] == "seeded"
+
+
+@pytest.mark.parametrize("why", [
+    "the clipboard holds a picture or files that copying would replace",
+    "Windows syncs this PC's clipboard to your other devices",
+])
+def test_pictures_in_an_excel_only_workbook_wait_when_the_clipboard_is_not_safe(
+        tmp_path, monkeypatch, why):
+    v = _vault(tmp_path)
+    sheet = _xls_with_picture(v)
+    asked = _excel_with_pictures(monkeypatch, sheet)
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (False, why))
+    stats = _kg(v, reader=_conf_reader(ROWS, {})).seed()
+    assert asked == [False]
+    assert stats["notes"] == [f"pics.xls: 1 picture(s) not read: {why} (rebuild again "
+                              "later to read them)"]
+
+
+def test_an_excel_only_workbooks_pictures_without_tesseract(tmp_path, monkeypatch):
+    v = _vault(tmp_path)
+    sheet = _xls_with_picture(v)
+    asked = _excel_with_pictures(monkeypatch, sheet)
+    called = []
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: called.append(1) or (True, ""))
+    stats = _kg(v, reader=None).seed()
+    assert asked == [False] and called == []          # no reader: the clipboard untouched
+    assert stats["notes"] == ["pics.xls: 1 picture(s) not read: install Tesseract (local "
+                              "OCR) to read them"]
+
+
+def test_the_clipboard_check_names_what_would_be_lost(monkeypatch):
+    if os.name != "nt":
+        pytest.skip("the Windows clipboard")
+    monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: {13, 1, 16})
+    monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: False)
+    assert excel_open.clipboard_safe() == (True, "")
+    monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: {13, 8})      # text + a DIB
+    assert excel_open.clipboard_safe() == (
+        False, "the clipboard holds a picture or files that copying would replace")
+    monkeypatch.setattr(excel_open, "_clipboard_formats", lambda: set())
+    monkeypatch.setattr(excel_open, "cloud_clipboard_on", lambda: True)
+    assert excel_open.clipboard_safe() == (
+        False, "Windows syncs this PC's clipboard to your other devices")
