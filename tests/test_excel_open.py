@@ -248,7 +248,8 @@ def test_folders_bring_every_workbook_kind(tmp_path):
     from council_core.ledger_ingest import collect_sources
     for n in ("a.xlsx", "b.xlsm", "c.xls", "d.xlsb", "~$a.xlsx", "notes.txt"):
         (tmp_path / n).write_bytes(b"")
-    assert sorted(p.name for p in collect_sources([tmp_path])) == [
+    kept, _ignored = collect_sources([tmp_path])
+    assert sorted(p.name for p in kept) == [
         "a.xlsx", "b.xlsm", "c.xls", "d.xlsb"]
 
 

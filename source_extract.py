@@ -1985,6 +1985,58 @@ def load_aliases(csv_path) -> Tuple[Dict[str, str], List[str]]:
     return data.get("map", {}), data.get("ignore", [])
 
 
+def load_ignore_files(csv_path) -> List[str]:
+    """Filename glob patterns the user has marked for a Ledger batch to
+    skip (e.g. ``cover*.xlsx``, ``agenda*.xlsx``).
+
+    Not every workbook in a folder has Ledger data — some are meeting
+    notes, cover sheets, administrative docs — and running the full
+    extraction against them is a cost with nothing to show. Patterns
+    match the file's name only (not its full path) and are
+    case-insensitive, honouring ``fnmatch`` semantics.
+
+    Written and read via the same aliases file; `save_aliases` keeps
+    this section intact across edits of the label mappings."""
+    p = aliases_path_for(csv_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    patterns = data.get("ignore_files") or []
+    return [str(x) for x in patterns if isinstance(x, str) and x.strip()]
+
+
+def save_ignore_files(csv_path, patterns: Sequence[str]) -> None:
+    """Persist filename glob patterns next to the aliases file.
+    Other sections — ``map``, ``ignore``, ``people`` — are preserved."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            data = {}
+    cleaned = sorted({pat.strip() for pat in patterns
+                      if isinstance(pat, str) and pat.strip()})
+    data["ignore_files"] = cleaned
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def file_matches_ignore(name: str, patterns: Sequence[str]) -> bool:
+    """True when ``name`` (not its path, just the base name) matches
+    any of ``patterns`` under ``fnmatch`` semantics, case-insensitively.
+    An empty pattern list never matches."""
+    import fnmatch
+    if not patterns:
+        return False
+    n = str(name).lower()
+    return any(fnmatch.fnmatchcase(n, pat.lower()) for pat in patterns)
+
+
 def load_people(csv_path) -> Dict[str, str]:
     """Who each inspector's initials stand for: the "people" section of the
     same aliases file, {"JB": "Jordan Blake"}, written by a person. The

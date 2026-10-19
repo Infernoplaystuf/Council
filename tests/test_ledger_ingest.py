@@ -57,9 +57,10 @@ def test_parent_is_made_beside_the_template_then_extended(books):
 
 def test_a_folder_means_its_workbooks_without_lock_files(books):
     _t, src, _tmp = books
-    got = ledger_ingest.collect_sources([src, src / "summary.xlsx"])
-    assert sorted(p.name.lower() for p in got) == ["laser_log.xlsx", "nde results.xlsx",
+    kept, ignored = ledger_ingest.collect_sources([src, src / "summary.xlsx"])
+    assert sorted(p.name.lower() for p in kept) == ["laser_log.xlsx", "nde results.xlsx",
                                                    "summary.xlsx"]
+    assert ignored == []
 
 
 def test_extract_then_apply_summaries(books):

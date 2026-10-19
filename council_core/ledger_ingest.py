@@ -46,19 +46,35 @@ def default_review_for(csv_path) -> Path:
     return Path(csv_path).with_name(f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
 
 
-def collect_sources(paths: Sequence) -> List[Path]:
-    """Files as given; a folder means every workbook UNDER it, recursively
-    (.xlsx, .xlsm, .xls, .xlsb; not Excel's ~$ lock files, and hidden /
-    ``~$`` folders at every depth are pruned). Duplicates dropped, order
-    kept."""
-    out: List[Path] = []
+def collect_sources(paths: Sequence,
+                    ignore_patterns: Optional[Sequence[str]] = None
+                    ) -> Tuple[List[Path], List[Path]]:
+    """Expand paths (files kept as-is, folders scanned recursively) into
+    the Ledger's source list.
+
+    ``ignore_patterns`` is a sequence of ``fnmatch`` glob patterns
+    (``cover*.xlsx``, ``agenda*.xlsx``). Each matched filename is kept
+    out of ``kept`` and recorded in ``ignored``, so the Ledger log can
+    say exactly which files were skipped and why. Case-insensitive;
+    matched against the base name only.
+
+    Returns ``(kept, ignored)``. Legacy single-list callers can
+    discard the ignored list."""
+    from source_extract import file_matches_ignore
+    patterns = list(ignore_patterns or [])
+    kept: List[Path] = []
+    ignored: List[Path] = []
     for s in paths:
         p = Path(s)
         found = workbook_files(p) if p.is_dir() else [p]
         for x in found:
-            if x not in out:
-                out.append(x)
-    return out
+            if x in kept or x in ignored:
+                continue
+            if file_matches_ignore(x.name, patterns):
+                ignored.append(x)
+            else:
+                kept.append(x)
+    return kept, ignored
 
 
 # ── step 1: template -> parent CSV ──────────────────────────────────────
@@ -190,8 +206,19 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     if ledger.schema is None:
         raise LedgerError(f"{Path(csv_path).name} has no schema beside it; "
                           "create it from a template first")
-    files = collect_sources(sources)
+    from source_extract import load_ignore_files
+    ignore_patterns = load_ignore_files(csv_path)
+    files, skipped_files = collect_sources(sources,
+                                           ignore_patterns=ignore_patterns)
     if not files:
+        if skipped_files and not sources:
+            raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
+        if skipped_files:
+            raise LedgerError(
+                f"no source workbooks left after filename-ignore patterns "
+                f"({len(skipped_files)} skipped: "
+                + ", ".join(sorted({p.name for p in skipped_files}))[:200]
+                + "). Edit the Skip these files field or clear it.")
         raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
     missing = [f.name for f in files if not f.exists()]
     if missing:
@@ -201,6 +228,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     if use_images and image_reader is None:
         say("starting the local image reader…")
         image_reader = default_image_reader()
+    if skipped_files:
+        say(f"ignoring {len(skipped_files)} file(s) by pattern: "
+            + ", ".join(sorted({p.name for p in skipped_files}))[:200])
     say(f"reading {len(files)} workbooks…")
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
