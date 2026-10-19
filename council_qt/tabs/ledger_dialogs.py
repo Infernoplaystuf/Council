@@ -219,13 +219,22 @@ class PreviewWorkbookDialog(QDialog):
     long batch."""
 
     _done = Signal(object, str)         # (WorkbookPreview or None, error text)
+    _llm_done = Signal(object, str, str) # (mapping dict, model name, error)
 
     def __init__(self, path, schema, aliases=None,
-                 pattern_mask: Optional[str] = None, parent=None):
+                 pattern_mask: Optional[str] = None,
+                 csv_path: Optional[str] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Preview: {path}")
-        self.resize(760, 520)
+        self.resize(760, 560)
+        self._schema = schema
+        self._csv_path = csv_path
+        self._existing_aliases = dict(aliases or {})
+        self._report = None
+        self._suggestions: Dict[str, Optional[str]] = {}
+        self._model_used = ""
         self._done.connect(self._on_done)
+        self._llm_done.connect(self._on_llm_done)
 
         root = QVBoxLayout(self)
         intro = QLabel(
@@ -246,6 +255,28 @@ class PreviewWorkbookDialog(QDialog):
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         root.addWidget(self.progress)
+
+        actions = QHBoxLayout()
+        self.ask_btn = QPushButton("Ask Council for mappings")
+        self.ask_btn.setToolTip(
+            "Send unmatched LABELS (never values) to a local US-origin "
+            "Ollama text model (Granite / Llama / Phi / Gemma / Olmo / "
+            "gpt-oss, auto-detected). The reply suggests a template "
+            "field for each label; nothing is saved on the model's "
+            "say-so.")
+        self.ask_btn.setEnabled(False)
+        self.ask_btn.clicked.connect(self.on_ask_llm)
+        actions.addWidget(self.ask_btn)
+        self.save_btn = QPushButton("Save suggestions as aliases")
+        self.save_btn.setToolTip(
+            "Write the suggested label → field mappings to this parent "
+            "CSV's aliases file. Pre-existing aliases are kept; only the "
+            "labels with a non-null suggestion are added.")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self.on_save_aliases)
+        actions.addWidget(self.save_btn)
+        actions.addStretch(1)
+        root.addLayout(actions)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -277,4 +308,98 @@ class PreviewWorkbookDialog(QDialog):
         if report is None:
             self.text.setPlainText("No preview — the reader returned nothing.")
             return
+        self._report = report
         self.text.setPlainText(report.describe())
+        # Enable "Ask Council" if there are any unmatched labels AND we
+        # have a schema that gives the model something to map onto.
+        any_unmatched = any(s.unmatched_labels for s in report.sheets)
+        self.ask_btn.setEnabled(any_unmatched and self._schema is not None)
+
+    # -- LLM mapping -------------------------------------------------
+    def _unmatched_labels(self) -> List[str]:
+        if self._report is None:
+            return []
+        seen: Dict[str, None] = {}
+        for s in self._report.sheets:
+            for label, _where in s.unmatched_labels:
+                seen.setdefault(label, None)
+        return list(seen)
+
+    def on_ask_llm(self) -> None:
+        if self._report is None:
+            return
+        labels = self._unmatched_labels()
+        if not labels:
+            return
+        self.ask_btn.setEnabled(False)
+        self.ask_btn.setText("Asking…")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        schema = self._schema
+
+        def work():
+            mapping: Dict[str, Optional[str]] = {}
+            model = ""
+            err = ""
+            try:
+                from source_extract import suggest_mappings_for_labels
+                mapping, model = suggest_mappings_for_labels(labels, schema)
+            except Exception as exc:                        # noqa: BLE001
+                err = str(exc)
+            self._llm_done.emit(mapping, model, err)
+
+        threading.Thread(target=work, name="ledger-llm-mapping",
+                         daemon=True).start()
+
+    def _on_llm_done(self, mapping, model: str, err: str) -> None:
+        self.progress.setVisible(False)
+        self.ask_btn.setText("Ask Council for mappings")
+        if err:
+            self.text.appendPlainText("\n--- Council mapping ---\n"
+                                       f"skipped: {err}")
+            self.ask_btn.setEnabled(True)
+            return
+        self._suggestions = dict(mapping or {})
+        self._model_used = model
+        confirmed = {k: v for k, v in self._suggestions.items() if v}
+        unknown = sorted(k for k, v in self._suggestions.items() if not v)
+        lines = ["", f"--- Council mapping (model: {model}) ---"]
+        if confirmed:
+            lines.append(f"Suggestions ({len(confirmed)}):")
+            for label in sorted(confirmed):
+                lines.append(f"  {label!r} → {confirmed[label]}")
+        else:
+            lines.append("The model offered no mappings.")
+        if unknown:
+            lines.append(f"No suggestion ({len(unknown)}):")
+            for label in unknown[:40]:
+                lines.append(f"  {label!r}")
+            if len(unknown) > 40:
+                lines.append(f"  …and {len(unknown) - 40} more.")
+        self.text.appendPlainText("\n".join(lines))
+        self.save_btn.setEnabled(bool(confirmed) and bool(self._csv_path))
+
+    def on_save_aliases(self) -> None:
+        if not self._suggestions or not self._csv_path:
+            return
+        confirmed = {k: v for k, v in self._suggestions.items() if v}
+        if not confirmed:
+            return
+        try:
+            from source_extract import load_aliases, save_aliases
+            existing_map, existing_ignore = load_aliases(self._csv_path)
+            merged = dict(existing_map)
+            added = 0
+            for label, field in confirmed.items():
+                if existing_map.get(label) != field:
+                    merged[label] = field
+                    added += 1
+            save_aliases(self._csv_path, merged, existing_ignore)
+        except Exception as exc:                            # noqa: BLE001
+            self.text.appendPlainText(f"\nSave failed: {exc!r}")
+            return
+        self.text.appendPlainText(
+            f"\nSaved {added} alias{'' if added == 1 else 'es'} to the "
+            "parent CSV's aliases file. Rerun the extract to see the "
+            "newly-bound columns.")
+        self.save_btn.setEnabled(False)
