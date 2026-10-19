@@ -611,6 +611,87 @@ def missing_reader(p: Path) -> str:
     return ""
 
 
+def _categorize_unreadable_reason(text: str) -> str:
+    """Compress an unreadable reason string into a short category label
+    so the Connections tab can roll a long list up into one line.
+
+    The categories are stable so the UI can display them in a fixed
+    order; anything that doesn't match a specific case lands in
+    ``other``."""
+    t = (text or "").lower()
+    if "needs the pypdf" in t or "pypdf" in t:
+        return "needs pypdf"
+    if "openpyxl" in t or "needs openpyxl" in t:
+        return "needs openpyxl"
+    if "password-protected" in t or "has a password" in t:
+        return "password-protected"
+    if "rights-protected" in t or "sensitivity label" in t:
+        return "rights-protected"
+    if "corrupt" in t or "excel refused to open" in t or "trust center" in t:
+        return "corrupt / wrong format"
+    if "access denied" in t:
+        return "access denied"
+    if "excel automation is not available" in t:
+        return "no Excel COM"
+    if "did not open" in t and "stopped" in t:
+        return "Excel timeout"
+    if "could not be found" in t or "not found" in t:
+        return "not found"
+    return "other"
+
+
+def unreadable_breakdown(unreadable_list) -> Dict[str, int]:
+    """Count the unreadable list's entries by their category label."""
+    from collections import Counter
+    counts: Counter = Counter()
+    for text in unreadable_list:
+        # Each entry is "<rel>: <reason>" or just "<reason>".
+        reason = text.split(":", 1)[1].strip() if ":" in text else text
+        counts[_categorize_unreadable_reason(reason)] += 1
+    return dict(counts)
+
+
+def rebuild_summary_line(stats) -> str:
+    """A one-line human summary of a kg.seed() stats dict for the UI.
+
+    Shape: ``"Rebuilt from N document(s) in X.Xs — W workbooks,
+    L ledgers, O other docs; U unreadable (needs pypdf: 10, ...);
+    R links (S suggested)"``. Keeps zeros out so a healthy run reads
+    cleanly."""
+    seconds = float(stats.get("seconds", 0) or 0)
+    bits = [f"Rebuilt from {stats.get('documents', 0)} document(s) in "
+            f"{seconds:.1f}s"]
+    kinds = []
+    if stats.get("workbooks"):
+        kinds.append(f"{stats['workbooks']} workbook"
+                     + ("s" if stats['workbooks'] != 1 else ""))
+    if stats.get("ledgers"):
+        kinds.append(f"{stats['ledgers']} ledger"
+                     + ("s" if stats['ledgers'] != 1 else ""))
+    if stats.get("documents_other"):
+        kinds.append(f"{stats['documents_other']} other doc"
+                     + ("s" if stats['documents_other'] != 1 else ""))
+    if kinds:
+        bits.append(" — " + ", ".join(kinds))
+    unreadable = stats.get("unreadable") or []
+    if unreadable:
+        counts = stats.get("unreadable_reasons") or unreadable_breakdown(unreadable)
+        parts = [f"{v} {k}" for k, v in sorted(counts.items(),
+                                               key=lambda kv: -kv[1])]
+        bits.append(f"; {len(unreadable)} unreadable ({', '.join(parts)})")
+    rels = stats.get("relations") or {}
+    seeded = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
+    suggested = int(rels.get("suggested") or 0)
+    if seeded or suggested:
+        extra = f"; {seeded} link" + ("s" if seeded != 1 else "")
+        if suggested:
+            extra += f" ({suggested} suggested)"
+        bits.append(extra)
+    else:
+        bits.append("; 0 links found")
+    return "".join(bits) + "."
+
+
 #: The image reader for the workbook being read, set by seed() for its own
 #: thread (a context variable: the Connections tab's rebuild worker and a
 #: label harvest on another thread never see each other's), so read_records
@@ -1537,6 +1618,11 @@ class KnowledgeGraph:
             finally:
                 _PROGRESS.reset(token)
             rels = stats.get("relations") or {}
+            # Pre-compute the categorized unreadable breakdown so callers
+            # that read the dict (the UI) do not need to repeat it.
+            if stats.get("unreadable") and not stats.get("unreadable_reasons"):
+                stats["unreadable_reasons"] = unreadable_breakdown(
+                    stats["unreadable"])
             prog.finish(f"{stats['documents']} documents ({stats['documents_read']} read, "
                         f"{stats['documents_unchanged']} unchanged, "
                         f"{len(stats['unreadable'])} not read); "
@@ -1583,8 +1669,10 @@ class KnowledgeGraph:
                                  "unreadable": [], "skipped_rows": [],
                                  "rules": len(rules), "documents_read": 0,
                                  "documents_unchanged": 0, "notes": [],
-                                 "ledgers": 0, "workbooks": 0, "pictures": 0,
-                                 "pictures_read": 0}
+                                 "ledgers": 0, "workbooks": 0,
+                                 "documents_other": 0, "pictures": 0,
+                                 "pictures_read": 0,
+                                 "unreadable_reasons": {}}
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
                                   "documents count as gone until it is back")
@@ -1746,6 +1834,11 @@ class KnowledgeGraph:
                         stats["workbooks"] += 1
                         stats["pictures"] += int(summary.get("pictures") or 0)
                         stats["pictures_read"] += int(summary.get("pictures_read") or 0)
+                    else:
+                        # Read, but without a workbook/ledger summary — a plain
+                        # document (PDF, text, image). Counted so the Rebuild
+                        # breakdown explains "243 files but only 2 workbooks".
+                        stats["documents_other"] += 1
                     prog.advance()
                 # Initials two Ledgers give to different people are nobody's
                 # outside those Ledgers: asked, not picked.
