@@ -590,9 +590,14 @@ class ReviewSource:
     def latest(self, folder: Any) -> Optional[Path]:
         """The newest file of this source in `folder`, by run name — in
         the slider's own order (council_qt.widgets.capture_review.
-        latest_raw: file names, naturally sorted), which it keeps until P4.
-        That order puts "<run>_events.raw" after "<run>_2_events.raw", two
-        runs started in one second: today's slider's, to be fixed there."""
+        latest_raw and its run_order_key, which this cannot import: the
+        slider is Qt), which it keeps until P4: the run compared first,
+        naturally, then the rest of the name. Two runs started in one
+        second are "<stamp>" and "<stamp>_2" (frame_camera.start), so
+        "<stamp>" < "<stamp>_2" < "<stamp>_10" < the next second. Whole
+        names sorted put "<stamp>_2<suffix>" first (an underscore sorts
+        before a letter), and the older recording was the newest
+        (qt-migration's c768e59 fixed the slider)."""
         try:
             names = [e.name for e in os.scandir(str(folder))
                      if e.is_file() and self.run_of(e.name)]
@@ -600,7 +605,13 @@ class ReviewSource:
             return None
         if not names:
             return None
-        return Path(str(folder)) / sorted(names, key=_natural)[-1]
+        return Path(str(folder)) / sorted(names, key=self._run_order)[-1]
+
+    def _run_order(self, name: str) -> List[Any]:
+        """capture_review.run_order_key for a file of this source: its
+        run, then what follows the run, each naturally."""
+        run = self.run_of(name)
+        return [_natural(run), _natural(name[len(run):])]
 
 
 @runtime_checkable

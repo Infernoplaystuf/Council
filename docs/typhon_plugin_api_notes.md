@@ -1627,11 +1627,17 @@ Decided here, where the design left it open:
 - **`python -m typhon_plugin_api.check` stays P5's** (the author's kit): the
   suites live in `tests/contracts/` until then, run against the built-ins;
   the fake host is what an author's own tests can use now.
-- **The review source's newest file follows today's slider** (file names,
-  naturally sorted), which puts `<run>_events.raw` after
-  `<run>_2_events.raw` for two runs started in one second: a P2 test holds
-  the two equal, and the slider is today's Typhon's, which takes bug fixes
-  on qt-migration. The contract asks only what both agree on.
+- **The review source's newest file follows today's slider.** At P3 that
+  was file names, naturally sorted, which put `<run>_events.raw` after
+  `<run>_2_events.raw` for two runs started in one second, and the
+  contract asked only what both agreed on. qt-migration fixed the slider
+  (c768e59, `capture_review.run_order_key`: the run compared first, so
+  `<run>` < `<run>_2` < `<run>_10` < the next second), and since the
+  merge of 9fc447f `ReviewSource.latest` keeps the same rule of its own
+  (the API cannot import the slider, which is Qt). The contract suite now
+  asks it ("the second run of a second is the newest"), and
+  `tests/test_typhon_plugins_cameras.py` holds the review source and the
+  slider equal for every set of seven names (127 folders).
 - **The API stays 0.3**: part C's additions are named by `has()`
   (`hook.frame_stage`) or are not API at all (the switch interval, the fake
   host's `load`).

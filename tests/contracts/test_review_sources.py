@@ -114,16 +114,17 @@ def test_it_is_a_review_source_its_manifest_declares(host, pid, folder):
 
 @pytest.mark.parametrize("pid, folder", SOURCES, ids=IDS)
 def test_it_finds_a_runs_file_and_the_newest(host, tmp_path, pid, folder):
-    """The newest by run name, in the slider's order (a later second; the
-    tenth rerun after the second). Which of "<run>" and "<run>_2" is
-    newer is the slider's to settle (it puts "<run>" last), and is not
-    asked here."""
+    """The newest by run name, in the slider's order (capture_review.
+    run_order_key, qt-migration c768e59): a later second; in one second
+    "<run>" before "<run>_2" before "<run>_10" — the reruns frame_camera
+    gives two runs started in one second."""
     from council_qt.widgets import capture_review as slider
 
     source = source_of(host, pid)
     runs = tmp_path / "runs"
     runs.mkdir()
-    for run in ("20261018_085959", "20261018_090000_2", "20261018_090000_10"):
+    for run in ("20261018_085959", "20261018_090000", "20261018_090000_2",
+                "20261018_090000_10"):
         (runs / f"{run}{source.suffix}").write_bytes(b"")
     (runs / "20261018_090000_frames.csv").write_text("file\n")
     assert source.run_of(runs / f"20261018_090000_2{source.suffix}") == \
@@ -138,6 +139,21 @@ def test_it_finds_a_runs_file_and_the_newest(host, tmp_path, pid, folder):
     if source.suffix == slider.RAW_SUFFIX:
         assert source.latest(runs) == slider.latest_raw(runs)
     assert source.latest(tmp_path / "no such folder") is None
+
+
+@pytest.mark.parametrize("pid, folder", SOURCES, ids=IDS)
+def test_the_second_run_of_a_second_is_the_newest(host, tmp_path, pid,
+                                                  folder):
+    """Two runs started in one second are "<stamp>" and "<stamp>_2"
+    (frame_camera.start): the second is the newer. Whole names sorted put
+    "<stamp>_2<suffix>" first (an underscore sorts before a letter), so the
+    raw view opened the older recording; the slider was fixed on
+    qt-migration (c768e59) and a review source keeps its order."""
+    source = source_of(host, pid)
+    for run in ("20261018_090000_2", "20261018_090000"):
+        (tmp_path / f"{run}{source.suffix}").write_bytes(b"")
+    assert source.latest(tmp_path) == \
+        tmp_path / f"20261018_090000_2{source.suffix}"
 
 
 def opened(source, path, window_us=20_000, **extra):

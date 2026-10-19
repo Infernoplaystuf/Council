@@ -155,6 +155,41 @@ def test_category_hints_and_a_review_source_are_plain_and_frozen(tmp_path):
     assert source.latest(tmp_path / "nowhere") is None
 
 
+@pytest.mark.parametrize("suffix", ["_events.raw", "_thermal.bin"])
+def test_a_review_sources_newest_keeps_the_run_order(tmp_path, suffix):
+    """Two runs started in one second are "<stamp>" and "<stamp>_2"
+    (frame_camera.start), then "_3" ... "_10": the newest is the last
+    rerun, and a later second is newer than any rerun. Whole names sorted
+    put "<stamp>_2<suffix>" before "<stamp><suffix>" (an underscore sorts
+    before a letter): the review source picked the older recording, as the
+    slider's latest_raw did before qt-migration's c768e59. The rule is the
+    API's own, for any suffix, with no Qt imported."""
+    source = api.ReviewSource("v", "V", suffix, open=lambda *a: a)
+
+    def newest(*runs):
+        for p in tmp_path.iterdir():
+            p.unlink()
+        for run in runs:
+            (tmp_path / f"{run}{suffix}").write_bytes(b"")
+        got = source.latest(tmp_path)
+        return got and source.run_of(got)
+
+    assert newest("20261018_120000", "20261018_120000_2") == \
+        "20261018_120000_2"
+    assert newest("20261018_120000", "20261018_120000_9",
+                  "20261018_120000_10") == "20261018_120000_10"
+    assert newest("20261018_120000_2", "20261018_120001") == \
+        "20261018_120001"
+    assert newest("20261018_120000_10", "20261018_120001") == \
+        "20261018_120001"
+    upper = suffix.upper()
+    for p in tmp_path.iterdir():
+        p.unlink()
+    (tmp_path / f"20261018_120000{upper}").write_bytes(b"")
+    (tmp_path / f"20261018_120000_2{upper}").write_bytes(b"")
+    assert source.latest(tmp_path) == tmp_path / f"20261018_120000_2{upper}"
+
+
 # ======================================================================
 # The manifest: what a camera plugin's cameras can have
 # ======================================================================
@@ -509,6 +544,34 @@ def test_the_review_source_finds_the_files_the_slider_finds(host, tmp_path):
     assert raw.latest(tmp_path) == cr.latest_raw(tmp_path)
     for name in ("20261016_101010_2_events.raw", "x_frames.csv", ""):
         assert raw.run_of(name) == cr.run_of_raw(name)
+
+
+def test_the_review_sources_newest_is_the_sliders_for_every_set_of_runs(
+        host, tmp_path):
+    """The raw view's newest recording, by the slider (capture_review.
+    latest_raw, its run_order_key) and by the Prophesee review source,
+    for every set of these runs: reruns of one second (none, _2, _9, _10),
+    the next second, a name Typhon did not give, and a suffix in capitals.
+    The API cannot import the slider (it is Qt), so it keeps the same rule
+    of its own; this holds the two together."""
+    import itertools
+
+    from council_qt.widgets import capture_review as cr
+    raw = host.review_sources()["typhon.prophesee"]
+    names = ("20261018_120000_events.raw", "20261018_120000_2_events.raw",
+             "20261018_120000_9_events.raw", "20261018_120000_10_events.raw",
+             "20261018_120001_events.raw", "take_events.raw",
+             "20261018_115959_EVENTS.RAW")
+    checked = 0
+    for k in range(1, len(names) + 1):
+        for chosen in itertools.combinations(names, k):
+            folder = tmp_path / f"s{checked}"
+            folder.mkdir()
+            for name in chosen:
+                (folder / name).write_bytes(b"")
+            assert raw.latest(folder) == cr.latest_raw(folder), chosen
+            checked += 1
+    assert checked == 2 ** len(names) - 1
 
 
 def test_the_review_source_opens_as_the_slider_opens(host, tmp_path,
