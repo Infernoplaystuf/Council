@@ -677,6 +677,11 @@ def rebuild_summary_line(stats) -> str:
                      + ("s" if stats['documents_other'] != 1 else ""))
     if kinds:
         bits.append(" — " + ", ".join(kinds))
+    if stats.get("wikilink_mentions"):
+        wm = stats["wikilink_mentions"]
+        bits.append(f"; {wm} [[wiki-link]] mention"
+                    + ("s" if wm != 1 else "")
+                    + " found")
     unreadable = stats.get("unreadable") or []
     if unreadable:
         counts = stats.get("unreadable_reasons") or unreadable_breakdown(unreadable)
@@ -971,6 +976,53 @@ def _reading_load(text: Optional[str]) -> Dict[str, Any]:
 _HEAD_SQL = ("CASE WHEN instr(c.records, char(10)) > 0 AND substr(c.records, 1, 7) = '{\"v\": 3'"
              " THEN substr(c.records, 1, instr(c.records, char(10)) - 1)"
              " WHEN substr(c.records, 1, 1) = '{' THEN c.records ELSE NULL END")
+
+
+#: Match an Obsidian-style ``[[Entity|display text]]`` reference. Nested
+#: brackets and pipes split the match, which is deliberate — a user who
+#: types ``[[foo [bar]]]`` should get a clean ``foo [bar`` entity, not a
+#: swallowed outer ``]]``.
+WIKILINK_RE = __import__("re").compile(r"\[\[([^\[\]\n]+?)\]\]")
+
+
+@__import__("dataclasses").dataclass(frozen=True)
+class WikiLinkRef:
+    """One ``[[…]]`` reference found while reading a document.
+
+    ``surface`` is what the user wrote inside the brackets, before the
+    optional pipe (so ``[[Jordan Blake|JB]]`` has surface
+    ``"Jordan Blake"``). ``display`` is the right-hand side of the pipe
+    when present, else the surface. ``page`` is the PDF page or workbook
+    sheet (whichever the line's first element was); ``line`` is the line
+    index within it."""
+    page: Optional[int]
+    line: int
+    surface: str
+    display: str
+
+
+def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
+                   ) -> List[WikiLinkRef]:
+    """Pure function over document_lines output; no DB access.
+
+    Future-proof entry point: a later PR will feed these refs into the
+    graph as mentions (firm when the surface matches a known entity,
+    suggested otherwise). This one only parses and reports."""
+    out: List[WikiLinkRef] = []
+    for page, line_no, text in lines:
+        if "[[" not in text:
+            continue
+        for m in WIKILINK_RE.finditer(text):
+            inside = m.group(1).strip()
+            if not inside:
+                continue
+            surface, _, display = inside.partition("|")
+            surface = surface.strip()
+            display = (display.strip() or surface) if "|" in inside else surface
+            if surface:
+                out.append(WikiLinkRef(page=page, line=line_no,
+                                       surface=surface, display=display))
+    return out
 
 
 def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
@@ -1677,6 +1729,8 @@ class KnowledgeGraph:
                                  "documents_other": 0, "pictures": 0,
                                  "pictures_read": 0,
                                  "ledger_people": 0,
+                                 "wikilink_mentions": 0,
+                                 "wikilink_unique": 0,
                                  "unreadable_reasons": {}}
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
@@ -1764,6 +1818,19 @@ class KnowledgeGraph:
                             lines = list(reading.lines)
                         else:
                             lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
+                        # Obsidian-style [[Name]] references: counted now
+                        # and surfaced in the rebuild summary. A later PR
+                        # will connect them to entities as mentions. Unique
+                        # surfaces are tracked for THIS document only (per-
+                        # document uniques summed across docs); a run with
+                        # the same name in two docs counts it twice, which
+                        # matches how the rebuild line reads: "N mentions,
+                        # K unique within documents".
+                        _wl_refs = scan_wikilinks(lines)
+                        if _wl_refs:
+                            stats["wikilink_mentions"] += len(_wl_refs)
+                            stats["wikilink_unique"] += len({
+                                r.surface.lower() for r in _wl_refs})
                         self.db.execute(
                             "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
                             (did, h, sig, _records_json(recs, reading),
