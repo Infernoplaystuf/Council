@@ -129,7 +129,11 @@ def test_rebuild_kg_button_appears_bold_after_a_successful_apply(qapp):
         return ApplySummary(accepted=5, rows=5, csv_result="x.csv",
                             learned={}, ignored=[], filled=[], problems=[])
 
-    actions = LedgerActions()
+    # Bare LedgerActions() would be flagged by
+    # test_no_tab_test_builds_actions_against_the_real_vault — pass an
+    # opener so the AST check sees a kwarg. The vault is never reached
+    # here anyway (apply is overridden), but the check cannot tell.
+    actions = LedgerActions(opener=lambda _p: None)
     actions.apply = fake_apply
     tab = LedgerTab(actions=actions)
     try:

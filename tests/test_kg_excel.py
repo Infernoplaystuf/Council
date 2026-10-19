@@ -739,7 +739,13 @@ def test_an_excel_failure_is_tried_again_next_time(tmp_path, monkeypatch):
     log = _fake_excel(monkeypatch, [], fail="Excel is busy")
     kg = _kg(v)
     stats = kg.seed()
-    assert stats["unreadable"] == ["b.xlsb: Excel could not open b.xlsb: Excel is busy"]
+    # The error now carries a diagnostic tail — [hresult=…, size=…, head=…,
+    # suffix=…] — so a bug report has something to go on. Check the leading
+    # part instead of an exact match; the tail is covered by
+    # tests/test_excel_open_errors.py.
+    assert len(stats["unreadable"]) == 1
+    assert stats["unreadable"][0].startswith(
+        "b.xlsb: Excel could not open b.xlsb: Excel is busy")
     assert log[-1] == ("quit",)                     # Excel closed after a failure too
     log.clear()
     kg.seed()
