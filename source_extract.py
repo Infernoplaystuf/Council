@@ -1362,6 +1362,10 @@ class Extraction:
     unmatched: List[Obs] = field(default_factory=list)
     images: List[ImageNote] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
+    #: One entry per workbook that Excel could not open: ``(name, kind)``
+    #: where ``kind`` is one of ExcelOpenError's named modes. Used by the
+    #: Ledger log summary at the end of a batch.
+    open_failures: List[Tuple[str, str]] = field(default_factory=list)
 
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
@@ -1387,6 +1391,13 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             grids, images = load_workbook_grids(src, run.problems)
         except LedgerError as e:
             run.problems.append(str(e))
+            # Keep the Excel-open-failure category so the Ledger log can
+            # summarize the batch: "N files failed to open - K rights, ...".
+            cause = e.__cause__
+            kind = (getattr(cause, "kind", "unknown")
+                    if cause is not None and type(cause).__name__ == "ExcelOpenError"
+                    else "other")
+            run.open_failures.append((src.name, kind))
             prog.advance(what=f"{src.name}: not read")
             continue
         for i, img in enumerate(images):

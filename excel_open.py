@@ -49,7 +49,139 @@ MSO_PICTURE, MSO_CHART, MSO_TEXTBOX, MSO_LINKED_PICTURE = 13, 3, 17, 11
 
 
 class ExcelOpenError(Exception):
-    """A plain-language reason a workbook could not be opened."""
+    """A plain-language reason a workbook could not be opened.
+
+    ``kind`` is one of:
+      * ``'password'`` — the workbook is password-protected to open.
+      * ``'rights'`` — IRM / sensitivity label; this account cannot read.
+      * ``'corrupt'`` — generic "could not be opened" (hresult 0x800A03EC):
+        corrupt file, HTML saved with an .xls extension, Trust-Center
+        File Block, or a non-workbook that happens to have a workbook
+        extension.
+      * ``'timeout'`` — Excel asked for input (sign-in) and the watchdog
+        stopped it.
+      * ``'unavailable'`` — Excel COM automation is not available on this
+        machine (no Windows, no pywin32, no registered Excel).
+      * ``'access'`` — access denied by the OS (locked file, missing
+        permission on the folder).
+      * ``'unknown'`` — fallback; the message includes diagnostic bytes.
+    """
+
+    def __init__(self, message: str, kind: str = "unknown"):
+        super().__init__(message)
+        self.kind = kind
+
+
+# COM error codes we recognize. Values stored as *signed* 32-bit ints because
+# that is what pywintypes.com_error reports. Excel's own 0x800A03EC overflows
+# a signed int, so it is -2146827284.
+_HRESULT_EXCEL_CANNOT_OPEN = -2146827284         # 0x800A03EC
+_HRESULT_ACCESS_DENIED = -2147024891             # 0x80070005
+_HRESULT_FILE_NOT_FOUND = -2147024894            # 0x80070002
+
+
+def _com_error_hresult(exc) -> Optional[int]:
+    """Pull the HRESULT from a pywintypes.com_error, or return None.
+
+    The structure is ``(hresult, description, excepinfo, argerr)`` where
+    ``excepinfo`` (when present) is ``(code, source, description, help_file,
+    help_context, scode)``. The scode inside excepinfo is the one Excel
+    itself raised, which is what we classify on."""
+    args = getattr(exc, "args", None) or ()
+    for i in (2, 0):
+        if i < len(args):
+            v = args[i]
+            if isinstance(v, tuple) and len(v) >= 6 and isinstance(v[5], int):
+                return v[5]
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def _com_error_description(exc) -> str:
+    args = getattr(exc, "args", None) or ()
+    if len(args) >= 3 and isinstance(args[2], tuple) and len(args[2]) >= 3:
+        text = args[2][2]
+        if text:
+            return str(text).strip()
+    if len(args) >= 2 and isinstance(args[1], str):
+        return args[1].strip()
+    return str(exc).strip()
+
+
+def _diag_bytes(path: Path) -> Tuple[int, str]:
+    """(size, first-8-bytes-as-hex) for a diagnostic error message."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0, ""
+    try:
+        with open(path, "rb") as fh:
+            return size, fh.read(8).hex()
+    except OSError:
+        return size, ""
+
+
+def classify_open_failure(exc, path, timeout: float = 0,
+                          stopped: Optional[list] = None) -> ExcelOpenError:
+    """Translate the exception from ``Workbooks.Open`` into a named mode.
+
+    The pywintypes.com_error class is not imported at module level because
+    tests may run on non-Windows machines and this module should still
+    import. We duck-type by inspecting ``args``."""
+    p = Path(path)
+    name = p.name
+    description = _com_error_description(exc)
+    hresult = _com_error_hresult(exc)
+
+    if stopped:
+        return ExcelOpenError(
+            f"Excel did not open {name} within {int(timeout)} s and was "
+            "stopped - it may be asking you to sign in or confirm something. "
+            "Open the file in Excel yourself once, then try again",
+            kind="timeout")
+
+    if re.search(r"(?i)password", description):
+        return ExcelOpenError(
+            f"{name} is password-protected; open it in Excel, remove the "
+            "password (or save an unprotected copy) and add that file",
+            kind="password")
+
+    if re.search(r"(?i)rights.?protected|information.?rights|sensitivity label",
+                 description):
+        return ExcelOpenError(
+            f"{name} is rights-protected (IRM / sensitivity label); open it "
+            "in Excel yourself first to confirm you can view it, then try "
+            "the extract again", kind="rights")
+
+    if hresult == _HRESULT_EXCEL_CANNOT_OPEN:
+        size, head = _diag_bytes(p)
+        return ExcelOpenError(
+            f"{name}: Excel refused to open the file. Common causes: the "
+            "file is corrupt, is HTML saved with an .xls extension, is "
+            "blocked by Excel's Trust Center (File Block rules for the "
+            "format), or is not actually a workbook. "
+            f"(size {size} bytes, first bytes {head or '<unreadable>'})",
+            kind="corrupt")
+
+    if hresult == _HRESULT_ACCESS_DENIED:
+        return ExcelOpenError(
+            f"{name}: access denied by the operating system. The file may be "
+            "locked by another process, on a share this account cannot read, "
+            "or in a folder Excel cannot reach.", kind="access")
+
+    if hresult == _HRESULT_FILE_NOT_FOUND:
+        return ExcelOpenError(
+            f"{name}: the file could not be found by Excel when it tried to "
+            "open it. It may have been moved or deleted since the scan.",
+            kind="unknown")
+
+    size, head = _diag_bytes(p)
+    short = (description or "no description")[:200]
+    return ExcelOpenError(
+        f"Excel could not open {name}: {short} "
+        f"[hresult={hresult!r}, size={size}, head={head or '<none>'}, "
+        f"suffix={p.suffix}]", kind="unknown")
 
 
 @dataclass
@@ -468,14 +600,16 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     back over what the user copied."""
     path = Path(path).resolve()
     if kind_of(path) == "password":
-        raise ExcelOpenError(f"{path.name} has a password to open; open it in Excel, save "
-                             "a copy without the password, and add that copy")
+        raise ExcelOpenError(
+            f"{path.name} has a password to open; open it in Excel, save a "
+            "copy without the password, and add that copy", kind="password")
     com = None
     if app_factory is None:
         if not excel_available():
             raise ExcelOpenError(
                 f"{path.name} can only be opened by Excel, and Excel automation is not "
-                "available here (it needs Windows, Excel and the pywin32 package)")
+                "available here (it needs Windows, Excel and the pywin32 package)",
+                kind="unavailable")
         import pythoncom
         from win32com.client import DispatchEx
         pythoncom.CoInitialize()                # per thread: the tab's worker too
@@ -514,17 +648,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                                       Notify=False, Password="council-no-password",
                                       WriteResPassword="council-no-password")
         except Exception as e:
-            msg = str(e)
-            if stopped:
-                raise ExcelOpenError(
-                    f"Excel did not open {path.name} within {int(timeout)} s and was "
-                    "stopped - it may be asking you to sign in or confirm something. "
-                    "Open the file in Excel yourself once, then try again") from e
-            if re.search(r"(?i)password", msg):
-                raise ExcelOpenError(f"{path.name} is password-protected; open it in Excel, "
-                                     "remove the password (or save an unprotected copy) "
-                                     "and add that file") from e
-            raise ExcelOpenError(f"Excel could not open {path.name}: {msg[:300]}") from e
+            raise classify_open_failure(e, path, timeout, stopped) from e
         if watchdog is not None:
             watchdog.cancel()          # opened: copying a big workbook out may take a while
         out = ExcelBook()
