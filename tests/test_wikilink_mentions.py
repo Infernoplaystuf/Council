@@ -59,12 +59,14 @@ def test_two_capitalized_words_infer_as_person():
 def test_other_shapes_fall_back_to_project():
     assert kgm._infer_wikilink_type("project with lower") == "PROJECT"
     assert kgm._infer_wikilink_type("Jordan") == "PROJECT"           # single Capitalized word → not a confident person
-    # Two Capitalized words that are not a name (e.g. "Night Line") still
-    # infer as PERSON because the regex cannot tell them apart from a
-    # person's name without extra context; this is a documented limit
-    # (user can relabel), and the test fixes it so future refactors do not
-    # silently change the behavior.
-    assert kgm._infer_wikilink_type("Night Line") == "PERSON"
+    # Two Capitalized words that are not a name used to infer as PERSON
+    # ("Night Line"). Since review, 2026-10-19 a word that names a thing,
+    # not a person (Line, Program, Inspection, ... - _NOT_NAME_WORDS),
+    # makes it a title. Two Capitalized words with no such word are still
+    # a PERSON: a documented limit (the user can relabel), fixed here so a
+    # refactor does not silently change it.
+    assert kgm._infer_wikilink_type("Night Line") == "PROJECT"
+    assert kgm._infer_wikilink_type("Night Owl") == "PERSON"
 
 
 # ---------------------------------------------- end-to-end seed + mentions

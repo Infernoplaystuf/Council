@@ -1014,17 +1014,27 @@ class WikiLinkRef:
 
 def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
                    ) -> List[WikiLinkRef]:
-    """Pure function over document_lines output; no DB access."""
+    """Pure function over document_lines output; no DB access.
+
+    Obsidian's own forms are read the way Obsidian reads them (review,
+    2026-10-19): ``[[Jordan Blake#Contact]]`` and ``[[Jordan Blake#^a1b2]]``
+    link to Jordan Blake (a heading or a block IN that note), so the anchor
+    is cut off the target - it made a 'Jordan Blake#Contact' entity. A
+    ``[[#Heading]]`` points into the note it is in and names nothing. An
+    embed, ``![[diagram.png]]``, shows a file inline: not a reference to an
+    entity, so it is skipped."""
     out: List[WikiLinkRef] = []
     for page, line_no, text in lines:
         if "[[" not in text:
             continue
         for m in WIKILINK_RE.finditer(text):
+            if m.start() > 0 and text[m.start() - 1] == "!":
+                continue                    # an embed
             inside = m.group(1).strip()
             if not inside:
                 continue
-            surface, _, display = inside.partition("|")
-            surface = surface.strip()
+            target, _, display = inside.partition("|")
+            surface = _WIKILINK_ANCHOR_RE.split(target, 1)[0].strip()
             display = (display.strip() or surface) if "|" in inside else surface
             if surface:
                 out.append(WikiLinkRef(page=page, line=line_no,
@@ -1032,15 +1042,74 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
     return out
 
 
-#: A loose check for "this looks like a human name" so an unresolved
-#: ``[[Jordan Blake]]`` lands as a PERSON. Two or more tokens, each
-#: starting with a capital and containing only letters, apostrophes and
-#: hyphens — so ``O'Brien``, ``McDonald`` and ``Jean-Luc`` all qualify.
-#: Deliberately loose: a two-word all-caps string like ``ABC DEF`` also
-#: lands as PERSON (``looks_like_code`` runs first on anything with a
-#: digit, so ``ABC-123`` still goes to PART).
-_HUMAN_NAME_RE = __import__("re").compile(
-    r"^[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)+$")
+#: Where a wiki-link's target ends and its anchor starts: ``#heading``,
+#: ``#^block`` (and a bare ``^block``).
+_WIKILINK_ANCHOR_RE = re.compile(r"[#^]")
+
+
+#: Words that make a run of Capitalised words a title, not a person:
+#: 'Blade Inspection Program', 'Engine Upgrade Plan', 'Night Line'. Folded
+#: forms; only words that are (nearly) never a given name or a surname.
+_NOT_NAME_WORDS = frozenset((
+    "program programme project projects upgrade upgrades inspection inspections"
+    " line lines plan plans report reports review reviews test tests testing"
+    " system systems process procedure meeting meetings notes team group phase"
+    " schedule spec specs specification manual design analysis study initiative"
+    " board committee lab laboratory center centre department division office"
+    " unit assembly module engine calibration maintenance overhaul repair build"
+    " release roadmap proposal budget contract requirements guide training"
+    " workshop audit survey log policy standard summary checklist template"
+    " results data minutes agenda the of and for inc llc ltd corp company").split())
+
+#: Lower-case particles a name may hold between its first and last word:
+#: 'Ludwig van Beethoven', 'Maria de la Cruz'.
+_NAME_PARTICLES = frozenset(
+    "de da del della der den di du la le van von bin ibn al dos das".split())
+
+
+def _name_word(tok: str) -> bool:
+    """'Blake', "O'Brien", 'Jean-Luc', 'García', 'Ångström': a capital and
+    then letters (any script's), apostrophes and hyphens; 2+ letters."""
+    core = tok.replace("'", "").replace("’", "").replace("-", "")
+    return len(core) >= 2 and core.isalpha() and tok[0].isupper()
+
+
+def _name_initial(tok: str) -> bool:
+    """'R.' in 'Jordan R. Blake', 'J.' in 'J. Blake'."""
+    return len(tok) == 2 and tok[1] == "." and tok[0].isalpha() and tok[0].isupper()
+
+
+def _looks_like_person(surface: str) -> bool:
+    """A loose check for "this looks like a human name" so an unresolved
+    ``[[Jordan Blake]]`` lands as a PERSON: two to four Capitalised words
+    (any script: 'José García'), the last a whole word, the others whole
+    words or initials ('Jordan R. Blake', 'J. Blake'), with lower-case
+    particles between ('Ludwig van Beethoven'). 'Last, First' is read the
+    way person_display reads it ('Blake, Jordan R.'), and a trailing 'Jr.'
+    or 'PhD' is not counted. A word that names a thing, not a person
+    ('Program', 'Inspection', 'Line' - _NOT_NAME_WORDS), makes it a title.
+
+    It only had ASCII letters and no initials (review, 2026-10-19):
+    'Jordan R. Blake', 'J. Blake' and 'José García' became PROJECTs.
+    Still loose: a two-word all-caps string like ``ABC DEF`` is a PERSON
+    (``looks_like_code`` runs first on anything with a digit)."""
+    s = person_display(surface)
+    if "," in s:
+        left, right = (x.strip() for x in s.split(",", 1))
+        if fold(right) not in _SUFFIXES:
+            return False            # a comma that is not 'Last, First' or ', Jr.'
+        s = left
+    toks = s.split()
+    while toks and fold(toks[-1]) in _SUFFIXES:
+        toks.pop()                  # 'Jordan Blake Jr.'
+    named = [t for t in toks if t not in _NAME_PARTICLES]
+    if not 2 <= len(named) <= 4 or toks[0] in _NAME_PARTICLES \
+            or toks[-1] in _NAME_PARTICLES:
+        return False
+    if any(fold(t) in _NOT_NAME_WORDS for t in named):
+        return False
+    return _name_word(named[-1]) and all(_name_word(t) or _name_initial(t)
+                                         for t in named[:-1])
 
 
 def _infer_wikilink_type(surface: str) -> str:
@@ -1048,13 +1117,12 @@ def _infer_wikilink_type(surface: str) -> str:
 
     Order:
       1. Looks like a code (``[A-Za-z]{1,8}[-_ ]?\\d[\\w\\-/.]*``) → PART.
-      2. Looks like a human name (two or more Capitalized tokens, no digits)
-         → PERSON.
+      2. Looks like a human name (_looks_like_person) → PERSON.
       3. Fallback → PROJECT (the KG's catch-all for named things)."""
     s = (surface or "").strip()
     if looks_like_code(s):
         return "PART"
-    if _HUMAN_NAME_RE.match(s):
+    if _looks_like_person(s):
         return "PERSON"
     return "PROJECT"
 
@@ -1609,48 +1677,97 @@ class KnowledgeGraph:
             return None
         return (row["entity_id"], row["type"])
 
-    def _seed_wikilinks(self, run_id: str, stats: Dict[str, Any]) -> None:
-        """Create (or resolve) an entity for every pending ``[[Name]]`` and
-        write a mention linking that entity to the document it appeared in.
+    def _wikilink_refs(self, did: str, h: str, p: Path) -> List[WikiLinkRef]:
+        """Every ``[[…]]`` in one document's text lines: the lines the
+        gazetteer searches (doc_cache when it holds this version, else the
+        file). A CSV is read by column and has none.
+
+        Only a cached reading that holds a ``[[`` past its own opening
+        ``[[`` is parsed: the lines are JSON ``[[page, line, "text"], …]``,
+        so any later ``[[`` is inside a line's text - and most documents
+        hold no wiki-link at all."""
+        if p.suffix.lower() in _CSV:
+            return []
+        row = self.db.execute(
+            "SELECT content_hash, CASE WHEN instr(substr(lines, 3), '[[') > 0"
+            " THEN lines END AS lines FROM doc_cache WHERE document_id=?",
+            (did,)).fetchone()
+        if row is not None and row["content_hash"] == h:
+            if row["lines"] is None:
+                return []
+            return scan_wikilinks([tuple(x) for x in json.loads(row["lines"])])
+        return scan_wikilinks(document_lines(p))
+
+    def _seed_wikilinks(self, usable: Sequence[Tuple[Path, str, str]], run_id: str,
+                        stats: Dict[str, Any]) -> None:
+        """Create (or resolve) an entity for every ``[[Name]]`` in every
+        usable document and write a mention linking that entity to the
+        document it appeared in.
+
+        The references are found HERE, in every document's cached lines -
+        not queued while documents were read: an unchanged document is not
+        read, and the graph phase clears every mention and every non-user
+        alias before this runs, so its wiki-links (and the entities only
+        they supported) were deleted whenever ANOTHER document changed
+        (review, 2026-10-19). One source for every document, re-read or not,
+        so none is counted twice; the counters cover them all.
 
         An existing-entity match stays with the entity's type; an unresolved
         name is classified by ``_infer_wikilink_type`` and inserted at the
         inferred type with ``alias_source='inferred'`` (wiped on next
         rebuild and rebuilt from the same documents, so withdrawn wiki-links
-        disappear cleanly)."""
-        pending = getattr(self, "_pending_wikilinks", None) or []
-        if not pending:
-            self._pending_wikilinks = []
-            return
-        for did, ref in pending:
-            match = self._lookup_entity_by_name(ref.surface)
-            if match is not None:
-                eid, _etype = match
-                stats["wikilinks_matched"] += 1
-            else:
-                etype = _infer_wikilink_type(ref.surface)
-                # The entity's name is the SURFACE (left of the pipe) — the
-                # user's canonical reference. ref.display is only the local
-                # alias used in that one line, so it is not passed as the
-                # entity's display name here.
-                eid = self._entity(etype, ref.surface,
-                                   alias_source="inferred")
-                stats["wikilinks_created"] += 1
-            loc = {"line": int(ref.line)}
-            if ref.page is not None:
-                loc["page" if isinstance(ref.page, int) else "sheet"] = ref.page
-            snippet = f"[[{ref.surface}]]"
+        disappear cleanly). ``wikilinks_created`` counts entities that were
+        not in the graph before; one that was (a wiki-link's own entity from
+        the last rebuild, kept until the clean-up at the end) is matched."""
+        surfaces = set()
+        for p, did, h in usable:
             try:
-                self._mention(eid, did, loc, ref.surface, snippet,
-                              "wikilink", run_id)
+                refs = self._wikilink_refs(did, h, p)
             except Exception as exc:                              # noqa: BLE001
-                # A mention row that is already there (same entity + doc +
-                # loc + method) is INSERT OR IGNORE's job; a plain Exception
-                # here means something more wrong than that, and the rebuild
-                # should keep going.
-                print(f"[wikilinks] skipped mention for {ref.surface!r}: {exc!r}",
-                      flush=True)
-        self._pending_wikilinks = []
+                # One document's lines that cannot be had (a damaged cache
+                # row, a file that went between the phases) must not stop
+                # the graph being built: it is in one transaction.
+                print(f"[wikilinks] skipped {self._rel(p)}: {exc!r}", flush=True)
+                continue
+            for ref in refs:
+                stats["wikilink_mentions"] += 1
+                surfaces.add(ref.surface.lower())
+                match = self._lookup_entity_by_name(ref.surface)
+                if match is not None:
+                    eid, _etype = match
+                    stats["wikilinks_matched"] += 1
+                else:
+                    etype = _infer_wikilink_type(ref.surface)
+                    known = self.db.execute(
+                        "SELECT 1 FROM entities WHERE id=?",
+                        (entity_id(etype, entity_key(etype, ref.surface)),)
+                    ).fetchone() is not None
+                    # The entity's name is the SURFACE (left of the pipe) — the
+                    # user's canonical reference. ref.display is only the local
+                    # alias used in that one line, so it is not passed as the
+                    # entity's display name here.
+                    eid = self._entity(etype, ref.surface,
+                                       alias_source="inferred")
+                    stats["wikilinks_matched" if known else "wikilinks_created"] += 1
+                # The gazetteer's locator for the same line ('page' is a
+                # workbook's sheet too): with 'sheet' here, _has_mention
+                # missed it and one reference got two mentions (review,
+                # 2026-10-19).
+                loc: Dict[str, Any] = {"line": int(ref.line)}
+                if ref.page is not None:
+                    loc["page"] = ref.page
+                snippet = f"[[{ref.surface}]]"
+                try:
+                    self._mention(eid, did, loc, ref.surface, snippet,
+                                  "wikilink", run_id)
+                except Exception as exc:                              # noqa: BLE001
+                    # A mention row that is already there (same entity + doc +
+                    # loc + method) is INSERT OR IGNORE's job; a plain Exception
+                    # here means something more wrong than that, and the rebuild
+                    # should keep going.
+                    print(f"[wikilinks] skipped mention for {ref.surface!r}: {exc!r}",
+                          flush=True)
+        stats["wikilink_unique"] = len(surfaces)
 
     def _alias(self, eid: str, alias: str, source: str) -> None:
         eid = self.resolve(eid)          # a merged entity's names live on its survivor
@@ -1829,9 +1946,6 @@ class KnowledgeGraph:
                                  "wikilinks_matched": 0,
                                  "wikilinks_created": 0,
                                  "unreadable_reasons": {}}
-        #: Per-rebuild list of (did, WikiLinkRef) collected during reading
-        #: and consumed by the graph phase; cleared at the end of _seed.
-        self._pending_wikilinks: List[Tuple[str, WikiLinkRef]] = []
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
                                   "documents count as gone until it is back")
@@ -1918,16 +2032,9 @@ class KnowledgeGraph:
                             lines = list(reading.lines)
                         else:
                             lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
-                        # Obsidian-style [[Name]] references: parsed now
-                        # and queued for the graph phase, which creates (or
-                        # resolves) entities and writes mentions.
-                        _wl_refs = scan_wikilinks(lines)
-                        if _wl_refs:
-                            stats["wikilink_mentions"] += len(_wl_refs)
-                            stats["wikilink_unique"] += len({
-                                r.surface.lower() for r in _wl_refs})
-                            self._pending_wikilinks.extend(
-                                (did, r) for r in _wl_refs)
+                        # Obsidian-style [[Name]] references are found in
+                        # these lines by the graph phase (_seed_wikilinks),
+                        # for every document - read now or unchanged.
                         self.db.execute(
                             "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
                             (did, h, sig, _records_json(recs, reading),
@@ -2137,7 +2244,8 @@ class KnowledgeGraph:
                 # that matches a record-created entity resolves to it) and
                 # BEFORE the gazetteer (which can then find other mentions of
                 # a brand-new PERSON a wiki-link named).
-                self._seed_wikilinks(run_id, stats)
+                prog.update("[[wiki-links]]")
+                self._seed_wikilinks(usable, run_id, stats)
                 if gazetteer:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
@@ -2178,7 +2286,11 @@ class KnowledgeGraph:
             last = self.db.execute("SELECT stats FROM runs WHERE kind='seed' AND finished_ts"
                                    " IS NOT NULL ORDER BY finished_ts DESC LIMIT 1").fetchone()
             before = json.loads(last["stats"]) if last and last["stats"] else {}
-            for k in ("collections", "gazetteer_mentions", "records", "skipped_rows"):
+            # The wiki-link counters too: they read 0 on every unchanged
+            # rebuild (review, 2026-10-19).
+            for k in ("collections", "gazetteer_mentions", "records", "skipped_rows",
+                      "wikilink_mentions", "wikilink_unique", "wikilinks_matched",
+                      "wikilinks_created"):
                 if k in before:
                     stats[k] = before[k]
             stats.update(self.counts())
