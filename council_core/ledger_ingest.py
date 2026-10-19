@@ -147,6 +147,8 @@ class ExtractSummary:
     #: True when the extract exited early via the Ledger tab's Cancel
     #: event. The caller shows a "Cancelled" status instead of "Done".
     cancelled: bool = False
+    #: What Council's model was asked and found (empty when not asked).
+    assist: str = ""
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
@@ -155,6 +157,8 @@ class ExtractSummary:
              f"images read")
         if self.cancelled:
             s = "CANCELLED — " + s
+        if self.assist:
+            s += "\n" + self.assist
         if self.open_failures:
             s += "\n" + summarize_open_failures(self.open_failures)
         if self.timings:
@@ -209,12 +213,15 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 progress: Optional[Listener] = None,
                 pattern_mask: Optional[str] = None,
                 cancel: Optional[Any] = None,
-                log: Optional[Callable[[str], None]] = None) -> ExtractSummary:
-    """``log``: where a stall dump goes (the Ledger tab's log)."""
+                log: Optional[Callable[[str], None]] = None,
+                assist: Any = False) -> ExtractSummary:
+    """``log``: where a stall dump goes (the Ledger tab's log). ``assist``:
+    ask Council's model about the labels and part numbers the rules could
+    not place (council_core.ledger_llm); its answers are suggestions."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask, cancel, log)
+                     prog, pattern_mask, cancel, log, assist)
         tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {tail}")
@@ -224,7 +231,8 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
              cancel: Optional[Any] = None,
-             log: Optional[Callable[[str], None]] = None) -> ExtractSummary:
+             log: Optional[Callable[[str], None]] = None,
+             assist: Any = False, chat=None) -> ExtractSummary:
     say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
@@ -259,10 +267,28 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             "own reviews / filled templates): "
             + ", ".join(sorted({p.name for p in skipped_files}))[:200])
     say(f"reading {len(files)} workbooks…")
+    report = part_finder = None
+    if assist:
+        from council_core import ledger_llm
+        report = ledger_llm.AssistReport()
+        stop = cancel.is_set if cancel is not None else None
+        # ``assist`` is the model the user picked ('ollama:<name>' or a GGUF
+        # path); True alone means Council's own choice
+        chat = chat or (ledger_llm.chat_for(assist, should_stop=stop)
+                        if isinstance(assist, str) else
+                        ledger_llm.council_chat(should_stop=stop))
+
+        def part_finder(name, grids):
+            return ledger_llm.find_part(name, grids, pattern_mask, chat, report)
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log)
+                  progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
+                  part_finder=part_finder)
+    if report is not None and not run.cancelled:
+        prog.stage("asking Council's model about the labels left over")
+        ledger_llm.place_labels(run, ledger.schema, chat, report)
+        run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
     # the mask and Part override go with the review: Apply reads the
@@ -274,7 +300,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
-                          list(run.timings), bool(run.cancelled))
+                          list(run.timings), bool(run.cancelled),
+                          assist=report.describe() if report is not None else "")
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────

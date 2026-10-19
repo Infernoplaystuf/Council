@@ -1684,7 +1684,9 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             part: str = "", use_images: bool = True, progress=None,
             pattern_mask: Optional[str] = None,
             cancel: Optional[Any] = None,
-            log: Optional[Callable[[str], None]] = None) -> Extraction:
+            log: Optional[Callable[[str], None]] = None,
+            part_finder: Optional[Callable[[str, List["Grid"]], Tuple[str, str]]] = None
+            ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
 
@@ -1702,7 +1704,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
 
     ``log``: where the stall watchdog's stack dump goes (the Ledger log);
     it is also written to <app dir>/logs/ledger_stalls.txt by faulthandler,
-    which works while the app is frozen."""
+    which works while the app is frozen.
+
+    ``part_finder(name, grids) -> (part, where)``: asked for a workbook whose
+    values found no part number (Council's model - council_core.ledger_llm);
+    what it finds is a suggestion, never pre-accepted."""
     import time as _time
     from progress_report import NullProgress
     from council_core import stall_watchdog
@@ -1738,7 +1744,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         prog.update(here["what"])
     try:
         _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                     m, codes, mask_re, part, schema, _time)
+                     m, codes, mask_re, part, schema, _time, part_finder)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
@@ -1777,7 +1783,7 @@ def source_labels(sources: Sequence) -> Dict[str, str]:
 
 
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                 m, codes, mask_re, part, schema, _time) -> None:
+                 m, codes, mask_re, part, schema, _time, part_finder=None) -> None:
     labels = source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
@@ -1789,7 +1795,7 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
         try:
             _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
                          reader, m, codes, mask_re, part, schema, _time,
-                         labels.get(str(src)) or Path(src).name)
+                         labels.get(str(src)) or Path(src).name, part_finder)
         except _Cancelled:
             # half a workbook is not offered for review: what it gave goes
             del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
@@ -1801,7 +1807,8 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
 
 
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                 m, codes, mask_re, part, schema, _time, label: str = "") -> None:
+                 m, codes, mask_re, part, schema, _time, label: str = "",
+                 part_finder=None) -> None:
     _t0 = _time.monotonic()
     via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
         src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -1890,6 +1897,14 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         how = f"file name {src.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
+    if part_finder is not None and not part and not book_part and any(
+            not ex.part for ex in exs):
+        here["what"] = f"{src.name}: asking Council's model which part it is"
+        prog.update(here["what"], force=True)
+        found_part, where = part_finder(label or src.name, grids)
+        _wd.beat()
+        if found_part:
+            book_part, how = found_part, f"{MODEL_PART_HOW} from {where} — check it"
     for ex in exs:
         if part:
             ex.part, ex.part_how = part, how
@@ -1995,7 +2010,8 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                 text = ", ".join(others) + (f", and {more} more" if more > 0 else "")
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
-                  and "not converted" not in o.note)
+                  and "not converted" not in o.note
+                  and not o.part_how.startswith(MODEL_PART_HOW))
             out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
@@ -2003,6 +2019,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                             order.get(d.obs.field, 1e9), -d.obs.score))
     return out
 
+
+#: How a part Council's model suggested is described (never pre-accepted).
+MODEL_PART_HOW = "suggested by Council's model"
 
 #: How many other values a clashing review row lists.
 OTHERS_SHOWN = 20
@@ -2424,7 +2443,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             yes, _text(part), _text(value), str(fname or ""))
         # accepting an unsure match teaches it, like a mapping on Labels to map;
         # a one-word label ("Date") is too generic to remember
-        if yes and fname in valid and label and via in ("match", "ambiguous") \
+        if yes and fname in valid and label and via in ("match", "ambiguous", "model") \
                 and not judge.is_generic(str(label)) and (_num(score) or 0) < ACCEPT_AT:
             learned.setdefault(normalize_label(label), str(fname))
     wb.close()
@@ -2591,6 +2610,7 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
                                  host: Optional[str] = None,
                                  timeout: float = 120,
                                  prefer_council: bool = True,
+                                 chat: Optional[Callable] = None,
                                  ) -> Tuple[Dict[str, Optional[str]], str]:
     """Ask a local Ollama TEXT model which template field each label
     means. Returns ``(mapping, model_label)`` where ``mapping`` is
@@ -2630,6 +2650,16 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
               "{\"label\": \"field or null\"}.\n\n"
               f"Fields:\n{json.dumps(fields)}\n\n"
               f"Labels:\n{json.dumps(labels)}")
+
+    # ── Path 0: the model the user picked (council_core.ledger_llm.chat_for) ──
+    if chat is not None:
+        from council_core.ledger_llm import map_labels
+        try:
+            return map_labels(labels, fields, chat)
+        except LedgerError:
+            raise
+        except Exception as exc:                            # noqa: BLE001
+            raise LedgerError(f"the model did not answer: {exc}") from exc
 
     # ── Path 1: Council's local_chat (GGUF or role Ollama) ──
     if prefer_council and model is None and host is None:

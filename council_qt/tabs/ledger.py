@@ -76,7 +76,7 @@ class LedgerActions:
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
-                cancel=None):
+                cancel=None, assist=False):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -85,7 +85,8 @@ class LedgerActions:
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
-                                         cancel=cancel, log=self.stall_log)
+                                         cancel=cancel, log=self.stall_log,
+                                         assist=assist)
 
     def apply(self, review, fill_dir, use_images, progress):
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
@@ -134,6 +135,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.window = window
         self.bridge = getattr(window, "bridge", None)
         self.actions = actions or LedgerActions()
+        #: asks which downloaded model Council's questions go to (tests
+        #: replace it)
+        from .ledger_dialogs import pick_model
+        self._pick_model = pick_model
         try:            # an extract's stall dump lands in this tab's log
             self.actions.stall_log = lambda text: self._to_ui(self._say, text)
         except Exception:                                 # noqa: BLE001
@@ -237,6 +242,19 @@ class LedgerTab(ViewHelpers, QWidget):
             "@ matches any letter, # any digit, anything else matches itself.\n"
             "Example: @@@#@@### finds ABC1DE234 in a filename.")
         mask_row.addWidget(self.pattern_mask, 1)
+        # Label matching alone is never enough on real workbooks (user,
+        # 2026-10-19): Council's model is asked about what the rules left.
+        self.ask_model = QCheckBox("Ask Council's model about the rest")
+        self.ask_model.setToolTip(
+            "After the label rules: Council's own model (your GGUF, or a US-origin "
+            "Ollama model on this PC / your Pi nodes) is asked\n"
+            " • which template field each unplaced label means (only labels are sent), and\n"
+            " • which part a workbook is about when no part number was found (its short\n"
+            "   text cells are sent; the pattern above is given as an example).\n"
+            "Nothing leaves your machines. Every answer lands in the review in amber for\n"
+            "you to accept; a part number not written in the workbook is dropped.\n"
+            "Accepting a suggested field teaches it for the next run.")
+        mask_row.addWidget(self.ask_model)
         v2.addLayout(mask_row)
         # Filename-ignore patterns — persisted next to the aliases file so a
         # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
@@ -628,6 +646,16 @@ class LedgerTab(ViewHelpers, QWidget):
         part, images = self.part.text().strip(), self.use_images.isChecked()
         mask = self.pattern_mask.text().strip()
         vision = self._selected_vision_model()
+        # only when ticked, so an actions stand-in without the option works
+        more = {}
+        if self.ask_model.isChecked():
+            # which model: the user picks one downloaded on this computer
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not extracted: no model picked. Untick "
+                                    "\"Ask Council's model about the rest\" to run without one.")
+                return
+            more = {"assist": model_id}
 
         def done(s) -> None:
             self.review.setText(s.review)
@@ -649,7 +677,7 @@ class LedgerTab(ViewHelpers, QWidget):
                   lambda p: self.actions.extract(csv, sources, part, images, p,
                                                  pattern_mask=mask,
                                                  vision_model=vision,
-                                                 cancel=self._cancel), done,
+                                                 cancel=self._cancel, **more), done,
                   cancellable=True)
 
     def on_open_review(self) -> None:
