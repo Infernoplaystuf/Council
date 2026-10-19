@@ -43,8 +43,17 @@ pywin32>=306; sys_platform == "win32"
                          # read-only, macros off). Optional: without it those
                          # files are reported, not read. Install with pip -
                          # conda-forge's build also replaces openssl.
-                         # Pictures are read by Tesseract (not a pip package):
-                         # a conda env named 'tesseract' or Program Files.
+                         # Pictures are read by Tesseract (SYSTEM binary, not
+                         # a pip package — install English pack via SECTION G
+                         # of installs.txt). The Ledger's reader calls the
+                         # tesseract binary directly via subprocess; the
+                         # pytesseract Python wrapper below is only needed by
+                         # the vault analyst's image-OCR helpers.
+pytesseract>=0.3.10      # Python wrapper used by image_stats.py's OCR path.
+                         # Harmless when the Tesseract binary is absent — the
+                         # analyst helpers degrade cleanly with a clear note.
+                         # Install Tesseract itself via installs.txt SECTION G
+                         # (English pack only).
 xlrd>=2.0                # legacy XLS support
 pyarrow>=15.0            # fast parquet/feather (optional but recommended)
 
