@@ -666,8 +666,12 @@ def rebuild_summary_line(stats) -> str:
         kinds.append(f"{stats['workbooks']} workbook"
                      + ("s" if stats['workbooks'] != 1 else ""))
     if stats.get("ledgers"):
-        kinds.append(f"{stats['ledgers']} ledger"
-                     + ("s" if stats['ledgers'] != 1 else ""))
+        ledger_bit = (f"{stats['ledgers']} ledger"
+                      + ("s" if stats['ledgers'] != 1 else ""))
+        if stats.get("ledger_people"):
+            ledger_bit += (f" ({stats['ledger_people']} "
+                           f"{'person' if stats['ledger_people'] == 1 else 'people'})")
+        kinds.append(ledger_bit)
     if stats.get("documents_other"):
         kinds.append(f"{stats['documents_other']} other doc"
                      + ("s" if stats['documents_other'] != 1 else ""))
@@ -1672,6 +1676,7 @@ class KnowledgeGraph:
                                  "ledgers": 0, "workbooks": 0,
                                  "documents_other": 0, "pictures": 0,
                                  "pictures_read": 0,
+                                 "ledger_people": 0,
                                  "unreadable_reasons": {}}
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
@@ -1844,6 +1849,11 @@ class KnowledgeGraph:
                 # outside those Ledgers: asked, not picked.
                 for k in clash:
                     self._people_all.pop(k, None)
+                # The unique-people-from-Ledgers count: part of the breakdown
+                # the Rebuild summary line shows, so the Ledger tab's "Rebuild
+                # knowledge graph" button has visible payoff beyond a
+                # workbook count.
+                stats["ledger_people"] = len(self._people_all)
 
                 def records():
                     """Every record, one document at a time, one record at a
