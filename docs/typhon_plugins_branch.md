@@ -133,6 +133,18 @@ python tools\typhon_plugins_gate.py --check-list
 - A failure of `tests/test_gui_settings.py::
   test_the_warm_list_test_still_catches_a_path_per_module` alone (known
   flaky) reruns that file once and says so.
+- **Load-sensitive in the pylon environment** (P3 review): in one pylon
+  process (`PYLON_CAMEMU=2`, OpenEB on the path), `tests/test_capture_review.py::
+  test_connected_with_an_empty_folder_shows_the_camera_live` and
+  `test_a_folder_with_frames_still_shows_the_camera_live` failed together
+  in one of the review's five such runs ("no live frame" within
+  `pump_until`'s 10 s), on the P3 commit 14b3566, and passed in the other
+  four (two of them on 7ec6bc4) and alone (49 passed) on both trees; at P3c
+  `test_drawing_on_the_live_view_sets_that_part_of_the_sensor` did the same
+  once. They are today's Typhon's tests and no P3 code is on their path, so
+  they are counted with the known load-sensitive tests on `qt-migration`,
+  and are not changed here; one that fails again gets a rerun-once entry
+  of its own in the gate.
 - A **Barbie test that fails on the branch is retired at once**, not fixed
   and not left red: its name goes on `RETIRED` in
   `tests/test_retired_tests.py` and in CLAUDE.md's "Retired tests" list with
@@ -405,6 +417,72 @@ test_the_warm_list_test_still_catches_a_path_per_module`, and
 `tests/test_excel_open.py::test_real_excel_xls_xlsb_text_box_chart_and_password`,
 which counts Excel processes before and after it and found two more (as at
 P3a, most likely another job's Excel while eight ran at once).
+
+**After the P3 review** (19 October 2026, branch `plugins/p3-fixed`, on
+`plugins/p3c`): the gate, 6 at a time, three times. On the code of
+0c8c125-e73ffed (the fixes and their tests, before two small commits
+after them): 78 files, 3,957 passed, 0 failed, 51 skipped, in 207 s, with
+no rerun. On d0b87cf (the review's last code commit): once 3,956 passed
+and 1 failed — `tests/test_designer_update.py::
+test_an_update_killed_part_way_is_put_back_when_the_project_is_opened[after-emit]`,
+whose child update came back 0 instead of being killed after its emit;
+that file passed alone three times in a row (59 passed each) and in the
+whole suite below, and neither it nor the Designer code it drives changed
+on the branch — and then 78 files, 3,957 passed, 0 failed, 51 skipped, in
+200 s, the known-flaky warm-list test rerun once (the gate's rule).
+`--check-list` said the list is complete: the new file,
+`tests/test_typhon_plugins_p3_review.py`, is in it by the branch's glob.
+No Typhon test file from qt-migration was changed and no test was
+retired. Of the branch's own tests, `tests/test_typhon_plugins_capture_setup.py`
+now finds its spot with `saved_to_sensor` (and with `to_sensor` on the
+picture the plugin is handed), and the contract suites gained the review's
+cases; one contract case changed its expectation: a frame stage that hangs
+3 s is switched off by the watchdog now (it "cost nothing" before, and
+nothing saw it).
+
+The review's own test file, `tests/test_typhon_plugins_p3_review.py` (72
+tests, a test or a few per finding), was also run on an untouched copy of
+the commit before the review (14b3566): 69 failed there and 3 passed — two
+guards (the Python Scripts list holds no new module of the branch; a stage
+may still crop for a whole run) and the half of the mirror test that was
+right already (ReverseX off). Each failure is the finding's: Start held
+20 s by a hook that waited 20 s, a 4.6 MB record that `read()` refused,
+`np.bool_` refused, no end record after a block's SystemExit, a gate's str
+for tags raising out of the grab step, `(1278.5, 958.5)` for a 640 x 480
+frame's last pixel, a frame camera called an event camera, and so on.
+
+Today's Typhon's Settings > Python Scripts list did not grow, and its
+loaded column is as before P3 again: the review's own probes, run on this
+branch, give 27 names for an app that imports `frame_camera` and 37 on the
+typhon example — the same names, groups and descriptions as typhon-plugins
+7ec6bc4 — and, in a built typhon example, 41 of 54 loaded at start, 43
+after Connect and 46 after a Start and Stop, exactly as on 7ec6bc4. On P3
+`council_core.reduce` and `council_core.triggered` showed "not yet" until
+Connect, because `capture.py` no longer imported them (P3 row 3); now
+frame_camera does.
+
+In the `pylon` environment, one process with `PYLON_CAMEMU=2` and OpenEB on
+the path, on e73ffed (the fixes and their tests; the two small commits
+after it change a docstring and how one function is looked up): the 23
+camera and Barbie v4 files of the gate and the branch's 20 camera files
+(the 19 of P3c and `tests/test_typhon_plugins_p3_review.py`), in one
+process, 1,747 passed, 0 failed, 1
+skipped (the check a simulated event camera cannot be put to), in 510 s —
+numpy 1.26 there, where the cleaner's numpy test meets `np.bool_` under
+its old name. The live-view tests that flaked once in the review's runs
+(above, "Load-sensitive in the pylon environment") passed.
+
+The whole suite on d0b87cf (a detached copy), 8 at a time: 255 files,
+9,598 passed, 2 failed, 40 skipped, in 655 s, and `smoke_test.py` passed
+1,313 with 0 failed. The known-flaky `tests/test_gui_settings.py::
+test_the_warm_list_test_still_catches_a_path_per_module` failed, and its
+file passed whole alone (35 passed).
+`tests/test_excel_open.py::test_real_excel_xls_xlsb_text_box_chart_and_password`
+failed too, and it fails ALONE now, on the review's commit and on the
+commit before it (14b3566) alike ("Right contains one more item: (Sheet,
+D5)"; the review found the same on 7ec6bc4): it drives this PC's own
+Excel, the file has not changed on the branch and touches no camera code
+— an environment failure, not a load one as P3a and P3c took it for.
 
 ## The plugin host (stage P1 row 2)
 
@@ -690,3 +768,4 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P3 row 5: the finer timer while recording | done on branch `plugins/p3c`, as far as this laptop could measure it (above, "Measured again for P3 row 5"): the plugin Typhon holds Python's switch interval at 1 ms while a run records and puts it back after (`plugin_host.SwitchInterval`); Windows' 1 ms timer is not asked for, because inside the real Qt Typhon the window's own Qt timers already give the process one. Measured on a PC that was not quiet; the bench PC, and a minimized window, are still to measure (the instructions above). Today's Typhon unchanged |
 | P3 row 6: contract suites for every kind, and the fake host | done: on branch `plugins/p3b` the fake host and the trigger-source and feature suites; on `plugins/p3c` the rest (`docs/typhon_plugin_api_notes.md`, "The fake host and the contract suites"): `tests/contracts/test_frame_stages.py` (the core's Downsample, and a built-in plugin's stage after it, now asked at Start), `test_record_gates.py` (the triggering plugin's books in four modes), `test_review_sources.py` (the Prophesee raw view), `test_file_services.py` (both services, through a plugin loaded from its folder), and the fault cases the feature and camera suites lacked; the fake host loads a plugin's folder as an author has it (`FakeHost.load`), scans only the simulated cameras, and checks a run's sums (`Run.problems`). Every built-in plugin passes its kind's suites. The recording path now hands a frame stage and a record gate read-only frames |
 | P3 closed (18 October 2026) | rows 1-6 on `plugins/p3a`, `plugins/p3b` and `plugins/p3c`, not yet merged into `typhon-plugins`. From P2's open list: the core keeps asking the Device's own flags for restarting, raw recording and the live area (no P3 row moves them; the open-time check and the camera suite hold them equal to the slot's capabilities; they move with M1's per-slot functions, P6), and the frame's own array is not made read-only at `read()` — instead every way a plugin is handed a frame is read-only (a FrameView since P1, a frame stage's input and a record gate's frame since P3c). What is left of P3 for later stages: the bench-PC timing (above), the third-party `sha256` in the camera record (P5), the screen points shown (P4) |
+| P3 review (19 October 2026) | fixed on branch `plugins/p3-fixed` (`tests/test_typhon_plugins_p3_review.py`, a test per finding, 69 of its 72 failing on 14b3566; `docs/typhon_plugin_api_notes.md`, "Taken at the P3 review"): Start, Stop and the end of a run wait for no plugin call longer than `RUN_HOOK_SECONDS` — check_start (a hung one refuses that Start), on_run_started, the run_started and run_stopped listeners, record_fields, on_run_finished — and a frame camera's run_stopped is told once its stream has stopped, so a hung listener adds no frame; a block is cleaned inside the guarded, bounded call that gave it, measured as the record writes it (indented, at its depth; it was measured compactly, and blocks inside the limits made records over the 4 MB read limit), stopped at the first byte past the limit, numpy 2's `np.bool_` cleaned; the end record and the frames CSV survive whatever a block, a gate's summary or the plugins' part raises, SystemExit included (core code: `Recorder.finish`, `FrameWriter._close_recorder`); a record gate's tags are the trigger columns with plain values, or a fault on the recording path; a frame stage keeps one picture per run and is watched by the watchdog; `FrameView.to_sensor` converts the view's own pixels and `saved_to_sensor` the saved picture's, the camera's own binning, decimation and mirroring are read from its settings (unknown refused), and `has("frame.saved")` is False until P4; kind "source" is refused until P6, and the trigger-source suite takes any source (start and stop repeated harmlessly); a frame camera whose plugin gives it no capture set-up gets the core's (`council_core/plugin_capture.py`: the trigger rows, the core's Downsample row, snapshot runs); the fake host refuses what discovery refuses, discovery refuses an ending held in another's, and a rerun file marks its run as taken; a faulted or let-go plugin's context refuses files, settings and listening; a run of several cameras files each camera's counts and asks a rig plugin once; a fault's words are cut in the records; streamed text files are line-buffered; the kept-keys words, the "Start refused — an exact ..." refusal and the simulated plugin's broken line mended. Today's Typhon: frame_camera loads `reduce` and `triggered` with itself again (its Python Scripts list's loaded column as on 7ec6bc4; the same 37 names); its records, run names and calls are as before. Two of the review's findings needed no change on the branch: a pylon-env live-view test that flaked once (above, "Load-sensitive in the pylon environment") and `tests/test_excel_open.py`'s failure, which fails alone on 14b3566 and 7ec6bc4 too (the PC's Excel). Not merged into `typhon-plugins` yet |

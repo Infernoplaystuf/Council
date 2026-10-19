@@ -25,6 +25,21 @@ switch interval at 1 ms while a run records ("What is wired, and what comes
 when"). The number stays 0.3: everything in part C is an addition, named by
 `has()`, and nothing outside the branch names 0.3.
 
+**The P3 review (19 October 2026, branch `plugins/p3-fixed`)** changed what
+the notes below say in these places, each marked "(P3 review)" where it is
+described: every call Start, Stop and the end of a run make into a plugin is
+bounded in time; a block is cleaned inside the guarded, bounded call that
+gave it, measured as the record writes it; a record gate's tags are checked
+and its summary guarded; a frame stage keeps one picture per run and is
+watched; `FrameView.to_sensor` converts the view's own pixels and
+`saved_to_sensor` the saved picture's, the camera's own terms read from its
+settings, and `has("frame.saved")` is False until P4; a trigger-source
+plugin is refused until P6; a frame camera with no capture set-up gets the
+core's; a plugin switched off has its context's services closed; a run of
+several cameras files each camera's counts; a fault's words are cut in the
+records. The number stays 0.3: nothing outside the branch names it, and
+`has()` names what changed.
+
 ## The pieces
 
 | Piece | Where | What it is |
@@ -46,7 +61,8 @@ when"). The number stays 0.3: everything in part C is an addition, named by
 | The contract suites | `tests/contracts/` | What every plugin of a kind must do (design 9.1), each run against the built-ins: camera plugins (`test_camera_plugins.py`, P2), trigger sources (`test_trigger_sources.py`), feature plugins (`test_feature_plugins.py`), frame stages (`test_frame_stages.py`), record gates (`test_record_gates.py`), review sources (`test_review_sources.py`), the file services (`test_file_services.py`) and the fake host itself (`test_fake_host.py`) (P3 row 6) |
 | A run, as the plugins see it | `council_core/plugin_runs.py` | The run in progress (`ActiveRun`), the two file services (`create_file`, `write_new`) and a plugin's data folder (stage P3 row 1); the host drives the hooks |
 | Whose a preset key is | `council_core/plugin_keys.py` | `owner`, `namespaced`, the split of a preset by owner and the merge that keeps a missing plugin's keys (stage P3 row 4) |
-| The core's points | `council_core/capture.py`, `council_core/camera_record.py` | The run-file suffix registry (`register_run_files`, `run_markers`), the frame-stage point (`Recorder.frame_stage`), the end record's plugin blocks (`Recorder.end_blocks`); block cleaning and size checks (`clean_block`, `plugins_block`) and the camera record's `plugins` block (stage P3 row 1). Core code: today's Typhon runs it too, and none of it does anything there |
+| The core's points | `council_core/capture.py`, `council_core/camera_record.py` | The run-file suffix registry (`register_run_files`, `run_markers`), the frame-stage point (`Recorder.frame_stage`), the end record's plugin blocks (`Recorder.end_blocks`); block cleaning and size checks (`clean_block`, `plugins_block`, `json_size`: as the record writes it, P3 review) and the camera record's `plugins` block (stage P3 row 1). Core code: today's Typhon runs it too, and none of it does anything there |
+| The core's capture set-up for a plain frame camera | `council_core/plugin_capture.py` | `CoreCapture`: a frame camera whose camera plugin gives it no capture set-up gets the core's — the trigger rows, the core's Downsample row, snapshot runs — while its plugin is still handed its own Device (`plugin_device`) (P3 review; design 2.5, 3.6). Reached only through the host |
 | The core's Downsample | `council_core/cameras.py`, `council_core/camera_settings.py` | `cameras.frame_stage`, the one frame stage, which a recorder with no stage of its own saves through; `camera_settings.downsample_setting`, the Downsample row of every frame camera's "Capture" group (stage P3 row 3). Today's Typhon runs both, and they do what today's code did |
 
 ## The rules that already hold
@@ -189,12 +205,20 @@ with the crash marker at stage P4.
 | `settings()`, `save_settings(values)` | See the previous section |
 | `state(camera=None)` | the plugin's dictionary on that slot (session only, never saved) |
 | `temp_dir()` | A folder of the plugin's own, which the host removes at `close()` |
-| `create_file(folder, name, binary=False)` | From P3 row 1. (a) A streamed run file: made exclusively in a folder of the run in progress, named `<run><ending>` with an ending the manifest declares; text (UTF-8, `newline=""`) or binary. Refused (`PluginFileError`) with no run in progress, in another folder, under another name, or when the file is there. Typhon closes what the plugin leaves open at the run's end — or, when the recording ended by itself before Stop, at Stop (P3 row 2: the triggers CSV has a row for every trigger until Stop) |
+| `create_file(folder, name, binary=False)` | From P3 row 1. (a) A streamed run file: made exclusively in a folder of the run in progress, named `<run><ending>` with an ending the manifest declares; text (UTF-8, `newline=""`, LINE-BUFFERED since the P3 review: each row reaches the file as its line ends, so a crash leaves every row written so far) or binary (buffered: a plugin flushes it where a crash must not cut a record). Refused (`PluginFileError`) with no run in progress, in another folder, under another name, or when the file is there. Typhon closes what the plugin leaves open at the run's end — or, when the recording ended by itself before Stop, at Stop (P3 row 2: the triggers CSV has a row for every trigger until Stop) |
 | `write_new(folder, name, data)` | From P3 row 1. (b) A whole file, `data` bytes: a temporary name of its own beside it (process, thread, a count), flushed, then a rename that refuses an existing name; `<stem>_2<ext>`, `_3` ... on a rerun. Beside a run (its frames CSV in `folder`, past runs included; `name` is `<run><declared ending>`), or in the plugin's `data_dir()` (any plain file name but code). Never over anything, never a delete; a temporary file that did not become the file is removed |
 | `data_dir()` | From P3 row 1. `<project>/plugin_data/<id>/` (design 4.1), made on first ask; holds no code (`.py` and the like are refused: the project's policy check reads every `.py` under a project) |
 | `capture_setup(camera=None)` | From P3 row 2. A copy of the camera's capture set-up (a `CaptureSetup`) as it is now — the plugin's camera, or the active one — or None (an event camera, no camera). Read in place: the camera's set-up is the storage today's code reads (design 2.5); a change goes through the camera's settings, its `capture.*` keys, never through the copy |
 
 `read_data` (a plugin's own checked files) comes at stage P5.
+
+**A plugin switched off is off** (design 3.10; P3 review). Once its plugin
+is faulted, or its instance let go (switched off in the project, another
+project opened, the window closing), a context's `create_file`,
+`write_new` and `data_dir` refuse (`PluginFileError`), `save_settings`
+refuses (`PluginListError`) and `on` listens for nothing. Before, a thread
+the plugin had started went on making run files and saving settings after
+its plugin was switched off; nothing was ever written over.
 
 **`has()` names a hook only once Typhon calls it:** `hook.activate`,
 `hook.deactivate` (the host) and `hook.on_frame` (the host's live feeds).
@@ -208,7 +232,9 @@ the context's three new calls and the types `RunPlan`, `RunInfo` and
 and `frame.saved`, `context.capture_setup`, and the triggering plugin's
 `hook.trigger_slot` and `hook.capture_now` (Start, Stop and F9 call them);
 at P3 row 6 `hook.frame_stage` (Start asks a built-in plugin for its
-run's frame stage).
+run's frame stage). At the P3 review `frame.saved` LEFT the list —
+nothing fills `FrameView.saved` until the window feeds live frames (P4),
+so it is always None — and `frame.saved_to_sensor` joined it.
 `hook.status`, `hook.panel`, `hook.toolbar` and `hook.settings_rows` join
 when the window asks them (P4): the triggering plugin has all four, and
 nothing calls them yet. status and check_start answered True in 0.1
@@ -465,28 +491,42 @@ Start and Stop are as before.
    Downsample's factor and method, and the capture set-up as plain values
    (`{}` for an event camera). A reason refuses Start ("Start refused —
    Hooks: ..."); a check that fails refuses it and switches the plugin
-   off. Every plugin's declared run files are registered then, before
-   the name is reserved.
+   off — and so does one that has not answered in `RUN_HOOK_SECONDS` (P3
+   review: "did not answer its start check within 2 s"). Every plugin's
+   declared run files are registered then, before the name is reserved.
 2. The run's name reserved (its frames CSV made exclusively), then
    `begin_run`: the run in progress for its camera.
 3. The camera record's `plugins` block (`record_plugins`), built with the
    record before the recording begins and written after, as the record
    always was: each plugin this project runs that is on, loaded or
    switched off after a fault — `name`, `version`, `short`, `kind`, and
-   `faulted` with why — and, for the camera plugin that opened the
-   camera, its `record_fields(device)` as `fields` (cleaned; a plugin
-   from someone else whose fields cannot go in is switched off, a
-   built-in camera plugin only said, design 3.10).
+   `faulted` with why (cut to 2,000 characters, P3 review) — and, for the
+   camera plugin that opened the camera, its `record_fields(device)` as
+   `fields` (cleaned; a plugin from someone else whose fields cannot go in
+   is switched off, a built-in camera plugin only said, design 3.10). The
+   call and the cleaning of what it gives run inside the camera guard, on
+   a thread of their own, bounded by `RUN_HOOK_SECONDS` (P3 review: a
+   block that raised when read refused Start, a SystemExit escaped
+   start(), a slow one held Start). An entry the record cannot hold is
+   said in Start's summary, never dropped in silence.
 4. The recording starts, then **`on_run_started(run)`** (a `RunInfo`:
    `run`, `folders` by camera, `started`) for every run-hook plugin — a
    camera-scoped one once for each camera of the run — then
    `run_started` is told, then the trigger source starts. Best effort: a
    fault is said in Start's summary, the plugin is switched off, the
-   capture carries on.
+   capture carries on. BOUNDED (P3 review): each hook and each listener on
+   a thread of its own, waited for `RUN_HOOK_SECONDS` at most; one that
+   has not returned is switched off as a hang and Start goes on (a hook
+   that slept 6 s held Start, and the trigger source, 6 s).
 5. Stop: once the trigger source has stopped and its last frames are
-   waited for, `run_stopped` (no new streamed file from then on;
-   "run_stopped" told, once) — before the recording ends. Disconnect in
-   the middle of a run does the same.
+   waited for — and, for a frame camera, once its stream has stopped (P3
+   review) — `run_stopped` (no new streamed file from then on;
+   "run_stopped" told, once, each listener bounded as in 4) — before the
+   recording ends. So a listener that hangs holds Stop no longer than its
+   bound and adds no frame to the run (one that slept 6 s let the run
+   record 6 s more). An event camera's stream runs on after a run, so its
+   plugins are told before the recording ends, as before. Disconnect in
+   the middle of a run tells it first, bounded.
 6. When the run's last frame is on disk and its end record is written
    (at Stop, or earlier when a failed write ended the recording),
    **`on_run_finished(run)`** for every plugin asked on_run_started and
@@ -495,8 +535,17 @@ Start and Stop are as before.
    `grab_attempts`, `first_index`, `last_index`, `recording_failed`,
    `stream_ended`). BOUNDED: one that has not returned in
    `RUN_HOOK_SECONDS` (2 s) is switched off as a hang and the record is
-   written without it. The mapping it returns is its block in
-   `<run>_run_end.json`'s `plugins`; the faults of plugins during the run
+   written without it. It runs on a thread of its own while the thread
+   writing the end record waits for it (P3 review: these notes said it ran
+   on the writing thread). The mapping it returns is its block in
+   `<run>_run_end.json`'s `plugins`, CLEANED INSIDE THAT SAME GUARDED,
+   BOUNDED CALL (P3 review): reading a block can run the plugin's own code
+   (a mapping's `items()`, a number's `__float__`), and before, a
+   SystemExit there lost the end record and left the frames CSV open, an
+   error lost every plugin's block with nobody named, and an oversized
+   one held the end record for tens of seconds; now any of these is that
+   plugin's fault — the end record is written, the other blocks kept, the
+   culprit named and switched off. The faults of plugins during the run
    are its `plugin_faults` (`id: why`). Then the files the plugins
    streamed into the run and left open are closed.
 
@@ -504,18 +553,42 @@ A run whose recording ended by itself before its plugins were told it
 started is not started: they are told nothing about it. A Start that fails
 after the name was reserved abandons the run: nothing is told.
 
+**A run of several cameras** (ready for M1's rig runs, P6; P3 review):
+each camera's recorder is bound to its own camera (`end_blocks(active,
+camera)`) and files its own counts. A camera-scoped plugin is asked
+`on_run_finished` with its camera's end record, its block in that one; a
+rig plugin is asked ONCE, with the end record of the run's last camera to
+end, when every camera's counts are in — its block is in that end record.
+(Before, every camera's counts were filed under the run's first camera,
+and each plugin was asked once per camera's recorder.) Every run of P3
+has one camera, for which nothing changes; M1's rig end record
+(`<run>_rig_end.json`) is where a rig plugin's block goes at P6.
+
 **Records, one rule** (design 3.9). Keys format 1 already has stay where
 they are: the camera record's `capture` and `downsample`, the end record's
 counts. A plugin's data is under `plugins`, by id, and nowhere else — a
 block holding `"capture"` stays inside `plugins[id]`. Every block is
 CLEANED (`camera_record.clean_block`: NaN and the infinities become null,
-tuples lists, any number type a plain number, numpy's included) and
-SIZE-CHECKED: at most 32 deep, 256 KB a block and 1 MB for all of a
-record's blocks, so the record stays under its 4 MB read limit. A block
-that is not JSON (a set, bytes, an object, a key that is not text) or too
-big is refused: its plugin is switched off and the end record says why. A
+tuples lists, any number type a plain number, numpy's included — np.bool_
+too, which numpy 2 names "bool" and the name test before the P3 review
+refused) and SIZE-CHECKED: at most 32 deep, 256 KB a block and 1 MB for
+all of a record's blocks, so the record stays under its 4 MB read limit.
+THE SIZE IS THE BYTES THE RECORD WRITES (P3 review): indented, as
+`write_once` writes a record, at the block's own depth in it
+(`camera_record.json_size`, exact; a test compares it with json.dumps).
+Measured compactly before, four blocks of [x, y] points inside the limits
+made a 4.6 MB record and one 30-deep block a 6.2 MB one, and `read()` gave
+None. The walk stops at the first byte past the limit, so an oversized
+block is refused at once (a million points took 10.4 s before, a tree of
+shared lists 19.5 s), and it reads dicts, lists, text and numbers with the
+built-in types' own methods, so cleaning runs as little of the plugin's
+code as it can. A block that is not JSON (a set, bytes, an object, a key
+that is not text, an array of more than one number) or too big is
+refused: its plugin is switched off and the end record says why. A
 plugins' part that still cannot be written leaves the end record written
-without it, saying so. `<run>_run_end.json` stays format 1: `plugins` and
+without it, saying so; and since the P3 review a capture block that is not
+JSON (a NaN from a run's books) is written made plain, so the end record
+is always written. `<run>_run_end.json` stays format 1: `plugins` and
 `plugin_faults` are new keys of version 1, written only when there is
 something in them, so a run of a "Typhon (plugins)" project with no
 run-hook plugin and no fault has today's end record; its camera record
@@ -529,7 +602,14 @@ taken, so a run whose only file left is a plugin's keeps its name (`run`
 taken: the next Start is `run_2`). The host registers them when it reads
 the manifests if the capture code is loaded (the host loads no camera code
 itself), and always before a run's name is reserved; `close()` forgets
-them.
+them. Since the P3 review a registered ending's rerun forms
+(`<run><stem>_2<ext>`, what `write_new` names a file written again) mark
+their run too — a run whose only file left was such a one was free again —
+and discovery (and the fake host's `load`) refuses an ending that holds
+another plugin's or is held in one (`ending_clash`): with `_ab_x.csv`
+taken, `<run>_zz_ab_x.csv` would read as a file of a run `<run>_zz`. The
+manifest already refused that of the core's and the built-ins' endings;
+now it holds between plugins too.
 
 **The two file services and the data folder** are in the context table
 above (`create_file`, `write_new`, `data_dir`), with `PluginFileError`
@@ -569,8 +649,12 @@ handed its own values, without its prefix, once the set is applied
 every plugin not running — not in the project's list, not on this PC,
 switched off after a fault, or running without `presets` — are never
 handed to the camera (which reported them refused) and are said: "Kept
-for plugins not running here, not applied: acme.thermal: 2 settings." The
-preset file is not touched.
+for plugins not running here, not applied: acme.thermal: 2 settings." —
+and, for a plugin that runs but takes no preset values (P3 review: the
+Timing scan was said as not running), "Kept for plugins running here that
+take no preset values, not applied: ...". A preset plugin's values are
+copied plain inside its guard (P3 review: their `items()` ran outside it).
+The preset file is not touched.
 
 **Saving a preset** adds each running `presets` plugin's own values
 (`preset_values(camera)`) as `<id>/<key>`, plain values only (true or
@@ -637,15 +721,51 @@ Choosing Downsample still writes `save.downsample` through the camera's
 provider, in place, until the notebook's Capture group holds the core's
 row alone (P4).
 
+**A frame camera with no capture set-up of its own gets the core's** (P3
+review; design 2.5 "the core adds the Downsample row to every frame
+camera", 3.6 "a third-party frame camera with no trigger at all still
+captures snapshot runs"). A camera plugin written against the API alone
+has a Device whose `capture` is None (the base Device's): before the
+review its camera got no Downsample row, no trigger rows and no snapshot
+runs — `capture.*` and `save.downsample` were "no such setting" — and
+Capture now called it an event camera. Now, when a "Typhon (plugins)"
+project opens such a frame camera, the host stands the core's capture
+set-up in front of it (`council_core.plugin_capture.CoreCapture`): a
+`CaptureSetup` of the core's own, the trigger rows and the core's
+Downsample row after the camera's own settings (`triggered.
+capture_settings`, read and written in place, so presets, the settings
+window and the records carry them as for today's cameras), Downsample by
+Typhon's averaging, and every other attribute and call the camera's own
+Device's. The camera has no trigger facet, so an exact run is refused by
+the triggering plugin's start check, with why, and a snapshot from
+Software or the Timer runs. Its plugin is always handed its own Device
+back (`plugin_device`: facet, record_fields), never the core's stand-in.
+An author therefore provides no `device.capture`, and nothing of
+`triggered` or `camera_settings` needs exporting for it.
+
 **A FrameView's coordinates** (design 3.8, 3.11, 3.12): `area`,
 `binning`, `decimation`, `mirror`, `downsample` and `downsample_method`,
 filled from the frame (its `aoi`, its Downsample) and, for the camera's
-own binning, decimation and mirroring, from what the core knows of the
-slot (no camera reports them yet); with the camera's binning as the
-Downsample, the binning is the factor. `to_sensor(x, y)` turns a pixel of
-the saved picture into sensor pixels with `reduce.sensor_position` on each
-axis — Typhon's factor first, then the area's origin, then the binning —
-and refuses a mirrored or decimated picture rather than guess. A test puts
+own binning, decimation and mirroring, FROM THE CAMERA'S SETTINGS (P3
+review: they were never filled in, so a mirrored picture's to_sensor gave
+a wrong place instead of refusing): a live feed reads GenICam's
+`BinningHorizontal`/`Vertical`, `DecimationHorizontal`/`Vertical` and
+`ReverseX`/`Y` once per stream (`host.camera_geometry`; the stream must be
+stopped to change them), a camera without such a setting does not do it,
+and one whose setting cannot be read leaves the term None — unknown. With
+the camera's binning as the Downsample, the binning is the factor.
+`to_sensor(x, y)` turns a pixel of the VIEW'S OWN picture — `image`, the
+full-size frame a plugin is handed — into sensor pixels (P3 review: it
+converted the saved picture's, so with Downsample 2x by Typhon a live
+plugin's own last pixel (639, 479) went to (1278.5, 958.5), off a 640 x
+480 sensor); `saved_to_sensor(x, y)` turns a pixel of the SAVED picture
+(the PNG, the live view, a box drawn on either) into sensor pixels —
+Typhon's factor first, then the area's origin, then the binning, with
+`reduce.sensor_position` on each axis. Both refuse a mirrored or
+decimated picture, or one whose terms are unknown, rather than guess.
+`FrameView.saved` is not filled yet (always None): the window feeds live
+frames with the file each is saved as at P4, and `has("frame.saved")` is
+False until then. A test puts
 a spot on a frame averaged 2x and 3x with an area offset and finds it at
 its sensor pixel within 0.01 px (design 9.4).
 
@@ -675,7 +795,7 @@ their trigger code:
 
 | Start | Stop |
 |---|---|
-| check_start, before anything stops → the run's name reserved → `trigger_slot` → `arm` (an exact run) → `record` (the camera record's `capture` block) → `gate` (the run's books, guarded by P1's GuardedGate; the triggers CSV made through `create_file`) → the recording → `ready` (an input line's edge count) → on_run_started → `start` (the source) → `words` (Start's summary) | `halt` (the source stops, the last frames are waited for, an input line is closed and its frames let land) → run_stopped → the stream stops → `close` (the books closed, the edges counted) → the recording ends → on_run_finished → `disarm` |
+| check_start, before anything stops → the run's name reserved → `trigger_slot` → `arm` (an exact run) → `record` (the camera record's `capture` block) → `gate` (the run's books, guarded by P1's GuardedGate; the triggers CSV made through `create_file`) → the recording → `ready` (an input line's edge count) → on_run_started → `start` (the source) → `words` (Start's summary) | `halt` (the source stops, the last frames are waited for, an input line is closed and its frames let land) → the stream stops (a frame camera; P3 review: before, it stopped after run_stopped) → run_stopped → `close` (the books closed, the edges counted) → the recording ends → on_run_finished → `disarm` |
 
 Disconnect calls `abort`, and a Start that fails after the run's name was
 reserved calls `undo`. How each step's fault ends (`TriggerSlot`): before
@@ -698,8 +818,10 @@ its other: both are today's `trigger_problem`), so the refusal reads as
 today's after "Start refused — Triggering: "; a camera with none is held
 to the rule (`problem`, which a panel greys modes with). A triggered
 set-up in a project whose triggering plugin does not run (switched off,
-or faulted) refuses Start before anything stops ("needs the Triggering
-plugin"), and Capture now says so.
+or faulted) refuses Start before anything stops ("Start refused — an
+exact, Software run needs the Triggering plugin ...": the P3 review gave it
+its "Start refused —" and its "an"), and Capture now says so. Capture now
+never calls a frame camera an event camera (P3 review).
 
 **Typhon's own sources** (`TyphonSource`, a `TriggerSource`): Software and
 the Timer, `needs(mode)` per design 3.6. The run's books keep the source:
@@ -708,7 +830,25 @@ today, so a tick that comes while the camera is busy is counted missed as
 today. `start(fire)` starts that worker and tells `fire` each trigger it
 numbers (`TriggerRun.on_trigger`, None in today's Typhon); `stop()` halts
 it within its bound, and a stopped source stays stopped (a source belongs
-to one run).
+to one run). Design 9.1's "start and stop can be repeated" is read that
+way (settled at the P3 review): repeating either call is harmless — a
+second start while it runs starts nothing more, a second stop returns at
+once, a start after stop starts nothing — and a run makes new sources.
+
+**Trigger-source plugins are not wired yet** (P3 review). Design 2.2 names
+a source that is a small plugin of its own (a trigger box). Nothing picks
+one for a run yet: the triggering plugin's sources are Typhon's own, and
+the books' triggers come from its worker, so a plugin's `fire()` would
+cause none. Its manifest kind, "source", is therefore REFUSED with that
+reason (`plugin_manifest.NOT_WIRED_KINDS`) — before, such a plugin loaded,
+became active and was never used, and setting `capture.source` to it was
+refused. It is wired with the rig's sources at stage P6 (one source firing
+several cameras, design 3.6's fan-out and P6 row 1): the triggering plugin
+lists source plugins among its sources, and a source plugin's `fire(event)`
+presses the run's books as Capture now does. The trigger-source contract
+suite already takes any source through a factory — Typhon's two, and a
+reference source written against the API alone — so a source plugin is
+held to it then.
 
 **Capture now (F9)**: frame_camera's `capture_now` in a "Typhon (plugins)"
 project asks the host (`host.capture_now`), which asks the run's slot
@@ -745,14 +885,17 @@ the app. `adopt(manifest, plugin)`, `connect(kind, label=)`, `live_view()`
 P4), `start`, `stop`, `capture(frames, during)` (a `Run`: its frames CSV,
 triggers CSV, end record, camera record and sidecars as today's readers
 read them, and `problems()`: the data-safety sums, frames saved = CSV rows
-= the end record's count, in one call), `faults`, `said` and `close()`.
-One at a time in a process (a second is refused).
+= the end record's count — and, since the P3 review, every picture of one
+size and mode, read from the PNGs' headers — in one call), `faults`,
+`said` and `close()`. One at a time in a process (a second is refused).
 
 **For a plugin's author** (P3 row 6, part C; design 3.11). `load(folder)`
 takes the plugin's folder as its author has it: the manifest read by the
 third-party rules (no record gate or frame stage; `_<short>_<what>` run
 files), refused with why where Typhon would refuse it (another plugin's
-short name or run file, compiled code in the folder, a wrong API number),
+short name or run file — every plugin Typhon found, built-ins this project
+switches off among them, and an ending held in another's: P3 review —
+compiled code in the folder, a wrong API number, a kind not wired yet),
 and its code imported from the folder's own files as a package of its
 own (`typhon_fakehost.<id>`, relative imports working) with no bytecode
 written into the folder — a `__pycache__` there would get the folder
@@ -772,13 +915,13 @@ and point, each run against every built-in plugin it applies to:
 | Suite | Held to it | What it checks |
 |---|---|---|
 | `test_camera_plugins.py` (P2; facets P3b; faults P3c) | Simulated, Prophesee (fake EVK4), Basler (fake, and pylon's emulator in the `pylon` env) | discover, open, read, the area, restarting, settings, capabilities and their facets, hints, record fields, review source, set-up; a camera whose read raises or exits mid-run costs no frame the run says it saved, the end record says why; a scan that fails is said while the others scan |
-| `test_trigger_sources.py` (P3b) | Software, Timer | a TriggerSource; start tells fire each TriggerEvent; stop within 1.5 s, in a burst too, nothing after it; a stopped source stays stopped |
-| `test_feature_plugins.py` (P3b; P3c) | Triggering, Classification, Timing scan, Cropped export | the manifest and its hooks; the core's order; refusals; a failed Start undone; snapshot on a camera with no trigger facet; eight faults; and from P3c its blocks plain and under the limit, its preset keys round-tripping under today's names, its settings saves under the lock, its panel built offscreen and fitting the smallest window, F9 claimed once, its status within 80 characters, its rows read in place |
-| `test_frame_stages.py` (P3c) | the core's Downsample; every built-in plugin with a stage (none yet) | a picture of the dtype given; as it came with nothing asked; block means; a Bayer frame refused; the input unchanged; the same on eight threads; through Typhon's Start and Stop a plugin's stage after Downsample on what is saved, one that cannot be had refusing Start before anything stops, and five faults (raising, SystemExit, writing to its picture or its meta, no picture) ending the recording with the plugin named, a slow and a hung stage costing nothing |
-| `test_record_gates.py` (P3c) | Triggering's books, exact and snapshot from Software and the Timer | tags only the CSV's trigger columns, every tag told saved once, the summary the end record's capture block, a tag under 1 ms, a frame it cannot change; faults (raising, SystemExit, writing to pixels or meta, a fault hearing a save) ending the recording with the frame marked and the camera put back; slow and hung gates costing nothing |
+| `test_trigger_sources.py` (P3b; any source from the P3 review) | Software, Timer, and a reference source written against the API alone (`Metronome`; a source plugin adds its case beside it) | a TriggerSource; start tells fire each TriggerEvent; stop within 1.5 s, in a burst too, nothing after it; start and stop repeated harmlessly, a start after stop starting nothing |
+| `test_feature_plugins.py` (P3b; P3c; P3 review) | Triggering, Classification, Timing scan, Cropped export | the manifest and its hooks; the core's order; refusals; a failed Start undone; snapshot on a camera with no trigger facet and no capture set-up of its own (the core's, P3 review), Downsample on it; eight faults; hangs in check_start, on_run_started and a run_stopped listener, bounded, and a block that raises, exits or hangs when read costing only its plugin (P3 review); and from P3c its blocks plain and under the limit, its preset keys round-tripping under today's names, its settings saves under the lock, its panel built offscreen and fitting the smallest window, F9 claimed once, its status within 80 characters, its rows read in place |
+| `test_frame_stages.py` (P3c; P3 review) | the core's Downsample; every built-in plugin with a stage (none yet) | a picture of the dtype given; as it came with nothing asked; block means; a Bayer frame refused; the input unchanged; the same on eight threads; well within half the watchdog's limit on a full boA5320 frame (P3 review); through Typhon's Start and Stop a plugin's stage after Downsample on what is saved, one that cannot be had refusing Start before anything stops, and seven faults (raising, SystemExit, writing to its picture or its meta, no picture, and a picture of another size or dtype mid-run: P3 review) ending the recording with the plugin named; a slow stage costing nothing, a hung one switched off by the watchdog with the run whole (P3 review: it "cost nothing", unseen) |
+| `test_record_gates.py` (P3c; P3 review) | Triggering's books, exact and snapshot from Software and the Timer | tags only the CSV's trigger columns, every tag told saved once, the summary the end record's capture block, a tag under 1 ms, a frame it cannot change; faults (raising, SystemExit, writing to pixels or meta, junk tags and a core meta key: P3 review, a fault hearing a save) ending the recording with the frame marked and the camera put back; a summary that exits or gives NaN still leaving the end record (P3 review); slow and hung gates costing nothing |
 | `test_review_sources.py` (P3c) | Prophesee's raw view (a stand-in SDK; a real .raw where OpenEB is importable) | a ReviewSource its manifest declares and a run marker; a run's file and the newest; windows the slider polls, in any order; a missing file said; no SDK said at once; nothing written beside the file or left behind |
-| `test_file_services.py` (P3c) | a plugin from someone else loaded from its folder; Triggering's triggers CSV; every built-in's run files | streamed: once, in the run's folder, only while it lasts, text or binary, closed at the end; whole: numbered, never over anything, beside past runs, in the data folder (no code), several at once; names that are not plain refused; no delete or move on the context; run files run markers and their plugin's own |
-| `test_fake_host.py` (P3c) | the fake host | `load` of an author's folder (and what it refuses), simulated cameras only, everything put back, one at a time, `Run.problems` |
+| `test_file_services.py` (P3c; P3 review) | a plugin from someone else loaded from its folder; Triggering's triggers CSV; every built-in's run files | streamed: once, in the run's folder, only while it lasts, text (reaching the file line by line: P3 review) or binary, closed at the end; whole: numbered, never over anything, beside past runs, in the data folder (no code), several at once; names that are not plain refused; no delete or move on the context; run files run markers and their plugin's own; a plugin switched off has its services closed (P3 review) |
+| `test_fake_host.py` (P3c; P3 review) | the fake host | `load` of an author's folder (and what it refuses: a switched-off built-in's short name and an ending held in another's too, P3 review), simulated cameras only, everything put back, one at a time, `Run.problems` (one picture size and mode per run, P3 review) |
 
 Cropped export's "the same files as today's link" waits for its plugin
 (P4 row 5); "each UI contribution lands only in its host, the main
@@ -807,7 +950,17 @@ A fault ends in one of three ways:
    off and the end record written without it), `record_fields` and the
    preset hooks are best effort; their faults are also said in Start's
    summary, or in the run's end record (`plugin_faults`, every plugin
-   that faulted while the run was not over).
+   that faulted while the run was not over). From the P3 review every one
+   of these that Start, Stop or the end of a run waits on — check_start,
+   on_run_started, a run_started or run_stopped listener, record_fields,
+   on_run_finished — runs on a thread of its own and is waited for
+   `RUN_HOOK_SECONDS` at most (`_bounded`), what it gives cleaned inside
+   that same call, so a hang or a junk result costs only its plugin. A
+   fault's words are cut to `FAULT_TEXT` (2,000) characters wherever they
+   are kept or said — the status line, Start's and Stop's lines,
+   `plugin_faults`, `faulted`, a recording's reason — and the whole text
+   and its traceback go to `plugin_errors.log` (a 6 MB message made a 6 MB
+   end record, over its read limit).
 2. **The recording path.** `host.record_gate(pid, gate, session)` wraps a
    plugin's record gate for one run; it is the `gate=` of
    `CaptureSession.record_to`.
@@ -834,6 +987,22 @@ A fault ends in one of three ways:
      frame of its own, so the recording ends at once. Frames already
      queued still land, because they were whole; the plugin is not told of
      them, so its books stop where the reason says.
+   - **Its tags are checked** (P3 review; `plugin_host.gate_tags`): None,
+     or a mapping of the frames CSV's trigger columns (`GATE_COLUMNS`,
+     `triggered.frame_columns()`) with text, whole or finite numbers or
+     nothing. Anything else is a tag fault as above, the frame marked —
+     before, a str for tags stopped the grab thread with no word, and a
+     `reduce` among them changed the size of the pictures saved with
+     nothing in the records. Its `summary()`, which the end record's
+     capture block is made of on a writer thread, is guarded and cleaned:
+     what it raises (SystemExit included) is its plugin's best-effort
+     fault, the block says so, and a NaN is written as null — before,
+     either left the run with no end record. The recorder itself now
+     catches BaseException around the books' summary and the plugins'
+     part, and closes the frames CSV whatever the end record raised.
+     A gate is NOT watched by the watchdog: its books write the triggers
+     CSV under the lock its `tag` takes, so a slow disk would read as a
+     hang and end the run.
    - **When its plugin is switched off elsewhere**, it depends on why. A
      fault in a best-effort hook (`status`, a panel, a listener,
      `on_run_started`) never stops a capture (3.10): the gate serves out
@@ -851,7 +1020,19 @@ A fault ends in one of three ways:
      it are not saved either (they were not yet staged, and saving them
      as they came would leave half a run staged and half not). The end
      record's `recording_failed` names the plugin and says "its frame
-     stage failed"; the frames before it are whole.
+     stage failed"; the frames before it are whole. From the P3 review a
+     stage keeps ONE PICTURE PER RUN — every picture it gives has the
+     size, dtype and colour mode of its first, or that is its fault (a
+     stage that cropped or changed dtype mid-run left one run with
+     pictures of two sizes, its records describing one) — and is
+     WATCHED: each call is in the busy table, so the watchdog switches off
+     one that has not returned in `WATCHDOG_SECONDS`, the recording ends
+     at the next frame staged with the plugin named, and the hung frame is
+     not saved when its call comes back. A stage that never returns still
+     holds its run's end record (the frames CSV is published in grab
+     order), so a built-in stage must return well within the watchdog's
+     limit: the frame-stage suite times every stage on a full boA5320
+     frame (the core's Downsample: about 0.07 s at 2x).
    - **Read-only frames on the recording path** (P3 row 6, part C). A
      frame stage is handed its picture behind a read-only buffer
      (`locked_pixels`, nothing copied) and the meta as a read-only view
@@ -867,7 +1048,9 @@ A fault ends in one of three ways:
 3. **The start check.** `host.check_start(plan)` asks only the plugins whose
    manifest lists `run_hooks`. A plugin returns a reason to refuse Start. A
    check that **fails** refuses that Start with the fault and switches the
-   plugin off, so the next Start runs without it.
+   plugin off, so the next Start runs without it. One that has not
+   answered in `RUN_HOOK_SECONDS` does the same (P3 review: it held Start
+   for as long as it hung).
 
 **Hangs.** The watchdog switches off a call that has run longer than 2 s.
 Python cannot interrupt the call itself. The host starts the watchdog on
@@ -890,9 +1073,11 @@ puts the frame into a two-slot queue: when the queue is full, the oldest
 frame is dropped and counted, and nothing is copied. On the plugin's own
 thread, `on_frame` then gets a `FrameView`. Its `meta` is read-only.
 From P3 `offer(frame, saved=)` says which file the frame is saved as
-(`FrameView.saved`; None: not saved), and the view carries the frame's
-coordinates (`to_sensor`, below). Typhon's window feeds live frames from
-P4; the fake host does now (`FakeHost.feed`).
+(`FrameView.saved`; None: not saved) — no caller passes it before P4, so
+`has("frame.saved")` is False (P3 review) — and the view carries the
+frame's coordinates (`to_sensor` and `saved_to_sensor`, above), the
+camera's own terms read from its settings once per stream. Typhon's window
+feeds live frames from P4; the fake host does now (`FakeHost.feed`).
 
 **The pixels cannot be unlocked by accident.** `image` is an array over a
 read-only buffer of the frame's pixels (`plugin_host.locked_pixels`), so
@@ -1028,10 +1213,28 @@ frame_camera gained no function (the frame stage is asked inside
 27 names for an app that imports frame_camera, 37 on the typhon example
 (counted again on plugins/p3c).
 
+**From the P3 review** (19 October 2026, `plugins/p3-fixed`), for today's
+Typhon: frame_camera imports `council_core.reduce` and `.triggered` with
+itself again — they came with the capture code until P3 row 3 took them
+out of `capture.py`'s imports — so Settings > Python Scripts shows them
+loaded from the start, as before: 41 of 54 at start, 43 after Connect, 46
+after a run, exactly as on typhon-plugins 7ec6bc4 (they showed "not yet"
+until Connect on P3); the list's names are the same 27 for an app that
+imports frame_camera and 37 on the typhon example, with the same groups
+and descriptions (counted with the review's own probes). Core code both
+Typhons run: `Recorder.finish` catches BaseException around a run's books'
+summary and the plugins' part, and a capture block that is not JSON is
+written made plain; `FrameWriter._close_recorder` closes the frames CSV
+whatever the end record raised; `capture.taken_runs` also counts a
+registered run file's numbered rerun forms — nothing is registered in
+today's Typhon, so its run names are as before. Its records are the same:
+its books' summary is plain JSON, and nothing raises there. Everything
+else of the review is in a "Typhon (plugins)" project only.
+
 | Stage | Adds to the API |
 |---|---|
 | P2 | Done (0.2, above). Rows 1 and 2: the camera plugins over today's Backend, Device and Provider classes, capabilities declared in the manifest and confirmed by the opened camera, the registry, category hints, the raw view as a review source, `Provider.extra_stops`, N simulated cameras and the rig's test fakes. Rows 3 and 4: `camera_rig.json` (names, rig presets), several camera families in the set-up as the enabled camera plugins, the wizard's check boxes, "in use as cam2" in the scan, each camera plugin's guide, checks and (Basler) scan page in the wizard, and `camera_setup.json`'s choice read as the project's plugin list |
-| P3 | Done (0.3, above). **Rows 1 and 4** (branch `plugins/p3a`): the run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start); `RunPlan`, `RunInfo`, `RunCamera`; the run-file suffix registry, with the Prophesee manifest declaring `_events.raw`; record blocks, cleaned and size-checked, and the run records' `plugins` blocks; the two file services and `<project>/plugin_data/<id>/`; the frame-stage point, and the fault rule for it and for the run hooks; preset and record namespacing, a missing plugin's keys kept untouched. **Rows 2, 3 and 6** (branch `plugins/p3b`): the facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) given by the Basler and Simulated plugins and reached through a camera handle; `CaptureOptions`, `CaptureSetup`, the modes and sources in the API; the triggering plugin over today's code — TriggerRun's books driven by the rig through its trigger slot, the record gate, its sources, check_start per mode and source, the `capture.*` keys read and written in place, Capture now (F9), its status segment, rows, toolbar and panel; Downsample as the core's frame stage and its Capture row the core's, `capture.py` importing neither reduce nor triggered; `FrameView`'s coordinates, `to_sensor` and `saved`; the fake host and the contract suites for trigger sources and feature plugins. **Rows 5 and 6** (branch `plugins/p3c`): Python's switch interval at 1 ms while a run records (the core's, no API; Windows' timer not asked for, Qt holds it already); a built-in plugin's frame stage after Downsample (`hook.frame_stage`); read-only frames for a frame stage and a record gate; the fake host for a plugin's author (`load`, simulated cameras only, `Run.problems`); contract suites for frame stages, record gates, review sources and the file services, and the faults the feature and camera suites lacked. Settled from P2's open list: the frame's own array stays writeable, every way a plugin is handed a frame being read-only instead; the core keeps asking the Device's own flags for restarting, raw recording and the live area while the code stays (the open-time check and the camera suite hold them equal to the slot's), until M1's per-slot functions (P6) |
+| P3 | Done (0.3, above). **Rows 1 and 4** (branch `plugins/p3a`): the run hooks (`on_run_started`, `on_run_finished`; `check_start` wired into Start); `RunPlan`, `RunInfo`, `RunCamera`; the run-file suffix registry, with the Prophesee manifest declaring `_events.raw`; record blocks, cleaned and size-checked, and the run records' `plugins` blocks; the two file services and `<project>/plugin_data/<id>/`; the frame-stage point, and the fault rule for it and for the run hooks; preset and record namespacing, a missing plugin's keys kept untouched. **Rows 2, 3 and 6** (branch `plugins/p3b`): the facets (`SoftwareTrigger`, `HardwareTrigger`, `Binning`) given by the Basler and Simulated plugins and reached through a camera handle; `CaptureOptions`, `CaptureSetup`, the modes and sources in the API; the triggering plugin over today's code — TriggerRun's books driven by the rig through its trigger slot, the record gate, its sources, check_start per mode and source, the `capture.*` keys read and written in place, Capture now (F9), its status segment, rows, toolbar and panel; Downsample as the core's frame stage and its Capture row the core's, `capture.py` importing neither reduce nor triggered; `FrameView`'s coordinates, `to_sensor` and `saved`; the fake host and the contract suites for trigger sources and feature plugins. **Rows 5 and 6** (branch `plugins/p3c`): Python's switch interval at 1 ms while a run records (the core's, no API; Windows' timer not asked for, Qt holds it already); a built-in plugin's frame stage after Downsample (`hook.frame_stage`); read-only frames for a frame stage and a record gate; the fake host for a plugin's author (`load`, simulated cameras only, `Run.problems`); contract suites for frame stages, record gates, review sources and the file services, and the faults the feature and camera suites lacked. Settled from P2's open list: the frame's own array stays writeable, every way a plugin is handed a frame being read-only instead; the core keeps asking the Device's own flags for restarting, raw recording and the live area while the code stays (the open-time check and the camera suite hold them equal to the slot's), until M1's per-slot functions (P6). **The P3 review** (branch `plugins/p3-fixed`): every call Start, Stop and the end of a run make into a plugin bounded (`RUN_HOOK_SECONDS`), a frame camera's run_stopped told once its stream has stopped; blocks cleaned inside their plugin's bounded guard, measured as the record writes them (`json_size`), numpy's scalars included; a record gate's tags checked (`GATE_COLUMNS`) and its summary guarded; a frame stage of one picture per run, watched; `FrameView.to_sensor` the view's own pixels, `saved_to_sensor` the saved picture's (`has("frame.saved_to_sensor")`), the camera's own terms from its settings, `has("frame.saved")` off until P4; kind "source" refused until P6, the trigger-source suite taking any source; the core's capture set-up for a frame camera with none (`council_core.plugin_capture`); a switched-off plugin's context closed; each camera of a run its own end-record counts; a fault's words cut in the records; streamed text files line-buffered; endings held in one another refused, rerun files marking their run |
 | P4 | The screen: pop-out panels, toolbar and status strips, the Plugins window (base set, additions, switch-offs, settings, approval states, each plugin's over-budget and dropped-frame counts), `current_frame` and `crop_box` wired. `status()` asked by the status strip and held to its limits, 80 characters and 5 ms (design 3.5, 3.11), with `has("hook.status")`. The crash marker and "asked after a crash". A plugin's Python packages checked in the project's own interpreter (`python_envs`) when the Council lists a project's plugins; inside the app the running interpreter is the project's. The settings tabs planned from `host.category_tables()` (they plan from today's tables until then, so a third party's own shared tab is not yet shown as planned) |
 | P5 | The hardened loader for third-party plugins (approval, `approvals.json`, the hash-then-compile importer, the `typhon_thirdparty.<folder>` package, `read_data`), the network field and its audit hook, the manifest's `uses` acted on (11.5), the API frozen as 1.0, and the author's guide and `python -m typhon_plugin_api.check`. An import of `typhon_plugin_api.builtin` (the built-in adapters' reach: brand classes, `CaptureSetup`, the Basler scan) refused to a plugin from someone else: it is a submodule of the one module a plugin may import, and nothing refuses it yet (P2 review) |
 
@@ -1205,13 +1408,15 @@ Decided here, where the design left it open:
   by `has()`, and nothing outside the branch names 0.2. A move to 0.3, if
   wanted, comes with the merge of P3's other rows, because it changes
   every manifest's `api` and is best made once.
-- **`on_run_finished` is called with the end record**, on the thread that
-  writes it, once the run's last frame is on disk — not on the Stop
-  thread, as design 3.11's table has it — so its counts are the end
-  record's and its block goes in that record, which is written once. It
-  is bounded (`RUN_HOOK_SECONDS`, 2 s, the watchdog's limit): the end
-  record is never held up by a plugin. With a disk that keeps up this is
-  during Stop; with a slow one it is after Stop returns.
+- **`on_run_finished` is called with the end record**, once the run's last
+  frame is on disk — not on the Stop thread, as design 3.11's table has it
+  — so its counts are the end record's and its block goes in that record,
+  which is written once. It runs on a thread of its own while the thread
+  that writes the end record waits for it (corrected at the P3 review:
+  this said "on the thread that writes it"), bounded (`RUN_HOOK_SECONDS`,
+  2 s, the watchdog's limit): the end record is never held up by a
+  plugin. With a disk that keeps up this is during Stop; with a slow one
+  it is after Stop returns.
 - **"run_stopped" is told as Stop ends the run, before its recording
   ends**, so always before `on_run_finished`, and once, also for a run
   whose recording ended by itself. A run whose recording ended before its
@@ -1235,7 +1440,10 @@ Decided here, where the design left it open:
   load during the run and write a sidecar. No sha256 yet: plugins from
   someone else load only from P5.
 - **`RunInfo.counts` is by camera** (`counts["cam1"]["frames_saved"]`),
-  ready for the rig's runs of M1.
+  ready for the rig's runs of M1. (It was not, until the P3 review: every
+  camera's counts were filed under the run's first camera, and each
+  plugin was asked once per camera's recorder; "A run of several cameras",
+  above.)
 - **The plan's name is the reservation's**: in a "Typhon (plugins)"
   project Start reserves from the same time stamp it told the start
   check (`RunPlan.base`), so the run is that name or its `_2`.
@@ -1427,3 +1635,99 @@ Decided here, where the design left it open:
 - **The API stays 0.3**: part C's additions are named by `has()`
   (`hook.frame_stage`) or are not API at all (the switch interval, the fake
   host's `load`).
+
+Taken at the P3 review (19 October 2026, branch `plugins/p3-fixed`). The
+design's own answers, used as it recommends them:
+
+- **A record gate that raises** leaves the frame it was handling saved and
+  marked by the gate's guard, and the recording ends with it (design 3.6
+  against 3.10; `FrameWriter.end_recording` does this) — and so do tags
+  that are not the trigger columns with plain values, now a fault like a
+  raise.
+- **A best-effort hook's fault is reported, that plugin is switched off,
+  and the run carries on** (3.10) — now also when the hook hangs (each is
+  bounded) or what it gives fails when it is read (cleaned inside its
+  guard), and for a gate's summary.
+- **Start-time and end-of-run hooks get a time limit** (3.11's table:
+  500 ms each, the watchdog's 2 s): `RUN_HOOK_SECONDS`, 2 s, for every one
+  Start, Stop and the end of a run wait on.
+- **The core adds the Downsample row to every frame camera, and a frame
+  camera with no trigger still captures snapshot runs** (2.5, 3.6): a
+  frame camera whose plugin gives it no capture set-up gets the core's.
+- **A 2 s watchdog switches a stuck plugin off** (3.10): a frame stage is
+  watched too.
+- **Everything a plugin draws or stores is in sensor coordinates, and a
+  position is never guessed** (3.12): `to_sensor` for the view's pixels,
+  `saved_to_sensor` for the saved picture's, the camera's terms read from
+  its settings, unknown ones refused.
+
+Decided here, where the design left it open:
+
+- **A hung start check refuses that Start**, as a failed one does, and the
+  next Start runs without it: design 3.10 lets only check_start refuse, and
+  a check that cannot answer gives no permission. Before the review the
+  watchdog already switched it off after 2 s; now Start does not wait for
+  it either.
+- **The hooks are bounded one at a time**, each on a thread of its own:
+  one hung plugin holds Start or Stop 2 s, several hung ones 2 s each, and
+  the order of the calls stays the project list's. A hook that runs on
+  after its bound is not stopped (Python cannot); nothing waits for it.
+- **run_stopped is told once a frame camera's stream has stopped**, still
+  before its recording ends and before on_run_finished, so the order the
+  feature suite holds (halt, run_stopped, close, on_run_finished, disarm)
+  is kept and a listener that hangs adds no frame; an event camera's stream
+  runs on after a run, so there it is told first, as before, and so is it
+  at Disconnect (bounded).
+- **A record gate is not watched; a frame stage is.** A gate's `tag` takes
+  the books' lock, under which the books write the triggers CSV, so a slow
+  disk would read as a hang and end a run over nothing; a stage only
+  computes. A stage that never returns still holds its run's end record
+  (the frames CSV is published in grab order): handing that frame over
+  would need the writer pool to give up on a frame in flight, which is
+  today's capture code; instead a built-in stage must return well within
+  the watchdog's limit, and the frame-stage suite times each one.
+- **One picture per run** for a frame stage: its first picture's size,
+  dtype and colour mode for the whole run. A stage may still crop for a
+  whole run (P3a's own test does); it may not change mid-run.
+- **Cleaning runs as little of a block's code as it can**: a dict's (and a
+  dict subclass's) items, a list's, a tuple's, a str's and a number's
+  value are read with the built-in types' own methods; another mapping's
+  items() and an unusual number's conversion still run its code — inside
+  the plugin's guard and bound. An n-dimensional numpy array is still
+  refused: a block holds plain values (a sidecar holds arrays).
+- **A block's size is the record's bytes**, indented at its depth, so a
+  block of 30,000 [x, y] points (240 KB on one line) is refused at about
+  1.2 MB as written: such data goes in a sidecar file (create_file or
+  write_new), as design 3.9 says of per-frame data.
+- **A fault's words are cut at 2,000 characters** in the records, the
+  status line and Start's and Stop's lines, the whole text and traceback
+  kept in `plugin_errors.log`.
+- **A plugin switched off is off for its context**: file services and
+  save_settings refuse, `on` listens for nothing; `say`, `settings`,
+  `state` and the camera handles still answer (they change nothing).
+- **Streamed text files are line-buffered; binary ones are buffered as
+  usual**, their plugin flushing them where a crash must not cut a record:
+  an unbuffered binary file may write only part of what it is given.
+- **`FrameView.saved` stays in the type, None until P4**, and
+  `has("frame.saved")` is False until the window fills it, rather than the
+  fake host guessing which frames were taken: what a frame is saved as is
+  known only once the writer has it.
+- **The camera's own terms are read once per stream** (GenICam locks
+  binning, decimation and ReverseX while grabbing; so does the simulated
+  camera), a camera without such a setting does not do it, and one whose
+  setting cannot be read leaves the term unknown.
+- **Trigger-source plugins wait for stage P6**, refused in the manifest
+  until then, with the rig's sources (one source firing several cameras):
+  that is where the triggering plugin first needs to pick a source that is
+  not its own. Design 9.1's "start and stop can be repeated" is read as
+  "repeating either is harmless; a start after stop starts nothing".
+- **A run of several cameras**: a camera-scoped plugin's block goes in its
+  camera's end record, a rig plugin's in the end record of the run's last
+  camera to end (asked once, every camera's counts in) — until M1's rig
+  end record (`<run>_rig_end.json`, P6) takes it.
+- **The kept-keys words name two cases**: "not running here" and "running
+  here that take no preset values".
+- **The API stays 0.3**: nothing outside the branch names it; what changed
+  is named by `has()` (`frame.saved_to_sensor` in, `frame.saved` out until
+  P4), and `to_sensor`'s meaning changed within 0.x, which allows any
+  change.
