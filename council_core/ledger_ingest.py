@@ -116,17 +116,19 @@ def _images_read(notes) -> int:
 
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
-                progress: Optional[Listener] = None) -> ExtractSummary:
+                progress: Optional[Listener] = None,
+                pattern_mask: Optional[str] = None) -> ExtractSummary:
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
-        s = _extract(csv_path, sources, review_path, part, use_images, image_reader, prog)
+        s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
+                     prog, pattern_mask)
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {len(s.problems)} problems")
         return s
 
 
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
-             prog) -> ExtractSummary:
+             prog, pattern_mask: Optional[str] = None) -> ExtractSummary:
     say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
@@ -147,7 +149,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog)
+                  progress=prog, pattern_mask=pattern_mask)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
     write_review(out, run, dec, ledger.schema, str(csv_path))
