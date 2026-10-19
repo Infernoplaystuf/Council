@@ -18,12 +18,16 @@ host), and against gates made to misbehave.
   * it is handed a frame it cannot change: the pixels and meta read-only —
     what is saved is never a gate's to change;
   * faults (design 3.10): raising, SystemExit, writing to a frame's pixels
-    or its meta, a fault in `saved` — each ends the recording with its
+    or its meta, tags that are not the trigger columns with plain values
+    (P3 review), a fault in `saved` — each ends the recording with its
     reason naming the plugin, the frame at a tag fault saved and marked
     "error: plugin fault", nothing after it, frames saved = frames CSV rows
     = the end record's count, the pixels as the camera sent them, and Stop
-    still puts the camera back; a slow gate and a sleeping hang cost no
-    frame the run says it saved;
+    still puts the camera back; a summary that raises SystemExit or gives a
+    NaN still leaves the end record (P3 review); a slow gate and a
+    sleeping hang cost no frame the run says it saved (a gate is not
+    watched: its books write the triggers CSV under the lock its tag takes,
+    so a slow disk would read as a hang);
   * a plugin from someone else cannot give one (its manifest is refused).
 
 Offscreen, temporary folders only.
@@ -111,7 +115,19 @@ class Watched:
         tags = self._gate.tag(frame)
         self.took.append(time.perf_counter() - began)
         self.tags.append((frame.index, None if tags is None else dict(tags)))
+        if how == "junk":
+            return "trigger 4"                   # not a mapping of tags
+        if how == "corekey":
+            return dict(tags or {}, reduce=4)    # not a trigger column
         return tags
+
+    def summary(self):
+        if self.how == "summary-exit":
+            raise SystemExit("the books left at the end")
+        out = self._gate.summary()
+        if self.how == "summary-nan":
+            out = dict(out, rate=float("nan"))
+        return out
 
     def saved(self, tags, ok, why=""):
         if self.how == "saved" and len(self.told) + 1 >= self.at:
@@ -273,7 +289,10 @@ def test_it_is_handed_a_frame_it_cannot_change(fake, watched):
 # ======================================================================
 # Faults (design 3.10)
 # ======================================================================
-FAULTS = ["raise", "systemexit", "pixels", "meta"]
+#: ... and, from the P3 review, tags that are not the trigger columns with
+#: plain values: a str (it stopped the grab thread with no word), and a
+#: core meta key ("reduce" changed the size of the pictures saved).
+FAULTS = ["raise", "systemexit", "pixels", "meta", "junk", "corekey"]
 
 
 def ended_by_itself(fake):
@@ -324,6 +343,25 @@ def test_a_fault_hearing_a_save_ends_the_recording_at_once(fake, watched):
     assert "plugin Triggering (typhon.trigger)" in said and "saved" in said
     assert fake.host.faults["typhon.trigger"].kind == ph.RECORDING
     assert not fake.device._armed
+
+
+@pytest.mark.parametrize("how", ["summary-exit", "summary-nan"])
+def test_a_summary_that_fails_still_leaves_a_whole_run(fake, watched, how):
+    """The end record's capture block is the books' summary, asked on the
+    writer thread as the recording ends: GUARDED and CLEANED since the P3
+    review — before, a SystemExit there, or a NaN, left no end record."""
+    fake.connect()
+    exact_timer(fake)
+    watched.how = how
+    run = fake.capture(frames=2, seconds=15)
+    assert run.problems() == [], "the end record is written"
+    block = run.end["capture"]
+    if how == "summary-exit":
+        assert "SystemExit" in block["error"]
+        assert fake.host.faults["typhon.trigger"].kind == ph.BEST_EFFORT
+    else:
+        assert block["rate"] is None and block["triggers"] >= 1
+    assert not fake.device._armed, "Stop put the camera back"
 
 
 @pytest.mark.parametrize("how", ["slow", "hang"])

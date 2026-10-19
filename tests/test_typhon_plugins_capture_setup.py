@@ -436,13 +436,22 @@ def test_a_spot_on_a_frame_averaged_by_typhon_maps_to_its_sensor_pixel(
     py, px = np.mgrid[0:saved.shape[0], 0:saved.shape[1]]
     total = saved.sum()
     cx, cy = (px * saved).sum() / total, (py * saved).sum() / total
-    got = view.to_sensor(cx, cy)
+    # A point measured on the SAVED picture (P3 review: saved_to_sensor;
+    # to_sensor is the view's own, full-size pixels).
+    got = view.saved_to_sensor(cx, cy)
     assert got == pytest.approx((sx, sy), abs=0.01)
     assert got == (reduce.sensor_position(cx, factor, ax),
                    reduce.sensor_position(cy, factor, ay))
     # A box's corner: the picture's pixel 0 is the block's centre.
-    assert view.to_sensor(0, 0) == (ax + (factor - 1) / 2.0,
-                                    ay + (factor - 1) / 2.0)
+    assert view.saved_to_sensor(0, 0) == (ax + (factor - 1) / 2.0,
+                                          ay + (factor - 1) / 2.0)
+    # The same spot measured on the picture the plugin is handed.
+    full = np.asarray(view.image, dtype=np.float64)
+    fy, fx = np.mgrid[0:full.shape[0], 0:full.shape[1]]
+    whole = full.sum()
+    assert view.to_sensor((fx * full).sum() / whole,
+                          (fy * full).sum() / whole) == \
+        pytest.approx((sx, sy), abs=0.01)
 
 
 def test_with_camera_binning_as_the_downsample_the_factor_is_the_binning():
@@ -455,6 +464,8 @@ def test_with_camera_binning_as_the_downsample_the_factor_is_the_binning():
     assert view.binning == (2, 2) and view.downsample == 2
     assert view.to_sensor(3, 1) == (reduce.sensor_position(3, 1, 5, 2),
                                     reduce.sensor_position(1, 1, 4, 2))
+    # The camera bins: the saved picture IS the one the plugin sees.
+    assert view.saved_to_sensor(3, 1) == view.to_sensor(3, 1)
     own = ph.frame_view(frame, "cam1", binning=(2, 2))
     assert own.to_sensor(3, 1) == view.to_sensor(3, 1)
 

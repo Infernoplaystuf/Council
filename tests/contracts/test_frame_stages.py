@@ -19,15 +19,18 @@ own Start and Stop (the fake host) — against stages made to misbehave.
     mixed colours;
   * it never changes the array or the meta it is given — a plugin's stage is
     handed read-only ones — and gives the same picture for the same input,
-    on several writer threads at once;
+    on several writer threads at once; it returns in well under half the
+    watchdog's limit on the largest frame Typhon records (it is watched);
   * what a run saves is what the stages made, and the run's records say the
     Downsample;
   * faults (design 3.10): raising, SystemExit, writing into its picture,
-    writing into its meta, giving no picture, a stage that cannot be had,
-    a slow one and a sleeping hang — each ends with frames saved = frames
-    CSV rows = the end record's count; a fault ends the recording there
-    with its reason naming the plugin, and the frames before it are whole
-    and as the camera sent them;
+    writing into its meta, giving no picture, a picture of another size or
+    dtype than its run's first (P3 review), a stage that cannot be had, a
+    slow one and a sleeping hang (switched off by the watchdog since the
+    P3 review) — each ends with frames saved = frames CSV rows = the end
+    record's count; a fault ends the recording there with its reason
+    naming the plugin, and the frames before it are whole and as the
+    camera sent them;
   * a plugin from someone else cannot give one (its manifest is refused).
 
 Offscreen, temporary folders only.
@@ -163,6 +166,27 @@ def test_same_in_same_out_on_several_writer_threads(name, stage):
     assert all(np.array_equal(m, want) for m in made)
 
 
+#: The largest frame Typhon records: a boA5320's whole sensor (rows, cols).
+FULL_FRAME = (4608, 5328)
+
+
+@pytest.mark.parametrize("name, stage", STAGES, ids=STAGE_IDS)
+def test_it_returns_well_within_the_watchdogs_limit_on_a_full_frame(
+        name, stage):
+    """A stage is WATCHED (P3 review): one that has not returned in
+    WATCHDOG_SECONDS is switched off as a hang and ends its run — and one
+    that never returns holds its run's end record, the frames CSV being
+    published in grab order. So every stage held to this contract returns
+    in well under half that on the largest frame Typhon records (the
+    core's Downsample: about 0.07 s at 2x, measured)."""
+    image = np.zeros(FULL_FRAME, np.uint16)
+    for factor in (1, 2, 4):
+        began = time.perf_counter()
+        stage(image, asked(factor))
+        took = time.perf_counter() - began
+        assert took < ph.WATCHDOG_SECONDS / 2, (factor, took)
+
+
 @pytest.mark.parametrize("bad, why", [
     (None, "NoneType, not a picture"),
     ("pixels", "str, not a picture"),
@@ -235,6 +259,12 @@ class Stage:
             meta["downsample"] = 9               # raises: read-only
         if how == "none":
             return None
+        if how == "resize":
+            # A picture of another size from frame `at` on (P3 review).
+            return np.ascontiguousarray(image[:max(1, image.shape[0] // 2)])
+        if how == "retype":
+            return image.astype(np.uint16 if image.dtype == np.uint8
+                                else np.uint8)
         if how == "slow":
             time.sleep(0.03)
         if how == "hang" and n == self.at:
@@ -339,7 +369,10 @@ def test_a_stage_that_cannot_be_had_refuses_start_before_anything_stops(
     whole(run)
 
 
-FAULTS = ["raise", "systemexit", "pixels", "meta", "none"]
+#: ... and, from the P3 review, a picture of another size or dtype than
+#: the run's first: one run holds pictures of one size and mode.
+FAULTS = ["raise", "systemexit", "pixels", "meta", "none", "resize",
+          "retype"]
 
 
 @pytest.mark.parametrize("how", FAULTS)
@@ -375,13 +408,23 @@ def test_a_fault_ends_the_recording_with_its_reason_and_nothing_is_lost(
 @pytest.mark.parametrize("how", ["slow", "hang"])
 def test_a_slow_or_hung_stage_costs_no_frame_the_run_says_it_saved(
         fake, frame_numbers, how):
+    """A slow stage costs nothing. A hung one — 3 s, past the watchdog's
+    2 s (design 3.10) — is WATCHED (P3 review; before, nothing saw it): it
+    is switched off as a hang, the recording ends with the plugin named,
+    and still every frame the run says it saved is on disk and in its
+    frames CSV."""
     fake.connect()
     plugin = Stage(how, at=2)
     fake.adopt(stage_manifest(), plugin)
     run = fake.capture(frames=4, seconds=20)
     end = whole(run)
-    assert end["recording_failed"] == ""
-    assert "typhon.stagecheck" not in fake.host.faults
+    if how == "slow":
+        assert end["recording_failed"] == ""
+        assert "typhon.stagecheck" not in fake.host.faults
+    else:
+        assert "typhon.stagecheck" in end["recording_failed"]
+        assert fake.host.faults["typhon.stagecheck"].kind == ph.HANG
+        assert "PluginHung" in end["plugin_faults"]["typhon.stagecheck"]
 
 
 def fake_run(fake, started):

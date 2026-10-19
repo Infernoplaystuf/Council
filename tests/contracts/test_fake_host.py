@@ -150,6 +150,17 @@ def test_another_plugins_short_name_or_run_file_is_refused(fake, tmp_path):
                          files=())
     with pytest.raises(FakeHostError, match="short name 'trig'"):
         fake.load(trig)
+    # P3 review: what Typhon's discovery refuses — the short name of a
+    # built-in this project switched off (the fake project switches the
+    # Prophesee plugin off), and a run file holding another's ending.
+    evk = plugin_folder(tmp_path / "four", pid="acme.evkish", short="evk",
+                        files=())
+    with pytest.raises(FakeHostError, match="short name 'evk'"):
+        fake.load(evk)
+    holds = plugin_folder(tmp_path / "five", pid="acme.holds", short="acmh",
+                          files=("_acmh_acmk_marks.csv",))
+    with pytest.raises(FakeHostError, match="holds acme.marks's"):
+        fake.load(holds)
 
 
 def test_only_the_simulated_cameras_are_scanned_unless_asked(tmp_path):
@@ -209,3 +220,24 @@ def test_a_runs_sums_are_checked_in_one_call(tmp_path):
     assert any("not there: r_frame_000002.png" in s for s in said), said
     assert Run(folder, "nothing").problems() == [
         "nothing_run_end.json is not there: the recording has not ended"]
+
+
+def test_a_run_of_two_picture_sizes_or_modes_is_a_problem(tmp_path):
+    """P3 review: one run holds pictures of one size and mode."""
+    import numpy as np
+    from PIL import Image
+
+    folder = tmp_path / "runs"
+    folder.mkdir()
+    (folder / "r_frames.csv").write_text(
+        "file,index\nr_frame_000001.png,1\nr_frame_000002.png,2\n",
+        encoding="utf-8")
+    Image.fromarray(np.zeros((4, 6), np.uint8)).save(
+        folder / "r_frame_000001.png")
+    Image.fromarray(np.zeros((4, 6, 3), np.uint8)).save(
+        folder / "r_frame_000002.png")
+    (folder / "r_run_end.json").write_text(json.dumps({"frames_saved": 2}),
+                                           encoding="utf-8")
+    said = Run(folder, "r").problems()
+    assert any("more than one size or mode" in s and "6x4 8-bit grey" in s
+               and "6x4 8-bit RGB" in s for s in said), said

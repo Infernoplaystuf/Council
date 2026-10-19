@@ -10,8 +10,9 @@ files.
   * (a) STREAMED, during a run (`ctx.create_file`): made exclusively — a
     second of one name refused — only in the run's folder, only as
     "<run><ending>" with an ending its manifest declares, only from the
-    name's reservation to Stop, text (UTF-8) or binary; a file left open
-    is closed at the run's end;
+    name's reservation to Stop, text (UTF-8, each line reaching the file
+    as it ends: P3 review) or binary; a file left open is closed at the
+    run's end;
   * (b) WHOLE, at any time (`ctx.write_new`): written under a temporary
     name, then renamed into a name that must not exist — "_2", "_3" on a
     rerun — beside a run (past runs too) or in the plugin's own data
@@ -20,7 +21,8 @@ files.
   * a name is a plain file name: no folder, no "..", no stream, no device
     name; the context has no delete, rename or move;
   * every declared run file is a run marker, so a run whose only file left
-    is a plugin's keeps its name; no plugin claims the core's files.
+    is a plugin's keeps its name; no plugin claims the core's files;
+  * a plugin switched off has its file services closed (P3 review).
 
 Offscreen, temporary folders only.
 """
@@ -115,6 +117,13 @@ PROBE = textwrap.dedent('''
             binary = ctx.create_file(folder, run.run + DATA, binary=True)
             binary.write(b"\\x00\\x01")
             self.left_open = binary          # Typhon closes it
+            lines = ctx.create_file(folder, run.run + "_prb_lines.csv")
+            lines.write("a,1\\r\\n")
+            lines.write("b,2\\r\\n")
+            with open(folder / (run.run + "_prb_lines.csv"), newline="",
+                      encoding="utf-8") as seen:
+                self.said["lines before close"] = seen.read()
+            lines.close()
 
         def on_run_finished(self, run):
             ctx = self.ctx
@@ -150,7 +159,8 @@ def probe_folder(where):
         "scope": "rig", "entry": "plugin:Probe",
         "contributes": ["run_hooks"],
         "files": ["_prb_marks.csv", "_prb_data.bin", "_prb_sum.json",
-                  "_prb_text.csv", "_prb_late.csv", "_prb_other2.csv"],
+                  "_prb_text.csv", "_prb_late.csv", "_prb_other2.csv",
+                  "_prb_lines.csv"],
         "author": "Someone", "description": "Tries to write.",
         "licence": "MIT"}), encoding="utf-8")
     (folder / "plugin.py").write_text(PROBE, encoding="utf-8")
@@ -202,6 +212,34 @@ def test_a_binary_streamed_file_left_open_is_closed_at_the_runs_end(probed):
     _fake, run, probe = probed
     assert probe.left_open is not None and probe.left_open.closed
     assert run.file("_prb_data.bin").read_bytes() == b"\x00\x01"
+
+
+def test_a_streamed_text_file_reaches_the_file_as_each_line_ends(probed):
+    """Line-buffered (P3 review): a crash mid-run leaves every row written
+    so far — before, a sidecar's rows sat in its 8 KB buffer, and a crash
+    left it empty. (A binary stream is its plugin's to flush.)"""
+    _fake, run, probe = probed
+    assert probe.said["lines before close"] == "a,1\r\nb,2\r\n"
+    assert run.file("_prb_lines.csv").read_bytes() == b"a,1\r\nb,2\r\n"
+
+
+def test_a_plugin_switched_off_has_its_file_services_closed(tmp_path):
+    """Design 3.10: switched off for the session — so a thread it left
+    running can no longer make, write or keep files (P3 review: a faulted
+    plugin's thread still made a run file and saved settings)."""
+    fake = FakeHost(tmp_path / "fake")
+    try:
+        fake.load(probe_folder(tmp_path / "author"))
+        probe = fake.instance("acme.probe")
+        own = probe.ctx.data_dir()
+        fake.host.fault("acme.probe", "a test", RuntimeError("switched"))
+        with pytest.raises(api.PluginFileError, match="switched off"):
+            probe.ctx.write_new(own, "notes.json", b"[]")
+        with pytest.raises(api.PluginFileError, match="switched off"):
+            probe.ctx.data_dir()
+        assert not (own / "notes.json").exists()
+    finally:
+        fake.close()
 
 
 @pytest.mark.parametrize("bad", NOT_PLAIN, ids=range(len(NOT_PLAIN)))

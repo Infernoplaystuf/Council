@@ -18,13 +18,22 @@ Typhon's own Start and Stop, simulated cameras, a temporary project).
     folder, under a name its manifest declares, and every declared ending is
     a run marker;
   * triggering: a snapshot from Software and from the Timer runs on a frame
-    camera that offers no trigger facet at all and saves the frames after
-    each trigger; an exact run on that camera is refused with a reason;
+    camera that offers no trigger facet at all — nor any capture set-up of
+    its own: since the P3 review a Device written against the API alone,
+    whose set-up (and Downsample row) is the core's — and saves the frames
+    after each trigger; an exact run on that camera is refused with a
+    reason;
   * faults, for every kind: raising, SystemExit, writing to a frame's
     pixels or its meta, a sleeping hang, a slow plugin, a write outside the
     run, making one file twice — each ends with the frames saved, the
     frames CSV's rows and the end record's count equal, the pixels as the
-    camera sent them, and the capture carried on;
+    camera sent them, and the capture carried on; and (P3 review) a hang
+    in check_start (that Start refused within its bound, the next one
+    without it), in on_run_started (Start held no longer than its bound),
+    in a run_stopped listener (no frame after Stop) and in the block
+    on_run_finished gives — raising, SystemExit or a hang when it is read
+    — costs only that plugin: the end record is written, the other
+    plugins' blocks kept, the culprit named and switched off;
   * (P3 row 6, part C) its blocks in a run's records are plain JSON under
     the size limit; its preset keys round-trip through a preset under
     their own names; its settings saves take the lock (many at once, from
@@ -45,6 +54,7 @@ import sys
 import textwrap
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -237,13 +247,51 @@ def test_its_records_are_format_1s_and_its_file_the_runs_own(fake):
 # ======================================================================
 # Triggering on a frame camera with no trigger facet at all (design 3.6)
 # ======================================================================
+class PlainDevice(api.Device):
+    """A frame camera's Device as a camera plugin written against
+    typhon_plugin_api alone has it (P3 review: the case before ran on the
+    simulated camera, which carries today's capture set-up): the base
+    Device's `capture` (None), no trigger, no binning, no settings. Its
+    capture set-up is the core's (council_core.plugin_capture)."""
+
+    def __init__(self, info):
+        self.info = info
+        self._started = False
+        self._index = 0
+        self._roi = api.Roi(0, 0, 64, 48)
+
+    def limits(self):
+        return api.Limits(width=64, height=48)
+
+    def roi(self):
+        return self._roi
+
+    def set_roi(self, roi):
+        self._roi = roi
+        return roi
+
+    def start(self):
+        self._started = True
+
+    def stop(self):
+        self._started = False
+
+    def read(self, timeout_ms=1000):
+        time.sleep(0.01)
+        if not self._started:
+            return None
+        self._index += 1
+        return api.Frame(np.full((48, 64), 10 + self._index % 200, np.uint8),
+                         self._index, self._index * 1000,
+                         {"aoi": (0, 0, 64, 48)})
+
+
 class PlainCameras:
     """A camera plugin whose frame cameras offer no trigger and no binning
     at all — no facet, and only `frames` and `restartable` confirmed (a
-    third party's simple camera, design 3.6). Its cameras are the simulated
-    frame camera under a family of its own; until stage P7 the camera's
-    set-up is still kept on the Device (design 2.5), which the simulated
-    one has."""
+    third party's simple camera, design 3.6) — and no capture set-up of
+    their own (PlainDevice): the core gives them its own (design 2.5: the
+    core adds the Downsample row to every frame camera)."""
 
     backend = "plain"
 
@@ -263,8 +311,7 @@ class PlainCameras:
                                    "frame")]
 
     def open(self, info):
-        from council_core import cameras
-        return cameras.SyntheticDevice(info)
+        return PlainDevice(info)
 
     def capabilities(self, device):
         return frozenset({"frames", "restartable"})
@@ -294,6 +341,9 @@ def no_trigger_camera(fake):
     assert fake._fc._RIG.active.capabilities == {"frames", "restartable"}
     handle = fake.host.camera_handles()[fake.camera]
     assert all(handle.facet(n) is None for n in api.FACETS), "no facet"
+    keys = {s.key for s in fake.device.settings()}
+    assert {tg.MODE_KEY, tg.SOURCE_KEY, tg.DOWNSAMPLE_KEY} <= keys, \
+        "the core's capture set-up: the trigger rows and Downsample's"
     return fake
 
 
@@ -320,6 +370,20 @@ def test_a_snapshot_runs_on_a_camera_with_no_trigger(no_trigger_camera,
     assert {r["trigger_frame"] for r in run.frames} == {"1", "2"}
     assert {r["trigger_source"] for r in run.frames} == {source}
     assert all(r["outcome"] == "ok" for r in run.triggers[:2])
+    assert run.problems() == []
+
+
+def test_downsample_is_the_cores_on_a_camera_with_no_set_up(
+        no_trigger_camera):
+    """Design 2.5: the core adds the Downsample row to every frame camera
+    (Typhon averages: this camera does not bin)."""
+    from PIL import Image
+    fake = no_trigger_camera
+    fake.set(tg.DOWNSAMPLE_KEY, "2x")
+    run = fake.capture(frames=2)
+    assert run.problems() == []
+    assert {Image.open(p).size for p in run.pngs()} == {(32, 24)}
+    assert run.record["downsample"]["method"] == "typhon_block_mean"
 
 
 @pytest.mark.parametrize("source", [tg.SOFTWARE, tg.TIMER, "Line1"])
@@ -429,6 +493,184 @@ def test_a_misbehaving_plugin_never_costs_a_frame(fake, how):
     if how == "twice":
         made = run.folder / f"{run.run}_bad_marks.csv"
         assert made.is_file(), "made once"
+
+
+# ======================================================================
+# Hangs in Start's and Stop's hooks, and in a block (P3 review)
+# ======================================================================
+#: Each run hook's bound while these run (plugin_host.RUN_HOOK_SECONDS).
+BOUND_S = 0.5
+
+
+class Hangs:
+    """A run-hook plugin that hangs in `where` until released: one of its
+    hooks (check_start, on_run_started), a run_stopped listener, or the
+    block on_run_finished gives ("block": its items() waits)."""
+
+    def __init__(self, where, release):
+        self.where = where
+        self.release = release
+        self.ctx = None
+
+    def activate(self, ctx):
+        self.ctx = ctx
+        if self.where == "run_stopped":
+            ctx.on("run_stopped", lambda data: self.release.wait(20))
+
+    def deactivate(self):
+        pass
+
+    def check_start(self, plan):
+        if self.where == "check_start":
+            self.release.wait(20)
+        return ""
+
+    def on_run_started(self, run):
+        if self.where == "on_run_started":
+            self.release.wait(20)
+
+    def on_run_finished(self, run):
+        if self.where == "block":
+            return Junk("hang", self.release)
+        return {"ok": True}
+
+
+class Junk(Mapping):
+    """What on_run_finished gives that is the plugin's own code to read (a
+    mapping that is no dict): items() raises (`how` "raise",
+    "systemexit") or waits ("hang")."""
+
+    def __init__(self, how, release=None):
+        self.how = how
+        self.release = release
+        self.value = {"x": 1}
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __iter__(self):
+        return iter(self.value)
+
+    def __len__(self):
+        return len(self.value)
+
+    def items(self):
+        if self.how == "raise":
+            raise RuntimeError("its block fell over")
+        if self.how == "systemexit":
+            raise SystemExit("its block left")
+        if self.how == "hang":
+            self.release.wait(20)
+        return dict(self.value).items()
+
+
+class Returns:
+    """A run-hook plugin whose on_run_finished gives `block`."""
+
+    def __init__(self, block):
+        self.block = block
+
+    def activate(self, ctx):
+        pass
+
+    def on_run_finished(self, run):
+        return self.block
+
+
+def _hook_plugin(fake, pid, short, plugin):
+    fake.adopt({"schema": 1, "id": pid, "short": short,
+                "name": short.title(), "version": "1.0.0",
+                "api": pm.API_VERSION, "kind": "feature", "scope": "rig",
+                "entry": "plugin:P", "contributes": ["run_hooks"]}, plugin)
+
+
+@pytest.fixture
+def bounded(monkeypatch):
+    monkeypatch.setattr(ph, "RUN_HOOK_SECONDS", BOUND_S)
+    release = threading.Event()
+    yield release
+    release.set()
+
+
+def test_a_hung_on_run_started_holds_start_no_longer_than_its_bound(
+        fake, bounded):
+    fake.connect()
+    _hook_plugin(fake, "typhon.hangs", "hangs",
+                 Hangs("on_run_started", bounded))
+    began = time.monotonic()
+    started = fake.start()
+    took = time.monotonic() - began
+    try:
+        assert took < BOUND_S + 2.0, took
+        assert "did not return from on_run_started" in started["summary"]
+    finally:
+        fake.stop()
+    run = fake_run(fake, started)
+    assert wait_for(lambda: run.file("_run_end.json").is_file())
+    assert run.problems() == []
+    assert fake.host.faults["typhon.hangs"].kind == ph.HANG
+
+
+def test_a_hung_start_check_refuses_start_within_its_bound(fake, bounded):
+    fake.connect()
+    _hook_plugin(fake, "typhon.hangs", "hangs",
+                 Hangs("check_start", bounded))
+    began = time.monotonic()
+    with pytest.raises(RuntimeError, match="did not answer its start check"):
+        fake.start()
+    assert time.monotonic() - began < BOUND_S + 2.0
+    assert not fake.runs.exists() or list(fake.runs.iterdir()) == [], \
+        "refused before anything was reserved"
+    run = fake.capture(frames=2)
+    assert run.problems() == [], "the next Start runs without it"
+
+
+def test_a_hung_run_stopped_listener_adds_no_frame_after_stop(fake,
+                                                              bounded):
+    fake.connect()
+    _hook_plugin(fake, "typhon.hangs", "hangs",
+                 Hangs("run_stopped", bounded))
+    fake.instance("typhon.hangs")
+    started = fake.start()
+    assert wait_for(lambda: fake.session.stats().recorded >= 3)
+    began = time.monotonic()
+    fake.stop()
+    assert time.monotonic() - began < BOUND_S + 2.0
+    grabbed = fake.session.stats().grabbed
+    run = fake_run(fake, started)
+    assert wait_for(lambda: run.file("_run_end.json").is_file())
+    assert run.problems() == []
+    assert run.end["frames_saved"] <= grabbed
+    time.sleep(0.3)
+    assert fake.session.stats().grabbed == grabbed, \
+        "the stream stopped before its listeners were told"
+
+
+@pytest.mark.parametrize("how", ["raise", "systemexit", "hang"])
+def test_a_block_that_fails_when_read_costs_only_its_plugin(fake, bounded,
+                                                            how):
+    """Design 3.10: on_run_finished is best effort — whatever its block
+    does when it is read is its plugin's fault, never the end record's."""
+    fake.connect()
+    _hook_plugin(fake, "typhon.good", "good", Returns({"ok": True}))
+    plugin = (Hangs("block", bounded) if how == "hang"
+              else Returns(Junk(how)))
+    _hook_plugin(fake, "typhon.bad", "bad", plugin)
+    began = time.monotonic()
+    run = fake.capture(frames=2)
+    assert time.monotonic() - began < BOUND_S + 8.0
+    assert run.problems() == [], "the end record is written, the run whole"
+    end = run.end
+    assert end["plugins"] == {"typhon.good": {"ok": True}}
+    assert "typhon.bad" in end["plugin_faults"]
+    assert "typhon.bad" in fake.host.faults
+    again = fake.capture(frames=2)
+    assert again.problems() == [], "and the next run is whole too"
+
+
+def fake_run(fake, started):
+    from typhon_plugin_api.fake_host import Run
+    return Run(fake.runs, started["run"])
 
 
 # ======================================================================
