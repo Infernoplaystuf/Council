@@ -484,6 +484,61 @@ D5)"; the review found the same on 7ec6bc4): it drives this PC's own
 Excel, the file has not changed on the branch and touches no camera code
 — an environment failure, not a load one as P3a and P3c took it for.
 
+**The merge of qt-migration after P3** (19 October 2026, branch
+`plugins/merge-qt2`, on `typhon-plugins` 3763e9c). qt-migration was merged
+at 9fc447f (1905d1a) and, as it moved on while that was checked, again at
+cd0e501 (8ff2379: PR #14's three foundation fixes and PR #15, no
+conflicts). Two conflicts, both in the first:
+
+- `council_core/capture.py`: qt-migration's grab-loop fix (d919100,
+  8de03eff: BaseException caught, the end record's `stream_ended`) is the
+  one the branch took at the P2 review (680195a), without the branch's
+  `FrameWriter.end_recording` (P3 row 6). The branch's file is kept whole;
+  it holds every line of qt-migration's change, and
+  `tests/test_capture.py`'s three new tests pass on it.
+- `CLAUDE.md`: both pointers kept.
+
+`tests/test_capture_review_order.py`, new on qt-migration (c768e59, two
+runs in one second keep their order), names `capture_review` and is in
+`TYPHON_FILES` now; `--check-list` says the list is complete. Every Typhon
+test file of the gate is as qt-migration (cd0e501) has it, but for the
+retired Barbie test and its `RETIRED` entry, as before. No test was
+retired and no Typhon test file changed.
+
+The one follow-up (b90137d): `ReviewSource.latest`, the Prophesee raw
+view's newest recording, sorted whole names, as the slider's `latest_raw`
+did before c768e59, and called `<run>_events.raw` newer than
+`<run>_2_events.raw`. It keeps the slider's `run_order_key` rule now, of
+its own (the API cannot import the slider, which is Qt). Six tests failed
+on the merge commit 1905d1a and pass after: the P2 test that holds the two
+equal, the API's rule for any suffix and in capitals, the two equal for
+every set of seven names (127 folders), and two of the review-source
+contract suite's.
+
+The gate, 6 at a time: on b90137d, 79 files, 3,977 passed, 0 failed, 51
+skipped, in 294 s; on 8ff2379, the same counts in 201 s; no rerun either
+time. In the `pylon` environment, one process with `PYLON_CAMEMU=2` and
+OpenEB on the path, on 8ff2379 (a detached copy): the 24 camera and
+Barbie v4 files of the gate (the 23 above and
+`tests/test_capture_review_order.py`) and the branch's 20 camera files, 44
+files, 1,767 passed, 0 failed, 1 skipped (the check a simulated event
+camera cannot be put to), in 545 s; `tests/test_basler_real.py` ran its 47.
+
+The whole suite, 8 at a time, in detached copies: on 8ff2379, 271 files,
+9,918 passed, 0 failed, 40 skipped, in 829 s; on qt-migration's cd0e501,
+253 files, 9,186 passed, 0 failed, 36 skipped, in 887 s; `smoke_test.py`
+passed 1,313 with 0 failed on both. The three failures 9fc447f had in the
+whole suite (`tests/test_council_qt_foundation.py::
+test_no_tab_test_builds_actions_against_the_real_vault` and
+`::test_the_drain_list_covers_every_worker_a_tab_starts`,
+`tests/test_kg_excel.py::test_an_excel_failure_is_tried_again_next_time`)
+are fixed by PR #14 and passed on both. The known-flaky warm-list test
+and `tests/test_excel_open.py`'s Excel test (now judged by its own Excels,
+d605984) passed too. The 18 more files and 4 more skips of the branch are
+its own (`tests/test_typhon_plugins_*.py` and the two rig files; that run
+takes `tests/test_*.py` only, so the contract suites are the gate's and
+the `pylon` run's).
+
 ## The plugin host (stage P1 row 2)
 
 The rig is the plugin host: `frame_camera._RIG.plugins`, made on first use.
@@ -769,3 +824,4 @@ python tools\typhon_plugins_timing.py --out timing.json
 | P3 row 6: contract suites for every kind, and the fake host | done: on branch `plugins/p3b` the fake host and the trigger-source and feature suites; on `plugins/p3c` the rest (`docs/typhon_plugin_api_notes.md`, "The fake host and the contract suites"): `tests/contracts/test_frame_stages.py` (the core's Downsample, and a built-in plugin's stage after it, now asked at Start), `test_record_gates.py` (the triggering plugin's books in four modes), `test_review_sources.py` (the Prophesee raw view), `test_file_services.py` (both services, through a plugin loaded from its folder), and the fault cases the feature and camera suites lacked; the fake host loads a plugin's folder as an author has it (`FakeHost.load`), scans only the simulated cameras, and checks a run's sums (`Run.problems`). Every built-in plugin passes its kind's suites. The recording path now hands a frame stage and a record gate read-only frames |
 | P3 closed (18 October 2026) | rows 1-6 on `plugins/p3a`, `plugins/p3b` and `plugins/p3c`, not yet merged into `typhon-plugins`. From P2's open list: the core keeps asking the Device's own flags for restarting, raw recording and the live area (no P3 row moves them; the open-time check and the camera suite hold them equal to the slot's capabilities; they move with M1's per-slot functions, P6), and the frame's own array is not made read-only at `read()` — instead every way a plugin is handed a frame is read-only (a FrameView since P1, a frame stage's input and a record gate's frame since P3c). What is left of P3 for later stages: the bench-PC timing (above), the third-party `sha256` in the camera record (P5), the screen points shown (P4) |
 | P3 review (19 October 2026) | fixed on branch `plugins/p3-fixed` (`tests/test_typhon_plugins_p3_review.py`, a test per finding, 69 of its 72 failing on 14b3566; `docs/typhon_plugin_api_notes.md`, "Taken at the P3 review"): Start, Stop and the end of a run wait for no plugin call longer than `RUN_HOOK_SECONDS` — check_start (a hung one refuses that Start), on_run_started, the run_started and run_stopped listeners, record_fields, on_run_finished — and a frame camera's run_stopped is told once its stream has stopped, so a hung listener adds no frame; a block is cleaned inside the guarded, bounded call that gave it, measured as the record writes it (indented, at its depth; it was measured compactly, and blocks inside the limits made records over the 4 MB read limit), stopped at the first byte past the limit, numpy 2's `np.bool_` cleaned; the end record and the frames CSV survive whatever a block, a gate's summary or the plugins' part raises, SystemExit included (core code: `Recorder.finish`, `FrameWriter._close_recorder`); a record gate's tags are the trigger columns with plain values, or a fault on the recording path; a frame stage keeps one picture per run and is watched by the watchdog; `FrameView.to_sensor` converts the view's own pixels and `saved_to_sensor` the saved picture's, the camera's own binning, decimation and mirroring are read from its settings (unknown refused), and `has("frame.saved")` is False until P4; kind "source" is refused until P6, and the trigger-source suite takes any source (start and stop repeated harmlessly); a frame camera whose plugin gives it no capture set-up gets the core's (`council_core/plugin_capture.py`: the trigger rows, the core's Downsample row, snapshot runs); the fake host refuses what discovery refuses, discovery refuses an ending held in another's, and a rerun file marks its run as taken; a faulted or let-go plugin's context refuses files, settings and listening; a run of several cameras files each camera's counts and asks a rig plugin once; a fault's words are cut in the records; streamed text files are line-buffered; the kept-keys words, the "Start refused — an exact ..." refusal and the simulated plugin's broken line mended. Today's Typhon: frame_camera loads `reduce` and `triggered` with itself again (its Python Scripts list's loaded column as on 7ec6bc4; the same 37 names); its records, run names and calls are as before. Two of the review's findings needed no change on the branch: a pylon-env live-view test that flaked once (above, "Load-sensitive in the pylon environment") and `tests/test_excel_open.py`'s failure, which fails alone on 14b3566 and 7ec6bc4 too (the PC's Excel). Not merged into `typhon-plugins` yet |
+| Merge of qt-migration after P3 (19 October 2026) | done on branch `plugins/merge-qt2` (above, "The merge of qt-migration after P3"): qt-migration at 9fc447f and then cd0e501 - the grab loop's `stream_ended` (the branch's own since the P2 review, kept with `end_recording`), the suite-reliability fixes, the grouped tabs, capture_review's run order, PR #14's foundation fixes, Ledger and knowledge-graph work; `tests/test_capture_review_order.py` in the gate; `ReviewSource.latest` takes the slider's run order (two runs in one second). No Typhon test file changed, none retired. Not merged into `typhon-plugins` yet |
