@@ -228,8 +228,9 @@ def data_dir(project_dir: Any, pid: str, make: bool = True) -> Path:
 def create_file(active: Optional[ActiveRun], folder: Any, name: Any,
                 suffixes: Sequence[str], *, binary: bool = False) -> Any:
     """A new run file `name` in `folder`, made EXCLUSIVELY and opened for
-    writing (text: UTF-8, newline=""; or `binary`), for the run in
-    progress `active` (see the module's notes). PluginFileError when there
+    writing (text: UTF-8, newline="", line-buffered; or `binary`, which
+    its plugin flushes), for the run in progress `active` (see the
+    module's notes). PluginFileError when there
     is no run in progress, `folder` is not one of its folders, `name` is
     not "<run><ending>" with an ending in `suffixes`, or the file is
     already there."""
@@ -252,8 +253,17 @@ def create_file(active: Optional[ActiveRun], folder: Any, name: Any,
             f"({', '.join(suffixes) or 'it declares none'})")
     path = Path(active.folders[camera]) / text
     try:
+        # A text file is LINE-BUFFERED: each row reaches the file as its
+        # line ends, so a crash mid-run leaves every row written so far (P3
+        # review: a sidecar held none of its five rows after a crash, all
+        # of them still in the 8 KB buffer). The OS keeps them; nothing is
+        # forced onto the disk itself. A binary file is buffered as usual —
+        # only its plugin knows where a record ends — so a plugin flushes
+        # it where a crash must not cut it (the API notes say so): an
+        # unbuffered one may write part of what it is given.
         handle = (open(path, "xb") if binary else
-                  open(path, "x", newline="", encoding="utf-8"))
+                  open(path, "x", newline="", encoding="utf-8",
+                       buffering=1))
     except FileExistsError as exc:
         raise PluginFileError(f"{text} is already there: a run's file is "
                               f"made once, never written over") from exc

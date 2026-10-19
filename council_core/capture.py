@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import csv
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -453,13 +454,35 @@ def run_markers() -> Tuple[str, ...]:
     return tuple(dict.fromkeys(RUN_MARKERS + tuple(registered)))
 
 
+def _reruns() -> List[Any]:
+    """For each registered run file "<stem><ext>", the pattern of its
+    numbered forms "<run><stem>_2<ext>", "_3" ... — what a plugin's whole
+    file written again beside the same run is named (plugin_runs.numbered;
+    typhon-plugins P3 review: a run whose only file left was such a one
+    was not counted as taken). Today's RUN_MARKERS have none: nothing
+    writes them twice."""
+    with _REGISTRY_LOCK:
+        registered = [s for suffixes in _REGISTERED.values()
+                      for s in suffixes]
+    out = []
+    for suffix in dict.fromkeys(registered):
+        stem, dot, ext = suffix.rpartition(".")
+        if not dot or not stem:
+            continue
+        out.append(re.compile(rf"^(?P<run>.+?){re.escape(stem)}_[0-9]+"
+                              rf"{re.escape(dot + ext)}\Z"))
+    return out
+
+
 def taken_runs(folder: Any) -> set:
     """The run names already used in `folder`: every name a file of a run
     starts with (run_markers: today's RUN_MARKERS and every registered run
-    file), and every sub-folder's name. Empty for a folder that does not
-    exist or cannot be listed."""
+    file, and a registered run file's numbered rerun forms), and every
+    sub-folder's name. Empty for a folder that does not exist or cannot be
+    listed."""
     names: set = set()
     markers = run_markers()
+    reruns = _reruns()
     try:
         with os.scandir(str(folder)) as found:
             for entry in found:
@@ -472,6 +495,10 @@ def taken_runs(folder: Any) -> set:
                     head, hit, _ = entry.name.partition(marker)
                     if hit:
                         names.add(head)
+                for pattern in reruns:
+                    match = pattern.match(entry.name)
+                    if match:
+                        names.add(match.group("run"))
     except OSError:
         pass
     return names
@@ -791,9 +818,13 @@ class Recorder:
             doc["stream_ended"] = str(totals["stream_ended"])
         info = self.capture_info
         if callable(info):
+            # BaseException (typhon-plugins P3 review): a run's books may be
+            # a plugin's (its guarded record gate), and this is the writer
+            # thread that writes the end record — nothing raised here may
+            # cost the run its end record.
             try:
                 doc["capture"] = dict(info())
-            except Exception as exc:                        # noqa: BLE001
+            except BaseException as exc:                    # noqa: BLE001
                 doc["capture"] = {"error": f"{type(exc).__name__}: {exc}"}
             doc["capture"]["frames_between_triggers"] = int(
                 totals.get("passed", 0) or 0)
@@ -802,11 +833,12 @@ class Recorder:
         extra = self.end_blocks
         if callable(extra):
             # The plugin host's part (its plugins' on_run_finished, bounded
-            # in time there), asked with the record so far — its counts —
-            # and allowed to add END_BLOCK_KEYS only.
+            # and guarded there), asked with the record so far — its
+            # counts — and allowed to add END_BLOCK_KEYS only. BaseException
+            # likewise: the end record is written whatever it raises.
             try:
                 more = dict(extra(dict(doc)) or {})
-            except Exception as exc:                        # noqa: BLE001
+            except BaseException as exc:                    # noqa: BLE001
                 more = {"plugin_faults": {
                     "": f"the plugins' end of the run failed — "
                         f"{type(exc).__name__}: {exc}"}}
@@ -817,16 +849,21 @@ class Recorder:
         try:
             return camera_record.write_once(self.end_path, doc)
         except (ValueError, TypeError) as exc:
-            # Not JSON: only the plugins' part can be (the record's own
-            # fields are plain), so the record is written without it.
-            if "plugins" not in doc:
+            # Not JSON: only the plugins' part and the books' capture block
+            # can be (the record's own fields are plain), so the record is
+            # written without the plugins' blocks and with the capture block
+            # made plain (a NaN as null).
+            if "plugins" not in doc and "capture" not in doc:
                 self.end_note = f"{type(exc).__name__}: {exc}"
                 return None
-            doc.pop("plugins")
-            faults = dict(doc.get("plugin_faults") or {})
-            faults[""] = (f"the plugins' blocks could not be written — "
-                          f"{type(exc).__name__}: {exc}")
-            doc["plugin_faults"] = faults
+            if "plugins" in doc:
+                doc.pop("plugins")
+                faults = dict(doc.get("plugin_faults") or {})
+                faults[""] = (f"the plugins' blocks could not be written — "
+                              f"{type(exc).__name__}: {exc}")
+                doc["plugin_faults"] = faults
+            if "capture" in doc:
+                doc["capture"] = camera_record._plain_tree(doc["capture"])
         except Exception as exc:                            # noqa: BLE001
             self.end_note = f"{type(exc).__name__}: {exc}"
             return None
@@ -1259,19 +1296,25 @@ class FrameWriter:
 
     def _close_recorder(self) -> None:
         """The last writer out: every frame is published (or the first
-        failed write ended the recording). The end record, then the index."""
+        failed write ended the recording). The end record, then the index —
+        the index closed whatever the end record raised, BaseException
+        included: a plugin's code may run there (typhon-plugins P3 review:
+        a SystemExit in a plugin's block left the frames CSV open), and
+        this is a writer thread, never the main one (no Ctrl+C lands
+        here)."""
         finish = getattr(self.recorder, "finish", None)
-        if callable(finish):
-            try:
+        try:
+            if callable(finish):
                 finish(self.totals())
-            except Exception:                               # noqa: BLE001
-                pass
-        closer = getattr(self.recorder, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:                               # noqa: BLE001
-                pass
+        except BaseException:                               # noqa: BLE001
+            pass
+        finally:
+            closer = getattr(self.recorder, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except BaseException:                       # noqa: BLE001
+                    pass
 
     def wait_empty(self, timeout: Optional[float] = None) -> bool:
         """Block until everything queued is on disk. False on timeout."""

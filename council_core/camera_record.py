@@ -41,10 +41,17 @@ Keys format 1 already has stay where they are (`capture`, `downsample`);
 everything new a plugin adds is in `plugins`, under its id, and nowhere
 else, so no fact is ever kept in two places across old and new runs. Each
 block is CLEANED (clean_block: NaN and infinities become null, tuples lists,
-numbers plain numbers) and SIZE-CHECKED (BLOCK_BYTES each, PLUGINS_BYTES in
-all), so a plugin can never make a record unwritable or unreadable: in the
-plugin design's prototype a NaN stopped the record being written, and a
-14.3 MB block made it unreadable, over MAX_RECORD_BYTES.
+numbers plain numbers, numpy's included) and SIZE-CHECKED (BLOCK_BYTES each,
+PLUGINS_BYTES in all) AS THE RECORD WRITES IT — indented, at the block's
+own depth in the record (json_size) — so a plugin can never make a record
+unwritable or unreadable: in the plugin design's prototype a NaN stopped the
+record being written, and a 14.3 MB block made it unreadable, over
+MAX_RECORD_BYTES. (Measured compactly before the P3 review, a block of
+[x, y] points inside the limits came out 4.6 MB indented, and read() gave
+None.) Cleaning runs no code of the block's own where it can help it — a
+dict's items, a list's items, a str's or a number's value are read with the
+built-in types' own methods — and stops at the first byte past the limit,
+so an oversized block is refused at once, not after a full copy.
 
 The run's area never changes mid-run: frame_camera refuses an area, a preset
 or a setting the stream is in the way of while capturing ("one set-up per
@@ -88,12 +95,19 @@ FORMAT_VERSION = 1
 #: Far bigger than any record (a few KB); something else has this name.
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 
-#: One plugin's block in a record, as JSON, at most; and all of them
-#: together — far under MAX_RECORD_BYTES, so the record stays readable.
+#: One plugin's block in a record, as the record writes it, at most; and
+#: all of them together — far under MAX_RECORD_BYTES, so the record stays
+#: readable.
 BLOCK_BYTES = 256 * 1024
 PLUGINS_BYTES = 1024 * 1024
 #: A block's nesting, at most (a cycle is refused as too deep).
 MAX_DEPTH = 32
+#: How write_once indents (json.dumps(indent=INDENT)), and where a plugin's
+#: block sits in a record: the record is level 0, its "plugins" level 1,
+#: each plugin's block level 2 (in the camera record and the end record).
+INDENT = 2
+PLUGINS_LEVEL = 1
+BLOCK_LEVEL = 2
 
 
 class RecordExists(FileExistsError):
@@ -219,79 +233,174 @@ def _plain_tree(value: Any) -> Any:
 # ======================================================================
 # Plugins' blocks: cleaned and size-checked (plugin design 3.9)
 # ======================================================================
-def _clean(value: Any, where: str, depth: int) -> Any:
-    if depth > MAX_DEPTH:
-        raise BlockError(f"{where} is nested more than {MAX_DEPTH} deep")
-    if value is None or isinstance(value, bool):
+class _Cleaner:
+    """One block's walk: the plain copy, and its size AS write_once WRITES
+    IT — json.dumps(indent=INDENT, ensure_ascii=False) in UTF-8, with the
+    block at nesting `level` of its record — counted as it goes, so the walk
+    stops at the first byte past `limit` (a block of a million points is
+    refused after the first 256 KB of them, not after a copy of all).
+
+    The size of a value at nesting level L: a scalar's JSON; "[]" or "{}"
+    when empty; else the opening bracket, a newline and (L+1)*INDENT spaces
+    before each item (a key is its JSON and ": " first), a comma between
+    items, then a newline, L*INDENT spaces and the closing bracket. That is
+    json.dumps's own layout (separators "," and ": " with an indent), so
+    the count is the bytes written, exactly (a test compares the two)."""
+
+    def __init__(self, limit: Optional[int], what: str) -> None:
+        self.limit = limit
+        self.what = what
+        self.size = 0
+
+    def add(self, n: int) -> None:
+        self.size += n
+        if self.limit is not None and self.size > self.limit:
+            raise BlockError(f"{self.what} is over the {self.limit:,} bytes "
+                             f"a plugin's block may be, as the record "
+                             f"writes it (indented)")
+
+    def text(self, value: str, where: str) -> str:
+        if self.limit is not None and len(value) > self.limit:
+            # More characters than bytes allowed: refused before encoding.
+            self.add(len(value) + 2)
+        try:
+            encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise BlockError(f"{where} holds text that is not UTF-8 (a lone "
+                             f"surrogate), which no record can hold") from exc
+        self.add(len(encoded))
         return value
-    if isinstance(value, str):
-        return str(value)               # a subclass of str as plain text
-    if type(value).__name__ == "bool_":
-        return bool(value)              # numpy's true and false
-    if isinstance(value, Mapping):
-        out: Dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise BlockError(f"{where} has the key {key!r}, which is not "
-                                 f"text — a record's keys are text")
-            out[str(key)] = _clean(item, f"{where}.{key}", depth + 1)
-        return out
-    if isinstance(value, (list, tuple)):
-        return [_clean(item, f"{where}[{i}]", depth + 1)
-                for i, item in enumerate(value)]
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    if isinstance(value, numbers.Real):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    raise BlockError(f"{where} is a {type(value).__name__}, which is not "
-                     f"JSON (text, a number, true or false, null, a list or "
-                     f"a mapping)")
+
+    def walk(self, value: Any, where: str, level: int, depth: int) -> Any:
+        if depth > MAX_DEPTH:
+            raise BlockError(f"{where} is nested more than {MAX_DEPTH} deep")
+        if value is None:
+            self.add(4)
+            return None
+        if isinstance(value, bool):
+            self.add(4 if value else 5)
+            return bool(value)
+        kind = type(value)
+        if (kind.__module__ or "").split(".")[0] == "numpy" \
+                and getattr(value, "ndim", None) == 0 \
+                and callable(getattr(value, "item", None)):
+            # numpy's scalars — np.bool_ (named "bool" in numpy 2, so a
+            # name test missed it), np.float32, np.int64 ... — as Python's.
+            return self.walk(value.item(), where, level, depth)
+        if isinstance(value, str):
+            return self.text(str.__str__(value), where)
+        if isinstance(value, int):
+            try:
+                number = int.__index__(value)
+                self.add(len(int.__repr__(number)))
+            except ValueError as exc:   # more digits than Python writes
+                raise BlockError(f"{where} is a whole number too long to "
+                                 f"write") from exc
+            return number
+        if isinstance(value, float):
+            number = float.__float__(value)
+            if not math.isfinite(number):
+                self.add(4)
+                return None
+            self.add(len(float.__repr__(number)))
+            return number
+        if isinstance(value, Mapping):
+            items = (dict.items(value) if isinstance(value, dict)
+                     else value.items())
+            self.add(1)
+            out: Dict[str, Any] = {}
+            for key, item in items:
+                if not isinstance(key, str):
+                    raise BlockError(f"{where} has the key {key!r}, which is "
+                                     f"not text — a record's keys are text")
+                key = str.__str__(key)
+                self.add((1 if out else 0) + 1 + INDENT * (level + 1))
+                self.text(key, where)
+                self.add(2)
+                out[key] = self.walk(item, f"{where}.{key}", level + 1,
+                                     depth + 1)
+            self.add(1 if not out else 1 + INDENT * level + 1)
+            return out
+        if isinstance(value, (list, tuple)):
+            items = (list.__iter__(value) if isinstance(value, list)
+                     else tuple.__iter__(value))
+            self.add(1)
+            made: List[Any] = []
+            for i, item in enumerate(items):
+                self.add((1 if made else 0) + 1 + INDENT * (level + 1))
+                made.append(self.walk(item, f"{where}[{i}]", level + 1,
+                                      depth + 1))
+            self.add(1 if not made else 1 + INDENT * level + 1)
+            return made
+        if isinstance(value, numbers.Integral):
+            return self.walk(int(value), where, level, depth)
+        if isinstance(value, numbers.Real):
+            return self.walk(float(value), where, level, depth)
+        raise BlockError(f"{where} is a {type(value).__name__}, which is not "
+                         f"JSON (text, a number, true or false, null, a list "
+                         f"or a mapping)")
 
 
-def clean_block(block: Any, limit: int = BLOCK_BYTES) -> Dict[str, Any]:
-    """A plugin's block as plain JSON, or BlockError saying why it cannot
-    be one: a mapping with text keys, of text, numbers, true or false,
-    null, lists and mappings, at most MAX_DEPTH deep and `limit` bytes as
-    JSON. CLEANED, not refused: NaN and the infinities become null (JSON
-    has none: a NaN stopped a record being written), tuples lists, any
-    number type a plain number (numpy's included)."""
+def json_size(value: Any, level: int = 0) -> int:
+    """The bytes `value` (plain JSON data) takes in a record as write_once
+    writes it, at nesting `level` of that record (0: the record itself)."""
+    walker = _Cleaner(None, "the value")
+    walker.walk(value, "the value", int(level), 0)
+    return walker.size
+
+
+def _clean_sized(block: Any, limit: int, level: int) -> Tuple[Dict[str, Any],
+                                                              int]:
     if not isinstance(block, Mapping):
         raise BlockError(f"a block is a mapping of names to values, not a "
                          f"{type(block).__name__}")
-    clean = _clean(block, "the block", 0)
-    size = len(json.dumps(clean, ensure_ascii=False, allow_nan=False)
-               .encode("utf-8"))
-    if size > limit:
-        raise BlockError(f"the block is {size:,} bytes as JSON — over the "
-                         f"{limit:,} bytes a plugin's block may be")
-    return clean
+    walker = _Cleaner(limit, "the block")
+    clean = walker.walk(block, "the block", int(level), 0)
+    return clean, walker.size
 
 
-def plugins_block(blocks: Mapping[str, Any]) -> Tuple[Dict[str, Any],
-                                                      Dict[str, str]]:
+def clean_block(block: Any, limit: int = BLOCK_BYTES,
+                level: int = BLOCK_LEVEL) -> Dict[str, Any]:
+    """A plugin's block as plain JSON, or BlockError saying why it cannot
+    be one: a mapping with text keys, of text, numbers, true or false,
+    null, lists and mappings, at most MAX_DEPTH deep and `limit` bytes as
+    the record writes it — indented, at nesting `level` of the record
+    (BLOCK_LEVEL: a plugin's block under a record's "plugins"; json_size).
+    CLEANED, not refused: NaN and the infinities become null (JSON has
+    none: a NaN stopped a record being written), tuples lists, any number
+    type a plain number (numpy's included, np.bool_ a plain true or
+    false). The walk stops at the first byte past the limit."""
+    return _clean_sized(block, limit, level)[0]
+
+
+def plugins_block(blocks: Mapping[str, Any],
+                  level: int = PLUGINS_LEVEL) -> Tuple[Dict[str, Any],
+                                                       Dict[str, str]]:
     """(the blocks that go in a record, by plugin id; why each other one
-    does not): each cleaned and size-checked (clean_block), and all of them
-    at most PLUGINS_BYTES together — the ones past it, in order, left out
-    — so a record holding them stays under MAX_RECORD_BYTES."""
+    does not): each cleaned and size-checked (clean_block, at its depth in
+    the record), and the record's whole `plugins` part — at nesting
+    `level` — at most PLUGINS_BYTES as the record writes it, the blocks
+    past it, in order, left out — so a record holding them stays under
+    MAX_RECORD_BYTES."""
     kept: Dict[str, Any] = {}
     refused: Dict[str, str] = {}
-    total = 2
+    # "{", then a newline, the indent and "}" once anything is in it.
+    total = 1 + 1 + INDENT * level + 1
     for pid, block in dict(blocks or {}).items():
         try:
-            clean = clean_block(block)
+            clean, size = _clean_sized(block, BLOCK_BYTES, level + 1)
         except BlockError as exc:
             refused[str(pid)] = str(exc)
             continue
-        size = len(json.dumps({str(pid): clean}, ensure_ascii=False)
-                   .encode("utf-8"))
-        if total + size > PLUGINS_BYTES:
-            refused[str(pid)] = (f"the block is {size:,} bytes as JSON, and "
-                                 f"the plugins' blocks may be "
+        entry = ((1 if kept else 0) + 1 + INDENT * (level + 1)
+                 + json_size(str(pid)) + 2 + size)
+        if total + entry > PLUGINS_BYTES:
+            refused[str(pid)] = (f"the block is {size:,} bytes as the record "
+                                 f"writes it, and the plugins' blocks may be "
                                  f"{PLUGINS_BYTES:,} bytes in all")
             continue
         kept[str(pid)] = clean
-        total += size
+        total += entry
     return kept, refused
 
 

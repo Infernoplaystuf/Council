@@ -85,6 +85,17 @@ REQUIREMENT_RE = re.compile(
 SPEC_RE = re.compile(r"(===|==|!=|<=|>=|~=|<|>)\s*([0-9][0-9A-Za-z.*+!-]*)")
 
 KINDS = ("camera", "source", "feature")
+#: Kinds named by the design and not wired into a run yet: refused, with
+#: why, until they are (P3 review). A trigger-source plugin (design 2.2: a
+#: trigger box) needs the triggering plugin to pick it for a run and its
+#: fire() to drive the run's books; that comes with the rig's sources at
+#: stage P6 (one source firing several cameras). Typhon's own Software and
+#: Timer sources are the triggering plugin's, not plugins of this kind.
+NOT_WIRED_KINDS = {"source": "a trigger-source plugin is not wired into a "
+                             "run yet — the triggering plugin picks its "
+                             "sources from stage P6; until then a run's "
+                             "sources are Typhon's own (Software, Timer) "
+                             "and the camera's lines"}
 SCOPES = ("camera", "rig")
 NETWORK = ("none", "camera-link", "internet")
 
@@ -360,6 +371,9 @@ def check(doc: Mapping[str, Any], *, builtin: bool,
     if kind not in KINDS:
         raise ManifestError(f"its kind {kind!r} is not one of "
                             f"{', '.join(KINDS)}", "kind")
+    if kind in NOT_WIRED_KINDS:
+        raise ManifestError(f"its kind is {kind!r}: {NOT_WIRED_KINDS[kind]}",
+                            "kind")
     if "scope" in doc:
         scope = _text(doc, "scope")
         if scope not in SCOPES:
