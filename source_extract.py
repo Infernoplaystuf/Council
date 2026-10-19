@@ -370,6 +370,151 @@ class SourceImage:
     saved_as: str = ""
 
 
+# ── preview (one workbook, no extraction) ──────────────────────────────
+@dataclass
+class _LabelHit:
+    label: str
+    field: str                       # the template field it binds to
+    score: float
+    where: str                       # "A3" / "D15"
+    via: str                         # alias | match | ambiguous | none
+
+
+@dataclass
+class SheetPreview:
+    """What ``preview_workbook`` found on one sheet."""
+    name: str
+    cells: int                       # non-empty cells
+    part_id: str                     # the heuristics' pick, or ""
+    part_how: str                    # how it was picked
+    inspectors: List[str]            # unique initial tokens found
+    sure: List[_LabelHit]            # confident label→field bindings
+    maybe: List[_LabelHit]            # low-score suggestions
+    unmatched_labels: List[Tuple[str, str]]  # (label_text, where)
+
+
+@dataclass
+class WorkbookPreview:
+    """``preview_workbook``'s report. Plain-Python; the Ledger tab's
+    preview dialog renders it as text, and tests assert on fields
+    directly."""
+    path: str
+    sheets: List[SheetPreview]
+    file_part_id: str                # inferred from the filename stem
+    file_part_how: str
+    pattern_mask: str = ""
+    problems: List[str] = field(default_factory=list)
+
+    def describe(self) -> str:
+        lines = [f"Preview of {self.path}"]
+        if self.file_part_id:
+            lines.append(f"  Filename suggests part {self.file_part_id!r} "
+                         f"({self.file_part_how})")
+        else:
+            lines.append("  Filename gives no part id "
+                         "(no 'Part/Sample' keyword, no lone 2-8-digit number).")
+        if self.pattern_mask:
+            lines.append(f"  Pattern mask: {self.pattern_mask!r}")
+        for s in self.sheets:
+            lines.append(f"\n  Sheet {s.name!r} ({s.cells} filled cells)")
+            lines.append(f"    Part on sheet: {s.part_id or '<not found>'}"
+                         + (f" — {s.part_how}" if s.part_how else ""))
+            lines.append("    Inspectors seen: "
+                         + (", ".join(s.inspectors) or "<none>"))
+            if s.sure:
+                lines.append(f"    Confident labels ({len(s.sure)}):")
+                for h in s.sure[:12]:
+                    lines.append(f"      {h.label!r} @ {h.where} → "
+                                 f"{h.field} ({h.score:.2f}, {h.via})")
+                if len(s.sure) > 12:
+                    lines.append(f"      …and {len(s.sure) - 12} more.")
+            if s.maybe:
+                lines.append(f"    Weak suggestions ({len(s.maybe)}):")
+                for h in s.maybe[:8]:
+                    lines.append(f"      {h.label!r} @ {h.where} → "
+                                 f"{h.field} ({h.score:.2f}, {h.via})")
+                if len(s.maybe) > 8:
+                    lines.append(f"      …and {len(s.maybe) - 8} more.")
+            if s.unmatched_labels:
+                lines.append(f"    Unmatched label cells "
+                             f"({len(s.unmatched_labels)}):")
+                for label, where in s.unmatched_labels[:12]:
+                    lines.append(f"      {label!r} @ {where}")
+                if len(s.unmatched_labels) > 12:
+                    lines.append(f"      …and {len(s.unmatched_labels) - 12} "
+                                 "more.")
+        for p in self.problems:
+            lines.append(f"  ! {p}")
+        return "\n".join(lines)
+
+
+def preview_workbook(path, schema, aliases=None,
+                     pattern_mask: Optional[str] = None) -> WorkbookPreview:
+    """Open ``path`` and report what the Ledger extractor can and can't
+    see — per sheet: non-empty cell count, the heuristics' candidate
+    part id (and how), inspector initials, label cells grouped by
+    confidence of their binding to a template field, and the unmatched
+    labels that need a schema alias or a header fix.
+
+    Fast: no values are extracted, no review workbook is written, no
+    pictures are copied. Mirrors ``extract()``'s per-sheet start —
+    ``load_workbook_grids`` + ``_Extractor.find_part/inspectors`` + a
+    ``Matcher.match`` sweep over every string cell."""
+    p = Path(path)
+    mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
+    file_part = _part_from_filename(p.stem, mask_re)
+    file_how = (f"filename {p.name!r}, mask-matched" if mask_re and file_part
+                else (f"filename {p.name!r}" if file_part else ""))
+    report = WorkbookPreview(path=str(p), sheets=[], file_part_id=file_part,
+                             file_part_how=file_how,
+                             pattern_mask=pattern_mask or "")
+    try:
+        grids, _images = load_workbook_grids(p, report.problems,
+                                             want_pictures=False)
+    except LedgerError as e:
+        report.problems.append(str(e))
+        return report
+    m = Matcher(schema, aliases, ignore=())
+    codes = ItemCodes(schema.items)
+    for g in grids:
+        ex = _Extractor(g, m, codes, "", mask_re)
+        try:
+            ex.find_part()
+            ex.find_inspectors()
+        except Exception as exc:                           # noqa: BLE001
+            report.problems.append(f"{g.sheet}: {exc!r}")
+        inspectors = sorted({who for _r, _c, who in ex.markers})
+        sure: List[_LabelHit] = []
+        maybe: List[_LabelHit] = []
+        unmatched: List[Tuple[str, str]] = []
+        for (r, c), v in g.cells.items():
+            if not isinstance(v, str):
+                continue
+            label = v.strip()
+            if not label or len(label) > 80:
+                continue
+            match = m.match(label)
+            where = g.where(r, c)
+            if match.target is not None and match.sure:
+                sure.append(_LabelHit(label, match.target.name, match.score,
+                                      where, match.via))
+            elif match.target is not None and match.score >= SUGGEST_AT:
+                maybe.append(_LabelHit(label, match.target.name, match.score,
+                                       where, match.via))
+            else:
+                # Only keep label-looking cells (letters, short-ish, not a
+                # number): otherwise every data value lands here.
+                if any(ch.isalpha() for ch in label):
+                    unmatched.append((label, where))
+        report.sheets.append(SheetPreview(
+            name=g.sheet, cells=len(g.cells),
+            part_id=ex.part, part_how=ex.part_how,
+            inspectors=inspectors,
+            sure=sure, maybe=maybe,
+            unmatched_labels=unmatched[:200]))
+    return report
+
+
 #: Workbook files the reader takes: openpyxl reads .xlsx/.xlsm; the installed
 #: Excel opens .xls, .xlsb and rights-protected files (excel_open.py).
 WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
