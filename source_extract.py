@@ -76,7 +76,9 @@ SUGGEST_AT = 0.6
 TIE_GAP = 0.04
 IMAGE_PENALTY = 0.8
 SECTION_BONUS = 0.1
-OLLAMA = "http://localhost:11434"
+#: 127.0.0.1, not localhost: Windows tries IPv6 ::1 first and every call
+#: waited ~2 s (review, 2026-10-19)
+OLLAMA = "http://127.0.0.1:11434"
 
 
 def enumerate_ollama_hosts(include_remote: Optional[bool] = None) -> List[str]:
@@ -92,7 +94,7 @@ def enumerate_ollama_hosts(include_remote: Optional[bool] = None) -> List[str]:
     Order matters: callers try the hosts in order and keep the first
     that has a US-origin model, so localhost comes first (lowest
     latency, no network leaving the LAN)."""
-    main = os.environ.get("COUNCIL_OLLAMA_HOST", "http://localhost:11434")
+    main = os.environ.get("COUNCIL_OLLAMA_HOST", OLLAMA)
     hosts = [main]
     if include_remote is None:
         include_remote = os.environ.get(

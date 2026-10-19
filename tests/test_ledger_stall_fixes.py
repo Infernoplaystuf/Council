@@ -275,3 +275,46 @@ def test_cancel_is_only_offered_for_the_extract(tmp_path):
     finally:
         gate.set()
         tab.deleteLater()
+
+
+# ---------------------------------------------- Excel pictures off the GIL
+
+class _Shape:
+    def __init__(self):
+        self.copied = 0
+
+    def CopyPicture(self, **kw):
+        self.copied += 1
+
+
+def _dib(color=(200, 30, 90)) -> bytes:
+    import io
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (9, 5), color).save(b, "BMP")
+    return b.getvalue()[14:]                               # CF_DIB: no file header
+
+
+def test_a_picture_is_read_through_pywin32_not_imagegrab(monkeypatch):
+    import io
+    import excel_open
+    from PIL import Image, ImageGrab
+    monkeypatch.setattr(excel_open, "_clipboard_dib", lambda timeout=5.0: _dib())
+    monkeypatch.setattr(ImageGrab, "grabclipboard",
+                        lambda: pytest.fail("ImageGrab holds the GIL; not used"))
+    shape = _Shape()
+    png = excel_open._copy_picture(shape)
+    assert shape.copied == 1
+    img = Image.open(io.BytesIO(png))
+    assert img.size == (9, 5) and img.convert("RGB").getpixel((0, 0)) == (200, 30, 90)
+
+
+def test_imagegrab_is_still_the_fallback(monkeypatch):
+    import excel_open
+    from PIL import Image, ImageGrab
+
+    def broken(timeout=5.0):
+        raise OSError("no pywin32 clipboard")
+    monkeypatch.setattr(excel_open, "_clipboard_dib", broken)
+    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: Image.new("RGB", (4, 4)))
+    assert excel_open._copy_picture(_Shape())

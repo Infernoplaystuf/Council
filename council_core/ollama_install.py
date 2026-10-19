@@ -21,7 +21,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, List, Optional
 
-OLLAMA = "http://localhost:11434"
+#: 127.0.0.1, not localhost: Windows tries IPv6 ::1 first and the probe
+#: (on the GUI thread, each time the dropdown opens) waited ~2 s
+OLLAMA = "http://127.0.0.1:11434"
 
 
 @dataclass(frozen=True)

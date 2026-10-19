@@ -92,7 +92,8 @@ def test_enumerate_hosts_lists_only_localhost_by_default(monkeypatch):
     monkeypatch.delenv("COUNCIL_REMOTE_NODES", raising=False)
     monkeypatch.delenv("COUNCIL_PI_HOSTS", raising=False)
     monkeypatch.delenv("COUNCIL_OLLAMA_HOST", raising=False)
-    assert enumerate_ollama_hosts() == ["http://localhost:11434"]
+    # 127.0.0.1, not 'localhost': Windows tried IPv6 first, ~2 s per call
+    assert enumerate_ollama_hosts() == ["http://127.0.0.1:11434"]
 
 
 def test_enumerate_hosts_adds_pi_hosts_when_remote_nodes_enabled(monkeypatch):

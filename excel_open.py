@@ -940,11 +940,47 @@ def _watchdog(app, timeout: float, stopped: list):
     return t
 
 
+def _clipboard_dib(timeout: float = 5.0) -> Optional[bytes]:
+    """The clipboard's bitmap (CF_DIB) through pywin32, which lets other
+    threads run while Windows waits. PIL's ImageGrab holds the GIL through
+    its own 0.5 s retry and Excel's rendering of the bitmap - the whole app
+    froze meanwhile (review, 2026-10-19). The clipboard busy (another app,
+    Win+V history) is retried for ``timeout`` seconds, sleeping between
+    tries; None when it never opens or holds no bitmap."""
+    import time
+    import win32clipboard
+    import win32con
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            win32clipboard.OpenClipboard()
+            break
+        except Exception:
+            if time.monotonic() > end:
+                return None
+            time.sleep(0.05)
+    try:
+        if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
+            return None
+        return win32clipboard.GetClipboardData(win32con.CF_DIB)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def _copy_picture(shape) -> Optional[bytes]:
     try:
         from PIL import Image, ImageGrab
         shape.CopyPicture(Appearance=1, Format=2)         # as shown, bitmap
-        img = ImageGrab.grabclipboard()
+        img = None
+        try:
+            dib = _clipboard_dib()
+            if dib:
+                from PIL import BmpImagePlugin
+                img = BmpImagePlugin.DibImageFile(io.BytesIO(dib))
+        except Exception:
+            img = None
+        if img is None:
+            img = ImageGrab.grabclipboard()
         if isinstance(img, Image.Image):
             buf = io.BytesIO()
             img.convert("RGB").save(buf, "PNG")
