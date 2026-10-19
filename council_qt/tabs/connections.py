@@ -143,6 +143,17 @@ class ConnectionsActions:
         best = kx.DEFAULT_EXTRACTOR
         return ([best] if best in names else []) + [n for n in names if n != best]
 
+    def gguf_models(self) -> List[tuple]:
+        """(label, path) of the GGUF files in Council's model folders that
+        are not of non-US origin: Suggest links listed Ollama models only,
+        so a GGUF-only PC could not use it."""
+        from council_core import local_models as lm
+        out = []
+        for e in lm.list_local_models(include_ollama=False):
+            if e.get("origin") != "non-US" and e.get("path"):
+                out.append((f"GGUF: {e.get('name') or e.get('file')}", str(e["path"])))
+        return out
+
     def pi_nodes(self) -> tuple:
         """``(usable, skipped)``: usable = (name, host url, model) of the
         registered Pi nodes whose model is US-origin; skipped = (name, model)
@@ -180,13 +191,18 @@ class ConnectionsActions:
         graph (it was added here too: 'extract:extract:gemma3:12b')."""
         from council_core import kg_extract as kx
         from council_core.pi_setup import pi_models
-        workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
+        if kx.is_gguf(model):
+            name = Path(model).name
+            workers = {f"this PC ({name})": (kx.gguf_chat(model), name)}
+        else:
+            workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
         if use_pis:
             for name, url, pmodel in self.pi_workers():
                 if pi_models.is_us_origin(pmodel):         # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
         with self.open_graph() as kg:
-            return kg.suggest_from_text(workers, model=model,
+            return kg.suggest_from_text(workers, model=Path(model).name if kx.is_gguf(model)
+                                        else model,
                                         on_progress=on_progress, should_stop=should_stop)
 
     def open_file(self, rel_path: str) -> None:
@@ -712,14 +728,20 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 pis, skipped = self.actions.pi_workers(), self.actions.pi_skipped()
             except Exception:                             # noqa: BLE001
                 pis, skipped = [], []
-            self._to_ui(self._models_ready, models, pis, skipped)
+            try:
+                ggufs = getattr(self.actions, "gguf_models", lambda: [])()
+            except Exception:                             # noqa: BLE001
+                ggufs = []
+            self._to_ui(self._models_ready, models, pis, skipped, ggufs)
 
         threading.Thread(target=work, name="kg-models", daemon=True).start()
 
-    def _models_ready(self, models, pis, skipped) -> None:
+    def _models_ready(self, models, pis, skipped, ggufs=()) -> None:
         self.model_box.clear()
         for m in models:
             self.model_box.addItem(m, m)
+        for label, path in ggufs:                    # GGUF files on this PC too
+            self.model_box.addItem(label, path)
         self.pis_box.setEnabled(bool(pis))
         tip = (", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
                "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
@@ -741,7 +763,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.suggest_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         use_pis = self.pis_box.isChecked()
-        self.status.setText(f"Reading free text with {model}…")
+        self.status.setText(f"Reading free text with {Path(str(model)).name}…")
         if self._kg is not None:
             self._kg.close()
             self._kg = None

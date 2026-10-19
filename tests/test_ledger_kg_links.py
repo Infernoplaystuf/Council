@@ -74,8 +74,9 @@ def _reviewed(tmp_path: Path, full_name: str = ""):
 
 def _rebuild(vault: Path, csv: Path):
     lines = []
-    stats = LedgerActions().rebuild_kg(lambda *a: lines.append(a), csv=str(csv),
-                                       connections=ConnectionsActions(vault_dir=vault))
+    stats = LedgerActions(opener=lambda p: None).rebuild_kg(
+        lambda *a: lines.append(a), csv=str(csv),
+        connections=ConnectionsActions(vault_dir=vault))
     return stats
 
 

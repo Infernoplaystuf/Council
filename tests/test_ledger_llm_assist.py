@@ -323,3 +323,26 @@ def test_a_model_that_answers_in_the_old_shape_is_still_read(ledger):
     mapping, _ = ledger_llm.map_labels(["Zorp rate", "Other"],
                                        [f.name for f in schema.fields], old_shape)
     assert mapping == {"Zorp rate": freq, "Other": None}
+
+
+# ---------------------------------------------- Connections' Suggest links takes a GGUF
+
+def test_suggest_links_lists_gguf_files_and_runs_on_one(tmp_path, monkeypatch):
+    from council_core import kg_extract as kx
+    from council_core import local_models as lm
+    from council_qt.tabs.connections import ConnectionsActions
+    monkeypatch.setattr(lm, "list_local_models", lambda **kw: [
+        {"id": "C:/m/granite.gguf", "path": "C:/m/granite.gguf", "name": "Granite 3.1 8b",
+         "origin": "US", "backend": "gguf"},
+        {"id": "C:/m/qwen.gguf", "path": "C:/m/qwen.gguf", "name": "Qwen", "origin": "non-US",
+         "backend": "gguf"}])
+    acts = ConnectionsActions(vault_dir=tmp_path / "v")
+    assert acts.gguf_models() == [("GGUF: Granite 3.1 8b", "C:/m/granite.gguf")]
+
+    class FakeLlama:
+        def create_chat_completion(self, **kw):
+            return {"choices": [{"message": {"content": '{"links": []}'}}]}
+    monkeypatch.setattr(ledger_llm, "_gguf_llm", lambda path: FakeLlama())
+    monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
+    assert kx.gguf_chat("C:/m/granite.gguf")([{"role": "user", "content": "x"}]) == \
+        '{"links": []}'

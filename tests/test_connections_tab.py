@@ -42,6 +42,9 @@ class StubActions(ConnectionsActions):
     def local_models(self):
         return ["llama3.1:8b", "granite3.3:8b"]
 
+    def gguf_models(self):
+        return []                        # never the real model folders
+
     def pi_workers(self):
         return []
 
