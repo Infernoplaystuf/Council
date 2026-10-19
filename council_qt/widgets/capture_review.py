@@ -97,17 +97,35 @@ RUN_OF = re.compile(r"^(\d{8}_\d{6}(?:_\d+)?)_frame_\d+", re.IGNORECASE)
 RAW_SUFFIX = "_events.raw"
 
 
+def _natural_row(seg: str) -> list:
+    row = []
+    for tok in re.split("([0-9]+)", seg):
+        if tok.isdigit():
+            row.append((0, int(tok), ""))
+        else:
+            row.append((1, 0, tok.lower()))
+    return row
+
+
 def natural_key(path: Any) -> list:
     """frame_9 before frame_10 — the generated browser's _natkey, exactly."""
-    parts = []
-    for seg in str(path).replace(chr(92), "/").split("/"):
-        row = []
-        for tok in re.split("([0-9]+)", seg):
-            if tok.isdigit():
-                row.append((0, int(tok), ""))
-            else:
-                row.append((1, 0, tok.lower()))
-        parts.append(row)
+    return [_natural_row(seg)
+            for seg in str(path).replace(chr(92), "/").split("/")]
+
+
+def run_order_key(path: Any) -> list:
+    """natural_key, with a file we named compared run first: <stamp> before
+    <stamp>_2 before <stamp>_10, then frame_9 before frame_10 within a run.
+    Whole names put "<stamp>_2_frame_..." before "<stamp>_frame_..." (an
+    underscore sorts before a letter), so the second run of a second came
+    first and the raw view opened the older recording."""
+    parts = natural_key(path)
+    name = os.path.basename(str(path).replace(chr(92), "/"))
+    run = run_of(name) or run_of_raw(name)
+    if run:
+        parts[-1:] = [_natural_row(run), _natural_row(name[len(run):])]
+    else:
+        parts.append([])
     return parts
 
 
@@ -122,7 +140,7 @@ def list_images(folder: str) -> List[str]:
                     files.append(entry.path)
     except OSError:
         return []
-    files.sort(key=natural_key)
+    files.sort(key=run_order_key)
     return files
 
 
@@ -157,7 +175,7 @@ def latest_raw(folder: Any) -> Optional[Path]:
         return None
     if not names:
         return None
-    return Path(str(folder)) / sorted(names, key=natural_key)[-1]
+    return Path(str(folder)) / sorted(names, key=run_order_key)[-1]
 
 
 class DisplayDecoder:
