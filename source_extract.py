@@ -1858,9 +1858,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         kind = (getattr(cause, "kind", "unknown")
                 if cause is not None and type(cause).__name__ == "ExcelOpenError"
                 else "other")
-        run.open_failures.append((src.name, kind))
+        run.open_failures.append((label or src.name, kind))
         _secs = _time.monotonic() - _t0
-        run.timings.append((src.name, _secs))
+        run.timings.append((label or src.name, _secs))
         prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
         return
     if label and label != src.name:            # a name another source shares
@@ -1952,7 +1952,7 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                                        note.anchor):
                     note.values += n
     _secs = _time.monotonic() - _t0
-    run.timings.append((src.name, _secs))
+    run.timings.append((label or src.name, _secs))
     prog.advance(what=f"{src.name} read in {_secs:.1f}s")
     _wd.beat()
     orphans = sum(1 for ex in exs for o in ex.out if not o.part)
