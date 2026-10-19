@@ -1621,6 +1621,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     Workbooks.Open sitting on a modal Excel dialog."""
     import time as _time
     from progress_report import NullProgress
+    from council_core import stall_watchdog
     prog = progress or NullProgress()
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore)
@@ -1628,7 +1629,16 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     run = Extraction([str(s) for s in sources])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
+    # The watchdog logs every live thread's stack when nothing has
+    # moved in >15s. Catches the GIL-hogging stall the user reported
+    # (whole-app unresponsive) — the thread holding the GIL shows up
+    # in the dump even when it is a C-extension call. Progress text
+    # already goes to prog.update; the watchdog adds the stack when
+    # nothing else is said.
     prog.stage("reading workbooks", total=len(sources), unit="workbooks")
+    _wd_cm = stall_watchdog.watch("ledger extract", prog.update,
+                                   stall_s=15.0)
+    _wd = _wd_cm.__enter__()
     for src in sources:
         if cancel is not None and cancel.is_set():
             run.cancelled = True
@@ -1641,8 +1651,10 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             src.exists() and __import__("excel_open").kind_of(src) == "rights")
         prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
                     force=via_excel)
+        _wd.beat()
         try:
             grids, images = load_workbook_grids(src, run.problems)
+            _wd.beat()
         except LedgerError as e:
             run.problems.append(str(e))
             # Keep the Excel-open-failure category so the Ledger log can
@@ -1726,10 +1738,15 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         _secs = _time.monotonic() - _t0
         run.timings.append((src.name, _secs))
         prog.advance(what=f"{src.name} read in {_secs:.1f}s")
+        _wd.beat()
         orphans = sum(1 for ex in exs for o in ex.out if not o.part)
         if orphans:
             run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
                                 "— fill the Part column in the review, or re-run with --part")
+    try:
+        _wd_cm.__exit__(None, None, None)
+    except Exception:                                       # noqa: BLE001
+        pass
     return run
 
 
