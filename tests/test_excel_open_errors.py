@@ -144,3 +144,31 @@ def test_the_summary_omits_zero_count_kinds():
 def test_an_empty_batch_summary_is_the_header_only():
     text = summarize_open_failures([])
     assert "0 files failed to open" in text
+
+
+# ------------------------------------------------------------- Excel's own words (review, 2026-10-19)
+
+def test_a_file_excel_cannot_find_is_not_called_corrupt(tmp_path):
+    p = tmp_path / "moved.xls"
+    p.write_bytes(b"\xd0\xcf\x11\xe0")
+    exc = _fake_com_error(-2146827284, "Sorry, we couldn't find moved.xls. Is it "
+                                       "possible it was moved, renamed or deleted?")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "unknown" and "could not find" in str(err)
+    assert "couldn't find moved.xls" in str(err)            # Excel's words kept
+
+
+def test_a_file_in_use_is_the_access_kind(tmp_path):
+    p = tmp_path / "busy.xls"
+    p.write_bytes(b"\xd0\xcf\x11\xe0")
+    exc = _fake_com_error(-2146827284, "Microsoft Excel cannot access the file "
+                                       "'busy.xls'. The document may be read-only")
+    assert classify_open_failure(exc, p).kind == "access"
+
+
+def test_corrupt_keeps_excels_description(tmp_path):
+    p = tmp_path / "weird.xls"
+    p.write_bytes(b"<html>")
+    exc = _fake_com_error(-2146827284, "The file format and extension don't match")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "corrupt" and "don't match" in str(err)

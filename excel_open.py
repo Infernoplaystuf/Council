@@ -155,13 +155,30 @@ def classify_open_failure(exc, path, timeout: float = 0,
             "the extract again", kind="rights")
 
     if hresult == _HRESULT_EXCEL_CANNOT_OPEN:
+        # 0x800A03EC is Excel's catch-all: its own words say which. A moved
+        # file, a path over Excel's 218 characters or a file open elsewhere
+        # were all reported as corrupt, with the words thrown away (review,
+        # 2026-10-19).
+        said = f" Excel said: {description[:200]}" if description else ""
+        if re.search(r"(?i)couldn.?t find|could not find|cannot find|"
+                     r"not found|check the spelling|path.*too long", description):
+            return ExcelOpenError(
+                f"{name}: Excel could not find the file - moved, renamed, or a "
+                f"path longer than Excel accepts (218 characters: {len(str(p))} "
+                f"here).{said}", kind="unknown")
+        if re.search(r"(?i)cannot access|can.?t access|being used|is locked|"
+                     r"read-only|permission", description):
+            return ExcelOpenError(
+                f"{name}: Excel cannot access the file - open in another "
+                f"program, locked, or on a share this account cannot read.{said}",
+                kind="access")
         size, head = _diag_bytes(p)
         return ExcelOpenError(
             f"{name}: Excel refused to open the file. Common causes: the "
             "file is corrupt, is HTML saved with an .xls extension, is "
             "blocked by Excel's Trust Center (File Block rules for the "
             "format), or is not actually a workbook. "
-            f"(size {size} bytes, first bytes {head or '<unreadable>'})",
+            f"(size {size} bytes, first bytes {head or '<unreadable>'}){said}",
             kind="corrupt")
 
     if hresult == _HRESULT_ACCESS_DENIED:
