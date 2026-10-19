@@ -47,8 +47,10 @@ def default_review_for(csv_path) -> Path:
 
 
 def collect_sources(paths: Sequence) -> List[Path]:
-    """Files as given; a folder means every workbook in it (.xlsx, .xlsm,
-    .xls, .xlsb; not Excel's ~$ lock files). Duplicates dropped, order kept."""
+    """Files as given; a folder means every workbook UNDER it, recursively
+    (.xlsx, .xlsm, .xls, .xlsb; not Excel's ~$ lock files, and hidden /
+    ``~$`` folders at every depth are pruned). Duplicates dropped, order
+    kept."""
     out: List[Path] = []
     for s in paths:
         p = Path(s)
