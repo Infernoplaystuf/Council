@@ -78,6 +78,33 @@ IMAGE_PENALTY = 0.8
 SECTION_BONUS = 0.1
 OLLAMA = "http://localhost:11434"
 
+
+def enumerate_ollama_hosts(include_remote: Optional[bool] = None) -> List[str]:
+    """Hosts the Ledger will query for installed US-origin models.
+
+    This is Council's own host enumeration surface: ``COUNCIL_OLLAMA_HOST``
+    (default localhost) is always included; ``COUNCIL_PI_HOSTS`` (a
+    comma-separated list) is added when remote nodes are enabled —
+    ``COUNCIL_REMOTE_NODES=1`` is Council's own opt-in. Pass
+    ``include_remote=True`` to force the Pi list in without touching
+    the env var (tests).
+
+    Order matters: callers try the hosts in order and keep the first
+    that has a US-origin model, so localhost comes first (lowest
+    latency, no network leaving the LAN)."""
+    main = os.environ.get("COUNCIL_OLLAMA_HOST", "http://localhost:11434")
+    hosts = [main]
+    if include_remote is None:
+        include_remote = os.environ.get(
+            "COUNCIL_REMOTE_NODES", "").strip().lower() in (
+            "1", "true", "yes", "on")
+    if include_remote:
+        for raw in os.environ.get("COUNCIL_PI_HOSTS", "").split(","):
+            h = raw.strip()
+            if h and h not in hosts:
+                hosts.append(h)
+    return hosts
+
 # ── label normalisation ─────────────────────────────────────────────────
 _ABBREV = {
     "ec": "eddy current", "pn": "part number", "p n": "part number",
@@ -1448,8 +1475,15 @@ def tesseract_reader(exe: Optional[Path] = None, timeout: float = 60) -> Optiona
     return read
 
 
-def _ollama(path: str, payload: Optional[dict] = None, timeout=10):
-    req = urllib.request.Request(OLLAMA + path, method="POST" if payload else "GET",
+def _ollama(path: str, payload: Optional[dict] = None, timeout=10,
+             host: Optional[str] = None):
+    """Call an Ollama endpoint. ``host`` defaults to the Council-standard
+    OLLAMA constant (localhost); callers that want a Pi node pass its
+    full ``http://pi:11434`` URL. See ``enumerate_ollama_hosts`` for how
+    Council decides which hosts are reachable."""
+    base = (host or OLLAMA).rstrip("/")
+    req = urllib.request.Request(base + path,
+                                 method="POST" if payload else "GET",
                                  data=json.dumps(payload).encode() if payload else None,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -2124,85 +2158,199 @@ US_TEXT_FAMILIES = ("granite", "llama", "phi", "gemma", "olmo", "gpt-oss")
 _FAMILY_RANK = {f: i for i, f in enumerate(US_TEXT_FAMILIES)}
 
 
-def first_us_text_model(installed: Optional[Sequence[str]] = None) -> Optional[str]:
+def first_us_text_model(
+        installed: Optional[Sequence[str]] = None,
+        *,
+        hosts: Optional[Sequence[str]] = None,
+        installed_per_host: Optional[Dict[str, Sequence[str]]] = None,
+) -> Optional[Tuple[str, str]]:
     """The best-fit installed Ollama model to ask for label mappings,
-    or None when nothing US-origin is installed.
+    or None when no host has a US-origin one.
 
-    Preference: family order in US_TEXT_FAMILIES (Granite first), then
-    whichever tag Ollama reports last (newest / largest), then stable
-    sort by name so a tie is deterministic. ``installed`` is the
-    ``/api/tags`` list; omitted = ask Ollama now."""
-    try:
-        names = (list(installed) if installed is not None
-                 else [m["name"] for m in _ollama("/api/tags", timeout=5)
-                       .get("models") or []])
-    except Exception:
-        return None
+    Returns ``(host, model_tag)`` so the caller knows where to send the
+    chat request. Legacy single-host callers can pass ``installed`` (a
+    sequence of model names on localhost); the result is still a tuple,
+    with the host set to the Council default.
 
-    def rank(n):
+    Preference: within a host, family order in US_TEXT_FAMILIES (Granite
+    first), then longer tag, then name. ACROSS hosts, the first that
+    has a US-origin model wins — localhost first by default (see
+    ``enumerate_ollama_hosts``)."""
+    def _rank(n):
         lo = n.lower()
         for i, fam in enumerate(US_TEXT_FAMILIES):
             if lo.startswith(fam):
                 return (i, -len(n), n)
         return (len(US_TEXT_FAMILIES), 0, n)
-    candidates = [n for n in names
-                  if n.lower().startswith(US_TEXT_FAMILIES)]
-    if not candidates:
+
+    def _pick(names):
+        candidates = [n for n in names
+                      if n and n.lower().startswith(US_TEXT_FAMILIES)]
+        if not candidates:
+            return None
+        candidates.sort(key=_rank)
+        return candidates[0]
+
+    if installed is not None:
+        tag = _pick(list(installed))
+        return (OLLAMA, tag) if tag else None
+
+    host_list = list(hosts) if hosts is not None else enumerate_ollama_hosts()
+    for host in host_list:
+        if installed_per_host is not None:
+            names = list(installed_per_host.get(host) or [])
+        else:
+            try:
+                data = _ollama("/api/tags", timeout=5, host=host)
+                names = [m["name"] for m in (data.get("models") or [])]
+            except Exception:
+                continue
+        tag = _pick(names)
+        if tag is not None:
+            return (host, tag)
+    return None
+
+
+#: What a mapping request's JSON answer must look like. The GGUF path
+#: enforces this via grammar; the Ollama path via its "format" field.
+_MAPPING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": {"type": ["string", "null"]},
+}
+
+
+def _council_chat(prompt: str, *, timeout: float
+                  ) -> Optional[Tuple[str, str]]:
+    """Delegate a mapping prompt to Council's own ``local_chat`` so
+    the call runs on whatever backend Council itself uses — the main
+    GGUF when ``COUNCIL_GGUF_PATH`` is set, else the role's assigned
+    Ollama. GGUF files should always be accepted by every LLM call in
+    Council per the user's standing instruction.
+
+    Returns ``(text, model_label)`` or None when council_engine cannot
+    be imported (test environments without the engine) or the call
+    fails. Callers fall back to a direct Ollama HTTP request."""
+    try:
+        import council_engine as ce
+    except Exception:                                       # noqa: BLE001
         return None
-    candidates.sort(key=rank)
-    return candidates[0]
+    try:
+        text = ce.local_chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+            num_predict=2048,
+            json_schema=_MAPPING_SCHEMA,
+            timeout=int(max(5, timeout)))
+    except Exception:                                       # noqa: BLE001
+        return None
+    # local_chat returns the raw text; its stats carry the model name,
+    # but we don't need the exact tag here. "council local_chat" is a
+    # clear label the dialog can show.
+    return text, "council local_chat"
 
 
 def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
                                  *, model: Optional[str] = None,
-                                 timeout: float = 120
+                                 host: Optional[str] = None,
+                                 timeout: float = 120,
+                                 prefer_council: bool = True,
                                  ) -> Tuple[Dict[str, Optional[str]], str]:
     """Ask a local Ollama TEXT model which template field each label
-    means. Returns ``(mapping, model_used)`` where ``mapping`` is
-    ``{label: field_name_or_None}``.
+    means. Returns ``(mapping, model_label)`` where ``mapping`` is
+    ``{label: field_name_or_None}`` and ``model_label`` reads
+    ``"<tag> @ <host>"`` so the Preview dialog can tell the user
+    which model actually answered.
 
     Pure helper — takes a sequence of label strings, not an
     ``Extraction``. The caller writes any accepted suggestions as
     aliases via ``save_aliases``.
 
-    Only labels are sent (to localhost — the Council does not phone
-    home), never values. Raises LedgerError when Ollama is not
-    reachable, when no US-origin text model is installed, or when the
-    model's answer is not JSON. See [[us-models-only]]."""
+    Only labels are sent (to the chosen host, localhost by default,
+    or a Pi node from COUNCIL_PI_HOSTS when COUNCIL_REMOTE_NODES=1).
+    Values are never sent. Raises LedgerError when no reachable host
+    has a US-origin text model, when the chosen model is not US-origin,
+    when the chosen Ollama cannot be reached, or when the model's
+    answer is not JSON. See [[us-models-only]]."""
+    """Ask a local text model which template field each label means.
+    Returns ``(mapping, model_label)``.
+
+    Resolution order (unless the caller forces one via ``model`` /
+    ``host`` / ``prefer_council=False``):
+      1. Council's own ``local_chat`` — GGUF when ``COUNCIL_GGUF_PATH``
+         is set, else the role's Ollama. GGUF files are always
+         accepted here per the user's standing instruction.
+      2. First US-origin Ollama model on localhost / ``COUNCIL_PI_HOSTS``
+         (see ``enumerate_ollama_hosts``).
+
+    Only labels are sent, never values. See [[us-models-only]]."""
     labels = [str(x).strip() for x in labels if str(x).strip()]
     labels = sorted({x for x in labels})[:150]
     if not labels:
         return {}, ""
-    if model is None:
-        model = first_us_text_model()
-        if model is None:
-            raise LedgerError(
-                "No US-origin Ollama text model is installed. Install one "
-                "(e.g. `ollama pull granite3.3:8b`); see installs.txt "
-                "and the Ledger tab's Install image model… dialog for "
-                "related pulls.")
-    if not model.lower().startswith(US_TEXT_FAMILIES):
-        raise LedgerError(
-            f"{model!r} is not a US-origin family (see [[us-models-only]])."
-            " Pick a Granite / Llama / Phi / Gemma / Olmo / gpt-oss tag.")
     fields = [f.name for f in schema.fields]
     prompt = ("Map each spreadsheet label to the one template field it "
               "means, or null if none. Reply with JSON only: "
               "{\"label\": \"field or null\"}.\n\n"
               f"Fields:\n{json.dumps(fields)}\n\n"
               f"Labels:\n{json.dumps(labels)}")
+
+    # ── Path 1: Council's local_chat (GGUF or role Ollama) ──
+    if prefer_council and model is None and host is None:
+        ans = _council_chat(prompt, timeout=timeout)
+        if ans is not None:
+            raw, model_label = ans
+            try:
+                sugg = json.loads(raw)
+            except Exception:
+                sugg = None
+            if isinstance(sugg, dict):
+                return _coerce_mapping(labels, fields, sugg), model_label
+            # Fall through to Ollama if Council's reply was not JSON —
+            # a tiny GGUF without grammar can wander. Ollama still has
+            # a shot with its own format=json.
+
+    # ── Path 2: direct Ollama (localhost + Pi hosts) ──
+    if model is None:
+        pick = first_us_text_model()
+        if pick is None:
+            raise LedgerError(
+                "No US-origin Ollama text model is reachable on this PC "
+                "or any configured Pi node, and Council's own local_chat "
+                "did not answer. Install an Ollama model "
+                "(e.g. `ollama pull granite3.3:8b`) or set "
+                "COUNCIL_GGUF_PATH to a US-origin GGUF. "
+                "COUNCIL_REMOTE_NODES=1 + COUNCIL_PI_HOSTS brings Pi "
+                "nodes into the search.")
+        host, model = pick
+    else:
+        host = host or OLLAMA
+    if not model.lower().startswith(US_TEXT_FAMILIES):
+        raise LedgerError(
+            f"{model!r} is not a US-origin family (see [[us-models-only]])."
+            " Pick a Granite / Llama / Phi / Gemma / Olmo / gpt-oss tag.")
     try:
         out = _ollama("/api/chat", {
             "model": model, "stream": False, "format": "json",
             "options": {"temperature": 0},
             "messages": [{"role": "user", "content": prompt}]},
-                      timeout=timeout)
+                      timeout=timeout, host=host)
     except Exception as exc:
-        raise LedgerError(f"local model {model!r} did not answer: {exc}") from exc
+        raise LedgerError(
+            f"local model {model!r} on {host} did not answer: {exc}") from exc
     try:
         sugg = json.loads(out["message"]["content"])
     except Exception as exc:
-        raise LedgerError(f"local model {model!r} did not return JSON: {exc}") from exc
+        raise LedgerError(
+            f"local model {model!r} on {host} did not return JSON: {exc}"
+        ) from exc
+    return _coerce_mapping(labels, fields, sugg), f"{model} @ {host}"
+
+
+def _coerce_mapping(labels: Sequence[str], fields: Sequence[str],
+                    sugg: Any) -> Dict[str, Optional[str]]:
+    """Keep only the suggestions whose field is in the schema; nulls and
+    unknown fields drop to None. ``sugg`` may be any shape (the model
+    sometimes answers with lists or strings); non-dicts return all-None."""
     valid = set(fields)
     result: Dict[str, Optional[str]] = {}
     for label in labels:
@@ -2211,7 +2359,7 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
             result[label] = s
         else:
             result[label] = None
-    return result, model
+    return result
 
 
 def suggest_with_llm(run: Extraction, schema: TemplateSchema,
