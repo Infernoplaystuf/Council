@@ -91,18 +91,38 @@ class LedgerActions:
     def open(self, path) -> None:
         self.opener(path)
 
-    def rebuild_kg(self, progress):
+    def rebuild_kg(self, progress, csv: Optional[str] = None,
+                   connections=None):
         """Rebuild the knowledge graph on the user's vault — same path the
         Connections tab uses. ``progress`` is the Ledger tab's
         ``(line, fraction)`` listener; the KG's own line-by-line stream is
         forwarded to it.
 
+        ``csv`` is the tab's parent CSV. The graph reads only data_in and
+        the folders added in Connections, and a parent CSV is made beside
+        its template — so it never reached the graph (review, 2026-10-19).
+        When the graph does not read it yet, that one file is added
+        (kg.add_ledger: the CSV and its schema/aliases, not its folder) and
+        ``stats['ledger_added']`` says so.
+
         Tests pass a ``rebuild_kg`` override to the LedgerActions
-        constructor to avoid touching the real vault or Ollama."""
+        constructor to avoid touching the real vault or Ollama, or a
+        ``connections`` (ConnectionsActions on a temp vault)."""
         if self._rebuild_kg_override is not None:
             return self._rebuild_kg_override(progress)
-        from council_qt.tabs.connections import ConnectionsActions
-        return ConnectionsActions().rebuild(listener=progress)
+        if connections is None:
+            from council_qt.tabs.connections import ConnectionsActions
+            connections = ConnectionsActions()
+        added = None
+        with connections.open_graph() as kg:
+            if csv and Path(csv).is_file():
+                from council_core import kg_excel
+                if kg_excel.is_ledger_csv(Path(csv)):
+                    added = kg.add_ledger(csv)
+            stats = kg.seed(listener=progress)
+        if added is not None:
+            stats["ledger_added"] = str(csv)
+        return stats
 
 
 class LedgerTab(ViewHelpers, QWidget):
@@ -247,9 +267,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.rebuild_kg_btn = self._step_button(
             row, "Rebuild knowledge graph", self.on_rebuild_kg)
         self.rebuild_kg_btn.setToolTip(
-            "Rebuild the Connections knowledge graph from the vault's "
-            "data_in folder, so a newly-applied Ledger shows up as parts, "
-            "people and inspections. Same path the Connections tab uses.")
+            "Rebuild the Connections knowledge graph, so a newly-applied "
+            "Ledger shows up as parts, people and inspections. The parent "
+            "CSV above is added to what the graph reads if it is not read "
+            "yet (only that file). Same rebuild the Connections tab runs.")
         row.addStretch(1)
         grid4.addLayout(row, 1, 1)
         outer.addWidget(g4)
@@ -440,10 +461,12 @@ class LedgerTab(ViewHelpers, QWidget):
     def _say(self, text: str) -> None:
         self.log.appendPlainText(text)
 
-    def _run(self, title: str, step: Callable, done: Callable) -> None:
+    def _run(self, title: str, step: Callable, done: Callable,
+             after: Optional[Callable] = None) -> None:
         """Run `step(progress)` on a thread; `done(result)` on the GUI thread.
         A LedgerError is the pipeline's own plain-language message; anything
-        else is shown with its traceback in the log.
+        else is shown with its traceback in the log. ``after(err)`` runs on
+        the GUI thread once the step ended either way (err None on success).
 
         The ``self._cancel`` event is cleared at the start of every run; the
         step may read it (via a ``cancel=`` kwarg) to exit early."""
@@ -474,7 +497,7 @@ class LedgerTab(ViewHelpers, QWidget):
                 result, err = None, f"error: {e}"
             except Exception as e:                        # noqa: BLE001
                 result, err = None, f"failed: {e!r}\n{traceback.format_exc()}"
-            self._to_ui(lambda: self._finish(title, result, err, done))
+            self._to_ui(lambda: self._finish(title, result, err, done, after))
 
         self._worker = threading.Thread(target=work, name="ledger-step", daemon=True)
         self._refresh_enabled()
@@ -532,15 +555,19 @@ class LedgerTab(ViewHelpers, QWidget):
         self.status.setText(f"Cancelling…{tail}")
         self._say(f"── Cancel requested{tail}")
 
-    def _finish(self, title, result, err, done) -> None:
+    def _finish(self, title, result, err, done, after=None) -> None:
         self._worker = None
         self.progress.setVisible(False)
-        if err:
-            self.status.setText(err.splitlines()[0])
-            self._say(err)
-        else:
-            done(result)
-        self._refresh_enabled()
+        try:
+            if err:
+                self.status.setText(err.splitlines()[0])
+                self._say(err)
+            else:
+                done(result)
+        finally:
+            if after is not None:
+                after(err)
+            self._refresh_enabled()
 
     def wait(self, timeout: float = 60.0) -> bool:
         """Block until the current step's result is shown (tests, scripts)."""
@@ -636,14 +663,41 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_rebuild_kg(self) -> None:
         """Rebuild the Connections knowledge graph; the Ledger log shows
         the breakdown line via rebuild_summary_line."""
+        if self.busy:
+            return
+        csv = self.csv.text().strip()
+        conn = self._connections_tab()
+        if conn is not None and not conn.hold_for_rebuild("Ledger"):
+            self.status.setText("The Connections tab is rebuilding the graph already; "
+                                "its rows will be there when it finishes.")
+            return
+        held = {"stats": None}
+
         def done(stats) -> None:
             from council_core import knowledge_graph as kgm
-            line = kgm.rebuild_summary_line(stats or {})
+            stats = held["stats"] = stats or {}
+            if stats.get("ledger_added"):
+                self._say(f"The graph now also reads {stats['ledger_added']} "
+                          "(only that file; Connections › Folders… lists it).")
+            line = kgm.rebuild_summary_line(stats)
             self.status.setText(line)
             self._say(line)
             self._kg_dirty = False
+
+        def after(err) -> None:
+            if conn is not None:
+                conn.rebuild_done_elsewhere(held["stats"],
+                                            RuntimeError(err.splitlines()[0]) if err else None)
         self._run("Rebuilding the knowledge graph",
-                  lambda p: self.actions.rebuild_kg(p), done)
+                  lambda p: self.actions.rebuild_kg(p, csv=csv or None), done,
+                  after=after)
+
+    def _connections_tab(self):
+        """The Connections tab, when it has been built (it holds the graph's
+        store open while it shows it)."""
+        from .connections import ConnectionsTab
+        built = getattr(self.window, "_built", None) or {}
+        return next((t for t in built.values() if isinstance(t, ConnectionsTab)), None)
 
     # ── file dialogs ────────────────────────────────────────────────────
     def _start_dir(self, edit: Optional[QLineEdit] = None) -> str:

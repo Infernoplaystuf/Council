@@ -637,6 +637,29 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="kg-rebuild", daemon=True).start()
 
+    def hold_for_rebuild(self, who: str) -> bool:
+        """Another tab (the Ledger's Rebuild) is about to rebuild the graph:
+        let go of the store - the rebuild writes with its own connection, and
+        a search here waited on its lock on the GUI thread for 5-8 s, then
+        failed 'database is locked' (review, 2026-10-19) - and keep Rebuild
+        off until rebuild_done_elsewhere. False when this tab is rebuilding
+        already (one rebuild at a time)."""
+        if self._busy:
+            return False
+        self._busy = True
+        self.rebuild_btn.setEnabled(False)
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+        self.status.setText(f"The {who} tab is rebuilding the graph…")
+        return True
+
+    def rebuild_done_elsewhere(self, stats: Optional[Dict[str, Any]],
+                               exc: Optional[BaseException]) -> None:
+        """The rebuild hold_for_rebuild waited for ended: reopen and show
+        its summary, as after this tab's own."""
+        self._rebuilt(stats, exc)
+
     def _progress_line(self, token, text: str) -> None:
         # Only while THIS rebuild runs: a line that arrives after it ended
         # (the reporter's heartbeat can fire once more) must not hide the

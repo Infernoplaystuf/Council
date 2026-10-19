@@ -270,6 +270,14 @@ DEFAULT_FIELD_RULES: Tuple[FieldRule, ...] = (
     FieldRule("P/N", "PART"),
     FieldRule("Part Number", "PART"),
     FieldRule("Part", "PART"),
+    # what inspection workbooks call the part: no rule covered them and
+    # Fields… could not offer them (review, 2026-10-19)
+    FieldRule("Sample ID", "PART"),
+    FieldRule("Sample No.", "PART"),
+    FieldRule("Serial Number", "PART"),
+    FieldRule("S/N", "PART"),
+    FieldRule("Specimen", "PART"),
+    FieldRule("Specimen ID", "PART"),
     FieldRule("Supersedes", "PART", supersedes=True),
     FieldRule("Program Lead", "PERSON", (("PROJECT", "LEADS"),)),
     FieldRule("Project Lead", "PERSON", (("PROJECT", "LEADS"),)),
@@ -709,6 +717,16 @@ def rebuild_summary_line(stats) -> str:
         bits.append(extra)
     else:
         bits.append("; 0 links found")
+    # "0 links" with initials nobody has named yet must point somewhere:
+    # those rows link once the question is answered (review, 2026-10-19)
+    n_q = int(stats.get("open_reviews") or 0)
+    if n_q:
+        who = list(stats.get("initials_open") or [])
+        tail = ""
+        if who:
+            tail = " (who is " + ", ".join(who[:4]) + ("…" if len(who) > 4 else "") + "?)"
+        bits.append(f"; {n_q} question{'s' if n_q != 1 else ''} waiting in "
+                    f"Connections › Questions{tail}")
     return "".join(bits) + "."
 
 
@@ -761,6 +779,16 @@ def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     if suf in _JSON:
         return _json_records(p, rel, rules)
     return _text_records(p, rel, rules)
+
+
+_REBUILD_LOCKS: Dict[str, Any] = {}
+
+
+def _rebuild_lock(store: Path):
+    """One rebuild at a time per store, whichever tab or tool starts it."""
+    import threading
+    key = _real(store)
+    return _REBUILD_LOCKS.setdefault(key, threading.Lock())
 
 
 def _is_ledger(p: Path) -> bool:
@@ -1354,14 +1382,79 @@ class KnowledgeGraph:
         for d in items if isinstance(items, list) else []:
             if isinstance(d, dict) and d.get("id") and d.get("path"):
                 p = Path(str(d["path"]))
+                files = d.get("files")
                 out.append({"id": str(d["id"]), "path": str(p), "name": p.name or str(p),
-                            "exists": p.is_dir(), "added_ts": d.get("added_ts")})
+                            "exists": p.is_dir(), "added_ts": d.get("added_ts"),
+                            # None: the whole folder; a list: only these
+                            # files in it (a Ledger the Ledger tab added)
+                            "files": ([str(f) for f in files] if isinstance(files, list)
+                                      else None)})
         return out
 
     def _extra_bases(self) -> List[Tuple[str, Path]]:
         if getattr(self, "_bases", None) is None:
             self._bases = [(r["id"], Path(r["path"])) for r in self.extra_roots()]
         return self._bases
+
+    def _save_roots(self, items: List[Dict[str, Any]], decision: str,
+                    detail: Dict[str, Any]) -> None:
+        keep = []
+        for r in items:
+            d = {"id": r["id"], "path": r["path"], "added_ts": r.get("added_ts")}
+            if r.get("files") is not None:
+                d["files"] = list(r["files"])
+            keep.append(d)
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.EXTRA_ROOTS_KEY, json.dumps(keep, ensure_ascii=False)))
+            self._decide(decision, detail)
+        self._bases = None
+
+    def reads(self, path: Any) -> bool:
+        """Whether a rebuild reads this file: under data_in, in a folder the
+        user added, or one of the files a Ledger added (add_ledger)."""
+        import os
+        p = Path(os.path.realpath(_plain_path(Path(str(path)).expanduser())))
+        if _overlaps(p, self.root, inside_only=True):
+            return True
+        for r in self.extra_roots():
+            if r["files"] is None:
+                if _overlaps(p, r["path"], inside_only=True) \
+                        and not _overlaps(p, self.vault, inside_only=True):
+                    return True
+            elif _real(p.parent) == _real(r["path"]) \
+                    and p.name.casefold() in {f.casefold() for f in r["files"]}:
+                return True
+        return False
+
+    def add_ledger(self, csv: Any) -> Optional[Dict[str, Any]]:
+        """Also read this one Ledger (a parent CSV; its schema, aliases and
+        review workbooks beside it go with it) - only that file, not the
+        folder it is in, which usually holds the template and inspection
+        workbooks too. The Ledger tab's Rebuild calls it: a parent CSV is
+        made beside its template, which is rarely under data_in, so an
+        applied Ledger never reached the graph (review, 2026-10-19). Only
+        READ, like an added folder. None when the graph reads it already."""
+        import os
+        p = Path(_plain_path(csv)).expanduser()
+        if not p.is_file():
+            raise ValueError(f"{csv} is not a file")
+        p = Path(os.path.realpath(str(p)))
+        if self.reads(p):
+            return None
+        if _overlaps(p, self.vault / STORE_DIR, inside_only=True):
+            raise ValueError(f"{p} is in the graph's own store")
+        folder = p.parent
+        current = self.extra_roots()
+        for r in current:
+            if r["files"] is not None and _real(r["path"]) == _real(folder):
+                r["files"] = r["files"] + [p.name]
+                self._save_roots(current, "add_ledger", {"id": r["id"], "path": str(p)})
+                return dict(r, exists=True)
+        entry = {"id": self.root_id(folder), "path": str(folder),
+                 "added_ts": time.time(), "files": [p.name]}
+        self._save_roots(current + [entry], "add_ledger", {"id": entry["id"], "path": str(p)})
+        return dict(entry, name=folder.name or str(folder), exists=True)
 
     def add_root(self, folder: Any) -> Dict[str, Any]:
         """Also read the documents of ``folder`` - a folder outside the vault,
@@ -1379,19 +1472,21 @@ class KnowledgeGraph:
         # its documents were read twice (review, 2026-10-16)
         if _overlaps(p, self.vault) or _overlaps(p, self.root):
             raise ValueError(f"{p} overlaps the vault, which the graph reads already")
-        current = self.extra_roots()
-        for r in current:
+        current = []
+        for r in self.extra_roots():
+            if r["files"] is not None:
+                # a Ledger's files: the whole folder now covers them when
+                # they are in it; otherwise they stay as they are
+                if not _overlaps(r["path"], p, inside_only=True):
+                    current.append(r)
+                continue
             if _overlaps(p, r["path"]):
                 raise ValueError(f"{p} overlaps a folder already added ({r['path']})")
+            current.append(r)
         entry = {"id": self.root_id(p), "path": str(p), "added_ts": time.time()}
-        items = [{"id": r["id"], "path": r["path"], "added_ts": r.get("added_ts")}
-                 for r in current] + [entry]
-        with self.db:
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
-                            (self.EXTRA_ROOTS_KEY, json.dumps(items, ensure_ascii=False)))
-            self._decide("add_folder", {"id": entry["id"], "path": entry["path"]})
-        self._bases = None
-        return dict(entry, name=p.name or str(p), exists=True)
+        self._save_roots(current + [entry], "add_folder",
+                         {"id": entry["id"], "path": entry["path"]})
+        return dict(entry, name=p.name or str(p), exists=True, files=None)
 
     def remove_root(self, rid: str) -> None:
         """Stop reading an added folder. Its documents leave the graph at the
@@ -1400,13 +1495,7 @@ class KnowledgeGraph:
         current = self.extra_roots()
         if not any(r["id"] == rid for r in current):
             raise KeyError(rid)
-        items = [{"id": r["id"], "path": r["path"], "added_ts": r.get("added_ts")}
-                 for r in current if r["id"] != rid]
-        with self.db:
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
-                            (self.EXTRA_ROOTS_KEY, json.dumps(items, ensure_ascii=False)))
-            self._decide("remove_folder", {"id": rid})
-        self._bases = None
+        self._save_roots([r for r in current if r["id"] != rid], "remove_folder", {"id": rid})
 
     def abs_path(self, rel: str) -> Path:
         """Where a document of the store is on disk: under data_in, or under
@@ -1468,13 +1557,24 @@ class KnowledgeGraph:
             if prog is not None:
                 prog.update(f"listing {self.root}", force=True)
             out += self._files_under(self.root, cl, kg_excel, sorted(self.root.rglob("*")))
-        others = [base for _rid, base in self._extra_bases()]
-        for base in others:
+        roots = self.extra_roots()
+        others = [Path(r["path"]) for r in roots if r["files"] is None]
+        seen = {_real(p) for p in out}
+        for r in roots:
+            base = Path(r["path"])
             if not base.is_dir():
                 continue
             if prog is not None:
                 prog.update(f"listing {base}", force=True)
-            out += self._files_under(base, cl, kg_excel, self._walk_added(base, others))
+            if r["files"] is not None:
+                # a Ledger's own files only - never what else is beside it
+                got = self._files_under(base, cl, kg_excel, [base / f for f in r["files"]])
+            else:
+                got = self._files_under(base, cl, kg_excel, self._walk_added(base, others))
+            for p in got:
+                if _real(p) not in seen:
+                    seen.add(_real(p))
+                    out.append(p)
         return out
 
     def _walk_added(self, base: Path, others: Sequence[Path]) -> List[Path]:
@@ -1524,11 +1624,18 @@ class KnowledgeGraph:
             return p.relative_to(self.root).as_posix()
         except ValueError:
             pass
+        # the closest folder: a Ledger's own folder can sit inside one the
+        # user added whole (added after it)
+        best = None
         for rid, base in self._extra_bases():
             try:
-                return f"<{rid}>/" + p.relative_to(base).as_posix()
+                rel = p.relative_to(base).as_posix()
             except ValueError:
                 continue
+            if best is None or len(rel) < len(best[1]):
+                best = (rid, rel)
+        if best is not None:
+            return f"<{best[0]}>/{best[1]}"
         raise ValueError(f"{p} is in none of the folders the graph reads")
 
     @staticmethod
@@ -1761,26 +1868,41 @@ class KnowledgeGraph:
         line while nothing moves) - also handed to ``listener(line,
         fraction)``, the Connections tab's status line. See _seed."""
         from progress_report import Progress
-        with Progress("kg rebuild", listener=listener) as prog:
-            token = _PROGRESS.set(prog)
-            try:
-                stats = self._seed(use_collections=use_collections, gazetteer=gazetteer,
-                                   on_progress=on_progress, prog=prog)
-            finally:
-                _PROGRESS.reset(token)
-            rels = stats.get("relations") or {}
-            # Pre-compute the categorized unreadable breakdown so callers
-            # that read the dict (the UI) do not need to repeat it.
-            if stats.get("unreadable") and not stats.get("unreadable_reasons"):
-                stats["unreadable_reasons"] = unreadable_breakdown(
-                    stats["unreadable"])
-            prog.finish(f"{stats['documents']} documents ({stats['documents_read']} read, "
-                        f"{stats['documents_unchanged']} unchanged, "
-                        f"{len(stats['unreadable'])} not read); "
-                        f"{rels.get('seeded', 0) + rels.get('accepted', 0)} links, "
-                        f"{rels.get('suggested', 0)} suggested, "
-                        f"{stats.get('open_reviews', 0)} question(s)")
-            return stats
+        lock = _rebuild_lock(self.path)
+        if not lock.acquire(blocking=False):
+            # The Ledger tab's and the Connections tab's rebuilds ran at once
+            # and the second died 'database is locked' (review, 2026-10-19)
+            raise KnowledgeGraphBusy("the knowledge graph is being rebuilt already")
+        try:
+            with Progress("kg rebuild", listener=listener) as prog:
+                token = _PROGRESS.set(prog)
+                try:
+                    stats = self._seed(use_collections=use_collections,
+                                       gazetteer=gazetteer, on_progress=on_progress,
+                                       prog=prog)
+                finally:
+                    _PROGRESS.reset(token)
+                self._seed_finish(stats, prog)
+                return stats
+        finally:
+            lock.release()
+
+    def _seed_finish(self, stats: Dict[str, Any], prog) -> None:
+        # the initials nobody has named yet: the summary line says who
+        stats["initials_open"] = [r[0] for r in self.db.execute(
+            "SELECT DISTINCT surface FROM review WHERE kind='initials'"
+            " AND status='open' ORDER BY surface")]
+        rels = stats.get("relations") or {}
+        # Pre-compute the categorized unreadable breakdown so callers
+        # that read the dict (the UI) do not need to repeat it.
+        if stats.get("unreadable") and not stats.get("unreadable_reasons"):
+            stats["unreadable_reasons"] = unreadable_breakdown(stats["unreadable"])
+        prog.finish(f"{stats['documents']} documents ({stats['documents_read']} read, "
+                    f"{stats['documents_unchanged']} unchanged, "
+                    f"{len(stats['unreadable'])} not read); "
+                    f"{rels.get('seeded', 0) + rels.get('accepted', 0)} links, "
+                    f"{rels.get('suggested', 0)} suggested, "
+                    f"{stats.get('open_reviews', 0)} question(s)")
 
     def _seed(self, *, use_collections: bool, gazetteer: bool, on_progress,
               prog) -> Dict[str, Any]:

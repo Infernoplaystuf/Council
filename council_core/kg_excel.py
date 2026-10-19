@@ -192,8 +192,9 @@ _NOT_INITIALS = {
     # a column header on their own ("MM", "KG"). As with the method
     # labels, we skip 2-letter units that could be initials ("MM" vs
     # Matt M., "LB" vs Lee B.) — only the ones that are overwhelmingly
-    # units.
-    "psi", "kw", "mw", "hz", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
+    # units. 'KW', 'MW', 'HZ' are real inspectors' initials (Mark Williams
+    # became a person called 'MW' - review, 2026-10-19): not listed.
+    "psi", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
     "sec", "min", "max", "avg", "std", "ppm",
 }
 #: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?'.

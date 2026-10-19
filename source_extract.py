@@ -342,8 +342,16 @@ _WHO_INLINE = re.compile(
     r"inspected\s+by|checked\s+by|logged\s+by)\s*(?:[:=\-–—]\s*|\s+by\s+)(?P<who>.+?)\s*$")
 _WHO_BY = re.compile(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
 #: A column / label that holds initials, with the value beside or below it.
-_WHO_HEAD = re.compile(r"(?i)^\s*(?:inspector(?:'?s)?(?:\s+initials)?|initials|operator|"
-                       r"technician|tech|analyst|inspected\s+by|by)\s*[:#]?\s*$")
+#: 'Inspector Name', 'QC Inspector', 'Technician Initials', 'Operator ID'
+#: count too: they never gave a person in the knowledge graph (review,
+#: 2026-10-19).
+_WHO_HEAD = re.compile(
+    r"(?i)^\s*(?:"
+    r"(?:(?:qc|qa|lead|nde|ndt|ndi)\s+)?"
+    r"(?:inspector|technician|tech|operator|analyst|examiner)(?:'?s)?"
+    r"(?:\s+(?:name|initials|id))?"
+    r"|initials|inspected\s+by|checked\s+by|performed\s+by|by"
+    r")\s*[:#]?\s*$")
 #: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
 _RUN_HEAD = re.compile(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
 #: The column holding the reading in a long log, beside one naming what it is.
@@ -1803,7 +1811,7 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                 continue
             firsts[o.value] = o = replace(o)
         for v, o in firsts.items():        # agreeing inspectors share one row
-            if len(who[v]) > 1:
+            if who[v]:                     # one signer of an unsigned top row too
                 o.inspector = "/".join(sorted(who[v]))
         obs = list(firsts.values())
         for o in obs:
@@ -1857,6 +1865,22 @@ VAL_HEAD = ["Accept", "Part", "Item", "Field", "Value", "Confidence", "Matched b
             "Inspector"]
 LAB_HEAD = ["Map to field", "Ignore", "Source label", "Example value", "Count",
             "Best guess", "Source", "Part", "Item"]
+PEOPLE_HEAD = ["Initials", "Full name", "Values signed", "First seen at"]
+
+
+def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]:
+    """Every inspector's initials the run found ('JB', and both of 'JB/MK'),
+    with how many values they signed and where first. Written names are
+    left out: they need no answer."""
+    out: Dict[str, Tuple[int, str]] = {}
+    for d in decisions:
+        for who in re.split(r"[/,;&+]", d.obs.inspector or ""):
+            key = _initials(who)
+            if not re.fullmatch(r"[A-Z]{2,4}", key):
+                continue
+            n, first = out.get(key, (0, d.obs.where))
+            out[key] = (n + 1, first)
+    return out
 
 
 def write_review(path, run: Extraction, decisions: List[Decision], schema: TemplateSchema,
@@ -1879,7 +1903,10 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         "rows are clashes between sources — accept one value only.",
         "2. Labels to map: labels that matched no field. Pick a field in 'Map to field' "
         "(it is remembered for every future file), or put Y in Ignore.",
-        "3. Save this workbook, then run:   python source_extract.py apply \"<this file>\"",
+        "3. People: type the full name for each inspector's initials (amber rows). It is "
+        "remembered, and the knowledge graph links their inspections to that person.",
+        "4. Save this workbook, then press Apply in the Ledger tab (or run:   "
+        "python source_extract.py apply \"<this file>\").",
         "",
         f"Parent CSV: {csv_path}",
         f"Made: {datetime.now().isoformat(timespec='seconds')}",
@@ -1958,6 +1985,18 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     for n in run.images:
         im.append([n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
     _style(im, bold, [28, 16, 8, 60, 26, 10, 80])
+
+    # Who each inspector's initials are. The knowledge graph never guesses
+    # a person from 'JB', and nothing let the user say who JB is, so a
+    # Ledger gave parts but no people and no links (review, 2026-10-19).
+    ppl = wb.create_sheet("People", 3)
+    ppl.append(PEOPLE_HEAD)
+    known = load_people(csv_path)
+    for key, (n, first) in sorted(review_initials(decisions).items()):
+        ppl.append([key, known.get(key, ""), n, first])
+        if not known.get(key):
+            ppl.cell(ppl.max_row, 2).fill = amber
+    _style(ppl, bold, [10, 32, 7, 50])
 
     meta = wb.create_sheet("_run")
     meta["A1"] = json.dumps({"csv": str(csv_path), "sources": run.sources})
@@ -2078,6 +2117,33 @@ def load_people(csv_path) -> Dict[str, str]:
     return out
 
 
+def save_people(csv_path, people: Dict[str, str]) -> Dict[str, str]:
+    """Add these initials -> full names to the "people" section (a name
+    given now replaces the one before; blank names are skipped). Every other
+    section is kept; a file that does not parse is NOT overwritten - the
+    user's label mappings would go with it. Returns the whole list."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise LedgerError(f"{p.name} could not be read, so the people list was not "
+                              f"saved (fix or remove the file): {e}") from e
+        if not isinstance(data, dict):
+            raise LedgerError(f"{p.name} is not a Ledger aliases file; people not saved")
+    have = data.get("people") if isinstance(data.get("people"), dict) else {}
+    for k, v in people.items():
+        key, name = _initials(k), " ".join(str(v or "").split())
+        if key and name:
+            have[key] = name
+    data["people"] = dict(sorted(have.items()))
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return load_people(csv_path)
+
+
 def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
     """The label mappings and ignores, written atomically. Any other section
     of the file (the "people" list of initials) is kept as it was: it used to
@@ -2107,6 +2173,8 @@ class ApplyResult:
     csv_result: str
     filled: List[str]
     warnings: List[str]
+    #: initials -> full name the reviewer typed on the People sheet
+    people: Dict[str, str] = field(default_factory=dict)
 
 
 def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader] = None,
@@ -2148,6 +2216,18 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     ignore = sorted(set(ignore) | set(ignored))
     if learned or ignored:
         save_aliases(csv_path, mapping, ignore)
+
+    people: Dict[str, str] = {}
+    if "People" in wb.sheetnames:                  # older reviews have none
+        for row in wb["People"].iter_rows(min_row=2, values_only=True):
+            if row and row[0] and len(row) > 1 and str(row[1] or "").strip():
+                people[str(row[0])] = str(row[1])
+    if people:
+        known = load_people(csv_path)
+        people = {k: v for k, v in people.items()
+                  if known.get(_initials(k)) != " ".join(v.split())}
+        if people:
+            save_people(csv_path, people)
 
     # the reviewer's choices, by where each value came from
     choice: Dict[Tuple[str, str, str], Tuple[bool, str, str, str]] = {}
@@ -2212,7 +2292,8 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             filled.append(str(out))
             prog.advance(what=f"{out.name} written")
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
-                       warnings + [f"conflict kept: {c}" for c in res.conflicts])
+                       warnings + [f"conflict kept: {c}" for c in res.conflicts],
+                       people=people)
 
 
 # ── optional: a local model suggests mappings for leftover labels ──────

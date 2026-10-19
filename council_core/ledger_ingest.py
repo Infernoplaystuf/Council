@@ -256,11 +256,16 @@ class ApplySummary:
     ignored: List[str]
     filled: List[str]
     problems: List[str] = field(default_factory=list)
+    #: initials -> full name saved from the review's People sheet
+    people: Dict[str, str] = field(default_factory=dict)
 
     def describe(self) -> str:
         s = ""
         if self.learned:
             s += f"learned {len(self.learned)} label mappings\n"
+        if self.people:
+            s += ("saved " + ", ".join(f"{k} = {v}" for k, v in sorted(self.people.items()))
+                  + " to the people list\n")
         s += f"{self.accepted} values accepted -> {self.rows} rows: {self.csv_result}"
         s += "".join(f"\n  filled {f}" for f in self.filled)
         return s + "".join(f"\n  ! {w}" for w in self.problems[:30])
@@ -278,7 +283,8 @@ def run_apply(review_path, fill_dir=None, use_images: bool = True,
                          use_images=use_images, progress=prog)
         prog.finish(f"{r.accepted} values accepted -> {r.rows} rows: {r.csv_result}")
         return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
-                            list(r.ignored), list(r.filled), list(r.warnings))
+                            list(r.ignored), list(r.filled), list(r.warnings),
+                            people=dict(getattr(r, "people", {}) or {}))
 
 
 def open_path(path) -> None:

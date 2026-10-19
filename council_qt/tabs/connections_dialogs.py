@@ -66,7 +66,11 @@ class FoldersDialog(QDialog):
         self.changed = False
 
     def _row(self, f: dict) -> None:
-        text = f["path"] + ("" if f.get("exists", True) else "   (not there now)")
+        text = f["path"]
+        if f.get("files") is not None:
+            # a Ledger the Ledger tab added: only its parent CSV is read
+            text += "   (only " + ", ".join(f["files"]) + ")"
+        text += "" if f.get("exists", True) else "   (not there now)"
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, f["id"])
         self.list.addItem(item)
