@@ -52,6 +52,10 @@ DOWNSAMPLE_HELP = (
     "offers no binning). Off (the default) never changes the data. Kept in "
     "presets; fixed while capturing.")
 
+#: cameras.downsample_meta, looked up at the first frame read (this module
+#: loads no camera code when imported).
+_DOWNSAMPLE_META: Any = None
+
 
 def plugin_device(device: Any) -> Any:
     """The Device the camera's plugin opened: `device` itself, or the one a
@@ -133,9 +137,11 @@ class CoreCapture:
         camera marks its own."""
         frame = object.__getattribute__(self, "_inner").read(timeout_ms)
         if frame is not None:
-            from .cameras import downsample_meta
-
-            extra = downsample_meta(self.capture, self.downsample_method)
+            global _DOWNSAMPLE_META
+            if _DOWNSAMPLE_META is None:
+                from .cameras import downsample_meta
+                _DOWNSAMPLE_META = downsample_meta
+            extra = _DOWNSAMPLE_META(self.capture, self.downsample_method)
             if extra:
                 meta = frame.meta if isinstance(frame.meta, dict) else \
                     dict(frame.meta or {})
@@ -158,7 +164,6 @@ class CoreCapture:
         from . import camera_settings
 
         return camera_settings.apply(self, values, roi)
-
 
 
 
