@@ -72,7 +72,8 @@ class LedgerActions:
 
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
-                vision_model: Optional[str] = None):
+                vision_model: Optional[str] = None,
+                cancel=None):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -80,7 +81,8 @@ class LedgerActions:
             reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
                                          image_reader=reader, progress=progress,
-                                         pattern_mask=pattern_mask or None)
+                                         pattern_mask=pattern_mask or None,
+                                         cancel=cancel)
 
     def apply(self, review, fill_dir, use_images, progress):
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
@@ -112,6 +114,11 @@ class LedgerTab(ViewHelpers, QWidget):
         self._tokens = theme.tokens("dark")
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
+        #: Set by the Cancel button; read inside the extract loop so the
+        #: next workbook is skipped. Pipelines that already hit a stuck
+        #: Workbooks.Open are released by excel_open.kill_active_excels,
+        #: which the button also calls.
+        self._cancel = threading.Event()
         #: True from an apply's completion until the next KG rebuild —
         #: used by _refresh_enabled to highlight the Rebuild button.
         self._kg_dirty = False
@@ -246,10 +253,21 @@ class LedgerTab(ViewHelpers, QWidget):
         self.status.setWordWrap(True)
         self.status.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         v5.addWidget(self.status)
+        progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)               # busy, no percentage
         self.progress.setVisible(False)
-        v5.addWidget(self.progress)
+        progress_row.addWidget(self.progress, 1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip(
+            "Stop the running step after the current workbook. Also kills "
+            "any hidden Excel process this run spawned, which unblocks a "
+            "Workbooks.Open stuck on a modal dialog (sign-in, license, "
+            "Trust Center Enable Editing).")
+        self.cancel_btn.clicked.connect(self.on_cancel)
+        self.cancel_btn.setEnabled(False)
+        progress_row.addWidget(self.cancel_btn)
+        v5.addLayout(progress_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         v5.addWidget(self.log, 1)
@@ -269,6 +287,9 @@ class LedgerTab(ViewHelpers, QWidget):
         idle = not self.busy
         for b in self._busy_buttons:
             b.setEnabled(idle)
+        if hasattr(self, "cancel_btn"):
+            # Only enabled while a step is actually running.
+            self.cancel_btn.setEnabled(not idle)
         if not idle:
             return
         csv = self.csv.text().strip()
@@ -357,9 +378,13 @@ class LedgerTab(ViewHelpers, QWidget):
     def _run(self, title: str, step: Callable, done: Callable) -> None:
         """Run `step(progress)` on a thread; `done(result)` on the GUI thread.
         A LedgerError is the pipeline's own plain-language message; anything
-        else is shown with its traceback in the log."""
+        else is shown with its traceback in the log.
+
+        The ``self._cancel`` event is cleared at the start of every run; the
+        step may read it (via a ``cancel=`` kwarg) to exit early."""
         if self.busy:
             return
+        self._cancel.clear()
         self.status.setText(f"{title}…")
         self._say(f"── {title}")
         self.progress.setRange(0, 0)               # busy until a percentage is known
@@ -389,6 +414,25 @@ class LedgerTab(ViewHelpers, QWidget):
         self._worker = threading.Thread(target=work, name="ledger-step", daemon=True)
         self._refresh_enabled()
         self._worker.start()
+
+    def on_cancel(self) -> None:
+        """Signal the running step to stop. The event is checked between
+        workbooks in extract(). If a Workbooks.Open is already blocking
+        on a modal Excel dialog, taskkill'ing the hidden Excel process
+        unblocks it — the COM call raises and the loop exits on its next
+        iteration."""
+        if not self.busy:
+            return
+        self._cancel.set()
+        try:
+            from excel_open import kill_active_excels
+            killed = kill_active_excels()
+        except Exception:                                 # noqa: BLE001
+            killed = 0
+        tail = f" (+{killed} Excel process{'es' if killed != 1 else ''} ended)" \
+            if killed else ""
+        self.status.setText(f"Cancelling…{tail}")
+        self._say(f"── Cancel requested{tail}")
 
     def _finish(self, title, result, err, done) -> None:
         self._worker = None
@@ -454,13 +498,20 @@ class LedgerTab(ViewHelpers, QWidget):
             self.stat["to_review"].setText(str(s.to_review))
             self.stat["images"].setText(f"{s.images_read} / {s.images}")
             self.stat["problems"].setText(str(len(s.problems)))
-            self.status.setText("Review written. Open it, check the amber and red rows, "
-                                "map the leftover labels, save it, then Apply.")
+            if getattr(s, "cancelled", False):
+                self.status.setText(
+                    "Cancelled. The partial review was still written — "
+                    "open it to see what landed, or clear it and run again.")
+            else:
+                self.status.setText(
+                    "Review written. Open it, check the amber and red rows, "
+                    "map the leftover labels, save it, then Apply.")
             self._say(s.describe())
         self._run("Extracting",
                   lambda p: self.actions.extract(csv, sources, part, images, p,
                                                  pattern_mask=mask,
-                                                 vision_model=vision), done)
+                                                 vision_model=vision,
+                                                 cancel=self._cancel), done)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()
