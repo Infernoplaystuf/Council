@@ -103,14 +103,25 @@ class ExtractSummary:
     #: One ``(filename, kind)`` per workbook Excel refused to open, so the
     #: Ledger log can show a breakdown at the end of a batch.
     open_failures: List[Any] = field(default_factory=list)
+    #: Per-workbook ``(name, seconds)`` wall-clock timings. The log
+    #: appends the slowest few so a user can pinpoint which workbook
+    #: ate the hour.
+    timings: List[Any] = field(default_factory=list)
+    #: True when the extract exited early via the Ledger tab's Cancel
+    #: event. The caller shows a "Cancelled" status instead of "Done".
+    cancelled: bool = False
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
              f"images read")
+        if self.cancelled:
+            s = "CANCELLED — " + s
         if self.open_failures:
             s += "\n" + summarize_open_failures(self.open_failures)
+        if self.timings:
+            s += "\n" + summarize_slowest(self.timings)
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
@@ -135,6 +146,22 @@ def summarize_open_failures(open_failures) -> str:
     return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
 
 
+def summarize_slowest(timings, top: int = 5) -> str:
+    """A one-line roll-up of the slowest workbooks in a batch — the
+    "What's slow?" line the Ledger log appends so a 20-minute extract's
+    hot spots are obvious without scrolling the terminal.
+
+    ``timings`` is ``[(name, seconds), ...]``; the ``top`` slowest are
+    rendered in descending order."""
+    if not timings:
+        return ""
+    ranked = sorted(timings, key=lambda t: -float(t[1]))[:max(1, int(top))]
+    total = sum(float(s) for _n, s in timings)
+    parts = ", ".join(f"{n} {s:.1f}s" for n, s in ranked)
+    return (f"Slowest {len(ranked)} of {len(timings)} workbooks "
+            f"({total:.1f}s total): {parts}")
+
+
 def _images_read(notes) -> int:
     return sum(1 for n in notes if n.reader not in ("", "none installed")
                and not n.text.startswith(("reader failed", "(no text found)")))
@@ -143,18 +170,21 @@ def _images_read(notes) -> int:
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
                 progress: Optional[Listener] = None,
-                pattern_mask: Optional[str] = None) -> ExtractSummary:
+                pattern_mask: Optional[str] = None,
+                cancel: Optional[Any] = None) -> ExtractSummary:
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask)
+                     prog, pattern_mask, cancel)
+        tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
-                    f"review, {len(s.problems)} problems")
+                    f"review, {tail}")
         return s
 
 
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
-             prog, pattern_mask: Optional[str] = None) -> ExtractSummary:
+             prog, pattern_mask: Optional[str] = None,
+             cancel: Optional[Any] = None) -> ExtractSummary:
     say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
@@ -175,14 +205,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog, pattern_mask=pattern_mask)
+                  progress=prog, pattern_mask=pattern_mask, cancel=cancel)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
     write_review(out, run, dec, ledger.schema, str(csv_path))
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),
-                          list(run.problems), list(run.open_failures))
+                          list(run.problems), list(run.open_failures),
+                          list(run.timings), bool(run.cancelled))
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────

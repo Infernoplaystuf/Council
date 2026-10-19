@@ -474,6 +474,71 @@ _TEXT_ONLY_FORMATS = {1, 7, 13, 16}
 _CLIPBOARD_LOCK = threading.Lock()
 
 
+#: PIDs of hidden Excel processes this process spawned through
+#: read_with_excel but has not yet closed. The Ledger tab's Cancel
+#: button reads this to taskkill a stuck Workbooks.Open — the only way
+#: to unblock a worker thread sitting in a C-level COM call. Not a
+#: leak: each read_with_excel's finally block removes its PID whether
+#: or not app.Quit() succeeded.
+_ACTIVE_EXCEL_PIDS: "set[int]" = set()
+_ACTIVE_EXCEL_LOCK = threading.Lock()
+
+
+def _register_excel_pid(app) -> Optional[int]:
+    """The PID behind an Excel.Application COM object. Returns None
+    outside Windows, when pywin32 is absent, or when the hwnd cannot
+    be read (DispatchEx without a visible window — rare)."""
+    try:
+        import win32process
+        hwnd = int(getattr(app, "Hwnd", 0))
+        if not hwnd:
+            return None
+        _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if not pid:
+            return None
+        with _ACTIVE_EXCEL_LOCK:
+            _ACTIVE_EXCEL_PIDS.add(int(pid))
+        return int(pid)
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _unregister_excel_pid(pid: Optional[int]) -> None:
+    if pid is None:
+        return
+    with _ACTIVE_EXCEL_LOCK:
+        _ACTIVE_EXCEL_PIDS.discard(int(pid))
+
+
+def kill_active_excels() -> int:
+    """Terminate every hidden Excel this process spawned but has not
+    yet closed. Returns the count taskkill was asked to end.
+
+    The Ledger's Cancel button is the one caller: a Workbooks.Open
+    blocked for 2 minutes on a modal dialog cannot be interrupted
+    from Python, but killing the subprocess forces the COM call to
+    raise and the worker thread to exit on the next iteration. The
+    user's manually-opened Excel is NOT touched — only PIDs this
+    process spawned via DispatchEx. No-op outside Windows or when
+    pywin32 is absent."""
+    if os.name != "nt":
+        return 0
+    with _ACTIVE_EXCEL_LOCK:
+        pids = list(_ACTIVE_EXCEL_PIDS)
+    if not pids:
+        return 0
+    import subprocess
+    killed = 0
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, check=False, timeout=5)
+            killed += 1
+        except Exception:                                   # noqa: BLE001
+            continue
+    return killed
+
+
 def _clipboard_formats() -> set:
     """What the clipboard holds now: its format numbers (registered formats
     as their lower-cased names)."""
@@ -629,9 +694,11 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     locked = used_clip = False
     watchdog = None
     stopped = []
+    pid: Optional[int] = None
     try:
         app = app_factory()
         _tie_excel(app)
+        pid = _register_excel_pid(app)   # so the Ledger's Cancel can kill it
         watchdog = _watchdog(app, timeout, stopped) if com is not None else None
         for attr, val in (("Visible", False), ("DisplayAlerts", False),
                           ("AskToUpdateLinks", False), ("EnableEvents", False),
@@ -772,6 +839,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             except Exception:
                 pass
         book = app = None
+        _unregister_excel_pid(pid)
         try:
             # careful: only when nothing else was put there since the last
             # copy (that would be the user's, and stays)
