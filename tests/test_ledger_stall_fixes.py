@@ -235,16 +235,32 @@ def test_apply_reads_the_sources_with_the_extracts_mask_and_part(tmp_path, ledge
 
 # ---------------------------------------------- the stall dump
 
-def test_the_stall_dump_is_written_to_a_file_by_faulthandler(tmp_path):
+def test_a_frozen_app_gets_a_faulthandler_dump_in_the_file(tmp_path):
+    """A C call that holds the GIL freezes the whole app and the Python
+    watchdog with it; faulthandler's own thread still writes the stacks."""
+    import re as _re
+    out = tmp_path / "logs" / "stalls.txt"
+    with stall_watchdog.watch("frozen step", lambda _t: None, stall_s=1.0, sample_s=0.5,
+                              dump_file=str(out)):
+        time.sleep(0.6)
+        _re.match(r"(a+)+$", "a" * 28 + "b")          # ~5 s holding the GIL
+    text = out.read_text(encoding="utf-8")
+    assert "frozen step: watching" in text
+    assert "most recent call first" in text                # faulthandler's dump
+    assert "test_a_frozen_app_gets_a_faulthandler_dump" in text
+
+
+def test_a_slow_but_running_app_is_reported_without_faulthandler(tmp_path):
+    """Nothing moves but the app runs: the Python watchdog reports it, and
+    faulthandler - which reads other threads unlocked, and crashed the
+    process once while a thread exited - stays quiet."""
     out = tmp_path / "logs" / "stalls.txt"
     said = []
-    with stall_watchdog.watch("test step", said.append, stall_s=0.5, sample_s=0.5,
+    with stall_watchdog.watch("slow step", said.append, stall_s=1.0, sample_s=0.5,
                               dump_file=str(out)):
-        time.sleep(1.6)                                    # nothing moves
-    text = out.read_text(encoding="utf-8")
-    assert "test step: watching" in text
-    assert "most recent call first" in text                # faulthandler's dump
+        time.sleep(2.5)                                    # GIL free: not frozen
     assert said and str(out) in said[0]
+    assert "most recent call first" not in out.read_text(encoding="utf-8")
 
 
 def test_cancel_is_only_offered_for_the_extract(tmp_path):

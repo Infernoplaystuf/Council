@@ -71,6 +71,14 @@ class _Watchdog:
         #: stack while a C call holds the GIL - the whole-app freeze this
         #: Python thread can never see (it ran 6 s late in a test, after
         #: the call returned; review, 2026-10-19). It needs a real file.
+        #:
+        #: It is a DEAD MAN'S SWITCH, not a timer on the work: this thread
+        #: pushes its deadline back on every sample, so it fires only when
+        #: this thread cannot run for ``stall_s`` - the GIL held, the app
+        #: frozen. It reads other threads' states without the GIL, and armed
+        #: on the work's progress instead it fired while the app ran and a
+        #: thread was exiting: an access violation killed the process
+        #: (2026-10-19, test run). Frozen, no thread can exit.
         self.dump_file = dump_file
         self._fh = None
 
@@ -79,8 +87,9 @@ class _Watchdog:
             return
         import faulthandler
         try:
-            faulthandler.cancel_dump_traceback_later()
-            faulthandler.dump_traceback_later(self.stall_s, repeat=True, file=self._fh)
+            # three missed samples at least: a late wake-up is not a freeze
+            faulthandler.dump_traceback_later(max(self.stall_s, 3 * self.sample_s),
+                                              repeat=False, file=self._fh)
         except Exception:                                  # noqa: BLE001
             pass
 
@@ -89,7 +98,6 @@ class _Watchdog:
         real work finishes (one workbook, one picture, one match)."""
         self._last_beat = time.monotonic()
         self._reported = False
-        self._arm()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -112,15 +120,16 @@ class _Watchdog:
 
     def stop(self) -> None:
         self._stop.set()
+        # the thread first: it re-arms the switch on each sample
+        if self._thread is not None:
+            self._thread.join(timeout=self.sample_s * 2)
+        self._thread = None
         if self._fh is not None:
             import faulthandler
             try:
                 faulthandler.cancel_dump_traceback_later()
             except Exception:                              # noqa: BLE001
                 pass
-        if self._thread is not None:
-            self._thread.join(timeout=self.sample_s * 2)
-        self._thread = None
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -130,13 +139,14 @@ class _Watchdog:
 
     def _run(self) -> None:
         while not self._stop.wait(self.sample_s):
+            self._arm()               # still running: the app is not frozen
             idle = time.monotonic() - self._last_beat
             if idle < self.stall_s or self._reported:
                 continue
             try:
                 stacks = format_all_stacks()
-                where = (f" (also in {self.dump_file}, written even while the "
-                         "app is frozen)" if self._fh is not None else "")
+                where = (f" (if the whole app freezes, {self.dump_file} gets a "
+                         "dump too)" if self._fh is not None else "")
                 self._log(f"[stall-watchdog] no progress on {self.label!r} "
                           f"for {idle:.1f}s{where} — stacks follow:\n{stacks}")
             except Exception as exc:                       # noqa: BLE001
