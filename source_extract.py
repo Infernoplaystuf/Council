@@ -65,7 +65,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateField,
                            TemplateSchema, _text, fill_template, inspector_column,
@@ -1414,18 +1414,33 @@ class Extraction:
     #: where ``kind`` is one of ExcelOpenError's named modes. Used by the
     #: Ledger log summary at the end of a batch.
     open_failures: List[Tuple[str, str]] = field(default_factory=list)
+    #: Per-workbook wall-clock timings as ``(name, seconds)``. The Ledger
+    #: log appends the slowest few at the end of a batch so a stall is
+    #: easy to attribute without reading the terminal.
+    timings: List[Tuple[str, float]] = field(default_factory=list)
+    #: True when the extract exited early because the Ledger tab's
+    #: Cancel event fired. Surfaced via ``ExtractSummary.cancelled``.
+    cancelled: bool = False
 
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
             part: str = "", use_images: bool = True, progress=None,
-            pattern_mask: Optional[str] = None) -> Extraction:
+            pattern_mask: Optional[str] = None,
+            cancel: Optional[Any] = None) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
 
     ``pattern_mask`` is an optional user-supplied part-name shape (see
     ``mask_to_regex``). When set, it is tried first on filenames and sheet
-    names before the keyword / lone-number heuristics."""
+    names before the keyword / lone-number heuristics.
+
+    ``cancel`` is an optional ``threading.Event``: when its ``is_set()``
+    returns True, the loop exits before the next workbook with
+    ``Extraction.cancelled = True``. The Ledger tab's Cancel button sets
+    it and also calls ``excel_open.kill_active_excels()`` to unblock a
+    Workbooks.Open sitting on a modal Excel dialog."""
+    import time as _time
     from progress_report import NullProgress
     prog = progress or NullProgress()
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
@@ -1436,6 +1451,12 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         default_image_reader() if use_images else None)
     prog.stage("reading workbooks", total=len(sources), unit="workbooks")
     for src in sources:
+        if cancel is not None and cancel.is_set():
+            run.cancelled = True
+            run.problems.append("Cancelled by user before "
+                                f"{Path(src).name!r}.")
+            break
+        _t0 = _time.monotonic()
         src = Path(src)
         via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
             src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -1452,7 +1473,9 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                     if cause is not None and type(cause).__name__ == "ExcelOpenError"
                     else "other")
             run.open_failures.append((src.name, kind))
-            prog.advance(what=f"{src.name}: not read")
+            _secs = _time.monotonic() - _t0
+            run.timings.append((src.name, _secs))
+            prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
             continue
         for i, img in enumerate(images):
             prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
@@ -1521,7 +1544,9 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                     if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
                                            note.anchor):
                         note.values += n
-        prog.advance(what=f"{src.name} read")
+        _secs = _time.monotonic() - _t0
+        run.timings.append((src.name, _secs))
+        prog.advance(what=f"{src.name} read in {_secs:.1f}s")
         orphans = sum(1 for ex in exs for o in ex.out if not o.part)
         if orphans:
             run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
