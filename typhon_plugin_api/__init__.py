@@ -500,7 +500,18 @@ class FeaturePlugin(Protocol):
     fault is said in Start's summary or the run's end record and the
     capture carries on; only check_start refuses a Start. On the RECORDING
     PATH (a record gate, a frame stage: built-in plugins only) a fault ends
-    the recording, with the reason in the end record."""
+    the recording, with the reason in the end record.
+
+    THREADS AND TIME (design 3.11; P3 review). check_start,
+    on_run_started, a run_started or run_stopped listener and
+    on_run_finished each run on a thread of their own while Start, Stop or
+    the end record waits for them — RUN_HOOK_SECONDS (2 s) at most: one
+    that has not returned by then is switched off as a hang and Typhon
+    goes on without it (a hung check_start refuses that Start). What
+    on_run_finished returns is read and cleaned inside that same call, so
+    a block that raises or hangs when read is its plugin's fault only.
+    on_frame runs on the plugin's own feed thread (duty-capped); a frame
+    stage on the writer threads, watched by the watchdog."""
 
     def activate(self, ctx: PluginContext) -> None: ...
 
