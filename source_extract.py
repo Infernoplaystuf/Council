@@ -58,6 +58,7 @@ import base64
 import difflib
 import io
 import json
+import os
 import re
 import urllib.request
 from collections import Counter, defaultdict
@@ -375,9 +376,24 @@ WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
 
 
 def workbook_files(folder) -> List[Path]:
-    """The workbooks in a folder, not Excel's ~$ lock files."""
-    return sorted(x for x in Path(folder).iterdir()
-                  if x.suffix.lower() in WORKBOOK_SUFFIXES and not x.name.startswith("~$"))
+    """The workbooks under a folder — recursively — not Excel's ~$ lock files.
+
+    Folders whose names start with "." or "~$" are pruned at every depth so
+    hidden caches (``.git``, ``.cache``), VCS metadata and Excel autosave
+    directories don't leak into the scan; ``~$`` files anywhere are skipped
+    for the same reason (Excel's lockfile for an open workbook)."""
+    root = Path(folder)
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # In-place prune so os.walk does not descend into hidden/lock dirs.
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and not d.startswith("~$")]
+        for name in filenames:
+            if name.startswith("~$"):
+                continue
+            if Path(name).suffix.lower() in WORKBOOK_SUFFIXES:
+                out.append(Path(dirpath) / name)
+    return sorted(out)
 
 
 def load_workbook_grids(path, notes: Optional[List[str]] = None,
