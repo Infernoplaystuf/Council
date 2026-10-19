@@ -171,9 +171,31 @@ def _norm(v) -> str:
 #: Short words a results or initials column holds that are not anyone's
 #: initials, however they are typed ('TBD', 'OK', 'NA'). Not 'EC': Eva Chen
 #: signs as EC.
-_NOT_INITIALS = {"seen", "ok", "okay", "yes", "no", "na", "n a", "tbd", "tba", "pass",
-                 "fail", "none", "nil", "good", "bad", "done", "open", "x", "y", "n", "nde",
-                 "fpi", "date", "flaw", "part", "run", "item", "id", "all", "any", "nd"}
+_NOT_INITIALS = {
+    # outcome / status cells
+    "seen", "ok", "okay", "yes", "no", "na", "n a", "tbd", "tba", "pass",
+    "fail", "none", "nil", "good", "bad", "done", "open", "x", "y", "n", "nd",
+    # method labels (deliberately NOT including 'VT', 'UT', 'ET', 'EC',
+    # 'PT', 'MT', 'RT' — the comment above calls out EC as a real
+    # inspector's initials, and the others collide with real names too)
+    "nde", "fpi",
+    # workbook-structure labels
+    "date", "flaw", "part", "run", "item", "id", "all", "any",
+    # stage / phase labels — the user hit "pre" and "post" being asked
+    # as people (bug 2026-10-19); inspection sheets routinely use these
+    # as column headers (short for Pre-Conceal / Post-Conceal), and all-
+    # caps "PRE" / "POST" match the 1-4-letter initials regex. Short-
+    # cut rejection here. No real inspector uses 'PRE' or 'POST' as
+    # initials — if that ever happens the user can clear the stop-list.
+    "pre", "post", "mid", "end", "start",
+    # unit labels that are 1-4 letters and sometimes typed all-caps as
+    # a column header on their own ("MM", "KG"). As with the method
+    # labels, we skip 2-letter units that could be initials ("MM" vs
+    # Matt M., "LB" vs Lee B.) — only the ones that are overwhelmingly
+    # units.
+    "psi", "kw", "mw", "hz", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
+    "sec", "min", "max", "avg", "std", "ppm",
+}
 #: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?'.
 _NOBODY = re.compile(r"(?i)\s*(?:n\s*/\s*a|n\.?\s*a\.?|-+|\?+|tbd|tba|none|nil|unknown)\s*")
 
