@@ -679,9 +679,20 @@ def rebuild_summary_line(stats) -> str:
         bits.append(" — " + ", ".join(kinds))
     if stats.get("wikilink_mentions"):
         wm = stats["wikilink_mentions"]
+        tail = ""
+        matched = stats.get("wikilinks_matched") or 0
+        created = stats.get("wikilinks_created") or 0
+        if matched or created:
+            parts = []
+            if matched:
+                parts.append(f"{matched} matched existing")
+            if created:
+                parts.append(f"{created} new "
+                             + ("entity" if created == 1 else "entities"))
+            tail = f" ({', '.join(parts)})"
         bits.append(f"; {wm} [[wiki-link]] mention"
                     + ("s" if wm != 1 else "")
-                    + " found")
+                    + " found" + tail)
     unreadable = stats.get("unreadable") or []
     if unreadable:
         counts = stats.get("unreadable_reasons") or unreadable_breakdown(unreadable)
@@ -1003,11 +1014,7 @@ class WikiLinkRef:
 
 def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
                    ) -> List[WikiLinkRef]:
-    """Pure function over document_lines output; no DB access.
-
-    Future-proof entry point: a later PR will feed these refs into the
-    graph as mentions (firm when the surface matches a known entity,
-    suggested otherwise). This one only parses and reports."""
+    """Pure function over document_lines output; no DB access."""
     out: List[WikiLinkRef] = []
     for page, line_no, text in lines:
         if "[[" not in text:
@@ -1023,6 +1030,33 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
                 out.append(WikiLinkRef(page=page, line=line_no,
                                        surface=surface, display=display))
     return out
+
+
+#: A loose check for "this looks like a human name" so an unresolved
+#: ``[[Jordan Blake]]`` lands as a PERSON. Two or more tokens, each
+#: starting with a capital and containing only letters, apostrophes and
+#: hyphens — so ``O'Brien``, ``McDonald`` and ``Jean-Luc`` all qualify.
+#: Deliberately loose: a two-word all-caps string like ``ABC DEF`` also
+#: lands as PERSON (``looks_like_code`` runs first on anything with a
+#: digit, so ``ABC-123`` still goes to PART).
+_HUMAN_NAME_RE = __import__("re").compile(
+    r"^[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)+$")
+
+
+def _infer_wikilink_type(surface: str) -> str:
+    """Pick an entity type for an unresolved ``[[surface]]``.
+
+    Order:
+      1. Looks like a code (``[A-Za-z]{1,8}[-_ ]?\\d[\\w\\-/.]*``) → PART.
+      2. Looks like a human name (two or more Capitalized tokens, no digits)
+         → PERSON.
+      3. Fallback → PROJECT (the KG's catch-all for named things)."""
+    s = (surface or "").strip()
+    if looks_like_code(s):
+        return "PART"
+    if _HUMAN_NAME_RE.match(s):
+        return "PERSON"
+    return "PROJECT"
 
 
 def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
@@ -1557,6 +1591,67 @@ class KnowledgeGraph:
             self._alias(eid, raw, alias_source)
         return eid
 
+    def _lookup_entity_by_name(self, name: str) -> Optional[Tuple[str, str]]:
+        """Find an existing entity whose alias folds to ``name``'s folded
+        form. Returns ``(eid, type)`` or None.
+
+        Used by the wiki-link pass: a ``[[Jordan Blake]]`` the user wrote in
+        a document resolves to the Jordan Blake who was created by a Ledger
+        row, instead of creating a parallel PERSON."""
+        fn = fold(name)
+        if not fn:
+            return None
+        row = self.db.execute(
+            "SELECT a.entity_id, e.type FROM aliases a JOIN entities e"
+            " ON e.id=a.entity_id WHERE a.alias_norm=? AND e.merged_into IS NULL"
+            " LIMIT 1", (fn,)).fetchone()
+        if row is None:
+            return None
+        return (row["entity_id"], row["type"])
+
+    def _seed_wikilinks(self, run_id: str, stats: Dict[str, Any]) -> None:
+        """Create (or resolve) an entity for every pending ``[[Name]]`` and
+        write a mention linking that entity to the document it appeared in.
+
+        An existing-entity match stays with the entity's type; an unresolved
+        name is classified by ``_infer_wikilink_type`` and inserted at the
+        inferred type with ``alias_source='inferred'`` (wiped on next
+        rebuild and rebuilt from the same documents, so withdrawn wiki-links
+        disappear cleanly)."""
+        pending = getattr(self, "_pending_wikilinks", None) or []
+        if not pending:
+            self._pending_wikilinks = []
+            return
+        for did, ref in pending:
+            match = self._lookup_entity_by_name(ref.surface)
+            if match is not None:
+                eid, _etype = match
+                stats["wikilinks_matched"] += 1
+            else:
+                etype = _infer_wikilink_type(ref.surface)
+                # The entity's name is the SURFACE (left of the pipe) — the
+                # user's canonical reference. ref.display is only the local
+                # alias used in that one line, so it is not passed as the
+                # entity's display name here.
+                eid = self._entity(etype, ref.surface,
+                                   alias_source="inferred")
+                stats["wikilinks_created"] += 1
+            loc = {"line": int(ref.line)}
+            if ref.page is not None:
+                loc["page" if isinstance(ref.page, int) else "sheet"] = ref.page
+            snippet = f"[[{ref.surface}]]"
+            try:
+                self._mention(eid, did, loc, ref.surface, snippet,
+                              "wikilink", run_id)
+            except Exception as exc:                              # noqa: BLE001
+                # A mention row that is already there (same entity + doc +
+                # loc + method) is INSERT OR IGNORE's job; a plain Exception
+                # here means something more wrong than that, and the rebuild
+                # should keep going.
+                print(f"[wikilinks] skipped mention for {ref.surface!r}: {exc!r}",
+                      flush=True)
+        self._pending_wikilinks = []
+
     def _alias(self, eid: str, alias: str, source: str) -> None:
         eid = self.resolve(eid)          # a merged entity's names live on its survivor
         alias = " ".join(str(alias).split())
@@ -1731,7 +1826,12 @@ class KnowledgeGraph:
                                  "ledger_people": 0,
                                  "wikilink_mentions": 0,
                                  "wikilink_unique": 0,
+                                 "wikilinks_matched": 0,
+                                 "wikilinks_created": 0,
                                  "unreadable_reasons": {}}
+        #: Per-rebuild list of (did, WikiLinkRef) collected during reading
+        #: and consumed by the graph phase; cleared at the end of _seed.
+        self._pending_wikilinks: List[Tuple[str, WikiLinkRef]] = []
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
                                   "documents count as gone until it is back")
@@ -1818,19 +1918,16 @@ class KnowledgeGraph:
                             lines = list(reading.lines)
                         else:
                             lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
-                        # Obsidian-style [[Name]] references: counted now
-                        # and surfaced in the rebuild summary. A later PR
-                        # will connect them to entities as mentions. Unique
-                        # surfaces are tracked for THIS document only (per-
-                        # document uniques summed across docs); a run with
-                        # the same name in two docs counts it twice, which
-                        # matches how the rebuild line reads: "N mentions,
-                        # K unique within documents".
+                        # Obsidian-style [[Name]] references: parsed now
+                        # and queued for the graph phase, which creates (or
+                        # resolves) entities and writes mentions.
                         _wl_refs = scan_wikilinks(lines)
                         if _wl_refs:
                             stats["wikilink_mentions"] += len(_wl_refs)
                             stats["wikilink_unique"] += len({
                                 r.surface.lower() for r in _wl_refs})
+                            self._pending_wikilinks.extend(
+                                (did, r) for r in _wl_refs)
                         self.db.execute(
                             "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
                             (did, h, sig, _records_json(recs, reading),
@@ -2036,6 +2133,11 @@ class KnowledgeGraph:
                     stats["collections"] = self._seed_collections(run_id)
                 self._flush()
                 self._memo["buffer"] = None
+                # Wiki-link mentions. Done AFTER the records pass (so a surface
+                # that matches a record-created entity resolves to it) and
+                # BEFORE the gazetteer (which can then find other mentions of
+                # a brand-new PERSON a wiki-link named).
+                self._seed_wikilinks(run_id, stats)
                 if gazetteer:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
