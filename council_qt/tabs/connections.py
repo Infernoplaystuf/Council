@@ -652,8 +652,23 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")
             return
-        self.status.setText(f"Rebuilt from {stats['documents']} document(s) in "
-                            f"{stats.get('seconds', 0):.1f} s.")
+        from council_core import knowledge_graph as kgm
+        self.status.setText(kgm.rebuild_summary_line(stats))
+        # The first few unreadable entries also go to the tooltip, where
+        # the user can hover without having to scroll a dialog.
+        reasons = stats.get("unreadable") or []
+        if reasons:
+            preview = "\n".join(reasons[:12])
+            if len(reasons) > 12:
+                preview += f"\n…and {len(reasons) - 12} more."
+            self.status.setToolTip("Unreadable files:\n" + preview)
+            # Also print the full list to the terminal so a Barbie / Pi
+            # run that bypasses the UI still has it.
+            print("[kg-rebuild] unreadable files:", flush=True)
+            for line in reasons:
+                print(f"  {line}", flush=True)
+        else:
+            self.status.setToolTip("")
         self.on_search()
         if self._current:
             self.show_entity(self._current)
