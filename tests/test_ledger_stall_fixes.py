@@ -318,3 +318,69 @@ def test_imagegrab_is_still_the_fallback(monkeypatch):
     monkeypatch.setattr(excel_open, "_clipboard_dib", broken)
     monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: Image.new("RGB", (4, 4)))
     assert excel_open._copy_picture(_Shape())
+
+
+# ---------------------------------------------- what a folder scan reads
+
+def _accept_all(review: str) -> None:
+    wb = openpyxl.load_workbook(review)
+    v = wb["Values"]
+    for r in range(2, v.max_row + 1):
+        v.cell(r, 1, "Y")
+    wb.save(review)
+
+
+def test_same_named_workbooks_in_sibling_folders_are_both_applied(tmp_path, ledger):
+    """A folder per sample, each with its own laser_log.xlsx: Apply matched
+    the reviewer's choices by file name, so one sample was lost."""
+    csv, _schema = ledger
+    root = tmp_path / "samples"
+    for part, power in (("201", 280), ("202", 300)):
+        d = root / part
+        d.mkdir(parents=True)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"Part {part}"
+        ws["A1"], ws["B1"] = "Laser Power (W)", power
+        wb.save(d / "laser_log.xlsx")
+    s = li.run_extract(str(csv), [str(root)], use_images=False)
+    wheres = {r[8] for r in openpyxl.load_workbook(s.review)["Values"].iter_rows(
+        min_row=2, values_only=True)}
+    assert any(w.startswith("201/laser_log.xlsx") for w in wheres)
+    assert any(w.startswith("202/laser_log.xlsx") for w in wheres)
+    _accept_all(s.review)
+    li.run_apply(s.review, use_images=False)
+    parts = {r[ParentCSV(csv).schema.id_field] for r in ParentCSV(csv).rows}
+    assert {"201", "202"} <= parts
+
+
+def test_a_folder_scan_leaves_the_ledgers_own_outputs_out(tmp_path, ledger):
+    csv, schema = ledger
+    root = tmp_path / "inspections"
+    root.mkdir()
+    lf.make_laser_log(root / "laser_101.xlsx")
+    s = li.run_extract(str(csv), [str(root)], use_images=False)
+    review = Path(s.review)
+    (root / "old_review.xlsx").write_bytes(review.read_bytes())   # a review kept here
+    from sample_ledger import fill_template
+    fill_template(schema, [{schema.id_field: "101"}] if not schema.item_field else
+                  [{schema.id_field: "101", schema.item_field: schema.items[0]}],
+                  root / "filled_101.xlsx")
+    kept, skipped = li.collect_sources([str(root)], template_path=schema.template_path)
+    assert [p.name for p in kept] == ["laser_101.xlsx"]
+    assert {p.name for p in skipped} == {"old_review.xlsx", "filled_101.xlsx"}
+    # picked by name, a file is read as asked
+    kept2, _ = li.collect_sources([str(root / "filled_101.xlsx")],
+                                  template_path=schema.template_path)
+    assert [p.name for p in kept2] == ["filled_101.xlsx"]
+
+
+def test_a_folder_scan_does_not_follow_a_junction(tmp_path):
+    _winapi = pytest.importorskip("_winapi")
+    if not hasattr(_winapi, "CreateJunction"):
+        pytest.skip("no junctions here")
+    root = tmp_path / "root"
+    (root / "real").mkdir(parents=True)
+    lf.make_laser_log(root / "real" / "a.xlsx")
+    _winapi.CreateJunction(str(root / "real"), str(root / "loop"))
+    assert [p.name for p in se.workbook_files(root)] == ["a.xlsx"]

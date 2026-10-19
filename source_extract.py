@@ -571,6 +571,17 @@ def preview_workbook(path, schema, aliases=None,
 WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
 
 
+_SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
+
+
+def _is_link_dir(path: str) -> bool:
+    try:
+        isj = getattr(os.path, "isjunction", None)
+        return os.path.islink(path) or bool(isj and isj(path))
+    except OSError:
+        return True
+
+
 def workbook_files(folder) -> List[Path]:
     """The workbooks under a folder — recursively — not Excel's ~$ lock files.
 
@@ -581,9 +592,14 @@ def workbook_files(folder) -> List[Path]:
     root = Path(folder)
     out: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # In-place prune so os.walk does not descend into hidden/lock dirs.
+        # In-place prune so os.walk does not descend into hidden/lock dirs,
+        # junctions / links (a loop read the same workbooks many times) or a
+        # drive's system folders (deleted workbooks came back) - review,
+        # 2026-10-19.
         dirnames[:] = [d for d in dirnames
-                       if not d.startswith(".") and not d.startswith("~$")]
+                       if not d.startswith(".") and not d.startswith("~$")
+                       and d.lower() not in _SYSTEM_DIRS
+                       and not _is_link_dir(os.path.join(dirpath, d))]
         for name in filenames:
             if name.startswith("~$"):
                 continue
@@ -1735,8 +1751,34 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     return run
 
 
+def source_labels(sources: Sequence) -> Dict[str, str]:
+    """How each source is named in the review: its file name, or - when
+    two picked workbooks share one (a folder per sample, each with its
+    'laser_log.xlsx') - its path from the folder they share. Apply matches
+    the reviewer's choices by that name, so a shared one merged the
+    samples and all but one were lost (review, 2026-10-19)."""
+    paths = [Path(s) for s in sources]
+    by_name: Dict[str, List[Path]] = defaultdict(list)
+    for p in paths:
+        by_name[p.name.lower()].append(p)
+    out: Dict[str, str] = {}
+    for same in by_name.values():
+        if len(same) == 1:
+            out[str(same[0])] = same[0].name
+            continue
+        try:
+            base = Path(os.path.commonpath([str(p.parent) for p in same]))
+            for p in same:
+                out[str(p)] = p.relative_to(base).as_posix()
+        except ValueError:                                   # other drives
+            for p in same:
+                out[str(p)] = p.as_posix()
+    return out
+
+
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time) -> None:
+    labels = source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
             run.cancelled = True
@@ -1746,7 +1788,8 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
         kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
         try:
             _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
-                         reader, m, codes, mask_re, part, schema, _time)
+                         reader, m, codes, mask_re, part, schema, _time,
+                         labels.get(str(src)) or Path(src).name)
         except _Cancelled:
             # half a workbook is not offered for review: what it gave goes
             del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
@@ -1758,7 +1801,7 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
 
 
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                 m, codes, mask_re, part, schema, _time) -> None:
+                 m, codes, mask_re, part, schema, _time, label: str = "") -> None:
     _t0 = _time.monotonic()
     via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
         src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -1787,6 +1830,11 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         run.timings.append((src.name, _secs))
         prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
         return
+    if label and label != src.name:            # a name another source shares
+        for g in grids:
+            g.file = label
+        for img in images:
+            img.file = label
     for i, img in enumerate(images):
         if cancel is not None and cancel.is_set():
             raise _Cancelled()
@@ -1797,7 +1845,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             d.mkdir(parents=True, exist_ok=True)
             # every part cleaned: a sheet, anchor or extension may hold
             # characters Windows refuses in a file name ("?" did)
-            p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
+            stem = Path(label).with_suffix("").as_posix() if label else src.stem
+            p = d / (f"{_safe(stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
                      f".{_safe(img.ext) or 'png'}")
             try:
                 p.write_bytes(img.data)

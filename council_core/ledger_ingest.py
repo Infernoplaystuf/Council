@@ -46,8 +46,25 @@ def default_review_for(csv_path) -> Path:
     return Path(csv_path).with_name(f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
 
 
+def is_ledger_output(p: Path, template_path: Optional[str] = None) -> bool:
+    """The Ledger's own files: a review workbook, a filled template, the
+    template itself. A recursive scan of a folder that also holds the
+    Ledger read them back as sources - old reviews' values outranked the
+    real ones (review, 2026-10-19)."""
+    from council_core import kg_excel
+    from sample_ledger import is_filled_template
+    if template_path:
+        try:
+            if p.resolve() == Path(template_path).resolve():
+                return True
+        except OSError:
+            pass
+    return kg_excel.is_review_workbook(p) or is_filled_template(p)
+
+
 def collect_sources(paths: Sequence,
-                    ignore_patterns: Optional[Sequence[str]] = None
+                    ignore_patterns: Optional[Sequence[str]] = None,
+                    template_path: Optional[str] = None
                     ) -> Tuple[List[Path], List[Path]]:
     """Expand paths (files kept as-is, folders scanned recursively) into
     the Ledger's source list.
@@ -66,11 +83,15 @@ def collect_sources(paths: Sequence,
     ignored: List[Path] = []
     for s in paths:
         p = Path(s)
-        found = workbook_files(p) if p.is_dir() else [p]
+        scanned = p.is_dir()
+        found = workbook_files(p) if scanned else [p]
         for x in found:
             if x in kept or x in ignored:
                 continue
-            if file_matches_ignore(x.name, patterns):
+            # a folder's scan leaves the Ledger's own outputs out; a file
+            # the user picked by name is read as asked
+            if file_matches_ignore(x.name, patterns) or (
+                    scanned and is_ledger_output(x, template_path)):
                 ignored.append(x)
             else:
                 kept.append(x)
@@ -212,13 +233,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     from source_extract import load_ignore_files
     ignore_patterns = load_ignore_files(csv_path)
     files, skipped_files = collect_sources(sources,
-                                           ignore_patterns=ignore_patterns)
+                                           ignore_patterns=ignore_patterns,
+                                           template_path=ledger.schema.template_path)
     if not files:
         if skipped_files and not sources:
             raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
         if skipped_files:
             raise LedgerError(
-                f"no source workbooks left after filename-ignore patterns "
+                f"no source workbooks left after the Skip patterns and the Ledger's own "
+                f"outputs were left out "
                 f"({len(skipped_files)} skipped: "
                 + ", ".join(sorted({p.name for p in skipped_files}))[:200]
                 + "). Edit the Skip these files field or clear it.")
@@ -232,7 +255,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         say("starting the local image reader…")
         image_reader = default_image_reader()
     if skipped_files:
-        say(f"ignoring {len(skipped_files)} file(s) by pattern: "
+        say(f"leaving out {len(skipped_files)} file(s) (Skip patterns, or the Ledger's "
+            "own reviews / filled templates): "
             + ", ".join(sorted({p.name for p in skipped_files}))[:200])
     say(f"reading {len(files)} workbooks…")
     run = extract(ledger.schema, files, mapping, ignore,

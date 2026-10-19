@@ -632,8 +632,32 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
         for f in schema.fields:
             if f.per_item and item in f.cells:
                 put(f, item, row.get(f.name))
+    # so a recursive source scan knows this is the Ledger's own output, not
+    # an inspection workbook (review, 2026-10-19)
+    try:
+        wb.properties.keywords = FILLED_MARK
+    except Exception:
+        pass
     wb.save(out_path)
     return warnings
+
+
+#: The keyword a filled template carries in its document properties.
+FILLED_MARK = "council-ledger-filled-template"
+
+
+def is_filled_template(p) -> bool:
+    """A template the Ledger filled (fill_template), told from its document
+    properties without opening the workbook."""
+    import zipfile
+    p = Path(p)
+    if p.suffix.lower() not in (".xlsx", ".xlsm"):
+        return False
+    try:
+        with zipfile.ZipFile(p) as z:
+            return FILLED_MARK.encode() in z.read("docProps/core.xml")
+    except Exception:
+        return False
 
 
 def _typed(v):
