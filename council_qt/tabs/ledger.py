@@ -61,9 +61,11 @@ class LedgerActions:
     """The tab's seam to the pipeline and the desktop: tests replace pieces
     (a stand-in image reader, no Excel, no file dialogs)."""
 
-    def __init__(self, image_reader=None, opener: Optional[Callable] = None):
+    def __init__(self, image_reader=None, opener: Optional[Callable] = None,
+                 rebuild_kg: Optional[Callable] = None):
         self.image_reader = image_reader
         self.opener = opener or ledger_ingest.open_path
+        self._rebuild_kg_override = rebuild_kg
 
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
@@ -87,6 +89,19 @@ class LedgerActions:
     def open(self, path) -> None:
         self.opener(path)
 
+    def rebuild_kg(self, progress):
+        """Rebuild the knowledge graph on the user's vault — same path the
+        Connections tab uses. ``progress`` is the Ledger tab's
+        ``(line, fraction)`` listener; the KG's own line-by-line stream is
+        forwarded to it.
+
+        Tests pass a ``rebuild_kg`` override to the LedgerActions
+        constructor to avoid touching the real vault or Ollama."""
+        if self._rebuild_kg_override is not None:
+            return self._rebuild_kg_override(progress)
+        from council_qt.tabs.connections import ConnectionsActions
+        return ConnectionsActions().rebuild(listener=progress)
+
 
 class LedgerTab(ViewHelpers, QWidget):
     def __init__(self, window=None, actions: Optional[LedgerActions] = None):
@@ -97,6 +112,9 @@ class LedgerTab(ViewHelpers, QWidget):
         self._tokens = theme.tokens("dark")
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
+        #: True from an apply's completion until the next KG rebuild —
+        #: used by _refresh_enabled to highlight the Rebuild button.
+        self._kg_dirty = False
         self._build()
         self._refresh_reader_choices()
         self._refresh_enabled()
@@ -196,6 +214,12 @@ class LedgerTab(ViewHelpers, QWidget):
                                        self.browse_fill_dir)
         row = QHBoxLayout()
         self.apply_btn = self._step_button(row, "Apply review → parent CSV", self.on_apply)
+        self.rebuild_kg_btn = self._step_button(
+            row, "Rebuild knowledge graph", self.on_rebuild_kg)
+        self.rebuild_kg_btn.setToolTip(
+            "Rebuild the Connections knowledge graph from the vault's "
+            "data_in folder, so a newly-applied Ledger shows up as parts, "
+            "people and inspections. Same path the Connections tab uses.")
         row.addStretch(1)
         grid4.addLayout(row, 1, 1)
         outer.addWidget(g4)
@@ -253,6 +277,11 @@ class LedgerTab(ViewHelpers, QWidget):
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
+        if hasattr(self, "rebuild_kg_btn"):
+            # Always clickable while idle; dirtiness only affects weight.
+            font = self.rebuild_kg_btn.font()
+            font.setBold(self._kg_dirty)
+            self.rebuild_kg_btn.setFont(font)
 
     # ── image-reader dropdown ───────────────────────────────────────────
     def _refresh_reader_choices(self, *, select: Optional[str] = None,
@@ -447,11 +476,25 @@ class LedgerTab(ViewHelpers, QWidget):
 
         def done(s) -> None:
             self.stat["problems"].setText(str(len(s.problems)))
-            self.status.setText(f"{s.accepted} values accepted → {s.rows} rows: "
-                                f"{s.csv_result}")
+            self.status.setText(
+                f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "
+                "Press Rebuild knowledge graph to pick up the new rows.")
             self._say(s.describe())
+            self._kg_dirty = True
         self._run("Applying the review",
                   lambda p: self.actions.apply(review, fill, images, p), done)
+
+    def on_rebuild_kg(self) -> None:
+        """Rebuild the Connections knowledge graph; the Ledger log shows
+        the breakdown line via rebuild_summary_line."""
+        def done(stats) -> None:
+            from council_core import knowledge_graph as kgm
+            line = kgm.rebuild_summary_line(stats or {})
+            self.status.setText(line)
+            self._say(line)
+            self._kg_dirty = False
+        self._run("Rebuilding the knowledge graph",
+                  lambda p: self.actions.rebuild_kg(p), done)
 
     # ── file dialogs ────────────────────────────────────────────────────
     def _start_dir(self, edit: Optional[QLineEdit] = None) -> str:
