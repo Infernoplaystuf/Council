@@ -169,6 +169,13 @@ class LedgerTab(ViewHelpers, QWidget):
         self._step_button(row, "Add folder…", self.browse_folder)
         self._step_button(row, "Remove selected", self.remove_selected)
         self._step_button(row, "Clear", self.clear_sources)
+        preview = self._step_button(row, "Preview a workbook…",
+                                    self.on_preview_workbook)
+        preview.setToolTip(
+            "Dry-run against one source workbook so you can see which "
+            "columns the matcher recognizes, which inspectors it finds, "
+            "and which labels it can't match. Fix the labels or add a "
+            "schema alias BEFORE running a long batch.")
         row.addWidget(QLabel("Part number (if not in them):"))
         self.part = QLineEdit()
         self.part.setFixedWidth(120)
@@ -414,6 +421,38 @@ class LedgerTab(ViewHelpers, QWidget):
         self._worker = threading.Thread(target=work, name="ledger-step", daemon=True)
         self._refresh_enabled()
         self._worker.start()
+
+    def on_preview_workbook(self) -> None:
+        """File-pick a single source workbook and show what the Ledger
+        extractor would make of it — no values extracted, no review
+        written. Needs a parent CSV with a schema beside it."""
+        csv_path = self.csv.text().strip()
+        if not csv_path:
+            self.status.setText(
+                "Set the parent CSV path first — the preview needs its schema.")
+            return
+        try:
+            from sample_ledger import ParentCSV
+            from source_extract import load_aliases
+            ledger = ParentCSV(csv_path)
+        except Exception as exc:                            # noqa: BLE001
+            self.status.setText(f"Could not open {csv_path}: {exc}")
+            return
+        if ledger.schema is None:
+            self.status.setText(
+                "That parent CSV has no schema beside it — run Create first.")
+            return
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick ONE source workbook to preview",
+            self._start_dir(), XLSX)
+        if not p:
+            return
+        aliases, _ignore = load_aliases(csv_path)
+        from .ledger_dialogs import PreviewWorkbookDialog
+        mask = self.pattern_mask.text().strip()
+        dlg = PreviewWorkbookDialog(p, ledger.schema, aliases=aliases,
+                                    pattern_mask=mask or None, parent=self)
+        dlg.exec()
 
     def on_cancel(self) -> None:
         """Signal the running step to stop. The event is checked between

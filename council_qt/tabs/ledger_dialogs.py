@@ -11,8 +11,10 @@ import threading
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QProgressBar,
+                               QListWidget, QListWidgetItem,
+                               QPlainTextEdit, QProgressBar,
                                QPushButton, QVBoxLayout, QWidget)
 
 from council_core import ollama_install
@@ -202,3 +204,77 @@ class InstallVisionModelDialog(QDialog):
             except Exception as exc:                        # noqa: BLE001
                 print(f"[ledger_dialogs] on_installed hook raised: {exc!r}",
                       flush=True)
+
+
+class PreviewWorkbookDialog(QDialog):
+    """Show what the Ledger extractor can see in one source workbook —
+    per-sheet candidate part ids, inspectors, confident label→field
+    bindings, weak suggestions, and unmatched label cells.
+
+    The expensive work (``source_extract.preview_workbook``) runs on a
+    worker thread; the GUI shows a placeholder until it finishes.
+
+    No value extraction happens — this is a *dry run* so the user can
+    tell whether a workbook is extraction-ready before kicking off a
+    long batch."""
+
+    _done = Signal(object, str)         # (WorkbookPreview or None, error text)
+
+    def __init__(self, path, schema, aliases=None,
+                 pattern_mask: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Preview: {path}")
+        self.resize(760, 520)
+        self._done.connect(self._on_done)
+
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            f"Dry run against {path}. Nothing is extracted. The report "
+            "shows what the pipeline would see — fix the labels / aliases "
+            "the matcher misses before running the batch.")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.text.setFont(font)
+        self.text.setPlainText("Reading the workbook…")
+        root.addWidget(self.text, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        root.addWidget(self.progress)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+
+        self._start_worker(path, schema, aliases, pattern_mask)
+
+    def _start_worker(self, path, schema, aliases, pattern_mask) -> None:
+        def work():
+            report = None
+            err = ""
+            try:
+                from source_extract import preview_workbook
+                report = preview_workbook(path, schema, aliases=aliases,
+                                          pattern_mask=pattern_mask)
+            except Exception as exc:                        # noqa: BLE001
+                err = f"preview failed: {exc!r}"
+            self._done.emit(report, err)
+
+        threading.Thread(target=work, name="ledger-preview",
+                         daemon=True).start()
+
+    def _on_done(self, report, err: str) -> None:
+        self.progress.setVisible(False)
+        if err:
+            self.text.setPlainText(err)
+            return
+        if report is None:
+            self.text.setPlainText("No preview — the reader returned nothing.")
+            return
+        self.text.setPlainText(report.describe())
