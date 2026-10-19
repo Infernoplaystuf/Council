@@ -23,10 +23,29 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QGridLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QListWidget, QPlainTextEdit,
+                               QProgressBar, QPushButton, QVBoxLayout, QWidget)
+
+
+class _VisionReaderCombo(QComboBox):
+    """A combobox that refreshes its installed-models list each time the
+    user opens the popup, instead of at construction. The owning tab
+    probes Ollama on every showPopup, so a test (which runs offline and
+    counts even caught connection attempts as failures) never touches
+    the network unless the user actually clicks the dropdown."""
+
+    def __init__(self, probe, parent=None):
+        super().__init__(parent)
+        self._probe = probe
+
+    def showPopup(self):
+        try:
+            self._probe()
+        except Exception:                                 # noqa: BLE001
+            pass
+        super().showPopup()
 
 from council_core import ledger_ingest
 from sample_ledger import LedgerError
@@ -50,9 +69,15 @@ class LedgerActions:
         return ledger_ingest.create_parent(template, csv or None)
 
     def extract(self, csv, sources, part, use_images, progress,
-                pattern_mask: Optional[str] = None):
+                pattern_mask: Optional[str] = None,
+                vision_model: Optional[str] = None):
+        reader = self.image_reader
+        if reader is None and use_images and vision_model:
+            # Explicit opt-in: the user picked a vision model in the dropdown.
+            from source_extract import ollama_vision_reader
+            reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
-                                         image_reader=self.image_reader, progress=progress,
+                                         image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None)
 
     def apply(self, review, fill_dir, use_images, progress):
@@ -73,6 +98,7 @@ class LedgerTab(ViewHelpers, QWidget):
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
         self._build()
+        self._refresh_reader_choices()
         self._refresh_enabled()
 
     # ── layout ──────────────────────────────────────────────────────────
@@ -122,9 +148,21 @@ class LedgerTab(ViewHelpers, QWidget):
         self.part = QLineEdit()
         self.part.setFixedWidth(120)
         row.addWidget(self.part)
-        self.use_images = QCheckBox("Read pasted images (Tesseract, local)")
+        self.use_images = QCheckBox("Read pasted images with")
         self.use_images.setChecked(True)
+        self.use_images.toggled.connect(self._refresh_reader_enabled)
         row.addWidget(self.use_images)
+        self.image_reader_choice = _VisionReaderCombo(
+            probe=lambda: self._refresh_reader_choices(from_popup=True))
+        self.image_reader_choice.setToolTip(
+            "Which reader runs on each pasted image. Tesseract is a local "
+            "OCR that reads clean text fast. Ollama vision models catch "
+            "handwriting and messy tables Tesseract misses, slower.")
+        row.addWidget(self.image_reader_choice)
+        self._install_vision_sentinel = "__install_vision__"
+        self._tesseract_sentinel = "__tesseract__"
+        self.image_reader_choice.currentIndexChanged.connect(
+            self._on_reader_changed)
         row.addStretch(1)
         v2.addLayout(row)
         # Pattern hint — not persisted; held for this session only. A follow-up
@@ -215,6 +253,74 @@ class LedgerTab(ViewHelpers, QWidget):
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
+
+    # ── image-reader dropdown ───────────────────────────────────────────
+    def _refresh_reader_choices(self, *, select: Optional[str] = None,
+                                from_popup: bool = False) -> None:
+        """Populate the reader dropdown with Tesseract + installed US vision
+        models + an 'Install…' entry.
+
+        The Ollama probe runs only when ``from_popup`` is true (the user
+        opened the dropdown) or ``select`` is set (an install just
+        finished). Construction stays offline so tests do not trip the
+        offline guard just by building the tab."""
+        if not hasattr(self, "image_reader_choice"):
+            return
+        self.image_reader_choice.blockSignals(True)
+        current_data = self.image_reader_choice.currentData() if select is None else select
+        try:
+            self.image_reader_choice.clear()
+            self.image_reader_choice.addItem("Tesseract (local, fast)",
+                                             self._tesseract_sentinel)
+            if from_popup or select is not None:
+                try:
+                    from council_core import ollama_install
+                    names = ollama_install.installed_models()
+                    for n in names:
+                        if n.lower().startswith(ollama_install.US_VISION_FAMILIES):
+                            self.image_reader_choice.addItem(f"Ollama: {n}", n)
+                except Exception:                             # noqa: BLE001
+                    pass
+            self.image_reader_choice.insertSeparator(
+                self.image_reader_choice.count())
+            self.image_reader_choice.addItem("Install vision model…",
+                                             self._install_vision_sentinel)
+            if current_data is not None:
+                idx = self.image_reader_choice.findData(current_data)
+                if idx >= 0:
+                    self.image_reader_choice.setCurrentIndex(idx)
+        finally:
+            self.image_reader_choice.blockSignals(False)
+        self._refresh_reader_enabled()
+
+    def _refresh_reader_enabled(self, *_args) -> None:
+        if hasattr(self, "image_reader_choice") and hasattr(self, "use_images"):
+            self.image_reader_choice.setEnabled(self.use_images.isChecked())
+
+    def _on_reader_changed(self, _index: int) -> None:
+        if not hasattr(self, "image_reader_choice"):
+            return
+        data = self.image_reader_choice.currentData()
+        if data == self._install_vision_sentinel:
+            # The 'Install…' sentinel: open the dialog, then put the
+            # dropdown back on whichever model is actually in use.
+            self._open_install_dialog()
+            self._refresh_reader_choices(select=self._tesseract_sentinel)
+
+    def _open_install_dialog(self) -> None:
+        from .ledger_dialogs import InstallVisionModelDialog
+        dlg = InstallVisionModelDialog(
+            on_installed=lambda name: self._refresh_reader_choices(select=name),
+            parent=self)
+        dlg.exec()
+
+    def _selected_vision_model(self) -> Optional[str]:
+        if not hasattr(self, "image_reader_choice"):
+            return None
+        data = self.image_reader_choice.currentData()
+        if data in (None, self._tesseract_sentinel, self._install_vision_sentinel):
+            return None
+        return str(data)
 
     def _say(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -310,6 +416,7 @@ class LedgerTab(ViewHelpers, QWidget):
         csv, sources = self.csv.text().strip(), self.source_paths()
         part, images = self.part.text().strip(), self.use_images.isChecked()
         mask = self.pattern_mask.text().strip()
+        vision = self._selected_vision_model()
 
         def done(s) -> None:
             self.review.setText(s.review)
@@ -323,7 +430,8 @@ class LedgerTab(ViewHelpers, QWidget):
             self._say(s.describe())
         self._run("Extracting",
                   lambda p: self.actions.extract(csv, sources, part, images, p,
-                                                 pattern_mask=mask), done)
+                                                 pattern_mask=mask,
+                                                 vision_model=vision), done)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()

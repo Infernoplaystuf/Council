@@ -103,7 +103,8 @@ def test_work_runs_off_the_gui_thread_with_buttons_locked(qapp, books):
     template, src, tmp = books
     gate, ran_on = threading.Event(), []
 
-    def slow_extract(csv, sources, part, use_images, progress, pattern_mask=None):
+    def slow_extract(csv, sources, part, use_images, progress,
+                     pattern_mask=None, vision_model=None):
         ran_on.append(threading.current_thread())
         progress("reading workbooks: 1/2 workbooks (50%)", 0.5)
         gate.wait(10)
