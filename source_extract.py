@@ -2113,30 +2113,125 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
 
 
 # ── optional: a local model suggests mappings for leftover labels ──────
-def suggest_with_llm(run: Extraction, schema: TemplateSchema, model: str = "qwen2.5:7b-instruct-q4_K_M"):
-    """Ask a local Ollama TEXT model which field each unmatched label is.
-    Only labels are sent (to localhost), never values. Suggestions go in the
-    'Best guess' column; nothing is accepted on a model's say-so."""
-    labels = sorted({o.label for o in run.unmatched})[:150]
-    if not labels:
-        return
-    fields = [f.name for f in schema.fields]
-    prompt = ("Map each spreadsheet label to the one template field it means, or null "
-              "if none. Reply with JSON only: {\"label\": \"field or null\"}.\n\n"
-              f"Fields:\n{json.dumps(fields)}\n\nLabels:\n{json.dumps(labels)}")
+#: Families Council recommends: see [[us-models-only]]. The CLI --llm
+#: option used to default to qwen2.5, which this policy does not
+#: allow; the mapping helpers auto-detect a US-origin model from the
+#: ones Ollama has installed, with Granite preferred.
+US_TEXT_FAMILIES = ("granite", "llama", "phi", "gemma", "olmo", "gpt-oss")
+#: Preference order inside US_TEXT_FAMILIES — Granite first because the
+#: [[us-models-only]] memory flags it as the user's preferred family;
+#: within a family a longer tag beats a shorter one so an 8B beats a 2B.
+_FAMILY_RANK = {f: i for i, f in enumerate(US_TEXT_FAMILIES)}
+
+
+def first_us_text_model(installed: Optional[Sequence[str]] = None) -> Optional[str]:
+    """The best-fit installed Ollama model to ask for label mappings,
+    or None when nothing US-origin is installed.
+
+    Preference: family order in US_TEXT_FAMILIES (Granite first), then
+    whichever tag Ollama reports last (newest / largest), then stable
+    sort by name so a tie is deterministic. ``installed`` is the
+    ``/api/tags`` list; omitted = ask Ollama now."""
     try:
-        out = _ollama("/api/chat", {"model": model, "stream": False, "format": "json",
-                                    "options": {"temperature": 0},
-                                    "messages": [{"role": "user", "content": prompt}]},
-                      timeout=300)
+        names = (list(installed) if installed is not None
+                 else [m["name"] for m in _ollama("/api/tags", timeout=5)
+                       .get("models") or []])
+    except Exception:
+        return None
+
+    def rank(n):
+        lo = n.lower()
+        for i, fam in enumerate(US_TEXT_FAMILIES):
+            if lo.startswith(fam):
+                return (i, -len(n), n)
+        return (len(US_TEXT_FAMILIES), 0, n)
+    candidates = [n for n in names
+                  if n.lower().startswith(US_TEXT_FAMILIES)]
+    if not candidates:
+        return None
+    candidates.sort(key=rank)
+    return candidates[0]
+
+
+def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
+                                 *, model: Optional[str] = None,
+                                 timeout: float = 120
+                                 ) -> Tuple[Dict[str, Optional[str]], str]:
+    """Ask a local Ollama TEXT model which template field each label
+    means. Returns ``(mapping, model_used)`` where ``mapping`` is
+    ``{label: field_name_or_None}``.
+
+    Pure helper — takes a sequence of label strings, not an
+    ``Extraction``. The caller writes any accepted suggestions as
+    aliases via ``save_aliases``.
+
+    Only labels are sent (to localhost — the Council does not phone
+    home), never values. Raises LedgerError when Ollama is not
+    reachable, when no US-origin text model is installed, or when the
+    model's answer is not JSON. See [[us-models-only]]."""
+    labels = [str(x).strip() for x in labels if str(x).strip()]
+    labels = sorted({x for x in labels})[:150]
+    if not labels:
+        return {}, ""
+    if model is None:
+        model = first_us_text_model()
+        if model is None:
+            raise LedgerError(
+                "No US-origin Ollama text model is installed. Install one "
+                "(e.g. `ollama pull granite3.3:8b`); see installs.txt "
+                "and the Ledger tab's Install image model… dialog for "
+                "related pulls.")
+    if not model.lower().startswith(US_TEXT_FAMILIES):
+        raise LedgerError(
+            f"{model!r} is not a US-origin family (see [[us-models-only]])."
+            " Pick a Granite / Llama / Phi / Gemma / Olmo / gpt-oss tag.")
+    fields = [f.name for f in schema.fields]
+    prompt = ("Map each spreadsheet label to the one template field it "
+              "means, or null if none. Reply with JSON only: "
+              "{\"label\": \"field or null\"}.\n\n"
+              f"Fields:\n{json.dumps(fields)}\n\n"
+              f"Labels:\n{json.dumps(labels)}")
+    try:
+        out = _ollama("/api/chat", {
+            "model": model, "stream": False, "format": "json",
+            "options": {"temperature": 0},
+            "messages": [{"role": "user", "content": prompt}]},
+                      timeout=timeout)
+    except Exception as exc:
+        raise LedgerError(f"local model {model!r} did not answer: {exc}") from exc
+    try:
         sugg = json.loads(out["message"]["content"])
-    except Exception as e:
-        run.problems.append(f"local model suggestion skipped: {e}")
-        return
+    except Exception as exc:
+        raise LedgerError(f"local model {model!r} did not return JSON: {exc}") from exc
     valid = set(fields)
+    result: Dict[str, Optional[str]] = {}
+    for label in labels:
+        s = sugg.get(label) if isinstance(sugg, dict) else None
+        if isinstance(s, str) and s in valid:
+            result[label] = s
+        else:
+            result[label] = None
+    return result, model
+
+
+def suggest_with_llm(run: Extraction, schema: TemplateSchema,
+                     model: Optional[str] = None):
+    """Ask a local Ollama TEXT model which field each unmatched label is.
+    Only labels are sent (to localhost), never values. Suggestions go in
+    the 'Best guess' column; nothing is accepted on a model's say-so.
+
+    Backward-compatible wrapper around ``suggest_mappings_for_labels``:
+    default model moved from qwen (not US-origin) to the first installed
+    US-origin text model. See [[us-models-only]]."""
+    try:
+        sugg, _m = suggest_mappings_for_labels(
+            [o.label for o in run.unmatched], schema, model=model)
+    except LedgerError as exc:
+        run.problems.append(f"local model suggestion skipped: {exc}")
+        return
     for o in run.unmatched:
         s = sugg.get(o.label)
-        if isinstance(s, str) and s in valid:
+        if s is not None:
             o.guesses = [(f"{s} [model]", 0.0)] + o.guesses
 
 
@@ -2152,8 +2247,9 @@ def main(argv=None) -> int:
                    "beside the parent CSV)")
     e.add_argument("--part", default="", help="part number for every source, if not in them")
     e.add_argument("--no-images", action="store_true", help="do not read embedded images")
-    e.add_argument("--llm", nargs="?", const="qwen2.5:7b-instruct-q4_K_M",
-                   help="ask a local Ollama model to guess unmatched labels")
+    e.add_argument("--llm", nargs="?", const="",
+                   help="ask a local Ollama text model (US-origin, auto-"
+                        "detected if blank) to guess unmatched labels")
     a = sub.add_parser("apply", help="put a reviewed workbook's accepted values in the CSV")
     a.add_argument("review")
     a.add_argument("--fill-dir", help="also write one filled template per part here")
@@ -2176,8 +2272,8 @@ def main(argv=None) -> int:
                 run = extract(ledger.schema, files, mapping, ignore,
                               image_dir=out.with_name(out.stem + "_images"),
                               part=args.part, use_images=not args.no_images, progress=prog)
-            if args.llm:
-                suggest_with_llm(run, ledger.schema, args.llm)
+            if args.llm is not None:        # "" from the --llm flag means auto-detect
+                suggest_with_llm(run, ledger.schema, args.llm or None)
             dec = decide(run, ledger.schema)
             write_review(out, run, dec, ledger.schema, args.csv)
             ok = sum(d.accept for d in dec)

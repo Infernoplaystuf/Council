@@ -451,7 +451,8 @@ class LedgerTab(ViewHelpers, QWidget):
         from .ledger_dialogs import PreviewWorkbookDialog
         mask = self.pattern_mask.text().strip()
         dlg = PreviewWorkbookDialog(p, ledger.schema, aliases=aliases,
-                                    pattern_mask=mask or None, parent=self)
+                                    pattern_mask=mask or None,
+                                    csv_path=csv_path, parent=self)
         dlg.exec()
 
     def on_cancel(self) -> None:
