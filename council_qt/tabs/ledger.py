@@ -49,9 +49,11 @@ class LedgerActions:
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
 
-    def extract(self, csv, sources, part, use_images, progress):
+    def extract(self, csv, sources, part, use_images, progress,
+                pattern_mask: Optional[str] = None):
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
-                                         image_reader=self.image_reader, progress=progress)
+                                         image_reader=self.image_reader, progress=progress,
+                                         pattern_mask=pattern_mask or None)
 
     def apply(self, review, fill_dir, use_images, progress):
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
@@ -125,6 +127,19 @@ class LedgerTab(ViewHelpers, QWidget):
         row.addWidget(self.use_images)
         row.addStretch(1)
         v2.addLayout(row)
+        # Pattern hint — not persisted; held for this session only. A follow-up
+        # could save it next to the parent CSV like aliases.
+        mask_row = QHBoxLayout()
+        mask_row.addWidget(QLabel("Part name pattern (optional):"))
+        self.pattern_mask = QLineEdit()
+        self.pattern_mask.setPlaceholderText(
+            "@@@#@@###   — @ letter, # digit, other characters literal")
+        self.pattern_mask.setToolTip(
+            "A shape used when the sample number is not labelled.\n"
+            "@ matches any letter, # any digit, anything else matches itself.\n"
+            "Example: @@@#@@### finds ABC1DE234 in a filename.")
+        mask_row.addWidget(self.pattern_mask, 1)
+        v2.addLayout(mask_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -294,6 +309,7 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_extract(self) -> None:
         csv, sources = self.csv.text().strip(), self.source_paths()
         part, images = self.part.text().strip(), self.use_images.isChecked()
+        mask = self.pattern_mask.text().strip()
 
         def done(s) -> None:
             self.review.setText(s.review)
@@ -306,7 +322,8 @@ class LedgerTab(ViewHelpers, QWidget):
                                 "map the leftover labels, save it, then Apply.")
             self._say(s.describe())
         self._run("Extracting",
-                  lambda p: self.actions.extract(csv, sources, part, images, p), done)
+                  lambda p: self.actions.extract(csv, sources, part, images, p,
+                                                 pattern_mask=mask), done)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()

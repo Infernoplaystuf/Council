@@ -523,9 +523,11 @@ class Obs:
 
 
 class _Extractor:
-    def __init__(self, grid: Grid, m: Matcher, codes: ItemCodes, part_hint: str):
+    def __init__(self, grid: Grid, m: Matcher, codes: ItemCodes, part_hint: str,
+                 mask_re: "Optional[re.Pattern]" = None):
         self.g, self.m, self.codes = grid, m, codes
         self.part = part_hint
+        self.mask_re = mask_re
         self.used = set()
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
@@ -677,7 +679,7 @@ class _Extractor:
                         self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
                             f", read from image {self.g.from_image}" if self.g.from_image else "")
                         return
-        sid = _part_from_name(self.g.sheet)
+        sid = _part_from_name(self.g.sheet, self.mask_re)
         if sid:
             self.part = sid
             self.part_how = f"sheet name {self.g.sheet!r}"
@@ -961,15 +963,61 @@ def _split_inline(v: str) -> Tuple[str, str]:
     return v.strip(), ""
 
 
-def _part_from_name(name: str) -> str:
+def _part_from_name(name: str, mask_re: "Optional[re.Pattern]" = None) -> str:
     if re.fullmatch(r"(?i)sheet\s*\d+", name.strip()):
         return ""
+    if mask_re is not None:
+        m = mask_re.search(name)
+        if m:
+            return m.group(0)
     m = re.fullmatch(r"(?i)\s*(?:part|sample|specimen|p/?n|s/?n)\s*(?:no\.?|#)?\s*[-_ ]?\s*([A-Za-z]*\d[\w\-]*)\s*", name)
     if m:
         return m.group(1)
     if re.fullmatch(r"\d{1,8}", name.strip()):
         return name.strip()
     return ""
+
+
+def mask_to_regex(mask: str) -> "re.Pattern":
+    """Compile a user-supplied part-name pattern into a regex.
+
+    Grammar is tiny:
+      * ``@``  matches any ASCII letter (case-insensitive).
+      * ``#``  matches any digit.
+      * any other character matches itself LITERALLY (so ``P/N-###`` requires
+        the literal prefix ``P/N-``).
+
+    Runs collapse, so ``@@@#@@###`` compiles to
+    ``[A-Za-z]{3}\\d[A-Za-z]{2}\\d{3}``. The match is bounded on both sides
+    by a non-alphanumeric lookaround so a mask that is all letters and digits
+    does not pick up a longer surrounding run.
+
+    Raises LedgerError on an empty mask, a mask with no concrete character,
+    or a regex that fails to compile."""
+    if mask is None or not mask.strip():
+        raise LedgerError("part name pattern is empty")
+    parts: List[str] = []
+    i = 0
+    while i < len(mask):
+        ch = mask[i]
+        if ch in "@#":
+            run = 1
+            while i + run < len(mask) and mask[i + run] == ch:
+                run += 1
+            cls = "[A-Za-z]" if ch == "@" else r"\d"
+            parts.append(cls + (f"{{{run}}}" if run > 1 else ""))
+            i += run
+        else:
+            parts.append(re.escape(ch))
+            i += 1
+    body = "".join(parts)
+    if not body:
+        raise LedgerError(f"part name pattern {mask!r} compiles to nothing")
+    try:
+        return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                          re.IGNORECASE)
+    except re.error as e:
+        raise LedgerError(f"part name pattern {mask!r}: {e}") from e
 
 
 def _num(s) -> Optional[float]:
@@ -1366,11 +1414,17 @@ class Extraction:
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
-            part: str = "", use_images: bool = True, progress=None) -> Extraction:
+            part: str = "", use_images: bool = True, progress=None,
+            pattern_mask: Optional[str] = None) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
-    what it is doing (opening through Excel, reading picture 3 of 7) is shown."""
+    what it is doing (opening through Excel, reading picture 3 of 7) is shown.
+
+    ``pattern_mask`` is an optional user-supplied part-name shape (see
+    ``mask_to_regex``). When set, it is tried first on filenames and sheet
+    names before the keyword / lone-number heuristics."""
     from progress_report import NullProgress
     prog = progress or NullProgress()
+    mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
     run = Extraction([str(s) for s in sources])
@@ -1424,7 +1478,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
 
         prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
         # pass 1: part numbers per sheet; then a workbook-wide fallback
-        exs = [_Extractor(g, m, codes, "") for g in grids]
+        exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
         for ex in exs:
             ex.find_part()
             ex.find_inspectors()
@@ -1434,7 +1488,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         elif len(found) == 1:
             book_part, how = found.pop(), "the one part number in the workbook"
         elif not found:
-            book_part = _part_from_filename(src.stem)
+            book_part = _part_from_filename(src.stem, mask_re)
             how = f"file name {src.name!r} — check it" if book_part else ""
         else:
             book_part, how = "", ""
@@ -1464,7 +1518,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     return run
 
 
-def _part_from_filename(stem: str) -> str:
+def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> str:
+    if mask_re is not None:
+        m = mask_re.search(stem)
+        if m:
+            return m.group(0)
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
