@@ -546,9 +546,25 @@ class TriggerPlugin:
         run = self._run(camera)
         if run is not None and run.live and run.books is not None:
             return run.capture_now()
-        setup = (self.ctx.capture_setup(self._camera(camera))
+        name = self._camera(camera)
+        setup = (self.ctx.capture_setup(name)
                  if self.ctx is not None else None)
+        if setup is None and self._kind(name) != "event":
+            # Today's words name an event camera for a camera with no
+            # set-up; a frame camera has the core's from P3's review on
+            # (council_core.plugin_capture), so this is only a camera that
+            # is not there (P3 review: a frame camera was called an event
+            # camera).
+            return ("Capture now is for a triggered capture of a frame "
+                    "camera — connect one, choose Capture: Triggered: exact "
+                    "or Triggered: snapshot, then Start.")
         return builtin.capture_now_idle(setup)
+
+    def _kind(self, camera: Optional[str]) -> str:
+        """"frame", "event", or "" for no camera open there."""
+        handle = (self.ctx.cameras().get(camera)
+                  if self.ctx is not None and camera else None)
+        return str(getattr(handle, "kind", "") or "")
 
     def status(self, camera: Optional[str] = None) -> str:
         """The status segment (design 3.5, 3.7): the run's triggers while

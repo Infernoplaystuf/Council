@@ -388,6 +388,13 @@ class _Live:
 #: so every function here and every caller runs unchanged. _Live above still
 #: declares every field; the split is read off it (camera_rig.split_fields).
 from council_core import camera_rig as _camera_rig  # noqa: E402
+# Downsample's and the trigger set-up's code, loaded with this module: until
+# stage P3 row 3 took them out of capture.py's imports they came with the
+# capture code, so today's Settings > Python Scripts list showed them loaded
+# from the start — and does again (P3 review). Both use the standard library
+# only; the functions here still import them where they use them.
+from council_core import reduce as _reduce  # noqa: E402,F401
+from council_core import triggered as _triggered  # noqa: E402,F401
 
 _RIG = _camera_rig.Rig(_Live)
 _LIVE = _camera_rig.LiveView(_RIG)
@@ -846,10 +853,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     if host is not None:
         host.register_run_files()
         if setup.triggered and host.trigger_plugin() is None:
-            raise RuntimeError(f"a {setup.short()} run needs the Triggering "
-                               f"plugin (typhon.trigger), which this project "
-                               f"does not run now — switch it on, or choose "
-                               f"Capture: Continuous")
+            raise RuntimeError(f"Start refused — {_a_run(setup)} needs the "
+                               f"Triggering plugin (typhon.trigger), which "
+                               f"this project does not run now — switch it "
+                               f"on, or choose Capture: Continuous")
         refused = host.check_start(_run_plan(host, base, out, session.device,
                                              setup))
         if refused:
@@ -909,7 +916,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # The run in progress, as its plugins see it: its end record
         # carries their blocks and faults (plugin design 3.9, 3.10).
         active = host.begin_run(run, {_RIG.active.name: out})
-        recorder.end_blocks = host.end_blocks(active)
+        recorder.end_blocks = host.end_blocks(active, _RIG.active.name)
     try:
         if host is not None and getattr(device, "capture", None) is not None:
             # The triggering plugin's part of this run (plugin design 3.6):
@@ -918,8 +925,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             # through its facets.
             plug = host.trigger_slot(_RIG.active.name)
             if plug is None and setup.triggered:
-                raise RuntimeError(f"a {setup.short()} run needs the "
-                                   f"Triggering plugin (typhon.trigger), "
+                raise RuntimeError(f"Start refused — {_a_run(setup)} needs "
+                                   f"the Triggering plugin (typhon.trigger), "
                                    f"which could not be had now")
         if host is not None:
             # A built-in plugin's frame stage, after the core's Downsample,
@@ -1147,14 +1154,22 @@ def stop() -> Dict[str, Any]:
             if isinstance(armed, dict) and armed.get("counter"):
                 _let_frames_land(session, device, trig)
     host = _plugin_host()
-    if host is not None:
+    restartable = getattr(device, "restartable", True)
+    if host is not None and not restartable:
         # The run is over for its plugins (plugin design 3.6): no new
         # streamed file in it, and "run_stopped" told — before its
         # recording ends, so before each one's on_run_finished, which
         # comes with the run's end record once its last frame is on disk.
+        # An event camera's stream runs on, so they hear of it now.
         host.run_stopped(camera=_RIG.active.name)
-    if getattr(device, "restartable", True):
+    if restartable:
         ended = session.stop()
+        if host is not None:
+            # As above, once a frame camera's stream has stopped: a
+            # listener that hangs (bounded, plugin_host._tell) holds Stop
+            # no longer than its limit and adds no frame to the run (P3
+            # review: one that slept 6 s let the run record 6 s more).
+            host.run_stopped(camera=_RIG.active.name)
         session.timeout_ms = FREE_READ_MS
         # The run's books closed before its recording ends, so its end
         # record (written as the last frame lands) has every trigger.
@@ -1575,6 +1590,13 @@ def _mode_word(setup: Any) -> str:
             triggered.MODE_SNAPSHOT:
         return "a snapshot run"
     return "a Continuous run"
+
+
+def _a_run(setup: Any) -> str:
+    """"an exact, Software run", "a snapshot, Timer run": the set-up's run,
+    with its article (a "Typhon (plugins)" refusal's words, P3 review)."""
+    words = f"{setup.short()} run"
+    return f"{'an' if words[:1].lower() in 'aeiou' else 'a'} {words}"
 
 
 # ======================================================================

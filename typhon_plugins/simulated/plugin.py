@@ -94,7 +94,9 @@ class SimulatedPlugin:
         (typhon_plugin_api.builtin.device_facet). It has no hardware input
         and no binning: its Downsample is Typhon's averaging. An event
         camera has no facet."""
-        if name == "software_trigger" and                 getattr(device, "capture", None) is not None and                 callable(getattr(device, "fire_trigger", None)):
+        if name == "software_trigger" and \
+                getattr(device, "capture", None) is not None and \
+                callable(getattr(device, "fire_trigger", None)):
             return builtin.device_facet(device, name)
         return None
 

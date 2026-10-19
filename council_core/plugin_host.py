@@ -156,6 +156,7 @@ from . import plugin_keys as pk
 from . import plugin_lists as pl
 from . import plugin_manifest as pm
 from . import plugin_runs as pr
+from .plugin_capture import needs_core_capture, plugin_device
 
 #: THE BUILT-IN LIST: (id, folder in typhon_plugins/). Only these load as
 #: built-in plugins, trusted like the rest of the Council's code (design
@@ -192,10 +193,20 @@ LOAD = "load"
 
 #: A call into a plugin that runs longer than this is switched off.
 WATCHDOG_SECONDS = 2.0
-#: How long the end of a run waits for one plugin's on_run_finished before
-#: the end record is written without its block (design 3.10: the end
-#: record is never held up by a plugin; the watchdog's limit).
+#: How long Start, Stop and the end of a run wait for one plugin's call —
+#: check_start, on_run_started, a run_started or run_stopped listener, a
+#: camera plugin's record_fields, on_run_finished (with the cleaning of the
+#: block it gives) — before going on without it, the plugin switched off
+#: as a hang (design 3.10: never held up by a plugin; design 3.11 gives
+#: these 500 ms each and the watchdog switches off a call over 2 s, which
+#: this is). Each runs on a thread of its own (_bounded).
 RUN_HOOK_SECONDS = 2.0
+#: A fault's words, at most, wherever they are kept or said — the status
+#: line, Start's and Stop's lines, the records' plugin_faults and
+#: `faulted`, a recording's reason. The whole text and its traceback go
+#: to plugin_errors.log (P3 review: a 6 MB exception message made a 6 MB
+#: end record, over the 4 MB a record may be read at).
+FAULT_TEXT = 2000
 #: How often the watchdog looks (seconds).
 WATCHDOG_EVERY = 0.5
 #: A live feed's queue: the newest frames, the oldest thrown away.
@@ -212,6 +223,83 @@ MAX_FILES = 2000
 #: The tags a frame gets when its plugin gate failed (as capture.py's own
 #: for a gate that raises).
 FAULT_TAGS = {"trigger": "", "trigger_source": "error: plugin fault"}
+#: What a record gate's tags may hold: the frames CSV's trigger columns
+#: (council_core.triggered.frame_columns, a test holds the two equal), each
+#: text, a whole or a finite number, or nothing — never one of the core's
+#: own meta keys (P3 review: a gate's "reduce" changed the saved pictures'
+#: size mid-run, and a str for tags killed the grab thread).
+GATE_COLUMNS = ("trigger", "trigger_frame", "trigger_source", "trigger_time",
+                "arrived")
+
+#: The camera settings a FrameView's own terms are read from (design 3.12):
+#: GenICam's names, which the built-in frame cameras use. A camera with no
+#: such setting does not bin, decimate or mirror; one whose setting cannot
+#: be read leaves the term unknown, and to_sensor then refuses.
+GEOMETRY = (("binning", "BinningHorizontal", "BinningVertical"),
+            ("decimation", "DecimationHorizontal", "DecimationVertical"),
+            ("mirror", "ReverseX", "ReverseY"))
+
+
+def fault_text(exc: BaseException) -> str:
+    """`exc` as a fault's words: its type and message, at most FAULT_TEXT
+    characters (the whole is in plugin_errors.log)."""
+    try:
+        text = f"{type(exc).__name__}: {exc}"
+    except BaseException:                               # noqa: BLE001
+        text = f"{type(exc).__name__}: (its message could not be read)"
+    return cut(text)
+
+
+def _trace(exc: BaseException) -> str:
+    """`exc`'s whole traceback, for plugin_errors.log only."""
+    try:
+        return "".join(traceback.format_exception(type(exc), exc,
+                                                  exc.__traceback__))
+    except BaseException:                               # noqa: BLE001
+        return f"{type(exc).__name__} (its traceback could not be read)\n"
+
+
+def cut(text: str, limit: int = FAULT_TEXT) -> str:
+    """`text` at most `limit` characters, saying so when it was cut."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    tail = " … (cut: the whole text is in plugin_errors.log)"
+    return text[:max(0, limit - len(tail))] + tail
+
+
+def gate_tags(tags: Any) -> Optional[Dict[str, Any]]:
+    """A record gate's tags for a frame, as the core puts them on it: None
+    (a frame no trigger asked for), or a new dict of the frames CSV's
+    trigger columns (GATE_COLUMNS) with plain values. Anything else raises
+    TypeError or ValueError — a fault on the recording path (GuardedGate),
+    so junk never reaches the frame's meta: a str there stopped the grab
+    thread, and "reduce" changed what was saved (P3 review)."""
+    if tags is None:
+        return None
+    if not isinstance(tags, Mapping):
+        raise TypeError(f"its tags are a {type(tags).__name__}, not a mapping "
+                        f"of the frames CSV's trigger columns")
+    out: Dict[str, Any] = {}
+    for key, value in (dict.items(tags) if isinstance(tags, dict)
+                       else tags.items()):
+        if not isinstance(key, str) or key not in GATE_COLUMNS:
+            raise ValueError(f"its tags hold {key!r}, which is not one of "
+                             f"the frames CSV's trigger columns "
+                             f"({', '.join(GATE_COLUMNS)})")
+        if value is None or isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, str):
+            out[key] = str.__str__(value)
+        elif isinstance(value, int):
+            out[key] = int.__index__(value)
+        elif isinstance(value, float) and value == value and \
+                value not in (float("inf"), float("-inf")):
+            out[key] = float.__float__(value)
+        else:
+            raise TypeError(f"its tag {key!r} is a {type(value).__name__}, "
+                            f"not text or a number")
+    return out
 
 #: PYTHON'S SWITCH INTERVAL WHILE A RUN RECORDS (design 10.2; stage P3 row
 #: 5), in seconds — None leaves it as it is (today's: Python's 5 ms). A live
@@ -301,6 +389,8 @@ def _ours(exc: BaseException) -> bool:
 
 #: What `_hook` returns for a hook the plugin does not have.
 _NO_HOOK = object()
+#: What `_bounded` returns for a call that did not return in time.
+_TIMED_OUT = object()
 
 #: The widest whole number a preset holds (camera_presets.WIDEST_INT).
 _WIDEST = 2 ** 63
@@ -315,6 +405,32 @@ def _plain_value(value: Any) -> bool:
         return -_WIDEST <= value < _WIDEST
     return isinstance(value, float) and value == value and \
         value not in (float("inf"), float("-inf"))
+
+
+def _plain_items(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """`fn`, its result — when a mapping — copied to a plain dict as it
+    returns (in its caller's guard: a mapping's items() is its own code),
+    its text keys and its text and number values made Python's own types,
+    so nothing read of it afterwards runs the plugin's code."""
+    def plain(value: Any) -> Any:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return str.__str__(value)
+        if isinstance(value, int):
+            return int.__index__(value)
+        if isinstance(value, float):
+            return float.__float__(value)
+        return value
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        got = fn(*args, **kwargs)
+        if got is None or got is _NO_HOOK or not isinstance(got, Mapping):
+            return got
+        items = dict.items(got) if isinstance(got, dict) else got.items()
+        return {(str.__str__(k) if isinstance(k, str) else k): plain(v)
+                for k, v in items}
+    return call
 
 
 def _hook(obj: Any, name: str) -> Callable[..., Any]:
@@ -401,6 +517,29 @@ def _compiled_files(folder: Path) -> Tuple[List[str], bool]:
     return found, False
 
 
+def ending_clash(files: Iterable[str], taken: Mapping[str, str]) -> str:
+    """Why run-file endings `files` cannot be a plugin's beside `taken`
+    (ending -> the plugin it is), or "": the same ending — one run file,
+    one plugin — or one HOLDING another anywhere. capture.taken_runs and a
+    run's readers split a file name at the first ending it holds, so with
+    "_ab_x.csv" taken, "<run>_zz_ab_x.csv" would read as the file of a run
+    "<run>_zz" (P3 review; the manifest refuses the same of the core's and
+    the built-ins' endings, plugin_manifest.check)."""
+    for mine in files:
+        for other, owner in taken.items():
+            if mine == other:
+                return f"its run file {mine!r} is {owner}'s already"
+            if other in mine:
+                return (f"its run file {mine!r} holds {owner}'s run-file "
+                        f"ending {other!r}, so its files would be read as "
+                        f"{owner}'s, of another run")
+            if mine in other:
+                return (f"its run file {mine!r} is held in {owner}'s ending "
+                        f"{other!r}, so {owner}'s files would be read as its "
+                        f"own, of another run")
+    return ""
+
+
 def discover(home: Any, *, builtin_dir: Any = None,
              builtins: Sequence[Tuple[str, str]] = BUILTIN_PLUGINS,
              api_version: str = pm.API_VERSION) -> Registry:
@@ -432,11 +571,8 @@ def discover(home: Any, *, builtin_dir: Any = None,
             if not record.problem:
                 # One run file, one plugin — built-ins too (stage P3: the
                 # registry marks each one a run's; before, only a third
-                # party's claim was checked).
-                clash = [s for s in m.files if s in suffixes]
-                if clash:
-                    record.problem = (f"its run file {clash[0]!r} is "
-                                      f"{suffixes[clash[0]]}'s already")
+                # party's claim was checked) — and none holding another's.
+                record.problem = ending_clash(m.files, suffixes)
             if not record.problem:
                 shorts.setdefault(m.short, pid)
                 for suffix in m.files:
@@ -486,10 +622,7 @@ def discover(home: Any, *, builtin_dir: Any = None,
             problem = (f"its short name {m.short!r} is {shorts[m.short]}'s "
                        f"already")
         else:
-            clash = [s for s in m.files if s in suffixes]
-            if clash:
-                problem = (f"its run file {clash[0]!r} is "
-                           f"{suffixes[clash[0]]}'s already")
+            problem = ending_clash(m.files, suffixes)
         if not problem:
             problem = pm.api_problem(m.api, api_version)
         if not problem:
@@ -949,9 +1082,47 @@ class PluginHost:
         if pid is None:
             return None
         try:
-            return self.camera_call(pid, "facet", device, str(name))
+            return self.camera_call(pid, "facet", plugin_device(device),
+                                    str(name))
         except CameraError:
             return None
+
+    def stream_of(self, camera: Optional[str]) -> Any:
+        """The grab thread of `camera`'s stream now (a new one at each
+        start), or None: what a live feed reads the camera's own terms
+        again at (LiveFeed.geometry)."""
+        session = getattr(self._slot(camera), "session", None)
+        return getattr(session, "_thread", None)
+
+    def camera_geometry(self, camera: Optional[str]) -> Dict[str, Any]:
+        """The camera's own binning, decimation and mirroring now (design
+        3.12), from its settings (GEOMETRY: GenICam's names) — each a pair,
+        or None when it cannot be told (the FrameView then refuses
+        to_sensor rather than guess). A camera that has no such setting
+        does not do it: (1, 1), or (False, False) (P3 review: they were
+        never filled in, so a mirrored picture's to_sensor gave a wrong
+        place instead of refusing)."""
+        out: Dict[str, Any] = {name: None for name, _x, _y in GEOMETRY}
+        device = getattr(self._slot(camera), "device", None)
+        if device is None:
+            return out
+        try:
+            from .camera_settings import SettingError
+
+            provider = device.settings_provider()
+        except Exception:                                 # noqa: BLE001
+            return out
+        for name, across, down in GEOMETRY:
+            values: List[Any] = []
+            for key in (across, down):
+                try:
+                    values.append(provider.read(key))
+                except SettingError:
+                    values.append(False if name == "mirror" else 1)
+                except Exception:                         # noqa: BLE001
+                    values.append(None)
+            out[name] = geometry_pair(name, values)
+        return out
 
     # -- loading -------------------------------------------------------------
     def adopt(self, manifest: pm.Manifest, factory: Callable[[], Any]) -> None:
@@ -1025,6 +1196,8 @@ class PluginHost:
             if keep:
                 self._contexts[key] = ctx
                 self._instances[key] = made
+            else:
+                ctx._gone = True
         if keep:
             return made
         if pid not in self.faults and pid not in self._load_failures:
@@ -1078,21 +1251,37 @@ class PluginHost:
         """Every run-hook plugin's check_start(plan): the reasons Start is
         refused (design 3.6, 3.10). A plugin whose check FAILS refuses this
         Start with its fault and is switched off; the next Start runs
-        without it."""
+        without it. BOUNDED (_bounded): one that has not answered in
+        RUN_HOOK_SECONDS is switched off as a hang and refuses this Start
+        the same way — Start's thread (the window's) is never held longer
+        (P3 review: a check that slept 6 s held Start 6 s)."""
         reasons: List[str] = []
         for pid in self.with_hook("run_hooks"):
             made = self.instance(pid)
             if made is None:
                 continue
-            said = self._guard(pid, "check_start", _hook(made, "check_start"),
-                               (plan,), {}, None, kind=START_CHECK)
+            # Its reason made plain text inside the guard: str() runs the
+            # plugin's own code for anything but a str.
+            said = self._bounded(pid, "check_start",
+                                 _hook(made, "check_start"), (plan,),
+                                 after="that Start was refused, and the next "
+                                       "runs without it", kind=START_CHECK,
+                                 then=lambda out: cut(str(out)) if out
+                                 else "")
             if said is _NO_HOOK:
                 continue
-            if pid in self.faults and self.faults[pid].hook == "check_start":
-                reasons.append(f"{self._name(pid)} failed its start check "
-                               f"and was switched off: "
-                               f"{self.faults[pid].error}")
-            elif said:
+            fault = self.faults.get(pid)
+            if fault is not None and fault.hook == "check_start":
+                if fault.kind == HANG:
+                    reasons.append(f"{self._name(pid)} did not answer its "
+                                   f"start check within "
+                                   f"{RUN_HOOK_SECONDS:g} s and was switched "
+                                   f"off")
+                else:
+                    reasons.append(f"{self._name(pid)} failed its start "
+                                   f"check and was switched off: "
+                                   f"{fault.error}")
+            elif said and said is not _TIMED_OUT:
                 reasons.append(f"{self._name(pid)}: {said}")
         return reasons
 
@@ -1178,7 +1367,14 @@ class PluginHost:
         off, and the capture carries on); then "run_started" is told. A
         run whose recording already ended by itself (its end record is
         written: a failed write) is not started: its plugins are told
-        nothing, as for a Start that failed."""
+        nothing, as for a Start that failed.
+
+        BOUNDED (_bounded): each hook and each listener on a thread of its
+        own, waited for RUN_HOOK_SECONDS at most — one that has not
+        returned is switched off as a hang and Start goes on — so Start's
+        thread (the window's) is never held by a plugin, nor the trigger
+        source, which starts after this, kept waiting (P3 review: a hook
+        that slept 6 s held Start 6 s while the run recorded)."""
         with active.lock:
             if active.state != pr.RESERVED:
                 return []
@@ -1194,28 +1390,40 @@ class PluginHost:
             if made is None:
                 continue
             active.hooked.append((pid, camera))
-            self._guard(pid, "on_run_started", _hook(made, "on_run_started"),
-                        (info,), {}, None)
+            self._bounded(pid, "on_run_started",
+                          _hook(made, "on_run_started"), (info,),
+                          after="Start went on without it")
             fault = self.faults.get(pid)
             if fault is not None and fault.hook == "on_run_started":
-                notes.append(f"{self._name(pid)} failed as the run started "
-                             f"and was switched off — {fault.error}; the "
-                             f"capture carries on")
-        self.emit("run_started", run=active.run, folders={
+                if fault.kind == HANG:
+                    notes.append(f"{self._name(pid)} did not return from "
+                                 f"on_run_started within "
+                                 f"{RUN_HOOK_SECONDS:g} s and was switched "
+                                 f"off; the capture carries on")
+                else:
+                    notes.append(f"{self._name(pid)} failed as the run "
+                                 f"started and was switched off — "
+                                 f"{fault.error}; the capture carries on")
+        notes += self._tell("run_started", run=active.run, folders={
             k: str(v) for k, v in active.folders.items()})
         return notes
 
     def run_stopped(self, active: Optional[pr.ActiveRun] = None,
-                    camera: Optional[str] = None) -> None:
+                    camera: Optional[str] = None) -> List[str]:
         """Stop was pressed (or the camera disconnected), before the
         recording is ended: no streamed file is made in the run from now
         on; "run_stopped" is told, once, to a run that was started — also
         when its recording had already ended by itself. Its plugins'
-        on_run_finished comes with its end record (end_blocks), after."""
+        on_run_finished comes with its end record (end_blocks), after.
+        Each listener is BOUNDED as in run_started (_tell); frame_camera's
+        Stop tells it once a frame camera's stream has stopped, so a
+        listener that hangs adds no frame to the run (P3 review: one that
+        slept 6 s held Stop 6 s, and the run recorded on meanwhile). The
+        words for a listener switched off."""
         if active is None:
             active = self.current_run(camera)
         if active is None:
-            return
+            return []
         SWITCH.release(active)
         with active.lock:
             started = active.told_started
@@ -1224,8 +1432,9 @@ class PluginHost:
             told, active.told_stopped = active.told_stopped, True
             ended = active.state == pr.ENDED
         self._forget(active, current=True)
+        notes: List[str] = []
         if started and not told:
-            self.emit("run_stopped", run=active.run, folders={
+            notes = self._tell("run_stopped", run=active.run, folders={
                 k: str(v) for k, v in active.folders.items()})
         if ended:
             # Its end record came first (the recording ended by itself):
@@ -1238,6 +1447,32 @@ class PluginHost:
                 slots[0].closes.append(active)
             else:
                 active.close_files()
+        return notes
+
+    def _tell(self, event: str, **payload: Any) -> List[str]:
+        """"run_started" or "run_stopped" told to every listener, as emit
+        does — but each BOUNDED (_bounded): one that has not returned in
+        RUN_HOOK_SECONDS is switched off as a hang and the rest are told.
+        The words for each one switched off that way."""
+        if event not in self._subs:
+            raise ValueError(f"{event!r} is not an event")
+        data = MappingProxyType(dict(payload))
+        with self._lock:
+            listeners = list(self._subs[event])
+        notes: List[str] = []
+        for pid, fn in listeners:
+            if pid in self.faults:
+                continue
+            hook = f"its {event} listener"
+            self._bounded(pid, hook, fn, (data,),
+                          after="the run went on without it")
+            fault = self.faults.get(pid)
+            if fault is not None and fault.hook == hook and \
+                    fault.kind == HANG:
+                notes.append(f"{self._name(pid)}'s {event} listener did not "
+                             f"return within {RUN_HOOK_SECONDS:g} s, and it "
+                             f"was switched off")
+        return notes
 
     def abandon_run(self, active: pr.ActiveRun) -> None:
         """A Start that failed after the run's name was reserved: its
@@ -1248,89 +1483,126 @@ class PluginHost:
         active.close_files()
         self._forget(active, current=True)
 
-    def end_blocks(self, active: pr.ActiveRun
+    def end_blocks(self, active: pr.ActiveRun, camera: Optional[str] = None
                    ) -> Callable[[Mapping[str, Any]], Dict[str, Any]]:
-        """What the run's Recorder asks once its last frame is on disk
-        (capture.Recorder.end_blocks): the end record's "plugins" and
-        "plugin_faults" (see _end_of_run). Bound to `active`, so a run
-        whose last frames land after the next Start still ends as its
-        own."""
-        return lambda doc: self._end_of_run(active, doc)
+        """What `camera`'s Recorder of the run asks once its last frame is
+        on disk (capture.Recorder.end_blocks): that end record's "plugins"
+        and "plugin_faults" (see _end_of_run). Bound to `active` and to
+        `camera` (the run's first, when not given), so a run whose last
+        frames land after the next Start still ends as its own, and each
+        camera of a run files its own counts."""
+        cam = (str(camera) if camera is not None
+               else next(iter(active.folders), ""))
+        return lambda doc: self._end_of_run(active, cam, doc)
 
-    def _end_of_run(self, active: pr.ActiveRun, doc: Mapping[str, Any]
-                    ) -> Dict[str, Any]:
-        """Each plugin asked on_run_started is asked on_run_finished(RunInfo
-        with the end record's counts) — best effort, and BOUNDED: one that
-        does not return in RUN_HOOK_SECONDS is switched off and the record
-        written without it. Each block is cleaned and size-checked (one
-        that cannot go in is a fault of its plugin); the files the plugins
-        left open in the run are closed; the faults of the run are listed.
-        Runs on the thread that writes the end record."""
-        camera = next(iter(active.folders), "")
+    def _end_of_run(self, active: pr.ActiveRun, camera: str,
+                    doc: Mapping[str, Any]) -> Dict[str, Any]:
+        """`camera`'s end record of the run is being written: its counts
+        are filed under `camera`, and the plugins whose turn it is are
+        asked on_run_finished(RunInfo with the end records' counts) — a
+        camera-scoped plugin with its camera's end record, a rig plugin
+        ONCE, with the end record of the run's last camera to end, when
+        every camera's counts are in (P3 review, ready for M1's runs of
+        several cameras; a run of one camera asks every plugin at its one
+        end record, as before). Best effort, and BOUNDED (_bounded): one
+        that does not return in RUN_HOOK_SECONDS is switched off and the
+        record written without it. Its block is CLEANED AND SIZE-CHECKED
+        INSIDE THAT SAME GUARDED, BOUNDED CALL — cleaning reads the block,
+        which can run the plugin's own code (a mapping's items(), a
+        number's __float__) — so whatever it raises, SystemExit included,
+        or however long it takes, is that plugin's fault and never the
+        writer thread's (P3 review: a SystemExit there lost the end
+        record, an error there lost every plugin's block, and an
+        oversized block held the end record for tens of seconds). The
+        files the plugins left open in the run are closed once its last
+        camera has ended; the faults of the run are listed. Runs on the
+        thread that writes the end record; each plugin's call on a thread
+        of its own."""
         with active.lock:
             active.counts[camera] = pr.counts_of(dict(doc))
-            if active.state in (pr.RESERVED, pr.RECORDING):
-                active.state = pr.STOPPED
-            active.ended = time.time()
-        # Its recording is over (a failed write may end it before Stop).
-        SWITCH.release(active)
+            last = all(c in active.counts for c in active.folders)
+            if last:
+                if active.state in (pr.RESERVED, pr.RECORDING):
+                    active.state = pr.STOPPED
+                active.ended = time.time()
+        if last:
+            # Its recording is over (a failed write may end it before Stop).
+            SWITCH.release(active)
         info = active.info()
         blocks: Dict[str, Any] = {}
         for pid, cam in list(active.hooked):
+            if not (cam == camera or (cam is None and last)):
+                continue
             if pid in self.faults:
                 continue
             made = self.instance(pid, cam)
             if made is None:
                 continue
-            out = self._bounded(pid, "on_run_finished", made, (info,))
-            if out is None or out is _NO_HOOK or pid in self.faults:
+            out = self._bounded(
+                pid, "on_run_finished", _hook(made, "on_run_finished"),
+                (info,), after="the run's end record was written without "
+                               "it",
+                then=camera_record.clean_block)
+            if out is None or out is _NO_HOOK or out is _TIMED_OUT \
+                    or pid in self.faults:
                 continue
-            try:
-                blocks[pid] = camera_record.clean_block(out)
-            except camera_record.BlockError as exc:
-                self.fault(pid, "on_run_finished", exc)
+            blocks[pid] = out
         kept, refused = camera_record.plugins_block(blocks)
         for pid, why in refused.items():
             if pid not in self.faults:
                 self.fault(pid, "on_run_finished",
                            camera_record.BlockError(why))
         with active.lock:
-            active.state = pr.ENDED
+            if last:
+                active.state = pr.ENDED
             faults = dict(active.faults)
             stopped = active.told_stopped
-        if stopped:
-            active.close_files()
-        # else: the recording ended by itself (a failed write) while the run
-        # goes on until Stop, and a plugin may still be writing what the run
-        # holds into its streamed file (the triggering plugin's triggers CSV
-        # has a row for every trigger until Stop, as today's): what is left
-        # open is closed at Stop (run_stopped).
-        self._forget(active)
+        if last:
+            if stopped:
+                active.close_files()
+            # else: the recording ended by itself (a failed write) while the
+            # run goes on until Stop, and a plugin may still be writing what
+            # the run holds into its streamed file (the triggering plugin's
+            # triggers CSV has a row for every trigger until Stop, as
+            # today's): what is left open is closed at Stop (run_stopped).
+            self._forget(active)
         return {"plugins": kept, "plugin_faults": faults}
 
-    def _bounded(self, pid: str, hook: str, made: Any,
-                 args: Sequence[Any]) -> Any:
-        """`made.hook(*args)`, guarded as best effort, on a thread of its
-        own: None when it has not returned within RUN_HOOK_SECONDS, and the
-        plugin is then switched off (a hang). The call itself cannot be
-        stopped (Python has no way to); nothing waits for it."""
+    def _bounded(self, pid: str, hook: str, fn: Callable[..., Any],
+                 args: Sequence[Any], *, after: str,
+                 then: Optional[Callable[[Any], Any]] = None,
+                 kind: str = BEST_EFFORT) -> Any:
+        """`fn(*args)` — plugin `pid`'s `hook` — guarded as `kind`, on a
+        thread of its own, and waited for RUN_HOOK_SECONDS at most: what it
+        returned (passed through `then` INSIDE THE SAME GUARD, so a result
+        that runs the plugin's code when it is read — a block's items(), a
+        reason's __str__ — is the plugin's to fail), its guard's default
+        (None) when it failed, or _TIMED_OUT when it has not returned in
+        time: the plugin is then switched off as a hang, `after` saying
+        what went on without it. The call itself cannot be stopped (Python
+        has no way to); nothing waits for it after that."""
         wait = RUN_HOOK_SECONDS
         box: Dict[str, Any] = {}
         done = threading.Event()
 
+        def call(*given: Any) -> Any:
+            out = fn(*given)
+            if then is not None and out is not None and out is not _NO_HOOK:
+                out = then(out)
+            return out
+
         def run() -> None:
             try:
-                box["out"] = self._guard(pid, hook, _hook(made, hook), args,
-                                         {}, None)
+                box["out"] = self._guard(pid, hook, call, args, {}, None,
+                                         kind=kind)
             finally:
                 done.set()
         threading.Thread(target=run, daemon=True,
                          name=f"plugin-{hook}-{pid}").start()
         if not done.wait(wait):
             self.fault(pid, hook, PluginHung(
-                f"{hook} did not return within {wait:g} s; the run's end "
-                f"record was written without it"), HANG)
-            return None
+                f"{hook} did not return within {wait:g} s; {after}"), HANG)
+            return _TIMED_OUT
         return box.get("out")
 
     def record_plugins(self, camera: Optional[str], device: Any = None
@@ -1342,7 +1614,9 @@ class PluginHost:
         put down to a later plugin of that short name) and kind, why it is
         switched off, and for the camera plugin that opened the camera its
         record_fields(device), cleaned and size-checked. With the words for
-        Start's summary of any record field that could not go in."""
+        Start's summary of any record field that could not go in, and of
+        any plugin's entry the record cannot hold (said, never dropped in
+        silence: P3 review)."""
         slot = self._slot(camera)
         info = getattr(slot, "info", None)
         backend = str(getattr(info, "backend", "") or "")
@@ -1357,7 +1631,7 @@ class PluginHost:
             entry: Dict[str, Any] = {"name": m.name, "version": m.version,
                                      "short": m.short, "kind": m.kind}
             if state == FAULTED:
-                entry["faulted"] = why
+                entry["faulted"] = cut(why)
             if pid == source and device is not None:
                 fields, note = self._record_fields(pid, device)
                 if fields:
@@ -1365,35 +1639,68 @@ class PluginHost:
                 if note:
                     notes.append(note)
             out[pid] = entry
-        return out, notes
+        kept, refused = camera_record.plugins_block(out)
+        for pid, why in refused.items():
+            notes.append(f"{self._name(pid)} is left out of the run's camera "
+                         f"record — {why}")
+        return kept, notes
 
     def _record_fields(self, pid: str, device: Any
                        ) -> Tuple[Dict[str, Any], str]:
         """Camera plugin `pid`'s record_fields(device), cleaned, best effort
-        (design 3.10): ({}, why) when they could not be had or kept."""
+        (design 3.10): ({}, why) when they could not be had or kept.
+
+        The call AND the cleaning of what it gives run inside the camera
+        guard (camera_call's rule: a built-in camera plugin is said and
+        stays on, one from someone else is switched off), on a thread of
+        its own, BOUNDED by RUN_HOOK_SECONDS — so a block that raises when
+        read, SystemExit included, or takes long to read never refuses or
+        holds Start (P3 review: it refused Start, a SystemExit escaped
+        start() on the window's thread, and a slow one held Start 6 s)."""
         from .cameras import CameraError
 
-        try:
-            fn = self._camera_run(pid, "record_fields",
-                                  lambda made: getattr(made, "record_fields",
-                                                       None))
-        except CameraError:
-            return {}, ""
-        if not callable(fn):
-            return {}, ""
-        try:
-            fields = self.camera_call(pid, "record_fields", device)
-        except CameraError as exc:
-            return {}, (f"{self._name(pid)}: its fields in the run's camera "
-                        f"record were not written — {exc}.")
-        if not fields:
-            return {}, ""
-        try:
-            return camera_record.clean_block(fields), ""
-        except camera_record.BlockError as exc:
-            self._camera_fault(pid, "record_fields", exc)
-            return {}, (f"{self._name(pid)}: its fields in the run's camera "
-                        f"record were not written — {exc}.")
+        own = plugin_device(device)
+
+        def call(made: Any) -> Any:
+            fn = getattr(made, "record_fields", None)
+            if not callable(fn):
+                return {}
+            fields = fn(own)
+            if not fields:
+                return {}
+            return camera_record.clean_block(
+                fields, level=camera_record.BLOCK_LEVEL + 1)
+
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["out"] = self._camera_run(pid, "record_fields", call)
+            except BaseException as exc:                # noqa: BLE001
+                # A CameraError: the camera's answer, or the plugin's fault
+                # already logged and said by the camera guard.
+                box["error"] = exc
+            finally:
+                done.set()
+        threading.Thread(target=run, daemon=True,
+                         name=f"plugin-record_fields-{pid}").start()
+        said = (f"{self._name(pid)}: its fields in the run's camera record "
+                f"were not written — ")
+        if not done.wait(RUN_HOOK_SECONDS):
+            self._camera_fault(pid, "record_fields", PluginHung(
+                f"record_fields did not return within {RUN_HOOK_SECONDS:g} "
+                f"s; the run's camera record was written without them"),
+                kind=HANG)
+            return {}, (f"{said}they did not come within "
+                        f"{RUN_HOOK_SECONDS:g} s.")
+        error = box.get("error")
+        if isinstance(error, CameraError):
+            return {}, f"{said}{cut(str(error))}."
+        if error is not None:
+            return {}, f"{said}{fault_text(error)}."
+        fields = box.get("out")
+        return (fields if isinstance(fields, dict) else {}), ""
 
     def frame_stage(self, pid: str, stage: Callable[[Any, Any], Any],
                     session: Any = None) -> "GuardedStage":
@@ -1603,9 +1910,11 @@ class PluginHost:
             made = self._for_camera(pid, camera)
             if made is None:
                 continue
+            # A mapping it gives is copied to a plain dict INSIDE the guard:
+            # its items() is the plugin's own code (P3 review).
             got = self._guard(pid, "preset_values",
-                              _hook(made, "preset_values"), (camera,), {},
-                              None)
+                              _plain_items(_hook(made, "preset_values")),
+                              (camera,), {}, None)
             if pid in self.faults:
                 fault = self.faults[pid]
                 if fault.hook == "preset_values":
@@ -1625,7 +1934,8 @@ class PluginHost:
             bad: List[str] = []
             for key, value in got.items():
                 if not isinstance(key, str) or not _plain_value(value):
-                    bad.append(str(key))
+                    bad.append(key if isinstance(key, str)
+                               else f"a {type(key).__name__} key")
                     continue
                 try:
                     new[pk.namespaced(pid, key)] = value
@@ -1655,20 +1965,29 @@ class PluginHost:
                    applied: bool = True) -> str:
         """The words for keys kept untouched for plugins not running here:
         "Kept for plugins not running here, not applied: Acme thermal
-        (acme.thermal): 2 settings." — "" for none."""
-        parts = []
+        (acme.thermal): 2 settings." — "" for none. A plugin that IS
+        running but takes no preset values (its manifest does not
+        contribute "presets") is said as such, never as not running (P3
+        review: the Timing scan, running, was listed as not running)."""
+        running = self._running()
+        absent: List[str] = []
+        idle: List[str] = []
         for pid, keys in dict(kept or {}).items():
             count = len(keys)
             label = self._name(pid)
             label = label if label == pid else f"{label} ({pid})"
-            parts.append(f"{label}: {count} "
-                         f"setting{'s' if count != 1 else ''}")
-        if not parts:
-            return ""
+            (idle if pid in running else absent).append(
+                f"{label}: {count} setting{'s' if count != 1 else ''}")
         how = ("not applied" if applied else "kept in the preset as they "
                "were")
-        return (f"Kept for plugins not running here, {how}: "
-                f"{'; '.join(parts)}.")
+        out = []
+        if absent:
+            out.append(f"Kept for plugins not running here, {how}: "
+                       f"{'; '.join(absent)}.")
+        if idle:
+            out.append(f"Kept for plugins running here that take no preset "
+                       f"values, {how}: {'; '.join(idle)}.")
+        return " ".join(out)
 
     # -- camera plugins (stage P2; design 2.4 item 3, 3.3, 3.4) ---------------
     def _runnable_cameras(self) -> List[str]:
@@ -1852,20 +2171,20 @@ class PluginHost:
                 raise
             self._camera_fault(pid, hook, exc)
             raise CameraError(f"{self._name(pid)} failed in {hook}: "
-                              f"{type(exc).__name__}: {exc}") from exc
+                              f"{fault_text(exc)}") from exc
 
-    def _camera_fault(self, pid: str, hook: str, exc: BaseException) -> None:
+    def _camera_fault(self, pid: str, hook: str, exc: BaseException,
+                      kind: str = BEST_EFFORT) -> None:
         """A camera plugin's own error (camera_call): a plugin from someone
         else is switched off; a built-in camera plugin is only logged and
         said, and stays on."""
         rec = self.record(pid)
         if rec is None or not rec.builtin:
-            self.fault(pid, hook, exc)
+            self.fault(pid, hook, exc, kind)
             return
-        made = Fault(plugin=pid, hook=hook, kind=BEST_EFFORT,
-                     error=f"{type(exc).__name__}: {exc}",
-                     trace="".join(traceback.format_exception(
-                         type(exc), exc, exc.__traceback__)),
+        made = Fault(plugin=pid, hook=hook, kind=kind,
+                     error=fault_text(exc),
+                     trace=_trace(exc),
                      at=time.strftime("%Y-%m-%d %H:%M:%S"))
         self._log(made)
         self._note_in_runs(pid, f"{made.reason} — a built-in camera plugin "
@@ -2076,6 +2395,14 @@ class PluginHost:
                                   f"{getattr(info, 'label', info)}, but the "
                                   f"camera and its plugin disagree on what it "
                                   f"can do: {said} — the camera is not used")
+        if needs_core_capture(device, str(getattr(info, "kind", "") or "")):
+            # A frame camera whose plugin gives it no capture set-up: the
+            # core holds one (council_core.plugin_capture) — the Downsample
+            # row, the trigger rows, snapshot runs (design 2.5, 3.6; P3
+            # review). Its plugin is still handed its own Device.
+            from .plugin_capture import CoreCapture
+
+            device = CoreCapture(device)
         confirm = getattr(slot, "confirm", None)
         if callable(confirm):
             confirm(device, caps)
@@ -2257,9 +2584,8 @@ class PluginHost:
         the P2 review a failed load switched it off for the session, and
         its cameras dropped out of the next scan with no word)."""
         made = Fault(plugin=pid, hook=hook, kind=kind,
-                     error=f"{type(exc).__name__}: {exc}",
-                     trace="".join(traceback.format_exception(
-                         type(exc), exc, exc.__traceback__)),
+                     error=fault_text(exc),
+                     trace=_trace(exc),
                      at=time.strftime("%Y-%m-%d %H:%M:%S"))
         with self._fault_lock:
             self._load_failures[pid] = made
@@ -2276,11 +2602,12 @@ class PluginHost:
         """Switch plugin `pid` off for the rest of the session, because of
         `exc` in `hook`: kept in `faults`, said in the status line, and its
         traceback appended to <project>/plugin_errors.log. The first fault
-        is the one its state shows; every one is logged."""
+        is the one its state shows; every one is logged. Its words are cut
+        to FAULT_TEXT characters wherever they are said or kept (the
+        records' plugin_faults and `faulted`); the log keeps the whole."""
         made = Fault(plugin=pid, hook=hook, kind=kind,
-                     error=f"{type(exc).__name__}: {exc}",
-                     trace="".join(traceback.format_exception(
-                         type(exc), exc, exc.__traceback__)),
+                     error=fault_text(exc),
+                     trace=_trace(exc),
                      at=time.strftime("%Y-%m-%d %H:%M:%S"))
         # Its own small lock, not the host's: the watchdog faults a plugin
         # whose hung call may be holding the host's lock (activate).
@@ -2372,7 +2699,7 @@ class PluginHost:
         where = (f" at frame {frame.index}"
                  if getattr(frame, "index", None) is not None else "")
         return (f"recording ended by plugin {self._name(pid)} ({pid}): its "
-                f"{hook} failed{where} — {type(exc).__name__}: {exc}")
+                f"{hook} failed{where} — {fault_text(exc)}")
 
     def recording_fault(self, pid: str, hook: str, exc: BaseException,
                         frame: Any = None) -> str:
@@ -2557,7 +2884,9 @@ class PluginHost:
             keys = [k for k in self._instances if which(k)]
             made = [(k, self._instances.pop(k)) for k in keys]
             for k in keys:
-                self._contexts.pop(k, None)
+                ctx = self._contexts.pop(k, None)
+                if ctx is not None:
+                    ctx._gone = True        # its services close with it
             for k, loading in self._loading.items():
                 if which(k):
                     loading.cancelled = True
@@ -2583,9 +2912,7 @@ class PluginHost:
             if not _ours(exc):
                 raise
             self._log(Fault(pid, "deactivate", BEST_EFFORT,
-                            f"{type(exc).__name__}: {exc}",
-                            "".join(traceback.format_exception(
-                                type(exc), exc, exc.__traceback__)),
+                            fault_text(exc), _trace(exc),
                             time.strftime("%Y-%m-%d %H:%M:%S")))
 
     def close(self) -> None:
@@ -2620,13 +2947,41 @@ class PluginHost:
 class Context:
     """What one plugin instance is handed (typhon_plugin_api.PluginContext).
     `slot_id` ties a camera-scoped feature to its slot; None follows the
-    active camera."""
+    active camera.
+
+    A PLUGIN SWITCHED OFF IS OFF (design 3.10): once its plugin is faulted,
+    or its instance let go (switched off in the project, another project
+    opened, the window closing), the context's file services refuse
+    (PluginFileError), save_settings refuses (PluginListError) and `on`
+    listens for nothing — a thread the plugin left running can no longer
+    make run files, write files or change the project (P3 review: a
+    faulted plugin's thread still made a run file and saved settings).
+    Nothing it could do was ever over anything; now it does nothing."""
 
     def __init__(self, host: PluginHost, pid: str,
                  slot_id: Optional[int] = None) -> None:
         self._host = host
         self.plugin_id = pid
         self._slot_id = slot_id
+        #: Its instance was let go (host._deactivate): its services close.
+        self._gone = False
+
+    def _off(self) -> str:
+        """Why this plugin may no longer act here, or ""."""
+        host = self._host
+        fault = host.faults.get(self.plugin_id)
+        if fault is not None:
+            return (f"{host._name(self.plugin_id)} was switched off for this "
+                    f"session ({fault.reason})")
+        if self._gone:
+            return (f"{host._name(self.plugin_id)} no longer runs in this "
+                    f"window (switched off, or its project closed)")
+        return ""
+
+    def _open(self) -> None:
+        why = self._off()
+        if why:
+            raise pr.PluginFileError(f"{why}: its file services are closed")
 
     def _own_slot(self) -> Any:
         rig = self._host.rig
@@ -2670,12 +3025,21 @@ class Context:
 
     def on(self, event: str, fn: Callable[[Mapping[str, Any]], Any]
            ) -> Callable[[], None]:
+        if self._off():
+            if event not in api.EVENTS:
+                raise ValueError(f"{event!r} is not an event a plugin can "
+                                 f"listen for ({', '.join(api.EVENTS)})")
+            return lambda: None             # a plugin switched off hears none
         return self._host.subscribe(self.plugin_id, event, fn)
 
     def settings(self) -> Dict[str, Any]:
         return self._host.settings(self.plugin_id)
 
     def save_settings(self, values: Mapping[str, Any]) -> None:
+        why = self._off()
+        if why:
+            raise pl.PluginListError(f"{why}: it changes nothing in the "
+                                     f"project now")
         self._host.save_settings(self.plugin_id, values)
 
     def state(self, camera: Optional[str] = None) -> Dict[str, Any]:
@@ -2689,13 +3053,16 @@ class Context:
 
     def create_file(self, folder: Any, name: str, *,
                     binary: bool = False) -> Any:
+        self._open()
         return self._host.create_file(self.plugin_id, folder, name,
                                       binary=binary)
 
     def write_new(self, folder: Any, name: str, data: Any) -> Path:
+        self._open()
         return self._host.write_new(self.plugin_id, folder, name, data)
 
     def data_dir(self) -> Path:
+        self._open()
         return self._host.data_dir(self.plugin_id)
 
     def capture_setup(self, camera: Optional[str] = None) -> Any:
@@ -2864,7 +3231,7 @@ class GuardedGate:
         reason = (host.recording_reason(self._pid, hook, exc, frame)
                   if host is not None else
                   f"recording ended: the record gate's {hook} failed — "
-                  f"{type(exc).__name__}: {exc}")
+                  f"{fault_text(exc)}")
         self._finish(reason, frame)
         if host is not None:
             host.fault(self._pid, hook, exc, RECORDING)
@@ -2879,17 +3246,62 @@ class GuardedGate:
             return dict(FAULT_TAGS)
         try:
             # A frame it can read and not change (P3 row 6): its pixels and
-            # meta are what is saved and recorded.
-            return self._gate.tag(read_only_frame(frame))
+            # meta are what is saved and recorded. ITS TAGS CHECKED (P3
+            # review): None, or the trigger columns with plain values — junk
+            # is a fault on the recording path like any other, so it never
+            # reaches the frame's meta (a str there stopped the grab thread,
+            # a "reduce" changed the pictures saved).
+            return gate_tags(self._gate.tag(read_only_frame(frame)))
         except BaseException as exc:                    # noqa: BLE001
             self._fail("record gate", exc, frame)
             return dict(FAULT_TAGS)
+
+    def _summary(self, target: Callable[[], Any]) -> Dict[str, Any]:
+        """The run's capture block for its end record (the books'
+        summary(), which Recorder.finish asks on a writer thread as the
+        recording ends): GUARDED and CLEANED — whatever it raises,
+        SystemExit included, is its plugin's best-effort fault and the
+        block says so; what it gives is made plain JSON (NaN as null), so
+        the end record is always written (P3 review: a SystemExit there,
+        or a NaN, left the run with no end record)."""
+        try:
+            got = target()
+            if not isinstance(got, Mapping):
+                raise TypeError(f"its summary is a {type(got).__name__}, "
+                                f"not a mapping")
+            made = camera_record._plain_tree(dict(
+                dict.items(got) if isinstance(got, dict) else got.items()))
+            return made if isinstance(made, dict) else {}
+        except BaseException as exc:                    # noqa: BLE001
+            if self._host is not None:
+                self._host.fault(self._pid, "record gate (summary)", exc)
+            return {"error": fault_text(exc)}
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             # Its own fields are never forwarded (and asking for one before
             # __init__ set it must not recurse).
             raise AttributeError(name)
+        if name == "summary":
+            # What the end record's capture block is made of (Recorder.
+            # capture_info): guarded and cleaned (_summary), looked up in
+            # the guard too.
+            try:
+                found = getattr(self._gate, name)
+            except AttributeError:
+                raise
+            except BaseException as exc:                # noqa: BLE001
+                failed = exc
+
+                def found() -> Any:                     # its fault, below
+                    raise failed
+            if not callable(found):
+                return found
+
+            def summary() -> Dict[str, Any]:
+                return self._summary(found)
+            self.__dict__[name] = summary
+            return summary
         if name not in self.RECORDING_CALLS:
             return getattr(self._gate, name)
         try:
@@ -2972,6 +3384,37 @@ def read_only_frame(frame: Any) -> Any:
                        meta=read_only(frame.meta))
 
 
+class _Watched:
+    """A call on the recording path, in the host's busy table while it runs
+    (as _guard puts every other call), so the watchdog switches off one
+    that hangs (P3 review). Nothing without a host."""
+
+    __slots__ = ("_host", "_key", "_hook", "_before")
+
+    def __init__(self, host: Optional[PluginHost], pid: str,
+                 hook: str) -> None:
+        self._host = host
+        self._key = (pid, threading.get_ident())
+        self._hook = hook
+        self._before: Any = None
+
+    def __enter__(self) -> "_Watched":
+        host = self._host
+        if host is not None:
+            self._before = host._busy.get(self._key)
+            host._busy[self._key] = (self._hook, host._clock())
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        host = self._host
+        if host is not None:
+            if self._before is None:
+                host._busy.pop(self._key, None)
+            else:
+                host._busy[self._key] = self._before
+        return False
+
+
 class GuardedStage:
     """A plugin's FRAME STAGE for one run (`stage(image, meta) -> image`,
     the picture to save), guarded on the RECORDING PATH (design 3.8, 3.10):
@@ -2997,7 +3440,24 @@ class GuardedStage:
     gate's (GuardedGate): a best-effort fault lets the stage serve out the
     run; a hang, a fault on the recording path, a failed load, or a fault it
     had before this run began end the run at the next frame, without
-    asking the plugin anything."""
+    asking the plugin anything.
+
+    ONE PICTURE PER RUN (P3 review): every picture it gives in a run must
+    have the size, the dtype and the colour mode of its first one, or it
+    fails as above; before, a stage that cropped or changed dtype mid-run
+    left one run holding pictures of two sizes and two modes, while its
+    records described one.
+
+    WATCHED (P3 review): each call is in the host's busy table, so the
+    watchdog switches off a stage that has not returned in
+    WATCHDOG_SECONDS — said, logged and in the end record's plugin_faults
+    — and the recording ends at the next frame staged, its reason naming
+    the plugin; the frame of the hung call is not saved when the call
+    comes back (it is counted as not saved). A stage that never returns
+    still holds its run's end record (the frames CSV is published in grab
+    order), so a built-in frame stage must return well within the
+    watchdog's limit: the frame-stage contract suite times each one on a
+    full-size frame."""
 
     STOPPING = GuardedGate.STOPPING
 
@@ -3012,6 +3472,8 @@ class GuardedStage:
         self._off_from_start = host is not None and pid in host.faults
         #: Why the recording was ended by this stage, or "".
         self.ended = ""
+        #: (shape, dtype) of the first picture it gave this run.
+        self._picture: Optional[Tuple[Tuple[int, ...], str]] = None
 
     def _finish(self, reason: str) -> str:
         with self._lock:
@@ -3031,20 +3493,40 @@ class GuardedStage:
                 f"recording ended: plugin {name} ({self._pid}) was switched "
                 f"off — {fault.reason}"))
         try:
-            made = self._stage(locked_pixels(image), read_only(meta))
+            with _Watched(host, self._pid, "frame stage"):
+                made = self._stage(locked_pixels(image), read_only(meta))
             problem = picture_problem(made)
             if problem:
                 raise TypeError(f"it gave {problem}")
-            return made
+            kind = (tuple(int(n) for n in made.shape), str(made.dtype))
+            with self._lock:
+                first = self._picture
+                if first is None:
+                    self._picture = first = kind
+            if kind != first:
+                raise TypeError(
+                    f"it gave a picture of shape {kind[0]}, {kind[1]}, after "
+                    f"ones of shape {first[0]}, {first[1]} in this run: one "
+                    f"run holds pictures of one size, dtype and colour "
+                    f"mode")
         except BaseException as exc:                    # noqa: BLE001
             reason = (host.recording_reason(self._pid, "frame stage", exc)
                       if host is not None else
                       f"recording ended: the frame stage failed — "
-                      f"{type(exc).__name__}: {exc}")
+                      f"{fault_text(exc)}")
             reason = self._finish(reason)
             if host is not None:
                 host.fault(self._pid, "frame stage", exc, RECORDING)
             raise RecordingEnded(reason) from exc
+        fault = host.faults.get(self._pid) if host is not None else None
+        if fault is not None and fault.kind in self.STOPPING:
+            # Switched off while this call ran (the watchdog: a hang): the
+            # picture it made late is not saved; the recording has ended.
+            name = host._name(self._pid)
+            raise RecordingEnded(self._finish(
+                f"recording ended: plugin {name} ({self._pid}) was switched "
+                f"off — {fault.reason}"))
+        return made
 
 
 class StagedAfterDownsample:
@@ -3182,7 +3664,7 @@ class TriggerSlot:
                 self.gate.end(reason)
             host.fault(self.plugin_id, f"trigger {step}", exc, RECORDING)
             return [f"{self._name()} failed as the run started, and the "
-                    f"recording ended — {type(exc).__name__}: {exc}"]
+                    f"recording ended — {fault_text(exc)}"]
 
     # -- Stop, and after: served out -----------------------------------------
     def _serve(self, step: str, *args: Any, default: Any = None) -> Any:
@@ -3193,7 +3675,7 @@ class TriggerSlot:
                 raise
             self._host.fault(self.plugin_id, f"trigger {step}", exc)
             self.notes.append(f"{self._name()} failed in its {step} at "
-                              f"Stop — {type(exc).__name__}: {exc}")
+                              f"Stop — {fault_text(exc)}")
             return default
 
     def halt(self, grabbed: Callable[[], int]) -> None:
@@ -3236,7 +3718,7 @@ class TriggerSlot:
                 raise
             self._host.fault(self.plugin_id, "capture_now", exc)
             return (f"Capture now: {self._name()} failed — "
-                    f"{type(exc).__name__}: {exc}.")
+                    f"{fault_text(exc)}.")
         return str(said or "")
 
     def _finished(self) -> None:
@@ -3286,6 +3768,21 @@ class LiveFeed:
         self.over_budget = 0
         self.busy_s = 0.0
         self.longest_s = 0.0
+        #: The camera's own binning, decimation and mirroring (design 3.12;
+        #: PluginHost.camera_geometry), read once per stream: they are
+        #: settings the stream must be stopped to change (GenICam locks
+        #: them while grabbing, as the simulated camera's ReverseX).
+        self._geometry: Optional[Dict[str, Any]] = None
+        self._geometry_of: Any = None
+
+    def geometry(self) -> Dict[str, Any]:
+        """The camera's own terms for this feed's frames, read again when
+        its stream has started anew since they were last read."""
+        stream = self.host.stream_of(self.camera)
+        if self._geometry is None or self._geometry_of is not stream:
+            self._geometry = self.host.camera_geometry(self.camera)
+            self._geometry_of = stream
+        return self._geometry
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -3336,7 +3833,14 @@ class LiveFeed:
                 frame, host_us, saved = self._queue.popleft()
             if self.plugin in host.faults:
                 return
-            view = frame_view(frame, self.camera, host_us, saved=saved)
+            try:
+                terms = self.geometry()
+            except Exception:                             # noqa: BLE001
+                terms = {}      # unknown: a FrameView then refuses to_sensor
+            view = frame_view(frame, self.camera, host_us, saved=saved,
+                              binning=terms.get("binning"),
+                              decimation=terms.get("decimation"),
+                              mirror=terms.get("mirror"))
             del frame
             started = time.perf_counter()
             host._guard(self.plugin, "on_frame", self._fn, (view,), {}, None)
@@ -3475,27 +3979,69 @@ class PluginBackend:
         return f"<PluginBackend {self.plugin}>"
 
 
+#: frame_view's "not given": the frame's own terms are taken as plain (no
+#: binning, decimation or mirroring) — what a caller that knows them says.
+#: None, given, is "not known": the FrameView keeps None and to_sensor
+#: refuses (design 3.12: a position is never guessed).
+NOT_GIVEN: Any = object()
+
+
+def geometry_pair(term: str, values: Sequence[Any]) -> Optional[Tuple[Any,
+                                                                      Any]]:
+    """A camera's two settings of `term` (GEOMETRY) as a FrameView term: a
+    pair of whole numbers (binning, decimation, at least 1) or of truths
+    (mirror) — or None when either is unknown or not a value of that
+    kind."""
+    if len(values) != 2 or any(v is None for v in values):
+        return None
+    if term == "mirror":
+        out = []
+        for value in values:
+            if isinstance(value, bool):
+                out.append(value)
+            elif isinstance(value, (int, float)):
+                out.append(bool(value))
+            elif str(value).strip().lower() in ("true", "on", "1", "yes"):
+                out.append(True)
+            elif str(value).strip().lower() in ("false", "off", "0", "no"):
+                out.append(False)
+            else:
+                return None
+        return (out[0], out[1])
+    try:
+        made = tuple(max(1, int(v)) for v in values)
+    except (TypeError, ValueError):
+        return None
+    return (made[0], made[1])
+
+
 def frame_view(frame: Any, camera: str, host_us: int = 0,
-               saved: Optional[str] = None, binning: Any = None,
-               decimation: Any = None, mirror: Any = None) -> api.FrameView:
+               saved: Optional[str] = None, binning: Any = NOT_GIVEN,
+               decimation: Any = NOT_GIVEN, mirror: Any = NOT_GIVEN
+               ) -> api.FrameView:
     """A FrameView of `frame` whose pixels the plugin cannot unlock by
     accident (locked_pixels; nothing is copied), with every term of design
     3.12 that turns its pixels into sensor pixels: the camera's area the
     frame was taken with (Frame.meta "aoi") and Downsample's factor and
     method (its "downsample", "downsample_method", "reduce"), as the frame
-    carries them; the camera's own `binning`, `decimation` and `mirror`, as
-    the core knows them for its slot (none, unless given). With the camera's
-    binning as the Downsample, the binning IS the factor. `saved`: the
-    file the frame is saved as, or None."""
+    carries them; the camera's own `binning`, `decimation` and `mirror` —
+    a live feed reads them from the camera's settings (PluginHost.
+    camera_geometry) — each a pair, None when it could not be told (the
+    view then refuses to_sensor), or plain when not given. With the
+    camera's binning as the Downsample, the binning IS the factor.
+    `saved`: the file the frame is saved as, or None."""
     view = locked_pixels(getattr(frame, "image", None))
     meta = dict(getattr(frame, "meta", None) or {})
 
-    def pair(value: Any, default: Any) -> Tuple[Any, Any]:
+    def term(value: Any, name: str, plain: Tuple[Any, Any]
+             ) -> Optional[Tuple[Any, Any]]:
+        if value is NOT_GIVEN:
+            return plain
         if value is None:
-            return default
-        if isinstance(value, (tuple, list)) and len(value) == 2:
-            return (value[0], value[1])
-        return (value, value)
+            return None
+        if isinstance(value, (tuple, list)):
+            return geometry_pair(name, list(value))
+        return geometry_pair(name, [value, value])
 
     try:
         area = tuple(int(v) for v in (meta.get("aoi") or (0, 0, 0, 0)))
@@ -3513,8 +4059,10 @@ def frame_view(frame: Any, camera: str, host_us: int = 0,
         method = api.TYPHON_DOWNSAMPLE
     if factor <= 1:
         method = ""
-    bins = pair(binning, (1, 1))
-    if binning is None and method == api.CAMERA_DOWNSAMPLE:
+    bins = term(binning, "binning", (1, 1))
+    if method == api.CAMERA_DOWNSAMPLE and (binning is NOT_GIVEN
+                                            or bins is None):
+        # The frame says the camera binned it by the factor.
         bins = (factor, factor)
     return api.FrameView(camera=camera, index=int(getattr(frame, "index", 0)),
                          image=view,
@@ -3522,9 +4070,7 @@ def frame_view(frame: Any, camera: str, host_us: int = 0,
                          host_us=int(host_us),
                          saved=str(saved) if saved else None,
                          meta=MappingProxyType(meta), area=area,
-                         binning=(int(bins[0]), int(bins[1])),
-                         decimation=tuple(int(d) for d in pair(decimation,
-                                                               (1, 1))),
-                         mirror=tuple(bool(m) for m in pair(mirror,
-                                                            (False, False))),
+                         binning=bins,
+                         decimation=term(decimation, "decimation", (1, 1)),
+                         mirror=term(mirror, "mirror", (False, False)),
                          downsample=factor, downsample_method=method)

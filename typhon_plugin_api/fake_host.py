@@ -160,7 +160,35 @@ class Run:
                        f"{', '.join(unlisted[:3])}")
         if rows != sorted(rows):
             out.append("the frames CSV is not in the order the frames came")
+        kinds = {}
+        for png in self.pngs():
+            kinds.setdefault(png_kind(png), png.name)
+        if len(kinds) > 1:
+            out.append("the run's pictures are of more than one size or "
+                       "mode: " + ", ".join(
+                           f"{name} {kind}" for kind, name in
+                           list(kinds.items())[:3]))
         return out
+
+
+def png_kind(path: Path) -> str:
+    """A PNG's size and mode from its header, "640x480 8-bit grey" — read
+    without decoding it (P3 review: a run's pictures are one size and one
+    mode, which the records describe)."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(29)
+    except OSError as exc:
+        return f"unreadable ({type(exc).__name__})"
+    if len(head) < 26 or head[:8] != b"\x89PNG\r\n\x1a\n" or \
+            head[12:16] != b"IHDR":
+        return "not a PNG"
+    width = int.from_bytes(head[16:20], "big")
+    height = int.from_bytes(head[20:24], "big")
+    depth, colour = head[24], head[25]
+    mode = {0: "grey", 2: "RGB", 3: "palette", 4: "grey+alpha",
+            6: "RGBA"}.get(colour, f"colour type {colour}")
+    return f"{width}x{height} {depth}-bit {mode}"
 
 
 def wait_for(condition: Callable[[], Any], seconds: float = 10.0) -> bool:
@@ -321,18 +349,26 @@ class FakeHost:
             problem = f"it holds more than {ph.MAX_FILES} files"
         host = self.host
         if not problem:
-            for pid in host.runs():
-                other = host.manifest(pid)
+            # Against EVERY plugin Typhon found — built-ins switched off in
+            # this project among them, whose short names and run files are
+            # still theirs — as Typhon's discovery checks it (P3 review: a
+            # switched-off built-in's short name was accepted here).
+            records = dict(host.registry.records)
+            records.update(host._adopted)
+            shorts: Dict[str, str] = {}
+            endings: Dict[str, str] = {}
+            for pid, rec in records.items():
+                other = rec.manifest
                 if other is None or pid == m.id:
                     continue
-                if other.short == m.short:
-                    problem = (f"its short name {m.short!r} is {pid}'s "
-                               f"already")
-                clash = [s for s in m.files if s in other.files]
-                if clash:
-                    problem = f"its run file {clash[0]!r} is {pid}'s already"
-                if problem:
-                    break
+                shorts.setdefault(other.short, pid)
+                for suffix in other.files:
+                    endings.setdefault(suffix, pid)
+            if m.short in shorts:
+                problem = (f"its short name {m.short!r} is "
+                           f"{shorts[m.short]}'s already")
+            else:
+                problem = ph.ending_clash(m.files, endings)
         if problem:
             raise FakeHostError(f"{m.id} would be refused: {problem}")
         package = f"{PACKAGE}.{m.id.replace('.', '_')}"

@@ -85,9 +85,13 @@ reads (`device.capture`), read by a plugin through `ctx.capture_setup()`.
 Downsample is the core's: its key (save.downsample), its row in every frame
 camera's "Capture" group and the one frame stage that makes the saved
 picture smaller are Typhon's, not a plugin's (design 2.1). A `FrameView`
-carries every term that turns a picture's pixel into a sensor pixel, and
-`to_sensor()` does it (design 3.12). A `TriggerSource` says "capture now"
-(design 3.6): Typhon's own are the triggering plugin's Software and Timer.
+carries every term that turns a picture's pixel into a sensor pixel:
+`to_sensor()` does it for the view's own pixels, `saved_to_sensor()` for
+the saved (Downsampled) picture's (design 3.12). A `TriggerSource` says
+"capture now" (design 3.6): Typhon's own are the triggering plugin's
+Software and Timer. A plugin of its own that is a source (manifest kind
+"source": a trigger box) is not wired into a run yet — the manifest
+refuses that kind until the triggering plugin can pick one (stage P6).
 
 IMPORTING THIS IS CHEAP
 The re-exported classes are looked up on first use (module __getattr__), so
@@ -156,8 +160,13 @@ FEATURES: FrozenSet[str] = frozenset({
     "camera.facet", "type.CaptureSetup", "type.CaptureOptions",
     "type.SoftwareTrigger", "type.HardwareTrigger", "type.Binning",
     "type.TriggerSource", "type.TriggerEvent", "type.Action",
-    "frame.to_sensor", "frame.saved", "context.capture_setup",
+    "frame.to_sensor", "context.capture_setup",
     "hook.trigger_slot", "hook.capture_now",
+    # P3 review: a saved picture's pixel to sensor pixels (to_sensor is the
+    # view's own pixels). "frame.saved" joins when the window feeds live
+    # frames with the file each is saved as (P4); FrameView.saved is None
+    # until then.
+    "frame.saved_to_sensor",
     # P3 row 6: a built-in plugin's frame stage for a run, which Start asks
     # (after the core's Downsample, guarded on the recording path)
     "hook.frame_stage",
@@ -238,20 +247,29 @@ class FrameView:
     camera's area the frame was taken with), `format`, and Downsample's
     `reduce` / `downsample` when on. `saved` is the frame's file name, or
     None for a frame not saved (a snapshot run passes over the frames
-    between its triggers; the live view saves nothing).
+    between its triggers; the live view saves nothing) — NOT YET FILLED:
+    None until the window feeds live frames (stage P4), so
+    has("frame.saved") is False until then.
 
     THE PICTURE'S COORDINATES (design 3.12, from P3). A plugin sees the
-    full-size frame, while the saved PNG, the live view and the boxes may be
-    reduced; everything a plugin stores or draws is in full-sensor, unbinned
-    pixels (pixel (x, y) centred at index (x, y)). The terms: `area`, the
-    camera's area the frame was taken with (x, y, w, h, in the camera's own
-    pixels — binned ones on a binned camera); `binning`, sensor pixels per
-    camera pixel (h, v) — with the camera's binning as Downsample, the
-    Downsample factor; `decimation` and `mirror`, as the camera reports
-    them; and Downsample's `downsample` factor and `downsample_method`
-    ("typhon_block_mean": Typhon averages the saved picture's blocks;
-    "camera_binning_average": the camera bins; "" for off). `to_sensor(x,
-    y)` turns a pixel of the SAVED picture into sensor pixels."""
+    full-size frame — `image` is the picture as the camera sent it, NOT
+    reduced by Typhon's Downsample — while the saved PNG, the live view
+    and the boxes may be reduced; everything a plugin stores or draws is in
+    full-sensor, unbinned pixels (pixel (x, y) centred at index (x, y)).
+    The terms: `area`, the camera's area the frame was taken with (x, y, w,
+    h, in the camera's own pixels — binned ones on a binned camera);
+    `binning`, sensor pixels per camera pixel (h, v) — with the camera's
+    binning as Downsample, the Downsample factor; `decimation` and
+    `mirror`, as the camera's settings have them (a live feed reads them
+    once per stream); and Downsample's `downsample` factor and
+    `downsample_method` ("typhon_block_mean": Typhon averages the saved
+    picture's blocks; "camera_binning_average": the camera bins; "" for
+    off). `binning`, `decimation` or `mirror` is None when Typhon could not
+    tell it. `to_sensor(x, y)` turns a pixel of `image` — the view's own —
+    into sensor pixels; `saved_to_sensor(x, y)` a pixel of the SAVED
+    picture (or of the live view, or a box: Downsample's). Both refuse
+    (ValueError) a mirrored or decimated picture, or one whose terms are
+    not known: a position is never guessed."""
     camera: str
     index: int
     image: Any
@@ -261,19 +279,40 @@ class FrameView:
     meta: Mapping[str, Any] = field(default_factory=lambda:
                                     MappingProxyType({}))
     area: Tuple[int, int, int, int] = (0, 0, 0, 0)
-    binning: Tuple[int, int] = (1, 1)
-    decimation: Tuple[int, int] = (1, 1)
-    mirror: Tuple[bool, bool] = (False, False)
+    binning: Optional[Tuple[int, int]] = (1, 1)
+    decimation: Optional[Tuple[int, int]] = (1, 1)
+    mirror: Optional[Tuple[bool, bool]] = (False, False)
     downsample: int = 1
     downsample_method: str = ""
 
     def to_sensor(self, x: float, y: float) -> Tuple[float, float]:
-        """The saved picture's pixel (x, y) in sensor pixels (design 3.12):
-        Typhon's Downsample factor first, then the area's origin, then the
-        camera's binning — council_core.reduce.sensor_position on each
-        axis. A mirrored or decimated picture raises ValueError: those
-        conversions need terms no camera reports yet, and a position is
-        never guessed."""
+        """Pixel (x, y) of `image` — the picture this view hands the
+        plugin, full size — in sensor pixels (design 3.12): the area's
+        origin, then the camera's binning, council_core.reduce.
+        sensor_position on each axis (P3 review: it converted the SAVED
+        picture's pixels, so a live plugin's own last pixel landed off the
+        sensor when Typhon downsampled). A mirrored or decimated picture,
+        or one whose terms are not known, raises ValueError."""
+        return self._sensor(x, y, 1)
+
+    def saved_to_sensor(self, x: float, y: float) -> Tuple[float, float]:
+        """Pixel (x, y) of the SAVED picture — the PNG, the live view, a
+        box drawn on either — in sensor pixels (design 3.12): Typhon's
+        Downsample factor first (the camera's binning is in `binning`
+        already), then the area's origin, then the camera's binning.
+        Refused as to_sensor is."""
+        factor = (max(1, int(self.downsample or 1))
+                  if self.downsample_method == TYPHON_DOWNSAMPLE else 1)
+        return self._sensor(x, y, factor)
+
+    def _sensor(self, x: float, y: float,
+                factor: int) -> Tuple[float, float]:
+        unknown = [name for name in ("binning", "decimation", "mirror")
+                   if getattr(self, name) is None]
+        if unknown:
+            raise ValueError(f"this frame's {' and '.join(unknown)} could "
+                             f"not be told (the camera's settings could not "
+                             f"be read) — no position is guessed")
         if any(bool(m) for m in self.mirror):
             raise ValueError("this picture is mirrored (the camera's "
                              "ReverseX / ReverseY): to_sensor needs the "
@@ -284,8 +323,6 @@ class FrameView:
                              "convert a decimated picture yet — no position "
                              "is guessed")
         place = __getattr__("sensor_position")
-        factor = (max(1, int(self.downsample or 1))
-                  if self.downsample_method == TYPHON_DOWNSAMPLE else 1)
         bx, by = (max(1, int(b)) for b in self.binning)
         ax, ay = (float(a) for a in tuple(self.area)[:2])
         return (place(float(x), factor, ax, bx),
@@ -302,10 +339,12 @@ CAMERA_DOWNSAMPLE = "camera_binning_average"
 class RunCamera:
     """One camera of a run to be, as a RunPlan names it (design 3.6, 3.11):
     its slot's name, "frame" or "event", what it is (`info`, a CameraInfo)
-    and can do, the folder its run saves into, its area (x, y, w, h, sensor
-    pixels), Downsample's factor (1: off) and method ("typhon_block_mean",
-    "camera_binning_average", or "" for off), and its capture set-up as
-    plain values ({} for a camera with none: an event camera)."""
+    and can do, the folder its run saves into, its area (x, y, w, h, in the
+    camera's own pixels — binned ones on a binned camera — as the run's
+    camera record has it), Downsample's factor (1: off) and method
+    ("typhon_block_mean", "camera_binning_average", or "" for off), and its
+    capture set-up as plain values ({} for a camera with none: an event
+    camera)."""
     name: str
     kind: str = ""
     info: Any = None
@@ -747,7 +786,14 @@ class TriggerSource(Protocol):
     snapshot from Typhon's own sources needs frames only, an exact run a
     trigger facet. `start(fire)`: from now on each trigger the source makes
     is told to `fire` (a TriggerEvent; it must return at once); `stop()`
-    returns within a moment, and nothing is fired after it."""
+    returns within a moment, and nothing is fired after it. Either call
+    may be REPEATED harmlessly (design 9.1, as settled at the P3 review): a
+    second start while it runs starts nothing more, a second stop returns
+    at once, and a start after stop starts nothing — a source belongs to
+    one run, and a run makes new ones. The contract suite holds every
+    source to this (tests/contracts/test_trigger_sources.py). Typhon's own
+    two are the only sources a run uses before stage P6: a plugin whose
+    manifest's kind is "source" is refused until then."""
 
     name: str
     camera_line: bool
