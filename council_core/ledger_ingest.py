@@ -100,13 +100,39 @@ class ExtractSummary:
     images: int
     images_read: int
     problems: List[str] = field(default_factory=list)
+    #: One ``(filename, kind)`` per workbook Excel refused to open, so the
+    #: Ledger log can show a breakdown at the end of a batch.
+    open_failures: List[Any] = field(default_factory=list)
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
              f"images read")
+        if self.open_failures:
+            s += "\n" + summarize_open_failures(self.open_failures)
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
+
+
+_OPEN_FAILURE_LABELS = {
+    "password": "password-protected",
+    "rights": "rights-protected (IRM)",
+    "corrupt": "corrupt / wrong format / blocked",
+    "timeout": "timed out (sign-in prompt?)",
+    "access": "access denied",
+    "unavailable": "Excel COM not available",
+    "unknown": "unknown reason",
+    "other": "other error",
+}
+
+
+def summarize_open_failures(open_failures) -> str:
+    """A one-line roll-up for the Ledger log."""
+    from collections import Counter
+    counts = Counter(k for _n, k in open_failures)
+    parts = [f"{counts[k]} {label}" for k, label in _OPEN_FAILURE_LABELS.items()
+             if counts.get(k)]
+    return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
 
 
 def _images_read(notes) -> int:
@@ -156,7 +182,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),
-                          list(run.problems))
+                          list(run.problems), list(run.open_failures))
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────
