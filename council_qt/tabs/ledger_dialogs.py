@@ -151,7 +151,9 @@ class InstallVisionModelDialog(QDialog):
                 err = str(exc)
             self.signals.done.emit(final, err)
 
-        self._worker = threading.Thread(target=work, name="ollama-pull",
+        # Prefix must match a TAB_WORKERS entry so CouncilWindow's close
+        # drain picks it up — see tests/test_council_qt_foundation.py.
+        self._worker = threading.Thread(target=work, name="ledger-ollama-pull",
                                         daemon=True)
         self._worker.start()
 
