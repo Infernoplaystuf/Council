@@ -360,7 +360,21 @@ _VALUE_HEAD = re.compile(r"(?i)^\s*(?:response|value|reading|result|measured(?: 
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
 _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za-zµμ/]+)\s*$")
 #: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
-_WHO_HEADING = re.compile(r"^\s*(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(]\s*[\d\s\-/.:,)]*)?\s*$")
+#: Matched on the stripped cell only (no overlapping whitespace runs: the
+#: old pattern backtracked cubically on a space-padded cell).
+_WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*)?$")
+
+
+def _existing_cells(ws):
+    """((row, col), value) of the cells the sheet really has. iter_rows()
+    walks the sheet's whole dimension and makes a Cell for every position:
+    one formatted empty cell at T1048576 turned a 5 KB file into 21 million
+    cells, 4 GB and garbage-collector passes that froze the app for seconds
+    (review, 2026-10-19)."""
+    store = getattr(ws, "_cells", None)
+    if isinstance(store, dict):
+        return [(rc, cell.value) for rc, cell in sorted(store.items())]
+    return [((c.row, c.column), c.value) for row in ws.iter_rows() for c in row]
 
 
 def _initials(v) -> str:
@@ -615,14 +629,12 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     grids, images = [], []
     for ws in wb.worksheets:
         cells = {}
-        for row in ws.iter_rows():
-            for c in row:
-                v = c.value
-                if v is None or (isinstance(v, str) and not v.strip()):
-                    continue
-                if isinstance(v, str) and v.strip().upper() in _EXCEL_ERRORS:
-                    continue
-                cells[(c.row, c.column)] = v
+        for (r, c), v in _existing_cells(ws):
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            if isinstance(v, str) and v.strip().upper() in _EXCEL_ERRORS:
+                continue
+            cells[(r, c)] = v
         # a merged label reads the same from every cell it covers
         for rng in ws.merged_cells.ranges:
             top = cells.get((rng.min_row, rng.min_col))
@@ -712,18 +724,44 @@ class _Extractor:
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
         self.markers: List[Tuple[int, int, str]] = []   # (row, col, who)
+        #: called every so often inside the long passes (extract: Cancel,
+        #: the stall watchdog's beat, progress); may raise _Cancelled
+        self.tick: Optional[Callable[[], None]] = None
+        # The cells of each row, made once. Every 'what is on row r' used
+        # to scan the whole sheet - context() 25 times per call - so one
+        # 2,000-row sheet took 4.6 minutes, 87% of it here (review,
+        # 2026-10-19).
+        self.rows: Dict[int, List[Tuple[int, object]]] = defaultdict(list)
+        for (r, c), v in sorted(grid.cells.items()):
+            self.rows[r].append((c, v))
+        self._ctx: Dict[Tuple[int, int], List[str]] = {}
+        self._ticks = 0
+
+    def _tick(self) -> None:
+        self._ticks += 1
+        if self.tick is not None and self._ticks % 200 == 0:
+            self.tick()
+
+    def row(self, r: int) -> List[Tuple[int, object]]:
+        """(column, value) of row r's cells, left to right."""
+        return self.rows.get(r, [])
 
     # context = sheet name + heading-like rows above
     def context(self, r: int) -> List[str]:
+        key = (r, len(self.markers))
+        got = self._ctx.get(key)
+        if got is not None:
+            return list(got)
         ctx = [self.g.sheet]
         people = {mr for mr, _mc, _ in self.markers}   # "Inspector: JB  Date: ..." rows
         for rr in range(max(1, r - 25), r):
             if rr in people:
                 continue                                  # say who, not what
-            row = [(c, v) for (r2, c), v in self.g.cells.items() if r2 == rr]
+            row = self.row(rr)
             if len(row) == 1 and isinstance(row[0][1], str):
                 ctx.append(row[0][1])
-        return ctx
+        self._ctx[key] = ctx
+        return list(ctx)
 
     def emit(self, part, item, label, r, c, value, match: Match, field_name=None,
              vr=None, vc=None, who=None):
@@ -772,6 +810,8 @@ class _Extractor:
         for (r, c), v in sorted(self.g.cells.items()):
             if not isinstance(v, str) or isinstance(v, _Merged) or (r, c) in self.used:
                 continue
+            self._tick()
+
             def person(text) -> str:
                 """Initials or a name - never a word of the template ('Date')."""
                 w = _initials(text)
@@ -786,8 +826,11 @@ class _Extractor:
                         if who:
                             self.used.add((r, c + dc))
                         break
-            if not who:
-                h = _WHO_HEADING.match(v)
+            if not who and len(v) <= 60:
+                # a heading of initials and a date is short; a long padded
+                # cell made this pattern backtrack for 54 s with the GIL held
+                # (review, 2026-10-19)
+                h = _WHO_HEADING.match(v.strip())
                 if h and person(h.group("who")) and not self.codes.canon(v) \
                         and self._heads_a_table(r, c):
                     who = h.group("who")
@@ -796,12 +839,12 @@ class _Extractor:
                 self.used.add((r, c))
                 # "Inspector: JB   Date: 2026-09-12": when THEY inspected, not
                 # the part's build Date
-                for (r2, c2), x in self.g.cells.items():
-                    if r2 == r and c2 != c and isinstance(x, str) \
+                for c2, x in self.row(r):
+                    if c2 != c and isinstance(x, str) \
                             and re.match(r"(?i)^\s*date\b", x):
-                        self.used.add((r2, c2))
+                        self.used.add((r, c2))
                         if not _split_inline(x)[1]:
-                            self.used.add((r2, c2 + 1))
+                            self.used.add((r, c2 + 1))
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
             if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
@@ -811,10 +854,10 @@ class _Extractor:
         """A heading, not a value: no numbers on its row, and right under it a
         header row of 2+ labels that starts at its column. (Initials typed in
         an 'Inspector Initials' column sit on a row of readings - not this.)"""
-        if any(r2 == r and not isinstance(v, str) for (r2, _c), v in self.g.cells.items()):
+        if any(not isinstance(v, str) for _c, v in self.row(r)):
             return False
-        below = sorted(cc for (r2, cc), v in self.g.cells.items()
-                       if r2 == r + 1 and isinstance(v, str) and c - 1 <= cc <= c + 8)
+        below = sorted(cc for cc, v in self.row(r + 1)
+                       if isinstance(v, str) and c - 1 <= cc <= c + 8)
         return len(below) >= 2 and below[0] <= c + 1
 
     def inspector_for(self, r, c) -> str:
@@ -831,8 +874,8 @@ class _Extractor:
 
     def _who_columns(self, r, skip) -> Dict[int, bool]:
         """Columns of header row r that hold initials ('Inspector Initials')."""
-        return {c: True for (r2, c), v in self.g.cells.items()
-                if r2 == r and c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
+        return {c: True for c, v in self.row(r)
+                if c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
 
     def run(self) -> None:
         self.find_part()
@@ -867,8 +910,8 @@ class _Extractor:
         self.part_how = ""
 
     def _is_table_header(self, r, c) -> bool:
-        hits = sum(1 for (r2, c2), v in self.g.cells.items()
-                   if r2 == r and c2 != c and isinstance(v, str)
+        hits = sum(1 for c2, v in self.row(r)
+                   if c2 != c and isinstance(v, str)
                    and (self.m.match(v).score >= SUGGEST_AT or self.m.is_item_header(v)))
         return hits >= 1 and self.g.cells.get((r, c + 1)) is not None \
             and isinstance(self.g.cells.get((r, c + 1)), str) \
@@ -906,6 +949,7 @@ class _Extractor:
             rr = r + 1
             blanks = 0
             while blanks < 2 and rr < r + 60:
+                self._tick()
                 label = self.g.text(rr, label_col)
                 if label is None:
                     blanks += 1
@@ -932,6 +976,7 @@ class _Extractor:
             if isinstance(v, str) and (r, c) not in self.used:
                 by_row[r].append(c)
         for r in sorted(by_row):
+            self._tick()
             cols = sorted(c for c in by_row[r] if (r, c) not in self.used)
             for run in self._header_runs(r, cols):
                 self._table(r, run)
@@ -1010,6 +1055,7 @@ class _Extractor:
                  for c, (label, _) in heads.items()}
         runs_seen: Dict[str, int] = defaultdict(int)
         for d in data_rows:
+            self._tick()
             part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
             item = self.codes.canon(self.g.cells.get((d, item_col))) if per_item else ""
             if per_item and not item:
@@ -1090,9 +1136,9 @@ class _Extractor:
             if o is not None and id_col:
                 o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
             # the rest of the row (date, inspector, part, flaw) says which reading
-            for (rr, c) in list(self.g.cells):
-                if rr == d:
-                    self.used.add((rr, c))
+            for c, _v in self.row(d):
+                self.used.add((d, c))
+            self._tick()
 
     # LABEL / VALUE
     def forms(self) -> None:
@@ -1102,6 +1148,7 @@ class _Extractor:
             label, inline = _split_inline(v)
             if len(label) > 60:
                 continue
+            self._tick()
             ctx = self.context(r)
             mt = self.m.match(label, ctx, per_item=False)
             if mt.target and mt.target.is_id:
@@ -1610,11 +1657,16 @@ class Extraction:
     cancelled: bool = False
 
 
+class _Cancelled(Exception):
+    """Cancel was pressed while a workbook was being read."""
+
+
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
             part: str = "", use_images: bool = True, progress=None,
             pattern_mask: Optional[str] = None,
-            cancel: Optional[Any] = None) -> Extraction:
+            cancel: Optional[Any] = None,
+            log: Optional[Callable[[str], None]] = None) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
 
@@ -1623,10 +1675,16 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     names before the keyword / lone-number heuristics.
 
     ``cancel`` is an optional ``threading.Event``: when its ``is_set()``
-    returns True, the loop exits before the next workbook with
-    ``Extraction.cancelled = True``. The Ledger tab's Cancel button sets
-    it and also calls ``excel_open.kill_active_excels()`` to unblock a
-    Workbooks.Open sitting on a modal Excel dialog."""
+    returns True, the run stops - between workbooks, and inside one every
+    few hundred cells and before each picture - with
+    ``Extraction.cancelled = True``; what the interrupted workbook gave is
+    dropped, the workbooks before it are kept. The Ledger tab's Cancel
+    button sets it and also calls ``excel_open.kill_active_excels()`` to
+    unblock a Workbooks.Open sitting on a modal Excel dialog.
+
+    ``log``: where the stall watchdog's stack dump goes (the Ledger log);
+    it is also written to <app dir>/logs/ledger_stalls.txt by faulthandler,
+    which works while the app is frozen."""
     import time as _time
     from progress_report import NullProgress
     from council_core import stall_watchdog
@@ -1637,125 +1695,178 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     run = Extraction([str(s) for s in sources])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
-    # The watchdog logs every live thread's stack when nothing has
-    # moved in >15s. Catches the GIL-hogging stall the user reported
-    # (whole-app unresponsive) — the thread holding the GIL shows up
-    # in the dump even when it is a C-extension call. Progress text
-    # already goes to prog.update; the watchdog adds the stack when
-    # nothing else is said.
+    # The watchdog dumps every thread's stack when nothing has moved for
+    # 15 s: to the Ledger log (not the progress line, whose heartbeat
+    # re-printed the whole dump every 20 s - review, 2026-10-19) and, via
+    # faulthandler, to a file even while a C call holds the GIL.
     prog.stage("reading workbooks", total=len(sources), unit="workbooks")
-    _wd_cm = stall_watchdog.watch("ledger extract", prog.update,
-                                   stall_s=15.0)
+
+    def _stall(text: str) -> None:
+        prog.update("no progress for a while — the stack dump is in the Ledger log")
+        if log is not None:
+            log(text)
+    _wd_cm = stall_watchdog.watch("ledger extract", _stall, stall_s=15.0,
+                                   dump_file=stall_watchdog.default_dump_file(
+                                       "ledger_stalls.txt"))
     _wd = _wd_cm.__enter__()
+    here = {"what": ""}
+
+    def tick() -> None:
+        """Inside a workbook, every few hundred cells: Cancel, the
+        watchdog's beat, and a progress line that moves."""
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        _wd.beat()
+        prog.update(here["what"])
+    try:
+        _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                     m, codes, mask_re, part, schema, _time)
+    finally:
+        try:
+            _wd_cm.__exit__(None, None, None)
+        except Exception:                                   # noqa: BLE001
+            pass
+    if cancel is not None and cancel.is_set() and not run.cancelled:
+        # pressed during the last workbook (or the only one)
+        run.cancelled = True
+        run.problems.append("Cancelled by user.")
+    return run
+
+
+def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                 m, codes, mask_re, part, schema, _time) -> None:
     for src in sources:
         if cancel is not None and cancel.is_set():
             run.cancelled = True
             run.problems.append("Cancelled by user before "
                                 f"{Path(src).name!r}.")
             break
-        _t0 = _time.monotonic()
-        src = Path(src)
-        via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
-            src.exists() and __import__("excel_open").kind_of(src) == "rights")
-        prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
-                    force=via_excel)
-        _wd.beat()
+        kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
         try:
-            grids, images = load_workbook_grids(src, run.problems)
-            _wd.beat()
-        except LedgerError as e:
-            run.problems.append(str(e))
-            # Keep the Excel-open-failure category so the Ledger log can
-            # summarize the batch: "N files failed to open - K rights, ...".
-            cause = e.__cause__
-            kind = (getattr(cause, "kind", "unknown")
-                    if cause is not None and type(cause).__name__ == "ExcelOpenError"
-                    else "other")
-            run.open_failures.append((src.name, kind))
-            _secs = _time.monotonic() - _t0
-            run.timings.append((src.name, _secs))
-            prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
-            continue
-        for i, img in enumerate(images):
-            prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
-            if image_dir:
-                d = Path(image_dir)
-                d.mkdir(parents=True, exist_ok=True)
-                # every part cleaned: a sheet, anchor or extension may hold
-                # characters Windows refuses in a file name ("?" did)
-                p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
-                         f".{_safe(img.ext) or 'png'}")
-                try:
-                    p.write_bytes(img.data)
-                    img.saved_as = str(p)
-                except OSError as e:          # one picture never stops the run
-                    run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
-                                        f"saved ({e.strerror or e}); it is still read")
-            note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
-            if reader is not None:
-                note.reader = getattr(reader, "name", "image reader")
-                try:
-                    rows = reader(img.data)
-                except Exception as e:
-                    rows = None
-                    note.text = f"reader failed: {e}"
-                if rows:
-                    note.text = "\n".join(" | ".join(r) for r in rows)[:2000]
-                    grids.append(rows_to_grid(rows, img))
-                elif not note.text:
-                    note.text = "(no text found)"
-            else:
-                note.reader = "none installed"
-                note.text = "not read: install Tesseract (local OCR) to read images"
-            run.images.append(note)
+            _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
+                         reader, m, codes, mask_re, part, schema, _time)
+        except _Cancelled:
+            # half a workbook is not offered for review: what it gave goes
+            del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
+            del run.problems[kept[3]:]
+            run.cancelled = True
+            run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
+                                "the workbooks before it are in this review.")
+            break
 
-        prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
-        # pass 1: part numbers per sheet; then a workbook-wide fallback
-        exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
-        for ex in exs:
-            ex.find_part()
-            ex.find_inspectors()
-        found = {ex.part for ex in exs if ex.part}
-        if part:
-            book_part, how = part, "given on the command line"
-        elif len(found) == 1:
-            book_part, how = found.pop(), "the one part number in the workbook"
-        elif not found:
-            book_part = _part_from_filename(src.stem, mask_re)
-            how = f"file name {src.name!r} — check it" if book_part else ""
-        else:
-            book_part, how = "", ""
-        for ex in exs:
-            if part:
-                ex.part, ex.part_how = part, how
-            elif not ex.part:
-                ex.part, ex.part_how = book_part, how
-            ex.item_grids()
-            ex.tables()
-            ex.forms()
-            for o in ex.out + ex.unmatched:
-                o.part_how = o.part_how or ex.part_how
-            n = len(ex.out)
-            run.obs.extend(ex.out)
-            run.unmatched.extend(ex.unmatched)
-            if ex.g.from_image:
-                for note in run.images:
-                    if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
-                                           note.anchor):
-                        note.values += n
+
+def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                 m, codes, mask_re, part, schema, _time) -> None:
+    _t0 = _time.monotonic()
+    via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
+        src.exists() and __import__("excel_open").kind_of(src) == "rights")
+    prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
+                force=via_excel)
+    _wd.beat()
+    try:
+        grids, images = load_workbook_grids(src, run.problems)
+        _wd.beat()
+    except Exception as e:                    # noqa: BLE001
+        if cancel is not None and cancel.is_set():
+            # Cancel killed the Excel reading it: the COM error that
+            # follows used to escape and lose the whole run (review,
+            # 2026-10-19)
+            raise _Cancelled() from e
+        run.problems.append(str(e) if isinstance(e, LedgerError)
+                            else f"{src.name}: could not be read ({e!r})")
+        # Keep the Excel-open-failure category so the Ledger log can
+        # summarize the batch: "N files failed to open - K rights, ...".
+        cause = e.__cause__ if isinstance(e, LedgerError) else e
+        kind = (getattr(cause, "kind", "unknown")
+                if cause is not None and type(cause).__name__ == "ExcelOpenError"
+                else "other")
+        run.open_failures.append((src.name, kind))
         _secs = _time.monotonic() - _t0
         run.timings.append((src.name, _secs))
-        prog.advance(what=f"{src.name} read in {_secs:.1f}s")
+        prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
+        return
+    for i, img in enumerate(images):
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
         _wd.beat()
-        orphans = sum(1 for ex in exs for o in ex.out if not o.part)
-        if orphans:
-            run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
-                                "— fill the Part column in the review, or re-run with --part")
-    try:
-        _wd_cm.__exit__(None, None, None)
-    except Exception:                                       # noqa: BLE001
-        pass
-    return run
+        prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
+        if image_dir:
+            d = Path(image_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            # every part cleaned: a sheet, anchor or extension may hold
+            # characters Windows refuses in a file name ("?" did)
+            p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
+                     f".{_safe(img.ext) or 'png'}")
+            try:
+                p.write_bytes(img.data)
+                img.saved_as = str(p)
+            except OSError as e:          # one picture never stops the run
+                run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
+                                    f"saved ({e.strerror or e}); it is still read")
+        note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
+        if reader is not None:
+            note.reader = getattr(reader, "name", "image reader")
+            try:
+                rows = reader(img.data)
+            except Exception as e:
+                rows = None
+                note.text = f"reader failed: {e}"
+            if rows:
+                note.text = "\n".join(" | ".join(r) for r in rows)[:2000]
+                grids.append(rows_to_grid(rows, img))
+            elif not note.text:
+                note.text = "(no text found)"
+        else:
+            note.reader = "none installed"
+            note.text = "not read: install Tesseract (local OCR) to read images"
+        run.images.append(note)
+
+    prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
+    # pass 1: part numbers per sheet; then a workbook-wide fallback
+    exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
+    for ex in exs:
+        ex.tick = tick
+        here["what"] = f"{src.name}: reading sheet {ex.g.sheet!r}"
+        ex.find_part()
+        ex.find_inspectors()
+    found = {ex.part for ex in exs if ex.part}
+    if part:
+        book_part, how = part, "given on the command line"
+    elif len(found) == 1:
+        book_part, how = found.pop(), "the one part number in the workbook"
+    elif not found:
+        book_part = _part_from_filename(src.stem, mask_re)
+        how = f"file name {src.name!r} — check it" if book_part else ""
+    else:
+        book_part, how = "", ""
+    for ex in exs:
+        if part:
+            ex.part, ex.part_how = part, how
+        elif not ex.part:
+            ex.part, ex.part_how = book_part, how
+        here["what"] = f"{src.name}: finding values on sheet {ex.g.sheet!r}"
+        prog.update(here["what"])
+        ex.item_grids()
+        ex.tables()
+        ex.forms()
+        for o in ex.out + ex.unmatched:
+            o.part_how = o.part_how or ex.part_how
+        n = len(ex.out)
+        run.obs.extend(ex.out)
+        run.unmatched.extend(ex.unmatched)
+        if ex.g.from_image:
+            for note in run.images:
+                if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
+                                       note.anchor):
+                    note.values += n
+    _secs = _time.monotonic() - _t0
+    run.timings.append((src.name, _secs))
+    prog.advance(what=f"{src.name} read in {_secs:.1f}s")
+    _wd.beat()
+    orphans = sum(1 for ex in exs for o in ex.out if not o.part)
+    if orphans:
+        run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
+                            "— fill the Part column in the review, or re-run with --part")
 
 
 def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> str:
@@ -1814,18 +1925,36 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
             if who[v]:                     # one signer of an unsigned top row too
                 o.inspector = "/".join(sorted(who[v]))
         obs = list(firsts.values())
+        # labelled once per group, and only the first OTHERS_SHOWN listed:
+        # thousands of readings under one key (no part number found) made
+        # this quadratic and overflowed Excel's 32,767-character cell
+        # (review, 2026-10-19)
+        labelled = sorted(((f"{v} ({'/'.join(who[v])})" if who[v] else v), v)
+                          for v in values) if clash else []
         for o in obs:
-            others = sorted(f"{v} ({'/'.join(who[v])})" if who[v] else v
-                            for v in values if v != o.value)
+            text = ""
+            if clash:
+                others = []
+                for t, v in labelled:
+                    if v != o.value:
+                        others.append(t)
+                        if len(others) >= OTHERS_SHOWN:
+                            break
+                more = len(values) - 1 - len(others)
+                text = ", ".join(others) + (f", and {more} more" if more > 0 else "")
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
                   and "not converted" not in o.note)
-            out.append(Decision(o, ok, ", ".join(others) if clash else ""))
+            out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
     out.sort(key=lambda d: (sample_sort_key(d.obs.part), item_rank.get(d.obs.item, -1),
                             order.get(d.obs.field, 1e9), -d.obs.score))
     return out
+
+
+#: How many other values a clashing review row lists.
+OTHERS_SHOWN = 20
 
 
 def _join(a: str, b: str) -> str:
@@ -1884,7 +2013,7 @@ def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]
 
 
 def write_review(path, run: Extraction, decisions: List[Decision], schema: TemplateSchema,
-                 csv_path: str) -> None:
+                 csv_path: str, pattern_mask: str = "", part: str = "") -> None:
     import openpyxl
     from openpyxl.styles import Font, PatternFill
     from openpyxl.worksheet.datavalidation import DataValidation
@@ -1926,16 +2055,19 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
 
     ws = wb.create_sheet("Values", 1)
     ws.append(VAL_HEAD)
+    # the row number is counted, not asked: ws.max_row / ws[n] measure the
+    # whole sheet each time - 16,000 rows took over a minute (review,
+    # 2026-10-19)
+    row_n = 1
     for d in decisions:
         o = d.obs
         ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
                    o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
-        if d.conflict:
-            for c in ws[ws.max_row]:
-                c.fill = red
-        elif not d.accept:
-            for c in ws[ws.max_row]:
-                c.fill = amber
+        row_n += 1
+        fill = red if d.conflict else (amber if not d.accept else None)
+        if fill is not None:
+            for col in range(1, len(VAL_HEAD) + 1):
+                ws.cell(row_n, col).fill = fill
     yn = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
     ws.add_data_validation(yn)
     yn.add(f"A2:A{max(ws.max_row, 2) + 200}")
@@ -1999,7 +2131,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     _style(ppl, bold, [10, 32, 7, 50])
 
     meta = wb.create_sheet("_run")
-    meta["A1"] = json.dumps({"csv": str(csv_path), "sources": run.sources})
+    meta["A1"] = json.dumps({"csv": str(csv_path), "sources": run.sources,
+                             "pattern_mask": pattern_mask or "", "part": part or ""})
     meta.sheet_state = "hidden"
     wb.active = 1
     _save_wb(wb, Path(path))
@@ -2248,8 +2381,11 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         mapping.update(learned)
         save_aliases(csv_path, mapping, ignore)
 
+    # read the sources as the extract did: same part-name mask, same Part
     run = extract(schema, meta["sources"], mapping, ignore, image_reader=image_reader,
-                  use_images=use_images, progress=prog)
+                  use_images=use_images, progress=prog,
+                  pattern_mask=meta.get("pattern_mask") or None,
+                  part=meta.get("part") or "")
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     accepted = 0
@@ -2573,7 +2709,7 @@ def main(argv=None) -> int:
             if args.llm is not None:        # "" from the --llm flag means auto-detect
                 suggest_with_llm(run, ledger.schema, args.llm or None)
             dec = decide(run, ledger.schema)
-            write_review(out, run, dec, ledger.schema, args.csv)
+            write_review(out, run, dec, ledger.schema, args.csv, part=args.part or "")
             ok = sum(d.accept for d in dec)
             print(f"{len(files)} files: {len(dec)} values found, {ok} pre-accepted, "
                   f"{len(dec) - ok} to review, {len(run.unmatched)} values under labels "

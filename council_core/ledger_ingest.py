@@ -187,11 +187,13 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
                 progress: Optional[Listener] = None,
                 pattern_mask: Optional[str] = None,
-                cancel: Optional[Any] = None) -> ExtractSummary:
+                cancel: Optional[Any] = None,
+                log: Optional[Callable[[str], None]] = None) -> ExtractSummary:
+    """``log``: where a stall dump goes (the Ledger tab's log)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask, cancel)
+                     prog, pattern_mask, cancel, log)
         tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {tail}")
@@ -200,7 +202,8 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
 
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
-             cancel: Optional[Any] = None) -> ExtractSummary:
+             cancel: Optional[Any] = None,
+             log: Optional[Callable[[str], None]] = None) -> ExtractSummary:
     say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
@@ -235,10 +238,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog, pattern_mask=pattern_mask, cancel=cancel)
+                  progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
-    write_review(out, run, dec, ledger.schema, str(csv_path))
+    # the mask and Part override go with the review: Apply reads the
+    # sources again and must give its values the same parts (review,
+    # 2026-10-19: mapped labels went to a phantom part or were dropped)
+    write_review(out, run, dec, ledger.schema, str(csv_path),
+                 pattern_mask=pattern_mask or "", part=part or "")
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),

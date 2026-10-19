@@ -70,6 +70,9 @@ class LedgerActions:
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
 
+    #: Set by the tab: where an extract's stall dump goes (its log).
+    stall_log: Optional[Callable[[str], None]] = None
+
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
@@ -82,7 +85,7 @@ class LedgerActions:
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
-                                         cancel=cancel)
+                                         cancel=cancel, log=self.stall_log)
 
     def apply(self, review, fill_dir, use_images, progress):
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
@@ -131,6 +134,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.window = window
         self.bridge = getattr(window, "bridge", None)
         self.actions = actions or LedgerActions()
+        try:            # an extract's stall dump lands in this tab's log
+            self.actions.stall_log = lambda text: self._to_ui(self._say, text)
+        except Exception:                                 # noqa: BLE001
+            pass
         self._tokens = theme.tokens("dark")
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
@@ -338,8 +345,8 @@ class LedgerTab(ViewHelpers, QWidget):
         for b in self._busy_buttons:
             b.setEnabled(idle)
         if hasattr(self, "cancel_btn"):
-            # Only enabled while a step is actually running.
-            self.cancel_btn.setEnabled(not idle)
+            # Only enabled while a step that honours it is running.
+            self.cancel_btn.setEnabled(not idle and getattr(self, "_cancellable", False))
         if not idle:
             return
         csv = self.csv.text().strip()
@@ -462,17 +469,21 @@ class LedgerTab(ViewHelpers, QWidget):
         self.log.appendPlainText(text)
 
     def _run(self, title: str, step: Callable, done: Callable,
-             after: Optional[Callable] = None) -> None:
+             after: Optional[Callable] = None, cancellable: bool = False) -> None:
         """Run `step(progress)` on a thread; `done(result)` on the GUI thread.
         A LedgerError is the pipeline's own plain-language message; anything
         else is shown with its traceback in the log. ``after(err)`` runs on
         the GUI thread once the step ended either way (err None on success).
 
-        The ``self._cancel`` event is cleared at the start of every run; the
-        step may read it (via a ``cancel=`` kwarg) to exit early."""
+        The ``self._cancel`` event is cleared at the start of every run; a
+        ``cancellable`` step reads it (via a ``cancel=`` kwarg) to exit
+        early. Only such a step enables Cancel: during Apply it said
+        'Cancelling…' and the parent CSV was written anyway (review,
+        2026-10-19)."""
         if self.busy:
             return
         self._cancel.clear()
+        self._cancellable = cancellable
         self.status.setText(f"{title}…")
         self._say(f"── {title}")
         self.progress.setRange(0, 0)               # busy until a percentage is known
@@ -483,7 +494,9 @@ class LedgerTab(ViewHelpers, QWidget):
             fraction turns the busy bar into a percentage."""
             def show() -> None:
                 self.status.setText(f"{title}: {msg}")
-                if fraction is None:
+                if fraction is None or fraction <= 0:
+                    # a big first workbook sat on a still 0% bar for minutes
+                    # and looked hung: busy until something is done
                     self.progress.setRange(0, 0)
                 else:
                     self.progress.setRange(0, 100)
@@ -542,7 +555,7 @@ class LedgerTab(ViewHelpers, QWidget):
         on a modal Excel dialog, taskkill'ing the hidden Excel process
         unblocks it — the COM call raises and the loop exits on its next
         iteration."""
-        if not self.busy:
+        if not self.busy or not getattr(self, "_cancellable", False):
             return
         self._cancel.set()
         try:
@@ -636,7 +649,8 @@ class LedgerTab(ViewHelpers, QWidget):
                   lambda p: self.actions.extract(csv, sources, part, images, p,
                                                  pattern_mask=mask,
                                                  vision_model=vision,
-                                                 cancel=self._cancel), done)
+                                                 cancel=self._cancel), done,
+                  cancellable=True)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()

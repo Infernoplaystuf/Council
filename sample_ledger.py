@@ -302,14 +302,19 @@ class _SheetReader:
         self.vals: Dict[Tuple[int, int], object] = {}
         self.text: Dict[Tuple[int, int], str] = {}
         sizes: Counter = Counter()
-        for row in ws.iter_rows():
-            for c in row:
-                if c.value in (None, ""):
-                    continue
-                self.vals[(c.row, c.column)] = c.value
-                if isinstance(c.value, str) and not c.value.startswith("="):
-                    self.text[(c.row, c.column)] = c.value.strip()
-                    sizes[c.font.sz or 11] += 1
+        # the cells the sheet has, not every position in its dimension: one
+        # formatted cell at the sheet's far corner made millions (review,
+        # 2026-10-19)
+        store = getattr(ws, "_cells", None)
+        existing = ([cell for _rc, cell in sorted(store.items())] if isinstance(store, dict)
+                    else [c for row in ws.iter_rows() for c in row])
+        for c in existing:
+            if c.value in (None, ""):
+                continue
+            self.vals[(c.row, c.column)] = c.value
+            if isinstance(c.value, str) and not c.value.startswith("="):
+                self.text[(c.row, c.column)] = c.value.strip()
+                sizes[c.font.sz or 11] += 1
         body = sizes.most_common(1)[0][0] if sizes else 11
         self.headings = sorted(
             (rc for rc, v in self.text.items()
