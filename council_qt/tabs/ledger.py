@@ -153,6 +153,7 @@ class LedgerTab(ViewHelpers, QWidget):
         self.csv = self._path_row(grid, 1, "Parent CSV:", self.browse_csv)
         self.csv.setPlaceholderText("made beside the template if left empty; "
                                     "or pick an existing parent CSV")
+        self.csv.editingFinished.connect(self._on_csv_changed)
         row = QHBoxLayout()
         self.create_btn = self._step_button(row, "Create / extend parent CSV", self.on_create)
         row.addStretch(1)
@@ -210,6 +211,21 @@ class LedgerTab(ViewHelpers, QWidget):
             "Example: @@@#@@### finds ABC1DE234 in a filename.")
         mask_row.addWidget(self.pattern_mask, 1)
         v2.addLayout(mask_row)
+        # Filename-ignore patterns — persisted next to the aliases file so a
+        # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
+        ignore_row = QHBoxLayout()
+        ignore_row.addWidget(QLabel("Skip these files (patterns, comma-sep):"))
+        self.ignore_files = QLineEdit()
+        self.ignore_files.setPlaceholderText(
+            "cover*.xlsx, agenda*.xlsx, meeting*.xlsx")
+        self.ignore_files.setToolTip(
+            "Workbook filenames (not full paths) matching ANY of these "
+            "glob patterns are skipped before Excel is opened. "
+            "fnmatch semantics, case-insensitive. Saved next to the "
+            "parent CSV's aliases file.")
+        self.ignore_files.editingFinished.connect(self._save_ignore_patterns)
+        ignore_row.addWidget(self.ignore_files, 1)
+        v2.addLayout(ignore_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -288,6 +304,12 @@ class LedgerTab(ViewHelpers, QWidget):
     def source_paths(self) -> List[str]:
         return [self.sources.item(i).text() for i in range(self.sources.count())]
 
+    def _on_csv_changed(self) -> None:
+        """Re-sync tab state that depends on the parent CSV path:
+        ignore-pattern field is populated from the aliases file so the
+        user sees their saved patterns as soon as they pick the CSV."""
+        self._load_ignore_patterns()
+
     def _refresh_enabled(self) -> None:
         if not hasattr(self, "progress"):
             return                                  # still building
@@ -312,6 +334,42 @@ class LedgerTab(ViewHelpers, QWidget):
             self.rebuild_kg_btn.setFont(font)
 
     # ── image-reader dropdown ───────────────────────────────────────────
+    # ── filename-ignore patterns (persisted next to aliases) ──────────
+    def _save_ignore_patterns(self) -> None:
+        """Persist the comma-separated patterns from the field. No-op
+        when no parent CSV is picked yet — the file lives next to it."""
+        csv_path = self.csv.text().strip()
+        if not csv_path:
+            return
+        text = self.ignore_files.text().strip()
+        patterns = [p.strip() for p in text.split(",") if p.strip()]
+        try:
+            from source_extract import save_ignore_files
+            save_ignore_files(csv_path, patterns)
+        except Exception as exc:                             # noqa: BLE001
+            self.status.setText(
+                f"Could not save ignore patterns to the aliases file: {exc}")
+
+    def _load_ignore_patterns(self) -> None:
+        """Populate the field from the aliases file. Called when the
+        parent CSV path changes."""
+        if not hasattr(self, "ignore_files"):
+            return
+        csv_path = self.csv.text().strip()
+        if not csv_path:
+            self.ignore_files.setText("")
+            return
+        try:
+            from source_extract import load_ignore_files
+            patterns = load_ignore_files(csv_path)
+        except Exception:                                    # noqa: BLE001
+            patterns = []
+        self.ignore_files.blockSignals(True)
+        try:
+            self.ignore_files.setText(", ".join(patterns))
+        finally:
+            self.ignore_files.blockSignals(False)
+
     def _refresh_reader_choices(self, *, select: Optional[str] = None,
                                 from_popup: bool = False) -> None:
         """Populate the reader dropdown with Tesseract + installed US vision
