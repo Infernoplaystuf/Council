@@ -346,3 +346,38 @@ def test_suggest_links_lists_gguf_files_and_runs_on_one(tmp_path, monkeypatch):
     monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
     assert kx.gguf_chat("C:/m/granite.gguf")([{"role": "user", "content": "x"}]) == \
         '{"links": []}'
+
+
+# ---------------------------------------------- pictures: only models that see
+
+def test_the_reader_dropdown_offers_only_models_that_read_pictures(monkeypatch):
+    from council_core import local_models as lm
+    from council_core import ollama_install
+    monkeypatch.setattr(lm, "list_local_models", lambda **kw: [
+        {"name": "granite3.3:8b", "origin": "US", "capabilities": ["completion", "tools"]},
+        {"name": "gemma3:12b", "origin": "US", "capabilities": ["completion", "vision"]},
+        {"name": "qwen2.5vl:7b", "origin": "non-US", "capabilities": ["vision"]},
+        {"name": "llava:7b", "origin": "US", "capabilities": []}])     # an old Ollama
+    assert ollama_install.vision_models() == ["gemma3:12b", "llava:7b"]
+
+
+def test_apply_uses_the_vision_model_the_extract_used(tmp_path):
+    from council_qt.tabs.ledger import LedgerActions, LedgerTab
+    _qapp()
+    seen = {}
+
+    class Acts(LedgerActions):
+        def apply(self, review, fill_dir, use_images, progress, **kw):
+            seen.update(kw)
+            raise se.LedgerError("stop")
+
+    tab = LedgerTab(actions=Acts())
+    try:
+        tab.image_reader_choice.addItem("Ollama: gemma3:12b", "gemma3:12b")
+        tab.image_reader_choice.setCurrentIndex(tab.image_reader_choice.count() - 1)
+        tab.review.setText(str(tmp_path / "r.xlsx"))
+        tab.on_apply()
+        assert tab.wait(10)
+        assert seen == {"vision_model": "gemma3:12b"}
+    finally:
+        tab.deleteLater()

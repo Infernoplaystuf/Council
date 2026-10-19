@@ -357,7 +357,7 @@ class PreviewWorkbookDialog(QDialog):
     def __init__(self, path, schema, aliases=None,
                  pattern_mask: Optional[str] = None,
                  csv_path: Optional[str] = None, parent=None,
-                 pick_model: Optional[Callable] = None):
+                 pick_model: Optional[Callable] = None, ignore=(), part: str = ""):
         super().__init__(parent)
         #: asks which model to use; tests pass their own
         self._pick_model = pick_model or globals()["pick_model"]
@@ -418,16 +418,19 @@ class PreviewWorkbookDialog(QDialog):
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
 
-        self._start_worker(path, schema, aliases, pattern_mask)
+        self._start_worker(path, schema, aliases, pattern_mask, ignore, part)
 
-    def _start_worker(self, path, schema, aliases, pattern_mask) -> None:
+    def _start_worker(self, path, schema, aliases, pattern_mask, ignore=(),
+                      part: str = "") -> None:
         def work():
             report = None
             err = ""
             try:
                 from source_extract import preview_workbook
+                # the same ignore list and Part the extract uses
                 report = preview_workbook(path, schema, aliases=aliases,
-                                          pattern_mask=pattern_mask)
+                                          pattern_mask=pattern_mask,
+                                          ignore=ignore, part=part)
             except Exception as exc:                        # noqa: BLE001
                 err = f"preview failed: {exc!r}"
             self._done.emit(report, err)

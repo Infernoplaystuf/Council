@@ -88,9 +88,16 @@ class LedgerActions:
                                          cancel=cancel, log=self.stall_log,
                                          assist=assist)
 
-    def apply(self, review, fill_dir, use_images, progress):
+    def apply(self, review, fill_dir, use_images, progress,
+              vision_model: Optional[str] = None):
+        # Apply reads the sources again: with the vision model the extract
+        # used, or a picture's values change reader (review, 2026-10-19)
+        reader = self.image_reader
+        if reader is None and use_images and vision_model:
+            from source_extract import ollama_vision_reader
+            reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
-                                       image_reader=self.image_reader, progress=progress)
+                                       image_reader=reader, progress=progress)
 
     def open(self, path) -> None:
         self.opener(path)
@@ -436,10 +443,8 @@ class LedgerTab(ViewHelpers, QWidget):
             if from_popup or select is not None:
                 try:
                     from council_core import ollama_install
-                    names = ollama_install.installed_models()
-                    for n in names:
-                        if n.lower().startswith(ollama_install.US_VISION_FAMILIES):
-                            self.image_reader_choice.addItem(f"Ollama: {n}", n)
+                    for n in ollama_install.vision_models():   # ones that see images
+                        self.image_reader_choice.addItem(f"Ollama: {n}", n)
                 except Exception:                             # noqa: BLE001
                     pass
             self.image_reader_choice.insertSeparator(
@@ -559,12 +564,14 @@ class LedgerTab(ViewHelpers, QWidget):
             self._start_dir(), XLSX)
         if not p:
             return
-        aliases, _ignore = load_aliases(csv_path)
+        aliases, ignore = load_aliases(csv_path)
         from .ledger_dialogs import PreviewWorkbookDialog
         mask = self.pattern_mask.text().strip()
         dlg = PreviewWorkbookDialog(p, ledger.schema, aliases=aliases,
                                     pattern_mask=mask or None,
-                                    csv_path=csv_path, parent=self)
+                                    csv_path=csv_path, parent=self,
+                                    pick_model=self._pick_model, ignore=ignore,
+                                    part=self.part.text().strip())
         dlg.exec()
 
     def on_cancel(self) -> None:
@@ -691,6 +698,8 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_apply(self) -> None:
         review, fill = self.review.text().strip(), self.fill_dir.text().strip()
         images = self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {"vision_model": vision} if images and vision else {}
 
         def done(s) -> None:
             self.stat["problems"].setText(str(len(s.problems)))
@@ -700,7 +709,7 @@ class LedgerTab(ViewHelpers, QWidget):
             self._say(s.describe())
             self._kg_dirty = True
         self._run("Applying the review",
-                  lambda p: self.actions.apply(review, fill, images, p), done)
+                  lambda p: self.actions.apply(review, fill, images, p, **more), done)
 
     def on_rebuild_kg(self) -> None:
         """Rebuild the Connections knowledge graph; the Ledger log shows

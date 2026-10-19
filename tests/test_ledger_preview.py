@@ -63,12 +63,13 @@ def test_preview_binds_label_cells_to_template_fields(template_and_csv,
     assert bound > 0, "the nde fixture should bind at least one label"
 
 
-def test_preview_lists_unmatched_label_cells_in_a_messy_sheet(
+def test_preview_lists_unmatched_labels_not_data_values(
         template_and_csv, tmp_path):
-    """A completely unlabelled workbook should produce zero bound
-    labels (the matcher cannot match ##) and a non-empty list of
-    unmatched label cells is still OK — the test checks the SHAPE,
-    not the content, so a fixture tweak does not break it."""
+    """The unmatched list is what the extract would put on 'Labels to
+    map': a label with its value beside it that no field takes. Data
+    values - a name, a block letter, a result, an 'Inspected by' cell -
+    are not labels; listing them sent them to the model under a 'never
+    values' promise (review, 2026-10-19)."""
     _tpl, _csv, schema = template_and_csv
     import openpyxl
     src = tmp_path / "bare.xlsx"
@@ -79,18 +80,17 @@ def test_preview_lists_unmatched_label_cells_in_a_messy_sheet(
     ws["E4"] = "pre"
     ws["B6"], ws["C6"], ws["D6"] = 10, "A", "EC"
     ws["B7"], ws["C7"], ws["D7"] = 20, "B", "EC"
+    ws["A10"], ws["B10"] = "Zorp rate", 55
+    ws["A12"] = "Inspected by: Jordan Blake"
     wb.save(src)
     rep = preview_workbook(src, schema)
-    assert rep.sheets
-    # The sheet named "Readings" — pre/post/sample headers are missing,
-    # so no confident matches expected.
     sheet = rep.sheets[0]
     assert sheet.name == "Readings"
     assert sheet.sure == []
-    # 'greg', 'pre', 'A', 'B', 'EC' are string label cells; at least
-    # SOME of them should land in unmatched_labels (they don't bind).
     labels = {label for label, _where in sheet.unmatched_labels}
-    assert labels & {"greg", "pre", "A", "B", "EC"}
+    assert "Zorp rate" in labels
+    assert not labels & {"greg", "A", "B", "EC", "Inspected by: Jordan Blake",
+                         "Jordan Blake"}
 
 
 # ------------------------------------------------- part-id inference

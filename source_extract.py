@@ -500,21 +500,26 @@ class WorkbookPreview:
 
 
 def preview_workbook(path, schema, aliases=None,
-                     pattern_mask: Optional[str] = None) -> WorkbookPreview:
+                     pattern_mask: Optional[str] = None, ignore=(),
+                     part: str = "") -> WorkbookPreview:
     """Open ``path`` and report what the Ledger extractor can and can't
-    see — per sheet: non-empty cell count, the heuristics' candidate
-    part id (and how), inspector initials, label cells grouped by
-    confidence of their binding to a template field, and the unmatched
-    labels that need a schema alias or a header fix.
+    see — per sheet: non-empty cell count, the part its values would get
+    (and how), inspector initials, the labels the extract binds to a
+    template field (confident / weak) and the labels it leaves for
+    'Labels to map'.
 
-    Fast: no values are extracted, no review workbook is written, no
-    pictures are copied. Mirrors ``extract()``'s per-sheet start —
-    ``load_workbook_grids`` + ``_Extractor.find_part/inspectors`` + a
-    ``Matcher.match`` sweep over every string cell."""
+    Runs extract()'s own passes on the workbook (same matcher, ignore list,
+    item grids, tables, forms, workbook-level part choice, Part override),
+    so the preview says what the batch will do: a context-free sweep over
+    every string cell listed data values (names, results, item codes) as
+    'unmatched labels' - and "Ask Council" sent them to the model - and
+    disagreed with the extract about bindings (review, 2026-10-19). No
+    review workbook is written, no pictures are copied."""
     p = Path(path)
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     file_part = _part_from_filename(p.stem, mask_re)
-    file_how = (f"filename {p.name!r}, mask-matched" if mask_re and file_part
+    by_mask = bool(mask_re and file_part and mask_re.search(p.stem))
+    file_how = (f"filename {p.name!r}, mask-matched" if by_mask
                 else (f"filename {p.name!r}" if file_part else ""))
     report = WorkbookPreview(path=str(p), sheets=[], file_part_id=file_part,
                              file_part_how=file_how,
@@ -525,40 +530,61 @@ def preview_workbook(path, schema, aliases=None,
     except LedgerError as e:
         report.problems.append(str(e))
         return report
-    m = Matcher(schema, aliases, ignore=())
+    m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
-    for g in grids:
-        ex = _Extractor(g, m, codes, "", mask_re)
+    exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
+    for ex in exs:
         try:
             ex.find_part()
             ex.find_inspectors()
         except Exception as exc:                           # noqa: BLE001
-            report.problems.append(f"{g.sheet}: {exc!r}")
+            report.problems.append(f"{ex.g.sheet}: {exc!r}")
+    # the part each sheet's values get - extract()'s own rule
+    found = {ex.part for ex in exs if ex.part}
+    if part:
+        book_part, how = part, "the Part number you typed"
+    elif len(found) == 1:
+        book_part, how = next(iter(found)), "the one part number in the workbook"
+    elif not found:
+        book_part = file_part
+        how = f"file name {p.name!r} — check it" if book_part else ""
+    else:
+        book_part, how = "", ""
+    for ex in exs:
+        if part:
+            ex.part, ex.part_how = part, how
+        elif not ex.part:
+            ex.part, ex.part_how = book_part, how
+        try:
+            ex.item_grids()
+            ex.tables()
+            ex.forms()
+        except Exception as exc:                           # noqa: BLE001
+            report.problems.append(f"{ex.g.sheet}: {exc!r}")
         inspectors = sorted({who for _r, _c, who in ex.markers})
         sure: List[_LabelHit] = []
         maybe: List[_LabelHit] = []
+        seen = set()
+        for o in ex.out:                                   # one line per label
+            key = (o.label, o.field)
+            if key in seen:
+                continue
+            seen.add(key)
+            hit = _LabelHit(o.label, o.field, o.score, o.where, o.via)
+            (sure if o.score >= ACCEPT_AT and o.via in ("alias", "match") else maybe).append(hit)
         unmatched: List[Tuple[str, str]] = []
-        for (r, c), v in g.cells.items():
-            if not isinstance(v, str):
-                continue
-            label = v.strip()
-            if not label or len(label) > 80:
-                continue
-            match = m.match(label)
-            where = g.where(r, c)
-            if match.target is not None and match.sure:
-                sure.append(_LabelHit(label, match.target.name, match.score,
-                                      where, match.via))
-            elif match.target is not None and match.score >= SUGGEST_AT:
-                maybe.append(_LabelHit(label, match.target.name, match.score,
-                                       where, match.via))
-            else:
-                # Only keep label-looking cells (letters, short-ish, not a
-                # number): otherwise every data value lands here.
-                if any(ch.isalpha() for ch in label):
-                    unmatched.append((label, where))
+        names = set()
+        for o in ex.unmatched:                             # what 'Labels to map' gets
+            label = (o.label or "").strip()
+            if label and label not in names:
+                names.add(label)
+                unmatched.append((label, o.where))
+        if not ex.part and ex.out:
+            report.problems.append(f"{ex.g.sheet}: {len(ex.out)} value(s) would get no "
+                                   f"{schema.id_field} — type one in Part number, or set "
+                                   "a part-name pattern")
         report.sheets.append(SheetPreview(
-            name=g.sheet, cells=len(g.cells),
+            name=ex.g.sheet, cells=len(ex.g.cells),
             part_id=ex.part, part_how=ex.part_how,
             inspectors=inspectors,
             sure=sure, maybe=maybe,
