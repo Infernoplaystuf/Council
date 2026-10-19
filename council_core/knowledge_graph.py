@@ -629,7 +629,14 @@ def _categorize_unreadable_reason(text: str) -> str:
     t = (text or "").lower()
     if "needs the pypdf" in t or "pypdf" in t:
         return "needs pypdf"
-    if "openpyxl" in t or "needs openpyxl" in t:
+    # the reader's own words, before the 'openpyxl' substring test: a
+    # .xls/.xlsb on a PC without Excel was 'other', and a file that is not
+    # a workbook 'needs openpyxl' (review, 2026-10-19)
+    if "opens only through microsoft excel" in t:
+        return "no Excel COM"
+    if "is not a workbook" in t:
+        return "corrupt / wrong format"
+    if "needs the openpyxl" in t or "needs openpyxl" in t:
         return "needs openpyxl"
     if "password-protected" in t or "has a password" in t:
         return "password-protected"

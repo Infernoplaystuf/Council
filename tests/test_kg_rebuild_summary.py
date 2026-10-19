@@ -137,3 +137,15 @@ def test_the_two_from_two_hundred_fourty_three_shape_prints_cleanly():
     assert "240 unreadable" in line
     assert "needs pypdf" in line
     assert "0 links found" in line
+
+
+def test_the_readers_own_reasons_land_in_their_categories():
+    """Real strings from kg_excel (review, 2026-10-19)."""
+    from council_core.knowledge_graph import unreadable_breakdown
+    got = unreadable_breakdown([
+        "a.xlsb: a .xlsb workbook opens only through Microsoft Excel (with the "
+        "pywin32 package), which is not available here",
+        "b.xlsx: is not a workbook openpyxl can read (and Excel, which might, is "
+        "not available here)",
+        "c.xlsx: needs the openpyxl package, which is not installed"])
+    assert got == {"no Excel COM": 1, "corrupt / wrong format": 1, "needs openpyxl": 1}
