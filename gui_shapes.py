@@ -620,6 +620,18 @@ def save_gspec(path: Any, project: Project, *,
 #: first: a name nobody gives a file of their own (".tmp" might be).
 ATOMIC_SUFFIX = ".partial"
 
+#: On Windows another process — a search indexer, an antivirus, a second
+#: Council window — can hold a file open for a moment, and os.replace (or
+#: opening the .partial to write it) then raises PermissionError though
+#: nothing is wrong and the lock clears on its own. The write is tried again
+#: for this long, this often, before it gives up and fails as it always did;
+#: agent_jobs._retrying does the same for the job store. Measured: the
+#: Designer's update rolled back on a transient lock under load, before the
+#: point a kill-part-way test meant to reach. Not on POSIX, where a
+#: PermissionError is a settled denial that waiting cannot change.
+_LOCK_RETRY_SECONDS = 2.0
+_LOCK_RETRY_PAUSE_S = 0.02
+
 
 def write_text_atomic(path: Any, text: str, encoding: str = "utf-8") -> None:
     """Write ``text`` to ``path`` whole or not at all (write_bytes_atomic).
@@ -640,17 +652,39 @@ def write_bytes_atomic(path: Any, data: bytes) -> None:
     — leaves the file as it was, never empty or half-written (measured
     before, for project.gspec, manifest.json and handlers.py: each was left
     empty). At worst a stray <name>.partial is left beside it.
+
+    A transient Windows lock on the write or the os.replace is waited out
+    (_LOCK_RETRY_SECONDS) rather than failing the whole save; see the note
+    on the constants.
     """
     import os
+    import time
+
+    def _past_a_windows_lock(action: Any) -> Any:
+        """``action()``, tried again while Windows reports the file busy."""
+        if os.name != "nt":
+            return action()
+        deadline = time.monotonic() + _LOCK_RETRY_SECONDS
+        while True:
+            try:
+                return action()
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_LOCK_RETRY_PAUSE_S)
 
     p = Path(path)
     tmp = p.with_name(p.name + ATOMIC_SUFFIX)
-    try:
+
+    def _write_tmp() -> None:
         with open(tmp, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, p)
+
+    try:
+        _past_a_windows_lock(_write_tmp)
+        _past_a_windows_lock(lambda: os.replace(tmp, p))
     finally:
         try:
             if tmp.exists():

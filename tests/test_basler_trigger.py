@@ -490,8 +490,12 @@ def preview():
     assert frame_camera._LIVE.previewing
 
 
-def wait_for(cond, seconds=3.0):
-    """cond() came true within `seconds` — never asked again after."""
+def wait_for(cond, seconds=30.0):
+    """cond() came true within `seconds` — never asked again after.
+
+    Patience, not a measurement: a condition that comes true ends the wait
+    at once. It was 3 s, which a whole-suite run 8 files at a time can
+    take from a grab or a save on this PC."""
     deadline = time.monotonic() + seconds
     while True:
         if cond():
@@ -551,9 +555,17 @@ def test_an_exact_run_from_line1_saves_one_frame_per_edge_and_counts_the_rest(
     cam.raise_line("Line1")
     cam.raise_line("Line1")                 # both while it is busy
     assert cam.ignored == 2
+    # "ok" means the run HOLDS the frame: a trigger's frame is written by
+    # the save thread, and its trigger told once it is on disk. Read the
+    # moment the third frame was grabbed, a busy PC still had it in the
+    # queue — "3 triggers · 2 ok" (whole-suite runs, 2026-10-15) — so the
+    # line is read once the writing has caught up, then judged as before.
+    expected = ("Armed — waiting for Line1 RisingEdge · 3 triggers · 3 ok "
+                "· missed: counted at Stop")
+    wait_for(lambda: frame_camera._LIVE.trigger_run.line().startswith(
+        expected))
     line = frame_camera._LIVE.trigger_run.line()
-    assert line.startswith("Armed — waiting for Line1 RisingEdge · 3 "
-                           "triggers · 3 ok · missed: counted at Stop"), line
+    assert line.startswith(expected), line
     said = frame_camera.stop()["summary"]
     assert "3 triggers, 3 ok, 2 missed · the camera counted 5 edges on " \
            "Line1" in said, said

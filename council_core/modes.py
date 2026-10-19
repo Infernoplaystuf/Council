@@ -14,6 +14,14 @@ READ LIVE, NOT CACHED AT IMPORT
 The Tk build evaluates this once at module import, which is fine for a process
 that never changes it. A test that sets the variable and a launcher that sets
 it are the same case, and neither controls import order.
+
+NEW SOURCE OF TRUTH: THE ACTIVE PROFILE
+The spec in TAB_CONSOLIDATION_SPEC.md moves advanced-mode under the per-user
+profile — Demo switches it off, Developer and Full turn it on, Custom carries
+its own flag. ``advanced()`` reads the profile for its default answer; the two
+long-standing overrides (``COUNCIL_ADVANCED=1`` and ``--advanced``) still win,
+because they are how a developer forces advanced on without touching settings
+and how the test suite drives the function.
 """
 from __future__ import annotations
 
@@ -31,9 +39,45 @@ FLAG = "--advanced"
 def advanced(argv: Optional[Sequence[str]] = None) -> bool:
     """Whether this build shows the advanced tabs.
 
-    Either `COUNCIL_ADVANCED=1` in the environment or `--advanced` on the
-    command line — the same two the Tk shell honours.
+    Returns True when ``COUNCIL_ADVANCED`` is set to a truthy value, or when
+    ``--advanced`` appears in ``argv`` (``sys.argv`` by default), or when the
+    user's active profile says so. The first two mirror the Tk-era overrides
+    and keep working the way the existing tests exercise them; the third is
+    the new source of truth for a normal launch.
     """
     if os.environ.get(ENV_VAR, "").strip().lower() in TRUE_VALUES:
         return True
-    return FLAG in list(argv if argv is not None else sys.argv)
+    if FLAG in list(argv if argv is not None else sys.argv):
+        return True
+    return _advanced_from_profile()
+
+
+def _advanced_from_profile() -> bool:
+    """What the user's saved profile says. Never raises on a bad file.
+
+    Imported lazily: ``council_qt.ui_settings`` depends on PySide6 by way of
+    its neighbours in the ``council_qt`` package, and ``modes`` is reached
+    from tests and command-line tools that must not pull Qt in.
+
+    This function READS, it does not migrate. A launch that opens the window
+    migrates once through ``load_or_migrate``; code that only wants the live
+    answer (every ``modes.advanced()`` call under the tab-registration path)
+    reads the on-disk section as it is. No file on disk → False, which keeps
+    tests that monkeypatch away the environment overrides deterministic and
+    matches the Tk-era default (no advanced tabs for anyone who did not ask).
+    """
+    try:
+        from council_qt import ui_settings
+    except Exception:                                        # noqa: BLE001
+        return False
+    try:
+        raw = ui_settings._read_raw()                        # noqa: SLF001
+    except Exception:                                        # noqa: BLE001
+        return False
+    section = raw.get("ui") if isinstance(raw, dict) else None
+    if not isinstance(section, dict):
+        return False
+    try:
+        return ui_settings.current_advanced_mode(section)
+    except Exception:                                        # noqa: BLE001
+        return False

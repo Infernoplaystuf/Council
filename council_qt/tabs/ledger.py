@@ -23,10 +23,29 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QGridLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QListWidget, QPlainTextEdit,
+                               QProgressBar, QPushButton, QVBoxLayout, QWidget)
+
+
+class _VisionReaderCombo(QComboBox):
+    """A combobox that refreshes its installed-models list each time the
+    user opens the popup, instead of at construction. The owning tab
+    probes Ollama on every showPopup, so a test (which runs offline and
+    counts even caught connection attempts as failures) never touches
+    the network unless the user actually clicks the dropdown."""
+
+    def __init__(self, probe, parent=None):
+        super().__init__(parent)
+        self._probe = probe
+
+    def showPopup(self):
+        try:
+            self._probe()
+        except Exception:                                 # noqa: BLE001
+            pass
+        super().showPopup()
 
 from council_core import ledger_ingest
 from sample_ledger import LedgerError
@@ -42,16 +61,28 @@ class LedgerActions:
     """The tab's seam to the pipeline and the desktop: tests replace pieces
     (a stand-in image reader, no Excel, no file dialogs)."""
 
-    def __init__(self, image_reader=None, opener: Optional[Callable] = None):
+    def __init__(self, image_reader=None, opener: Optional[Callable] = None,
+                 rebuild_kg: Optional[Callable] = None):
         self.image_reader = image_reader
         self.opener = opener or ledger_ingest.open_path
+        self._rebuild_kg_override = rebuild_kg
 
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
 
-    def extract(self, csv, sources, part, use_images, progress):
+    def extract(self, csv, sources, part, use_images, progress,
+                pattern_mask: Optional[str] = None,
+                vision_model: Optional[str] = None,
+                cancel=None):
+        reader = self.image_reader
+        if reader is None and use_images and vision_model:
+            # Explicit opt-in: the user picked a vision model in the dropdown.
+            from source_extract import ollama_vision_reader
+            reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
-                                         image_reader=self.image_reader, progress=progress)
+                                         image_reader=reader, progress=progress,
+                                         pattern_mask=pattern_mask or None,
+                                         cancel=cancel)
 
     def apply(self, review, fill_dir, use_images, progress):
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
@@ -59,6 +90,19 @@ class LedgerActions:
 
     def open(self, path) -> None:
         self.opener(path)
+
+    def rebuild_kg(self, progress):
+        """Rebuild the knowledge graph on the user's vault — same path the
+        Connections tab uses. ``progress`` is the Ledger tab's
+        ``(line, fraction)`` listener; the KG's own line-by-line stream is
+        forwarded to it.
+
+        Tests pass a ``rebuild_kg`` override to the LedgerActions
+        constructor to avoid touching the real vault or Ollama."""
+        if self._rebuild_kg_override is not None:
+            return self._rebuild_kg_override(progress)
+        from council_qt.tabs.connections import ConnectionsActions
+        return ConnectionsActions().rebuild(listener=progress)
 
 
 class LedgerTab(ViewHelpers, QWidget):
@@ -70,7 +114,16 @@ class LedgerTab(ViewHelpers, QWidget):
         self._tokens = theme.tokens("dark")
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
+        #: Set by the Cancel button; read inside the extract loop so the
+        #: next workbook is skipped. Pipelines that already hit a stuck
+        #: Workbooks.Open are released by excel_open.kill_active_excels,
+        #: which the button also calls.
+        self._cancel = threading.Event()
+        #: True from an apply's completion until the next KG rebuild —
+        #: used by _refresh_enabled to highlight the Rebuild button.
+        self._kg_dirty = False
         self._build()
+        self._refresh_reader_choices()
         self._refresh_enabled()
 
     # ── layout ──────────────────────────────────────────────────────────
@@ -120,11 +173,36 @@ class LedgerTab(ViewHelpers, QWidget):
         self.part = QLineEdit()
         self.part.setFixedWidth(120)
         row.addWidget(self.part)
-        self.use_images = QCheckBox("Read pasted images (Tesseract, local)")
+        self.use_images = QCheckBox("Read pasted images with")
         self.use_images.setChecked(True)
+        self.use_images.toggled.connect(self._refresh_reader_enabled)
         row.addWidget(self.use_images)
+        self.image_reader_choice = _VisionReaderCombo(
+            probe=lambda: self._refresh_reader_choices(from_popup=True))
+        self.image_reader_choice.setToolTip(
+            "Which reader runs on each pasted image. Tesseract is a local "
+            "OCR that reads clean text fast. Ollama vision models catch "
+            "handwriting and messy tables Tesseract misses, slower.")
+        row.addWidget(self.image_reader_choice)
+        self._install_vision_sentinel = "__install_vision__"
+        self._tesseract_sentinel = "__tesseract__"
+        self.image_reader_choice.currentIndexChanged.connect(
+            self._on_reader_changed)
         row.addStretch(1)
         v2.addLayout(row)
+        # Pattern hint — not persisted; held for this session only. A follow-up
+        # could save it next to the parent CSV like aliases.
+        mask_row = QHBoxLayout()
+        mask_row.addWidget(QLabel("Part name pattern (optional):"))
+        self.pattern_mask = QLineEdit()
+        self.pattern_mask.setPlaceholderText(
+            "@@@#@@###   — @ letter, # digit, other characters literal")
+        self.pattern_mask.setToolTip(
+            "A shape used when the sample number is not labelled.\n"
+            "@ matches any letter, # any digit, anything else matches itself.\n"
+            "Example: @@@#@@### finds ABC1DE234 in a filename.")
+        mask_row.addWidget(self.pattern_mask, 1)
+        v2.addLayout(mask_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -143,6 +221,12 @@ class LedgerTab(ViewHelpers, QWidget):
                                        self.browse_fill_dir)
         row = QHBoxLayout()
         self.apply_btn = self._step_button(row, "Apply review → parent CSV", self.on_apply)
+        self.rebuild_kg_btn = self._step_button(
+            row, "Rebuild knowledge graph", self.on_rebuild_kg)
+        self.rebuild_kg_btn.setToolTip(
+            "Rebuild the Connections knowledge graph from the vault's "
+            "data_in folder, so a newly-applied Ledger shows up as parts, "
+            "people and inspections. Same path the Connections tab uses.")
         row.addStretch(1)
         grid4.addLayout(row, 1, 1)
         outer.addWidget(g4)
@@ -169,10 +253,21 @@ class LedgerTab(ViewHelpers, QWidget):
         self.status.setWordWrap(True)
         self.status.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         v5.addWidget(self.status)
+        progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)               # busy, no percentage
         self.progress.setVisible(False)
-        v5.addWidget(self.progress)
+        progress_row.addWidget(self.progress, 1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip(
+            "Stop the running step after the current workbook. Also kills "
+            "any hidden Excel process this run spawned, which unblocks a "
+            "Workbooks.Open stuck on a modal dialog (sign-in, license, "
+            "Trust Center Enable Editing).")
+        self.cancel_btn.clicked.connect(self.on_cancel)
+        self.cancel_btn.setEnabled(False)
+        progress_row.addWidget(self.cancel_btn)
+        v5.addLayout(progress_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         v5.addWidget(self.log, 1)
@@ -192,6 +287,9 @@ class LedgerTab(ViewHelpers, QWidget):
         idle = not self.busy
         for b in self._busy_buttons:
             b.setEnabled(idle)
+        if hasattr(self, "cancel_btn"):
+            # Only enabled while a step is actually running.
+            self.cancel_btn.setEnabled(not idle)
         if not idle:
             return
         csv = self.csv.text().strip()
@@ -200,6 +298,79 @@ class LedgerTab(ViewHelpers, QWidget):
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
+        if hasattr(self, "rebuild_kg_btn"):
+            # Always clickable while idle; dirtiness only affects weight.
+            font = self.rebuild_kg_btn.font()
+            font.setBold(self._kg_dirty)
+            self.rebuild_kg_btn.setFont(font)
+
+    # ── image-reader dropdown ───────────────────────────────────────────
+    def _refresh_reader_choices(self, *, select: Optional[str] = None,
+                                from_popup: bool = False) -> None:
+        """Populate the reader dropdown with Tesseract + installed US vision
+        models + an 'Install…' entry.
+
+        The Ollama probe runs only when ``from_popup`` is true (the user
+        opened the dropdown) or ``select`` is set (an install just
+        finished). Construction stays offline so tests do not trip the
+        offline guard just by building the tab."""
+        if not hasattr(self, "image_reader_choice"):
+            return
+        self.image_reader_choice.blockSignals(True)
+        current_data = self.image_reader_choice.currentData() if select is None else select
+        try:
+            self.image_reader_choice.clear()
+            self.image_reader_choice.addItem("Tesseract (local, fast)",
+                                             self._tesseract_sentinel)
+            if from_popup or select is not None:
+                try:
+                    from council_core import ollama_install
+                    names = ollama_install.installed_models()
+                    for n in names:
+                        if n.lower().startswith(ollama_install.US_VISION_FAMILIES):
+                            self.image_reader_choice.addItem(f"Ollama: {n}", n)
+                except Exception:                             # noqa: BLE001
+                    pass
+            self.image_reader_choice.insertSeparator(
+                self.image_reader_choice.count())
+            self.image_reader_choice.addItem("Install vision model…",
+                                             self._install_vision_sentinel)
+            if current_data is not None:
+                idx = self.image_reader_choice.findData(current_data)
+                if idx >= 0:
+                    self.image_reader_choice.setCurrentIndex(idx)
+        finally:
+            self.image_reader_choice.blockSignals(False)
+        self._refresh_reader_enabled()
+
+    def _refresh_reader_enabled(self, *_args) -> None:
+        if hasattr(self, "image_reader_choice") and hasattr(self, "use_images"):
+            self.image_reader_choice.setEnabled(self.use_images.isChecked())
+
+    def _on_reader_changed(self, _index: int) -> None:
+        if not hasattr(self, "image_reader_choice"):
+            return
+        data = self.image_reader_choice.currentData()
+        if data == self._install_vision_sentinel:
+            # The 'Install…' sentinel: open the dialog, then put the
+            # dropdown back on whichever model is actually in use.
+            self._open_install_dialog()
+            self._refresh_reader_choices(select=self._tesseract_sentinel)
+
+    def _open_install_dialog(self) -> None:
+        from .ledger_dialogs import InstallVisionModelDialog
+        dlg = InstallVisionModelDialog(
+            on_installed=lambda name: self._refresh_reader_choices(select=name),
+            parent=self)
+        dlg.exec()
+
+    def _selected_vision_model(self) -> Optional[str]:
+        if not hasattr(self, "image_reader_choice"):
+            return None
+        data = self.image_reader_choice.currentData()
+        if data in (None, self._tesseract_sentinel, self._install_vision_sentinel):
+            return None
+        return str(data)
 
     def _say(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -207,15 +378,29 @@ class LedgerTab(ViewHelpers, QWidget):
     def _run(self, title: str, step: Callable, done: Callable) -> None:
         """Run `step(progress)` on a thread; `done(result)` on the GUI thread.
         A LedgerError is the pipeline's own plain-language message; anything
-        else is shown with its traceback in the log."""
+        else is shown with its traceback in the log.
+
+        The ``self._cancel`` event is cleared at the start of every run; the
+        step may read it (via a ``cancel=`` kwarg) to exit early."""
         if self.busy:
             return
+        self._cancel.clear()
         self.status.setText(f"{title}…")
         self._say(f"── {title}")
+        self.progress.setRange(0, 0)               # busy until a percentage is known
         self.progress.setVisible(True)
 
-        def progress(msg: str) -> None:
-            self._to_ui(lambda: self.status.setText(f"{title}: {msg}"))
+        def progress(msg: str, fraction: Optional[float] = None) -> None:
+            """Every progress line (the terminal shows them too); a known
+            fraction turns the busy bar into a percentage."""
+            def show() -> None:
+                self.status.setText(f"{title}: {msg}")
+                if fraction is None:
+                    self.progress.setRange(0, 0)
+                else:
+                    self.progress.setRange(0, 100)
+                    self.progress.setValue(int(100 * fraction))
+            self._to_ui(show)
 
         def work() -> None:
             try:
@@ -229,6 +414,25 @@ class LedgerTab(ViewHelpers, QWidget):
         self._worker = threading.Thread(target=work, name="ledger-step", daemon=True)
         self._refresh_enabled()
         self._worker.start()
+
+    def on_cancel(self) -> None:
+        """Signal the running step to stop. The event is checked between
+        workbooks in extract(). If a Workbooks.Open is already blocking
+        on a modal Excel dialog, taskkill'ing the hidden Excel process
+        unblocks it — the COM call raises and the loop exits on its next
+        iteration."""
+        if not self.busy:
+            return
+        self._cancel.set()
+        try:
+            from excel_open import kill_active_excels
+            killed = kill_active_excels()
+        except Exception:                                 # noqa: BLE001
+            killed = 0
+        tail = f" (+{killed} Excel process{'es' if killed != 1 else ''} ended)" \
+            if killed else ""
+        self.status.setText(f"Cancelling…{tail}")
+        self._say(f"── Cancel requested{tail}")
 
     def _finish(self, title, result, err, done) -> None:
         self._worker = None
@@ -284,6 +488,8 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_extract(self) -> None:
         csv, sources = self.csv.text().strip(), self.source_paths()
         part, images = self.part.text().strip(), self.use_images.isChecked()
+        mask = self.pattern_mask.text().strip()
+        vision = self._selected_vision_model()
 
         def done(s) -> None:
             self.review.setText(s.review)
@@ -292,11 +498,20 @@ class LedgerTab(ViewHelpers, QWidget):
             self.stat["to_review"].setText(str(s.to_review))
             self.stat["images"].setText(f"{s.images_read} / {s.images}")
             self.stat["problems"].setText(str(len(s.problems)))
-            self.status.setText("Review written. Open it, check the amber and red rows, "
-                                "map the leftover labels, save it, then Apply.")
+            if getattr(s, "cancelled", False):
+                self.status.setText(
+                    "Cancelled. The partial review was still written — "
+                    "open it to see what landed, or clear it and run again.")
+            else:
+                self.status.setText(
+                    "Review written. Open it, check the amber and red rows, "
+                    "map the leftover labels, save it, then Apply.")
             self._say(s.describe())
         self._run("Extracting",
-                  lambda p: self.actions.extract(csv, sources, part, images, p), done)
+                  lambda p: self.actions.extract(csv, sources, part, images, p,
+                                                 pattern_mask=mask,
+                                                 vision_model=vision,
+                                                 cancel=self._cancel), done)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()
@@ -312,11 +527,25 @@ class LedgerTab(ViewHelpers, QWidget):
 
         def done(s) -> None:
             self.stat["problems"].setText(str(len(s.problems)))
-            self.status.setText(f"{s.accepted} values accepted → {s.rows} rows: "
-                                f"{s.csv_result}")
+            self.status.setText(
+                f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "
+                "Press Rebuild knowledge graph to pick up the new rows.")
             self._say(s.describe())
+            self._kg_dirty = True
         self._run("Applying the review",
                   lambda p: self.actions.apply(review, fill, images, p), done)
+
+    def on_rebuild_kg(self) -> None:
+        """Rebuild the Connections knowledge graph; the Ledger log shows
+        the breakdown line via rebuild_summary_line."""
+        def done(stats) -> None:
+            from council_core import knowledge_graph as kgm
+            line = kgm.rebuild_summary_line(stats or {})
+            self.status.setText(line)
+            self._say(line)
+            self._kg_dirty = False
+        self._run("Rebuilding the knowledge graph",
+                  lambda p: self.actions.rebuild_kg(p), done)
 
     # ── file dialogs ────────────────────────────────────────────────────
     def _start_dir(self, edit: Optional[QLineEdit] = None) -> str:

@@ -1035,3 +1035,101 @@ def test_the_source_commit_is_read_from_git_files_never_by_running_git(
     (repo / ".git" / "HEAD").write_text(sha + "\n")
     assert camera_record.source_commit(repo) == sha
     assert camera_record.source_commit(tmp_path / "nothing") == ""
+
+
+# ---------------------------------------------------------------------------
+# A stream that ends by itself: the grab thread says so, and the end record
+# says why (found by the Typhon plugins P2 review, 18 October 2026)
+# ---------------------------------------------------------------------------
+def _sim_device():
+    backend = cameras.SyntheticBackend()
+    return backend.open(backend.discover()[0])
+
+
+def _dies_after(device, frames, exc):
+    real = device.read
+    count = [0]
+
+    def read(timeout_ms=1000):
+        if count[0] >= frames:
+            raise exc
+        got = real(timeout_ms)
+        if got is not None:
+            count[0] += 1
+        return got
+    device.read = read
+
+
+def _recording(tmp_path, device, run="20261018_120000"):
+    capture.warm_imports()
+    name, claim = capture.claim_run(tmp_path, run)
+    session = CaptureSession(device, timeout_ms=50)
+    session.record_to(capture.run_recorder(tmp_path, name, claim),
+                      reset=True)
+    return session, name
+
+
+def _end_record(folder, run):
+    import json
+    return json.loads((Path(folder) / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+
+
+def _wait_until(test, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while not test():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+def test_a_read_that_raises_systemexit_ends_the_grab_loop_and_says_so(
+        tmp_path, monkeypatch):
+    """SystemExit is not an Exception: it used to end the grab thread
+    without a word - still "capturing", 0 errors, and Stop recorded the run
+    as a normal stop."""
+    escaped = []
+    monkeypatch.setattr(threading, "excepthook",
+                        lambda args: escaped.append(args.exc_type))
+    device = _sim_device()
+    _dies_after(device, 3, SystemExit("plugin quit"))
+    session, run = _recording(tmp_path, device)
+    session.start()
+    _wait_until(lambda: not session.running)
+    assert escaped == [], "the exception escaped the grab thread"
+    stats = session.stats()
+    assert stats.errors == 1 and "SystemExit" in stats.last_error, stats
+    session.stop()
+    session.record_to(None)
+    end = _end_record(tmp_path, run)
+    assert end["frames_saved"] == 3
+    assert "SystemExit" in end["stream_ended"], end
+    assert end["recording_failed"] == ""
+    device.close()
+
+
+def test_a_read_that_raises_says_in_the_end_record_why_the_stream_ended(
+        tmp_path):
+    device = _sim_device()
+    _dies_after(device, 2, RuntimeError("cable"))
+    session, run = _recording(tmp_path, device)
+    session.start()
+    _wait_until(lambda: not session.running)
+    session.stop()
+    session.record_to(None)
+    end = _end_record(tmp_path, run)
+    assert end["frames_saved"] == 2
+    assert end["stream_ended"] == "RuntimeError: cable", end
+    device.close()
+
+
+def test_a_stopped_recording_has_no_stream_ended(tmp_path):
+    """A GUARD on today's end record: a run ended by Stop is as before, no
+    new key."""
+    device = _sim_device()
+    session, run = _recording(tmp_path, device)
+    session.start()
+    _wait_until(lambda: session.stats().grabbed >= 2)
+    session.stop()
+    session.record_to(None)
+    assert "stream_ended" not in _end_record(tmp_path, run)
+    device.close()

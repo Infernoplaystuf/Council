@@ -202,7 +202,9 @@ def main() -> int:
 
     def ask_client(request: dict) -> Optional[dict]:
         write(request)
-        deadline = time.monotonic() + 3
+        # Patience for the client's answer, not a claim: an answer ends the
+        # wait at once. 3 s was within reach of a whole-suite run's load.
+        deadline = time.monotonic() + 30
         with arrived:
             while request["id"] not in waiting:
                 left = deadline - time.monotonic()

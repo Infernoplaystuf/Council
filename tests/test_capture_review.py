@@ -253,6 +253,164 @@ def test_after_stop_the_slider_covers_every_saved_frame(ui, tmp_path):
     assert ui.ports.current_frame.get() == os.path.basename(rv.files[-1])
 
 
+@pytest.mark.parametrize("show_ms", [cr.SHOW_MS, 400],
+                         ids=["as-built", "restart-first"])
+def test_a_frame_picked_right_after_stop_is_kept_when_the_live_view_is_back(
+        ui, tmp_path, monkeypatch, show_ms):
+    """Picked after Stop and before the live view is back — the run's last
+    frames landing, a frame camera restarting its stream — a saved frame
+    stays on screen when the live view returns, with live at the slider's
+    end, as one picked a moment later does. Before, the restart took it
+    away (_go_live went live), and so did the last frame landing while the
+    pick's show was still due (_finished kept what was shown BEFORE it): a
+    built Typhon's test lost the pick under a whole-suite run's load. The
+    show's delay (SHOW_MS) at 400 ms puts the restart first every time."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    frame_camera.stop()
+    frame_camera._LIVE.session.flush(30)
+    assert not frame_camera._LIVE.previewing
+    monkeypatch.setattr(cr, "SHOW_MS", show_ms)
+    drag(rv, 0)                       # before any tick has seen the Stop
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    assert pump_until(rv.showing_saved), (rv.live, rv.scrubber.get())
+    pump(0.3)
+    assert rv.showing_saved() and not rv.live, "the pick was taken away"
+    assert rv.scrubber.get() == 0, rv.scrubber.get()
+    assert ui.ports.current_frame.get() == os.path.basename(rv.files[0])
+    assert rv.scrubber._hi == len(rv.files), "live is at the end"
+    drag(rv, len(rv.files))
+    pump(0.1)
+    assert rv.live, "dragging to the end is live again"
+
+
+def _stopped_with_the_live_view_not_back(ui, tmp_path):
+    """Connected, a few frames captured, Stop, the run landed — and a tick
+    has seen the Stop while the live view is still to come back: where a
+    user's pick almost always falls (the slider ticks 30 times a second)."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    # The restart waits for a moment the test chooses (_manage_preview
+    # leaves a stopped stream alone until preview_retry_at), so the tick
+    # below sees the Stop with the live view certainly not back yet.
+    frame_camera._LIVE.preview_retry_at = time.monotonic() + 3600
+    frame_camera.stop()
+    frame_camera._LIVE.session.flush(30)
+    rv.tick(None)
+    assert not rv._capturing and rv._run_ended, "a tick has seen the Stop"
+    assert not frame_camera._LIVE.previewing and not rv._previewing
+    return rv
+
+
+def test_a_frame_picked_after_a_tick_has_seen_stop_is_kept_too(ui, tmp_path):
+    """The same pick as above, made after a tick has seen the Stop (the
+    usual case: the case above drags before any tick has, so it never
+    reaches this branch) — still kept when the live view comes back."""
+    rv = _stopped_with_the_live_view_not_back(ui, tmp_path)
+    drag(rv, 0)
+    assert rv._keep_pick
+    frame_camera._LIVE.preview_retry_at = 0.0        # let it come back
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    pump(0.3)
+    assert rv.showing_saved() and not rv.live, "the pick was taken away"
+    assert rv.scrubber.get() == 0, rv.scrubber.get()
+    assert ui.ports.current_frame.get() == os.path.basename(rv.files[0])
+    assert rv.scrubber._hi == len(rv.files), "live is at the end"
+
+
+def test_a_pick_after_stop_does_not_outlive_a_disconnect(ui, tmp_path):
+    """Picked after Stop, then Disconnect before the live view is back: the
+    pick belonged to that connection. The next Connect is live ("connected
+    means live"), as it is with no pick — not the old saved frame."""
+    rv = _stopped_with_the_live_view_not_back(ui, tmp_path)
+    drag(rv, 0)
+    assert pump_until(rv.showing_saved)
+    frame_camera.disconnect()
+    pump(0.2)
+    assert not rv._run_ended and not rv._keep_pick, \
+        "the Disconnect ended the after-Stop gap"
+    connect_frame_camera()
+    assert pump_until(lambda: rv._previewing), "the live view did not start"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    assert not rv.showing_saved()
+    assert rv.scrubber.get() == len(rv.files), "at the live end"
+
+
+def test_a_pick_after_stop_does_not_outlive_another_folder(ui, tmp_path):
+    """Picked after Stop, then another folder chosen before the live view is
+    back: the pick was a frame of the old folder, and choosing the new one
+    showed its first frame instead. The live view coming back is live, as it
+    is in a folder chosen with no pick — not that first frame. Before, the
+    folder change reset the frame on screen but left the pick set, and
+    _go_live kept it."""
+    other = tmp_path / "other"
+    saved_run(other)
+    run = tmp_path / "run"
+    run.mkdir()
+    rv = _stopped_with_the_live_view_not_back(ui, run)
+    drag(rv, 0)
+    assert rv._keep_pick
+    ui.ports.capture_folder.set(str(other))
+    assert pump_until(lambda: rv._root_key == cr._key(other)
+                      and len(rv.files) == 10), (rv.root, len(rv.files))
+    assert not rv._previewing, "the live view is still to come back"
+    frame_camera._LIVE.preview_retry_at = 0.0        # let it come back
+    assert pump_until(lambda: rv._previewing), "the live view did not return"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    pump(0.3)
+    assert rv.live and not rv.showing_saved(), "the old pick was kept"
+    assert rv.scrubber.get() == len(rv.files) == rv.scrubber._hi, \
+        "at the live end"
+    assert ui.ports.current_frame.get() == "", "live is not a file"
+
+
+@pytest.mark.parametrize("wait", [0.0, 1.5], ids=["at-once", "after-1.5s"])
+def test_a_disconnect_during_a_capture_then_a_pick_still_connects_live(
+        ui, tmp_path, wait):
+    """Disconnect in the middle of a capture (no Stop), move the slider —
+    straight away or a while later — and Connect: live, as it always was.
+    Before, the one tick that saw the Disconnect cleared the after-Stop gap
+    on the run's change (frame_camera clears the run) and then opened it
+    again because capturing went False in the same tick; the live view had
+    not been running during the capture, so _live_lost never closed it, and
+    the pick was kept past the Connect, on a saved frame."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 4)
+    frame_camera.disconnect()                 # no Stop
+    pump(0.2)
+    assert not rv._capturing and not rv._previewing
+    assert not rv._run_ended, "a Disconnect is not a Stop"
+    if wait:
+        pump(wait)
+    drag(rv, 0)
+    assert not rv._keep_pick, "a pick after a Disconnect is not kept"
+    pump(0.2)
+    connect_frame_camera()
+    assert pump_until(lambda: rv._previewing), "the live view did not start"
+    assert pump_until(lambda: rv.live), (rv.live, rv.showing_saved(),
+                                         rv.scrubber.get(), len(rv.files))
+    pump(0.3)
+    assert rv.live and not rv.showing_saved()
+    assert rv.scrubber.get() == len(rv.files), "at the live end"
+
+
 class StillCapturing:
     """A capture that is running but, for the moment, saving nothing new —
     so playback can catch up with it. (At a steady 50 windows a second a

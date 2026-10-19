@@ -38,6 +38,8 @@
 #   WSL2 + want GPU-accelerated Council (no dream3d) → SECTION F
 #   WSL2 + want dream3dnx pipeline exec              → SECTION E
 #                                                       (run inside WSL)
+#   Plus (optional, needed for OCR of pasted images) → SECTION G
+#                                                       (Tesseract, English)
 
 
 # ============================================================
@@ -664,3 +666,70 @@ python tests/smoke_test.py
 #  Fix:     Microsoft Visual C++ 2015-2022 Redistributable — install
 #           the x64 version from microsoft.com.
 # ─────────────────────────────────────────────────────────────
+
+
+# ============================================================
+#  SECTION G — Tesseract OCR  (English only, US-origin)
+#  Required for the Ledger tab to read text out of pasted images
+#  without a vision model, and for the vault analyst's image-OCR
+#  helpers. Tesseract itself is a SYSTEM binary — not a pip
+#  package — so this is one install line per OS.
+#
+#  Why in a section of its own: the binary is tiny (~40 MB with
+#  the English language pack), it is US-origin end to end
+#  (originated at Hewlett-Packard in 1985, maintained by Google
+#  since 2006; the default English language model is produced by
+#  Google-sponsored training), and it is OPTIONAL — Council runs
+#  without it, images are saved for a person to read instead.
+#  Install this AFTER your main hardware section (A/B/C/D/E/F)
+#  has finished and the env is active.
+#
+#  Language policy: install the English pack only. Tesseract
+#  supports many other language packs; Council never asks for
+#  them and the [[us-models-only]] rule only clears the
+#  Google-trained English pack. If a different pack is already on
+#  disk (e.g. a corporate image), it is harmless — Council passes
+#  `-l eng` to the binary.
+# ============================================================
+#
+#  ── Windows ──
+#  The UB-Mannheim MSI installer is the standard Windows build and
+#  is signed; the winget line pulls that same MSI.
+#  Default install includes English; untick the other language
+#  checkboxes in the installer if you want strict English-only.
+#      winget install -e --id UB-Mannheim.TesseractOCR
+#  OR, interactive (recommended for English-only):
+#      Download https://github.com/UB-Mannheim/tesseract/wiki
+#      Run the installer; in the components step, DESELECT every
+#      language under "Additional language data" except English,
+#      then let it finish.
+#  Add `C:\Program Files\Tesseract-OCR` to PATH if the installer
+#  did not (its "Add to PATH" option is checked by default on
+#  recent builds). Verify:
+#      tesseract --version
+#
+#  ── Linux (Ubuntu / Debian / Pop!_OS / WSL2) ──
+#      sudo apt update
+#      sudo apt install -y tesseract-ocr tesseract-ocr-eng
+#      tesseract --version
+#
+#  ── Fedora ──
+#      sudo dnf install -y tesseract tesseract-langpack-eng
+#      tesseract --version
+#
+#  ── Arch ──
+#      sudo pacman -S --needed tesseract tesseract-data-eng
+#      tesseract --version
+#
+#  ── Python wrapper (optional — pulls the vault analyst's OCR
+#     helpers in image_stats.py; the Ledger tab does NOT need
+#     this, it calls the binary via subprocess) ──
+#      pip install pytesseract>=0.3.10
+#
+#  ── Verify the Council app sees it ──
+#  After the first launch of Council, the Ledger tab's "Read
+#  pasted images with" dropdown should offer "Tesseract (local,
+#  fast)" alongside any installed Ollama vision model. If it
+#  does not, run `tesseract --version` from the same shell and
+#  check that Tesseract's install folder is on PATH.
+# ============================================================

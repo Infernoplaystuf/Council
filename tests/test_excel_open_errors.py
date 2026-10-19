@@ -1,0 +1,146 @@
+"""
+Tests for the Excel-open error classifier. The classifier translates
+Workbooks.Open exceptions into named ExcelOpenError kinds so a batch of
+extracts can summarize what went wrong instead of surfacing opaque
+"An exception was thrown" / xlmain11.chm references.
+
+pywintypes.com_error is not available cross-platform; the tests pass a
+plain Exception whose args match com_error's shape:
+(hresult, description, excepinfo, argerr) with excepinfo =
+(code, source, description, help_file, help_context, scode).
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from excel_open import (ExcelOpenError, _com_error_description,       # noqa: E402
+                        _com_error_hresult, classify_open_failure)
+from council_core.ledger_ingest import summarize_open_failures        # noqa: E402
+
+
+def _fake_com_error(hresult, description, excepinfo_desc=None,
+                    excepinfo_scode=None):
+    """Build an exception shaped like pywintypes.com_error."""
+    excepinfo = (0, "Microsoft Excel",
+                 excepinfo_desc or description,
+                 "xlmain11.chm", 0,
+                 excepinfo_scode if excepinfo_scode is not None else hresult)
+    exc = Exception(hresult, description, excepinfo, 0)
+    return exc
+
+
+# ------------------------------------------------------------- hresult extraction
+
+def test_extracts_hresult_from_the_excepinfo_scode_first(tmp_path):
+    """pywintypes.com_error puts the Excel-side code in excepinfo[5]."""
+    exc = _fake_com_error(-2146828218, "Call was rejected by callee",
+                          excepinfo_desc="file could not be opened",
+                          excepinfo_scode=-2146827284)
+    assert _com_error_hresult(exc) == -2146827284
+
+
+def test_falls_back_to_the_outer_hresult_when_no_excepinfo():
+    exc = Exception(-2147024891, "Access denied", None, 0)
+    assert _com_error_hresult(exc) == -2147024891
+
+
+def test_description_prefers_excepinfo_text():
+    exc = _fake_com_error(-2146827284, "outer text",
+                          excepinfo_desc="the file could not be opened")
+    assert _com_error_description(exc) == "the file could not be opened"
+
+
+# ------------------------------------------------------------- the common cases
+
+def test_the_cannot_open_hresult_becomes_the_corrupt_kind(tmp_path):
+    p = tmp_path / "weird.xls"
+    p.write_bytes(b"<html>...</html>")
+    exc = _fake_com_error(-2146827284, "the file could not be opened")
+    err = classify_open_failure(exc, p)
+    assert isinstance(err, ExcelOpenError)
+    assert err.kind == "corrupt"
+    msg = str(err)
+    assert "weird.xls" in msg
+    assert "corrupt" in msg.lower() or "Trust Center" in msg
+    # Diagnostic bytes present so a bug report has something to look at.
+    assert "size" in msg
+    assert "first bytes" in msg or "<unreadable>" in msg
+
+
+def test_access_denied_becomes_the_access_kind(tmp_path):
+    p = tmp_path / "locked.xlsx"
+    p.write_bytes(b"PK\x03\x04")
+    exc = _fake_com_error(-2147024891, "Access denied")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "access"
+    assert "access denied" in str(err).lower()
+
+
+def test_a_description_mentioning_password_becomes_the_password_kind(tmp_path):
+    p = tmp_path / "p.xlsx"
+    p.write_bytes(b"PK\x03\x04")
+    exc = Exception(-2146788248, "The password you supplied is not correct.")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "password"
+
+
+def test_a_description_mentioning_rights_becomes_the_rights_kind(tmp_path):
+    p = tmp_path / "irm.xlsx"
+    p.write_bytes(b"PK\x03\x04")
+    exc = Exception(-2147024671, "This file is rights-protected and cannot be opened.")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "rights"
+
+
+def test_a_timeout_wins_over_everything(tmp_path):
+    p = tmp_path / "slow.xlsx"
+    p.write_bytes(b"PK\x03\x04")
+    exc = _fake_com_error(-2146827284, "the file could not be opened")
+    err = classify_open_failure(exc, p, timeout=90, stopped=[True])
+    assert err.kind == "timeout"
+    assert "90 s" in str(err)
+
+
+def test_an_unknown_error_falls_back_with_diagnostic_bytes(tmp_path):
+    p = tmp_path / "mystery.xlsx"
+    p.write_bytes(b"PK\x03\x04\x14\x00\x00\x00")
+    exc = _fake_com_error(-123456789, "something strange happened")
+    err = classify_open_failure(exc, p)
+    assert err.kind == "unknown"
+    msg = str(err)
+    assert "hresult=-123456789" in msg
+    assert "504b030414000000" in msg       # first bytes rendered as hex
+    assert "size=" in msg
+
+
+# ------------------------------------------------------------- summary line
+
+def test_the_summary_counts_each_kind_once():
+    text = summarize_open_failures([
+        ("a.xlsx", "corrupt"),
+        ("b.xlsx", "rights"),
+        ("c.xlsx", "corrupt"),
+        ("d.xlsx", "corrupt"),
+        ("e.xlsx", "password"),
+    ])
+    assert text.startswith("5 files failed to open")
+    assert "3 corrupt / wrong format / blocked" in text
+    assert "1 rights-protected (IRM)" in text
+    assert "1 password-protected" in text
+
+
+def test_the_summary_omits_zero_count_kinds():
+    text = summarize_open_failures([("a.xlsx", "timeout")])
+    assert "timed out" in text
+    assert "password" not in text
+    assert "rights" not in text
+
+
+def test_an_empty_batch_summary_is_the_header_only():
+    text = summarize_open_failures([])
+    assert "0 files failed to open" in text

@@ -41,7 +41,7 @@ from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers, amp
-from .connections_dialogs import FieldsDialog
+from .connections_dialogs import FieldsDialog, FoldersDialog
 
 TYPE_FILTERS = (("Everything", None), ("People", "PERSON"),
                 ("Parts", "PART"), ("Projects", "PROJECT"))
@@ -55,8 +55,33 @@ PHRASES = {
     "USES_PART": ("uses part", "used in"),
     "SUPERSEDES": ("supersedes", "superseded by"),
     "DOCUMENTED_IN": ("documents (Collection)", "in Collection of"),
+    "INSPECTED": ("inspected", "inspected by"),
 }
 TYPE_ICON = {"PERSON": "👤", "PART": "⚙", "PROJECT": "📁", "DOCUMENT": "📄"}
+
+#: How a piece of evidence from a spreadsheet was found, in words (the
+#: older methods - row, record, document, model ... - show as they always
+#: have).
+METHOD_WORDS = {
+    "ledger": "Ledger row (accepted)", "sheet": "workbook cell",
+    "picture": "picture (OCR)",
+}
+#: The tree shows this much of a big neighbourhood; the rest is counted
+#: ("… and 87 more"). An inspector of 3,000 parts has 3,000 links, each
+#: with a row per flaw: drawing every one froze the tab.
+EVIDENCE_SHOWN = 20
+RELATIONS_SHOWN = 300
+MENTIONS_SHOWN = 200
+#: The answer that means "a person not listed: type their name".
+NEW_PERSON = "__new_person__"
+#: A file at least this big is previewed on a worker thread, as every
+#: workbook is: the preview of row 59,990 of a Ledger took 2.4 s on the GUI
+#: thread (review, 2026-10-16).
+PREVIEW_ASYNC_BYTES = 1 << 20
+
+
+def method_words(method: str) -> str:
+    return METHOD_WORDS.get(method, method)
 
 ROLE_KIND = Qt.ItemDataRole.UserRole          # 'entity' | 'relation' | 'evidence' | 'mention'
 ROLE_DATA = Qt.ItemDataRole.UserRole + 1
@@ -91,16 +116,17 @@ class ConnectionsActions:
     def open_graph(self) -> kgm.KnowledgeGraph:
         return kgm.KnowledgeGraph(self.vault_dir, self.root)
 
-    def rebuild(self, on_progress=None) -> Dict[str, Any]:
+    def rebuild(self, on_progress=None, listener=None) -> Dict[str, Any]:
+        """The rebuild; its progress lines also go to the terminal."""
         with self.open_graph() as kg:
-            return kg.seed(on_progress=on_progress)
+            return kg.seed(on_progress=on_progress, listener=listener)
 
     def label_suggestions(self) -> List[Dict[str, Any]]:
         with self.open_graph() as kg:
             return kg.suggest_label_synonyms()
 
-    def context(self, rel_path: str, locator: Any):
-        return kgm.source_context(self.root, rel_path, locator)
+    def context(self, rel_path: str, locator: Any, quote: str = ""):
+        return kgm.source_context(self.root, rel_path, locator, quote=quote)
 
     # -- free-text suggestions (KG2) --
     def local_models(self) -> List[str]:
@@ -173,7 +199,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
                  auto_refresh: bool = True, ask_string=None, ask_yes_no=None,
-                 ask_choice=None):
+                 ask_choice=None, ask_folder=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -188,6 +214,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.ask_string = ask_string or _dialogs.askstring
         self.ask_yes_no = ask_yes_no or _dialogs.askyesno
         self.ask_choice = ask_choice or _dialogs.askchoice
+        # askdirectory itself does not look at COUNCIL_NO_DIALOGS: offscreen
+        # it would wait on a file dialog nobody can see.
+        self.ask_folder = ask_folder or (lambda: None if _dialogs.disabled() else
+                                         _dialogs.askdirectory(
+                                             "Add a folder for the graph to read",
+                                             parent=self))
         self._build()
         if auto_refresh:
             self._reopen()
@@ -213,6 +245,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         self.answers_btn = self._button(row, "Your answers", self.on_answers)
+        self.sources_btn = self._button(row, "Spreadsheets", self.on_sources)
+        self.folders_btn = self._button(row, "Folders…", self.on_folders)
         outer.addLayout(row)
 
         srow = QHBoxLayout()
@@ -298,6 +332,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self._kg = None
         try:
             self._kg = self.actions.open_graph()
+        except kgm.KnowledgeGraphBusy as exc:
+            # held by a rebuild elsewhere (the agent's tools, another
+            # window): not damage - the buttons stay, try again shortly
+            self.status.setText(f"{str(exc)[0].upper()}{str(exc)[1:]}.")
+            return
         except kgm.KnowledgeGraphDamaged as exc:
             self.status.setText(str(exc))
             self.rebuild_btn.setEnabled(False)
@@ -333,6 +372,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if skipped:
             text += (f" ROWS NOT READ: {len(skipped)} — " + "; ".join(skipped[:3])
                      + (" …" if len(skipped) > 3 else ""))
+        if cov.get("ledgers") or cov.get("workbooks"):
+            text += (f" Spreadsheets: {cov.get('ledgers', 0)} Ledger(s), "
+                     f"{cov.get('workbooks', 0)} workbook(s)")
+            if cov.get("pictures"):
+                text += (f", {cov.get('pictures_read', 0)} of {cov['pictures']} "
+                         "picture(s) read")
+            text += " (Spreadsheets… says what each gave)."
         if not confirmed:
             text += " No field labels are ticked yet (Fields…)."
         self.coverage.setText(text)
@@ -381,7 +427,15 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status.setText(f"{TYPE_ICON.get(ent['type'], '')} {display_name(ent)}"
                             + (f"   also written: {', '.join(aliases)}" if aliases else ""))
         groups: Dict[str, QTreeWidgetItem] = {}
-        for n in kg.neighbors(eid):
+        shown: Dict[str, int] = {}
+        hidden: Dict[str, int] = {}
+        # Only what is drawn is looked up; the rest of each kind is counted.
+        for (pred, direction), k in kg.neighbor_counts(eid).items():
+            if k > RELATIONS_SHOWN:
+                label = phrase(pred, direction)
+                hidden[label] = hidden.get(label, 0) + k - RELATIONS_SHOWN
+        for n in kg.neighbors(eid, evidence_limit=EVIDENCE_SHOWN,
+                              relation_limit=RELATIONS_SHOWN):
             label = phrase(n["predicate"], n["direction"])
             g = groups.get(label)
             if g is None:
@@ -392,11 +446,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 g.setFont(0, f)
                 self.tree.addTopLevelItem(g)
                 groups[label] = g
+            shown[label] = shown.get(label, 0) + 1
             other = n["other"] or {}
             icon = TYPE_ICON.get(other.get("type", ""), "")
             name = display_name(other) if other.get("type") != "DOCUMENT" else other.get("name", "")
-            r_item = QTreeWidgetItem([f"{icon} {name}", n["status"],
-                                      f"{len(n['evidence'])} source(s)"])
+            total = n.get("evidence_total", len(n["evidence"]))
+            r_item = QTreeWidgetItem([f"{icon} {name}", n["status"], f"{total} source(s)"])
             r_item.setData(0, ROLE_KIND, "relation")
             r_item.setData(0, ROLE_DATA, n)
             if n["status"] == "suggested":
@@ -405,27 +460,36 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 r_item.setForeground(1, QColor(self._tokens["success"]))
             g.addChild(r_item)
             for ev in n["evidence"]:
-                e_item = QTreeWidgetItem([ev["quote"], ev["method"]
+                e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"])
                                           + (" (changed since)" if ev["stale"] else ""),
-                                          f"{ev['path']} · {ev['where']}"])
+                                          f"{ev.get('file', ev['path'])} · {ev['where']}"])
                 e_item.setToolTip(0, ev["quote"])
                 e_item.setData(0, ROLE_KIND, "evidence")
                 e_item.setData(0, ROLE_DATA, ev)
                 r_item.addChild(e_item)
-        mentions = kg.mentions(eid)
+            if total > len(n["evidence"]):
+                r_item.addChild(QTreeWidgetItem(
+                    [f"… and {total - len(n['evidence'])} more (all in the export)", "", ""]))
+        for label, k in hidden.items():
+            groups[label].addChild(QTreeWidgetItem([f"… and {k} more", "", ""]))
+        n_mentions = kg.mention_count(eid)
+        mentions = kg.mentions(eid, limit=MENTIONS_SHOWN)
         if mentions:
-            g = QTreeWidgetItem([f"mentioned in ({len(mentions)})", "", ""])
+            g = QTreeWidgetItem([f"mentioned in ({n_mentions})", "", ""])
             f = g.font(0)
             f.setBold(True)
             g.setFont(0, f)
             self.tree.addTopLevelItem(g)
             for m in mentions:
-                m_item = QTreeWidgetItem([m["snippet"], m["method"],
-                                          f"{m['path']} · {m['where']}"])
+                m_item = QTreeWidgetItem([m["snippet"], method_words(m["method"]),
+                                          f"{m.get('file', m['path'])} · {m['where']}"])
                 m_item.setToolTip(0, m["snippet"])
                 m_item.setData(0, ROLE_KIND, "mention")
                 m_item.setData(0, ROLE_DATA, m)
                 g.addChild(m_item)
+            if n_mentions > len(mentions):
+                g.addChild(QTreeWidgetItem([f"… and {n_mentions - len(mentions)} more",
+                                            "", ""]))
         for i in range(self.tree.topLevelItemCount()):
             self.tree.topLevelItem(i).setExpanded(True)
         self._selected = None
@@ -443,10 +507,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kind == "question":
             self._fill_answers(data["review"])
         if kind in ("evidence", "mention", "question"):
-            self._preview(data["path"], data["locator"], data.get("where", ""))
+            self._preview(data["path"], data["locator"], data.get("where", ""),
+                          data.get("quote") or data.get("snippet") or "")
         elif kind == "relation" and data.get("evidence"):
             ev = data["evidence"][0]
-            self._preview(ev["path"], ev["locator"], ev["where"])
+            self._preview(ev["path"], ev["locator"], ev["where"], ev.get("quote", ""))
+        elif kind == "source":
+            self._show_source(data)
         self._enable_actions()
 
     def _on_tree_double(self, item, _col=0) -> None:
@@ -456,10 +523,39 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if other.get("id") and other.get("type") != "DOCUMENT":
             self.show_entity(other["id"])
 
-    def _preview(self, rel_path: str, locator: Any, where: str) -> None:
-        lines = self.actions.context(rel_path, locator)
-        self.preview_title.setText(f"{rel_path} · {where}")
+    #: Workbooks are previewed on a worker: openpyxl streams to the cited row,
+    #: which for row 90,000 of a big sheet takes seconds.
+    _WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+
+    def _preview(self, rel_path: str, locator: Any, where: str, quote: str = "") -> None:
+        if not rel_path:
+            return
+        shown = self._kg.display_path(rel_path) if self._kg is not None else rel_path
+        self.preview_title.setText(f"{shown} · {where}")
         self._preview_path = rel_path
+        self._preview_token = token = object()
+        disk = self._disk(rel_path)
+        try:
+            big = (Path(self.actions.root) / disk).stat().st_size >= PREVIEW_ASYNC_BYTES
+        except OSError:
+            big = False
+        if Path(rel_path).suffix.lower() not in self._WORKBOOK_SUFFIXES and not big:
+            self._show_preview(token, self.actions.context(disk, locator, quote))
+            return
+        self.preview.setPlainText("Reading the file…")
+
+        def work() -> None:
+            try:
+                lines = self.actions.context(disk, locator, quote)
+            except Exception:                             # noqa: BLE001
+                lines = []
+            self._to_ui(self._show_preview, token, lines)
+
+        threading.Thread(target=work, name="kg-preview", daemon=True).start()
+
+    def _show_preview(self, token, lines) -> None:
+        if token is not getattr(self, "_preview_token", None):
+            return                       # another spot was clicked meanwhile
         if not lines:
             self.preview.setPlainText("(this spot could not be read)")
             return
@@ -467,12 +563,21 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.preview.setPlainText("\n".join(
             f"{'▶' if hit else ' '} {g.rjust(width)} │ {t}" for g, t, hit in lines))
 
+    def _show_source(self, data: Dict[str, Any]) -> None:
+        self._preview_path = data.get("path")
+        self._preview_token = None
+        self.preview_title.setText(data.get("file") or data.get("path", ""))
+        body = [data.get("text", "")]
+        if data.get("notes"):
+            body += ["", "Notes:"] + [f"  • {n}" for n in data["notes"]]
+        self.preview.setPlainText("\n".join(body))
+
     def _enable_actions(self) -> None:
         cur = self._kg.entity(self._current) if (self._kg and self._current) else None
         self.merge_btn.setEnabled(bool(cur and cur["type"] != "DOCUMENT"))
         self.split_btn.setEnabled(bool(cur and self._kg.merged_into_me(self._current)))
         sel = self._selected or {}
-        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question")
+        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question", "source")
         self.open_btn.setEnabled(bool(has_file and getattr(self, "_preview_path", None)))
         is_rel = sel.get("kind") == "relation"
         status = (sel.get("data") or {}).get("status") if is_rel else None
@@ -486,7 +591,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if not path:
             return
         try:
-            self.actions.open_file(path)
+            self.actions.open_file(self._disk(path))
         except Exception as exc:                          # noqa: BLE001
             self.status.setText(f"Could not open {path}: {exc}")
 
@@ -512,28 +617,58 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self._kg.close()
             self._kg = None
 
+        self._rebuild_token = token = object()
+
         def progress(i: int, n: int) -> None:
-            if i % 25 == 0:
-                self._to_ui(self.status.setText, f"Reading the documents… {i} of {n}")
+            pass                     # the progress lines below say more
+
+        def line(text: str, _fraction) -> None:
+            # 'reading documents: 40/200 files (20%) · x.xlsx read · 0:12',
+            # and 'still working …' while nothing moves (the terminal gets
+            # the same lines)
+            self._to_ui(self._progress_line, token, text)
 
         def work() -> None:
             try:
-                stats = self.actions.rebuild(progress)
+                stats = self.actions.rebuild(progress, listener=line)
                 self._to_ui(self._rebuilt, stats, None)
             except Exception as exc:                      # noqa: BLE001
                 self._to_ui(self._rebuilt, None, exc)
 
         threading.Thread(target=work, name="kg-rebuild", daemon=True).start()
 
+    def _progress_line(self, token, text: str) -> None:
+        # Only while THIS rebuild runs: a line that arrives after it ended
+        # (the reporter's heartbeat can fire once more) must not hide the
+        # result.
+        if self._busy and token is getattr(self, "_rebuild_token", None):
+            self.status.setText(f"Rebuilding: {text}")
+
     def _rebuilt(self, stats: Optional[Dict[str, Any]], exc: Optional[BaseException]) -> None:
         self._busy = False
+        self._rebuild_token = None
         self.rebuild_btn.setEnabled(True)
         self._reopen()
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")
             return
-        self.status.setText(f"Rebuilt from {stats['documents']} document(s) in "
-                            f"{stats.get('seconds', 0):.1f} s.")
+        from council_core import knowledge_graph as kgm
+        self.status.setText(kgm.rebuild_summary_line(stats))
+        # The first few unreadable entries also go to the tooltip, where
+        # the user can hover without having to scroll a dialog.
+        reasons = stats.get("unreadable") or []
+        if reasons:
+            preview = "\n".join(reasons[:12])
+            if len(reasons) > 12:
+                preview += f"\n…and {len(reasons) - 12} more."
+            self.status.setToolTip("Unreadable files:\n" + preview)
+            # Also print the full list to the terminal so a Barbie / Pi
+            # run that bypasses the UI still has it.
+            print("[kg-rebuild] unreadable files:", flush=True)
+            for line in reasons:
+                print(f"  {line}", flush=True)
+        else:
+            self.status.setToolTip("")
         self.on_search()
         if self._current:
             self.show_entity(self._current)
@@ -675,14 +810,96 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status.setText(f"{len(reviews)} open question(s).")
         for r in reviews:
             names = " or ".join(display_name(c) for c in r["candidates"] if c)
-            q = (f"Is '{r['surface']}' {names}?" if r["kind"] == "ambiguous_name"
-                 else f"'{r['surface']}' was read as {names} — right?")
+            if r["kind"] == "initials":
+                # An inspector's initials no Ledger people list names: asked
+                # once, whatever number of rows they signed.
+                q = f"Who is '{r['surface']}'?" + (f" Perhaps {names}." if names else "")
+                q += f"  ({r['snippet']})" if r.get("snippet") else ""
+            elif r["kind"] == "ambiguous_name":
+                q = f"Is '{r['surface']}' {names}?"
+            else:
+                q = f"'{r['surface']}' was read as {names} — right?"
             item = QTreeWidgetItem([q, r["kind"].replace("_", " "),
-                                    f"{r['path']} · {r['where']}"])
+                                    f"{r.get('file') or r['path']} · {r['where']}"])
+            item.setToolTip(0, q)
             item.setData(0, ROLE_KIND, "question")
             item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
                                         "where": r["where"], "review": r})
             self.tree.addTopLevelItem(item)
+
+    def on_folders(self) -> None:
+        """Folders outside the vault for the graph to read as well (read
+        only), kept per vault in the graph's store."""
+        if self._kg is None or self._busy:
+            return
+        dlg = FoldersDialog(str(self.actions.root), self._kg.extra_roots(),
+                            self.add_folder, self.remove_folder, self.ask_folder, self)
+        self._folders_dialog = dlg          # tests reach it here
+        dlg.exec()
+        if dlg.changed:
+            self.status.setText("Folders changed. Rebuild to read them.")
+
+    def add_folder(self, path: str) -> str:
+        """'' when added, else why not (in words)."""
+        if self._kg is None:
+            return "The graph is not open."
+        try:
+            self._kg.add_root(path)
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    def remove_folder(self, rid: str) -> str:
+        if self._kg is None:
+            return "The graph is not open."
+        try:
+            self._kg.remove_root(rid)
+        except KeyError:
+            return "That folder is not in the list."
+        return ""
+
+    def _disk(self, rel: str) -> str:
+        """What actions.context / open_file get for a document: its path
+        relative to data_in, or, for an added folder's document, where it
+        is on disk (they resolve it against data_in, and an absolute path
+        wins)."""
+        if self._kg is not None and str(rel or "").startswith("<"):
+            return str(self._kg.abs_path(rel))
+        return rel
+
+    def on_sources(self) -> None:
+        """The spreadsheets the graph read - each Ledger (parent CSV) and
+        workbook, what reading it gave, and the ones it could not read, with
+        why - in plain words. Select one for its notes."""
+        if self._kg is None:
+            return
+        self.tree.clear()
+        self._current = None
+        self._selected = None
+        sources = self._kg.sources()
+        self.status.setText(f"{len(sources)} spreadsheet(s). Select one to see what "
+                            "reading it gave.")
+        groups: Dict[str, QTreeWidgetItem] = {}
+        for title, key in (("Ledgers (parent CSVs: values you accepted)", "ledger"),
+                           ("Workbooks", "workbook"), ("Not read", "bad")):
+            g = QTreeWidgetItem([title, "", ""])
+            g.setFirstColumnSpanned(True)
+            f = g.font(0)
+            f.setBold(True)
+            g.setFont(0, f)
+            groups[key] = g
+        for s in sources:
+            key = "bad" if s["status"] != "ok" else s["kind"]
+            item = QTreeWidgetItem([s["text"], s["kind"], s.get("file", s["path"])])
+            item.setToolTip(0, s["text"])
+            item.setData(0, ROLE_KIND, "source")
+            item.setData(0, ROLE_DATA, s)
+            groups.get(key, groups["workbook"]).addChild(item)
+        for g in groups.values():
+            if g.childCount():
+                self.tree.addTopLevelItem(g)
+                g.setExpanded(True)
+        self._enable_actions()
 
     # -- KG3 ---------------------------------------------------------------
     def _fill_answers(self, review) -> None:
@@ -690,8 +907,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         for c in review["candidates"]:
             if c:
                 self.answer_box.addItem(display_name(c), c["id"])
-        self.answer_box.addItem("Neither — a different person", None)
-        self.everywhere_box.setChecked(review["kind"] == "inferred_alias")
+        if review["kind"] == "initials":
+            self.answer_box.addItem("Someone else — type their name…", NEW_PERSON)
+            self.answer_box.addItem(f"Keep '{review['surface']}' as a person of their own",
+                                    None)
+        else:
+            self.answer_box.addItem("Neither — a different person", None)
+        self.everywhere_box.setChecked(review["kind"] in ("inferred_alias", "initials"))
 
     def on_answer(self) -> None:
         sel = self._selected or {}
@@ -699,8 +921,20 @@ class ConnectionsTab(ViewHelpers, QWidget):
             return
         review = sel["data"]["review"]
         eid = self.answer_box.currentData()
-        self._kg.answer_review(review["id"], eid, everywhere=self.everywhere_box.isChecked())
         who = self.answer_box.currentText()
+        if eid == NEW_PERSON:
+            name = self.ask_string("Who is it?", f"Whose initials are '{review['surface']}'? "
+                                   "Type their full name:", parent=self)
+            name = " ".join(str(name or "").split())
+            if not name:
+                return
+            try:
+                eid = self._kg.add_person(name)
+            except ValueError as exc:
+                self.status.setText(str(exc))
+                return
+            who = name
+        self._kg.answer_review(review["id"], eid, everywhere=self.everywhere_box.isChecked())
         self.answer_row.setVisible(False)
         self.status.setText(f"'{review['surface']}' is {who}"
                             + (" everywhere" if self.everywhere_box.isChecked() else

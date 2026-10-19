@@ -29,8 +29,21 @@ _spec = importlib.util.spec_from_file_location("mcp_fixture_server", FIXTURE)
 fixture_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixture_mod)
 
+#: How long a call whose test is NOT about time may wait for its answer —
+#: patience, never a claim: an answer that comes ends the wait at once, so
+#: this costs nothing unless something is broken. It was 5 s (HTTP) and 10 s
+#: (stdio), and the whole suite, 8 files at a time on a busy PC, failed
+#: tests about headers and event streams with "initialize got no answer
+#: within 5 s" (2026-10-15) — a loopback request on this PC passes through a
+#: network filter (the one that rewrites POST /mcp replies, see
+#: mcp_client.unmangle), measured at 13 ms quiet and up to 430 ms with the
+#: CPUs busy, and a refused loopback connect, 2 s on Windows, went past 3 s.
+#: The tests that ARE about time (a 0.4 s timeout, Stop within one poll,
+#: close within 3.5 s) keep their own bounds.
+PATIENCE = 60.0
 
-def stdio(*flags, timeout=10.0) -> mc.McpClient:
+
+def stdio(*flags, timeout=PATIENCE) -> mc.McpClient:
     return mc.McpClient.stdio(sys.executable, [str(FIXTURE), *flags],
                               timeout=timeout)
 
@@ -64,7 +77,7 @@ def test_an_unknown_version_is_refused_and_the_process_released():
         c.connect()
     assert "1999-01-01" in str(err.value)
     proc = c.transport.proc
-    proc.wait(timeout=5)
+    proc.wait(timeout=PATIENCE)
     assert proc.poll() is not None, "a refused server was left running"
 
 
@@ -295,7 +308,7 @@ class HttpFixture:
 
                 def ask_client(request):
                     self._event(request)
-                    deadline = time.monotonic() + 3
+                    deadline = time.monotonic() + PATIENCE / 2
                     with fx_owner.cond:
                         while request["id"] not in fx_owner.client_replies:
                             left = deadline - time.monotonic()
@@ -338,7 +351,7 @@ def http_sse():
 
 
 def test_http_carries_the_session_and_version_headers(http_json):
-    c = mc.McpClient.http(http_json.url, timeout=5).connect()
+    c = mc.McpClient.http(http_json.url, timeout=PATIENCE).connect()
     tools = c.list_tools()
     assert len(tools) == len(fixture_mod.TOOLS)
     c.close()
@@ -353,21 +366,21 @@ def test_http_carries_the_session_and_version_headers(http_json):
 
 
 def test_http_event_stream_answers_and_server_requests(http_sse):
-    with mc.McpClient.http(http_sse.url, timeout=5).connect() as c:
+    with mc.McpClient.http(http_sse.url, timeout=PATIENCE).connect() as c:
         assert c.call_tool("echo", {"x": 1}).text == '{"x": 1}'
         assert c.call_tool("ping_me").text == "pong ok"
         assert any(entry.get("data") == "working on it" for entry in c.log)
 
 
 def test_http_timeout_cancels_on_the_server(http_json):
-    with mc.McpClient.http(http_json.url, timeout=5).connect() as c:
+    with mc.McpClient.http(http_json.url, timeout=PATIENCE).connect() as c:
         t0 = time.monotonic()
         with pytest.raises(mc.McpTimeout):
             c.call_tool("slow", {"seconds": 5}, timeout=0.4)
         assert time.monotonic() - t0 < 1.5
         # The cancel is posted off the caller's thread (a wedged server must
         # not hold Stop up), so it may land a moment after the timeout.
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + PATIENCE / 2
         seen = []
         while not seen and time.monotonic() < deadline:
             seen = json.loads(c.call_tool("cancellations").text)
@@ -376,7 +389,7 @@ def test_http_timeout_cancels_on_the_server(http_json):
 
 
 def test_http_session_expiry_is_explained(http_json):
-    with mc.McpClient.http(http_json.url, timeout=5).connect() as c:
+    with mc.McpClient.http(http_json.url, timeout=PATIENCE).connect() as c:
         http_json.expire = True
         with pytest.raises(mc.McpConnectionError) as err:
             c.list_tools()
@@ -447,7 +460,7 @@ def test_both_framings_of_a_chunked_reply_are_read(framing):
     real one is what Go and uvicorn send for large bodies."""
     server = RawServer(framing)
     try:
-        with mc.McpClient.http(server.url, timeout=5).connect() as c:
+        with mc.McpClient.http(server.url, timeout=PATIENCE).connect() as c:
             assert len(c.list_tools()) == len(fixture_mod.TOOLS)
             assert c.call_tool("echo", {"k": "v"}).text == '{"k": "v"}'
     finally:
@@ -480,7 +493,9 @@ def test_http_nothing_listening_is_a_sentence():
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
-    c = mc.McpClient.http(f"http://127.0.0.1:{port}/mcp", timeout=3)
+    # Patience: Windows retries a refused loopback connect for about 2 s
+    # before it says so; the sentence is the claim, not the time.
+    c = mc.McpClient.http(f"http://127.0.0.1:{port}/mcp", timeout=PATIENCE)
     with pytest.raises(mc.McpConnectionError) as err:
         c.connect()
     assert "Nothing is listening" in str(err.value)

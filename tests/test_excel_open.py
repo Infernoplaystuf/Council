@@ -257,18 +257,47 @@ real_excel = pytest.mark.skipif(not excel_open.excel_available(),
                                 reason="no Excel automation here (Windows + Excel + pywin32)")
 
 
-def _excel_count() -> int:
+def _record_excel_pids(monkeypatch) -> list:
+    """The process id of every hidden Excel started from now on in this
+    process — win32com.client.DispatchEx wrapped (excel_open and
+    ledger_bench both import it when they start one), each instance's
+    process read from its window, as excel_open._watchdog does.
+
+    BY PROCESS ID, NOT BY COUNTING EXCEL.EXE. The test counted every
+    EXCEL.EXE on the PC against the count before it, and a whole-suite run
+    8 files at a time failed it with "assert 3 <= 0" (2026-10-18):
+    tests/test_ledger_bench.py was building its workbooks in Excel at the
+    same time, in another process. Whether THIS test's Excels were closed
+    is the claim, so they are the ones looked for."""
+    import win32com.client
+    import win32process
+    real = win32com.client.DispatchEx
+    pids: list = []
+
+    def recording(*args, **kwargs):
+        app = real(*args, **kwargs)
+        try:
+            pids.append(int(win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]))
+        except Exception as exc:                 # an Excel this test cannot follow
+            pids.append(repr(exc))
+        return app
+    monkeypatch.setattr(win32com.client, "DispatchEx", recording)
+    return pids
+
+
+def _excel_running(pid: int) -> bool:
     import subprocess
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE"], capture_output=True,
+    out = subprocess.run(["tasklist", "/NH", "/FI", f"PID eq {pid}",
+                          "/FI", "IMAGENAME eq EXCEL.EXE"], capture_output=True,
                          text=True).stdout
-    return out.count("EXCEL.EXE")
+    return "EXCEL.EXE" in out.upper()
 
 
 @real_excel
-def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path):
+def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path, monkeypatch):
     from ledger_bench import _excel_save
     from source_extract import LedgerError, load_workbook_grids
-    before = _excel_count()
+    started = _record_excel_pids(monkeypatch)
     wb = openpyxl.Workbook()
     wb.active["A1"], wb.active["B1"] = "Power (W)", 285
     wb.save(tmp_path / "s.xlsx")
@@ -305,9 +334,12 @@ def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path):
     _excel_save(tmp_path / "s.xlsx", tmp_path / "pw.xlsx", 51, password="x")
     with pytest.raises(LedgerError, match="password to open"):
         load_workbook_grids(tmp_path / "pw.xlsx")
+    # every hidden Excel this test started was closed
+    assert len(started) >= 4 and all(isinstance(p, int) for p in started), started
     import time                                         # Excel takes a moment to exit
     for _ in range(40):
-        if _excel_count() <= before:
+        if not any(_excel_running(p) for p in started):
             break
         time.sleep(0.5)
-    assert _excel_count() <= before                     # every hidden Excel was closed
+    left = [p for p in started if _excel_running(p)]
+    assert not left, f"{len(left)} of the {len(started)} hidden Excels left running: {left}"

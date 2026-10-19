@@ -68,10 +68,10 @@ def test_extract_then_apply_summaries(books):
     seen = []
     s = ledger_ingest.run_extract(csv, [src], tmp / "review.xlsx",
                                   image_reader=fake_reader(CONCEALMENT_IMAGE_ROWS),
-                                  progress=seen.append)
+                                  progress=lambda line, frac: seen.append(line))
     assert s.files == 3 and s.images == 1 and s.images_read == 1
     assert s.values == s.pre_accepted + s.to_review and s.pre_accepted > 0 and s.to_review > 0
-    assert "reading image 1…" in seen
+    assert any(line.startswith("reading workbooks: 3/3 workbooks (100%)") for line in seen)
     assert (tmp / "review.xlsx").exists() and (tmp / "review_images").is_dir()
     assert "values found" in s.describe()
 
@@ -162,3 +162,21 @@ def test_tools_refuse_paths_outside_their_roots(policy, books):
     r = ex({"csv": "parent.csv", "sources": ["."]}, policy)
     with pytest.raises(PermissionError):
         ap({"review": Path(r["review"]).name, "fill_dir": str(tmp)}, policy)
+
+
+def test_extract_and_apply_report_progress_in_the_terminal(books, capsys):
+    template, src, tmp = books
+    csv = ledger_ingest.create_parent(template).csv
+    heard = []
+    ledger_ingest.run_extract(csv, [src], tmp / "review.xlsx", use_images=False,
+                              progress=lambda line, frac: heard.append((line, frac)))
+    err = capsys.readouterr().err
+    assert "[ledger extract] reading workbooks: 0/3 workbooks (0%)" in err
+    assert "[ledger extract] reading workbooks: 3/3 workbooks (100%)" in err
+    assert "[ledger extract] done in" in err
+    assert any(f == 1.0 for _, f in heard)
+    ledger_ingest.run_apply(tmp / "review.xlsx", tmp / "filled", use_images=False)
+    err = capsys.readouterr().err
+    assert "[ledger apply] reading workbooks: 3/3 workbooks (100%)" in err
+    assert "[ledger apply] filling templates: 2/2 parts (100%)" in err
+    assert "[ledger apply] done in" in err

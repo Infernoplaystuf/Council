@@ -68,6 +68,7 @@ TYPHON_FILES = (
     "tests/test_capture.py",
     "tests/test_capture_data_safety.py",
     "tests/test_capture_review.py",
+    "tests/test_capture_review_order.py",   # from qt-migration (c768e59)
     "tests/test_capture_tab.py",
     "tests/test_fast_png.py",
     "tests/test_event_playback.py",

@@ -31,8 +31,9 @@ from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (ImageReader, apply_review, decide, default_image_reader,
                             extract, load_aliases, workbook_files, write_review)
 
-#: progress(message) — called from the worker thread; the caller hops to its UI.
-Progress = Callable[[str], None]
+#: listener(line, fraction or None) - called from the worker thread with every
+#: progress line (also printed in the terminal); the caller hops to its UI.
+Listener = Callable[[str, Optional[float]], None]
 
 
 def default_csv_for(template) -> Path:
@@ -46,8 +47,10 @@ def default_review_for(csv_path) -> Path:
 
 
 def collect_sources(paths: Sequence) -> List[Path]:
-    """Files as given; a folder means every workbook in it (.xlsx, .xlsm,
-    .xls, .xlsb; not Excel's ~$ lock files). Duplicates dropped, order kept."""
+    """Files as given; a folder means every workbook UNDER it, recursively
+    (.xlsx, .xlsm, .xls, .xlsb; not Excel's ~$ lock files, and hidden /
+    ``~$`` folders at every depth are pruned). Duplicates dropped, order
+    kept."""
     out: List[Path] = []
     for s in paths:
         p = Path(s)
@@ -97,27 +100,66 @@ class ExtractSummary:
     images: int
     images_read: int
     problems: List[str] = field(default_factory=list)
+    #: One ``(filename, kind)`` per workbook Excel refused to open, so the
+    #: Ledger log can show a breakdown at the end of a batch.
+    open_failures: List[Any] = field(default_factory=list)
+    #: Per-workbook ``(name, seconds)`` wall-clock timings. The log
+    #: appends the slowest few so a user can pinpoint which workbook
+    #: ate the hour.
+    timings: List[Any] = field(default_factory=list)
+    #: True when the extract exited early via the Ledger tab's Cancel
+    #: event. The caller shows a "Cancelled" status instead of "Done".
+    cancelled: bool = False
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
              f"images read")
+        if self.cancelled:
+            s = "CANCELLED — " + s
+        if self.open_failures:
+            s += "\n" + summarize_open_failures(self.open_failures)
+        if self.timings:
+            s += "\n" + summarize_slowest(self.timings)
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
-def _counting(reader: Optional[ImageReader], progress: Optional[Progress]):
-    """Wrap the image reader so each image is reported as it is read."""
-    if reader is None or progress is None:
-        return reader
-    n = [0]
+_OPEN_FAILURE_LABELS = {
+    "password": "password-protected",
+    "rights": "rights-protected (IRM)",
+    "corrupt": "corrupt / wrong format / blocked",
+    "timeout": "timed out (sign-in prompt?)",
+    "access": "access denied",
+    "unavailable": "Excel COM not available",
+    "unknown": "unknown reason",
+    "other": "other error",
+}
 
-    def read(data: bytes):
-        n[0] += 1
-        progress(f"reading image {n[0]}…")
-        return reader(data)
-    read.name = getattr(reader, "name", "image reader")
-    return read
+
+def summarize_open_failures(open_failures) -> str:
+    """A one-line roll-up for the Ledger log."""
+    from collections import Counter
+    counts = Counter(k for _n, k in open_failures)
+    parts = [f"{counts[k]} {label}" for k, label in _OPEN_FAILURE_LABELS.items()
+             if counts.get(k)]
+    return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
+
+
+def summarize_slowest(timings, top: int = 5) -> str:
+    """A one-line roll-up of the slowest workbooks in a batch — the
+    "What's slow?" line the Ledger log appends so a 20-minute extract's
+    hot spots are obvious without scrolling the terminal.
+
+    ``timings`` is ``[(name, seconds), ...]``; the ``top`` slowest are
+    rendered in descending order."""
+    if not timings:
+        return ""
+    ranked = sorted(timings, key=lambda t: -float(t[1]))[:max(1, int(top))]
+    total = sum(float(s) for _n, s in timings)
+    parts = ", ".join(f"{n} {s:.1f}s" for n, s in ranked)
+    return (f"Slowest {len(ranked)} of {len(timings)} workbooks "
+            f"({total:.1f}s total): {parts}")
 
 
 def _images_read(notes) -> int:
@@ -127,8 +169,23 @@ def _images_read(notes) -> int:
 
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
-                progress: Optional[Progress] = None) -> ExtractSummary:
-    say = progress or (lambda _m: None)
+                progress: Optional[Listener] = None,
+                pattern_mask: Optional[str] = None,
+                cancel: Optional[Any] = None) -> ExtractSummary:
+    from progress_report import Progress
+    with Progress("ledger extract", listener=progress) as prog:
+        s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
+                     prog, pattern_mask, cancel)
+        tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
+        prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
+                    f"review, {tail}")
+        return s
+
+
+def _extract(csv_path, sources, review_path, part, use_images, image_reader,
+             prog, pattern_mask: Optional[str] = None,
+             cancel: Optional[Any] = None) -> ExtractSummary:
+    say = prog.update
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
         raise LedgerError(f"{Path(csv_path).name} has no schema beside it; "
@@ -147,15 +204,16 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     say(f"reading {len(files)} workbooks…")
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
-                  image_reader=_counting(image_reader, progress), part=part,
-                  use_images=use_images)
+                  image_reader=image_reader, part=part, use_images=use_images,
+                  progress=prog, pattern_mask=pattern_mask, cancel=cancel)
+    prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
-    say("writing the review workbook…")
     write_review(out, run, dec, ledger.schema, str(csv_path))
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),
-                          list(run.problems))
+                          list(run.problems), list(run.open_failures),
+                          list(run.timings), bool(run.cancelled))
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────
@@ -180,16 +238,17 @@ class ApplySummary:
 
 def run_apply(review_path, fill_dir=None, use_images: bool = True,
               image_reader: Optional[ImageReader] = None,
-              progress: Optional[Progress] = None) -> ApplySummary:
-    say = progress or (lambda _m: None)
-    if use_images and image_reader is None:
-        say("starting the local image reader…")
-        image_reader = default_image_reader()
-    say("applying the review…")
-    r = apply_review(review_path, fill_dir or None,
-                     image_reader=_counting(image_reader, progress), use_images=use_images)
-    return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
-                        list(r.ignored), list(r.filled), list(r.warnings))
+              progress: Optional[Listener] = None) -> ApplySummary:
+    from progress_report import Progress
+    with Progress("ledger apply", listener=progress) as prog:
+        if use_images and image_reader is None:
+            prog.update("starting the local image reader…")
+            image_reader = default_image_reader()
+        r = apply_review(review_path, fill_dir or None, image_reader=image_reader,
+                         use_images=use_images, progress=prog)
+        prog.finish(f"{r.accepted} values accepted -> {r.rows} rows: {r.csv_result}")
+        return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
+                            list(r.ignored), list(r.filled), list(r.warnings))
 
 
 def open_path(path) -> None:

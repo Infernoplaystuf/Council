@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1503,21 +1504,120 @@ def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
     (EvkDevice.restartable), so a slow node-map read after the switch made
     its frames part of the run. The simulated event camera restarts its
     stream like a frame camera — where the read comes then makes no
-    difference — so here it keeps it running, as the EVK4 does."""
+    difference — so here it keeps it running, as the EVK4 does.
+
+    JUDGED FRAME BY FRAME, NOT BY A COUNT TAKEN WHEN START RETURNS. It
+    asserted at most 2 frames grabbed when Start returned; but Start writes
+    the run's files AFTER the switch (the record, on purpose — a refused
+    Start leaves none), and on a busy PC that took 3-8 frames' time with
+    the read where it belongs (6 failures in 10 beside 14 busy processes;
+    2 whole-suite runs, 2026-10-15/16). Now every frame the camera sends
+    WHILE the slow read runs is followed into the session: not one may be
+    counted in the run, and the run's switch must come after the read."""
     connected("event")
     monkeypatch.setattr(device(), "restartable", False, raising=False)
     ticks(Viewer(), 0.3)
+    session = frame_camera._LIVE.session
+    reading = threading.Event()
+    read_done = threading.Event()
+    during = []               # per frame taken while reading: is it the run's?
+    switches = []             # per switch to a recorder: had the read ended?
+    real_record, real_switch = session._record, session.record_to
+
+    def record(frame):
+        # Called by the grab loop under the session's lock, in the same
+        # step the frame is counted (record_to's `reset` swaps both at once).
+        if reading.is_set():
+            during.append(session.writer is not None)
+        return real_record(frame)
+
+    def record_to(recorder, *args, **kwargs):
+        if recorder is not None:
+            switches.append(read_done.is_set())
+        return real_switch(recorder, *args, **kwargs)
+
+    monkeypatch.setattr(session, "_record", record)
+    monkeypatch.setattr(session, "record_to", record_to)
     real = frame_camera.settings_list
 
     def slow():
-        time.sleep(0.3)                     # a real camera's node map, slowly
-        return real()
+        reading.set()
+        try:
+            time.sleep(0.3)                 # a real camera's node map, slowly
+            # ...and long enough to see frames, however busy the PC.
+            deadline = time.monotonic() + 30
+            while len(during) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return real()
+        finally:
+            reading.clear()
+            read_done.set()
 
     monkeypatch.setattr(frame_camera, "settings_list", slow)
     frame_camera.start(str(tmp_path / "runs"))
-    grabbed = frame_camera._LIVE.session.stats().grabbed
     frame_camera.stop()
-    assert grabbed <= 2, f"{grabbed} frames of a slow read counted in the run"
+    assert len(during) >= 3, "the camera sent nothing during the read"
+    counted = sum(during)
+    assert counted == 0, (f"{counted} of the {len(during)} frames of a slow "
+                          f"read counted in the run")
+    assert switches == [True], f"the run began before the read ended: {switches}"
+
+
+def test_frames_sent_while_start_writes_the_record_are_the_runs(
+        tmp_path, monkeypatch):
+    """The other side of the test above — and why its old count failed in
+    the pylon env and on busy PCs while Typhon was right. Start WRITES the
+    run's record after the switch, on purpose (a refused Start leaves no
+    record of a run that never happened), and the write is atomic: a
+    temporary file, fsync, rename. With the stream left running, every
+    frame the camera sends meanwhile is the run's — counted, and handed to
+    the run's writer — not a frame of the read and not lost. The old test
+    ("at most 2 frames grabbed when Start returned") counted these too, so
+    it really bounded the record's write at two frame times: measured
+    5-36 ms beside 20 ms frames on a quiet PC, and every frame it counted
+    came after the switch (2026-10-18, both envs) — no frame of the read
+    was ever among them, yet it failed 1 run in 8 in the pylon env ("3
+    frames of a slow read counted"). Here the write is held until the
+    camera has sent 3 frames, the stand-in for a slow disk: the old count
+    fails on this every time (3 of 3), Typhon's run keeps every one."""
+    connected("event")
+    monkeypatch.setattr(device(), "restartable", False, raising=False)
+    ticks(Viewer(), 0.3)
+    session = frame_camera._LIVE.session
+    writing = threading.Event()
+    during = []               # per frame sent while the record is written
+    real_record = session._record
+
+    def record(frame):
+        # Under the session's lock, in the step that counts the frame.
+        if writing.is_set():
+            during.append(session.writer is not None)
+        return real_record(frame)
+
+    monkeypatch.setattr(session, "_record", record)
+    real_save = frame_camera._save_camera_record
+
+    def slow_save(*args, **kwargs):
+        writing.set()
+        try:
+            deadline = time.monotonic() + 30
+            while len(during) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return real_save(*args, **kwargs)
+        finally:
+            writing.clear()
+
+    monkeypatch.setattr(frame_camera, "_save_camera_record", slow_save)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    grabbed = session.stats().grabbed
+    frame_camera.stop()
+    assert len(during) >= 3, "the camera sent nothing while Start wrote"
+    assert all(during), (f"{during.count(False)} of the {len(during)} frames "
+                         f"sent while Start wrote the record were not the run's")
+    assert grabbed >= len(during), (
+        f"{grabbed} grabbed: the {len(during)} frames sent while Start wrote "
+        f"the record were not counted in the run")
+    assert out["record"] and Path(out["record"]).is_file()
 
 
 def test_a_record_is_never_written_over_and_its_name_is_never_reused(

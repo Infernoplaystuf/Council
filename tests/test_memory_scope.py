@@ -263,11 +263,28 @@ def test_importing_the_tk_module_after_the_pin_keeps_qt_memory(tmp_path):
 def test_the_qt_app_imports_neither_tk_module(tmp_path):
     """Every Qt tab, default and advanced, builds without importing the Tk
     shell (council_gui_engine, council_modules) — in a child process, so no
-    other test's import counts."""
+    other test's import counts.
+
+    EACH TAB IS BUILT INTO THE WINDOW, AS THE APP BUILDS IT. The child used
+    to call each factory and drop the page, which the app never does
+    (council_qt._register_tabs hands every one to window.add_tab, and the
+    tab widget owns it). A page nobody owns lives until Python frees it —
+    and for the pages a reference cycle or a tab's own worker holds, that is
+    whenever the cyclic collector runs or the worker ends, ON WHICHEVER
+    THREAD that is: the GUI Designer's page was seen destroyed on the
+    Agents tab's "agents-status" worker. A widget destroyed off the GUI
+    thread while that thread is in Qt is an access violation: this child
+    exited 0xC0000005 once under a whole-suite run's load (2026-10-16), and
+    15 times in 16 with the collector run on a worker in a loop (0 in 16
+    with the pages in the window; the real app, every tab visited and
+    quit, 0 in 16 under the same loop — the app was never at fault). So
+    the child now builds through window.add_tab, and runs the collector on
+    a worker itself: no page may be destroyed there."""
     import os
     import subprocess
-    code = ("import os, sys\n"
+    code = ("import gc, os, sys, threading\n"
             f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from PySide6.QtCore import Qt\n"
             "from PySide6.QtWidgets import QApplication\n"
             "app = QApplication([])\n"
             # No model server here: some tabs ask this PC's Ollama at its
@@ -279,22 +296,74 @@ def test_the_qt_app_imports_neither_tk_module(tmp_path):
             "from council_qt import tabs\n"
             "from council_qt.window import CouncilWindow\n"
             "window = CouncilWindow()\n"
+            # Each page is watched from the moment it is made: the thread
+            # that destroys it is noted if it is not this one.
+            "made, off_thread, slots = [], [], {}\n"
+            "def _watched(title, factory):\n"
+            "    def build(w):\n"
+            "        page = factory(w)\n"
+            "        made.append(title)\n"
+            "        def destroyed(*_args):\n"
+            "            if threading.current_thread() is not "
+            "threading.main_thread():\n"
+            "                off_thread.append(title)\n"
+            "        slots[title] = destroyed\n"
+            "        page.destroyed.connect(destroyed, "
+            "Qt.ConnectionType.DirectConnection)\n"
+            "        return page\n"
+            "    return build\n"
             "failed, built = [], 0\n"
             "for title, factory, _eager in tabs.registry(advanced=True):\n"
             "    try:\n"
-            "        factory(window)\n"
+            # The app's own call (council_qt._register_tabs), built now.
+            "        window.add_tab(title, lambda f=_watched(title, factory), "
+            "w=window: f(w), eager=True)\n"
             "        built += 1\n"
             "    except Exception as exc:\n"
             "        failed.append((title, repr(exc)[:100]))\n"
             "    app.processEvents()\n"
+            # A collection on a worker thread, as a busy worker's allocation
+            # triggers one now and then: it must destroy no page.
+            "worker = threading.Thread(target=gc.collect, name='collector')\n"
+            "worker.start()\n"
+            "worker.join()\n"
+            "unowned = [t for t in made if window.tab(t) is None\n"
+            "           or window.tabs.indexOf(window.tab(t)) < 0]\n"
+            "for t in made:\n"
+            "    if window.tab(t) is not None:\n"
+            "        window.tab(t).destroyed.disconnect(slots[t])\n"
             "window.request_close()\n"
             "app.processEvents()\n"
+            # SHUT DOWN CLEANLY. request_close stops the bridge's pump and
+            # timers, so no new worker starts; but a tab's constructor-time
+            # worker (agents-status, a model assess) may still be running, and
+            # a daemon thread the interpreter kills mid-Qt-call while the main
+            # thread tears QApplication down is an access violation (0xC0000005
+            # once under an 8-way whole-suite run, 2026-10-16). So JOIN every
+            # worker before exit, pumping events so its last call_on_ui lands
+            # on the GUI thread here (where the bridge's guards drop it if its
+            # widget is gone) rather than on the dying worker. A worker still
+            # alive after a generous wait is reported, not left to race exit.
+            "import time as _time\n"
+            "_deadline = _time.monotonic() + 30\n"
+            "for _w in list(threading.enumerate()):\n"
+            "    if _w is threading.main_thread():\n"
+            "        continue\n"
+            "    _w.join(timeout=max(0.0, _deadline - _time.monotonic()))\n"
+            "    app.processEvents()\n"
+            "app.processEvents()\n"
+            "stragglers = sorted(w.name for w in threading.enumerate()\n"
+            "                    if w is not threading.main_thread()"
+            " and w.is_alive())\n"
             "from council_core import memory_scope\n"
             "print('BUILT', built, len(tabs.registry(advanced=True)))\n"
             "print('FAILED', failed)\n"
+            "print('OFFTHREAD', off_thread)\n"
+            "print('STRAGGLERS', stragglers)\n"
+            "print('UNOWNED', unowned)\n"
             "print('LOADED', sorted(m for m in ('council_gui_engine', "
             "'council_modules') if m in sys.modules))\n"
-            "print('SCOPE', memory_scope.for_qt())\n")
+            "print('SCOPE', memory_scope.for_qt(), flush=True)\n")
     import socket
     with socket.socket() as sock:              # a loopback port nobody has:
         sock.bind(("127.0.0.1", 0))            # the Models and Nodes tabs
@@ -309,10 +378,19 @@ def test_the_qt_app_imports_neither_tk_module(tmp_path):
                          encoding="utf-8", errors="replace", timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     lines = dict(line.split(" ", 1) for line in out.stdout.splitlines()
-                 if line.split(" ", 1)[0] in ("BUILT", "FAILED", "LOADED",
+                 if line.split(" ", 1)[0] in ("BUILT", "FAILED", "OFFTHREAD",
+                                              "STRAGGLERS", "UNOWNED", "LOADED",
                                               "SCOPE"))
     built, total = map(int, lines["BUILT"].split())
     assert built == total, lines["FAILED"]
+    assert lines["OFFTHREAD"] == "[]", (
+        f"tabs destroyed on a worker thread: {lines['OFFTHREAD']}")
+    assert lines["STRAGGLERS"] == "[]", (
+        f"a tab's worker was still running at the child's exit, so the "
+        f"interpreter could kill it mid-Qt-call while QApplication is torn "
+        f"down (0xC0000005): {lines['STRAGGLERS']}")
+    assert lines["UNOWNED"] == "[]", (
+        f"tabs the window does not hold: {lines['UNOWNED']}")
     assert lines["LOADED"] == "[]", out.stdout[-2000:]
     assert lines["SCOPE"] == "conversation"
 

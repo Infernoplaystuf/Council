@@ -97,17 +97,35 @@ RUN_OF = re.compile(r"^(\d{8}_\d{6}(?:_\d+)?)_frame_\d+", re.IGNORECASE)
 RAW_SUFFIX = "_events.raw"
 
 
+def _natural_row(seg: str) -> list:
+    row = []
+    for tok in re.split("([0-9]+)", seg):
+        if tok.isdigit():
+            row.append((0, int(tok), ""))
+        else:
+            row.append((1, 0, tok.lower()))
+    return row
+
+
 def natural_key(path: Any) -> list:
     """frame_9 before frame_10 — the generated browser's _natkey, exactly."""
-    parts = []
-    for seg in str(path).replace(chr(92), "/").split("/"):
-        row = []
-        for tok in re.split("([0-9]+)", seg):
-            if tok.isdigit():
-                row.append((0, int(tok), ""))
-            else:
-                row.append((1, 0, tok.lower()))
-        parts.append(row)
+    return [_natural_row(seg)
+            for seg in str(path).replace(chr(92), "/").split("/")]
+
+
+def run_order_key(path: Any) -> list:
+    """natural_key, with a file we named compared run first: <stamp> before
+    <stamp>_2 before <stamp>_10, then frame_9 before frame_10 within a run.
+    Whole names put "<stamp>_2_frame_..." before "<stamp>_frame_..." (an
+    underscore sorts before a letter), so the second run of a second came
+    first and the raw view opened the older recording."""
+    parts = natural_key(path)
+    name = os.path.basename(str(path).replace(chr(92), "/"))
+    run = run_of(name) or run_of_raw(name)
+    if run:
+        parts[-1:] = [_natural_row(run), _natural_row(name[len(run):])]
+    else:
+        parts.append([])
     return parts
 
 
@@ -122,7 +140,7 @@ def list_images(folder: str) -> List[str]:
                     files.append(entry.path)
     except OSError:
         return []
-    files.sort(key=natural_key)
+    files.sort(key=run_order_key)
     return files
 
 
@@ -157,7 +175,7 @@ def latest_raw(folder: Any) -> Optional[Path]:
         return None
     if not names:
         return None
-    return Path(str(folder)) / sorted(names, key=natural_key)[-1]
+    return Path(str(folder)) / sorted(names, key=run_order_key)[-1]
 
 
 class DisplayDecoder:
@@ -270,6 +288,11 @@ class CaptureReviewer(QObject):
         #: Just back from the raw view: stay on the PNG it landed on rather
         #: than jumping to live when the live view comes back.
         self._stay_on_png = False
+        #: A capture has ended and the live view has not come back since.
+        self._run_ended = False
+        #: The user picked a saved frame in that gap: the live view coming
+        #: back keeps it (see _moved).
+        self._keep_pick = False
         self.playing = False
         self.raw: Any = None
         self.raw_file: Optional[Path] = None
@@ -339,6 +362,10 @@ class CaptureReviewer(QObject):
             if self.mode == RAW:
                 self._close_raw()
             keep = None
+            # A pick after Stop (_moved) was a frame of the OLD folder, and
+            # this shows the new one's first frame instead: the live view
+            # coming back is live, not that frame.
+            self._keep_pick = False
         self.root = folder
         self._root_key = _key(folder)
         self.files = list_images(folder) if folder else []
@@ -446,10 +473,25 @@ class CaptureReviewer(QObject):
             # A new run means a new writer, whose list starts empty.
             self._run = run
             self._seen = 0
+            # ...and the after-Stop gap (_moved) is over: the run changes
+            # at a Start, and at a Disconnect (frame_camera clears it), which
+            # comes with no previewing change to tell _live_lost — the live
+            # view was not back yet. A pick kept past it made the next
+            # Connect show that saved frame, not live.
+            self._run_ended = self._keep_pick = False
         was_capturing = self._capturing
         if capturing and not self._capturing:
             self._began()
         self._capturing = capturing
+        if was_capturing and not capturing and run:
+            # A Stop ends the run and leaves it set: the after-Stop gap
+            # (_moved) opens. A Disconnect clears the run in the same moment
+            # (frame_camera._LIVE.clear), so the tick that sees it sees both
+            # — the run's change above closed the gap, and this must not
+            # open it again: the live view was not running during the
+            # capture, so _live_lost would never close it, and the next
+            # Connect kept a pick made in between, on a saved frame.
+            self._run_ended = True
         if growing:
             self._take_new()
         if self._growing and not growing:
@@ -489,11 +531,14 @@ class CaptureReviewer(QObject):
     def _go_live(self) -> None:
         """The live view (re)started: connected, or back after Stop. The
         slider gains its live end, and goes there — unless the user has just
-        come back from the raw view to a particular PNG."""
+        come back from the raw view to a particular PNG, or picked a saved
+        frame after the capture ended and before this (_moved)."""
         if self.mode != PNG or self._capturing:
             return
         self._set_range()
-        if self._stay_on_png:
+        after_run, self._run_ended = self._run_ended, False
+        picked, self._keep_pick = self._keep_pick, False
+        if self._stay_on_png or (after_run and picked):
             self._stay_on_png = False
             return
         self._stop_playing()
@@ -509,6 +554,10 @@ class CaptureReviewer(QObject):
         frame, or nothing."""
         if self._capturing:
             return
+        # The live view going ends the after-Stop gap too (a failed camera,
+        # the raw view): the next time it comes back is not "back after
+        # Stop". (In the gap itself it is not running, so cannot stop.)
+        self._run_ended = self._keep_pick = False
         was_live = self.live
         self.live = False
         # The next camera (or the same one reconnected) may use other bits.
@@ -537,6 +586,7 @@ class CaptureReviewer(QObject):
         # frame (it is live), not a position of its own.
         self._capturing = True
         self._stay_on_png = False
+        self._run_ended = self._keep_pick = False
         self._stop_playing()
         self._end_after_save = False
         if self.mode == RAW:
@@ -568,6 +618,14 @@ class CaptureReviewer(QObject):
         self.live = self.live and self._live_slot()
         self._end_after_save = False
         keep = self._shown[2] if self._shown and self._shown[0] == PNG else None
+        if self.mode == PNG and not to_end and self._show.isActive():
+            # The user has just picked a frame and its show is still due
+            # (SHOW_MS): THAT is the place to keep. Read from what was shown
+            # before, the pick was lost — to the end — whenever the last
+            # frame landed inside those few milliseconds.
+            at = int(self.scrubber.get())
+            if 0 <= at < len(self.files):
+                keep = self.files[at]
         if self.mode == PNG:
             self.reload(keep=None if to_end else keep,
                         at_end=to_end or keep is None)
@@ -596,6 +654,7 @@ class CaptureReviewer(QObject):
             return
         self._end_after_save = False            # the user chose a place
         self._stay_on_png = False
+        self._keep_pick = False
         if self.playing:
             # Playback carries on from where the user put it, rather than
             # snapping back to where the play clock thinks it should be.
@@ -611,6 +670,16 @@ class CaptureReviewer(QObject):
             if live:
                 self._say()
                 return
+        if self.mode == PNG and (self._run_ended or (
+                self._capturing and not self.feed.capturing())):
+            # A SAVED FRAME PICKED AFTER STOP, before the live view is back
+            # (the run's last frames still landing, the camera restarting):
+            # kept when it comes back, as one picked a moment later is.
+            # _go_live took it away, so whether a pick right after Stop
+            # held depended on which came first, it or the restart — tens
+            # of milliseconds (a built Typhon's test lost it under a
+            # whole-suite run's load).
+            self._keep_pick = True
         self._show.start(SHOW_MS)
 
     def _show_now(self) -> None:

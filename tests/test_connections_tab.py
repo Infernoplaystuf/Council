@@ -60,7 +60,13 @@ def qapp():
     app.processEvents()
 
 
-def drive(qapp, tab, seconds=15.0):
+#: How long a test waits for the tab's worker — patience, not a claim: work
+#: that finishes ends the wait at once. 15 s ran out once in a whole-suite
+#: run 8 files at a time ("still working", 2026-10-15).
+PATIENCE = 120.0
+
+
+def drive(qapp, tab, seconds=PATIENCE):
     deadline = time.time() + seconds
     while tab._busy and time.time() < deadline:
         qapp.processEvents()
@@ -70,7 +76,7 @@ def drive(qapp, tab, seconds=15.0):
 
 
 def _wait_threads(qapp):
-    deadline = time.time() + 5.0
+    deadline = time.time() + PATIENCE
     while any(t.name.startswith("kg-") and t.is_alive()
               for t in threading.enumerate()) and time.time() < deadline:
         qapp.processEvents()

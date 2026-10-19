@@ -58,13 +58,14 @@ import base64
 import difflib
 import io
 import json
+import os
 import re
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateField,
                            TemplateSchema, _text, fill_template, inspector_column,
@@ -375,17 +376,45 @@ WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
 
 
 def workbook_files(folder) -> List[Path]:
-    """The workbooks in a folder, not Excel's ~$ lock files."""
-    return sorted(x for x in Path(folder).iterdir()
-                  if x.suffix.lower() in WORKBOOK_SUFFIXES and not x.name.startswith("~$"))
+    """The workbooks under a folder — recursively — not Excel's ~$ lock files.
+
+    Folders whose names start with "." or "~$" are pruned at every depth so
+    hidden caches (``.git``, ``.cache``), VCS metadata and Excel autosave
+    directories don't leak into the scan; ``~$`` files anywhere are skipped
+    for the same reason (Excel's lockfile for an open workbook)."""
+    root = Path(folder)
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # In-place prune so os.walk does not descend into hidden/lock dirs.
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and not d.startswith("~$")]
+        for name in filenames:
+            if name.startswith("~$"):
+                continue
+            if Path(name).suffix.lower() in WORKBOOK_SUFFIXES:
+                out.append(Path(dirpath) / name)
+    return sorted(out)
 
 
-def load_workbook_grids(path, notes: Optional[List[str]] = None
-                        ) -> Tuple[List[Grid], List[SourceImage]]:
+def load_workbook_grids(path, notes: Optional[List[str]] = None,
+                        want_pictures: bool = True, data: Optional[bytes] = None,
+                        careful: bool = False) -> Tuple[List[Grid], List[SourceImage]]:
     """Every sheet as a Grid, every text box and chart as a small Grid of its
     own, and the pictures. openpyxl when it can open the file; the installed
     Excel when it cannot (.xls, .xlsb, rights-protected). `notes` collects
-    what could not be read (a picture Excel would not copy out)."""
+    what could not be read (a picture Excel would not copy out).
+
+    want_pictures=False leaves the pictures out: Excel copies each one out
+    through the clipboard, which the knowledge graph's background rebuild
+    does not touch (Excel then lists each picture with no data, so it can
+    be counted).
+
+    data: the workbook's bytes, already read (an .xlsx / .xlsm): it is
+    parsed from them, so the file is not held open while openpyxl works -
+    Excel could not save it meanwhile.
+
+    careful: Excel copies pictures only while nothing else uses the clipboard
+    (excel_open.read_with_excel; the knowledge graph's background rebuild)."""
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
@@ -397,9 +426,10 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
         raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
                           "copy without the password, and add that copy")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
-        return _grids_from_excel(path, notes)
+        return _grids_from_excel(path, notes, want_pictures, careful)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(data) if data is not None else path,
+                                    data_only=True)
     except Exception as e:
         raise LedgerError(f"could not open {path.name}: {e}") from e
     grids, images = [], []
@@ -423,7 +453,7 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
                     if (r, cc) != (rng.min_row, rng.min_col) and isinstance(top, str):
                         cells.setdefault((r, cc), _Merged(top))
         grids.append(Grid(path.name, ws.title, cells))
-        for img in getattr(ws, "_images", []):
+        for img in (getattr(ws, "_images", []) if want_pictures else []):
             try:
                 data = img._data()
                 fr = img.anchor._from
@@ -433,15 +463,18 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None
             images.append(SourceImage(path.name, ws.title, anchor, data,
                                       (getattr(img, "format", None) or "png").lower()))
     wb.close()
-    for ex in excel_open.zip_extras(path):                # text boxes and charts
+    for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
+        # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
     return grids, images
 
 
-def _grids_from_excel(path: Path, notes: Optional[List[str]]):
+def _grids_from_excel(path: Path, notes: Optional[List[str]], want_pictures: bool = True,
+                      careful: bool = False):
     import excel_open
     try:
-        book = excel_open.read_with_excel(path)
+        book = excel_open.read_with_excel(path, want_pictures=want_pictures,
+                                          **({"careful": True} if careful else {}))
     except excel_open.ExcelOpenError as e:
         raise LedgerError(str(e)) from e
     grids: List[Grid] = []
@@ -490,9 +523,11 @@ class Obs:
 
 
 class _Extractor:
-    def __init__(self, grid: Grid, m: Matcher, codes: ItemCodes, part_hint: str):
+    def __init__(self, grid: Grid, m: Matcher, codes: ItemCodes, part_hint: str,
+                 mask_re: "Optional[re.Pattern]" = None):
         self.g, self.m, self.codes = grid, m, codes
         self.part = part_hint
+        self.mask_re = mask_re
         self.used = set()
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
@@ -644,7 +679,7 @@ class _Extractor:
                         self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
                             f", read from image {self.g.from_image}" if self.g.from_image else "")
                         return
-        sid = _part_from_name(self.g.sheet)
+        sid = _part_from_name(self.g.sheet, self.mask_re)
         if sid:
             self.part = sid
             self.part_how = f"sheet name {self.g.sheet!r}"
@@ -928,15 +963,61 @@ def _split_inline(v: str) -> Tuple[str, str]:
     return v.strip(), ""
 
 
-def _part_from_name(name: str) -> str:
+def _part_from_name(name: str, mask_re: "Optional[re.Pattern]" = None) -> str:
     if re.fullmatch(r"(?i)sheet\s*\d+", name.strip()):
         return ""
+    if mask_re is not None:
+        m = mask_re.search(name)
+        if m:
+            return m.group(0)
     m = re.fullmatch(r"(?i)\s*(?:part|sample|specimen|p/?n|s/?n)\s*(?:no\.?|#)?\s*[-_ ]?\s*([A-Za-z]*\d[\w\-]*)\s*", name)
     if m:
         return m.group(1)
     if re.fullmatch(r"\d{1,8}", name.strip()):
         return name.strip()
     return ""
+
+
+def mask_to_regex(mask: str) -> "re.Pattern":
+    """Compile a user-supplied part-name pattern into a regex.
+
+    Grammar is tiny:
+      * ``@``  matches any ASCII letter (case-insensitive).
+      * ``#``  matches any digit.
+      * any other character matches itself LITERALLY (so ``P/N-###`` requires
+        the literal prefix ``P/N-``).
+
+    Runs collapse, so ``@@@#@@###`` compiles to
+    ``[A-Za-z]{3}\\d[A-Za-z]{2}\\d{3}``. The match is bounded on both sides
+    by a non-alphanumeric lookaround so a mask that is all letters and digits
+    does not pick up a longer surrounding run.
+
+    Raises LedgerError on an empty mask, a mask with no concrete character,
+    or a regex that fails to compile."""
+    if mask is None or not mask.strip():
+        raise LedgerError("part name pattern is empty")
+    parts: List[str] = []
+    i = 0
+    while i < len(mask):
+        ch = mask[i]
+        if ch in "@#":
+            run = 1
+            while i + run < len(mask) and mask[i + run] == ch:
+                run += 1
+            cls = "[A-Za-z]" if ch == "@" else r"\d"
+            parts.append(cls + (f"{{{run}}}" if run > 1 else ""))
+            i += run
+        else:
+            parts.append(re.escape(ch))
+            i += 1
+    body = "".join(parts)
+    if not body:
+        raise LedgerError(f"part name pattern {mask!r} compiles to nothing")
+    try:
+        return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                          re.IGNORECASE)
+    except re.error as e:
+        raise LedgerError(f"part name pattern {mask!r}: {e}") from e
 
 
 def _num(s) -> Optional[float]:
@@ -1050,13 +1131,15 @@ def _tessdata_for(exe: Path) -> Optional[Path]:
     return None
 
 
-def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
+def tsv_to_boxes(tsv: str, confs: Optional[List[float]] = None
+                 ) -> List[Tuple[float, float, float, float, str]]:
     """Tesseract TSV words -> phrase boxes (x0, y0, x1, y1, text).
 
     Words of one Tesseract line closer than ~0.8 x the text height are one
     phrase ("Laser Power (W)"); a wider gap is a table column boundary, which
-    boxes_to_rows then aligns across rows."""
-    lines: Dict[Tuple[str, ...], List[Tuple[float, float, float, float, str]]] = {}
+    boxes_to_rows then aligns across rows. ``confs``, when given, gets each
+    box's confidence (its least sure word's TSV 'conf'), in the same order."""
+    lines: Dict[Tuple[str, ...], List[Tuple[float, float, float, float, str, float]]] = {}
     for row in tsv.splitlines()[1:]:
         f = row.split("\t")
         if len(f) < 12 or f[0] != "5" or not f[11].strip():
@@ -1065,7 +1148,11 @@ def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
             x, y, w, h = (float(v) for v in f[6:10])
         except ValueError:
             continue
-        lines.setdefault(tuple(f[1:5]), []).append((x, y, x + w, y + h, f[11].strip()))
+        try:
+            conf = max(float(f[10]), 0.0)
+        except ValueError:
+            conf = 0.0
+        lines.setdefault(tuple(f[1:5]), []).append((x, y, x + w, y + h, f[11].strip(), conf))
     out = []
     for words in lines.values():
         words.sort(key=lambda b: b[0])
@@ -1074,11 +1161,50 @@ def tsv_to_boxes(tsv: str) -> List[Tuple[float, float, float, float, str]]:
         cur = words[0]
         for b in words[1:]:
             if b[0] - cur[2] <= gap_max:
-                cur = (cur[0], min(cur[1], b[1]), b[2], max(cur[3], b[3]), cur[4] + " " + b[4])
+                cur = (cur[0], min(cur[1], b[1]), b[2], max(cur[3], b[3]),
+                       cur[4] + " " + b[4], min(cur[5], b[5]))
             else:
                 out.append(cur)
                 cur = b
         out.append(cur)
+    if confs is not None:
+        confs.extend(b[5] for b in out)
+    return [b[:5] for b in out]
+
+
+def rows_with_confidence(tsv: str) -> Tuple[List[List[str]], List[List[float]]]:
+    """Tesseract TSV -> (rows, confidences): boxes_to_rows' rows, and beside
+    each cell how sure Tesseract was of it (its least sure word; 0 for an
+    empty cell). By position, not by word: the knowledge graph trusted a
+    misread 'PN-7'+'7' because 'PN-77' was read sure in another cell (review,
+    2026-10-18)."""
+    confs: List[float] = []
+    boxes = tsv_to_boxes(tsv, confs)
+    rows = boxes_to_rows(boxes)
+    # the same boxes once more with their numbers for text: boxes_to_rows
+    # places a box by its position only, so each cell's numbers say which
+    # boxes it was made of
+    marked = boxes_to_rows([b[:4] + (f"<{i}>",) for i, b in enumerate(boxes)])
+    sure = [[min((confs[int(i)] for i in re.findall(r"<(\d+)>", cell)), default=0.0)
+             for cell in row] for row in marked]
+    return rows, sure
+
+
+def word_confidences(tsv: str) -> Dict[str, float]:
+    """How sure Tesseract was of each word it read (its TSV 'conf', 0-100),
+    the lowest when a word was read more than once. The knowledge graph
+    trusts a value read from a picture only when the OCR was sure of it."""
+    out: Dict[str, float] = {}
+    for row in tsv.splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or f[0] != "5" or not f[11].strip():
+            continue
+        try:
+            conf = float(f[10])
+        except ValueError:
+            continue
+        word = f[11].strip()
+        out[word] = min(conf, out.get(word, conf))
     return out
 
 
@@ -1156,14 +1282,24 @@ def tesseract_reader(exe: Optional[Path] = None, timeout: float = 60) -> Optiona
     cmd += ["-l", "eng", "tsv"]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-    def read(data: bytes):
+    def tsv(data: bytes) -> str:
         done = subprocess.run(cmd, input=_for_ocr(data), capture_output=True,
                               timeout=timeout, creationflags=flags)
         if done.returncode != 0:
             raise RuntimeError(done.stderr.decode("utf-8", "replace").strip()[-300:]
                                or f"tesseract exited {done.returncode}")
-        return boxes_to_rows(tsv_to_boxes(done.stdout.decode("utf-8", "replace"))) or None
+        return done.stdout.decode("utf-8", "replace")
+
+    def read(data: bytes):
+        return boxes_to_rows(tsv_to_boxes(tsv(data))) or None
+
+    def with_confidence(data: bytes):
+        """(rows, confidences) from one Tesseract run: beside each cell of
+        rows, how sure it was of that cell (rows_with_confidence)."""
+        rows, sure = rows_with_confidence(tsv(data))
+        return (rows or None), sure
     read.name = "Tesseract (local)"
+    read.with_confidence = with_confidence
     return read
 
 
@@ -1274,24 +1410,75 @@ class Extraction:
     unmatched: List[Obs] = field(default_factory=list)
     images: List[ImageNote] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
+    #: One entry per workbook that Excel could not open: ``(name, kind)``
+    #: where ``kind`` is one of ExcelOpenError's named modes. Used by the
+    #: Ledger log summary at the end of a batch.
+    open_failures: List[Tuple[str, str]] = field(default_factory=list)
+    #: Per-workbook wall-clock timings as ``(name, seconds)``. The Ledger
+    #: log appends the slowest few at the end of a batch so a stall is
+    #: easy to attribute without reading the terminal.
+    timings: List[Tuple[str, float]] = field(default_factory=list)
+    #: True when the extract exited early because the Ledger tab's
+    #: Cancel event fired. Surfaced via ``ExtractSummary.cancelled``.
+    cancelled: bool = False
 
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
-            part: str = "", use_images: bool = True) -> Extraction:
+            part: str = "", use_images: bool = True, progress=None,
+            pattern_mask: Optional[str] = None,
+            cancel: Optional[Any] = None) -> Extraction:
+    """`progress`: a progress_report.Progress; each workbook is one step, and
+    what it is doing (opening through Excel, reading picture 3 of 7) is shown.
+
+    ``pattern_mask`` is an optional user-supplied part-name shape (see
+    ``mask_to_regex``). When set, it is tried first on filenames and sheet
+    names before the keyword / lone-number heuristics.
+
+    ``cancel`` is an optional ``threading.Event``: when its ``is_set()``
+    returns True, the loop exits before the next workbook with
+    ``Extraction.cancelled = True``. The Ledger tab's Cancel button sets
+    it and also calls ``excel_open.kill_active_excels()`` to unblock a
+    Workbooks.Open sitting on a modal Excel dialog."""
+    import time as _time
+    from progress_report import NullProgress
+    prog = progress or NullProgress()
+    mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
     run = Extraction([str(s) for s in sources])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
+    prog.stage("reading workbooks", total=len(sources), unit="workbooks")
     for src in sources:
+        if cancel is not None and cancel.is_set():
+            run.cancelled = True
+            run.problems.append("Cancelled by user before "
+                                f"{Path(src).name!r}.")
+            break
+        _t0 = _time.monotonic()
         src = Path(src)
+        via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
+            src.exists() and __import__("excel_open").kind_of(src) == "rights")
+        prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
+                    force=via_excel)
         try:
             grids, images = load_workbook_grids(src, run.problems)
         except LedgerError as e:
             run.problems.append(str(e))
+            # Keep the Excel-open-failure category so the Ledger log can
+            # summarize the batch: "N files failed to open - K rights, ...".
+            cause = e.__cause__
+            kind = (getattr(cause, "kind", "unknown")
+                    if cause is not None and type(cause).__name__ == "ExcelOpenError"
+                    else "other")
+            run.open_failures.append((src.name, kind))
+            _secs = _time.monotonic() - _t0
+            run.timings.append((src.name, _secs))
+            prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
             continue
         for i, img in enumerate(images):
+            prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
             if image_dir:
                 d = Path(image_dir)
                 d.mkdir(parents=True, exist_ok=True)
@@ -1323,8 +1510,9 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                 note.text = "not read: install Tesseract (local OCR) to read images"
             run.images.append(note)
 
+        prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
         # pass 1: part numbers per sheet; then a workbook-wide fallback
-        exs = [_Extractor(g, m, codes, "") for g in grids]
+        exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
         for ex in exs:
             ex.find_part()
             ex.find_inspectors()
@@ -1334,7 +1522,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         elif len(found) == 1:
             book_part, how = found.pop(), "the one part number in the workbook"
         elif not found:
-            book_part = _part_from_filename(src.stem)
+            book_part = _part_from_filename(src.stem, mask_re)
             how = f"file name {src.name!r} — check it" if book_part else ""
         else:
             book_part, how = "", ""
@@ -1356,6 +1544,9 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                     if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
                                            note.anchor):
                         note.values += n
+        _secs = _time.monotonic() - _t0
+        run.timings.append((src.name, _secs))
+        prog.advance(what=f"{src.name} read in {_secs:.1f}s")
         orphans = sum(1 for ex in exs for o in ex.out if not o.part)
         if orphans:
             run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
@@ -1363,7 +1554,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     return run
 
 
-def _part_from_filename(stem: str) -> str:
+def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> str:
+    if mask_re is not None:
+        m = mask_re.search(stem)
+        if m:
+            return m.group(0)
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
@@ -1611,11 +1806,46 @@ def load_aliases(csv_path) -> Tuple[Dict[str, str], List[str]]:
     return data.get("map", {}), data.get("ignore", [])
 
 
-def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
+def load_people(csv_path) -> Dict[str, str]:
+    """Who each inspector's initials stand for: the "people" section of the
+    same aliases file, {"JB": "Jordan Blake"}, written by a person. The
+    knowledge graph (council_core/kg_excel.py) reads it so that 'JB' in the
+    parent CSV is linked to Jordan Blake without a guess. Keys are the
+    initials as the Ledger reads them (upper case, no dots); a damaged or
+    missing section is {}."""
     p = aliases_path_for(csv_path)
+    if not p.exists():
+        return {}
+    try:
+        people = json.loads(p.read_text(encoding="utf-8")).get("people", {})
+    except Exception:
+        return {}
+    if not isinstance(people, dict):
+        return {}
+    out = {}
+    for k, v in people.items():
+        key = _initials(k)
+        if key and isinstance(v, str) and v.strip():
+            out[key] = " ".join(v.split())
+    return out
+
+
+def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
+    """The label mappings and ignores, written atomically. Any other section
+    of the file (the "people" list of initials) is kept as it was: it used to
+    be dropped by the first save."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, object] = {"map": dict(sorted(mapping.items())),
+                               "ignore": sorted(set(ignore))}
+    if p.exists():
+        try:
+            old = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        if isinstance(old, dict):
+            data.update({k: v for k, v in old.items() if k not in ("map", "ignore")})
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"map": dict(sorted(mapping.items())),
-                               "ignore": sorted(set(ignore))}, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(p)
 
 
@@ -1632,8 +1862,11 @@ class ApplyResult:
 
 
 def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader] = None,
-                 use_images: bool = True) -> ApplyResult:
+                 use_images: bool = True, progress=None) -> ApplyResult:
     import openpyxl
+    from progress_report import NullProgress
+    prog = progress or NullProgress()
+    prog.stage("reading the review workbook")
     review_path = Path(review_path)
     wb = openpyxl.load_workbook(review_path, data_only=True)
     try:
@@ -1688,7 +1921,8 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         save_aliases(csv_path, mapping, ignore)
 
     run = extract(schema, meta["sources"], mapping, ignore, image_reader=image_reader,
-                  use_images=use_images)
+                  use_images=use_images, progress=prog)
+    prog.stage("matching your choices")
     decisions = decide(run, schema)
     accepted = 0
     for d in decisions:
@@ -1713,16 +1947,22 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             accepted += 1
 
     rows = rows_from(decisions, schema)
+    prog.stage("writing the parent CSV", total=len(rows), unit="rows")
     res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in meta["sources"])[:200])
+    prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:
         d = Path(fill_dir)
         d.mkdir(parents=True, exist_ok=True)
         stem = Path(schema.template_path).stem
-        for p in sorted({r[schema.id_field] for r in rows}, key=sample_sort_key):
+        parts = sorted({r[schema.id_field] for r in rows}, key=sample_sort_key)
+        prog.stage("filling templates", total=len(parts), unit="parts")
+        for p in parts:
             out = d / f"{_safe(stem)}_{_safe(p)}.xlsx"
+            prog.update(f"part {p}")
             warnings += fill_template(schema, ledger.rows_for(p), out)
             filled.append(str(out))
+            prog.advance(what=f"{out.name} written")
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
                        warnings + [f"conflict kept: {c}" for c in res.conflicts])
 
@@ -1786,9 +2026,11 @@ def main(argv=None) -> int:
             out = Path(args.out) if args.out else Path(args.csv).with_name(
                 f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
             mapping, ignore = load_aliases(args.csv)
-            run = extract(ledger.schema, files, mapping, ignore,
-                          image_dir=out.with_name(out.stem + "_images"),
-                          part=args.part, use_images=not args.no_images)
+            from progress_report import Progress
+            with Progress("ledger extract") as prog:
+                run = extract(ledger.schema, files, mapping, ignore,
+                              image_dir=out.with_name(out.stem + "_images"),
+                              part=args.part, use_images=not args.no_images, progress=prog)
             if args.llm:
                 suggest_with_llm(run, ledger.schema, args.llm)
             dec = decide(run, ledger.schema)
@@ -1801,7 +2043,10 @@ def main(argv=None) -> int:
                 print(f"  ! {p}")
             print(f"review: {out}")
         else:
-            r = apply_review(args.review, args.fill_dir, use_images=not args.no_images)
+            from progress_report import Progress
+            with Progress("ledger apply") as prog:
+                r = apply_review(args.review, args.fill_dir, use_images=not args.no_images,
+                                 progress=prog)
             if r.learned:
                 print(f"learned {len(r.learned)} label mappings")
             print(f"{r.accepted} values accepted -> {r.rows} rows: {r.csv_result}")

@@ -103,9 +103,10 @@ def test_work_runs_off_the_gui_thread_with_buttons_locked(qapp, books):
     template, src, tmp = books
     gate, ran_on = threading.Event(), []
 
-    def slow_extract(csv, sources, part, use_images, progress):
+    def slow_extract(csv, sources, part, use_images, progress,
+                     pattern_mask=None, vision_model=None, cancel=None):
         ran_on.append(threading.current_thread())
-        progress("reading image 1…")
+        progress("reading workbooks: 1/2 workbooks (50%)", 0.5)
         gate.wait(10)
         raise RuntimeError("stopped by the test")
 
@@ -118,7 +119,8 @@ def test_work_runs_off_the_gui_thread_with_buttons_locked(qapp, books):
     tab.extract_btn.click()                              # ignored while busy
     for _ in range(50):
         QApplication.processEvents()
-    assert "reading image 1" in tab.status.text()
+    assert "1/2 workbooks (50%)" in tab.status.text()
+    assert (tab.progress.maximum(), tab.progress.value()) == (100, 50)   # a real percentage
     gate.set()
     assert tab.wait()
     assert ran_on and ran_on[0] is not threading.main_thread() and len(ran_on) == 1

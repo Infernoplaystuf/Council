@@ -136,12 +136,32 @@ def test_chat_tools_survives_a_deeply_nested_reply(eng,
 
 
 def test_a_degenerate_brace_run_is_not_quadratic():
-    """A small model stuck on one token: 20,000 '{' took ~25 s to scan."""
-    t0 = time.perf_counter()
-    assert so.extract_json_text("{" * 20000) is None
-    assert so.extract_json_text("[" * 20000) is None
-    took = time.perf_counter() - t0
-    assert took < 1.0, f"{took:.2f}s"
+    """A small model stuck on one token: 20,000 '{' took ~25 s to scan.
+
+    BY ITS GROWTH, AND THE FASTEST OF THREE. It timed one scan of 20,000
+    against 1.0 s; it takes 0.35 s here, and beside 30 busy and 12
+    file-churning processes 1.26-2.01 s — 4 failures in 5 on unchanged
+    code. Quadratic is a claim about growth, so it is measured as one:
+    4x the braces may cost at most 8x (linear is 4x, measured 4.2x;
+    quadratic 16x), each size the fastest of three runs, interleaved — a
+    busy PC only ever adds time, and adds it to both. The absolute bound
+    stays, at 3 s: generous for a busy PC, and still 8x under the 25 s the
+    quadratic scan took."""
+    def cost(n):
+        t0 = time.perf_counter()
+        assert so.extract_json_text("{" * n) is None
+        assert so.extract_json_text("[" * n) is None
+        return time.perf_counter() - t0
+
+    small, large = [], []
+    for _ in range(3):
+        small.append(cost(5000))
+        large.append(cost(20000))
+    small, large = min(small), min(large)
+    assert large < 3.0, f"{large:.2f}s for 20,000"
+    assert large < 8 * small, (f"4x the braces cost {large / small:.1f}x: "
+                               f"{small:.3f}s for 5,000, {large:.3f}s for "
+                               f"20,000")
 
 
 def test_json_after_a_few_stray_braces_is_still_found():
@@ -237,26 +257,66 @@ def test_a_cold_model_load_is_not_a_stall(eng):
     assert len(eng.fake.state.chats) == 1
 
 
-def test_a_stall_after_the_first_byte_still_times_out(eng):
+def _timed_streams(eng, monkeypatch) -> list:
+    """How long each _ollama_stream call — the one that waits on the
+    answer — took: local_chat does more than wait (see below)."""
+    real, waits = eng.ce._ollama_stream, []
+
+    def timed(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return real(*args, **kwargs)
+        finally:
+            waits.append(time.perf_counter() - t0)
+
+    monkeypatch.setattr(eng.ce, "_ollama_stream", timed)
+    return waits
+
+
+def test_a_stall_after_the_first_byte_still_times_out(eng, monkeypatch):
+    """Stuck mid-answer (1.5 s between tokens), the 0.4 s stall limit ends
+    the wait: under 1.4 s, so before the next token could come.
+
+    TIMED ON THE WAIT ITSELF, as the cold-start test below is, and for the
+    same reason: the whole local_chat also asks the server for its models
+    first (loopback requests through this PC's network filter, up to 430 ms
+    each with the CPUs busy), and a whole-suite run measured 10.5 s for it
+    (2026-10-18) with the stall still the error and the partial answer
+    still "abcd". The bound is the same, on the one call that waits — made
+    once, so a retry cannot hide inside it."""
     _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
     eng.fake.state.reply = "abcd" * 3
     eng.fake.state.token_delay = 1.5               # stuck mid-answer
-    t0 = time.perf_counter()
+    waits = _timed_streams(eng, monkeypatch)
     with pytest.raises(TimeoutError) as info:
         eng.ce.local_chat(MSGS, role="coder", timeout=0.4)
-    assert time.perf_counter() - t0 < 1.4
+    assert len(waits) == 1, waits
+    assert waits[0] < 1.4, waits
     assert info.value.partial == "abcd"
     assert len(eng.fake.state.chats) == 1          # never re-sent
 
 
 def test_the_cold_start_allowance_is_bounded(eng, monkeypatch):
+    """The wait for the first byte is the allowance (0.6 s), not the stall
+    limit (0.2 s), not the server's 3 s, not the 300 s default.
+
+    TIMED ON THE WAIT ITSELF. It timed the whole local_chat, which does
+    more than wait: it first asks the server for its models (/api/tags, a
+    loopback request through a network filter on this PC — up to 430 ms
+    each with the CPUs busy, measured; answered 2 s late, this test failed
+    at 2.8 s) and takes the engine's locks. Twice a whole-suite run
+    measured 10.7 s, and the error was still "did not start answering" —
+    the server's first line, 3 s after the question, never came, so most of
+    that was not the wait. The bound is the same, on the call that waits —
+    and that call is made once, so a retry cannot hide inside it."""
     _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
     monkeypatch.setenv("COUNCIL_OLLAMA_LOAD_TIMEOUT", "0.6")
     eng.fake.state.first_delay = 3.0               # a hung server
-    t0 = time.perf_counter()
+    waits = _timed_streams(eng, monkeypatch)
     with pytest.raises(TimeoutError, match="did not start answering"):
         eng.ce.local_chat(MSGS, role="coder", timeout=0.2)
-    assert 0.5 < time.perf_counter() - t0 < 1.5
+    assert len(waits) == 1, waits
+    assert 0.5 < waits[0] < 1.5, waits
 
 
 def test_gguf_load_time_is_not_reported_as_waiting_for_the_model(
