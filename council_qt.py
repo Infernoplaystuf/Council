@@ -98,11 +98,38 @@ def _register_tabs(window) -> None:
     the same thing for advanced mode, where six tabs are absent.
     """
     from council_core import modes
+    from council_qt import group_tabs, ui_settings
     from council_qt.tabs import registry
+
+    # The grouped layout, if Council has delivered profiles.py. It is wired
+    # BEFORE any tab registers so the first add_tab call can place its page
+    # inside a group.
+    profiles_mod = group_tabs.try_import_profiles()
+    ui_section, notice = ui_settings.load_or_migrate()
+    if profiles_mod is not None:
+        controller = group_tabs.GroupedTabsController(window, profiles_mod)
+        window.install_grouped_layout(controller)
+        controller.apply_profile_state(ui_section)
+        if notice:
+            controller.show_once_notice(notice)
+
     # Advanced mode ADDS tabs; it does not unlock a setting. The six behind it
     # commit the vault to git, SSH into a Pi, or rewrite the model registry.
     for title, factory, eager in registry(advanced=modes.advanced()):
-        window.add_tab(title, lambda f=factory, w=window: f(w), eager=eager)
+        tab_id = _tab_id_of(factory)
+        window.add_tab(title, lambda f=factory, w=window: f(w),
+                       eager=eager, tab_id=tab_id)
+
+    if window.grouped is not None:
+        # Re-apply once every tab has registered so empty groups auto-hide
+        # with their real inner counts.
+        window.grouped.apply_profile_state(ui_section)
+
+
+def _tab_id_of(factory) -> str:
+    """Derive the spec-§1 id from a tab factory (``build_X`` → ``X``)."""
+    name = getattr(factory, "__name__", "")
+    return name[len("build_"):] if name.startswith("build_") else name
 
 
 if __name__ == "__main__":
