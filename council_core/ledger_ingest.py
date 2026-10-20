@@ -199,6 +199,10 @@ _OPEN_FAILURE_LABELS = {
     "corrupt": "corrupt / wrong format / blocked",
     "timeout": "timed out (sign-in prompt?)",
     "access": "access denied",
+    # (review, 2026-10-20) a path past Excel's 255 characters or Windows'
+    # MAX_PATH was 'other error' or 'corrupt'; a 0-byte file was 'read'
+    "path": "path too long",
+    "empty": "empty file (0 bytes)",
     "unavailable": "Excel COM not available",
     "unknown": "unknown reason",
     "other": "other error",

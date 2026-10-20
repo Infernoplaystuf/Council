@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from council_core.knowledge_graph import (_categorize_unreadable_reason,  # noqa: E402
@@ -40,6 +42,41 @@ def test_each_known_reason_maps_to_a_short_label():
 def test_an_uncategorized_reason_falls_back_to_other():
     assert _categorize_unreadable_reason("something strange") == "other"
     assert _categorize_unreadable_reason("") == "other"
+
+
+def test_the_excel_readers_newer_reasons_have_labels_of_their_own(tmp_path):
+    """A path too long for Excel or for Windows, an empty file, an Excel
+    refusing every call (or never starting) and an Excel stopping in the
+    middle of a read were all rolled up as 'other' - and a valid .xls 256-259
+    characters deep had at least been 'corrupt / wrong format' (review,
+    2026-10-20). The reasons as the readers word them."""
+    import excel_open
+
+    def said(path):
+        with pytest.raises(excel_open.ExcelOpenError) as e:
+            excel_open.read_with_excel(path, want_pictures=False,
+                                       app_factory=lambda: pytest.fail("Excel started"))
+        return str(e.value)
+    base = tmp_path.resolve()
+    deep = base / ("p" * (258 - len(str(base)) - 1 - 4) + ".xls")
+    empty = base / "e.xls"
+    empty.write_bytes(b"")
+    cases = {
+        said(deep): "path too long",
+        ("long.xlsx: path too long: 270 characters — enable Windows long paths or move "
+         "the folder"): "path too long",                             # source_extract
+        said(empty): "empty file",
+        str(excel_open._excel_down("Call was rejected by callee", True)): "no Excel COM",
+        str(excel_open._excel_down("Server execution failed", False)): "no Excel COM",
+        ("a.xls: Excel stopped while the workbook was being read (The RPC server is "
+         "unavailable) — it may have closed or crashed on it"): "Excel stopped",
+        ("Excel stopped while it was being read (AttributeError: "
+         "<unknown>.Shapes)"): "Excel stopped",                       # kg_excel's own
+    }
+    assert "path too long for Excel: 258 characters" in said(deep)
+    for reason, label in cases.items():
+        assert _categorize_unreadable_reason(reason) == label, reason
+        assert unreadable_breakdown([f"data_in/x.xls: {reason}"]) == {label: 1}
 
 
 # ------------------------------------------------------------- breakdown

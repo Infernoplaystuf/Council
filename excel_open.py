@@ -16,9 +16,15 @@ HOW EXCEL IS DRIVEN (everything stays on this machine)
     the workbook - decrypted or not - is ever written;
   * a password-protected workbook is refused with a message, never prompted for.
   * an Excel that will not start, or refuses every call (a dialog of its own
-    waiting - its license agreement), is said so once per Ledger extract,
-    and the one it started is ended, never left running hidden; a call
-    refused for a moment (a new Excel still busy) is asked again.
+    waiting - its license agreement), before the workbook opens or while it
+    is read, is said so once per Ledger extract, and the one it started is
+    ended, never left running hidden; a call refused for a moment (a new
+    Excel still busy) is asked again.
+  * every Excel object a read held - in an error's frames too - is let go
+    before COM is closed on its thread (_drop_frames): an Excel told to quit
+    then ends at once, and COM's memory is not left corrupt.
+  * a path longer than Excel opens (EXCEL_MAX_PATH) and a 0-byte file are
+    said so before Excel starts.
   * Pictures come out through the clipboard (Excel offers no other way, and
     rights protection may forbid even that - then the picture is reported, not
     read). Text on the clipboard beforehand is put back afterwards.
@@ -38,6 +44,7 @@ import io
 import os
 import re
 import struct
+import sys
 import threading
 import zipfile
 from contextlib import contextmanager
@@ -73,12 +80,21 @@ class ExcelOpenError(Exception):
         waiting) - then ``down`` says why (_excel_down).
       * ``'access'`` — access denied by the OS (locked file, missing
         permission on the folder).
+      * ``'path'`` — the path is longer than Excel opens (EXCEL_MAX_PATH),
+        or than Windows allows (MAX_PATH, long paths off): checked before
+        Excel starts.
+      * ``'empty'`` — a 0-byte file: there is nothing in it to read.
       * ``'cancelled'`` — the Ledger's Cancel was pressed while this
         read was starting Excel (kill_active_excels).
       * ``'unknown'`` — fallback; the message includes diagnostic bytes.
+
+    ``for_good``: reading the same bytes again cannot help (an empty file;
+    Excel saying the file's format or extension is not valid), so the
+    knowledge graph remembers it by content hash (kg_excel.Unreadable).
     """
 
     down = ""
+    for_good = False
 
     def __init__(self, message: str, kind: str = "unknown"):
         super().__init__(message)
@@ -94,6 +110,17 @@ _HRESULT_FILE_NOT_FOUND = -2147024894            # 0x80070002
 #: Excel refusing a call: a dialog of its own is up (its license agreement,
 #: measured on this PC) - RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER.
 _HRESULTS_REFUSED = (-2147418111, -2147417846)   # 0x80010001, 0x8001010A
+#: Excel gone in the middle of a call: RPC_E_DISCONNECTED (0x80010108),
+#: RPC_S_SERVER_UNAVAILABLE (0x800706BA), RPC_S_CALL_FAILED (0x800706BE) -
+#: it closed or crashed, or was ended from outside (Task Manager, Cancel).
+_HRESULTS_GONE = (-2147417848, -2147023174, -2147023170)
+
+#: The longest full path the installed Excel opens. Measured on this PC
+#: (Microsoft 365): a valid .xls opens at 255 characters; at 256-259 Excel
+#: says only 'Open method of Workbooks class failed', which read as a
+#: corrupt file - and the 218 this code assumed was wrong (review,
+#: 2026-10-20). Longer paths are refused before Excel starts.
+EXCEL_MAX_PATH = 255
 
 
 def _com_error_hresult(exc) -> Optional[int]:
@@ -121,6 +148,13 @@ def _refused(exc) -> bool:
                for c in (args[0] if args else None, _com_error_hresult(exc)))
 
 
+def _gone(exc) -> bool:
+    """`exc` is Excel gone in the middle of a call (_HRESULTS_GONE)."""
+    args = getattr(exc, "args", None) or ()
+    return any(isinstance(c, int) and c in _HRESULTS_GONE
+               for c in (args[0] if args else None, _com_error_hresult(exc)))
+
+
 def _refusal(exc, obj=None, name: str = ""):
     """The refusal behind `exc` - Excel refusing a call on `obj` looking up
     `name` - or None. pywin32's late-bound object (what DispatchEx gives
@@ -141,6 +175,29 @@ def _refusal(exc, obj=None, name: str = ""):
     except Exception as e:                                  # noqa: BLE001
         return e if _refused(e) else None
     return exc
+
+
+def _gone_behind(exc, obj=None, name: str = ""):
+    """The error saying Excel is gone (_gone) behind `exc` - Excel's `obj`
+    failing `name` - or None. pywin32's late-bound object swallows the
+    error of a name it looks up on an object for the first time: Excel
+    ended in the middle of a read raised a bare AttributeError
+    ('<unknown>.Shapes'), the HRESULT lost - and each new worksheet's Name,
+    UsedRange and Shapes are such names - so the read ended 'could not be
+    read (AttributeError(...))', kind 'other' (2 runs in 2 with real
+    Excel ended by taskkill, measured here; review, 2026-10-20). The name
+    is looked up again through the object's own IDispatch, as _refusal
+    does: RPC_S_SERVER_UNAVAILABLE there (measured), that error."""
+    if _gone(exc):
+        return exc
+    ole = (getattr(obj, "__dict__", None) or {}).get("_oleobj_")
+    if not isinstance(exc, AttributeError) or ole is None or not name:
+        return None
+    try:
+        ole.GetIDsOfNames(0, name)
+    except Exception as e:                                  # noqa: BLE001
+        return e if _gone(e) else None
+    return None
 
 
 def _com_error_description(exc) -> str:
@@ -201,16 +258,17 @@ def classify_open_failure(exc, path, timeout: float = 0,
 
     if hresult == _HRESULT_EXCEL_CANNOT_OPEN:
         # 0x800A03EC is Excel's catch-all: its own words say which. A moved
-        # file, a path over Excel's 218 characters or a file open elsewhere
-        # were all reported as corrupt, with the words thrown away (review,
-        # 2026-10-19).
+        # file, a path over Excel's limit or a file open elsewhere were all
+        # reported as corrupt, with the words thrown away (review,
+        # 2026-10-19). A path over EXCEL_MAX_PATH no longer gets here
+        # (read_with_excel); the 218 said here was wrong (review, 2026-10-20).
         said = f" Excel said: {description[:200]}" if description else ""
         if re.search(r"(?i)couldn.?t find|could not find|cannot find|"
                      r"not found|check the spelling|path.*too long", description):
             return ExcelOpenError(
                 f"{name}: Excel could not find the file - moved, renamed, or a "
-                f"path longer than Excel accepts (218 characters: {len(str(p))} "
-                f"here).{said}", kind="unknown")
+                f"path longer than Excel accepts ({EXCEL_MAX_PATH} characters: "
+                f"{len(str(p))} here).{said}", kind="unknown")
         if re.search(r"(?i)cannot access|can.?t access|being used|is locked|"
                      r"read-only|permission", description):
             return ExcelOpenError(
@@ -218,13 +276,22 @@ def classify_open_failure(exc, path, timeout: float = 0,
                 f"program, locked, or on a share this account cannot read.{said}",
                 kind="access")
         size, head = _diag_bytes(p)
-        return ExcelOpenError(
+        err = ExcelOpenError(
             f"{name}: Excel refused to open the file. Common causes: the "
             "file is corrupt, is HTML saved with an .xls extension, is "
             "blocked by Excel's Trust Center (File Block rules for the "
             "format), or is not actually a workbook. "
             f"(size {size} bytes, first bytes {head or '<unreadable>'}){said}",
             kind="corrupt")
+        # Excel's own words that these bytes are no workbook of this kind:
+        # the same file is refused again, and the knowledge graph started a
+        # hidden Excel for it on every rebuild, unchanged or not (review,
+        # 2026-10-20). 'Open method of Workbooks class failed' says nothing
+        # of the kind (a path too long gave it too), nor does a Trust Center
+        # block (a setting the user may change): those are asked again.
+        err.for_good = bool(re.search(r"(?i)file format or file extension is not valid",
+                                      description))
+        return err
 
     if hresult == _HRESULT_ACCESS_DENIED:
         return ExcelOpenError(
@@ -899,21 +966,59 @@ def _ask(call, obj, name: str, wait: Optional[float] = None, stopped=()):
     """call() - `name` read, set or called on Excel's `obj` - asked again for
     `wait` seconds (_REFUSED_WAIT_S) while Excel refuses it (_refusal);
     _Refused when it still does then, at once when the watchdog stopped this
-    Excel (`stopped`). Any other failure is raised as it came."""
+    Excel (`stopped`). Excel gone meanwhile is raised as the error saying so
+    (_gone_behind); any other failure as it came."""
     import time
+    handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     end = time.monotonic() + (_REFUSED_WAIT_S if wait is None else wait)
     while True:
         try:
             return call()
         except Exception as e:
-            why = _refusal(e, obj, name)
-            if why is None:
-                raise
-            if stopped or time.monotonic() >= end:
-                if not _refused(why):
-                    raise           # pywin32's lookup kept failing; Excel's answered
-                raise _Refused(why) from e
+            why = gone = None
+            try:
+                why = _refusal(e, obj, name)
+                if why is None:
+                    gone = _gone_behind(e, obj, name)
+                    if gone is None or gone is e:
+                        raise
+                    raise gone from e
+                if stopped or time.monotonic() >= end:
+                    if not _refused(why):
+                        raise       # pywin32's lookup kept failing; Excel's answered
+                    raise _Refused(why) from e
+                # refused for a moment: asked again, its error let go first
+                _drop_frames(why, keep=handling)
+            finally:
+                # The refusal kept here held this frame through its traceback,
+                # and this frame held Excel's objects (`obj`, `call`): a cycle
+                # only gc freed, after COM was closed on the thread - Excel
+                # busy once and then answering froze a Ledger extract for
+                # 60-120 s (5 runs in 11, real Excel; review, 2026-10-20).
+                why = gone = None
         time.sleep(0.1)
+
+
+def _drop_frames(exc, keep=None) -> None:
+    """Clear the locals of the finished frames `exc` - and the errors it came
+    from - passed through: they held Excel's objects (_ask's frame the
+    Workbooks collection Excel would not open a workbook with, pywin32's
+    own frames the object asked). Released after CoUninitialize, with the
+    error, they kept that hidden Excel running for a minute after it was
+    told to quit, and left COM's memory corrupt: a later workbook's Excel
+    crashed the Council - an access violation in pywin32's typecomp.Bind,
+    on the Ledger's worker thread 3 times in 3 (measured here; review,
+    2026-10-20). `keep`: the error the caller was handling when the read
+    began, and those it came from - not this read's - left as they are."""
+    import traceback
+    todo, seen = [exc], set()
+    while todo:
+        x = todo.pop()
+        if x is None or x is keep or id(x) in seen:
+            continue
+        seen.add(id(x))
+        traceback.clear_frames(x.__traceback__)   # a frame still running: skipped
+        todo += [x.__cause__, x.__context__]
 
 
 def _put(app, attr: str, value) -> None:
@@ -934,13 +1039,17 @@ def _excel_pid(app, wait: Optional[float] = None) -> Optional[int]:
     asked again for `wait` seconds (_REFUSED_WAIT_S) while Excel refuses the
     call. None outside Windows, when pywin32 is absent, when the window
     cannot be read (a fake, an Excel still refusing) or names no process."""
+    handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     try:
         import win32process
         hwnd = int(_ask(lambda: app.Hwnd, app, "Hwnd", wait))
         if not hwnd:
             return None
         return int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
-    except Exception:                                       # noqa: BLE001
+    except Exception as e:                                  # noqa: BLE001
+        # Its refusal, kept, kept Excel itself alive past CoUninitialize
+        # (an Excel refusing from the start; review, 2026-10-20)
+        _drop_frames(e, keep=handling)
         return None
 
 
@@ -1273,12 +1382,31 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     the rebuild ran - no more pictures are copied (each is listed with no
     data, and a note says why) and the clipboard is left as it is, not put
     back over what the user copied."""
+    handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     # a Cancel after this stops the read (_CANCELS) - inside a Ledger extract,
     # one since the extract began (cancel_scope)
     since = getattr(_SCOPE, "since", None)
     cancels = _cancels() if since is None else since
     path = Path(path).resolve()
     _stop_if_cancelled(path, cancels)       # pressed already: no Excel at all
+    if len(str(path)) > EXCEL_MAX_PATH:
+        # Excel said only 'Open method of Workbooks class failed', read as a
+        # corrupt file (review, 2026-10-20): said for what it is, no Excel
+        raise ExcelOpenError(
+            f"{path.name}: path too long for Excel: {len(str(path))} characters (Excel "
+            f"opens paths of up to {EXCEL_MAX_PATH}) — move the folder or shorten its name",
+            kind="path")
+    try:
+        empty = path.stat().st_size == 0
+    except OSError:
+        empty = False                       # kind_of says why
+    if empty:
+        # Excel 'read' a 0-byte .xls as one blank sheet, and the run said
+        # nothing of it (review, 2026-10-20)
+        err = ExcelOpenError(f"{path.name}: empty file (0 bytes) — there is nothing in it "
+                             "to read", kind="empty")
+        err.for_good = True
+        raise err
     if kind_of(path) == "password":
         raise ExcelOpenError(
             f"{path.name} has a password to open; open it in Excel, save a "
@@ -1362,8 +1490,8 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 # still refused: macros not turned off, among the rest -
                 # nothing is opened in it
                 raise _excel_failed(e.why, path, cancels, True, left) from e.why
-            except Exception:
-                pass
+            except Exception as e:
+                _drop_frames(e, keep=handling)  # it held Excel (_drop_frames)
         _stop_if_cancelled(path, cancels)
         try:
             # A password the workbook does not have, so a protected file fails
@@ -1386,12 +1514,19 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         if watchdog is not None:
             watchdog.cancel()          # opened: copying a big workbook out may take a while
         out = ExcelBook()
-        for ws in book.Worksheets:
-            name = str(ws.Name)
+        # Each call the copy cannot do without is asked again while Excel
+        # refuses it (_ask): its license agreement came up while a workbook
+        # was copied out (~0.7-1.7 s after it starts, measured here), and the
+        # raw 'Call was rejected by callee' ended the read as 'other', each
+        # workbook after it starting an Excel of its own (review, 2026-10-20).
+        # Still refused, it is said so once per extract (the except below).
+        for ws in _ask(lambda: book.Worksheets, book, "Worksheets"):
+            name = str(_ask(lambda w=ws: w.Name, ws, "Name"))
             cells: Cells = {}
-            used = ws.UsedRange
-            r0, c0 = int(used.Row), int(used.Column)
-            data = used.Value
+            used = _ask(lambda w=ws: w.UsedRange, ws, "UsedRange")
+            r0 = int(_ask(lambda u=used: u.Row, used, "Row"))
+            c0 = int(_ask(lambda u=used: u.Column, used, "Column"))
+            data = _ask(lambda u=used: u.Value, used, "Value")
             if not isinstance(data, tuple):
                 data = ((data,),)
             elif data and not isinstance(data[0], tuple):
@@ -1404,8 +1539,9 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             _fill_merged(ws, used, cells)     # a merged label, in every cell it covers
             out.sheets.append((name, cells))
             n = 0
-            for k in range(1, int(ws.Shapes.Count) + 1):
-                sh = ws.Shapes.Item(k)
+            shapes = _ask(lambda w=ws: w.Shapes, ws, "Shapes")
+            for k in range(1, int(_ask(lambda s=shapes: s.Count, shapes, "Count")) + 1):
+                sh = _ask(lambda s=shapes, i=k: s.Item(i), shapes, "Item")
                 try:
                     typ = int(sh.Type)
                 except Exception:
@@ -1491,6 +1627,26 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                         out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
                                          "be copied out (the workbook may forbid copying)")
         return out
+    except Exception as e:
+        _drop_frames(e, keep=handling)
+        if book is None or isinstance(e, ExcelOpenError):
+            raise                   # before it opened: said above
+        # While the workbook was copied out (review, 2026-10-20):
+        why = e.why if isinstance(e, _Refused) else _refusal(e)
+        if why is not None:
+            # still refused: said once per extract, as an Excel refusing
+            # before the workbook opened is
+            raise _excel_failed(why, path, cancels, True, left) from why
+        if _gone(e):
+            # closed, crashed or ended from outside: this workbook only -
+            # the next one starts an Excel of its own (a Cancel meanwhile
+            # is said as one)
+            _stop_if_cancelled(path, cancels)
+            gone = (_com_error_description(e) or repr(e)).rstrip(". ")[:200]
+            raise ExcelOpenError(f"{path.name}: Excel stopped while the workbook was being "
+                                 f"read ({gone}) — it may have closed or crashed on it",
+                                 kind="unavailable") from e
+        raise
     finally:
         if watchdog is not None:
             watchdog.cancel()
@@ -1505,7 +1661,9 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 app.Quit()
             except Exception:
                 quit_refused = True
-        book = app = None
+        # every Excel object let go before CoUninitialize, not only the
+        # workbook and Excel itself (see _drop_frames)
+        book = app = books = ws = used = shapes = sh = ch = ax = sc = item = None
         if held is not None:
             # Quit refused ('Call was rejected by callee': its license
             # agreement waiting), or an Excel that never answered: ended,

@@ -1049,8 +1049,11 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     if not path.exists():
         n = path_too_long(path)
         if n:
-            raise LedgerError(f"{path.name}: path too long: {n} characters — enable Windows "
-                              "long paths or move the folder")
+            # from an ExcelOpenError of kind 'path', so the batch's roll-up
+            # says 'path too long', not 'other error' (review, 2026-10-20)
+            msg = (f"{path.name}: path too long: {n} characters — enable Windows "
+                   "long paths or move the folder")
+            raise LedgerError(msg) from excel_open.ExcelOpenError(msg, kind="path")
         raise LedgerError(f"{path.name} not found")
     if kind == "password":
         # from an ExcelOpenError of kind 'password', so the batch's roll-up
