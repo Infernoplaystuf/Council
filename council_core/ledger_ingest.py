@@ -28,9 +28,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError, ParentCSV, read_template
-from source_extract import (ImageReader, apply_review, decide, default_image_reader,
-                            extract, load_aliases, path_too_long, workbook_files,
-                            write_review)
+from source_extract import (REVIEW_TOO_LONG, ImageReader, apply_review, decide,
+                            default_image_reader, extract, load_aliases, path_too_long,
+                            too_long_to_write, workbook_files, write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -291,6 +291,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     if missing:
         raise LedgerError(f"source workbooks not found: {missing}")
     out = Path(review_path) if review_path else default_review_for(csv_path)
+    n = too_long_to_write(out)
+    if n:
+        # said now, not as a raw FileNotFoundError once every workbook was
+        # read (review, 2026-10-19)
+        raise LedgerError(REVIEW_TOO_LONG.format(n=n))
     mapping, ignore = load_aliases(csv_path)
     if use_images and image_reader is None:
         say("starting the local image reader…")
@@ -321,8 +326,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                   progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                   part_finder=part_finder)
     if report is not None and not run.cancelled:
-        prog.stage("asking Council's model about the labels left over")
-        ledger_llm.place_labels(run, ledger.schema, chat, report)
+        if cancel is not None and cancel.is_set():
+            # pressed after the last workbook was read: every value is in
+            # the review, which is not a cancelled one; the model is not
+            # asked about the labels after a Cancel (review, 2026-10-19)
+            report.problems.append("Cancelled before Council's model was asked about the "
+                                   "labels left over")
+        else:
+            prog.stage("asking Council's model about the labels left over")
+            ledger_llm.place_labels(run, ledger.schema, chat, report)
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)

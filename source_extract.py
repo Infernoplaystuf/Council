@@ -38,6 +38,11 @@ LAYOUTS RECOGNISED IN A SOURCE SHEET
 Which part a value belongs to: a Part Number found on that sheet, else a
 sheet named like a part ("Part 101", "101"), else the one Part Number found
 in the workbook, else a number in the file name (flagged), else --part.
+'TBD', 'N/A', '-' in a Part Number are no part; a 'Lot Number', 'Heat #',
+'Drawing No.', 'P.O. Number', 'Part Name' or a 'Part Information' heading is
+not the Part Number ('Customer P/N', 'Serial No.', 'Sample Number' are); a
+part that does not fit the part-name pattern you gave is kept, never
+pre-accepted.
 
 HOW A LABEL IS MATCHED TO A FIELD
 ---------------------------------
@@ -56,6 +61,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import errno
 import io
 import json
 import os
@@ -122,6 +128,10 @@ _ABBREV = {
 }
 _ABBREV_RE = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True)) + r")\b")
+#: The same, a bare 'part' left as typed: what a label says in so many
+#: words ('Part Revision' is not 'Part Number Revision').
+_ABBREV_TYPED_RE = re.compile(r"\b(" + "|".join(
+    re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True) if k != "part") + r")\b")
 _STOP = {"the", "of", "a", "an", "at", "to", "for", "and", "per"}
 UNITS = {   # unit -> (dimension, factor to SI)
     "um": ("len", 1e-6), "µm": ("len", 1e-6), "μm": ("len", 1e-6),
@@ -153,9 +163,9 @@ def split_unit(label: str) -> Tuple[str, str]:
     return s, (m.group(1).strip() if m else "")
 
 
-def tokens(text: str) -> List[str]:
+def tokens(text: str, typed: bool = False) -> List[str]:
     """Normalised words of a label: units and block letters out, short forms
-    spelt out."""
+    spelt out. typed: a bare 'part' stays 'part' (not 'part number')."""
     base, _ = split_unit(text)
     base = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", base)    # OCR's "PartNumber"
     s = re.sub(r"p\s*/\s*n", " pn ", base.lower())
@@ -165,7 +175,8 @@ def tokens(text: str) -> List[str]:
     # S/N label by its value (_SN_LABEL).
     s = re.sub(r"[#]", " number ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-    s = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(1)], s)   # one pass: no re-expansion
+    s = (_ABBREV_TYPED_RE if typed else _ABBREV_RE).sub(
+        lambda m: _ABBREV[m.group(1)], s)                    # one pass: no re-expansion
     out: List[str] = []
     for w in s.split():
         if w in _STOP or (len(w) == 1 and w.isalpha()) or (out and out[-1] == w):
@@ -265,12 +276,71 @@ class Matcher:
                 self.by_name.setdefault(fn, t)
         self._tok = {t.name: tokens(t.text) for t in self.targets}
         self._sec = {t.name: set(tokens(t.section)) for t in self.targets}
+        self._id_tok = set(tokens(schema.id_field or ""))
 
     def is_generic(self, label: str) -> bool:
         """A one-word label shared by 3+ fields ("Date", "Notes")."""
         s = set(tokens(label))
         return len(s) == 1 and sum(1 for t in self.targets
                                    if s <= set(self._tok[t.name])) >= 3
+
+    def spelt_out(self, label) -> bool:
+        """The id field's own words typed in the label - 'Customer P/N',
+        'Part No./Rev', 'Supplier Part Number' - not read into a bare 'part'
+        ('Part Revision')."""
+        return bool(self._id_tok) and self._id_tok <= set(tokens(label, typed=True))
+
+    def names_other(self, label) -> bool:
+        """A word of another kind of identifier in the label, spelt out as
+        the id field's or not: 'Part No./Rev', 'Part Number per Drawing'."""
+        return isinstance(label, str) and bool(
+            (set(tokens(label)) - self._id_tok) & _OTHER_ID_WORDS)
+
+    def other_id(self, label) -> bool:
+        """An id label of another kind of identifier: 'Lot Number', 'Heat #',
+        'Work Order Number', 'Drawing No.', 'Part Revision' - a word of
+        _OTHER_ID_WORDS the template's own id field does not have - or one
+        of someone else's ('Customer Number', 'Report No.': _ID_OWNER_WORDS,
+        with no word of the id field's). 'Serial Number', 'S/N', 'Sample
+        ID' are not; a template whose id field is 'Lot Number' keeps its own
+        label. Nor is one that spells out the id field's words: 'Customer
+        P/N', 'Part No./Rev', 'Part Number per Drawing', 'Build Part Number'
+        were the part, rightly, until a bare 'part' read as 'part number'
+        put them with 'Part Revision' (review, 2026-10-19)."""
+        if not isinstance(label, str) or self.spelt_out(label):
+            return False
+        extra = set(tokens(label)) - self._id_tok
+        if extra & _OTHER_ID_WORDS:
+            return True
+        return bool(extra & _ID_OWNER_WORDS) and not (
+            set(tokens(label, typed=True)) & (self._id_tok - _GENERIC_ID_WORDS))
+
+    def other_id_label(self, label) -> bool:
+        """'Lot Number', 'Heat #', 'Part Revision': another identifier's
+        label written like the id field's (with a word of it). match() gives
+        it no field now, but it is still a label, never a value: a 'Part
+        Number | Lot Number' header row made the part 'Lot Number'. 'Lot
+        7734-B' and 'Rev B' are values, and so is a note: a label is a few
+        words, no digits or sentence marks, not opening with 'No' - 'No
+        issues, see report 12', 'No change to program' were labels, and a
+        Notes field lost them (review, 2026-10-19)."""
+        if not isinstance(label, str):
+            return False
+        s = label.strip()
+        n = len(s.split())
+        if not (1 <= n <= 4 and _ID_LABEL_SHAPE.fullmatch(s)):
+            return False
+        w = tokens(s)
+        if not w or not set(w) & self._id_tok:
+            return False
+        if n > 2 and w[-1] not in _GENERIC_ID_WORDS:
+            return False                 # 'Part reworked per drawing' is a note
+        return self.other_id(s)
+
+    def is_label(self, v) -> bool:
+        """A label of a field, or another identifier's label."""
+        return isinstance(v, str) and (self.match(v).target is not None
+                                       or self.other_id_label(v))
 
     def is_item_header(self, label: str) -> bool:
         if not self.schema.item_field:
@@ -301,9 +371,14 @@ class Matcher:
         joined = " ".join(src)
         sset = set(src)
         snums = {w for w in src if w.isdigit()}
+        # 'Lot Number' is not the Part Number: it took the id column of a
+        # table, pre-accepted (review, 2026-10-19)
+        other_id = bool((sset - self._id_tok) & _ANY_OTHER_ID_WORDS) and self.other_id(label)
         scored = []
         for t in self.targets:
             if per_item is not None and t.per_item != per_item and not t.is_id:
+                continue
+            if t.is_id and other_id:
                 continue
             ft = self._tok[t.name]
             if not ft:
@@ -450,6 +525,63 @@ _SN_LABEL = re.compile(r"(?i)s\s?/?\s?n\s?(?:#|no\.?)?\s?[:.]?")
 #: Words a label shares with the part number's that do not make it one:
 #: 'Run Number', 'Lot Number', 'Heat Number' share only 'number'.
 _GENERIC_ID_WORDS = frozenset({"number", "id"})
+#: Words that make an id label another kind of identifier - a lot, a heat, a
+#: job, a drawing, a revision - not the part's: a 'Lot Number' column was
+#: every row's part, pre-accepted, and 'Part Revision: B' named the part
+#: (review, 2026-10-19). Serial, sample, specimen are the part's own.
+_OTHER_ID_WORDS = frozenset({
+    "lot", "heat", "melt", "batch", "run", "job", "work", "order", "wo", "po", "purchase",
+    "drawing", "dwg", "revision", "rev", "version", "ver", "fixture", "tool",
+    "station", "machine", "cert", "certificate", "procedure",
+    "invoice", "ticket", "ncr", "step", "employee", "badge",
+    "tracking", "shipment",
+})
+#: Whose number it is, or what it numbers: another's identifier only with no
+#: word of the part's - 'Customer Number', 'Report No.', 'Sheet No.' - for
+#: 'Customer P/N', 'Supplier Part Number', 'Build Part Number', 'Part
+#: Number - Sheet 1' name the part (review, 2026-10-19).
+_ID_OWNER_WORDS = frozenset({
+    "customer", "vendor", "supplier", "build", "program", "project", "report",
+    "operation", "op", "document", "doc", "file", "page", "sheet",
+})
+_ANY_OTHER_ID_WORDS = _OTHER_ID_WORDS | _ID_OWNER_WORDS
+#: Words that say a label numbers the part itself, with only 'number' or
+#: 'id' of the part number's: 'Serial No.', 'Sample Number' - a sample is
+#: what a Ledger row is (its value was lost, review 2026-10-19).
+_PART_OWN_WORDS = frozenset({"serial", "sample", "specimen", "coupon"})
+#: Words that make a label sharing the part number's word something else of
+#: the part: a heading over a block ('Part Information', 'Part Details') or
+#: the part's name or kind ('Part Name: Bracket'). 'Part Information' over
+#: 'Customer | Acme' made the part 'Customer', pre-accepted (review,
+#: 2026-10-19).
+_NOT_ID_WORDS = frozenset({
+    "information", "info", "details", "detail", "data", "name", "description", "desc",
+    "title", "type", "family", "status", "material", "amount", "quantity", "count",
+    "weight", "location", "notes", "note", "comments", "remarks",
+})
+#: Another identifier's label as typed ('Lot Number', 'Heat #', 'Drawing
+#: No.'): letters and a few marks, no digits or sentence marks, not opening
+#: with 'No'/'Not' (a note: 'No change to program').
+_ID_LABEL_SHAPE = re.compile(r"(?i)(?!no\b|not\b)[a-z][a-z.#/&\s-]{0,38}:?")
+#: What a cell holds where a value is not known yet: 'TBD', 'N/A', 'n.a.',
+#: '-', '?', 'pending', 'to be assigned'. Not a part number: 'TBD' was the
+#: part, pre-accepted, and Apply wrote its values (review, 2026-10-19).
+#: council_core.kg_excel takes it for 'nobody signed'. 'XXX', '0',
+#: 'awaiting', 'later' and 'n/a (rework)' are stand-ins too: each was the
+#: part, pre-accepted (review, 2026-10-19).
+PLACEHOLDER = re.compile(
+    r"(?i)[\s(\[#]*(?:n\s*/\s*a|n\.?\s*a\.?|[-–—]+|\?+|x+|0+|tb[adc]|none|nil|null|unknown"
+    r"|pending|unassigned|awaiting(?:\s+[a-z/#]+){0,2}|later|to\s+follow"
+    r"|not\s+(?:yet\s+)?(?:assigned|known|available|applicable)"
+    r"|to\s+be\s+(?:assigned|determined|confirmed|advised))[\s)\].!]*"
+    r"(?:[(\[][^()\[\]]{0,30}[)\]][\s.!]*)?")
+
+
+def is_placeholder(v) -> bool:
+    """A blank's stand-in ('TBD', 'N/A', '-'), not a value. Tried on a short
+    cell only."""
+    s = _text(v) if v is not None else ""
+    return bool(s) and len(s) <= 40 and bool(PLACEHOLDER.fullmatch(s))
 
 
 def _signed_by(text: str) -> str:
@@ -683,7 +815,9 @@ def preview_workbook(path, schema, aliases=None,
                                    "a part-name pattern")
         report.sheets.append(SheetPreview(
             name=ex.g.sheet, cells=len(ex.g.cells),
-            part_id=ex.part, part_how=ex.part_how,
+            part_id=ex.part,
+            part_how=ex.part_how if ex.part == part else _fit_mask(ex.part, ex.part_how,
+                                                                    mask_re),
             inspectors=inspectors,
             sure=sure, maybe=maybe,
             unmatched_labels=unmatched[:200]))
@@ -733,6 +867,54 @@ def path_too_long(path) -> int:
     if len(p) < _MAX_PATH or os.path.exists(p):
         return 0
     return len(p) if os.path.exists(_long_path(p)) else 0
+
+
+def _long_paths_on() -> bool:
+    """Whether this program may use paths of MAX_PATH or more: Windows 10
+    1607+ with long paths enabled, asked of Windows itself (it weighs the
+    policy and the program's manifest). Older Windows: never."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        f = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+        f.restype = ctypes.c_ubyte
+        return bool(f())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def too_long_to_write(path) -> int:
+    """The length of `path` when Windows will not let a file be written
+    there - MAX_PATH (260) characters or more, long paths off - else 0."""
+    if os.name != "nt":
+        return 0
+    n = len(os.path.abspath(str(path)))
+    return n if n >= _MAX_PATH and not _long_paths_on() else 0
+
+
+#: What a review path Windows cannot write is told (ledger_ingest says it
+#: before a workbook is read).
+REVIEW_TOO_LONG = ("review path too long ({n} characters) — enable Windows long paths "
+                   "or pick a shorter folder")
+
+
+#: The one problem line a run gets when its pictures cannot be saved for the
+#: length of their path.
+_PICTURES_TOO_LONG = "pictures not saved: path too long"
+
+
+def _too_long(path, e: OSError) -> int:
+    """The length of `path` when writing there failed for that length - on
+    Windows with long paths off, WinError 206 for a folder of 248+
+    characters and 'not found' for a file of 260+; ENAMETOOLONG elsewhere -
+    else 0."""
+    n = len(os.path.abspath(str(path)))
+    if getattr(e, "winerror", None) == 206 or e.errno == errno.ENAMETOOLONG:
+        return n
+    if os.name == "nt" and n >= _MAX_PATH and isinstance(e, FileNotFoundError):
+        return n
+    return 0
 
 
 def workbook_files(folder) -> List[Path]:
@@ -1144,7 +1326,22 @@ class _Extractor:
                 val = inline if inline else self._value_near(r, c)
                 if val and self.codes.canon(val):
                     continue                   # a flaw code is never a part number
-                if val and not self.m.match(val).target:
+                if is_placeholder(val):
+                    # 'Part Number: TBD' names no part: the sheet name, the
+                    # workbook, the file name or the model may (review,
+                    # 2026-10-19: 'TBD' was the part, pre-accepted)
+                    continue
+                if not inline and isinstance(val, str) and _split_inline(val)[1] \
+                        and self.m.is_label(_split_inline(val)[0]):
+                    # 'Lot Number: AB-2041' below is a label with its own
+                    # value, not this one's; 'AB-12:01', 'LMM1AB101 Rev: B'
+                    # are part numbers with a colon in them (review,
+                    # 2026-10-19: any colon lost the part)
+                    continue
+                if val and not self.m.is_label(val):
+                    if mt.via != "alias" and self.m.names_other(label) \
+                            and not self._looks_like_id(val):
+                        continue               # 'Part No. Rev: B' is the revision
                     if not self._is_table_header(r, c):
                         self.part = _text(val)
                         self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
@@ -1159,22 +1356,55 @@ class _Extractor:
 
     def _sure_id(self, label, mt: Match) -> bool:
         """A label that IS the part number's: an alias, a sure match, or one
-        sharing a word with it ('Part No.', 'P/N') or saying serial ('Serial
-        No.'). A 'Parameter | Value' table matched 'Part Number' at 0.6 and
-        made every part 'Value'; 'Partner' did too; and 'Run #', 'Lot Number',
-        'Heat Number' share only the word 'number' (review, 2026-10-19)."""
+        sharing a word with it ('Part No.', 'P/N') or saying serial or sample
+        ('Serial No.', 'Sample Number'). A 'Parameter | Value' table matched
+        'Part Number' at 0.6 and made every part 'Value'; 'Partner' did too;
+        and 'Run #', 'Lot Number',
+        'Heat Number' share only the word 'number' (review, 2026-10-19). One
+        naming another kind of identifier ('Part Revision') is not it either
+        (Matcher.other_id), nor a heading or the part's name ('Part
+        Information', 'Part Name': _NOT_ID_WORDS), unless you mapped it.
+
+        `mt` is the label's match without context: a heading's word above a
+        table ('Part Number: LMM1AB101') lifted 'P.O. Number' to 0.9, a sure
+        match, and every row's part was 1, 2 ... (review, 2026-10-19)."""
         if not (mt.target and mt.target.is_id and mt.score >= SUGGEST_AT):
             return False
+        if mt.via == "alias":
+            return True
+        if self.m.other_id(label):
+            return False                   # 'Part Revision', 'Lot Number'
         words = set(tokens(label))
-        return mt.via == "alias" or mt.score >= ACCEPT_AT or "serial" in words or bool(
+        if (words - self.m._id_tok) & _NOT_ID_WORDS:
+            return False                   # 'Part Information', 'Part Name'
+        return mt.score >= ACCEPT_AT or bool(words & _PART_OWN_WORDS) or bool(
             (words & set(self.m._tok[mt.target.name])) - _GENERIC_ID_WORDS)
+
+    def _is_id_label(self, label) -> bool:
+        """_sure_id for a table's or a form's label, matched without the
+        headings above it."""
+        return self._sure_id(label, self.m.match(label, per_item=False))
+
+    def _id_column(self, r, c, label) -> bool:
+        """Column c under header row r is the part number's: its label is
+        the part number's (_is_id_label) - and when the label names another
+        identifier as well ('Part No./Rev'), the column holds part numbers,
+        not 'A', 'B'."""
+        mt = self.m.match(label, per_item=False)
+        if not self._sure_id(label, mt):
+            return False
+        if mt.via == "alias" or not self.m.names_other(label):
+            return True
+        vals = [v for v in (self.g.cells.get((rr, c)) for rr in range(r + 1, r + 4))
+                if v is not None and not is_placeholder(v)]
+        return not vals or any(self._looks_like_id(v) for v in vals)
 
     def _looks_like_id(self, val) -> bool:
         """A part's serial number, not a signal-to-noise reading: the user's
         part shape, letters with digits ('LMM1AB101', 'SN-0042') or a whole
         number of 3+ digits - never '3.2', '12', '12 dB' or a flaw code."""
         s = _text(val).strip() if val is not None else ""
-        if not s or len(s) > 40 or self.codes.canon(s):
+        if not s or len(s) > 40 or self.codes.canon(s) or is_placeholder(s):
             return False
         if self.mask_re is not None and self.mask_re.search(s):
             return True
@@ -1186,10 +1416,9 @@ class _Extractor:
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
                    if c2 != c and isinstance(v, str)
-                   and (self.m.match(v).score >= SUGGEST_AT or self.m.is_item_header(v)))
-        return hits >= 1 and self.g.cells.get((r, c + 1)) is not None \
-            and isinstance(self.g.cells.get((r, c + 1)), str) \
-            and self.m.match(self.g.cells[(r, c + 1)]).target is not None
+                   and (self.m.match(v).score >= SUGGEST_AT or self.m.is_item_header(v)
+                        or self.m.other_id_label(v)))
+        return hits >= 1 and self.m.is_label(self.g.cells.get((r, c + 1)))
 
     def _value_near(self, r, c):
         for dc in (1, 2, 3):
@@ -1274,6 +1503,7 @@ class _Extractor:
         heads = {}
         item_col = who_col = run_col = value_col = None
         ids: List[Tuple[float, int]] = []
+        lookalike = False
         for c in cols:
             v = self.g.text(r, c)
             if self.m.is_item_header(v):
@@ -1290,8 +1520,15 @@ class _Extractor:
                 continue
             mt = self.m.match(v, ctx)
             if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
-                ids.append((mt.score, c))
-                continue
+                if self._id_column(r, c, v):
+                    ids.append((mt.score, c))
+                    continue
+                # like the Part Number's but not it ('P.O. Number', 'Item No.',
+                # 'Part Name'): an ordinary column, its values offered to map.
+                # It was every row's part, 1, 2 ..., pre-accepted, over the
+                # sheet's own 'Part Number: ...' (review, 2026-10-19).
+                lookalike = True
+                mt = Match(None, mt.score, mt.guesses, via="none")
             heads[c] = (v, mt)
         # the best Part Number column wins; a weaker one is an ordinary column
         id_col = max(ids)[1] if ids else None
@@ -1312,7 +1549,7 @@ class _Extractor:
         stage_col = self._stage_col(heads, data_rows, ctx) \
             if per_item and value_col is not None else None
         matched = [c for c, (_, mt) in heads.items() if mt.target]
-        if len(matched) + (item_col is not None) + (id_col is not None) \
+        if len(matched) + (item_col is not None) + (id_col is not None or lookalike) \
                 + (stage_col is not None) < 2:
             return
         # values under a header must not be more labels
@@ -1325,12 +1562,19 @@ class _Extractor:
             self._long_rows(r, data_rows, item_col, id_col, who_col, stage_col,
                             value_col, ctx)
             return
-        final = {c: (label, self.m.match(label, ctx, per_item=per_item))
-                 for c, (label, _) in heads.items()}
+        final = {}
+        for c, (label, _) in heads.items():
+            mt = self.m.match(label, ctx, per_item=per_item)
+            if mt.target is not None and mt.target.is_id:
+                # a column that is not the part's ('Customer P/N' beside
+                # 'Part Number', 'P.O. Number'): never a Part Number value -
+                # Apply put that in the row's Part Number (review, 2026-10-19)
+                mt = Match(None, mt.score, mt.guesses, via="none")
+            final[c] = (label, mt)
         runs_seen: Dict[str, int] = defaultdict(int)
         for d in data_rows:
             self._tick()
-            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            part, part_how = self._row_part(d, id_col) if id_col else (self.part, "")
             item = self.codes.canon(self.g.cells.get((d, item_col))) if per_item else ""
             if per_item and not item:
                 continue
@@ -1353,11 +1597,21 @@ class _Extractor:
                               who=_initials(self.g.cells.get((d, who_col))) or None
                               if who_col else None)
                 if o is not None and id_col:
-                    o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+                    o.part_how = part_how
                 self.used.add((d, c))
             for c in (id_col, item_col, who_col, run_col):
                 if c:
                     self.used.add((d, c))
+
+    def _row_part(self, d, id_col) -> Tuple[str, str]:
+        """(part, how) of table row d from its Part Number cell. A placeholder
+        ('TBD', 'N/A', '-') is no part, as a blank cell is: 'TBD' was the
+        row's part, pre-accepted (review, 2026-10-19)."""
+        v = self.g.cells.get((d, id_col))
+        how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+        if is_placeholder(v):
+            return "", f"{how}: {_text(v).strip()!r} is not a part number"
+        return _text(v), how
 
     def _data_rows(self, r, cols, item_col) -> List[int]:
         """Rows under a header until an empty one. In a flaw table one blank
@@ -1400,7 +1654,7 @@ class _Extractor:
             stage = self.g.text(d, stage_col)
             if not item or not stage or (d, value_col) not in self.g.cells:
                 continue
-            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            part, part_how = self._row_part(d, id_col) if id_col else (self.part, "")
             label = f"{head} {stage}".strip()
             mt = self.m.match(label, ctx, per_item=True)
             o = self.emit(part, item, label, d, stage_col, self.g.cells[(d, value_col)], mt,
@@ -1408,7 +1662,7 @@ class _Extractor:
                           who=_initials(self.g.cells.get((d, who_col))) or None
                           if who_col else None)
             if o is not None and id_col:
-                o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+                o.part_how = part_how
             # the rest of the row (date, inspector, part, flaw) says which reading
             for c, _v in self.row(d):
                 self.used.add((d, c))
@@ -1426,8 +1680,13 @@ class _Extractor:
             ctx = self.context(r)
             mt = self.m.match(label, ctx, per_item=False)
             if mt.target and mt.target.is_id:
-                self.used.add((r, c))
-                continue
+                if self._is_id_label(label):
+                    self.used.add((r, c))      # find_part's: the part, or none
+                    continue
+                # 'P.O. Number', 'Mold Number', 'Part Name' look like the
+                # Part Number's label and are not it: their value went
+                # nowhere, not even to Labels to map (review, 2026-10-19)
+                mt = Match(None, mt.score, mt.guesses, via="none")
             if inline:
                 vr, vc, val = r, c, inline
             else:
@@ -1439,7 +1698,7 @@ class _Extractor:
                     # another label (of any field, per-flaw ones too) is not a value,
                     # nor is a lone block letter or flaw code ("B" beside "Date")
                     if isinstance(x, str) and not _num(x) and (
-                            self.m.match(x).target or self.codes.canon(x)
+                            self.m.is_label(x) or self.codes.canon(x)
                             or re.fullmatch(r"[A-Za-z]", x.strip())):
                         break
                     vr, vc, val = r, c + dc, x
@@ -2012,10 +2271,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             _wd_cm.__exit__(None, None, None)
         except Exception:                                   # noqa: BLE001
             pass
-    if cancel is not None and cancel.is_set() and not run.cancelled:
-        # pressed during the last workbook (or the only one)
-        run.cancelled = True
-        run.problems.append("Cancelled by user.")
+    # Cancelled only when a workbook was skipped or cut short (_extract_all
+    # says so): a Cancel pressed after the last one was read made a whole
+    # review 'Cancelled… partial review' (review, 2026-10-19). One that cut
+    # a read short in a way the read swallowed is caught after the read
+    # and after the model's question (_extract_one).
     return run
 
 
@@ -2099,6 +2359,10 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         run.timings.append((label or src.name, _secs))
         prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
         return
+    if cancel is not None and cancel.is_set():
+        # pressed while Excel read it: what came back may be cut short
+        # (a picture Excel did not copy out is a note, not an error)
+        raise _Cancelled()
     if label and label != src.name:            # a name another source shares
         for g in grids:
             g.file = label
@@ -2118,18 +2382,33 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             continue
         if image_dir:
             d = Path(image_dir)
-            d.mkdir(parents=True, exist_ok=True)
             # every part cleaned: a sheet, anchor or extension may hold
             # characters Windows refuses in a file name ("?" did)
             stem = Path(label).with_suffix("").as_posix() if label else src.stem
             p = d / (f"{_safe(stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
                      f".{_safe(img.ext) or 'png'}")
+            made = not d.exists()
             try:
+                # the folder is made here, for a picture being saved: made
+                # up front, a review folder path of 248+ characters failed
+                # the whole Extract with WinError 206, pictures ticked or
+                # not (review, 2026-10-19)
+                d.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(img.data)
                 img.saved_as = str(p)
             except OSError as e:          # one picture never stops the run
-                run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
-                                    f"saved ({e.strerror or e}); it is still read")
+                if made:
+                    try:
+                        d.rmdir()         # nothing was saved in it
+                    except OSError:
+                        pass
+                n = _too_long(p, e)
+                if not n:
+                    run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
+                                        f"saved ({e.strerror or e}); it is still read")
+                elif not any(x.startswith(_PICTURES_TOO_LONG) for x in run.problems):
+                    run.problems.append(f"{_PICTURES_TOO_LONG} ({n} characters) — enable "
+                                        "Windows long paths or move the folder")
         note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
         if reader is not None:
             note.reader = getattr(reader, "name", "image reader")
@@ -2172,6 +2451,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         prog.update(here["what"], force=True)
         found_part, where = part_finder(label or src.name, grids)
         _wd.beat()
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()                # the model's answer was cut short
         if found_part:
             book_part, how = found_part, f"{MODEL_PART_HOW} from {where} — check it"
     for ex in exs:
@@ -2186,6 +2467,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         ex.forms()
         for o in ex.out + ex.unmatched:
             o.part_how = o.part_how or ex.part_how
+            if o.part != part:                       # not the Part you typed
+                o.part_how = _fit_mask(o.part, o.part_how, mask_re)
         n = len(ex.out)
         run.obs.extend(ex.out)
         run.unmatched.extend(ex.unmatched)
@@ -2295,7 +2578,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   and not o.part_how.startswith(MODEL_PART_HOW)
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
-                  and not o.part_how.startswith(FILE_PART_HOW))
+                  and not o.part_how.startswith(FILE_PART_HOW)
+                  # nor one that is not the shape of your part-name pattern
+                  and MISFIT_PART_HOW not in o.part_how)
             out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
@@ -2309,6 +2594,19 @@ MODEL_PART_HOW = "suggested by Council's model"
 #: How a part read from the workbook's file name is described (never
 #: pre-accepted either).
 FILE_PART_HOW = "file name"
+#: Added to how a part was found when you gave a part-name pattern and the
+#: part does not fit it: kept, never pre-accepted (review, 2026-10-19).
+MISFIT_PART_HOW = "does not fit the part-name pattern"
+
+
+def _fit_mask(part: str, how: str, mask_re: "Optional[re.Pattern]") -> str:
+    """`how`, saying so when the user's part-name pattern is set and `part`
+    is not of that shape ('AB-2041' for '@@@#@@###')."""
+    if mask_re is None or not part or MISFIT_PART_HOW in how \
+            or mask_re.fullmatch(part.strip()):
+        return how
+    return f"{how} — {MISFIT_PART_HOW}" if how else MISFIT_PART_HOW
+
 
 #: How many other values a clashing review row lists.
 OTHERS_SHOWN = 20
@@ -2516,6 +2814,14 @@ def _save_wb(wb, path: Path) -> None:
     except PermissionError as e:
         raise LedgerError(f"could not write {path.name}: it is probably open in Excel. "
                           "Close it and try again.") from e
+    except OSError as e:
+        n = _too_long(path, e)
+        if not n:
+            raise
+        # a raw FileNotFoundError [Errno 2] after every workbook was read
+        # (review, 2026-10-19)
+        raise LedgerError(f"could not write {path.name}: "
+                          + REVIEW_TOO_LONG.format(n=n)) from e
 
 
 # ── aliases (what you taught it) ────────────────────────────────────────
