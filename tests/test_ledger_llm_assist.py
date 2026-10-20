@@ -559,14 +559,38 @@ def test_cancel_while_the_model_is_asked_about_the_labels_is_a_cancelled_run(tmp
     cancel = threading.Event()
     s = li._extract(str(csv), [str(src)], tmp_path / "review.xlsx", "", False, None,
                     _NoProg(), None, cancel, None, True, _stopped_by_cancel(cancel, "labels"))
-    assert s.cancelled and s.values and Path(s.review).exists()
+    assert s.cancelled and s.read_all and s.values and Path(s.review).exists()
     text = s.describe()
-    assert text.startswith("CANCELLED")
+    assert text.startswith("CANCELLED after every workbook was read — ")
     assert "did not answer" not in text and "none answered" not in text
     assert s.assist == ("Council's model: Cancel stopped it while it was asked about the "
                         "labels left over, so nothing in the review is its suggestion.")
     assert "Cancelled by user while Council's model was asked about the labels left over; " \
            "every value the rules found is in this review." in s.problems
+
+
+def test_a_model_that_answers_despite_cancel_says_its_values_are_in(tmp_path, ledger):
+    """A model Cancel cannot stop (a GGUF in this process) answers anyway:
+    its values are placed, amber - the log said only that every value the
+    rules found was in the review (second review, 2026-10-20)."""
+    import threading
+    csv, schema = ledger
+    src = _unlabelled_book(tmp_path / "untitled.xlsx")
+    cancel = threading.Event()
+    model = FakeModel(mapping={"Zorp rate": _field(schema, "Frequency")})
+
+    def chat(prompt, schema_):
+        if "Which part" not in prompt:
+            cancel.set()                                   # pressed; it answers anyway
+        return model(prompt, schema_)
+    s = li._extract(str(csv), [str(src)], tmp_path / "review.xlsx", "", False, None,
+                    _NoProg(), None, cancel, None, True, chat)
+    assert s.cancelled and s.read_all
+    assert "placed 1 value(s) from 2 unplaced label(s)" in s.assist
+    assert "all amber in the review: check them" in s.assist
+    assert ("Cancelled by user while Council's model was asked about the labels left over, "
+            "but it answered first; every value the rules found is in this review, and the "
+            "1 value(s) it placed are too (amber: check them).") in s.problems
 
 
 def test_cancel_while_the_model_is_asked_for_a_part_is_not_its_failure(tmp_path, ledger):
@@ -579,7 +603,7 @@ def test_cancel_while_the_model_is_asked_for_a_part_is_not_its_failure(tmp_path,
     s = li._extract(str(csv), [str(tmp_path / "nopart.xlsx")], tmp_path / "review.xlsx", "",
                     False, None, _NoProg(), None, cancel, None, True,
                     _stopped_by_cancel(cancel, "part"))
-    assert s.cancelled
+    assert s.cancelled and not s.read_all                  # the workbook was cut short
     text = s.describe()
     assert "did not answer" not in text and "none answered" not in text
     assert s.assist == ("Council's model: Cancel stopped it while it was asked about "
@@ -1243,3 +1267,22 @@ def test_the_ledger_and_connections_use_one_rule_for_an_unknown_ollama_model(mon
                       "C:/m/qwen.gguf": False}
     with pytest.raises(se.LedgerError, match="cannot tell where mystery:1b comes from"):
         ledger_llm.chat_for("ollama:mystery:1b")
+
+
+@pytest.mark.parametrize("sep", [":", ",", ";"])
+def test_a_spaced_part_after_a_run_of_separators_is_read_at_once(sep):
+    """_inside_a_value tried r'\\S+[\\s,;:]*$' from every character before a
+    spaced part id the model named: 1,000 ':' and a word before it held the
+    GIL for 0.8 s, 2,000 for 6 s, while the extract asked for the part
+    (review, 2026-10-20). The same reading, from the end."""
+    import re
+    import time
+    for n in (1000, 30000):
+        cell = sep * n + " end QRS 6TU 789"
+        t0 = time.perf_counter()
+        got = ledger_llm._whole_word("QRS 6TU 789", cell)
+        assert time.perf_counter() - t0 < 0.05 and got == "QRS 6TU 789"
+    for s in ("", "  ", " :: ", "AB 12::", "x", "ab:cd:", "AB 12 ::: ", "a ;\t,b , ",
+              "Oct 5,", ":, ;", "12:30 \n", "\xa0x\u3000:"):
+        m = re.search(r"\S+[\s,;:]*$", s)
+        assert ledger_llm._word_before(s) == (m.start() if m else None), repr(s)

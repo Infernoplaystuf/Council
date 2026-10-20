@@ -235,9 +235,12 @@ def _partless(path: Path) -> Path:
     return path
 
 
-def test_a_cancel_after_the_last_workbook_was_read_is_not_a_cancelled_run(tmp_path, ledger):
+def test_a_cancel_after_the_last_workbook_was_read_is_a_whole_review(tmp_path, ledger):
     """Pressed after the last workbook was read, it marked a whole review
-    'Cancelled... partial review' (review, 2026-10-19)."""
+    'Cancelled... partial review' (review, 2026-10-19). With Council's
+    model ticked, the Cancel stops its question: cancelled, and said as one
+    pressed while it is asked is - a review with every value the rules
+    found, not a partial one (second review, 2026-10-20)."""
     csv, schema = ledger
     a = lf.make_laser_log(tmp_path / "a_laser.xlsx")
     b = _partless(tmp_path / "b_nopart.xlsx")
@@ -260,10 +263,11 @@ def test_a_cancel_after_the_last_workbook_was_read_is_not_a_cancelled_run(tmp_pa
     s = li._extract(str(csv), [str(a), str(b)], tmp_path / "review.xlsx", "", False, None,
                     _CancelWhenRead(cancel, "b_nopart.xlsx read in"), None, cancel, None,
                     True, chat)
-    assert cancel.is_set() and not s.cancelled and s.values
+    assert cancel.is_set() and s.cancelled and s.read_all and s.values
+    assert s.describe().startswith("CANCELLED after every workbook was read — ")
     assert asked and all("Which part" in p for p in asked)
-    assert any("Cancelled before Council's model was asked about the labels" in p
-               for p in s.problems)
+    assert ("Cancelled before Council's model was asked about the labels left over; every "
+            "value the rules found is in this review.") in s.problems
 
 
 def test_a_cancel_that_cut_the_last_workbook_short_is_still_a_cancelled_run(
@@ -716,3 +720,67 @@ def test_cancel_during_a_sheet_of_padded_cells_ends_the_run_at_once(tmp_path, le
                      progress=_PressOnce(cancel, ""))
     assert run.cancelled and not run.obs
     assert time.perf_counter() - pressed["at"] < 2
+
+
+# ---------------------------------------------- a who cell typed on two lines (review, 2026-10-20)
+
+def _who_read(cell, schema):
+    """Who the Ledger (find_inspectors) and the knowledge graph read from
+    ``cell`` above a reading."""
+    from council_core import kg_excel as kx
+    m, codes = se.Matcher(schema), se.ItemCodes(schema.items)
+    g = se.Grid("w.xlsx", "Sheet1", {(1, 1): cell, (2, 1): "Laser Power (W)", (2, 2): 280})
+    ex = se._Extractor(g, m, codes, "", None)
+    ex.find_inspectors()
+    return [w for _r, _c, w in ex.markers], kx._who_inline(cell)
+
+
+@pytest.mark.parametrize("cell", ["Inspector: JB\nMK", "Inspector: JB\r\nMK",
+                                  "Inspector: J\nB", "Inspector: John\nBlake",
+                                  "Inspector: JB  \n  MK", "Inspected by JB\nMK",
+                                  "Inspector: JB\rMK"])
+def test_a_who_cell_on_two_lines_is_nobody(cell, ledger):
+    """The who patterns read a cell's words with its spaces collapsed, line
+    breaks too: 'Inspector: JB' Alt+Enter 'MK' became one person 'Jb Mk' -
+    'JBMK' in the graph - who signed and pre-accepted every reading under
+    it. The pattern as typed kept a who on one line, and still does (review,
+    2026-10-20); a lone '\\r' is a line break too."""
+    _csv, schema = ledger
+    assert _who_read(cell, schema) == ([], [])
+
+
+@pytest.mark.parametrize("cell, who", [("Inspector: JB", "JB"), ("Inspector:\nJB", "JB"),
+                                       ("Inspector: JB\n", "JB"), ("Checked by\nJB", "JB"),
+                                       ("Inspector:\tJB", "JB"), ("Operator - MK", "MK"),
+                                       ("  Inspector:  " + " " * 3000 + "JB  ", "JB")])
+def test_a_who_on_one_line_is_still_read(cell, who, ledger):
+    _csv, schema = ledger
+    assert _who_read(cell, schema) == ([who], [who])
+
+
+def test_readings_under_a_two_line_who_cell_are_not_signed_by_a_phantom(tmp_path, ledger):
+    """End to end: an EC table under 'Inspector: JB' Alt+Enter 'MK'. Every
+    reading was pre-accepted with Inspector 'Jb Mk' and the graph had a
+    person 'JBMK'; as typed, nobody signed: the readings are to review."""
+    from council_core import kg_excel as kx
+    from council_core import knowledge_graph as kgm
+    csv, schema = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"], ws["B1"] = "Part Number", "LMM1AB101"
+    ws["A3"] = "Inspector: JB\nMK"
+    ws["B5"] = "Flaw #"
+    for i, it in enumerate(lf.ITEMS[:3]):
+        ws.cell(5, 3 + i, it)
+        ws.cell(6, 3 + i, 60 + i)
+    ws["B6"] = "Eddy Current Response Pre-Conceal"
+    src = tmp_path / "ec.xlsx"
+    wb.save(src)
+    run = se.extract(schema, [src], use_images=False)
+    assert run.obs and not any(o.inspector for o in run.obs)
+    s = li.run_extract(str(csv), [str(src)], tmp_path / "review.xlsx", use_images=False)
+    assert s.values and s.pre_accepted == 0
+    reading = kx.read_workbook(src, "ec.xlsx", kgm.DEFAULT_FIELD_RULES)
+    assert not [v.raw for rec in reading.records for v in rec.values
+                if v.rule.type == "PERSON"]

@@ -1015,14 +1015,29 @@ def _inside_a_value(text: str, start: int, end: int) -> bool:
         return _a_value(token)
     if not re.search(r"\s", token):
         return False
-    prev = re.search(r"\S+[\s,;:]*$", text[:start])
+    a = _word_before(text[:start])
     nxt = re.match(r"[\s,;:]*[^\s,;:]+", text[end:])
-    a = prev.start() if prev else start
+    a = start if a is None else a
     b = end + nxt.end() if nxt else end
     first, last = start + len(token.split()[0]), end - len(token.split()[-1])
     spans = {text[a:end], text[start:b], text[a:b], text[a:first], text[last:b]}
     return any(_a_value(" ".join(s.split()).strip(_TRIM + "."))
                for s in spans if s != token)
+
+
+def _word_before(s: str) -> Optional[int]:
+    """Where r'\\S+[\\s,;:]*$' first matches in ``s`` - the word written
+    last, with the ',', ';', ':' and spaces after it - or None; read from
+    the end, once. The pattern was tried from every character and rescanned
+    the rest: a cell of 2,000 ':' and a word before a spaced part id held
+    the GIL for 6 s while the extract asked for its part (second
+    review, 2026-10-20)."""
+    r = s[::-1]
+    tail = re.match(r"[\s,;:]*", r).end()                 # one class: no backtracking
+    if tail == len(s):                                     # ',', ';', ':' and spaces only
+        m = re.search(r"\S", s)
+        return m.start() if m else None
+    return len(s) - tail - re.match(r"\S*", r[tail:]).end()
 
 
 def _a_value(s: str) -> bool:

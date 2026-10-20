@@ -475,19 +475,39 @@ def _words(v, most: int = LABEL_MAX) -> str:
     return s if len(s) <= most else ""
 
 
+#: A run of spaces, tabs or line breaks: one match each, read once.
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def _lines(v, most: int = LABEL_MAX) -> str:
+    """_words, but a run of spaces with a line break in it ('\\n', '\\r\\n',
+    '\\r') is one '\\n', not a space: the lines a cell is typed on stay
+    apart. 'Inspector: JB' Alt+Enter 'MK' is two lines, nobody's initials -
+    read as 'Inspector: JB MK' it signed and pre-accepted every reading
+    under it as 'Jb Mk' and gave the graph a person 'JBMK' (second
+    review, 2026-10-20). Still one pass over the cell, no run left to backtrack
+    over; as long as _words (a run is one character either way)."""
+    s = _words(v, most)
+    if not s or ("\n" not in v and "\r" not in v):
+        return s                          # one line, or too long to be a label
+    return _SPACE_RUN.sub(lambda m: "\n" if "\n" in m.group() or "\r" in m.group() else " ",
+                          v).strip()
+
+
 class _OnWords:
-    """A label pattern tried on a cell's words (_words), never on the cell
+    """A label pattern tried on a cell's words (_lines), never on the cell
     as typed: '\\s*[:#]?\\s*$', '(?P<who>.+?)\\s*$' and the like backtracked
     quadratically over a run of spaces - 'Inspector', 'inspected by', 'Run'
     or 'Response' padded with thousands of them held the GIL for seconds to
     minutes, the app froze and Cancel could not be pressed (review,
-    2026-10-20). council_core.kg_excel uses these too."""
+    2026-10-20). Its lines stay apart, as they were for the pattern: a
+    '(?P<who>.+?)' is on one line. council_core.kg_excel uses these too."""
 
     def __init__(self, pattern: str):
         self.pattern = re.compile(pattern)
 
     def match(self, v):
-        s = _words(v)
+        s = _lines(v)
         return self.pattern.match(s) if s else None
 
 
