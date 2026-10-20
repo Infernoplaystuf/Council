@@ -484,6 +484,10 @@ _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za
 #: Matched on the stripped cell only (no overlapping whitespace runs: the
 #: old pattern backtracked cubically on a space-padded cell).
 _WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*)?$")
+#: A date typed as text: '2026-09-22', '22.09.2026', '9/22/26', '09/22' - not
+#: a run's number ('EC-1', 'EC (1)', 'EC 1/2').
+_DATE_TEXT = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+                        r"|(?<!\d)\d{2}/\d{2}(?!\d)")
 #: Short words an inspection sheet writes where initials could stand that are
 #: nobody's initials: result codes (FPI's 'NRI' no relevant indication, 'IND',
 #: 'NDI', 'ACC', 'REJ', 'RJT', 'NCR'), outcomes ('OK', 'NA', 'TBD') and a
@@ -494,6 +498,9 @@ NOT_INITIALS = frozenset({
     "nri", "ind", "ndi", "acc", "rej", "rjt", "ncr", "ok", "na", "tbd",
     "pass", "fail", "nde", "fpi", "avg", "max", "min", "std", "nogo",
 })
+#: What a cell holds as a reading in words: FPI's results, an outcome.
+_RESULT_WORDS = frozenset({"nri", "ind", "ndi", "rli", "rni", "acc", "rej", "rjt", "pass",
+                           "fail", "ok", "ng", "nogo", "go"})
 #: Units a reading's brackets hold that UNITS cannot convert: the ones
 #: council_core.kg_excel's stop list has ('psi', 'rpm', 'ipm' ...) and an
 #: NDE sheet's ('FSH' full screen height, 'dB', 'Vpp', 'div'). '12 (IPM)'
@@ -518,9 +525,15 @@ _SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*(?:°|\"|[A-Za-z
 _SIGNED_BARE = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
                           r"(?:\s*(?P<sep>[/\-–—])\s*|\s+)"
                           r"(?P<who>[A-Z]\.?\s?[A-Z]\.?(?:\s?[A-Z]\.?)?)$")
-#: The note on a reading that ends in someone's initials after a bare space
-#: ('49 JB') when no one signs so on its sheet: a signer or a unit ('45
-#: HRC')? Kept as typed, never pre-accepted (review, 2026-10-20).
+#: The same in small letters after a '/' or a dash, or glued on in capitals:
+#: '51/jb', '52JB' - never split, only told (UNSURE_SIGNER_NOTE). Not '33
+#: mV', '12 ms': a unit after a space.
+_SIGNED_LOOSE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*[/\-–—]\s*"
+                           r"(?P<who>[A-Za-z]\.?\s?[A-Za-z]\.?(?:\s?[A-Za-z]\.?)?)"
+                           r"|(?P<glued>[A-Z]{2,3}\.?))$")
+#: The note on a reading that ends in initials no one signs with on its
+#: sheet ('49 JB', '47/RLI'): a signer, a unit or a code? Kept as typed,
+#: never pre-accepted (review, 2026-10-20).
 UNSURE_SIGNER_NOTE = "ends in initials or a unit: who signed it? check it"
 #: The note on a reading of a table beside another that has no label column
 #: of its own: the field is the other table's label, a guess (review,
@@ -842,7 +855,7 @@ def preview_workbook(path, schema, aliases=None,
         # the sheet's other parts, each from its own label down (find_part)
         more = "".join(f"; {p or 'no part yet'} from row {r} down" + (
             f" ({SHEET_PARTS_HOW}: check it)" if SHEET_PARTS_HOW in h else "")
-            for r, _c, p, h in ex.part_labels[1:])
+            for i, (r, _c, p, h) in enumerate(ex.part_labels) if i or not p)
         report.sheets.append(SheetPreview(
             name=ex.g.sheet, cells=len(ex.g.cells),
             part_id=ex.part,
@@ -1120,6 +1133,7 @@ class _Extractor:
         #: (row, col, part, how) of each part's label when the sheet has
         #: more than one part (find_part, part_at)
         self.part_labels: List[Tuple[int, int, str, str]] = []
+        self._unsure_labels: set = set()                 # (row, col): _later_part
         self._signers: Optional[set] = None              # _sheet_signers
         self.mask_re = mask_re
         self.used = set()
@@ -1188,15 +1202,21 @@ class _Extractor:
             # '47/JB', '48 - JB', '49 JB' were the text, pre-accepted as the
             # heading's MK's (review, 2026-10-20). Only a reading someone
             # signs ('2041-AB' is a lot), only initials (_signed_by: no unit,
-            # code or stand-in), and after a bare space only someone signing
-            # on this sheet: '45 HRC', '12 FT' are units. Else kept as typed,
-            # never pre-accepted.
+            # code or stand-in), and only someone signing on this sheet
+            # (_sheet_signers): after a '/' or a dash too, '45-HRC', '47/RLI',
+            # '48-LOW' were signed by HRC, RLI, LOW, pre-accepted (review,
+            # 2026-10-20). Else kept as typed, never pre-accepted - and so
+            # are '51/jb', '52JB'.
             bare = _SIGNED_BARE.match(txt.strip())
             by = _signed_by(bare.group("who")) if bare else ""
-            if by and (bare.group("sep") or by in self._sheet_signers()):
+            if by and by in self._sheet_signers():
                 txt, who = bare.group("v"), by
             elif by:
                 unsure = True
+            else:
+                loose = _SIGNED_LOOSE.match(txt.strip())
+                unsure = bool(loose and _signed_by(
+                    (loose.group("who") or loose.group("glued")).upper()))
         if short and match.target and match.target.unit:
             nu = _NUM_UNIT.match(txt)
             pu = _NUM_PAREN_UNIT.match(txt.strip())
@@ -1234,14 +1254,15 @@ class _Extractor:
 
     def _sheet_signers(self) -> set:
         """Initials of who signs on this sheet: its inspector headings and
-        labels, and the readings signed in brackets or after a '/' or a
-        dash. Made once, when a reading first needs it."""
+        labels, and the readings signed in brackets ('41 [JB]'). Not a
+        '47/RLI' itself: that would vouch for itself. Made once, when a
+        reading first needs it."""
         if self._signers is None:
             got = {w for _r, _c, w in self.markers}
             for v in self.g.cells.values():
                 s = v.strip() if isinstance(v, str) and len(v) <= 40 else ""
-                m = (_SIGNED.match(s) or _SIGNED_BARE.match(s)) if s else None
-                if m and (m.re is _SIGNED or m.group("sep")):
+                m = _SIGNED.match(s) if s else None
+                if m:
                     got.add(_signed_by(m.group("who")))
             self._signers = got - {""}
         return self._signers
@@ -1275,12 +1296,18 @@ class _Extractor:
                 for dc in (1, 2):
                     x = self.g.cells.get((r, c + dc))
                     if x is not None:
-                        who = person(x, acronym=True) if isinstance(x, str) else ""
+                        # 'EC' beside 'Inspector Initials' is Eva Chen only
+                        # where that pair is all its row holds: in a header
+                        # row ('Inspector | PN | Flaw | EC Pre') the next
+                        # column's title was the inspector and the table was
+                        # lost (review, 2026-10-20)
+                        who = person(x, acronym=self._lone_pair(r, c, c + dc)) \
+                            if isinstance(x, str) else ""
                         if who:
                             self.used.add((r, c + dc))
                         break
             if not who:
-                h = self._heading_who(v, person)
+                h = self._heading_who(v, person, self.g.cells.get((r, c + 1)))
                 if h and self._heads_a_table(r, c, person):
                     who = h
             if who:
@@ -1300,9 +1327,29 @@ class _Extractor:
                     and h.group(1).lower() not in NOT_INITIALS:
                 self.markers.append((0, 0, h.group(1)))
 
-    def _heading_who(self, v, person) -> str:
+    def _lone_pair(self, r, c, cx) -> bool:
+        """A label at (r, c) and its value at (r, cx) are all row r holds
+        (a date and its label aside), and under the value is no reading
+        ('Inspector Initials | EC' over a table titled 'Flaw | EC Post'): a
+        label and its value, not two titles of a header row."""
+        for c2, x in self.row(r):
+            if c2 in (c, cx) or isinstance(x, date):
+                continue
+            s = x.strip() if isinstance(x, str) and len(x) <= 60 else ""
+            if not (s and (re.match(r"(?i)^date\b", s) or _DATE_TEXT.fullmatch(s))):
+                return False
+        under = self.g.cells.get((r + 1, cx))
+        if under is None or isinstance(under, (date, _Merged)):
+            return True
+        s = _text(under).strip()
+        return not (isinstance(under, (int, float)) or _num(s) is not None
+                    or self.codes.canon(s) or self._looks_like_id(s)
+                    or _CODE_CELL.fullmatch(s) or is_placeholder(s))
+
+    def _heading_who(self, v, person, beside=None) -> str:
         """The initials a table heading is ('JB', 'JB — 2026-09-18'), or ''.
-        Never a result code ('NRI', 'IND', 'OK') nor a flaw code."""
+        Never a result code ('NRI', 'IND', 'OK') nor a flaw code. beside:
+        the cell right of it (its date, typed as one)."""
         if not isinstance(v, str) or len(v) > 60:
             # a heading of initials and a date is short; a long padded
             # cell made this pattern backtrack for 54 s with the GIL held
@@ -1312,8 +1359,11 @@ class _Extractor:
         # 'EC — 2026-09-22' is Eva Chen's heading: with its date, initials
         # spelling out a template's words are still someone's. Her readings
         # went to the heading before (review, 2026-10-20). A bare 'EC' over
-        # a table is the method's title.
-        dated = bool(h) and any(ch.isdigit() for ch in v.strip()[h.end("who"):])
+        # a table is the method's title, and so are 'EC-1', 'EC: 2', 'EC
+        # (1)', 'PN-1': a run's number is no date - they made EC and PN the
+        # inspectors, pre-accepted (review, 2026-10-20).
+        dated = bool(h) and (bool(_DATE_TEXT.search(v.strip()[h.end("who"):]))
+                             or isinstance(beside, date))
         if not h or h.group("who").lower() in NOT_INITIALS \
                 or not person(h.group("who"), acronym=dated) or self.codes.canon(v):
             return ""
@@ -1380,27 +1430,33 @@ class _Extractor:
         the second coupon's readings were put on the first, pre-accepted
         (review, 2026-10-20). See _part_blocks."""
         self.part_labels = []
+        self._unsure_labels = set()
         key = None
+        lead: List[Tuple[int, int, str]] = []      # 'Part Number: TBD' above the first
         for (r, c), v in sorted(self.g.cells.items()):
             if not isinstance(v, str):
                 continue
-            if key is not None:
-                # after the first, only the same label typed again, told
-                # cheaply: a match() for every cell of a 5,000-row sheet
-                # would be the freeze again
-                label = _split_inline(v)[0] if len(v) <= 200 else ""
-                if not label or len(label) > 60 or normalize_label(label) != key:
-                    continue
+            if key is not None and not self._same_id_label(v, key):
+                continue
             got = self._part_label(r, c, v)
+            if got is None:
+                continue
             if key is None:
                 if not got:
+                    # 'Part Number: TBD' over the upper block: its readings
+                    # were put on the lower block's part, pre-accepted
+                    # (review, 2026-10-20)
+                    lead.append((r, c, got))
                     continue
                 self.part = got
                 self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
                     f", read from image {self.g.from_image}" if self.g.from_image else "")
-                key = normalize_label(_split_inline(v)[0])
-            if got is not None:
-                self.part_labels.append((r, c, got))
+                label = _split_inline(v)[0]
+                key = (normalize_label(label), _id_label_key(label))
+                self.part_labels = lead
+            elif not self._later_part(r, c, v, got):
+                continue
+            self.part_labels.append((r, c, got))
         if key is not None:
             self._part_blocks()
             return
@@ -1453,32 +1509,88 @@ class _Extractor:
                     return _text(val)
         return None
 
+    def _same_id_label(self, v, key) -> bool:
+        """v is the sheet's first part label typed again, told cheaply - a
+        match() for every cell of a 5,000-row sheet would be the freeze
+        again: the same text, or a short label of the same words ('Part
+        No.:', 'P/N:' under 'Part Number:' - its readings stayed on the
+        first part, review 2026-10-20). 'Serial No.' under 'Part Number' is
+        another of the part's labels, not another part."""
+        label = _split_inline(v)[0] if len(v) <= 200 else ""
+        if not label or len(label) > 60:
+            return False
+        if normalize_label(label) == key[0]:
+            return True
+        return len(label) <= 30 and bool(_ID_LABEL_SHAPE.fullmatch(label)) \
+            and _id_label_key(label) == key[1]
+
+    def _later_part(self, r, c, v, got) -> bool:
+        """A part label after the sheet's first starts a block only when its
+        value is shaped like a part ('LMM3EF305', your part-name pattern) or
+        names none yet, and it is no column's title: 'Part Number | Status |
+        Notes' over a table of parts made 'Status' the part of every reading
+        below it, pre-accepted, and lost the workbook its one part (review,
+        2026-10-20). A table's own Part Number column says each row's part.
+        One on a row of other titles or labels is kept, never sure."""
+        if got and not self._looks_like_id(got):
+            return False
+        if _split_inline(v)[1]:
+            return True                        # 'Part Number: LMM3EF305' in one cell
+        if self._looks_like_id(self.g.cells.get((r + 1, c))):
+            return False                       # a column of part numbers under it
+        if any(isinstance(x, str) and x.strip() and _text(x).strip() != got
+               for c2, x in self.row(r) if c2 != c):
+            self._unsure_labels.add((r, c))
+        return True
+
     def _part_blocks(self) -> None:
         """More than one part on the sheet: each part label's block is the
         rows from it down to the next one's (part_at). Only when every later
         label is below the one before, with readings between them, are the
         blocks sure; two labels on one row, two typed one under the other
         with nothing between ('Part Number: X', 'Part Number: Y' over one
-        table) or one naming no part yet ('TBD') leave every value of the
-        sheet to check, never pre-accepted (SHEET_PARTS_HOW)."""
+        table) or one naming no part yet ('TBD') over readings, above or
+        below, leave every value of the sheet to check, never pre-accepted
+        (SHEET_PARTS_HOW). A 'TBD' over an empty block is a spare coupon's,
+        left blank: nothing to check - the whole sheet went amber (review,
+        2026-10-20)."""
         labels, self.part_labels = self.part_labels, []
+        labels = [x for x in labels if x[2] or self._readings_after(x[0], labels)]
         if len({p for _r, _c, p in labels}) < 2:
             return                             # one part, typed once or again
         blocks = [labels[0]]
-        unclear = False
+        unclear = not labels[0][2]             # readings under a 'TBD' above the part
         for r, c, p in labels[1:]:
             pr, _pc, pp = blocks[-1]
             if p == pp:
                 continue                       # the same part again
-            if not p or r == pr or not self._readings_between(pr, r):
+            if not p or r == pr or not self._readings_between(pr, r) \
+                    or (r, c) in self._unsure_labels:
                 unclear = True
             blocks.append((r, c, p))
         from openpyxl.utils import get_column_letter
         self.part_labels = [
             (r, c, p, (f"{self.m.schema.id_field} at {self.g.sheet}!{get_column_letter(c)}{r}"
-                       if i else self.part_how)
+                       + ("" if p else ", no part yet") if i or not p else self.part_how)
              + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
             for i, (r, c, p) in enumerate(blocks)]
+
+    def _readings_after(self, r, labels) -> bool:
+        """Readings in the block of the part label at row r, down to the
+        next label's row: a number, typed or as text ('47/JB'), or a result
+        ('NRI', 'IND'). An empty block's flaw codes and labels are none."""
+        end = min((x[0] for x in labels if x[0] > r), default=max(self.rows, default=r) + 1)
+        for rr in range(r + 1, end):
+            for _c, v in self.row(rr):
+                if isinstance(v, (bool, _Merged)):
+                    continue
+                if isinstance(v, (int, float)):
+                    return True
+                s = v.strip() if isinstance(v, str) and len(v) <= 20 else ""
+                if s and (re.match(r"[+-]?\.?\d", s) and not self.codes.canon(s)
+                          or s.lower() in _RESULT_WORDS):
+                    return True
+        return False
 
     def _readings_between(self, r1, r2) -> bool:
         """A number or a flaw code on a row between r1 and r2: the block of
@@ -1609,7 +1721,12 @@ class _Extractor:
             # (review, 2026-10-20).
             blocks, cols = self._grid_blocks(r, hits)
             cols[0] = label_col
-            starts = [0] + [lc or b[0][0] for lc, b in zip(cols[1:], blocks[1:])] + [1 << 30]
+            # who columns between two tables are the right one's from the
+            # empty spacer column between them on: 'Inspector Initials'
+            # typed left of a table's labels was the left table's, and the
+            # right one's readings had no inspector (review, 2026-10-20)
+            starts = [0] + [self._block_start(r, left[-1][0], lc or b[0][0])
+                            for left, lc, b in zip(blocks, cols[1:], blocks[1:])] + [1 << 30]
             for i, block in enumerate(blocks):
                 lc = cols[i]
                 guess = lc is None
@@ -1626,27 +1743,59 @@ class _Extractor:
     def _grid_blocks(self, r, hits) -> Tuple[List[List[Tuple[int, str]]], List[Optional[int]]]:
         """A header row's item codes split into the tables side by side, and
         each later table's own label column (None: it has none). A column
-        between two codes with a header on row r ('Flaw #', 'Inspector
-        Initials') or a label on the first row of readings starts another
-        table; the nearest such label column is that table's. An empty
-        spacer column does not."""
+        between two codes starts another table when it is titled like a
+        grid's own ('Flaw #') or its first row of readings is a template
+        field's label ('EC Post-Conceal'). An 'Inspector Initials' column, a
+        summary ('Avg'), a note ('ok') or an empty spacer column between
+        two groups of codes is the same table: each split one, the right
+        group's readings lost to Labels to map, or its inspectors, or
+        amber (review, 2026-10-20)."""
         first = next((rr for rr in range(r + 1, r + 12)
                       if any((rr, c) in self.g.cells for c, _ in hits)), r + 1)
         blocks: List[List[Tuple[int, str]]] = [[hits[0]]]
         own: List[Optional[int]] = [None]
         for (c0, _), (c1, it) in zip(hits, hits[1:]):
             gap = range(c1 - 1, c0, -1)
-            if any(self.g.cells.get((r, cc)) is not None or self.g.text(first, cc)
-                   for cc in gap):
+            heads = [cc for cc in gap if self.m.is_item_header(self.g.text(r, cc) or "")]
+            lab = next((cc for cc in heads if self.g.text(first, cc)), None) \
+                or next((cc for cc in gap if self._grid_label_col(r, first, cc)), None)
+            if heads or lab is not None:
                 blocks.append([])
-                own.append(next((cc for cc in gap if self.g.text(first, cc)), None))
+                own.append(lab)
             blocks[-1].append((c1, it))
         return blocks, own
+
+    def _grid_label_col(self, r, first, cc) -> bool:
+        """Column cc's first row of readings is a template field's label, and
+        its title is not 'Inspector Initials' (where 'EC' is Eva Chen)."""
+        head = self.g.text(r, cc)
+        t = self.g.text(first, cc)
+        if not t or len(t) > 60 or (head and _WHO_HEAD.match(head)):
+            return False
+        mt = self.m.match(t, per_item=True)
+        return mt.target is not None and mt.score >= SUGGEST_AT
+
+    def _block_start(self, r, last, lc) -> int:
+        """The first column of the table whose labels are in column lc,
+        beside one whose last code is in column `last`: right of the empty
+        column between them on header row r, else lc."""
+        for cc in range(lc - 1, last, -1):
+            if (r, cc) not in self.g.cells:
+                return cc + 1
+        return lc
 
     def _grid(self, r, hits, label_col, ctx, who_cols, guess=False) -> None:
         """One item grid: codes `hits` on header row r, labels down
         label_col. guess: the labels are another table's (_grid_blocks)."""
         self.used.add((r, label_col))                # the grid's own "Flaw #" cell
+        # Each code's own 'Inspector Initials' column: of two in one grid
+        # ('1A 2A 3A | Inspector Initials | 1B 2B 3B | Inspector Initials')
+        # the nearest after it - before it where they come first. The first
+        # one's initials were every group's (review, 2026-10-20).
+        before = any(wc < hits[0][0] for wc in who_cols)
+        order = {c: sorted(who_cols, key=lambda wc, c=c: ((wc > c) if before else (wc < c),
+                                                          abs(wc - c)))
+                 for c, _ in hits}
         rr = r + 1
         blanks = 0
         while blanks < 2 and rr < r + 60:
@@ -1664,10 +1813,10 @@ class _Extractor:
             mt = self.m.match(label, ctx, per_item=True)
             if guess and mt.target is not None:
                 mt = Match(mt.target, mt.score, mt.guesses, via="ambiguous")
-            who = next((w for w in (_initials(self.g.cells.get((rr, wc)))
-                                    for wc in who_cols) if w), None)
             for c, it in hits:
                 if (rr, c) in self.g.cells:
+                    who = next((w for w in (_initials(self.g.cells.get((rr, wc)))
+                                            for wc in order[c]) if w), None)
                     part, how = self.part_at(rr, c)
                     o = self.emit(part, it, label, rr, label_col,
                                   self.g.cells[(rr, c)], mt, vr=rr, vc=c, who=who)
@@ -1720,12 +1869,45 @@ class _Extractor:
             x = self.g.cells.get((r + 1, c))
             if x is None or isinstance(x, _Merged) and c not in spans:
                 continue                       # a header of one row, or merged down
-            if not isinstance(x, str) or isinstance(x, _Merged) or len(x) > 60 \
-                    or _num(x) is not None or self.codes.canon(x) or is_placeholder(x):
-                return {}                      # a row of readings, not of labels
-            if c in spans:
-                out[c] = x.strip()
+            if c not in spans or not isinstance(x, str) or isinstance(x, _Merged) \
+                    or len(x) > 60 or _num(x) is not None or self.codes.canon(x) \
+                    or is_placeholder(x) or x.strip().lower() in _RESULT_WORDS:
+                # a row of readings, not of labels: 'KP | NRI | ok' under
+                # 'Inspector | FPI Result' (merged) was a header, and lost
+                # (review, 2026-10-20)
+                return {}
+            out[c] = x.strip()
         return out if spans and set(out) == spans else {}
+
+    def _parents_above(self, r, cols) -> Dict[int, str]:
+        """Header row r's columns under a parent merged over some of them on
+        the row above, which holds nothing else: 'Eddy Current Response'
+        over B:C, with 'Flaw | Pre-Conceal | Post-Conceal | FPI' all on row
+        r. {column: its parent}, or {}: a title merged over the whole
+        header is not a parent. The table was lost to Labels to map
+        (review, 2026-10-20)."""
+        lo, hi = cols[0], cols[-1]
+        out: Dict[int, str] = {}
+        for c, v in self.row(r - 1):
+            if c < lo or c > hi:
+                continue
+            if isinstance(v, _Merged):
+                if out.get(c - 1) != str(v):
+                    return {}                  # merged in from outside the header
+                out[c] = str(v)
+                continue
+            nxt = self.g.cells.get((r - 1, c + 1))
+            if not isinstance(v, str) or len(v) > 60 or not isinstance(nxt, _Merged) \
+                    or str(nxt) != v or _num(v) is not None or self.codes.canon(v) \
+                    or (r - 1, c) in self.used or _split_inline(v)[1]:
+                # a cell of its own, or a label with its value ('Part
+                # Number: X', 'Inspector: KP' merged over two): no parents
+                return {}
+            out[c] = v
+        if not out or not set(out) < set(cols) \
+                or isinstance(self.g.cells.get((r - 1, max(out) + 1)), _Merged):
+            return {}
+        return {c: " ".join(p.split()) for c, p in out.items()}
 
     def _table(self, r, cols) -> None:
         if len(cols) < 2:
@@ -1735,12 +1917,20 @@ class _Extractor:
         item_col = who_col = run_col = value_col = None
         ids: List[Tuple[float, int]] = []
         lookalike = False
+        below = next((run for run in self._header_runs(r + 1, sorted(
+            c for c, v in self.row(r + 1) if isinstance(v, str) and (r + 1, c) not in self.used))
+            if cols[0] in run), [])
+        if below and set(cols) <= set(self._parents_above(r + 1, below)):
+            return                                # parents over the header under it
         sub = self._sub_heads(r, cols)
+        above = {} if sub else self._parents_above(r, cols)
         top = r + 1 if sub else r                 # the header's last row
         for c in cols:
             v = self.g.text(r, c)
             if c in sub:
                 v = f"{v} {sub[c]}"               # 'Eddy Current Response Post-Conceal'
+            elif c in above:
+                v = f"{above[c]} {v}"
             if self.m.is_item_header(v):
                 item_col = c
                 continue
@@ -1793,6 +1983,7 @@ class _Extractor:
             return
         for c in cols:
             self.used.update(((r, c), (top, c)))
+        self.used.update((r - 1, c) for c in above)
         if stage_col is not None:
             self._long_rows(r, data_rows, item_col, id_col, who_col, stage_col,
                             value_col, ctx)
@@ -1960,6 +2151,15 @@ def _split_inline(v: str) -> Tuple[str, str]:
     if m and re.search(r"[A-Za-z]", m.group(1)) and not m.group(2).startswith(("/", "\\")):
         return m.group(1), m.group(2).strip()
     return v.strip(), ""
+
+
+def _id_label_key(label: str) -> Tuple[str, ...]:
+    """What a part label says, however spelt: 'Part Number', 'Part No.',
+    'P/N', 'PART #' are ('part', 'number'); 'S/N', 'SN #' are the serial."""
+    s = label.strip()
+    if len(s) <= 12 and _SN_LABEL.fullmatch(s):
+        return ("s/n",)
+    return tuple(tokens(s)) or (normalize_label(s),)
 
 
 def _part_from_name(name: str, mask_re: "Optional[re.Pattern]" = None) -> str:
