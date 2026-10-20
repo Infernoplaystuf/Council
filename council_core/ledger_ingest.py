@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (ImageReader, apply_review, decide, default_image_reader,
@@ -52,20 +52,28 @@ def is_ledger_output(p: Path, template_path: Optional[str] = None) -> bool:
     template itself. A recursive scan of a folder that also holds the
     Ledger read them back as sources - old reviews' values outranked the
     real ones (review, 2026-10-19)."""
+    return bool(_ledger_output_kind(p, template_path))
+
+
+def _ledger_output_kind(p: Path, template_path: Optional[str] = None) -> str:
+    """'the template' / 'a Ledger review' / 'a filled template', or ''."""
     from council_core import kg_excel
     from sample_ledger import is_filled_template
     if template_path:
         try:
             if p.resolve() == Path(template_path).resolve():
-                return True
+                return "the template"
         except OSError:
             pass
-    return kg_excel.is_review_workbook(p) or is_filled_template(p)
+    if kg_excel.is_review_workbook(p):
+        return "a Ledger review"
+    return "a filled template" if is_filled_template(p) else ""
 
 
 def collect_sources(paths: Sequence,
                     ignore_patterns: Optional[Sequence[str]] = None,
-                    template_path: Optional[str] = None
+                    template_path: Optional[str] = None,
+                    reasons: Optional[Dict[Path, str]] = None
                     ) -> Tuple[List[Path], List[Path]]:
     """Expand paths (files kept as-is, folders scanned recursively) into
     the Ledger's source list.
@@ -77,7 +85,9 @@ def collect_sources(paths: Sequence,
     matched against the base name only.
 
     Returns ``(kept, ignored)``. Legacy single-list callers can
-    discard the ignored list."""
+    discard the ignored list. ``reasons``, when given, gets why each
+    ignored file was left out ("Skip pattern 'cover*'", "a Ledger
+    review")."""
     from source_extract import file_matches_ignore
     patterns = list(ignore_patterns or [])
     kept: List[Path] = []
@@ -91,9 +101,13 @@ def collect_sources(paths: Sequence,
                 continue
             # a folder's scan leaves the Ledger's own outputs out; a file
             # the user picked by name is read as asked
-            if file_matches_ignore(x.name, patterns) or (
-                    scanned and is_ledger_output(x, template_path)):
+            pat = next((q for q in patterns if file_matches_ignore(x.name, [q])), None)
+            why = f"Skip pattern {pat!r}" if pat is not None else (
+                _ledger_output_kind(x, template_path) if scanned else "")
+            if why:
                 ignored.append(x)
+                if reasons is not None:
+                    reasons[x] = why
             else:
                 kept.append(x)
     return kept, ignored
@@ -150,6 +164,10 @@ class ExtractSummary:
     cancelled: bool = False
     #: What Council's model was asked and found (empty when not asked).
     assist: str = ""
+    #: One ``(name, reason)`` per file left out before reading: a Skip
+    #: pattern, or the Ledger's own review / filled template / template.
+    #: Only a progress line said so, and it went by (review, 2026-10-19).
+    skipped: List[Any] = field(default_factory=list)
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
@@ -158,6 +176,8 @@ class ExtractSummary:
              f"images read")
         if self.cancelled:
             s = "CANCELLED — " + s
+        if self.skipped:
+            s += "\n" + summarize_skipped(self.skipped)
         if self.assist:
             s += "\n" + self.assist
         if self.open_failures:
@@ -186,6 +206,14 @@ def summarize_open_failures(open_failures) -> str:
     parts = [f"{counts[k]} {label}" for k, label in _OPEN_FAILURE_LABELS.items()
              if counts.get(k)]
     return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
+
+
+def summarize_skipped(skipped, top: int = 10) -> str:
+    """'left out 3 file(s): cover_sheet.xlsx (Skip pattern 'cover*'), …'"""
+    shown = ", ".join(f"{n} ({why})" for n, why in list(skipped)[:max(1, int(top))])
+    more = len(skipped) - min(len(skipped), max(1, int(top)))
+    return (f"left out {len(skipped)} file(s): {shown}"
+            + (f", and {more} more" if more > 0 else ""))
 
 
 def summarize_slowest(timings, top: int = 5) -> str:
@@ -241,9 +269,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           "create it from a template first")
     from source_extract import load_ignore_files
     ignore_patterns = load_ignore_files(csv_path)
+    why_skipped: Dict[Path, str] = {}
     files, skipped_files = collect_sources(sources,
                                            ignore_patterns=ignore_patterns,
-                                           template_path=ledger.schema.template_path)
+                                           template_path=ledger.schema.template_path,
+                                           reasons=why_skipped)
     if not files:
         if skipped_files and not sources:
             raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
@@ -276,10 +306,12 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         report = ledger_llm.AssistReport()
         stop = cancel.is_set if cancel is not None else None
         # ``assist`` is the model the user picked ('ollama:<name>' or a GGUF
-        # path); True alone means Council's own choice
-        chat = chat or (ledger_llm.chat_for(assist, should_stop=stop)
-                        if isinstance(assist, str) else
-                        ledger_llm.council_chat(should_stop=stop))
+        # path); True alone means Council's own choice. Asked only while it
+        # answers: one failure, one problem line (ledger_llm.one_shot).
+        chat = ledger_llm.one_shot(chat or (ledger_llm.chat_for(assist, should_stop=stop)
+                                            if isinstance(assist, str) else
+                                            ledger_llm.council_chat(should_stop=stop)),
+                                   report, stop)
 
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report)
@@ -304,7 +336,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
                           list(run.timings), bool(run.cancelled),
-                          assist=report.describe() if report is not None else "")
+                          assist=report.describe() if report is not None else "",
+                          skipped=[(p.name, why_skipped.get(p, "left out"))
+                                   for p in skipped_files])
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────

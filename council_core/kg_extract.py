@@ -349,6 +349,7 @@ def gguf_chat(path: str) -> ChatFn:
                     response_format={"type": "json_object", "schema": SCHEMA}, **kw)
             except TypeError:                              # an older llama-cpp-python
                 out = llm.create_chat_completion(**kw)
+        ledger_llm._gpu_ok()          # it answered: the GPU-crash marker goes
         return out["choices"][0]["message"]["content"] or ""
     return chat
 

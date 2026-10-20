@@ -2931,7 +2931,11 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
     labels = sorted({x for x in labels})[:150]
     if not labels:
         return {}, ""
-    fields = [f.name for f in schema.fields]
+    # never the part-number field, as in the extract (ledger_llm.place_labels):
+    # the Preview offered 'Part Number' for a label the extract would not
+    # put there (review, 2026-10-19)
+    id_field = getattr(schema, "id_field", None)
+    fields = [f.name for f in schema.fields if not id_field or f.name != id_field]
     prompt = ("Map each spreadsheet label to the one template field it "
               "means, or null if none. Reply with JSON only: "
               "{\"label\": \"field or null\"}.\n\n"

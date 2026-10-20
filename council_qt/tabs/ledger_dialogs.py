@@ -499,10 +499,12 @@ class PreviewWorkbookDialog(QDialog):
     def _on_llm_done(self, mapping, model: str, err: str) -> None:
         self.progress.setVisible(False)
         self.ask_btn.setText("Ask Council for mappings")
+        # asked again (another model) after an answer too: it stayed
+        # disabled after a good one (review, 2026-10-19)
+        self.ask_btn.setEnabled(True)
         if err:
             self.text.appendPlainText("\n--- Council mapping ---\n"
                                        f"skipped: {err}")
-            self.ask_btn.setEnabled(True)
             return
         self._suggestions = dict(mapping or {})
         self._model_used = model

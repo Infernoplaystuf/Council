@@ -381,3 +381,553 @@ def test_apply_uses_the_vision_model_the_extract_used(tmp_path):
         assert seen == {"vision_model": "gemma3:12b"}
     finally:
         tab.deleteLater()
+
+
+# ---------------------------------------------- review fixes (2026-10-19, real models)
+
+def _titled_book(path: Path) -> Path:
+    """The tester's book_lowercase.xlsx: a title, the part id 'efg5hj678'
+    alone in A2, labels with measured values and a date - no part label."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Build"
+    ws["A1"] = "Laser build record"
+    ws["A2"] = "efg5hj678"
+    rows = [("Pulse freq", 61.35), ("Travel speed mm per s", 1238.54),
+            ("Beam power", 291.29), ("Laser wattage", 295.79), ("Probe gain dB", 46.165),
+            ("Operator name", "Cornelius Dappleby"), ("Rep rate", 65.54),
+            ("Feed velocity", 1115.29), ("Coolant brand", "Xylofrost Nine E"),
+            ("Date", "2026-10-05")]
+    for r, (lab, val) in enumerate(rows, start=4):
+        ws.cell(r, 1, lab)
+        ws.cell(r, 2, val)
+    wb.save(path)
+    return path
+
+
+QUOTE_CASES = [  # (the model's answer, accepted?) - the tester's s05_quote_check.py
+    ("efg5hj678", True),                 # the real part
+    ("EFG5HJ678", True),                 # case differs only
+    ("Laser build record", False),       # a title (llama3.1:8b's real answer)
+    ("Build", False),                    # the sheet name, not an id
+    ("efg5hj67", False),                 # cut short: a substring of the real one
+    ("5hj6", False),                     # a fragment of the id
+    ("1", False),                        # one digit (in a value / date)
+    ("2026", False),                     # part of the date cell
+    ("61.35", False),                    # a measured VALUE (Pulse freq)
+    ("Probe gain dB", False),            # a label
+    ("XYZ9AB999", False),                # not written anywhere
+    ("book_lowercase", False),           # the file name stem
+]
+
+
+@pytest.mark.parametrize("answer,accepted", QUOTE_CASES)
+def test_the_part_must_be_an_identifier_written_as_a_whole_word(tmp_path, answer, accepted):
+    """The quote check took any substring of the workbook: llama3.1:8b
+    named 'Laser build record' and three workbooks merged into that
+    phantom part (review, 2026-10-19)."""
+    src = _titled_book(tmp_path / "book_lowercase.xlsx")
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+
+    def chat(prompt, schema):
+        return json.dumps({"part": answer, "evidence": "stub"}), "stub"
+    part, where = ledger_llm.find_part(src.name, grids, "@@@#@@###", chat, rep)
+    if accepted:
+        # given as it is written in the workbook, where it is written
+        assert (part, where) == ("efg5hj678", "book_lowercase.xlsx › Build!A2")
+        assert rep.parts_found == [(src.name, "efg5hj678")] and not rep.problems
+    else:
+        assert (part, where) == ("", "") and not rep.parts_found
+        assert any("dropped" in p for p in rep.problems)
+
+
+def test_what_looks_like_a_part_number():
+    looks = ledger_llm.looks_like_part
+    assert looks("ABC1DE234") and looks("DEF-4GH-567") and looks("12345")
+    assert not looks("1234") and not looks("2026-10-05") and not looks("-12345")
+    assert not looks("1,234") and not looks("ABC1 DE234")
+    # the user's own pattern is a part number however it looks
+    assert looks("1234", "####") and looks("ABC", "@@@")
+    assert looks("1234", "#####")                       # an all-digit pattern
+    assert not looks("2026", "#####")                   # but not a year
+
+
+def test_the_part_prompt_shows_ids_from_every_sheet_before_numbers():
+    """Only the first 200 cells went, numbers counted: an id below a data
+    table or on a later sheet never reached the model (review, 2026-10-19)."""
+    table = {(1, 1): "Scan data"}
+    for r in range(2, 152):
+        for c in range(1, 4):
+            table[(r, c)] = r * 1.5 + c / 4
+    table[(160, 1)] = "S/N: XYZ9AB123"                  # below the table
+    notes = {(1, 1): "Remarks", (2, 1): "Lot", (2, 2): "QRS4TU567"}
+    grids = [se.Grid("big.xlsx", "Data", table), se.Grid("big.xlsx", "Notes", notes)]
+    model = FakeModel(part="")
+    ledger_llm.find_part("big.xlsx", grids, None, model, ledger_llm.AssistReport())
+    cells = json.loads(model.prompts[0].split("Cells:\n", 1)[1])
+    assert cells[:2] == ["S/N: XYZ9AB123", "QRS4TU567"]           # ids first
+    assert cells[2:5] == ["Scan data", "Remarks", "Lot"]          # then the labels
+    assert len(cells) == ledger_llm.MAX_CELLS                     # numbers fill the rest
+
+
+def _sentinel(monkeypatch, tmp_path):
+    import council_engine as ce
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    monkeypatch.setattr(ce, "_GPU_CONFIRMED_THIS_PROCESS", False)
+    marker = ce._gpu_sentinel_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("n_gpu_layers=99\n", encoding="utf-8")      # as _load_gguf leaves it
+    return marker
+
+
+def test_a_gguf_answer_clears_the_gpu_crash_marker(monkeypatch, tmp_path):
+    """A clean Ledger / Suggest-links answer on a GGUF left <vault>/.gpu_attempt
+    behind, so the next Council process loaded every GGUF on the CPU
+    (review, 2026-10-19)."""
+    from council_core import kg_extract as kx
+
+    class FakeLlama:
+        def create_chat_completion(self, **kw):
+            return {"choices": [{"message": {"content": '{"links": []}'}}]}
+    monkeypatch.setattr(ledger_llm, "_gguf_llm", lambda path: FakeLlama())
+    monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
+    marker = _sentinel(monkeypatch, tmp_path)
+    ledger_llm.chat_for(str(tmp_path / "granite.gguf"))("p", ledger_llm._PART_SCHEMA)
+    assert not marker.exists()
+    marker = _sentinel(monkeypatch, tmp_path)
+    kx.gguf_chat(str(tmp_path / "granite.gguf"))([{"role": "user", "content": "x"}])
+    assert not marker.exists()
+
+
+def test_a_model_that_cannot_answer_is_asked_once(tmp_path, ledger, monkeypatch):
+    """It was asked again for every workbook (a GGUF that would not load was
+    loaded again each time): the same multi-line error N+1 times (review,
+    2026-10-19)."""
+    import council_engine as ce
+    csv, _schema = ledger
+    books = [_unlabelled_book(tmp_path / f"untitled_{i}.xlsx") for i in range(3)]
+    calls = []
+
+    def broken(path, **kw):             # council_engine's own words, as _load_gguf says
+        calls.append(path)
+        raise ce.BackendUnavailable("llama-cpp-python is not installed. Install with:\n"
+                                    "  pip install llama-cpp-python")
+    monkeypatch.setattr(ce, "_load_gguf", broken)
+    monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
+    # the user's pick: a GGUF file, through chat_for as the Ledger tab sends it
+    s = li._extract(str(csv), [str(b) for b in books], None, "", False, None, _NoProg(),
+                    None, None, None, str(tmp_path / "granite.gguf"))
+    assert len(calls) == 1
+    assert sum("llama-cpp-python" in p for p in s.problems) == 1
+    assert s.assist == ("Council's model was unavailable, so nothing in the review is its "
+                        "suggestion: granite.gguf could not be loaded: llama-cpp-python is "
+                        "not installed.")
+
+
+def test_cancel_is_not_a_broken_model():
+    rep = ledger_llm.AssistReport()
+
+    def stopped(prompt, schema):
+        raise RuntimeError("stopped by the caller")
+    ask = ledger_llm.one_shot(stopped, rep, should_stop=lambda: True)
+    with pytest.raises(RuntimeError):
+        ask("p", {})
+    assert not rep.unavailable and not rep.problems
+
+
+def test_a_missing_ollama_model_says_how_to_install_it(monkeypatch):
+    """'... in the Models tab.. Is Ollama running?' for a model Ollama - which
+    had answered - does not have (review, 2026-10-19)."""
+    import council_engine as ce
+    name = "granite9.9:404b"
+
+    def missing(messages, **kw):        # council_engine's own message
+        raise RuntimeError(
+            f"Ollama at http://127.0.0.1:11434 has no model '{name}'. Install it yourself "
+            f"(`ollama pull {name}` — the council never downloads), or pick "
+            "another model for this role in the Models tab.")
+    monkeypatch.setattr(ce, "local_chat", missing)
+    with pytest.raises(se.LedgerError) as e:
+        ledger_llm.chat_for(f"ollama:{name}")("p", {})
+    assert str(e.value) == (f"{name} is not installed in Ollama — pick another model, or "
+                            f"install it (ollama pull {name})")
+
+    def down(messages, **kw):
+        raise ce.BackendUnavailable("No Ollama server answers at http://127.0.0.1:11434.")
+    monkeypatch.setattr(ce, "local_chat", down)
+    with pytest.raises(se.LedgerError) as e:
+        ledger_llm.chat_for(f"ollama:{name}")("p", {})
+    assert str(e.value).endswith("11434. Is Ollama running?") and ".." not in str(e.value)
+
+    def slow(messages, **kw):
+        raise RuntimeError("Ollama (granite) at http://127.0.0.1:11434 timed out.")
+    monkeypatch.setattr(ce, "local_chat", slow)
+    with pytest.raises(se.LedgerError) as e:
+        ledger_llm.chat_for(f"ollama:{name}")("p", {})
+    assert "Is Ollama running?" not in str(e.value) and ".." not in str(e.value)
+
+
+def test_a_label_the_model_placed_is_not_left_to_map(tmp_path, ledger):
+    """It stayed on 'Labels to map' with the rules' contradicting guesses
+    and was counted as unmatched (review, 2026-10-19)."""
+    csv, schema = ledger
+    src = _unlabelled_book(tmp_path / "untitled.xlsx")
+    freq = _field(schema, "Frequency")
+    before = li._extract(str(csv), [str(src)], tmp_path / "r1.xlsx", "", False, None,
+                         _NoProg(), None, None, None, False)
+    s = li._extract(str(csv), [str(src)], tmp_path / "r2.xlsx", "", False, None, _NoProg(),
+                    None, None, None, True, FakeModel(mapping={"Zorp rate": freq}))
+    to_map = [r[2] for r in openpyxl.load_workbook(s.review)["Labels to map"].iter_rows(
+        min_row=2, values_only=True)]
+    assert "Zorp rate" not in to_map
+    assert s.unmatched == before.unmatched - 1
+
+
+def test_the_preview_can_ask_again_after_an_answer(tmp_path, ledger, monkeypatch):
+    """'Ask Council for mappings' stayed disabled after a good answer
+    (review, 2026-10-19)."""
+    from council_qt.tabs.ledger_dialogs import PreviewWorkbookDialog
+    app = _qapp()
+    _csv, schema = ledger
+    src = _unlabelled_book(tmp_path / "untitled.xlsx")
+    model = FakeModel(mapping={"Zorp rate": _field(schema, "Frequency")})
+    monkeypatch.setattr(ledger_llm, "chat_for", lambda model_id, **kw: model)
+    dlg = PreviewWorkbookDialog(str(src), schema, pick_model=lambda parent: "ollama:x")
+    try:
+        _wait(app, lambda: dlg.ask_btn.isEnabled())
+        dlg.on_ask_llm()
+        _wait(app, lambda: "Council mapping" in dlg.text.toPlainText())
+        assert "'Zorp rate' → " in dlg.text.toPlainText()
+        assert dlg.ask_btn.isEnabled()
+    finally:
+        dlg.deleteLater()
+
+
+def test_the_preview_never_offers_the_part_field(ledger):
+    """The Preview offered 'Part Number' for a label; the extract
+    (place_labels) never does (review, 2026-10-19)."""
+    _csv, schema = ledger
+    model = FakeModel(mapping={"mappings": [{"label": "Zorp rate",
+                                             "field": schema.id_field}]})
+    mapping, _ = se.suggest_mappings_for_labels(["Zorp rate"], schema, chat=model)
+    assert mapping == {"Zorp rate": None}
+    fields = json.loads(model.prompts[0].split("Template fields:\n", 1)[1]
+                        .split("\n\nLabels:", 1)[0])
+    assert fields and schema.id_field not in fields
+
+
+def test_skip_patterns_typed_before_the_csv_exists_are_kept(tmp_path):
+    """They were dropped: the field was cleared when a CSV path was typed,
+    or kept showing them after Create while the extract read every file
+    (review, 2026-10-19)."""
+    from council_qt.tabs.ledger import LedgerActions, LedgerTab
+    _qapp()
+    # the real create_parent; the graph rebuild (the vault) stubbed
+    tab = LedgerTab(actions=LedgerActions(rebuild_kg=lambda progress: {}))
+    try:
+        # typed: the CSV path is typed after the patterns
+        csv = tmp_path / "typed.csv"
+        tab.ignore_files.setText("cover*.xlsx")
+        tab._save_ignore_patterns()                  # editingFinished, no CSV yet
+        tab.csv.setText(str(csv))
+        tab._on_csv_changed()                        # editingFinished on the CSV
+        assert se.load_ignore_files(csv) == ["cover*.xlsx"]
+        assert tab.ignore_files.text() == "cover*.xlsx"
+        # Create: the CSV is made beside the template
+        tab.csv.setText("")
+        tab._on_csv_changed()
+        tab.template.setText(str(lf.make_template(tmp_path / "template.xlsx")))
+        tab.ignore_files.setText("agenda*.xlsx")
+        tab._save_ignore_patterns()
+        tab.on_create()
+        assert tab.wait(30)
+        made = Path(tab.csv.text())
+        assert made.exists() and se.load_ignore_files(made) == ["agenda*.xlsx"]
+        assert tab.ignore_files.text() == "agenda*.xlsx"
+        # a CSV with its own patterns: the typed ones are added, not dropped
+        se.save_ignore_files(tmp_path / "own.csv", ["meeting*.xlsx"])
+        tab.csv.setText("")
+        tab._on_csv_changed()
+        tab.ignore_files.setText("notes*.xlsx")
+        tab._save_ignore_patterns()
+        tab.csv.setText(str(tmp_path / "own.csv"))
+        tab._on_csv_changed()
+        assert se.load_ignore_files(tmp_path / "own.csv") == ["meeting*.xlsx",
+                                                               "notes*.xlsx"]
+    finally:
+        tab.deleteLater()
+
+
+def test_the_summary_says_which_files_were_left_out_and_why(tmp_path):
+    """Only a progress line said so, and it went by (review, 2026-10-19)."""
+    tpl = lf.make_template(tmp_path / "template.xlsx")
+    csv = Path(li.create_parent(tpl).csv)
+    lf.make_laser_log(tmp_path / "laser_101.xlsx")
+    lf.make_laser_log(tmp_path / "cover_sheet.xlsx")
+    se.save_ignore_files(csv, ["cover*"])
+    first = li._extract(str(csv), [str(tmp_path)], tmp_path / "review_1.xlsx", "", False,
+                        None, _NoProg(), None, None, None, False)
+    assert sorted(first.skipped) == [("cover_sheet.xlsx", "Skip pattern 'cover*'"),
+                                     ("template.xlsx", "the template")]
+    assert "left out 2 file(s): " in first.describe()
+    assert "cover_sheet.xlsx (Skip pattern 'cover*')" in first.describe()
+    again = li._extract(str(csv), [str(tmp_path)], tmp_path / "review_2.xlsx", "", False,
+                        None, _NoProg(), None, None, None, False)
+    assert ("review_1.xlsx", "a Ledger review") in again.skipped
+
+
+# ---------------------------------------------- one origin rule for every model list
+
+def test_connections_lists_models_by_the_same_origin_as_the_ledger(monkeypatch, tmp_path):
+    """llava:7b was US (Meta) in the Ledger's list and non-US in Suggest
+    links' (pi_models' name prefixes) - review, 2026-10-19."""
+    import council_engine as ce
+    from council_core import local_models as lm
+    from council_qt.tabs.connections import ConnectionsActions
+    tags = [{"name": "llava:7b", "details": {"family": "llama", "families": ["llama", "clip"]}},
+            {"name": "qwen2.5:7b", "details": {"family": "qwen2"}},
+            {"name": "llama-pro:8b", "details": {"family": "llama"}},     # Tencent
+            {"name": "mystery:1b", "details": {"family": "mystery"}},     # unknown: not US
+            {"name": "granite3.3:8b", "details": {"family": "granite"}},
+            # family "llama", not Meta's: Mistral fine-tunes and a TinyLlama
+            # ('phi' in 'dolphin') - second review, 2026-10-19
+            {"name": "zephyr:7b", "details": {"family": "llama"}},
+            {"name": "openhermes:7b", "details": {"family": "llama"}},
+            {"name": "tinydolphin:1.1b", "details": {"family": "llama"}}]
+    monkeypatch.setattr(ce, "_ollama_tags", lambda host, **kw: {"models": tags})
+    got = ConnectionsActions(vault_dir=tmp_path / "v").local_models()
+    assert got == ["granite3.3:8b", "llava:7b"]
+    assert got == sorted(t["name"] for t in tags if lm.ollama_entry(
+        t, fill_from_show=False)["origin"] == "US")
+    # a Pi node's model by the same rule: llama-pro is Tencent's, not Meta's
+    monkeypatch.setenv("COUNCIL_REMOTE_NODES", "1")
+    vault = tmp_path / "v"
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "node_registry.json").write_text(json.dumps({"nodes": [
+        {"name": "NodePrimus", "host": "192.0.2.10", "model": "llama-pro:8b"},
+        {"name": "NodeTertius", "host": "192.0.2.12", "model": "llama3.2:3b"}]}),
+        encoding="utf-8")
+    usable, skipped = ConnectionsActions(vault_dir=vault).pi_nodes()
+    assert [n for n, _u, _m in usable] == ["NodeTertius"]
+    assert skipped == [("NodePrimus", "llama-pro:8b")]
+
+
+# ---------------------------------------------- second review of the fixes (2026-10-19)
+
+def _one_value_book(path: Path, label: str, value, sheet: str = "Build") -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws["A1"], ws["B1"] = label, value
+    wb.save(path)
+    return path
+
+
+def _stub(answer):
+    def chat(prompt, schema):
+        return json.dumps({"part": answer, "evidence": "stub"}), "stub"
+    return chat
+
+
+def test_the_default_sheet_name_is_not_a_part(tmp_path):
+    """'Sheet1' is in almost every workbook and passed as an identifier:
+    three unrelated workbooks merged into one phantom part 'Sheet1'
+    (review, 2026-10-19)."""
+    for name in ("log_a.xlsx", "log_b.xlsx", "log_c.xlsx"):
+        src = _one_value_book(tmp_path / name, "Pulse freq", 61.35, sheet="Sheet1")
+        grids, _imgs = se.load_workbook_grids(src, [])
+        rep = ledger_llm.AssistReport()
+        assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub("Sheet1"),
+                                    rep) == ("", "")
+        assert any("dropped" in p for p in rep.problems)
+    for generic in ("Sheet1", "Sheet 2", "Book1", "Table3", "Run2", "IMG_1234"):
+        assert not ledger_llm.looks_like_part(generic), generic
+    assert ledger_llm.looks_like_part("Sheet1", "@@@@@#")     # the user's own pattern
+
+
+NON_IDS = [  # (label, the cell and the model's answer) - none is a part number
+    ("Start time", "10:30"),
+    ("Date", "05-Oct-2026"),
+    ("Time", "2026-10-05T10:30"),                   # its piece '2026-10-05T10' too
+    ("Thickness", "61.35mm"),
+    ("Freq", "100kHz"),
+    ("Yield", "12.5%"),
+    ("Run", "Run2"),
+]
+
+
+@pytest.mark.parametrize("label,value", NON_IDS)
+def test_a_value_with_a_unit_a_time_or_a_date_is_not_a_part(tmp_path, label, value):
+    """They passed the identifier check and the whole-word check (review,
+    2026-10-19)."""
+    src = _one_value_book(tmp_path / "x.xlsx", label, value)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(value), rep) == ("", "")
+    assert not rep.parts_found
+
+
+def test_the_file_name_itself_is_not_a_part_unless_it_is_one_code(tmp_path):
+    """'inspection_run_3' (from inspection_run_3.xlsx) passed: '_' is a word
+    boundary (review, 2026-10-19). A file named by its part still gives it."""
+    src = _one_value_book(tmp_path / "inspection_run_3.xlsx", "Pulse freq", 61.35)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, None, _stub("inspection_run_3"),
+                                rep) == ("", "")
+    src = _one_value_book(tmp_path / "AB12CD345.xlsx", "Pulse freq", 61.35)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    assert ledger_llm.find_part(src.name, grids, None, _stub("AB12CD345"),
+                                ledger_llm.AssistReport()) == (
+        "AB12CD345", "file name 'AB12CD345.xlsx'")
+
+
+def test_real_part_numbers_still_pass():
+    looks = ledger_llm.looks_like_part
+    for s in ("ABC1DE234", "XYZ9AB123-R2", "SN#4471", "XJ-9", "AB12", "4471A", "12345"):
+        assert looks(s), s
+
+
+def _sent(grids, mask):
+    model = FakeModel(part="")
+    ledger_llm.find_part("big.xlsx", grids, mask, model, ledger_llm.AssistReport())
+    return json.loads(model.prompts[0].split("Cells:\n", 1)[1])
+
+
+def test_whole_number_readings_do_not_crowd_out_the_part():
+    """Excel stores 10200 Hz as 10200.0: a table of whole numbers went first
+    as 'ids' and the S/N below it never reached the model (review,
+    2026-10-19)."""
+    table = {(1, 1): "Freq (Hz)", (1, 2): "Gain", (1, 3): "Phase"}
+    for r in range(2, 152):
+        for c in range(1, 4):
+            table[(r, c)] = 10000.0 + r * 100 + c
+    table[(160, 1)] = "S/N: XYZ9AB123"
+    grids = [se.Grid("big.xlsx", "Data", table)]
+    for mask in ("@@@#@@###", None):
+        cells = _sent(grids, mask)
+        assert cells[:4] == ["S/N: XYZ9AB123", "Freq (Hz)", "Gain", "Phase"]
+    # an all-digit pattern: what it matches whole comes after the text ids,
+    # and readings it does not match go last - with the labels before them
+    loads = {(1, 1): "Load (N)", (230, 1): "Part", (230, 2): "48213"}
+    loads.update({(r, 1): 1000.0 + r for r in range(2, 220)})
+    cells = _sent([se.Grid("big.xlsx", "Data", loads)], "#####")
+    assert cells[:3] == ["48213", "Load (N)", "Part"]
+
+
+def test_skip_patterns_do_not_leak_from_one_ledger_into_another(tmp_path):
+    """Switching from a ledger with Skip patterns to one without wrote the
+    first one's patterns into the second's aliases file (review,
+    2026-10-19). Only patterns TYPED with no CSV are carried over."""
+    from council_qt.tabs.ledger import LedgerActions, LedgerTab
+    _qapp()
+    a, b = tmp_path / "ledger_a.csv", tmp_path / "ledger_b.csv"
+    se.save_ignore_files(a, ["cover*.xlsx", "agenda*"])
+    tab = LedgerTab(actions=LedgerActions(rebuild_kg=lambda progress: {}))
+    try:
+        tab.csv.setText(str(a))
+        tab._on_csv_changed()
+        assert se.load_ignore_files(a) and tab.ignore_files.text()
+        tab.csv.setText(str(b))
+        tab._on_csv_changed()
+        assert tab.ignore_files.text() == ""
+        assert se.load_ignore_files(b) == []
+        # typed with no CSV, the field not left yet (no editingFinished)
+        tab.csv.setText("")
+        tab._on_csv_changed()
+        tab.ignore_files.setText("draft*")
+        tab.ignore_files.textEdited.emit("draft*")      # as typing does
+        tab.csv.setText(str(b))
+        tab._on_csv_changed()
+        assert se.load_ignore_files(b) == ["draft*"]
+    finally:
+        tab.deleteLater()
+
+
+def test_one_timeout_does_not_stop_the_model():
+    """The breaker tripped on any failure: a timeout on one big workbook and
+    no other workbook or label was asked, and the summary called an
+    answering model unavailable (review, 2026-10-19)."""
+    calls = []
+
+    def flaky(prompt, schema):
+        calls.append(prompt)
+        if "first.xlsx" in prompt:
+            raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+        return json.dumps({"part": "ABC1DE234", "evidence": "A1"}), "granite3.3:8b"
+    rep = ledger_llm.AssistReport()
+    ask = ledger_llm.one_shot(flaky, rep)
+    got = [ledger_llm.find_part(n, [se.Grid(n, "Data", {(1, 1): "ABC1DE234"})],
+                                "@@@#@@###", ask, rep)[0]
+           for n in ("first.xlsx", "second.xlsx", "third.xlsx")]
+    assert len(calls) == 3 and got == ["", "ABC1DE234", "ABC1DE234"]
+    assert not rep.unavailable
+    assert "unavailable" not in rep.describe()
+    assert sum("sent nothing" in p for p in rep.problems) == 1
+
+
+def test_a_model_that_fails_twice_in_a_row_is_not_asked_again():
+    calls = []
+
+    def slow(prompt, schema):
+        calls.append(prompt)
+        raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+    rep = ledger_llm.AssistReport()
+    ask = ledger_llm.one_shot(slow, rep)
+    for n in ("a.xlsx", "b.xlsx", "c.xlsx", "d.xlsx"):
+        ledger_llm.find_part(n, [se.Grid(n, "Data", {(1, 1): "ABC1DE234"})], None, ask, rep)
+    assert len(calls) == 2
+    assert sum("sent nothing" in p for p in rep.problems) == 1      # said once
+    assert rep.describe() == (
+        "Council's model did not answer twice in a row and was not asked again, so "
+        "nothing in the review is its suggestion: Ollama (granite3.3:8b) sent nothing "
+        "for 120 s.")
+
+
+def test_the_summary_does_not_add_a_full_stop_after_a_question_mark():
+    """'... Is Ollama running?.' (review, 2026-10-19)."""
+    why = "granite3.3:8b (Ollama) did not answer: No Ollama server answers. Is Ollama running?"
+    rep = ledger_llm.AssistReport(unavailable=why)
+    assert rep.describe().endswith("Is Ollama running?")
+    rep = ledger_llm.AssistReport(unavailable=why, parts_asked=2, model="granite3.3:8b",
+                                  parts_found=[("a.xlsx", "ABC1DE234")])
+    assert rep.describe().endswith("not asked again: " + why)
+    rep = ledger_llm.AssistReport(parts_asked=1, model="m")
+    assert rep.describe().endswith("check them.")
+
+
+@pytest.mark.parametrize("name", ["zephyr:7b", "openhermes:7b", "neural-chat:7b",
+                                  "vicuna:7b", "orca-mini:3b", "tinydolphin:1.1b",
+                                  "llava:34b"])
+def test_a_llama_family_alone_does_not_make_a_model_us(name):
+    """Ollama reports family 'llama' for every Llama- or Mistral-architecture
+    model; these came out ('Meta', 'US') and Suggest links ran on them, and
+    'phi' inside 'tinydolphin' read as Microsoft (review, 2026-10-19)."""
+    from council_core import local_models as lm
+    assert lm.maker_and_origin(name, "llama", ["llama", "clip"])[1] != "US"
+
+
+def test_the_ledger_and_connections_use_one_rule_for_an_unknown_ollama_model(monkeypatch,
+                                                                            tmp_path):
+    """An unknown-origin Ollama model was usable in the Ledger and left out
+    of Suggest links (review, 2026-10-19). A GGUF is always accepted unless
+    it is known to be non-US."""
+    import council_engine as ce
+    from council_core import local_models as lm
+    from council_qt.tabs.connections import ConnectionsActions
+    tags = [{"name": "zephyr:7b", "details": {"family": "llama"}},
+            {"name": "mystery:1b", "details": {"family": "mystery"}},
+            {"name": "granite3.3:8b", "details": {"family": "granite"}}]
+    monkeypatch.setattr(ce, "_ollama_tags", lambda host, **kw: {"models": tags})
+    assert ConnectionsActions(vault_dir=tmp_path / "v").local_models() == ["granite3.3:8b"]
+    entries = [lm.ollama_entry(t, fill_from_show=False) for t in tags] + [
+        {"id": "C:/m/model.gguf", "name": "model", "backend": "gguf", "origin": "unknown"},
+        {"id": "C:/m/qwen.gguf", "name": "qwen", "backend": "gguf", "origin": "non-US"}]
+    monkeypatch.setattr(lm, "list_local_models", lambda **kw: [dict(e) for e in entries])
+    usable = {e["id"]: e["usable"] for e in ledger_llm.available_models()}
+    assert usable == {"ollama:zephyr:7b": False, "ollama:mystery:1b": False,
+                      "ollama:granite3.3:8b": True, "C:/m/model.gguf": True,
+                      "C:/m/qwen.gguf": False}
+    with pytest.raises(se.LedgerError, match="cannot tell where mystery:1b comes from"):
+        ledger_llm.chat_for("ollama:mystery:1b")
