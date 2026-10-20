@@ -691,6 +691,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")
             return
+        # The view is refreshed FIRST: show_entity writes the open item's
+        # header into the status line, and the summary set before it was
+        # gone at once ('⚙ 101' was all a rebuild said - review, 2026-10-19).
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
         from council_core import knowledge_graph as kgm
         self.status.setText(kgm.rebuild_summary_line(stats))
         # The first few unreadable entries also go to the tooltip, where
@@ -708,9 +714,6 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 print(f"  {line}", flush=True)
         else:
             self.status.setToolTip("")
-        self.on_search()
-        if self._current:
-            self.show_entity(self._current)
 
     def refresh_models(self) -> None:
         """List the installed US-origin models and the Pi nodes, on a worker:

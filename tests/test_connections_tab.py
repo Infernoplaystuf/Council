@@ -196,6 +196,20 @@ def test_search_shows_links_with_evidence_and_preview(qapp, tab):
     assert tab.actions.opened == ["ironbridge/trackers/parts_list.csv"]
 
 
+def test_the_rebuild_summary_is_not_hidden_by_the_open_item(qapp, tab):
+    """A rebuild with an item open: the view was refreshed after the
+    summary was set, and the item's header ('⚙ 101') replaced it at once
+    (review, 2026-10-19)."""
+    _rebuilt(qapp, tab)
+    tab.search.setText("Lee, Carol")
+    tab.results.setCurrentRow(0)
+    assert "Carol Lee" in tab.status.text()
+    tab.on_rebuild()
+    drive(qapp, tab)
+    assert tab.status.text().startswith("Rebuilt from"), tab.status.text()
+    assert tab._current and _items(tab.tree)               # the item is still shown
+
+
 def test_text_evidence_preview_marks_the_line(qapp, tab):
     _rebuilt(qapp, tab)
     tab.search.setText("Bob Smith")
