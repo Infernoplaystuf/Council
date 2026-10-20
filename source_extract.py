@@ -2668,7 +2668,9 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
     part's workbooks."""
     part_vals: Dict[str, Dict[str, str]] = defaultdict(dict)
     item_vals: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
-    books: Dict[Tuple[str, str], List[str]] = defaultdict(list)    # (part, item) ->
+    # (part, item) -> the workbooks its values came from; (part, None): all
+    # of the part's
+    books: Dict[Tuple[str, Optional[str]], List[str]] = defaultdict(list)
     for d in decisions:
         if not d.accept or not d.obs.part or not d.obs.field:
             continue
@@ -2679,7 +2681,7 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
         if f.inspector and f.item and schema.takes_inspectors(f.field):
             target.setdefault(initials, f.inspector)    # whose value went in
         book = f.where.split(" › ", 1)[0]
-        for key in ((f.part, f.item), (f.part, None)):  # None: any of the part's
+        for key in ((f.part, f.item), (f.part, None)):
             if book and book not in books[key]:
                 books[key].append(book)
 
