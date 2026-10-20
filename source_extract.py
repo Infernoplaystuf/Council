@@ -37,12 +37,14 @@ LAYOUTS RECOGNISED IN A SOURCE SHEET
 
 Which part a value belongs to: a Part Number found on that sheet, else a
 sheet named like a part ("Part 101", "101"), else the one Part Number found
-in the workbook, else a number in the file name (flagged), else --part.
-'TBD', 'N/A', '-' in a Part Number are no part; a 'Lot Number', 'Heat #',
-'Drawing No.', 'P.O. Number', 'Part Name' or a 'Part Information' heading is
-not the Part Number ('Customer P/N', 'Serial No.', 'Sample Number' are); a
-part that does not fit the part-name pattern you gave is kept, never
-pre-accepted.
+in the workbook, else your part-name pattern in the file name or in a title
+cell's words (flagged), else a number in the file name (flagged), else
+--part. 'TBD', 'N/A', '-' in a Part Number are no part; a 'Lot Number',
+'Heat #', 'Drawing No.', 'P.O. Number', 'Part Name' or a 'Part Information'
+heading is not the Part Number ('Customer P/N', 'Serial No.', 'Sample
+Number' are); a part that does not fit the part-name pattern you typed is
+kept, never pre-accepted (the Ledger's saved pattern is only a hint).
+A label on the ignore list is not offered on 'Labels to map'.
 
 HOW A LABEL IS MATCHED TO A FIELD
 ---------------------------------
@@ -377,8 +379,15 @@ class Matcher:
 
     def no_one(self, text) -> bool:
         """Initials or a label the user said are no one ('NDT' of a heading
-        'NDT — 2026-09-18', 'Operator'): Taught.not_who."""
+        'NDT — 2026-09-18', 'Operator'): Taught.not_who. Initials are no
+        one only in a heading or a sheet's name (find_inspectors)."""
         return bool(self.not_who) and self.key_of(text) in self.not_who
+
+    def ignored(self, label) -> bool:
+        """A label on the Ledger's ignore list ('Ignore (not data)' in Teach,
+        the Ignore column of 'Labels to map'): its values are not offered on
+        'Labels to map' nor sent to Council's model (review, 2026-10-20)."""
+        return bool(self.ignore) and normalize_label(label or "") in self.ignore
 
     def is_item_header(self, label: str) -> bool:
         if not self.schema.item_field or not _words(label):
@@ -560,6 +569,11 @@ _WHO_INLINE = _OnWords(
     r"(?i)^\s*(?:inspector(?:\s+initials)?|initials|operator|technician|tech|analyst|"
     r"inspected\s+by|checked\s+by|logged\s+by)\s*(?:[:=\-–—]\s*|\s+by\s+)(?P<who>.+?)\s*$")
 _WHO_BY = _OnWords(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
+#: A label with the initials after it in brackets: 'Inspector (JB)',
+#: 'Tech Sig [MK]'. Tried on a short cell, its spaces collapsed (_who_paren):
+#: the label's run cannot hold a bracket, so it is split one way.
+_WHO_PAREN = re.compile(r"(?P<label>[^()\[\]]{1,60}?)\s*[\(\[]\s*"
+                        r"(?P<who>(?:[A-Za-z]\.?\s?){2,4}?)\s*[\)\]]")
 #: A column / label that holds initials, with the value beside or below it.
 #: 'Inspector Name', 'QC Inspector', 'Technician Initials', 'Operator ID'
 #: count too: they never gave a person in the knowledge graph (review,
@@ -722,6 +736,18 @@ def _signed_by(text: str) -> str:
         or t in _UNIT_WORDS else t.upper()
 
 
+def _who_paren(v) -> Tuple[str, str]:
+    """('Inspector', 'JB') of a cell 'Inspector (JB)' - a label, then
+    initials in brackets - else ('', ''). Only initials (_signed_by): not
+    'Operator (ID)', 'Inspector (Name)' or a unit's brackets, which title a
+    column. The 'initials in parentheses' layout signed nothing, and
+    Teach did not show it (review, 2026-10-20)."""
+    s = " ".join(v.split()) if isinstance(v, str) and len(v) <= 80 else ""
+    m = _WHO_PAREN.fullmatch(s) if s else None
+    who = _signed_by(m.group("who")) if m else ""
+    return (m.group("label").strip(" :=-–—"), who) if who else ("", "")
+
+
 def _acronym_initials(text) -> bool:
     """'EC', 'PN', 'E.C.' typed in capitals: two or three letters that
     _ABBREV spells out into several words ('eddy current', 'part number').
@@ -746,8 +772,14 @@ def _existing_cells(ws):
 
 def _initials(v) -> str:
     """'jb' / 'J.B.' -> 'JB'; a written name is kept as written; anything
-    else (a number, a long sentence) is not a person."""
+    else (a number, a long sentence) is not a person. Initials in brackets
+    are someone's too: '(JB)' in an 'Inspector' column signed nothing, and
+    Teach's 'Inspector' answer for it was said to be learned (review,
+    2026-10-20)."""
     s = re.sub(r"\.", "", str(v or "")).strip()
+    b = re.fullmatch(r"[\(\[]\s*([^()\[\]]*?)\s*[\)\]]", s)
+    if b:
+        s = b.group(1)
     if re.fullmatch(r"[A-Za-z]{1,4}", s):
         return s.upper()
     if re.fullmatch(r"[A-Za-z][A-Za-z '\-]{2,30}", s) and len(s.split()) <= 3:
@@ -882,7 +914,8 @@ class WorkbookPreview:
 
 def preview_workbook(path, schema, aliases=None,
                      pattern_mask: Optional[str] = None, ignore=(),
-                     part: str = "", taught: Optional["Taught"] = None) -> WorkbookPreview:
+                     part: str = "", taught: Optional["Taught"] = None,
+                     pattern_strict: bool = True) -> WorkbookPreview:
     """Open ``path`` and report what the Ledger extractor can and can't
     see — per sheet: non-empty cell count, the part its values would get
     (and how), inspector initials, the labels the extract binds to a
@@ -895,10 +928,11 @@ def preview_workbook(path, schema, aliases=None,
     every string cell listed data values (names, results, item codes) as
     'unmatched labels' - and "Ask Council" sent them to the model - and
     disagreed with the extract about bindings (review, 2026-10-19). No
-    review workbook is written, no pictures are copied."""
+    review workbook is written, no pictures are copied. ``pattern_strict``:
+    extract()'s (False: the Ledger's saved pattern, a hint)."""
     p = Path(path)
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
-    file_part = _part_from_filename(p.stem, mask_re)
+    file_part = _part_from_filename(p.stem, mask_re, strict=pattern_strict)
     by_mask = bool(mask_re and file_part and mask_re.search(p.stem))
     file_how = (f"filename {p.name!r}, mask-matched" if by_mask
                 else (f"filename {p.name!r}" if file_part else ""))
@@ -928,10 +962,15 @@ def preview_workbook(path, schema, aliases=None,
     elif len(found) == 1:
         book_part, how = next(iter(found)), "the one part number in the workbook"
     elif not found:
-        book_part = file_part
-        how = f"{FILE_PART_HOW} {p.name!r} — check it" if book_part else ""
+        # extract()'s order: the pattern in the file's name, in a title's
+        # words, then the file name's other clues
+        book_part, how = ("", "") if by_mask else _text_part(exs)
+        if not book_part:
+            book_part = file_part
+            how = f"{FILE_PART_HOW} {p.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
+    fit_re = mask_re if pattern_strict else None
     for ex in exs:
         if part:
             ex.part, ex.part_how = part, how
@@ -959,7 +998,7 @@ def preview_workbook(path, schema, aliases=None,
         names = set()
         for o in ex.unmatched:                             # what 'Labels to map' gets
             label = (o.label or "").strip()
-            if label and label not in names:
+            if label and label not in names and not m.ignored(label):
                 names.add(label)
                 unmatched.append((label, o.where))
         if not ex.part and ex.out:
@@ -974,7 +1013,7 @@ def preview_workbook(path, schema, aliases=None,
             name=ex.g.sheet, cells=len(ex.g.cells),
             part_id=ex.part,
             part_how=(ex.part_how if ex.part == part else _fit_mask(ex.part, ex.part_how,
-                                                                     mask_re)) + more,
+                                                                     fit_re)) + more,
             inspectors=inspectors,
             sure=sure, maybe=maybe,
             unmatched_labels=unmatched[:200]))
@@ -1253,6 +1292,9 @@ class _Extractor:
         self._unsure_labels: set = set()                 # (row, col): _later_part
         self._signers: Optional[set] = None              # _sheet_signers
         self.mask_re = mask_re
+        #: the cell your part-name pattern found the part in, when no label
+        #: or sheet named one (_text_part)
+        self.part_cell: Optional[Tuple[int, int]] = None
         self.used = set()
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
@@ -1401,14 +1443,19 @@ class _Extractor:
                 continue
             self._tick()
 
-            def person(text, acronym=False) -> str:
+            def person(text, acronym=False, heading=False) -> str:
                 """Initials or a name - never a word of the template ('Date').
                 acronym: where it can only be someone, 'EC' and 'PN' are
-                initials too, not 'eddy current' (_acronym_initials)."""
+                initials too, not 'eddy current' (_acronym_initials).
+                heading: a heading that is only initials ('NDT — 2026-09-18'),
+                where initials Teach was told are no one's are no one.
+                Never beside a label that says who: 'Inspector: JB' was
+                unsigned after a heading 'JB — ...' was answered Ignore
+                (review, 2026-10-20)."""
                 w = _initials(text)
                 if w and set(tokens(w)) & known and not (acronym and _acronym_initials(text)):
                     return ""
-                if w and self.m.no_one(w):
+                if heading and w and self.m.no_one(w):
                     return ""                # taught: 'NDT' is no one's initials
                 return w
             m = _WHO_INLINE.match(v) or _WHO_BY.match(v)
@@ -1421,6 +1468,12 @@ class _Extractor:
                 lab, inline = _split_inline(v)
                 if inline and self.m.key_of(lab) in self.m.who:
                     who = person(inline, acronym=True)
+            if not who and not m:
+                # 'Inspector (JB)', a taught 'Tech Sig (JB)': the initials in
+                # brackets after the label (review, 2026-10-20)
+                lab, w = _who_paren(v)
+                if w and self.m.who_head(lab):
+                    who = person(w, acronym=True)
             if not who and self.m.who_head(v):
                 for dc in (1, 2):
                     x = self.g.cells.get((r, c + dc))
@@ -1494,7 +1547,8 @@ class _Extractor:
         dated = bool(h) and (bool(_DATE_TEXT.search(v.strip()[h.end("who"):]))
                              or isinstance(beside, date))
         if not h or h.group("who").lower() in NOT_INITIALS \
-                or not person(h.group("who"), acronym=dated) or self.codes.canon(v):
+                or not person(h.group("who"), acronym=dated, heading=True) \
+                or self.codes.canon(v):
             return ""
         return h.group("who")
 
@@ -1808,6 +1862,30 @@ class _Extractor:
             return False                                   # '12 dB'
         return bool(re.search(r"[A-Za-z]", s) and re.search(r"\d", s)
                     or re.fullmatch(r"\d{3,}", s))
+
+    def parts_in_text(self) -> List[Tuple[int, int, str]]:
+        """(row, col, part) of each part your part-name pattern finds in a
+        short text cell - a title 'LMM1AB101 laser build record', a heading -
+        with letters and digits both (a digits-only match is any reading in a
+        sentence), never a flaw code or a stand-in. Only a whole word of the
+        cell: 'XYZ9AB123' of 'Serial: XYZ9AB123-R2' is not the part. The
+        pattern was tried on sheet and file names only: a part Teach
+        confirmed from a title was not found again without Council's model
+        (review, 2026-10-20)."""
+        out: List[Tuple[int, int, str]] = []
+        if self.mask_re is None:
+            return out
+        for (r, c), v in sorted(self.g.cells.items()):
+            if not isinstance(v, str) or isinstance(v, _Merged) or len(v) > TEXT_PART_CHARS:
+                continue
+            self._tick()
+            words = {w.strip("()[]{}<>,;:.'\"") for w in v.split()}
+            for hit in self.mask_re.finditer(v):
+                s = hit.group(0).strip()
+                if s in words and re.search(r"[A-Za-z]", s) and re.search(r"\d", s) \
+                        and not self.codes.canon(s) and not is_placeholder(s):
+                    out.append((r, c, s))
+        return out
 
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
@@ -2800,14 +2878,21 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             labels: Optional[Dict[str, str]] = None,
             taught: Optional["Taught"] = None,
             reader_cls: Optional[type] = None,
-            readers: Optional[List["_Extractor"]] = None
+            readers: Optional[List["_Extractor"]] = None,
+            pattern_strict: bool = True
             ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
 
     ``pattern_mask`` is an optional user-supplied part-name shape (see
     ``mask_to_regex``). When set, it is tried first on filenames and sheet
-    names before the keyword / lone-number heuristics.
+    names before the keyword / lone-number heuristics, and - when no label
+    or sheet names a part - on the workbook's short text cells (a title:
+    parts_in_text; never pre-accepted). ``pattern_strict`` (a pattern you
+    typed): a part of another shape is never pre-accepted and a file name
+    not of its shape gives no part. False (the Ledger's saved pattern, the
+    field left empty): a hint only - one sample's shape stopped every
+    pre-acceptance of the Ledger (review, 2026-10-20).
 
     ``cancel`` is an optional ``threading.Event``: when its ``is_set()``
     returns True, the run stops - between workbooks, and inside one every
@@ -2877,7 +2962,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         with excel_open.cancel_scope():
             _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                          m, codes, mask_re, part, schema, _time, part_finder, labels,
-                         reader_cls=reader_cls, readers=readers)
+                         reader_cls=reader_cls, readers=readers,
+                         mask_strict=pattern_strict)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
@@ -2918,7 +3004,7 @@ def source_labels(sources: Sequence) -> Dict[str, str]:
 
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, part_finder=None,
-                 labels=None, reader_cls=None, readers=None) -> None:
+                 labels=None, reader_cls=None, readers=None, mask_strict=True) -> None:
     labels = labels or source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
@@ -2931,7 +3017,8 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
         try:
             _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
                          reader, m, codes, mask_re, part, schema, _time,
-                         label, part_finder, reader_cls=reader_cls, readers=readers)
+                         label, part_finder, reader_cls=reader_cls, readers=readers,
+                         mask_strict=mask_strict)
         except _Cancelled:
             # half a workbook is not offered for review: what it gave goes
             del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
@@ -2958,7 +3045,8 @@ def _excel_down_line(problems: List[str], msg: str, name: str) -> None:
 
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, label: str = "",
-                 part_finder=None, reader_cls=None, readers=None) -> None:
+                 part_finder=None, reader_cls=None, readers=None,
+                 mask_strict: bool = True) -> None:
     _t0 = _time.monotonic()
     via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
         src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -3075,8 +3163,13 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
     elif len(found) == 1:
         book_part, how = found.pop(), "the one part number in the workbook"
     elif not found:
-        book_part = _part_from_filename(src.stem, mask_re)
-        how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
+        # the part-name pattern in the file's name, then in a title's words,
+        # then the file name's other clues
+        book_part, how = ("", "") if mask_re is not None and mask_re.search(src.stem) \
+            else _text_part(exs)
+        if not book_part:
+            book_part = _part_from_filename(src.stem, mask_re, strict=mask_strict)
+            how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
     for ex in exs:
@@ -3096,7 +3189,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
     # column got a question, and the answer ('101') a false problem line
     # (review, 2026-10-20). A row whose Part Number cell says 'TBD' has
     # its own 'how' and is not given the model's part.
-    partless = [o for ex in exs for o in ex.out + ex.unmatched
+    partless = [o for ex in exs
+                for o in ex.out + [u for u in ex.unmatched if not m.ignored(u.label)]
                 if not o.part and not o.part_how] \
         if part_finder is not None and not part and not book_part else []
     if partless:
@@ -3117,11 +3211,14 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
     for ex in exs:
         for o in ex.out + ex.unmatched:
             o.part_how = o.part_how or ex.part_how
-            if o.part != part:                       # not the Part you typed
+            if o.part != part and mask_strict:       # not the Part you typed
                 o.part_how = _fit_mask(o.part, o.part_how, mask_re)
         n = len(ex.out)
         run.obs.extend(ex.out)
-        run.unmatched.extend(ex.unmatched)
+        # a label on the ignore list is not one to map: it was listed on
+        # 'Labels to map' again and its values were sent to Council's model
+        # (review, 2026-10-20). Teach's reader keeps them (ex.unmatched).
+        run.unmatched.extend(o for o in ex.unmatched if not m.ignored(o.label))
         if ex.g.from_image:
             for note in run.images:
                 if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
@@ -3141,7 +3238,11 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                             "— fill the Part column in the review, or re-run with --part")
 
 
-def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> str:
+def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None,
+                        strict: bool = True) -> str:
+    """``strict``: the pattern was typed - a file name not of its shape
+    gives no number on its own; the Ledger's saved one is a hint (extract's
+    pattern_strict)."""
     if mask_re is not None:
         m = mask_re.search(stem)
         if m:
@@ -3149,7 +3250,7 @@ def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> st
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
-    if mask_re is not None:
+    if mask_re is not None and strict:
         return ""          # the user said what a part looks like; this is not one
     # a number on its own ('101 inspection', 'line3_2048'), never one inside a
     # longer word: 'week41' made part 41 and 'LMM1AB101' part 101, pre-accepted
@@ -3236,6 +3337,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
                   and not o.part_how.startswith(FILE_PART_HOW)
+                  # nor one your pattern found in a title's words (review,
+                  # 2026-10-20)
+                  and not o.part_how.startswith(TEXT_PART_HOW)
                   # nor one that is not the shape of your part-name pattern
                   and MISFIT_PART_HOW not in o.part_how
                   # nor one of a sheet whose parts' blocks are not clear
@@ -3260,6 +3364,12 @@ MODEL_PART_HOW = "suggested by Council's model"
 #: How a part read from the workbook's file name is described (never
 #: pre-accepted either).
 FILE_PART_HOW = "file name"
+#: How a part your part-name pattern found in a title or heading cell is
+#: described, when no label or sheet named one (never pre-accepted).
+TEXT_PART_HOW = "the part-name pattern found it in"
+#: The longest text cell the part-name pattern is looked for in: a title,
+#: a heading - not a paragraph of notes.
+TEXT_PART_CHARS = 80
 #: Added to how a part was found when you gave a part-name pattern and the
 #: part does not fit it: kept, never pre-accepted (review, 2026-10-19).
 MISFIT_PART_HOW = "does not fit the part-name pattern"
@@ -3268,6 +3378,22 @@ MISFIT_PART_HOW = "does not fit the part-name pattern"
 #: the other with no readings between): kept, never pre-accepted (review,
 #: 2026-10-20).
 SHEET_PARTS_HOW = "more than one part number on this sheet"
+
+
+def _text_part(exs: Sequence["_Extractor"]) -> Tuple[str, str]:
+    """(part, how) when the part-name pattern names ONE part in the short
+    text cells of a workbook no label or sheet name gave a part to (a title
+    'LMM1AB101 laser build record'), else ('', ''). Two parts named: no
+    guess. The extractor it was found on keeps the cell (part_cell)."""
+    hits: Dict[str, Tuple["_Extractor", int, int]] = {}
+    for ex in exs:
+        for r, c, p in ex.parts_in_text():
+            hits.setdefault(p, (ex, r, c))
+    if len(hits) != 1:
+        return "", ""
+    part, (ex, r, c) = next(iter(hits.items()))
+    ex.part_cell = (r, c)
+    return part, f"{TEXT_PART_HOW} {ex.g.where(r, c).split(' › ', 1)[-1]} — check it"
 
 
 def _fit_mask(part: str, how: str, mask_re: "Optional[re.Pattern]") -> str:
@@ -3418,7 +3544,10 @@ def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]
 
 
 def write_review(path, run: Extraction, decisions: List[Decision], schema: TemplateSchema,
-                 csv_path: str, pattern_mask: str = "", part: str = "") -> None:
+                 csv_path: str, pattern_mask: str = "", part: str = "",
+                 pattern_hint: bool = False) -> None:
+    """``pattern_hint``: ``pattern_mask`` is the Ledger's saved pattern,
+    read as a hint (extract's pattern_strict=False); Apply reads it so."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill
     from openpyxl.worksheet.datavalidation import DataValidation
@@ -3560,6 +3689,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     meta = wb.create_sheet("_run")
     data: Dict[str, Any] = {"csv": str(csv_path), "sources": run.sources,
                             "pattern_mask": pattern_mask or "", "part": part or ""}
+    if pattern_mask and pattern_hint:
+        data["pattern_hint"] = True
     if read is not None:
         # what Apply reads again (Extraction.read), by place in "sources" (a
         # cell holds 32,767 characters); none given: every source was read
@@ -3753,11 +3884,15 @@ class Taught:
                 (Matcher.who_head), and never as a field
       not_who   labels or initials the Ledger's own words read as a person
                 that are no one ('Operator' mapped to a field, 'NDT' of a
-                heading 'NDT — 2026-09-18')
+                heading 'NDT — 2026-09-18'). Initials are no one only in a
+                heading or a sheet's name, never beside 'Inspector:'; the
+                template's own fields are never touched (kg_excel)
       items     labels of a column of flaw / item codes ('Site', 'Loc')
       patterns  part-name patterns ('@@@#@@###'), newest first: Extract
                 uses the first when the pattern field is empty
-                (ledger_ingest), and the tab offers them
+                (ledger_ingest) - as a hint, never to hold back a part of
+                another shape (extract's pattern_strict) - and the tab
+                offers them, and forgets them (forget_patterns)
 
     Labels are kept as typed; they are compared by normalize_label."""
     who: List[str] = field(default_factory=list)
@@ -3793,6 +3928,19 @@ def load_taught(csv_path) -> Taught:
 def load_patterns(csv_path) -> List[str]:
     """The Ledger's saved part-name patterns, newest first."""
     return load_taught(csv_path).patterns
+
+
+def forget_patterns(csv_path) -> List[str]:
+    """Drop the Ledger's saved part-name patterns (the tab's 'Forget saved
+    pattern'): one Teach saved could not be taken back, and it applied to
+    every later Extract, Preview and Teach (review, 2026-10-20). The rest
+    of the aliases file is kept. Returns the patterns forgotten."""
+    taught = load_taught(csv_path)
+    gone = list(taught.patterns)
+    if gone:
+        taught.patterns = []
+        save_taught(csv_path, taught)
+    return gone
 
 
 def save_taught(csv_path, taught: Taught) -> Taught:
@@ -3964,6 +4112,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     run = extract(schema, read, mapping, ignore, image_reader=image_reader,
                   use_images=use_images, progress=prog,
                   pattern_mask=meta.get("pattern_mask") or None,
+                  pattern_strict=not meta.get("pattern_hint"),
                   part=meta.get("part") or "",
                   part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
                   labels=source_labels(sources), taught=load_taught(csv_path))

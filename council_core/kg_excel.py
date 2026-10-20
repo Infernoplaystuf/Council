@@ -248,6 +248,9 @@ def split_people(s: Any) -> List[str]:
     capitals ('jb' -> 'JB'); a name stays whole ('Lee, Carol'). Anything else
     ('seen', '63', a date) is nobody."""
     raw = " ".join(str(s or "").split())
+    # '(JB)', '[MK]': initials in brackets are someone's (the Ledger reads
+    # them so - source_extract._initials; review, 2026-10-20)
+    raw = re.sub(r"^[\(\[]\s*([^()\[\]]*?)\s*[\)\]]$", r"\1", raw)
     if not raw or _NOBODY.fullmatch(raw):
         return []
     parts = [p.strip() for p in re.split(r"\s*(?:/|&|;|\band\b)\s*", raw) if p.strip()]
@@ -402,13 +405,13 @@ def ledger_fingerprint(csv_path: Path) -> bytes:
         out += schema_path(csv_path).read_bytes()
     except OSError:
         out += b"no schema"
-    # the labels Teach learned are (or are not) an inspector's: a column of
-    # this Ledger reads as a person by them (read_ledger). Only when some
-    # are: a Ledger with none keeps the reading it has.
+    # the labels Teach learned are an inspector's: a column of this Ledger
+    # reads as a person by them (read_ledger). Only when some are: a Ledger
+    # with none keeps the reading it has. Labels taught as no one's are not
+    # read here (read_ledger never lets them undo a template's own field).
     taught = _se().load_taught(csv_path)
-    if taught.who or taught.not_who:
-        out += ("\0who\0" + json.dumps([sorted(taught.who), sorted(taught.not_who)])
-                ).encode("utf-8")
+    if taught.who:
+        out += ("\0who\0" + json.dumps(sorted(taught.who))).encode("utf-8")
     for x in _reviews_of(csv_path):
         st = x.stat()
         out += f"\0{x.name}\0{st.st_size}\0{st.st_mtime_ns}".encode("utf-8")
@@ -547,9 +550,12 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     schema = load_schema(p)
     by_norm = kgm._rule_index(rules)
     fields = {f.name: f for f in schema.fields}
-    # the labels this Ledger's Teach learned are an inspector's ('Tech Sig')
-    # or no one's: its person columns follow them (user, 2026-10-20)
-    taught = _se().load_taught(p)
+    # the labels this Ledger's Teach learned are an inspector's ('Tech Sig'):
+    # its person columns follow them (user, 2026-10-20). Never the labels
+    # taught as no one's: they are a workbook's labels, and one answer made
+    # the template's own 'Inspector Initials' fields no one's (review,
+    # 2026-10-20)
+    taught = _se().Taught(who=list(_se().load_taught(p).who))
     prov, n_reviews, notes = _provenance(p)
     sink = _Sink()
     try:

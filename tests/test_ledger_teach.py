@@ -409,9 +409,150 @@ def test_extract_uses_the_saved_pattern_when_the_field_is_empty(tmp_path, ledger
     assert "this Ledger's saved one (the pattern field was empty)" in s.describe()
     meta = json.loads(openpyxl.load_workbook(s.review)["_run"]["A1"].value)
     assert meta["pattern_mask"] == "@@@#@@###"                 # Apply reads it the same way
+    assert meta["pattern_hint"] is True                        # ... as a hint
     typed = li.run_extract(csv, [str(src)], tmp_path / "review2.xlsx", use_images=False,
                            pattern_mask="###")
     assert not typed.pattern_saved and typed.pattern == "###"
+    meta = json.loads(openpyxl.load_workbook(typed.review)["_run"]["A1"].value)
+    assert "pattern_hint" not in meta
+
+
+def _lmm_book(path: Path, title: str = "", label: str = "") -> Path:
+    """A workbook of one part: a title naming it, or 'Part Number: ...'."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Build"
+    if title:
+        ws["A1"] = title
+    if label:
+        ws["A2"] = label
+    ws["A3"], ws["B3"] = "Power (W)", 280
+    ws["A4"], ws["B4"] = "Scan Speed", 1200
+    wb.save(path)
+    return path
+
+
+def test_the_saved_pattern_is_a_hint_and_can_be_forgotten(tmp_path, ledger):
+    """A pattern Teach saved from one sample ('XYZ9AB123-R2' ->
+    '@@@#@@###-@#') held back every part of another shape from
+    pre-acceptance, and nothing could take it back (review, 2026-10-20).
+    Saved, it is a hint; typed, it still holds a misfit back."""
+    csv, _schema = ledger
+    books = [str(lf.make_laser_log(tmp_path / "laser_101.xlsx")),
+             str(_lmm_book(tmp_path / "lmm.xlsx", label="Part Number: LMM1AB101"))]
+    plain = li.run_extract(csv, books, tmp_path / "r0.xlsx", use_images=False)
+    assert plain.pre_accepted > 0
+    se.save_taught(csv, se.Taught(patterns=["@@@#@@###-@#"]))
+    hinted = li.run_extract(csv, books, tmp_path / "r1.xlsx", use_images=False)
+    assert hinted.pattern_saved and hinted.pre_accepted == plain.pre_accepted
+    typed = li.run_extract(csv, books, tmp_path / "r2.xlsx", use_images=False,
+                           pattern_mask="@@@#@@###-@#")
+    assert typed.pre_accepted == 0                             # a typed one still holds back
+    # Apply reads the review as Extract did: a hint, not a filter
+    run = se.extract(ParentCSV(csv).schema, books, use_images=False,
+                     pattern_mask="@@@#@@###-@#", pattern_strict=False)
+    assert not any(se.MISFIT_PART_HOW in o.part_how for o in run.obs)
+    # Teach's own read takes it as a hint too
+    s = lt.guess(csv, books[0], use_images=False)
+    assert s.pattern_saved and "a hint" in s.describe()
+    assert se.forget_patterns(csv) == ["@@@#@@###-@#"]
+    assert se.load_patterns(csv) == [] and se.forget_patterns(csv) == []
+    assert se.aliases_path_for(csv).exists()                   # the rest of the file is kept
+
+
+def test_the_pattern_finds_a_part_written_only_in_a_title(tmp_path, ledger):
+    """Teach confirmed 'LMM1AB101' from the title 'LMM1AB101 laser build
+    record' and saved its shape, but the pattern was tried on sheet and
+    file names only: a rules-only Extract found no part (review,
+    2026-10-20). It is looked for in short text cells now - a whole word,
+    one part only - and such a part is never pre-accepted."""
+    csv, schema = ledger
+    a = _lmm_book(tmp_path / "a.xlsx", title="LMM1AB101 laser build record")
+    b = _lmm_book(tmp_path / "b.xlsx", title="LMM1AB102 visual inspection")
+    s = li.run_extract(csv, [str(a), str(b)], tmp_path / "r0.xlsx", use_images=False)
+    assert sum("have no Part Number" in p for p in s.problems) == 2   # no pattern: no part
+    # Teach on a.xlsx: the model found the part in the title; the user
+    # confirms it and keeps its shape
+    model = FakeModel(part="LMM1AB101")
+    first = lt.guess(csv, a, chat=model, use_images=False)
+    assert first.part.value == "LMM1AB101" and first.part.via == lt.VIA_MODEL
+    rep = lt.learn(csv, first, {}, part="LMM1AB101", save_pattern=True)
+    assert rep.pattern == "@@@#@@###"
+    # the next rules-only Extract finds both parts in their titles
+    run = se.extract(schema, [a, b], use_images=False, pattern_mask="@@@#@@###",
+                     pattern_strict=False)
+    parts = {o.where.split(" › ")[0]: (o.part, o.part_how) for o in run.obs}
+    assert parts["a.xlsx"][0] == "LMM1AB101" and parts["b.xlsx"][0] == "LMM1AB102"
+    assert parts["a.xlsx"][1] == f"{se.TEXT_PART_HOW} Build!A1 — check it"
+    assert not any(d.accept for d in se.decide(run, schema))  # never pre-accepted
+    s = li.run_extract(csv, [str(a), str(b)], tmp_path / "r1.xlsx", use_images=False)
+    assert not any("have no Part Number" in p for p in s.problems)
+    # Guess again: the rules read it now, without the model
+    again = lt.guess(csv, a, chat=FakeModel(part=""), use_images=False)
+    assert (again.part.value, again.part.via) == ("LMM1AB101", lt.VIA_ALIAS)
+    assert again.part.where == "Build!A1" and "your part-name pattern" in again.part.how
+    assert "LMM1AB101 is now read by the rules" in lt.improvement(first, again)
+    # only a whole word: 'XYZ9AB123' of 'Serial: XYZ9AB123-R2' is no part;
+    # two parts in titles: no guess
+    ex = se._Extractor(se.Grid("x", "S", {(1, 1): "Serial: XYZ9AB123-R2"}),
+                       se.Matcher(schema), se.ItemCodes(schema.items), "",
+                       se.mask_to_regex("@@@#@@###"))
+    assert ex.parts_in_text() == []
+    two = se._Extractor(se.Grid("x", "S", {(1, 1): "LMM1AB101 build", (2, 1): "LMM1AB102"}),
+                        se.Matcher(schema), se.ItemCodes(schema.items), "",
+                        se.mask_to_regex("@@@#@@###"))
+    assert se._text_part([two]) == ("", "")
+
+
+def test_ignored_labels_are_not_offered_to_map_or_sent_to_the_model(tmp_path, ledger):
+    """Labels answered 'Ignore (not data)' were listed on the next review's
+    'Labels to map' and sent to Council's model (review, 2026-10-20)."""
+    csv, schema = ledger
+    book = _unlabelled_book(tmp_path / "u.xlsx")
+    s = lt.guess(csv, book, use_images=False)
+    rep = lt.learn(csv, s, {_row(s, "Zorp rate").key: lt.ROLE_IGNORE})
+    assert rep.ignored == ["Zorp rate"]
+    run = se.extract(schema, [book], *se.load_aliases(csv), use_images=False)
+    assert run.unmatched and not any(o.label == "Zorp rate" for o in run.unmatched)
+    model = FakeModel(part="")
+    summary = li._extract(str(csv), [str(book)], tmp_path / "review.xlsx", "", False, None,
+                          _NoProg(), None, None, None, True, model)
+    asked = model.label_prompts()[0].split("Labels:\n", 1)[1]
+    assert "Zorp rate" not in asked and "Remarks to self" in asked
+    to_map = openpyxl.load_workbook(summary.review)["Labels to map"]
+    assert not any(c.value == "Zorp rate" for row in to_map.iter_rows() for c in row)
+    # Teach still shows it, as your earlier answer
+    again = _row(lt.guess(csv, book, use_images=False), "Zorp rate")
+    assert (again.guess.key, again.guess.via) == (lt.ROLE_IGNORE, lt.VIA_ALIAS)
+
+
+def test_guesses_left_unconfirmed_are_not_learned(tmp_path, ledger):
+    """Save wrote every guess left as it was, a 50%-sure model guess too, as
+    an alias that wins outright (review, 2026-10-20): the model's guesses
+    and the rules' unsure matches are kept only when confirmed."""
+    csv, schema = ledger
+    freq = _field(schema, "Frequency")
+    model = FakeModel({"Zorp rate": freq, "Tech Sig": INSPECTOR})
+    s = lt.guess(csv, _unlabelled_book(tmp_path / "u.xlsx"), chat=model, use_images=False)
+    zorp, tech, serial = _row(s, "Zorp rate"), _row(s, "Tech Sig"), _row(s, "Serial")
+    power = _row(s, "Power (W)")
+    assert lt.needs_confirm(zorp) and lt.needs_confirm(tech) and lt.needs_confirm(serial)
+    assert not lt.needs_confirm(power)                         # a sure rule match
+    weak = lt.TeachRow(key="k", kind="label", label="Media", where="", sheet="",
+                       guess=lt.Guess(lt.ROLE_FIELD, "Concealment 1: Media", lt.VIA_RULE, 0.8))
+    assert lt.needs_confirm(weak)
+    sure = lt.confirmed_by_default(s)
+    assert power.key in sure and zorp.key not in sure
+    answers = lt.answers_from_guesses(s)
+    rep = lt.learn(csv, s, answers, confirmed=sure)
+    assert sorted(rep.unconfirmed) == ["Serial", "Tech Sig", "Zorp rate"]
+    assert "3 guess(es) you did not confirm, so not learned" in rep.describe()
+    assert se.load_aliases(csv)[0] == {} and se.load_taught(csv).who == []
+    assert not any(e.role == lt.ROLE_FIELD and e.label == "Zorp rate" for e in lt.examples(csv))
+    # confirmed (the box ticked, or another answer picked): learned
+    rep = lt.learn(csv, s, answers, confirmed=sure | {zorp.key, tech.key})
+    assert rep.mapped == {"Zorp rate": freq} and rep.who_labels == ["Tech Sig"]
+    assert rep.unconfirmed == ["Serial"]
 
 
 def test_inspector_labels_sign_readings_in_extract(tmp_path, ledger):
@@ -444,31 +585,210 @@ def test_inspector_labels_sign_readings_in_extract(tmp_path, ledger):
     assert se.Matcher(schema, taught=taught).match("Tech Sig").target is None
 
 
-def test_a_heading_that_is_no_one_is_not_read_as_initials_again(tmp_path, ledger):
-    """'NDT — 2026-09-18' over a table is read as an inspector's heading;
-    answered Ignore, NDT is no one's initials from then on."""
-    csv, schema = ledger
-    book = tmp_path / "ndt.xlsx"
+def _headed_book(path: Path, heading: str, sheet: str = "Part 101") -> Path:
+    """A heading over a small EC table: 'NDT — 2026-09-18', 'Inspector: JB'."""
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Part 101"
-    ws["A1"] = "NDT — 2026-09-18"
+    ws.title = sheet
+    ws["A1"] = heading
     ws["A2"], ws["B2"] = "Flaw", "EC Pre (%FSH)"
     for i, item in enumerate(lf.ITEMS[:3]):
         ws.cell(3 + i, 1, item)
         ws.cell(3 + i, 2, 60 + i)
-    wb.save(book)
+    wb.save(path)
+    return path
+
+
+def _signed(csv, schema, book):
+    """(reading, who signed it) of the EC readings the next Extract gives."""
+    run = se.extract(schema, [book], *se.load_aliases(csv), use_images=False,
+                     taught=se.load_taught(csv))
+    return sorted((o.value, o.inspector) for o in run.obs
+                  if "Pre-Conceal" in o.field and not lt.initials_field(o.field))
+
+
+def test_a_heading_that_is_no_one_is_not_read_as_initials_again(tmp_path, ledger):
+    """'NDT — 2026-09-18' over a table is read as an inspector's heading;
+    answered 'Not an inspector', NDT is no one's initials in headings from
+    then on. The answer is offered on that row only."""
+    csv, schema = ledger
+    book = _headed_book(tmp_path / "ndt.xlsx", "NDT — 2026-09-18")
     s = lt.guess(csv, book, use_images=False)
     head = next(r for r in s.rows if r.kind == "inspector")
     assert head.shape == "heading" and head.initials == ["NDT"]
-    rep = lt.learn(csv, s, {head.key: lt.ROLE_IGNORE})
+    offered = [k for k, _t in lt.row_choices(s, head)]
+    assert offered.index(lt.ROLE_NO_ONE) == offered.index(lt.ROLE_INSPECTOR) + 1
+    assert lt.ROLE_NO_ONE not in [k for k, _t in lt.row_choices(s, _row(s, "Flaw"))]
+    rep = lt.learn(csv, s, {head.key: lt.ROLE_NO_ONE})
     assert rep.not_who == ["NDT"] and se.load_taught(csv).not_who == ["NDT"]
     assert not rep.ignored                                     # a value, not a label
+    assert "names no one, in every workbook" in rep.describe()
     again = lt.guess(csv, book, use_images=False)
     assert not any(r.kind == "inspector" for r in again.rows)
     assert again.inspectors == []
-    run = se.extract(schema, [book], use_images=False, taught=se.load_taught(csv))
-    assert run.obs and not any(o.inspector for o in run.obs)
+    assert _signed(csv, schema, book) == [("60", ""), ("61", ""), ("62", "")]
+
+
+def test_ignore_on_a_heading_of_initials_changes_nobodys_readings(tmp_path, ledger):
+    """'Ignore (not data)' on a heading 'JB — 2026-09-18' made JB no one in
+    every workbook, even beside 'Inspector:' (review, 2026-10-20). Ignore
+    now learns nothing from a heading, and says so; 'Not an inspector'
+    makes JB no one's in headings only."""
+    csv, schema = ledger
+    sample = _headed_book(tmp_path / "sample.xlsx", "JB — 2026-09-18")
+    labelled = _headed_book(tmp_path / "labelled.xlsx", "Inspector: JB", "Part 102")
+    signed = [("60", "JB"), ("61", "JB"), ("62", "JB")]
+    assert _signed(csv, schema, labelled) == signed
+    s = lt.guess(csv, sample, use_images=False)
+    head = next(r for r in s.rows if r.kind == "inspector")
+    assert (head.shape, head.initials) == ("heading", ["JB"])
+    rep = lt.learn(csv, s, {head.key: lt.ROLE_IGNORE})
+    assert not rep.not_who and se.load_taught(csv).not_who == []
+    assert not rep.learned and "JB still signed the readings under it" in rep.notes[0]
+    assert "'Not an inspector (names no one)'" in rep.describe()
+    assert _signed(csv, schema, sample) == signed and _signed(csv, schema, labelled) == signed
+    # 'Not an inspector': no one in a heading, still JB beside 'Inspector:'
+    rep = lt.learn(csv, s, {head.key: lt.ROLE_NO_ONE})
+    assert rep.not_who == ["JB"]
+    assert _signed(csv, schema, sample) == [("60", ""), ("61", ""), ("62", "")]
+    assert _signed(csv, schema, labelled) == signed
+    other = _headed_book(tmp_path / "other.xlsx", "Initials: JB", "Part 103")
+    assert _signed(csv, schema, other) == signed
+    # answered Inspector again, JB is someone in headings again
+    lt.learn(csv, s, {head.key: lt.ROLE_INSPECTOR})
+    assert se.load_taught(csv).not_who == []
+    assert _signed(csv, schema, sample) == signed
+
+
+def _initials_column_book(path: Path, who: str = "JB", head: str = "Inspector Initials"
+                          ) -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Part 101"
+    for j, h in enumerate(["Flaw ID", "EC Pre (%FSH)", head]):
+        ws.cell(1, 1 + j, h)
+    for i, it in enumerate(lf.ITEMS[:3]):
+        ws.cell(2 + i, 1, it)
+        ws.cell(2 + i, 2, 60 + i)
+        ws.cell(2 + i, 3, who)
+    wb.save(path)
+    return path
+
+
+def test_an_inspector_initials_field_answer_is_the_inspector(tmp_path, ledger):
+    """An 'Inspector Initials' column answered as the template's own '... —
+    Inspector Initials' field (the dropdown offered it) made 'Inspector
+    Initials' no one's for the whole Ledger and put the initials in one
+    reading's field (review, 2026-10-20). Those fields are not offered;
+    such an answer is 'Inspector'; 'Ignore' on an inspector's column turns
+    off nobody's signatures either."""
+    csv, schema = ledger
+    companion = next(f.name for f in schema.fields if lt.initials_field(f.name))
+    assert lt.choice_key(lt.ROLE_FIELD, companion) not in dict(lt.choices(schema))
+    sample = _initials_column_book(tmp_path / "sample.xlsx")
+    other = _initials_column_book(tmp_path / "other.xlsx", who="MK")
+    signed = [("60", "MK"), ("61", "MK"), ("62", "MK")]
+    assert _signed(csv, schema, other) == signed
+    s = lt.guess(csv, sample, use_images=False)
+    col = _row(s, "Inspector Initials")
+    assert (col.kind, col.shape, col.guess.role, col.initials) == (
+        "inspector", "column", lt.ROLE_INSPECTOR, ["JB"])
+    rep = lt.learn(csv, s, {col.key: lt.choice_key(lt.ROLE_FIELD, companion)})
+    assert rep.unchanged == 1 and not rep.not_who and not rep.mapped
+    taught = se.load_taught(csv)
+    assert taught.not_who == [] and se.load_aliases(csv)[0] == {}
+    assert _signed(csv, schema, other) == signed
+    run = se.extract(schema, [other], *se.load_aliases(csv), use_images=False, taught=taught)
+    assert not any(o.field == companion for o in run.obs)        # no one reading's field
+    # 'Ignore' on it: not data either way - it still signs, and says so
+    rep = lt.learn(csv, s, {col.key: lt.ROLE_IGNORE})
+    assert not rep.not_who and not rep.ignored and "still says who signed" in rep.notes[0]
+    assert _signed(csv, schema, other) == signed
+    # 'Not an inspector' is the answer that makes the label no one's
+    rep = lt.learn(csv, s, {col.key: lt.ROLE_NO_ONE})
+    assert rep.not_who == ["Inspector Initials"]
+    assert _signed(csv, schema, other) == [("60", ""), ("61", ""), ("62", "")]
+
+
+def test_labels_taught_as_no_ones_never_undo_the_templates_person_columns(tmp_path):
+    """kg_excel.read_ledger: a template field whose label says who signed
+    ('Inspector Initials') stays a person column whatever a workbook's
+    label was taught to be; the fingerprint follows only the inspectors'
+    labels (review, 2026-10-20)."""
+    tpl = tmp_path / "tpl.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Attributes"
+    ws["A1"].font = Font(size=16, bold=True)
+    for col, label in enumerate(["Part Number", "Power (W)", "Inspector Initials"], start=1):
+        ws.cell(2, col, label)
+    wb.save(tpl)
+    csv = Path(li.create_parent(tpl).csv)
+    ParentCSV(csv).add_samples([{"Part Number": "101", "Power (W)": "280",
+                                 "Inspector Initials": "JB"}])
+    before = kg_excel.read_ledger(csv, "ledger.csv", [])
+    fp = kg_excel.ledger_fingerprint(csv)
+    assert "Inspector Initials" in before.summary["person_columns"]
+    se.save_taught(csv, se.Taught(not_who=["Inspector Initials"]))
+    after = kg_excel.read_ledger(csv, "ledger.csv", [])
+    assert "Inspector Initials" in after.summary["person_columns"]
+    assert after.summary["people"] == ["JB"]
+    assert kg_excel.ledger_fingerprint(csv) == fp
+
+
+@pytest.mark.parametrize("variant", ["title", "colon", "column"])
+def test_initials_in_brackets_are_read_and_taught(tmp_path, ledger, variant):
+    """The 'initials in parentheses' layout: 'Inspector (JB)' over a table,
+    'Inspector: (JB)', a column 'Insp.' of '(JB)'. None signed a reading,
+    and Teach's 'Inspector' answer was said to be learned while the next
+    Extract still signed nothing (review, 2026-10-20)."""
+    csv, schema = ledger
+    book = tmp_path / f"{variant}.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Part 101"
+    head = ["Flaw ID", "EC Pre (%FSH)"] + (["Insp."] if variant == "column" else [])
+    if variant != "column":
+        ws["A1"] = "Inspector (JB)" if variant == "title" else "Inspector: (JB)"
+    for j, h in enumerate(head):
+        ws.cell(4, 1 + j, h)
+    for i, it in enumerate(lf.ITEMS[:3]):
+        ws.cell(5 + i, 1, it)
+        ws.cell(5 + i, 2, 60 + i)
+        if variant == "column":
+            ws.cell(5 + i, 3, "(JB)")
+    wb.save(book)
+    signed = [("60", "JB"), ("61", "JB"), ("62", "JB")]
+    s = lt.guess(csv, book, use_images=False)
+    if variant != "column":
+        # read by the rules: a row to answer, its initials in People
+        row = next(r for r in s.rows if r.kind == "inspector")
+        assert (row.label, row.shape, row.initials) == ("Inspector", "label", ["JB"])
+        assert [p.initials for p in s.inspectors] == ["JB"]
+        assert _signed(csv, schema, book) == signed
+        return
+    insp = _row(s, "Insp.")
+    assert insp.example == "(JB)" and lt.initials_in(insp.example) == ["JB"]
+    rep = lt.learn(csv, s, {insp.key: lt.ROLE_INSPECTOR}, {"JB": "Jordan Blake"})
+    assert rep.who_labels == ["Insp."]
+    assert _signed(csv, schema, book) == signed
+    again = lt.guess(csv, book, use_images=False)
+    col = _row(again, "Insp.")
+    assert (col.kind, col.guess.via, col.initials) == ("inspector", lt.VIA_ALIAS, ["JB"])
+    assert [(p.initials, p.full_name) for p in again.inspectors] == [("JB", "Jordan Blake")]
+
+
+def test_bracketed_initials_and_their_look_alikes():
+    assert se._initials("(JB)") == "JB" and se._initials("[j.b.]") == "JB"
+    assert se._initials("(12)") == "" and se._initials("(N/A)") == ""
+    assert lt.initials_in("(JB/MK)") == ["JB", "MK"] and lt.initials_in("(ok)") == []
+    assert se._who_paren("Inspector (JB)") == ("Inspector", "JB")
+    assert se._who_paren("Tech Sig [M.K.]") == ("Tech Sig", "MK")
+    # a column's title, a unit, a word: no one
+    for cell in ("Operator (ID)", "Inspector (Name)", "Inspector (mm)", "Speed (IPM)",
+                 "Inspector (Level II)", "Notes (see JB)"):
+        assert se._who_paren(cell) == ("", ""), cell
+    assert kg_excel.split_people("(JB)") == ["JB"]
 
 
 def test_a_flaw_code_column_is_learned(tmp_path, ledger):
