@@ -203,6 +203,76 @@ def test_a_real_pictures_folder_path_too_long_does_not_fail_the_extract(tmp_path
         assert [p for p in s.problems if p.startswith("pictures not saved: path too long")]
 
 
+def _long_folder(tmp_path, review_len):
+    """A folder made past MAX_PATH (as another program can, long paths on or
+    off) and a review path in it of `review_len` characters."""
+    import os
+    import source_extract as se
+    name = "review_20261019_123456.xlsx"
+    folder = tmp_path / ("d" * (review_len - len(str(tmp_path)) - len(name) - 2))
+    os.makedirs(se._long_path(str(folder)))
+    review = folder / name
+    assert len(str(review)) == review_len
+    return folder, review
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_review_path_too_long_is_said_before_a_workbook_is_read(tmp_path, monkeypatch):
+    """A review path of 260+ characters (its pictures folder 262+) failed
+    the Extract with a raw FileNotFoundError [Errno 2] once every workbook
+    was read (review, 2026-10-19). Now a plain error, before any is read."""
+    import shutil
+    import source_extract as se
+    from council_core import ledger_ingest as li
+    from sample_ledger import LedgerError
+    # as on most PCs, whatever this one says
+    monkeypatch.setattr(se, "_long_paths_on", lambda: False, raising=False)
+    tpl = make_template(tmp_path / "t.xlsx")
+    csv = tmp_path / "p.csv"
+    li.create_parent(str(tpl), str(csv))
+    src = make_laser_log(tmp_path / "laser.xlsx")
+
+    def read(*a, **k):
+        raise AssertionError("a workbook was read")
+    monkeypatch.setattr(li, "extract", read)
+    folder, review = _long_folder(tmp_path, 265)
+    try:
+        with pytest.raises(LedgerError) as e:
+            li.run_extract(str(csv), [str(src)], str(review), use_images=False)
+        assert str(e.value) == ("review path too long (265 characters) — enable Windows "
+                                "long paths or pick a shorter folder")
+        # one Windows can write is not stopped
+        assert not se.too_long_to_write(tmp_path / "review.xlsx")
+        monkeypatch.setattr(se, "_long_paths_on", lambda: True)
+        assert not se.too_long_to_write(review)
+    finally:
+        shutil.rmtree(se._long_path(str(folder)), ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_review_too_long_to_save_is_a_plain_error(setup):
+    """Whoever writes the review past MAX_PATH (long paths off) is told so,
+    not given FileNotFoundError [Errno 2]."""
+    import os
+    import shutil
+    import source_extract as se
+    from sample_ledger import LedgerError
+    schema, csv, sources, tmp = setup
+    try:
+        os.makedirs(tmp / ("p" * 130) / ("q" * 130))
+        pytest.skip("Windows long paths are on here")
+    except OSError:
+        pass
+    run = extract(schema, [sources[0]], use_images=False)
+    folder, review = _long_folder(tmp, 270)
+    try:
+        with pytest.raises(LedgerError, match=r"^could not write review_20261019_123456\.xlsx: "
+                                              r"review path too long \(270 characters\)"):
+            write_review(review, run, decide(run, schema), schema, str(csv))
+    finally:
+        shutil.rmtree(se._long_path(str(folder)), ignore_errors=True)
+
+
 def test_unknown_labels_and_problems(setup):
     schema, _, sources, tmp = setup
     run = _run(schema, sources, tmp)
