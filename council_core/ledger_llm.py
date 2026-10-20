@@ -85,6 +85,33 @@ def _cannot_answer(exc: BaseException) -> bool:
     return False
 
 
+#: How a timeout reads when only its words are left: council_engine's
+#: LocalChatTimeout, Ollama's own 'timed out waiting for llama runner'.
+_TIMED_OUT = re.compile(r"(?i)\btimed out\b|did not start answering within|sent nothing for \d"
+                        r"|deadline exceeded")
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """Did ``exc`` (or what caused it) run out of time - council_engine's
+    LocalChatTimeout ('did not start answering within 300 s'), a socket
+    timeout, Ollama's 'timed out waiting for llama runner'? Each question
+    after it can wait as long again: in the real app every part-less
+    workbook waited the full 300 s once more after the model had already
+    timed out (review, 2026-10-19)."""
+    import urllib.error
+    seen = set()
+    e: Optional[BaseException] = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, TimeoutError) or (isinstance(e, urllib.error.URLError)
+                                           and isinstance(e.reason, TimeoutError)):
+            return True
+        if _TIMED_OUT.search(str(e)):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
 _PART_SCHEMA = {
     "type": "object",
     "properties": {"part": {"type": "string"}, "evidence": {"type": "string"}},
@@ -355,18 +382,34 @@ class AssistReport:
     problems: List[str] = field(default_factory=list)
     #: Why the model stopped being asked (one_shot), '' while it answers.
     unavailable: str = ""
-    #: It stopped being asked after failing twice in a row (a timeout, say),
-    #: not because it cannot answer at all.
+    #: It stopped being asked after failing twice in a row, not because it
+    #: cannot answer at all.
     gave_up: bool = False
+    #: It stopped being asked after running out of time once (one_shot).
+    timed_out: bool = False
+    #: What the question being asked is about - a workbook's name, or the
+    #: labels left over - so a timeout can say which one it was.
+    asking: str = ""
+    #: ``asking`` when the model stopped being asked.
+    stopped_on: str = ""
+
+    def _ran_out(self) -> str:
+        """Why a model that timed out was not asked again: one slow workbook
+        stops the rest too, so the summary has to say so (review,
+        2026-10-19)."""
+        on = f" on {self.stopped_on}" if self.stopped_on else ""
+        return (f"ran out of time{on} and was not asked again in this run (each later "
+                "question could have waited as long)")
 
     def describe(self) -> str:
         # the error's first sentence: the problem line below has all of it
         down = (self.unavailable.splitlines() or [""])[0].strip()
         if down.endswith(":") and ". " in down:            # '... installed. Install with:'
             down = down.rsplit(". ", 1)[0]
-        down = down[:200]
+        down = _clip(down, 200)
         if down and not (self.values_placed or self.parts_found):
-            lead = ("Council's model did not answer twice in a row and was not asked "
+            lead = ("Council's model " + self._ran_out() if self.timed_out else
+                    "Council's model did not answer twice in a row and was not asked "
                     "again" if self.gave_up else "Council's model was unavailable")
             return f"{lead}, so nothing in the review is its suggestion: {_end(down)}"
         if not (self.labels_asked or self.parts_asked):
@@ -378,17 +421,32 @@ class AssistReport:
         if self.parts_asked:
             got = ", ".join(f"{w} → {p}" for w, p in self.parts_found) or "none found"
             bits.append(f"part numbers for {self.parts_asked} workbook(s): {got}")
-        tail = (f". Then it stopped answering and was not asked again: {down}" if down
-                else "")
+        stopped = (self._ran_out() if self.timed_out else
+                   "stopped answering and was not asked again")
+        tail = (f". Then it {stopped}: {down}" if down else "")
         return _end(" ".join(bits[:1]) + " " + "; ".join(bits[1:]) +
                     " — all amber in the review: check them" + tail)
 
 
 def _end(text: str) -> str:
     """``text`` as a sentence: one full stop, unless it already ends in
-    '.', '?' or '!' ('... Is Ollama running?.' - review, 2026-10-19)."""
+    '.', '?', '!' or '…' ('... Is Ollama running?.' - review, 2026-10-19)."""
     text = text.rstrip().rstrip(":;,").rstrip()
-    return text if text.endswith((".", "?", "!")) else text + "."
+    return text if text.endswith((".", "?", "!", "…")) else text + "."
+
+
+def _clip(text: str, most: int) -> str:
+    """``text`` in at most about ``most`` characters, cut at the end of a
+    clause ('; ', ', ', '. ') or else of a word ('…'), never inside a word:
+    council_engine's own timeout words ended '... the request was canc.' in
+    the summary (second review, 2026-10-19). The problem line has it all."""
+    if len(text) <= most:
+        return text
+    cut = max(text.rfind(s, 0, most) for s in ("; ", ", ", ". "))
+    if cut > most // 2:
+        return text[:cut + (text[cut] == ".")]
+    cut = text.rfind(" ", 0, most)
+    return (text[:cut] if cut > most // 2 else text[:most]).rstrip(" ,;:") + "…"
 
 
 def one_shot(chat: Chat, report: AssistReport,
@@ -400,12 +458,16 @@ def one_shot(chat: Chat, report: AssistReport,
 
     A model that cannot answer at all (_cannot_answer: not installed, would
     not load, no Ollama) is one problem line and ``report.unavailable``;
-    every later question raises ModelUnavailable without asking. One that
-    failed a question (a timeout on one big workbook) is asked again - it
-    stopped every later workbook and the labels too - until it fails twice
-    in a row; an error already said once raises ModelFailedAgain, so the
-    caller names the workbook without the whole error again. Cancel is not
-    a failure."""
+    every later question raises ModelUnavailable without asking. So does
+    one that ran out of time (_timed_out), at its first timeout: asked
+    again, each part-less workbook waited the full Ollama timeout once more
+    (300 s each in the real app - review, 2026-10-19). The price is that one
+    slow workbook stops the questions after it, labels too; the summary
+    says so and which one (AssistReport._ran_out). One that failed a
+    question quickly (a reply error) is asked again - it stopped every later
+    workbook and the labels too - until it fails twice in a row; an error
+    already said once raises ModelFailedAgain, so the caller names the
+    workbook without the whole error again. Cancel is not a failure."""
     state = {"fails": 0, "said": set()}
 
     def ask(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
@@ -421,13 +483,18 @@ def one_shot(chat: Chat, report: AssistReport,
             said = msg in state["said"]
             state["said"].add(msg)
             fatal = _cannot_answer(exc)
-            if fatal or state["fails"] >= 2:
+            slow = not fatal and _timed_out(exc)
+            if fatal or slow or state["fails"] >= 2:
                 report.unavailable = msg
-                report.gave_up = not fatal
-                why = ("did not answer twice in a row" if report.gave_up else
-                       "did not answer")
+                report.gave_up = not (fatal or slow)
+                report.timed_out = slow
+                report.stopped_on = report.asking
+                why = (report._ran_out() if slow else
+                       "did not answer twice in a row, so it was not asked again in this run"
+                       if report.gave_up else
+                       "did not answer, so it was not asked again in this run")
                 report.problems.append(
-                    f"Council's model {why}, so it was not asked again in this run: "
+                    f"Council's model {why}: "
                     + ("the same error as above" if said else msg))
                 raise ModelUnavailable(msg) from exc
             if said:
@@ -503,6 +570,7 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
         return
     fields = [f.name for f in schema.fields if f.name != schema.id_field]
     report.labels_asked = len(labels)
+    report.asking = "the labels left over"
     try:
         mapping, report.model = map_labels(labels, fields, chat)
     except ModelUnavailable:
@@ -565,6 +633,18 @@ _GENERIC = re.compile(
     r"|file|book|workbook|untitled|image|img|photo|pic|dsc)[\s_\-#.]*\d+")
 #: What is trimmed off a word before it is judged ('(XYZ9AB123),').
 _TRIM = "()[],;:"
+#: A word of an id written with spaces ('QRS 6TU 789'): letters, digits,
+#: '-', '_', '.', '/' - nothing in brackets.
+_CODE_WORD = re.compile(r"[^\W_][\w\-./]*")
+#: An id's label written before it ('S/N', 'P/N', 'ID', 'No.', 'PART',
+#: 'Lot'): not a word of the id.
+_ID_LABEL = re.compile(r"(?i)[sp]/?n|id|no\.?|nr\.?|part|serial|sample|specimen|lot|batch")
+#: A month's name ('Oct', 'MAY'): not a word of an id.
+_MONTH = re.compile(_MON)
+#: A number written in groups of digits ('12 345', '1 234 567'): a value.
+_GROUPED = re.compile(r"\d{1,3}(?: \d{3})+")
+#: A name and a number - an axis, a channel, a cell ('X12', 'CH1', 'R1').
+_NAMED = re.compile(r"([A-Za-z]+)\d+")
 
 
 def _measured(s: str) -> bool:
@@ -618,6 +698,89 @@ def _part_test(pattern_mask: Optional[str]) -> Callable[[str], bool]:
             return False
         return not (s.isdigit() and len(s) < 5 and not digits_mask)
     return test
+
+
+def _mask_whole(text: str, rx) -> bool:
+    """Does the user's pattern match ``text`` whole - as written, or with
+    the spaces inside it left out ('QRS 6TU 789' for @@@#@@###)? Then it is
+    the id, whatever is written next to it ('QRS 6TU 789 A' was dropped -
+    second review, 2026-10-19). Not a number written in groups ('12 345'
+    for #####) nor words with a year ('FY 2026' for @@####): values."""
+    if rx is None:
+        return False
+    words = text.split()
+    spaced = " ".join(words)
+    if rx.fullmatch(spaced):
+        return True
+    return (len(words) > 1 and bool(rx.fullmatch("".join(words)))
+            and not _GROUPED.fullmatch(spaced) and not any(_YEAR.fullmatch(w) for w in words))
+
+
+def _spaced_part(text: str, is_part: Callable[[str], bool], rx) -> bool:
+    """Is ``text`` - written in a cell with spaces inside it - one part
+    identifier ('QRS 6TU 789')? looks_like_part refuses every space, so the
+    id was dropped, or cut to a piece of it (review, 2026-10-19). Yes when
+    the user's pattern matches it whole (_mask_whole).
+
+    Otherwise only an id made of code groups: a model that copies the cell
+    glued the words next to an id to it ('JD ABC1DE234', 'ABC1DE234 TOP',
+    two ids), and labels with their values passed ('ISO 9001', 'CH 12',
+    'Q3 2026', '10 30 AM') - phantom parts again (second review,
+    2026-10-19). So the identifier rules hold for the words together
+    ('Sheet 1', 'Run 3 of 5', a value with its unit - '280 W' - a date like
+    'Oct 5 2026'); no word is an id by itself (_alone), nor is a word of
+    letters alone outside what the user's pattern matches in it ('UT QRS
+    6TU 789 A': a method and a side); one word at least mixes letters and
+    digits ('6TU': not a label and its number); 6+ characters, not axes or
+    a list of channels ('X12 Y34', 'CH1 CH2'); and each word is a code
+    group (_code)."""
+    words = text.split()
+    spaced, joined = " ".join(words), "".join(words)
+    if _mask_whole(spaced, rx):
+        return True
+    if (len(words) < 2 or len(joined) < 6 or joined.isdigit() or not is_part(joined)
+            or _MEASURE.fullmatch(spaced) or _MONTH_DATE.fullmatch(spaced)):
+        return False
+    if any(_GENERIC.fullmatch(f"{u} {v}") for u, v in zip(words, words[1:])):
+        return False                                       # 'Run 3 of 5', 'X7 Rev 2'
+    if any(_alone(w, is_part, rx) for w in words):
+        return False                                       # 'JD ABC1DE234', 'ABC1DE234 TOP'
+    if rx is not None and any(
+            _mask_whole(" ".join(words[a:b]), rx) and any(
+                w.isalpha() for w in words[:a] + words[b:])
+            for a in range(len(words)) for b in range(a + 1, len(words) + 1)):
+        return False                                       # 'UT QRS 6TU 789 A'
+    named = [_NAMED.fullmatch(w) for w in words]
+    if all(named) and (all(len(m.group(1)) == 1 for m in named)
+                       or len({m.group(1).casefold() for m in named}) == 1):
+        return False                                       # 'X12 Y34', 'CH1 CH2'
+    if not any(_mixed(w) for w in words):
+        return False                                       # 'ISO 9001', 'CH 12', '10 30 AM'
+    return all(_code(w) for w in words)
+
+
+def _alone(w: str, is_part: Callable[[str], bool], rx) -> bool:
+    """Is ``w`` an id by itself - the user's pattern, or looks_like_part
+    with 6+ characters ('ABC1DE234')? A short one ('AB12') is also how an
+    id written with spaces is grouped ('AB12 CD34')."""
+    return bool(rx is not None and rx.fullmatch(w)) or (len(w) >= 6 and is_part(w))
+
+
+def _mixed(w: str) -> bool:
+    return any(ch.isalpha() for ch in w) and any(ch.isdigit() for ch in w)
+
+
+def _code(w: str) -> bool:
+    """Can ``w`` be one word of an id written with spaces (_spaced_part)?
+    Not in brackets, not an id's label ('S/N', 'No.', 'PART'), a value
+    ('61.35'), a year or a month; letters alone only as a group of at most
+    3 in one case ('QRS') - not 'Rev', 'Tag', 'PROBE' or 'record': a label,
+    a title."""
+    if not _CODE_WORD.fullmatch(w) or _ID_LABEL.fullmatch(w) or _GENERIC.fullmatch(w):
+        return False
+    if _a_value(w) or _YEAR.fullmatch(w) or _MONTH.fullmatch(w):
+        return False
+    return not w.isalpha() or (len(w) <= 3 and (w.isupper() or w.islower()))
 
 
 def _cells_text(grids, pattern_mask: Optional[str] = None) -> List[str]:
@@ -696,6 +859,7 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
               f"File name: {file_name}\nSheet names: {json.dumps(sheets)}\n"
               f"Cells:\n{json.dumps(cells, ensure_ascii=False)}")
     report.parts_asked += 1
+    report.asking = file_name
     try:
         text, report.model = chat(prompt, _PART_SCHEMA)
     except ModelUnavailable:
@@ -713,23 +877,46 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
     if not answer or len(answer) > 60:
         return "", ""
     # The quote check: it must look like an identifier and be written there
-    # as a whole word. A model adds words around the identifier
-    # ('XYZ9AB123-R2 (rev B)' for a cell 'S/N XYZ9AB123-R2  (rev B)',
-    # granite3.3:8b, 2026-10-19), so the answer's pieces are tried too,
-    # longest first.
+    # as a whole word - compared ignoring case and the spaces inside it, and
+    # given as the workbook writes it. The whole answer first: an id written
+    # with spaces ('QRS 6TU 789', what gemma3, granite3.3, llama3.1 and phi4
+    # all answered) was dropped or cut to a piece of it ('6TU'), and the
+    # answer 'QRS6TU789' for that cell was dropped (review, 2026-10-19).
+    # Then the answer without the words around it that are no id's ('Part
+    # QRS 6TU 789', 'S/N: AB12 CD34'), what the user's pattern matches whole
+    # in it ('QRS 6TU 789' of 'QRS 6TU 789 Rev B'), then its pieces alone,
+    # longest first: a model adds words around the identifier ('XYZ9AB123-R2
+    # (rev B)' for a cell 'S/N XYZ9AB123-R2  (rev B)', granite3.3:8b,
+    # 2026-10-19), or copies the cell ('JD ABC1DE234' - _spaced_part).
+    is_part, rx = _part_test(pattern_mask), _mask_re(pattern_mask)
+
+    def ok(s: str, in_cell: bool = True) -> bool:
+        """An identifier as written: spaces inside it only in a cell."""
+        if re.search(r"\s", s):
+            return in_cell and _spaced_part(s, is_part, rx)
+        return is_part(s) and not _named_file(s, file_name, pattern_mask)
+
+    words = answer.split()
+    i, j = 0, len(words)
+    while i < j and not _code(words[i]):
+        i += 1
+    while j > i and not _code(words[j - 1]):
+        j -= 1
+    masked = sorted((s for s in (" ".join(words[a:b]) for a in range(len(words))
+                                 for b in range(a + 2, len(words) + 1))
+                     if rx is not None and _mask_whole(s, rx)), key=len, reverse=True)
     pieces = sorted((p for p in re.split(r"[\s()\[\],;:]+", answer) if len(p) >= 3),
                     key=len, reverse=True)
-    # an identifier has no spaces: with words around it, the piece first
-    tries = (pieces + [answer]) if re.search(r"\s", answer) else ([answer] + pieces)
-    is_part = _part_test(pattern_mask)
-    tries = [p for p in dict.fromkeys(tries)
-             if is_part(p) and not _named_file(p, file_name, pattern_mask)]
-    for part in tries:
-        where, written = _written_at(part, file_name, sheets, grids)
+    tries = [p for p in dict.fromkeys([" ".join(words), " ".join(words[i:j])] + masked
+                                      + pieces) if p]
+    looks = any(ok(p) for p in tries)
+    # judged as the workbook writes it: 'efg5hj 678' for a sheet 'EFG5HJ678'
+    for part in (p for p in tries if ok(p) or ok("".join(p.split()))):
+        where, written = _written_at(part, file_name, sheets, grids, ok, rx)
         if where:
             report.parts_found.append((file_name, written))
             return written, where
-    why = ("is not written in the workbook as a whole word" if tries else
+    why = ("is not written in the workbook as a whole word" if looks else
            "does not look like a part number (a title, label, value, date, sheet or "
            "file name?)")
     report.problems.append(f"{file_name}: Council's model named part {answer!r}, which "
@@ -752,50 +939,109 @@ def _named_file(part: str, file_name: str, pattern_mask: Optional[str]) -> bool:
     return any(len(w) >= 4 and w.isalpha() for w in re.split(r"[\s_\-.]+", part))
 
 
-def _whole_word(part: str, text: Any) -> str:
+def _squash(text: Any) -> str:
+    return "".join(str(text).split()).casefold()
+
+
+def _whole_word(part: str, text: Any, ok: Optional[Callable[[str], bool]] = None,
+                rx=None, exact: bool = True) -> str:
     """``part`` as it is written in ``text`` as a whole word - no letter or
-    digit right before or after it; case and runs of spaces aside - or ''.
-    A plain substring took 'efg5hj67' from 'efg5hj678' (review,
-    2026-10-19)."""
-    words = part.split()
-    if not words:
-        return ""
-    body = r"\s+".join(re.escape(w) for w in words)
+    digit right before or after it; case and runs of spaces aside, and with
+    ``exact`` False the spaces inside it too ('QRS 6TU 789' for
+    'QRS6TU789', and the other way round) - or ''. ``ok`` judges how it is
+    written there. A plain substring took 'efg5hj67' from 'efg5hj678'
+    (review, 2026-10-19)."""
+    chars = "".join(part.split())
     text = str(text)
+    if not chars or _squash(chars) not in _squash(text):   # most cells: no regex
+        return ""
+    body = (r"\s+".join(re.escape(w) for w in part.split()) if exact else
+            r"\s*".join(re.escape(ch) for ch in chars))
     for m in re.finditer(r"(?<![^\W_])" + body + r"(?![^\W_])", text, re.IGNORECASE):
-        if not _inside_a_value(text, m.start(), m.end()):
-            return m.group(0)
+        got = m.group(0)
+        if _inside_a_value(text, m.start(), m.end()) or (ok is not None and not ok(got)):
+            continue
+        if ok is not None and _more_of_it(text, m.start(), m.end(), ok, rx):
+            continue
+        return " ".join(got.split())        # one space between its words, as the model saw it
     return ""
+
+
+def _more_of_it(text: str, start: int, end: int, ok: Callable[[str], bool], rx) -> bool:
+    """Is text[start:end] a piece of a longer id written there with spaces
+    inside ('QRS 6TU' of 'QRS 6TU 789', 'ABC1' of 'ABC1 DE23 4XY')? A piece
+    of a spaced id is what was wrong (review, 2026-10-19). What the user's
+    pattern matches whole is no piece, whatever is written next to it, and
+    a word of letters alone next to it ('A', 'TOP', 'UT', 'Rev' - a side, a
+    method) does not make it longer: 'QRS 6TU 789 A' was dropped (second
+    review, 2026-10-19)."""
+    mid = text[start:end]
+    if _mask_whole(mid, rx):
+        return False
+    before = text[:start].split()[-4:] if start and text[start - 1].isspace() else []
+    after = text[end:].split()[:4] if end < len(text) and text[end].isspace() else []
+    if rx is not None and any(_mask_whole(" ".join(before[len(before) - b:] + [mid] + after[:a]),
+                                          rx)
+                              for b in range(len(before) + 1) for a in range(len(after) + 1)
+                              if a or b):
+        return True                                        # '6TU 789' of 'QRS 6TU 789'
+    return any(ok(" ".join(span)) for word, span in ((before[-1:], before[-1:] + [mid]),
+                                                     (after[:1], [mid] + after[:1]))
+               if word and any(ch.isdigit() for ch in word[0]))
 
 
 def _inside_a_value(text: str, start: int, end: int) -> bool:
     """Is text[start:end] a piece of a date, time or measured value written
     there ('2026-10-05T10' of '2026-10-05T10:30': the answer's pieces are
-    split at ':' - review, 2026-10-19)?"""
+    split at ':' - review, 2026-10-19)? One with spaces inside is judged
+    with the words written before and after it too: 'Oct 5' of 'Oct 5,
+    2026', 'AB 12' of 'AB 12 mm'."""
     a = max(text.rfind(ch, 0, start) for ch in " \t\n") + 1
     b = min((i for i in (text.find(ch, end) for ch in " \t\n") if i >= 0), default=len(text))
     token = text[a:b].strip(_TRIM + ".")
-    if token == text[start:end]:
+    if token != text[start:end]:
+        return _a_value(token)
+    if not re.search(r"\s", token):
         return False
-    return bool(_NUMBER.fullmatch(token) or _DATE.fullmatch(token) or _measured(token)
-                or _TIME.fullmatch(token) or _MONTH_DATE.fullmatch(token)
-                or _ISO_DT.fullmatch(token))
+    prev = re.search(r"\S+[\s,;:]*$", text[:start])
+    nxt = re.match(r"[\s,;:]*[^\s,;:]+", text[end:])
+    a = prev.start() if prev else start
+    b = end + nxt.end() if nxt else end
+    first, last = start + len(token.split()[0]), end - len(token.split()[-1])
+    spans = {text[a:end], text[start:b], text[a:b], text[a:first], text[last:b]}
+    return any(_a_value(" ".join(s.split()).strip(_TRIM + "."))
+               for s in spans if s != token)
 
 
-def _written_at(part: str, file_name: str, sheets: Sequence[str], grids
-                ) -> Tuple[str, str]:
+def _a_value(s: str) -> bool:
+    """A number, date, time or measured value, as written."""
+    return bool(_NUMBER.fullmatch(s) or _DATE.fullmatch(s) or _measured(s)
+                or _TIME.fullmatch(s) or _MONTH_DATE.fullmatch(s) or _ISO_DT.fullmatch(s))
+
+
+def _written_at(part: str, file_name: str, sheets: Sequence[str], grids,
+                ok: Optional[Callable[..., bool]] = None, rx=None) -> Tuple[str, str]:
     """(where ``part`` is written as a whole word, how it is written there),
-    or ('', '')."""
-    got = _whole_word(part, file_name)
-    if got:
-        return f"file name {file_name!r}", got
-    for s in sheets:
-        got = _whole_word(part, s)
+    or ('', ''). ``ok(written, in_cell)`` judges how it is written: an id
+    with spaces inside is taken only as a cell writes it. Written as the
+    model wrote it first, anywhere, and only then with other spaces inside:
+    with 'QRS 6TU 789' in A1 and 'QRS6TU789' in A2, the answer 'QRS6TU789'
+    was given as A1 writes it - the ledger compares ids with their spaces,
+    so one sample became two (second review, 2026-10-19)."""
+    def fits(in_cell: bool) -> Optional[Callable[[str], bool]]:
+        return None if ok is None else (lambda s: ok(s, in_cell))
+    for exact in (True, False):
+        got = _whole_word(part, file_name, fits(False), rx, exact)
         if got:
-            return f"sheet name {s!r}", got
-    for g in grids:
-        for (r, c), v in sorted(g.cells.items()):
-            got = _whole_word(part, v)
+            return f"file name {file_name!r}", got
+        for s in sheets:
+            got = _whole_word(part, s, fits(False), rx, exact)
             if got:
-                return g.where(r, c), got
+                return f"sheet name {s!r}", got
+        in_cell = fits(True)
+        for g in grids:
+            for (r, c), v in sorted(g.cells.items()):
+                got = _whole_word(part, v, in_cell, rx, exact)
+                if got:
+                    return g.where(r, c), got
     return "", ""
