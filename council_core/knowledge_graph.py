@@ -3493,29 +3493,64 @@ class KnowledgeGraph:
 
     def search(self, text: str, etype: Optional[str] = None, limit: int = 50
                ) -> List[Dict[str, Any]]:
-        """Entities whose name or any alias contains ``text`` (accent- and
-        case-insensitive), best first: exact, then prefix, then substring."""
+        """Entities whose name or any alias has a word starting with ``text``
+        (accent- and case-insensitive), best first: exact, then prefix, then
+        a later word's start. A query with a digit in it is a piece of a code
+        ('7720' of BRG-7720, a serial's tail) and matches anywhere in one.
+        Initials ('AK', 'A.K.') also find the people whose initials they are,
+        and 'D. Whitfield' the people that initial and surname fit."""
+        from council_core import kg_excel
         # 'Lee, Carol' also searches as 'Carol Lee', whichever was seen.
         forms = {f for f in (fold(text), fold(person_display(text))) if f}
         if not forms:
             return []
         best: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+        def hit(r, score: int) -> None:
+            cur = best.get(r["id"])
+            if cur is None or score < cur[0]:
+                best[r["id"]] = (score, {"id": r["id"], "type": r["type"],
+                                         "name": r["name"]})
         for ft in forms:
+            # On word starts: 'AK' found 'Jordan Blake' (blAKe) - review,
+            # 2026-10-19. fold() leaves only [a-z0-9 ], so no LIKE wildcard
+            # can be in ft, and every word follows exactly one space.
+            code = any(ch.isdigit() for ch in ft)
             q = ("SELECT DISTINCT e.id, e.type, e.name, a.alias_norm FROM aliases a"
-                 " JOIN entities e ON e.id=a.entity_id WHERE e.merged_into IS NULL"
-                 " AND a.alias_norm LIKE ?")
-            # fold() leaves only [a-z0-9 ], so no LIKE wildcard can be in ft.
-            args: List[Any] = [f"%{ft}%"]
+                 " JOIN entities e ON e.id=a.entity_id WHERE e.merged_into IS NULL")
+            if code:
+                q += " AND a.alias_norm LIKE ?"
+                args: List[Any] = [f"%{ft}%"]
+            else:
+                q += " AND (a.alias_norm LIKE ? OR a.alias_norm LIKE ?)"
+                args = [f"{ft}%", f"% {ft}%"]
             if etype:
                 q += " AND e.type=?"
                 args.append(etype)
             for r in self.db.execute(q, args):
-                score = (0 if r["alias_norm"] == ft
-                         else 1 if r["alias_norm"].startswith(ft) else 2)
-                cur = best.get(r["id"])
-                if cur is None or score < cur[0]:
-                    best[r["id"]] = (score, {"id": r["id"], "type": r["type"],
-                                             "name": r["name"]})
+                norm = r["alias_norm"]
+                hit(r, 0 if norm == ft else 1 if norm.startswith(ft)
+                    else 2 if f" {ft}" in f" {norm}" else 3)
+        if etype in (None, "PERSON"):
+            # Initials: every word's first letter, or the first and last
+            # name's (as the initials questions offer their candidates).
+            if kg_excel.is_initials(text, loose=True):
+                want = kg_excel.initials_key(text).lower()
+                if len(want) >= 2:
+                    for r in self.db.execute(
+                            "SELECT id, type, name, key FROM entities WHERE"
+                            " type='PERSON' AND merged_into IS NULL AND key LIKE ?"
+                            " AND key LIKE '% %'", (f"{want[0]}%",)):
+                        toks = r["key"].split()
+                        if want in ("".join(t[0] for t in toks), toks[0][0] + toks[-1][0]):
+                            hit(r, 2)
+            key = person_key(text)
+            if is_initial_form(key):
+                for eid in self.initial_candidates(key):
+                    r = self.db.execute("SELECT id, type, name FROM entities WHERE id=?"
+                                        " AND merged_into IS NULL", (eid,)).fetchone()
+                    if r is not None:
+                        hit(r, 2)
         ranked = sorted(best.values(), key=lambda x: (x[0], x[1]["name"].lower()))
         return [d for _s, d in ranked[:limit]]
 

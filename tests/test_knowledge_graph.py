@@ -380,6 +380,33 @@ def test_search_is_accent_and_order_insensitive(tmp_path):
     assert kg.search("pn-1234", "PART")[0]["name"].startswith("PN-1234/")
 
 
+def test_search_matches_word_starts_and_initials_not_mid_word(tmp_path):
+    """'AK' found 'Jordan Blake' (blAKe) in the Connections search (review,
+    2026-10-19). Names match where a word starts; initials find the people
+    whose initials they are; a code still matches on any piece of it."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Jordan Blake", "Alex Kim", "Dana Whitfield", "Kim Lee"):
+            kg.add_person(name)
+        with kg.db:
+            kg._entity("PART", "ABC1DE234")
+
+        def names(text, etype=None):
+            return [h["name"] for h in kg.search(text, etype)]
+        assert names("AK") == ["Alex Kim"]                   # not Jordan blAKe
+        assert names("lake") == [] and names("ordan") == []
+        assert names("blake") == ["Jordan Blake"]           # a later word's start
+        assert names("jor") == ["Jordan Blake"]
+        assert names("JB") == ["Jordan Blake"] == names("j.b.") == names("jb")
+        assert names("JB", "PART") == []
+        assert names("D. Whitfield") == ["Dana Whitfield"]
+        # a name that starts so first, then one with a later word that does
+        assert names("kim") == ["Kim Lee", "Alex Kim"]
+        assert names("234") == ["ABC1DE234"] == names("1de2", "PART")
+        assert names("de") == []                             # letters: word starts only
+
+
 def test_gazetteer_finds_unlabelled_mentions(tmp_path):
     v, _key = _vault(tmp_path)
     kg = _graph(v)
