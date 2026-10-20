@@ -119,7 +119,6 @@ _ABBREV = {
     "concealment": "conceal", "pre concealment": "pre conceal",
     "post concealment": "post conceal", "mid concealment": "mid conceal",
     "response": "", "repsonse": "", "reading": "", "value": "", "measured": "",
-    "sn": "serial number",
 }
 _ABBREV_RE = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True)) + r")\b")
@@ -160,9 +159,10 @@ def tokens(text: str) -> List[str]:
     base, _ = split_unit(text)
     base = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", base)    # OCR's "PartNumber"
     s = re.sub(r"p\s*/\s*n", " pn ", base.lower())
-    # 'S/N', 'S/N:', 'SN' - the serial number, which names the part like P/N
-    # does; it read as nothing and the part was missed (review, 2026-10-19)
-    s = re.sub(r"\bs\s*/\s*n\b", " sn ", s)
+    # Not 'S/N' -> serial number here: in an EC or UT table S/N is the
+    # signal-to-noise column, which became every row's part, pre-accepted,
+    # and 'Inspector: SN' was no one (review, 2026-10-19). find_part reads an
+    # S/N label by its value (_SN_LABEL).
     s = re.sub(r"[#]", " number ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     s = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(1)], s)   # one pass: no re-expansion
@@ -319,10 +319,15 @@ class Matcher:
                 s *= 0.5
             if ctx & (self._sec[t.name] | (fset - sset)):
                 s += SECTION_BONUS
-            if not sset & fset and not _near_typo(src, ft):
-                # no word in common: letters alone made 'Owner' Power (W) at
-                # 0.8 and 'Parameter' the Part Number (review, 2026-10-19)
-                s = min(s, SUGGEST_AT - 0.01)
+            if not sset & fset and not any(a == b + "s" or b == a + "s"
+                                           for a in sset for b in fset):
+                # no word in common (a plural is the word: 'Dates', 'Amplitudes'):
+                # letters alone made 'Owner' Power (W) at 0.8 and 'Parameter'
+                # the Part Number (review, 2026-10-19). A slip of the field's
+                # word ('Frequncy', 'Powr') is offered for review, never
+                # pre-accepted: 'Powder' was Power (W) at 0.91 with the alloy
+                # as its value.
+                s = min(s, (ACCEPT_AT if _near_typo(src, ft) else SUGGEST_AT) - 0.01)
             scored.append((s, t))
         if not scored:
             return Match(None, 0.0, via="none")
@@ -343,17 +348,31 @@ class Matcher:
 
 def _near_typo(src: Sequence[str], field_toks: Sequence[str]) -> bool:
     """A label word that is a slip of one of the field's words ('Lenght',
-    'Frequncy', 'Amplitde') or its first letters ('Ampl'): same first letter,
-    nearly the same letters. 'Owner' / 'Tower' are not 'Power', 'Partner' is
-    not 'Part'."""
+    'Frequncy', 'Powr', 'Meda', 'Medai', 'Datte') or its first letters
+    ('Ampl'): same first letter, two letters swapped or nearly the same
+    letters - stricter for a short word, where one letter is more of the word
+    ('Data' is not 'Date', 'Medal' not 'Media'). 'Owner' / 'Tower' are not
+    'Power', 'Partner' is not 'Part', and a short word with a letter more is
+    a word of its own ('Powder') unless the letter is a doubled one or a
+    plural 's' (review, 2026-10-19)."""
     for a in src:
         for b in field_toks:
             if a[0] != b[0]:
                 continue
             if len(a) >= 3 and len(b) > len(a) and b.startswith(a):
                 return True
-            if min(len(a), len(b)) >= 5 and \
-                    difflib.SequenceMatcher(None, a, b).ratio() >= 0.8:
+            short = min(len(a), len(b))
+            if short < 4:
+                continue
+            if len(a) == len(b):
+                d = [i for i in range(len(a)) if a[i] != b[i]]
+                if len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] \
+                        and a[d[1]] == b[d[0]]:
+                    return True                                  # 'Notse', 'Lenght'
+            if len(a) > len(b) and len(b) <= 6 and a != b + "s" and not any(
+                    a[i] == a[i - 1] and a[:i] + a[i + 1:] == b for i in range(1, len(a))):
+                continue
+            if difflib.SequenceMatcher(None, a, b).ratio() >= (0.85 if short <= 5 else 0.8):
                 return True
     return False
 
@@ -398,29 +417,52 @@ _WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*
 #: Chen signs as EC. council_core.kg_excel's stop list takes these too.
 NOT_INITIALS = frozenset({
     "nri", "ind", "ndi", "acc", "rej", "rjt", "ncr", "ok", "na", "tbd",
-    "pass", "fail", "nde", "fpi", "avg", "max", "min", "std",
+    "pass", "fail", "nde", "fpi", "avg", "max", "min", "std", "nogo",
 })
-#: What else a reading's brackets hold in capitals: a direction or a kind of
-#: value ('45 (CCW)', '0.5 (REF)'), kept with the reading - not a signer.
-_NOT_SIGNERS = frozenset({"cw", "ccw", "ref", "typ", "nom", "est", "rms"})
+#: Units a reading's brackets hold that UNITS cannot convert: the ones
+#: council_core.kg_excel's stop list has ('psi', 'rpm', 'ipm' ...) and an
+#: NDE sheet's ('FSH' full screen height, 'dB', 'Vpp', 'div'). '12 (IPM)'
+#: was a reading signed by IPM, and the in/min dropped (review, 2026-10-19).
+_UNIT_WORDS = frozenset({
+    "psi", "ksi", "mpa", "gpa", "rpm", "ipm", "fpm", "ppm", "sec", "fsh", "db", "dbm",
+    "vpp", "div", "pct", "lbs", "lbf", "ghz",
+})
+#: What else a reading's brackets hold in capitals: a direction, a kind of
+#: value or a result ('45 (CCW)', '0.5 (REF)', '54 (NG)' no good, '3 (EA)'
+#: each, '0.5 (OD)'), kept with the reading - not a signer.
+_NOT_SIGNERS = frozenset({"cw", "ccw", "ref", "typ", "nom", "est", "rms", "ng", "go",
+                          "ea", "pc", "pcs", "nd", "pk", "pp", "id", "od"})
 #: A reading signed in its cell: '31 (JB)', '31 [JB]', '0.245 mm (J.B.)'.
-_SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+\.?\d*|\.\d+)(?:\s*(?:°|\"|[A-Za-zµμ/]+))?)"
+#: Tried on a short cell only, and '\d+(\.\d*)?' cannot split a run of digits
+#: two ways: a long one made '\d+\.?\d*' backtrack (review, 2026-10-19).
+_SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*(?:°|\"|[A-Za-zµμ/]+))?)"
                      r"\s*[\(\[]\s*(?P<who>[A-Za-z][A-Za-z.\s]{1,7})\s*[\)\]]$")
-#: What may share a row with a heading of initials: its date ('2026-09-18',
-#: '9/18', 'Date: 2026-09-18', 'Date').
-_DATE_CELL = re.compile(r"(?i)^\s*(?:date\b\s*[:=\-]?\s*)?"
-                        r"(?:\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{1,2}[-/]\d{1,2})?\s*$")
+#: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
+_NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
+                             r"(?P<u>°|\"|%?[A-Za-zµμ/]{1,8})\s*[\)\]]$")
+#: A short code in capitals ('NRI', 'NG', 'NOGO'): what a row of results
+#: holds beside a code that looks like initials.
+_CODE_CELL = re.compile(r"[A-Z][A-Z0-9/\-]{1,5}")
+#: The serial number's label - 'S/N', 'SN', 'S/N:', 'S/N #' - and nothing
+#: more: 'S/N Ratio', 'S/N (dB)' are signal-to-noise. Matched on a short,
+#: stripped label (single optional spaces: no backtracking).
+_SN_LABEL = re.compile(r"(?i)s\s?/?\s?n\s?(?:#|no\.?)?\s?[:.]?")
+#: Words a label shares with the part number's that do not make it one:
+#: 'Run Number', 'Lot Number', 'Heat Number' share only 'number'.
+_GENERIC_ID_WORDS = frozenset({"number", "id"})
 
 
 def _signed_by(text: str) -> str:
     """The initials in a reading's brackets ('J.B.' -> 'JB'), or '' when the
-    brackets hold a unit ('0.245 (mm)', '(IN)') or a code ('(NA)', '(AVG)')."""
+    brackets hold a unit ('0.245 (mm)', '(IN)', '(IPM)', '(FSH)') or a code
+    ('(NA)', '(AVG)', '(NG)')."""
     raw = " ".join(text.split())
     if not (re.fullmatch(r"(?:[A-Z]\.?\s?){2,4}", raw)
             or re.fullmatch(r"(?:[A-Za-z]\.\s?){2,4}", raw)):
         return ""                         # 'Jb', 'avg', 'mm': not someone signing
     t = re.sub(r"[.\s]", "", raw).lower()
-    return "" if t in UNITS or t in NOT_INITIALS or t in _NOT_SIGNERS else t.upper()
+    return "" if t in UNITS or t in NOT_INITIALS or t in _NOT_SIGNERS \
+        or t in _UNIT_WORDS else t.upper()
 
 
 def _existing_cells(ws):
@@ -875,17 +917,28 @@ class _Extractor:
         fname = field_name or (match.target.fields[0] if match.target else "")
         note = ""
         val_unit = ""
-        signed = _SIGNED.match(txt.strip()) if isinstance(value, str) else None
+        # a number with its unit or its signer is short: these patterns are
+        # not tried on a long cell (a padded one froze the app before)
+        short = isinstance(value, str) and len(txt) <= 40
+        signed = _SIGNED.match(txt.strip()) if short else None
         if signed and _signed_by(signed.group("who")):
             # '31 (JB)': the reading is 31 and JB signed it - not the text
             # '31 (JB)', pre-accepted and put down to the sheet's 'Inspector:
             # MK' (review, 2026-10-19)
             txt, who = signed.group("v").strip(), _signed_by(signed.group("who"))
-        if isinstance(value, str) and match.target and match.target.unit:
+        if short and match.target and match.target.unit:
             nu = _NUM_UNIT.match(txt)
+            pu = _NUM_PAREN_UNIT.match(txt.strip())
             if nu and nu.group("u").lower() in UNITS:     # a unit we know, not "2x"
                 txt, val_unit = nu.group("n"), nu.group("u")
-        if match.target and match.target.unit:
+            elif pu and pu.group("u").lower() in UNITS:   # '0.3 (kW)': converted below
+                txt, val_unit = pu.group("n"), pu.group("u")
+            elif pu and pu.group("u").lower().lstrip("%") in _UNIT_WORDS:
+                # '12 (IPM)' in mm/s: kept as typed, and said so - never the
+                # bare 12, pre-accepted as 12 mm/s (review, 2026-10-19)
+                note = (f"unit {pu.group('u')!r} vs template {match.target.unit!r}: "
+                        "not converted")
+        if match.target and match.target.unit and not note:
             src_unit = val_unit or split_unit(label)[1]
             if src_unit and src_unit.lower() != match.target.unit.lower():
                 f = _unit_factor(src_unit, match.target.unit)
@@ -971,20 +1024,34 @@ class _Extractor:
         return h.group("who")
 
     def _heads_a_table(self, r, c, person) -> bool:
-        """A heading, not a value: ALONE on its row - beside it only its date,
-        or another inspector's heading over a table side by side - and right
-        under it a header row of 2+ labels that starts at its column.
-        (Initials typed in an 'Inspector Initials' column sit on a row of
-        readings, and 'FPI | NRI | IND' is a row of results over the next
-        flaw table - neither is this; review, 2026-10-19.)"""
+        """A heading, not a value: right under it a header row of 2+ labels
+        that starts at its column, and nothing on its row that makes it one
+        of a row of results: no number (initials typed in an 'Inspector
+        Initials' column sit on a row of readings), no other short code
+        ('FPI | NRI | IND', 'NG | NG | NG' over the next flaw table) unless
+        that is another inspector's heading over a table of its own, side by
+        side, and no row label just before it over the table ('Result |
+        RLI'). Its date in any form, 'Day 1' or a title may share its row:
+        only a typed '2026-09-18' could before (review, 2026-10-19)."""
+        below = sorted(cc for cc, v in self.row(r + 1)
+                       if isinstance(v, str) and c - 1 <= cc <= c + 8)
+        if len(below) < 2 or below[0] > c + 1:
+            return False
+        under = {cc for cc, _v in self.row(r + 1)}
         for c2, v in self.row(r):
             if c2 == c or isinstance(v, date):            # a datetime too
                 continue
-            if not isinstance(v, str) or not (_DATE_CELL.match(v) or self._heading_who(v, person)):
+            if not isinstance(v, str):
                 return False
-        below = sorted(cc for cc, v in self.row(r + 1)
-                       if isinstance(v, str) and c - 1 <= cc <= c + 8)
-        return len(below) >= 2 and below[0] <= c + 1
+            s = v.strip() if len(v) <= 60 else ""
+            if _CODE_CELL.fullmatch(s) or s.lower() in NOT_INITIALS:
+                # a gap in the header row between the two: two tables
+                apart = any(cc not in under for cc in range(min(c, c2) + 1, max(c, c2)))
+                if not (apart and self._heading_who(v, person)):
+                    return False
+            elif below[0] <= c2 < c:
+                return False
+        return True
 
     def inspector_for(self, r, c) -> str:
         """The nearest marker above the value (the lowest row above it), and of
@@ -1015,8 +1082,22 @@ class _Extractor:
             if not isinstance(v, str):
                 continue
             label, inline = _split_inline(v)
-            if self.m.is_item_header(label):
-                continue                       # "Flaw #" is not "Part #"
+            if self.m.is_item_header(label) or (len(label) <= 30 and _RUN_HEAD.match(label)):
+                continue                       # "Flaw #", "Run #" are not "Part #"
+            if len(label) <= 12 and _SN_LABEL.fullmatch(label):
+                # 'S/N: LMM1AB101' names the part; an S/N column of 3.2, 4.2
+                # (signal-to-noise) does not: only a part-like value typed
+                # beside the label (review, 2026-10-19)
+                val = inline or next((x for x in (self.g.cells.get((r, c + dc))
+                                                  for dc in (1, 2, 3))
+                                      if x is not None and not isinstance(x, _Merged)), None)
+                if self._looks_like_id(val):
+                    self.used.add((r, c))
+                    self.part = _text(val)
+                    self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
+                        f", read from image {self.g.from_image}" if self.g.from_image else "")
+                    return
+                continue
             mt = self.m.match(label, per_item=False)
             if self._sure_id(label, mt):
                 val = inline if inline else self._value_near(r, c)
@@ -1037,13 +1118,29 @@ class _Extractor:
 
     def _sure_id(self, label, mt: Match) -> bool:
         """A label that IS the part number's: an alias, a sure match, or one
-        sharing a word with it ('Part No.', 'P/N', 'Serial Number'). A
-        'Parameter | Value' table matched 'Part Number' at 0.6 and made every
-        part 'Value'; 'Partner' did too (review, 2026-10-19)."""
+        sharing a word with it ('Part No.', 'P/N') or saying serial ('Serial
+        No.'). A 'Parameter | Value' table matched 'Part Number' at 0.6 and
+        made every part 'Value'; 'Partner' did too; and 'Run #', 'Lot Number',
+        'Heat Number' share only the word 'number' (review, 2026-10-19)."""
         if not (mt.target and mt.target.is_id and mt.score >= SUGGEST_AT):
             return False
-        return mt.via == "alias" or mt.score >= ACCEPT_AT or bool(
-            set(tokens(label)) & set(self.m._tok[mt.target.name]))
+        words = set(tokens(label))
+        return mt.via == "alias" or mt.score >= ACCEPT_AT or "serial" in words or bool(
+            (words & set(self.m._tok[mt.target.name])) - _GENERIC_ID_WORDS)
+
+    def _looks_like_id(self, val) -> bool:
+        """A part's serial number, not a signal-to-noise reading: the user's
+        part shape, letters with digits ('LMM1AB101', 'SN-0042') or a whole
+        number of 3+ digits - never '3.2', '12', '12 dB' or a flaw code."""
+        s = _text(val).strip() if val is not None else ""
+        if not s or len(s) > 40 or self.codes.canon(s):
+            return False
+        if self.mask_re is not None and self.mask_re.search(s):
+            return True
+        if _NUM_UNIT.match(s):
+            return False                                   # '12 dB'
+        return bool(re.search(r"[A-Za-z]", s) and re.search(r"\d", s)
+                    or re.fullmatch(r"\d{3,}", s))
 
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
