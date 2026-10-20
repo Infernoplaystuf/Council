@@ -63,7 +63,7 @@ import re
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -159,6 +159,10 @@ def tokens(text: str) -> List[str]:
     base, _ = split_unit(text)
     base = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", base)    # OCR's "PartNumber"
     s = re.sub(r"p\s*/\s*n", " pn ", base.lower())
+    # Not 'S/N' -> serial number here: in an EC or UT table S/N is the
+    # signal-to-noise column, which became every row's part, pre-accepted,
+    # and 'Inspector: SN' was no one (review, 2026-10-19). find_part reads an
+    # S/N label by its value (_SN_LABEL).
     s = re.sub(r"[#]", " number ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     s = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(1)], s)   # one pass: no re-expansion
@@ -315,6 +319,15 @@ class Matcher:
                 s *= 0.5
             if ctx & (self._sec[t.name] | (fset - sset)):
                 s += SECTION_BONUS
+            if not sset & fset and not any(a == b + "s" or b == a + "s"
+                                           for a in sset for b in fset):
+                # no word in common (a plural is the word: 'Dates', 'Amplitudes'):
+                # letters alone made 'Owner' Power (W) at 0.8 and 'Parameter'
+                # the Part Number (review, 2026-10-19). A slip of the field's
+                # word ('Frequncy', 'Powr') is offered for review, never
+                # pre-accepted: 'Powder' was Power (W) at 0.91 with the alloy
+                # as its value.
+                s = min(s, (ACCEPT_AT if _near_typo(src, ft) else SUGGEST_AT) - 0.01)
             scored.append((s, t))
         if not scored:
             return Match(None, 0.0, via="none")
@@ -331,6 +344,37 @@ class Matcher:
         if len(scored) > 1 and raw - scored[1][0] < TIE_GAP:
             return Match(best, shown, guesses, via="ambiguous")
         return Match(best, shown, guesses, via="match")
+
+
+def _near_typo(src: Sequence[str], field_toks: Sequence[str]) -> bool:
+    """A label word that is a slip of one of the field's words ('Lenght',
+    'Frequncy', 'Powr', 'Meda', 'Medai', 'Datte') or its first letters
+    ('Ampl'): same first letter, two letters swapped or nearly the same
+    letters - stricter for a short word, where one letter is more of the word
+    ('Data' is not 'Date', 'Medal' not 'Media'). 'Owner' / 'Tower' are not
+    'Power', 'Partner' is not 'Part', and a short word with a letter more is
+    a word of its own ('Powder') unless the letter is a doubled one or a
+    plural 's' (review, 2026-10-19)."""
+    for a in src:
+        for b in field_toks:
+            if a[0] != b[0]:
+                continue
+            if len(a) >= 3 and len(b) > len(a) and b.startswith(a):
+                return True
+            short = min(len(a), len(b))
+            if short < 4:
+                continue
+            if len(a) == len(b):
+                d = [i for i in range(len(a)) if a[i] != b[i]]
+                if len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] \
+                        and a[d[1]] == b[d[0]]:
+                    return True                                  # 'Notse', 'Lenght'
+            if len(a) > len(b) and len(b) <= 6 and a != b + "s" and not any(
+                    a[i] == a[i - 1] and a[:i] + a[i + 1:] == b for i in range(1, len(a))):
+                continue
+            if difflib.SequenceMatcher(None, a, b).ratio() >= (0.85 if short <= 5 else 0.8):
+                return True
+    return False
 
 
 def _strip_unit(label: str) -> str:
@@ -365,6 +409,60 @@ _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za
 #: Matched on the stripped cell only (no overlapping whitespace runs: the
 #: old pattern backtracked cubically on a space-padded cell).
 _WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*)?$")
+#: Short words an inspection sheet writes where initials could stand that are
+#: nobody's initials: result codes (FPI's 'NRI' no relevant indication, 'IND',
+#: 'NDI', 'ACC', 'REJ', 'RJT', 'NCR'), outcomes ('OK', 'NA', 'TBD') and a
+#: reading's qualifier ('31 (AVG)'). A row of 'NRI | IND' over the next table
+#: was taken as an inspector's heading (review, 2026-10-19). Not 'EC': Eva
+#: Chen signs as EC. council_core.kg_excel's stop list takes these too.
+NOT_INITIALS = frozenset({
+    "nri", "ind", "ndi", "acc", "rej", "rjt", "ncr", "ok", "na", "tbd",
+    "pass", "fail", "nde", "fpi", "avg", "max", "min", "std", "nogo",
+})
+#: Units a reading's brackets hold that UNITS cannot convert: the ones
+#: council_core.kg_excel's stop list has ('psi', 'rpm', 'ipm' ...) and an
+#: NDE sheet's ('FSH' full screen height, 'dB', 'Vpp', 'div'). '12 (IPM)'
+#: was a reading signed by IPM, and the in/min dropped (review, 2026-10-19).
+_UNIT_WORDS = frozenset({
+    "psi", "ksi", "mpa", "gpa", "rpm", "ipm", "fpm", "ppm", "sec", "fsh", "db", "dbm",
+    "vpp", "div", "pct", "lbs", "lbf", "ghz",
+})
+#: What else a reading's brackets hold in capitals: a direction, a kind of
+#: value or a result ('45 (CCW)', '0.5 (REF)', '54 (NG)' no good, '3 (EA)'
+#: each, '0.5 (OD)'), kept with the reading - not a signer.
+_NOT_SIGNERS = frozenset({"cw", "ccw", "ref", "typ", "nom", "est", "rms", "ng", "go",
+                          "ea", "pc", "pcs", "nd", "pk", "pp", "id", "od"})
+#: A reading signed in its cell: '31 (JB)', '31 [JB]', '0.245 mm (J.B.)'.
+#: Tried on a short cell only, and '\d+(\.\d*)?' cannot split a run of digits
+#: two ways: a long one made '\d+\.?\d*' backtrack (review, 2026-10-19).
+_SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*(?:°|\"|[A-Za-zµμ/]+))?)"
+                     r"\s*[\(\[]\s*(?P<who>[A-Za-z][A-Za-z.\s]{1,7})\s*[\)\]]$")
+#: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
+_NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
+                             r"(?P<u>°|\"|%?[A-Za-zµμ/]{1,8})\s*[\)\]]$")
+#: A short code in capitals ('NRI', 'NG', 'NOGO'): what a row of results
+#: holds beside a code that looks like initials.
+_CODE_CELL = re.compile(r"[A-Z][A-Z0-9/\-]{1,5}")
+#: The serial number's label - 'S/N', 'SN', 'S/N:', 'S/N #' - and nothing
+#: more: 'S/N Ratio', 'S/N (dB)' are signal-to-noise. Matched on a short,
+#: stripped label (single optional spaces: no backtracking).
+_SN_LABEL = re.compile(r"(?i)s\s?/?\s?n\s?(?:#|no\.?)?\s?[:.]?")
+#: Words a label shares with the part number's that do not make it one:
+#: 'Run Number', 'Lot Number', 'Heat Number' share only 'number'.
+_GENERIC_ID_WORDS = frozenset({"number", "id"})
+
+
+def _signed_by(text: str) -> str:
+    """The initials in a reading's brackets ('J.B.' -> 'JB'), or '' when the
+    brackets hold a unit ('0.245 (mm)', '(IN)', '(IPM)', '(FSH)') or a code
+    ('(NA)', '(AVG)', '(NG)')."""
+    raw = " ".join(text.split())
+    if not (re.fullmatch(r"(?:[A-Z]\.?\s?){2,4}", raw)
+            or re.fullmatch(r"(?:[A-Za-z]\.\s?){2,4}", raw)):
+        return ""                         # 'Jb', 'avg', 'mm': not someone signing
+    t = re.sub(r"[.\s]", "", raw).lower()
+    return "" if t in UNITS or t in NOT_INITIALS or t in _NOT_SIGNERS \
+        or t in _UNIT_WORDS else t.upper()
 
 
 def _existing_cells(ws):
@@ -547,7 +645,7 @@ def preview_workbook(path, schema, aliases=None,
         book_part, how = next(iter(found)), "the one part number in the workbook"
     elif not found:
         book_part = file_part
-        how = f"file name {p.name!r} — check it" if book_part else ""
+        how = f"{FILE_PART_HOW} {p.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
     for ex in exs:
@@ -661,8 +759,11 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     if not path.exists():
         raise LedgerError(f"{path.name} not found")
     if kind == "password":
-        raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
-                          "copy without the password, and add that copy")
+        # from an ExcelOpenError of kind 'password', so the batch's roll-up
+        # says 'password-protected', not 'other' (review, 2026-10-19)
+        msg = (f"{path.name} has a password to open; open it in Excel, save a "
+               "copy without the password, and add that copy")
+        raise LedgerError(msg) from excel_open.ExcelOpenError(msg, kind="password")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
         return _grids_from_excel(path, notes, want_pictures, careful)
     try:
@@ -816,11 +917,28 @@ class _Extractor:
         fname = field_name or (match.target.fields[0] if match.target else "")
         note = ""
         val_unit = ""
-        if isinstance(value, str) and match.target and match.target.unit:
+        # a number with its unit or its signer is short: these patterns are
+        # not tried on a long cell (a padded one froze the app before)
+        short = isinstance(value, str) and len(txt) <= 40
+        signed = _SIGNED.match(txt.strip()) if short else None
+        if signed and _signed_by(signed.group("who")):
+            # '31 (JB)': the reading is 31 and JB signed it - not the text
+            # '31 (JB)', pre-accepted and put down to the sheet's 'Inspector:
+            # MK' (review, 2026-10-19)
+            txt, who = signed.group("v").strip(), _signed_by(signed.group("who"))
+        if short and match.target and match.target.unit:
             nu = _NUM_UNIT.match(txt)
+            pu = _NUM_PAREN_UNIT.match(txt.strip())
             if nu and nu.group("u").lower() in UNITS:     # a unit we know, not "2x"
                 txt, val_unit = nu.group("n"), nu.group("u")
-        if match.target and match.target.unit:
+            elif pu and pu.group("u").lower() in UNITS:   # '0.3 (kW)': converted below
+                txt, val_unit = pu.group("n"), pu.group("u")
+            elif pu and pu.group("u").lower().lstrip("%") in _UNIT_WORDS:
+                # '12 (IPM)' in mm/s: kept as typed, and said so - never the
+                # bare 12, pre-accepted as 12 mm/s (review, 2026-10-19)
+                note = (f"unit {pu.group('u')!r} vs template {match.target.unit!r}: "
+                        "not converted")
+        if match.target and match.target.unit and not note:
             src_unit = val_unit or split_unit(label)[1]
             if src_unit and src_unit.lower() != match.target.unit.lower():
                 f = _unit_factor(src_unit, match.target.unit)
@@ -870,14 +988,10 @@ class _Extractor:
                         if who:
                             self.used.add((r, c + dc))
                         break
-            if not who and len(v) <= 60:
-                # a heading of initials and a date is short; a long padded
-                # cell made this pattern backtrack for 54 s with the GIL held
-                # (review, 2026-10-19)
-                h = _WHO_HEADING.match(v.strip())
-                if h and person(h.group("who")) and not self.codes.canon(v) \
-                        and self._heads_a_table(r, c):
-                    who = h.group("who")
+            if not who:
+                h = self._heading_who(v, person)
+                if h and self._heads_a_table(r, c, person):
+                    who = h
             if who:
                 self.markers.append((r, c, who))
                 self.used.add((r, c))
@@ -891,18 +1005,53 @@ class _Extractor:
                             self.used.add((r, c2 + 1))
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
-            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
+            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE") \
+                    and h.group(1).lower() not in NOT_INITIALS:
                 self.markers.append((0, 0, h.group(1)))
 
-    def _heads_a_table(self, r, c) -> bool:
-        """A heading, not a value: no numbers on its row, and right under it a
-        header row of 2+ labels that starts at its column. (Initials typed in
-        an 'Inspector Initials' column sit on a row of readings - not this.)"""
-        if any(not isinstance(v, str) for _c, v in self.row(r)):
-            return False
+    def _heading_who(self, v, person) -> str:
+        """The initials a table heading is ('JB', 'JB — 2026-09-18'), or ''.
+        Never a result code ('NRI', 'IND', 'OK') nor a flaw code."""
+        if not isinstance(v, str) or len(v) > 60:
+            # a heading of initials and a date is short; a long padded
+            # cell made this pattern backtrack for 54 s with the GIL held
+            # (review, 2026-10-19)
+            return ""
+        h = _WHO_HEADING.match(v.strip())
+        if not h or h.group("who").lower() in NOT_INITIALS or not person(h.group("who")) \
+                or self.codes.canon(v):
+            return ""
+        return h.group("who")
+
+    def _heads_a_table(self, r, c, person) -> bool:
+        """A heading, not a value: right under it a header row of 2+ labels
+        that starts at its column, and nothing on its row that makes it one
+        of a row of results: no number (initials typed in an 'Inspector
+        Initials' column sit on a row of readings), no other short code
+        ('FPI | NRI | IND', 'NG | NG | NG' over the next flaw table) unless
+        that is another inspector's heading over a table of its own, side by
+        side, and no row label just before it over the table ('Result |
+        RLI'). Its date in any form, 'Day 1' or a title may share its row:
+        only a typed '2026-09-18' could before (review, 2026-10-19)."""
         below = sorted(cc for cc, v in self.row(r + 1)
                        if isinstance(v, str) and c - 1 <= cc <= c + 8)
-        return len(below) >= 2 and below[0] <= c + 1
+        if len(below) < 2 or below[0] > c + 1:
+            return False
+        under = {cc for cc, _v in self.row(r + 1)}
+        for c2, v in self.row(r):
+            if c2 == c or isinstance(v, date):            # a datetime too
+                continue
+            if not isinstance(v, str):
+                return False
+            s = v.strip() if len(v) <= 60 else ""
+            if _CODE_CELL.fullmatch(s) or s.lower() in NOT_INITIALS:
+                # a gap in the header row between the two: two tables
+                apart = any(cc not in under for cc in range(min(c, c2) + 1, max(c, c2)))
+                if not (apart and self._heading_who(v, person)):
+                    return False
+            elif below[0] <= c2 < c:
+                return False
+        return True
 
     def inspector_for(self, r, c) -> str:
         """The nearest marker above the value (the lowest row above it), and of
@@ -933,10 +1082,24 @@ class _Extractor:
             if not isinstance(v, str):
                 continue
             label, inline = _split_inline(v)
-            if self.m.is_item_header(label):
-                continue                       # "Flaw #" is not "Part #"
+            if self.m.is_item_header(label) or (len(label) <= 30 and _RUN_HEAD.match(label)):
+                continue                       # "Flaw #", "Run #" are not "Part #"
+            if len(label) <= 12 and _SN_LABEL.fullmatch(label):
+                # 'S/N: LMM1AB101' names the part; an S/N column of 3.2, 4.2
+                # (signal-to-noise) does not: only a part-like value typed
+                # beside the label (review, 2026-10-19)
+                val = inline or next((x for x in (self.g.cells.get((r, c + dc))
+                                                  for dc in (1, 2, 3))
+                                      if x is not None and not isinstance(x, _Merged)), None)
+                if self._looks_like_id(val):
+                    self.used.add((r, c))
+                    self.part = _text(val)
+                    self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
+                        f", read from image {self.g.from_image}" if self.g.from_image else "")
+                    return
+                continue
             mt = self.m.match(label, per_item=False)
-            if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
+            if self._sure_id(label, mt):
                 val = inline if inline else self._value_near(r, c)
                 if val and self.codes.canon(val):
                     continue                   # a flaw code is never a part number
@@ -952,6 +1115,32 @@ class _Extractor:
             self.part_how = f"sheet name {self.g.sheet!r}"
             return
         self.part_how = ""
+
+    def _sure_id(self, label, mt: Match) -> bool:
+        """A label that IS the part number's: an alias, a sure match, or one
+        sharing a word with it ('Part No.', 'P/N') or saying serial ('Serial
+        No.'). A 'Parameter | Value' table matched 'Part Number' at 0.6 and
+        made every part 'Value'; 'Partner' did too; and 'Run #', 'Lot Number',
+        'Heat Number' share only the word 'number' (review, 2026-10-19)."""
+        if not (mt.target and mt.target.is_id and mt.score >= SUGGEST_AT):
+            return False
+        words = set(tokens(label))
+        return mt.via == "alias" or mt.score >= ACCEPT_AT or "serial" in words or bool(
+            (words & set(self.m._tok[mt.target.name])) - _GENERIC_ID_WORDS)
+
+    def _looks_like_id(self, val) -> bool:
+        """A part's serial number, not a signal-to-noise reading: the user's
+        part shape, letters with digits ('LMM1AB101', 'SN-0042') or a whole
+        number of 3+ digits - never '3.2', '12', '12 dB' or a flaw code."""
+        s = _text(val).strip() if val is not None else ""
+        if not s or len(s) > 40 or self.codes.canon(s):
+            return False
+        if self.mask_re is not None and self.mask_re.search(s):
+            return True
+        if _NUM_UNIT.match(s):
+            return False                                   # '12 dB'
+        return bool(re.search(r"[A-Za-z]", s) and re.search(r"\d", s)
+                    or re.fullmatch(r"\d{3,}", s))
 
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
@@ -1920,7 +2109,7 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         book_part, how = found.pop(), "the one part number in the workbook"
     elif not found:
         book_part = _part_from_filename(src.stem, mask_re)
-        how = f"file name {src.name!r} — check it" if book_part else ""
+        how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
     if part_finder is not None and not part and not book_part and any(
@@ -1969,7 +2158,14 @@ def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> st
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
-    nums = re.findall(r"(?<![\d.])\d{2,8}(?![\d.])", stem)
+    if mask_re is not None:
+        return ""          # the user said what a part looks like; this is not one
+    # a number on its own ('101 inspection', 'line3_2048'), never one inside a
+    # longer word: 'week41' made part 41 and 'LMM1AB101' part 101, pre-accepted
+    # (review, 2026-10-19). Two numbers: no guess.
+    if len(re.findall(r"\d{2,8}", stem)) != 1:
+        return ""
+    nums = re.findall(r"(?<![A-Za-z\d.])\d{2,8}(?![A-Za-z\d.])", stem)
     return nums[0] if len(nums) == 1 else ""
 
 
@@ -1993,14 +2189,19 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     in that person's own column, "<field> [JB]", where it is the only value
     and can be pre-accepted; and as a candidate for the template's single
     cell, where readings that disagree clash - the reviewer accepts one."""
-    groups: Dict[Tuple[str, str, str], List[Obs]] = defaultdict(list)
+    groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
     for o in run.obs:
-        groups[(o.part, o.item, o.field)].append(o)
+        # A value with no part is its own workbook's: two part-less workbooks
+        # with the same Frequency were one review row ('also at ...'), the
+        # reviewer typed one part in it, and the other sample lost the value
+        # at Apply (review, 2026-10-19).
+        book = "" if o.part else o.where.split(" › ", 1)[0]
+        groups[(o.part, o.item, o.field, book)].append(o)
         if o.inspector:
             own = replace(o, field=inspector_column(o.field, o.inspector))
-            groups[(o.part, o.item, own.field)].append(own)
+            groups[(o.part, o.item, own.field, book)].append(own)
     out = []
-    for (part, item, fname), obs in groups.items():
+    for (part, item, fname, _book), obs in groups.items():
         obs.sort(key=lambda o: -o.score)
         values = Counter(o.value for o in obs)
         clash = len(values) > 1
@@ -2037,7 +2238,10 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
                   and "not converted" not in o.note
-                  and not o.part_how.startswith(MODEL_PART_HOW))
+                  and not o.part_how.startswith(MODEL_PART_HOW)
+                  # a part read from the file name says '— check it': it is
+                  # (digits of 'EC_log_week41' were pre-accepted as part 41)
+                  and not o.part_how.startswith(FILE_PART_HOW))
             out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
@@ -2048,6 +2252,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
 
 #: How a part Council's model suggested is described (never pre-accepted).
 MODEL_PART_HOW = "suggested by Council's model"
+#: How a part read from the workbook's file name is described (never
+#: pre-accepted either).
+FILE_PART_HOW = "file name"
 
 #: How many other values a clashing review row lists.
 OTHERS_SHOWN = 20
