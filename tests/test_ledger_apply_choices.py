@@ -1,0 +1,658 @@
+"""Apply does what the reviewer chose, and the review is always written
+(review, 2026-10-20).
+
+What independent testers found, and what each test pins:
+- a value marked N went into the parent CSV: read again, the same reading
+  was found first at its 'also at' cell (a label learned at Apply ranked it
+  higher), so it was 'not seen in the review' and taken as just mapped;
+  Apply also said more values were accepted than were;
+- a control character in a cell read through Excel ('Remark' + CHAR(1))
+  made openpyxl raise IllegalCharacterError: no review, the whole extract
+  failed;
+- Apply after a cancelled Extract read every source again and wrote values
+  from workbooks the review never showed;
+- both rows of a red clash accepted: Apply kept one, silently;
+- a label mapped on 'Labels to map' in a workbook whose part only
+  Council's model found was dropped at Apply (read again without the
+  model, its values had no part);
+- the People sheet counted a signed reading twice (its template cell and
+  its signer's own column), and 'First seen at' could be another
+  inspector's cell.
+
+Synthetic data only (tests/ledger_fixtures.py); the model is a fake.
+"""
+from __future__ import annotations
+
+import csv
+import json
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+openpyxl = pytest.importorskip("openpyxl")
+
+sys.path.insert(0, str(Path(__file__).parent))
+import ledger_fixtures as lf  # noqa: E402
+import sample_ledger as sl  # noqa: E402
+import source_extract as se  # noqa: E402
+from council_core import ledger_ingest as li  # noqa: E402
+
+PRE = "NDE Inspection: Eddy Current Response Pre-Conceal"
+
+
+@pytest.fixture()
+def ledger(tmp_path):
+    ps = li.create_parent(lf.make_template(tmp_path / "template.xlsx"))
+    return Path(ps.csv), sl.ParentCSV(ps.csv).schema
+
+
+class _NoProg:
+    def update(self, *a, **k):
+        pass
+
+    def stage(self, *a, **k):
+        pass
+
+    def advance(self, *a, **k):
+        pass
+
+
+def _values(review):
+    wb = openpyxl.load_workbook(review)
+    return wb, [dict(zip(se.VAL_HEAD, (c.value for c in row)), row=row[0].row)
+                for row in wb["Values"].iter_rows(min_row=2)]
+
+
+def _csv_rows(path):
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+# ── N means N ───────────────────────────────────────────────────────────
+def _inspection_and_log(src: Path) -> None:
+    """The same reading in an inspection workbook and in a weekly log
+    (signed MK there), and one reading only in the log."""
+    src.mkdir()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"], ws["B1"] = "Part Number", "LMM9ZZ910"
+    ws["A3"], ws["B3"] = "Flaw", "EC Pre-Conceal"
+    ws["A4"], ws["B4"] = "1A", 55
+    wb.save(src / "LMM9ZZ910 inspection.xlsx")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Log"
+    ws.append(["Part Number", "Flaw", "Stage", "Response", "Inspector"])
+    ws.append(["LMM9ZZ910", "1A", "Pre-Conceal", 55, "MK"])       # the same reading
+    ws.append(["LMM9ZZ910", "2A", "Pre-Conceal", 47, "MK"])       # only here
+    wb.save(src / "EC_log.xlsx")
+
+
+def test_a_value_marked_n_stays_out_when_read_again_at_its_also_at_cell(tmp_path, ledger):
+    csv_path, _schema = ledger
+    _inspection_and_log(tmp_path / "src")
+    s = li.run_extract(csv_path, [tmp_path / "src"], tmp_path / "review.xlsx",
+                       use_images=False)
+    wb, rows = _values(s.review)
+    pre = [r for r in rows if str(r["Field"] or "").startswith(PRE)]
+    main = next(r for r in pre if r["Item"] == "1A" and r["Field"] == PRE)
+    assert "also at EC_log.xlsx › Log!D2" in (main["Note"] or "")
+    for r in pre:
+        # accept the log's own 2A reading (it teaches 'Response Pre-Conceal');
+        # 55 for 1A is wrong, everywhere
+        wb["Values"].cell(r["row"], 1).value = "Y" if r["Item"] == "2A" else "N"
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert a.learned                                     # the label was learned...
+    row1a = next(r for r in _csv_rows(csv_path) if r["Flaw #"] == "1A")
+    assert row1a[PRE] == "" and row1a.get(PRE + " [MK]", "") == ""   # ...and N is N
+    row2a = next(r for r in _csv_rows(csv_path) if r["Flaw #"] == "2A")
+    assert row2a[PRE] == "47" and row2a[PRE + " [MK]"] == "47"
+    assert a.accepted == 2                       # 2A and MK's own copy of it, no more
+
+
+def test_a_value_left_blank_on_values_is_not_taken_by_a_label_learned_at_apply(
+        tmp_path, ledger):
+    """Part 402's 'Scan rate' row was left blank (amber). On part 401's the
+    reviewer typed another field and accepted it, which teaches the label:
+    read again, 402's reading is that field - and still not accepted."""
+    csv_path, _schema = ledger
+    for part in ("401", "402"):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"], ws["B1"] = "Part Number", part
+        ws["A2"], ws["B2"] = "Scan rate", 1200                   # an unsure match
+        wb.save(tmp_path / f"build_{part}.xlsx")
+    s = li.run_extract(csv_path, [tmp_path / "build_401.xlsx", tmp_path / "build_402.xlsx"],
+                       tmp_path / "review.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    scan = {r["Part"]: r for r in rows if r["Source label"] == "Scan rate"}
+    assert scan["402"]["Field"] == "Scan Speed (mm/s)" and not scan["402"]["Accept"]
+    wb["Values"].cell(scan["401"]["row"], 1).value = "Y"
+    wb["Values"].cell(scan["401"]["row"], 4).value = "Frequency (kHz)"   # typed
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert a.learned == {"scan rate": "Frequency (kHz)"}
+    got = {r["Part Number"]: r["Frequency (kHz)"] for r in _csv_rows(csv_path)}
+    assert got["401"] == "1200" and got.get("402", "") == ""
+
+
+# ── control characters ──────────────────────────────────────────────────
+def test_a_control_character_does_not_stop_the_review(tmp_path, ledger):
+    """openpyxl refuses CHAR(1) in a cell: every sheet write_review fills
+    is given text without it."""
+    csv_path, schema = ledger
+    obs = [se.Obs("101\x02", "", "Power (W)", "285\x01", 1.0, "alias", "Power\x03 (W)",
+                  "a.xls › Sheet\x04!B2", note="see log\x07", inspector="JB"),
+           se.Obs("101", "1A", PRE, "63", 1.0, "alias", "EC Pre", "a.xls › Sheet!C4",
+                  inspector="J\x05B")]
+    run = se.Extraction(["a.xls"], obs=obs,
+                        unmatched=[se.Obs("101", "", "", "see log\x07", 0.0, "none",
+                                          "Remark\x01", "a.xls › Sheet!A8")],
+                        images=[se.ImageNote("a.xls", "Sheet", "F2", "", "ocr",
+                                             "Media | ceramic\x01")],
+                        problems=["a.xls: odd text\x0b in a cell"])
+    review = tmp_path / "review.xlsx"
+    se.write_review(review, run, se.decide(run, schema), schema, str(csv_path))
+    wb = openpyxl.load_workbook(review)
+    text = [str(c.value) for ws in wb.worksheets for row in ws.iter_rows()
+            for c in row if c.value is not None]
+    assert not any(sl._ILLEGAL_XL.search(t) for t in text)
+    vals = [dict(zip(se.VAL_HEAD, r)) for r in wb["Values"].iter_rows(min_row=2,
+                                                                     values_only=True)]
+    assert any(r["Value"] == "285" and r["Part"] == "101" for r in vals)
+    lab = list(wb["Labels to map"].iter_rows(min_row=2, values_only=True))
+    assert lab[0][2] == "Remark" and lab[0][3] == "see log"
+    assert any("odd text" in t and "in a cell" in t for t in text)
+
+
+def test_a_control_character_read_through_excel_reaches_the_csv_and_templates_clean(
+        tmp_path, ledger, monkeypatch):
+    """The whole loop on a workbook 'read through Excel' (the .xls reader
+    is faked): the review is written, Apply writes the value without the
+    control character to the parent CSV and to a filled template."""
+    csv_path, schema = ledger
+    src = tmp_path / "PN216_ctrl.xls"
+    src.write_bytes(b"not read: the reader below stands in for Excel")
+
+    def fake_grids(path, notes=None, *a, **k):
+        return [se.Grid(Path(path).name, "Sheet1", {
+            (1, 1): "Part Number", (1, 2): "216",
+            (2, 1): "Power (W)", (2, 2): "285\x01",
+            (3, 1): "Date", (3, 2): "2026-10-19\x01",
+            (8, 1): "Remark\x01", (8, 2): "see log\x07"})], []
+    monkeypatch.setattr(se, "load_workbook_grids", fake_grids)
+    s = li.run_extract(csv_path, [src], tmp_path / "review.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    li.run_apply(s.review, fill_dir=tmp_path / "filled", use_images=False)
+    row = next(r for r in _csv_rows(csv_path) if r["Part Number"] == "216")
+    assert row["Power (W)"] == "285" and row["Date"] == "2026-10-19"
+    assert not sl._ILLEGAL_XL.search(Path(csv_path).read_text(encoding="utf-8-sig"))
+    out = openpyxl.load_workbook(next((tmp_path / "filled").glob("*.xlsx"))).active
+    assert out[schema.field("Power (W)").cells[""]].value == 285
+
+
+def test_a_grid_holds_no_control_character():
+    """Cleaned as it is read: a merged label stays one, a cell of nothing
+    but control characters is no cell, a number is as it was."""
+    g = se.Grid("a.xls", "S", {(1, 1): "216\x01", (1, 2): se._Merged("Flaw\x01 #"),
+                               (1, 3): "\x01\x02", (1, 4): 5, (1, 5): "ok"})
+    assert g.cells == {(1, 1): "216", (1, 2): "Flaw  #", (1, 4): 5, (1, 5): "ok"}
+    assert isinstance(g.cells[(1, 2)], se._Merged)
+
+
+def test_a_part_with_a_control_character_read_through_excel_is_one_part_everywhere(
+        tmp_path, ledger, monkeypatch):
+    """The Part cell holds '216' + CHAR(1) and a label is mapped on 'Labels
+    to map'. The review showed '216'; Apply read '216\\x01' again - another
+    part: it said 18 rows for 9 and, with a folder for filled templates,
+    raised after writing the CSV (review, 2026-10-20)."""
+    csv_path, schema = ledger
+    src = tmp_path / "PN216_ctrl.xls"
+    src.write_bytes(b"not read: the reader below stands in for Excel")
+
+    def fake_grids(path, notes=None, *a, **k):
+        return [se.Grid(Path(path).name, "Sheet1", {
+            (1, 1): "Part Number", (1, 2): "216\x01",
+            (2, 1): "Power (W)", (2, 2): "285",
+            (8, 1): "Zorp\x01 rate", (8, 2): "55"})], []
+    monkeypatch.setattr(se, "load_workbook_grids", fake_grids)
+    s = li.run_extract(csv_path, [src], tmp_path / "review.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    for r in wb["Labels to map"].iter_rows(min_row=2):
+        if "Zorp" in str(r[2].value):
+            r[0].value = "Frequency (kHz)"
+    wb.save(s.review)
+    a = li.run_apply(s.review, fill_dir=tmp_path / "filled", use_images=False)
+    got = _csv_rows(csv_path)
+    assert {r["Part Number"] for r in got} == {"216"} and len(got) == len(lf.ITEMS)
+    assert a.rows == len(lf.ITEMS) and {r["Frequency (kHz)"] for r in got} == {"55"}
+    assert [Path(f).name for f in a.filled] == ["template_216.xlsx"]
+
+
+def test_the_parent_csv_and_a_filled_template_take_no_control_character(tmp_path, ledger):
+    csv_path, schema = ledger
+    led = sl.ParentCSV(csv_path)
+    led.add_samples([{"Part Number": "301", "Flaw #": "1A", "Date": "2026\x01-10-19"}])
+    assert sl.ParentCSV(csv_path).get("301", "1A")["Date"] == "2026 -10-19"
+    # a CSV a person (or an older Council) wrote with one in it still fills
+    text = Path(csv_path).read_text(encoding="utf-8-sig").replace("2026 -10-19",
+                                                                  "2026-10-19\x01")
+    Path(csv_path).write_text(text, encoding="utf-8-sig")
+    out = tmp_path / "filled.xlsx"
+    sl.fill_template(schema, sl.ParentCSV(csv_path).rows_for("301"), out)
+    got = openpyxl.load_workbook(out).active[schema.field("Date").cells[""]].value
+    assert got == "2026-10-19"
+
+
+# ── Apply reads only what the review holds ──────────────────────────────
+def test_apply_after_a_cancelled_extract_reads_only_the_workbooks_in_the_review(
+        tmp_path, ledger):
+    csv_path, _schema = ledger
+    a = lf.make_laser_log(tmp_path / "laser_101.xlsx")
+    wb = openpyxl.load_workbook(a)
+    wb["Build"]["A3"] = "P/N: 103"
+    wb.save(tmp_path / "laser_103.xlsx")
+    cancel = threading.Event()
+
+    def progress(line, frac=None):
+        if " read in " in line:
+            cancel.set()                           # Cancel, once the first is read
+    s = li.run_extract(csv_path, [a, tmp_path / "laser_103.xlsx"], tmp_path / "review.xlsx",
+                       use_images=False, progress=progress, cancel=cancel)
+    assert s.cancelled
+    wb, rows = _values(s.review)
+    assert {r["Part"] for r in rows} == {"101"}
+    meta = json.loads(wb["_run"]["A1"].value)
+    assert len(meta["sources"]) == 2 and meta["read"] == [0]
+    read_me = [c.value for c in wb["Read me"]["A"] if c.value]
+    assert any("laser_103.xlsx" in t and "not read" in t for t in read_me)
+    for r in rows:                                 # accept all: FOD is learned
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    lines = []
+    ap = li.run_apply(s.review, use_images=False, progress=lambda l, f=None: lines.append(l))
+    assert ap.learned
+    assert {r["Part Number"] for r in _csv_rows(csv_path)} == {"101"}
+    assert not any("laser_103" in line for line in lines)
+
+
+def test_an_older_review_without_the_list_still_reads_every_source(tmp_path, ledger):
+    csv_path, schema = ledger
+    a = lf.make_laser_log(tmp_path / "laser_101.xlsx")
+    s = li.run_extract(csv_path, [a], tmp_path / "review.xlsx", use_images=False)
+    wb = openpyxl.load_workbook(s.review)
+    meta = json.loads(wb["_run"]["A1"].value)
+    assert "read" not in meta                      # every source was read
+    ap = li.run_apply(s.review, use_images=False)
+    assert ap.rows and {r["Part Number"] for r in _csv_rows(csv_path)} == {"101"}
+
+
+# ── both rows of a red clash ────────────────────────────────────────────
+def test_two_different_values_accepted_for_one_cell_are_both_left_out(tmp_path, ledger):
+    csv_path, _schema = ledger
+    (tmp_path / "src").mkdir()
+    for name, power in (("build.xlsx", 285), ("summary.xlsx", 290)):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"], ws["B1"] = "Part Number", "LMM9ZZ909"
+        ws["A2"], ws["B2"] = "Power (W)", power
+        ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+        wb.save(tmp_path / "src" / name)
+    s = li.run_extract(csv_path, [tmp_path / "src"], tmp_path / "review.xlsx",
+                       use_images=False)
+    wb, rows = _values(s.review)
+    power = [r for r in rows if r["Field"] == "Power (W)"]
+    assert len(power) == 2 and all(r["Other values offered"] for r in power)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    read_me = " ".join(c.value for c in wb["Read me"]["A"] if c.value)
+    assert "both left out at Apply" in read_me
+    a = li.run_apply(s.review, use_images=False)
+    got = {r["Power (W)"] for r in _csv_rows(csv_path)}
+    assert got == {""}                                  # neither, not one of them
+    assert {r["Frequency (kHz)"] for r in _csv_rows(csv_path)} == {"50"}
+    said = [p for p in a.problems if "285" in p and "290" in p]
+    assert said == ["2 values accepted for LMM9ZZ909 Power (W) (285, 290) — kept none; "
+                    "choose one"]
+    assert a.accepted == 1                              # the Frequency
+    assert said[0] in a.describe()
+
+
+# ── a label mapped in a workbook whose part the model found ─────────────
+class FakeModel:
+    """Finds the part; places no label."""
+    def __init__(self, part="XYZ9AB123-R2"):
+        self.part = part
+
+    def __call__(self, prompt, schema):
+        if "Which part" in prompt:
+            return json.dumps({"part": self.part, "evidence": "Serial"}), "fake-granite"
+        return json.dumps({}), "fake-granite"
+
+
+def _serial_book(tmp_path, previous: str = "") -> Path:
+    """A workbook whose part only Council's model can find, with a label
+    no field matches ('Zorp rate')."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Serial: XYZ9AB123-R2"
+    if previous:
+        ws["D1"] = f"Previous: {previous}"
+    ws["A3"], ws["B3"] = "Power (W)", 280
+    ws["A4"], ws["B4"] = "Zorp rate", 55
+    wb.save(tmp_path / "untitled.xlsx")
+    return tmp_path / "untitled.xlsx"
+
+
+def _model_extract(tmp_path, csv_path, model):
+    return li._extract(str(csv_path), [str(tmp_path / "untitled.xlsx")], tmp_path / "r.xlsx",
+                       "", False, None, _NoProg(), None, None, None, True, model)
+
+
+def _parts_with_values(csv_path):
+    return {r["Part Number"] for r in _csv_rows(csv_path)
+            if any(v for k, v in r.items() if k not in ("Part Number", "Flaw #",
+                                                        "source_file", "updated_at"))}
+
+
+def test_a_label_mapped_in_a_workbook_whose_part_the_model_found_keeps_that_part(
+        tmp_path, ledger):
+    """Mapped on 'Labels to map', the value goes into the part the row
+    shows - once the reviewer confirmed the model's part on Values."""
+    csv_path, schema = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    _serial_book(tmp_path)
+    s = _model_extract(tmp_path, csv_path, FakeModel())
+    wb, rows = _values(s.review)
+    lab = wb["Labels to map"]
+    row = next(r for r in lab.iter_rows(min_row=2) if r[2].value == "Zorp rate")
+    assert row[7].value == "XYZ9AB123-R2"                 # the part the row shows
+    row[0].value = freq                                   # mapped, as the Read me says
+    power = next(r for r in rows if r["Field"] == "Power (W)")
+    assert power["Part from"].startswith(se.MODEL_PART_HOW) and not power["Accept"]
+    wb["Values"].cell(power["row"], 1).value = "Y"        # the model's part: checked
+    wb.save(s.review)
+    meta = json.loads(wb["_run"]["A1"].value)
+    assert meta["model_parts"]["untitled.xlsx"][0] == "XYZ9AB123-R2"
+    a = li.run_apply(s.review, use_images=False)
+    got = {r["Part Number"]: (r["Power (W)"], r[freq]) for r in _csv_rows(csv_path)
+           if r[freq]}
+    assert set(got.values()) == {("280", "55")} and set(got) == {"XYZ9AB123-R2"}
+    assert a.accepted == 2 and not a.problems
+
+
+def test_a_mapped_value_goes_into_the_part_the_reviewer_typed_not_the_models(
+        tmp_path, ledger):
+    """The model picked the wrong part (R1, the 'Previous' one). The
+    reviewer typed R2 over it - on Values, or on the 'Labels to map' row of
+    the label they mapped: the mapped value goes into R2, and nothing into
+    R1. It went into R1, a sample that does not exist (review, 2026-10-20)."""
+    csv_path, schema = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    for where in ("values", "labels"):
+        led = tmp_path / where
+        led.mkdir()
+        ps = li.create_parent(lf.make_template(led / "template.xlsx"))
+        csv_path = Path(ps.csv)
+        _serial_book(led, previous="XYZ9AB123-R1")
+        s = _model_extract(led, csv_path, FakeModel("XYZ9AB123-R1"))
+        wb, rows = _values(s.review)
+        assert {r["Part"] for r in rows} == {"XYZ9AB123-R1"}
+        if where == "values":
+            for r in rows:                       # 'the model is wrong: it is R2'
+                wb["Values"].cell(r["row"], 2).value = "XYZ9AB123-R2"
+                wb["Values"].cell(r["row"], 1).value = "Y"
+        for r in wb["Labels to map"].iter_rows(min_row=2):
+            if r[2].value == "Zorp rate":
+                assert r[7].value == "XYZ9AB123-R1"
+                r[0].value = freq
+                if where == "labels":
+                    r[7].value = "XYZ9AB123-R2"
+        wb.save(s.review)
+        a = li.run_apply(s.review, use_images=False)
+        assert _parts_with_values(csv_path) == {"XYZ9AB123-R2"}, where
+        assert {r[freq] for r in _csv_rows(csv_path)} == {"55"}, where
+        assert not a.problems, where
+
+
+def test_a_mapped_value_under_a_part_only_the_model_suggested_is_said_not_written(
+        tmp_path, ledger):
+    """Nothing on the review says the model's part is right: the mapped
+    value is left out and Apply says why and what to do. The Part the
+    'Labels to map' row shows is amber, as on Values."""
+    csv_path, schema = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    _serial_book(tmp_path, previous="XYZ9AB123-R1")
+    s = _model_extract(tmp_path, csv_path, FakeModel("XYZ9AB123-R1"))
+    wb = openpyxl.load_workbook(s.review)
+    row = next(r for r in wb["Labels to map"].iter_rows(min_row=2)
+               if r[2].value == "Zorp rate")
+    assert row[7].fill.fgColor.rgb.endswith("FFF2CC")       # to check
+    row[0].value = freq
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert _parts_with_values(csv_path) == set()
+    assert a.accepted == 0
+    assert a.problems == [
+        "1 mapped value from untitled.xlsx was not written: its part XYZ9AB123-R1 was "
+        "only suggested by Council's model — accept one of that workbook's values on "
+        "Values with that part (Extract again if none is there), or type the right part "
+        "in the Part column on 'Labels to map', and Apply again"]
+
+
+def test_a_part_typed_on_labels_to_map_places_a_mapped_value_of_a_workbook_with_none(
+        tmp_path, ledger):
+    csv_path, schema = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A4"], ws["B4"] = "Zorp rate", 55
+    wb.save(tmp_path / "untitled.xlsx")
+    s = li.run_extract(csv_path, [tmp_path / "untitled.xlsx"], tmp_path / "r.xlsx",
+                       use_images=False)
+    wb = openpyxl.load_workbook(s.review)
+    row = next(r for r in wb["Labels to map"].iter_rows(min_row=2)
+               if r[2].value == "Zorp rate")
+    assert not row[7].value
+    row[0].value, row[7].value = freq, "501"
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert {r["Part Number"]: r[freq] for r in _csv_rows(csv_path) if r[freq]} == {"501": "55"}
+    assert a.accepted == 1 and not a.problems
+
+
+def test_a_mapped_value_with_no_part_is_said_not_dropped(tmp_path, ledger):
+    csv_path, schema = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A3"], ws["B3"] = "Power (W)", 280
+    ws["A4"], ws["B4"] = "Zorp rate", 55
+    wb.save(tmp_path / "untitled.xlsx")
+    s = li.run_extract(csv_path, [tmp_path / "untitled.xlsx"], tmp_path / "r.xlsx",
+                       use_images=False)
+    wb = openpyxl.load_workbook(s.review)
+    row = next(r for r in wb["Labels to map"].iter_rows(min_row=2)
+               if r[2].value == "Zorp rate")
+    row[0].value = freq
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert a.accepted == 0
+    assert any(p.startswith("1 accepted or mapped values have no Part Number")
+               for p in a.problems)
+
+
+# ── People: each reading once, at its signer's cell ─────────────────────
+def test_people_count_each_reading_once_at_its_signers_cell(tmp_path, ledger):
+    csv_path, schema = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"], ws["A2"] = "Part Number: LMM9ZZ908", "Inspector: MK"
+    ws["B3"], ws["C3"], ws["D3"], ws["E3"] = "Flaw #", "1A", "2A", "3A"
+    ws["B4"] = "Eddy Current Response Pre-Conceal"
+    ws["C4"], ws["D4"], ws["E4"] = 40, 41, 42
+    wb.save(tmp_path / "mk.xlsx")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"], ws["A2"] = "Part Number: LMM9ZZ908", "Inspector: JB"
+    ws["B3"], ws["C3"], ws["D3"], ws["E3"] = "Flaw #", "1A", "2A", "3A"
+    ws["B4"] = "Eddy Current Response Pre-Conceal"
+    ws["C4"], ws["D4"], ws["E4"] = 40, 50, 51                    # 1A agrees with MK
+    wb.save(tmp_path / "jb.xlsx")
+    run = se.extract(schema, [tmp_path / "jb.xlsx", tmp_path / "mk.xlsx"], use_images=False)
+    dec = se.decide(run, schema)
+    shared = next(d for d in dec if d.obs.field == PRE and d.obs.item == "1A")
+    assert shared.obs.inspector == "JB/MK" and shared.obs.where.startswith("jb.xlsx")
+    people = se.review_initials(dec)
+    assert people["MK"] == (3, "mk.xlsx › EC!C4")        # not 6, not JB's cell
+    assert people["JB"] == (3, "jb.xlsx › EC!C4")
+
+
+# ── each row names its own workbooks ────────────────────────────────────
+def _signed_book(path: Path, part: str, who: str) -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Part {part}"
+    ws["A1"], ws["B3"], ws["B4"] = f"Inspector: {who}", "Flaw", "EC Pre (%FSH)"
+    for i, item in enumerate(lf.ITEMS):
+        ws.cell(3, 3 + i, item)
+        ws.cell(4, 3 + i, 60 + i)
+    wb.save(path)
+    return path
+
+
+def test_each_row_names_the_workbooks_its_values_came_from(tmp_path, ledger):
+    from council_core import kg_excel
+    from council_core import knowledge_graph as kgm
+    csv_path, _schema = ledger
+    a = _signed_book(tmp_path / "nde_101.xlsx", "101", "JB")
+    b = _signed_book(tmp_path / "nde_102.xlsx", "102", "MK")
+    s = li.run_extract(csv_path, [a, b], tmp_path / "review_1.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    li.run_apply(s.review, use_images=False)
+    got = {(r["Part Number"], r["source_file"]) for r in _csv_rows(csv_path)}
+    assert got == {("101", "nde_101.xlsx"), ("102", "nde_102.xlsx")}
+    # the knowledge graph still traces each value to its cell
+    reading = kg_excel.read_ledger(csv_path, "lmm_parent.csv",
+                                   list(kgm.DEFAULT_FIELD_RULES))
+    froms = {v.locator.get("from") for rec in reading.records for v in rec.values
+             if v.locator.get("item") == "Flaw # 1A" and v.locator.get("from")}
+    assert froms == {"nde_101.xlsx › Part 101!C4", "nde_102.xlsx › Part 102!C4"}
+
+
+def test_long_workbook_names_are_each_named_whole_and_each_still_cited(tmp_path, ledger):
+    """Three real-length NDE workbook names for one part: source_file was
+    cut at 200 characters, in the third name, and the knowledge graph no
+    longer found that workbook's cells - MK's Post-Conceal reading lost its
+    'from' (review, 2026-10-20)."""
+    from council_core import kg_excel
+    from council_core import knowledge_graph as kgm
+    csv_path, _schema = ledger
+    src = tmp_path / "src"
+    src.mkdir()
+    laser = lf.make_laser_log(src / "LMM1AB101 Laser Powder Bed Fusion Build Parameters "
+                                    "Rev C final.xlsx")
+    books = [laser.name]
+    for stage, who, base in (("Pre", "JB", 60), ("Post", "MK", 20)):
+        p = src / f"LMM1AB101 Eddy Current Inspection {stage}-Conceal Results signed.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Part 101"
+        ws["A1"], ws["B3"], ws["B4"] = f"Inspector: {who}", "Flaw", f"EC {stage} (%FSH)"
+        for i, item in enumerate(lf.ITEMS):
+            ws.cell(3, 3 + i, item)
+            ws.cell(4, 3 + i, base + i)
+        wb.save(p)
+        books.append(p.name)
+    s = li.run_extract(csv_path, [src], tmp_path / "review.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    li.run_apply(s.review, use_images=False)
+    row1a = next(r for r in _csv_rows(csv_path) if r["Flaw #"] == "1A")
+    assert len(row1a["source_file"]) > 200
+    assert sorted(row1a["source_file"].split(", ")) == sorted(books)
+    reading = kg_excel.read_ledger(csv_path, "x/p.csv", list(kgm.DEFAULT_FIELD_RULES))
+    mk = [v for rec in reading.records for v in rec.values
+          if v.locator.get("item") == "Flaw # 1A" and v.raw == "MK"]
+    assert mk and mk[0].locator.get("from") == (
+        "LMM1AB101 Eddy Current Inspection Post-Conceal Results signed.xlsx › Part 101!C4")
+
+
+def test_a_rows_workbook_list_keeps_whole_names_and_counts_the_rest():
+    names = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]
+    assert se._book_list(names[:2]) == f"{'a' * 30}, {'b' * 30}"
+    assert se._book_list(names, limit=70) == f"{'a' * 30}, {'b' * 30}, and 2 more"
+
+
+# ── the knowledge graph cites the cell the applied review shows ─────────
+def test_the_cell_a_review_shows_is_cited_before_one_it_is_also_at(tmp_path, ledger):
+    """The review row is at the inspection workbook, 'also at' the weekly
+    log; the CSV row names the log first. The log's cell was cited, not the
+    one the review shows (review, 2026-10-20)."""
+    from dataclasses import replace
+    from council_core import kg_excel
+    from council_core import knowledge_graph as kgm
+    csv_path, schema = ledger
+    o = se.Obs("LMM9ZZ911", "1A", PRE, "55", 1.0, "alias", "EC Pre", "insp.xlsx › EC!B5",
+               note="also at EC_log.xlsx › Log!E2", inspector="MK")
+    decs = [se.Decision(o, True),
+            se.Decision(replace(o, field=sl.inspector_column(PRE, "MK")), True)]
+    se.write_review(csv_path.parent / "review_1.xlsx",
+                    se.Extraction(["insp.xlsx", "EC_log.xlsx"], obs=[o]),
+                    decs, schema, str(csv_path))
+    rows = se.rows_from(decs, schema)
+    for r in rows:
+        r[sl.SOURCE_COL] = "EC_log.xlsx, insp.xlsx"          # the log first
+    sl.ParentCSV(csv_path).add_samples(rows, source="EC_log.xlsx, insp.xlsx")
+    reading = kg_excel.read_ledger(csv_path, "x/p.csv", list(kgm.DEFAULT_FIELD_RULES))
+    mk = {v.locator.get("from") for rec in reading.records for v in rec.values
+          if v.locator.get("item") == "Flaw # 1A" and v.raw == "MK"}
+    assert mk == {"insp.xlsx › EC!B5"}
+
+
+def test_a_newer_review_of_a_workbook_of_the_same_name_is_not_cited(tmp_path, ledger):
+    """nde.xlsx was reviewed and applied; then sent again (the readings now
+    two rows lower), reviewed, accepted and saved - not applied. The row
+    still cites the cell of the review applied to it."""
+    import time as _t
+    from council_core import kg_excel
+    from council_core import knowledge_graph as kgm
+    csv_path, _schema = ledger
+    src = tmp_path / "nde.xlsx"
+    for n in (1, 2):
+        _signed_book(src, "101", "JB")
+        if n == 2:
+            wb = openpyxl.load_workbook(src)
+            wb.active.insert_rows(1, 2)
+            wb.save(src)
+        review = csv_path.parent / f"review_{n}.xlsx"
+        s = li.run_extract(csv_path, [src], review, use_images=False)
+        wb, rows = _values(s.review)
+        assert any(r["Source"] == f"nde.xlsx › Part 101!C{2 + 2 * n}" for r in rows)
+        for r in rows:
+            wb["Values"].cell(r["row"], 1).value = "Y"
+        wb.save(s.review)
+        if n == 1:
+            li.run_apply(s.review, use_images=False)
+            _t.sleep(1.1)                   # the next review is made after the Apply
+    reading = kg_excel.read_ledger(csv_path, "x/p.csv", list(kgm.DEFAULT_FIELD_RULES))
+    froms = {v.locator.get("from") for rec in reading.records for v in rec.values
+             if v.locator.get("item") == "Flaw # 1A" and v.raw == "JB"}
+    assert froms == {"nde.xlsx › Part 101!C4"}

@@ -59,6 +59,15 @@ PHRASES = {
 }
 TYPE_ICON = {"PERSON": "👤", "PART": "⚙", "PROJECT": "📁", "DOCUMENT": "📄"}
 
+
+def _us_origin(model: str) -> bool:
+    """A model name is of US origin by council_core.local_models - the
+    classification the Ledger's list and the Models tab use; an unknown
+    origin is not US."""
+    from council_core import local_models as lm
+    return lm.maker_and_origin(str(model or ""))[1] == "US"
+
+
 #: How a piece of evidence from a spreadsheet was found, in words (the
 #: older methods - row, record, document, model ... - show as they always
 #: have).
@@ -130,18 +139,40 @@ class ConnectionsActions:
 
     # -- free-text suggestions (KG2) --
     def local_models(self) -> List[str]:
-        """US-origin models installed in this PC's Ollama, extractor first."""
+        """US-origin models installed in this PC's Ollama, extractor first.
+        Origin is council_core.local_models', as in the Ledger's model list:
+        pi_models' name prefixes called llava:7b non-US here and US there
+        (review, 2026-10-19). The family Ollama reports only rejects - it
+        is "llama" for zephyr or openhermes too; the name has to say US.
+        An unknown origin is not US."""
         from council_core import kg_extract as kx
-        from council_core.pi_setup import pi_models
+        from council_core import local_models as lm
         try:
             import council_engine as ce
             tags = ce._ollama_tags("http://127.0.0.1:11434") or {}
         except Exception:
             tags = {}
-        names = [m.get("name", "") for m in tags.get("models", [])]
-        names = sorted(n for n in names if n and pi_models.is_us_origin(n))
+        names = []
+        for m in tags.get("models", []):
+            det = m.get("details") or {}
+            name = m.get("name", "")
+            if name and lm.maker_and_origin(name, str(det.get("family") or ""),
+                                            det.get("families") or ())[1] == "US":
+                names.append(name)
+        names = sorted(names)
         best = kx.DEFAULT_EXTRACTOR
         return ([best] if best in names else []) + [n for n in names if n != best]
+
+    def gguf_models(self) -> List[tuple]:
+        """(label, path) of the GGUF files in Council's model folders that
+        are not of non-US origin: Suggest links listed Ollama models only,
+        so a GGUF-only PC could not use it."""
+        from council_core import local_models as lm
+        out = []
+        for e in lm.list_local_models(include_ollama=False):
+            if e.get("origin") != "non-US" and e.get("path"):
+                out.append((f"GGUF: {e.get('name') or e.get('file')}", str(e["path"])))
+        return out
 
     def pi_nodes(self) -> tuple:
         """``(usable, skipped)``: usable = (name, host url, model) of the
@@ -150,8 +181,8 @@ class ConnectionsActions:
         (COUNCIL_REMOTE_NODES=1), the engine's own opt-in. A node's model
         was used whatever it was — the real NodePrimus has only qwen2.5:3b,
         so 'and my Pi nodes' ran extraction on it; local_models() already
-        offered only US-origin models for this PC."""
-        from council_core.pi_setup import pi_models
+        offered only US-origin models for this PC. Origin is
+        council_core.local_models', as everywhere else (_us_origin)."""
         try:
             import council_engine as ce
             if not ce._remote_nodes_enabled():
@@ -162,8 +193,8 @@ class ConnectionsActions:
                      for n in reg.list_nodes() if (n.model or n.active_model)]
         except Exception:
             return [], []
-        usable = [x for x in nodes if pi_models.is_us_origin(x[2])]
-        skipped = [(n, m) for n, _u, m in nodes if not pi_models.is_us_origin(m)]
+        usable = [x for x in nodes if _us_origin(x[2])]
+        skipped = [(n, m) for n, _u, m in nodes if not _us_origin(m)]
         return usable, skipped
 
     def pi_workers(self) -> List[tuple]:
@@ -179,14 +210,18 @@ class ConnectionsActions:
         the run is named by the bare model: 'extract:' is added once, by the
         graph (it was added here too: 'extract:extract:gemma3:12b')."""
         from council_core import kg_extract as kx
-        from council_core.pi_setup import pi_models
-        workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
+        if kx.is_gguf(model):
+            name = Path(model).name
+            workers = {f"this PC ({name})": (kx.gguf_chat(model), name)}
+        else:
+            workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
         if use_pis:
             for name, url, pmodel in self.pi_workers():
-                if pi_models.is_us_origin(pmodel):         # pi_workers filters too
+                if _us_origin(pmodel):                     # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
         with self.open_graph() as kg:
-            return kg.suggest_from_text(workers, model=model,
+            return kg.suggest_from_text(workers, model=Path(model).name if kx.is_gguf(model)
+                                        else model,
                                         on_progress=on_progress, should_stop=should_stop)
 
     def open_file(self, rel_path: str) -> None:
@@ -637,6 +672,29 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="kg-rebuild", daemon=True).start()
 
+    def hold_for_rebuild(self, who: str) -> bool:
+        """Another tab (the Ledger's Rebuild) is about to rebuild the graph:
+        let go of the store - the rebuild writes with its own connection, and
+        a search here waited on its lock on the GUI thread for 5-8 s, then
+        failed 'database is locked' (review, 2026-10-19) - and keep Rebuild
+        off until rebuild_done_elsewhere. False when this tab is rebuilding
+        already (one rebuild at a time)."""
+        if self._busy:
+            return False
+        self._busy = True
+        self.rebuild_btn.setEnabled(False)
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+        self.status.setText(f"The {who} tab is rebuilding the graph…")
+        return True
+
+    def rebuild_done_elsewhere(self, stats: Optional[Dict[str, Any]],
+                               exc: Optional[BaseException]) -> None:
+        """The rebuild hold_for_rebuild waited for ended: reopen and show
+        its summary, as after this tab's own."""
+        self._rebuilt(stats, exc)
+
     def _progress_line(self, token, text: str) -> None:
         # Only while THIS rebuild runs: a line that arrives after it ended
         # (the reporter's heartbeat can fire once more) must not hide the
@@ -652,6 +710,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")
             return
+        # The view is refreshed FIRST: show_entity writes the open item's
+        # header into the status line, and the summary set before it was
+        # gone at once ('⚙ 101' was all a rebuild said - review, 2026-10-19).
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
         from council_core import knowledge_graph as kgm
         self.status.setText(kgm.rebuild_summary_line(stats))
         # The first few unreadable entries also go to the tooltip, where
@@ -669,9 +733,6 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 print(f"  {line}", flush=True)
         else:
             self.status.setToolTip("")
-        self.on_search()
-        if self._current:
-            self.show_entity(self._current)
 
     def refresh_models(self) -> None:
         """List the installed US-origin models and the Pi nodes, on a worker:
@@ -689,14 +750,20 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 pis, skipped = self.actions.pi_workers(), self.actions.pi_skipped()
             except Exception:                             # noqa: BLE001
                 pis, skipped = [], []
-            self._to_ui(self._models_ready, models, pis, skipped)
+            try:
+                ggufs = getattr(self.actions, "gguf_models", lambda: [])()
+            except Exception:                             # noqa: BLE001
+                ggufs = []
+            self._to_ui(self._models_ready, models, pis, skipped, ggufs)
 
         threading.Thread(target=work, name="kg-models", daemon=True).start()
 
-    def _models_ready(self, models, pis, skipped) -> None:
+    def _models_ready(self, models, pis, skipped, ggufs=()) -> None:
         self.model_box.clear()
         for m in models:
             self.model_box.addItem(m, m)
+        for label, path in ggufs:                    # GGUF files on this PC too
+            self.model_box.addItem(label, path)
         self.pis_box.setEnabled(bool(pis))
         tip = (", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
                "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
@@ -718,7 +785,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.suggest_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         use_pis = self.pis_box.isChecked()
-        self.status.setText(f"Reading free text with {model}…")
+        self.status.setText(f"Reading free text with {Path(str(model)).name}…")
         if self._kg is not None:
             self._kg.close()
             self._kg = None
@@ -951,6 +1018,15 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if not text:
             return
         hits = [h for h in self._kg.search(text, cur["type"]) if h["id"] != self._current]
+        if len(hits) > 1:
+            # The one entry whose name or alias IS what was typed is the one
+            # meant: 'JB' (a person of their own) beside a Jill Brown whose
+            # initials are also JB was '2 entries match', and nothing more
+            # of the name could be typed (review, 2026-10-19).
+            exact = [h for h in self._kg.search(text, cur["type"], exact=True)
+                     if h["id"] != self._current]
+            if len(exact) == 1:
+                hits = exact
         if len(hits) != 1:
             self.status.setText(f"{len(hits)} entries match '{text}' — type more of the name.")
             return

@@ -57,7 +57,8 @@ def format_all_stacks() -> str:
 
 class _Watchdog:
     def __init__(self, label: str, log: Callable[[str], None],
-                 *, stall_s: float, sample_s: float) -> None:
+                 *, stall_s: float, sample_s: float,
+                 dump_file: Optional[str] = None) -> None:
         self.label = label
         self._log = log
         self.stall_s = float(stall_s)
@@ -66,6 +67,31 @@ class _Watchdog:
         self._stop = threading.Event()
         self._reported = False
         self._thread: Optional[threading.Thread] = None
+        #: faulthandler's own dumper is a C thread: it writes every thread's
+        #: stack while a C call holds the GIL - the whole-app freeze this
+        #: Python thread can never see (it ran 6 s late in a test, after
+        #: the call returned; review, 2026-10-19). It needs a real file.
+        #:
+        #: It is a DEAD MAN'S SWITCH, not a timer on the work: this thread
+        #: pushes its deadline back on every sample, so it fires only when
+        #: this thread cannot run for ``stall_s`` - the GIL held, the app
+        #: frozen. It reads other threads' states without the GIL, and armed
+        #: on the work's progress instead it fired while the app ran and a
+        #: thread was exiting: an access violation killed the process
+        #: (2026-10-19, test run). Frozen, no thread can exit.
+        self.dump_file = dump_file
+        self._fh = None
+
+    def _arm(self) -> None:
+        if self._fh is None:
+            return
+        import faulthandler
+        try:
+            # three missed samples at least: a late wake-up is not a freeze
+            faulthandler.dump_traceback_later(max(self.stall_s, 3 * self.sample_s),
+                                              repeat=False, file=self._fh)
+        except Exception:                                  # noqa: BLE001
+            pass
 
     def beat(self) -> None:
         """Mark progress. Call this from the worker whenever a unit of
@@ -76,6 +102,17 @@ class _Watchdog:
     def start(self) -> None:
         if self._thread is not None:
             return
+        if self.dump_file:
+            try:
+                os.makedirs(os.path.dirname(self.dump_file) or ".", exist_ok=True)
+                self._fh = open(self.dump_file, "a", encoding="utf-8")
+                self._fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                               f"{self.label}: watching (a dump below = no "
+                               f"progress for {self.stall_s:.0f}s) ===\n")
+                self._fh.flush()
+            except Exception:                              # noqa: BLE001
+                self._fh = None
+            self._arm()
         self._thread = threading.Thread(
             target=self._run, name=f"stall-watchdog:{self.label}",
             daemon=True)
@@ -83,19 +120,35 @@ class _Watchdog:
 
     def stop(self) -> None:
         self._stop.set()
+        # the thread first: it re-arms the switch on each sample
         if self._thread is not None:
             self._thread.join(timeout=self.sample_s * 2)
         self._thread = None
+        if self._fh is not None:
+            import faulthandler
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:                              # noqa: BLE001
+                pass
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:                              # noqa: BLE001
+                pass
+            self._fh = None
 
     def _run(self) -> None:
         while not self._stop.wait(self.sample_s):
+            self._arm()               # still running: the app is not frozen
             idle = time.monotonic() - self._last_beat
             if idle < self.stall_s or self._reported:
                 continue
             try:
                 stacks = format_all_stacks()
+                where = (f" (if the whole app freezes, {self.dump_file} gets a "
+                         "dump too)" if self._fh is not None else "")
                 self._log(f"[stall-watchdog] no progress on {self.label!r} "
-                          f"for {idle:.1f}s — stacks follow:\n{stacks}")
+                          f"for {idle:.1f}s{where} — stacks follow:\n{stacks}")
             except Exception as exc:                       # noqa: BLE001
                 try:
                     self._log(f"[stall-watchdog] could not snapshot: {exc!r}")
@@ -106,10 +159,19 @@ class _Watchdog:
             self._reported = True
 
 
+def default_dump_file(name: str = "stalls.txt") -> Optional[str]:
+    """<app dir>/logs/<name>: where a step's stall dumps go."""
+    try:
+        from council_core import paths
+        return str(paths.app_dir() / "logs" / name)
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 @contextmanager
 def watch(label: str, log: Callable[[str], None],
-          *, stall_s: float = 15.0, sample_s: float = 2.0
-          ) -> Iterator[_Watchdog]:
+          *, stall_s: float = 15.0, sample_s: float = 2.0,
+          dump_file: Optional[str] = None) -> Iterator[_Watchdog]:
     """Monitor progress of a block of work; dump stacks when it stalls.
 
     Usage::
@@ -119,7 +181,7 @@ def watch(label: str, log: Callable[[str], None],
                 process(src)
                 w.beat()
     """
-    w = _Watchdog(label, log, stall_s=stall_s, sample_s=sample_s)
+    w = _Watchdog(label, log, stall_s=stall_s, sample_s=sample_s, dump_file=dump_file)
     w.start()
     try:
         yield w

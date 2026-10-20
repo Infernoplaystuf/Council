@@ -38,6 +38,11 @@ LAYOUTS RECOGNISED IN A SOURCE SHEET
 Which part a value belongs to: a Part Number found on that sheet, else a
 sheet named like a part ("Part 101", "101"), else the one Part Number found
 in the workbook, else a number in the file name (flagged), else --part.
+'TBD', 'N/A', '-' in a Part Number are no part; a 'Lot Number', 'Heat #',
+'Drawing No.', 'P.O. Number', 'Part Name' or a 'Part Information' heading is
+not the Part Number ('Customer P/N', 'Serial No.', 'Sample Number' are); a
+part that does not fit the part-name pattern you gave is kept, never
+pre-accepted.
 
 HOW A LABEL IS MATCHED TO A FIELD
 ---------------------------------
@@ -56,6 +61,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import errno
 import io
 import json
 import os
@@ -63,20 +69,23 @@ import re
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateField,
-                           TemplateSchema, _text, fill_template, inspector_column,
-                           normalize_label, sample_sort_key, schema_path_for)
+from sample_ledger import (INITIALS_SUFFIX, INSPECTOR_COL, SOURCE_COL, LedgerError,
+                           ParentCSV, TemplateField, TemplateSchema, _text, fill_template,
+                           inspector_column, normalize_label, sample_sort_key,
+                           schema_path_for, xl_text)
 
 ACCEPT_AT = 0.85
 SUGGEST_AT = 0.6
 TIE_GAP = 0.04
 IMAGE_PENALTY = 0.8
 SECTION_BONUS = 0.1
-OLLAMA = "http://localhost:11434"
+#: 127.0.0.1, not localhost: Windows tries IPv6 ::1 first and every call
+#: waited ~2 s (review, 2026-10-19)
+OLLAMA = "http://127.0.0.1:11434"
 
 
 def enumerate_ollama_hosts(include_remote: Optional[bool] = None) -> List[str]:
@@ -92,7 +101,7 @@ def enumerate_ollama_hosts(include_remote: Optional[bool] = None) -> List[str]:
     Order matters: callers try the hosts in order and keep the first
     that has a US-origin model, so localhost comes first (lowest
     latency, no network leaving the LAN)."""
-    main = os.environ.get("COUNCIL_OLLAMA_HOST", "http://localhost:11434")
+    main = os.environ.get("COUNCIL_OLLAMA_HOST", OLLAMA)
     hosts = [main]
     if include_remote is None:
         include_remote = os.environ.get(
@@ -120,6 +129,10 @@ _ABBREV = {
 }
 _ABBREV_RE = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True)) + r")\b")
+#: The same, a bare 'part' left as typed: what a label says in so many
+#: words ('Part Revision' is not 'Part Number Revision').
+_ABBREV_TYPED_RE = re.compile(r"\b(" + "|".join(
+    re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True) if k != "part") + r")\b")
 _STOP = {"the", "of", "a", "an", "at", "to", "for", "and", "per"}
 UNITS = {   # unit -> (dimension, factor to SI)
     "um": ("len", 1e-6), "µm": ("len", 1e-6), "μm": ("len", 1e-6),
@@ -151,15 +164,20 @@ def split_unit(label: str) -> Tuple[str, str]:
     return s, (m.group(1).strip() if m else "")
 
 
-def tokens(text: str) -> List[str]:
+def tokens(text: str, typed: bool = False) -> List[str]:
     """Normalised words of a label: units and block letters out, short forms
-    spelt out."""
+    spelt out. typed: a bare 'part' stays 'part' (not 'part number')."""
     base, _ = split_unit(text)
     base = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", base)    # OCR's "PartNumber"
     s = re.sub(r"p\s*/\s*n", " pn ", base.lower())
+    # Not 'S/N' -> serial number here: in an EC or UT table S/N is the
+    # signal-to-noise column, which became every row's part, pre-accepted,
+    # and 'Inspector: SN' was no one (review, 2026-10-19). find_part reads an
+    # S/N label by its value (_SN_LABEL).
     s = re.sub(r"[#]", " number ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-    s = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(1)], s)   # one pass: no re-expansion
+    s = (_ABBREV_TYPED_RE if typed else _ABBREV_RE).sub(
+        lambda m: _ABBREV[m.group(1)], s)                    # one pass: no re-expansion
     out: List[str] = []
     for w in s.split():
         if w in _STOP or (len(w) == 1 and w.isalpha()) or (out and out[-1] == w):
@@ -259,6 +277,7 @@ class Matcher:
                 self.by_name.setdefault(fn, t)
         self._tok = {t.name: tokens(t.text) for t in self.targets}
         self._sec = {t.name: set(tokens(t.section)) for t in self.targets}
+        self._id_tok = set(tokens(schema.id_field or ""))
 
     def is_generic(self, label: str) -> bool:
         """A one-word label shared by 3+ fields ("Date", "Notes")."""
@@ -266,16 +285,76 @@ class Matcher:
         return len(s) == 1 and sum(1 for t in self.targets
                                    if s <= set(self._tok[t.name])) >= 3
 
-    def is_item_header(self, label: str) -> bool:
-        if not self.schema.item_field:
+    def spelt_out(self, label) -> bool:
+        """The id field's own words typed in the label - 'Customer P/N',
+        'Part No./Rev', 'Supplier Part Number' - not read into a bare 'part'
+        ('Part Revision')."""
+        return bool(self._id_tok) and self._id_tok <= set(tokens(label, typed=True))
+
+    def names_other(self, label) -> bool:
+        """A word of another kind of identifier in the label, spelt out as
+        the id field's or not: 'Part No./Rev', 'Part Number per Drawing'."""
+        return isinstance(label, str) and bool(
+            (set(tokens(label)) - self._id_tok) & _OTHER_ID_WORDS)
+
+    def other_id(self, label) -> bool:
+        """An id label of another kind of identifier: 'Lot Number', 'Heat #',
+        'Work Order Number', 'Drawing No.', 'Part Revision' - a word of
+        _OTHER_ID_WORDS the template's own id field does not have - or one
+        of someone else's ('Customer Number', 'Report No.': _ID_OWNER_WORDS,
+        with no word of the id field's). 'Serial Number', 'S/N', 'Sample
+        ID' are not; a template whose id field is 'Lot Number' keeps its own
+        label. Nor is one that spells out the id field's words: 'Customer
+        P/N', 'Part No./Rev', 'Part Number per Drawing', 'Build Part Number'
+        were the part, rightly, until a bare 'part' read as 'part number'
+        put them with 'Part Revision' (review, 2026-10-19)."""
+        if not isinstance(label, str) or self.spelt_out(label):
             return False
+        extra = set(tokens(label)) - self._id_tok
+        if extra & _OTHER_ID_WORDS:
+            return True
+        return bool(extra & _ID_OWNER_WORDS) and not (
+            set(tokens(label, typed=True)) & (self._id_tok - _GENERIC_ID_WORDS))
+
+    def other_id_label(self, label) -> bool:
+        """'Lot Number', 'Heat #', 'Part Revision': another identifier's
+        label written like the id field's (with a word of it). match() gives
+        it no field now, but it is still a label, never a value: a 'Part
+        Number | Lot Number' header row made the part 'Lot Number'. 'Lot
+        7734-B' and 'Rev B' are values, and so is a note: a label is a few
+        words, no digits or sentence marks, not opening with 'No' - 'No
+        issues, see report 12', 'No change to program' were labels, and a
+        Notes field lost them (review, 2026-10-19)."""
+        if not isinstance(label, str):
+            return False
+        s = label.strip()
+        n = len(s.split())
+        if not (1 <= n <= 4 and _ID_LABEL_SHAPE.fullmatch(s)):
+            return False
+        w = tokens(s)
+        if not w or not set(w) & self._id_tok:
+            return False
+        if n > 2 and w[-1] not in _GENERIC_ID_WORDS:
+            return False                 # 'Part reworked per drawing' is a note
+        return self.other_id(s)
+
+    def is_label(self, v) -> bool:
+        """A label of a field, or another identifier's label."""
+        return isinstance(v, str) and (self.match(v).target is not None
+                                       or self.other_id_label(v))
+
+    def is_item_header(self, label: str) -> bool:
+        if not self.schema.item_field or not _words(label):
+            return False                 # a long cell is no 'Flaw #' (LABEL_MAX)
         t = tokens(label)
         return t in (tokens(self.schema.item_field), ["flaw"], ["flaw", "id"],
                      ["defect"], ["defect", "number"], ["feature"], ["item"])
 
     def match(self, label, context: Sequence[str] = (), per_item: Optional[bool] = None) -> Match:
         """per_item: True inside an item grid/table, False outside, None = any."""
-        if not isinstance(label, str):
+        if not isinstance(label, str) or (len(label) > LABEL_MAX and not _words(label)):
+            # a note or a padded cell is no label: scored against every
+            # field, a long one held the GIL (review, 2026-10-20)
             return Match(None, 0.0, via="none")
         key = normalize_label(label)
         if not key or key in self.ignore:
@@ -295,9 +374,14 @@ class Matcher:
         joined = " ".join(src)
         sset = set(src)
         snums = {w for w in src if w.isdigit()}
+        # 'Lot Number' is not the Part Number: it took the id column of a
+        # table, pre-accepted (review, 2026-10-19)
+        other_id = bool((sset - self._id_tok) & _ANY_OTHER_ID_WORDS) and self.other_id(label)
         scored = []
         for t in self.targets:
             if per_item is not None and t.per_item != per_item and not t.is_id:
+                continue
+            if t.is_id and other_id:
                 continue
             ft = self._tok[t.name]
             if not ft:
@@ -313,6 +397,15 @@ class Matcher:
                 s *= 0.5
             if ctx & (self._sec[t.name] | (fset - sset)):
                 s += SECTION_BONUS
+            if not sset & fset and not any(a == b + "s" or b == a + "s"
+                                           for a in sset for b in fset):
+                # no word in common (a plural is the word: 'Dates', 'Amplitudes'):
+                # letters alone made 'Owner' Power (W) at 0.8 and 'Parameter'
+                # the Part Number (review, 2026-10-19). A slip of the field's
+                # word ('Frequncy', 'Powr') is offered for review, never
+                # pre-accepted: 'Powder' was Power (W) at 0.91 with the alloy
+                # as its value.
+                s = min(s, (ACCEPT_AT if _near_typo(src, ft) else SUGGEST_AT) - 0.01)
             scored.append((s, t))
         if not scored:
             return Match(None, 0.0, via="none")
@@ -331,28 +424,281 @@ class Matcher:
         return Match(best, shown, guesses, via="match")
 
 
+def _near_typo(src: Sequence[str], field_toks: Sequence[str]) -> bool:
+    """A label word that is a slip of one of the field's words ('Lenght',
+    'Frequncy', 'Powr', 'Meda', 'Medai', 'Datte') or its first letters
+    ('Ampl'): same first letter, two letters swapped or nearly the same
+    letters - stricter for a short word, where one letter is more of the word
+    ('Data' is not 'Date', 'Medal' not 'Media'). 'Owner' / 'Tower' are not
+    'Power', 'Partner' is not 'Part', and a short word with a letter more is
+    a word of its own ('Powder') unless the letter is a doubled one or a
+    plural 's' (review, 2026-10-19)."""
+    for a in src:
+        for b in field_toks:
+            if a[0] != b[0]:
+                continue
+            if len(a) >= 3 and len(b) > len(a) and b.startswith(a):
+                return True
+            short = min(len(a), len(b))
+            if short < 4:
+                continue
+            if len(a) == len(b):
+                d = [i for i in range(len(a)) if a[i] != b[i]]
+                if len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] \
+                        and a[d[1]] == b[d[0]]:
+                    return True                                  # 'Notse', 'Lenght'
+            if len(a) > len(b) and len(b) <= 6 and a != b + "s" and not any(
+                    a[i] == a[i - 1] and a[:i] + a[i + 1:] == b for i in range(1, len(a))):
+                continue
+            if difflib.SequenceMatcher(None, a, b).ratio() >= (0.85 if short <= 5 else 0.8):
+                return True
+    return False
+
+
 def _strip_unit(label: str) -> str:
     return re.sub(r"\s*[:*]+\s*$", "", split_unit(label)[0])
 
 
 # ── who logged a reading ────────────────────────────────────────────────
+#: The most a label is, in characters of its words: a field's, a person's,
+#: a run's or a column's title is a few words. Longer text - a note, a cell
+#: padded with spaces - is a value, never matched as a label.
+LABEL_MAX = 120
+
+
+def _words(v, most: int = LABEL_MAX) -> str:
+    """``v``'s words with one space between them, or '' when they run past
+    ``most`` characters (or ``v`` is not text): what a label is matched on.
+    No run of spaces is left for a pattern to backtrack over."""
+    if not isinstance(v, str):
+        return ""
+    s = " ".join(v.split())
+    return s if len(s) <= most else ""
+
+
+#: A run of spaces, tabs or line breaks: one match each, read once.
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def _lines(v, most: int = LABEL_MAX) -> str:
+    """_words, but a run of spaces with a line break in it ('\\n', '\\r\\n',
+    '\\r') is one '\\n', not a space: the lines a cell is typed on stay
+    apart. 'Inspector: JB' Alt+Enter 'MK' is two lines, nobody's initials -
+    read as 'Inspector: JB MK' it signed and pre-accepted every reading
+    under it as 'Jb Mk' and gave the graph a person 'JBMK' (second
+    review, 2026-10-20). Still one pass over the cell, no run left to backtrack
+    over; as long as _words (a run is one character either way)."""
+    s = _words(v, most)
+    if not s or ("\n" not in v and "\r" not in v):
+        return s                          # one line, or too long to be a label
+    return _SPACE_RUN.sub(lambda m: "\n" if "\n" in m.group() or "\r" in m.group() else " ",
+                          v).strip()
+
+
+class _OnWords:
+    """A label pattern tried on a cell's words (_lines), never on the cell
+    as typed: '\\s*[:#]?\\s*$', '(?P<who>.+?)\\s*$' and the like backtracked
+    quadratically over a run of spaces - 'Inspector', 'inspected by', 'Run'
+    or 'Response' padded with thousands of them held the GIL for seconds to
+    minutes, the app froze and Cancel could not be pressed (review,
+    2026-10-20). Its lines stay apart, as they were for the pattern: a
+    '(?P<who>.+?)' is on one line. council_core.kg_excel uses these too."""
+
+    def __init__(self, pattern: str):
+        self.pattern = re.compile(pattern)
+
+    def match(self, v):
+        s = _lines(v)
+        return self.pattern.match(s) if s else None
+
+
 #: A label that introduces a person: "Inspector: JB", "Operator - MK".
-_WHO_INLINE = re.compile(
+_WHO_INLINE = _OnWords(
     r"(?i)^\s*(?:inspector(?:\s+initials)?|initials|operator|technician|tech|analyst|"
     r"inspected\s+by|checked\s+by|logged\s+by)\s*(?:[:=\-–—]\s*|\s+by\s+)(?P<who>.+?)\s*$")
-_WHO_BY = re.compile(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
+_WHO_BY = _OnWords(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
 #: A column / label that holds initials, with the value beside or below it.
-_WHO_HEAD = re.compile(r"(?i)^\s*(?:inspector(?:'?s)?(?:\s+initials)?|initials|operator|"
-                       r"technician|tech|analyst|inspected\s+by|by)\s*[:#]?\s*$")
+#: 'Inspector Name', 'QC Inspector', 'Technician Initials', 'Operator ID'
+#: count too: they never gave a person in the knowledge graph (review,
+#: 2026-10-19).
+_WHO_HEAD = _OnWords(
+    r"(?i)^\s*(?:"
+    r"(?:(?:qc|qa|lead|nde|ndt|ndi)\s+)?"
+    r"(?:inspector|technician|tech|operator|analyst|examiner)(?:'?s)?"
+    r"(?:\s+(?:name|initials|id))?"
+    r"|initials|inspected\s+by|checked\s+by|performed\s+by|by"
+    r")\s*[:#]?\s*$")
 #: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
-_RUN_HEAD = re.compile(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
+_RUN_HEAD = _OnWords(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
 #: The column holding the reading in a long log, beside one naming what it is.
-_VALUE_HEAD = re.compile(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
-                         r"measurement)\s*(?:\([^)]*\))?\s*$")
+_VALUE_HEAD = _OnWords(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
+                       r"measurement)\s*(?:\([^)]*\))?\s*$")
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
 _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za-zµμ/]+)\s*$")
 #: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
-_WHO_HEADING = re.compile(r"^\s*(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(]\s*[\d\s\-/.:,)]*)?\s*$")
+#: Matched on the stripped cell only (no overlapping whitespace runs: the
+#: old pattern backtracked cubically on a space-padded cell).
+_WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*)?$")
+#: A date typed as text: '2026-09-22', '22.09.2026', '9/22/26', '09/22' - not
+#: a run's number ('EC-1', 'EC (1)', 'EC 1/2').
+_DATE_TEXT = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+                        r"|(?<!\d)\d{2}/\d{2}(?!\d)")
+#: Short words an inspection sheet writes where initials could stand that are
+#: nobody's initials: result codes (FPI's 'NRI' no relevant indication, 'IND',
+#: 'NDI', 'ACC', 'REJ', 'RJT', 'NCR'), outcomes ('OK', 'NA', 'TBD') and a
+#: reading's qualifier ('31 (AVG)'). A row of 'NRI | IND' over the next table
+#: was taken as an inspector's heading (review, 2026-10-19). Not 'EC': Eva
+#: Chen signs as EC. council_core.kg_excel's stop list takes these too.
+NOT_INITIALS = frozenset({
+    "nri", "ind", "ndi", "acc", "rej", "rjt", "ncr", "ok", "na", "tbd",
+    "pass", "fail", "nde", "fpi", "avg", "max", "min", "std", "nogo",
+})
+#: What a cell holds as a reading in words: FPI's results, an outcome.
+_RESULT_WORDS = frozenset({"nri", "ind", "ndi", "rli", "rni", "acc", "rej", "rjt", "pass",
+                           "fail", "ok", "ng", "nogo", "go"})
+#: Units a reading's brackets hold that UNITS cannot convert: the ones
+#: council_core.kg_excel's stop list has ('psi', 'rpm', 'ipm' ...) and an
+#: NDE sheet's ('FSH' full screen height, 'dB', 'Vpp', 'div'). '12 (IPM)'
+#: was a reading signed by IPM, and the in/min dropped (review, 2026-10-19).
+_UNIT_WORDS = frozenset({
+    "psi", "ksi", "mpa", "gpa", "rpm", "ipm", "fpm", "ppm", "sec", "fsh", "db", "dbm",
+    "vpp", "div", "pct", "lbs", "lbf", "ghz",
+})
+#: What else a reading's brackets hold in capitals: a direction, a kind of
+#: value or a result ('45 (CCW)', '0.5 (REF)', '54 (NG)' no good, '3 (EA)'
+#: each, '0.5 (OD)'), kept with the reading - not a signer.
+_NOT_SIGNERS = frozenset({"cw", "ccw", "ref", "typ", "nom", "est", "rms", "ng", "go",
+                          "ea", "pc", "pcs", "nd", "pk", "pp", "id", "od"})
+#: A reading signed in its cell: '31 (JB)', '31 [JB]', '0.245 mm (J.B.)'.
+#: Tried on a short cell only, and '\d+(\.\d*)?' cannot split a run of digits
+#: two ways: a long one made '\d+\.?\d*' backtrack (review, 2026-10-19).
+_SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*(?:°|\"|[A-Za-zµμ/]+))?)"
+                     r"\s*[\(\[]\s*(?P<who>[A-Za-z][A-Za-z.\s]{1,7})\s*[\)\]]$")
+#: A reading signed without brackets: '47/JB', '48 - JB', '51-JB', '49 JB',
+#: '52 JB.' - a number, then a '/' or a dash (sep) or only a space, then
+#: two or three capitals. Tried on a short cell only; one way to split it.
+_SIGNED_BARE = re.compile(r"^(?P<v>[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+                          r"(?:\s*(?P<sep>[/\-–—])\s*|\s+)"
+                          r"(?P<who>[A-Z]\.?\s?[A-Z]\.?(?:\s?[A-Z]\.?)?)$")
+#: The same in small letters after a '/' or a dash, or glued on in capitals:
+#: '51/jb', '52JB' - never split, only told (UNSURE_SIGNER_NOTE). Not '33
+#: mV', '12 ms': a unit after a space.
+_SIGNED_LOOSE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*[/\-–—]\s*"
+                           r"(?P<who>[A-Za-z]\.?\s?[A-Za-z]\.?(?:\s?[A-Za-z]\.?)?)"
+                           r"|(?P<glued>[A-Z]{2,3}\.?))$")
+#: The note on a reading that ends in initials no one signs with on its
+#: sheet ('49 JB', '47/RLI'): a signer, a unit or a code? Kept as typed,
+#: never pre-accepted (review, 2026-10-20).
+UNSURE_SIGNER_NOTE = "ends in initials or a unit: who signed it? check it"
+#: The note on a reading of a table beside another that has no label column
+#: of its own: the field is the other table's label, a guess (review,
+#: 2026-10-20).
+_BESIDE_NOTE = "a table beside another, with no labels of its own: which field? check it"
+#: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
+_NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
+                             r"(?P<u>°|\"|%?[A-Za-zµμ/]{1,8})\s*[\)\]]$")
+#: A short code in capitals ('NRI', 'NG', 'NOGO'): what a row of results
+#: holds beside a code that looks like initials.
+_CODE_CELL = re.compile(r"[A-Z][A-Z0-9/\-]{1,5}")
+#: The serial number's label - 'S/N', 'SN', 'S/N:', 'S/N #' - and nothing
+#: more: 'S/N Ratio', 'S/N (dB)' are signal-to-noise. Matched on a short,
+#: stripped label (single optional spaces: no backtracking).
+_SN_LABEL = re.compile(r"(?i)s\s?/?\s?n\s?(?:#|no\.?)?\s?[:.]?")
+#: Words a label shares with the part number's that do not make it one:
+#: 'Run Number', 'Lot Number', 'Heat Number' share only 'number'.
+_GENERIC_ID_WORDS = frozenset({"number", "id"})
+#: Words that make an id label another kind of identifier - a lot, a heat, a
+#: job, a drawing, a revision - not the part's: a 'Lot Number' column was
+#: every row's part, pre-accepted, and 'Part Revision: B' named the part
+#: (review, 2026-10-19). Serial, sample, specimen are the part's own.
+_OTHER_ID_WORDS = frozenset({
+    "lot", "heat", "melt", "batch", "run", "job", "work", "order", "wo", "po", "purchase",
+    "drawing", "dwg", "revision", "rev", "version", "ver", "fixture", "tool",
+    "station", "machine", "cert", "certificate", "procedure",
+    "invoice", "ticket", "ncr", "step", "employee", "badge",
+    "tracking", "shipment",
+})
+#: Whose number it is, or what it numbers: another's identifier only with no
+#: word of the part's - 'Customer Number', 'Report No.', 'Sheet No.' - for
+#: 'Customer P/N', 'Supplier Part Number', 'Build Part Number', 'Part
+#: Number - Sheet 1' name the part (review, 2026-10-19).
+_ID_OWNER_WORDS = frozenset({
+    "customer", "vendor", "supplier", "build", "program", "project", "report",
+    "operation", "op", "document", "doc", "file", "page", "sheet",
+})
+_ANY_OTHER_ID_WORDS = _OTHER_ID_WORDS | _ID_OWNER_WORDS
+#: Words that say a label numbers the part itself, with only 'number' or
+#: 'id' of the part number's: 'Serial No.', 'Sample Number' - a sample is
+#: what a Ledger row is (its value was lost, review 2026-10-19).
+_PART_OWN_WORDS = frozenset({"serial", "sample", "specimen", "coupon"})
+#: Words that make a label sharing the part number's word something else of
+#: the part: a heading over a block ('Part Information', 'Part Details') or
+#: the part's name or kind ('Part Name: Bracket'). 'Part Information' over
+#: 'Customer | Acme' made the part 'Customer', pre-accepted (review,
+#: 2026-10-19).
+_NOT_ID_WORDS = frozenset({
+    "information", "info", "details", "detail", "data", "name", "description", "desc",
+    "title", "type", "family", "status", "material", "amount", "quantity", "count",
+    "weight", "location", "notes", "note", "comments", "remarks",
+})
+#: Another identifier's label as typed ('Lot Number', 'Heat #', 'Drawing
+#: No.'): letters and a few marks, no digits or sentence marks, not opening
+#: with 'No'/'Not' (a note: 'No change to program').
+_ID_LABEL_SHAPE = re.compile(r"(?i)(?!no\b|not\b)[a-z][a-z.#/&\s-]{0,38}:?")
+#: What a cell holds where a value is not known yet: 'TBD', 'N/A', 'n.a.',
+#: '-', '?', 'pending', 'to be assigned'. Not a part number: 'TBD' was the
+#: part, pre-accepted, and Apply wrote its values (review, 2026-10-19).
+#: council_core.kg_excel takes it for 'nobody signed'. 'XXX', '0',
+#: 'awaiting', 'later' and 'n/a (rework)' are stand-ins too: each was the
+#: part, pre-accepted (review, 2026-10-19).
+PLACEHOLDER = re.compile(
+    r"(?i)[\s(\[#]*(?:n\s*/\s*a|n\.?\s*a\.?|[-–—]+|\?+|x+|0+|tb[adc]|none|nil|null|unknown"
+    r"|pending|unassigned|awaiting(?:\s+[a-z/#]+){0,2}|later|to\s+follow"
+    r"|not\s+(?:yet\s+)?(?:assigned|known|available|applicable)"
+    r"|to\s+be\s+(?:assigned|determined|confirmed|advised))[\s)\].!]*"
+    r"(?:[(\[][^()\[\]]{0,30}[)\]][\s.!]*)?")
+
+
+def is_placeholder(v) -> bool:
+    """A blank's stand-in ('TBD', 'N/A', '-'), not a value. Tried on a short
+    cell only."""
+    s = _text(v) if v is not None else ""
+    return bool(s) and len(s) <= 40 and bool(PLACEHOLDER.fullmatch(s))
+
+
+def _signed_by(text: str) -> str:
+    """The initials in a reading's brackets ('J.B.' -> 'JB'), or '' when the
+    brackets hold a unit ('0.245 (mm)', '(IN)', '(IPM)', '(FSH)') or a code
+    ('(NA)', '(AVG)', '(NG)')."""
+    raw = " ".join(text.split())
+    if not (re.fullmatch(r"(?:[A-Z]\.?\s?){2,4}", raw)
+            or re.fullmatch(r"(?:[A-Za-z]\.\s?){2,4}", raw)):
+        return ""                         # 'Jb', 'avg', 'mm': not someone signing
+    t = re.sub(r"[.\s]", "", raw).lower()
+    return "" if t in UNITS or t in NOT_INITIALS or t in _NOT_SIGNERS \
+        or t in _UNIT_WORDS else t.upper()
+
+
+def _acronym_initials(text) -> bool:
+    """'EC', 'PN', 'E.C.' typed in capitals: two or three letters that
+    _ABBREV spells out into several words ('eddy current', 'part number').
+    Eva Chen signs as EC: 'Inspector: EC' was no one, as tokens('EC') is
+    a template's words (review, 2026-10-20). 'FREQ', 'TEMP', 'NO' shorten
+    one word and stay words."""
+    s = re.sub(r"[.\s]", "", str(text or ""))
+    return bool(re.fullmatch(r"[A-Z]{2,3}", s)) and len(_ABBREV.get(s.lower(), "").split()) > 1
+
+
+def _existing_cells(ws):
+    """((row, col), value) of the cells the sheet really has. iter_rows()
+    walks the sheet's whole dimension and makes a Cell for every position:
+    one formatted empty cell at T1048576 turned a 5 KB file into 21 million
+    cells, 4 GB and garbage-collector passes that froze the app for seconds
+    (review, 2026-10-19)."""
+    store = getattr(ws, "_cells", None)
+    if isinstance(store, dict):
+        return [(rc, cell.value) for rc, cell in sorted(store.items())]
+    return [((c.row, c.column), c.value) for row in ws.iter_rows() for c in row]
 
 
 def _initials(v) -> str:
@@ -374,6 +720,22 @@ class Grid:
     sheet: str
     cells: Dict[Tuple[int, int], object]
     from_image: str = ""             # image file name when read from an image
+
+    def __post_init__(self):
+        # Text with a control character (read through Excel: '216' +
+        # CHAR(1)) is cleaned here, as it is read, so the review, Apply and
+        # the parent CSV all see one text: cleaned only where it was
+        # written, Apply read part '216\x01' - another part than the
+        # review's '216' - and filling its template raised (review,
+        # 2026-10-20)
+        bad = [k for k, v in self.cells.items() if isinstance(v, str) and xl_text(v) is not v]
+        if bad:
+            self.cells = dict(self.cells)
+            for k in bad:
+                v = self.cells.pop(k)
+                t = xl_text(v)
+                if t:
+                    self.cells[k] = _Merged(t) if isinstance(v, _Merged) else t
 
     def text(self, r, c) -> Optional[str]:
         v = self.cells.get((r, c))
@@ -476,21 +838,26 @@ class WorkbookPreview:
 
 
 def preview_workbook(path, schema, aliases=None,
-                     pattern_mask: Optional[str] = None) -> WorkbookPreview:
+                     pattern_mask: Optional[str] = None, ignore=(),
+                     part: str = "") -> WorkbookPreview:
     """Open ``path`` and report what the Ledger extractor can and can't
-    see — per sheet: non-empty cell count, the heuristics' candidate
-    part id (and how), inspector initials, label cells grouped by
-    confidence of their binding to a template field, and the unmatched
-    labels that need a schema alias or a header fix.
+    see — per sheet: non-empty cell count, the part its values would get
+    (and how), inspector initials, the labels the extract binds to a
+    template field (confident / weak) and the labels it leaves for
+    'Labels to map'.
 
-    Fast: no values are extracted, no review workbook is written, no
-    pictures are copied. Mirrors ``extract()``'s per-sheet start —
-    ``load_workbook_grids`` + ``_Extractor.find_part/inspectors`` + a
-    ``Matcher.match`` sweep over every string cell."""
+    Runs extract()'s own passes on the workbook (same matcher, ignore list,
+    item grids, tables, forms, workbook-level part choice, Part override),
+    so the preview says what the batch will do: a context-free sweep over
+    every string cell listed data values (names, results, item codes) as
+    'unmatched labels' - and "Ask Council" sent them to the model - and
+    disagreed with the extract about bindings (review, 2026-10-19). No
+    review workbook is written, no pictures are copied."""
     p = Path(path)
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     file_part = _part_from_filename(p.stem, mask_re)
-    file_how = (f"filename {p.name!r}, mask-matched" if mask_re and file_part
+    by_mask = bool(mask_re and file_part and mask_re.search(p.stem))
+    file_how = (f"filename {p.name!r}, mask-matched" if by_mask
                 else (f"filename {p.name!r}" if file_part else ""))
     report = WorkbookPreview(path=str(p), sheets=[], file_part_id=file_part,
                              file_part_how=file_how,
@@ -501,41 +868,70 @@ def preview_workbook(path, schema, aliases=None,
     except LedgerError as e:
         report.problems.append(str(e))
         return report
-    m = Matcher(schema, aliases, ignore=())
+    m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
-    for g in grids:
-        ex = _Extractor(g, m, codes, "", mask_re)
+    exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
+    for ex in exs:
         try:
             ex.find_part()
             ex.find_inspectors()
         except Exception as exc:                           # noqa: BLE001
-            report.problems.append(f"{g.sheet}: {exc!r}")
+            report.problems.append(f"{ex.g.sheet}: {exc!r}")
+    # the part each sheet's values get - extract()'s own rule
+    found = {ex.part for ex in exs if ex.part} | {
+        p for ex in exs for _r, _c, p, _h in ex.part_labels if p}
+    if part:
+        book_part, how = part, "the Part number you typed"
+    elif len(found) == 1:
+        book_part, how = next(iter(found)), "the one part number in the workbook"
+    elif not found:
+        book_part = file_part
+        how = f"{FILE_PART_HOW} {p.name!r} — check it" if book_part else ""
+    else:
+        book_part, how = "", ""
+    for ex in exs:
+        if part:
+            ex.part, ex.part_how = part, how
+            ex.part_labels = []
+        elif not ex.part:
+            ex.part, ex.part_how = book_part, how
+        try:
+            ex.item_grids()
+            ex.tables()
+            ex.forms()
+        except Exception as exc:                           # noqa: BLE001
+            report.problems.append(f"{ex.g.sheet}: {exc!r}")
         inspectors = sorted({who for _r, _c, who in ex.markers})
         sure: List[_LabelHit] = []
         maybe: List[_LabelHit] = []
+        seen = set()
+        for o in ex.out:                                   # one line per label
+            key = (o.label, o.field)
+            if key in seen:
+                continue
+            seen.add(key)
+            hit = _LabelHit(o.label, o.field, o.score, o.where, o.via)
+            (sure if o.score >= ACCEPT_AT and o.via in ("alias", "match") else maybe).append(hit)
         unmatched: List[Tuple[str, str]] = []
-        for (r, c), v in g.cells.items():
-            if not isinstance(v, str):
-                continue
-            label = v.strip()
-            if not label or len(label) > 80:
-                continue
-            match = m.match(label)
-            where = g.where(r, c)
-            if match.target is not None and match.sure:
-                sure.append(_LabelHit(label, match.target.name, match.score,
-                                      where, match.via))
-            elif match.target is not None and match.score >= SUGGEST_AT:
-                maybe.append(_LabelHit(label, match.target.name, match.score,
-                                       where, match.via))
-            else:
-                # Only keep label-looking cells (letters, short-ish, not a
-                # number): otherwise every data value lands here.
-                if any(ch.isalpha() for ch in label):
-                    unmatched.append((label, where))
+        names = set()
+        for o in ex.unmatched:                             # what 'Labels to map' gets
+            label = (o.label or "").strip()
+            if label and label not in names:
+                names.add(label)
+                unmatched.append((label, o.where))
+        if not ex.part and ex.out:
+            report.problems.append(f"{ex.g.sheet}: {len(ex.out)} value(s) would get no "
+                                   f"{schema.id_field} — type one in Part number, or set "
+                                   "a part-name pattern")
+        # the sheet's other parts, each from its own label down (find_part)
+        more = "".join(f"; {p or 'no part yet'} from row {r} down" + (
+            f" ({SHEET_PARTS_HOW}: check it)" if SHEET_PARTS_HOW in h else "")
+            for i, (r, _c, p, h) in enumerate(ex.part_labels) if i or not p)
         report.sheets.append(SheetPreview(
-            name=g.sheet, cells=len(g.cells),
-            part_id=ex.part, part_how=ex.part_how,
+            name=ex.g.sheet, cells=len(ex.g.cells),
+            part_id=ex.part,
+            part_how=(ex.part_how if ex.part == part else _fit_mask(ex.part, ex.part_how,
+                                                                     mask_re)) + more,
             inspectors=inspectors,
             sure=sure, maybe=maybe,
             unmatched_labels=unmatched[:200]))
@@ -547,24 +943,125 @@ def preview_workbook(path, schema, aliases=None,
 WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
 
 
+_SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
+
+
+def _is_link_dir(path: str) -> bool:
+    try:
+        isj = getattr(os.path, "isjunction", None)
+        return os.path.islink(path) or bool(isj and isj(path))
+    except OSError:
+        return True
+
+
+#: Windows' MAX_PATH: with long paths off (LongPathsEnabled=0, the default)
+#: a path this long or longer cannot be opened, listed or even seen.
+_MAX_PATH = 260
+
+
+def _long_path(path: str) -> str:
+    """`path` with Windows' \\\\?\\ prefix, which lifts MAX_PATH for this
+    one call; unchanged elsewhere."""
+    if os.name != "nt":
+        return path
+    p = os.path.abspath(path)
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):                                  # \\server\share
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def path_too_long(path) -> int:
+    """The length of `path` when Windows refuses it only for being longer than
+    MAX_PATH (long paths off, the file there all the same); else 0."""
+    if os.name != "nt":
+        return 0
+    p = os.path.abspath(str(path))
+    if len(p) < _MAX_PATH or os.path.exists(p):
+        return 0
+    return len(p) if os.path.exists(_long_path(p)) else 0
+
+
+def _long_paths_on() -> bool:
+    """Whether this program may use paths of MAX_PATH or more: Windows 10
+    1607+ with long paths enabled, asked of Windows itself (it weighs the
+    policy and the program's manifest). Older Windows: never."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        f = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+        f.restype = ctypes.c_ubyte
+        return bool(f())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def too_long_to_write(path) -> int:
+    """The length of `path` when Windows will not let a file be written
+    there - MAX_PATH (260) characters or more, long paths off - else 0."""
+    if os.name != "nt":
+        return 0
+    n = len(os.path.abspath(str(path)))
+    return n if n >= _MAX_PATH and not _long_paths_on() else 0
+
+
+#: What a review path Windows cannot write is told (ledger_ingest says it
+#: before a workbook is read).
+REVIEW_TOO_LONG = ("review path too long ({n} characters) — enable Windows long paths "
+                   "or pick a shorter folder")
+
+
+#: The one problem line a run gets when its pictures cannot be saved for the
+#: length of their path.
+_PICTURES_TOO_LONG = "pictures not saved: path too long"
+
+
+def _too_long(path, e: OSError) -> int:
+    """The length of `path` when writing there failed for that length - on
+    Windows with long paths off, WinError 206 for a folder of 248+
+    characters and 'not found' for a file of 260+; ENAMETOOLONG elsewhere -
+    else 0."""
+    n = len(os.path.abspath(str(path)))
+    if getattr(e, "winerror", None) == 206 or e.errno == errno.ENAMETOOLONG:
+        return n
+    if os.name == "nt" and n >= _MAX_PATH and isinstance(e, FileNotFoundError):
+        return n
+    return 0
+
+
 def workbook_files(folder) -> List[Path]:
     """The workbooks under a folder — recursively — not Excel's ~$ lock files.
 
     Folders whose names start with "." or "~$" are pruned at every depth so
     hidden caches (``.git``, ``.cache``), VCS metadata and Excel autosave
     directories don't leak into the scan; ``~$`` files anywhere are skipped
-    for the same reason (Excel's lockfile for an open workbook)."""
+    for the same reason (Excel's lockfile for an open workbook).
+
+    Listed through the \\\\?\\ prefix on Windows: a folder whose path is
+    longer than MAX_PATH could not be listed and its workbooks were skipped
+    without a word (review, 2026-10-19). They are returned as plain paths;
+    reading one says the path is too long (load_workbook_grids)."""
     root = Path(folder)
+    top = _long_path(str(root))
     out: List[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        # In-place prune so os.walk does not descend into hidden/lock dirs.
+    for dirpath, dirnames, filenames in os.walk(top):
+        # In-place prune so os.walk does not descend into hidden/lock dirs,
+        # junctions / links (a loop read the same workbooks many times) or a
+        # drive's system folders (deleted workbooks came back) - review,
+        # 2026-10-19.
         dirnames[:] = [d for d in dirnames
-                       if not d.startswith(".") and not d.startswith("~$")]
+                       if not d.startswith(".") and not d.startswith("~$")
+                       and d.lower() not in _SYSTEM_DIRS
+                       and not _is_link_dir(os.path.join(dirpath, d))]
+        rel = os.path.relpath(dirpath, top)
+        here = root if rel == os.curdir else root / rel     # the folder as it was given
         for name in filenames:
             if name.startswith("~$"):
                 continue
             if Path(name).suffix.lower() in WORKBOOK_SUFFIXES:
-                out.append(Path(dirpath) / name)
+                out.append(here / name)
     return sorted(out)
 
 
@@ -593,10 +1090,20 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     path = Path(path)
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
+        n = path_too_long(path)
+        if n:
+            # from an ExcelOpenError of kind 'path', so the batch's roll-up
+            # says 'path too long', not 'other error' (review, 2026-10-20)
+            msg = (f"{path.name}: path too long: {n} characters — enable Windows "
+                   "long paths or move the folder")
+            raise LedgerError(msg) from excel_open.ExcelOpenError(msg, kind="path")
         raise LedgerError(f"{path.name} not found")
     if kind == "password":
-        raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
-                          "copy without the password, and add that copy")
+        # from an ExcelOpenError of kind 'password', so the batch's roll-up
+        # says 'password-protected', not 'other' (review, 2026-10-19)
+        msg = (f"{path.name} has a password to open; open it in Excel, save a "
+               "copy without the password, and add that copy")
+        raise LedgerError(msg) from excel_open.ExcelOpenError(msg, kind="password")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
         return _grids_from_excel(path, notes, want_pictures, careful)
     try:
@@ -607,14 +1114,12 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     grids, images = [], []
     for ws in wb.worksheets:
         cells = {}
-        for row in ws.iter_rows():
-            for c in row:
-                v = c.value
-                if v is None or (isinstance(v, str) and not v.strip()):
-                    continue
-                if isinstance(v, str) and v.strip().upper() in _EXCEL_ERRORS:
-                    continue
-                cells[(c.row, c.column)] = v
+        for (r, c), v in _existing_cells(ws):
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            if isinstance(v, str) and v.strip().upper() in _EXCEL_ERRORS:
+                continue
+            cells[(r, c)] = v
         # a merged label reads the same from every cell it covers
         for rng in ws.merged_cells.ranges:
             top = cells.get((rng.min_row, rng.min_col))
@@ -699,23 +1204,56 @@ class _Extractor:
                  mask_re: "Optional[re.Pattern]" = None):
         self.g, self.m, self.codes = grid, m, codes
         self.part = part_hint
+        #: (row, col, part, how) of each part's label when the sheet has
+        #: more than one part (find_part, part_at)
+        self.part_labels: List[Tuple[int, int, str, str]] = []
+        self._unsure_labels: set = set()                 # (row, col): _later_part
+        self._signers: Optional[set] = None              # _sheet_signers
         self.mask_re = mask_re
         self.used = set()
         self.out: List[Obs] = []
         self.unmatched: List[Obs] = []
         self.markers: List[Tuple[int, int, str]] = []   # (row, col, who)
+        #: called every so often inside the long passes (extract: Cancel,
+        #: the stall watchdog's beat, progress); may raise _Cancelled
+        self.tick: Optional[Callable[[], None]] = None
+        # The cells of each row, made once. Every 'what is on row r' used
+        # to scan the whole sheet - context() 25 times per call - so one
+        # 2,000-row sheet took 4.6 minutes, 87% of it here (review,
+        # 2026-10-19).
+        self.rows: Dict[int, List[Tuple[int, object]]] = defaultdict(list)
+        for (r, c), v in sorted(grid.cells.items()):
+            self.rows[r].append((c, v))
+        self._ctx: Dict[Tuple[int, int], List[str]] = {}
+        self._ticks = 0
+
+    def _tick(self) -> None:
+        self._ticks += 1
+        if self.tick is not None and self._ticks % 200 == 0:
+            self.tick()
+
+    def row(self, r: int) -> List[Tuple[int, object]]:
+        """(column, value) of row r's cells, left to right."""
+        return self.rows.get(r, [])
 
     # context = sheet name + heading-like rows above
     def context(self, r: int) -> List[str]:
+        key = (r, len(self.markers))
+        got = self._ctx.get(key)
+        if got is not None:
+            return list(got)
         ctx = [self.g.sheet]
         people = {mr for mr, _mc, _ in self.markers}   # "Inspector: JB  Date: ..." rows
         for rr in range(max(1, r - 25), r):
             if rr in people:
                 continue                                  # say who, not what
-            row = [(c, v) for (r2, c), v in self.g.cells.items() if r2 == rr]
-            if len(row) == 1 and isinstance(row[0][1], str):
+            row = self.row(rr)
+            if len(row) == 1 and _words(row[0][1]):
+                # a heading, not a note or a padded cell: its words were
+                # read again for every label under it (review, 2026-10-20)
                 ctx.append(row[0][1])
-        return ctx
+        self._ctx[key] = ctx
+        return list(ctx)
 
     def emit(self, part, item, label, r, c, value, match: Match, field_name=None,
              vr=None, vc=None, who=None):
@@ -726,11 +1264,48 @@ class _Extractor:
         fname = field_name or (match.target.fields[0] if match.target else "")
         note = ""
         val_unit = ""
-        if isinstance(value, str) and match.target and match.target.unit:
+        # a number with its unit or its signer is short: these patterns are
+        # not tried on a long cell (a padded one froze the app before)
+        short = isinstance(value, str) and len(txt) <= 40
+        signed = _SIGNED.match(txt.strip()) if short else None
+        unsure = False
+        if signed and _signed_by(signed.group("who")):
+            # '31 (JB)': the reading is 31 and JB signed it - not the text
+            # '31 (JB)', pre-accepted and put down to the sheet's 'Inspector:
+            # MK' (review, 2026-10-19)
+            txt, who = signed.group("v").strip(), _signed_by(signed.group("who"))
+        elif short and match.target and self.m.schema.takes_inspectors(fname):
+            # '47/JB', '48 - JB', '49 JB' were the text, pre-accepted as the
+            # heading's MK's (review, 2026-10-20). Only a reading someone
+            # signs ('2041-AB' is a lot), only initials (_signed_by: no unit,
+            # code or stand-in), and only someone signing on this sheet
+            # (_sheet_signers): after a '/' or a dash too, '45-HRC', '47/RLI',
+            # '48-LOW' were signed by HRC, RLI, LOW, pre-accepted (review,
+            # 2026-10-20). Else kept as typed, never pre-accepted - and so
+            # are '51/jb', '52JB'.
+            bare = _SIGNED_BARE.match(txt.strip())
+            by = _signed_by(bare.group("who")) if bare else ""
+            if by and by in self._sheet_signers():
+                txt, who = bare.group("v"), by
+            elif by:
+                unsure = True
+            else:
+                loose = _SIGNED_LOOSE.match(txt.strip())
+                unsure = bool(loose and _signed_by(
+                    (loose.group("who") or loose.group("glued")).upper()))
+        if short and match.target and match.target.unit:
             nu = _NUM_UNIT.match(txt)
+            pu = _NUM_PAREN_UNIT.match(txt.strip())
             if nu and nu.group("u").lower() in UNITS:     # a unit we know, not "2x"
                 txt, val_unit = nu.group("n"), nu.group("u")
-        if match.target and match.target.unit:
+            elif pu and pu.group("u").lower() in UNITS:   # '0.3 (kW)': converted below
+                txt, val_unit = pu.group("n"), pu.group("u")
+            elif pu and pu.group("u").lower().lstrip("%") in _UNIT_WORDS:
+                # '12 (IPM)' in mm/s: kept as typed, and said so - never the
+                # bare 12, pre-accepted as 12 mm/s (review, 2026-10-19)
+                note = (f"unit {pu.group('u')!r} vs template {match.target.unit!r}: "
+                        "not converted")
+        if match.target and match.target.unit and not note:
             src_unit = val_unit or split_unit(label)[1]
             if src_unit and src_unit.lower() != match.target.unit.lower():
                 f = _unit_factor(src_unit, match.target.unit)
@@ -740,6 +1315,8 @@ class _Extractor:
                     note = f"converted {src_unit} -> {match.target.unit}"
                 else:
                     note = f"unit {src_unit!r} vs template {match.target.unit!r}: not converted"
+        if unsure:
+            note = _join(note, UNSURE_SIGNER_NOTE)
         score = match.score * (IMAGE_PENALTY if self.g.from_image else 1.0)
         o = Obs(part=part or "", item=item or "", field=fname if match.target else "",
                 value=txt, score=round(score, 2),
@@ -750,6 +1327,21 @@ class _Extractor:
             o.inspector = who or self.inspector_for(vr or r, vc or c)
         (self.out if match.target else self.unmatched).append(o)
         return o
+
+    def _sheet_signers(self) -> set:
+        """Initials of who signs on this sheet: its inspector headings and
+        labels, and the readings signed in brackets ('41 [JB]'). Not a
+        '47/RLI' itself: that would vouch for itself. Made once, when a
+        reading first needs it."""
+        if self._signers is None:
+            got = {w for _r, _c, w in self.markers}
+            for v in self.g.cells.values():
+                s = v.strip() if isinstance(v, str) and len(v) <= 40 else ""
+                m = _SIGNED.match(s) if s else None
+                if m:
+                    got.add(_signed_by(m.group("who")))
+            self._signers = got - {""}
+        return self._signers
 
     # who logged what: markers found before the values are read
     def find_inspectors(self) -> None:
@@ -764,50 +1356,124 @@ class _Extractor:
         for (r, c), v in sorted(self.g.cells.items()):
             if not isinstance(v, str) or isinstance(v, _Merged) or (r, c) in self.used:
                 continue
-            def person(text) -> str:
-                """Initials or a name - never a word of the template ('Date')."""
+            self._tick()
+
+            def person(text, acronym=False) -> str:
+                """Initials or a name - never a word of the template ('Date').
+                acronym: where it can only be someone, 'EC' and 'PN' are
+                initials too, not 'eddy current' (_acronym_initials)."""
                 w = _initials(text)
-                return w if w and not set(tokens(w)) & known else ""
+                if w and set(tokens(w)) & known and not (acronym and _acronym_initials(text)):
+                    return ""
+                return w
             m = _WHO_INLINE.match(v) or _WHO_BY.match(v)
-            who = person(m.group("who")) if m else ""
+            who = person(m.group("who"), acronym=True) if m else ""
             if not who and _WHO_HEAD.match(v):
                 for dc in (1, 2):
                     x = self.g.cells.get((r, c + dc))
                     if x is not None:
-                        who = person(x) if isinstance(x, str) else ""
+                        # 'EC' beside 'Inspector Initials' is Eva Chen only
+                        # where that pair is all its row holds: in a header
+                        # row ('Inspector | PN | Flaw | EC Pre') the next
+                        # column's title was the inspector and the table was
+                        # lost (review, 2026-10-20)
+                        who = person(x, acronym=self._lone_pair(r, c, c + dc)) \
+                            if isinstance(x, str) else ""
                         if who:
                             self.used.add((r, c + dc))
                         break
             if not who:
-                h = _WHO_HEADING.match(v)
-                if h and person(h.group("who")) and not self.codes.canon(v) \
-                        and self._heads_a_table(r, c):
-                    who = h.group("who")
+                h = self._heading_who(v, person, self.g.cells.get((r, c + 1)))
+                if h and self._heads_a_table(r, c, person):
+                    who = h
             if who:
                 self.markers.append((r, c, who))
                 self.used.add((r, c))
                 # "Inspector: JB   Date: 2026-09-12": when THEY inspected, not
                 # the part's build Date
-                for (r2, c2), x in self.g.cells.items():
-                    if r2 == r and c2 != c and isinstance(x, str) \
+                for c2, x in self.row(r):
+                    if c2 != c and isinstance(x, str) \
                             and re.match(r"(?i)^\s*date\b", x):
-                        self.used.add((r2, c2))
+                        self.used.add((r, c2))
                         if not _split_inline(x)[1]:
-                            self.used.add((r2, c2 + 1))
+                            self.used.add((r, c2 + 1))
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
-            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
+            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE") \
+                    and h.group(1).lower() not in NOT_INITIALS:
                 self.markers.append((0, 0, h.group(1)))
 
-    def _heads_a_table(self, r, c) -> bool:
-        """A heading, not a value: no numbers on its row, and right under it a
-        header row of 2+ labels that starts at its column. (Initials typed in
-        an 'Inspector Initials' column sit on a row of readings - not this.)"""
-        if any(r2 == r and not isinstance(v, str) for (r2, _c), v in self.g.cells.items()):
+    def _lone_pair(self, r, c, cx) -> bool:
+        """A label at (r, c) and its value at (r, cx) are all row r holds
+        (a date and its label aside), and under the value is no reading
+        ('Inspector Initials | EC' over a table titled 'Flaw | EC Post'): a
+        label and its value, not two titles of a header row."""
+        for c2, x in self.row(r):
+            if c2 in (c, cx) or isinstance(x, date):
+                continue
+            s = x.strip() if isinstance(x, str) and len(x) <= 60 else ""
+            if not (s and (re.match(r"(?i)^date\b", s) or _DATE_TEXT.fullmatch(s))):
+                return False
+        under = self.g.cells.get((r + 1, cx))
+        if under is None or isinstance(under, (date, _Merged)):
+            return True
+        s = _text(under).strip()
+        return not (isinstance(under, (int, float)) or _num(s) is not None
+                    or self.codes.canon(s) or self._looks_like_id(s)
+                    or _CODE_CELL.fullmatch(s) or is_placeholder(s))
+
+    def _heading_who(self, v, person, beside=None) -> str:
+        """The initials a table heading is ('JB', 'JB — 2026-09-18'), or ''.
+        Never a result code ('NRI', 'IND', 'OK') nor a flaw code. beside:
+        the cell right of it (its date, typed as one)."""
+        if not isinstance(v, str) or len(v) > 60:
+            # a heading of initials and a date is short; a long padded
+            # cell made this pattern backtrack for 54 s with the GIL held
+            # (review, 2026-10-19)
+            return ""
+        h = _WHO_HEADING.match(v.strip())
+        # 'EC — 2026-09-22' is Eva Chen's heading: with its date, initials
+        # spelling out a template's words are still someone's. Her readings
+        # went to the heading before (review, 2026-10-20). A bare 'EC' over
+        # a table is the method's title, and so are 'EC-1', 'EC: 2', 'EC
+        # (1)', 'PN-1': a run's number is no date - they made EC and PN the
+        # inspectors, pre-accepted (review, 2026-10-20).
+        dated = bool(h) and (bool(_DATE_TEXT.search(v.strip()[h.end("who"):]))
+                             or isinstance(beside, date))
+        if not h or h.group("who").lower() in NOT_INITIALS \
+                or not person(h.group("who"), acronym=dated) or self.codes.canon(v):
+            return ""
+        return h.group("who")
+
+    def _heads_a_table(self, r, c, person) -> bool:
+        """A heading, not a value: right under it a header row of 2+ labels
+        that starts at its column, and nothing on its row that makes it one
+        of a row of results: no number (initials typed in an 'Inspector
+        Initials' column sit on a row of readings), no other short code
+        ('FPI | NRI | IND', 'NG | NG | NG' over the next flaw table) unless
+        that is another inspector's heading over a table of its own, side by
+        side, and no row label just before it over the table ('Result |
+        RLI'). Its date in any form, 'Day 1' or a title may share its row:
+        only a typed '2026-09-18' could before (review, 2026-10-19)."""
+        below = sorted(cc for cc, v in self.row(r + 1)
+                       if isinstance(v, str) and c - 1 <= cc <= c + 8)
+        if len(below) < 2 or below[0] > c + 1:
             return False
-        below = sorted(cc for (r2, cc), v in self.g.cells.items()
-                       if r2 == r + 1 and isinstance(v, str) and c - 1 <= cc <= c + 8)
-        return len(below) >= 2 and below[0] <= c + 1
+        under = {cc for cc, _v in self.row(r + 1)}
+        for c2, v in self.row(r):
+            if c2 == c or isinstance(v, date):            # a datetime too
+                continue
+            if not isinstance(v, str):
+                return False
+            s = v.strip() if len(v) <= 60 else ""
+            if _CODE_CELL.fullmatch(s) or s.lower() in NOT_INITIALS:
+                # a gap in the header row between the two: two tables
+                apart = any(cc not in under for cc in range(min(c, c2) + 1, max(c, c2)))
+                if not (apart and self._heading_who(v, person)):
+                    return False
+            elif below[0] <= c2 < c:
+                return False
+        return True
 
     def inspector_for(self, r, c) -> str:
         """The nearest marker above the value (the lowest row above it), and of
@@ -823,8 +1489,8 @@ class _Extractor:
 
     def _who_columns(self, r, skip) -> Dict[int, bool]:
         """Columns of header row r that hold initials ('Inspector Initials')."""
-        return {c: True for (r2, c), v in self.g.cells.items()
-                if r2 == r and c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
+        return {c: True for c, v in self.row(r)
+                if c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
 
     def run(self) -> None:
         self.find_part()
@@ -834,23 +1500,43 @@ class _Extractor:
 
     # part number on this sheet
     def find_part(self) -> None:
+        """The sheet's part: its first part label with a value. The same
+        label again lower down with another part ('Part Number: LMM3EF305'
+        under the 'Part Number: LMM3EF304' block) starts that part's block:
+        the second coupon's readings were put on the first, pre-accepted
+        (review, 2026-10-20). See _part_blocks."""
+        self.part_labels = []
+        self._unsure_labels = set()
+        key = None
+        lead: List[Tuple[int, int, str]] = []      # 'Part Number: TBD' above the first
         for (r, c), v in sorted(self.g.cells.items()):
             if not isinstance(v, str):
                 continue
-            label, inline = _split_inline(v)
-            if self.m.is_item_header(label):
-                continue                       # "Flaw #" is not "Part #"
-            mt = self.m.match(label, per_item=False)
-            if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
-                val = inline if inline else self._value_near(r, c)
-                if val and self.codes.canon(val):
-                    continue                   # a flaw code is never a part number
-                if val and not self.m.match(val).target:
-                    if not self._is_table_header(r, c):
-                        self.part = _text(val)
-                        self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
-                            f", read from image {self.g.from_image}" if self.g.from_image else "")
-                        return
+            self._tick()                       # Cancel is seen here too (review, 2026-10-20)
+            if key is not None and not self._same_id_label(v, key):
+                continue
+            got = self._part_label(r, c, v)
+            if got is None:
+                continue
+            if key is None:
+                if not got:
+                    # 'Part Number: TBD' over the upper block: its readings
+                    # were put on the lower block's part, pre-accepted
+                    # (review, 2026-10-20)
+                    lead.append((r, c, got))
+                    continue
+                self.part = got
+                self.part_how = f"{self.m.schema.id_field} on {self.g.sheet}" + (
+                    f", read from image {self.g.from_image}" if self.g.from_image else "")
+                label = _split_inline(v)[0]
+                key = (normalize_label(label), _id_label_key(label))
+                self.part_labels = lead
+            elif not self._later_part(r, c, v, got):
+                continue
+            self.part_labels.append((r, c, got))
+        if key is not None:
+            self._part_blocks()
+            return
         sid = _part_from_name(self.g.sheet, self.mask_re)
         if sid:
             self.part = sid
@@ -858,13 +1544,224 @@ class _Extractor:
             return
         self.part_how = ""
 
+    def _part_label(self, r, c, v) -> Optional[str]:
+        """The part a part label at (r, c) names, '' for one naming no part
+        yet ('Part Number: TBD'), None when the cell is no part label."""
+        label, inline = _split_inline(v)
+        if self.m.is_item_header(label) or (len(label) <= 30 and _RUN_HEAD.match(label)):
+            return None                        # "Flaw #", "Run #" are not "Part #"
+        if len(label) <= 12 and _SN_LABEL.fullmatch(label):
+            # 'S/N: LMM1AB101' names the part; an S/N column of 3.2, 4.2
+            # (signal-to-noise) does not: only a part-like value typed
+            # beside the label (review, 2026-10-19)
+            val = inline or next((x for x in (self.g.cells.get((r, c + dc))
+                                              for dc in (1, 2, 3))
+                                  if x is not None and not isinstance(x, _Merged)), None)
+            if self._looks_like_id(val):
+                self.used.add((r, c))
+                return _text(val)
+            return None
+        mt = self.m.match(label, per_item=False)
+        if self._sure_id(label, mt):
+            val = inline if inline else self._value_near(r, c)
+            if val and self.codes.canon(val):
+                return None                    # a flaw code is never a part number
+            if is_placeholder(val):
+                # 'Part Number: TBD' names no part: the sheet name, the
+                # workbook, the file name or the model may (review,
+                # 2026-10-19: 'TBD' was the part, pre-accepted)
+                return ""
+            if not inline and isinstance(val, str) and _split_inline(val)[1] \
+                    and self.m.is_label(_split_inline(val)[0]):
+                # 'Lot Number: AB-2041' below is a label with its own
+                # value, not this one's; 'AB-12:01', 'LMM1AB101 Rev: B'
+                # are part numbers with a colon in them (review,
+                # 2026-10-19: any colon lost the part)
+                return None
+            if val and not self.m.is_label(val):
+                if mt.via != "alias" and self.m.names_other(label) \
+                        and not self._looks_like_id(val):
+                    return None                # 'Part No. Rev: B' is the revision
+                if not self._is_table_header(r, c):
+                    return _text(val)
+        return None
+
+    def _same_id_label(self, v, key) -> bool:
+        """v is the sheet's first part label typed again, told cheaply - a
+        match() for every cell of a 5,000-row sheet would be the freeze
+        again: the same text, or a short label of the same words ('Part
+        No.:', 'P/N:' under 'Part Number:' - its readings stayed on the
+        first part, review 2026-10-20). 'Serial No.' under 'Part Number' is
+        another of the part's labels, not another part."""
+        label = _split_inline(v)[0] if len(v) <= 200 else ""
+        if not label or len(label) > 60:
+            return False
+        if normalize_label(label) == key[0]:
+            return True
+        return len(label) <= 30 and bool(_ID_LABEL_SHAPE.fullmatch(label)) \
+            and _id_label_key(label) == key[1]
+
+    def _later_part(self, r, c, v, got) -> bool:
+        """A part label after the sheet's first starts a block only when its
+        value is shaped like a part ('LMM3EF305', your part-name pattern) or
+        names none yet, and it is no column's title: 'Part Number | Status |
+        Notes' over a table of parts made 'Status' the part of every reading
+        below it, pre-accepted, and lost the workbook its one part (review,
+        2026-10-20). A table's own Part Number column says each row's part.
+        One on a row of other titles or labels is kept, never sure."""
+        if got and not self._looks_like_id(got):
+            return False
+        if _split_inline(v)[1]:
+            return True                        # 'Part Number: LMM3EF305' in one cell
+        if self._looks_like_id(self.g.cells.get((r + 1, c))):
+            return False                       # a column of part numbers under it
+        if any(isinstance(x, str) and x.strip() and _text(x).strip() != got
+               for c2, x in self.row(r) if c2 != c):
+            self._unsure_labels.add((r, c))
+        return True
+
+    def _part_blocks(self) -> None:
+        """More than one part on the sheet: each part label's block is the
+        rows from it down to the next one's (part_at). Only when every later
+        label is below the one before, with readings between them, are the
+        blocks sure; two labels on one row, two typed one under the other
+        with nothing between ('Part Number: X', 'Part Number: Y' over one
+        table) or one naming no part yet ('TBD') over readings, above or
+        below, leave every value of the sheet to check, never pre-accepted
+        (SHEET_PARTS_HOW). A 'TBD' over an empty block is a spare coupon's,
+        left blank: nothing to check - the whole sheet went amber (review,
+        2026-10-20)."""
+        labels, self.part_labels = self.part_labels, []
+        labels = [x for x in labels if x[2] or self._readings_after(x[0], labels)]
+        if len({p for _r, _c, p in labels}) < 2:
+            return                             # one part, typed once or again
+        blocks = [labels[0]]
+        unclear = not labels[0][2]             # readings under a 'TBD' above the part
+        for r, c, p in labels[1:]:
+            pr, _pc, pp = blocks[-1]
+            if p == pp:
+                continue                       # the same part again
+            if not p or r == pr or not self._readings_between(pr, r) \
+                    or (r, c) in self._unsure_labels:
+                unclear = True
+            blocks.append((r, c, p))
+        from openpyxl.utils import get_column_letter
+        self.part_labels = [
+            (r, c, p, (f"{self.m.schema.id_field} at {self.g.sheet}!{get_column_letter(c)}{r}"
+                       + ("" if p else ", no part yet") if i or not p else self.part_how)
+             + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
+            for i, (r, c, p) in enumerate(blocks)]
+
+    def _readings_after(self, r, labels) -> bool:
+        """Readings in the block of the part label at row r, down to the
+        next label's row: a number, typed or as text ('47/JB'), or a result
+        ('NRI', 'IND'). An empty block's flaw codes and labels are none."""
+        end = min((x[0] for x in labels if x[0] > r), default=max(self.rows, default=r) + 1)
+        for rr in range(r + 1, end):
+            for _c, v in self.row(rr):
+                if isinstance(v, (bool, _Merged)):
+                    continue
+                if isinstance(v, (int, float)):
+                    return True
+                s = v.strip() if isinstance(v, str) and len(v) <= 20 else ""
+                if s and (re.match(r"[+-]?\.?\d", s) and not self.codes.canon(s)
+                          or s.lower() in _RESULT_WORDS):
+                    return True
+        return False
+
+    def _readings_between(self, r1, r2) -> bool:
+        """A number or a flaw code on a row between r1 and r2: the block of
+        the part label at r1 has readings of its own."""
+        for rr in range(r1 + 1, r2):
+            for _c, v in self.row(rr):
+                if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                        or self.codes.canon(v):
+                    return True
+        return False
+
+    def part_at(self, r, c) -> Tuple[str, str]:
+        """(part, how) of a value at (r, c): the part label's at or above
+        its row - of two on that row the one at or left of its column. how
+        is '' on a sheet of one part (its part_how says)."""
+        if not self.part_labels:
+            return self.part, ""
+        above = [x for x in self.part_labels if x[0] <= r]
+        if not above:
+            # above the first part label: the sheet's part, as before - but
+            # never sure when the sheet's parts are not
+            first = self.part_labels[0]
+            return self.part, (first[3] if SHEET_PARTS_HOW in first[3] else "")
+        top = max(x[0] for x in above)
+        row = [x for x in above if x[0] == top]
+        left = [x for x in row if x[1] <= c]
+        pick = max(left, key=lambda x: x[1]) if left else min(row, key=lambda x: x[1])
+        return pick[2], pick[3]
+
+    def _sure_id(self, label, mt: Match) -> bool:
+        """A label that IS the part number's: an alias, a sure match, or one
+        sharing a word with it ('Part No.', 'P/N') or saying serial or sample
+        ('Serial No.', 'Sample Number'). A 'Parameter | Value' table matched
+        'Part Number' at 0.6 and made every part 'Value'; 'Partner' did too;
+        and 'Run #', 'Lot Number',
+        'Heat Number' share only the word 'number' (review, 2026-10-19). One
+        naming another kind of identifier ('Part Revision') is not it either
+        (Matcher.other_id), nor a heading or the part's name ('Part
+        Information', 'Part Name': _NOT_ID_WORDS), unless you mapped it.
+
+        `mt` is the label's match without context: a heading's word above a
+        table ('Part Number: LMM1AB101') lifted 'P.O. Number' to 0.9, a sure
+        match, and every row's part was 1, 2 ... (review, 2026-10-19)."""
+        if not (mt.target and mt.target.is_id and mt.score >= SUGGEST_AT):
+            return False
+        if mt.via == "alias":
+            return True
+        if self.m.other_id(label):
+            return False                   # 'Part Revision', 'Lot Number'
+        words = set(tokens(label))
+        if (words - self.m._id_tok) & _NOT_ID_WORDS:
+            return False                   # 'Part Information', 'Part Name'
+        return mt.score >= ACCEPT_AT or bool(words & _PART_OWN_WORDS) or bool(
+            (words & set(self.m._tok[mt.target.name])) - _GENERIC_ID_WORDS)
+
+    def _is_id_label(self, label) -> bool:
+        """_sure_id for a table's or a form's label, matched without the
+        headings above it."""
+        return self._sure_id(label, self.m.match(label, per_item=False))
+
+    def _id_column(self, r, c, label) -> bool:
+        """Column c under header row r is the part number's: its label is
+        the part number's (_is_id_label) - and when the label names another
+        identifier as well ('Part No./Rev'), the column holds part numbers,
+        not 'A', 'B'."""
+        mt = self.m.match(label, per_item=False)
+        if not self._sure_id(label, mt):
+            return False
+        if mt.via == "alias" or not self.m.names_other(label):
+            return True
+        vals = [v for v in (self.g.cells.get((rr, c)) for rr in range(r + 1, r + 4))
+                if v is not None and not is_placeholder(v)]
+        return not vals or any(self._looks_like_id(v) for v in vals)
+
+    def _looks_like_id(self, val) -> bool:
+        """A part's serial number, not a signal-to-noise reading: the user's
+        part shape, letters with digits ('LMM1AB101', 'SN-0042') or a whole
+        number of 3+ digits - never '3.2', '12', '12 dB' or a flaw code."""
+        s = _text(val).strip() if val is not None else ""
+        if not s or len(s) > 40 or self.codes.canon(s) or is_placeholder(s):
+            return False
+        if self.mask_re is not None and self.mask_re.search(s):
+            return True
+        if _NUM_UNIT.match(s):
+            return False                                   # '12 dB'
+        return bool(re.search(r"[A-Za-z]", s) and re.search(r"\d", s)
+                    or re.fullmatch(r"\d{3,}", s))
+
     def _is_table_header(self, r, c) -> bool:
-        hits = sum(1 for (r2, c2), v in self.g.cells.items()
-                   if r2 == r and c2 != c and isinstance(v, str)
-                   and (self.m.match(v).score >= SUGGEST_AT or self.m.is_item_header(v)))
-        return hits >= 1 and self.g.cells.get((r, c + 1)) is not None \
-            and isinstance(self.g.cells.get((r, c + 1)), str) \
-            and self.m.match(self.g.cells[(r, c + 1)]).target is not None
+        hits = sum(1 for c2, v in self.row(r)
+                   if c2 != c and isinstance(v, str)
+                   and (self.m.match(v).score >= SUGGEST_AT or self.m.is_item_header(v)
+                        or self.m.other_id_label(v)))
+        return hits >= 1 and self.m.is_label(self.g.cells.get((r, c + 1)))
 
     def _value_near(self, r, c):
         for dc in (1, 2, 3):
@@ -887,35 +1784,125 @@ class _Extractor:
             hits.sort()
             first = hits[0][0]
             label_col = next((cc for cc in range(first - 1, 0, -1)
-                              if any(self.g.text(rr, cc) for rr in range(r + 1, r + 12))), None)
+                              if self._labels_below(r, cc)), None)
             if label_col is None:
                 continue
             for c, _ in hits:
                 self.used.add((r, c))
-            self.used.add((r, label_col))            # the grid's own "Flaw #" cell
             who_cols = self._who_columns(r, {c for c, _ in hits} | {label_col})
             ctx = self.context(r)
-            rr = r + 1
-            blanks = 0
-            while blanks < 2 and rr < r + 60:
-                label = self.g.text(rr, label_col)
-                if label is None:
-                    blanks += 1
-                    rr += 1
-                    continue
-                if sum(1 for c, _ in hits if self.codes.canon(self.g.cells.get((rr, c)))) >= 3:
-                    break                          # the next grid's header
-                blanks = 0
-                self.used.add((rr, label_col))
-                mt = self.m.match(label, ctx, per_item=True)
-                who = next((w for w in (_initials(self.g.cells.get((rr, wc)))
-                                        for wc in who_cols) if w), None)
-                for c, it in hits:
-                    if (rr, c) in self.g.cells:
-                        self.emit(self.part, it, label, rr, label_col,
-                                  self.g.cells[(rr, c)], mt, vr=rr, vc=c, who=who)
-                        self.used.add((rr, c))
+            # Tables side by side on the header row (a Pre-Conceal grid in
+            # B:E, a Post-Conceal grid in H:K): each reads its own label
+            # column. The right one's readings were filed under the left
+            # one's field, and their per-inspector copies pre-accepted
+            # (review, 2026-10-20).
+            blocks, cols = self._grid_blocks(r, hits)
+            cols[0] = label_col
+            # who columns between two tables are the right one's from the
+            # empty spacer column between them on: 'Inspector Initials'
+            # typed left of a table's labels was the left table's, and the
+            # right one's readings had no inspector (review, 2026-10-20)
+            starts = [0] + [self._block_start(r, left[-1][0], lc or b[0][0])
+                            for left, lc, b in zip(blocks, cols[1:], blocks[1:])] + [1 << 30]
+            for i, block in enumerate(blocks):
+                lc = cols[i]
+                guess = lc is None
+                if guess:
+                    # its own header but no label column of its own: the
+                    # one beside it is a guess, never pre-accepted
+                    lc = next(x for x in reversed(cols[:i]) if x is not None)
+                self._grid(r, block, lc, ctx, [wc for wc in who_cols
+                                               if starts[i] <= wc < starts[i + 1]], guess)
+
+    def _labels_below(self, r, cc) -> bool:
+        return any(self.g.text(rr, cc) for rr in range(r + 1, r + 12))
+
+    def _grid_blocks(self, r, hits) -> Tuple[List[List[Tuple[int, str]]], List[Optional[int]]]:
+        """A header row's item codes split into the tables side by side, and
+        each later table's own label column (None: it has none). A column
+        between two codes starts another table when it is titled like a
+        grid's own ('Flaw #') or its first row of readings is a template
+        field's label ('EC Post-Conceal'). An 'Inspector Initials' column, a
+        summary ('Avg'), a note ('ok') or an empty spacer column between
+        two groups of codes is the same table: each split one, the right
+        group's readings lost to Labels to map, or its inspectors, or
+        amber (review, 2026-10-20)."""
+        first = next((rr for rr in range(r + 1, r + 12)
+                      if any((rr, c) in self.g.cells for c, _ in hits)), r + 1)
+        blocks: List[List[Tuple[int, str]]] = [[hits[0]]]
+        own: List[Optional[int]] = [None]
+        for (c0, _), (c1, it) in zip(hits, hits[1:]):
+            gap = range(c1 - 1, c0, -1)
+            heads = [cc for cc in gap if self.m.is_item_header(self.g.text(r, cc) or "")]
+            lab = next((cc for cc in heads if self.g.text(first, cc)), None) \
+                or next((cc for cc in gap if self._grid_label_col(r, first, cc)), None)
+            if heads or lab is not None:
+                blocks.append([])
+                own.append(lab)
+            blocks[-1].append((c1, it))
+        return blocks, own
+
+    def _grid_label_col(self, r, first, cc) -> bool:
+        """Column cc's first row of readings is a template field's label, and
+        its title is not 'Inspector Initials' (where 'EC' is Eva Chen)."""
+        head = self.g.text(r, cc)
+        t = self.g.text(first, cc)
+        if not t or len(t) > 60 or (head and _WHO_HEAD.match(head)):
+            return False
+        mt = self.m.match(t, per_item=True)
+        return mt.target is not None and mt.score >= SUGGEST_AT
+
+    def _block_start(self, r, last, lc) -> int:
+        """The first column of the table whose labels are in column lc,
+        beside one whose last code is in column `last`: right of the empty
+        column between them on header row r, else lc."""
+        for cc in range(lc - 1, last, -1):
+            if (r, cc) not in self.g.cells:
+                return cc + 1
+        return lc
+
+    def _grid(self, r, hits, label_col, ctx, who_cols, guess=False) -> None:
+        """One item grid: codes `hits` on header row r, labels down
+        label_col. guess: the labels are another table's (_grid_blocks)."""
+        self.used.add((r, label_col))                # the grid's own "Flaw #" cell
+        # Each code's own 'Inspector Initials' column: of two in one grid
+        # ('1A 2A 3A | Inspector Initials | 1B 2B 3B | Inspector Initials')
+        # the nearest after it - before it where they come first. The first
+        # one's initials were every group's (review, 2026-10-20).
+        before = any(wc < hits[0][0] for wc in who_cols)
+        order = {c: sorted(who_cols, key=lambda wc, c=c: ((wc > c) if before else (wc < c),
+                                                          abs(wc - c)))
+                 for c, _ in hits}
+        rr = r + 1
+        blanks = 0
+        while blanks < 2 and rr < r + 60:
+            self._tick()
+            label = self.g.text(rr, label_col)
+            if label is None:
+                blanks += 1
                 rr += 1
+                continue
+            if sum(1 for c, _ in hits if self.codes.canon(self.g.cells.get((rr, c)))) \
+                    >= min(3, len(hits)):
+                break                              # the next grid's header
+            blanks = 0
+            self.used.add((rr, label_col))
+            mt = self.m.match(label, ctx, per_item=True)
+            if guess and mt.target is not None:
+                mt = Match(mt.target, mt.score, mt.guesses, via="ambiguous")
+            for c, it in hits:
+                if (rr, c) in self.g.cells:
+                    who = next((w for w in (_initials(self.g.cells.get((rr, wc)))
+                                            for wc in order[c]) if w), None)
+                    part, how = self.part_at(rr, c)
+                    o = self.emit(part, it, label, rr, label_col,
+                                  self.g.cells[(rr, c)], mt, vr=rr, vc=c, who=who)
+                    if o is not None:
+                        o.part_how = how or o.part_how
+                        if guess:
+                            o.note = _join(o.note, _BESIDE_NOTE)
+                    self.used.add((rr, c))
+            rr += 1
 
     # TABLE: header row + rows
     def tables(self) -> None:
@@ -924,6 +1911,7 @@ class _Extractor:
             if isinstance(v, str) and (r, c) not in self.used:
                 by_row[r].append(c)
         for r in sorted(by_row):
+            self._tick()
             cols = sorted(c for c in by_row[r] if (r, c) not in self.used)
             for run in self._header_runs(r, cols):
                 self._table(r, run)
@@ -940,6 +1928,64 @@ class _Extractor:
                 runs.append([c])
         return runs
 
+    def _sub_heads(self, r, cols) -> Dict[int, str]:
+        """A two-row header: a parent merged over some columns ('Eddy
+        Current Response' over B:C) and a label under each of them ('Pre-
+        Conceal' | 'Post-Conceal'). {column: its label under the parent},
+        or {} when row r+1 is not that. The Post column was filed as Pre-
+        Conceal: both read 'Eddy Current Response' (review, 2026-10-20)."""
+        if len({self.g.text(r, c) for c in cols}) < 2:
+            return {}                          # one title merged over a table
+        spans = set()
+        for c in cols:
+            v, nxt = self.g.cells.get((r, c)), self.g.cells.get((r, c + 1))
+            if isinstance(nxt, _Merged) and c + 1 in cols and str(nxt) == str(v):
+                spans.update((c, c + 1))
+        out: Dict[int, str] = {}
+        for c in cols:
+            x = self.g.cells.get((r + 1, c))
+            if x is None or isinstance(x, _Merged) and c not in spans:
+                continue                       # a header of one row, or merged down
+            if c not in spans or not isinstance(x, str) or isinstance(x, _Merged) \
+                    or len(x) > 60 or _num(x) is not None or self.codes.canon(x) \
+                    or is_placeholder(x) or x.strip().lower() in _RESULT_WORDS:
+                # a row of readings, not of labels: 'KP | NRI | ok' under
+                # 'Inspector | FPI Result' (merged) was a header, and lost
+                # (review, 2026-10-20)
+                return {}
+            out[c] = x.strip()
+        return out if spans and set(out) == spans else {}
+
+    def _parents_above(self, r, cols) -> Dict[int, str]:
+        """Header row r's columns under a parent merged over some of them on
+        the row above, which holds nothing else: 'Eddy Current Response'
+        over B:C, with 'Flaw | Pre-Conceal | Post-Conceal | FPI' all on row
+        r. {column: its parent}, or {}: a title merged over the whole
+        header is not a parent. The table was lost to Labels to map
+        (review, 2026-10-20)."""
+        lo, hi = cols[0], cols[-1]
+        out: Dict[int, str] = {}
+        for c, v in self.row(r - 1):
+            if c < lo or c > hi:
+                continue
+            if isinstance(v, _Merged):
+                if out.get(c - 1) != str(v):
+                    return {}                  # merged in from outside the header
+                out[c] = str(v)
+                continue
+            nxt = self.g.cells.get((r - 1, c + 1))
+            if not isinstance(v, str) or len(v) > 60 or not isinstance(nxt, _Merged) \
+                    or str(nxt) != v or _num(v) is not None or self.codes.canon(v) \
+                    or (r - 1, c) in self.used or _split_inline(v)[1]:
+                # a cell of its own, or a label with its value ('Part
+                # Number: X', 'Inspector: KP' merged over two): no parents
+                return {}
+            out[c] = v
+        if not out or not set(out) < set(cols) \
+                or isinstance(self.g.cells.get((r - 1, max(out) + 1)), _Merged):
+            return {}
+        return {c: " ".join(p.split()) for c, p in out.items()}
+
     def _table(self, r, cols) -> None:
         if len(cols) < 2:
             return
@@ -947,8 +1993,21 @@ class _Extractor:
         heads = {}
         item_col = who_col = run_col = value_col = None
         ids: List[Tuple[float, int]] = []
+        lookalike = False
+        below = next((run for run in self._header_runs(r + 1, sorted(
+            c for c, v in self.row(r + 1) if isinstance(v, str) and (r + 1, c) not in self.used))
+            if cols[0] in run), [])
+        if below and set(cols) <= set(self._parents_above(r + 1, below)):
+            return                                # parents over the header under it
+        sub = self._sub_heads(r, cols)
+        above = {} if sub else self._parents_above(r, cols)
+        top = r + 1 if sub else r                 # the header's last row
         for c in cols:
             v = self.g.text(r, c)
+            if c in sub:
+                v = f"{v} {sub[c]}"               # 'Eddy Current Response Post-Conceal'
+            elif c in above:
+                v = f"{above[c]} {v}"
             if self.m.is_item_header(v):
                 item_col = c
                 continue
@@ -963,8 +2022,15 @@ class _Extractor:
                 continue
             mt = self.m.match(v, ctx)
             if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
-                ids.append((mt.score, c))
-                continue
+                if self._id_column(r, c, v):
+                    ids.append((mt.score, c))
+                    continue
+                # like the Part Number's but not it ('P.O. Number', 'Item No.',
+                # 'Part Name'): an ordinary column, its values offered to map.
+                # It was every row's part, 1, 2 ..., pre-accepted, over the
+                # sheet's own 'Part Number: ...' (review, 2026-10-19).
+                lookalike = True
+                mt = Match(None, mt.score, mt.guesses, via="none")
             heads[c] = (v, mt)
         # the best Part Number column wins; a weaker one is an ordinary column
         id_col = max(ids)[1] if ids else None
@@ -973,19 +2039,19 @@ class _Extractor:
                 heads[c] = (self.g.text(r, c), Match(None, score, via="none"))
         if item_col is None:                     # a column of item codes?
             for c in cols:
-                vals = [self.g.cells.get((rr, c)) for rr in range(r + 1, r + 6)]
+                vals = [self.g.cells.get((rr, c)) for rr in range(top + 1, top + 6)]
                 if sum(1 for v in vals if self.codes.canon(v)) >= 2:
                     item_col = c
                     heads.pop(c, None)
                     break
         per_item = item_col is not None
-        data_rows = self._data_rows(r, cols, item_col)
+        data_rows = self._data_rows(top, cols, item_col)
         if not data_rows:
             return
         stage_col = self._stage_col(heads, data_rows, ctx) \
             if per_item and value_col is not None else None
         matched = [c for c, (_, mt) in heads.items() if mt.target]
-        if len(matched) + (item_col is not None) + (id_col is not None) \
+        if len(matched) + (item_col is not None) + (id_col is not None or lookalike) \
                 + (stage_col is not None) < 2:
             return
         # values under a header must not be more labels
@@ -993,16 +2059,25 @@ class _Extractor:
         if heads and filled == 0 and stage_col is None:
             return
         for c in cols:
-            self.used.add((r, c))
+            self.used.update(((r, c), (top, c)))
+        self.used.update((r - 1, c) for c in above)
         if stage_col is not None:
             self._long_rows(r, data_rows, item_col, id_col, who_col, stage_col,
                             value_col, ctx)
             return
-        final = {c: (label, self.m.match(label, ctx, per_item=per_item))
-                 for c, (label, _) in heads.items()}
+        final = {}
+        for c, (label, _) in heads.items():
+            mt = self.m.match(label, ctx, per_item=per_item)
+            if mt.target is not None and mt.target.is_id:
+                # a column that is not the part's ('Customer P/N' beside
+                # 'Part Number', 'P.O. Number'): never a Part Number value -
+                # Apply put that in the row's Part Number (review, 2026-10-19)
+                mt = Match(None, mt.score, mt.guesses, via="none")
+            final[c] = (label, mt)
         runs_seen: Dict[str, int] = defaultdict(int)
         for d in data_rows:
-            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            self._tick()
+            part, part_how = self._row_part(d, id_col) if id_col else self.part_at(d, cols[0])
             item = self.codes.canon(self.g.cells.get((d, item_col))) if per_item else ""
             if per_item and not item:
                 continue
@@ -1024,12 +2099,22 @@ class _Extractor:
                               field_name=fname, vr=d, vc=c,
                               who=_initials(self.g.cells.get((d, who_col))) or None
                               if who_col else None)
-                if o is not None and id_col:
-                    o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+                if o is not None and part_how:
+                    o.part_how = part_how
                 self.used.add((d, c))
             for c in (id_col, item_col, who_col, run_col):
                 if c:
                     self.used.add((d, c))
+
+    def _row_part(self, d, id_col) -> Tuple[str, str]:
+        """(part, how) of table row d from its Part Number cell. A placeholder
+        ('TBD', 'N/A', '-') is no part, as a blank cell is: 'TBD' was the
+        row's part, pre-accepted (review, 2026-10-19)."""
+        v = self.g.cells.get((d, id_col))
+        how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+        if is_placeholder(v):
+            return "", f"{how}: {_text(v).strip()!r} is not a part number"
+        return _text(v), how
 
     def _data_rows(self, r, cols, item_col) -> List[int]:
         """Rows under a header until an empty one. In a flaw table one blank
@@ -1072,19 +2157,20 @@ class _Extractor:
             stage = self.g.text(d, stage_col)
             if not item or not stage or (d, value_col) not in self.g.cells:
                 continue
-            part = _text(self.g.cells.get((d, id_col))) if id_col else self.part
+            part, part_how = self._row_part(d, id_col) if id_col \
+                else self.part_at(d, item_col)
             label = f"{head} {stage}".strip()
             mt = self.m.match(label, ctx, per_item=True)
             o = self.emit(part, item, label, d, stage_col, self.g.cells[(d, value_col)], mt,
                           vr=d, vc=value_col,
                           who=_initials(self.g.cells.get((d, who_col))) or None
                           if who_col else None)
-            if o is not None and id_col:
-                o.part_how = f"{self.m.schema.id_field} column on {self.g.sheet}"
+            if o is not None and part_how:
+                o.part_how = part_how
             # the rest of the row (date, inspector, part, flaw) says which reading
-            for (rr, c) in list(self.g.cells):
-                if rr == d:
-                    self.used.add((rr, c))
+            for c, _v in self.row(d):
+                self.used.add((d, c))
+            self._tick()
 
     # LABEL / VALUE
     def forms(self) -> None:
@@ -1094,11 +2180,17 @@ class _Extractor:
             label, inline = _split_inline(v)
             if len(label) > 60:
                 continue
+            self._tick()
             ctx = self.context(r)
             mt = self.m.match(label, ctx, per_item=False)
             if mt.target and mt.target.is_id:
-                self.used.add((r, c))
-                continue
+                if self._is_id_label(label):
+                    self.used.add((r, c))      # find_part's: the part, or none
+                    continue
+                # 'P.O. Number', 'Mold Number', 'Part Name' look like the
+                # Part Number's label and are not it: their value went
+                # nowhere, not even to Labels to map (review, 2026-10-19)
+                mt = Match(None, mt.score, mt.guesses, via="none")
             if inline:
                 vr, vc, val = r, c, inline
             else:
@@ -1110,7 +2202,7 @@ class _Extractor:
                     # another label (of any field, per-flaw ones too) is not a value,
                     # nor is a lone block letter or flaw code ("B" beside "Date")
                     if isinstance(x, str) and not _num(x) and (
-                            self.m.match(x).target or self.codes.canon(x)
+                            self.m.is_label(x) or self.codes.canon(x)
                             or re.fullmatch(r"[A-Za-z]", x.strip())):
                         break
                     vr, vc, val = r, c + dc, x
@@ -1123,16 +2215,44 @@ class _Extractor:
             self.used.add((r, c))
             if vr is not None:
                 self.used.add((vr, vc))
-            self.emit(self.part, "", label, r, c, val, mt, field_name=fname, vr=vr, vc=vc)
+            part, how = self.part_at(r, c)
+            o = self.emit(part, "", label, r, c, val, mt, field_name=fname, vr=vr, vc=vc)
+            if o is not None and how:
+                o.part_how = how
 
 
 def _split_inline(v: str) -> Tuple[str, str]:
     """'Operator: AK' -> ('Operator', 'AK'); OCR's 'PartNumber:2041' too.
-    Times like 10:30 stay whole: the label must have a letter in it."""
-    m = re.match(r"^\s*([^:=]{1,60}?)\s*[:=]\s*(.+)$", v)
-    if m and re.search(r"[A-Za-z]", m.group(1)) and not m.group(2).startswith(("/", "\\")):
-        return m.group(1), m.group(2).strip()
+    Times like 10:30 stay whole: the label must have a letter in it.
+
+    Read without a pattern over the whole cell: '^\\s*([^:=]{1,60}?)\\s*[:=]
+    \\s*(.+)$' backtracked quadratically over a run of spaces - a cell of
+    4,000 spaces and 'NOTE' held the GIL for 2 s, one of 20,000 for 63 s,
+    the app froze and Cancel could not be pressed (review, 2026-10-20). The
+    same reading: the label is what comes before the first ':' or '=' (60
+    characters at most, stripped), the value what follows it, on one line
+    (a trailing line break aside), kept as typed."""
+    i = min((j for j in (v.find(":"), v.find("=")) if j >= 0), default=-1)
+    label = v[:i].strip() if i >= 0 else ""
+    if 0 < len(label) <= 60 and re.search(r"[A-Za-z]", label):
+        rest = v[i + 1:]
+        if rest.endswith("\n"):
+            rest = rest[:-1]                  # '$' matches before a last line break
+        value = rest.lstrip()
+        if value and "\n" not in value and not value.startswith(("/", "\\")):
+            return label, value.strip()
+        if not value and rest and rest[-1] != "\n":
+            return label, ""                  # 'Operator: ' - a label, no value
     return v.strip(), ""
+
+
+def _id_label_key(label: str) -> Tuple[str, ...]:
+    """What a part label says, however spelt: 'Part Number', 'Part No.',
+    'P/N', 'PART #' are ('part', 'number'); 'S/N', 'SN #' are the serial."""
+    s = label.strip()
+    if len(s) <= 12 and _SN_LABEL.fullmatch(s):
+        return ("s/n",)
+    return tuple(tokens(s)) or (normalize_label(s),)
 
 
 def _part_from_name(name: str, mask_re: "Optional[re.Pattern]" = None) -> str:
@@ -1600,13 +2720,32 @@ class Extraction:
     #: True when the extract exited early because the Ledger tab's
     #: Cancel event fired. Surfaced via ``ExtractSummary.cancelled``.
     cancelled: bool = False
+    #: The sources read to the end - what the review holds. Apply reads
+    #: these again, not every source: after a Cancel it read all 62 and
+    #: wrote values from workbooks the review never showed (review,
+    #: 2026-10-20). One Excel could not open is not in it either. None:
+    #: not kept (a run not made by extract) - every source.
+    read: Optional[List[str]] = None
+    #: The part Council's model found for a workbook, by its name in the
+    #: review: ``{name: (part, where)}``. Apply reads without the model, so
+    #: a label mapped in such a workbook had no part and was dropped
+    #: (review, 2026-10-20); it is given these parts again.
+    model_parts: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+
+
+class _Cancelled(Exception):
+    """Cancel was pressed while a workbook was being read."""
 
 
 def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             image_dir=None, image_reader: Optional[ImageReader] = None,
             part: str = "", use_images: bool = True, progress=None,
             pattern_mask: Optional[str] = None,
-            cancel: Optional[Any] = None) -> Extraction:
+            cancel: Optional[Any] = None,
+            log: Optional[Callable[[str], None]] = None,
+            part_finder: Optional[Callable[[str, List["Grid"]], Tuple[str, str]]] = None,
+            labels: Optional[Dict[str, str]] = None
+            ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
 
@@ -1615,10 +2754,26 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     names before the keyword / lone-number heuristics.
 
     ``cancel`` is an optional ``threading.Event``: when its ``is_set()``
-    returns True, the loop exits before the next workbook with
-    ``Extraction.cancelled = True``. The Ledger tab's Cancel button sets
-    it and also calls ``excel_open.kill_active_excels()`` to unblock a
-    Workbooks.Open sitting on a modal Excel dialog."""
+    returns True, the run stops - between workbooks, and inside one every
+    few hundred cells and before each picture - with
+    ``Extraction.cancelled = True``; what the interrupted workbook gave is
+    dropped, the workbooks before it are kept. The Ledger tab's Cancel
+    button sets it and also calls ``excel_open.kill_active_excels()`` to
+    unblock a Workbooks.Open sitting on a modal Excel dialog (a read whose
+    Excel is still starting, or that has not started one yet, stops itself:
+    excel_open.cancel_scope).
+
+    ``log``: where the stall watchdog's stack dump goes (the Ledger log);
+    it is also written to <app dir>/logs/ledger_stalls.txt by faulthandler,
+    which works while the app is frozen.
+
+    ``part_finder(name, grids) -> (part, where)``: asked for a workbook whose
+    values found no part number (Council's model - council_core.ledger_llm);
+    what it finds is a suggestion, never pre-accepted.
+
+    ``labels``: each source's name in the review (source_labels), when
+    these sources are some of a run's (Apply reads only those the review
+    holds, and names them as the review did)."""
     import time as _time
     from progress_report import NullProgress
     from council_core import stall_watchdog
@@ -1626,128 +2781,298 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
-    run = Extraction([str(s) for s in sources])
+    run = Extraction([str(s) for s in sources], read=[])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
-    # The watchdog logs every live thread's stack when nothing has
-    # moved in >15s. Catches the GIL-hogging stall the user reported
-    # (whole-app unresponsive) — the thread holding the GIL shows up
-    # in the dump even when it is a C-extension call. Progress text
-    # already goes to prog.update; the watchdog adds the stack when
-    # nothing else is said.
+    # The watchdog dumps every thread's stack when nothing has moved for
+    # 15 s: to the Ledger log (not the progress line, whose heartbeat
+    # re-printed the whole dump every 20 s - review, 2026-10-19) and, via
+    # faulthandler, to a file even while a C call holds the GIL.
     prog.stage("reading workbooks", total=len(sources), unit="workbooks")
-    _wd_cm = stall_watchdog.watch("ledger extract", prog.update,
-                                   stall_s=15.0)
+
+    def _stall(text: str) -> None:
+        prog.update("no progress for a while — the stack dump is in the Ledger log")
+        if log is not None:
+            log(text)
+    _wd_cm = stall_watchdog.watch("ledger extract", _stall, stall_s=15.0,
+                                   dump_file=stall_watchdog.default_dump_file(
+                                       "ledger_stalls.txt"))
     _wd = _wd_cm.__enter__()
+    here = {"what": ""}
+
+    def tick() -> None:
+        """Inside a workbook, every few hundred cells: Cancel, the
+        watchdog's beat, and a progress line that moves."""
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        _wd.beat()
+        prog.update(here["what"])
+    import excel_open
+    try:
+        # a Cancel (kill_active_excels) at any time from here stops this
+        # run's Excel reads, also one pressed before a read began
+        with excel_open.cancel_scope():
+            _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                         m, codes, mask_re, part, schema, _time, part_finder, labels)
+    finally:
+        try:
+            _wd_cm.__exit__(None, None, None)
+        except Exception:                                   # noqa: BLE001
+            pass
+    # Cancelled only when a workbook was skipped or cut short (_extract_all
+    # says so): a Cancel pressed after the last one was read made a whole
+    # review 'Cancelled… partial review' (review, 2026-10-19). One that cut
+    # a read short in a way the read swallowed is caught after the read
+    # and after the model's question (_extract_one).
+    return run
+
+
+def source_labels(sources: Sequence) -> Dict[str, str]:
+    """How each source is named in the review: its file name, or - when
+    two picked workbooks share one (a folder per sample, each with its
+    'laser_log.xlsx') - its path from the folder they share. Apply matches
+    the reviewer's choices by that name, so a shared one merged the
+    samples and all but one were lost (review, 2026-10-19)."""
+    paths = [Path(s) for s in sources]
+    by_name: Dict[str, List[Path]] = defaultdict(list)
+    for p in paths:
+        by_name[p.name.lower()].append(p)
+    out: Dict[str, str] = {}
+    for same in by_name.values():
+        if len(same) == 1:
+            out[str(same[0])] = same[0].name
+            continue
+        try:
+            base = Path(os.path.commonpath([str(p.parent) for p in same]))
+            for p in same:
+                out[str(p)] = p.relative_to(base).as_posix()
+        except ValueError:                                   # other drives
+            for p in same:
+                out[str(p)] = p.as_posix()
+    return out
+
+
+def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                 m, codes, mask_re, part, schema, _time, part_finder=None,
+                 labels=None) -> None:
+    labels = labels or source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
             run.cancelled = True
             run.problems.append("Cancelled by user before "
                                 f"{Path(src).name!r}.")
             break
-        _t0 = _time.monotonic()
-        src = Path(src)
-        via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
-            src.exists() and __import__("excel_open").kind_of(src) == "rights")
-        prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
-                    force=via_excel)
-        _wd.beat()
+        kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
+        label = labels.get(str(src)) or labels.get(str(Path(src))) or Path(src).name
         try:
-            grids, images = load_workbook_grids(src, run.problems)
-            _wd.beat()
-        except LedgerError as e:
-            run.problems.append(str(e))
-            # Keep the Excel-open-failure category so the Ledger log can
-            # summarize the batch: "N files failed to open - K rights, ...".
-            cause = e.__cause__
-            kind = (getattr(cause, "kind", "unknown")
-                    if cause is not None and type(cause).__name__ == "ExcelOpenError"
-                    else "other")
-            run.open_failures.append((src.name, kind))
-            _secs = _time.monotonic() - _t0
-            run.timings.append((src.name, _secs))
-            prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
+            _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
+                         reader, m, codes, mask_re, part, schema, _time,
+                         label, part_finder)
+        except _Cancelled:
+            # half a workbook is not offered for review: what it gave goes
+            del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
+            del run.problems[kept[3]:]
+            run.model_parts.pop(label, None)
+            run.cancelled = True
+            run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
+                                "the workbooks before it are in this review.")
+            break
+
+
+def _excel_down_line(problems: List[str], msg: str, name: str) -> None:
+    """Excel could not be started (excel_open: the rest of the extract does
+    not try again): one problem line for the run - `msg`, the same for every
+    workbook - naming each workbook it left unread, not one line per
+    workbook (review, 2026-10-20)."""
+    head = f"{msg} (not read: "
+    for i, p in enumerate(problems):
+        if p.startswith(head) and p.endswith(")"):
+            problems[i] = f"{p[:-1]}, {name})"
+            return
+    problems.append(f"{head}{name})")
+
+
+def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                 m, codes, mask_re, part, schema, _time, label: str = "",
+                 part_finder=None) -> None:
+    _t0 = _time.monotonic()
+    via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
+        src.exists() and __import__("excel_open").kind_of(src) == "rights")
+    prog.update(f"opening {src.name}" + (" through Excel (up to 2 min)" if via_excel else ""),
+                force=via_excel)
+    _wd.beat()
+    try:
+        grids, images = load_workbook_grids(src, run.problems)
+        _wd.beat()
+    except Exception as e:                    # noqa: BLE001
+        if cancel is not None and cancel.is_set():
+            # Cancel killed the Excel reading it: the COM error that
+            # follows used to escape and lose the whole run (review,
+            # 2026-10-19)
+            raise _Cancelled() from e
+        msg = (str(e) if isinstance(e, LedgerError)
+               else f"{src.name}: could not be read ({e!r})")
+        # Keep the Excel-open-failure category so the Ledger log can
+        # summarize the batch: "N files failed to open - K rights, ...".
+        cause = e.__cause__ if isinstance(e, LedgerError) else e
+        kind = (getattr(cause, "kind", "unknown")
+                if cause is not None and type(cause).__name__ == "ExcelOpenError"
+                else "other")
+        if kind == "unavailable" and getattr(cause, "down", ""):
+            _excel_down_line(run.problems, msg, label or src.name)
+        else:
+            run.problems.append(msg)
+        run.open_failures.append((label or src.name, kind))
+        _secs = _time.monotonic() - _t0
+        run.timings.append((label or src.name, _secs))
+        prog.advance(what=f"{src.name}: not read ({_secs:.1f}s)")
+        return
+    if cancel is not None and cancel.is_set():
+        # pressed while Excel read it: what came back may be cut short
+        # (a picture Excel did not copy out is a note, not an error)
+        raise _Cancelled()
+    if label and label != src.name:            # a name another source shares
+        for g in grids:
+            g.file = label
+        for img in images:
+            img.file = label
+    for i, img in enumerate(images):
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        _wd.beat()
+        prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
+        if not img.data:
+            # listed by Excel but not copied out (the clipboard was busy):
+            # counted as not read, never saved or read as an empty file
+            run.images.append(ImageNote(img.file, img.sheet, img.anchor, "", "",
+                                        "not read: Excel could not copy it out (see the "
+                                        "problems)"))
             continue
-        for i, img in enumerate(images):
-            prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
-            if image_dir:
-                d = Path(image_dir)
+        if image_dir:
+            d = Path(image_dir)
+            # every part cleaned: a sheet, anchor or extension may hold
+            # characters Windows refuses in a file name ("?" did)
+            stem = Path(label).with_suffix("").as_posix() if label else src.stem
+            p = d / (f"{_safe(stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
+                     f".{_safe(img.ext) or 'png'}")
+            made = not d.exists()
+            try:
+                # the folder is made here, for a picture being saved: made
+                # up front, a review folder path of 248+ characters failed
+                # the whole Extract with WinError 206, pictures ticked or
+                # not (review, 2026-10-19)
                 d.mkdir(parents=True, exist_ok=True)
-                # every part cleaned: a sheet, anchor or extension may hold
-                # characters Windows refuses in a file name ("?" did)
-                p = d / (f"{_safe(src.stem)}_{_safe(img.sheet)}_{_safe(img.anchor)}_{i + 1}"
-                         f".{_safe(img.ext) or 'png'}")
-                try:
-                    p.write_bytes(img.data)
-                    img.saved_as = str(p)
-                except OSError as e:          # one picture never stops the run
+                p.write_bytes(img.data)
+                img.saved_as = str(p)
+            except OSError as e:          # one picture never stops the run
+                if made:
+                    try:
+                        d.rmdir()         # nothing was saved in it
+                    except OSError:
+                        pass
+                n = _too_long(p, e)
+                if not n:
                     run.problems.append(f"{src.name} › {img.sheet}: a picture could not be "
                                         f"saved ({e.strerror or e}); it is still read")
-            note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
-            if reader is not None:
-                note.reader = getattr(reader, "name", "image reader")
-                try:
-                    rows = reader(img.data)
-                except Exception as e:
-                    rows = None
-                    note.text = f"reader failed: {e}"
-                if rows:
-                    note.text = "\n".join(" | ".join(r) for r in rows)[:2000]
-                    grids.append(rows_to_grid(rows, img))
-                elif not note.text:
-                    note.text = "(no text found)"
-            else:
-                note.reader = "none installed"
-                note.text = "not read: install Tesseract (local OCR) to read images"
-            run.images.append(note)
-
-        prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
-        # pass 1: part numbers per sheet; then a workbook-wide fallback
-        exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
-        for ex in exs:
-            ex.find_part()
-            ex.find_inspectors()
-        found = {ex.part for ex in exs if ex.part}
-        if part:
-            book_part, how = part, "given on the command line"
-        elif len(found) == 1:
-            book_part, how = found.pop(), "the one part number in the workbook"
-        elif not found:
-            book_part = _part_from_filename(src.stem, mask_re)
-            how = f"file name {src.name!r} — check it" if book_part else ""
+                elif not any(x.startswith(_PICTURES_TOO_LONG) for x in run.problems):
+                    run.problems.append(f"{_PICTURES_TOO_LONG} ({n} characters) — enable "
+                                        "Windows long paths or move the folder")
+        note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
+        if reader is not None:
+            note.reader = getattr(reader, "name", "image reader")
+            try:
+                rows = reader(img.data)
+            except Exception as e:
+                rows = None
+                note.text = f"reader failed: {e}"
+            if rows:
+                note.text = "\n".join(" | ".join(r) for r in rows)[:2000]
+                grids.append(rows_to_grid(rows, img))
+            elif not note.text:
+                note.text = "(no text found)"
         else:
-            book_part, how = "", ""
-        for ex in exs:
-            if part:
-                ex.part, ex.part_how = part, how
-            elif not ex.part:
-                ex.part, ex.part_how = book_part, how
-            ex.item_grids()
-            ex.tables()
-            ex.forms()
-            for o in ex.out + ex.unmatched:
-                o.part_how = o.part_how or ex.part_how
-            n = len(ex.out)
-            run.obs.extend(ex.out)
-            run.unmatched.extend(ex.unmatched)
-            if ex.g.from_image:
-                for note in run.images:
-                    if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
-                                           note.anchor):
-                        note.values += n
-        _secs = _time.monotonic() - _t0
-        run.timings.append((src.name, _secs))
-        prog.advance(what=f"{src.name} read in {_secs:.1f}s")
+            note.reader = "none installed"
+            note.text = "not read: install Tesseract (local OCR) to read images"
+        run.images.append(note)
+
+    prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
+    # pass 1: part numbers per sheet; then a workbook-wide fallback
+    exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
+    for ex in exs:
+        ex.tick = tick
+        here["what"] = f"{src.name}: reading sheet {ex.g.sheet!r}"
+        ex.find_part()
+        ex.find_inspectors()
+    # a sheet's other parts too: a sheet holding two is no workbook of one
+    found = {ex.part for ex in exs if ex.part} | {
+        p for ex in exs for _r, _c, p, _h in ex.part_labels if p}
+    if part:
+        book_part, how = part, "given on the command line"
+    elif len(found) == 1:
+        book_part, how = found.pop(), "the one part number in the workbook"
+    elif not found:
+        book_part = _part_from_filename(src.stem, mask_re)
+        how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
+    else:
+        book_part, how = "", ""
+    for ex in exs:
+        if part:
+            ex.part, ex.part_how = part, how
+            ex.part_labels = []                # the Part you typed: every value's
+        elif not ex.part:
+            ex.part, ex.part_how = book_part, how
+        here["what"] = f"{src.name}: finding values on sheet {ex.g.sheet!r}"
+        prog.update(here["what"])
+        ex.item_grids()
+        ex.tables()
+        ex.forms()
+    # Council's model is asked only for values that really have no part:
+    # asked before the values were read - whenever a sheet had no part of
+    # its own - a sheet whose rows each name their part in a Part Number
+    # column got a question, and the answer ('101') a false problem line
+    # (review, 2026-10-20). A row whose Part Number cell says 'TBD' has
+    # its own 'how' and is not given the model's part.
+    partless = [o for ex in exs for o in ex.out + ex.unmatched
+                if not o.part and not o.part_how] \
+        if part_finder is not None and not part and not book_part else []
+    if partless:
+        here["what"] = f"{src.name}: asking Council's model which part it is"
+        prog.update(here["what"], force=True)
+        found_part, where = part_finder(label or src.name, grids)
         _wd.beat()
-        orphans = sum(1 for ex in exs for o in ex.out if not o.part)
-        if orphans:
-            run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
-                                "— fill the Part column in the review, or re-run with --part")
-    try:
-        _wd_cm.__exit__(None, None, None)
-    except Exception:                                       # noqa: BLE001
-        pass
-    return run
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()                # the model's answer was cut short
+        if found_part:
+            how = f"{MODEL_PART_HOW} from {where} — check it"
+            run.model_parts[label or src.name] = (found_part, where)
+            for o in partless:
+                o.part, o.part_how = found_part, how
+            for ex in exs:
+                if not ex.part:
+                    ex.part, ex.part_how = found_part, how
+    for ex in exs:
+        for o in ex.out + ex.unmatched:
+            o.part_how = o.part_how or ex.part_how
+            if o.part != part:                       # not the Part you typed
+                o.part_how = _fit_mask(o.part, o.part_how, mask_re)
+        n = len(ex.out)
+        run.obs.extend(ex.out)
+        run.unmatched.extend(ex.unmatched)
+        if ex.g.from_image:
+            for note in run.images:
+                if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
+                                       note.anchor):
+                    note.values += n
+    _secs = _time.monotonic() - _t0
+    run.timings.append((label or src.name, _secs))
+    if run.read is not None:
+        run.read.append(str(src))                    # in the review: Apply reads it
+    prog.advance(what=f"{src.name} read in {_secs:.1f}s")
+    _wd.beat()
+    orphans = sum(1 for ex in exs for o in ex.out if not o.part)
+    if orphans:
+        run.problems.append(f"{src.name}: {orphans} values have no {schema.id_field} "
+                            "— fill the Part column in the review, or re-run with --part")
 
 
 def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> str:
@@ -1758,7 +3083,14 @@ def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> st
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
-    nums = re.findall(r"(?<![\d.])\d{2,8}(?![\d.])", stem)
+    if mask_re is not None:
+        return ""          # the user said what a part looks like; this is not one
+    # a number on its own ('101 inspection', 'line3_2048'), never one inside a
+    # longer word: 'week41' made part 41 and 'LMM1AB101' part 101, pre-accepted
+    # (review, 2026-10-19). Two numbers: no guess.
+    if len(re.findall(r"\d{2,8}", stem)) != 1:
+        return ""
+    nums = re.findall(r"(?<![A-Za-z\d.])\d{2,8}(?![A-Za-z\d.])", stem)
     return nums[0] if len(nums) == 1 else ""
 
 
@@ -1782,14 +3114,19 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     in that person's own column, "<field> [JB]", where it is the only value
     and can be pre-accepted; and as a candidate for the template's single
     cell, where readings that disagree clash - the reviewer accepts one."""
-    groups: Dict[Tuple[str, str, str], List[Obs]] = defaultdict(list)
+    groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
     for o in run.obs:
-        groups[(o.part, o.item, o.field)].append(o)
+        # A value with no part is its own workbook's: two part-less workbooks
+        # with the same Frequency were one review row ('also at ...'), the
+        # reviewer typed one part in it, and the other sample lost the value
+        # at Apply (review, 2026-10-19).
+        book = "" if o.part else o.where.split(" › ", 1)[0]
+        groups[(o.part, o.item, o.field, book)].append(o)
         if o.inspector:
             own = replace(o, field=inspector_column(o.field, o.inspector))
-            groups[(o.part, o.item, own.field)].append(own)
+            groups[(o.part, o.item, own.field, book)].append(own)
     out = []
-    for (part, item, fname), obs in groups.items():
+    for (part, item, fname, _book), obs in groups.items():
         obs.sort(key=lambda o: -o.score)
         values = Counter(o.value for o in obs)
         clash = len(values) > 1
@@ -1803,16 +3140,48 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                 continue
             firsts[o.value] = o = replace(o)
         for v, o in firsts.items():        # agreeing inspectors share one row
-            if len(who[v]) > 1:
+            if who[v]:                     # one signer of an unsigned top row too
                 o.inspector = "/".join(sorted(who[v]))
         obs = list(firsts.values())
+        # labelled once per group, and only the first OTHERS_SHOWN listed:
+        # thousands of readings under one key (no part number found) made
+        # this quadratic and overflowed Excel's 32,767-character cell
+        # (review, 2026-10-19)
+        labelled = sorted(((f"{v} ({'/'.join(who[v])})" if who[v] else v), v)
+                          for v in values) if clash else []
         for o in obs:
-            others = sorted(f"{v} ({'/'.join(who[v])})" if who[v] else v
-                            for v in values if v != o.value)
+            text = ""
+            if clash:
+                others = []
+                for t, v in labelled:
+                    if v != o.value:
+                        others.append(t)
+                        if len(others) >= OTHERS_SHOWN:
+                            break
+                more = len(values) - 1 - len(others)
+                text = ", ".join(others) + (f", and {more} more" if more > 0 else "")
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
-                  and "not converted" not in o.note)
-            out.append(Decision(o, ok, ", ".join(others) if clash else ""))
+                  and "not converted" not in o.note
+                  # nor a reading ending in initials no one signs with here
+                  # ('49 JB'), nor one of a table with no labels of its own
+                  and UNSURE_SIGNER_NOTE not in o.note and _BESIDE_NOTE not in o.note
+                  and not o.part_how.startswith(MODEL_PART_HOW)
+                  # a part read from the file name says '— check it': it is
+                  # (digits of 'EC_log_week41' were pre-accepted as part 41)
+                  and not o.part_how.startswith(FILE_PART_HOW)
+                  # nor one that is not the shape of your part-name pattern
+                  and MISFIT_PART_HOW not in o.part_how
+                  # nor one of a sheet whose parts' blocks are not clear
+                  and SHEET_PARTS_HOW not in o.part_how)
+            if needs_item(schema, o.field, o.item):
+                # a per-flaw value with no flaw: Apply would put it on every
+                # flaw row (review, 2026-10-20)
+                ok = False
+                o.note = _join(o.note, f"kept per {schema.item_field}, and no "
+                                       f"{schema.item_field} was found for it: type the "
+                                       f"{schema.item_field} in Item before accepting it")
+            out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
     out.sort(key=lambda d: (sample_sort_key(d.obs.part), item_rank.get(d.obs.item, -1),
@@ -1820,15 +3189,72 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     return out
 
 
+#: How a part Council's model suggested is described (never pre-accepted).
+MODEL_PART_HOW = "suggested by Council's model"
+#: How a part read from the workbook's file name is described (never
+#: pre-accepted either).
+FILE_PART_HOW = "file name"
+#: Added to how a part was found when you gave a part-name pattern and the
+#: part does not fit it: kept, never pre-accepted (review, 2026-10-19).
+MISFIT_PART_HOW = "does not fit the part-name pattern"
+#: Added to how a part was found on a sheet holding more than one part
+#: whose blocks are not clear (two part labels on one row, or one under
+#: the other with no readings between): kept, never pre-accepted (review,
+#: 2026-10-20).
+SHEET_PARTS_HOW = "more than one part number on this sheet"
+
+
+def _fit_mask(part: str, how: str, mask_re: "Optional[re.Pattern]") -> str:
+    """`how`, saying so when the user's part-name pattern is set and `part`
+    is not of that shape ('AB-2041' for '@@@#@@###')."""
+    if mask_re is None or not part or MISFIT_PART_HOW in how \
+            or mask_re.fullmatch(part.strip()):
+        return how
+    return f"{how} — {MISFIT_PART_HOW}" if how else MISFIT_PART_HOW
+
+
+#: How many other values a clashing review row lists.
+OTHERS_SHOWN = 20
+
+
 def _join(a: str, b: str) -> str:
     return f"{a}; {b}" if a else b
 
 
-def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dict[str, str]]:
+def needs_item(schema: TemplateSchema, fname: str, item: str) -> bool:
+    """Is ``fname`` a field the template keeps per item (per flaw) while
+    the value has no item? rows_from puts a value with no item on EVERY
+    item row of its part: a per-flaw value placed by Council's model, or
+    under a label mapped on 'Labels to map', went to all nine flaw rows
+    (review, 2026-10-20). Such a value is never pre-accepted nor written;
+    the reviewer types its item first.
+
+    One inspector's own column of such a field ('<field> [JB]', decide's
+    copy of a signed reading) is held the same: it was pre-accepted and
+    written to all nine flaw rows while its field's own row was held
+    (second review, 2026-10-20)."""
+    if item or not fname or not schema.item_field or len(schema.items) < 2:
+        return False
+    base = schema.inspector_base(str(fname)) or fname
+    f = next((x for x in schema.fields if x.name == base), None)
+    return f is not None and f.per_item
+
+
+def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
+              sources: bool = False) -> List[Dict[str, str]]:
     """Accepted values -> parent-CSV rows. A part-level value lands on every
-    item row of its part, as the parent CSV keeps it."""
+    item row of its part, as the parent CSV keeps it.
+
+    ``sources``: each row also names the workbooks its values came from, as
+    the review names them (source_file): Apply wrote every workbook of the
+    run on every row (review, 2026-10-20). A part-level value's workbook is
+    on each row of its part; a row with no value of its own names the
+    part's workbooks."""
     part_vals: Dict[str, Dict[str, str]] = defaultdict(dict)
     item_vals: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
+    # (part, item) -> the workbooks its values came from; (part, None): all
+    # of the part's
+    books: Dict[Tuple[str, Optional[str]], List[str]] = defaultdict(list)
     for d in decisions:
         if not d.accept or not d.obs.part or not d.obs.field:
             continue
@@ -1838,17 +3264,48 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dic
         initials = f.field + INITIALS_SUFFIX
         if f.inspector and f.item and schema.takes_inspectors(f.field):
             target.setdefault(initials, f.inspector)    # whose value went in
+        book = f.where.split(" › ", 1)[0]
+        for key in ((f.part, f.item), (f.part, None)):
+            if book and book not in books[key]:
+                books[key].append(book)
+
+    def named(p, it) -> Dict[str, str]:
+        if not sources:
+            return {}
+        mine = list(dict.fromkeys(books.get((p, it), []) + books.get((p, ""), [])))
+        return {SOURCE_COL: _book_list(mine or books.get((p, None), []))}
     rows = []
     parts = sorted(set(part_vals) | {p for p, _ in item_vals}, key=sample_sort_key)
     for p in parts:
         if not schema.item_field:
-            rows.append({schema.id_field: p, **part_vals[p]})
+            rows.append({schema.id_field: p, **part_vals[p], **named(p, "")})
             continue
         for it in schema.items:
             row = {schema.id_field: p, schema.item_field: it, **part_vals[p]}
             row.update(item_vals.get((p, it), {}))
+            row.update(named(p, it))
             rows.append(row)
     return rows
+
+
+#: How long a row's list of workbooks (source_file) may grow.
+ROW_SOURCES_MAX = 2000
+
+
+def _book_list(books: Sequence[str], limit: int = ROW_SOURCES_MAX) -> str:
+    """Workbook names joined for one row's source_file - whole names only.
+    Cut at 200 characters, three long NDE workbook names lost the last
+    one's end, and the knowledge graph no longer found that workbook's
+    cells (kg_excel.read_ledger; review, 2026-10-20). Past `limit` the
+    rest are counted ('and 3 more')."""
+    out: List[str] = []
+    size = 0
+    for i, b in enumerate(books):
+        if out and size + 2 + len(b) > limit:
+            return ", ".join(out) + f", and {len(books) - i} more"
+        out.append(b)
+        size += len(b) + (2 if len(out) > 1 else 0)
+    return ", ".join(out)
 
 
 # ── the review workbook ─────────────────────────────────────────────────
@@ -1856,11 +3313,46 @@ VAL_HEAD = ["Accept", "Part", "Item", "Field", "Value", "Confidence", "Matched b
             "Source label", "Source", "Other values offered", "Note", "Part from",
             "Inspector"]
 LAB_HEAD = ["Map to field", "Ignore", "Source label", "Example value", "Count",
-            "Best guess", "Source", "Part", "Item"]
+            "Best guess", "Source", "Part", "Item", "Note"]
+PEOPLE_HEAD = ["Initials", "Full name", "Values signed", "First seen at"]
+
+
+def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]:
+    """Every inspector's initials the run found ('JB', and both of 'JB/MK'),
+    with how many values they signed and where first. Written names are
+    left out: they need no answer.
+
+    Each reading is counted once, at its signer's cell. A signed reading is
+    offered twice (decide: the template's cell and '<field> [MK]'), and
+    both rows were counted - 'Inspector: MK' over 3 readings said 6; and a
+    row agreeing inspectors share ('JB/MK') is at JB's cell, which was
+    MK's 'First seen at' (review, 2026-10-20). So a person's own-column
+    rows are counted; a template-cell row only for a reading that has none."""
+    decisions = list(decisions)
+
+    def own(d) -> Optional[str]:            # '<field> [MK]' signed by MK: its base
+        m = INSPECTOR_COL.match(d.obs.field or "")
+        return m.group("field") if m and d.obs.inspector \
+            and m.group("who") == d.obs.inspector else None
+
+    def signers(d) -> List[str]:
+        keys = [_initials(w) for w in re.split(r"[/,;&+]", d.obs.inspector or "")]
+        return [k for k in dict.fromkeys(keys) if re.fullmatch(r"[A-Z]{2,4}", k)]
+    covered = {(k, d.obs.part, d.obs.item, base) for d in decisions
+               for base in [own(d)] if base for k in signers(d)}
+    out: Dict[str, Tuple[int, str]] = {}
+    for d in decisions:
+        base = own(d)
+        for key in signers(d):
+            if base is None and (key, d.obs.part, d.obs.item, d.obs.field) in covered:
+                continue                    # counted on its own-column row
+            n, first = out.get(key, (0, d.obs.where))
+            out[key] = (n + 1, first)
+    return out
 
 
 def write_review(path, run: Extraction, decisions: List[Decision], schema: TemplateSchema,
-                 csv_path: str) -> None:
+                 csv_path: str, pattern_mask: str = "", part: str = "") -> None:
     import openpyxl
     from openpyxl.styles import Font, PatternFill
     from openpyxl.worksheet.datavalidation import DataValidation
@@ -1869,6 +3361,13 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     amber = PatternFill("solid", fgColor="FFF2CC")
     red = PatternFill("solid", fgColor="F8CBAD")
 
+    def put(sheet, row) -> None:
+        # no control character: one cell read through Excel holding CHAR(1)
+        # raised IllegalCharacterError here and no review was written
+        # (review, 2026-10-20)
+        sheet.append([xl_text(v) for v in row])
+
+    read = None if run.read is None else {str(Path(s)) for s in run.read}
     info = wb.active
     info.title = "Read me"
     lines = [
@@ -1876,39 +3375,51 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         "",
         "1. Values: check each row. Accept = Y goes into the parent CSV; blank or N "
         "does not. Rows already Y were clear matches. Amber rows need a decision; red "
-        "rows are clashes between sources — accept one value only.",
+        "rows are clashes between sources — accept one value only: two different "
+        "values accepted for one cell are both left out at Apply, which says so.",
         "2. Labels to map: labels that matched no field. Pick a field in 'Map to field' "
-        "(it is remembered for every future file), or put Y in Ignore.",
-        "3. Save this workbook, then run:   python source_extract.py apply \"<this file>\"",
+        "(it is remembered for every future file), or put Y in Ignore. Mapped values go "
+        "into the row's Part: type over it if it is wrong. An amber Part was only "
+        "suggested by Council's model: they go into it once you accept a value of that "
+        "workbook on Values with that part.",
+        "3. People: type the full name for each inspector's initials (amber rows). It is "
+        "remembered, and the knowledge graph links their inspections to that person.",
+        "4. Save this workbook, then press Apply in the Ledger tab (or run:   "
+        "python source_extract.py apply \"<this file>\").",
         "",
         f"Parent CSV: {csv_path}",
         f"Made: {datetime.now().isoformat(timespec='seconds')}",
         "Sources:",
-    ] + [f"  {s}" for s in run.sources] + ([""] + ["Problems:"] +
-                                           [f"  {p}" for p in run.problems] if run.problems else [])
+    ] + [f"  {s}" + ("" if read is None or str(Path(s)) in read else
+                      "   (not read: nothing from it is in this review, and Apply leaves it out)")
+         for s in run.sources] + ([""] + ["Problems:"] +
+                                  [f"  {p}" for p in run.problems] if run.problems else [])
     for i, line in enumerate(lines, start=1):
-        info.cell(i, 1, line)
+        info.cell(i, 1, xl_text(line))
     info["A1"].font = Font(bold=True, size=14)
     info.column_dimensions["A"].width = 120
 
     fields_ws = wb.create_sheet("Fields")
     for i, f in enumerate(schema.fields, start=1):
-        fields_ws.cell(i, 1, f.name)
+        fields_ws.cell(i, 1, xl_text(f.name))
     fields_ws.sheet_state = "hidden"
     field_list = f"=Fields!$A$1:$A${len(schema.fields)}"
 
     ws = wb.create_sheet("Values", 1)
     ws.append(VAL_HEAD)
+    # the row number is counted, not asked: ws.max_row / ws[n] measure the
+    # whole sheet each time - 16,000 rows took over a minute (review,
+    # 2026-10-19)
+    row_n = 1
     for d in decisions:
         o = d.obs
-        ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
-                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
-        if d.conflict:
-            for c in ws[ws.max_row]:
-                c.fill = red
-        elif not d.accept:
-            for c in ws[ws.max_row]:
-                c.fill = amber
+        put(ws, ["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
+                 o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
+        row_n += 1
+        fill = red if d.conflict else (amber if not d.accept else None)
+        if fill is not None:
+            for col in range(1, len(VAL_HEAD) + 1):
+                ws.cell(row_n, col).fill = fill
     yn = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
     ws.add_data_validation(yn)
     yn.add(f"A2:A{max(ws.max_row, 2) + 200}")
@@ -1920,19 +3431,28 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     lab = wb.create_sheet("Labels to map", 2)
     lab.append(LAB_HEAD)
     grouped: Dict[Tuple[str, str], List[Obs]] = defaultdict(list)
+    keys: Dict[str, str] = {}          # one label per column of rows: read once
     for o in run.unmatched:
-        grouped[(normalize_label(o.label), o.where.split("!")[0])].append(o)
-    for (_, _), obs in sorted(grouped.items()):
+        k = keys.get(o.label)
+        if k is None:
+            k = keys[o.label] = normalize_label(o.label)
+        grouped[(k, o.where.split("!")[0])].append(o)
+    for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
         o = obs[0]
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
-        lab.append(["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item])
+        # the note says why Council's model's field was not used (review,
+        # 2026-10-20: a per-flaw field for values with no flaw)
+        put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item,
+                  next((x.note for x in obs if x.note), "")])
+        if o.part_how.startswith(MODEL_PART_HOW):
+            lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
     lab.add_data_validation(dv2)
     dv2.add(f"A2:A{max(lab.max_row, 2) + 100}")
     yn2 = DataValidation(type="list", formula1='"Y"', allow_blank=True)
     lab.add_data_validation(yn2)
     yn2.add(f"B2:B{max(lab.max_row, 2) + 100}")
-    _style(lab, bold, [44, 8, 34, 18, 7, 60, 50, 10, 7])
+    _style(lab, bold, [44, 8, 34, 18, 7, 60, 50, 10, 7, 60])
 
     miss = wb.create_sheet("Missing", 3)
     miss.append(["Part", "Field", "Items with no value", "Of"])
@@ -1948,19 +3468,41 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             if f.per_item:
                 gap = [it for it in schema.items if it in f.cells and it not in got]
                 if gap:
-                    miss.append([p, f.name, _span(gap, schema.items), len(f.cells)])
+                    put(miss, [p, f.name, _span(gap, schema.items), len(f.cells)])
             elif not got:
-                miss.append([p, f.name, "", ""])
+                put(miss, [p, f.name, "", ""])
     _style(miss, bold, [10, 60, 40, 6])
 
     im = wb.create_sheet("Images", 4)
     im.append(["File", "Sheet", "Anchor", "Saved as", "Read by", "Values used", "Text read"])
     for n in run.images:
-        im.append([n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
+        put(im, [n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
     _style(im, bold, [28, 16, 8, 60, 26, 10, 80])
 
+    # Who each inspector's initials are. The knowledge graph never guesses
+    # a person from 'JB', and nothing let the user say who JB is, so a
+    # Ledger gave parts but no people and no links (review, 2026-10-19).
+    ppl = wb.create_sheet("People", 3)
+    ppl.append(PEOPLE_HEAD)
+    known = load_people(csv_path)
+    for key, (n, first) in sorted(review_initials(decisions).items()):
+        put(ppl, [key, known.get(key, ""), n, first])
+        if not known.get(key):
+            ppl.cell(ppl.max_row, 2).fill = amber
+    _style(ppl, bold, [10, 32, 7, 50])
+
     meta = wb.create_sheet("_run")
-    meta["A1"] = json.dumps({"csv": str(csv_path), "sources": run.sources})
+    data: Dict[str, Any] = {"csv": str(csv_path), "sources": run.sources,
+                            "pattern_mask": pattern_mask or "", "part": part or ""}
+    if read is not None:
+        # what Apply reads again (Extraction.read), by place in "sources" (a
+        # cell holds 32,767 characters); none given: every source was read
+        idx = [i for i, s in enumerate(run.sources) if str(Path(s)) in read]
+        if len(idx) < len(run.sources):
+            data["read"] = idx
+    if run.model_parts:                   # and the parts the model gave them
+        data["model_parts"] = {k: list(v) for k, v in run.model_parts.items()}
+    meta["A1"] = json.dumps(data)
     meta.sheet_state = "hidden"
     wb.active = 1
     _save_wb(wb, Path(path))
@@ -1987,6 +3529,14 @@ def _save_wb(wb, path: Path) -> None:
     except PermissionError as e:
         raise LedgerError(f"could not write {path.name}: it is probably open in Excel. "
                           "Close it and try again.") from e
+    except OSError as e:
+        n = _too_long(path, e)
+        if not n:
+            raise
+        # a raw FileNotFoundError [Errno 2] after every workbook was read
+        # (review, 2026-10-19)
+        raise LedgerError(f"could not write {path.name}: "
+                          + REVIEW_TOO_LONG.format(n=n)) from e
 
 
 # ── aliases (what you taught it) ────────────────────────────────────────
@@ -2078,6 +3628,33 @@ def load_people(csv_path) -> Dict[str, str]:
     return out
 
 
+def save_people(csv_path, people: Dict[str, str]) -> Dict[str, str]:
+    """Add these initials -> full names to the "people" section (a name
+    given now replaces the one before; blank names are skipped). Every other
+    section is kept; a file that does not parse is NOT overwritten - the
+    user's label mappings would go with it. Returns the whole list."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise LedgerError(f"{p.name} could not be read, so the people list was not "
+                              f"saved (fix or remove the file): {e}") from e
+        if not isinstance(data, dict):
+            raise LedgerError(f"{p.name} is not a Ledger aliases file; people not saved")
+    have = data.get("people") if isinstance(data.get("people"), dict) else {}
+    for k, v in people.items():
+        key, name = _initials(k), " ".join(str(v or "").split())
+        if key and name:
+            have[key] = name
+    data["people"] = dict(sorted(have.items()))
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return load_people(csv_path)
+
+
 def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
     """The label mappings and ignores, written atomically. Any other section
     of the file (the "people" list of initials) is kept as it was: it used to
@@ -2107,6 +3684,8 @@ class ApplyResult:
     csv_result: str
     filled: List[str]
     warnings: List[str]
+    #: initials -> full name the reviewer typed on the People sheet
+    people: Dict[str, str] = field(default_factory=dict)
 
 
 def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader] = None,
@@ -2135,6 +3714,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     judge = Matcher(schema)
 
     learned, ignored = {}, []
+    # the Part on each mapped row of 'Labels to map', by (label, workbook ›
+    # sheet) as write_review groups them: one typed there is the reviewer's
+    on_labels: Dict[Tuple[str, str], str] = {}
     lab = wb["Labels to map"]
     for row in lab.iter_rows(min_row=2, values_only=True):
         to, ign, label = row[0], row[1], row[2]
@@ -2142,6 +3724,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             continue
         if to and str(to) in valid:
             learned[normalize_label(label)] = str(to)
+            if len(row) > 7:
+                on_labels[(normalize_label(label), str(row[6] or "").split("!")[0])] = \
+                    _text(row[7])
         elif str(ign or "").strip().upper() == "Y":
             ignored.append(normalize_label(label))
     mapping.update(learned)
@@ -2149,18 +3734,54 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     if learned or ignored:
         save_aliases(csv_path, mapping, ignore)
 
-    # the reviewer's choices, by where each value came from
+    people: Dict[str, str] = {}
+    if "People" in wb.sheetnames:                  # older reviews have none
+        for row in wb["People"].iter_rows(min_row=2, values_only=True):
+            if row and row[0] and len(row) > 1 and str(row[1] or "").strip():
+                people[str(row[0])] = str(row[1])
+    if people:
+        known = load_people(csv_path)
+        people = {k: v for k, v in people.items()
+                  if known.get(_initials(k)) != " ".join(v.split())}
+        if people:
+            save_people(csv_path, people)
+
+    # The reviewer's choices, by where each value came from: a row's own cell
+    # and each cell its note says the same value is 'also at'. Read again,
+    # the value can be found first at one of those (a label learned just
+    # now ranks it higher): it was then 'not seen in the review', and a
+    # value marked N went into the parent CSV (review, 2026-10-20).
     choice: Dict[Tuple[str, str, str], Tuple[bool, str, str, str]] = {}
+    reviewed: List[Tuple[List[str], str, str, Tuple[bool, str, str, str]]] = []
+    shown = set()                       # (cell, item) of every reading on Values
+    # The part Council's model gave a workbook (Extraction.model_parts), and
+    # what the reviewer said of it on Values: another part typed over it, or
+    # it accepted as it is (_place_mapped)
+    found = {str(k): (str(v[0]), str(v[1])) for k, v in (meta.get("model_parts") or {}).items()
+             if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
+    retyped: Dict[str, set] = defaultdict(set)
+    confirmed = set()
     for row in wb["Values"].iter_rows(min_row=2, values_only=True):
         acc, part, item, fname, value, score, via, label, where = row[:9]
         if not where:
             continue
         yes = str(acc or "").strip().upper() == "Y"
-        choice[(str(where), str(fname or ""), _text(item))] = (
-            yes, _text(part), _text(value), str(fname or ""))
+        c = (yes, _text(part), _text(value), str(fname or ""))
+        book = str(where).split(" › ", 1)[0]
+        if book in found and str(row[11] if len(row) > 11 else "").startswith(MODEL_PART_HOW):
+            if c[1] and c[1] != found[book][0]:
+                retyped[book].add(c[1])
+            elif c[1] and yes:
+                confirmed.add(book)
+        cells = [str(where)] + _also_at(row[10] if len(row) > 10 else "")
+        choice[(cells[0], c[3], _text(item))] = c
+        for w in cells[1:]:
+            choice.setdefault((w, c[3], _text(item)), c)
+        shown.update((w, _text(item)) for w in cells)
+        reviewed.append((cells, c[3], _text(item), c))
         # accepting an unsure match teaches it, like a mapping on Labels to map;
         # a one-word label ("Date") is too generic to remember
-        if yes and fname in valid and label and via in ("match", "ambiguous") \
+        if yes and fname in valid and label and via in ("match", "ambiguous", "model") \
                 and not judge.is_generic(str(label)) and (_num(score) or 0) < ACCEPT_AT:
             learned.setdefault(normalize_label(label), str(fname))
     wb.close()
@@ -2168,35 +3789,74 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         mapping.update(learned)
         save_aliases(csv_path, mapping, ignore)
 
-    run = extract(schema, meta["sources"], mapping, ignore, image_reader=image_reader,
-                  use_images=use_images, progress=prog)
+    # read the sources as the extract did: same part-name mask, same Part,
+    # the same names; only those the review holds (Extraction.read), with
+    # the parts Council's model gave them (Extraction.model_parts)
+    sources = list(meta["sources"])
+    read = meta.get("read")
+    if isinstance(read, list):
+        read = [sources[i] for i in read if isinstance(i, int) and 0 <= i < len(sources)]
+    else:
+        read = sources                                  # all read, or an older review
+    run = extract(schema, read, mapping, ignore, image_reader=image_reader,
+                  use_images=use_images, progress=prog,
+                  pattern_mask=meta.get("pattern_mask") or None,
+                  part=meta.get("part") or "",
+                  part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
+                  labels=source_labels(sources))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
-    accepted = 0
+    mapped: List[Decision] = []
+    # a per-flaw value with no flaw is not written: it went to every flaw
+    # row of its part (review, 2026-10-20) - (field, mapped on 'Labels to
+    # map' just now) -> where the values are. A mapped label's field is
+    # the one you picked: its inspector's copy ('<field> [JB]') is the
+    # same value, said once.
+    no_item: Dict[Tuple[str, bool], set] = defaultdict(set)
     for d in decisions:
         o = d.obs
-        c = choice.get((o.where, o.field, o.item))
+        cells = [o.where] + _also_at(o.note)
+        c = next((choice[k] for k in ((w, o.field, o.item) for w in cells) if k in choice),
+                 None)
         if c is not None:
             d.accept, part, value, _ = c
             o.part = part or o.part
             o.value = value if value != "" else o.value
-        elif normalize_label(o.label) in learned:
-            d.accept = bool(o.part) and not d.conflict      # you mapped it just now
+        elif normalize_label(o.label) in learned and \
+                not any((w, o.item) in shown for w in cells):
+            # you mapped it just now: never a reading Values showed you, which
+            # was accepted there or not at all (review, 2026-10-20)
+            d.accept = not d.conflict
+            mapped.append(d)
         else:
             d.accept = False                                # not seen in review
-        accepted += d.accept
+        if d.accept and needs_item(schema, o.field, o.item):
+            d.accept = False
+            just_mapped = c is None
+            f = (schema.inspector_base(o.field) or o.field) if just_mapped else o.field
+            no_item[(f, just_mapped)].add(o.where)
+    held = _place_mapped(mapped, on_labels, retyped, confirmed)
     # rows edited in the review whose source re-read differently (a Field or
     # Part typed in by hand) are taken as typed
-    seen = {(d.obs.where, d.obs.field, d.obs.item) for d in decisions}
-    for (where, fname, item), (acc, part, value, _) in choice.items():
-        if acc and (where, fname, item) not in seen and placeable(fname) and part:
+    seen = {(w, d.obs.field, d.obs.item) for d in decisions
+            for w in [d.obs.where] + _also_at(d.obs.note)}
+    no_part = 0
+    for cells, fname, item, (acc, part, value, _) in reviewed:
+        if acc and not any((w, fname, item) in seen for w in cells) and placeable(fname):
+            if needs_item(schema, fname, item):
+                no_item[(fname, False)].add(cells[0])
+                continue
+            if not part:
+                no_part += 1
+                continue
             decisions.append(Decision(Obs(part, item, fname, value, 1.0, "review",
-                                          "", where), True))
-            accepted += 1
+                                          "", cells[0]), True))
+    accepted, notes = _one_value_per_cell(decisions, schema, no_part)
+    notes = held + notes
 
-    rows = rows_from(decisions, schema)
+    rows = rows_from(decisions, schema, sources=True)       # each row: its workbooks
     prog.stage("writing the parent CSV", total=len(rows), unit="rows")
-    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in meta["sources"])[:200])
+    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in read)[:200])
     prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:
@@ -2211,8 +3871,119 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             warnings += fill_template(schema, ledger.rows_for(p), out)
             filled.append(str(out))
             prog.advance(what=f"{out.name} written")
+    # A value under a label mapped on 'Labels to map' has no Values row in
+    # this review to type its item in: 'type it in the review's Item column
+    # and Apply again' wrote nothing, and said so again (second review,
+    # 2026-10-20). Its mapping is saved; the next Extract gives it one.
+    it = schema.item_field
+    warnings += [(f"{len(at)} value(s) under a label you mapped to {f!r} on 'Labels to map' "
+                  f"not written: the field is kept per {it} and they have no {it}. The mapping "
+                  f"is saved — run Extract again, type the {it} on each value's Values row, "
+                  "then Apply") if mapped else
+                 (f"{len(at)} accepted value(s) of {f!r} not written: the field is kept per "
+                  f"{it} and they have no {it} — type it in the review's Item column and Apply "
+                  "again") for (f, mapped), at in sorted(no_item.items())]
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
-                       warnings + [f"conflict kept: {c}" for c in res.conflicts])
+                       notes + warnings + [f"conflict kept: {c}" for c in res.conflicts],
+                       people=people)
+
+
+def _also_at(note) -> List[str]:
+    """The cells a value's note says the same value was found at too
+    ('also at EC_log.xlsx › Log!D2', decide)."""
+    return [p[8:] for p in str(note or "").split("; ") if p.startswith("also at ")]
+
+
+def _place_mapped(mapped: List[Decision], on_labels: Dict[Tuple[str, str], str],
+                  retyped: Dict[str, set], confirmed: set) -> List[str]:
+    """The part each value of a label mapped on 'Labels to map' goes into;
+    what Apply says of those it leaves out.
+
+    A Part typed over the one its 'Labels to map' row showed is the
+    reviewer's, and is used. A part only Council's model suggested is used
+    once the reviewer confirmed it on Values (a value of that workbook
+    accepted with it); typed over there, the typed part is used. Replayed at
+    Apply, mapped values went under the model's part although the reviewer
+    had typed another on both sheets: a sample that does not exist (review,
+    2026-10-20). Not confirmed, they are left out and said so - the model's
+    part is never pre-accepted."""
+    groups: Dict[Tuple[str, str], List[Decision]] = defaultdict(list)
+    for d in mapped:
+        groups[(normalize_label(d.obs.label), d.obs.where.split("!")[0])].append(d)
+    held: Dict[Tuple[str, str], int] = Counter()          # (workbook, why) -> values
+    for key, ds in groups.items():
+        typed = on_labels.get(key, "")
+        parts = {d.obs.part for d in ds}
+        if typed and typed not in parts:
+            if len(parts - {""}) <= 1:        # the one part the row showed, typed over
+                for d in ds:
+                    d.obs.part, d.obs.part_how = typed, "typed on Labels to map"
+                continue
+            # one row for readings of several parts: which one is meant is not known
+            for d in ds:
+                if d.accept:
+                    d.accept = False
+                    held[(key[1], f"they are of {len(parts)} parts and one Part ({typed}) "
+                                  "was typed for them on 'Labels to map' — Extract again "
+                                  "(the mapping is remembered) and type each part on Values")] += 1
+            continue
+        for d in ds:
+            o = d.obs
+            if not d.accept or not o.part_how.startswith(MODEL_PART_HOW):
+                continue
+            book = o.where.split(" › ", 1)[0]
+            other = retyped.get(book, set())
+            if len(other) == 1 and book not in confirmed:
+                o.part = next(iter(other))          # the part typed on Values for it
+                continue
+            if book in confirmed and not other:
+                continue                            # the model's part, accepted on Values
+            d.accept = False
+            held[(book, f"the parts given for it on Values disagree "
+                        f"({', '.join(sorted(other | {o.part}))}) — type the right one in the "
+                        "Part column on 'Labels to map' and Apply again" if other else
+                        f"its part {o.part} was only suggested by Council's model — accept "
+                        "one of that workbook's values on Values with that part (Extract "
+                        "again if none is there), or type the right part in the Part column "
+                        "on 'Labels to map', and Apply again")] += 1
+    return [f"{n} mapped value{'s' if n > 1 else ''} from {book} {'were' if n > 1 else 'was'} "
+            f"not written: {why}" for (book, why), n in held.items()]
+
+
+def _one_value_per_cell(decisions: List[Decision], schema: TemplateSchema,
+                        no_part: int = 0) -> Tuple[int, List[str]]:
+    """How many values go into the parent CSV, and what Apply says.
+
+    Two different values accepted for one cell (both rows of a red clash)
+    are both left out, and said so: rows_from kept the first, silently
+    (review, 2026-10-20). An accepted value with no part is left out and
+    counted - it was counted as accepted and dropped. The same value
+    accepted twice is one."""
+    by_cell: Dict[Tuple[str, str, str], List[Decision]] = defaultdict(list)
+    for d in decisions:
+        if not d.accept or not d.obs.field:
+            continue
+        if not d.obs.part:
+            d.accept = False
+            no_part += 1
+            continue
+        by_cell[(d.obs.part, d.obs.item, d.obs.field)].append(d)
+    notes: List[str] = []
+    accepted = 0
+    for (part, item, fname), ds in by_cell.items():
+        values = list(dict.fromkeys(d.obs.value for d in ds))
+        if len(values) == 1:
+            accepted += 1
+            continue
+        for d in ds:
+            d.accept = False
+        notes.append(f"{len(values)} values accepted for {part} {item + ' ' if item else ''}"
+                     f"{fname} ({', '.join(values)}) — kept none; choose one")
+    if no_part:
+        notes.append(f"{no_part} accepted or mapped values have no {schema.id_field} and "
+                     "were not written — type it in the Part column on Values (on "
+                     "'Labels to map' for a mapped label) and Apply again")
+    return accepted, notes
 
 
 # ── optional: a local model suggests mappings for leftover labels ──────
@@ -2223,8 +3994,17 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
 US_TEXT_FAMILIES = ("granite", "llama", "phi", "gemma", "olmo", "gpt-oss")
 #: Preference order inside US_TEXT_FAMILIES — Granite first because the
 #: [[us-models-only]] memory flags it as the user's preferred family;
-#: within a family a longer tag beats a shorter one so an 8B beats a 2B.
+#: within a family the larger parameter count wins, so an 8B beats a 2B.
 _FAMILY_RANK = {f: i for i, f in enumerate(US_TEXT_FAMILIES)}
+#: The largest model (billions of parameters) first_us_text_model prefers:
+#: what a 16 GB RTX 4080 runs on the GPU (gpt-oss:20b, phi4:14b). A larger
+#: one is still picked when it is the family's only model.
+_PICK_MAX_B = 20.0
+#: How first_us_text_model ranks a model whose size nothing says (an
+#: Ollama ':latest' tag not listed with details.parameter_size): about what
+#: a family's default tag is (granite3.3, llama3.1: 8B), so it beats a 1-3B
+#: one and a named 8B still beats it.
+_UNKNOWN_B = 7.0
 
 
 def first_us_text_model(
@@ -2242,19 +4022,47 @@ def first_us_text_model(
     with the host set to the Council default.
 
     Preference: within a host, family order in US_TEXT_FAMILIES (Granite
-    first), then longer tag, then name. ACROSS hosts, the first that
-    has a US-origin model wins — localhost first by default (see
-    ``enumerate_ollama_hosts``)."""
+    first), then the larger parameter count in the tag ('8b' over '2b',
+    up to _PICK_MAX_B - a bigger one goes after, it would not fit the GPU),
+    then longer tag, then name. The tag's length alone picked
+    granite3.3:2b over granite3.3:8b - the same length, '2' sorting first
+    (review, 2026-10-20) - and would pick 'granite-embedding:30m', which
+    cannot chat. ACROSS hosts, the first that has a US-origin model wins —
+    localhost first by default (see ``enumerate_ollama_hosts``).
+
+    A tag that names no size ('granite3.3:latest', what ``ollama pull
+    granite3.3`` installs - the 8B) is sized by Ollama's own
+    details.parameter_size when /api/tags lists it; when nothing says, it
+    ranks as _UNKNOWN_B, ahead of the small ones: ranked as 0B it lost to
+    granite3.3:2b, llama3.2:1b and gemma3:1b (second review, 2026-10-20)."""
+    try:
+        from council_core.local_models import maker_and_origin, parse_params_b
+    except Exception:                                       # noqa: BLE001
+        maker_and_origin = parse_params_b = None
+    sizes: Dict[str, float] = {}                            # name -> Ollama's own size
+
+    def _size(n) -> float:
+        got = sizes.get(n)
+        if got is None and parse_params_b is not None:
+            got = parse_params_b(n)
+        return _UNKNOWN_B if got is None else got
+
     def _rank(n):
         lo = n.lower()
+        size = _size(n)
         for i, fam in enumerate(US_TEXT_FAMILIES):
             if lo.startswith(fam):
-                return (i, -len(n), n)
-        return (len(US_TEXT_FAMILIES), 0, n)
+                return (i, size > _PICK_MAX_B, -size, -len(n), n)
+        return (len(US_TEXT_FAMILIES), False, 0.0, 0, n)
+
+    def _us(n):
+        # a family's prefix alone is not its maker: 'llama-pro' is Tencent's
+        return maker_and_origin is None or maker_and_origin(n)[1] == "US"
 
     def _pick(names):
         candidates = [n for n in names
-                      if n and n.lower().startswith(US_TEXT_FAMILIES)]
+                      if n and n.lower().startswith(US_TEXT_FAMILIES)
+                      and "embed" not in n.lower() and _us(n)]
         if not candidates:
             return None
         candidates.sort(key=_rank)
@@ -2274,6 +4082,14 @@ def first_us_text_model(
                 names = [m["name"] for m in (data.get("models") or [])]
             except Exception:
                 continue
+            for m in data.get("models") or []:
+                try:
+                    listed = (m.get("details") or {}).get("parameter_size")
+                    got = parse_params_b(listed) if listed and parse_params_b else None
+                except Exception:                           # noqa: BLE001
+                    got = None                              # an odd entry: sized by its tag
+                if got:
+                    sizes[m["name"]] = got
         tag = _pick(names)
         if tag is not None:
             return (host, tag)
@@ -2323,6 +4139,7 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
                                  host: Optional[str] = None,
                                  timeout: float = 120,
                                  prefer_council: bool = True,
+                                 chat: Optional[Callable] = None,
                                  ) -> Tuple[Dict[str, Optional[str]], str]:
     """Ask a local Ollama TEXT model which template field each label
     means. Returns ``(mapping, model_label)`` where ``mapping`` is
@@ -2356,12 +4173,26 @@ def suggest_mappings_for_labels(labels: Sequence[str], schema: TemplateSchema,
     labels = sorted({x for x in labels})[:150]
     if not labels:
         return {}, ""
-    fields = [f.name for f in schema.fields]
+    # never the part-number field, as in the extract (ledger_llm.place_labels):
+    # the Preview offered 'Part Number' for a label the extract would not
+    # put there (review, 2026-10-19)
+    id_field = getattr(schema, "id_field", None)
+    fields = [f.name for f in schema.fields if not id_field or f.name != id_field]
     prompt = ("Map each spreadsheet label to the one template field it "
               "means, or null if none. Reply with JSON only: "
               "{\"label\": \"field or null\"}.\n\n"
               f"Fields:\n{json.dumps(fields)}\n\n"
               f"Labels:\n{json.dumps(labels)}")
+
+    # ── Path 0: the model the user picked (council_core.ledger_llm.chat_for) ──
+    if chat is not None:
+        from council_core.ledger_llm import map_labels
+        try:
+            return map_labels(labels, fields, chat)
+        except LedgerError:
+            raise
+        except Exception as exc:                            # noqa: BLE001
+            raise LedgerError(f"the model did not answer: {exc}") from exc
 
     # ── Path 1: Council's local_chat (GGUF or role Ollama) ──
     if prefer_council and model is None and host is None:
@@ -2492,7 +4323,7 @@ def main(argv=None) -> int:
             if args.llm is not None:        # "" from the --llm flag means auto-detect
                 suggest_with_llm(run, ledger.schema, args.llm or None)
             dec = decide(run, ledger.schema)
-            write_review(out, run, dec, ledger.schema, args.csv)
+            write_review(out, run, dec, ledger.schema, args.csv, part=args.part or "")
             ok = sum(d.accept for d in dec)
             print(f"{len(files)} files: {len(dec)} values found, {ok} pre-accepted, "
                   f"{len(dec) - ok} to review, {len(run.unmatched)} values under labels "

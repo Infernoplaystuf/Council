@@ -206,6 +206,139 @@ class InstallVisionModelDialog(QDialog):
                       flush=True)
 
 
+class PickModelDialog(QDialog):
+    """Which downloaded model answers the Ledger's questions (user,
+    2026-10-19: asking failed when no Ollama model was loaded and no GGUF
+    was set - ask the user instead, from every model on the computer).
+
+    Lists the GGUF files in Council's model folders and the models this
+    PC's Ollama has (council_core.ledger_llm.available_models, on a worker:
+    Ollama is never asked on the GUI thread). A non-US-origin model is
+    listed but cannot be picked. "Another GGUF file…" picks one anywhere
+    on disk. ``model_id`` is the choice: a GGUF path or 'ollama:<name>'."""
+
+    _listed = Signal(object, str)
+
+    def __init__(self, current: str = "", lister: Optional[Callable] = None,
+                 browse: Optional[Callable[[], str]] = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Which model should Council use?")
+        self.resize(640, 380)
+        self.model_id = ""
+        self._current = current
+        self._browse = browse
+        root = QVBoxLayout(self)
+        intro = QLabel("Pick a model downloaded on this computer. Only labels and short "
+                       "cell text are sent to it, and it runs here (or on your own Pi "
+                       "nodes for an Ollama model when Council's remote nodes are on).")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _i: self._ok())
+        self.list.currentItemChanged.connect(lambda *_a: self._refresh())
+        root.addWidget(self.list, 1)
+        self.message = QLabel("Looking for models…")
+        self.message.setWordWrap(True)
+        root.addWidget(self.message)
+        row = QHBoxLayout()
+        self.browse_btn = QPushButton("Another GGUF file…")
+        self.browse_btn.clicked.connect(self.on_browse)
+        row.addWidget(self.browse_btn)
+        row.addStretch(1)
+        root.addLayout(row)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                        | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self._ok)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+        self._listed.connect(self._fill)
+        self._refresh()
+        lister = lister or self._default_lister
+
+        def work():
+            try:
+                self._listed.emit(lister(), "")
+            except Exception as exc:                        # noqa: BLE001
+                self._listed.emit([], f"could not list the models: {exc}")
+        threading.Thread(target=work, name="ledger-model-list", daemon=True).start()
+
+    @staticmethod
+    def _default_lister():
+        from council_core import ledger_llm
+        return ledger_llm.available_models()
+
+    def _add(self, model_id: str, label: str, usable: bool = True) -> QListWidgetItem:
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, model_id)
+        if not usable:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                          & ~Qt.ItemFlag.ItemIsSelectable)
+        self.list.addItem(item)
+        return item
+
+    def _fill(self, models, err: str) -> None:
+        self.list.clear()
+        first = remembered = None
+        for m in models or []:
+            usable = bool(m.get("usable", True))
+            item = self._add(str(m.get("id") or ""), str(m.get("label") or m.get("id")),
+                             usable)
+            if usable:
+                first = first or item
+                if m.get("id") == self._current:
+                    remembered = item           # last time's choice, when still here
+        if remembered or first:
+            self.list.setCurrentItem(remembered or first)
+        usable = sum(1 for m in models or [] if m.get("usable", True))
+        if err:
+            self.message.setText(err)
+        elif not models:
+            self.message.setText(
+                "No downloaded models found: no GGUF files in Council's model folders and "
+                "no Ollama models (or Ollama is not running). Download one in the Models "
+                "tab, run `ollama pull granite3.3:8b`, or pick a GGUF file below.")
+        else:
+            self.message.setText(f"{usable} model(s) Council can use.")
+        self._refresh()
+
+    def on_browse(self) -> None:
+        path = self._browse() if self._browse else ""
+        if not path:
+            from PySide6.QtWidgets import QFileDialog
+            path, _ = QFileDialog.getOpenFileName(self, "A GGUF model file", "",
+                                                  "GGUF models (*.gguf)")
+        if path:
+            import os
+            item = self._add(path, f"{os.path.basename(path)} — GGUF file you picked")
+            self.list.setCurrentItem(item)
+            self._refresh()
+
+    def _refresh(self) -> None:
+        item = self.list.currentItem()
+        ok = item is not None and bool(item.flags() & Qt.ItemFlag.ItemIsEnabled) \
+            and bool(item.data(Qt.ItemDataRole.UserRole))
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ok)
+
+    def _ok(self) -> None:
+        item = self.list.currentItem()
+        if item is None or not item.data(Qt.ItemDataRole.UserRole) \
+                or not (item.flags() & Qt.ItemFlag.ItemIsEnabled):
+            return
+        self.model_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self.accept()
+
+
+def pick_model(parent=None) -> str:
+    """Ask which model to use (last choice preselected, and remembered);
+    '' when the user cancels."""
+    from council_core import ledger_llm
+    dlg = PickModelDialog(current=ledger_llm.remembered_model(), parent=parent)
+    if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.model_id:
+        return ""
+    ledger_llm.remember_model(dlg.model_id)
+    return dlg.model_id
+
+
 class PreviewWorkbookDialog(QDialog):
     """Show what the Ledger extractor can see in one source workbook —
     per-sheet candidate part ids, inspectors, confident label→field
@@ -223,8 +356,11 @@ class PreviewWorkbookDialog(QDialog):
 
     def __init__(self, path, schema, aliases=None,
                  pattern_mask: Optional[str] = None,
-                 csv_path: Optional[str] = None, parent=None):
+                 csv_path: Optional[str] = None, parent=None,
+                 pick_model: Optional[Callable] = None, ignore=(), part: str = ""):
         super().__init__(parent)
+        #: asks which model to use; tests pass their own
+        self._pick_model = pick_model or globals()["pick_model"]
         self.setWindowTitle(f"Preview: {path}")
         self.resize(760, 560)
         self._schema = schema
@@ -259,11 +395,10 @@ class PreviewWorkbookDialog(QDialog):
         actions = QHBoxLayout()
         self.ask_btn = QPushButton("Ask Council for mappings")
         self.ask_btn.setToolTip(
-            "Send unmatched LABELS (never values) to a local US-origin "
-            "Ollama text model (Granite / Llama / Phi / Gemma / Olmo / "
-            "gpt-oss, auto-detected). The reply suggests a template "
-            "field for each label; nothing is saved on the model's "
-            "say-so.")
+            "Send unmatched LABELS (never values) to a model you pick from the "
+            "ones downloaded on this computer (GGUF files or Ollama models; "
+            "US-origin only). The reply suggests a template field for each "
+            "label; nothing is saved on the model's say-so.")
         self.ask_btn.setEnabled(False)
         self.ask_btn.clicked.connect(self.on_ask_llm)
         actions.addWidget(self.ask_btn)
@@ -283,16 +418,19 @@ class PreviewWorkbookDialog(QDialog):
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
 
-        self._start_worker(path, schema, aliases, pattern_mask)
+        self._start_worker(path, schema, aliases, pattern_mask, ignore, part)
 
-    def _start_worker(self, path, schema, aliases, pattern_mask) -> None:
+    def _start_worker(self, path, schema, aliases, pattern_mask, ignore=(),
+                      part: str = "") -> None:
         def work():
             report = None
             err = ""
             try:
                 from source_extract import preview_workbook
+                # the same ignore list and Part the extract uses
                 report = preview_workbook(path, schema, aliases=aliases,
-                                          pattern_mask=pattern_mask)
+                                          pattern_mask=pattern_mask,
+                                          ignore=ignore, part=part)
             except Exception as exc:                        # noqa: BLE001
                 err = f"preview failed: {exc!r}"
             self._done.emit(report, err)
@@ -331,6 +469,11 @@ class PreviewWorkbookDialog(QDialog):
         labels = self._unmatched_labels()
         if not labels:
             return
+        # which model: the user picks one of the models on the computer (it
+        # failed when Council had no GGUF set and Ollama none loaded)
+        model_id = self._pick_model(self)
+        if not model_id:
+            return
         self.ask_btn.setEnabled(False)
         self.ask_btn.setText("Asking…")
         self.progress.setVisible(True)
@@ -342,8 +485,10 @@ class PreviewWorkbookDialog(QDialog):
             model = ""
             err = ""
             try:
+                from council_core import ledger_llm
                 from source_extract import suggest_mappings_for_labels
-                mapping, model = suggest_mappings_for_labels(labels, schema)
+                mapping, model = suggest_mappings_for_labels(
+                    labels, schema, chat=ledger_llm.chat_for(model_id))
             except Exception as exc:                        # noqa: BLE001
                 err = str(exc)
             self._llm_done.emit(mapping, model, err)
@@ -354,10 +499,12 @@ class PreviewWorkbookDialog(QDialog):
     def _on_llm_done(self, mapping, model: str, err: str) -> None:
         self.progress.setVisible(False)
         self.ask_btn.setText("Ask Council for mappings")
+        # asked again (another model) after an answer too: it stayed
+        # disabled after a good one (review, 2026-10-19)
+        self.ask_btn.setEnabled(True)
         if err:
             self.text.appendPlainText("\n--- Council mapping ---\n"
                                        f"skipped: {err}")
-            self.ask_btn.setEnabled(True)
             return
         self._suggestions = dict(mapping or {})
         self._model_used = model

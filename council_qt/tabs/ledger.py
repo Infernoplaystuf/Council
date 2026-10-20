@@ -70,10 +70,13 @@ class LedgerActions:
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
 
+    #: Set by the tab: where an extract's stall dump goes (its log).
+    stall_log: Optional[Callable[[str], None]] = None
+
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
-                cancel=None):
+                cancel=None, assist=False):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -82,27 +85,55 @@ class LedgerActions:
         return ledger_ingest.run_extract(csv, sources, part=part, use_images=use_images,
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
-                                         cancel=cancel)
+                                         cancel=cancel, log=self.stall_log,
+                                         assist=assist)
 
-    def apply(self, review, fill_dir, use_images, progress):
+    def apply(self, review, fill_dir, use_images, progress,
+              vision_model: Optional[str] = None):
+        # Apply reads the sources again: with the vision model the extract
+        # used, or a picture's values change reader (review, 2026-10-19)
+        reader = self.image_reader
+        if reader is None and use_images and vision_model:
+            from source_extract import ollama_vision_reader
+            reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
-                                       image_reader=self.image_reader, progress=progress)
+                                       image_reader=reader, progress=progress)
 
     def open(self, path) -> None:
         self.opener(path)
 
-    def rebuild_kg(self, progress):
+    def rebuild_kg(self, progress, csv: Optional[str] = None,
+                   connections=None):
         """Rebuild the knowledge graph on the user's vault — same path the
         Connections tab uses. ``progress`` is the Ledger tab's
         ``(line, fraction)`` listener; the KG's own line-by-line stream is
         forwarded to it.
 
+        ``csv`` is the tab's parent CSV. The graph reads only data_in and
+        the folders added in Connections, and a parent CSV is made beside
+        its template — so it never reached the graph (review, 2026-10-19).
+        When the graph does not read it yet, that one file is added
+        (kg.add_ledger: the CSV and its schema/aliases, not its folder) and
+        ``stats['ledger_added']`` says so.
+
         Tests pass a ``rebuild_kg`` override to the LedgerActions
-        constructor to avoid touching the real vault or Ollama."""
+        constructor to avoid touching the real vault or Ollama, or a
+        ``connections`` (ConnectionsActions on a temp vault)."""
         if self._rebuild_kg_override is not None:
             return self._rebuild_kg_override(progress)
-        from council_qt.tabs.connections import ConnectionsActions
-        return ConnectionsActions().rebuild(listener=progress)
+        if connections is None:
+            from council_qt.tabs.connections import ConnectionsActions
+            connections = ConnectionsActions()
+        added = None
+        with connections.open_graph() as kg:
+            if csv and Path(csv).is_file():
+                from council_core import kg_excel
+                if kg_excel.is_ledger_csv(Path(csv)):
+                    added = kg.add_ledger(csv)
+            stats = kg.seed(listener=progress)
+        if added is not None:
+            stats["ledger_added"] = str(csv)
+        return stats
 
 
 class LedgerTab(ViewHelpers, QWidget):
@@ -111,6 +142,14 @@ class LedgerTab(ViewHelpers, QWidget):
         self.window = window
         self.bridge = getattr(window, "bridge", None)
         self.actions = actions or LedgerActions()
+        #: asks which downloaded model Council's questions go to (tests
+        #: replace it)
+        from .ledger_dialogs import pick_model
+        self._pick_model = pick_model
+        try:            # an extract's stall dump lands in this tab's log
+            self.actions.stall_log = lambda text: self._to_ui(self._say, text)
+        except Exception:                                 # noqa: BLE001
+            pass
         self._tokens = theme.tokens("dark")
         self._worker: Optional[threading.Thread] = None
         self._busy_buttons: List[QPushButton] = []
@@ -122,6 +161,9 @@ class LedgerTab(ViewHelpers, QWidget):
         #: True from an apply's completion until the next KG rebuild —
         #: used by _refresh_enabled to highlight the Rebuild button.
         self._kg_dirty = False
+        #: Skip patterns typed while there was no parent CSV to save them
+        #: beside: saved when one is set.
+        self._ignore_unsaved = False
         self._build()
         self._refresh_reader_choices()
         self._refresh_enabled()
@@ -210,6 +252,19 @@ class LedgerTab(ViewHelpers, QWidget):
             "@ matches any letter, # any digit, anything else matches itself.\n"
             "Example: @@@#@@### finds ABC1DE234 in a filename.")
         mask_row.addWidget(self.pattern_mask, 1)
+        # Label matching alone is never enough on real workbooks (user,
+        # 2026-10-19): Council's model is asked about what the rules left.
+        self.ask_model = QCheckBox("Ask Council's model about the rest")
+        self.ask_model.setToolTip(
+            "After the label rules: Council's own model (your GGUF, or a US-origin "
+            "Ollama model on this PC / your Pi nodes) is asked\n"
+            " • which template field each unplaced label means (only labels are sent), and\n"
+            " • which part a workbook is about when no part number was found (its short\n"
+            "   text cells are sent; the pattern above is given as an example).\n"
+            "Nothing leaves your machines. Every answer lands in the review in amber for\n"
+            "you to accept; a part number not written in the workbook is dropped.\n"
+            "Accepting a suggested field teaches it for the next run.")
+        mask_row.addWidget(self.ask_model)
         v2.addLayout(mask_row)
         # Filename-ignore patterns — persisted next to the aliases file so a
         # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
@@ -224,6 +279,7 @@ class LedgerTab(ViewHelpers, QWidget):
             "fnmatch semantics, case-insensitive. Saved next to the "
             "parent CSV's aliases file.")
         self.ignore_files.editingFinished.connect(self._save_ignore_patterns)
+        self.ignore_files.textEdited.connect(self._on_ignore_edited)
         ignore_row.addWidget(self.ignore_files, 1)
         v2.addLayout(ignore_row)
         outer.addWidget(g2)
@@ -247,9 +303,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.rebuild_kg_btn = self._step_button(
             row, "Rebuild knowledge graph", self.on_rebuild_kg)
         self.rebuild_kg_btn.setToolTip(
-            "Rebuild the Connections knowledge graph from the vault's "
-            "data_in folder, so a newly-applied Ledger shows up as parts, "
-            "people and inspections. Same path the Connections tab uses.")
+            "Rebuild the Connections knowledge graph, so a newly-applied "
+            "Ledger shows up as parts, people and inspections. The parent "
+            "CSV above is added to what the graph reads if it is not read "
+            "yet (only that file). Same rebuild the Connections tab runs.")
         row.addStretch(1)
         grid4.addLayout(row, 1, 1)
         outer.addWidget(g4)
@@ -317,8 +374,8 @@ class LedgerTab(ViewHelpers, QWidget):
         for b in self._busy_buttons:
             b.setEnabled(idle)
         if hasattr(self, "cancel_btn"):
-            # Only enabled while a step is actually running.
-            self.cancel_btn.setEnabled(not idle)
+            # Only enabled while a step that honours it is running.
+            self.cancel_btn.setEnabled(not idle and getattr(self, "_cancellable", False))
         if not idle:
             return
         csv = self.csv.text().strip()
@@ -335,35 +392,73 @@ class LedgerTab(ViewHelpers, QWidget):
 
     # ── image-reader dropdown ───────────────────────────────────────────
     # ── filename-ignore patterns (persisted next to aliases) ──────────
-    def _save_ignore_patterns(self) -> None:
-        """Persist the comma-separated patterns from the field. No-op
-        when no parent CSV is picked yet — the file lives next to it."""
-        csv_path = self.csv.text().strip()
-        if not csv_path:
-            return
+    def _typed_ignore_patterns(self) -> List[str]:
         text = self.ignore_files.text().strip()
-        patterns = [p.strip() for p in text.split(",") if p.strip()]
+        return [p.strip() for p in text.split(",") if p.strip()]
+
+    def _on_ignore_edited(self, _text: str = "") -> None:
+        """Typed by the user (not loaded) with no parent CSV to save them
+        beside: held for the CSV that is set next, even before the field
+        loses focus."""
+        if not self.csv.text().strip():
+            self._ignore_unsaved = bool(self._typed_ignore_patterns())
+
+    def _save_ignore_patterns(self) -> None:
+        """Persist the comma-separated patterns from the field. With no
+        parent CSV yet they are held in the field and saved when one is
+        set (_load_ignore_patterns) — the file lives next to it."""
+        csv_path = self.csv.text().strip()
+        patterns = self._typed_ignore_patterns()
+        if not csv_path:
+            self._ignore_unsaved = bool(patterns)
+            return
         try:
             from source_extract import save_ignore_files
             save_ignore_files(csv_path, patterns)
+            self._ignore_unsaved = False
         except Exception as exc:                             # noqa: BLE001
             self.status.setText(
                 f"Could not save ignore patterns to the aliases file: {exc}")
 
     def _load_ignore_patterns(self) -> None:
         """Populate the field from the aliases file. Called when the
-        parent CSV path changes."""
+        parent CSV path changes (typed, Browse…, Create).
+
+        Patterns typed before there was a CSV are saved beside it, not
+        cleared: the field was emptied, or kept showing them while the
+        extract read every file, because nothing had saved them (review,
+        2026-10-19). Typed patterns are never dropped: the CSV's own are
+        kept with them. Only TYPED ones (_ignore_unsaved): the field also
+        shows the patterns loaded from the last CSV, and switching from a
+        ledger that has some to one that has none wrote the first one's
+        into the second's aliases file (review, 2026-10-19)."""
         if not hasattr(self, "ignore_files"):
             return
         csv_path = self.csv.text().strip()
+        typed = self._typed_ignore_patterns()
         if not csv_path:
-            self.ignore_files.setText("")
+            if not getattr(self, "_ignore_unsaved", False):
+                self.ignore_files.setText("")
             return
         try:
             from source_extract import load_ignore_files
             patterns = load_ignore_files(csv_path)
         except Exception:                                    # noqa: BLE001
             patterns = []
+        if typed and getattr(self, "_ignore_unsaved", False):
+            merged = patterns + [p for p in typed if p not in patterns]
+            try:
+                from source_extract import save_ignore_files
+                if merged != patterns:
+                    save_ignore_files(csv_path, merged)
+                    self._say(f"Skip patterns saved beside {Path(csv_path).name}: "
+                              + ", ".join(merged))
+                self._ignore_unsaved = False
+                patterns = merged
+            except Exception as exc:                         # noqa: BLE001
+                self.status.setText(f"Could not save the Skip patterns beside "
+                                    f"{Path(csv_path).name}: {exc}")
+                return                                       # the field keeps them
         self.ignore_files.blockSignals(True)
         try:
             self.ignore_files.setText(", ".join(patterns))
@@ -390,10 +485,8 @@ class LedgerTab(ViewHelpers, QWidget):
             if from_popup or select is not None:
                 try:
                     from council_core import ollama_install
-                    names = ollama_install.installed_models()
-                    for n in names:
-                        if n.lower().startswith(ollama_install.US_VISION_FAMILIES):
-                            self.image_reader_choice.addItem(f"Ollama: {n}", n)
+                    for n in ollama_install.vision_models():   # ones that see images
+                        self.image_reader_choice.addItem(f"Ollama: {n}", n)
                 except Exception:                             # noqa: BLE001
                     pass
             self.image_reader_choice.insertSeparator(
@@ -440,16 +533,22 @@ class LedgerTab(ViewHelpers, QWidget):
     def _say(self, text: str) -> None:
         self.log.appendPlainText(text)
 
-    def _run(self, title: str, step: Callable, done: Callable) -> None:
+    def _run(self, title: str, step: Callable, done: Callable,
+             after: Optional[Callable] = None, cancellable: bool = False) -> None:
         """Run `step(progress)` on a thread; `done(result)` on the GUI thread.
         A LedgerError is the pipeline's own plain-language message; anything
-        else is shown with its traceback in the log.
+        else is shown with its traceback in the log. ``after(err)`` runs on
+        the GUI thread once the step ended either way (err None on success).
 
-        The ``self._cancel`` event is cleared at the start of every run; the
-        step may read it (via a ``cancel=`` kwarg) to exit early."""
+        The ``self._cancel`` event is cleared at the start of every run; a
+        ``cancellable`` step reads it (via a ``cancel=`` kwarg) to exit
+        early. Only such a step enables Cancel: during Apply it said
+        'Cancelling…' and the parent CSV was written anyway (review,
+        2026-10-19)."""
         if self.busy:
             return
         self._cancel.clear()
+        self._cancellable = cancellable
         self.status.setText(f"{title}…")
         self._say(f"── {title}")
         self.progress.setRange(0, 0)               # busy until a percentage is known
@@ -460,7 +559,9 @@ class LedgerTab(ViewHelpers, QWidget):
             fraction turns the busy bar into a percentage."""
             def show() -> None:
                 self.status.setText(f"{title}: {msg}")
-                if fraction is None:
+                if fraction is None or fraction <= 0:
+                    # a big first workbook sat on a still 0% bar for minutes
+                    # and looked hung: busy until something is done
                     self.progress.setRange(0, 0)
                 else:
                     self.progress.setRange(0, 100)
@@ -474,7 +575,7 @@ class LedgerTab(ViewHelpers, QWidget):
                 result, err = None, f"error: {e}"
             except Exception as e:                        # noqa: BLE001
                 result, err = None, f"failed: {e!r}\n{traceback.format_exc()}"
-            self._to_ui(lambda: self._finish(title, result, err, done))
+            self._to_ui(lambda: self._finish(title, result, err, done, after))
 
         self._worker = threading.Thread(target=work, name="ledger-step", daemon=True)
         self._refresh_enabled()
@@ -505,12 +606,14 @@ class LedgerTab(ViewHelpers, QWidget):
             self._start_dir(), XLSX)
         if not p:
             return
-        aliases, _ignore = load_aliases(csv_path)
+        aliases, ignore = load_aliases(csv_path)
         from .ledger_dialogs import PreviewWorkbookDialog
         mask = self.pattern_mask.text().strip()
         dlg = PreviewWorkbookDialog(p, ledger.schema, aliases=aliases,
                                     pattern_mask=mask or None,
-                                    csv_path=csv_path, parent=self)
+                                    csv_path=csv_path, parent=self,
+                                    pick_model=self._pick_model, ignore=ignore,
+                                    part=self.part.text().strip())
         dlg.exec()
 
     def on_cancel(self) -> None:
@@ -519,7 +622,7 @@ class LedgerTab(ViewHelpers, QWidget):
         on a modal Excel dialog, taskkill'ing the hidden Excel process
         unblocks it — the COM call raises and the loop exits on its next
         iteration."""
-        if not self.busy:
+        if not self.busy or not getattr(self, "_cancellable", False):
             return
         self._cancel.set()
         try:
@@ -532,15 +635,19 @@ class LedgerTab(ViewHelpers, QWidget):
         self.status.setText(f"Cancelling…{tail}")
         self._say(f"── Cancel requested{tail}")
 
-    def _finish(self, title, result, err, done) -> None:
+    def _finish(self, title, result, err, done, after=None) -> None:
         self._worker = None
         self.progress.setVisible(False)
-        if err:
-            self.status.setText(err.splitlines()[0])
-            self._say(err)
-        else:
-            done(result)
-        self._refresh_enabled()
+        try:
+            if err:
+                self.status.setText(err.splitlines()[0])
+                self._say(err)
+            else:
+                done(result)
+        finally:
+            if after is not None:
+                after(err)
+            self._refresh_enabled()
 
     def wait(self, timeout: float = 60.0) -> bool:
         """Block until the current step's result is shown (tests, scripts)."""
@@ -560,6 +667,7 @@ class LedgerTab(ViewHelpers, QWidget):
             self.csv.setText(s.csv)
             self.status.setText(s.describe().splitlines()[0])
             self._say(s.describe())
+            self._on_csv_changed()          # setText is not editingFinished
         self._run("Reading the template",
                   lambda _p: self.actions.create_parent(template, csv), done)
 
@@ -588,6 +696,16 @@ class LedgerTab(ViewHelpers, QWidget):
         part, images = self.part.text().strip(), self.use_images.isChecked()
         mask = self.pattern_mask.text().strip()
         vision = self._selected_vision_model()
+        # only when ticked, so an actions stand-in without the option works
+        more = {}
+        if self.ask_model.isChecked():
+            # which model: the user picks one downloaded on this computer
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not extracted: no model picked. Untick "
+                                    "\"Ask Council's model about the rest\" to run without one.")
+                return
+            more = {"assist": model_id}
 
         def done(s) -> None:
             self.review.setText(s.review)
@@ -596,7 +714,14 @@ class LedgerTab(ViewHelpers, QWidget):
             self.stat["to_review"].setText(str(s.to_review))
             self.stat["images"].setText(f"{s.images_read} / {s.images}")
             self.stat["problems"].setText(str(len(s.problems)))
-            if getattr(s, "cancelled", False):
+            if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
+                # before or while Council's model was asked: the same words
+                # for both, and not 'partial' (second review, 2026-10-20)
+                self.status.setText(
+                    "Cancelled after every workbook was read: every value the rules found "
+                    "is in the review. Open it, check the amber and red rows, map the "
+                    "leftover labels, save it, then Apply.")
+            elif getattr(s, "cancelled", False):
                 self.status.setText(
                     "Cancelled. The partial review was still written — "
                     "open it to see what landed, or clear it and run again.")
@@ -609,7 +734,8 @@ class LedgerTab(ViewHelpers, QWidget):
                   lambda p: self.actions.extract(csv, sources, part, images, p,
                                                  pattern_mask=mask,
                                                  vision_model=vision,
-                                                 cancel=self._cancel), done)
+                                                 cancel=self._cancel, **more), done,
+                  cancellable=True)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()
@@ -622,6 +748,8 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_apply(self) -> None:
         review, fill = self.review.text().strip(), self.fill_dir.text().strip()
         images = self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {"vision_model": vision} if images and vision else {}
 
         def done(s) -> None:
             self.stat["problems"].setText(str(len(s.problems)))
@@ -631,19 +759,46 @@ class LedgerTab(ViewHelpers, QWidget):
             self._say(s.describe())
             self._kg_dirty = True
         self._run("Applying the review",
-                  lambda p: self.actions.apply(review, fill, images, p), done)
+                  lambda p: self.actions.apply(review, fill, images, p, **more), done)
 
     def on_rebuild_kg(self) -> None:
         """Rebuild the Connections knowledge graph; the Ledger log shows
         the breakdown line via rebuild_summary_line."""
+        if self.busy:
+            return
+        csv = self.csv.text().strip()
+        conn = self._connections_tab()
+        if conn is not None and not conn.hold_for_rebuild("Ledger"):
+            self.status.setText("The Connections tab is rebuilding the graph already; "
+                                "its rows will be there when it finishes.")
+            return
+        held = {"stats": None}
+
         def done(stats) -> None:
             from council_core import knowledge_graph as kgm
-            line = kgm.rebuild_summary_line(stats or {})
+            stats = held["stats"] = stats or {}
+            if stats.get("ledger_added"):
+                self._say(f"The graph now also reads {stats['ledger_added']} "
+                          "(only that file; Connections › Folders… lists it).")
+            line = kgm.rebuild_summary_line(stats)
             self.status.setText(line)
             self._say(line)
             self._kg_dirty = False
+
+        def after(err) -> None:
+            if conn is not None:
+                conn.rebuild_done_elsewhere(held["stats"],
+                                            RuntimeError(err.splitlines()[0]) if err else None)
         self._run("Rebuilding the knowledge graph",
-                  lambda p: self.actions.rebuild_kg(p), done)
+                  lambda p: self.actions.rebuild_kg(p, csv=csv or None), done,
+                  after=after)
+
+    def _connections_tab(self):
+        """The Connections tab, when it has been built (it holds the graph's
+        store open while it shows it)."""
+        from .connections import ConnectionsTab
+        built = getattr(self.window, "_built", None) or {}
+        return next((t for t in built.values() if isinstance(t, ConnectionsTab)), None)
 
     # ── file dialogs ────────────────────────────────────────────────────
     def _start_dir(self, edit: Optional[QLineEdit] = None) -> str:
@@ -664,6 +819,7 @@ class LedgerTab(ViewHelpers, QWidget):
             "CSV (*.csv)", options=QFileDialog.Option.DontConfirmOverwrite)
         if p:
             self.csv.setText(p)
+            self._on_csv_changed()
 
     def browse_sources(self) -> None:
         ps, _ = QFileDialog.getOpenFileNames(self, "Source workbooks", self._start_dir(), XLSX)

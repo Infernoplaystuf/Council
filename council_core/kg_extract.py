@@ -330,6 +330,34 @@ def ollama_chat(model: str, host: Optional[str] = None) -> ChatFn:
     return chat
 
 
+def gguf_chat(path: str) -> ChatFn:
+    """chat(messages) on a GGUF file the user picked: Council's main model
+    when it is that file, else the file loaded in process
+    (council_core.ledger_llm) - every LLM call in Council takes a GGUF
+    (user, 2026-10-19); Suggest links offered Ollama models only."""
+    def chat(messages, *, num_predict: int = NUM_PREDICT) -> str:
+        from council_core import ledger_llm
+        if ledger_llm._is_main_gguf(path):
+            import council_engine as ce
+            return ce.local_chat(list(messages), temperature=0.0, num_predict=num_predict,
+                                 json_schema=SCHEMA, seed=7, timeout=300)
+        llm = ledger_llm._gguf_llm(path)
+        kw = dict(messages=list(messages), temperature=0.0, max_tokens=num_predict, seed=7)
+        with ledger_llm._GGUF_LOCK:
+            try:
+                out = llm.create_chat_completion(
+                    response_format={"type": "json_object", "schema": SCHEMA}, **kw)
+            except TypeError:                              # an older llama-cpp-python
+                out = llm.create_chat_completion(**kw)
+        ledger_llm._gpu_ok()          # it answered: the GPU-crash marker goes
+        return out["choices"][0]["message"]["content"] or ""
+    return chat
+
+
+def is_gguf(model: str) -> bool:
+    return str(model or "").lower().endswith(".gguf")
+
+
 def extract(text: str, known: Sequence[Known], chat: ChatFn) -> Result:
     res = Result()
     try:
