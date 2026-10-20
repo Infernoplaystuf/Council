@@ -422,15 +422,22 @@ class PreviewWorkbookDialog(QDialog):
 
     def _start_worker(self, path, schema, aliases, pattern_mask, ignore=(),
                       part: str = "") -> None:
+        csv_path = self._csv_path
+
         def work():
             report = None
             err = ""
             try:
-                from source_extract import preview_workbook
-                # the same ignore list and Part the extract uses
+                from source_extract import load_patterns, load_taught, preview_workbook
+                # the same ignore list, Part, and what Teach taught (the
+                # inspectors' and flaw-code labels, the saved pattern when
+                # the field is empty) the extract uses
+                taught = load_taught(csv_path) if csv_path else None
+                mask = pattern_mask or ((load_patterns(csv_path) or [None])[0]
+                                        if csv_path else None)
                 report = preview_workbook(path, schema, aliases=aliases,
-                                          pattern_mask=pattern_mask,
-                                          ignore=ignore, part=part)
+                                          pattern_mask=mask,
+                                          ignore=ignore, part=part, taught=taught)
             except Exception as exc:                        # noqa: BLE001
                 err = f"preview failed: {exc!r}"
             self._done.emit(report, err)

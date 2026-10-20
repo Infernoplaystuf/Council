@@ -46,7 +46,9 @@ pre-accepted.
 
 HOW A LABEL IS MATCHED TO A FIELD
 ---------------------------------
-Your remembered mappings win outright. Otherwise the label and each field's
+Your remembered mappings win outright, and a label the Ledger tab's Teach
+learned is an inspector's or a flaw code's (Taught) is never a field.
+Otherwise the label and each field's
 name are normalised (units stripped, EC -> eddy current, P/N -> part number,
 ...) and compared by spelling and by shared words, with a bonus when the
 sheet or a nearby heading names the field's section ("NDE", "Visual"). A
@@ -248,10 +250,17 @@ class Match:
 
 class Matcher:
     def __init__(self, schema: TemplateSchema, aliases: Optional[Dict[str, str]] = None,
-                 ignore: Iterable[str] = ()):
+                 ignore: Iterable[str] = (), taught: Optional["Taught"] = None):
         self.schema = schema
         self.aliases = {normalize_label(k): v for k, v in (aliases or {}).items()}
         self.ignore = {normalize_label(x) for x in ignore}
+        # what 'Teach from a sample workbook' learned (council_core/
+        # ledger_teach.py): labels that say who logged a value, labels or
+        # initials that are no one, labels of a flaw-code column
+        taught = taught or Taught()
+        self.who = {normalize_label(x) for x in taught.who} - {""}
+        self.not_who = {normalize_label(x) for x in taught.not_who} - {""}
+        self.item_heads = {normalize_label(x) for x in taught.items} - {""}
         self.targets: List[Target] = []
         groups: Dict[str, Target] = {}
         for f in schema.fields:
@@ -343,9 +352,39 @@ class Matcher:
         return isinstance(v, str) and (self.match(v).target is not None
                                        or self.other_id_label(v))
 
+    @staticmethod
+    def key_of(label) -> str:
+        """A label's key as the aliases file keeps it (normalize_label),
+        or '' for a long cell or one that is not text: never a label."""
+        s = _words(label, 60)
+        return normalize_label(s) if s else ""
+
+    def who_head(self, v) -> bool:
+        """A label that says who logged the values beside or under it: the
+        Ledger's own words (_WHO_HEAD: 'Inspector', 'Initials', 'Operator'
+        ...) or one taught for this Ledger ('Tech Sig' - Taught.who), never
+        one the user said is no one (Taught.not_who: 'Operator' mapped to a
+        field). ledger_teach (user, 2026-10-20)."""
+        if not isinstance(v, str):
+            return False
+        if self.who or self.not_who:
+            key = self.key_of(v)
+            if key and key in self.not_who:
+                return False
+            if key and key in self.who:
+                return True
+        return bool(_WHO_HEAD.match(v))
+
+    def no_one(self, text) -> bool:
+        """Initials or a label the user said are no one ('NDT' of a heading
+        'NDT — 2026-09-18', 'Operator'): Taught.not_who."""
+        return bool(self.not_who) and self.key_of(text) in self.not_who
+
     def is_item_header(self, label: str) -> bool:
         if not self.schema.item_field or not _words(label):
             return False                 # a long cell is no 'Flaw #' (LABEL_MAX)
+        if self.item_heads and self.key_of(label) in self.item_heads:
+            return True                  # taught: 'Site', 'Loc' (ledger_teach)
         t = tokens(label)
         return t in (tokens(self.schema.item_field), ["flaw"], ["flaw", "id"],
                      ["defect"], ["defect", "number"], ["feature"], ["item"])
@@ -358,6 +397,10 @@ class Matcher:
             return Match(None, 0.0, via="none")
         key = normalize_label(label)
         if not key or key in self.ignore:
+            return Match(None, 0.0, via="none")
+        if key in self.who or key in self.item_heads:
+            # taught as an inspector's or a flaw code's label: no field's,
+            # however it is spelt ('Insp. Sig' is not 'Inspector 1')
             return Match(None, 0.0, via="none")
         if key in self.aliases:
             t = self.by_name.get(self.aliases[key])
@@ -839,7 +882,7 @@ class WorkbookPreview:
 
 def preview_workbook(path, schema, aliases=None,
                      pattern_mask: Optional[str] = None, ignore=(),
-                     part: str = "") -> WorkbookPreview:
+                     part: str = "", taught: Optional["Taught"] = None) -> WorkbookPreview:
     """Open ``path`` and report what the Ledger extractor can and can't
     see — per sheet: non-empty cell count, the part its values would get
     (and how), inspector initials, the labels the extract binds to a
@@ -868,7 +911,7 @@ def preview_workbook(path, schema, aliases=None,
     except LedgerError as e:
         report.problems.append(str(e))
         return report
-    m = Matcher(schema, aliases, ignore)
+    m = Matcher(schema, aliases, ignore, taught=taught)
     codes = ItemCodes(schema.items)
     exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
     for ex in exs:
@@ -1365,10 +1408,20 @@ class _Extractor:
                 w = _initials(text)
                 if w and set(tokens(w)) & known and not (acronym and _acronym_initials(text)):
                     return ""
+                if w and self.m.no_one(w):
+                    return ""                # taught: 'NDT' is no one's initials
                 return w
             m = _WHO_INLINE.match(v) or _WHO_BY.match(v)
+            if m and self.m.no_one(m.string[:m.start("who")]):
+                m = None                     # taught: 'Operator' is a field here
             who = person(m.group("who"), acronym=True) if m else ""
-            if not who and _WHO_HEAD.match(v):
+            if not who and not m and self.m.who and len(v) <= 200:
+                # a label taught as an inspector's, its initials after it in
+                # the cell: 'Tech Sig: JB' (ledger_teach, user 2026-10-20)
+                lab, inline = _split_inline(v)
+                if inline and self.m.key_of(lab) in self.m.who:
+                    who = person(inline, acronym=True)
+            if not who and self.m.who_head(v):
                 for dc in (1, 2):
                     x = self.g.cells.get((r, c + dc))
                     if x is not None:
@@ -1400,7 +1453,7 @@ class _Extractor:
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
             if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE") \
-                    and h.group(1).lower() not in NOT_INITIALS:
+                    and h.group(1).lower() not in NOT_INITIALS and not self.m.no_one(h.group(1)):
                 self.markers.append((0, 0, h.group(1)))
 
     def _lone_pair(self, r, c, cx) -> bool:
@@ -1490,7 +1543,7 @@ class _Extractor:
     def _who_columns(self, r, skip) -> Dict[int, bool]:
         """Columns of header row r that hold initials ('Inspector Initials')."""
         return {c: True for c, v in self.row(r)
-                if c not in skip and isinstance(v, str) and _WHO_HEAD.match(v)}
+                if c not in skip and isinstance(v, str) and self.m.who_head(v)}
 
     def run(self) -> None:
         self.find_part()
@@ -1847,7 +1900,7 @@ class _Extractor:
         its title is not 'Inspector Initials' (where 'EC' is Eva Chen)."""
         head = self.g.text(r, cc)
         t = self.g.text(first, cc)
-        if not t or len(t) > 60 or (head and _WHO_HEAD.match(head)):
+        if not t or len(t) > 60 or (head and self.m.who_head(head)):
             return False
         mt = self.m.match(t, per_item=True)
         return mt.target is not None and mt.score >= SUGGEST_AT
@@ -2011,7 +2064,7 @@ class _Extractor:
             if self.m.is_item_header(v):
                 item_col = c
                 continue
-            if _WHO_HEAD.match(v):
+            if self.m.who_head(v):
                 who_col = c
                 continue
             if _RUN_HEAD.match(v):
@@ -2744,7 +2797,10 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             cancel: Optional[Any] = None,
             log: Optional[Callable[[str], None]] = None,
             part_finder: Optional[Callable[[str, List["Grid"]], Tuple[str, str]]] = None,
-            labels: Optional[Dict[str, str]] = None
+            labels: Optional[Dict[str, str]] = None,
+            taught: Optional["Taught"] = None,
+            reader_cls: Optional[type] = None,
+            readers: Optional[List["_Extractor"]] = None
             ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
@@ -2773,13 +2829,20 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
 
     ``labels``: each source's name in the review (source_labels), when
     these sources are some of a run's (Apply reads only those the review
-    holds, and names them as the review did)."""
+    holds, and names them as the review did).
+
+    ``taught``: what 'Teach from a sample workbook' learned for this Ledger
+    (load_taught: inspectors' labels, labels that are no one, flaw-code
+    columns). ``reader_cls`` / ``readers``: council_core.ledger_teach reads
+    one workbook exactly as this does, with a sheet reader of its own that
+    notes what the passes recognised; each workbook's readers are added to
+    ``readers`` once it is read to the end."""
     import time as _time
     from progress_report import NullProgress
     from council_core import stall_watchdog
     prog = progress or NullProgress()
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
-    m = Matcher(schema, aliases, ignore)
+    m = Matcher(schema, aliases, ignore, taught=taught)
     codes = ItemCodes(schema.items)
     run = Extraction([str(s) for s in sources], read=[])
     reader = image_reader if image_reader is not None else (
@@ -2813,7 +2876,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         # run's Excel reads, also one pressed before a read began
         with excel_open.cancel_scope():
             _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                         m, codes, mask_re, part, schema, _time, part_finder, labels)
+                         m, codes, mask_re, part, schema, _time, part_finder, labels,
+                         reader_cls=reader_cls, readers=readers)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
@@ -2854,7 +2918,7 @@ def source_labels(sources: Sequence) -> Dict[str, str]:
 
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, part_finder=None,
-                 labels=None) -> None:
+                 labels=None, reader_cls=None, readers=None) -> None:
     labels = labels or source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
@@ -2867,7 +2931,7 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
         try:
             _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
                          reader, m, codes, mask_re, part, schema, _time,
-                         label, part_finder)
+                         label, part_finder, reader_cls=reader_cls, readers=readers)
         except _Cancelled:
             # half a workbook is not offered for review: what it gave goes
             del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
@@ -2894,7 +2958,7 @@ def _excel_down_line(problems: List[str], msg: str, name: str) -> None:
 
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, label: str = "",
-                 part_finder=None) -> None:
+                 part_finder=None, reader_cls=None, readers=None) -> None:
     _t0 = _time.monotonic()
     via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
         src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -2997,7 +3061,7 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
 
     prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
     # pass 1: part numbers per sheet; then a workbook-wide fallback
-    exs = [_Extractor(g, m, codes, "", mask_re) for g in grids]
+    exs = [(reader_cls or _Extractor)(g, m, codes, "", mask_re) for g in grids]
     for ex in exs:
         ex.tick = tick
         here["what"] = f"{src.name}: reading sheet {ex.g.sheet!r}"
@@ -3063,6 +3127,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                 if ex.g.from_image in (Path(note.saved_as).name if note.saved_as else "",
                                        note.anchor):
                     note.values += n
+    if readers is not None:
+        readers.extend(exs)                          # read to the end (ledger_teach)
     _secs = _time.monotonic() - _t0
     run.timings.append((label or src.name, _secs))
     if run.read is not None:
@@ -3674,6 +3740,103 @@ def save_aliases(csv_path, mapping: Dict[str, str], ignore: List[str]) -> None:
     tmp.replace(p)
 
 
+# ── what 'Teach from a sample workbook' learned (council_core/ledger_teach.py)
+@dataclass
+class Taught:
+    """What the Ledger tab's Teach learned for one Ledger beyond its label
+    map and ignore list, kept in the same aliases file (user, 2026-10-20: "I
+    line up where they match the templates ... hopefully this will help
+    train the Ledger and knowledge graph to work"):
+
+      who       labels that say who logged the values beside or under them
+                ('Tech Sig', 'Insp.'): read as the Ledger's own 'Inspector'
+                (Matcher.who_head), and never as a field
+      not_who   labels or initials the Ledger's own words read as a person
+                that are no one ('Operator' mapped to a field, 'NDT' of a
+                heading 'NDT — 2026-09-18')
+      items     labels of a column of flaw / item codes ('Site', 'Loc')
+      patterns  part-name patterns ('@@@#@@###'), newest first: Extract
+                uses the first when the pattern field is empty
+                (ledger_ingest), and the tab offers them
+
+    Labels are kept as typed; they are compared by normalize_label."""
+    who: List[str] = field(default_factory=list)
+    not_who: List[str] = field(default_factory=list)
+    items: List[str] = field(default_factory=list)
+    patterns: List[str] = field(default_factory=list)
+
+
+#: Where each list of Taught is in the aliases file.
+_TAUGHT_KEYS = {"who": "who_labels", "not_who": "not_who_labels", "items": "item_labels",
+                "patterns": "patterns"}
+
+
+def load_taught(csv_path) -> Taught:
+    """The Ledger's Taught lists; a missing or damaged file, or section, is
+    empty (nothing taught), never an error: the extract still runs."""
+    p = aliases_path_for(csv_path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:                                       # noqa: BLE001
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    out = Taught()
+    for attr, key in _TAUGHT_KEYS.items():
+        raw = data.get(key)
+        if isinstance(raw, list):
+            setattr(out, attr, [" ".join(x.split()) for x in raw
+                                if isinstance(x, str) and x.strip()])
+    return out
+
+
+def load_patterns(csv_path) -> List[str]:
+    """The Ledger's saved part-name patterns, newest first."""
+    return load_taught(csv_path).patterns
+
+
+def save_taught(csv_path, taught: Taught) -> Taught:
+    """Write the Taught lists into the aliases file, every other section
+    (the label map, the ignore list, the people) kept. A file that does not
+    parse is NOT overwritten - the user's label mappings would go with it
+    (as save_people). Labels are kept once each (by normalize_label);
+    patterns once each, in order. Returns what the file now holds."""
+    p = aliases_path_for(csv_path)
+    data: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise LedgerError(f"{p.name} could not be read, so what Teach learned was not "
+                              f"saved (fix or remove the file): {e}") from e
+        if not isinstance(data, dict):
+            raise LedgerError(f"{p.name} is not a Ledger aliases file; nothing saved")
+    for attr, key in _TAUGHT_KEYS.items():
+        seen: Dict[str, str] = {}
+        for x in getattr(taught, attr) or []:
+            s = " ".join(str(x or "").split())
+            k = s if attr == "patterns" else normalize_label(s)
+            if s and k and k not in seen:
+                seen[k] = s
+        if seen:
+            data[key] = list(seen.values())
+        else:
+            data.pop(key, None)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return load_taught(csv_path)
+
+
+def mask_from_part(part: str) -> str:
+    """A part-name pattern in the shape of a part number the user confirmed:
+    letters -> '@', digits -> '#', anything else as it is ('ABC1DE234' ->
+    '@@@#@@###', 'P/N-0042' -> '@/@-####'). mask_to_regex reads it back."""
+    return "".join("@" if ch.isascii() and ch.isalpha() else
+                   "#" if ch.isascii() and ch.isdigit() else ch
+                   for ch in " ".join(str(part or "").split()))
+
+
 # ── apply a reviewed workbook ───────────────────────────────────────────
 @dataclass
 class ApplyResult:
@@ -3803,7 +3966,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                   pattern_mask=meta.get("pattern_mask") or None,
                   part=meta.get("part") or "",
                   part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
-                  labels=source_labels(sources))
+                  labels=source_labels(sources), taught=load_taught(csv_path))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     mapped: List[Decision] = []
@@ -4319,7 +4482,8 @@ def main(argv=None) -> int:
             with Progress("ledger extract") as prog:
                 run = extract(ledger.schema, files, mapping, ignore,
                               image_dir=out.with_name(out.stem + "_images"),
-                              part=args.part, use_images=not args.no_images, progress=prog)
+                              part=args.part, use_images=not args.no_images, progress=prog,
+                              taught=load_taught(args.csv))
             if args.llm is not None:        # "" from the --llm flag means auto-detect
                 suggest_with_llm(run, ledger.schema, args.llm or None)
             dec = decide(run, ledger.schema)

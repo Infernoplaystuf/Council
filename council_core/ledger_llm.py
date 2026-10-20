@@ -20,6 +20,13 @@ nothing a model says is accepted on its own:
   identifier, or is not written as a whole word in a cell, the sheet name
   or the file name, is dropped (the quote check kg_extract uses for links).
 
+Both questions carry the user's own past answers as examples (few-shot):
+what they answered in the Ledger tab's Teach (council_core.ledger_teach,
+user 2026-10-20: "First I want an LLM guess to be made, then I give an
+answer — hopefully this will help train the Ledger"). Up to MAX_EXAMPLES,
+the ones most like the labels asked first (pick_examples); only labels,
+field names and the part numbers the user confirmed - never other values.
+
 Backend: council_engine.local_chat first - the user's GGUF, or the role's
 Ollama - then a US-origin Ollama on this PC / the Pi nodes Council itself
 enabled (source_extract.suggest_mappings_for_labels' order). Nothing leaves
@@ -587,14 +594,82 @@ def _field_named(answer: Any, fields: Sequence[str]) -> Optional[str]:
     return plain[0] if len(plain) == 1 else None
 
 
-def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat
+#: Past answers of the user's that go into one question as examples
+#: (few-shot): enough to show their corrections, short enough for a small
+#: model's context.
+MAX_EXAMPLES = 20
+
+#: (label, the field it means or None, why) - one answer the user gave in
+#: the Ledger tab's Teach (council_core.ledger_teach.label_examples).
+LabelExample = Tuple[str, Optional[str], str]
+
+
+def _label_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def pick_examples(examples: Sequence[LabelExample], labels: Sequence[str],
+                  limit: int = MAX_EXAMPLES) -> List[LabelExample]:
+    """The user's past answers most like the labels being asked, at most
+    ``limit``: the same label first, then by shared words and spelling, then
+    the newest (``examples`` oldest first, as the examples file keeps them).
+    One answer per label: the newest. So the model's next guesses follow the
+    user's corrections (user, 2026-10-20: "hopefully this will help train
+    the Ledger")."""
+    import difflib
+    newest: Dict[str, Tuple[int, LabelExample]] = {}
+    for i, ex in enumerate(examples):
+        key = _label_key(ex[0])
+        if key:
+            newest[key] = (i, ex)
+    asked = [(_label_key(x), set(_label_key(x).split())) for x in labels]
+    asked = [(k, w) for k, w in asked if k]
+
+    def near(key: str) -> float:
+        words = set(key.split())
+        best = 0.0
+        for k, w in asked:
+            if k == key:
+                return 2.0
+            shared = len(words & w) / max(len(words | w), 1)
+            best = max(best, shared, difflib.SequenceMatcher(None, key, k).ratio() * 0.9)
+        return best
+    ranked = sorted(newest.items(), key=lambda kv: (-near(kv[0]), -kv[1][0]))
+    return [ex for _k, (_i, ex) in ranked[:max(0, int(limit))]]
+
+
+def _examples_text(examples: Sequence[LabelExample], fields: Sequence[str]) -> str:
+    """The user's past answers as lines for a prompt: 'label -> field', or
+    '-> null (why)' for one that is no field. An answer naming a field the
+    question does not offer is left out: the model may only name those."""
+    valid = set(fields)
+    lines = []
+    for ex in list(examples)[:MAX_EXAMPLES]:
+        label, answer = ex[0], ex[1]
+        why = ex[2] if len(ex) > 2 else ""
+        if answer is not None and answer not in valid:
+            continue
+        lines.append(f"- {json.dumps(label, ensure_ascii=False)} -> "
+                     + (json.dumps(answer, ensure_ascii=False) if answer else "null")
+                     + (f" ({why})" if why and not answer else ""))
+    if not lines:
+        return ""
+    return ("The user answered these labels before, for this same template; follow them for "
+            "the same or similar labels:\n" + "\n".join(lines) + "\n\n")
+
+
+def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat,
+               examples: Optional[Sequence[LabelExample]] = None
                ) -> Tuple[Dict[str, Optional[str]], str]:
     """{label: field or None} from the model, and which model answered.
 
     Asked as a LIST of {label, field} with both constrained to the given
     names: asked for {"label": "field"}, a real model (granite3.3:8b,
     2026-10-19) answered {"label": "Frequency (kHz)"} - the example taken
-    literally. The old object shape is still read."""
+    literally. The old object shape is still read.
+
+    ``examples``: the user's past answers (pick_examples), shown first so
+    the model follows them; only labels and field names, never values."""
     labels, fields = list(labels), list(fields)
     schema = {"type": "object", "required": ["mappings"], "properties": {"mappings": {
         "type": "array", "items": {
@@ -607,6 +682,7 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat
               "Reply with JSON only, shaped like "
               "{\"mappings\": [{\"label\": <a label below>, \"field\": <a template field "
               "below, or null>}]}.\n\n"
+              + _examples_text(examples or (), fields) +
               f"Template fields:\n{json.dumps(fields)}\n\nLabels:\n{json.dumps(labels)}")
     text, model = chat(prompt, schema)
     got = _json(text)
@@ -625,11 +701,16 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat
     return out, model
 
 
-def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
+def place_labels(run, schema, chat: Chat, report: AssistReport,
+                 examples: Optional[Sequence[LabelExample]] = None) -> None:
     """Values under labels no rule placed: ask which field each label is and
     add those values as suggested rows (via 'model'), in place of their
     'Labels to map' rows - except a value with no item for a field kept
-    per item (source_extract.needs_item), which stays there with a note."""
+    per item (source_extract.needs_item), which stays there with a note.
+
+    ``examples``: the user's answers from the Ledger tab's Teach
+    (council_core.ledger_teach.label_examples); the ones most like these
+    labels go in the question (pick_examples)."""
     import source_extract as se
     if report.unavailable:                                 # one_shot: not asked again
         return
@@ -641,7 +722,8 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
     report.labels_asked = len(labels)
     report.asking = "the labels left over"
     try:
-        mapping, report.model = map_labels(labels, fields, chat)
+        mapping, report.model = map_labels(labels, fields, chat,
+                                           examples=pick_examples(examples or (), labels))
     except ModelUnavailable:
         report.labels_failed = True
         return                                             # said once, by one_shot
@@ -956,10 +1038,35 @@ def _cells_text(grids, pattern_mask: Optional[str] = None) -> List[str]:
     return out
 
 
+def _parts_text(examples: Sequence[Tuple[str, str]]) -> str:
+    """Part numbers the user confirmed in other workbooks (Teach), newest
+    first, as a sentence for the part question: what theirs look like."""
+    seen: Dict[str, str] = {}
+    for part, label in examples:
+        part = " ".join(str(part or "").split())
+        if part and len(part) <= 40 and part not in seen:
+            seen[part] = " ".join(str(label or "").split())[:40]
+        if len(seen) >= MAX_EXAMPLES:
+            break
+    if not seen:
+        return ""
+    said = ", ".join(json.dumps(p, ensure_ascii=False)
+                     + (f" (labelled {json.dumps(lab, ensure_ascii=False)})" if lab else "")
+                     for p, lab in seen.items())
+    return ("Part numbers the user confirmed in other workbooks of this kind: " + said
+            + " - this workbook's may look like them, but it must be written in THIS "
+              "workbook. ")
+
+
 def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
-              report: AssistReport) -> Tuple[str, str]:
+              report: AssistReport,
+              examples: Optional[Sequence[Tuple[str, str]]] = None) -> Tuple[str, str]:
     """(part, where) the model found for one workbook, or ('', ''). The part
-    is given as it is written in the workbook."""
+    is given as it is written in the workbook.
+
+    ``examples``: (part, its label) the user confirmed in the Ledger tab's
+    Teach, newest first (council_core.ledger_teach.part_examples): shown as
+    what their part numbers look like. The quote check still holds."""
     if report.unavailable:                                 # one_shot: not asked again
         return "", ""
     sheets = [g.sheet for g in grids]
@@ -970,6 +1077,7 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
                  f"'#' a digit), for example {mask_example(pattern_mask)!r}, but other formats "
                  "also occur (separators, prefixes, revision suffixes, shorter or longer "
                  "variants). ")
+    shape += _parts_text(examples or ())
     prompt = ("Which part (sample) is this inspection workbook about? " + shape +
               "Answer with the part identifier exactly as written in the workbook, and the "
               "cell text, sheet name or file name it is in. If no part identifier is "

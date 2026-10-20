@@ -29,8 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (REVIEW_TOO_LONG, ImageReader, apply_review, decide,
-                            default_image_reader, extract, load_aliases, path_too_long,
-                            too_long_to_write, workbook_files, write_review)
+                            default_image_reader, extract, load_aliases, load_taught,
+                            path_too_long, too_long_to_write, workbook_files,
+                            write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -173,6 +174,10 @@ class ExtractSummary:
     #: pattern, or the Ledger's own review / filled template / template.
     #: Only a progress line said so, and it went by (review, 2026-10-19).
     skipped: List[Any] = field(default_factory=list)
+    #: The part-name pattern the run used, and whether it was the Ledger's
+    #: saved one (Teach saved it; the pattern field was empty).
+    pattern: str = ""
+    pattern_saved: bool = False
 
     def describe(self) -> str:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
@@ -182,6 +187,9 @@ class ExtractSummary:
         if self.cancelled:
             s = ("CANCELLED after every workbook was read — " if self.read_all else
                  "CANCELLED — ") + s
+        if self.pattern_saved:
+            s += (f"\nPart-name pattern {self.pattern!r}: this Ledger's saved one (the "
+                  "pattern field was empty)")
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
         if self.assist:
@@ -256,7 +264,12 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 assist: Any = False) -> ExtractSummary:
     """``log``: where a stall dump goes (the Ledger tab's log). ``assist``:
     ask Council's model about the labels and part numbers the rules could
-    not place (council_core.ledger_llm); its answers are suggestions."""
+    not place (council_core.ledger_llm); its answers are suggestions, and
+    the user's answers in Teach go in as its examples.
+
+    ``pattern_mask`` empty: the Ledger's saved part-name pattern (Teach
+    saves one; source_extract.load_patterns) is used, and the summary says
+    so (ExtractSummary.pattern_saved)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
@@ -307,6 +320,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         # read (review, 2026-10-19)
         raise LedgerError(REVIEW_TOO_LONG.format(n=n))
     mapping, ignore = load_aliases(csv_path)
+    # what the Ledger tab's Teach learned (council_core.ledger_teach): its
+    # inspectors' labels, flaw-code columns - and its part-name pattern,
+    # used when the field is empty, and said so (user, 2026-10-20)
+    taught = load_taught(csv_path)
+    pattern_saved = False
+    if not (pattern_mask or "").strip() and taught.patterns:
+        pattern_mask, pattern_saved = taught.patterns[0], True
+        say(f"using this Ledger's saved part-name pattern {pattern_mask!r} (the pattern "
+            "field is empty)")
     if use_images and image_reader is None:
         say("starting the local image reader…")
         image_reader = default_image_reader()
@@ -316,8 +338,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             + ", ".join(sorted({p.name for p in skipped_files}))[:200])
     say(f"reading {len(files)} workbooks…")
     report = part_finder = None
+    label_examples: List[Any] = []
     if assist:
-        from council_core import ledger_llm
+        from council_core import ledger_llm, ledger_teach
         report = ledger_llm.AssistReport()
         stop = cancel.is_set if cancel is not None else None
         # ``assist`` is the model the user picked ('ollama:<name>' or a GGUF
@@ -327,14 +350,18 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                             if isinstance(assist, str) else
                                             ledger_llm.council_chat(should_stop=stop)),
                                    report, stop)
+        # the user's answers in Teach go in as examples (few-shot)
+        label_examples = ledger_teach.label_examples(csv_path, ledger.schema)
+        part_examples = ledger_teach.part_examples(csv_path)
 
         def part_finder(name, grids):
-            return ledger_llm.find_part(name, grids, pattern_mask, chat, report)
+            return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
+                                        examples=part_examples)
     run = extract(ledger.schema, files, mapping, ignore,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
                   progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
-                  part_finder=part_finder)
+                  part_finder=part_finder, taught=taught)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -349,7 +376,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    f"labels left over; {rules}.")
         else:
             prog.stage("asking Council's model about the labels left over")
-            ledger_llm.place_labels(run, ledger.schema, chat, report)
+            ledger_llm.place_labels(run, ledger.schema, chat, report,
+                                    examples=label_examples)
             if cancel is not None and cancel.is_set():
                 # pressed while the model was asked: a cancelled run - it
                 # said 'Review written…' and that the model did not answer
@@ -381,7 +409,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           list(run.timings), bool(run.cancelled), read_all=read_all,
                           assist=report.describe() if report is not None else "",
                           skipped=[(p.name, why_skipped.get(p, "left out"))
-                                   for p in skipped_files])
+                                   for p in skipped_files],
+                          pattern=pattern_mask or "", pattern_saved=pattern_saved)
 
 
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────
