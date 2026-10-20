@@ -219,6 +219,50 @@ def test_a_second_rebuild_of_the_same_store_is_refused_not_locked(tmp_path):
         assert kg.seed()["documents"] == 0                  # free again
 
 
+def test_another_council_rebuilding_the_store_is_busy_not_locked(tmp_path, monkeypatch):
+    """Two Council PROCESSES rebuilt the same vault: the in-process lock
+    does not see the other one, and the second died with a raw sqlite3
+    'database is locked' - the tab said 'The rebuild failed: database is
+    locked' (review, 2026-10-19)."""
+    import sqlite3
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "data_in" / "note.md").write_text("Owner: Jordan Blake\n", encoding="utf-8")
+    monkeypatch.setattr(kgm.KnowledgeGraph, "BUSY_TIMEOUT_S", 0.2)
+    with kgm.KnowledgeGraph(vault, image_reader=None) as kg:
+        # the other process's rebuild: its own connection, holding the write lock
+        other = sqlite3.connect(str(kg.path), timeout=0.2)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(kgm.KnowledgeGraphBusy, match="rebuilt elsewhere") as err:
+                kg.seed()
+            assert isinstance(err.value.__cause__, sqlite3.OperationalError)
+        finally:
+            other.rollback()
+            other.close()
+        assert kg.seed()["documents"] == 1                  # free again
+
+
+def test_a_store_locked_mid_reading_is_busy_not_an_unreadable_file(tmp_path, monkeypatch):
+    """The lock can come while a document is being filed: that is the
+    store's, not the file's - it is not counted 'unreadable: OperationalError'
+    and the rebuild does not carry on as if it were."""
+    import sqlite3
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    (vault / "data_in" / "note.md").write_text("Owner: Jordan Blake\n", encoding="utf-8")
+
+    def locked(self, p, run_id):
+        raise sqlite3.OperationalError("database is locked")
+    with kgm.KnowledgeGraph(vault, image_reader=None) as kg:
+        monkeypatch.setattr(kgm.KnowledgeGraph, "_document", locked)
+        with pytest.raises(kgm.KnowledgeGraphBusy):
+            kg.seed()
+        monkeypatch.undo()
+        stats = kg.seed()
+        assert stats["documents"] == 1 and stats["unreadable"] == []
+
+
 def test_the_ledger_rebuild_lets_go_of_the_connections_store(tmp_path):
     """The Connections tab holds the store open; a Ledger-tab rebuild used
     to run beside it, so its searches waited on the rebuild's lock on the

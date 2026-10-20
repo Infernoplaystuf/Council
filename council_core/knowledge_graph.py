@@ -1887,9 +1887,20 @@ class KnowledgeGraph:
                     stats = self._seed(use_collections=use_collections,
                                        gazetteer=gazetteer, on_progress=on_progress,
                                        prog=prog)
+                    self._seed_finish(stats, prog)
+                except sqlite3.OperationalError as exc:
+                    # The lock above is this process's only: another Council
+                    # rebuilding the same vault held the store past the busy
+                    # timeout, and this rebuild died with a raw 'database is
+                    # locked' (review, 2026-10-19). Its batches committed so
+                    # far stay; nothing of the graph phase was written.
+                    if _busy(exc):
+                        raise KnowledgeGraphBusy(
+                            "the knowledge graph is being rebuilt elsewhere — try "
+                            "again when that finishes") from exc
+                    raise
                 finally:
                     _PROGRESS.reset(token)
-                self._seed_finish(stats, prog)
                 return stats
         finally:
             lock.release()
@@ -2064,6 +2075,11 @@ class KnowledgeGraph:
                         stats["documents_read"] += 1
                         readable.append((p, did, h))
                 except Exception as exc:
+                    # The STORE held by another Council's rebuild is not this
+                    # file's fault: it is not counted 'unreadable' (seed()
+                    # says the graph is busy).
+                    if _busy(exc):
+                        raise
                     # Listed but not readable now (held open with an exclusive
                     # lock by another program, a parse error): 'unreadable',
                     # with what it had - not 'missing'. It never reached
