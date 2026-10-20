@@ -2571,17 +2571,6 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
-    if part_finder is not None and not part and not book_part and any(
-            not ex.part for ex in exs):
-        here["what"] = f"{src.name}: asking Council's model which part it is"
-        prog.update(here["what"], force=True)
-        found_part, where = part_finder(label or src.name, grids)
-        _wd.beat()
-        if cancel is not None and cancel.is_set():
-            raise _Cancelled()                # the model's answer was cut short
-        if found_part:
-            book_part, how = found_part, f"{MODEL_PART_HOW} from {where} — check it"
-            run.model_parts[label or src.name] = (found_part, where)
     for ex in exs:
         if part:
             ex.part, ex.part_how = part, how
@@ -2592,6 +2581,31 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         ex.item_grids()
         ex.tables()
         ex.forms()
+    # Council's model is asked only for values that really have no part:
+    # asked before the values were read - whenever a sheet had no part of
+    # its own - a sheet whose rows each name their part in a Part Number
+    # column got a question, and the answer ('101') a false problem line
+    # (review, 2026-10-20). A row whose Part Number cell says 'TBD' has
+    # its own 'how' and is not given the model's part.
+    partless = [o for ex in exs for o in ex.out + ex.unmatched
+                if not o.part and not o.part_how] \
+        if part_finder is not None and not part and not book_part else []
+    if partless:
+        here["what"] = f"{src.name}: asking Council's model which part it is"
+        prog.update(here["what"], force=True)
+        found_part, where = part_finder(label or src.name, grids)
+        _wd.beat()
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()                # the model's answer was cut short
+        if found_part:
+            how = f"{MODEL_PART_HOW} from {where} — check it"
+            run.model_parts[label or src.name] = (found_part, where)
+            for o in partless:
+                o.part, o.part_how = found_part, how
+            for ex in exs:
+                if not ex.part:
+                    ex.part, ex.part_how = found_part, how
+    for ex in exs:
         for o in ex.out + ex.unmatched:
             o.part_how = o.part_how or ex.part_how
             if o.part != part:                       # not the Part you typed
@@ -2710,6 +2724,13 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   and not o.part_how.startswith(FILE_PART_HOW)
                   # nor one that is not the shape of your part-name pattern
                   and MISFIT_PART_HOW not in o.part_how)
+            if needs_item(schema, o.field, o.item):
+                # a per-flaw value with no flaw: Apply would put it on every
+                # flaw row (review, 2026-10-20)
+                ok = False
+                o.note = _join(o.note, f"kept per {schema.item_field}, and no "
+                                       f"{schema.item_field} was found for it: type the "
+                                       f"{schema.item_field} in Item before accepting it")
             out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
@@ -2743,6 +2764,25 @@ OTHERS_SHOWN = 20
 
 def _join(a: str, b: str) -> str:
     return f"{a}; {b}" if a else b
+
+
+def needs_item(schema: TemplateSchema, fname: str, item: str) -> bool:
+    """Is ``fname`` a field the template keeps per item (per flaw) while
+    the value has no item? rows_from puts a value with no item on EVERY
+    item row of its part: a per-flaw value placed by Council's model, or
+    under a label mapped on 'Labels to map', went to all nine flaw rows
+    (review, 2026-10-20). Such a value is never pre-accepted nor written;
+    the reviewer types its item first.
+
+    One inspector's own column of such a field ('<field> [JB]', decide's
+    copy of a signed reading) is held the same: it was pre-accepted and
+    written to all nine flaw rows while its field's own row was held
+    (second review, 2026-10-20)."""
+    if item or not fname or not schema.item_field or len(schema.items) < 2:
+        return False
+    base = schema.inspector_base(str(fname)) or fname
+    f = next((x for x in schema.fields if x.name == base), None)
+    return f is not None and f.per_item
 
 
 def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
@@ -2818,7 +2858,7 @@ VAL_HEAD = ["Accept", "Part", "Item", "Field", "Value", "Confidence", "Matched b
             "Source label", "Source", "Other values offered", "Note", "Part from",
             "Inspector"]
 LAB_HEAD = ["Map to field", "Ignore", "Source label", "Example value", "Count",
-            "Best guess", "Source", "Part", "Item"]
+            "Best guess", "Source", "Part", "Item", "Note"]
 PEOPLE_HEAD = ["Initials", "Full name", "Values signed", "First seen at"]
 
 
@@ -2945,7 +2985,10 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
         o = obs[0]
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
-        put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item])
+        # the note says why Council's model's field was not used (review,
+        # 2026-10-20: a per-flaw field for values with no flaw)
+        put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item,
+                  next((x.note for x in obs if x.note), "")])
         if o.part_how.startswith(MODEL_PART_HOW):
             lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
@@ -2954,7 +2997,7 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     yn2 = DataValidation(type="list", formula1='"Y"', allow_blank=True)
     lab.add_data_validation(yn2)
     yn2.add(f"B2:B{max(lab.max_row, 2) + 100}")
-    _style(lab, bold, [44, 8, 34, 18, 7, 60, 50, 10, 7])
+    _style(lab, bold, [44, 8, 34, 18, 7, 60, 50, 10, 7, 60])
 
     miss = wb.create_sheet("Missing", 3)
     miss.append(["Part", "Field", "Items with no value", "Of"])
@@ -3309,6 +3352,12 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     mapped: List[Decision] = []
+    # a per-flaw value with no flaw is not written: it went to every flaw
+    # row of its part (review, 2026-10-20) - (field, mapped on 'Labels to
+    # map' just now) -> where the values are. A mapped label's field is
+    # the one you picked: its inspector's copy ('<field> [JB]') is the
+    # same value, said once.
+    no_item: Dict[Tuple[str, bool], set] = defaultdict(set)
     for d in decisions:
         o = d.obs
         cells = [o.where] + _also_at(o.note)
@@ -3326,6 +3375,11 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             mapped.append(d)
         else:
             d.accept = False                                # not seen in review
+        if d.accept and needs_item(schema, o.field, o.item):
+            d.accept = False
+            just_mapped = c is None
+            f = (schema.inspector_base(o.field) or o.field) if just_mapped else o.field
+            no_item[(f, just_mapped)].add(o.where)
     held = _place_mapped(mapped, on_labels, retyped, confirmed)
     # rows edited in the review whose source re-read differently (a Field or
     # Part typed in by hand) are taken as typed
@@ -3334,6 +3388,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     no_part = 0
     for cells, fname, item, (acc, part, value, _) in reviewed:
         if acc and not any((w, fname, item) in seen for w in cells) and placeable(fname):
+            if needs_item(schema, fname, item):
+                no_item[(fname, False)].add(cells[0])
+                continue
             if not part:
                 no_part += 1
                 continue
@@ -3359,6 +3416,18 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             warnings += fill_template(schema, ledger.rows_for(p), out)
             filled.append(str(out))
             prog.advance(what=f"{out.name} written")
+    # A value under a label mapped on 'Labels to map' has no Values row in
+    # this review to type its item in: 'type it in the review's Item column
+    # and Apply again' wrote nothing, and said so again (second review,
+    # 2026-10-20). Its mapping is saved; the next Extract gives it one.
+    it = schema.item_field
+    warnings += [(f"{len(at)} value(s) under a label you mapped to {f!r} on 'Labels to map' "
+                  f"not written: the field is kept per {it} and they have no {it}. The mapping "
+                  f"is saved — run Extract again, type the {it} on each value's Values row, "
+                  "then Apply") if mapped else
+                 (f"{len(at)} accepted value(s) of {f!r} not written: the field is kept per "
+                  f"{it} and they have no {it} — type it in the review's Item column and Apply "
+                  "again") for (f, mapped), at in sorted(no_item.items())]
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
                        notes + warnings + [f"conflict kept: {c}" for c in res.conflicts],
                        people=people)
@@ -3470,8 +3539,17 @@ def _one_value_per_cell(decisions: List[Decision], schema: TemplateSchema,
 US_TEXT_FAMILIES = ("granite", "llama", "phi", "gemma", "olmo", "gpt-oss")
 #: Preference order inside US_TEXT_FAMILIES — Granite first because the
 #: [[us-models-only]] memory flags it as the user's preferred family;
-#: within a family a longer tag beats a shorter one so an 8B beats a 2B.
+#: within a family the larger parameter count wins, so an 8B beats a 2B.
 _FAMILY_RANK = {f: i for i, f in enumerate(US_TEXT_FAMILIES)}
+#: The largest model (billions of parameters) first_us_text_model prefers:
+#: what a 16 GB RTX 4080 runs on the GPU (gpt-oss:20b, phi4:14b). A larger
+#: one is still picked when it is the family's only model.
+_PICK_MAX_B = 20.0
+#: How first_us_text_model ranks a model whose size nothing says (an
+#: Ollama ':latest' tag not listed with details.parameter_size): about what
+#: a family's default tag is (granite3.3, llama3.1: 8B), so it beats a 1-3B
+#: one and a named 8B still beats it.
+_UNKNOWN_B = 7.0
 
 
 def first_us_text_model(
@@ -3489,19 +3567,47 @@ def first_us_text_model(
     with the host set to the Council default.
 
     Preference: within a host, family order in US_TEXT_FAMILIES (Granite
-    first), then longer tag, then name. ACROSS hosts, the first that
-    has a US-origin model wins — localhost first by default (see
-    ``enumerate_ollama_hosts``)."""
+    first), then the larger parameter count in the tag ('8b' over '2b',
+    up to _PICK_MAX_B - a bigger one goes after, it would not fit the GPU),
+    then longer tag, then name. The tag's length alone picked
+    granite3.3:2b over granite3.3:8b - the same length, '2' sorting first
+    (review, 2026-10-20) - and would pick 'granite-embedding:30m', which
+    cannot chat. ACROSS hosts, the first that has a US-origin model wins —
+    localhost first by default (see ``enumerate_ollama_hosts``).
+
+    A tag that names no size ('granite3.3:latest', what ``ollama pull
+    granite3.3`` installs - the 8B) is sized by Ollama's own
+    details.parameter_size when /api/tags lists it; when nothing says, it
+    ranks as _UNKNOWN_B, ahead of the small ones: ranked as 0B it lost to
+    granite3.3:2b, llama3.2:1b and gemma3:1b (second review, 2026-10-20)."""
+    try:
+        from council_core.local_models import maker_and_origin, parse_params_b
+    except Exception:                                       # noqa: BLE001
+        maker_and_origin = parse_params_b = None
+    sizes: Dict[str, float] = {}                            # name -> Ollama's own size
+
+    def _size(n) -> float:
+        got = sizes.get(n)
+        if got is None and parse_params_b is not None:
+            got = parse_params_b(n)
+        return _UNKNOWN_B if got is None else got
+
     def _rank(n):
         lo = n.lower()
+        size = _size(n)
         for i, fam in enumerate(US_TEXT_FAMILIES):
             if lo.startswith(fam):
-                return (i, -len(n), n)
-        return (len(US_TEXT_FAMILIES), 0, n)
+                return (i, size > _PICK_MAX_B, -size, -len(n), n)
+        return (len(US_TEXT_FAMILIES), False, 0.0, 0, n)
+
+    def _us(n):
+        # a family's prefix alone is not its maker: 'llama-pro' is Tencent's
+        return maker_and_origin is None or maker_and_origin(n)[1] == "US"
 
     def _pick(names):
         candidates = [n for n in names
-                      if n and n.lower().startswith(US_TEXT_FAMILIES)]
+                      if n and n.lower().startswith(US_TEXT_FAMILIES)
+                      and "embed" not in n.lower() and _us(n)]
         if not candidates:
             return None
         candidates.sort(key=_rank)
@@ -3521,6 +3627,14 @@ def first_us_text_model(
                 names = [m["name"] for m in (data.get("models") or [])]
             except Exception:
                 continue
+            for m in data.get("models") or []:
+                try:
+                    listed = (m.get("details") or {}).get("parameter_size")
+                    got = parse_params_b(listed) if listed and parse_params_b else None
+                except Exception:                           # noqa: BLE001
+                    got = None                              # an odd entry: sized by its tag
+                if got:
+                    sizes[m["name"]] = got
         tag = _pick(names)
         if tag is not None:
             return (host, tag)
