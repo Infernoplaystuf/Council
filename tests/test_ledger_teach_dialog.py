@@ -412,8 +412,11 @@ def test_save_keeps_the_answers_and_guess_again_shows_the_rules(qapp, ledger,
     assert data["patterns"] == ["@@@#@@###-@#"]
     assert {e.label for e in lt.examples(csv)} >= {"Zorp rate", "Tech Sig", "Serial",
                                                    "Remarks to self"}
-    # the knowledge graph, opened on the save's worker
-    assert graph_opened_on == ["ledger-teach-learn"]
+    # the knowledge graph, opened on the save's worker - and on the worker
+    # that adds the Ledger to it when its parent CSV is picked - never on
+    # the GUI thread
+    assert "ledger-teach-learn" in graph_opened_on
+    assert set(graph_opened_on) <= {"ledger-teach-learn", "ledger-kg-add"}
     with kgm.KnowledgeGraph(vault) as kg:
         rules = {r.label: st for r, st in kg.field_rules()}
     assert rules["Serial"] == "confirmed"
