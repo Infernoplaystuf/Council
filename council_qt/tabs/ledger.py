@@ -161,6 +161,9 @@ class LedgerTab(ViewHelpers, QWidget):
         #: True from an apply's completion until the next KG rebuild —
         #: used by _refresh_enabled to highlight the Rebuild button.
         self._kg_dirty = False
+        #: Skip patterns typed while there was no parent CSV to save them
+        #: beside: saved when one is set.
+        self._ignore_unsaved = False
         self._build()
         self._refresh_reader_choices()
         self._refresh_enabled()
@@ -388,35 +391,63 @@ class LedgerTab(ViewHelpers, QWidget):
 
     # ── image-reader dropdown ───────────────────────────────────────────
     # ── filename-ignore patterns (persisted next to aliases) ──────────
-    def _save_ignore_patterns(self) -> None:
-        """Persist the comma-separated patterns from the field. No-op
-        when no parent CSV is picked yet — the file lives next to it."""
-        csv_path = self.csv.text().strip()
-        if not csv_path:
-            return
+    def _typed_ignore_patterns(self) -> List[str]:
         text = self.ignore_files.text().strip()
-        patterns = [p.strip() for p in text.split(",") if p.strip()]
+        return [p.strip() for p in text.split(",") if p.strip()]
+
+    def _save_ignore_patterns(self) -> None:
+        """Persist the comma-separated patterns from the field. With no
+        parent CSV yet they are held in the field and saved when one is
+        set (_load_ignore_patterns) — the file lives next to it."""
+        csv_path = self.csv.text().strip()
+        patterns = self._typed_ignore_patterns()
+        if not csv_path:
+            self._ignore_unsaved = bool(patterns)
+            return
         try:
             from source_extract import save_ignore_files
             save_ignore_files(csv_path, patterns)
+            self._ignore_unsaved = False
         except Exception as exc:                             # noqa: BLE001
             self.status.setText(
                 f"Could not save ignore patterns to the aliases file: {exc}")
 
     def _load_ignore_patterns(self) -> None:
         """Populate the field from the aliases file. Called when the
-        parent CSV path changes."""
+        parent CSV path changes (typed, Browse…, Create).
+
+        Patterns typed before there was a CSV are saved beside it, not
+        cleared: the field was emptied, or kept showing them while the
+        extract read every file, because nothing had saved them (review,
+        2026-10-19). Typed patterns are never dropped: the CSV's own are
+        kept with them."""
         if not hasattr(self, "ignore_files"):
             return
         csv_path = self.csv.text().strip()
+        typed = self._typed_ignore_patterns()
         if not csv_path:
-            self.ignore_files.setText("")
+            if not getattr(self, "_ignore_unsaved", False):
+                self.ignore_files.setText("")
             return
         try:
             from source_extract import load_ignore_files
             patterns = load_ignore_files(csv_path)
         except Exception:                                    # noqa: BLE001
             patterns = []
+        if typed and (not patterns or getattr(self, "_ignore_unsaved", False)):
+            merged = patterns + [p for p in typed if p not in patterns]
+            try:
+                from source_extract import save_ignore_files
+                if merged != patterns:
+                    save_ignore_files(csv_path, merged)
+                    self._say(f"Skip patterns saved beside {Path(csv_path).name}: "
+                              + ", ".join(merged))
+                self._ignore_unsaved = False
+                patterns = merged
+            except Exception as exc:                         # noqa: BLE001
+                self.status.setText(f"Could not save the Skip patterns beside "
+                                    f"{Path(csv_path).name}: {exc}")
+                return                                       # the field keeps them
         self.ignore_files.blockSignals(True)
         try:
             self.ignore_files.setText(", ".join(patterns))
@@ -625,6 +656,7 @@ class LedgerTab(ViewHelpers, QWidget):
             self.csv.setText(s.csv)
             self.status.setText(s.describe().splitlines()[0])
             self._say(s.describe())
+            self._on_csv_changed()          # setText is not editingFinished
         self._run("Reading the template",
                   lambda _p: self.actions.create_parent(template, csv), done)
 
@@ -769,6 +801,7 @@ class LedgerTab(ViewHelpers, QWidget):
             "CSV (*.csv)", options=QFileDialog.Option.DontConfirmOverwrite)
         if p:
             self.csv.setText(p)
+            self._on_csv_changed()
 
     def browse_sources(self) -> None:
         ps, _ = QFileDialog.getOpenFileNames(self, "Source workbooks", self._start_dir(), XLSX)

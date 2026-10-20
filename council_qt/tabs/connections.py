@@ -59,6 +59,15 @@ PHRASES = {
 }
 TYPE_ICON = {"PERSON": "👤", "PART": "⚙", "PROJECT": "📁", "DOCUMENT": "📄"}
 
+
+def _us_origin(model: str) -> bool:
+    """A model name is of US origin by council_core.local_models - the
+    classification the Ledger's list and the Models tab use; an unknown
+    origin is not US."""
+    from council_core import local_models as lm
+    return lm.maker_and_origin(str(model or ""))[1] == "US"
+
+
 #: How a piece of evidence from a spreadsheet was found, in words (the
 #: older methods - row, record, document, model ... - show as they always
 #: have).
@@ -130,16 +139,26 @@ class ConnectionsActions:
 
     # -- free-text suggestions (KG2) --
     def local_models(self) -> List[str]:
-        """US-origin models installed in this PC's Ollama, extractor first."""
+        """US-origin models installed in this PC's Ollama, extractor first.
+        Origin is council_core.local_models' (name and the family Ollama
+        reports), as in the Ledger's model list: pi_models' name prefixes
+        called llava:7b non-US here and US (Meta) there (review,
+        2026-10-19). An unknown origin is not US."""
         from council_core import kg_extract as kx
-        from council_core.pi_setup import pi_models
+        from council_core import local_models as lm
         try:
             import council_engine as ce
             tags = ce._ollama_tags("http://127.0.0.1:11434") or {}
         except Exception:
             tags = {}
-        names = [m.get("name", "") for m in tags.get("models", [])]
-        names = sorted(n for n in names if n and pi_models.is_us_origin(n))
+        names = []
+        for m in tags.get("models", []):
+            det = m.get("details") or {}
+            name = m.get("name", "")
+            if name and lm.maker_and_origin(name, str(det.get("family") or ""),
+                                            det.get("families") or ())[1] == "US":
+                names.append(name)
+        names = sorted(names)
         best = kx.DEFAULT_EXTRACTOR
         return ([best] if best in names else []) + [n for n in names if n != best]
 
@@ -161,8 +180,8 @@ class ConnectionsActions:
         (COUNCIL_REMOTE_NODES=1), the engine's own opt-in. A node's model
         was used whatever it was — the real NodePrimus has only qwen2.5:3b,
         so 'and my Pi nodes' ran extraction on it; local_models() already
-        offered only US-origin models for this PC."""
-        from council_core.pi_setup import pi_models
+        offered only US-origin models for this PC. Origin is
+        council_core.local_models', as everywhere else (_us_origin)."""
         try:
             import council_engine as ce
             if not ce._remote_nodes_enabled():
@@ -173,8 +192,8 @@ class ConnectionsActions:
                      for n in reg.list_nodes() if (n.model or n.active_model)]
         except Exception:
             return [], []
-        usable = [x for x in nodes if pi_models.is_us_origin(x[2])]
-        skipped = [(n, m) for n, _u, m in nodes if not pi_models.is_us_origin(m)]
+        usable = [x for x in nodes if _us_origin(x[2])]
+        skipped = [(n, m) for n, _u, m in nodes if not _us_origin(m)]
         return usable, skipped
 
     def pi_workers(self) -> List[tuple]:
@@ -190,7 +209,6 @@ class ConnectionsActions:
         the run is named by the bare model: 'extract:' is added once, by the
         graph (it was added here too: 'extract:extract:gemma3:12b')."""
         from council_core import kg_extract as kx
-        from council_core.pi_setup import pi_models
         if kx.is_gguf(model):
             name = Path(model).name
             workers = {f"this PC ({name})": (kx.gguf_chat(model), name)}
@@ -198,7 +216,7 @@ class ConnectionsActions:
             workers = {f"this PC ({model})": (kx.ollama_chat(model), model)}
         if use_pis:
             for name, url, pmodel in self.pi_workers():
-                if pi_models.is_us_origin(pmodel):         # pi_workers filters too
+                if _us_origin(pmodel):                     # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
         with self.open_graph() as kg:
             return kg.suggest_from_text(workers, model=Path(model).name if kx.is_gguf(model)
