@@ -435,9 +435,11 @@ class PreviewWorkbookDialog(QDialog):
                 taught = load_taught(csv_path) if csv_path else None
                 mask = pattern_mask or ((load_patterns(csv_path) or [None])[0]
                                         if csv_path else None)
+                # the saved pattern is a hint, as Extract reads it
                 report = preview_workbook(path, schema, aliases=aliases,
                                           pattern_mask=mask,
-                                          ignore=ignore, part=part, taught=taught)
+                                          ignore=ignore, part=part, taught=taught,
+                                          pattern_strict=bool(pattern_mask))
             except Exception as exc:                        # noqa: BLE001
                 err = f"preview failed: {exc!r}"
             self._done.emit(report, err)

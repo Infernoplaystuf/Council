@@ -189,7 +189,8 @@ class ExtractSummary:
                  "CANCELLED — ") + s
         if self.pattern_saved:
             s += (f"\nPart-name pattern {self.pattern!r}: this Ledger's saved one (the "
-                  "pattern field was empty)")
+                  "pattern field was empty) — a hint for file and sheet names and "
+                  "titles; a part of another shape is still pre-accepted")
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
         if self.assist:
@@ -268,8 +269,9 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     the user's answers in Teach go in as its examples.
 
     ``pattern_mask`` empty: the Ledger's saved part-name pattern (Teach
-    saves one; source_extract.load_patterns) is used, and the summary says
-    so (ExtractSummary.pattern_saved)."""
+    saves one; source_extract.load_patterns) is used as a hint - a part of
+    another shape is still pre-accepted (extract's pattern_strict) - and the
+    summary says so (ExtractSummary.pattern_saved)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
@@ -322,13 +324,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     mapping, ignore = load_aliases(csv_path)
     # what the Ledger tab's Teach learned (council_core.ledger_teach): its
     # inspectors' labels, flaw-code columns - and its part-name pattern,
-    # used when the field is empty, and said so (user, 2026-10-20)
+    # used when the field is empty, and said so (user, 2026-10-20). Only as
+    # a hint: one sample's shape held back every part of another shape
+    # from pre-acceptance (review, 2026-10-20)
     taught = load_taught(csv_path)
     pattern_saved = False
     if not (pattern_mask or "").strip() and taught.patterns:
         pattern_mask, pattern_saved = taught.patterns[0], True
-        say(f"using this Ledger's saved part-name pattern {pattern_mask!r} (the pattern "
-            "field is empty)")
+        say(f"using this Ledger's saved part-name pattern {pattern_mask!r} as a hint (the "
+            "pattern field is empty)")
     if use_images and image_reader is None:
         say("starting the local image reader…")
         image_reader = default_image_reader()
@@ -361,7 +365,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                   image_dir=out.with_name(out.stem + "_images"),
                   image_reader=image_reader, part=part, use_images=use_images,
                   progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
-                  part_finder=part_finder, taught=taught)
+                  part_finder=part_finder, taught=taught, pattern_strict=not pattern_saved)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -401,7 +405,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)
     write_review(out, run, dec, ledger.schema, str(csv_path),
-                 pattern_mask=pattern_mask or "", part=part or "")
+                 pattern_mask=pattern_mask or "", part=part or "",
+                 pattern_hint=pattern_saved)
     ok = sum(d.accept for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),

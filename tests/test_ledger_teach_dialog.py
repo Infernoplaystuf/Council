@@ -8,14 +8,16 @@ and what they are in the template. First I want an LLM guess to be made, then
 I give an answer — hopefully this will help train the Ledger and knowledge
 graph to work."
 
-What is pinned: the button needs a parent CSV with its schema; the dialog
-lists the tab's sources and guesses on a 'ledger-teach-guess' worker (the
-model is never asked on the GUI thread, which stays live: progress, Cancel);
-the answers are pre-filled from the guess and can be changed; Save writes the
-aliases, ignores, inspectors' labels, people and pattern, and ticks the
-knowledge graph on a 'ledger-teach-learn' worker; Guess again shows what the
-rules place now. Offscreen; synthetic workbooks; a fake model; no file
-dialogs; a temporary vault.
+What is pinned: the button needs a parent CSV with its schema (a pasted
+path is looked up when it is pressed); the dialog lists the tab's sources
+and guesses on a 'ledger-teach-guess' worker (the model is never asked on
+the GUI thread, which stays live: progress, Cancel); the answers are
+pre-filled from the guess and can be changed; the model's guesses are kept
+only when confirmed; an inspector's row can be 'Not an inspector'; Save
+writes the aliases, ignores, inspectors' labels, people and pattern, and
+ticks the knowledge graph on a 'ledger-teach-learn' worker; Guess again
+shows what the rules place now; the tab forgets a saved pattern. Offscreen;
+synthetic workbooks; a fake model; no file dialogs; a temporary vault.
 """
 from __future__ import annotations
 
@@ -46,7 +48,7 @@ from council_core import ledger_teach as lt  # noqa: E402
 from council_qt.tabs.connections import ConnectionsActions  # noqa: E402
 from council_qt.tabs.ledger import LedgerActions, LedgerTab  # noqa: E402
 from council_qt.tabs.ledger_teach_dialog import (ANSWER_COL, COLUMNS,  # noqa: E402
-                                                 PICTURE_COL, TeachDialog)
+                                                 CONFIRM_COL, PICTURE_COL, TeachDialog)
 from sample_ledger import ParentCSV  # noqa: E402
 
 MODEL = "ollama:granite3.3:8b"
@@ -176,8 +178,20 @@ def test_the_teach_button_needs_a_parent_csv_with_its_schema(qapp, tmp_path):
     tab.create_btn.click()
     assert tab.wait()
     assert tab.teach_btn.isEnabled()                            # Create made the schema
-    tab.csv.setText(tab.csv.text() + "x")                       # typing another path
-    assert not tab.teach_btn.isEnabled()
+    # a path typed or pasted - no Enter, no Tab - is looked up when Teach
+    # is pressed: the button stayed off until editingFinished (review,
+    # 2026-10-20)
+    made = tab.csv.text()
+    tab.csv.setText(made + "x")
+    assert tab.teach_btn.isEnabled()
+    tab.teach_btn.click()
+    assert "no schema" in tab.status.text() and tab.teach_dialog is None
+    assert not tab.teach_btn.isEnabled()                        # looked up: none there
+    tab.csv.setText(made)                                       # pasted, not yet looked up
+    assert tab.teach_btn.isEnabled()
+    tab.teach_btn.click()
+    assert isinstance(tab.teach_dialog, TeachDialog)
+    close(tab.teach_dialog)
     assert "Teach from a sample workbook" in tab.teach_btn.text()
 
 
@@ -370,11 +384,22 @@ def test_save_keeps_the_answers_and_guess_again_shows_the_rules(qapp, ledger,
     choose(dlg, untitled)
     guess(dlg)
     assert cell(dlg, "Remarks to self", FROM_COL) == "nobody placed it"
+    # the model's guesses wait for the user's tick (review, 2026-10-20)
+    waiting = {"Zorp rate", "Tech Sig", "Serial"}
+    assert {r.label for r in dlg.session.rows
+            if not dlg.confirm_boxes[r.key].isChecked()} == waiting
     # the user's answers: the note is not data; JB is Jordan Blake; the
-    # part is right and its shape is this Ledger's pattern
+    # model's guesses are right; the part is right and its shape is this
+    # Ledger's pattern
     dlg.set_answer(key_of(dlg, "Remarks to self"), lt.ROLE_IGNORE)
-    assert dlg.changed_label.text() == "1 answer(s) changed from Council's guess."
+    assert dlg.changed_label.text().startswith("1 answer(s) changed from Council's guess.")
     assert dlg.table.item(row_of(dlg, "Remarks to self"), 1).font().bold()
+    assert dlg.confirm_boxes[key_of(dlg, "Remarks to self")].isChecked()
+    assert "3 guess(es) not confirmed" in dlg.changed_label.text()
+    for label in waiting:
+        dlg.set_confirmed(key_of(dlg, label))
+    assert "not confirmed" not in dlg.changed_label.text()
+    assert not dlg.confirm_all_btn.isEnabled()
     dlg.people_edits["JB"].setText("Jordan  Blake")
     dlg.save_pattern.setChecked(True)
     dlg.save_btn.click()
@@ -438,6 +463,75 @@ def test_answering_inspector_adds_their_initials_to_people(qapp, ledger):
     assert se.load_taught(csv).who == ["Tech Sig"]
     assert "inspector label(s): Tech Sig" in dlg.result.toPlainText()
     close(dlg)
+
+
+def test_an_unconfirmed_guess_is_left_out_and_an_inspectors_row_can_be_no_one(
+        qapp, ledger, monkeypatch):
+    """Save kept every guess left as it was - the model's too - as an alias
+    (review, 2026-10-20): Confirm starts unticked on the model's guesses.
+    The dropdowns offer no '— Inspector Initials' field, and 'Not an
+    inspector' on what the rules read as an inspector's only."""
+    csv, schema, src, untitled, sample, vault = ledger
+    freq = next(f.name for f in schema.fields if "Frequency" in f.name)
+    use_model(monkeypatch, ThreadModel({"Zorp rate": freq}))
+    tab, _ = make_tab(qapp, csv, vault, [src])
+    dlg = open_teach(tab)
+    choose(dlg, untitled)
+    guess(dlg)
+    zorp = key_of(dlg, "Zorp rate")
+    assert not dlg.confirm_boxes[zorp].isChecked()
+    assert dlg.confirm_boxes[key_of(dlg, "Power (W)")].isChecked()
+    assert dlg.table.cellWidget(row_of(dlg, "Zorp rate"), CONFIRM_COL) is dlg.confirm_boxes[zorp]
+    keys = [dlg.answer_boxes[zorp].itemData(i) for i in range(dlg.answer_boxes[zorp].count())]
+    assert lt.ROLE_NO_ONE not in keys
+    assert not any(lt.initials_field(lt.parse_choice(k)[1]) for k in keys)
+    dlg.save_btn.click()
+    assert dlg.wait()
+    assert se.load_aliases(csv)[0] == {}                        # the model's guesses: left out
+    assert "2 guess(es) you did not confirm" in dlg.result.toPlainText()
+    assert "you did not confirm were left out" in dlg.status.text()
+    assert dlg.confirm_all_btn.isEnabled()
+    dlg.confirm_all_btn.click()
+    assert all(b.isChecked() for b in dlg.confirm_boxes.values())
+    dlg.save_btn.click()
+    assert dlg.wait()
+    assert se.load_aliases(csv)[0] == {"zorp rate": freq, "serial": "Part Number"}
+    # an inspector's label: 'Not an inspector' right after 'Inspector'
+    dlg.use_model.setChecked(False)
+    choose(dlg, sample)
+    guess(dlg)
+    insp = key_of(dlg, "Inspector")
+    box = dlg.answer_boxes[insp]
+    keys = [box.itemData(i) for i in range(box.count())]
+    assert keys.index(lt.ROLE_NO_ONE) == keys.index(lt.ROLE_INSPECTOR) + 1
+    dlg.set_answer(insp, lt.ROLE_NO_ONE)
+    dlg.save_btn.click()
+    assert dlg.wait()
+    assert se.load_taught(csv).not_who == ["Inspector"]
+    assert "not an inspector (names no one" in dlg.result.toPlainText()
+    close(dlg)
+
+
+def test_forget_saved_pattern(qapp, ledger):
+    """A pattern Teach saved could not be taken back from the UI (review,
+    2026-10-20)."""
+    csv, _schema, _src, _untitled, _sample, vault = ledger
+    se.save_taught(csv, se.Taught(who=["Tech Sig"], patterns=["@@@#@@###"]))
+    tab, _ = make_tab(qapp, csv, vault)
+    assert tab.forget_pattern_btn.isEnabled()
+    assert "saved pattern @@@#@@### is used as a hint" in tab.pattern_mask.placeholderText()
+    tab.forget_pattern_btn.click()
+    assert se.load_patterns(csv) == [] and se.load_taught(csv).who == ["Tech Sig"]
+    assert not tab.forget_pattern_btn.isEnabled()
+    assert "saved pattern" not in tab.pattern_mask.placeholderText()
+    assert tab._pattern_completer.model().stringList() == []
+    assert "Forgot this Ledger's saved part-name pattern(s): @@@#@@###" in \
+        tab.log.toPlainText()
+    se.save_taught(csv, se.Taught(patterns=["@@@###"]))
+    tab._on_csv_changed()
+    assert tab.forget_pattern_btn.isEnabled()
+    tab.csv.setText(str(csv) + "x")                             # another Ledger's path
+    assert not tab.forget_pattern_btn.isEnabled()
 
 
 def test_a_damaged_aliases_file_is_said_and_kept(qapp, ledger):

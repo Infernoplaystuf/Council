@@ -125,18 +125,19 @@ class LedgerActions:
                                   progress=progress)
 
     def teach_learn(self, csv, session, answers, people=None, *, part=None,
-                    save_pattern: bool = False, connections=None):
-        """Keep the user's Teach answers (council_core.ledger_teach.learn)
-        and tick the knowledge graph's field rules they prove, in
-        ``connections`` (else this one's, else the default vault's). Worker
-        thread: it opens the graph."""
+                    save_pattern: bool = False, connections=None, confirmed=None):
+        """Keep the user's Teach answers (council_core.ledger_teach.learn) -
+        of the rows they confirmed - and tick the knowledge graph's field
+        rules they prove, in ``connections`` (else this one's, else the
+        default vault's). Worker thread: it opens the graph."""
         from council_core import ledger_teach
         vault = connections or self.connections
         if vault is None:
             from council_qt.tabs.connections import ConnectionsActions
             vault = ConnectionsActions()
         return ledger_teach.learn(csv, session, answers, people, part=part,
-                                  save_pattern=save_pattern, connections_vault=vault)
+                                  save_pattern=save_pattern, connections_vault=vault,
+                                  confirmed=confirmed)
 
     def open(self, path) -> None:
         self.opener(path)
@@ -207,6 +208,10 @@ class LedgerTab(ViewHelpers, QWidget):
         #: path is set, not on every keystroke (a CSV on a network share can
         #: take seconds to answer). Teach needs the schema.
         self._schema_known = ("", False)
+        #: (parent CSV, the part-name patterns Teach saved beside it), read
+        #: when the path is set (_load_saved_patterns): 'Forget saved
+        #: pattern' is on when there are some
+        self._saved_patterns = ("", [])
         #: The open Teach dialog, and how its Browse… picks one workbook
         #: (tests replace it: no file dialogs).
         self.teach_dialog = None
@@ -301,7 +306,7 @@ class LedgerTab(ViewHelpers, QWidget):
         v2.addLayout(one_row)
         # Pattern hint — what is typed is held for this session only; the
         # patterns Teach saved beside the parent CSV are offered, and the
-        # newest is used when the field is left empty.
+        # newest is used, as a hint, when the field is left empty.
         mask_row = QHBoxLayout()
         mask_row.addWidget(QLabel("Part name pattern (optional):"))
         self.pattern_mask = QLineEdit()
@@ -310,8 +315,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.pattern_mask.setToolTip(
             "A shape used when the sample number is not labelled.\n"
             "@ matches any letter, # any digit, anything else matches itself.\n"
-            "Example: @@@#@@### finds ABC1DE234 in a filename.\n"
-            "Left empty, the pattern Teach saved for this Ledger is used.")
+            "Example: @@@#@@### finds ABC1DE234 in a filename or a title.\n"
+            "A part of another shape is kept but never pre-accepted.\n"
+            "Left empty, the pattern Teach saved for this Ledger is used as a hint\n"
+            "(parts of another shape are still pre-accepted); Forget saved pattern drops it.")
         # the patterns Teach saved for this Ledger, offered as you type
         # (_load_saved_patterns)
         self._pattern_completer = QCompleter([], self.pattern_mask)
@@ -319,6 +326,15 @@ class LedgerTab(ViewHelpers, QWidget):
             QCompleter.CompletionMode.UnfilteredPopupCompletion)
         self.pattern_mask.setCompleter(self._pattern_completer)
         mask_row.addWidget(self.pattern_mask, 1)
+        # a pattern Teach saved could not be taken back, and it applied to
+        # every later Extract, Preview and Teach (review, 2026-10-20)
+        self.forget_pattern_btn = QPushButton("Forget saved pattern")
+        self.forget_pattern_btn.setToolTip(
+            "Stop using the part-name pattern Teach saved for this Ledger: with the field "
+            "empty, Extract, Preview and Teach then use no pattern.")
+        self.forget_pattern_btn.clicked.connect(self.on_forget_patterns)
+        self.forget_pattern_btn.setEnabled(False)
+        mask_row.addWidget(self.forget_pattern_btn)
         # Label matching alone is never enough on real workbooks (user,
         # 2026-10-19): Council's model is asked about what the rules left.
         self.ask_model = QCheckBox("Ask Council's model about the rest")
@@ -466,10 +482,32 @@ class LedgerTab(ViewHelpers, QWidget):
         except Exception:                                    # noqa: BLE001
             saved = []
         self._pattern_completer.model().setStringList(saved)
+        self._saved_patterns = (csv, list(saved))
         hint = "@ letter, # digit, other characters literal"
         self.pattern_mask.setPlaceholderText(
-            f"empty: this Ledger's saved pattern {saved[0]} is used   — {hint}" if saved
-            else f"@@@#@@###   — {hint}")
+            f"empty: this Ledger's saved pattern {saved[0]} is used as a hint   — {hint}"
+            if saved else f"@@@#@@###   — {hint}")
+        self._refresh_enabled()
+
+    def on_forget_patterns(self) -> None:
+        """Forget the part-name pattern(s) Teach saved for this Ledger
+        (source_extract.forget_patterns); the rest of the aliases file is
+        kept. A small file beside the parent CSV, written here as the Skip
+        patterns are."""
+        csv = self.csv.text().strip()
+        if not csv or self.busy:
+            return
+        try:
+            from source_extract import forget_patterns
+            gone = forget_patterns(csv)
+        except Exception as exc:                             # noqa: BLE001
+            self.status.setText(f"Could not forget the saved pattern: {exc}")
+            return
+        self._load_saved_patterns()
+        if gone:
+            self._say("Forgot this Ledger's saved part-name pattern(s): " + ", ".join(gone)
+                      + " — Extract, Preview and Teach use only a pattern you type now.")
+            self.status.setText("Saved part-name pattern forgotten.")
 
     def _refresh_enabled(self) -> None:
         if not hasattr(self, "progress"):
@@ -480,13 +518,21 @@ class LedgerTab(ViewHelpers, QWidget):
         if hasattr(self, "cancel_btn"):
             # Only enabled while a step that honours it is running.
             self.cancel_btn.setEnabled(not idle and getattr(self, "_cancellable", False))
+        csv = self.csv.text().strip()
+        if hasattr(self, "forget_pattern_btn"):
+            # this Ledger has a saved pattern (_load_saved_patterns)
+            had, saved = self._saved_patterns
+            self.forget_pattern_btn.setEnabled(idle and bool(csv) and had == csv
+                                               and bool(saved))
         if not idle:
             return
-        csv = self.csv.text().strip()
         self.create_btn.setEnabled(bool(self.template.text().strip()))
         self.extract_btn.setEnabled(bool(csv) and bool(self.source_paths()))
-        # the schema was looked up when this path was set (_check_schema)
-        self.teach_btn.setEnabled(bool(csv) and self._schema_known == (csv, True))
+        # off only for a path already looked up and found without its schema
+        # (_check_schema). A path typed or pasted is looked up when Teach is
+        # pressed: the button stayed off until Enter or Tab, and clicking it
+        # did not move the focus (review, 2026-10-20)
+        self.teach_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
@@ -777,7 +823,7 @@ class LedgerTab(ViewHelpers, QWidget):
         saved, and the knowledge graph wants a rebuild when the Ledger's
         inspectors or people changed (kg_excel reads them)."""
         self._load_saved_patterns()
-        if report.who_labels or report.not_who or report.people:
+        if report.who_labels or report.people:
             self._kg_dirty = True
             self.status.setText("Teach saved your answers. Press Rebuild knowledge graph "
                                 "so the graph reads the inspectors the new way.")

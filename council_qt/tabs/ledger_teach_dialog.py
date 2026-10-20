@@ -13,8 +13,10 @@ hopefully this will help train the Ledger and knowledge graph to work").
   2. Guess: ledger_teach.guess reads it exactly as Extract does, on a
      'ledger-teach-guess' worker, with progress and Cancel.
   3. Answer: one row per thing found, Council's guess pre-selected in its
-     dropdown; the People section (initials -> full name); the part number
-     and "save its shape as a part-name pattern".
+     dropdown and a Confirm box (Council's model's guesses and the rules'
+     unsure matches are kept only when confirmed); the People section
+     (initials -> full name); the part number and "save its shape as a
+     part-name pattern".
   4. Save: ledger_teach.learn on a 'ledger-teach-learn' worker (it may open
      the knowledge graph); what was learned is shown here and in the
      Ledger log. "Guess again" then shows what the rules place now.
@@ -51,12 +53,16 @@ MAX_LISTED = 500
 #: The answers table's columns, and the widest each starts (the answer
 #: stays in view without scrolling sideways). 'Read in the picture' shows
 #: only when the workbook has pictures: what the image reader read, for a
-#: thing found in one.
+#: thing found in one. 'Confirm': Save keeps a row's answer only when it is
+#: ticked - ticked to begin with but for Council's model's guesses and the
+#: rules' unsure matches, and ticked when you pick an answer (review,
+#: 2026-10-20: untouched 50%-sure guesses became aliases).
 COLUMNS = ("Where", "Label as written", "Example value", "Council's guess", "From",
-           "Your answer", "Read in the picture")
-_WIDEST = (170, 190, 140, 190, 160, 230, 260)
+           "Your answer", "Confirm", "Read in the picture")
+_WIDEST = (170, 190, 140, 190, 160, 230, 70, 260)
 PICTURE_COL = COLUMNS.index("Read in the picture")
 ANSWER_COL = COLUMNS.index("Your answer")
+CONFIRM_COL = COLUMNS.index("Confirm")
 #: A picture's text shown in its cell, at most (the whole of it in the tip).
 PICTURE_CELL_CHARS = 80
 
@@ -99,7 +105,8 @@ class TeachDialog(QDialog):
     graph (see the module's docstring).
 
     ``guess(csv, workbook, model_id=, cancel=, progress=)`` and
-    ``learn(csv, session, answers, people, part=, save_pattern=)`` are the
+    ``learn(csv, session, answers, people, part=, save_pattern=, confirmed=)``
+    are the
     Ledger tab's (LedgerActions.teach_guess / teach_learn with the tab's
     image reader, pattern and Connections vault bound); by default
     ledger_teach's own, the graph untouched. ``pick_model(parent)`` asks
@@ -153,6 +160,7 @@ class TeachDialog(QDialog):
         self._rows: Dict[str, lt.TeachRow] = {}
         self._row_index: Dict[str, int] = {}
         self.answer_boxes: Dict[str, QComboBox] = {}
+        self.confirm_boxes: Dict[str, QCheckBox] = {}
         self.people_edits: Dict[str, QLineEdit] = {}
         self.last_report: Optional[lt.LearnReport] = None
 
@@ -249,8 +257,16 @@ class TeachDialog(QDialog):
         self.detail.setWordWrap(True)
         self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self.detail)
+        counts = QHBoxLayout()
         self.changed_label = QLabel("")
-        root.addWidget(self.changed_label)
+        counts.addWidget(self.changed_label, 1)
+        self.confirm_all_btn = QPushButton("Confirm every guess")
+        self.confirm_all_btn.setToolTip(
+            "Tick Confirm on every row: Save then keeps Council's model's guesses and the "
+            "rules' unsure matches as they are shown. Check them first.")
+        self.confirm_all_btn.clicked.connect(self.on_confirm_all)
+        counts.addWidget(self.confirm_all_btn)
+        root.addLayout(counts)
 
         lower = QHBoxLayout()
         people = QGroupBox("People: who the initials stand for")
@@ -341,6 +357,8 @@ class TeachDialog(QDialog):
                                  and (has_rows or bool(self.part_edit.text().strip())))
         self.again_btn.setEnabled(idle and self.last_report is not None
                                   and self.session is not None)
+        self.confirm_all_btn.setEnabled(idle and any(
+            not b.isChecked() for b in self.confirm_boxes.values()))
         self.table.setEnabled(idle)
         self.people_table.setEnabled(idle)
         self.part_edit.setEnabled(idle and self.session is not None)
@@ -610,9 +628,11 @@ class TeachDialog(QDialog):
                                  + (f" ({s.hidden} more not shown)" if s.hidden else ""))
         self.table.setRowCount(0)
         self.answer_boxes.clear()
+        self.confirm_boxes.clear()
         self._rows = {r.key: r for r in s.rows}
         self._row_index = {}
         self.table.setRowCount(len(s.rows))
+        sure = lt.confirmed_by_default(s)
         for i, row in enumerate(s.rows):
             self._row_index[row.key] = i
             guessed = row.guess.text(s.item_field)
@@ -631,7 +651,8 @@ class TeachDialog(QDialog):
                     item.setToolTip(tip)
                 self.table.setItem(i, col, item)
             box = _AnswerBox()
-            for key, text in s.choices:
+            # an inspector's label or heading also offers 'Not an inspector'
+            for key, text in lt.row_choices(s, row):
                 box.addItem(text, key)
             if box.findData(row.guess.key) < 0:             # a field the list does not name
                 box.addItem(guessed, row.guess.key)
@@ -641,6 +662,14 @@ class TeachDialog(QDialog):
                 lambda _i, key=row.key: self._answer_changed(key))
             self.table.setCellWidget(i, ANSWER_COL, box)
             self.answer_boxes[row.key] = box
+            ok = QCheckBox()
+            ok.setChecked(row.key in sure)
+            ok.setToolTip("Ticked: Save keeps this answer. Council's model's guesses and the "
+                          "rules' unsure matches start unticked - tick to keep one as it is; "
+                          "picking an answer ticks it.")
+            ok.toggled.connect(lambda _on: self._count_changes())
+            self.table.setCellWidget(i, CONFIRM_COL, ok)
+            self.confirm_boxes[row.key] = ok
         self.table.setColumnHidden(PICTURE_COL, not any(r.picture for r in s.rows))
         self.table.resizeColumnsToContents()
         for col, most in enumerate(_WIDEST):
@@ -660,6 +689,11 @@ class TeachDialog(QDialog):
         more = [p for p in s.parts if p != part]
         if s.part is not None:
             how = f"Found: {s.part.how}."
+            if s.part.via == lt.VIA_MODEL and not s.pattern_mask:
+                # without a pattern, nothing taught finds it again without
+                # the model (review, 2026-10-20)
+                how += (" Save its shape below and the next Extract looks for parts of "
+                        "that shape in file names and titles by itself.")
         else:
             how = "Not found in the workbook: type it if you know it."
         if more:
@@ -706,6 +740,9 @@ class TeachDialog(QDialog):
             font = QFont(item.font())
             font.setBold(changed)
             item.setFont(font)
+        ok = self.confirm_boxes.get(key)
+        if ok is not None:
+            ok.setChecked(True)                             # an answer picked is meant
         if box.currentData() == lt.ROLE_INSPECTOR:
             # the initials beside an inspector's label go to the People
             # section, to be named
@@ -716,8 +753,30 @@ class TeachDialog(QDialog):
     def _count_changes(self) -> None:
         n = sum(1 for k, box in self.answer_boxes.items()
                 if k in self._rows and box.currentData() != self._rows[k].guess.key)
-        self.changed_label.setText(f"{n} answer(s) changed from Council's guess."
-                                   if n else "")
+        waiting = sum(1 for k, ok in self.confirm_boxes.items()
+                      if not ok.isChecked() and k in self.answer_boxes
+                      and self.answer_boxes[k].currentData() != lt.ROLE_UNSURE)
+        said = [f"{n} answer(s) changed from Council's guess." if n else "",
+                f"{waiting} guess(es) not confirmed: Save leaves them out until you tick "
+                "Confirm." if waiting else ""]
+        self.changed_label.setText(" ".join(x for x in said if x))
+        if hasattr(self, "confirm_all_btn"):
+            self.confirm_all_btn.setEnabled(not self.busy and any(
+                not b.isChecked() for b in self.confirm_boxes.values()))
+
+    def on_confirm_all(self) -> None:
+        """Tick every row's Confirm: Save keeps every answer as shown."""
+        for ok in self.confirm_boxes.values():
+            ok.setChecked(True)
+        self._count_changes()
+
+    def set_confirmed(self, key: str, on: bool = True) -> None:
+        """Tick (or untick) a row's Confirm, as the user would."""
+        self.confirm_boxes[key].setChecked(on)
+
+    def confirmed(self) -> set:
+        """The rows whose answer Save keeps (their Confirm ticked)."""
+        return {k for k, ok in self.confirm_boxes.items() if ok.isChecked()}
 
     def set_answer(self, key: str, choice: str) -> None:
         """Pick ``choice`` (a choice key: 'field:<name>', 'part', 'ignore'
@@ -762,7 +821,7 @@ class TeachDialog(QDialog):
         if self.busy or self.session is None:
             return
         session, csv, learn = self.session, self.csv_path, self._learn
-        answers, people = self.answers(), self.people()
+        answers, people, confirmed = self.answers(), self.people(), self.confirmed()
         part = " ".join(self.part_edit.text().split())
         keep = self.save_pattern.isChecked() and bool(part)
         self.status.setText("Saving your answers…")
@@ -773,7 +832,7 @@ class TeachDialog(QDialog):
             report, err = None, ""
             try:
                 report = learn(csv, session, answers, people, part=part or None,
-                               save_pattern=keep)
+                               save_pattern=keep, confirmed=confirmed)
             except LedgerError as exc:
                 err = str(exc)
             except Exception as exc:                        # noqa: BLE001
@@ -797,9 +856,14 @@ class TeachDialog(QDialog):
         said = report.describe()
         self.result.setPlainText(said)
         self._say(said)
+        left = (f" {len(report.unconfirmed)} guess(es) you did not confirm were left out."
+                if report.unconfirmed else "")
         if report.learned:
             self.status.setText("Saved. Press Guess again to see what the Ledger's rules "
-                                "place now.")
+                                "place now." + left)
+        elif report.unconfirmed:
+            self.status.setText("Nothing new saved:" + left + " Tick Confirm on the ones "
+                                "that are right and Save again.")
         else:
             self.status.setText("Saved: nothing new to learn — the rules already read "
                                 "every answer that way.")
@@ -819,4 +883,5 @@ class TeachDialog(QDialog):
         super().done(result)
 
 
-__all__ = ["TeachDialog", "model_name", "from_text", "MAX_LISTED", "COLUMNS"]
+__all__ = ["TeachDialog", "model_name", "from_text", "MAX_LISTED", "COLUMNS", "ANSWER_COL",
+           "CONFIRM_COL", "PICTURE_COL"]
