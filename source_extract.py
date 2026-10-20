@@ -630,6 +630,22 @@ class Grid:
     cells: Dict[Tuple[int, int], object]
     from_image: str = ""             # image file name when read from an image
 
+    def __post_init__(self):
+        # Text with a control character (read through Excel: '216' +
+        # CHAR(1)) is cleaned here, as it is read, so the review, Apply and
+        # the parent CSV all see one text: cleaned only where it was
+        # written, Apply read part '216\x01' - another part than the
+        # review's '216' - and filling its template raised (review,
+        # 2026-10-20)
+        bad = [k for k, v in self.cells.items() if isinstance(v, str) and xl_text(v) is not v]
+        if bad:
+            self.cells = dict(self.cells)
+            for k in bad:
+                v = self.cells.pop(k)
+                t = xl_text(v)
+                if t:
+                    self.cells[k] = _Merged(t) if isinstance(v, _Merged) else t
+
     def text(self, r, c) -> Optional[str]:
         v = self.cells.get((r, c))
         return v.strip() if isinstance(v, str) and v.strip() else None
@@ -2689,7 +2705,7 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
         if not sources:
             return {}
         mine = list(dict.fromkeys(books.get((p, it), []) + books.get((p, ""), [])))
-        return {SOURCE_COL: ", ".join(mine or books.get((p, None), []))[:200]}
+        return {SOURCE_COL: _book_list(mine or books.get((p, None), []))}
     rows = []
     parts = sorted(set(part_vals) | {p for p, _ in item_vals}, key=sample_sort_key)
     for p in parts:
@@ -2702,6 +2718,26 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
             row.update(named(p, it))
             rows.append(row)
     return rows
+
+
+#: How long a row's list of workbooks (source_file) may grow.
+ROW_SOURCES_MAX = 2000
+
+
+def _book_list(books: Sequence[str], limit: int = ROW_SOURCES_MAX) -> str:
+    """Workbook names joined for one row's source_file - whole names only.
+    Cut at 200 characters, three long NDE workbook names lost the last
+    one's end, and the knowledge graph no longer found that workbook's
+    cells (kg_excel.read_ledger; review, 2026-10-20). Past `limit` the
+    rest are counted ('and 3 more')."""
+    out: List[str] = []
+    size = 0
+    for i, b in enumerate(books):
+        if out and size + 2 + len(b) > limit:
+            return ", ".join(out) + f", and {len(books) - i} more"
+        out.append(b)
+        size += len(b) + (2 if len(out) > 1 else 0)
+    return ", ".join(out)
 
 
 # ── the review workbook ─────────────────────────────────────────────────
@@ -2774,7 +2810,10 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         "rows are clashes between sources — accept one value only: two different "
         "values accepted for one cell are both left out at Apply, which says so.",
         "2. Labels to map: labels that matched no field. Pick a field in 'Map to field' "
-        "(it is remembered for every future file), or put Y in Ignore.",
+        "(it is remembered for every future file), or put Y in Ignore. Mapped values go "
+        "into the row's Part: type over it if it is wrong. An amber Part was only "
+        "suggested by Council's model: they go into it once you accept a value of that "
+        "workbook on Values with that part.",
         "3. People: type the full name for each inspector's initials (amber rows). It is "
         "remembered, and the knowledge graph links their inspections to that person.",
         "4. Save this workbook, then press Apply in the Ledger tab (or run:   "
@@ -2826,10 +2865,12 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     grouped: Dict[Tuple[str, str], List[Obs]] = defaultdict(list)
     for o in run.unmatched:
         grouped[(normalize_label(o.label), o.where.split("!")[0])].append(o)
-    for (_, _), obs in sorted(grouped.items()):
+    for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
         o = obs[0]
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
         put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item])
+        if o.part_how.startswith(MODEL_PART_HOW):
+            lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
     lab.add_data_validation(dv2)
     dv2.add(f"A2:A{max(lab.max_row, 2) + 100}")
@@ -3098,6 +3139,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     judge = Matcher(schema)
 
     learned, ignored = {}, []
+    # the Part on each mapped row of 'Labels to map', by (label, workbook ›
+    # sheet) as write_review groups them: one typed there is the reviewer's
+    on_labels: Dict[Tuple[str, str], str] = {}
     lab = wb["Labels to map"]
     for row in lab.iter_rows(min_row=2, values_only=True):
         to, ign, label = row[0], row[1], row[2]
@@ -3105,6 +3149,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             continue
         if to and str(to) in valid:
             learned[normalize_label(label)] = str(to)
+            if len(row) > 7:
+                on_labels[(normalize_label(label), str(row[6] or "").split("!")[0])] = \
+                    _text(row[7])
         elif str(ign or "").strip().upper() == "Y":
             ignored.append(normalize_label(label))
     mapping.update(learned)
@@ -3132,12 +3179,25 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     choice: Dict[Tuple[str, str, str], Tuple[bool, str, str, str]] = {}
     reviewed: List[Tuple[List[str], str, str, Tuple[bool, str, str, str]]] = []
     shown = set()                       # (cell, item) of every reading on Values
+    # The part Council's model gave a workbook (Extraction.model_parts), and
+    # what the reviewer said of it on Values: another part typed over it, or
+    # it accepted as it is (_place_mapped)
+    found = {str(k): (str(v[0]), str(v[1])) for k, v in (meta.get("model_parts") or {}).items()
+             if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
+    retyped: Dict[str, set] = defaultdict(set)
+    confirmed = set()
     for row in wb["Values"].iter_rows(min_row=2, values_only=True):
         acc, part, item, fname, value, score, via, label, where = row[:9]
         if not where:
             continue
         yes = str(acc or "").strip().upper() == "Y"
         c = (yes, _text(part), _text(value), str(fname or ""))
+        book = str(where).split(" › ", 1)[0]
+        if book in found and str(row[11] if len(row) > 11 else "").startswith(MODEL_PART_HOW):
+            if c[1] and c[1] != found[book][0]:
+                retyped[book].add(c[1])
+            elif c[1] and yes:
+                confirmed.add(book)
         cells = [str(where)] + _also_at(row[10] if len(row) > 10 else "")
         choice[(cells[0], c[3], _text(item))] = c
         for w in cells[1:]:
@@ -3163,8 +3223,6 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         read = [sources[i] for i in read if isinstance(i, int) and 0 <= i < len(sources)]
     else:
         read = sources                                  # all read, or an older review
-    found = {str(k): (str(v[0]), str(v[1])) for k, v in (meta.get("model_parts") or {}).items()
-             if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
     run = extract(schema, read, mapping, ignore, image_reader=image_reader,
                   use_images=use_images, progress=prog,
                   pattern_mask=meta.get("pattern_mask") or None,
@@ -3173,6 +3231,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                   labels=source_labels(sources))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
+    mapped: List[Decision] = []
     for d in decisions:
         o = d.obs
         cells = [o.where] + _also_at(o.note)
@@ -3187,8 +3246,10 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             # you mapped it just now: never a reading Values showed you, which
             # was accepted there or not at all (review, 2026-10-20)
             d.accept = not d.conflict
+            mapped.append(d)
         else:
             d.accept = False                                # not seen in review
+    held = _place_mapped(mapped, on_labels, retyped, confirmed)
     # rows edited in the review whose source re-read differently (a Field or
     # Part typed in by hand) are taken as typed
     seen = {(w, d.obs.field, d.obs.item) for d in decisions
@@ -3202,6 +3263,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             decisions.append(Decision(Obs(part, item, fname, value, 1.0, "review",
                                           "", cells[0]), True))
     accepted, notes = _one_value_per_cell(decisions, schema, no_part)
+    notes = held + notes
 
     rows = rows_from(decisions, schema, sources=True)       # each row: its workbooks
     prog.stage("writing the parent CSV", total=len(rows), unit="rows")
@@ -3229,6 +3291,62 @@ def _also_at(note) -> List[str]:
     """The cells a value's note says the same value was found at too
     ('also at EC_log.xlsx › Log!D2', decide)."""
     return [p[8:] for p in str(note or "").split("; ") if p.startswith("also at ")]
+
+
+def _place_mapped(mapped: List[Decision], on_labels: Dict[Tuple[str, str], str],
+                  retyped: Dict[str, set], confirmed: set) -> List[str]:
+    """The part each value of a label mapped on 'Labels to map' goes into;
+    what Apply says of those it leaves out.
+
+    A Part typed over the one its 'Labels to map' row showed is the
+    reviewer's, and is used. A part only Council's model suggested is used
+    once the reviewer confirmed it on Values (a value of that workbook
+    accepted with it); typed over there, the typed part is used. Replayed at
+    Apply, mapped values went under the model's part although the reviewer
+    had typed another on both sheets: a sample that does not exist (review,
+    2026-10-20). Not confirmed, they are left out and said so - the model's
+    part is never pre-accepted."""
+    groups: Dict[Tuple[str, str], List[Decision]] = defaultdict(list)
+    for d in mapped:
+        groups[(normalize_label(d.obs.label), d.obs.where.split("!")[0])].append(d)
+    held: Dict[Tuple[str, str], int] = Counter()          # (workbook, why) -> values
+    for key, ds in groups.items():
+        typed = on_labels.get(key, "")
+        parts = {d.obs.part for d in ds}
+        if typed and typed not in parts:
+            if len(parts - {""}) <= 1:        # the one part the row showed, typed over
+                for d in ds:
+                    d.obs.part, d.obs.part_how = typed, "typed on Labels to map"
+                continue
+            # one row for readings of several parts: which one is meant is not known
+            for d in ds:
+                if d.accept:
+                    d.accept = False
+                    held[(key[1], f"they are of {len(parts)} parts and one Part ({typed}) "
+                                  "was typed for them on 'Labels to map' — Extract again "
+                                  "(the mapping is remembered) and type each part on Values")] += 1
+            continue
+        for d in ds:
+            o = d.obs
+            if not d.accept or not o.part_how.startswith(MODEL_PART_HOW):
+                continue
+            book = o.where.split(" › ", 1)[0]
+            other = retyped.get(book, set())
+            if len(other) == 1 and book not in confirmed:
+                o.part = next(iter(other))          # the part typed on Values for it
+                continue
+            if book in confirmed and not other:
+                continue                            # the model's part, accepted on Values
+            d.accept = False
+            held[(book, f"the parts given for it on Values disagree "
+                        f"({', '.join(sorted(other | {o.part}))}) — type the right one in the "
+                        "Part column on 'Labels to map' and Apply again" if other else
+                        f"its part {o.part} was only suggested by Council's model — accept "
+                        "one of that workbook's values on Values with that part (Extract "
+                        "again if none is there), or type the right part in the Part column "
+                        "on 'Labels to map', and Apply again")] += 1
+    return [f"{n} mapped value{'s' if n > 1 else ''} from {book} {'were' if n > 1 else 'was'} "
+            f"not written: {why}" for (book, why), n in held.items()]
 
 
 def _one_value_per_cell(decisions: List[Decision], schema: TemplateSchema,
@@ -3262,8 +3380,8 @@ def _one_value_per_cell(decisions: List[Decision], schema: TemplateSchema,
                      f"{fname} ({', '.join(values)}) — kept none; choose one")
     if no_part:
         notes.append(f"{no_part} accepted or mapped values have no {schema.id_field} and "
-                     "were not written — type it in the Part column on Values (Extract "
-                     "again to see mapped ones there) and Apply again")
+                     "were not written — type it in the Part column on Values (on "
+                     "'Labels to map' for a mapped label) and Apply again")
     return accepted, notes
 
 
