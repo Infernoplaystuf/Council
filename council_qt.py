@@ -104,23 +104,51 @@ def _register_tabs(window) -> None:
     # The grouped layout, if Council has delivered profiles.py. It is wired
     # BEFORE any tab registers so the first add_tab call can place its page
     # inside a group.
+    #
+    # Two gates are deliberate here:
+    # (1) ``load_or_migrate`` only runs when profiles.py is present. The flat
+    #     fallback must not write ``{"ui":{"profile":"full"}}`` to disk — the
+    #     next ``modes.advanced()`` call reads that back as True and turns on
+    #     six advanced tabs for every user who never asked (committing the
+    #     vault to git, SSHing into a Pi, rewriting the model registry).
+    # (2) The grouped-controller setup is wrapped in try/except: a broken
+    #     profiles.py contract takes the LAUNCH down otherwise.
     profiles_mod = group_tabs.try_import_profiles()
-    ui_section, notice = ui_settings.load_or_migrate()
+    ui_section = None
+    notice = None
     if profiles_mod is not None:
-        controller = group_tabs.GroupedTabsController(window, profiles_mod)
-        window.install_grouped_layout(controller)
-        controller.apply_profile_state(ui_section)
-        if notice:
-            controller.show_once_notice(notice)
+        try:
+            ui_section, notice = ui_settings.load_or_migrate()
+            controller = group_tabs.GroupedTabsController(window, profiles_mod)
+            window.install_grouped_layout(controller)
+            controller.apply_profile_state(ui_section)
+            if notice:
+                controller.show_once_notice(notice)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[council_qt] grouped layout setup failed, falling back "
+                  f"to the flat shell: {exc!r}", flush=True)
+            window.grouped = None
+            ui_section = None
 
     # Advanced mode ADDS tabs; it does not unlock a setting. The six behind it
     # commit the vault to git, SSH into a Pi, or rewrite the model registry.
-    for title, factory, eager in registry(advanced=modes.advanced()):
+    #
+    # With the grouped controller installed, we register them unconditionally
+    # and let the profile filter hide them — otherwise a runtime
+    # Demo → Developer switch cannot show them.
+    # In the flat fallback, we use the Tk-era env/CLI gate only; the profile
+    # file is deliberately not consulted here (see (1) above).
+    if window.grouped is not None:
+        show_advanced = True
+    else:
+        show_advanced = modes.advanced_env_or_cli()
+
+    for title, factory, eager in registry(advanced=show_advanced):
         tab_id = _tab_id_of(factory)
         window.add_tab(title, lambda f=factory, w=window: f(w),
                        eager=eager, tab_id=tab_id)
 
-    if window.grouped is not None:
+    if window.grouped is not None and ui_section is not None:
         # Re-apply once every tab has registered so empty groups auto-hide
         # with their real inner counts.
         window.grouped.apply_profile_state(ui_section)

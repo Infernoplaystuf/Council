@@ -335,6 +335,17 @@ class GroupedTabsController:
             self.profile_name = profile
             self.visible_ids = self._preset_ids(profile)
         elif profile == "custom":
+            # Spec §4: switching to Custom from scratch starts with what
+            # the user is seeing — so the previous preset's base and its
+            # advanced-mode flag carry over, matching the behaviour of
+            # ``_on_toggle`` when the user flips a checkbox on a preset.
+            # Without this, Custom lands on base=demo/advanced=False
+            # whatever the user was on, dropping the advanced tabs they
+            # expected to keep.
+            previous = self.profile_name
+            if previous in ("demo", "developer", "full"):
+                self.custom_base = previous
+                self.custom_advanced = previous in ("developer", "full")
             self.profile_name = "custom"
         else:
             return
@@ -374,6 +385,14 @@ class GroupedTabsController:
         return set(self._id_to_group)
 
     def _preset_ids(self, name: str) -> set:
+        """Tab ids for a named preset.
+
+        The Council dogfood PR delivers DEMO/DEVELOPER/FULL as frozen
+        ``Profile`` dataclass instances with a ``visible_tabs: frozenset``
+        attribute. Pre-dogfood tests pass them as plain sets. Both must
+        work; iterating a dataclass directly raises TypeError and that
+        would take the launch down.
+        """
         attr = {
             "demo": "DEMO",
             "developer": "DEVELOPER",
@@ -382,7 +401,15 @@ class GroupedTabsController:
         preset = getattr(self.profiles, attr, None)
         if preset is None:
             return set(self._id_to_group)
-        return {t for t in preset if t in self._id_to_group}
+        tabs = getattr(preset, "visible_tabs", preset)
+        try:
+            return {t for t in tabs if t in self._id_to_group}
+        except TypeError:
+            # A preset that is neither iterable nor exposes visible_tabs is
+            # malformed; a visible defect, not a launch crash.
+            print(f"[group_tabs] preset {attr!r} is neither iterable nor "
+                  f"has a visible_tabs attribute: {preset!r}", flush=True)
+            return set()
 
     def _rebuild_show_more_menu(
             self, hidden_by_group: Dict[str, List[str]]) -> None:

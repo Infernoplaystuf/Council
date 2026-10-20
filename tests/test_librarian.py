@@ -379,10 +379,25 @@ def test_the_advanced_tabs_are_not_in_the_default_build(monkeypatch):
 
 
 def test_the_entry_point_asks_before_registering_the_advanced_tabs():
+    """Guard against the regression this test was written for: the entry
+    point must consult the advanced-mode gate before adding the six tabs
+    that commit the vault, SSH into a Pi, or rewrite the model registry.
+
+    Two valid shapes:
+    - ``modes.advanced()`` — the composed gate (env, CLI, profile).
+    - ``modes.advanced_env_or_cli()`` — the Tk-era subset used in the flat
+      fallback, where consulting the profile would surprise-upgrade a
+      first-time user to Full. The grouped layout uses the profile filter
+      directly instead; this file's ``_register_tabs`` must still name the
+      gate somewhere, which is what this check protects.
+    """
     from tests.source_checks import code_of
     source = (ROOT / "council_qt.py").read_text(encoding="utf-8")
     body = code_of(source, "_register_tabs")
-    assert "modes.advanced()" in body
+    assert ("modes.advanced()" in body
+            or "modes.advanced_env_or_cli()" in body), (
+        "_register_tabs no longer consults modes.advanced — the advanced "
+        "tabs would register unconditionally")
 
 
 # ============================================================
