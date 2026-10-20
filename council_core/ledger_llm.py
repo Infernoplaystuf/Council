@@ -43,7 +43,46 @@ MAX_CELLS, MAX_CELL_CHARS = 200, 80
 
 
 class ModelUnavailable(Exception):
-    """The model failed once in this run and is not asked again (one_shot)."""
+    """The model is not asked again in this run (one_shot)."""
+
+
+class ModelFailedAgain(Exception):
+    """The model failed again with an error already in the problems: the
+    caller says which workbook, not the whole error again (one_shot)."""
+
+
+def _cannot(err: BaseException) -> BaseException:
+    """Mark ``err`` as a model that cannot answer at all (not installed,
+    would not load, nothing serves it): one_shot stops asking at once."""
+    err.cannot_answer = True                               # type: ignore[attr-defined]
+    return err
+
+
+def _cannot_answer(exc: BaseException) -> bool:
+    """Is ``exc`` (or what caused it) a model that cannot answer at all, not
+    one question that failed? A timeout on one big workbook stopped every
+    question after it - parts and labels - and the summary called an
+    installed, answering model unavailable (review, 2026-10-19)."""
+    import urllib.error
+    try:
+        import council_engine as ce
+        down: Tuple[type, ...] = (ce.BackendUnavailable,)
+    except Exception:                                      # noqa: BLE001
+        down = ()
+    seen = set()
+    e: Optional[BaseException] = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if getattr(e, "cannot_answer", False) or isinstance(
+                e, down + (ConnectionRefusedError, ImportError, FileNotFoundError)):
+            return True
+        if isinstance(e, urllib.error.URLError) and not isinstance(
+                e, urllib.error.HTTPError) and not isinstance(e.reason, TimeoutError):
+            return True                                    # nothing listens there
+        if "has no model" in str(e):                       # council_engine: not installed
+            return True
+        e = e.__cause__ or e.__context__
+    return False
 
 
 _PART_SCHEMA = {
@@ -89,9 +128,9 @@ def council_chat(timeout: float = 120,
         import source_extract as se
         pick = se.first_us_text_model()
         if pick is None:
-            raise se.LedgerError(
+            raise _cannot(se.LedgerError(
                 "no local model answered: set COUNCIL_GGUF_PATH to a US-origin GGUF, "
-                "or install an Ollama model (e.g. `ollama pull granite3.3:8b`)")
+                "or install an Ollama model (e.g. `ollama pull granite3.3:8b`)"))
         host, model = pick
         out = se._ollama("/api/chat", {
             "model": model, "stream": False, "format": schema,
@@ -103,18 +142,29 @@ def council_chat(timeout: float = 120,
 
 # ── the user picks the model (user, 2026-10-19: "ask the user to select what
 # model they want to use that is downloaded on the computer") ──────────────
+def _usable(backend: str, origin: str) -> bool:
+    """Council's rule for a model the user picks: an Ollama model must be of
+    US origin; a GGUF file is used unless it is known to be non-US (a GGUF
+    is always accepted - its name often says nothing). An unknown-origin
+    Ollama model was usable here and left out of Connections' Suggest
+    links (review, 2026-10-19): one rule, as there."""
+    return origin == "US" if backend == "ollama" else origin != "non-US"
+
+
 def available_models() -> List[Dict[str, Any]]:
     """Every model downloaded on this PC - GGUF files in Council's model
     folders and the models this PC's Ollama has - as local_models lists
-    them, each with 'usable' False for a non-US-origin one (Council's
-    rule: listed, never used)."""
+    them, each with 'usable' False for one Council does not use (_usable:
+    listed, never used)."""
     from council_core import local_models
     out = []
     for e in local_models.list_local_models():
         e = dict(e)
-        e["usable"] = e.get("origin") != "non-US"
+        e["usable"] = _usable(str(e.get("backend") or ""), str(e.get("origin") or ""))
+        why = ("not US-origin" if e.get("origin") == "non-US" else
+               "origin unknown")
         e["label"] = local_models.describe(e) + (
-            "" if e["usable"] else "   (not US-origin: not used by Council)")
+            "" if e["usable"] else f"   ({why}: not used by Council)")
         out.append(e)
     return out
 
@@ -163,13 +213,13 @@ def _gguf_llm(path: str):
             try:
                 from llama_cpp import Llama
             except Exception as exc:                       # noqa: BLE001
-                raise se.LedgerError(
+                raise _cannot(se.LedgerError(
                     "this Council install cannot run GGUF files (llama-cpp-python "
-                    f"would not load: {exc}). Pick an Ollama model instead.") from exc
+                    f"would not load: {exc}). Pick an Ollama model instead.")) from exc
             llm = Llama(model_path=path, n_ctx=8192, n_gpu_layers=-1, verbose=False)
         except Exception as exc:                           # noqa: BLE001
-            raise se.LedgerError(f"{os.path.basename(path)} could not be loaded: {exc}") \
-                from exc
+            raise _cannot(se.LedgerError(
+                f"{os.path.basename(path)} could not be loaded: {exc}")) from exc
         _GGUF["key"], _GGUF["llm"] = key, llm
         return llm
 
@@ -228,8 +278,12 @@ def chat_for(model_id: str, timeout: float = 120,
     if local_models.is_ollama_id(model_id):
         name = local_models.ollama_name(model_id)
         _, origin = local_models.maker_and_origin(name)
-        if origin == "non-US":
-            raise se.LedgerError(f"{name} is not a US-origin model; Council does not use it")
+        if not _usable("ollama", origin):
+            raise se.LedgerError(
+                f"{name} is not a US-origin model; Council does not use it" if
+                origin == "non-US" else
+                f"Council cannot tell where {name} comes from, so it does not use it "
+                "— pick a US-origin model (Granite, Llama, Gemma, Phi, gpt-oss)")
 
         def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
             try:
@@ -301,16 +355,20 @@ class AssistReport:
     problems: List[str] = field(default_factory=list)
     #: Why the model stopped being asked (one_shot), '' while it answers.
     unavailable: str = ""
+    #: It stopped being asked after failing twice in a row (a timeout, say),
+    #: not because it cannot answer at all.
+    gave_up: bool = False
 
     def describe(self) -> str:
         # the error's first sentence: the problem line below has all of it
         down = (self.unavailable.splitlines() or [""])[0].strip()
         if down.endswith(":") and ". " in down:            # '... installed. Install with:'
             down = down.rsplit(". ", 1)[0]
-        down = down[:200].rstrip(".:")
+        down = down[:200]
         if down and not (self.values_placed or self.parts_found):
-            return (f"Council's model was unavailable, so nothing in the review is its "
-                    f"suggestion: {down}.")
+            lead = ("Council's model did not answer twice in a row and was not asked "
+                    "again" if self.gave_up else "Council's model was unavailable")
+            return f"{lead}, so nothing in the review is its suggestion: {_end(down)}"
         if not (self.labels_asked or self.parts_asked):
             return "Council's model: nothing it needed to be asked."
         bits = [f"Council's model ({self.model or 'none answered'}):"]
@@ -322,8 +380,15 @@ class AssistReport:
             bits.append(f"part numbers for {self.parts_asked} workbook(s): {got}")
         tail = (f". Then it stopped answering and was not asked again: {down}" if down
                 else "")
-        return " ".join(bits[:1]) + " " + "; ".join(bits[1:]) + \
-            " — all amber in the review: check them" + tail + "."
+        return _end(" ".join(bits[:1]) + " " + "; ".join(bits[1:]) +
+                    " — all amber in the review: check them" + tail)
+
+
+def _end(text: str) -> str:
+    """``text`` as a sentence: one full stop, unless it already ends in
+    '.', '?' or '!' ('... Is Ollama running?.' - review, 2026-10-19)."""
+    text = text.rstrip().rstrip(":;,").rstrip()
+    return text if text.endswith((".", "?", "!")) else text + "."
 
 
 def one_shot(chat: Chat, report: AssistReport,
@@ -331,21 +396,45 @@ def one_shot(chat: Chat, report: AssistReport,
     """``chat`` asked only while it answers. A model that could not answer
     was asked again for every workbook (and a GGUF that would not load was
     loaded again each time): the same multi-line error was printed N+1
-    times (review, 2026-10-19). The first failure is one problem line and
-    ``report.unavailable``; every later question raises ModelUnavailable
-    without asking. Cancel is not a failure."""
+    times (review, 2026-10-19).
+
+    A model that cannot answer at all (_cannot_answer: not installed, would
+    not load, no Ollama) is one problem line and ``report.unavailable``;
+    every later question raises ModelUnavailable without asking. One that
+    failed a question (a timeout on one big workbook) is asked again - it
+    stopped every later workbook and the labels too - until it fails twice
+    in a row; an error already said once raises ModelFailedAgain, so the
+    caller names the workbook without the whole error again. Cancel is not
+    a failure."""
+    state = {"fails": 0, "said": set()}
+
     def ask(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
         if report.unavailable:
             raise ModelUnavailable(report.unavailable)
         try:
-            return chat(prompt, schema)
+            out = chat(prompt, schema)
         except Exception as exc:                           # noqa: BLE001
             if should_stop is not None and should_stop():
                 raise
-            report.unavailable = str(exc).strip() or type(exc).__name__
-            report.problems.append("Council's model did not answer, so it was not asked "
-                                   f"again in this run: {report.unavailable}")
-            raise ModelUnavailable(report.unavailable) from exc
+            msg = str(exc).strip() or type(exc).__name__
+            state["fails"] += 1
+            said = msg in state["said"]
+            state["said"].add(msg)
+            fatal = _cannot_answer(exc)
+            if fatal or state["fails"] >= 2:
+                report.unavailable = msg
+                report.gave_up = not fatal
+                why = ("did not answer twice in a row" if report.gave_up else
+                       "did not answer")
+                report.problems.append(
+                    f"Council's model {why}, so it was not asked again in this run: "
+                    + ("the same error as above" if said else msg))
+                raise ModelUnavailable(msg) from exc
+            if said:
+                raise ModelFailedAgain(msg) from exc
+            raise
+        state["fails"] = 0
+        return out
     return ask
 
 
@@ -418,6 +507,10 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
         mapping, report.model = map_labels(labels, fields, chat)
     except ModelUnavailable:
         return                                             # said once, by one_shot
+    except ModelFailedAgain:
+        report.problems.append("Council's model did not answer about the labels (the "
+                               "same error as above)")
+        return
     except Exception as exc:                               # noqa: BLE001
         report.problems.append(f"Council's model was not asked about labels: {exc}")
         return
@@ -443,8 +536,45 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
 _NUMBER = re.compile(r"[+-]\d+|[+-]?\d+(?:[.,]\d+)+|[+-]?\d*\.\d+")
 _YEAR = re.compile(r"(?:19|20)\d\d")
 _DATE = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}")
+#: ... nor a value with its unit ('61.35mm', '100kHz', '12.5%'), a time
+#: ('10:30'), a date with a month name ('05-Oct-2026') or an ISO date-time:
+#: all of them passed as part numbers (review, 2026-10-19). Units are
+#: matched as written (mA, kg, ms - not MA, KG, MS, which end part numbers),
+#: and an integer with a one-letter unit ('4471A') stays a possible part.
+_UNIT = (r"(?:%|‰|°[CFK]?|deg[CF]?|Ω|ohms?|(?i:psi|ksi|rpm|ppm|bar|mbar|dBm?)"
+         r"|(?i:[kmg]?hz)|[kMG]?Pa|[kmµμun]?[WVAJN]|[kmcµμun]?m|[mµμun]?s|[kmµμ]?g|[mµμ]?[lL]"
+         r"|in|ft|lbs?|oz|min|hrs?|sec)(?:/(?:s|min|h|hr|rev|mm|m|in))?[23²³]?")
+_MEASURE = re.compile(rf"(?P<num>[+-]?(?:\d+(?:[.,]\d+)*|\d*\.\d+))\s?(?P<unit>{_UNIT})")
+_TIME_RX = r"\d{1,2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?(?:\s?(?i:[ap]\.?m\.?))?"
+_TIME = re.compile(_TIME_RX)
+_MON = (r"(?i:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+        r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_MONTH_DATE = re.compile(
+    rf"\d{{1,2}}[-/. ]?{_MON}[-/., ]?\d{{2,4}}"            # 05-Oct-2026, 5Oct26
+    rf"|{_MON}[-/. ]?\d{{1,2}}(?i:st|nd|rd|th)?[-/., ]+\d{{2,4}}"   # Oct-05-2026
+    rf"|\d{{4}}[-/. ]?{_MON}[-/. ]?\d{{1,2}}"              # 2026-Oct-05
+    rf"|{_MON}[-/. ]?(?:19|20)?\d\d")                      # Oct2026, Oct-26
+_ISO_DT = re.compile(rf"\d{{4}}-?\d{{2}}-?\d{{2}}[T_ ]{_TIME_RX}(?:Z|[+-]\d{{2}}:?\d{{2}})?"
+                     r"|\d{8}T\d{4,6}Z?")
+#: A container's default or generic name with a number: Excel's 'Sheet1' is
+#: in almost every workbook, so a model that answered the sheet name merged
+#: unrelated workbooks into one phantom part (review, 2026-10-19).
+_GENERIC = re.compile(
+    r"(?i:sheet|page|tab|table|chart|graph|plot|fig(?:ure)?|run|data(?:set)?|series"
+    r"|row|col(?:umn)?|step|item|trial|test|rev(?:ision)?|ver(?:sion)?|log|scan|report"
+    r"|file|book|workbook|untitled|image|img|photo|pic|dsc)[\s_\-#.]*\d+")
 #: What is trimmed off a word before it is judged ('(XYZ9AB123),').
 _TRIM = "()[],;:"
+
+
+def _measured(s: str) -> bool:
+    """A value with its unit - but not an integer with a one-letter unit,
+    which is also how part numbers end ('4471A')."""
+    m = _MEASURE.fullmatch(s)
+    if not m:
+        return False
+    unit, num = m.group("unit"), m.group("num").lstrip("+-")
+    return not (num.isdigit() and len(unit) == 1 and unit.isascii() and unit.isalpha())
 
 
 def _mask_re(pattern_mask: Optional[str]):
@@ -460,8 +590,9 @@ def _mask_re(pattern_mask: Optional[str]):
 def looks_like_part(text: Any, pattern_mask: Optional[str] = None) -> bool:
     """Could ``text`` be a part identifier: the user's pattern exactly, or
     one word of 4+ characters with a digit in it that is not a number, a
-    year or a date (only digits: 5+ of them, unless the user's pattern is
-    all digits). The quote check alone took a title ('Laser build record',
+    year, a date or time, a value with its unit or a default name like
+    'Sheet1' (only digits: 5+ of them, unless the user's pattern is all
+    digits). The quote check alone took a title ('Laser build record',
     llama3.1:8b - three workbooks merged into that phantom part), the sheet
     name, a label, a measured value, a year and a lone digit (review,
     2026-10-19)."""
@@ -482,6 +613,9 @@ def _part_test(pattern_mask: Optional[str]) -> Callable[[str], bool]:
             return False
         if _NUMBER.fullmatch(s) or _YEAR.fullmatch(s) or _DATE.fullmatch(s):
             return False
+        if (_measured(s) or _TIME.fullmatch(s) or _MONTH_DATE.fullmatch(s)
+                or _ISO_DT.fullmatch(s) or _GENERIC.fullmatch(s)):
+            return False
         return not (s.isdigit() and len(s) < 5 and not digits_mask)
     return test
 
@@ -492,32 +626,48 @@ def _cells_text(grids, pattern_mask: Optional[str] = None) -> List[str]:
     the other short text (labels, titles), plain numbers last - they are
     not part ids. The first 200 cells went, numbers included, so an id
     below a data table or on a later sheet never reached the model
-    (review, 2026-10-19)."""
+    (review, 2026-10-19).
+
+    A number - stored as one or as text - is never an identifier here: a
+    table of whole-number readings (Excel stores 10200 Hz as 10200.0) went
+    first as 'ids' and filled every place ahead of the S/N below it
+    (review, 2026-10-19). One the user's pattern matches whole goes after
+    the text ids."""
     rx = _mask_re(pattern_mask)
     is_part = _part_test(pattern_mask)
     ids: List[str] = []
+    masked: List[str] = []
     text: List[str] = []
     numbers: List[str] = []
+
+    def number(s: str) -> None:
+        (masked if rx is not None and rx.fullmatch(s) else numbers).append(s)
+
     for g in grids:
         for (_r, _c), v in sorted(g.cells.items()):
             if isinstance(v, bool):
                 continue
             if isinstance(v, (int, float)):
-                s = str(int(v)) if isinstance(v, float) and v.is_integer() else str(v)
-                (ids if is_part(s) else numbers).append(s)
+                number(str(int(v)) if isinstance(v, float) and v.is_integer() else str(v))
                 continue
             if not isinstance(v, str):
                 continue
             s = " ".join(v.split())
-            found = [w.strip(_TRIM) for w in s.split() if is_part(w.strip(_TRIM))]
+            if not s:
+                continue
+            if s.lstrip("+-").isdigit() or _NUMBER.fullmatch(s):
+                number(s)                                  # a number stored as text
+                continue
+            words = [w.strip(_TRIM) for w in s.split()]
+            found = [w for w in words if is_part(w) and not w.isdigit()]
             if rx is not None:
                 found += [m.group(0) for m in rx.finditer(s)]
-            if s and len(s) <= MAX_CELL_CHARS:
+            if len(s) <= MAX_CELL_CHARS:
                 (ids if found else text).append(s)
             else:                                          # a long cell: its ids alone
                 ids.extend(found)
     out: List[str] = []
-    for s in dict.fromkeys(ids + text + numbers):
+    for s in dict.fromkeys(ids + masked + text + numbers):
         out.append(s)
         if len(out) >= MAX_CELLS:
             break
@@ -550,6 +700,10 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
         text, report.model = chat(prompt, _PART_SCHEMA)
     except ModelUnavailable:
         return "", ""                                      # said once, by one_shot
+    except ModelFailedAgain:
+        report.problems.append(f"{file_name}: Council's model did not answer for its part "
+                               "(the same error as above)")
+        return "", ""
     except Exception as exc:                               # noqa: BLE001
         report.problems.append(f"{file_name}: Council's model was not asked for its part: "
                                f"{exc}")
@@ -568,17 +722,34 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
     # an identifier has no spaces: with words around it, the piece first
     tries = (pieces + [answer]) if re.search(r"\s", answer) else ([answer] + pieces)
     is_part = _part_test(pattern_mask)
-    tries = [p for p in dict.fromkeys(tries) if is_part(p)]
+    tries = [p for p in dict.fromkeys(tries)
+             if is_part(p) and not _named_file(p, file_name, pattern_mask)]
     for part in tries:
         where, written = _written_at(part, file_name, sheets, grids)
         if where:
             report.parts_found.append((file_name, written))
             return written, where
     why = ("is not written in the workbook as a whole word" if tries else
-           "does not look like a part number (a title, label, value or date?)")
+           "does not look like a part number (a title, label, value, date, sheet or "
+           "file name?)")
     report.problems.append(f"{file_name}: Council's model named part {answer!r}, which "
                            f"{why} — dropped")
     return "", ""
+
+
+def _named_file(part: str, file_name: str, pattern_mask: Optional[str]) -> bool:
+    """``part`` is the workbook's whole file name, made of words
+    ('inspection_run_3'): a file's name, not a part number - it passed, '_'
+    being a word boundary (review, 2026-10-19). A stem that is one code
+    ('AB12CD345.xlsx') can be the part, and so can whatever the user's
+    pattern matches whole."""
+    from pathlib import Path
+    if part.casefold() != Path(file_name).stem.casefold():
+        return False
+    rx = _mask_re(pattern_mask)
+    if rx is not None and rx.fullmatch(part):
+        return False
+    return any(len(w) >= 4 and w.isalpha() for w in re.split(r"[\s_\-.]+", part))
 
 
 def _whole_word(part: str, text: Any) -> str:
@@ -590,8 +761,25 @@ def _whole_word(part: str, text: Any) -> str:
     if not words:
         return ""
     body = r"\s+".join(re.escape(w) for w in words)
-    m = re.search(r"(?<![^\W_])" + body + r"(?![^\W_])", str(text), re.IGNORECASE)
-    return m.group(0) if m else ""
+    text = str(text)
+    for m in re.finditer(r"(?<![^\W_])" + body + r"(?![^\W_])", text, re.IGNORECASE):
+        if not _inside_a_value(text, m.start(), m.end()):
+            return m.group(0)
+    return ""
+
+
+def _inside_a_value(text: str, start: int, end: int) -> bool:
+    """Is text[start:end] a piece of a date, time or measured value written
+    there ('2026-10-05T10' of '2026-10-05T10:30': the answer's pieces are
+    split at ':' - review, 2026-10-19)?"""
+    a = max(text.rfind(ch, 0, start) for ch in " \t\n") + 1
+    b = min((i for i in (text.find(ch, end) for ch in " \t\n") if i >= 0), default=len(text))
+    token = text[a:b].strip(_TRIM + ".")
+    if token == text[start:end]:
+        return False
+    return bool(_NUMBER.fullmatch(token) or _DATE.fullmatch(token) or _measured(token)
+                or _TIME.fullmatch(token) or _MONTH_DATE.fullmatch(token)
+                or _ISO_DT.fullmatch(token))
 
 
 def _written_at(part: str, file_name: str, sheets: Sequence[str], grids

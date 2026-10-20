@@ -500,20 +500,24 @@ def test_a_gguf_answer_clears_the_gpu_crash_marker(monkeypatch, tmp_path):
     assert not marker.exists()
 
 
-def test_a_model_that_cannot_answer_is_asked_once(tmp_path, ledger):
+def test_a_model_that_cannot_answer_is_asked_once(tmp_path, ledger, monkeypatch):
     """It was asked again for every workbook (a GGUF that would not load was
     loaded again each time): the same multi-line error N+1 times (review,
     2026-10-19)."""
+    import council_engine as ce
     csv, _schema = ledger
     books = [_unlabelled_book(tmp_path / f"untitled_{i}.xlsx") for i in range(3)]
     calls = []
 
-    def broken(prompt, schema):
-        calls.append(prompt)
-        raise se.LedgerError("granite.gguf could not be loaded: llama-cpp-python is not "
-                             "installed. Install with:\n  pip install llama-cpp-python")
+    def broken(path, **kw):             # council_engine's own words, as _load_gguf says
+        calls.append(path)
+        raise ce.BackendUnavailable("llama-cpp-python is not installed. Install with:\n"
+                                    "  pip install llama-cpp-python")
+    monkeypatch.setattr(ce, "_load_gguf", broken)
+    monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
+    # the user's pick: a GGUF file, through chat_for as the Ledger tab sends it
     s = li._extract(str(csv), [str(b) for b in books], None, "", False, None, _NoProg(),
-                    None, None, None, True, broken)
+                    None, None, None, str(tmp_path / "granite.gguf"))
     assert len(calls) == 1
     assert sum("llama-cpp-python" in p for p in s.problems) == 1
     assert s.assist == ("Council's model was unavailable, so nothing in the review is its "
@@ -685,7 +689,12 @@ def test_connections_lists_models_by_the_same_origin_as_the_ledger(monkeypatch, 
             {"name": "qwen2.5:7b", "details": {"family": "qwen2"}},
             {"name": "llama-pro:8b", "details": {"family": "llama"}},     # Tencent
             {"name": "mystery:1b", "details": {"family": "mystery"}},     # unknown: not US
-            {"name": "granite3.3:8b", "details": {"family": "granite"}}]
+            {"name": "granite3.3:8b", "details": {"family": "granite"}},
+            # family "llama", not Meta's: Mistral fine-tunes and a TinyLlama
+            # ('phi' in 'dolphin') - second review, 2026-10-19
+            {"name": "zephyr:7b", "details": {"family": "llama"}},
+            {"name": "openhermes:7b", "details": {"family": "llama"}},
+            {"name": "tinydolphin:1.1b", "details": {"family": "llama"}}]
     monkeypatch.setattr(ce, "_ollama_tags", lambda host, **kw: {"models": tags})
     got = ConnectionsActions(vault_dir=tmp_path / "v").local_models()
     assert got == ["granite3.3:8b", "llava:7b"]
@@ -702,3 +711,223 @@ def test_connections_lists_models_by_the_same_origin_as_the_ledger(monkeypatch, 
     usable, skipped = ConnectionsActions(vault_dir=vault).pi_nodes()
     assert [n for n, _u, _m in usable] == ["NodeTertius"]
     assert skipped == [("NodePrimus", "llama-pro:8b")]
+
+
+# ---------------------------------------------- second review of the fixes (2026-10-19)
+
+def _one_value_book(path: Path, label: str, value, sheet: str = "Build") -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws["A1"], ws["B1"] = label, value
+    wb.save(path)
+    return path
+
+
+def _stub(answer):
+    def chat(prompt, schema):
+        return json.dumps({"part": answer, "evidence": "stub"}), "stub"
+    return chat
+
+
+def test_the_default_sheet_name_is_not_a_part(tmp_path):
+    """'Sheet1' is in almost every workbook and passed as an identifier:
+    three unrelated workbooks merged into one phantom part 'Sheet1'
+    (review, 2026-10-19)."""
+    for name in ("log_a.xlsx", "log_b.xlsx", "log_c.xlsx"):
+        src = _one_value_book(tmp_path / name, "Pulse freq", 61.35, sheet="Sheet1")
+        grids, _imgs = se.load_workbook_grids(src, [])
+        rep = ledger_llm.AssistReport()
+        assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub("Sheet1"),
+                                    rep) == ("", "")
+        assert any("dropped" in p for p in rep.problems)
+    for generic in ("Sheet1", "Sheet 2", "Book1", "Table3", "Run2", "IMG_1234"):
+        assert not ledger_llm.looks_like_part(generic), generic
+    assert ledger_llm.looks_like_part("Sheet1", "@@@@@#")     # the user's own pattern
+
+
+NON_IDS = [  # (label, the cell and the model's answer) - none is a part number
+    ("Start time", "10:30"),
+    ("Date", "05-Oct-2026"),
+    ("Time", "2026-10-05T10:30"),                   # its piece '2026-10-05T10' too
+    ("Thickness", "61.35mm"),
+    ("Freq", "100kHz"),
+    ("Yield", "12.5%"),
+    ("Run", "Run2"),
+]
+
+
+@pytest.mark.parametrize("label,value", NON_IDS)
+def test_a_value_with_a_unit_a_time_or_a_date_is_not_a_part(tmp_path, label, value):
+    """They passed the identifier check and the whole-word check (review,
+    2026-10-19)."""
+    src = _one_value_book(tmp_path / "x.xlsx", label, value)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(value), rep) == ("", "")
+    assert not rep.parts_found
+
+
+def test_the_file_name_itself_is_not_a_part_unless_it_is_one_code(tmp_path):
+    """'inspection_run_3' (from inspection_run_3.xlsx) passed: '_' is a word
+    boundary (review, 2026-10-19). A file named by its part still gives it."""
+    src = _one_value_book(tmp_path / "inspection_run_3.xlsx", "Pulse freq", 61.35)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, None, _stub("inspection_run_3"),
+                                rep) == ("", "")
+    src = _one_value_book(tmp_path / "AB12CD345.xlsx", "Pulse freq", 61.35)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    assert ledger_llm.find_part(src.name, grids, None, _stub("AB12CD345"),
+                                ledger_llm.AssistReport()) == (
+        "AB12CD345", "file name 'AB12CD345.xlsx'")
+
+
+def test_real_part_numbers_still_pass():
+    looks = ledger_llm.looks_like_part
+    for s in ("ABC1DE234", "XYZ9AB123-R2", "SN#4471", "XJ-9", "AB12", "4471A", "12345"):
+        assert looks(s), s
+
+
+def _sent(grids, mask):
+    model = FakeModel(part="")
+    ledger_llm.find_part("big.xlsx", grids, mask, model, ledger_llm.AssistReport())
+    return json.loads(model.prompts[0].split("Cells:\n", 1)[1])
+
+
+def test_whole_number_readings_do_not_crowd_out_the_part():
+    """Excel stores 10200 Hz as 10200.0: a table of whole numbers went first
+    as 'ids' and the S/N below it never reached the model (review,
+    2026-10-19)."""
+    table = {(1, 1): "Freq (Hz)", (1, 2): "Gain", (1, 3): "Phase"}
+    for r in range(2, 152):
+        for c in range(1, 4):
+            table[(r, c)] = 10000.0 + r * 100 + c
+    table[(160, 1)] = "S/N: XYZ9AB123"
+    grids = [se.Grid("big.xlsx", "Data", table)]
+    for mask in ("@@@#@@###", None):
+        cells = _sent(grids, mask)
+        assert cells[:4] == ["S/N: XYZ9AB123", "Freq (Hz)", "Gain", "Phase"]
+    # an all-digit pattern: what it matches whole comes after the text ids,
+    # and readings it does not match go last - with the labels before them
+    loads = {(1, 1): "Load (N)", (230, 1): "Part", (230, 2): "48213"}
+    loads.update({(r, 1): 1000.0 + r for r in range(2, 220)})
+    cells = _sent([se.Grid("big.xlsx", "Data", loads)], "#####")
+    assert cells[:3] == ["48213", "Load (N)", "Part"]
+
+
+def test_skip_patterns_do_not_leak_from_one_ledger_into_another(tmp_path):
+    """Switching from a ledger with Skip patterns to one without wrote the
+    first one's patterns into the second's aliases file (review,
+    2026-10-19). Only patterns TYPED with no CSV are carried over."""
+    from council_qt.tabs.ledger import LedgerActions, LedgerTab
+    _qapp()
+    a, b = tmp_path / "ledger_a.csv", tmp_path / "ledger_b.csv"
+    se.save_ignore_files(a, ["cover*.xlsx", "agenda*"])
+    tab = LedgerTab(actions=LedgerActions(rebuild_kg=lambda progress: {}))
+    try:
+        tab.csv.setText(str(a))
+        tab._on_csv_changed()
+        assert se.load_ignore_files(a) and tab.ignore_files.text()
+        tab.csv.setText(str(b))
+        tab._on_csv_changed()
+        assert tab.ignore_files.text() == ""
+        assert se.load_ignore_files(b) == []
+        # typed with no CSV, the field not left yet (no editingFinished)
+        tab.csv.setText("")
+        tab._on_csv_changed()
+        tab.ignore_files.setText("draft*")
+        tab.ignore_files.textEdited.emit("draft*")      # as typing does
+        tab.csv.setText(str(b))
+        tab._on_csv_changed()
+        assert se.load_ignore_files(b) == ["draft*"]
+    finally:
+        tab.deleteLater()
+
+
+def test_one_timeout_does_not_stop_the_model():
+    """The breaker tripped on any failure: a timeout on one big workbook and
+    no other workbook or label was asked, and the summary called an
+    answering model unavailable (review, 2026-10-19)."""
+    calls = []
+
+    def flaky(prompt, schema):
+        calls.append(prompt)
+        if "first.xlsx" in prompt:
+            raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+        return json.dumps({"part": "ABC1DE234", "evidence": "A1"}), "granite3.3:8b"
+    rep = ledger_llm.AssistReport()
+    ask = ledger_llm.one_shot(flaky, rep)
+    got = [ledger_llm.find_part(n, [se.Grid(n, "Data", {(1, 1): "ABC1DE234"})],
+                                "@@@#@@###", ask, rep)[0]
+           for n in ("first.xlsx", "second.xlsx", "third.xlsx")]
+    assert len(calls) == 3 and got == ["", "ABC1DE234", "ABC1DE234"]
+    assert not rep.unavailable
+    assert "unavailable" not in rep.describe()
+    assert sum("sent nothing" in p for p in rep.problems) == 1
+
+
+def test_a_model_that_fails_twice_in_a_row_is_not_asked_again():
+    calls = []
+
+    def slow(prompt, schema):
+        calls.append(prompt)
+        raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+    rep = ledger_llm.AssistReport()
+    ask = ledger_llm.one_shot(slow, rep)
+    for n in ("a.xlsx", "b.xlsx", "c.xlsx", "d.xlsx"):
+        ledger_llm.find_part(n, [se.Grid(n, "Data", {(1, 1): "ABC1DE234"})], None, ask, rep)
+    assert len(calls) == 2
+    assert sum("sent nothing" in p for p in rep.problems) == 1      # said once
+    assert rep.describe() == (
+        "Council's model did not answer twice in a row and was not asked again, so "
+        "nothing in the review is its suggestion: Ollama (granite3.3:8b) sent nothing "
+        "for 120 s.")
+
+
+def test_the_summary_does_not_add_a_full_stop_after_a_question_mark():
+    """'... Is Ollama running?.' (review, 2026-10-19)."""
+    why = "granite3.3:8b (Ollama) did not answer: No Ollama server answers. Is Ollama running?"
+    rep = ledger_llm.AssistReport(unavailable=why)
+    assert rep.describe().endswith("Is Ollama running?")
+    rep = ledger_llm.AssistReport(unavailable=why, parts_asked=2, model="granite3.3:8b",
+                                  parts_found=[("a.xlsx", "ABC1DE234")])
+    assert rep.describe().endswith("not asked again: " + why)
+    rep = ledger_llm.AssistReport(parts_asked=1, model="m")
+    assert rep.describe().endswith("check them.")
+
+
+@pytest.mark.parametrize("name", ["zephyr:7b", "openhermes:7b", "neural-chat:7b",
+                                  "vicuna:7b", "orca-mini:3b", "tinydolphin:1.1b",
+                                  "llava:34b"])
+def test_a_llama_family_alone_does_not_make_a_model_us(name):
+    """Ollama reports family 'llama' for every Llama- or Mistral-architecture
+    model; these came out ('Meta', 'US') and Suggest links ran on them, and
+    'phi' inside 'tinydolphin' read as Microsoft (review, 2026-10-19)."""
+    from council_core import local_models as lm
+    assert lm.maker_and_origin(name, "llama", ["llama", "clip"])[1] != "US"
+
+
+def test_the_ledger_and_connections_use_one_rule_for_an_unknown_ollama_model(monkeypatch,
+                                                                            tmp_path):
+    """An unknown-origin Ollama model was usable in the Ledger and left out
+    of Suggest links (review, 2026-10-19). A GGUF is always accepted unless
+    it is known to be non-US."""
+    import council_engine as ce
+    from council_core import local_models as lm
+    from council_qt.tabs.connections import ConnectionsActions
+    tags = [{"name": "zephyr:7b", "details": {"family": "llama"}},
+            {"name": "mystery:1b", "details": {"family": "mystery"}},
+            {"name": "granite3.3:8b", "details": {"family": "granite"}}]
+    monkeypatch.setattr(ce, "_ollama_tags", lambda host, **kw: {"models": tags})
+    assert ConnectionsActions(vault_dir=tmp_path / "v").local_models() == ["granite3.3:8b"]
+    entries = [lm.ollama_entry(t, fill_from_show=False) for t in tags] + [
+        {"id": "C:/m/model.gguf", "name": "model", "backend": "gguf", "origin": "unknown"},
+        {"id": "C:/m/qwen.gguf", "name": "qwen", "backend": "gguf", "origin": "non-US"}]
+    monkeypatch.setattr(lm, "list_local_models", lambda **kw: [dict(e) for e in entries])
+    usable = {e["id"]: e["usable"] for e in ledger_llm.available_models()}
+    assert usable == {"ollama:zephyr:7b": False, "ollama:mystery:1b": False,
+                      "ollama:granite3.3:8b": True, "C:/m/model.gguf": True,
+                      "C:/m/qwen.gguf": False}
+    with pytest.raises(se.LedgerError, match="cannot tell where mystery:1b comes from"):
+        ledger_llm.chat_for("ollama:mystery:1b")

@@ -279,6 +279,7 @@ class LedgerTab(ViewHelpers, QWidget):
             "fnmatch semantics, case-insensitive. Saved next to the "
             "parent CSV's aliases file.")
         self.ignore_files.editingFinished.connect(self._save_ignore_patterns)
+        self.ignore_files.textEdited.connect(self._on_ignore_edited)
         ignore_row.addWidget(self.ignore_files, 1)
         v2.addLayout(ignore_row)
         outer.addWidget(g2)
@@ -395,6 +396,13 @@ class LedgerTab(ViewHelpers, QWidget):
         text = self.ignore_files.text().strip()
         return [p.strip() for p in text.split(",") if p.strip()]
 
+    def _on_ignore_edited(self, _text: str = "") -> None:
+        """Typed by the user (not loaded) with no parent CSV to save them
+        beside: held for the CSV that is set next, even before the field
+        loses focus."""
+        if not self.csv.text().strip():
+            self._ignore_unsaved = bool(self._typed_ignore_patterns())
+
     def _save_ignore_patterns(self) -> None:
         """Persist the comma-separated patterns from the field. With no
         parent CSV yet they are held in the field and saved when one is
@@ -420,7 +428,10 @@ class LedgerTab(ViewHelpers, QWidget):
         cleared: the field was emptied, or kept showing them while the
         extract read every file, because nothing had saved them (review,
         2026-10-19). Typed patterns are never dropped: the CSV's own are
-        kept with them."""
+        kept with them. Only TYPED ones (_ignore_unsaved): the field also
+        shows the patterns loaded from the last CSV, and switching from a
+        ledger that has some to one that has none wrote the first one's
+        into the second's aliases file (review, 2026-10-19)."""
         if not hasattr(self, "ignore_files"):
             return
         csv_path = self.csv.text().strip()
@@ -434,7 +445,7 @@ class LedgerTab(ViewHelpers, QWidget):
             patterns = load_ignore_files(csv_path)
         except Exception:                                    # noqa: BLE001
             patterns = []
-        if typed and (not patterns or getattr(self, "_ignore_unsaved", False)):
+        if typed and getattr(self, "_ignore_unsaved", False):
             merged = patterns + [p for p in typed if p not in patterns]
             try:
                 from source_extract import save_ignore_files

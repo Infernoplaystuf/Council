@@ -140,10 +140,11 @@ class ConnectionsActions:
     # -- free-text suggestions (KG2) --
     def local_models(self) -> List[str]:
         """US-origin models installed in this PC's Ollama, extractor first.
-        Origin is council_core.local_models' (name and the family Ollama
-        reports), as in the Ledger's model list: pi_models' name prefixes
-        called llava:7b non-US here and US (Meta) there (review,
-        2026-10-19). An unknown origin is not US."""
+        Origin is council_core.local_models', as in the Ledger's model list:
+        pi_models' name prefixes called llava:7b non-US here and US there
+        (review, 2026-10-19). The family Ollama reports only rejects - it
+        is "llama" for zephyr or openhermes too; the name has to say US.
+        An unknown origin is not US."""
         from council_core import kg_extract as kx
         from council_core import local_models as lm
         try:
