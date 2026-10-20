@@ -222,6 +222,22 @@ def _looks_like_id(label: str) -> bool:
     return any(re.search(p, low) for p in _ID_PATTERNS)
 
 
+#: What a workbook cell cannot hold (openpyxl's ILLEGAL_CHARACTERS_RE):
+#: control characters other than tab and line breaks.
+_ILLEGAL_XL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+")
+
+
+def xl_text(v):
+    """`v` with the control characters a workbook cell cannot hold put as
+    a space (and trimmed): text pasted from another system ('Remark' +
+    CHAR(1)) read through Excel made openpyxl raise IllegalCharacterError,
+    and the whole extract wrote no review (review, 2026-10-20). Anything
+    that is not text is returned as it is."""
+    if not isinstance(v, str) or not _ILLEGAL_XL.search(v):
+        return v
+    return _ILLEGAL_XL.sub(" ", v).strip()
+
+
 def _text(v) -> str:
     """A cell value as CSV text: 12.0 -> '12', dates ISO, None -> ''."""
     if v is None:
@@ -621,6 +637,7 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
     written: Dict[Tuple[str, str], str] = {}
 
     def put(f: TemplateField, item: str, value) -> None:
+        value = xl_text(value)          # a parent CSV may hold CHAR(1)
         if value in (None, ""):
             return
         ws = wb[f.sheet] if f.sheet in wb.sheetnames else wb.worksheets[0]
@@ -817,8 +834,9 @@ class ParentCSV:
                     if str(k) not in res.unknown_columns:
                         res.unknown_columns.append(str(k))
                     continue
-                if col not in META_COLS and _text(v) != "":
-                    mapped[col] = _text(v)
+                # as the review shows it: no control character (xl_text)
+                if col not in META_COLS and xl_text(_text(v)) != "":
+                    mapped[col] = xl_text(_text(v))
             key = self._key(mapped)
             label = " / ".join(mapped.get(k, "") for k in self.keys)
             if not all(key):
