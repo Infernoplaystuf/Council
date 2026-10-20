@@ -14,8 +14,8 @@ Beside step 2, "Teach from a sample workbook…" (ledger_teach_dialog.py):
 Council guesses what each thing in one workbook is, the user answers, and
 the answers are kept so the next Extract places them by itself.
 
-Create and Apply also add the parent CSV to what the Connections tab's
-knowledge graph reads (only that file), so a rebuild there reads it too.
+Create, Apply and picking a parent CSV also add it to what the Connections
+tab's knowledge graph reads (only that file), so a rebuild there reads it too.
 
 Every step runs on a worker thread (a workbook of many pictures takes a while) and the buttons are
 disabled until it finishes; the summary line and the log say what it found.
@@ -29,7 +29,7 @@ import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QCompleter,
                                QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QPlainTextEdit,
@@ -131,18 +131,19 @@ class LedgerActions:
                                   progress=progress)
 
     def teach_learn(self, csv, session, answers, people=None, *, part=None,
-                    save_pattern: bool = False, connections=None):
-        """Keep the user's Teach answers (council_core.ledger_teach.learn)
-        and tick the knowledge graph's field rules they prove, in
-        ``connections`` (else this one's, else the default vault's). Worker
-        thread: it opens the graph."""
+                    save_pattern: bool = False, connections=None, confirmed=None):
+        """Keep the user's Teach answers (council_core.ledger_teach.learn) -
+        of the rows they confirmed - and tick the knowledge graph's field
+        rules they prove, in ``connections`` (else this one's, else the
+        default vault's). Worker thread: it opens the graph."""
         from council_core import ledger_teach
         vault = connections or self.connections
         if vault is None:
             from council_qt.tabs.connections import ConnectionsActions
             vault = ConnectionsActions()
         return ledger_teach.learn(csv, session, answers, people, part=part,
-                                  save_pattern=save_pattern, connections_vault=vault)
+                                  save_pattern=save_pattern, connections_vault=vault,
+                                  confirmed=confirmed)
 
     def open(self, path) -> None:
         self.opener(path)
@@ -189,8 +190,8 @@ class LedgerActions:
         the parent CSV only, not its folder), so a rebuild in the
         Connections tab reads it too. Only the Ledger tab's own Rebuild used
         to add it, and a tester rebuilding in Connections saw no links
-        (user, 2026-10-20). Runs on the step's worker, after Create and
-        after Apply.
+        (user, 2026-10-20). Asked after Create and Apply, and for a parent
+        CSV picked in the tab - on a worker of its own (LedgerTab._register).
 
         Never raises - a Ledger is made whatever the graph is doing:
         ``{'csv', 'added', 'busy', 'error'}``, ``added`` False when the
@@ -236,6 +237,10 @@ class LedgerActions:
 
 
 class LedgerTab(ViewHelpers, QWidget):
+    #: How often a Ledger waiting for the Connections tab to finish with the
+    #: graph (a rebuild, Suggest links) asks again, in ms.
+    KG_RETRY_MS = 1500
+
     def __init__(self, window=None, actions: Optional[LedgerActions] = None):
         super().__init__()
         self.window = window
@@ -267,6 +272,10 @@ class LedgerTab(ViewHelpers, QWidget):
         #: path is set, not on every keystroke (a CSV on a network share can
         #: take seconds to answer). Teach needs the schema.
         self._schema_known = ("", False)
+        #: (parent CSV, the part-name patterns Teach saved beside it), read
+        #: when the path is set (_load_saved_patterns): 'Forget saved
+        #: pattern' is on when there are some
+        self._saved_patterns = ("", [])
         #: The open Teach dialog, and how its Browse… picks one workbook
         #: (tests replace it: no file dialogs).
         self.teach_dialog = None
@@ -274,7 +283,17 @@ class LedgerTab(ViewHelpers, QWidget):
         #: (CSV, line) the log said about the Connections graph reading a
         #: Ledger: each said once.
         self._kg_said: set = set()
+        #: Adding a Ledger to the Connections graph (_register): the CSVs
+        #: whose worker is running, the ones added (or read already) this
+        #: session, and the ones waiting for the Connections tab to finish.
+        self._kg_running: set = set()
+        self._kg_known: set = set()
+        self._kg_pending: List[str] = []
         self._build()
+        self._kg_timer = QTimer(self)
+        self._kg_timer.setSingleShot(True)
+        self._kg_timer.setInterval(self.KG_RETRY_MS)
+        self._kg_timer.timeout.connect(self._register_pending)
         self._refresh_reader_choices()
         self._refresh_enabled()
 
@@ -364,7 +383,7 @@ class LedgerTab(ViewHelpers, QWidget):
         v2.addLayout(one_row)
         # Pattern hint — what is typed is held for this session only; the
         # patterns Teach saved beside the parent CSV are offered, and the
-        # newest is used when the field is left empty.
+        # newest is used, as a hint, when the field is left empty.
         mask_row = QHBoxLayout()
         mask_row.addWidget(QLabel("Part name pattern (optional):"))
         self.pattern_mask = QLineEdit()
@@ -373,8 +392,10 @@ class LedgerTab(ViewHelpers, QWidget):
         self.pattern_mask.setToolTip(
             "A shape used when the sample number is not labelled.\n"
             "@ matches any letter, # any digit, anything else matches itself.\n"
-            "Example: @@@#@@### finds ABC1DE234 in a filename.\n"
-            "Left empty, the pattern Teach saved for this Ledger is used.")
+            "Example: @@@#@@### finds ABC1DE234 in a filename or a title.\n"
+            "A part of another shape is kept but never pre-accepted.\n"
+            "Left empty, the pattern Teach saved for this Ledger is used as a hint\n"
+            "(parts of another shape are still pre-accepted); Forget saved pattern drops it.")
         # the patterns Teach saved for this Ledger, offered as you type
         # (_load_saved_patterns)
         self._pattern_completer = QCompleter([], self.pattern_mask)
@@ -382,6 +403,15 @@ class LedgerTab(ViewHelpers, QWidget):
             QCompleter.CompletionMode.UnfilteredPopupCompletion)
         self.pattern_mask.setCompleter(self._pattern_completer)
         mask_row.addWidget(self.pattern_mask, 1)
+        # a pattern Teach saved could not be taken back, and it applied to
+        # every later Extract, Preview and Teach (review, 2026-10-20)
+        self.forget_pattern_btn = QPushButton("Forget saved pattern")
+        self.forget_pattern_btn.setToolTip(
+            "Stop using the part-name pattern Teach saved for this Ledger: with the field "
+            "empty, Extract, Preview and Teach then use no pattern.")
+        self.forget_pattern_btn.clicked.connect(self.on_forget_patterns)
+        self.forget_pattern_btn.setEnabled(False)
+        mask_row.addWidget(self.forget_pattern_btn)
         # Label matching alone is never enough on real workbooks (user,
         # 2026-10-19): Council's model is asked about what the rules left.
         self.ask_model = QCheckBox("Ask Council's model about the rest")
@@ -496,10 +526,16 @@ class LedgerTab(ViewHelpers, QWidget):
         ignore-pattern field is populated from the aliases file so the
         user sees their saved patterns as soon as they pick the CSV; the
         part-name patterns Teach saved are offered; Teach is enabled when
-        the CSV has its schema."""
+        the CSV has its schema.
+
+        A parent CSV picked here is also added to what the Connections graph
+        reads (_register): a Ledger made with an earlier build was added only
+        at its next Apply, and the tester's rebuild in Connections found no
+        Ledger (user, 2026-10-20)."""
         self._load_ignore_patterns()
         self._check_schema()
         self._load_saved_patterns()
+        self._register(self.csv.text().strip())
 
     def _check_schema(self) -> None:
         """Whether the parent CSV and its schema are there (Teach needs
@@ -529,10 +565,32 @@ class LedgerTab(ViewHelpers, QWidget):
         except Exception:                                    # noqa: BLE001
             saved = []
         self._pattern_completer.model().setStringList(saved)
+        self._saved_patterns = (csv, list(saved))
         hint = "@ letter, # digit, other characters literal"
         self.pattern_mask.setPlaceholderText(
-            f"empty: this Ledger's saved pattern {saved[0]} is used   — {hint}" if saved
-            else f"@@@#@@###   — {hint}")
+            f"empty: this Ledger's saved pattern {saved[0]} is used as a hint   — {hint}"
+            if saved else f"@@@#@@###   — {hint}")
+        self._refresh_enabled()
+
+    def on_forget_patterns(self) -> None:
+        """Forget the part-name pattern(s) Teach saved for this Ledger
+        (source_extract.forget_patterns); the rest of the aliases file is
+        kept. A small file beside the parent CSV, written here as the Skip
+        patterns are."""
+        csv = self.csv.text().strip()
+        if not csv or self.busy:
+            return
+        try:
+            from source_extract import forget_patterns
+            gone = forget_patterns(csv)
+        except Exception as exc:                             # noqa: BLE001
+            self.status.setText(f"Could not forget the saved pattern: {exc}")
+            return
+        self._load_saved_patterns()
+        if gone:
+            self._say("Forgot this Ledger's saved part-name pattern(s): " + ", ".join(gone)
+                      + " — Extract, Preview and Teach use only a pattern you type now.")
+            self.status.setText("Saved part-name pattern forgotten.")
 
     def _refresh_enabled(self) -> None:
         if not hasattr(self, "progress"):
@@ -543,13 +601,21 @@ class LedgerTab(ViewHelpers, QWidget):
         if hasattr(self, "cancel_btn"):
             # Only enabled while a step that honours it is running.
             self.cancel_btn.setEnabled(not idle and getattr(self, "_cancellable", False))
+        csv = self.csv.text().strip()
+        if hasattr(self, "forget_pattern_btn"):
+            # this Ledger has a saved pattern (_load_saved_patterns)
+            had, saved = self._saved_patterns
+            self.forget_pattern_btn.setEnabled(idle and bool(csv) and had == csv
+                                               and bool(saved))
         if not idle:
             return
-        csv = self.csv.text().strip()
         self.create_btn.setEnabled(bool(self.template.text().strip()))
         self.extract_btn.setEnabled(bool(csv) and bool(self.source_paths()))
-        # the schema was looked up when this path was set (_check_schema)
-        self.teach_btn.setEnabled(bool(csv) and self._schema_known == (csv, True))
+        # off only for a path already looked up and found without its schema
+        # (_check_schema). A path typed or pasted is looked up when Teach is
+        # pressed: the button stayed off until Enter or Tab, and clicking it
+        # did not move the focus (review, 2026-10-20)
+        self.teach_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
@@ -840,7 +906,7 @@ class LedgerTab(ViewHelpers, QWidget):
         saved, and the knowledge graph wants a rebuild when the Ledger's
         inspectors or people changed (kg_excel reads them)."""
         self._load_saved_patterns()
-        if report.who_labels or report.not_who or report.people:
+        if report.who_labels or report.people:
             self._kg_dirty = True
             self.status.setText("Teach saved your answers. Press Rebuild knowledge graph "
                                 "so the graph reads the inspectors the new way.")
@@ -888,38 +954,83 @@ class LedgerTab(ViewHelpers, QWidget):
             self._refresh_enabled()
 
     def wait(self, timeout: float = 60.0) -> bool:
-        """Block until the current step's result is shown (tests, scripts)."""
+        """Block until the current step's result is shown, and the Ledger it
+        made or applied is added to the Connections graph - or said why not
+        (tests, scripts). A Ledger waiting for the Connections tab is not
+        waited for."""
         import time
         end = time.monotonic() + timeout
-        while self.busy and time.monotonic() < end:
+        while (self.busy or self._kg_running) and time.monotonic() < end:
             QApplication.processEvents()
             time.sleep(0.01)
         QApplication.processEvents()
-        return not self.busy
+        return not (self.busy or self._kg_running)
 
     # ── step 1 ──────────────────────────────────────────────────────────
     def on_create(self) -> None:
         template, csv = self.template.text().strip(), self.csv.text().strip()
 
-        def step(_p):
-            s = self.actions.create_parent(template, csv)
-            return s, self._register(s.csv)
-
-        def done(result) -> None:
-            s, registered = result
+        def done(s) -> None:
             self.csv.setText(s.csv)
             self.status.setText(s.describe().splitlines()[0])
             self._say(s.describe())
-            self._say_registered(registered)
+            self._register(s.csv, again=True)
             self._on_csv_changed()          # setText is not editingFinished
-        self._run("Reading the template", step, done)
+        self._run("Reading the template",
+                  lambda _p: self.actions.create_parent(template, csv), done)
 
-    def _register(self, csv) -> Optional[dict]:
-        """On the step's worker: the Ledger added to what the knowledge
-        graph reads (LedgerActions.register_ledger). An actions stand-in
-        without it registers nothing."""
+    # ── the Connections graph reads this Ledger (user, 2026-10-20) ──────
+    def _register(self, csv, again: bool = False) -> None:
+        """Add this Ledger to what the Connections graph reads
+        (LedgerActions.register_ledger), on its own worker, once the step's
+        result is shown: inside the step a busy store held 'Parent CSV
+        created' back 6-7 s (review, 2026-10-20). While the Connections tab
+        has the graph (a rebuild, Suggest links) it waits for that to finish
+        and asks again every KG_RETRY_MS.
+
+        ``again``: Create and Apply ask even when this session added it
+        before (Folders… may have removed it since); a CSV merely picked is
+        asked once. An actions stand-in without register_ledger adds
+        nothing."""
+        csv = str(csv or "").strip()
         register = getattr(self.actions, "register_ledger", None)
-        return register(csv) if register is not None else None
+        if not csv or register is None or csv in self._kg_running:
+            return
+        if csv in self._kg_known and not again:
+            return
+        conn = self._connections_tab()
+        if conn is not None and conn.graph_in_use():
+            if csv not in self._kg_pending:
+                self._kg_pending.append(csv)
+            self._say_once(csv, "The Connections tab is using the graph right now (a "
+                                "rebuild, or Suggest links): this Ledger is added to what it "
+                                "reads once that finishes.")
+            self._kg_timer.start()
+            return
+        self._kg_running.add(csv)
+
+        def work() -> None:
+            try:
+                result = register(csv)
+            except Exception as exc:                      # noqa: BLE001
+                result = {"csv": csv, "added": False, "busy": False,
+                          "error": str(exc) or exc.__class__.__name__}
+            self._to_ui(self._registered, csv, result)
+
+        threading.Thread(target=work, name="ledger-kg-add", daemon=True).start()
+
+    def _register_pending(self) -> None:
+        """The timer: the Ledgers waiting for the Connections tab, asked
+        again (still busy: they wait on)."""
+        pending, self._kg_pending = self._kg_pending, []
+        for csv in pending:
+            self._register(csv, again=True)
+
+    def _registered(self, csv: str, registered: Optional[dict]) -> None:
+        self._kg_running.discard(csv)
+        if registered and not registered.get("busy") and not registered.get("error"):
+            self._kg_known.add(csv)
+        self._say_registered(registered)
 
     def _say_registered(self, registered: Optional[dict]) -> None:
         """Say once, in the log, that Connections now reads this Ledger -
@@ -938,6 +1049,9 @@ class LedgerTab(ViewHelpers, QWidget):
                     "or Rebuild knowledge graph below picks up its rows.")
         else:
             return
+        self._say_once(csv, text)
+
+    def _say_once(self, csv: str, text: str) -> None:
         if (csv, text) not in self._kg_said:
             self._kg_said.add((csv, text))
             self._say(text)
@@ -1028,17 +1142,17 @@ class LedgerTab(ViewHelpers, QWidget):
             # the CSV the review was applied to (its _run sheet), else the
             # one this tab shows
             applied = getattr(self.actions, "applied_csv", lambda _r: None)(review)
-            return s, self._register(applied or tab_csv)
+            return s, applied or tab_csv
 
         def done(result) -> None:
-            s, registered = result
+            s, applied = result
             self.stat["problems"].setText(str(len(s.problems)))
             self.status.setText(
                 f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "
                 "Rebuild the knowledge graph (here, or in Connections) to pick up the "
                 "new rows.")
             self._say(s.describe())
-            self._say_registered(registered)
+            self._register(applied, again=True)
             self._kg_dirty = True
         self._run("Applying the review", step, done)
 

@@ -29,6 +29,9 @@ class WhyNoLinksDialog(QDialog):
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Why no links?")
+        # Not modal, and asked again and again: one closed is gone, not kept
+        # hidden behind the tab (review, 2026-10-20)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.resize(680, 500)
         outer = QVBoxLayout(self)
         self.text = QPlainTextEdit()
@@ -51,6 +54,11 @@ class WhyNoLinksDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         outer.addWidget(buttons)
+
+    def set_text(self, text: str) -> None:
+        """Asked again while open: the new answer, in the same dialog."""
+        self.text.setPlainText(text)
+        self.message.setText("")
 
     def on_copy(self) -> None:
         QApplication.clipboard().setText(self.text.toPlainText())

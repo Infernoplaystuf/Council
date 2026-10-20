@@ -31,10 +31,15 @@ the knowledge graph; nothing here touches Qt)
            .problems, .hidden (rows not shown), .cancelled, .model,
            .pattern_mask / .pattern_saved, .describe() for the Ledger log
     report = learn(csv_path, session, answers, people=None, part=None,
-                   save_pattern=False, connections_vault=None)
+                   save_pattern=False, connections_vault=None, confirmed=None)
         answers  {row.key: choice key}: 'field:<template field>', 'part',
-                 'inspector', 'item', 'ignore' or 'unsure' (choice_key /
-                 parse_choice; a Guess or a (role, field) pair also does)
+                 'inspector', 'item', 'ignore', 'unsure' or - for an
+                 inspector's label or heading - 'noone' (choice_key /
+                 parse_choice; a Guess or a (role, field) pair also does;
+                 row_choices: what a row's dropdown offers)
+        confirmed  the rows the user confirmed; the others are not learned
+                 (needs_confirm: Council's model's guesses and the rules'
+                 unsure matches start unconfirmed). None: every answer
         people   {initials: full name} from the People section
         part     the part number the user confirmed or typed;
                  save_pattern=True keeps its shape as a part-name pattern
@@ -57,9 +62,11 @@ the knowledge graph; nothing here touches Qt)
                                            field can offer them)
 
 ROLES: what a thing can be - a template field (ROLE_FIELD, with the field's
-name), the Part number (ROLE_PART), an Inspector's initials or name label
-(ROLE_INSPECTOR), a flaw / item code (ROLE_ITEM), not data (ROLE_IGNORE),
-or not known (ROLE_UNSURE). A guess comes from the Ledger's rules
+name; a '— Inspector Initials' field is the Inspector), the Part number
+(ROLE_PART), an Inspector's initials or name label (ROLE_INSPECTOR), a flaw
+/ item code (ROLE_ITEM), not data (ROLE_IGNORE), not known (ROLE_UNSURE),
+or - for what the rules read as an inspector's - no one (ROLE_NO_ONE).
+A guess comes from the Ledger's rules
 (VIA_RULE), the user's earlier answers (VIA_ALIAS), Council's model
 (VIA_MODEL) or nothing (VIA_NONE).
 
@@ -79,7 +86,9 @@ WHAT LEARN WRITES (all beside the parent CSV)
   <stem>.aliases.json  "map": label -> field (and the part-number label ->
                        the template's id field); "ignore"; "people";
                        "who_labels", "not_who_labels", "item_labels",
-                       "patterns" (source_extract.Taught)
+                       "patterns" (source_extract.Taught: the saved pattern
+                       is a hint, also looked for in titles; the tab can
+                       forget it)
   <stem>.teach.jsonl   one line per answer: label, role, field, flaw code,
                        workbook, sheet - and for the part number, the part
                        the user confirmed. Never other cell values.
@@ -99,7 +108,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import source_extract as se
-from sample_ledger import LedgerError, ParentCSV, TemplateSchema, normalize_label
+from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateSchema,
+                           normalize_label)
 
 # ── roles and where a guess came from ───────────────────────────────────
 ROLE_FIELD = "field"
@@ -108,7 +118,13 @@ ROLE_INSPECTOR = "inspector"
 ROLE_ITEM = "item"
 ROLE_IGNORE = "ignore"
 ROLE_UNSURE = "unsure"
-ROLES = (ROLE_FIELD, ROLE_PART, ROLE_INSPECTOR, ROLE_ITEM, ROLE_IGNORE, ROLE_UNSURE)
+#: Offered only for what the rules read as an inspector's label, column or
+#: heading (row_choices): it names no one. 'Ignore (not data)' on a heading
+#: 'JB — 2026-09-18' made JB no one in every workbook, even beside
+#: 'Inspector:' (review, 2026-10-20); Ignore now only says it is not data.
+ROLE_NO_ONE = "noone"
+ROLES = (ROLE_FIELD, ROLE_PART, ROLE_INSPECTOR, ROLE_ITEM, ROLE_IGNORE, ROLE_UNSURE,
+         ROLE_NO_ONE)
 
 VIA_RULE = "rule"            # the Ledger's own matching
 VIA_ALIAS = "alias"          # the user's earlier answer (aliases, who_labels ...)
@@ -154,20 +170,59 @@ def role_text(role: str, schema_item_field: str = "") -> str:
             ROLE_INSPECTOR: "Inspector (initials or name)",
             ROLE_ITEM: f"{schema_item_field or 'Flaw / item'} code",
             ROLE_IGNORE: "Ignore (not data)",
-            ROLE_UNSURE: "Unsure"}.get(role, role)
+            ROLE_UNSURE: "Unsure",
+            ROLE_NO_ONE: "Not an inspector (names no one)"}.get(role, role)
+
+
+def initials_field(name: str) -> bool:
+    """A template's '<reading> — Inspector Initials' field: the Ledger fills
+    it from who signed each reading (source_extract.rows_from), so a label
+    answered as it says who signed - it is ROLE_INSPECTOR. Answered as the
+    field, 'Inspector Initials' became no one's in every workbook and its
+    initials went to one reading's field (review, 2026-10-20)."""
+    return str(name or "").endswith(INITIALS_SUFFIX)
 
 
 def choices(schema: TemplateSchema) -> List[Tuple[str, str]]:
     """Every answer a row can be given, (choice key, plain words): the
     roles, then each template field but the part number's (that is 'Part
-    number')."""
+    number') and the '— Inspector Initials' ones (that is 'Inspector':
+    initials_field)."""
     out = [(r, role_text(r, schema.item_field))
            for r in (ROLE_PART, ROLE_INSPECTOR, ROLE_ITEM, ROLE_IGNORE, ROLE_UNSURE)]
     out += [(choice_key(ROLE_FIELD, f.name), f.name + (" (per " + schema.item_field + ")"
                                                        if f.per_item and schema.item_field
                                                        else ""))
-            for f in schema.fields if f.name != schema.id_field]
+            for f in schema.fields if f.name != schema.id_field and not initials_field(f.name)]
     return out
+
+
+def row_choices(session: "TeachSession", row: "TeachRow") -> List[Tuple[str, str]]:
+    """The answers ``row``'s dropdown offers: the session's choices, and -
+    for what the rules read as an inspector's label, column or heading -
+    'Not an inspector (names no one)' after 'Inspector'."""
+    out = list(session.choices)
+    if row.kind == "inspector":
+        at = next((i + 1 for i, (k, _t) in enumerate(out) if k == ROLE_INSPECTOR), len(out))
+        out.insert(at, (ROLE_NO_ONE, role_text(ROLE_NO_ONE)))
+    return out
+
+
+def needs_confirm(row: "TeachRow") -> bool:
+    """A guess Save keeps only when the user confirms it (the dialog's
+    Confirm box, ticked when they pick an answer): Council's model's, and a
+    rule's unsure match of a label to a field. Left untouched, a 50%-sure
+    model guess was written as an alias, which wins outright in every later
+    Extract (review, 2026-10-20)."""
+    g = row.guess
+    return g.via == VIA_MODEL or (g.via == VIA_RULE and g.role == ROLE_FIELD
+                                  and g.score < se.ACCEPT_AT)
+
+
+def confirmed_by_default(session: "TeachSession") -> set:
+    """The rows whose guess Save keeps as it is (needs_confirm says no):
+    what the dialog's Confirm boxes start ticked on."""
+    return {r.key for r in session.rows if not needs_confirm(r)}
 
 
 # ── what the dialog shows ───────────────────────────────────────────────
@@ -286,7 +341,7 @@ class TeachSession:
                 for p in self.inspectors))
         if self.pattern_mask:
             lines.append(f"  part-name pattern {self.pattern_mask!r}"
-                         + (" (this Ledger's saved one)" if self.pattern_saved else ""))
+                         + (" (this Ledger's saved one, a hint)" if self.pattern_saved else ""))
         if self.pictures:
             lines.append(f"  pictures: {self.pictures_read} of {self.pictures} read")
         return "\n".join(lines + [f"  ! {p}" for p in self.problems])
@@ -377,6 +432,8 @@ def label_examples(csv_path, schema: TemplateSchema, roles: bool = False
             if e.field in fields:
                 out.append((e.label, e.field, ""))
             continue
+        if roles and e.role not in ask:
+            continue                    # 'names no one': not an answer the model is offered
         out.append((e.label, ask[e.role] if roles else None,
                     "" if roles else f"the user said: {role_text(e.role, schema.item_field)}"))
     return out
@@ -521,10 +578,13 @@ def _markers(src: _Source, rows: _Rows, people: Dict[str, List[Any]]) -> set:
         text = " ".join(str(v or "").split())
         hit = se._WHO_INLINE.match(v) or se._WHO_BY.match(v)
         label, shape = text, "heading"
+        paren_label, paren_who = se._who_paren(v)
         if hit:
             label, shape = hit.string[:hit.start("who")].strip(" :=-–—") or text, "label"
         elif m.who_head(v):
             shape = "label"
+        elif paren_who and m.who_head(paren_label):
+            label, shape = paren_label, "label"            # 'Inspector (JB)'
         else:
             lab, inline = se._split_inline(v) if len(text) <= 200 else ("", "")
             if inline and m.key_of(lab) in m.who:
@@ -555,13 +615,16 @@ def _markers(src: _Source, rows: _Rows, people: Dict[str, List[Any]]) -> set:
 
 
 def initials_in(text: Any) -> List[str]:
-    """The initials a cell names ('JB', 'j.b.', both of 'JB/MK'); a written
-    name needs no answer and is left out."""
+    """The initials a cell names ('JB', 'j.b.', '(JB)', both of 'JB/MK'); a
+    written name needs no answer and is left out."""
     from council_core.kg_excel import is_initials       # 'seen', 'OK', 'TBD' are no one
     out: List[str] = []
     for w in re.split(r"[/,;&+]", str(text or "")):
-        k = se._initials(w.strip())
-        if re.fullmatch(r"[A-Z]{2,4}", k) and k not in out and is_initials(w.strip(), loose=True):
+        # '(JB)': initials in brackets (review, 2026-10-20: the People
+        # section stayed empty for them)
+        w = re.sub(r"^[\(\[]\s*|\s*[\)\]]$", "", w.strip())
+        k = se._initials(w)
+        if re.fullmatch(r"[A-Z]{2,4}", k) and k not in out and is_initials(w, loose=True):
             out.append(k)
     return out
 
@@ -575,9 +638,11 @@ def _people_add(people: Dict[str, List[Any]], who: str, where: str, n: int = 1) 
 
 
 def _parts(src: _Source, rows: _Rows, schema: TemplateSchema, wb_name: str,
-           found: List[PartGuess]) -> None:
+           found: List[PartGuess], pattern_saved: bool = False) -> None:
     """The part number's labels and columns the reader used, and the part
-    each names; a part read from the sheet's or the file's name."""
+    each names; a part read from the sheet's or the file's name, or found
+    by the part-name pattern in a title's words (``pattern_saved``: the
+    pattern is the one Teach saved - the user's earlier answer)."""
     ex, m = src.ex, src.ex.m
     for r, c, v, got in ex.part_hits:
         lab, inline = se._split_inline(v) if isinstance(v, str) and len(v) <= 200 else ("", "")
@@ -609,6 +674,16 @@ def _parts(src: _Source, rows: _Rows, schema: TemplateSchema, wb_name: str,
         elif ex.part_how.startswith(se.FILE_PART_HOW):
             found.append(PartGuess(ex.part, "", f"file name {wb_name!r}", VIA_RULE,
                                    _FILE_PART_SCORE, f"the file's name {wb_name!r} — check it"))
+        elif ex.part_how.startswith(se.TEXT_PART_HOW) and ex.part_cell is not None:
+            # 'LMM1AB101 laser build record': no label, the pattern's shape
+            # in a title (review, 2026-10-20: Teach confirmed a part from a
+            # title, and the next Extract found none without the model)
+            at = src.where(*ex.part_cell)
+            found.append(PartGuess(ex.part, "", at, VIA_ALIAS if pattern_saved else VIA_RULE,
+                                   _FILE_PART_SCORE,
+                                   f"your part-name pattern in {at}"
+                                   + (" (your earlier answer)" if pattern_saved else "")
+                                   + " — check it"))
 
 
 def _items(src: _Source, rows: _Rows) -> None:
@@ -664,6 +739,9 @@ def _values(src: _Source, rows: _Rows, schema: TemplateSchema,
             g = Guess(ROLE_PART if fname == schema.id_field else ROLE_FIELD,
                       "" if fname == schema.id_field else fname, via,
                       round(max(o.score for o in mine), 2))
+            if initials_field(fname):
+                # a '— Inspector Initials' field: who signed (choices)
+                g = Guess(ROLE_INSPECTOR, "", via, g.score)
             if any(o.via == "ambiguous" for o in mine) and first.guesses:
                 note = "two fields nearly tied: " + ", ".join(
                     f"{n} ({s})" for n, s in first.guesses[:2])
@@ -684,8 +762,14 @@ def _values(src: _Source, rows: _Rows, schema: TemplateSchema,
             note = se._join(note, f"no {schema.item_field or 'item'} code beside it")
         if any(o.from_image for o in obs):
             note = se._join(note, "read from a picture: check the value")
-        rows.add(src, "label", first.label, r, c, g, example=written(first), count=len(obs),
-                 where=at, item=item, note=note)
+        row = rows.add(src, "label", first.label, r, c, g, example=written(first),
+                       count=len(obs), where=at, item=item, note=note)
+        if row is not None and g.role == ROLE_INSPECTOR:
+            # the initials under it go in the People section, to be named
+            for k in initials_in(", ".join(written(o) for o in obs[:40])):
+                if k not in row.initials:
+                    row.initials.append(k)
+                _people_add(people, k, row.where, n=0)
 
 
 def _picture_alone(src: _Source, rows: _Rows) -> None:
@@ -766,9 +850,11 @@ def guess(csv_path, workbook, *, model_id: Optional[str] = None,
             prog.update("starting the local image reader…")
             image_reader = se.default_image_reader()
         readers: List[_Reader] = []
+        # the Ledger's saved pattern is a hint, as Extract reads it
         run = se.extract(schema, [wb], mapping, ignore, image_reader=image_reader,
                          use_images=use_images, progress=prog, pattern_mask=mask or None,
-                         cancel=cancel, taught=taught, reader_cls=_Reader, readers=readers)
+                         pattern_strict=not saved, cancel=cancel, taught=taught,
+                         reader_cls=_Reader, readers=readers)
         # not the review's 'N values have no Part Number - fill the Part
         # column in the review': Teach asks for the part itself
         s.problems += [p for p in run.problems if "fill the Part column" not in p]
@@ -786,7 +872,7 @@ def guess(csv_path, workbook, *, model_id: Optional[str] = None,
         sources = _sources(readers, run.images)
         for src in sources:
             _markers(src, rows, people)
-            _parts(src, rows, schema, wb.name, found)
+            _parts(src, rows, schema, wb.name, found, pattern_saved=saved)
             _items(src, rows)
             _values(src, rows, schema, people)
         for src in sources:
@@ -867,7 +953,9 @@ def _ask_labels(s: TeachSession, rows: _Rows, schema: TemplateSchema, ask, repor
     if not labels or report.unavailable:
         return
     roles = _ask_roles(schema)
-    fields = [f.name for f in schema.fields if f.name != schema.id_field] + list(roles.values())
+    # not the '— Inspector Initials' fields: the inspector's role is offered
+    fields = [f.name for f in schema.fields if f.name != schema.id_field
+              and not initials_field(f.name)] + list(roles.values())
     prog.stage(f"asking Council's model about {len(labels)} label(s)")
     report.labels_asked = len(labels)
     report.asking = "the labels nobody placed"
@@ -955,6 +1043,11 @@ class LearnReport:
     kg: List[str] = field(default_factory=list)
     unchanged: int = 0       # answers the rules already read that way
     unsure: int = 0
+    #: guesses the user did not confirm (needs_confirm): not learned
+    unconfirmed: List[str] = field(default_factory=list)
+    #: what an answer did not change, in plain words ('Ignore' on a heading
+    #: of initials: it still says who signed)
+    notes: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
 
@@ -977,7 +1070,8 @@ class LearnReport:
         if self.who_labels:
             lines.append("  inspector label(s): " + ", ".join(self.who_labels))
         if self.not_who:
-            lines.append("  not an inspector: " + ", ".join(self.not_who))
+            lines.append("  not an inspector (names no one, in every workbook of this "
+                         "Ledger): " + ", ".join(self.not_who))
         if self.item_labels:
             lines.append("  flaw-code column(s): " + ", ".join(self.item_labels))
         if self.ignored:
@@ -998,15 +1092,35 @@ class LearnReport:
         lines += [f"  knowledge graph: {k}" for k in self.kg]
         if len(lines) == 1:
             lines.append("  nothing new")
+        if self.unconfirmed:
+            lines.append(f"  {len(self.unconfirmed)} guess(es) you did not confirm, so not "
+                         "learned: " + ", ".join(self.unconfirmed[:8])
+                         + (" …" if len(self.unconfirmed) > 8 else "")
+                         + " — tick Confirm (or pick the answer) and Save again")
+        lines += [f"  note: {n}" for n in self.notes]
         return "\n".join(lines + [f"  ! {c}" for c in self.conflicts + self.problems])
 
 
 def learn(csv_path, session: TeachSession, answers: Dict[str, Any],
           people: Optional[Dict[str, str]] = None, *, part: Optional[str] = None,
-          save_pattern: bool = False, connections_vault: Any = None) -> LearnReport:
+          save_pattern: bool = False, connections_vault: Any = None,
+          confirmed: Optional[Any] = None) -> LearnReport:
     """Keep what the user's answers mean (see the module's docstring), so
     the next Extract, Apply and rebuild use them without a model. Run it on
     a worker thread: it may open the knowledge graph.
+
+    ``confirmed``: the keys of the rows the user confirmed (the dialog's
+    Confirm boxes: ticked to begin with where needs_confirm says no, and
+    when an answer is picked); the other rows are not learned and are
+    listed (LearnReport.unconfirmed). None: every answer counts.
+
+    An answer naming a '— Inspector Initials' field is 'Inspector'
+    (initials_field). For what the rules read as an inspector's label,
+    column or heading, only 'Not an inspector' (ROLE_NO_ONE) - or, for a
+    label or column, a field, the part number or a flaw code - makes it no
+    one's; 'Ignore' changes nothing (it is not data either way), and a
+    heading's initials are no one's only in headings and sheet names
+    (source_extract.Matcher.no_one).
 
     Raises LedgerError, writing nothing, when the aliases file cannot be
     read: the user's mappings would be lost."""
@@ -1048,8 +1162,15 @@ def learn(csv_path, session: TeachSession, answers: Dict[str, Any],
         role, fname = parse_choice(answers[row.key])
         if role == ROLE_FIELD and fname == schema.id_field:
             role, fname = ROLE_PART, ""
+        if role == ROLE_FIELD and initials_field(fname):
+            # the Ledger fills a '— Inspector Initials' field from who signed
+            # each reading: this label says who signed
+            role, fname = ROLE_INSPECTOR, ""
         if role == ROLE_UNSURE:
             rep.unsure += 1
+            continue
+        if confirmed is not None and row.key not in confirmed:
+            rep.unconfirmed.append(row.label)
             continue
         if role == ROLE_FIELD and fname not in fields:
             rep.problems.append(f"{fname!r} is not a field of this Ledger's template: "
@@ -1066,17 +1187,29 @@ def learn(csv_path, session: TeachSession, answers: Dict[str, Any],
         seen[key] = (role, fname, row.where)
         # a heading of initials ('JB — 2026-09-18') or a sheet named for
         # someone is a value, not a label: it can only be someone, or no one
-        heading = row.kind == "inspector" and row.shape in ("heading", "sheet name")
-        if row.kind == "inspector" and role != ROLE_INSPECTOR:
-            # the Ledger's own words read it as a person: no one, now
-            for t in (row.initials if heading else [row.label]):
-                add(not_who, t, rep.not_who)
+        marker = row.kind == "inspector"
+        heading = marker and row.shape in ("heading", "sheet name")
         if heading:
             if role == ROLE_INSPECTOR:
                 for t in row.initials:
                     drop(not_who, normalize_label(t))
                 rep.unchanged += _rules_knew(row, role, fname, m)
+            elif role == ROLE_NO_ONE:
+                # no one's in a heading or a sheet's name - never beside
+                # 'Inspector:' (source_extract.Matcher.no_one)
+                for t in row.initials:
+                    add(not_who, t, rep.not_who)
+            else:
+                rep.notes.append(_still_signs(row, heading=True))
             continue
+        if marker and role == ROLE_IGNORE:
+            # not data either way: 'Ignore' on 'Inspector Initials' turned
+            # off every workbook's signatures (review, 2026-10-20)
+            rep.notes.append(_still_signs(row))
+            continue
+        if marker and role in (ROLE_FIELD, ROLE_PART, ROLE_ITEM):
+            # the Ledger's own words read it as a person: no one, now
+            add(not_who, row.label, rep.not_who)
         if _rules_knew(row, role, fname, m):
             rep.unchanged += 1
         elif role in (ROLE_FIELD, ROLE_PART):
@@ -1103,6 +1236,9 @@ def learn(csv_path, session: TeachSession, answers: Dict[str, Any],
             new_map.pop(key, None)
             for lst in (who, items):
                 drop(lst, key)
+        elif role == ROLE_NO_ONE:
+            drop(who, key)
+            add(not_who, row.label, rep.not_who)
         if role == ROLE_PART:
             rep.part_labels.append(row.label)
         elif role == ROLE_FIELD:
@@ -1162,6 +1298,20 @@ def _rules_knew(row: TeachRow, role: str, fname: str, m: se.Matcher) -> bool:
     if role == ROLE_FIELD:
         return g.score >= se.ACCEPT_AT or m.is_generic(row.label)
     return True
+
+
+def _still_signs(row: TeachRow, heading: bool = False) -> str:
+    """What an answer other than 'Inspector' or 'Not an inspector' leaves
+    of an inspector's label or heading: it is never data, and it still says
+    who signed."""
+    who = ", ".join(row.initials) or "the initials beside it"
+    no_one = role_text(ROLE_NO_ONE)
+    if heading:
+        return (f"{row.label!r} ({row.where}) is a heading, not a label: nothing was learned "
+                f"from it, and {who} still signed the readings under it — answer "
+                f"'{no_one}' if {who} is no one")
+    return (f"{row.label!r} ({row.where}) still says who signed the readings beside or under "
+            f"it (it is never data) — answer '{no_one}' if it names no one")
 
 
 def _teach_graph(vault: Any, schema: TemplateSchema, part_labels: Sequence[str],
@@ -1266,9 +1416,10 @@ def answers_from_guesses(session: TeachSession) -> Dict[str, str]:
 
 __all__ = [
     "ROLES", "ROLE_FIELD", "ROLE_PART", "ROLE_INSPECTOR", "ROLE_ITEM", "ROLE_IGNORE",
-    "ROLE_UNSURE", "VIA_RULE", "VIA_ALIAS", "VIA_MODEL", "VIA_NONE", "MAX_ROWS",
-    "Guess", "TeachRow", "PartGuess", "Person", "TeachSession", "LearnReport", "Example",
-    "choice_key", "parse_choice", "role_text", "choices", "guess", "learn", "improvement",
-    "answers_from_guesses", "initials_in", "examples", "examples_path_for", "label_examples",
-    "part_examples",
+    "ROLE_UNSURE", "ROLE_NO_ONE", "VIA_RULE", "VIA_ALIAS", "VIA_MODEL", "VIA_NONE",
+    "MAX_ROWS", "Guess", "TeachRow", "PartGuess", "Person", "TeachSession", "LearnReport",
+    "Example", "choice_key", "parse_choice", "role_text", "choices", "row_choices",
+    "initials_field", "needs_confirm", "confirmed_by_default", "guess", "learn",
+    "improvement", "answers_from_guesses", "initials_in", "examples", "examples_path_for",
+    "label_examples", "part_examples",
 ]
