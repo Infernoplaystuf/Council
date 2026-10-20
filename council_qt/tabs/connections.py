@@ -710,6 +710,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")
             return
+        # The view is refreshed FIRST: show_entity writes the open item's
+        # header into the status line, and the summary set before it was
+        # gone at once ('⚙ 101' was all a rebuild said - review, 2026-10-19).
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
         from council_core import knowledge_graph as kgm
         self.status.setText(kgm.rebuild_summary_line(stats))
         # The first few unreadable entries also go to the tooltip, where
@@ -727,9 +733,6 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 print(f"  {line}", flush=True)
         else:
             self.status.setToolTip("")
-        self.on_search()
-        if self._current:
-            self.show_entity(self._current)
 
     def refresh_models(self) -> None:
         """List the installed US-origin models and the Pi nodes, on a worker:
@@ -1015,6 +1018,15 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if not text:
             return
         hits = [h for h in self._kg.search(text, cur["type"]) if h["id"] != self._current]
+        if len(hits) > 1:
+            # The one entry whose name or alias IS what was typed is the one
+            # meant: 'JB' (a person of their own) beside a Jill Brown whose
+            # initials are also JB was '2 entries match', and nothing more
+            # of the name could be typed (review, 2026-10-19).
+            exact = [h for h in self._kg.search(text, cur["type"], exact=True)
+                     if h["id"] != self._current]
+            if len(exact) == 1:
+                hits = exact
         if len(hits) != 1:
             self.status.setText(f"{len(hits)} entries match '{text}' — type more of the name.")
             return

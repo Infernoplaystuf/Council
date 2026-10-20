@@ -671,9 +671,10 @@ def rebuild_summary_line(stats) -> str:
 
     Shape: ``"Rebuilt from N document(s) in X.Xs — W workbooks,
     L ledgers, O other docs; U unreadable (needs pypdf: 10, ...);
-    R links (S suggested)"``. Keeps zeros out so a healthy run reads
+    R links + S suggested"``. Keeps zeros out so a healthy run reads
     cleanly."""
     seconds = float(stats.get("seconds", 0) or 0)
+    unchanged = bool(stats.get("graph_unchanged"))
     bits = [f"Rebuilt from {stats.get('documents', 0)} document(s) in "
             f"{seconds:.1f}s"]
     kinds = []
@@ -692,12 +693,17 @@ def rebuild_summary_line(stats) -> str:
                      + ("s" if stats['documents_other'] != 1 else ""))
     if kinds:
         bits.append(" — " + ", ".join(kinds))
+    if unchanged:
+        # The graph that was there is the answer: no entity is new this run.
+        # It used to repeat the last run's '(23 matched existing, 18 new
+        # entities)' with nothing saying so (review, 2026-10-19).
+        bits.append("; nothing changed since the last rebuild")
     if stats.get("wikilink_mentions"):
         wm = stats["wikilink_mentions"]
         tail = ""
         matched = stats.get("wikilinks_matched") or 0
         created = stats.get("wikilinks_created") or 0
-        if matched or created:
+        if (matched or created) and not unchanged:
             parts = []
             if matched:
                 parts.append(f"{matched} matched existing")
@@ -718,9 +724,14 @@ def rebuild_summary_line(stats) -> str:
     seeded = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
     suggested = int(rels.get("suggested") or 0)
     if seeded or suggested:
+        # The suggested ones are added ON: '20 links (5 suggested)' read as 5
+        # of the 20 when there were 25. 'Links' stays the seeded + accepted
+        # ones, as the coverage line and the progress finish line count them
+        # ('20 links, 5 waiting for you'); a total with the suggested ones in
+        # it put two link counts on screen at once (review, 2026-10-19).
         extra = f"; {seeded} link" + ("s" if seeded != 1 else "")
         if suggested:
-            extra += f" ({suggested} suggested)"
+            extra += f" + {suggested} suggested"
         bits.append(extra)
     else:
         bits.append("; 0 links found")
@@ -1887,9 +1898,20 @@ class KnowledgeGraph:
                     stats = self._seed(use_collections=use_collections,
                                        gazetteer=gazetteer, on_progress=on_progress,
                                        prog=prog)
+                    self._seed_finish(stats, prog)
+                except sqlite3.OperationalError as exc:
+                    # The lock above is this process's only: another Council
+                    # rebuilding the same vault held the store past the busy
+                    # timeout, and this rebuild died with a raw 'database is
+                    # locked' (review, 2026-10-19). Its batches committed so
+                    # far stay; nothing of the graph phase was written.
+                    if _busy(exc):
+                        raise KnowledgeGraphBusy(
+                            "the knowledge graph is being rebuilt elsewhere — try "
+                            "again when that finishes") from exc
+                    raise
                 finally:
                     _PROGRESS.reset(token)
-                self._seed_finish(stats, prog)
                 return stats
         finally:
             lock.release()
@@ -2064,6 +2086,11 @@ class KnowledgeGraph:
                         stats["documents_read"] += 1
                         readable.append((p, did, h))
                 except Exception as exc:
+                    # The STORE held by another Council's rebuild is not this
+                    # file's fault: it is not counted 'unreadable' (seed()
+                    # says the graph is busy).
+                    if _busy(exc):
+                        raise
                     # Listed but not readable now (held open with an exclusive
                     # lock by another program, a parse error): 'unreadable',
                     # with what it had - not 'missing'. It never reached
@@ -3464,32 +3491,80 @@ class KnowledgeGraph:
             "SELECT alias FROM aliases WHERE entity_id=? ORDER BY alias", (eid,))]
         return d
 
-    def search(self, text: str, etype: Optional[str] = None, limit: int = 50
-               ) -> List[Dict[str, Any]]:
-        """Entities whose name or any alias contains ``text`` (accent- and
-        case-insensitive), best first: exact, then prefix, then substring."""
+    def search(self, text: str, etype: Optional[str] = None, limit: int = 50,
+               exact: bool = False) -> List[Dict[str, Any]]:
+        """Entities whose name or any alias has a word starting with ``text``
+        (accent- and case-insensitive), best first: exact, then prefix, then
+        a later word's start. A query with a digit in it is a piece of a code
+        ('7720' of BRG-7720, a serial's tail) and matches anywhere in one.
+        Initials ('AK', 'A.K.') also find the people whose initials they are,
+        and 'D. Whitfield' the people that initial and surname fit; letters
+        typed in lower case ('al', 'jb') are a piece of a name first, so the
+        people whose initials they spell come after every name hit.
+
+        ``exact``: only the entries whose name or an alias IS ``text`` - for
+        a lookup that wants the one entry meant, not a list (the 'Same as…'
+        merge)."""
+        from council_core import kg_excel
         # 'Lee, Carol' also searches as 'Carol Lee', whichever was seen.
         forms = {f for f in (fold(text), fold(person_display(text))) if f}
         if not forms:
             return []
         best: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+        def hit(r, score: int) -> None:
+            cur = best.get(r["id"])
+            if cur is None or score < cur[0]:
+                best[r["id"]] = (score, {"id": r["id"], "type": r["type"],
+                                         "name": r["name"]})
         for ft in forms:
+            # On word starts: 'AK' found 'Jordan Blake' (blAKe) - review,
+            # 2026-10-19. fold() leaves only [a-z0-9 ], so no LIKE wildcard
+            # can be in ft, and every word follows exactly one space.
+            code = any(ch.isdigit() for ch in ft)
             q = ("SELECT DISTINCT e.id, e.type, e.name, a.alias_norm FROM aliases a"
-                 " JOIN entities e ON e.id=a.entity_id WHERE e.merged_into IS NULL"
-                 " AND a.alias_norm LIKE ?")
-            # fold() leaves only [a-z0-9 ], so no LIKE wildcard can be in ft.
-            args: List[Any] = [f"%{ft}%"]
+                 " JOIN entities e ON e.id=a.entity_id WHERE e.merged_into IS NULL")
+            if code:
+                q += " AND a.alias_norm LIKE ?"
+                args: List[Any] = [f"%{ft}%"]
+            else:
+                q += " AND (a.alias_norm LIKE ? OR a.alias_norm LIKE ?)"
+                args = [f"{ft}%", f"% {ft}%"]
             if etype:
                 q += " AND e.type=?"
                 args.append(etype)
             for r in self.db.execute(q, args):
-                score = (0 if r["alias_norm"] == ft
-                         else 1 if r["alias_norm"].startswith(ft) else 2)
-                cur = best.get(r["id"])
-                if cur is None or score < cur[0]:
-                    best[r["id"]] = (score, {"id": r["id"], "type": r["type"],
-                                             "name": r["name"]})
+                norm = r["alias_norm"]
+                hit(r, 0 if norm == ft else 1 if norm.startswith(ft)
+                    else 2 if f" {ft}" in f" {norm}" else 3)
+        if etype in (None, "PERSON") and not exact:
+            # Initials: every word's first letter, or the first and last
+            # name's (as the initials questions offer their candidates).
+            # Typed as initials ('AK', 'J.B.') they rank with a later word's
+            # start; in lower case ('al', 'dan') they are a name fragment
+            # first, and Anna Lopez came in among the Al... names at the same
+            # rank, on every keystroke (review, 2026-10-19).
+            if kg_excel.is_initials(text, loose=True):
+                rank = 2 if kg_excel.is_initials(text) else 3
+                want = kg_excel.initials_key(text).lower()
+                if len(want) >= 2:
+                    for r in self.db.execute(
+                            "SELECT id, type, name, key FROM entities WHERE"
+                            " type='PERSON' AND merged_into IS NULL AND key LIKE ?"
+                            " AND key LIKE '% %'", (f"{want[0]}%",)):
+                        toks = r["key"].split()
+                        if want in ("".join(t[0] for t in toks), toks[0][0] + toks[-1][0]):
+                            hit(r, rank)
+            key = person_key(text)
+            if is_initial_form(key):
+                for eid in self.initial_candidates(key):
+                    r = self.db.execute("SELECT id, type, name FROM entities WHERE id=?"
+                                        " AND merged_into IS NULL", (eid,)).fetchone()
+                    if r is not None:
+                        hit(r, 2)
         ranked = sorted(best.values(), key=lambda x: (x[0], x[1]["name"].lower()))
+        if exact:
+            ranked = [x for x in ranked if x[0] == 0]
         return [d for _s, d in ranked[:limit]]
 
     def neighbors(self, eid: str, *, include_rejected: bool = False,

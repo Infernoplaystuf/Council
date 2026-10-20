@@ -110,11 +110,49 @@ def test_the_summary_says_zero_links_when_nothing_was_seeded():
 
 
 def test_the_summary_includes_seeded_and_suggested_counts():
+    # Updated on purpose (review, 2026-10-19): the suggested links are added
+    # on ('5 links (7 suggested)' read as 7 of the 5).
     stats = _stats(documents=10, workbooks=10,
                    relations={"seeded": 3, "accepted": 2, "suggested": 7})
     line = rebuild_summary_line(stats)
-    assert "5 links" in line
-    assert "7 suggested" in line
+    assert "; 5 links + 7 suggested" in line
+
+
+def test_the_suggested_links_are_added_on_not_part_of_the_links():
+    """20 seeded + 5 suggested said '20 links (5 suggested)': it read as 5
+    of the 20. 'Links' are the seeded and accepted ones, as the coverage
+    line counts them ('20 links, 5 waiting for you') - a total with the
+    suggested ones in it put a second link count on screen (review,
+    2026-10-19)."""
+    line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 20,
+                                                                "suggested": 5}))
+    assert "; 20 links + 5 suggested" in line
+    assert "(5 suggested)" not in line and "25 links" not in line
+    line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 20}))
+    assert line.endswith("; 20 links.")
+    line = rebuild_summary_line(_stats(documents=3, relations={"suggested": 4}))
+    assert "; 0 links + 4 suggested" in line
+    line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 1,
+                                                                "suggested": 1}))
+    assert "; 1 link + 1 suggested" in line
+
+
+def test_an_unchanged_rebuild_says_so_and_claims_no_new_entities():
+    """An unchanged rebuild carries the last run's wiki-link counters: it
+    said '(23 matched existing, 18 new entities)' and nothing said the
+    graph was the same (review, 2026-10-19)."""
+    stats = _stats(documents=21, documents_other=21, graph_unchanged=True,
+                   wikilink_mentions=41, wikilinks_matched=23, wikilinks_created=18,
+                   relations={"seeded": 20, "suggested": 5})
+    line = rebuild_summary_line(stats)
+    assert "nothing changed since the last rebuild" in line
+    assert "new entit" not in line and "matched existing" not in line
+    assert "; 20 links + 5 suggested" in line               # the graph as it stands
+    # a rebuild that worked the graph out again still says what it found
+    stats["graph_unchanged"] = False
+    line = rebuild_summary_line(stats)
+    assert "nothing changed" not in line
+    assert "(23 matched existing, 18 new entities)" in line
 
 
 def test_a_rebuild_with_only_other_docs_does_not_claim_workbooks():

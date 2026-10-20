@@ -196,6 +196,38 @@ def test_search_shows_links_with_evidence_and_preview(qapp, tab):
     assert tab.actions.opened == ["ironbridge/trackers/parts_list.csv"]
 
 
+def test_the_rebuild_summary_is_not_hidden_by_the_open_item(qapp, tab):
+    """A rebuild with an item open: the view was refreshed after the
+    summary was set, and the item's header ('⚙ 101') replaced it at once
+    (review, 2026-10-19)."""
+    _rebuilt(qapp, tab)
+    tab.search.setText("Lee, Carol")
+    tab.results.setCurrentRow(0)
+    assert "Carol Lee" in tab.status.text()
+    tab.on_rebuild()
+    drive(qapp, tab)
+    assert tab.status.text().startswith("Rebuilt from"), tab.status.text()
+    assert tab._current and _items(tab.tree)               # the item is still shown
+
+
+def test_the_rebuild_summary_counts_links_as_the_coverage_line_does(qapp, tab):
+    """The summary said '36 links (1 of them suggested)' over a coverage
+    line saying '35 links, 1 waiting for you': two link counts on screen at
+    once (review, 2026-10-19). Both count the seeded and accepted links."""
+    import re
+    _rebuilt(qapp, tab)
+    _wait_threads(qapp)
+    tab.on_suggest()                        # some links only a model suggests
+    drive(qapp, tab)
+    tab.on_rebuild()
+    drive(qapp, tab)
+    links, waiting = re.search(r"(\d+) links, (\d+) waiting for you",
+                               tab.coverage.text()).groups()
+    assert int(waiting) > 0
+    assert f"; {links} links + {waiting} suggested" in tab.status.text(), (
+        tab.status.text(), tab.coverage.text())
+
+
 def test_text_evidence_preview_marks_the_line(qapp, tab):
     _rebuilt(qapp, tab)
     tab.search.setText("Bob Smith")
@@ -368,6 +400,45 @@ def test_same_as_merges_after_confirming(qapp, vault):
         view.on_merge()
         assert asked and view._kg.resolve(view._kg.search("Caroline Lee")[0]["id"]) == carol
         assert view.split_btn.isEnabled()
+    finally:
+        _wait_threads(qapp)
+        view.close()
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_same_as_takes_the_entry_of_that_exact_name(qapp, tmp_path):
+    """'Keep JB as a person of their own' makes an entry whose whole name is
+    'JB'. Merging it into Jordan Blake while a Jill Brown exists said '2
+    entries match 'JB' - type more of the name' (the search also finds
+    people by their initials), and there was no more to type; so did 'D.
+    Whitfield' beside Dan Whitfield (review, 2026-10-19)."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        jordan = kg.add_person("Jordan Blake")
+        kg.add_person("Jill Brown")
+        dana = kg.add_person("Dana Whitfield")
+        kg.add_person("Dan Whitfield")
+        with kg.db:
+            jb = kg._entity("PERSON", "JB", alias_source="user")
+            dw = kg._entity("PERSON", "D. Whitfield", alias_source="user")
+    typed = []
+    view = ConnectionsTab(actions=StubActions(v),
+                          ask_string=lambda *a, **k: typed[-1],
+                          ask_yes_no=lambda *a, **k: True)
+    try:
+        for cur, text, other in ((jordan, "JB", jb), (dana, "D. Whitfield", dw)):
+            view._current = cur
+            typed.append(text)
+            view.on_merge()
+            assert view._kg.resolve(other) == cur, view.status.text()
+            assert f"also written: {text}" in view.status.text()   # the item's header
+        # what matches by initials alone is still a choice to narrow down
+        view._current = view._kg.search("Jill Brown")[0]["id"]
+        typed.append("DW")
+        view.on_merge()
+        assert "2 entries match 'DW'" in view.status.text()
     finally:
         _wait_threads(qapp)
         view.close()
