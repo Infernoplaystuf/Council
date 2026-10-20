@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # ledger_fixtures
 
 from source_extract import WORKBOOK_SUFFIXES, workbook_files   # noqa: E402
 
@@ -111,3 +112,57 @@ def test_the_result_is_sorted_deterministically(tmp_path):
     _touch(tmp_path / "aa.xlsx")
     _touch(tmp_path / "mid" / "mm.xlsx")
     assert workbook_files(tmp_path) == sorted(workbook_files(tmp_path))
+
+
+def test_a_relative_folder_gives_relative_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _touch(tmp_path / "rel" / "sub" / "a.xlsx")
+    assert workbook_files("rel") == [Path("rel") / "sub" / "a.xlsx"]
+
+
+# ------------------------------------------------------------- past MAX_PATH
+
+def _long_paths_off() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\FileSystem") as k:
+            return int(winreg.QueryValueEx(k, "LongPathsEnabled")[0]) == 0
+    except OSError:
+        return True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="MAX_PATH is a Windows limit")
+def test_a_workbook_past_max_path_is_listed_and_named_too_long(tmp_path):
+    """With LongPathsEnabled=0 a folder whose path is over 260 characters
+    could not be listed, and its workbooks were skipped without a word
+    (review, 2026-10-19)."""
+    import os
+    import shutil
+    import openpyxl
+    import source_extract as se
+    from council_core import ledger_ingest as li
+    from ledger_fixtures import make_template
+    root = tmp_path / "src"
+    deep = "\\\\?\\" + str(root / ("L" * 120) / ("M" * 120))
+    os.makedirs(deep)
+    try:
+        for where in (deep + "\\long.xlsx", str(root / "short.xlsx")):
+            wb = openpyxl.Workbook()
+            wb.active["A1"], wb.active["B1"] = "Laser Power (W)", 285
+            wb.save(where)
+        found = workbook_files(root)
+        assert [p.name for p in found] == ["long.xlsx", "short.xlsx"]
+        long_one = found[0]
+        assert len(str(long_one)) > 260 and "\\\\?\\" not in str(long_one)
+        if _long_paths_off():
+            n = len(str(long_one))
+            assert se.path_too_long(long_one) == n
+            # the run reads the other one and says why this one was not
+            ps = li.create_parent(make_template(tmp_path / "t.xlsx"))
+            s = li.run_extract(ps.csv, [str(root)], use_images=False)
+            assert s.files == 2 and s.values
+            assert any(f"long.xlsx: path too long: {n} characters — enable Windows long "
+                       "paths or move the folder" in p for p in s.problems), s.problems
+    finally:
+        shutil.rmtree("\\\\?\\" + str(root), ignore_errors=True)
