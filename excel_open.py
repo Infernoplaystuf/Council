@@ -177,6 +177,29 @@ def _refusal(exc, obj=None, name: str = ""):
     return exc
 
 
+def _gone_behind(exc, obj=None, name: str = ""):
+    """The error saying Excel is gone (_gone) behind `exc` - Excel's `obj`
+    failing `name` - or None. pywin32's late-bound object swallows the
+    error of a name it looks up on an object for the first time: Excel
+    ended in the middle of a read raised a bare AttributeError
+    ('<unknown>.Shapes'), the HRESULT lost - and each new worksheet's Name,
+    UsedRange and Shapes are such names - so the read ended 'could not be
+    read (AttributeError(...))', kind 'other' (2 runs in 2 with real
+    Excel ended by taskkill, measured here; review, 2026-10-20). The name
+    is looked up again through the object's own IDispatch, as _refusal
+    does: RPC_S_SERVER_UNAVAILABLE there (measured), that error."""
+    if _gone(exc):
+        return exc
+    ole = (getattr(obj, "__dict__", None) or {}).get("_oleobj_")
+    if not isinstance(exc, AttributeError) or ole is None or not name:
+        return None
+    try:
+        ole.GetIDsOfNames(0, name)
+    except Exception as e:                                  # noqa: BLE001
+        return e if _gone(e) else None
+    return None
+
+
 def _com_error_description(exc) -> str:
     args = getattr(exc, "args", None) or ()
     if len(args) >= 3 and isinstance(args[2], tuple) and len(args[2]) >= 3:
@@ -943,20 +966,36 @@ def _ask(call, obj, name: str, wait: Optional[float] = None, stopped=()):
     """call() - `name` read, set or called on Excel's `obj` - asked again for
     `wait` seconds (_REFUSED_WAIT_S) while Excel refuses it (_refusal);
     _Refused when it still does then, at once when the watchdog stopped this
-    Excel (`stopped`). Any other failure is raised as it came."""
+    Excel (`stopped`). Excel gone meanwhile is raised as the error saying so
+    (_gone_behind); any other failure as it came."""
     import time
+    handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     end = time.monotonic() + (_REFUSED_WAIT_S if wait is None else wait)
     while True:
         try:
             return call()
         except Exception as e:
-            why = _refusal(e, obj, name)
-            if why is None:
-                raise
-            if stopped or time.monotonic() >= end:
-                if not _refused(why):
-                    raise           # pywin32's lookup kept failing; Excel's answered
-                raise _Refused(why) from e
+            why = gone = None
+            try:
+                why = _refusal(e, obj, name)
+                if why is None:
+                    gone = _gone_behind(e, obj, name)
+                    if gone is None or gone is e:
+                        raise
+                    raise gone from e
+                if stopped or time.monotonic() >= end:
+                    if not _refused(why):
+                        raise       # pywin32's lookup kept failing; Excel's answered
+                    raise _Refused(why) from e
+                # refused for a moment: asked again, its error let go first
+                _drop_frames(why, keep=handling)
+            finally:
+                # The refusal kept here held this frame through its traceback,
+                # and this frame held Excel's objects (`obj`, `call`): a cycle
+                # only gc freed, after COM was closed on the thread - Excel
+                # busy once and then answering froze a Ledger extract for
+                # 60-120 s (5 runs in 11, real Excel; review, 2026-10-20).
+                why = gone = None
         time.sleep(0.1)
 
 
@@ -1000,13 +1039,17 @@ def _excel_pid(app, wait: Optional[float] = None) -> Optional[int]:
     asked again for `wait` seconds (_REFUSED_WAIT_S) while Excel refuses the
     call. None outside Windows, when pywin32 is absent, when the window
     cannot be read (a fake, an Excel still refusing) or names no process."""
+    handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     try:
         import win32process
         hwnd = int(_ask(lambda: app.Hwnd, app, "Hwnd", wait))
         if not hwnd:
             return None
         return int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
-    except Exception:                                       # noqa: BLE001
+    except Exception as e:                                  # noqa: BLE001
+        # Its refusal, kept, kept Excel itself alive past CoUninitialize
+        # (an Excel refusing from the start; review, 2026-10-20)
+        _drop_frames(e, keep=handling)
         return None
 
 
@@ -1447,8 +1490,8 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 # still refused: macros not turned off, among the rest -
                 # nothing is opened in it
                 raise _excel_failed(e.why, path, cancels, True, left) from e.why
-            except Exception:
-                pass
+            except Exception as e:
+                _drop_frames(e, keep=handling)  # it held Excel (_drop_frames)
         _stop_if_cancelled(path, cancels)
         try:
             # A password the workbook does not have, so a protected file fails

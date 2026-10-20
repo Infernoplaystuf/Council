@@ -1584,6 +1584,79 @@ def test_an_excel_gone_while_the_workbook_is_read_fails_that_workbook_only(tmp_p
     assert len(apps) == 2
 
 
+class _SheetIDispatch:
+    """A worksheet's own IDispatch, for pywin32 to wrap as Excel's
+    Worksheets give it (a late-bound CDispatch named '<unknown>'): answered
+    as _Sheet until `dies` is looked up - Excel ended there (Task Manager,
+    a crash) - and from then on every call fails RPC_S_SERVER_UNAVAILABLE
+    with a real pywintypes.com_error, as real Excel's did (measured here,
+    Excel ended by taskkill after the first sheet's cells were copied)."""
+    NAMES = ("Name", "UsedRange", "Cells", "Range", "Shapes")
+
+    def __init__(self, dies):
+        self.sheet, self.dies, self.dead = _Sheet(), dies, False
+
+    def _gone(self):
+        import pywintypes
+        raise pywintypes.com_error(_RPC_S_SERVER_UNAVAILABLE, "The RPC server is unavailable.",
+                                   None, None)
+
+    def GetTypeInfo(self, *a):
+        import pywintypes
+        raise pywintypes.com_error(-2147467263, "Not implemented", None, None)
+
+    def GetIDsOfNames(self, lcid, name):
+        import pywintypes
+        self.dead = self.dead or name == self.dies
+        if self.dead:
+            self._gone()
+        if name not in self.NAMES:
+            raise pywintypes.com_error(-2147352570, "Unknown name.", None, None)
+        return self.NAMES.index(name) + 1
+
+    def Invoke(self, dispid, lcid, flags, want, *args):
+        if self.dead:
+            self._gone()
+        return getattr(self.sheet, self.NAMES[dispid - 1], None)
+
+    def InvokeTypes(self, *a):
+        import pywintypes
+        raise pywintypes.com_error(-2147467263, "Not implemented", None, None)
+
+
+@pytest.mark.parametrize("dies", ["UsedRange", "Shapes"])
+def test_an_excel_gone_while_read_through_pywin32s_own_object_fails_that_workbook_only(
+        tmp_path, dies):
+    """Real Excel ended in the middle of a read: pywin32's late-bound
+    worksheet swallows the HRESULT of a name it looks up for the first time
+    (each new sheet's UsedRange, Shapes) and raises a bare AttributeError
+    ('<unknown>.Shapes'), so the read still ended 'could not be read
+    (AttributeError(...))', kind 'other' - 2 runs in 2 with real Excel; only
+    the fake raising the HRESULT itself was said in words (review,
+    2026-10-20). The name is looked up again through the sheet's own
+    IDispatch: the RPC server is unavailable, said for this workbook."""
+    win32com_client = pytest.importorskip("win32com.client")
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log, apps = [], []
+
+    def factory():
+        app = _App(log)
+        app._book.Worksheets = [win32com_client.Dispatch(_SheetIDispatch(dies))]
+        apps.append(app)
+        return app
+    with pytest.raises(AttributeError, match=r"<unknown>\." + dies):
+        getattr(factory()._book.Worksheets[0], dies)        # what pywin32 itself says
+    with excel_open.cancel_scope():
+        with pytest.raises(ExcelOpenError) as e:
+            read_with_excel(f, want_pictures=False, app_factory=factory)
+        assert getattr(excel_open._SCOPE, "down", None) is None   # the next one is tried
+    assert e.value.kind == "unavailable" and not e.value.down
+    assert str(e.value) == ("a.xls: Excel stopped while the workbook was being read (The RPC "
+                            "server is unavailable) — it may have closed or crashed on it")
+    assert log[-1] == ("quit",)
+
+
 def test_an_extract_whose_excel_refuses_while_reading_says_so_on_one_line(tmp_path, monkeypatch):
     """The Ledger end to end, as the tester's: each .xls read 'could not be
     read (com_error(-2147418111, ...))', kind 'other', an Excel started for
@@ -1726,14 +1799,28 @@ def test_an_extract_reports_0_byte_workbooks(tmp_path, monkeypatch):
 
 # Excel objects that hold nothing else (no reference cycles), so what is
 # still alive is what the read itself kept
+def _busy():
+    return Exception(_RPC_E_SERVERCALL_RETRYLATER, "The message filter indicated that the "
+                     "application is busy.", None, None)
+
+
+def _busy_once(how, busied: set, where: str):
+    """'The application is busy' the first time `where` is asked, when that
+    is what `how` names ('busy-Hwnd'); then answered. `busied`: where it was."""
+    if how == f"busy-{where}" and where not in busied:
+        busied.add(where)
+        raise _busy()
+
+
 class _PlainBook:
-    def __init__(self, refusing=False):
-        self.refusing = refusing
+    def __init__(self, how, busied):
+        self.how, self.busied = how, busied
 
     @property
     def Worksheets(self):
-        if self.refusing:                   # its license agreement came up
+        if self.how == "refusing":          # its license agreement came up
             raise _call_rejected()
+        _busy_once(self.how, self.busied, "Worksheets")
         return []
 
     def Close(self, SaveChanges=True):
@@ -1741,30 +1828,50 @@ class _PlainBook:
 
 
 class _PlainBooks:
-    def __init__(self, how, made):
-        self.how, self.made = how, made
+    def __init__(self, how, made, busied):
+        self.how, self.made, self.busied = how, made, busied
 
     def Open(self, path, **kw):
         if self.how == "refused":
             raise Exception(-2147352567, "Exception occurred.", (
                 0, "Microsoft Excel", "Open method of Workbooks class failed",
                 "xlmain11.chm", 0, -2146827284), None)
-        book = _PlainBook(refusing=self.how == "refusing")
+        _busy_once(self.how, self.busied, "Open")
+        book = _PlainBook(self.how, self.busied)
         self.made.append(weakref.ref(book))
         return book
 
 
 class _PlainApp:
-    Hwnd = 77
+    def __init__(self, how, made, busied=None):
+        self.how, self.busied = how, set() if busied is None else busied
+        self.Workbooks = _PlainBooks(how, made, self.busied)
 
-    def __init__(self, how, made):
-        self.Workbooks = _PlainBooks(how, made)
+    @property
+    def Hwnd(self):
+        _busy_once(self.how, self.busied, "Hwnd")
+        return 77
 
     def Quit(self):
         pass
 
 
-@pytest.mark.parametrize("how", ["refused", "read", "refusing"])
+class _PlainRefusingApp:
+    """Refusing every call from the start - its window, each property set,
+    Quit: its license agreement up before anything opened (wave 2's case)."""
+
+    def __getattr__(self, name):
+        raise _call_rejected()
+
+    def __setattr__(self, name, value):
+        raise _call_rejected()
+
+    def Quit(self):
+        raise _call_rejected()
+
+
+@pytest.mark.parametrize("how", ["refused", "read", "refusing", "busy-Hwnd", "busy-Open",
+                                 "busy-Worksheets", "refusing-from-the-start"])
 def test_no_excel_object_outlives_com_on_the_thread(tmp_path, monkeypatch, how):
     """The Workbooks collection Excel would not open a workbook with (kept
     in an error's frames and in the read's own) was let go only after
@@ -1773,13 +1880,23 @@ def test_no_excel_object_outlives_com_on_the_thread(tmp_path, monkeypatch, how):
     the next workbook's Excel crashed the Council, an access violation in
     pywin32 (3 runs in 3 on the Ledger's worker thread, measured here;
     review, 2026-10-20). Nothing of Excel is alive when COM is closed now:
-    a workbook it would not open, one read, one it refused to go on with."""
+    a workbook it would not open, one read, one it refused to go on with.
+
+    Nor when Excel was busy for a moment and then answered (its window,
+    Workbooks.Open, Worksheets), or refused from the start: the refusal
+    _ask kept for the next try, and the one _excel_pid swallowed, held its
+    own frame and so Excel's objects - freed only by gc, later; a real
+    Ledger extract stalled 60-120 s in 5 runs of 11 (review, 2026-10-20)."""
     pythoncom = pytest.importorskip("pythoncom")
     import gc
-    made = []
+    made, busied = [], set()
 
     def dispatch(name):
-        app = _PlainApp(how, made)
+        if how == "refusing-from-the-start":
+            app = _PlainRefusingApp()
+            made.append(weakref.ref(app))
+            return app
+        app = _PlainApp(how, made, busied)
         made.extend([weakref.ref(app), weakref.ref(app.Workbooks)])
         return app
     _dispatch(monkeypatch, None, [{(100, 1)}, {(100, 1), (4242, 9)}], log=[],
@@ -1796,12 +1913,53 @@ def test_no_excel_object_outlives_com_on_the_thread(tmp_path, monkeypatch, how):
     f.write_bytes(OLE_MAGIC)
     gc.disable()                                         # what refcounts free, not gc
     try:
-        if how == "read":
-            read_with_excel(f, want_pictures=False, timeout=30)
+        if how == "read" or how.startswith("busy-"):
+            assert read_with_excel(f, want_pictures=False, timeout=30).sheets == []
         else:
             with pytest.raises(ExcelOpenError):
                 read_with_excel(f, want_pictures=False, timeout=30)
     finally:
         gc.enable()
-    assert len(made) == (2 if how == "refused" else 3)
+    assert len(made) == {"refused": 2, "refusing-from-the-start": 1}.get(how, 3)
+    assert busied == ({how[len("busy-"):]} if how.startswith("busy-") else set())
+    assert alive == [[]], alive
+
+
+@pytest.mark.parametrize("refuse", [lambda: _first(4),
+                                    lambda: _once("invoke", "AutomationSecurity", 4),
+                                    lambda: _once("lookup", "Workbooks"),
+                                    lambda: _once("lookup", "Hwnd")],
+                         ids=["lookups", "macro-setting", "workbooks", "window"])
+def test_no_excel_object_outlives_com_when_busy_through_pywin32s_own_object(
+        tmp_path, monkeypatch, refuse):
+    """The same through pywin32's own late-bound object, as DispatchEx gives
+    Excel: busy for a moment, then read - and Excel's object (the CDispatch
+    and the IDispatch under it) still alive at CoUninitialize, every time
+    (review, 2026-10-20)."""
+    pythoncom = pytest.importorskip("pythoncom")
+    pytest.importorskip("pywintypes")
+    import gc
+    log, refuse, made = [], refuse(), []
+
+    def dispatch(name):
+        idispatch = _ExcelIDispatch(log, refuse)
+        app = _pywin32(idispatch)
+        made.extend([weakref.ref(app), weakref.ref(idispatch)])
+        return app
+    _dispatch(monkeypatch, None, [{(100, 1)}, {(100, 1), (4242, 9)}], log=log, dispatch=dispatch)
+    alive = []
+    real = pythoncom.CoUninitialize
+
+    def uninit():
+        alive.append([type(r()).__name__ for r in made if r() is not None])
+        real()
+    monkeypatch.setattr(pythoncom, "CoUninitialize", uninit)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    gc.disable()                                         # what refcounts free, not gc
+    try:
+        assert read_with_excel(f, want_pictures=False, timeout=30).sheets
+    finally:
+        gc.enable()
+    assert any(x[0] == "refused" for x in log)
     assert alive == [[]], alive

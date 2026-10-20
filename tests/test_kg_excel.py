@@ -792,6 +792,8 @@ def test_a_file_excel_says_is_no_workbook_is_not_opened_again_while_unchanged(
     assert said == ["cut.xls", "empty.xls", "notes.xlsx"], stats["unreadable"]
     assert "empty.xls: empty.xls: empty file (0 bytes) — there is nothing in it to read" in (
         stats["unreadable"])
+    # rolled up as such, not 'other' (review, 2026-10-20)
+    assert stats["unreadable_reasons"] == {"corrupt / wrong format": 2, "empty file": 1}
     assert sorted(opened) == ["cut.xls", "notes.xlsx"]           # no Excel for the empty one
     opened.clear()
     stats = kg.seed()

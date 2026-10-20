@@ -634,6 +634,16 @@ def _categorize_unreadable_reason(text: str) -> str:
     # a workbook 'needs openpyxl' (review, 2026-10-19)
     if "opens only through microsoft excel" in t:
         return "no Excel COM"
+    # the Excel reader's newer words were all 'other', and a valid .xls in a
+    # 256-259 character path had at least been 'corrupt' (review, 2026-10-20)
+    if "path too long" in t:
+        return "path too long"
+    if "empty file" in t:
+        return "empty file"
+    if "refuses every call" in t or "excel could not be started" in t:
+        return "no Excel COM"
+    if "excel stopped while" in t:
+        return "Excel stopped"
     if "is not a workbook" in t:
         return "corrupt / wrong format"
     if "needs the openpyxl" in t or "needs openpyxl" in t:
