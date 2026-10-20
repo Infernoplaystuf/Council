@@ -405,6 +405,9 @@ class AssistReport:
     parts_none: int = 0
     labels_mapped: int = 0
     values_held: int = 0
+    #: The label question failed (its error is a problem line): '0 given a
+    #: field, 0 value(s) placed' read as answered (second review, 2026-10-20).
+    labels_failed: bool = False
     #: The template's item field ('Flaw #'), for what values_held says.
     item_field: str = ""
     #: Why the model stopped being asked (one_shot), '' while it answers.
@@ -462,7 +465,10 @@ class AssistReport:
                 said.append(f"{silent} not answered")
             bits.append(f"asked which part {self.parts_asked} workbook(s) are about: "
                         + ", ".join(said))
-        if self.labels_asked:
+        if self.labels_asked and self.labels_failed:
+            bits.append(f"asked which field {self.labels_asked} unplaced label(s) are: "
+                        "not answered (see the problems)")
+        elif self.labels_asked:
             said = [f"{self.labels_mapped} given a field", f"{self.values_placed} value(s) "
                     "placed"]
             if self.values_held:
@@ -627,12 +633,15 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
     try:
         mapping, report.model = map_labels(labels, fields, chat)
     except ModelUnavailable:
+        report.labels_failed = True
         return                                             # said once, by one_shot
     except ModelFailedAgain:
+        report.labels_failed = True
         report.problems.append("Council's model did not answer about the labels (the "
                                "same error as above)")
         return
     except Exception as exc:                               # noqa: BLE001
+        report.labels_failed = True
         report.problems.append(f"Council's model was not asked about labels: {exc}")
         return
     report.labels_mapped = sum(1 for f in mapping.values() if f)
@@ -711,11 +720,22 @@ _GENERIC = re.compile(
 #: inspection workbooks and not a part. Taken as the part, part-less
 #: workbooks merged into one phantom part 'AMS2750' (review, 2026-10-20).
 #: The user's own pattern still wins (_part_test, _spaced_part).
+#:
+#: Only the standard's own shape: its body's name in capitals, then a
+#: number - digits, a revision letter, a year ('ISO 9001:2015', 'AMS2750E')
+#: - with the letters a body puts first ('E1444', 'AS9100', '-STD-'). Any
+#: prefix and any code after it refused real ids ('EN12AB345', 'DIN7AB123',
+#: 'BS-4471A', 'AMS-4UV-567'), and an inspector's initials before one
+#: ('BS AB12CD345') made it a standard's (second review, 2026-10-20).
+_STD_NUM = (r"\d+(?:[.:\-]\d+)*[A-Z]?(?:[.:\-]\d+)*"
+            r"(?:/[A-Z]{0,2}\d+(?:[.:\-]\d+)*[A-Z]?)?")    # 'E1444/E1444M', 'D17.1/D17.1M'
 _STANDARD = re.compile(
-    r"(?i:AMS|ASTM|ISO|MIL|NAS|AWS|ASME|SAE|ANSI|DIN|EN|BS|ARP)"
-    r"(?:[\s\-/]*(?i:EN|ISO)(?=[\s\-/]))*"                 # 'BS EN 10204', 'DIN EN ISO 9712'
-    r"(?:\d|[\s\-/]+(?:[A-Za-z]{1,4}[\s\-/]?)?\d)"         # 'AMS2750', 'ASTM E1444', 'MIL-STD-1'
-    r"[\w.\-:/]*")
+    r"(?:(?:BS|DIN|EN|ISO)(?:[\s/]+(?:EN|ISO|IEC))+\s*"    # 'BS EN 10204', 'ISO/IEC 17025'
+    r"|(?:EN|BS)\s*"                                       # 'EN 4179', 'EN4179' - not 'BS-4471A'
+    r"|(?:ISO|DIN|NAS|ARP)[\s\-]?"                         # 'ISO 9001', 'NAS410', 'ARP4754A'
+    r"|(?:ASTM|AWS|ANSI|ASME|SAE)[\s\-]?(?:[A-Z]{1,2}[\s\-]?)?"   # 'ASTM E1444', 'SAE AS9100'
+    r"|(?:MIL|AMS)(?:[\s\-][A-Z]{1,4}[\s\-]|[\s\-]?))"     # 'MIL-STD-1916', 'AMS2750E'
+    + _STD_NUM)
 #: What is trimmed off a word before it is judged ('(XYZ9AB123),').
 _TRIM = "()[],;:"
 #: A word of an id written with spaces ('QRS 6TU 789'): letters, digits,
@@ -985,11 +1005,18 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
     # 2026-10-19), or copies the cell ('JD ABC1DE234' - _spaced_part).
     is_part, rx = _part_test(pattern_mask), _mask_re(pattern_mask)
 
-    def ok(s: str, in_cell: bool = True) -> bool:
-        """An identifier as written: spaces inside it only in a cell."""
+    def ok(s: str, in_cell: bool = True, in_name: bool = False) -> bool:
+        """An identifier as written: spaces inside it only in a cell; in the
+        file name, one code alone (_name_code). A cell or a sheet's name
+        that writes the file's name is judged by _named_file: the stricter
+        rule everywhere dropped real ids the cells write that are also the
+        file's name ('PANEL1234' of PANEL1234.xlsx - second review,
+        2026-10-20)."""
         if re.search(r"\s", s):
             return in_cell and _spaced_part(s, is_part, rx)
-        return is_part(s) and not _named_file(s, file_name, pattern_mask)
+        if not is_part(s):
+            return False
+        return _name_code(s, rx) if in_name else not _named_file(s, file_name, pattern_mask)
 
     words = answer.split()
     i, j = 0, len(words)
@@ -1021,6 +1048,10 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
     why = ("is not written in the workbook as a whole word" if looks else
            "does not look like a part number (a title, label, value, date, sheet or "
            "file name, a standard's number?)")
+    if looks and _only_in_name(tries, file_name, ok, rx):
+        why = ("is written only in the file name, where only one code of letters and digits "
+               "(or your part-name pattern) is taken as the part, not a word with a number "
+               "('week41', 'wb08', 'Results2026')")
     report.parts_dropped.append((file_name, answer))
     report.problems.append(f"{file_name}: Council's model named part {answer!r}, which "
                            f"{why} — dropped")
@@ -1028,26 +1059,43 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
 
 
 def _named_file(part: str, file_name: str, pattern_mask: Optional[str]) -> bool:
-    """``part`` is the workbook's file name, not a part number in it: the
-    whole name with its extension ('wb08.xlsx'), or the whole stem when it
-    is not one code (_one_code: 'inspection_run_3', 'EC_log_week41',
-    'wb08', 'Copy of …'). They passed - '_' being a word boundary, and
-    'wb08' or 'EC_log_week41' having no word of 4+ letters - and seven
-    workbooks had their own file name as the part (llama3.2:1b, review,
-    2026-10-20). A stem that is one code ('AB12CD345.xlsx') can be the part,
-    and so can whatever the user's pattern matches whole."""
-    import os
+    """``part``, written in a cell or a sheet's name, is the workbook's file
+    name, not a part number: the whole name with its extension
+    ('wb08.xlsx' - review, 2026-10-20), or the whole stem made of words
+    ('inspection_run_3': it passed, '_' being a word boundary - review,
+    2026-10-19). A stem that is one code ('AB12CD345', 'PANEL1234') can be
+    the part, and so can whatever the user's pattern matches whole. In the
+    file name itself _name_code judges: stricter."""
     from pathlib import PurePath
     folded = part.casefold()
     if folded in (file_name.casefold(), PurePath(file_name).name.casefold()):
         return True
-    stems = {os.path.splitext(file_name)[0].casefold(), PurePath(file_name).stem.casefold()}
-    if folded not in stems:
+    if folded != PurePath(file_name).stem.casefold():
         return False
     rx = _mask_re(pattern_mask)
     if rx is not None and rx.fullmatch(part):
         return False
-    return not _one_code(part)
+    return any(len(w) >= 4 and w.isalpha() for w in re.split(r"[\s_\-.]+", part))
+
+
+def _name_code(s: str, rx) -> bool:
+    """Can ``s``, written in the file name, be the part? Only one code
+    (_one_code) or what the user's pattern matches whole. Any piece of the
+    name was taken: llama3.2:1b answered each workbook's own name, and
+    'week41' of EC_log_week41.xlsx, 'wb08' of wb08_final.xlsx and
+    'Results_2026' of Inspection_Results_2026.xlsx were the part (second
+    review, 2026-10-20)."""
+    return bool(rx is not None and rx.fullmatch(s)) or _one_code(s)
+
+
+def _only_in_name(tries: Sequence[str], file_name: str, ok: Callable[..., bool], rx) -> bool:
+    """Is one of the answer's ``tries`` an identifier written in the file
+    name - where _name_code refused it - as a whole word? Then the problem
+    line says so."""
+    import os
+    stem = os.path.splitext(file_name)[0]
+    return any(_whole_word(p, stem, lambda s: ok(s, False), rx, exact)
+               for p in tries for exact in (True, False, "sep"))
 
 
 def _one_code(stem: str) -> bool:
@@ -1088,9 +1136,10 @@ def _whole_word(part: str, text: Any, ok: Optional[Callable[[str], bool]] = None
         if not chars or chars.casefold() not in _SEPS.sub("", text).casefold():
             return ""
         # ... and never a piece of an id written with them: 'ABC1DE' is
-        # not 'ABC-1DE' of 'ABC-1DE-234'
-        body = (r"(?<![^\W_][\-./])" + r"[\s\-_./]*".join(re.escape(ch) for ch in chars)
-                + r"(?![\-./][^\W_])")
+        # not 'ABC-1DE' of 'ABC-1DE-234', nor 'RST_4UV' of 'RST_4UV_567'
+        # ('_' joins an id's groups here too - second review, 2026-10-20)
+        body = (r"(?<![^\W_][\-./_])" + r"[\s\-_./]*".join(re.escape(ch) for ch in chars)
+                + r"(?![\-./_][^\W_])")
     else:
         chars = "".join(part.split())
         if not chars or _squash(chars) not in _squash(text):   # most cells: no regex
@@ -1136,7 +1185,9 @@ def _more_of_it(text: str, start: int, end: int, ok: Callable[[str], bool], rx) 
 def _in_a_standard(text: str, start: int, end: int) -> bool:
     """Is text[start:end] the number of a standard written there with its
     name before it - 'E1444' of 'ASTM E1444', '10204' of 'BS EN 10204',
-    'AS9100' of 'SAE AS9100' (review, 2026-10-20)?"""
+    'AS9100' of 'SAE AS9100' (review, 2026-10-20)? The name in capitals and
+    the number of a standard's shape (_STANDARD): initials before an id
+    ('BS AB12CD345', 'AMS ABC1DE234') are no standard's name."""
     head = text[:start]
     if not head or not (head[-1].isspace() or head[-1] in "-/"):
         return False
@@ -1188,14 +1239,16 @@ def _written_at(part: str, file_name: str, sheets: Sequence[str], grids,
 
     In the file name, only the name without its extension is read: the
     piece '2026.xlsx' of 'Inspection Results 2026.xlsx' was the part
-    (review, 2026-10-20)."""
+    (review, 2026-10-20). What is found there is judged with
+    ``ok(written, False, True)``: a stricter rule (find_part's _name_code)."""
     import os
     named = os.path.splitext(file_name)[0]
 
     def fits(in_cell: bool) -> Optional[Callable[[str], bool]]:
         return None if ok is None else (lambda s: ok(s, in_cell))
+    in_name = None if ok is None else (lambda s: ok(s, False, True))
     for exact in modes:
-        got = _whole_word(part, named, fits(False), rx, exact)
+        got = _whole_word(part, named, in_name, rx, exact)
         if got:
             return f"file name {file_name!r}", got
         for s in sheets:

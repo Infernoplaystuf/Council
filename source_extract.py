@@ -2660,10 +2660,16 @@ def needs_item(schema: TemplateSchema, fname: str, item: str) -> bool:
     item row of its part: a per-flaw value placed by Council's model, or
     under a label mapped on 'Labels to map', went to all nine flaw rows
     (review, 2026-10-20). Such a value is never pre-accepted nor written;
-    the reviewer types its item first."""
+    the reviewer types its item first.
+
+    One inspector's own column of such a field ('<field> [JB]', decide's
+    copy of a signed reading) is held the same: it was pre-accepted and
+    written to all nine flaw rows while its field's own row was held
+    (second review, 2026-10-20)."""
     if item or not fname or not schema.item_field or len(schema.items) < 2:
         return False
-    f = next((x for x in schema.fields if x.name == fname), None)
+    base = schema.inspector_base(str(fname)) or fname
+    f = next((x for x in schema.fields if x.name == base), None)
     return f is not None and f.per_item
 
 
@@ -3107,8 +3113,11 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     decisions = decide(run, schema)
     accepted = 0
     # a per-flaw value with no flaw is not written: it went to every flaw
-    # row of its part (review, 2026-10-20) - field -> how many
-    no_item: Dict[str, int] = defaultdict(int)
+    # row of its part (review, 2026-10-20) - (field, mapped on 'Labels to
+    # map' just now) -> where the values are. A mapped label's field is
+    # the one you picked: its inspector's copy ('<field> [JB]') is the
+    # same value, said once.
+    no_item: Dict[Tuple[str, bool], set] = defaultdict(set)
     for d in decisions:
         o = d.obs
         c = choice.get((o.where, o.field, o.item))
@@ -3122,7 +3131,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             d.accept = False                                # not seen in review
         if d.accept and needs_item(schema, o.field, o.item):
             d.accept = False
-            no_item[o.field] += 1
+            mapped = c is None
+            f = (schema.inspector_base(o.field) or o.field) if mapped else o.field
+            no_item[(f, mapped)].add(o.where)
         accepted += d.accept
     # rows edited in the review whose source re-read differently (a Field or
     # Part typed in by hand) are taken as typed
@@ -3130,7 +3141,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     for (where, fname, item), (acc, part, value, _) in choice.items():
         if acc and (where, fname, item) not in seen and placeable(fname) and part:
             if needs_item(schema, fname, item):
-                no_item[fname] += 1
+                no_item[(fname, False)].add(where)
                 continue
             decisions.append(Decision(Obs(part, item, fname, value, 1.0, "review",
                                           "", where), True))
@@ -3153,9 +3164,18 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             warnings += fill_template(schema, ledger.rows_for(p), out)
             filled.append(str(out))
             prog.advance(what=f"{out.name} written")
-    warnings += [f"{n} accepted value(s) of {f!r} not written: the field is kept per "
-                 f"{schema.item_field} and they have no {schema.item_field} — type it in the "
-                 "review's Item column and Apply again" for f, n in sorted(no_item.items())]
+    # A value under a label mapped on 'Labels to map' has no Values row in
+    # this review to type its item in: 'type it in the review's Item column
+    # and Apply again' wrote nothing, and said so again (second review,
+    # 2026-10-20). Its mapping is saved; the next Extract gives it one.
+    it = schema.item_field
+    warnings += [(f"{len(at)} value(s) under a label you mapped to {f!r} on 'Labels to map' "
+                  f"not written: the field is kept per {it} and they have no {it}. The mapping "
+                  f"is saved — run Extract again, type the {it} on each value's Values row, "
+                  "then Apply") if mapped else
+                 (f"{len(at)} accepted value(s) of {f!r} not written: the field is kept per "
+                  f"{it} and they have no {it} — type it in the review's Item column and Apply "
+                  "again") for (f, mapped), at in sorted(no_item.items())]
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
                        warnings + [f"conflict kept: {c}" for c in res.conflicts],
                        people=people)
@@ -3175,6 +3195,11 @@ _FAMILY_RANK = {f: i for i, f in enumerate(US_TEXT_FAMILIES)}
 #: what a 16 GB RTX 4080 runs on the GPU (gpt-oss:20b, phi4:14b). A larger
 #: one is still picked when it is the family's only model.
 _PICK_MAX_B = 20.0
+#: How first_us_text_model ranks a model whose size nothing says (an
+#: Ollama ':latest' tag not listed with details.parameter_size): about what
+#: a family's default tag is (granite3.3, llama3.1: 8B), so it beats a 1-3B
+#: one and a named 8B still beats it.
+_UNKNOWN_B = 7.0
 
 
 def first_us_text_model(
@@ -3198,15 +3223,28 @@ def first_us_text_model(
     granite3.3:2b over granite3.3:8b - the same length, '2' sorting first
     (review, 2026-10-20) - and would pick 'granite-embedding:30m', which
     cannot chat. ACROSS hosts, the first that has a US-origin model wins —
-    localhost first by default (see ``enumerate_ollama_hosts``)."""
+    localhost first by default (see ``enumerate_ollama_hosts``).
+
+    A tag that names no size ('granite3.3:latest', what ``ollama pull
+    granite3.3`` installs - the 8B) is sized by Ollama's own
+    details.parameter_size when /api/tags lists it; when nothing says, it
+    ranks as _UNKNOWN_B, ahead of the small ones: ranked as 0B it lost to
+    granite3.3:2b, llama3.2:1b and gemma3:1b (second review, 2026-10-20)."""
     try:
         from council_core.local_models import maker_and_origin, parse_params_b
     except Exception:                                       # noqa: BLE001
         maker_and_origin = parse_params_b = None
+    sizes: Dict[str, float] = {}                            # name -> Ollama's own size
+
+    def _size(n) -> float:
+        got = sizes.get(n)
+        if got is None and parse_params_b is not None:
+            got = parse_params_b(n)
+        return _UNKNOWN_B if got is None else got
 
     def _rank(n):
         lo = n.lower()
-        size = (parse_params_b(n) if parse_params_b is not None else None) or 0.0
+        size = _size(n)
         for i, fam in enumerate(US_TEXT_FAMILIES):
             if lo.startswith(fam):
                 return (i, size > _PICK_MAX_B, -size, -len(n), n)
@@ -3239,6 +3277,14 @@ def first_us_text_model(
                 names = [m["name"] for m in (data.get("models") or [])]
             except Exception:
                 continue
+            for m in data.get("models") or []:
+                try:
+                    listed = (m.get("details") or {}).get("parameter_size")
+                    got = parse_params_b(listed) if listed and parse_params_b else None
+                except Exception:                           # noqa: BLE001
+                    got = None                              # an odd entry: sized by its tag
+                if got:
+                    sizes[m["name"]] = got
         tag = _pick(names)
         if tag is not None:
             return (host, tag)
