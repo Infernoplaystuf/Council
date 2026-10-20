@@ -768,6 +768,12 @@ def rebuild_summary_line(stats) -> str:
         bits.append(extra)
     else:
         bits.append("; 0 links found")
+    # '0 links' and nothing more left a tester with no next step (user,
+    # 2026-10-20): the most likely reason, from the rebuild's own
+    # why_no_links (see KnowledgeGraph._seed_finish)
+    why = stats.get("no_links") or {}
+    if not seeded and why.get("short"):
+        bits[-1] += f": {why['short']}"
     # "0 links" with initials nobody has named yet must point somewhere:
     # those rows link once the question is answered (review, 2026-10-19)
     n_q = int(stats.get("open_reviews") or 0)
@@ -778,7 +784,216 @@ def rebuild_summary_line(stats) -> str:
             tail = " (who is " + ", ".join(who[:4]) + ("…" if len(who) > 4 else "") + "?)"
         bits.append(f"; {n_q} question{'s' if n_q != 1 else ''} waiting in "
                     f"Connections › Questions{tail}")
-    return "".join(bits) + "."
+    return _sentence("".join(bits))
+
+
+def _sentence(text: str) -> str:
+    """``text`` with a full stop, unless it ends in one already ('Fields…')."""
+    return text if text.endswith(("…", ".", "?", "!")) else text + "."
+
+
+def _plural(k: int, one: str, many: str = "") -> str:
+    return f"{k} {one if k == 1 else (many or one + 's')}"
+
+
+def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
+    """What keeps links away, most likely first, from KnowledgeGraph.
+    why_no_links' facts: each ``{code, short, todo}`` - ``short`` is what the
+    rebuild's summary line says after '0 links found:', ``todo`` what to do.
+    The first is the one a '0 links' summary names."""
+    out: List[Dict[str, str]] = []
+
+    def why(code: str, short: str, todo: str) -> None:
+        out.append({"code": code, "short": short, "todo": todo})
+    led, docs, rules = d["ledgers"], d["documents"], d["rules"]
+
+    def ledgers(k: int) -> str:
+        """'the Ledger' when it is the only one, else '2 Ledgers'."""
+        return "the Ledger" if k == 1 and led["known"] == 1 else _plural(k, "Ledger")
+    if not d["built"]:
+        why("not_built", "the graph has not been built yet",
+            "Press ⟳ Rebuild graph. It reads the vault's data_in folder, the folders added "
+            "in Connections › Folders… and the Ledgers made in the Ledger tab.")
+        return out
+    if not docs["read"] + docs["unreadable"] and not led["waiting"]:
+        why("no_documents", "no documents to read — put some in data_in, or add a folder "
+            "(Connections › Folders…)",
+            "Put documents in the vault's data_in folder, add a folder in Connections › "
+            "Folders…, or create or apply a Ledger in the Ledger tab; then ⟳ Rebuild graph.")
+    if led["waiting"]:
+        k = led["waiting"]
+        why("ledger_not_read", f"{ledgers(k)} {'has' if k == 1 else 'have'} not been read "
+            "yet — ⟳ Rebuild graph",
+            f"The Ledger tab added {'it' if k == 1 else 'them'} after the last rebuild: press "
+            "⟳ Rebuild graph here (or Rebuild knowledge graph in the Ledger tab).")
+    if docs["unreadable"] and not docs["read"]:
+        why("all_unreadable", "none of the documents could be read",
+            "The rebuild's line and Connections › Spreadsheets… say why for each: a reader "
+            "package that is not installed, a password, Excel not available on this PC.")
+    elif led["unreadable"] or led["not_there"]:
+        k = led["unreadable"] + led["not_there"]
+        why("ledger_unreadable", f"{ledgers(k)} could not be read — Connections › "
+            "Spreadsheets… says why",
+            "Connections › Spreadsheets… lists it under Not read, with why. A Ledger that is "
+            "not there now was moved, or its drive is unplugged: put it back, or create it "
+            "again in the Ledger tab.")
+    if d["initials_waiting"]:
+        k = d["initials_waiting"]
+        why("initials_unnamed", ("an inspector's initials have" if k == 1 else
+                                 f"{k} inspectors' initials have") + " no name yet",
+            "Say who each one is in Connections › Questions, or type the full names on the "
+            "People sheet of the Ledger's review and Apply it again; then ⟳ Rebuild graph. "
+            "Initials are never guessed.")
+    if led["empty"]:
+        k = led["empty"]
+        why("ledger_empty", f"{ledgers(k)} {'has' if k == 1 else 'have'} no rows yet — Apply "
+            "a review in the Ledger tab",
+            "Extract, review and Apply in the Ledger tab: only the rows a person accepted are "
+            "in the parent CSV, and only they give links.")
+    if led["no_inspectors"]:
+        k = led["no_inspectors"]
+        why("no_inspectors", f"{ledgers(k)} {'has' if k == 1 else 'have'} no inspector columns",
+            "A Ledger links each part to who inspected it, so its template needs an "
+            "'Inspector Initials' cell beside the readings (or 'Inspector 1' rows, or an "
+            "'Inspected by' / 'Operator' column). Add one to the template, press Create / "
+            "extend parent CSV in the Ledger tab, then extract, review and Apply again.")
+    if led["no_signers"]:
+        k = led["no_signers"]
+        why("no_signers", ("the Ledger's inspector columns are" if k == 1 and led["known"] == 1
+                           else f"the inspector columns of {_plural(k, 'Ledger')} are")
+            + " empty",
+            "No accepted row names an inspector: accept (Y) the inspectors' initials in the "
+            "review too - or type them in - and Apply again.")
+    seen = rules["proposed_seen"]
+    if seen:
+        k = len(seen)
+        short = ("no field rules ticked" if not rules["confirmed"] else
+                 f"{_plural(k, 'field label')} your documents use "
+                 f"{'is' if k == 1 else 'are'} not ticked")
+        why("rules_unticked", short + " — Connections › Fields…",
+            "Connections › Fields…: tick the labels that mean a person, part or project ("
+            + ", ".join(seen[:8]) + (" …" if k > 8 else "") + ") - or press 'Tick the "
+            "suggested field rules' - then ⟳ Rebuild graph. Only ticked labels are read.")
+    elif docs["workbooks"] + docs["text"] and not rules["confirmed_seen"]:
+        why("rules_not_seen", "no field label the graph knows is in your documents — "
+            "Connections › Fields…",
+            "Connections › Fields… also lists labels your documents use that may mean the "
+            "same ('POC' for 'Point of Contact'): tick those, then ⟳ Rebuild graph. Suggest "
+            "links can read free text with a model.")
+    if not d["links"] and d["suggested"]:
+        k = d["suggested"]
+        why("only_suggested", f"{_plural(k, 'suggested link')} {'waits' if k == 1 else 'wait'} "
+            "for you — ✓ Accept",
+            "Open a person, part or project and ✓ Accept (or ✗ Reject) each suggested link: "
+            "a suggestion is not a link until you accept it.")
+    if not d["links"] and not out:
+        if sum(d["entities"].values()):
+            why("no_pairs", "people, parts or projects were found, but never two in one row "
+                "or document",
+                "A link needs two of them together: a part and its owner in one row, a "
+                "project and its lead in one document. Tick a part or project label beside "
+                "the people in Connections › Fields…, or Suggest links from free text.")
+        else:
+            why("nothing_named", "nothing in the documents was read as a person, part or "
+                "project",
+                "Connections › Fields…: tick the labels your documents use, then ⟳ Rebuild "
+                "graph.")
+    return out
+
+
+def why_no_links_text(d: Dict[str, Any]) -> str:
+    """KnowledgeGraph.why_no_links as plain text, for the Connections tab's
+    'Why no links?' and its Copy: the reason and what to do first, then the
+    facts. Counts and column / label names only - never a value from a
+    document, nor a file name."""
+    led, docs, rules = d["ledgers"], d["documents"], d["rules"]
+    out = ["Why no links? (Council › Connections)"]
+    if d["built"]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["last_run"]))
+        out.append(f"Links now: {d['links']}"
+                   + (f", and {d['suggested']} suggested waiting for you" if d["suggested"]
+                      else "") + f" (last rebuild {when}).")
+    reasons = d["reasons"]
+    if reasons and not d["links"]:
+        out += ["", _sentence(f"Most likely: {reasons[0]['short']}"),
+                f"What to do: {reasons[0]['todo']}"]
+        rest = reasons[1:]
+        if rest:
+            out += ["", "Also:"]
+    else:
+        rest = reasons
+        if rest:
+            out += ["", "What keeps more links away:"]
+    for r in rest:
+        out += [_sentence(f"  • {r['short']}"), f"    {r['todo']}"]
+    out += ["", "What the graph read:"]
+    if d["built"]:
+        n_docs = docs["read"] + docs["unreadable"]
+        kinds = ", ".join(_plural(k, w) for k, w in ((docs["ledgers"], "Ledger"),
+                                                     (docs["workbooks"], "workbook"),
+                                                     (docs["text"], "text document"))
+                          if k)
+        line = f"  Documents: {n_docs} — {docs['read']} read" + (f" ({kinds})" if kinds else "")
+        if docs["unreadable"]:
+            why = ", ".join(f"{k}: {v}" for k, v in sorted(
+                docs["unreadable_reasons"].items(), key=lambda kv: -kv[1]))
+            line += f"; {docs['unreadable']} not read" + (f" ({why})" if why else "")
+        out.append(line)
+    if led["known"]:
+        line = f"  Ledgers (parent CSVs): {led['known']} known to the graph, {led['read']} read"
+        bad = [f"{led[k]} {w}" for k, w in (("waiting", "waiting for a rebuild"),
+                                            ("unreadable", "not readable"),
+                                            ("not_there", "not there now")) if led[k]]
+        out.append(line + (f" ({', '.join(bad)})" if bad else ""))
+        if led["read"]:
+            out.append(f"    {_plural(led['rows'], 'row')}, {_plural(led['parts'], 'part')}, "
+                       f"{_plural(led['people'], 'person', 'people')} signing")
+            cols = led["person_columns"]
+            n_cols = len(cols) + led["reading_columns"]
+            line = f"    inspector columns: {n_cols}"
+            if cols:
+                line += " — " + "; ".join(cols[:6]) + (" …" if len(cols) > 6 else "")
+            if led["reading_columns"]:
+                line += (f" (and {_plural(led['reading_columns'], 'reading column')} of "
+                         "one inspector each)")
+            out.append(line)
+    else:
+        out.append("  Ledgers (parent CSVs): none known to the graph. A Ledger is added when "
+                   "it is created or applied in the Ledger tab (or by its Rebuild knowledge "
+                   "graph).")
+    out.append(f"  Inspector initials waiting for a name: {d['initials_waiting']}")
+    out.append(f"  Field rules: {rules['confirmed']} ticked, {rules['proposed']} proposed "
+               "(a proposed rule is not read until it is ticked)")
+    if d["built"]:
+        for title, labels in (("proposed", rules["proposed_seen"]),
+                              ("ticked", rules["confirmed_seen"])):
+            out.append(f"    {title} labels your documents use: {len(labels)}"
+                       + (f" — {', '.join(labels)}" if labels else ""))
+        rels = d["relations"]
+        out.append("  Links by status: " + ", ".join(
+            f"{s} {rels.get(s, 0)}" for s in ("seeded", "accepted", "suggested", "rejected")))
+        ents = d["entities"]
+        out.append(f"  Found: {_plural(ents.get('PERSON', 0), 'person', 'people')}, "
+                   f"{_plural(ents.get('PART', 0), 'part')}, "
+                   f"{_plural(ents.get('PROJECT', 0), 'project')}")
+        out.append(f"  Open questions: {d['questions']} (Connections › Questions)")
+    return "\n".join(out)
+
+
+def _csv_header(p: Path) -> List[str]:
+    """A CSV's (or TSV's) first non-empty row, from its first 64 KB: the
+    labels a plain table uses, which the rebuild's cache does not keep."""
+    import field_search as fs
+    try:
+        with open(p, "rb") as fh:
+            text = fs.decode_text(fh.read(1 << 16))
+        for row in csv.reader(io.StringIO(text, newline=""),
+                              delimiter="\t" if p.suffix.lower() == ".tsv" else ","):
+            if any(c.strip() for c in row):
+                return [c.strip() for c in row]
+    except (OSError, csv.Error):
+        pass
+    return []
 
 
 #: The image reader for the workbook being read, set by seed() for its own
@@ -2469,6 +2684,23 @@ class KnowledgeGraph:
         # that read the dict (the UI) do not need to repeat it.
         if stats.get("unreadable") and not stats.get("unreadable_reasons"):
             stats["unreadable_reasons"] = unreadable_breakdown(stats["unreadable"])
+        # No links: why, for the summary line. No links, or no field rule
+        # ticked yet (a first run: raw workbooks gave 1 link with every rule
+        # proposed, and 25 once ticked - user, 2026-10-20): the proposed rules
+        # the documents use, for the Connections tab to offer to tick. Never
+        # fails the rebuild: it only explains it.
+        links = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
+        if not links or not stats.get("rules"):
+            prog.update("working out why there are no links" if not links else
+                        "looking for the field labels your documents use", force=True)
+            try:
+                why = self.why_no_links(stats)
+            except Exception:
+                why = None
+            if why is not None:
+                if not links and why["reason"] is not None:
+                    stats["no_links"] = dict(why["reason"])
+                stats["rules_to_tick"] = list(why["rules"]["proposed_seen"])
         prog.finish(f"{stats['documents']} documents ({stats['documents_read']} read, "
                     f"{stats['documents_unchanged']} unchanged, "
                     f"{len(stats['unreadable'])} not read); "
@@ -4255,6 +4487,176 @@ class KnowledgeGraph:
                 "pictures": st.get("pictures", 0),
                 "pictures_read": st.get("pictures_read", 0),
                 "last_run": last["finished_ts"] if last else None}
+
+    # ── why no links ──
+    def why_no_links(self, stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Why the graph has no links - or not more of them - as plain
+        facts, and the most likely reason first with what to do about it.
+
+        A tester saw no links in Connections on a machine nobody else can
+        see, and nothing said why (user, 2026-10-20): a Ledger that only the
+        Ledger tab's Rebuild added to what the graph reads, every field rule
+        still proposed (raw workbooks gave 1 link of 25 until they were
+        ticked), inspector initials nobody had named.
+
+        Read from the store and the last rebuild's cache - never a document,
+        but for a CSV's header row - so the end of a rebuild can ask it.
+        ``text`` holds counts and column / label names only, never a cell
+        value or a file name: it can be copied into a message as it is.
+
+        Keys: built, links (seeded + accepted), suggested, relations (by
+        status), documents, ledgers, initials_waiting, questions, rules
+        (confirmed, proposed, proposed_seen, confirmed_seen), reasons
+        ([{code, short, todo}], most likely first), reason (the first, or
+        None) and text."""
+        import field_search as fs
+        import sample_ledger as sl
+        from council_core import kg_excel
+        q = self.db.execute
+        last = q("SELECT stats, finished_ts FROM runs WHERE kind='seed' AND finished_ts"
+                 " IS NOT NULL ORDER BY finished_ts DESC LIMIT 1").fetchone()
+        if stats is None:
+            stats = json.loads(last["stats"]) if last and last["stats"] else {}
+        counts = self.counts()
+        rels = {k: int(v) for k, v in counts["relations"].items()}
+        links = rels.get("seeded", 0) + rels.get("accepted", 0)
+        docs = {"read": 0, "ledgers": 0, "workbooks": 0, "text": 0, "unreadable": 0,
+                "unreadable_reasons": dict(stats.get("unreadable_reasons")
+                                           or unreadable_breakdown(stats.get("unreadable")
+                                                                   or []))}
+        led: Dict[str, Any] = {"known": 0, "read": 0, "waiting": 0, "unreadable": 0,
+                               "not_there": 0, "rows": 0, "parts": 0, "people": 0,
+                               "person_columns": [], "reading_columns": 0, "empty": 0,
+                               "no_inspectors": 0, "no_signers": 0}
+        known = set()
+        for d in q(f"SELECT d.path, d.status, {_HEAD_SQL} AS records FROM documents d"
+                   " LEFT JOIN doc_cache c ON c.document_id=d.id"
+                   " WHERE d.status != 'missing'").fetchall():
+            summary = _reading_load(d["records"]).get("summary") or {}
+            if d["status"] != "ok":
+                docs["unreadable"] += 1
+                p = self.abs_path(d["path"])
+                if p.suffix.lower() == ".csv" and kg_excel.is_ledger_csv(p):
+                    known.add(_real(p))
+                    led["unreadable"] += 1
+                continue
+            docs["read"] += 1
+            kind = summary.get("kind")
+            if kind == "workbook":
+                docs["workbooks"] += 1
+                continue
+            if kind != "ledger":
+                docs["text"] += 1
+                continue
+            docs["ledgers"] += 1
+            known.add(_real(self.abs_path(d["path"])))
+            led["read"] += 1
+            rows = int(summary.get("rows") or 0)
+            led["rows"] += rows
+            led["parts"] += int(summary.get("parts") or 0)
+            led["people"] += len(summary.get("people") or [])
+            pcols = list(summary.get("person_columns") or [])
+            for c in pcols:
+                # 'EC Pre [JB]' names a person: counted, never shown
+                if sl.INSPECTOR_COL.match(c):
+                    led["reading_columns"] += 1
+                elif c not in led["person_columns"]:
+                    led["person_columns"].append(c)
+            if not rows:
+                led["empty"] += 1
+            elif not pcols and not summary.get("rule_columns"):
+                led["no_inspectors"] += 1
+            elif pcols and not summary.get("people"):
+                led["no_signers"] += 1
+        # The Ledgers the Ledger tab added (add_ledger) that no rebuild has
+        # read yet, or that are not there now.
+        for r in self.extra_roots():
+            for f in r["files"] or []:
+                p = Path(r["path"]) / f
+                if _real(p) in known:
+                    continue
+                known.add(_real(p))
+                led["waiting" if p.is_file() else "not_there"] += 1
+        led["known"] = len(known)
+        initials = q("SELECT COUNT(DISTINCT surface) FROM review WHERE kind='initials'"
+                     " AND status='open'").fetchone()[0]
+        confirmed = [r for r, _s in self.field_rules("confirmed")]
+        proposed = [r for r, _s in self.field_rules("proposed")]
+        seen = self._labels_seen({fs._norm_key(r.label) for r in confirmed + proposed}) \
+            if last is not None else set()
+        rules = {"confirmed": len(confirmed), "proposed": len(proposed),
+                 "proposed_seen": [r.label for r in proposed
+                                   if fs._norm_key(r.label) in seen],
+                 "confirmed_seen": [r.label for r in confirmed
+                                    if fs._norm_key(r.label) in seen]}
+        out: Dict[str, Any] = {
+            "built": last is not None, "last_run": last["finished_ts"] if last else None,
+            "links": links, "suggested": rels.get("suggested", 0), "relations": rels,
+            "documents": docs, "ledgers": led, "initials_waiting": int(initials),
+            "questions": int(counts["open_reviews"]), "rules": rules,
+            "entities": {k: v for k, v in counts["entities"].items() if k != "DOCUMENT"}}
+        out["reasons"] = _no_links_reasons(out)
+        out["reason"] = out["reasons"][0] if out["reasons"] else None
+        out["text"] = why_no_links_text(out)
+        return out
+
+    def _labels_seen(self, want: Collection[str] = (), max_lines: int = 200_000) -> set:
+        """The labels the documents use (column headers, 'Label:' keys,
+        a table's header cells), folded as field_search compares them -
+        from the last rebuild's cache: a workbook's and a Ledger's labels
+        (not the Ledger's own ID / item / bookkeeping columns), a text
+        document's lines; a CSV's header row is read from the file (its
+        first 64 KB only). Stops once every label in ``want`` is seen, and
+        reads at most ``max_lines`` text lines in all."""
+        import field_search as fs
+        import sample_ledger as sl
+        want, seen, left = set(want), set(), max_lines
+
+        def add(label: Any) -> None:
+            label = str(label or "").strip()
+            if label and len(label.split()) <= 5:          # a sentence is no label
+                seen.add(fs._norm_key(label))
+        for d in self.db.execute(f"SELECT d.id, d.path, {_HEAD_SQL} AS records FROM"
+                                 " documents d JOIN doc_cache c ON c.document_id=d.id"
+                                 " WHERE d.status='ok' ORDER BY d.path").fetchall():
+            if want and want <= seen:
+                break
+            head = _reading_load(d["records"])
+            if head.get("labels") is not None:
+                summary = head.get("summary") or {}
+                own = {summary.get("id_field"), summary.get("item_field"), *sl.META_COLS}
+                for lab in head["labels"]:
+                    if lab not in own:
+                        add(lab)
+                        if summary.get("kind") == "ledger" and ": " in str(lab):
+                            # 'Part Attributes: Project' is read as 'Project'
+                            add(str(lab).split(": ", 1)[1])
+                continue
+            if Path(d["path"]).suffix.lower() in _CSV:
+                for lab in _csv_header(self.abs_path(d["path"])):
+                    add(lab)
+                continue
+            if left <= 0:
+                continue
+            row = self.db.execute("SELECT lines FROM doc_cache WHERE document_id=?",
+                                  (d["id"],)).fetchone()
+            try:
+                lines = json.loads(row["lines"] or "[]") if row else []
+            except Exception:
+                lines = []
+            for x in lines:
+                if left <= 0:
+                    break
+                left -= 1
+                text = str(x[2] if isinstance(x, (list, tuple)) and len(x) > 2 else x)
+                if text.lstrip().startswith("|"):           # a Markdown table row
+                    for cell in text.strip().strip("|").split("|"):
+                        add(cell)
+                elif any(s in text for s in (":", "=", " - ", " – ", " — ")):
+                    for k, _v in fs._kv_pairs(text):
+                        add(k)
+        seen.discard("")
+        return seen
 
     def all_relations(self, include_rejected: bool = False) -> List[Dict[str, Any]]:
         q = "SELECT * FROM relations"

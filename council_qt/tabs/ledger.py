@@ -10,6 +10,9 @@ The four steps, top to bottom, are the pipeline's own order:
   4. Apply the saved review -> the parent CSV, and optionally one filled
      template per part.
 
+Create and Apply also add the parent CSV to what the Connections tab's
+knowledge graph reads (only that file), so a rebuild there reads it too.
+
 Every step runs on a worker thread (a workbook of many pictures takes a while) and the buttons are
 disabled until it finishes; the summary line and the log say what it found.
 Everything stays on this machine: the work is council_core/ledger_ingest.py,
@@ -62,10 +65,16 @@ class LedgerActions:
     (a stand-in image reader, no Excel, no file dialogs)."""
 
     def __init__(self, image_reader=None, opener: Optional[Callable] = None,
-                 rebuild_kg: Optional[Callable] = None):
+                 rebuild_kg: Optional[Callable] = None, connections=None,
+                 register_kg: Optional[Callable] = None):
         self.image_reader = image_reader
         self.opener = opener or ledger_ingest.open_path
         self._rebuild_kg_override = rebuild_kg
+        #: The Connections side (ConnectionsActions) whose graph this tab
+        #: adds its Ledger to and rebuilds; None = the user's vault. Tests
+        #: pass one on a temp vault.
+        self.connections = connections
+        self._register_kg_override = register_kg
 
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
@@ -121,9 +130,7 @@ class LedgerActions:
         ``connections`` (ConnectionsActions on a temp vault)."""
         if self._rebuild_kg_override is not None:
             return self._rebuild_kg_override(progress)
-        if connections is None:
-            from council_qt.tabs.connections import ConnectionsActions
-            connections = ConnectionsActions()
+        connections = connections or self._connections()
         added = None
         with connections.open_graph() as kg:
             if csv and Path(csv).is_file():
@@ -134,6 +141,62 @@ class LedgerActions:
         if added is not None:
             stats["ledger_added"] = str(csv)
         return stats
+
+    def _connections(self):
+        if self.connections is None:
+            from council_qt.tabs.connections import ConnectionsActions
+            return ConnectionsActions()
+        return self.connections
+
+    def register_ledger(self, csv) -> Optional[dict]:
+        """Add this Ledger to what the knowledge graph reads (kg.add_ledger:
+        the parent CSV only, not its folder), so a rebuild in the
+        Connections tab reads it too. Only the Ledger tab's own Rebuild used
+        to add it, and a tester rebuilding in Connections saw no links
+        (user, 2026-10-20). Runs on the step's worker, after Create and
+        after Apply.
+
+        Never raises - a Ledger is made whatever the graph is doing:
+        ``{'csv', 'added', 'busy', 'error'}``, ``added`` False when the
+        graph read it already, ``error`` why it could not be added now
+        (``busy``: the graph is being rebuilt; else its store could not be
+        opened). None when there is nothing to add (no CSV, not a Ledger) or
+        a test stood in for the graph (a ``rebuild_kg`` override and no
+        ``register_kg``)."""
+        if self._register_kg_override is not None:
+            return self._register_kg_override(csv)
+        if self._rebuild_kg_override is not None or not csv or not Path(csv).is_file():
+            return None
+        import sqlite3
+
+        from council_core import kg_excel
+        from council_core import knowledge_graph as kgm
+        if not kg_excel.is_ledger_csv(Path(csv)):
+            return None
+        out = {"csv": str(csv), "added": False, "busy": False, "error": ""}
+        try:
+            with self._connections().open_graph() as kg:
+                out["added"] = kg.add_ledger(csv) is not None
+        except kgm.KnowledgeGraphBusy:
+            out["busy"] = True
+        except sqlite3.OperationalError as exc:
+            out["busy"] = kgm._busy(exc)
+            out["error"] = "" if out["busy"] else f"its store said {exc}"
+        except Exception as exc:                          # noqa: BLE001
+            out["error"] = str(exc) or exc.__class__.__name__
+        if out["busy"]:
+            out["error"] = "the graph is being rebuilt right now"
+        return out
+
+    def applied_csv(self, review) -> Optional[str]:
+        """The parent CSV a review workbook was applied to (its hidden _run
+        sheet says), or None."""
+        from council_core import kg_excel
+        try:
+            meta = kg_excel._review_meta(Path(review)) if review else None
+        except Exception:                                 # noqa: BLE001
+            meta = None
+        return str(meta["csv"]) if meta and meta.get("csv") else None
 
 
 class LedgerTab(ViewHelpers, QWidget):
@@ -164,6 +227,9 @@ class LedgerTab(ViewHelpers, QWidget):
         #: Skip patterns typed while there was no parent CSV to save them
         #: beside: saved when one is set.
         self._ignore_unsaved = False
+        #: (CSV, line) the log said about the Connections graph reading a
+        #: Ledger: each said once.
+        self._kg_said: set = set()
         self._build()
         self._refresh_reader_choices()
         self._refresh_enabled()
@@ -663,13 +729,46 @@ class LedgerTab(ViewHelpers, QWidget):
     def on_create(self) -> None:
         template, csv = self.template.text().strip(), self.csv.text().strip()
 
-        def done(s) -> None:
+        def step(_p):
+            s = self.actions.create_parent(template, csv)
+            return s, self._register(s.csv)
+
+        def done(result) -> None:
+            s, registered = result
             self.csv.setText(s.csv)
             self.status.setText(s.describe().splitlines()[0])
             self._say(s.describe())
+            self._say_registered(registered)
             self._on_csv_changed()          # setText is not editingFinished
-        self._run("Reading the template",
-                  lambda _p: self.actions.create_parent(template, csv), done)
+        self._run("Reading the template", step, done)
+
+    def _register(self, csv) -> Optional[dict]:
+        """On the step's worker: the Ledger added to what the knowledge
+        graph reads (LedgerActions.register_ledger). An actions stand-in
+        without it registers nothing."""
+        register = getattr(self.actions, "register_ledger", None)
+        return register(csv) if register is not None else None
+
+    def _say_registered(self, registered: Optional[dict]) -> None:
+        """Say once, in the log, that Connections now reads this Ledger -
+        or why it does not yet."""
+        if not registered:
+            return
+        csv = registered.get("csv", "")
+        if registered.get("busy"):
+            text = (f"Not added to the Connections graph yet ({registered['error']}): "
+                    "Rebuild knowledge graph below adds it once that finishes.")
+        elif registered.get("error"):
+            text = f"Not added to the Connections graph: {registered['error']}."
+        elif registered.get("added"):
+            text = (f"The Connections graph now reads this Ledger too ({Path(csv).name}; "
+                    "only that file - Connections › Folders… lists it): a rebuild there "
+                    "or Rebuild knowledge graph below picks up its rows.")
+        else:
+            return
+        if (csv, text) not in self._kg_said:
+            self._kg_said.add((csv, text))
+            self._say(text)
 
     # ── step 2 ──────────────────────────────────────────────────────────
     def add_sources(self, paths) -> None:
@@ -750,16 +849,26 @@ class LedgerTab(ViewHelpers, QWidget):
         images = self.use_images.isChecked()
         vision = self._selected_vision_model()
         more = {"vision_model": vision} if images and vision else {}
+        tab_csv = self.csv.text().strip()
 
-        def done(s) -> None:
+        def step(p):
+            s = self.actions.apply(review, fill, images, p, **more)
+            # the CSV the review was applied to (its _run sheet), else the
+            # one this tab shows
+            applied = getattr(self.actions, "applied_csv", lambda _r: None)(review)
+            return s, self._register(applied or tab_csv)
+
+        def done(result) -> None:
+            s, registered = result
             self.stat["problems"].setText(str(len(s.problems)))
             self.status.setText(
                 f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "
-                "Press Rebuild knowledge graph to pick up the new rows.")
+                "Rebuild the knowledge graph (here, or in Connections) to pick up the "
+                "new rows.")
             self._say(s.describe())
+            self._say_registered(registered)
             self._kg_dirty = True
-        self._run("Applying the review",
-                  lambda p: self.actions.apply(review, fill, images, p, **more), done)
+        self._run("Applying the review", step, done)
 
     def on_rebuild_kg(self) -> None:
         """Rebuild the Connections knowledge graph; the Ledger log shows

@@ -41,7 +41,7 @@ from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers, amp
-from .connections_dialogs import FieldsDialog, FoldersDialog
+from .connections_dialogs import FieldsDialog, FoldersDialog, WhyNoLinksDialog
 
 TYPE_FILTERS = (("Everything", None), ("People", "PERSON"),
                 ("Parts", "PART"), ("Projects", "PROJECT"))
@@ -133,6 +133,11 @@ class ConnectionsActions:
     def label_suggestions(self) -> List[Dict[str, Any]]:
         with self.open_graph() as kg:
             return kg.suggest_label_synonyms()
+
+    def why_no_links(self) -> Dict[str, Any]:
+        """KnowledgeGraph.why_no_links, with its own connection (a worker's)."""
+        with self.open_graph() as kg:
+            return kg.why_no_links()
 
     def context(self, rel_path: str, locator: Any, quote: str = ""):
         return kgm.source_context(self.root, rel_path, locator, quote=quote)
@@ -282,6 +287,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.answers_btn = self._button(row, "Your answers", self.on_answers)
         self.sources_btn = self._button(row, "Spreadsheets", self.on_sources)
         self.folders_btn = self._button(row, "Folders…", self.on_folders)
+        # Always there: most useful at 0 links (user, 2026-10-20)
+        self.why_btn = self._button(row, "Why no links?", self.on_why)
+        self.why_btn.setToolTip("What the graph read and the most likely reason it has no "
+                                "links (or not more), with what to do. Copy it to send it on: "
+                                "counts and labels only, nothing from inside a document.")
         outer.addLayout(row)
 
         srow = QHBoxLayout()
@@ -298,6 +308,16 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status = QLabel("")
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
+        # First-run help: offered when a rebuild finds proposed field rules
+        # the documents use (on_tick_suggested); hidden otherwise.
+        orow = QHBoxLayout()
+        self.tick_btn = self._button(orow, "Tick the suggested field rules",
+                                     self.on_tick_suggested)
+        self.tick_btn.setVisible(False)
+        orow.addStretch(1)
+        outer.addLayout(orow)
+        #: The proposed field rules on offer (labels).
+        self._to_tick: List[str] = []
         self.coverage = QLabel("")
         self.coverage.setWordWrap(True)
         self.coverage.setStyleSheet(f"color: {self._tokens['muted_fg']};")
@@ -717,7 +737,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if self._current:
             self.show_entity(self._current)
         from council_core import knowledge_graph as kgm
-        self.status.setText(kgm.rebuild_summary_line(stats))
+        line = kgm.rebuild_summary_line(stats)
+        # The seed lists them only at 0 links or with no rule ticked yet
+        if self._offer_rules(stats.get("rules_to_tick") or []):
+            n = len(self._to_tick)
+            line += (f" Your documents use {n} label{'s' if n != 1 else ''} the graph does "
+                     "not read yet: 'Tick the suggested field rules' reads them.")
+        self.status.setText(line)
         # The first few unreadable entries also go to the tooltip, where
         # the user can hover without having to scroll a dialog.
         reasons = stats.get("unreadable") or []
@@ -863,7 +889,90 @@ class ConnectionsTab(ViewHelpers, QWidget):
         for label, means in synonyms:
             kg.add_label_synonym(label, means)
         self.status.setText("Fields saved. Rebuild to read the documents with them.")
+        self._offer_rules([])                 # chosen one by one: nothing to offer
         self._show_coverage()
+
+    # -- why no links (user, 2026-10-20) ---------------------------------
+    def on_why(self) -> None:
+        """What the graph read and why it has no links, in a dialog with
+        Copy. Worked out on a worker with its own connection: it reads the
+        rebuild's cache (and a CSV's header row)."""
+        if self._busy:
+            self.status.setText("The graph is busy (a rebuild, or reading labels): ask "
+                                "'Why no links?' again when it finishes.")
+            return
+        self.status.setText("Working out why…")
+
+        def work() -> None:
+            try:
+                diag, err = self.actions.why_no_links(), ""
+            except kgm.KnowledgeGraphBusy:
+                diag, err = None, "the graph is being rebuilt elsewhere; ask again when it finishes"
+            except Exception as exc:                      # noqa: BLE001
+                diag, err = None, str(exc) or exc.__class__.__name__
+            self._to_ui(self._show_why, diag, err)
+
+        threading.Thread(target=work, name="kg-why", daemon=True).start()
+
+    def _show_why(self, diag: Optional[Dict[str, Any]], err: str = "") -> None:
+        if diag is None:
+            self.status.setText(f"Could not work out why: {err}.")
+            return
+        reason = diag.get("reason")
+        if diag["links"]:
+            self.status.setText(f"{diag['links']} link(s)." + (
+                kgm._sentence(f" More could come: {reason['short']}") if reason else ""))
+        elif reason is not None:
+            self.status.setText(kgm._sentence(f"No links: {reason['short']}"))
+        rules = diag["rules"]
+        if not diag["links"] or not rules["confirmed"]:
+            self._offer_rules(rules["proposed_seen"])
+        dlg = WhyNoLinksDialog(diag["text"], self)
+        self._why_dialog = dlg              # tests reach it here
+        dlg.show()                          # not modal: the tab stays usable beside it
+
+    def _offer_rules(self, labels) -> bool:
+        """Offer to tick these proposed field rules (the documents use their
+        labels), or stop offering (``[]``). True when on offer."""
+        self._to_tick = list(labels)
+        n = len(self._to_tick)
+        self.tick_btn.setText(amp(f"Tick the suggested field rules ({n})"))
+        self.tick_btn.setToolTip("Reads " + ", ".join(self._to_tick[:12])
+                                 + (" …" if n > 12 else "") if n else "")
+        self.tick_btn.setVisible(bool(n))
+        return bool(n)
+
+    def on_tick_suggested(self) -> None:
+        """Tick the proposed field rules whose labels the documents use, once
+        the user says yes, then rebuild. Every rule starts proposed, so a
+        first rebuild of raw workbooks gave 1 link of the 25 they hold and
+        nothing said why (user, 2026-10-20). Never ticked without asking."""
+        labels = list(self._to_tick)
+        if not labels:
+            return
+        if self._busy or self._kg is None:
+            self.status.setText("The graph is busy: tick the suggested field rules when it "
+                                "finishes.")
+            return
+        shown = ", ".join(f"'{x}'" for x in labels[:10]) + (
+            f" and {len(labels) - 10} more" if len(labels) > 10 else "")
+        if not self.ask_yes_no(
+                "Tick the suggested field rules?",
+                f"Your documents use {len(labels)} label(s) the graph does not read yet: "
+                f"{shown}.\n\nTick them, so the values under them become people, parts and "
+                "projects, and rebuild now? You can untick any of them in Fields….",
+                parent=self):
+            self.status.setText("Nothing ticked. Fields… lets you choose them one by one.")
+            return
+        current = {r.label: s for r, s in self._kg.field_rules()}
+        ticked = 0
+        for label in labels:
+            if current.get(label) == "proposed":
+                self._kg.set_rule_status(label, "confirmed")
+                ticked += 1
+        self._offer_rules([])
+        self.status.setText(f"Ticked {ticked} field rule(s). Rebuilding…")
+        self.on_rebuild()
 
     def on_questions(self) -> None:
         """The open questions (an initial that fits two people, an inferred

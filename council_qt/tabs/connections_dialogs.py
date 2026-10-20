@@ -10,12 +10,51 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
-                               QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QScrollArea,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
+                               QDialogButtonBox, QGroupBox, QHBoxLayout,
+                               QLabel, QListWidget, QListWidgetItem,
+                               QPlainTextEdit, QPushButton, QScrollArea,
                                QVBoxLayout, QWidget)
 
 from ..view import amp
+
+
+class WhyNoLinksDialog(QDialog):
+    """Why the graph has no links (KnowledgeGraph.why_no_links): the most
+    likely reason and what to do, then what the graph read. Copy puts the
+    text on the clipboard for a message to whoever helps - it holds counts
+    and column / label names only, nothing from inside a document (user,
+    2026-10-20: a tester's machine nobody else can see)."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Why no links?")
+        self.resize(680, 500)
+        outer = QVBoxLayout(self)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.text.setPlainText(text)
+        outer.addWidget(self.text, 1)
+        note = QLabel("Counts and column / label names only - no values from your "
+                      "documents and no file names - so you can send it as it is.")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+        row = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.clicked.connect(self.on_copy)
+        row.addWidget(self.copy_btn)
+        self.message = QLabel("")
+        row.addWidget(self.message, 1)
+        outer.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        outer.addWidget(buttons)
+
+    def on_copy(self) -> None:
+        QApplication.clipboard().setText(self.text.toPlainText())
+        self.message.setText("Copied.")
 
 
 class FoldersDialog(QDialog):
