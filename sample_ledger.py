@@ -194,8 +194,15 @@ class TemplateSchema:
 
 
 def normalize_label(text: str) -> str:
-    """'Laser Power (W):' -> 'laser power'. Used to match source labels."""
-    text = _UNIT_RE.sub(r"\1", str(text).strip()) or str(text)
+    """'Laser Power (W):' -> 'laser power'. Used to match source labels.
+
+    Runs of whitespace are collapsed BEFORE the unit pattern: its lazy
+    '(.*?)' then '\\s*' backtracked over every space, so a cell padded to
+    Excel's 32,767 characters held the GIL for 2.5-3.8 s per call and froze
+    the app for 10-14 s (end-to-end test, 2026-10-19). The result is the
+    same: the last step folds every non-alphanumeric run anyway."""
+    text = " ".join(str(text).split())
+    text = _UNIT_RE.sub(r"\1", text) or text
     text = re.sub(r"[:#*]+$", "", text.strip())
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
@@ -205,6 +212,7 @@ def _clean(label: str) -> str:
 
 
 def _split_unit(label: str) -> Tuple[str, str]:
+    label = " ".join(str(label).split())          # see normalize_label
     m = _UNIT_RE.match(label)
     return (m.group(1).strip(), m.group(2).strip()) if m and m.group(1) else (label, "")
 
