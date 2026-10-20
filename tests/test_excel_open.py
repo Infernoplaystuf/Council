@@ -52,6 +52,146 @@ def test_a_password_file_is_refused_before_excel_is_asked(tmp_path):
     assert asked == []
 
 
+# ── a password-to-open .xls (review, 2026-10-19) ───────────────────────
+def _cfb(streams: dict, pad: int = 0, ss: int = 512) -> bytes:
+    """A compound file (MS-CFB; 512-byte sectors, or 4096 for version 4)
+    with `streams` in its root - those under 4096 bytes in the mini stream,
+    as Excel writes them. `pad` bytes go before the directory (it then lies
+    past the first 8 MB that kind_of scans for stream names)."""
+    import struct
+    end, free, fatsect, none = 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD, 0xFFFFFFFF
+    per = ss // 4
+    small = {n: d for n, d in streams.items() if len(d) < 4096}
+    mini, minifat, mini_at = b"", [], {}
+    for n, d in small.items():
+        k = max(1, -(-len(d) // 64))
+        mini_at[n] = len(minifat)
+        minifat += [len(minifat) + i + 1 for i in range(k - 1)] + [end]
+        mini += d.ljust(k * 64, b"\0")
+    blobs = []
+    if minifat:
+        blobs.append(("minifat", struct.pack(f"<{len(minifat)}I", *minifat)))
+        blobs.append(("mini", mini))
+    blobs += [(n, d) for n, d in streams.items() if n not in small]
+    if pad:
+        blobs.append(("pad", b"\0" * pad))
+    blobs.append(("dir", b"\0" * (128 * (1 + len(streams)))))
+    count = {k: max(1, -(-len(b) // ss)) for k, b in blobs}
+    n_fat = 1
+    while n_fat * per < n_fat + sum(count.values()):
+        n_fat += 1
+    fat, at, s = [fatsect] * n_fat, {}, n_fat
+    for k, _b in blobs:
+        at[k] = s
+        fat += [s + i + 1 for i in range(count[k] - 1)] + [end]
+        s += count[k]
+    fat += [free] * (n_fat * per - len(fat))
+
+    def entry(name, typ, right, child, first, size):
+        nm = name.encode("utf-16-le") + b"\0\0" if name else b""
+        return (nm.ljust(64, b"\0") + struct.pack("<HBBIII", len(nm), typ, 1, none, right, child)
+                + b"\0" * 36 + struct.pack("<IQ", first, size))
+    names = list(streams)
+    d = entry("Root Entry", 5, none, 1 if names else none, at.get("mini", end), len(mini))
+    for i, n in enumerate(names):
+        d += entry(n, 2, i + 2 if i + 1 < len(names) else none, none,
+                   mini_at[n] if n in small else at[n], len(streams[n]))
+    d = d.ljust(count["dir"] * ss, b"\0")
+    head = (OLE_MAGIC + b"\0" * 16 + struct.pack("<HHHHH", 0x3E, 3 if ss == 512 else 4, 0xFFFE,
+                                                  9 if ss == 512 else 12, 6)
+            + b"\0" * 6 + struct.pack("<9I", 0, n_fat, at["dir"], 0, 4096,
+                                      at.get("minifat", end), count.get("minifat", 0), end, 0)
+            + struct.pack("<109I", *(list(range(n_fat)) + [free] * (109 - n_fat))))
+    body = head.ljust(ss, b"\0") + struct.pack(f"<{len(fat)}I", *fat)
+    for k, b in blobs:
+        body += (d if k == "dir" else b).ljust(count[k] * ss, b"\0")
+    return body
+
+
+def _biff(*records) -> bytes:
+    import struct
+    return b"".join(struct.pack("<HH", t, len(b)) + b for t, b in records)
+
+
+BOF = (0x0809, bytes.fromhex("000605005a4fcd07c100020006080000"))
+EOF = (0x000A, b"")
+#: FILEPASS records Excel 16 wrote. RC4 CryptoAPI for SaveAs(Password="x");
+#: RC4 under Excel's default password (VelvetSweatshop) for a workbook whose
+#: structure is protected with a password - Excel opens that one unasked.
+FILEPASS_PASSWORD = bytes.fromhex(
+    "0100040002000c0000007e0000000c000000000000000168000004800000800000000100"
+    "000000000000000000004d006900630072006f0073006f0066007400200045006e006800"
+    "61006e006300650064002000430072007900700074006f00670072006100700068006900"
+    "63002000500072006f00760069006400650072002000760031002e003000000010000000"
+    "3b138bb43654c22b71844d5a9f9b5e63fd6cfd611e4428ad045b0d86bfabff8014000000"
+    "a38113351641add8b8eaead5b9ab6c850c3c0b4a")
+FILEPASS_DEFAULT = bytes.fromhex(
+    "010001000100a0935bbdfab947a4cbc6970230f0975d343e73bb1ff12d80139c3327f625"
+    "cbce8de7320c771af5402412f57e77a189ae")
+
+
+def _xls(path, *records, size=6000, stream="Workbook"):
+    """An .xls whose Workbook stream holds `records` (padded to `size`)."""
+    path.write_bytes(_cfb({stream: _biff(*records).ljust(size, b"\0"),
+                           "\x05SummaryInformation": b"\xfe\xff" + b"\0" * 200}))
+    return path
+
+
+def test_a_password_xls_is_told_by_its_filepass_record(tmp_path):
+    """Excel showed a VISIBLE 'Password' dialog for a password .xls (the
+    Password= argument does not stop it for .xls) and the read sat on it
+    for 2 minutes, reported as a sign-in timeout."""
+    interface = (0x00E1, b"\xb0\x04")
+    for size in (6000, 300):                         # a regular and a mini stream
+        pw = _xls(tmp_path / f"pw{size}.xls", BOF, (0x002F, FILEPASS_PASSWORD), interface,
+                  size=size)
+        assert kind_of(pw) == "password"
+        asked = []
+        with pytest.raises(ExcelOpenError, match="password to open") as e:
+            read_with_excel(pw, app_factory=lambda: asked.append(1))
+        assert e.value.kind == "password" and asked == []
+        assert kind_of(_xls(tmp_path / f"plain{size}.xls", BOF, interface, EOF,
+                            size=size)) == "legacy"
+    # Excel's own default password: Excel opens it without asking, so it is read
+    assert kind_of(_xls(tmp_path / "wbprot.xls", BOF, (0x002F, FILEPASS_DEFAULT),
+                        interface)) == "legacy"
+    # Excel 5 (a 'Book' stream): XOR obfuscation, a 4-byte FILEPASS
+    xor_default = (0x002F, b"\x34\x12" + (0x9A0A).to_bytes(2, "little"))
+    xor_other = (0x002F, b"\x34\x12" + (0xCEBA).to_bytes(2, "little"))
+    assert kind_of(_xls(tmp_path / "b5.xls", BOF, xor_default, stream="Book")) == "legacy"
+    assert kind_of(_xls(tmp_path / "b5pw.xls", BOF, xor_other, stream="Book")) == "password"
+    # what is not understood is left to Excel, as before
+    assert kind_of(_xls(tmp_path / "odd.xls", (0x1234, b"zz"), (0x002F, b"x"))) == "legacy"
+    assert kind_of(_ole(tmp_path / "torn.xls", "Workbook")) == "legacy"
+
+
+def test_the_xor_verifier_is_excels_password_hash():
+    from openpyxl.utils.protection import hash_password
+    for pw in ("VelvetSweatshop", "x", "Password1", "a longer pass phrase"):
+        assert f"{excel_open._xor_verifier(pw):X}" == hash_password(pw)
+
+
+def test_a_password_xls_is_counted_as_a_password_in_the_run(tmp_path, monkeypatch):
+    import source_extract as se
+    from ledger_fixtures import make_template
+    from sample_ledger import read_template
+    # never the real Excel, even if the file were not told apart
+    monkeypatch.setattr(excel_open, "excel_available", lambda: False)
+    pw = _xls(tmp_path / "locked.xls", BOF, (0x002F, FILEPASS_PASSWORD))
+    run = se.extract(read_template(make_template(tmp_path / "t.xlsx")), [pw], use_images=False)
+    assert run.open_failures == [("locked.xls", "password")]
+    assert any("password to open" in p for p in run.problems)
+
+
+def test_an_encrypted_package_is_found_past_the_first_8_mb(tmp_path):
+    """kind_of looked for the stream names only in the first 8 MB; a big
+    encrypted .xlsx keeps its directory at the end."""
+    big = _cfb({"EncryptionInfo": b"\x04\x00\x04\x00" + b"\0" * 5000,
+                "EncryptedPackage": b"\0" * 5000}, pad=9 << 20, ss=4096)
+    (tmp_path / "big.xlsx").write_bytes(big)
+    assert kind_of(tmp_path / "big.xlsx") == "password"
+
+
 # ── text boxes and charts as tables ─────────────────────────────────────
 def test_text_box_lines_become_label_value_cells():
     assert text_cells("Scan Speed (mm/s): 1800\r\nSpot Size (mm): 0.05\n") == {
@@ -153,6 +293,7 @@ class _Sheet:
         self.UsedRange = _Range(1, 1, (("Flaw report", None, None),
                                        ("Part Number", 2041.0, when),
                                        ("Power (W)", -2146826281, 285.5)))
+        self.UsedRange.MergeCells = None        # as Excel says: some of it (A1:C1) is merged
         self.Shapes = _Coll([_Shape(17, "Spot Size (mm): 0.05"), _Shape(3, chart=_Chart())])
 
     def Cells(self, r, c):
@@ -208,6 +349,83 @@ def test_excel_is_driven_read_only_with_macros_off_and_closed_unsaved(tmp_path):
     assert book.extras[0].cells == {(1, 1): "Spot Size (mm): 0.05"}
 
 
+class _GridSheet:
+    """A sheet of text cells, some of them merged, that counts what Excel is
+    asked: MergeCells is True / False / None (all / none / some of the range
+    merged), as Excel answers."""
+    Name = "Grid"
+
+    def __init__(self, rows, cols, merged=()):
+        self.merged = list(merged)                       # (r1, c1, r2, c2)
+        self.asked = 0
+        sheet = self
+        data = [[f"t{r}.{c}" for c in range(1, cols + 1)] for r in range(1, rows + 1)]
+        for r1, c1, r2, c2 in self.merged:               # only the top-left keeps a value
+            for r in range(r1, r2 + 1):
+                for c in range(c1, c2 + 1):
+                    if (r, c) != (r1, c1):
+                        data[r - 1][c - 1] = None
+
+        class Rng:
+            def __init__(self, r1, c1, r2, c2, value=None):
+                self.Row, self.Column, self.Value = r1, c1, value
+                self.box = (r1, c1, r2, c2)
+                self.Rows = type("n", (), {"Count": r2 - r1 + 1})()
+                self.Columns = type("n", (), {"Count": c2 - c1 + 1})()
+
+            @property
+            def MergeCells(self):
+                sheet.asked += 1
+                r1, c1, r2, c2 = self.box
+                inside = [sheet._area(r, c) is not None for r in range(r1, r2 + 1)
+                          for c in range(c1, c2 + 1)]
+                return True if all(inside) else (False if not any(inside) else None)
+
+            @property
+            def MergeArea(self):
+                a = sheet._area(self.Row, self.Column)
+                return Rng(*a) if a else self
+        self._Rng = Rng
+        self.UsedRange = Rng(1, 1, rows, cols, tuple(tuple(r) for r in data))
+        self.Shapes = _Coll([])
+
+    def _area(self, r, c):
+        return next((a for a in self.merged if a[0] <= r <= a[2] and a[1] <= c <= a[3]), None)
+
+    def Cells(self, r, c):
+        return self._Rng(r, c, r, c)
+
+    def Range(self, address):
+        from openpyxl.utils.cell import range_boundaries
+        c1, r1, c2, r2 = range_boundaries(address)
+        return self._Rng(r1, c1, r2, c2)
+
+
+def _read_sheet(tmp_path, sheet):
+    app = _App([])
+    app._book.Worksheets = [sheet]
+    f = tmp_path / "grid.xls"
+    f.write_bytes(OLE_MAGIC)
+    (_name, cells), = read_with_excel(f, want_pictures=False, app_factory=lambda: app).sheets
+    return cells
+
+
+def test_merged_labels_are_found_without_asking_cell_by_cell(tmp_path):
+    """Two COM calls per text cell took 24-39 s for a 12,000-cell .xls and
+    set off the stall watchdog in ordinary reads (review, 2026-10-19)."""
+    plain = _GridSheet(60, 40)
+    cells = _read_sheet(tmp_path, plain)
+    assert len(cells) == 2400 and plain.asked == 1               # one question: none merged
+    areas = [(2, 2, 2, 5), (10, 1, 14, 1), (30, 30, 32, 33), (60, 39, 60, 40)]
+    sheet = _GridSheet(60, 40, areas)
+    cells = _read_sheet(tmp_path, sheet)
+    fill = {k: v for k, v in cells.items() if isinstance(v, tuple)}
+    want = {(r, c): ("__merged__", f"t{a[0]}.{a[1]}") for a in areas
+            for r in range(a[0], a[2] + 1) for c in range(a[1], a[3] + 1) if (r, c) != a[:2]}
+    assert fill == want                                          # the same labels as before
+    assert sheet.asked < 150, sheet.asked                        # not ~2,400
+
+
 def test_a_picture_that_cannot_be_saved_is_reported_and_the_run_goes_on(tmp_path, monkeypatch):
     """The user's run stopped on 'OSError 22 ... Sheet1_?_1.png'. Now the name
     is cleaned, and a save that still fails is a problem, not a crash."""
@@ -233,6 +451,93 @@ def test_a_picture_that_cannot_be_saved_is_reported_and_the_run_goes_on(tmp_path
     run = se.extract(schema, [src], image_dir=tmp_path / "imgs2", use_images=False)
     assert any("could not be saved" in p for p in run.problems)
     assert run.obs                                              # the rest was still read
+
+
+def _busy_clipboard(monkeypatch) -> list:
+    """_copy_picture as when another program holds the clipboard open."""
+    tried = []
+
+    def busy(shape):
+        tried.append(shape)
+        why = getattr(excel_open, "_COPY_WHY", None)
+        if why is not None:
+            why.why = "busy"
+        return None
+    monkeypatch.setattr(excel_open, "_copy_picture", busy)
+    monkeypatch.setattr(excel_open, "_clip_text", lambda: None)
+    monkeypatch.setattr(excel_open, "_clip_restore", lambda text: None)   # the real one stays
+    return tried
+
+
+def _picture_app(n=1):
+    sheet = _Sheet()
+    sheet.Shapes = _Coll([_Shape(13) for _ in range(n)])     # pictures at E2
+    app = _App([])
+    app._book.Worksheets = [sheet]
+    return app
+
+
+def test_a_picture_the_busy_clipboard_kept_out_is_still_listed(tmp_path, monkeypatch):
+    """It left the picture count and the Images sheet, and the note blamed the
+    workbook ('may forbid copying') - review, 2026-10-19."""
+    tried = _busy_clipboard(monkeypatch)
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    app = _picture_app(2)
+    book = read_with_excel(f, app_factory=lambda: app)
+    assert [(p.sheet, p.anchor, p.data) for p in book.pictures] == [("EC", "E2", b"")] * 2
+    assert len(tried) == 1                                   # the second waits for nothing
+    assert [n for n in book.notes if "clipboard was busy" in n] == [
+        "pics.xls › EC!E2: a picture could not be copied out: the clipboard was busy "
+        "(another program held it open); read the workbook again later"]
+    assert not any("may forbid" in n for n in book.notes)
+
+
+def test_a_picture_excel_could_not_copy_is_counted_as_not_read(tmp_path, monkeypatch):
+    import source_extract as se
+    from council_core.ledger_ingest import _images_read
+    from ledger_fixtures import make_template
+    from sample_ledger import read_template
+    _busy_clipboard(monkeypatch)
+    app = _picture_app()
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, want_pictures=True, **kw:
+                        real(path, want_pictures=want_pictures, app_factory=lambda: app))
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    read = []
+
+    def reader(data):
+        read.append(data)
+        return []
+    reader.name = "OCR"
+    run = se.extract(read_template(make_template(tmp_path / "t.xlsx")), [f],
+                     image_dir=tmp_path / "imgs", image_reader=reader)
+    assert [(n.sheet, n.anchor, n.saved_as, n.reader) for n in run.images] == [("EC", "E2", "", "")]
+    assert run.images[0].text.startswith("not read") and _images_read(run.images) == 0
+    assert read == [] and not (tmp_path / "imgs").exists()      # no empty file saved or read
+    assert any("clipboard was busy" in p for p in run.problems)
+
+
+def test_copy_picture_says_when_the_clipboard_was_busy(monkeypatch):
+    class Refused:
+        def CopyPicture(self, **kw):
+            raise Exception("CopyPicture method of Shape class failed")
+    monkeypatch.setattr(excel_open, "_clipboard_busy", lambda timeout=0.5: True)
+    assert excel_open._copy_picture(Refused()) is None and excel_open._COPY_WHY.why == "busy"
+    monkeypatch.setattr(excel_open, "_clipboard_busy", lambda timeout=0.5: False)
+    assert excel_open._copy_picture(Refused()) is None and excel_open._COPY_WHY.why == ""
+
+
+def test_a_clipboard_that_never_opens_is_busy(monkeypatch):
+    win32clipboard = pytest.importorskip("win32clipboard")
+
+    def held(*a):
+        raise OSError("OpenClipboard: access is denied")
+    monkeypatch.setattr(win32clipboard, "OpenClipboard", held)
+    excel_open._COPY_WHY.why = ""
+    assert excel_open._clipboard_dib(timeout=0.1) is None
+    assert excel_open._COPY_WHY.why == "busy"
 
 
 def test_an_excel_failure_says_what_happened(tmp_path):
@@ -344,3 +649,51 @@ def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path, monkeypatch):
         time.sleep(0.5)
     left = [p for p in started if _excel_running(p)]
     assert not left, f"{len(left)} of the {len(started)} hidden Excels left running: {left}"
+
+
+@real_excel
+def test_real_excel_password_xls_is_refused_at_once_and_excel_is_not_started(
+        tmp_path, monkeypatch):
+    """Excel 16 itself. A password .xls showed a VISIBLE 'Password' dialog on
+    the user's desktop and was read as a 2-minute sign-in timeout (review,
+    2026-10-19): it, and a password .xlsb, are now refused before any Excel
+    starts. A workbook Excel encrypts with its own default password (its
+    structure protected) still opens unasked, so it is still read - merged
+    label and all."""
+    import time
+    from ledger_bench import _excel_save
+    from source_extract import load_workbook_grids
+
+    def made(name, fmt, password="", edit=None):
+        wb = openpyxl.Workbook()
+        wb.active["A1"], wb.active["B1"] = "Power (W)", 285
+        wb.active["A3"] = "Flaw report"
+        wb.save(tmp_path / f"{name}.xlsx")
+        _excel_save(tmp_path / f"{name}.xlsx", tmp_path / name, fmt, password=password,
+                    edit=edit)
+        return tmp_path / name
+
+    def merge_and_protect(sheet):
+        sheet.Range("A3:C3").Merge()
+        sheet.Parent.Protect("x", True, False)           # the workbook's structure
+    locked = [made("pw.xls", 56, password="x"), made("pw.xlsb", 50, password="x")]
+    protected = made("prot.xls", 56, edit=merge_and_protect)
+    started = _record_excel_pids(monkeypatch)
+    for f in locked:
+        assert kind_of(f) == "password"
+        t = time.monotonic()
+        with pytest.raises(ExcelOpenError) as e:
+            read_with_excel(f, timeout=10)           # a regression waits 10 s, not 120
+        assert e.value.kind == "password" and time.monotonic() - t < 5
+    assert started == []                                 # no Excel for them
+    assert kind_of(protected) == "legacy"
+    grids, _images = load_workbook_grids(protected)
+    cells = grids[0].cells
+    assert cells[(1, 2)] == 285 and cells[(3, 1)] == "Flaw report"
+    assert cells[(3, 2)] == cells[(3, 3)] == "Flaw report"          # the merged label
+    assert len(started) == 1 and isinstance(started[0], int), started
+    for _ in range(40):                                  # Excel takes a moment to exit
+        if not _excel_running(started[0]):
+            break
+        time.sleep(0.5)
+    assert not _excel_running(started[0])

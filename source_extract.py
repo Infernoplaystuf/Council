@@ -608,16 +608,51 @@ def _is_link_dir(path: str) -> bool:
         return True
 
 
+#: Windows' MAX_PATH: with long paths off (LongPathsEnabled=0, the default)
+#: a path this long or longer cannot be opened, listed or even seen.
+_MAX_PATH = 260
+
+
+def _long_path(path: str) -> str:
+    """`path` with Windows' \\\\?\\ prefix, which lifts MAX_PATH for this
+    one call; unchanged elsewhere."""
+    if os.name != "nt":
+        return path
+    p = os.path.abspath(path)
+    if p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):                                  # \\server\share
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def path_too_long(path) -> int:
+    """The length of `path` when Windows refuses it only for being longer than
+    MAX_PATH (long paths off, the file there all the same); else 0."""
+    if os.name != "nt":
+        return 0
+    p = os.path.abspath(str(path))
+    if len(p) < _MAX_PATH or os.path.exists(p):
+        return 0
+    return len(p) if os.path.exists(_long_path(p)) else 0
+
+
 def workbook_files(folder) -> List[Path]:
     """The workbooks under a folder — recursively — not Excel's ~$ lock files.
 
     Folders whose names start with "." or "~$" are pruned at every depth so
     hidden caches (``.git``, ``.cache``), VCS metadata and Excel autosave
     directories don't leak into the scan; ``~$`` files anywhere are skipped
-    for the same reason (Excel's lockfile for an open workbook)."""
+    for the same reason (Excel's lockfile for an open workbook).
+
+    Listed through the \\\\?\\ prefix on Windows: a folder whose path is
+    longer than MAX_PATH could not be listed and its workbooks were skipped
+    without a word (review, 2026-10-19). They are returned as plain paths;
+    reading one says the path is too long (load_workbook_grids)."""
     root = Path(folder)
+    top = _long_path(str(root))
     out: List[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(top):
         # In-place prune so os.walk does not descend into hidden/lock dirs,
         # junctions / links (a loop read the same workbooks many times) or a
         # drive's system folders (deleted workbooks came back) - review,
@@ -626,11 +661,13 @@ def workbook_files(folder) -> List[Path]:
                        if not d.startswith(".") and not d.startswith("~$")
                        and d.lower() not in _SYSTEM_DIRS
                        and not _is_link_dir(os.path.join(dirpath, d))]
+        rel = os.path.relpath(dirpath, top)
+        here = root if rel == os.curdir else root / rel     # the folder as it was given
         for name in filenames:
             if name.startswith("~$"):
                 continue
             if Path(name).suffix.lower() in WORKBOOK_SUFFIXES:
-                out.append(Path(dirpath) / name)
+                out.append(here / name)
     return sorted(out)
 
 
@@ -659,10 +696,17 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     path = Path(path)
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
+        n = path_too_long(path)
+        if n:
+            raise LedgerError(f"{path.name}: path too long: {n} characters — enable Windows "
+                              "long paths or move the folder")
         raise LedgerError(f"{path.name} not found")
     if kind == "password":
-        raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
-                          "copy without the password, and add that copy")
+        # from ExcelOpenError('password'), so the run's summary counts it as
+        # a password, not as 'other'
+        why = (f"{path.name} has a password to open; open it in Excel, save a "
+               "copy without the password, and add that copy")
+        raise LedgerError(why) from excel_open.ExcelOpenError(why, kind="password")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
         return _grids_from_excel(path, notes, want_pictures, careful)
     try:
@@ -1726,7 +1770,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     ``Extraction.cancelled = True``; what the interrupted workbook gave is
     dropped, the workbooks before it are kept. The Ledger tab's Cancel
     button sets it and also calls ``excel_open.kill_active_excels()`` to
-    unblock a Workbooks.Open sitting on a modal Excel dialog.
+    unblock a Workbooks.Open sitting on a modal Excel dialog (a read whose
+    Excel is still starting stops itself once it has one).
 
     ``log``: where the stall watchdog's stack dump goes (the Ledger log);
     it is also written to <app dir>/logs/ledger_stalls.txt by faulthandler,
@@ -1873,6 +1918,13 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             raise _Cancelled()
         _wd.beat()
         prog.update(f"{src.name}: picture {i + 1} of {len(images)}")
+        if not img.data:
+            # listed by Excel but not copied out (the clipboard was busy):
+            # counted as not read, never saved or read as an empty file
+            run.images.append(ImageNote(img.file, img.sheet, img.anchor, "", "",
+                                        "not read: Excel could not copy it out (see the "
+                                        "problems)"))
+            continue
         if image_dir:
             d = Path(image_dir)
             d.mkdir(parents=True, exist_ok=True)

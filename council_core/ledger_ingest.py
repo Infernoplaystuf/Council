@@ -29,7 +29,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (ImageReader, apply_review, decide, default_image_reader,
-                            extract, load_aliases, workbook_files, write_review)
+                            extract, load_aliases, path_too_long, workbook_files,
+                            write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -254,7 +255,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                 + ", ".join(sorted({p.name for p in skipped_files}))[:200]
                 + "). Edit the Skip these files field or clear it.")
         raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
-    missing = [f.name for f in files if not f.exists()]
+    # one whose path is only too long for Windows is there: the run says so
+    # for it (source_extract.load_workbook_grids) and reads the rest
+    missing = [f.name for f in files if not f.exists() and not path_too_long(f)]
     if missing:
         raise LedgerError(f"source workbooks not found: {missing}")
     out = Path(review_path) if review_path else default_review_for(csv_path)

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # ledger_fixtures
 
 import excel_open                                                     # noqa: E402
 from council_core.ledger_ingest import (ExtractSummary,               # noqa: E402
@@ -61,6 +62,92 @@ def test_on_windows_each_registered_pid_is_taskkilled(monkeypatch):
     for cmd in seen:
         assert cmd[0] == "taskkill"
         assert "/F" in cmd
+
+
+# ----------------------------------------- Cancel while Excel is starting
+
+def _excel_cancelled_while_starting(log, cancel=None):
+    """An app_factory standing in for DispatchEx: the Ledger's Cancel is
+    pressed while it is still starting Excel - before the new Excel's PID is
+    registered, so kill_active_excels has nothing to end."""
+    class Books:
+        def Open(self, path, **kw):
+            log.append("open")
+            raise RuntimeError("Excel opened the workbook after Cancel")
+
+    class App:
+        Workbooks = Books()
+
+        def Quit(self):
+            log.append("quit")
+
+    def factory():
+        if cancel is not None:
+            cancel.set()                             # the tab's Cancel button...
+        log.append(("killed", excel_open.kill_active_excels()))   # ...and its kill
+        return App()
+    return factory
+
+
+def test_cancel_while_excel_is_starting_stops_the_read(tmp_path, monkeypatch):
+    """It ended nothing, and the read ran to the end or to the 2-minute
+    watchdog (review, 2026-10-19)."""
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+    f = tmp_path / "a.xls"
+    f.write_bytes(excel_open.OLE_MAGIC)
+    log = []
+    with pytest.raises(excel_open.ExcelOpenError) as e:
+        excel_open.read_with_excel(f, want_pictures=False,
+                                   app_factory=_excel_cancelled_while_starting(log))
+    assert e.value.kind == "cancelled"
+    assert log == [("killed", 0), "quit"]            # never opened; its Excel quit
+
+
+def test_a_read_that_starts_after_a_cancel_is_not_stopped(tmp_path, monkeypatch):
+    """The Cancel counts only for reads under way: the knowledge graph's
+    reads after it go on."""
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+    excel_open.kill_active_excels()                  # an earlier extract's Cancel
+    f = tmp_path / "a.xls"
+    f.write_bytes(excel_open.OLE_MAGIC)
+    log = []
+
+    class Book:
+        Worksheets = []
+
+        def Close(self, SaveChanges=True):
+            log.append("close")
+
+    class App:
+        class Workbooks:
+            @staticmethod
+            def Open(path, **kw):
+                log.append("open")
+                return Book()
+
+        def Quit(self):
+            log.append("quit")
+    book = excel_open.read_with_excel(f, want_pictures=False, app_factory=App)
+    assert book.sheets == [] and log == ["open", "close", "quit"]
+
+
+def test_cancel_while_excel_starts_ends_the_extract_without_opening(tmp_path, monkeypatch):
+    import source_extract as se
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    b = tmp_path / "b.xls"
+    b.write_bytes(excel_open.OLE_MAGIC)
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+    cancel, log = threading.Event(), []
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=_excel_cancelled_while_starting(log, cancel)))
+    run = se.extract(schema, [a, b], use_images=False, cancel=cancel)
+    assert run.cancelled and run.obs                 # a's values kept
+    assert any("while reading 'b.xls'" in p for p in run.problems)
+    assert "open" not in log and log[-1] == "quit"
 
 
 # ----------------------------------------- summarize_slowest

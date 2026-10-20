@@ -29,9 +29,11 @@ TEXT BOXES AND CHARTS
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
+import struct
 import threading
 import zipfile
 from dataclasses import dataclass, field
@@ -64,6 +66,8 @@ class ExcelOpenError(Exception):
         machine (no Windows, no pywin32, no registered Excel).
       * ``'access'`` — access denied by the OS (locked file, missing
         permission on the folder).
+      * ``'cancelled'`` — the Ledger's Cancel was pressed while this
+        read was starting Excel (kill_active_excels).
       * ``'unknown'`` — fallback; the message includes diagnostic bytes.
     """
 
@@ -232,7 +236,9 @@ def kind_of(path) -> str:
     (a password to open: refused - Excel would sit on a hidden prompt, measured);
     'legacy' (.xls / other OLE workbook); 'unknown'. Told apart by the stream
     names inside the OLE container (MS-OFFCRYPTO): IRM uses the
-    DRMEncrypted data space, a password the StrongEncryption one."""
+    DRMEncrypted data space, a password the StrongEncryption one. An .xls
+    with a password to open is told by the FILEPASS record at the start of
+    its Workbook stream (_ole_kind)."""
     p = Path(path)
     with open(p, "rb") as fh:
         head = fh.read(8)
@@ -240,10 +246,241 @@ def kind_of(path) -> str:
             body = head + fh.read(8 << 20)
             if "EncryptedPackage".encode("utf-16-le") in body:
                 return "rights" if "DRMEncrypted".encode("utf-16-le") in body else "password"
-            return "legacy"
+            return _ole_kind(fh)
     if zipfile.is_zipfile(p):
         return "zip"
     return "unknown"
+
+
+# ── inside an OLE (compound file) container ─────────────────────────────
+#: Sector numbers from here up end a chain or mark FAT / DIFAT sectors (MS-CFB).
+_MAXREGSECT = 0xFFFFFFFA
+
+
+class _Ole:
+    """Just enough of a compound file (MS-CFB) to list its streams and read
+    the start of one; olefile is not a dependency. Raises ValueError (or
+    struct.error) on anything it does not understand."""
+
+    def __init__(self, fh):
+        self.fh = fh
+        fh.seek(0)
+        h = fh.read(512)
+        if len(h) < 512 or h[:8] != OLE_MAGIC:
+            raise ValueError("not a compound file")
+        major, _order, shift, mini_shift = struct.unpack_from("<HHHH", h, 0x1A)
+        if shift not in (9, 12) or mini_shift != 6:
+            raise ValueError("odd sector size")
+        self.ss, self.mss, self.v3 = 1 << shift, 1 << mini_shift, major == 3
+        n_fat, dir_start = struct.unpack_from("<II", h, 0x2C)
+        self.cutoff, self.minifat_start, _n_mini, difat_next = struct.unpack_from(
+            "<IIII", h, 0x38)
+        fh.seek(0, 2)
+        self.nsect = fh.tell() // self.ss          # no chain is longer than the file
+        difat = list(struct.unpack_from("<109I", h, 0x4C))
+        seen: set = set()
+        while difat_next < _MAXREGSECT and difat_next not in seen and len(difat) < n_fat + 109:
+            seen.add(difat_next)
+            more = struct.unpack(f"<{self.ss // 4}I", self._sector(difat_next))
+            difat.extend(more[:-1])
+            difat_next = more[-1]
+        self.fat_sectors = [s for s in difat if s < _MAXREGSECT][:n_fat]
+        self._fat: Dict[int, tuple] = {}
+        self.entries = self._directory(dir_start)
+
+    def _sector(self, n: int) -> bytes:
+        self.fh.seek((n + 1) * self.ss)
+        b = self.fh.read(self.ss)
+        if len(b) < self.ss:
+            raise ValueError("a sector past the end of the file")
+        return b
+
+    def _next(self, n: int) -> int:
+        per = self.ss // 4
+        k = n // per
+        if k not in self._fat:
+            if k >= len(self.fat_sectors):
+                raise ValueError("a sector outside the FAT")
+            self._fat[k] = struct.unpack(f"<{per}I", self._sector(self.fat_sectors[k]))
+        return self._fat[k][n % per]
+
+    def _chain(self, start: int, nxt=None):
+        nxt, n = nxt or self._next, 0
+        while start < _MAXREGSECT:
+            yield start
+            n += 1
+            if n > self.nsect:
+                raise ValueError("a sector chain loops")
+            start = nxt(start)
+
+    def _directory(self, start: int) -> List[tuple]:
+        """(name, type, left, right, child, first sector, size) per entry."""
+        out = []
+        for s in self._chain(start):
+            b = self._sector(s)
+            for i in range(0, self.ss, 128):
+                nlen = struct.unpack_from("<H", b, i + 0x40)[0]
+                left, right, child = struct.unpack_from("<III", b, i + 0x44)
+                first, size = struct.unpack_from("<IQ", b, i + 0x74)
+                name = b[i:i + max(0, min(nlen, 64) - 2)].decode("utf-16-le", "replace")
+                out.append((name, b[i + 0x42], left, right, child, first,
+                            size & 0xFFFFFFFF if self.v3 else size))
+        return out
+
+    def root_names(self) -> Dict[str, int]:
+        """The streams and storages directly in the root, by name - not one
+        of the same name inside an embedded object's storage."""
+        out: Dict[str, int] = {}
+        todo, seen = [self.entries[0][4]] if self.entries else [], set()
+        while todo:
+            i = todo.pop()
+            if i >= len(self.entries) or i in seen:
+                continue
+            seen.add(i)
+            e = self.entries[i]
+            out.setdefault(e[0], i)
+            todo += [e[2], e[3]]
+        return out
+
+    def read(self, i: int, limit: int) -> bytes:
+        """The first `limit` bytes of stream `i`."""
+        _name, _typ, _l, _r, _c, first, size = self.entries[i]
+        want, buf = min(size, limit), bytearray()
+        if size >= self.cutoff:
+            for s in self._chain(first):
+                if len(buf) >= want:
+                    break
+                buf += self._sector(s)
+            return bytes(buf[:want])
+        # a small stream lives in the mini stream (the root's own chain)
+        root = list(self._chain(self.entries[0][5]))
+        minifat = list(self._chain(self.minifat_start))
+        per = self.ss // 4
+
+        def next_mini(m: int) -> int:
+            if m // per >= len(minifat):
+                raise ValueError("a mini sector outside the mini FAT")
+            return struct.unpack_from("<I", self._sector(minifat[m // per]), (m % per) * 4)[0]
+        for m in self._chain(first, next_mini):
+            if len(buf) >= want:
+                break
+            off = m * self.mss
+            if off // self.ss >= len(root):
+                raise ValueError("a mini sector past the mini stream")
+            b = self._sector(root[off // self.ss])
+            buf += b[off % self.ss:off % self.ss + self.mss]
+        return bytes(buf[:want])
+
+
+def _ole_kind(fh) -> str:
+    """'password', 'rights' or 'legacy' for an OLE container, from its
+    directory. A password-to-open .xls made Excel show a VISIBLE 'Password'
+    dialog on the user's desktop - Password= in Workbooks.Open does not stop
+    that for .xls - and the read sat on it for the 2-minute watchdog and was
+    called a sign-in timeout (review, 2026-10-19). An encrypted .xlsx /
+    .xlsb whose directory lies past the first 8 MB is found here too.
+    Anything not understood stays 'legacy': Excel is asked, as before."""
+    try:
+        ole = _Ole(fh)
+        names = ole.root_names()
+        if "EncryptedPackage" in names or "EncryptionInfo" in names:
+            return "rights" if any("DRMEncrypted" in e[0] for e in ole.entries) else "password"
+        for stream in ("Workbook", "Book"):              # BIFF8 / BIFF5
+            if stream in names:
+                fp = _filepass(ole.read(names[stream], 8192))
+                if fp is not None and not _default_password_opens(fp):
+                    return "password"
+                break
+    except Exception:                                       # noqa: BLE001
+        pass
+    return "legacy"
+
+
+_BIFF_BOF = (0x0809, 0x0409, 0x0209, 0x0009)
+_BIFF_FILEPASS, _BIFF_EOF = 0x002F, 0x000A
+#: The password Excel encrypts an .xls with when it has none to open (one
+#: whose structure is protected with a password, measured with Excel 16):
+#: Excel opens it without asking, so it is read as before (MS-OFFCRYPTO 2.3.6).
+_DEFAULT_XLS_PASSWORD = "VelvetSweatshop"
+
+
+def _filepass(stream: bytes) -> Optional[bytes]:
+    """The body of the FILEPASS record of a BIFF Workbook stream's globals
+    (it follows BOF: the rest of the file is encrypted), or None. Record
+    headers stay plain after it, so the scan can go on safely."""
+    pos = 0
+    for n in range(64):
+        if pos + 4 > len(stream):
+            return None
+        typ, length = struct.unpack_from("<HH", stream, pos)
+        if n == 0 and typ not in _BIFF_BOF:
+            return None                                     # not a BIFF stream
+        if typ == _BIFF_FILEPASS:
+            return stream[pos + 4:pos + 4 + length]
+        if typ == _BIFF_EOF:
+            return None
+        pos += 4 + length
+    return None
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    s, j = list(range(256)), 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out, i, j = bytearray(), 0, 0
+    for b in data:
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out.append(b ^ s[(s[i] + s[j]) & 0xFF])
+    return bytes(out)
+
+
+def _xor_verifier(password: str) -> int:
+    """MS-OFFCRYPTO 2.3.7.1: the 16-bit verifier of XOR obfuscation."""
+    v = 0
+    for b in reversed([len(password)] + list(password.encode("latin-1", "replace"))):
+        v = (((v >> 14) & 1) | ((v << 1) & 0x7FFF)) ^ b
+    return v ^ 0xCE4B
+
+
+def _default_password_opens(fp: bytes, password: str = _DEFAULT_XLS_PASSWORD) -> bool:
+    """FILEPASS body `fp` verifies against `password` (Excel's default, so
+    Excel opens the file without asking): XOR obfuscation, RC4 (MD5) or RC4
+    CryptoAPI (SHA-1), each as MS-OFFCRYPTO 2.3.5 - 2.3.7 checks a password.
+    False for anything else: a password Excel would ask for."""
+    try:
+        if len(fp) == 4:                                    # BIFF5: XOR key, verifier
+            return struct.unpack_from("<H", fp, 2)[0] == _xor_verifier(password)
+        kind, major, minor = struct.unpack_from("<HHH", fp, 0)
+        if kind == 0:                                       # XOR obfuscation
+            return struct.unpack_from("<H", fp, 4)[0] == _xor_verifier(password)
+        if kind != 1:
+            return False
+        pw = password.encode("utf-16-le")
+        if (major, minor) == (1, 1):                        # RC4, 40-bit, MD5
+            salt, verifier = fp[6:22], fp[22:54]
+            h1 = hashlib.md5((hashlib.md5(pw).digest()[:5] + salt) * 16).digest()[:5]
+            key = hashlib.md5(h1 + struct.pack("<I", 0)).digest()
+            plain = _rc4(key, verifier)
+            return len(plain) == 32 and hashlib.md5(plain[:16]).digest() == plain[16:]
+        if major in (2, 3, 4) and minor == 2:               # RC4 CryptoAPI
+            hsize = struct.unpack_from("<I", fp, 10)[0]
+            bits = struct.unpack_from("<I", fp, 14 + 16)[0] or 40
+            v = 14 + hsize
+            salt_size = struct.unpack_from("<I", fp, v)[0]
+            salt = fp[v + 4:v + 4 + salt_size]
+            enc = fp[v + 4 + salt_size:v + 20 + salt_size]
+            hash_size = struct.unpack_from("<I", fp, v + 20 + salt_size)[0]
+            enc_hash = fp[v + 24 + salt_size:v + 24 + salt_size + hash_size]
+            h = hashlib.sha1(hashlib.sha1(salt + pw).digest() + struct.pack("<I", 0)).digest()
+            key = h[:5] + b"\0" * 11 if bits == 40 else h[:bits // 8]
+            plain = _rc4(key, enc + enc_hash)
+            return hashlib.sha1(plain[:16]).digest() == plain[16:36]
+    except (struct.error, ValueError, ZeroDivisionError):
+        return False
+    return False
 
 
 def excel_available() -> bool:
@@ -500,6 +737,21 @@ _CLIPBOARD_LOCK = threading.Lock()
 _ACTIVE_EXCEL_PIDS: "set[int]" = set()
 _ACTIVE_EXCEL_LOCK = threading.Lock()
 
+#: How many times kill_active_excels (the Ledger's Cancel) has run. A read
+#: notes it before it starts Excel and looks again once its PID is
+#: registered: Cancel pressed in the ~0.5 s DispatchEx takes found no PID to
+#: end, and the read went on to the end or to the 2-minute watchdog
+#: (review, 2026-10-19). A count rather than a flag left set until the next
+#: extract: the knowledge graph's reads that start after a Cancel are not
+#: stopped by it. Read and bumped under _ACTIVE_EXCEL_LOCK, so a Cancel
+#: either sees the PID or is seen by the read.
+_CANCELS = 0
+
+
+def _cancels() -> int:
+    with _ACTIVE_EXCEL_LOCK:
+        return _CANCELS
+
 
 def _register_excel_pid(app) -> Optional[int]:
     """The PID behind an Excel.Application COM object. Returns None
@@ -537,11 +789,14 @@ def kill_active_excels() -> int:
     raise and the worker thread to exit on the next iteration. The
     user's manually-opened Excel is NOT touched — only PIDs this
     process spawned via DispatchEx. No-op outside Windows or when
-    pywin32 is absent."""
+    pywin32 is absent - but a read still starting its Excel then stops
+    itself (_CANCELS)."""
+    global _CANCELS
+    with _ACTIVE_EXCEL_LOCK:
+        _CANCELS += 1
+        pids = list(_ACTIVE_EXCEL_PIDS)
     if os.name != "nt":
         return 0
-    with _ACTIVE_EXCEL_LOCK:
-        pids = list(_ACTIVE_EXCEL_PIDS)
     if not pids:
         return 0
     import subprocess
@@ -554,6 +809,15 @@ def kill_active_excels() -> int:
         except Exception:                                   # noqa: BLE001
             continue
     return killed
+
+
+def _stop_if_cancelled(path: Path, cancels: int) -> None:
+    """Raise ExcelOpenError('cancelled') when kill_active_excels ran since
+    the read noted `cancels`; read_with_excel's finally then quits its
+    Excel, before any workbook is opened in it."""
+    if _cancels() != cancels:
+        raise ExcelOpenError(f"{path.name}: cancelled while Excel was starting",
+                             kind="cancelled")
 
 
 def _clipboard_formats() -> set:
@@ -661,6 +925,63 @@ def _clip_restore(text: Optional[str]) -> None:
         pass
 
 
+def _a1(row: int, col: int) -> str:
+    letters = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return f"{letters}{row}"
+
+
+def _merged_text_cells(ws, used, cells: Cells) -> List[Tuple[int, int]]:
+    """The text cells of sheet `ws` that are part of a merged range. Two COM
+    calls per text cell (Cells(r, c).MergeCells) took 24-39 s for a
+    12,000-cell .xls and set off the stall watchdog in ordinary reads
+    (review, 2026-10-19). Now one question for the whole used range -
+    Excel's MergeCells is False when nothing in a range is merged, True when
+    all of it is, None when some is - and only when some is, the same
+    question for halves of it, down to the text cells that are merged."""
+    texts = [k for k, v in cells.items() if isinstance(v, str)]
+    if not texts:
+        return []
+    try:
+        whole = used.MergeCells
+    except Exception:
+        whole = None
+
+    def asked(pts):
+        """MergeCells of the box around `pts`; '?' when it cannot be asked."""
+        r1, r2 = min(p[0] for p in pts), max(p[0] for p in pts)
+        c1, c2 = min(p[1] for p in pts), max(p[1] for p in pts)
+        try:
+            return ws.Range(f"{_a1(r1, c1)}:{_a1(r2, c2)}").MergeCells
+        except Exception:
+            return "?"
+    found: set = set()
+    todo = [(texts, whole)]
+    while todo:
+        pts, merged = todo.pop()
+        if merged is not None and merged != "?":
+            if merged:                           # every cell in the box is merged
+                found.update(pts)
+            continue
+        if len(pts) == 1 or merged == "?":       # cell by cell, as before
+            for r, c in pts:
+                try:
+                    if ws.Cells(r, c).MergeCells:
+                        found.add((r, c))
+                except Exception:
+                    pass
+            continue
+        rows = max(p[0] for p in pts) - min(p[0] for p in pts)
+        cols = max(p[1] for p in pts) - min(p[1] for p in pts)
+        axis = 0 if rows >= cols else 1         # halve the longer side
+        mid = (max(p[axis] for p in pts) + min(p[axis] for p in pts)) // 2
+        for half in ([p for p in pts if p[axis] <= mid], [p for p in pts if p[axis] > mid]):
+            todo.append((half, asked(half)))
+    return [k for k in texts if k in found]
+
+
 #: How long Excel may take to open one workbook before it is stopped. A
 #: rights-protected file can ask the user to sign in, and a hidden Excel would
 #: wait for that forever (measured with a password prompt: the reader hung).
@@ -680,6 +1001,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     the rebuild ran - no more pictures are copied (each is listed with no
     data, and a note says why) and the clipboard is left as it is, not put
     back over what the user copied."""
+    cancels = _cancels()            # a Cancel after this stops the read (_CANCELS)
     path = Path(path).resolve()
     if kind_of(path) == "password":
         raise ExcelOpenError(
@@ -716,6 +1038,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         app = app_factory()
         _tie_excel(app)
         pid = _register_excel_pid(app)   # so the Ledger's Cancel can kill it
+        _stop_if_cancelled(path, cancels)    # ...pressed before the PID was there
         watchdog = _watchdog(app, timeout, stopped) if com is not None else None
         for attr, val in (("Visible", False), ("DisplayAlerts", False),
                           ("AskToUpdateLinks", False), ("EnableEvents", False),
@@ -724,9 +1047,12 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 setattr(app, attr, val)
             except Exception:
                 pass
+        _stop_if_cancelled(path, cancels)
         try:
-            # A password the workbook does not have: a protected file fails here
-            # instead of putting a password prompt in front of the user.
+            # A password the workbook does not have, so a protected file fails
+            # here instead of prompting. A password .xls did not: Excel showed
+            # its Password dialog anyway (measured), so kind_of refuses every
+            # password-to-open file above, before Excel starts.
             book = app.Workbooks.Open(str(path), UpdateLinks=0, ReadOnly=True,
                                       IgnoreReadOnlyRecommended=True, AddToMru=False,
                                       Notify=False, Password="council-no-password",
@@ -752,17 +1078,14 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     if v is not None:
                         cells[(r0 + i, c0 + j)] = v
             # a merged label reads the same from every cell it covers
-            for (r, c), v in list(cells.items()):
-                if not isinstance(v, str):
-                    continue
+            for r, c in _merged_text_cells(ws, used, cells):
+                v = cells[(r, c)]
                 try:
-                    cell = ws.Cells(r, c)
-                    if cell.MergeCells:
-                        area = cell.MergeArea
-                        for rr in range(int(area.Row), int(area.Row) + int(area.Rows.Count)):
-                            for cc in range(int(area.Column),
-                                            int(area.Column) + int(area.Columns.Count)):
-                                cells.setdefault((rr, cc), ("__merged__", v))
+                    area = ws.Cells(r, c).MergeArea
+                    for rr in range(int(area.Row), int(area.Row) + int(area.Rows.Count)):
+                        for cc in range(int(area.Column),
+                                        int(area.Column) + int(area.Columns.Count)):
+                            cells.setdefault((rr, cc), ("__merged__", v))
                 except Exception:
                     pass
             out.sheets.append((name, cells))
@@ -832,12 +1155,24 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                                              f"{clip_why}")
                         out.pictures.append(Picture(name, anchor, b""))
                         continue
+                    _COPY_WHY.why = ""
                     data_png = _copy_picture(sh)
                     used_clip = True
                     if careful:
                         seq = _clip_seq()
                     if data_png:
                         out.pictures.append(Picture(name, anchor, data_png))
+                    elif getattr(_COPY_WHY, "why", "") == "busy":
+                        # Listed with no data, so it is counted as not read
+                        # (and read again later): it left the count and the
+                        # Images sheet, and the note blamed the workbook
+                        # (review, 2026-10-19). The rest are not tried: each
+                        # would wait for the clipboard again.
+                        clip_why = ("the clipboard was busy (another program held it "
+                                    "open); read the workbook again later")
+                        out.pictures.append(Picture(name, anchor, b""))
+                        out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
+                                         f"be copied out: {clip_why}")
                     else:
                         out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
                                          "be copied out (the workbook may forbid copying)")
@@ -974,6 +1309,7 @@ def _clipboard_dib(timeout: float = 5.0) -> Optional[bytes]:
             break
         except Exception:
             if time.monotonic() > end:
+                _COPY_WHY.why = "busy"
                 return None
             time.sleep(0.05)
     try:
@@ -984,10 +1320,44 @@ def _clipboard_dib(timeout: float = 5.0) -> Optional[bytes]:
         win32clipboard.CloseClipboard()
 
 
+#: Why the last _copy_picture on this thread gave nothing: 'busy' when the
+#: clipboard could not be opened (another program held it open), else ''
+#: (Excel refused: the workbook may forbid copying).
+_COPY_WHY = threading.local()
+
+
+def _clipboard_busy(timeout: float = 0.5) -> bool:
+    """The clipboard cannot be opened now: another program holds it open."""
+    import time
+    try:
+        import win32clipboard
+    except Exception:
+        return False
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception:
+            if time.monotonic() > end:
+                return True
+            time.sleep(0.05)
+            continue
+        win32clipboard.CloseClipboard()
+        return False
+
+
 def _copy_picture(shape) -> Optional[bytes]:
+    _COPY_WHY.why = ""
     try:
         from PIL import Image, ImageGrab
-        shape.CopyPicture(Appearance=1, Format=2)         # as shown, bitmap
+        try:
+            shape.CopyPicture(Appearance=1, Format=2)     # as shown, bitmap
+        except Exception:
+            # Excel could not put it on the clipboard: another program
+            # holding the clipboard open, or the workbook forbids copying
+            if _clipboard_busy():
+                _COPY_WHY.why = "busy"
+            return None
         img = None
         try:
             dib = _clipboard_dib()
