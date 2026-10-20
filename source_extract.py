@@ -73,9 +73,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sample_ledger import (INITIALS_SUFFIX, LedgerError, ParentCSV, TemplateField,
-                           TemplateSchema, _text, fill_template, inspector_column,
-                           normalize_label, sample_sort_key, schema_path_for)
+from sample_ledger import (INITIALS_SUFFIX, INSPECTOR_COL, SOURCE_COL, LedgerError,
+                           ParentCSV, TemplateField, TemplateSchema, _text, fill_template,
+                           inspector_column, normalize_label, sample_sort_key,
+                           schema_path_for, xl_text)
 
 ACCEPT_AT = 0.85
 SUGGEST_AT = 0.6
@@ -628,6 +629,22 @@ class Grid:
     sheet: str
     cells: Dict[Tuple[int, int], object]
     from_image: str = ""             # image file name when read from an image
+
+    def __post_init__(self):
+        # Text with a control character (read through Excel: '216' +
+        # CHAR(1)) is cleaned here, as it is read, so the review, Apply and
+        # the parent CSV all see one text: cleaned only where it was
+        # written, Apply read part '216\x01' - another part than the
+        # review's '216' - and filling its template raised (review,
+        # 2026-10-20)
+        bad = [k for k, v in self.cells.items() if isinstance(v, str) and xl_text(v) is not v]
+        if bad:
+            self.cells = dict(self.cells)
+            for k in bad:
+                v = self.cells.pop(k)
+                t = xl_text(v)
+                if t:
+                    self.cells[k] = _Merged(t) if isinstance(v, _Merged) else t
 
     def text(self, r, c) -> Optional[str]:
         v = self.cells.get((r, c))
@@ -2188,6 +2205,17 @@ class Extraction:
     #: True when the extract exited early because the Ledger tab's
     #: Cancel event fired. Surfaced via ``ExtractSummary.cancelled``.
     cancelled: bool = False
+    #: The sources read to the end - what the review holds. Apply reads
+    #: these again, not every source: after a Cancel it read all 62 and
+    #: wrote values from workbooks the review never showed (review,
+    #: 2026-10-20). One Excel could not open is not in it either. None:
+    #: not kept (a run not made by extract) - every source.
+    read: Optional[List[str]] = None
+    #: The part Council's model found for a workbook, by its name in the
+    #: review: ``{name: (part, where)}``. Apply reads without the model, so
+    #: a label mapped in such a workbook had no part and was dropped
+    #: (review, 2026-10-20); it is given these parts again.
+    model_parts: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
 
 class _Cancelled(Exception):
@@ -2200,7 +2228,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             pattern_mask: Optional[str] = None,
             cancel: Optional[Any] = None,
             log: Optional[Callable[[str], None]] = None,
-            part_finder: Optional[Callable[[str, List["Grid"]], Tuple[str, str]]] = None
+            part_finder: Optional[Callable[[str, List["Grid"]], Tuple[str, str]]] = None,
+            labels: Optional[Dict[str, str]] = None
             ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
@@ -2225,7 +2254,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
 
     ``part_finder(name, grids) -> (part, where)``: asked for a workbook whose
     values found no part number (Council's model - council_core.ledger_llm);
-    what it finds is a suggestion, never pre-accepted."""
+    what it finds is a suggestion, never pre-accepted.
+
+    ``labels``: each source's name in the review (source_labels), when
+    these sources are some of a run's (Apply reads only those the review
+    holds, and names them as the review did)."""
     import time as _time
     from progress_report import NullProgress
     from council_core import stall_watchdog
@@ -2233,7 +2266,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore)
     codes = ItemCodes(schema.items)
-    run = Extraction([str(s) for s in sources])
+    run = Extraction([str(s) for s in sources], read=[])
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
     # The watchdog dumps every thread's stack when nothing has moved for
@@ -2265,7 +2298,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
         # run's Excel reads, also one pressed before a read began
         with excel_open.cancel_scope():
             _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                         m, codes, mask_re, part, schema, _time, part_finder)
+                         m, codes, mask_re, part, schema, _time, part_finder, labels)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
@@ -2305,8 +2338,9 @@ def source_labels(sources: Sequence) -> Dict[str, str]:
 
 
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                 m, codes, mask_re, part, schema, _time, part_finder=None) -> None:
-    labels = source_labels(sources)
+                 m, codes, mask_re, part, schema, _time, part_finder=None,
+                 labels=None) -> None:
+    labels = labels or source_labels(sources)
     for src in sources:
         if cancel is not None and cancel.is_set():
             run.cancelled = True
@@ -2314,14 +2348,16 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                                 f"{Path(src).name!r}.")
             break
         kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
+        label = labels.get(str(src)) or labels.get(str(Path(src))) or Path(src).name
         try:
             _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
                          reader, m, codes, mask_re, part, schema, _time,
-                         labels.get(str(src)) or Path(src).name, part_finder)
+                         label, part_finder)
         except _Cancelled:
             # half a workbook is not offered for review: what it gave goes
             del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
             del run.problems[kept[3]:]
+            run.model_parts.pop(label, None)
             run.cancelled = True
             run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
                                 "the workbooks before it are in this review.")
@@ -2472,6 +2508,7 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             raise _Cancelled()                # the model's answer was cut short
         if found_part:
             book_part, how = found_part, f"{MODEL_PART_HOW} from {where} — check it"
+            run.model_parts[label or src.name] = (found_part, where)
     for ex in exs:
         if part:
             ex.part, ex.part_how = part, how
@@ -2496,6 +2533,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                     note.values += n
     _secs = _time.monotonic() - _t0
     run.timings.append((label or src.name, _secs))
+    if run.read is not None:
+        run.read.append(str(src))                    # in the review: Apply reads it
     prog.advance(what=f"{src.name} read in {_secs:.1f}s")
     _wd.beat()
     orphans = sum(1 for ex in exs for o in ex.out if not o.part)
@@ -2633,11 +2672,21 @@ def _join(a: str, b: str) -> str:
     return f"{a}; {b}" if a else b
 
 
-def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dict[str, str]]:
+def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
+              sources: bool = False) -> List[Dict[str, str]]:
     """Accepted values -> parent-CSV rows. A part-level value lands on every
-    item row of its part, as the parent CSV keeps it."""
+    item row of its part, as the parent CSV keeps it.
+
+    ``sources``: each row also names the workbooks its values came from, as
+    the review names them (source_file): Apply wrote every workbook of the
+    run on every row (review, 2026-10-20). A part-level value's workbook is
+    on each row of its part; a row with no value of its own names the
+    part's workbooks."""
     part_vals: Dict[str, Dict[str, str]] = defaultdict(dict)
     item_vals: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
+    # (part, item) -> the workbooks its values came from; (part, None): all
+    # of the part's
+    books: Dict[Tuple[str, Optional[str]], List[str]] = defaultdict(list)
     for d in decisions:
         if not d.accept or not d.obs.part or not d.obs.field:
             continue
@@ -2647,17 +2696,48 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dic
         initials = f.field + INITIALS_SUFFIX
         if f.inspector and f.item and schema.takes_inspectors(f.field):
             target.setdefault(initials, f.inspector)    # whose value went in
+        book = f.where.split(" › ", 1)[0]
+        for key in ((f.part, f.item), (f.part, None)):
+            if book and book not in books[key]:
+                books[key].append(book)
+
+    def named(p, it) -> Dict[str, str]:
+        if not sources:
+            return {}
+        mine = list(dict.fromkeys(books.get((p, it), []) + books.get((p, ""), [])))
+        return {SOURCE_COL: _book_list(mine or books.get((p, None), []))}
     rows = []
     parts = sorted(set(part_vals) | {p for p, _ in item_vals}, key=sample_sort_key)
     for p in parts:
         if not schema.item_field:
-            rows.append({schema.id_field: p, **part_vals[p]})
+            rows.append({schema.id_field: p, **part_vals[p], **named(p, "")})
             continue
         for it in schema.items:
             row = {schema.id_field: p, schema.item_field: it, **part_vals[p]}
             row.update(item_vals.get((p, it), {}))
+            row.update(named(p, it))
             rows.append(row)
     return rows
+
+
+#: How long a row's list of workbooks (source_file) may grow.
+ROW_SOURCES_MAX = 2000
+
+
+def _book_list(books: Sequence[str], limit: int = ROW_SOURCES_MAX) -> str:
+    """Workbook names joined for one row's source_file - whole names only.
+    Cut at 200 characters, three long NDE workbook names lost the last
+    one's end, and the knowledge graph no longer found that workbook's
+    cells (kg_excel.read_ledger; review, 2026-10-20). Past `limit` the
+    rest are counted ('and 3 more')."""
+    out: List[str] = []
+    size = 0
+    for i, b in enumerate(books):
+        if out and size + 2 + len(b) > limit:
+            return ", ".join(out) + f", and {len(books) - i} more"
+        out.append(b)
+        size += len(b) + (2 if len(out) > 1 else 0)
+    return ", ".join(out)
 
 
 # ── the review workbook ─────────────────────────────────────────────────
@@ -2672,13 +2752,32 @@ PEOPLE_HEAD = ["Initials", "Full name", "Values signed", "First seen at"]
 def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]:
     """Every inspector's initials the run found ('JB', and both of 'JB/MK'),
     with how many values they signed and where first. Written names are
-    left out: they need no answer."""
+    left out: they need no answer.
+
+    Each reading is counted once, at its signer's cell. A signed reading is
+    offered twice (decide: the template's cell and '<field> [MK]'), and
+    both rows were counted - 'Inspector: MK' over 3 readings said 6; and a
+    row agreeing inspectors share ('JB/MK') is at JB's cell, which was
+    MK's 'First seen at' (review, 2026-10-20). So a person's own-column
+    rows are counted; a template-cell row only for a reading that has none."""
+    decisions = list(decisions)
+
+    def own(d) -> Optional[str]:            # '<field> [MK]' signed by MK: its base
+        m = INSPECTOR_COL.match(d.obs.field or "")
+        return m.group("field") if m and d.obs.inspector \
+            and m.group("who") == d.obs.inspector else None
+
+    def signers(d) -> List[str]:
+        keys = [_initials(w) for w in re.split(r"[/,;&+]", d.obs.inspector or "")]
+        return [k for k in dict.fromkeys(keys) if re.fullmatch(r"[A-Z]{2,4}", k)]
+    covered = {(k, d.obs.part, d.obs.item, base) for d in decisions
+               for base in [own(d)] if base for k in signers(d)}
     out: Dict[str, Tuple[int, str]] = {}
     for d in decisions:
-        for who in re.split(r"[/,;&+]", d.obs.inspector or ""):
-            key = _initials(who)
-            if not re.fullmatch(r"[A-Z]{2,4}", key):
-                continue
+        base = own(d)
+        for key in signers(d):
+            if base is None and (key, d.obs.part, d.obs.item, d.obs.field) in covered:
+                continue                    # counted on its own-column row
             n, first = out.get(key, (0, d.obs.where))
             out[key] = (n + 1, first)
     return out
@@ -2694,6 +2793,13 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     amber = PatternFill("solid", fgColor="FFF2CC")
     red = PatternFill("solid", fgColor="F8CBAD")
 
+    def put(sheet, row) -> None:
+        # no control character: one cell read through Excel holding CHAR(1)
+        # raised IllegalCharacterError here and no review was written
+        # (review, 2026-10-20)
+        sheet.append([xl_text(v) for v in row])
+
+    read = None if run.read is None else {str(Path(s)) for s in run.read}
     info = wb.active
     info.title = "Read me"
     lines = [
@@ -2701,9 +2807,13 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         "",
         "1. Values: check each row. Accept = Y goes into the parent CSV; blank or N "
         "does not. Rows already Y were clear matches. Amber rows need a decision; red "
-        "rows are clashes between sources — accept one value only.",
+        "rows are clashes between sources — accept one value only: two different "
+        "values accepted for one cell are both left out at Apply, which says so.",
         "2. Labels to map: labels that matched no field. Pick a field in 'Map to field' "
-        "(it is remembered for every future file), or put Y in Ignore.",
+        "(it is remembered for every future file), or put Y in Ignore. Mapped values go "
+        "into the row's Part: type over it if it is wrong. An amber Part was only "
+        "suggested by Council's model: they go into it once you accept a value of that "
+        "workbook on Values with that part.",
         "3. People: type the full name for each inspector's initials (amber rows). It is "
         "remembered, and the knowledge graph links their inspections to that person.",
         "4. Save this workbook, then press Apply in the Ledger tab (or run:   "
@@ -2712,16 +2822,18 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         f"Parent CSV: {csv_path}",
         f"Made: {datetime.now().isoformat(timespec='seconds')}",
         "Sources:",
-    ] + [f"  {s}" for s in run.sources] + ([""] + ["Problems:"] +
-                                           [f"  {p}" for p in run.problems] if run.problems else [])
+    ] + [f"  {s}" + ("" if read is None or str(Path(s)) in read else
+                      "   (not read: nothing from it is in this review, and Apply leaves it out)")
+         for s in run.sources] + ([""] + ["Problems:"] +
+                                  [f"  {p}" for p in run.problems] if run.problems else [])
     for i, line in enumerate(lines, start=1):
-        info.cell(i, 1, line)
+        info.cell(i, 1, xl_text(line))
     info["A1"].font = Font(bold=True, size=14)
     info.column_dimensions["A"].width = 120
 
     fields_ws = wb.create_sheet("Fields")
     for i, f in enumerate(schema.fields, start=1):
-        fields_ws.cell(i, 1, f.name)
+        fields_ws.cell(i, 1, xl_text(f.name))
     fields_ws.sheet_state = "hidden"
     field_list = f"=Fields!$A$1:$A${len(schema.fields)}"
 
@@ -2733,8 +2845,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     row_n = 1
     for d in decisions:
         o = d.obs
-        ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
-                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
+        put(ws, ["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
+                 o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
         row_n += 1
         fill = red if d.conflict else (amber if not d.accept else None)
         if fill is not None:
@@ -2753,10 +2865,12 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     grouped: Dict[Tuple[str, str], List[Obs]] = defaultdict(list)
     for o in run.unmatched:
         grouped[(normalize_label(o.label), o.where.split("!")[0])].append(o)
-    for (_, _), obs in sorted(grouped.items()):
+    for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
         o = obs[0]
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
-        lab.append(["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item])
+        put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item])
+        if o.part_how.startswith(MODEL_PART_HOW):
+            lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
     lab.add_data_validation(dv2)
     dv2.add(f"A2:A{max(lab.max_row, 2) + 100}")
@@ -2779,15 +2893,15 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             if f.per_item:
                 gap = [it for it in schema.items if it in f.cells and it not in got]
                 if gap:
-                    miss.append([p, f.name, _span(gap, schema.items), len(f.cells)])
+                    put(miss, [p, f.name, _span(gap, schema.items), len(f.cells)])
             elif not got:
-                miss.append([p, f.name, "", ""])
+                put(miss, [p, f.name, "", ""])
     _style(miss, bold, [10, 60, 40, 6])
 
     im = wb.create_sheet("Images", 4)
     im.append(["File", "Sheet", "Anchor", "Saved as", "Read by", "Values used", "Text read"])
     for n in run.images:
-        im.append([n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
+        put(im, [n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
     _style(im, bold, [28, 16, 8, 60, 26, 10, 80])
 
     # Who each inspector's initials are. The knowledge graph never guesses
@@ -2797,14 +2911,23 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     ppl.append(PEOPLE_HEAD)
     known = load_people(csv_path)
     for key, (n, first) in sorted(review_initials(decisions).items()):
-        ppl.append([key, known.get(key, ""), n, first])
+        put(ppl, [key, known.get(key, ""), n, first])
         if not known.get(key):
             ppl.cell(ppl.max_row, 2).fill = amber
     _style(ppl, bold, [10, 32, 7, 50])
 
     meta = wb.create_sheet("_run")
-    meta["A1"] = json.dumps({"csv": str(csv_path), "sources": run.sources,
-                             "pattern_mask": pattern_mask or "", "part": part or ""})
+    data: Dict[str, Any] = {"csv": str(csv_path), "sources": run.sources,
+                            "pattern_mask": pattern_mask or "", "part": part or ""}
+    if read is not None:
+        # what Apply reads again (Extraction.read), by place in "sources" (a
+        # cell holds 32,767 characters); none given: every source was read
+        idx = [i for i, s in enumerate(run.sources) if str(Path(s)) in read]
+        if len(idx) < len(run.sources):
+            data["read"] = idx
+    if run.model_parts:                   # and the parts the model gave them
+        data["model_parts"] = {k: list(v) for k, v in run.model_parts.items()}
+    meta["A1"] = json.dumps(data)
     meta.sheet_state = "hidden"
     wb.active = 1
     _save_wb(wb, Path(path))
@@ -3016,6 +3139,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     judge = Matcher(schema)
 
     learned, ignored = {}, []
+    # the Part on each mapped row of 'Labels to map', by (label, workbook ›
+    # sheet) as write_review groups them: one typed there is the reviewer's
+    on_labels: Dict[Tuple[str, str], str] = {}
     lab = wb["Labels to map"]
     for row in lab.iter_rows(min_row=2, values_only=True):
         to, ign, label = row[0], row[1], row[2]
@@ -3023,6 +3149,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             continue
         if to and str(to) in valid:
             learned[normalize_label(label)] = str(to)
+            if len(row) > 7:
+                on_labels[(normalize_label(label), str(row[6] or "").split("!")[0])] = \
+                    _text(row[7])
         elif str(ign or "").strip().upper() == "Y":
             ignored.append(normalize_label(label))
     mapping.update(learned)
@@ -3042,15 +3171,39 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         if people:
             save_people(csv_path, people)
 
-    # the reviewer's choices, by where each value came from
+    # The reviewer's choices, by where each value came from: a row's own cell
+    # and each cell its note says the same value is 'also at'. Read again,
+    # the value can be found first at one of those (a label learned just
+    # now ranks it higher): it was then 'not seen in the review', and a
+    # value marked N went into the parent CSV (review, 2026-10-20).
     choice: Dict[Tuple[str, str, str], Tuple[bool, str, str, str]] = {}
+    reviewed: List[Tuple[List[str], str, str, Tuple[bool, str, str, str]]] = []
+    shown = set()                       # (cell, item) of every reading on Values
+    # The part Council's model gave a workbook (Extraction.model_parts), and
+    # what the reviewer said of it on Values: another part typed over it, or
+    # it accepted as it is (_place_mapped)
+    found = {str(k): (str(v[0]), str(v[1])) for k, v in (meta.get("model_parts") or {}).items()
+             if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
+    retyped: Dict[str, set] = defaultdict(set)
+    confirmed = set()
     for row in wb["Values"].iter_rows(min_row=2, values_only=True):
         acc, part, item, fname, value, score, via, label, where = row[:9]
         if not where:
             continue
         yes = str(acc or "").strip().upper() == "Y"
-        choice[(str(where), str(fname or ""), _text(item))] = (
-            yes, _text(part), _text(value), str(fname or ""))
+        c = (yes, _text(part), _text(value), str(fname or ""))
+        book = str(where).split(" › ", 1)[0]
+        if book in found and str(row[11] if len(row) > 11 else "").startswith(MODEL_PART_HOW):
+            if c[1] and c[1] != found[book][0]:
+                retyped[book].add(c[1])
+            elif c[1] and yes:
+                confirmed.add(book)
+        cells = [str(where)] + _also_at(row[10] if len(row) > 10 else "")
+        choice[(cells[0], c[3], _text(item))] = c
+        for w in cells[1:]:
+            choice.setdefault((w, c[3], _text(item)), c)
+        shown.update((w, _text(item)) for w in cells)
+        reviewed.append((cells, c[3], _text(item), c))
         # accepting an unsure match teaches it, like a mapping on Labels to map;
         # a one-word label ("Date") is too generic to remember
         if yes and fname in valid and label and via in ("match", "ambiguous", "model") \
@@ -3061,38 +3214,60 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         mapping.update(learned)
         save_aliases(csv_path, mapping, ignore)
 
-    # read the sources as the extract did: same part-name mask, same Part
-    run = extract(schema, meta["sources"], mapping, ignore, image_reader=image_reader,
+    # read the sources as the extract did: same part-name mask, same Part,
+    # the same names; only those the review holds (Extraction.read), with
+    # the parts Council's model gave them (Extraction.model_parts)
+    sources = list(meta["sources"])
+    read = meta.get("read")
+    if isinstance(read, list):
+        read = [sources[i] for i in read if isinstance(i, int) and 0 <= i < len(sources)]
+    else:
+        read = sources                                  # all read, or an older review
+    run = extract(schema, read, mapping, ignore, image_reader=image_reader,
                   use_images=use_images, progress=prog,
                   pattern_mask=meta.get("pattern_mask") or None,
-                  part=meta.get("part") or "")
+                  part=meta.get("part") or "",
+                  part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
+                  labels=source_labels(sources))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
-    accepted = 0
+    mapped: List[Decision] = []
     for d in decisions:
         o = d.obs
-        c = choice.get((o.where, o.field, o.item))
+        cells = [o.where] + _also_at(o.note)
+        c = next((choice[k] for k in ((w, o.field, o.item) for w in cells) if k in choice),
+                 None)
         if c is not None:
             d.accept, part, value, _ = c
             o.part = part or o.part
             o.value = value if value != "" else o.value
-        elif normalize_label(o.label) in learned:
-            d.accept = bool(o.part) and not d.conflict      # you mapped it just now
+        elif normalize_label(o.label) in learned and \
+                not any((w, o.item) in shown for w in cells):
+            # you mapped it just now: never a reading Values showed you, which
+            # was accepted there or not at all (review, 2026-10-20)
+            d.accept = not d.conflict
+            mapped.append(d)
         else:
             d.accept = False                                # not seen in review
-        accepted += d.accept
+    held = _place_mapped(mapped, on_labels, retyped, confirmed)
     # rows edited in the review whose source re-read differently (a Field or
     # Part typed in by hand) are taken as typed
-    seen = {(d.obs.where, d.obs.field, d.obs.item) for d in decisions}
-    for (where, fname, item), (acc, part, value, _) in choice.items():
-        if acc and (where, fname, item) not in seen and placeable(fname) and part:
+    seen = {(w, d.obs.field, d.obs.item) for d in decisions
+            for w in [d.obs.where] + _also_at(d.obs.note)}
+    no_part = 0
+    for cells, fname, item, (acc, part, value, _) in reviewed:
+        if acc and not any((w, fname, item) in seen for w in cells) and placeable(fname):
+            if not part:
+                no_part += 1
+                continue
             decisions.append(Decision(Obs(part, item, fname, value, 1.0, "review",
-                                          "", where), True))
-            accepted += 1
+                                          "", cells[0]), True))
+    accepted, notes = _one_value_per_cell(decisions, schema, no_part)
+    notes = held + notes
 
-    rows = rows_from(decisions, schema)
+    rows = rows_from(decisions, schema, sources=True)       # each row: its workbooks
     prog.stage("writing the parent CSV", total=len(rows), unit="rows")
-    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in meta["sources"])[:200])
+    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in read)[:200])
     prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:
@@ -3108,8 +3283,106 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
             filled.append(str(out))
             prog.advance(what=f"{out.name} written")
     return ApplyResult(learned, ignored, accepted, len(rows), res.describe(), filled,
-                       warnings + [f"conflict kept: {c}" for c in res.conflicts],
+                       notes + warnings + [f"conflict kept: {c}" for c in res.conflicts],
                        people=people)
+
+
+def _also_at(note) -> List[str]:
+    """The cells a value's note says the same value was found at too
+    ('also at EC_log.xlsx › Log!D2', decide)."""
+    return [p[8:] for p in str(note or "").split("; ") if p.startswith("also at ")]
+
+
+def _place_mapped(mapped: List[Decision], on_labels: Dict[Tuple[str, str], str],
+                  retyped: Dict[str, set], confirmed: set) -> List[str]:
+    """The part each value of a label mapped on 'Labels to map' goes into;
+    what Apply says of those it leaves out.
+
+    A Part typed over the one its 'Labels to map' row showed is the
+    reviewer's, and is used. A part only Council's model suggested is used
+    once the reviewer confirmed it on Values (a value of that workbook
+    accepted with it); typed over there, the typed part is used. Replayed at
+    Apply, mapped values went under the model's part although the reviewer
+    had typed another on both sheets: a sample that does not exist (review,
+    2026-10-20). Not confirmed, they are left out and said so - the model's
+    part is never pre-accepted."""
+    groups: Dict[Tuple[str, str], List[Decision]] = defaultdict(list)
+    for d in mapped:
+        groups[(normalize_label(d.obs.label), d.obs.where.split("!")[0])].append(d)
+    held: Dict[Tuple[str, str], int] = Counter()          # (workbook, why) -> values
+    for key, ds in groups.items():
+        typed = on_labels.get(key, "")
+        parts = {d.obs.part for d in ds}
+        if typed and typed not in parts:
+            if len(parts - {""}) <= 1:        # the one part the row showed, typed over
+                for d in ds:
+                    d.obs.part, d.obs.part_how = typed, "typed on Labels to map"
+                continue
+            # one row for readings of several parts: which one is meant is not known
+            for d in ds:
+                if d.accept:
+                    d.accept = False
+                    held[(key[1], f"they are of {len(parts)} parts and one Part ({typed}) "
+                                  "was typed for them on 'Labels to map' — Extract again "
+                                  "(the mapping is remembered) and type each part on Values")] += 1
+            continue
+        for d in ds:
+            o = d.obs
+            if not d.accept or not o.part_how.startswith(MODEL_PART_HOW):
+                continue
+            book = o.where.split(" › ", 1)[0]
+            other = retyped.get(book, set())
+            if len(other) == 1 and book not in confirmed:
+                o.part = next(iter(other))          # the part typed on Values for it
+                continue
+            if book in confirmed and not other:
+                continue                            # the model's part, accepted on Values
+            d.accept = False
+            held[(book, f"the parts given for it on Values disagree "
+                        f"({', '.join(sorted(other | {o.part}))}) — type the right one in the "
+                        "Part column on 'Labels to map' and Apply again" if other else
+                        f"its part {o.part} was only suggested by Council's model — accept "
+                        "one of that workbook's values on Values with that part (Extract "
+                        "again if none is there), or type the right part in the Part column "
+                        "on 'Labels to map', and Apply again")] += 1
+    return [f"{n} mapped value{'s' if n > 1 else ''} from {book} {'were' if n > 1 else 'was'} "
+            f"not written: {why}" for (book, why), n in held.items()]
+
+
+def _one_value_per_cell(decisions: List[Decision], schema: TemplateSchema,
+                        no_part: int = 0) -> Tuple[int, List[str]]:
+    """How many values go into the parent CSV, and what Apply says.
+
+    Two different values accepted for one cell (both rows of a red clash)
+    are both left out, and said so: rows_from kept the first, silently
+    (review, 2026-10-20). An accepted value with no part is left out and
+    counted - it was counted as accepted and dropped. The same value
+    accepted twice is one."""
+    by_cell: Dict[Tuple[str, str, str], List[Decision]] = defaultdict(list)
+    for d in decisions:
+        if not d.accept or not d.obs.field:
+            continue
+        if not d.obs.part:
+            d.accept = False
+            no_part += 1
+            continue
+        by_cell[(d.obs.part, d.obs.item, d.obs.field)].append(d)
+    notes: List[str] = []
+    accepted = 0
+    for (part, item, fname), ds in by_cell.items():
+        values = list(dict.fromkeys(d.obs.value for d in ds))
+        if len(values) == 1:
+            accepted += 1
+            continue
+        for d in ds:
+            d.accept = False
+        notes.append(f"{len(values)} values accepted for {part} {item + ' ' if item else ''}"
+                     f"{fname} ({', '.join(values)}) — kept none; choose one")
+    if no_part:
+        notes.append(f"{no_part} accepted or mapped values have no {schema.id_field} and "
+                     "were not written — type it in the Part column on Values (on "
+                     "'Labels to map' for a mapped label) and Apply again")
+    return accepted, notes
 
 
 # ── optional: a local model suggests mappings for leftover labels ──────

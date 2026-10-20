@@ -404,14 +404,18 @@ def _decode(raw: bytes) -> str:
     return raw.decode("latin-1", "replace")
 
 
-#: (the review's sources as the CSV's source_file says them, part, item,
-#: field, value) -> 'nde.xlsx › Part 101!C4'
-Provenance = Dict[Tuple[str, str, str, str, str], str]
+#: (the review's sources as the CSV's source_file says them - or one
+#: workbook of them, part, item, field, value) -> the cells found for it,
+#: newest review first: (0 for the cell the review shows, 1 for one its
+#: note says the value is 'also at'; when the review was made; the cell,
+#: 'nde.xlsx › Part 101!C4')
+Provenance = Dict[Tuple[str, str, str, str, str], List[Tuple[int, str, str]]]
 
 
 def _applied_as(meta: Dict[str, Any]) -> str:
-    """What apply_review writes in the CSV's source_file for this review's
-    rows: its sources' names, joined, cut at 200 characters."""
+    """What apply_review wrote in the CSV's source_file for this review's
+    rows until 2026-10-20: its sources' names, joined, cut at 200
+    characters. Since then each row names its own workbooks."""
     return ", ".join(Path(str(s)).name for s in meta.get("sources", []))[:200]
 
 
@@ -421,6 +425,9 @@ def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
     source_file column names them - so a row cites only the review that was
     APPLIED to it, never a newer one saved and not applied (review,
     2026-10-16: a resent workbook was cited for a value it did not give).
+    Keyed by one workbook too (a row now names its own), a newer review of
+    a workbook of the same name is found as well: read_ledger.where ranks a
+    review made after the row was written last.
     A review belongs to this CSV by its resolved path (by name only when that
     path is gone: the folder was moved). Only a place for a value already in
     the CSV is looked up here: nothing in a review is read as a fact."""
@@ -462,15 +469,42 @@ def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
         try:
             if "Values" not in wb.sheetnames:
                 continue
+            made = _made(wb)
+
+            def put(key, rank: int, cell: str) -> None:
+                got = index.setdefault(key, [])
+                if (rank, made, cell) not in got:
+                    got.append((rank, made, cell))
             for row in wb["Values"].iter_rows(min_row=2, values_only=True):
                 if len(row) < 9 or str(row[0] or "").strip().upper() != "Y" or not row[8]:
                     continue
-                key = (applied, _text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
-                       _text(row[4]))
-                index.setdefault(key, str(row[8]))
+                rest = (_text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
+                        _text(row[4]))
+                put((applied,) + rest, 0, str(row[8]))
+                # Apply now names each row's own workbooks (source_extract.
+                # rows_from), not the whole run's (review, 2026-10-20): the
+                # value is also found by the workbook it was at - its cell,
+                # or a cell its note says it is 'also at' (ranked after the
+                # cell the review shows: read_ledger.where)
+                note = str(row[10] or "") if len(row) > 10 else ""
+                for rank, w in enumerate([str(row[8])] + [p[8:] for p in note.split("; ")
+                                                          if p.startswith("also at ")]):
+                    put((w.split(" › ", 1)[0],) + rest, min(rank, 1), w)
         finally:
             wb.close()
     return index, n, notes
+
+
+def _made(wb) -> str:
+    """When a review workbook was made ('Made: 2026-10-20T06:43:12' on its
+    Read me sheet, as the CSV's updated_at is written), or ''."""
+    if "Read me" not in wb.sheetnames:
+        return ""
+    for row in wb["Read me"].iter_rows(min_row=1, max_row=40, max_col=1, values_only=True):
+        t = str(row[0] or "")
+        if t.startswith("Made: "):
+            return t[6:].strip()
+    return ""
 
 
 def load_schema(csv_path: Path):
@@ -502,7 +536,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     reader = csv.reader(io.StringIO(text, newline=""))
     header: Optional[List[str]] = None
     roles: Dict[int, Tuple[str, Any]] = {}
-    id_i = item_i = src_i = None
+    id_i = item_i = src_i = upd_i = None
     part_rule = kgm.LEDGER_PART
     parts, people = set(), set()
     n_rows = skipped = located = 0
@@ -530,6 +564,8 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                     item_i = i
                 elif col == sl.SOURCE_COL:
                     src_i = i
+                elif col == sl.UPDATED_COL:
+                    upd_i = i
                 elif col in sl.META_COLS:
                     continue
                 elif schema.inspector_base(col):
@@ -565,6 +601,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
         parts.add(part)
         item = cell(item_i)
         sources = cell(src_i)
+        updated = cell(upd_i)
         base: Dict[str, Any] = {"row": n}
         if item:
             base["item"] = f"{schema.item_field} {item}"
@@ -577,9 +614,22 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
 
         def where(field: str, value: str) -> str:
             # a part-level value sits on every flaw row of its part, but the
-            # review lists it once, under no flaw
-            return (prov.get((sources, part.lower(), item, field, value))
-                    or prov.get((sources, part.lower(), "", field, value)) or "")
+            # review lists it once, under no flaw. The row's sources as one
+            # review's whole run first (an older Apply wrote that), then each
+            # workbook it names (_provenance). Of the cells found, one from a
+            # review made before this row was written (the one applied to
+            # it, not a newer one saved and not applied) first, then the
+            # cell the review shows before one it is 'also at' - which was
+            # cited when its workbook came first in source_file (review,
+            # 2026-10-20)
+            pl = part.lower()
+            hits = [h for s in [sources] + [b for b in sources.split(", ") if b and b != sources]
+                    for k in ((s, pl, item, field, value), (s, pl, "", field, value))
+                    for h in prov.get(k, ())]
+            if not hits:
+                return ""
+            return min(hits, key=lambda h: (bool(updated and h[1] and h[1] > updated),
+                                            h[0]))[2]
 
         def add_person(who: str, col: str, shown: str, src_key: Tuple[str, str]):
             nonlocal located
