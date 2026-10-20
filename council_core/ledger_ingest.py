@@ -321,8 +321,15 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                   progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                   part_finder=part_finder)
     if report is not None and not run.cancelled:
-        prog.stage("asking Council's model about the labels left over")
-        ledger_llm.place_labels(run, ledger.schema, chat, report)
+        if cancel is not None and cancel.is_set():
+            # pressed after the last workbook was read: every value is in
+            # the review, which is not a cancelled one; the model is not
+            # asked about the labels after a Cancel (review, 2026-10-19)
+            report.problems.append("Cancelled before Council's model was asked about the "
+                                   "labels left over")
+        else:
+            prog.stage("asking Council's model about the labels left over")
+            ledger_llm.place_labels(run, ledger.schema, chat, report)
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)

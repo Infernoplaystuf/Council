@@ -136,6 +136,73 @@ def test_no_reader_means_images_are_saved_not_read(setup):
     assert not any(o.from_image for o in run.obs)
 
 
+def test_no_pictures_folder_is_made_for_a_workbook_without_pictures(setup):
+    schema, _, sources, tmp = setup
+    run = extract(schema, [sources[0]], image_dir=tmp / "imgs", use_images=False)
+    assert run.obs and not run.images
+    assert not (tmp / "imgs").exists()
+
+
+def test_a_pictures_folder_path_too_long_is_one_problem_not_a_failed_extract(
+        setup, monkeypatch):
+    """A review folder whose '<review>_images' path was 248+ characters
+    failed the whole Extract with a raw FileNotFoundError [WinError 206],
+    pictures ticked or not: the folder was made before anything else
+    (review, 2026-10-19). Now the pictures are not saved, once said, and
+    the values are all read."""
+    import errno
+    schema, _, sources, tmp = setup
+    nde2 = make_nde_book(tmp / "NDE again.xlsx")            # a second picture
+    real = Path.mkdir
+
+    def too_long(self, *a, **kw):
+        if self.name == "imgs":
+            raise OSError(errno.ENAMETOOLONG, "The filename or extension is too long")
+        return real(self, *a, **kw)
+    monkeypatch.setattr(Path, "mkdir", too_long)
+    for use_images in (False, True):
+        reader = fake_reader(CONCEALMENT_IMAGE_ROWS) if use_images else None
+        run = extract(schema, sources + [nde2], image_dir=tmp / "imgs", image_reader=reader,
+                      use_images=use_images)
+        said = [p for p in run.problems if "path too long" in p]
+        n = len(str((tmp / "imgs").absolute())) + 1
+        assert len(said) == 1, run.problems
+        assert said[0].startswith("pictures not saved: path too long (")
+        assert said[0].endswith(" characters) — enable Windows long paths or move the folder")
+        assert int(said[0].split("(")[1].split()[0]) > n
+        assert len(run.images) == 2 and not any(i.saved_as for i in run.images)
+        assert any(o.field == "Frequency (kHz)" for o in run.obs)
+        assert any(o.from_image for o in run.obs) == use_images     # still read
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_real_pictures_folder_path_too_long_does_not_fail_the_extract(tmp_path):
+    """The tester's repro: <review>_images of 248+ characters, Windows long
+    paths off."""
+    import os
+    from council_core import ledger_ingest as li
+    probe = tmp_path / ("p" * 120) / ("q" * 120)
+    try:
+        os.makedirs(probe)
+        pytest.skip("Windows long paths are on here")
+    except OSError:
+        pass
+    suffix = len("\\review_20261019_123456_images")
+    folder = tmp_path / ("d" * (250 - suffix - len(str(tmp_path)) - 1))
+    folder.mkdir()
+    review = folder / "review_20261019_123456.xlsx"
+    assert len(str(review.with_name(review.stem + "_images"))) == 250
+    tpl = make_template(folder / "t.xlsx")
+    csv = folder / "p.csv"
+    li.create_parent(str(tpl), str(csv))
+    src = make_nde_book(folder / "nde.xlsx")                  # has a picture
+    for use_images in (False, True):
+        s = li.run_extract(str(csv), [str(src)], str(review), use_images=use_images,
+                           image_reader=fake_reader(CONCEALMENT_IMAGE_ROWS))
+        assert Path(s.review).exists() and s.values
+        assert [p for p in s.problems if p.startswith("pictures not saved: path too long")]
+
+
 def test_unknown_labels_and_problems(setup):
     schema, _, sources, tmp = setup
     run = _run(schema, sources, tmp)

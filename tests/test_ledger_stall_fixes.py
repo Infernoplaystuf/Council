@@ -9,7 +9,9 @@ What the stall hunt measured, and what each test pins:
   54 s with the GIL held;
 - the review writer and 'Other values offered' were quadratic;
 - Cancel did nothing inside a workbook, a Cancel that killed Excel lost
-  the whole run, and Cancel during the last workbook was not recorded;
+  the whole run, and Cancel during the last workbook was not recorded -
+  and then a Cancel pressed after the last workbook was read made a whole
+  review a cancelled, 'partial' one;
 - Apply re-read the sources without the part-name mask;
 - the stall dump could not be written while the app was frozen.
 """
@@ -211,6 +213,90 @@ def test_cancel_during_the_last_workbook_is_recorded(tmp_path, ledger):
     run = se.extract(schema, [big], use_images=False, cancel=cancel,
                      progress=_Prog(cancel, "finding values"))
     assert run.cancelled and not run.obs
+
+
+class _CancelWhenRead(_Prog):
+    """Presses Cancel once a workbook has been read to the end."""
+    def update(self, what="", **k):
+        pass
+
+    def advance(self, *a, what="", **k):
+        if self.when in str(what):
+            self.cancel.set()
+
+
+def _partless(path: Path) -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Build"
+    ws["A1"], ws["B1"] = "Frequency (kHz)", 55
+    ws["A2"], ws["B2"] = "Zorp rate", 7
+    wb.save(path)
+    return path
+
+
+def test_a_cancel_after_the_last_workbook_was_read_is_not_a_cancelled_run(tmp_path, ledger):
+    """Pressed after the last workbook was read, it marked a whole review
+    'Cancelled... partial review' (review, 2026-10-19)."""
+    csv, schema = ledger
+    a = lf.make_laser_log(tmp_path / "a_laser.xlsx")
+    b = _partless(tmp_path / "b_nopart.xlsx")
+    cancel = threading.Event()
+    run = se.extract(schema, [a, b], use_images=False, cancel=cancel,
+                     progress=_CancelWhenRead(cancel, "b_nopart.xlsx read in"))
+    assert cancel.is_set() and not run.cancelled
+    assert not any("ancel" in p for p in run.problems)
+    assert {o.where.split(" › ")[0] for o in run.obs} == {"a_laser.xlsx", "b_nopart.xlsx"}
+
+    # the Ledger tab's call, Council's model ticked: a whole review, and the
+    # model is not asked about the labels after the Cancel
+    asked = []
+
+    def chat(prompt, _schema):
+        asked.append(prompt)
+        return json.dumps({"part": "", "evidence": ""} if "Which part" in prompt
+                          else {"mappings": []}), "fake-granite"
+    cancel = threading.Event()
+    s = li._extract(str(csv), [str(a), str(b)], tmp_path / "review.xlsx", "", False, None,
+                    _CancelWhenRead(cancel, "b_nopart.xlsx read in"), None, cancel, None,
+                    True, chat)
+    assert cancel.is_set() and not s.cancelled and s.values
+    assert asked and all("Which part" in p for p in asked)
+    assert any("Cancelled before Council's model was asked about the labels" in p
+               for p in s.problems)
+
+
+def test_a_cancel_that_cut_the_last_workbook_short_is_still_a_cancelled_run(
+        tmp_path, ledger, monkeypatch):
+    """Cut short where the read swallowed it - Excel killed while it copied
+    a picture out, the model stopped mid-answer: that workbook is not in
+    the review, and the run is cancelled."""
+    _csv, schema = ledger
+    a = lf.make_laser_log(tmp_path / "a_laser.xlsx")
+    b = _partless(tmp_path / "b_nopart.xlsx")
+    cancel = threading.Event()
+
+    def stopped_model(name, grids):
+        cancel.set()                         # Cancel pressed: the model stops
+        return "", ""
+    run = se.extract(schema, [a, b], use_images=False, cancel=cancel,
+                     part_finder=stopped_model)
+    assert run.cancelled
+    assert run.obs and all("a_laser" in o.where for o in run.obs)
+    assert any("while reading 'b_nopart.xlsx'" in p for p in run.problems)
+
+    real = se.load_workbook_grids
+
+    def killed_while_copying(path, *args, **kw):
+        out = real(path, *args, **kw)
+        if Path(path).name == "b_nopart.xlsx":
+            cancel.set()                     # what Excel gave back is cut short
+        return out
+    monkeypatch.setattr(se, "load_workbook_grids", killed_while_copying)
+    cancel = threading.Event()
+    run = se.extract(schema, [a, b], use_images=False, cancel=cancel)
+    assert run.cancelled
+    assert run.obs and all("a_laser" in o.where for o in run.obs)
 
 
 # ---------------------------------------------- Apply keeps the mask

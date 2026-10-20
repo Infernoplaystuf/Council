@@ -29,12 +29,21 @@ And what a review of those fixes found (review, 2026-10-19):
 - a row of 'NG' results with no label over the next table was an inspector;
 - 'Run #: 3' named the part.
 
+And what testers found after those (review, 2026-10-19):
+- 'TBD', 'N/A', 'to be assigned', '-' in the Part Number was the part,
+  pre-accepted, and Apply wrote it to the parent CSV; a part not of the
+  user's part-name pattern was pre-accepted too;
+- a 'Lot Number', 'Job Number', 'Drawing Number' column was every row's
+  part, pre-accepted; 'Part Revision' named the part, and so did the
+  'Lot Number: ...' cell under a 'Part Information' heading.
+
 Synthetic data only (tests/ledger_fixtures.py).
 """
 from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -572,3 +581,198 @@ def test_a_password_workbook_is_counted_as_password_protected(ledger, tmp_path):
     assert run.open_failures == [("pw.xlsx", "password")]
     assert "password to open" in run.problems[0]
     assert "1 password-protected" in summarize_open_failures(run.open_failures)
+
+
+# ── 8. a placeholder is not a part ──────────────────────────────────────
+PLACEHOLDERS = ["TBD", "N/A", "n/a", "to be assigned", "pending", "unknown", "-", "?", "none"]
+
+
+def _build_sheet(wb, title="Build"):
+    ws = wb.active
+    ws.title = title
+    return ws
+
+
+@pytest.mark.parametrize("typed", PLACEHOLDERS)
+def test_a_placeholder_in_the_part_number_is_no_part(ledger, tmp_path, typed):
+    """'Part Number: TBD' made the part 'TBD', its values pre-accepted, and
+    Apply wrote them to the parent CSV."""
+    schema, csv = ledger
+    for layout in ("inline", "beside", "column"):
+        wb = openpyxl.Workbook()
+        ws = _build_sheet(wb)
+        if layout == "column":
+            ws["A3"], ws["B3"], ws["C3"] = "Part Number", "Frequency (kHz)", "Power (W)"
+            ws["A4"], ws["B4"], ws["C4"] = typed, 50, 250
+        else:
+            if layout == "inline":
+                ws["A1"] = f"Part Number: {typed}"
+            else:
+                ws["A1"], ws["B1"] = "Part Number", typed
+            ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+        src = tmp_path / f"build_{layout}.xlsx"
+        run, dec = _decided(schema, wb, src)
+        assert run.obs and {o.part for o in run.obs} == {""}, (typed, layout)
+        assert not any(d.accept for d in dec), (typed, layout)
+        review = tmp_path / f"review_{layout}.xlsx"
+        se.write_review(review, run, dec, schema, str(csv))
+        se.apply_review(review, use_images=False)
+        assert ParentCSV(csv).sample_ids() == [], (typed, layout)
+
+
+def test_a_placeholder_part_leaves_the_part_to_the_other_ways(ledger, tmp_path):
+    """No part on the sheet: its name, the workbook, the file name are tried."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb, "Part 2041")
+    ws["A1"] = "Part Number: TBD"
+    ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+    _, dec = _decided(schema, wb, tmp_path / "sheet.xlsx")
+    assert [(d.obs.part, d.obs.part_how) for d in dec] == [("2041", "sheet name 'Part 2041'")]
+
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb)
+    ws["A1"], ws["B1"] = "Part Number", "N/A"
+    ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+    wb.create_sheet("Cover")["A1"] = "S/N: LMM1AB101"
+    _, dec = _decided(schema, wb, tmp_path / "cover.xlsx")
+    assert [(d.obs.part, d.obs.part_how) for d in dec] == [
+        ("LMM1AB101", "the one part number in the workbook")]
+
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb)
+    ws["A1"] = "Part Number: to be assigned"
+    ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+    _, dec = _decided(schema, wb, tmp_path / "LMM1AB102_build.xlsx", pattern_mask="@@@#@@###")
+    assert [d.obs.part for d in dec] == ["LMM1AB102"]
+    assert dec[0].obs.part_how.startswith("file name") and not dec[0].accept
+
+
+def test_placeholders_are_known():
+    for typed in PLACEHOLDERS + ["TBA", "n.a.", "NA", "--", "(TBD)", "Not assigned",
+                                 "to be determined", " tbd "]:
+        assert se.is_placeholder(typed), typed
+    for real in ("LMM1AB101", "AB-2041", "101", "TBD-101", "N/A-7", "Pending 4", "NAB1"):
+        assert not se.is_placeholder(real), real
+    from council_core import kg_excel
+    assert kg_excel.split_people("to be assigned") == [] and kg_excel.split_people("N/A") == []
+
+
+def test_a_part_not_of_the_users_pattern_is_kept_but_not_pre_accepted(ledger, tmp_path):
+    schema, _ = ledger
+    for i, (typed, fits) in enumerate([("AB-2041", False), ("LMM1AB101", True)]):
+        wb = openpyxl.Workbook()
+        ws = _build_sheet(wb)
+        ws["A1"] = f"Part Number: {typed}"
+        ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+        ws["D3"], ws["E3"], ws["F3"] = "Part Number", "Power (W)", "Frequency (kHz)"
+        ws["D4"], ws["E4"], ws["F4"] = typed, 250, 50
+        _, dec = _decided(schema, wb, tmp_path / f"mask{i}.xlsx", pattern_mask="@@@#@@###")
+        assert dec and {d.obs.part for d in dec} == {typed}
+        if fits:
+            assert all(d.accept for d in dec if not d.conflict)
+            assert not any(se.MISFIT_PART_HOW in d.obs.part_how for d in dec)
+        else:
+            assert not any(d.accept for d in dec), typed
+            assert all(d.obs.part_how.endswith("does not fit the part-name pattern")
+                       for d in dec), [d.obs.part_how for d in dec]
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb)
+    ws["A1"] = "Part Number: AB-2041"
+    ws["A3"], ws["B3"] = "Frequency (kHz)", 50
+    # the Part you typed is yours, whatever its shape
+    _, dec = _decided(schema, wb, tmp_path / "typed.xlsx", pattern_mask="@@@#@@###",
+                      part="AB-2041")
+    assert [(d.obs.part, d.accept) for d in dec] == [("AB-2041", True)]
+    # and the preview says what the extract does
+    wb.save(tmp_path / "preview.xlsx")
+    rep = se.preview_workbook(tmp_path / "preview.xlsx", schema, pattern_mask="@@@#@@###")
+    assert rep.sheets[0].part_id == "AB-2041"
+    assert rep.sheets[0].part_how.endswith(se.MISFIT_PART_HOW)
+
+
+# ── 9. another kind of identifier is not the part ───────────────────────
+OTHER_IDS = ["Lot Number", "Job Number", "Heat Number", "Work Order Number", "Drawing Number",
+             "Revision", "Part Revision", "Lot No.", "Heat #", "Dwg No", "PO Number"]
+
+
+@pytest.mark.parametrize("label", OTHER_IDS)
+def test_another_identifiers_column_is_not_the_part_column(ledger, tmp_path, label):
+    """A 'Lot Number' column was the Part Number column: every row's part
+    was its lot, pre-accepted."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb)
+    ws["A1"] = "Part records"
+    ws["A3"], ws["B3"], ws["C3"] = label, "Frequency (kHz)", "Power (W)"
+    ws["A4"], ws["B4"], ws["C4"] = "AB-2041", 50, 250
+    ws["A5"], ws["B5"], ws["C5"] = "AB-2042", 60, 260
+    run, dec = _decided(schema, wb, tmp_path / "table.xlsx")
+    assert run.obs and {o.part for o in run.obs} == {""}, label
+    assert not any(d.accept for d in dec), label
+    # its values are offered to map, not lost
+    assert sorted(o.value for o in run.unmatched if o.label == label) == ["AB-2041", "AB-2042"]
+
+
+@pytest.mark.parametrize("label", OTHER_IDS)
+def test_another_identifier_on_a_form_does_not_name_the_part(ledger, tmp_path, label):
+    """Under a 'Part Information' heading the 'Lot Number: AB-2041' cell was
+    the part; 'Part Revision: B' named the part on its own."""
+    schema, _ = ledger
+    for heading in (True, False):
+        wb = openpyxl.Workbook()
+        ws = _build_sheet(wb)
+        if heading:
+            ws["A1"] = "Part Information"
+        ws["A2"] = f"{label}: AB-2041"
+        ws["A4"], ws["B4"] = "Frequency (kHz)", 50
+        run, dec = _decided(schema, wb, tmp_path / f"form_{heading}.xlsx")
+        assert [(o.field, o.part) for o in run.obs] == [("Frequency (kHz)", "")], label
+        assert not any(d.accept for d in dec), label
+        assert [(o.label, o.value) for o in run.unmatched] == [(label, "AB-2041")]
+
+
+def test_a_lot_column_beside_the_part_column_is_a_label_not_the_part(ledger, tmp_path):
+    """'Lot Number' matches no field now, but it is still a label: the
+    'Part Number | Lot Number' header must not read as a Part Number with
+    the value 'Lot Number' beside it - for this sheet and the next."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = _build_sheet(wb)
+    rows = [["Part Number", "Lot Number", "Frequency (kHz)", "Power (W)"],
+            ["AB-2041", "L-77", 50, 250], ["AB-2042", "L-78", 60, 260]]
+    for r, row in enumerate(rows, 3):
+        for c, v in enumerate(row, 1):
+            ws.cell(r, c, v)
+    notes = wb.create_sheet("Notes")
+    notes["A1"], notes["B1"] = "Date", "2026-10-05"
+    run, dec = _decided(schema, wb, tmp_path / "lots.xlsx")
+    assert {(o.field, o.part) for o in run.obs} == {
+        ("Frequency (kHz)", "AB-2041"), ("Power (W)", "AB-2041"),
+        ("Frequency (kHz)", "AB-2042"), ("Power (W)", "AB-2042"), ("Date", "")}
+    assert sorted(o.value for o in run.unmatched if o.label == "Lot Number") == ["L-77", "L-78"]
+    assert all(d.accept for d in dec if d.obs.part)
+
+
+def test_the_parts_own_labels_still_name_it(ledger, tmp_path):
+    """Serial Number, S/N, Part No. name the part, with a heading over them
+    or in a table; a template whose id IS the lot keeps its own label."""
+    schema, _ = ledger
+    for i, label in enumerate(["Serial Number", "S/N", "Part No.", "Part #"]):
+        wb = openpyxl.Workbook()
+        ws = _build_sheet(wb)
+        ws["A1"] = "Part Information"
+        ws["A2"] = f"{label}: AB-2041"
+        ws["A4"], ws["B4"] = "Frequency (kHz)", 50
+        _, dec = _decided(schema, wb, tmp_path / f"own{i}.xlsx")
+        assert [(d.obs.part, d.accept) for d in dec] == [("AB-2041", True)], label
+    m = se.Matcher(schema)
+    for label in ("Serial Number", "S/N", "Sample ID", "Specimen ID", "Part Number"):
+        assert not m.other_id(label), label
+    lot = replace(schema, id_field="Lot Number")
+    assert not se.Matcher(lot).other_id("Lot Number")
+    assert se.Matcher(lot).other_id("Heat Number")
+    pn = m.by_name[schema.id_field]
+    ex = se._Extractor(se.Grid("f.xlsx", "S", {}), m, se.ItemCodes(schema.items), "")
+    assert not ex._sure_id("Part Revision", se.Match(pn, 0.87, via="match"))
+    assert ex._sure_id("Part Revision", se.Match(pn, 1.0, via="alias"))      # you mapped it
