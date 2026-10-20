@@ -196,7 +196,7 @@ _NOT_INITIALS = {
     # became a person called 'MW' - review, 2026-10-19): not listed.
     "psi", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
     "sec", "min", "max", "avg", "std", "ppm",
-}
+} | _se().NOT_INITIALS        # the Ledger's: result codes 'NRI', 'IND', 'REJ' ...
 #: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?'.
 _NOBODY = re.compile(r"(?i)\s*(?:n\s*/\s*a|n\.?\s*a\.?|-+|\?+|tbd|tba|none|nil|unknown)\s*")
 

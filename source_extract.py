@@ -63,7 +63,7 @@ import re
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -119,6 +119,7 @@ _ABBREV = {
     "concealment": "conceal", "pre concealment": "pre conceal",
     "post concealment": "post conceal", "mid concealment": "mid conceal",
     "response": "", "repsonse": "", "reading": "", "value": "", "measured": "",
+    "sn": "serial number",
 }
 _ABBREV_RE = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_ABBREV, key=len, reverse=True)) + r")\b")
@@ -159,6 +160,9 @@ def tokens(text: str) -> List[str]:
     base, _ = split_unit(text)
     base = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", base)    # OCR's "PartNumber"
     s = re.sub(r"p\s*/\s*n", " pn ", base.lower())
+    # 'S/N', 'S/N:', 'SN' - the serial number, which names the part like P/N
+    # does; it read as nothing and the part was missed (review, 2026-10-19)
+    s = re.sub(r"\bs\s*/\s*n\b", " sn ", s)
     s = re.sub(r"[#]", " number ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     s = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(1)], s)   # one pass: no re-expansion
@@ -315,6 +319,10 @@ class Matcher:
                 s *= 0.5
             if ctx & (self._sec[t.name] | (fset - sset)):
                 s += SECTION_BONUS
+            if not sset & fset and not _near_typo(src, ft):
+                # no word in common: letters alone made 'Owner' Power (W) at
+                # 0.8 and 'Parameter' the Part Number (review, 2026-10-19)
+                s = min(s, SUGGEST_AT - 0.01)
             scored.append((s, t))
         if not scored:
             return Match(None, 0.0, via="none")
@@ -331,6 +339,23 @@ class Matcher:
         if len(scored) > 1 and raw - scored[1][0] < TIE_GAP:
             return Match(best, shown, guesses, via="ambiguous")
         return Match(best, shown, guesses, via="match")
+
+
+def _near_typo(src: Sequence[str], field_toks: Sequence[str]) -> bool:
+    """A label word that is a slip of one of the field's words ('Lenght',
+    'Frequncy', 'Amplitde') or its first letters ('Ampl'): same first letter,
+    nearly the same letters. 'Owner' / 'Tower' are not 'Power', 'Partner' is
+    not 'Part'."""
+    for a in src:
+        for b in field_toks:
+            if a[0] != b[0]:
+                continue
+            if len(a) >= 3 and len(b) > len(a) and b.startswith(a):
+                return True
+            if min(len(a), len(b)) >= 5 and \
+                    difflib.SequenceMatcher(None, a, b).ratio() >= 0.8:
+                return True
+    return False
 
 
 def _strip_unit(label: str) -> str:
@@ -365,6 +390,37 @@ _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za
 #: Matched on the stripped cell only (no overlapping whitespace runs: the
 #: old pattern backtracked cubically on a space-padded cell).
 _WHO_HEADING = re.compile(r"^(?P<who>[A-Z]{2,4})(?:\s*[-–—:,(][\d\s\-/.:,)]*)?$")
+#: Short words an inspection sheet writes where initials could stand that are
+#: nobody's initials: result codes (FPI's 'NRI' no relevant indication, 'IND',
+#: 'NDI', 'ACC', 'REJ', 'RJT', 'NCR'), outcomes ('OK', 'NA', 'TBD') and a
+#: reading's qualifier ('31 (AVG)'). A row of 'NRI | IND' over the next table
+#: was taken as an inspector's heading (review, 2026-10-19). Not 'EC': Eva
+#: Chen signs as EC. council_core.kg_excel's stop list takes these too.
+NOT_INITIALS = frozenset({
+    "nri", "ind", "ndi", "acc", "rej", "rjt", "ncr", "ok", "na", "tbd",
+    "pass", "fail", "nde", "fpi", "avg", "max", "min", "std",
+})
+#: What else a reading's brackets hold in capitals: a direction or a kind of
+#: value ('45 (CCW)', '0.5 (REF)'), kept with the reading - not a signer.
+_NOT_SIGNERS = frozenset({"cw", "ccw", "ref", "typ", "nom", "est", "rms"})
+#: A reading signed in its cell: '31 (JB)', '31 [JB]', '0.245 mm (J.B.)'.
+_SIGNED = re.compile(r"^(?P<v>[+-]?(?:\d+\.?\d*|\.\d+)(?:\s*(?:°|\"|[A-Za-zµμ/]+))?)"
+                     r"\s*[\(\[]\s*(?P<who>[A-Za-z][A-Za-z.\s]{1,7})\s*[\)\]]$")
+#: What may share a row with a heading of initials: its date ('2026-09-18',
+#: '9/18', 'Date: 2026-09-18', 'Date').
+_DATE_CELL = re.compile(r"(?i)^\s*(?:date\b\s*[:=\-]?\s*)?"
+                        r"(?:\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{1,2}[-/]\d{1,2})?\s*$")
+
+
+def _signed_by(text: str) -> str:
+    """The initials in a reading's brackets ('J.B.' -> 'JB'), or '' when the
+    brackets hold a unit ('0.245 (mm)', '(IN)') or a code ('(NA)', '(AVG)')."""
+    raw = " ".join(text.split())
+    if not (re.fullmatch(r"(?:[A-Z]\.?\s?){2,4}", raw)
+            or re.fullmatch(r"(?:[A-Za-z]\.\s?){2,4}", raw)):
+        return ""                         # 'Jb', 'avg', 'mm': not someone signing
+    t = re.sub(r"[.\s]", "", raw).lower()
+    return "" if t in UNITS or t in NOT_INITIALS or t in _NOT_SIGNERS else t.upper()
 
 
 def _existing_cells(ws):
@@ -547,7 +603,7 @@ def preview_workbook(path, schema, aliases=None,
         book_part, how = next(iter(found)), "the one part number in the workbook"
     elif not found:
         book_part = file_part
-        how = f"file name {p.name!r} — check it" if book_part else ""
+        how = f"{FILE_PART_HOW} {p.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
     for ex in exs:
@@ -661,8 +717,11 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     if not path.exists():
         raise LedgerError(f"{path.name} not found")
     if kind == "password":
-        raise LedgerError(f"{path.name} has a password to open; open it in Excel, save a "
-                          "copy without the password, and add that copy")
+        # from an ExcelOpenError of kind 'password', so the batch's roll-up
+        # says 'password-protected', not 'other' (review, 2026-10-19)
+        msg = (f"{path.name} has a password to open; open it in Excel, save a "
+               "copy without the password, and add that copy")
+        raise LedgerError(msg) from excel_open.ExcelOpenError(msg, kind="password")
     if kind != "zip" or path.suffix.lower() in (".xls", ".xlsb"):
         return _grids_from_excel(path, notes, want_pictures, careful)
     try:
@@ -816,6 +875,12 @@ class _Extractor:
         fname = field_name or (match.target.fields[0] if match.target else "")
         note = ""
         val_unit = ""
+        signed = _SIGNED.match(txt.strip()) if isinstance(value, str) else None
+        if signed and _signed_by(signed.group("who")):
+            # '31 (JB)': the reading is 31 and JB signed it - not the text
+            # '31 (JB)', pre-accepted and put down to the sheet's 'Inspector:
+            # MK' (review, 2026-10-19)
+            txt, who = signed.group("v").strip(), _signed_by(signed.group("who"))
         if isinstance(value, str) and match.target and match.target.unit:
             nu = _NUM_UNIT.match(txt)
             if nu and nu.group("u").lower() in UNITS:     # a unit we know, not "2x"
@@ -870,14 +935,10 @@ class _Extractor:
                         if who:
                             self.used.add((r, c + dc))
                         break
-            if not who and len(v) <= 60:
-                # a heading of initials and a date is short; a long padded
-                # cell made this pattern backtrack for 54 s with the GIL held
-                # (review, 2026-10-19)
-                h = _WHO_HEADING.match(v.strip())
-                if h and person(h.group("who")) and not self.codes.canon(v) \
-                        and self._heads_a_table(r, c):
-                    who = h.group("who")
+            if not who:
+                h = self._heading_who(v, person)
+                if h and self._heads_a_table(r, c, person):
+                    who = h
             if who:
                 self.markers.append((r, c, who))
                 self.used.add((r, c))
@@ -891,15 +952,36 @@ class _Extractor:
                             self.used.add((r, c2 + 1))
         if not self.markers:
             h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
-            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE"):
+            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE") \
+                    and h.group(1).lower() not in NOT_INITIALS:
                 self.markers.append((0, 0, h.group(1)))
 
-    def _heads_a_table(self, r, c) -> bool:
-        """A heading, not a value: no numbers on its row, and right under it a
-        header row of 2+ labels that starts at its column. (Initials typed in
-        an 'Inspector Initials' column sit on a row of readings - not this.)"""
-        if any(not isinstance(v, str) for _c, v in self.row(r)):
-            return False
+    def _heading_who(self, v, person) -> str:
+        """The initials a table heading is ('JB', 'JB — 2026-09-18'), or ''.
+        Never a result code ('NRI', 'IND', 'OK') nor a flaw code."""
+        if not isinstance(v, str) or len(v) > 60:
+            # a heading of initials and a date is short; a long padded
+            # cell made this pattern backtrack for 54 s with the GIL held
+            # (review, 2026-10-19)
+            return ""
+        h = _WHO_HEADING.match(v.strip())
+        if not h or h.group("who").lower() in NOT_INITIALS or not person(h.group("who")) \
+                or self.codes.canon(v):
+            return ""
+        return h.group("who")
+
+    def _heads_a_table(self, r, c, person) -> bool:
+        """A heading, not a value: ALONE on its row - beside it only its date,
+        or another inspector's heading over a table side by side - and right
+        under it a header row of 2+ labels that starts at its column.
+        (Initials typed in an 'Inspector Initials' column sit on a row of
+        readings, and 'FPI | NRI | IND' is a row of results over the next
+        flaw table - neither is this; review, 2026-10-19.)"""
+        for c2, v in self.row(r):
+            if c2 == c or isinstance(v, date):            # a datetime too
+                continue
+            if not isinstance(v, str) or not (_DATE_CELL.match(v) or self._heading_who(v, person)):
+                return False
         below = sorted(cc for cc, v in self.row(r + 1)
                        if isinstance(v, str) and c - 1 <= cc <= c + 8)
         return len(below) >= 2 and below[0] <= c + 1
@@ -936,7 +1018,7 @@ class _Extractor:
             if self.m.is_item_header(label):
                 continue                       # "Flaw #" is not "Part #"
             mt = self.m.match(label, per_item=False)
-            if mt.target and mt.target.is_id and mt.score >= SUGGEST_AT:
+            if self._sure_id(label, mt):
                 val = inline if inline else self._value_near(r, c)
                 if val and self.codes.canon(val):
                     continue                   # a flaw code is never a part number
@@ -952,6 +1034,16 @@ class _Extractor:
             self.part_how = f"sheet name {self.g.sheet!r}"
             return
         self.part_how = ""
+
+    def _sure_id(self, label, mt: Match) -> bool:
+        """A label that IS the part number's: an alias, a sure match, or one
+        sharing a word with it ('Part No.', 'P/N', 'Serial Number'). A
+        'Parameter | Value' table matched 'Part Number' at 0.6 and made every
+        part 'Value'; 'Partner' did too (review, 2026-10-19)."""
+        if not (mt.target and mt.target.is_id and mt.score >= SUGGEST_AT):
+            return False
+        return mt.via == "alias" or mt.score >= ACCEPT_AT or bool(
+            set(tokens(label)) & set(self.m._tok[mt.target.name]))
 
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
@@ -1920,7 +2012,7 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         book_part, how = found.pop(), "the one part number in the workbook"
     elif not found:
         book_part = _part_from_filename(src.stem, mask_re)
-        how = f"file name {src.name!r} — check it" if book_part else ""
+        how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
     else:
         book_part, how = "", ""
     if part_finder is not None and not part and not book_part and any(
@@ -1969,7 +2061,14 @@ def _part_from_filename(stem: str, mask_re: "Optional[re.Pattern]" = None) -> st
     m = re.search(r"(?i)(?:part|sample|p/?n|s/?n)[\s_\-#]*([A-Za-z]*\d[\w\-]*)", stem)
     if m:
         return m.group(1)
-    nums = re.findall(r"(?<![\d.])\d{2,8}(?![\d.])", stem)
+    if mask_re is not None:
+        return ""          # the user said what a part looks like; this is not one
+    # a number on its own ('101 inspection', 'line3_2048'), never one inside a
+    # longer word: 'week41' made part 41 and 'LMM1AB101' part 101, pre-accepted
+    # (review, 2026-10-19). Two numbers: no guess.
+    if len(re.findall(r"\d{2,8}", stem)) != 1:
+        return ""
+    nums = re.findall(r"(?<![A-Za-z\d.])\d{2,8}(?![A-Za-z\d.])", stem)
     return nums[0] if len(nums) == 1 else ""
 
 
@@ -1993,14 +2092,19 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     in that person's own column, "<field> [JB]", where it is the only value
     and can be pre-accepted; and as a candidate for the template's single
     cell, where readings that disagree clash - the reviewer accepts one."""
-    groups: Dict[Tuple[str, str, str], List[Obs]] = defaultdict(list)
+    groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
     for o in run.obs:
-        groups[(o.part, o.item, o.field)].append(o)
+        # A value with no part is its own workbook's: two part-less workbooks
+        # with the same Frequency were one review row ('also at ...'), the
+        # reviewer typed one part in it, and the other sample lost the value
+        # at Apply (review, 2026-10-19).
+        book = "" if o.part else o.where.split(" › ", 1)[0]
+        groups[(o.part, o.item, o.field, book)].append(o)
         if o.inspector:
             own = replace(o, field=inspector_column(o.field, o.inspector))
-            groups[(o.part, o.item, own.field)].append(own)
+            groups[(o.part, o.item, own.field, book)].append(own)
     out = []
-    for (part, item, fname), obs in groups.items():
+    for (part, item, fname, _book), obs in groups.items():
         obs.sort(key=lambda o: -o.score)
         values = Counter(o.value for o in obs)
         clash = len(values) > 1
@@ -2037,7 +2141,10 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
             ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
                   and "not converted" not in o.note
-                  and not o.part_how.startswith(MODEL_PART_HOW))
+                  and not o.part_how.startswith(MODEL_PART_HOW)
+                  # a part read from the file name says '— check it': it is
+                  # (digits of 'EC_log_week41' were pre-accepted as part 41)
+                  and not o.part_how.startswith(FILE_PART_HOW))
             out.append(Decision(o, ok, text))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
@@ -2048,6 +2155,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
 
 #: How a part Council's model suggested is described (never pre-accepted).
 MODEL_PART_HOW = "suggested by Council's model"
+#: How a part read from the workbook's file name is described (never
+#: pre-accepted either).
+FILE_PART_HOW = "file name"
 
 #: How many other values a clashing review row lists.
 OTHERS_SHOWN = 20
