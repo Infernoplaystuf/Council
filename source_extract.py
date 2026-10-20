@@ -344,15 +344,17 @@ class Matcher:
                                        or self.other_id_label(v))
 
     def is_item_header(self, label: str) -> bool:
-        if not self.schema.item_field:
-            return False
+        if not self.schema.item_field or not _words(label):
+            return False                 # a long cell is no 'Flaw #' (LABEL_MAX)
         t = tokens(label)
         return t in (tokens(self.schema.item_field), ["flaw"], ["flaw", "id"],
                      ["defect"], ["defect", "number"], ["feature"], ["item"])
 
     def match(self, label, context: Sequence[str] = (), per_item: Optional[bool] = None) -> Match:
         """per_item: True inside an item grid/table, False outside, None = any."""
-        if not isinstance(label, str):
+        if not isinstance(label, str) or (len(label) > LABEL_MAX and not _words(label)):
+            # a note or a padded cell is no label: scored against every
+            # field, a long one held the GIL (review, 2026-10-20)
             return Match(None, 0.0, via="none")
         key = normalize_label(label)
         if not key or key in self.ignore:
@@ -458,16 +460,68 @@ def _strip_unit(label: str) -> str:
 
 
 # ── who logged a reading ────────────────────────────────────────────────
+#: The most a label is, in characters of its words: a field's, a person's,
+#: a run's or a column's title is a few words. Longer text - a note, a cell
+#: padded with spaces - is a value, never matched as a label.
+LABEL_MAX = 120
+
+
+def _words(v, most: int = LABEL_MAX) -> str:
+    """``v``'s words with one space between them, or '' when they run past
+    ``most`` characters (or ``v`` is not text): what a label is matched on.
+    No run of spaces is left for a pattern to backtrack over."""
+    if not isinstance(v, str):
+        return ""
+    s = " ".join(v.split())
+    return s if len(s) <= most else ""
+
+
+#: A run of spaces, tabs or line breaks: one match each, read once.
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def _lines(v, most: int = LABEL_MAX) -> str:
+    """_words, but a run of spaces with a line break in it ('\\n', '\\r\\n',
+    '\\r') is one '\\n', not a space: the lines a cell is typed on stay
+    apart. 'Inspector: JB' Alt+Enter 'MK' is two lines, nobody's initials -
+    read as 'Inspector: JB MK' it signed and pre-accepted every reading
+    under it as 'Jb Mk' and gave the graph a person 'JBMK' (second
+    review, 2026-10-20). Still one pass over the cell, no run left to backtrack
+    over; as long as _words (a run is one character either way)."""
+    s = _words(v, most)
+    if not s or ("\n" not in v and "\r" not in v):
+        return s                          # one line, or too long to be a label
+    return _SPACE_RUN.sub(lambda m: "\n" if "\n" in m.group() or "\r" in m.group() else " ",
+                          v).strip()
+
+
+class _OnWords:
+    """A label pattern tried on a cell's words (_lines), never on the cell
+    as typed: '\\s*[:#]?\\s*$', '(?P<who>.+?)\\s*$' and the like backtracked
+    quadratically over a run of spaces - 'Inspector', 'inspected by', 'Run'
+    or 'Response' padded with thousands of them held the GIL for seconds to
+    minutes, the app froze and Cancel could not be pressed (review,
+    2026-10-20). Its lines stay apart, as they were for the pattern: a
+    '(?P<who>.+?)' is on one line. council_core.kg_excel uses these too."""
+
+    def __init__(self, pattern: str):
+        self.pattern = re.compile(pattern)
+
+    def match(self, v):
+        s = _lines(v)
+        return self.pattern.match(s) if s else None
+
+
 #: A label that introduces a person: "Inspector: JB", "Operator - MK".
-_WHO_INLINE = re.compile(
+_WHO_INLINE = _OnWords(
     r"(?i)^\s*(?:inspector(?:\s+initials)?|initials|operator|technician|tech|analyst|"
     r"inspected\s+by|checked\s+by|logged\s+by)\s*(?:[:=\-–—]\s*|\s+by\s+)(?P<who>.+?)\s*$")
-_WHO_BY = re.compile(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
+_WHO_BY = _OnWords(r"(?i)^\s*(?:inspected|checked|logged)\s+by\s+(?P<who>.+?)\s*$")
 #: A column / label that holds initials, with the value beside or below it.
 #: 'Inspector Name', 'QC Inspector', 'Technician Initials', 'Operator ID'
 #: count too: they never gave a person in the knowledge graph (review,
 #: 2026-10-19).
-_WHO_HEAD = re.compile(
+_WHO_HEAD = _OnWords(
     r"(?i)^\s*(?:"
     r"(?:(?:qc|qa|lead|nde|ndt|ndi)\s+)?"
     r"(?:inspector|technician|tech|operator|analyst|examiner)(?:'?s)?"
@@ -475,10 +529,10 @@ _WHO_HEAD = re.compile(
     r"|initials|inspected\s+by|checked\s+by|performed\s+by|by"
     r")\s*[:#]?\s*$")
 #: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
-_RUN_HEAD = re.compile(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
+_RUN_HEAD = _OnWords(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
 #: The column holding the reading in a long log, beside one naming what it is.
-_VALUE_HEAD = re.compile(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
-                         r"measurement)\s*(?:\([^)]*\))?\s*$")
+_VALUE_HEAD = _OnWords(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
+                       r"measurement)\s*(?:\([^)]*\))?\s*$")
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
 _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za-zµμ/]+)\s*$")
 #: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
@@ -1143,7 +1197,9 @@ class _Extractor:
             if rr in people:
                 continue                                  # say who, not what
             row = self.row(rr)
-            if len(row) == 1 and isinstance(row[0][1], str):
+            if len(row) == 1 and _words(row[0][1]):
+                # a heading, not a note or a padded cell: its words were
+                # read again for every label under it (review, 2026-10-20)
                 ctx.append(row[0][1])
         self._ctx[key] = ctx
         return list(ctx)
@@ -1321,6 +1377,7 @@ class _Extractor:
         for (r, c), v in sorted(self.g.cells.items()):
             if not isinstance(v, str):
                 continue
+            self._tick()                       # Cancel is seen here too (review, 2026-10-20)
             label, inline = _split_inline(v)
             if self.m.is_item_header(label) or (len(label) <= 30 and _RUN_HEAD.match(label)):
                 continue                       # "Flaw #", "Run #" are not "Part #"
@@ -1733,10 +1790,26 @@ class _Extractor:
 
 def _split_inline(v: str) -> Tuple[str, str]:
     """'Operator: AK' -> ('Operator', 'AK'); OCR's 'PartNumber:2041' too.
-    Times like 10:30 stay whole: the label must have a letter in it."""
-    m = re.match(r"^\s*([^:=]{1,60}?)\s*[:=]\s*(.+)$", v)
-    if m and re.search(r"[A-Za-z]", m.group(1)) and not m.group(2).startswith(("/", "\\")):
-        return m.group(1), m.group(2).strip()
+    Times like 10:30 stay whole: the label must have a letter in it.
+
+    Read without a pattern over the whole cell: '^\\s*([^:=]{1,60}?)\\s*[:=]
+    \\s*(.+)$' backtracked quadratically over a run of spaces - a cell of
+    4,000 spaces and 'NOTE' held the GIL for 2 s, one of 20,000 for 63 s,
+    the app froze and Cancel could not be pressed (review, 2026-10-20). The
+    same reading: the label is what comes before the first ':' or '=' (60
+    characters at most, stripped), the value what follows it, on one line
+    (a trailing line break aside), kept as typed."""
+    i = min((j for j in (v.find(":"), v.find("=")) if j >= 0), default=-1)
+    label = v[:i].strip() if i >= 0 else ""
+    if 0 < len(label) <= 60 and re.search(r"[A-Za-z]", label):
+        rest = v[i + 1:]
+        if rest.endswith("\n"):
+            rest = rest[:-1]                  # '$' matches before a last line break
+        value = rest.lstrip()
+        if value and "\n" not in value and not value.startswith(("/", "\\")):
+            return label, value.strip()
+        if not value and rest and rest[-1] != "\n":
+            return label, ""                  # 'Operator: ' - a label, no value
     return v.strip(), ""
 
 
@@ -2863,8 +2936,12 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     lab = wb.create_sheet("Labels to map", 2)
     lab.append(LAB_HEAD)
     grouped: Dict[Tuple[str, str], List[Obs]] = defaultdict(list)
+    keys: Dict[str, str] = {}          # one label per column of rows: read once
     for o in run.unmatched:
-        grouped[(normalize_label(o.label), o.where.split("!")[0])].append(o)
+        k = keys.get(o.label)
+        if k is None:
+            k = keys[o.label] = normalize_label(o.label)
+        grouped[(k, o.where.split("!")[0])].append(o)
     for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
         o = obs[0]
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])

@@ -159,8 +159,10 @@ def _col_letter(c: int) -> str:
 
 
 def _label_text(v) -> str:
-    """'Program Lead:' -> 'Program Lead'."""
-    return re.sub(r"[\s:]+$", "", " ".join(str(v).split()))
+    """'Program Lead:' -> 'Program Lead'. Not '[\\s:]+$': it rescanned a
+    run of colons from each of them, quadratic on a cell of ':' (review,
+    2026-10-20); the words have no other space to strip."""
+    return " ".join(str(v).split()).rstrip(" :")
 
 
 def _norm(v) -> str:
@@ -668,7 +670,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
             else:
                 r = x
                 import field_search as fs
-                for one in (fs._split_values(v, r.label, r.type) or [v]):
+                for one in (fs._split_values(_unpadded(v), r.label, r.type) or [v]):
                     loc = {**base, "column": col}
                     w = where(col, v)
                     if w:
@@ -1179,9 +1181,24 @@ def sheet_part(name: str) -> str:
     return _se()._part_from_name(n)
 
 
+#: A run of spaces, tabs or line breaks this long is padding, not a gap
+#: between values.
+_PADDING = re.compile(r"\s{32}")
+
+
+def _unpadded(raw: str) -> str:
+    """``raw`` for field_search's split: as typed, unless it holds padding
+    (_PADDING) - then its words, one space apart. The split's '\\s*;\\s*',
+    '\\s*,\\s*' and '\\s+and\\s+' rescan a run of spaces from each of its
+    characters: one cell of 'x', 32,000 spaces and 'y' held the GIL for 8 s,
+    an 'Inspector:' padded cell for 22 s (review, 2026-10-20)."""
+    return " ".join(raw.split()) if _PADDING.search(raw) else raw
+
+
 def _split(raw: str, rule) -> List[str]:
     import field_search as fs
-    return [x for x in (fs._split_values(raw, rule.label, rule.type) or [raw]) if x]
+    return [x for x in (fs._split_values(_unpadded(raw), rule.label, rule.type) or [raw])
+            if x]
 
 
 def plausible(rule, raw: str) -> bool:

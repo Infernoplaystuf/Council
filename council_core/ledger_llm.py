@@ -392,6 +392,9 @@ class AssistReport:
     asking: str = ""
     #: ``asking`` when the model stopped being asked.
     stopped_on: str = ""
+    #: Cancel stopped the question being asked (one_shot): the model did
+    #: not fail, and no problem line says it did not answer.
+    cancelled: bool = False
 
     def _ran_out(self) -> str:
         """Why a model that timed out was not asked again: one slow workbook
@@ -407,6 +410,11 @@ class AssistReport:
         if down.endswith(":") and ". " in down:            # '... installed. Install with:'
             down = down.rsplit(". ", 1)[0]
         down = _clip(down, 200)
+        stop = f"Cancel stopped it while it was asked about {self.asking or 'the workbooks'}"
+        if self.cancelled and not (self.values_placed or self.parts_found):
+            # not '(none answered) ... did not answer: stopped by the
+            # caller' (review, 2026-10-20)
+            return f"Council's model: {stop}, so nothing in the review is its suggestion."
         if down and not (self.values_placed or self.parts_found):
             lead = ("Council's model " + self._ran_out() if self.timed_out else
                     "Council's model did not answer twice in a row and was not asked "
@@ -423,7 +431,8 @@ class AssistReport:
             bits.append(f"part numbers for {self.parts_asked} workbook(s): {got}")
         stopped = (self._ran_out() if self.timed_out else
                    "stopped answering and was not asked again")
-        tail = (f". Then it {stopped}: {down}" if down else "")
+        tail = (f". Then it {stopped}: {down}" if down else "") + (
+            f". Then {stop}" if self.cancelled else "")
         return _end(" ".join(bits[:1]) + " " + "; ".join(bits[1:]) +
                     " — all amber in the review: check them" + tail)
 
@@ -477,6 +486,7 @@ def one_shot(chat: Chat, report: AssistReport,
             out = chat(prompt, schema)
         except Exception as exc:                           # noqa: BLE001
             if should_stop is not None and should_stop():
+                report.cancelled = True                    # said by the caller, not here
                 raise
             msg = str(exc).strip() or type(exc).__name__
             state["fails"] += 1
@@ -580,7 +590,8 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
                                "same error as above)")
         return
     except Exception as exc:                               # noqa: BLE001
-        report.problems.append(f"Council's model was not asked about labels: {exc}")
+        if not report.cancelled:                           # Cancel is not a failure
+            report.problems.append(f"Council's model was not asked about labels: {exc}")
         return
     placed = set()
     for o in list(run.unmatched):
@@ -869,8 +880,9 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
                                "(the same error as above)")
         return "", ""
     except Exception as exc:                               # noqa: BLE001
-        report.problems.append(f"{file_name}: Council's model was not asked for its part: "
-                               f"{exc}")
+        if not report.cancelled:                           # Cancel is not a failure
+            report.problems.append(f"{file_name}: Council's model was not asked for its "
+                                   f"part: {exc}")
         return "", ""
     got = _json(text)
     answer = str((got or {}).get("part") or "").strip() if isinstance(got, dict) else ""
@@ -1003,14 +1015,29 @@ def _inside_a_value(text: str, start: int, end: int) -> bool:
         return _a_value(token)
     if not re.search(r"\s", token):
         return False
-    prev = re.search(r"\S+[\s,;:]*$", text[:start])
+    a = _word_before(text[:start])
     nxt = re.match(r"[\s,;:]*[^\s,;:]+", text[end:])
-    a = prev.start() if prev else start
+    a = start if a is None else a
     b = end + nxt.end() if nxt else end
     first, last = start + len(token.split()[0]), end - len(token.split()[-1])
     spans = {text[a:end], text[start:b], text[a:b], text[a:first], text[last:b]}
     return any(_a_value(" ".join(s.split()).strip(_TRIM + "."))
                for s in spans if s != token)
+
+
+def _word_before(s: str) -> Optional[int]:
+    """Where r'\\S+[\\s,;:]*$' first matches in ``s`` - the word written
+    last, with the ',', ';', ':' and spaces after it - or None; read from
+    the end, once. The pattern was tried from every character and rescanned
+    the rest: a cell of 2,000 ':' and a word before a spaced part id held
+    the GIL for 6 s while the extract asked for its part (second
+    review, 2026-10-20)."""
+    r = s[::-1]
+    tail = re.match(r"[\s,;:]*", r).end()                 # one class: no backtracking
+    if tail == len(s):                                     # ',', ';', ':' and spaces only
+        m = re.search(r"\S", s)
+        return m.start() if m else None
+    return len(s) - tail - re.match(r"\S*", r[tail:]).end()
 
 
 def _a_value(s: str) -> bool:

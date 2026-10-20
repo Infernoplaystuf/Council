@@ -140,6 +140,110 @@ def test_pipeline_errors_are_shown_in_plain_words(qapp, books):
     assert "Traceback" not in tab.log.toPlainText()
 
 
+#: What the tab says for a Cancel after every workbook was read.
+_CANCELLED_READ_ALL = ("Cancelled after every workbook was read: every value the rules found "
+                       "is in the review. Open it, check the amber and red rows, map the "
+                       "leftover labels, save it, then Apply.")
+
+
+def test_cancel_while_councils_model_is_asked_says_cancelled(qapp, books, monkeypatch):
+    """Cancel pressed while Council's model was asked about the labels left
+    over: the run stopped, but the tab said 'Review written…' and its log
+    that the model had not answered - '(none answered)', 'did not answer:
+    stopped by the caller' (review, 2026-10-20). Then it said 'Cancelled.
+    The partial review…' of a review that had every value the rules found,
+    and one pressed a moment earlier, before the model was asked, 'Review
+    written…' (second review, 2026-10-20): both say the same, not
+    'partial'."""
+    import time
+    import openpyxl
+    import source_extract as se
+    from council_core import ledger_llm
+    template, src, _tmp = books
+    wb = openpyxl.Workbook()
+    wb.active["A1"], wb.active["A2"], wb.active["B2"] = "P/N: 3307", "Zorp rate", 7
+    wb.save(src / "extra.xlsx")                           # a label no rule places
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.create_btn.click()
+    assert tab.wait()
+    tab.add_sources([src])
+    tab.ask_model.setChecked(True)
+    tab._pick_model = lambda parent=None: "ollama:granite3.3:8b"
+    asked = threading.Event()
+
+    def chat_for(model_id, timeout=120, should_stop=None):
+        def chat(prompt, schema):                 # council_engine's Ollama call
+            if "Which part" in prompt:
+                return '{"part": "", "evidence": ""}', "granite3.3:8b"
+            asked.set()
+            end = time.monotonic() + 30
+            while not should_stop() and time.monotonic() < end:     # generating
+                time.sleep(0.02)
+            raise se.LedgerError("granite3.3:8b (Ollama) did not answer: stopped by the "
+                                 "caller")
+        return chat
+    monkeypatch.setattr(ledger_llm, "chat_for", chat_for)
+    tab.extract_btn.click()
+    end = time.monotonic() + 60
+    while not asked.is_set() and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert asked.is_set() and tab.cancel_btn.isEnabled()
+    tab.cancel_btn.click()
+    assert tab.wait()
+    assert tab.status.text() == _CANCELLED_READ_ALL
+    log = tab.log.toPlainText()
+    assert "did not answer" not in log and "none answered" not in log
+    assert "Cancel stopped it while it was asked about the labels left over" in log
+    assert "CANCELLED after every workbook was read" in log
+    assert ("Cancelled by user while Council's model was asked about the labels left over; "
+            "every value the rules found is in this review.") in log
+
+
+def test_cancel_before_councils_model_is_asked_says_the_same(qapp, books, monkeypatch):
+    """Pressed after the last workbook was read and before Council's model
+    was asked: the same words as pressed while it is asked - it said
+    'Review written…' (second review, 2026-10-20)."""
+    import openpyxl
+    from council_core import ledger_ingest as li
+    from council_core import ledger_llm
+    template, src, _tmp = books
+    wb = openpyxl.Workbook()
+    wb.active["A1"], wb.active["A2"], wb.active["B2"] = "P/N: 3307", "Zorp rate", 7
+    wb.save(src / "extra.xlsx")                           # a label no rule places
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.create_btn.click()
+    assert tab.wait()
+    tab.add_sources([src])
+    tab.ask_model.setChecked(True)
+    tab._pick_model = lambda parent=None: "ollama:granite3.3:8b"
+    asked = []
+
+    def chat_for(model_id, timeout=120, should_stop=None):
+        def chat(prompt, schema):
+            asked.append(prompt)
+            return '{"part": "", "evidence": ""}', "granite3.3:8b"
+        return chat
+    monkeypatch.setattr(ledger_llm, "chat_for", chat_for)
+    real = li.extract
+
+    def read_then_cancel(*a, **k):                         # pressed as the last one is read
+        run = real(*a, **k)
+        k["cancel"].set()
+        return run
+    monkeypatch.setattr(li, "extract", read_then_cancel)
+    tab.extract_btn.click()
+    assert tab.wait()
+    assert not any("Which part" not in p for p in asked)   # not asked about the labels
+    assert tab.status.text() == _CANCELLED_READ_ALL
+    log = tab.log.toPlainText()
+    assert "CANCELLED after every workbook was read" in log and "partial" not in log
+    assert ("Cancelled before Council's model was asked about the labels left over; "
+            "every value the rules found is in this review.") in log
+
+
 def test_sources_can_be_removed_and_cleared(qapp, books):
     _t, src, _tmp = books
     tab, _ = make_tab(qapp)

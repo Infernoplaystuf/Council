@@ -714,7 +714,14 @@ class LedgerTab(ViewHelpers, QWidget):
             self.stat["to_review"].setText(str(s.to_review))
             self.stat["images"].setText(f"{s.images_read} / {s.images}")
             self.stat["problems"].setText(str(len(s.problems)))
-            if getattr(s, "cancelled", False):
+            if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
+                # before or while Council's model was asked: the same words
+                # for both, and not 'partial' (second review, 2026-10-20)
+                self.status.setText(
+                    "Cancelled after every workbook was read: every value the rules found "
+                    "is in the review. Open it, check the amber and red rows, map the "
+                    "leftover labels, save it, then Apply.")
+            elif getattr(s, "cancelled", False):
                 self.status.setText(
                     "Cancelled. The partial review was still written — "
                     "open it to see what landed, or clear it and run again.")

@@ -200,10 +200,15 @@ def normalize_label(text: str) -> str:
     '(.*?)' then '\\s*' backtracked over every space, so a cell padded to
     Excel's 32,767 characters held the GIL for 2.5-3.8 s per call and froze
     the app for 10-14 s (end-to-end test, 2026-10-19). The result is the
-    same: the last step folds every non-alphanumeric run anyway."""
+    same: the last step folds every non-alphanumeric run anyway. The marks
+    at the end are stripped, not matched: '[:#*]+$' rescanned a cell of
+    32,000 ':' or '*' from each of them for 2 s (review, 2026-10-20)."""
     text = " ".join(str(text).split())
-    text = _UNIT_RE.sub(r"\1", text) or text
-    text = re.sub(r"[:#*]+$", "", text.strip())
+    # the unit is the last 26 characters at most (one space each side of its
+    # brackets): read there, not tried from every bracket of a long cell
+    head, tail = text[:-40], text[-40:]
+    text = (head + _UNIT_RE.sub(r"\1", tail)) or text
+    text = text.strip().rstrip(":#*")
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 

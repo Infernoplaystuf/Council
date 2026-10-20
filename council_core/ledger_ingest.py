@@ -162,6 +162,11 @@ class ExtractSummary:
     #: True when the extract exited early via the Ledger tab's Cancel
     #: event. The caller shows a "Cancelled" status instead of "Done".
     cancelled: bool = False
+    #: Cancelled after every workbook was read, before or while Council's
+    #: model was asked about the labels left over: every value the rules
+    #: found is in the review - it is not a partial one (second review,
+    #: 2026-10-20).
+    read_all: bool = False
     #: What Council's model was asked and found (empty when not asked).
     assist: str = ""
     #: One ``(name, reason)`` per file left out before reading: a Skip
@@ -175,7 +180,8 @@ class ExtractSummary:
              f"labels that matched no field, {self.images_read} of {self.images} "
              f"images read")
         if self.cancelled:
-            s = "CANCELLED — " + s
+            s = ("CANCELLED after every workbook was read — " if self.read_all else
+                 "CANCELLED — ") + s
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
         if self.assist:
@@ -325,16 +331,37 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                   image_reader=image_reader, part=part, use_images=use_images,
                   progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                   part_finder=part_finder)
+    read_all = False
     if report is not None and not run.cancelled:
+        rules = "every value the rules found is in this review"
         if cancel is not None and cancel.is_set():
             # pressed after the last workbook was read: every value is in
-            # the review, which is not a cancelled one; the model is not
-            # asked about the labels after a Cancel (review, 2026-10-19)
+            # the review; the model is not asked about the labels after a
+            # Cancel (review, 2026-10-19). Said as the Cancel below is: one
+            # said 'Review written…', the other 'Cancelled… partial review'
+            # (second review, 2026-10-20)
+            read_all = run.cancelled = True
             report.problems.append("Cancelled before Council's model was asked about the "
-                                   "labels left over")
+                                   f"labels left over; {rules}.")
         else:
             prog.stage("asking Council's model about the labels left over")
             ledger_llm.place_labels(run, ledger.schema, chat, report)
+            if cancel is not None and cancel.is_set():
+                # pressed while the model was asked: a cancelled run - it
+                # said 'Review written…' and that the model did not answer
+                # ('stopped by the caller', review 2026-10-20)
+                read_all = run.cancelled = True
+                if report.cancelled or not report.values_placed:
+                    run.problems.append("Cancelled by user while Council's model was asked "
+                                        f"about the labels left over; {rules}.")
+                else:
+                    # a model Cancel cannot stop (a GGUF in this process)
+                    # answered anyway: its suggestions are in the review
+                    run.problems.append(
+                        "Cancelled by user while Council's model was asked about the labels "
+                        f"left over, but it answered first; {rules}, and the "
+                        f"{report.values_placed} value(s) it placed are too (amber: check "
+                        "them).")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)
@@ -347,7 +374,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
-                          list(run.timings), bool(run.cancelled),
+                          list(run.timings), bool(run.cancelled), read_all=read_all,
                           assist=report.describe() if report is not None else "",
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files])
