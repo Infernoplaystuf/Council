@@ -15,6 +15,9 @@ HOW EXCEL IS DRIVEN (everything stays on this machine)
   * read-only, not added to recent files, closed without saving; no copy of
     the workbook - decrypted or not - is ever written;
   * a password-protected workbook is refused with a message, never prompted for.
+  * an Excel that will not start, or refuses every call (a dialog of its own
+    waiting - its license agreement), is said so once per Ledger extract,
+    and the one it started is ended, never left running hidden.
   * Pictures come out through the clipboard (Excel offers no other way, and
     rights protection may forbid even that - then the picture is reported, not
     read). Text on the clipboard beforehand is put back afterwards.
@@ -64,13 +67,17 @@ class ExcelOpenError(Exception):
       * ``'timeout'`` — Excel asked for input (sign-in) and the watchdog
         stopped it.
       * ``'unavailable'`` — Excel COM automation is not available on this
-        machine (no Windows, no pywin32, no registered Excel).
+        machine (no Windows, no pywin32, no registered Excel); or Excel
+        could not be started, or refuses every call (a dialog of its own
+        waiting) - then ``down`` says why (_excel_down).
       * ``'access'`` — access denied by the OS (locked file, missing
         permission on the folder).
       * ``'cancelled'`` — the Ledger's Cancel was pressed while this
         read was starting Excel (kill_active_excels).
       * ``'unknown'`` — fallback; the message includes diagnostic bytes.
     """
+
+    down = ""
 
     def __init__(self, message: str, kind: str = "unknown"):
         super().__init__(message)
@@ -83,6 +90,9 @@ class ExcelOpenError(Exception):
 _HRESULT_EXCEL_CANNOT_OPEN = -2146827284         # 0x800A03EC
 _HRESULT_ACCESS_DENIED = -2147024891             # 0x80070005
 _HRESULT_FILE_NOT_FOUND = -2147024894            # 0x80070002
+#: Excel refusing a call: a dialog of its own is up (its license agreement,
+#: measured on this PC) - RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER.
+_HRESULTS_REFUSED = (-2147418111, -2147417846)   # 0x80010001, 0x8001010A
 
 
 def _com_error_hresult(exc) -> Optional[int]:
@@ -101,6 +111,13 @@ def _com_error_hresult(exc) -> Optional[int]:
             if isinstance(v, int):
                 return v
     return None
+
+
+def _refused(exc) -> bool:
+    """`exc` is Excel refusing the call ('Call was rejected by callee')."""
+    args = getattr(exc, "args", None) or ()
+    return any(isinstance(c, int) and c in _HRESULTS_REFUSED
+               for c in (args[0] if args else None, _com_error_hresult(exc)))
 
 
 def _com_error_description(exc) -> str:
@@ -767,7 +784,8 @@ _ACTIVE_EXCEL_LOCK = threading.Lock()
 #: either sees the PID or is seen by the read.
 _CANCELS = 0
 
-#: The Cancel count when this thread's Ledger extract began (cancel_scope).
+#: The Cancel count when this thread's Ledger extract began (cancel_scope),
+#: and why Excel could not be started in it (``down``; None while it can).
 _SCOPE = threading.local()
 
 
@@ -785,32 +803,85 @@ def cancel_scope():
     share) and the 'through Excel' line was showing: a Cancel then found no
     PID, was not seen by the read, and the workbook was opened all the same
     (review, 2026-10-19). Reads on other threads - the knowledge graph's -
-    still count from their own start."""
+    still count from their own start.
+
+    An Excel that could not be started, or refuses every call, is not tried
+    again inside the scope: every .xls / .xlsb cost ~93 s, at Extract and
+    again at Apply, each failing the same way (review, 2026-10-20). Each
+    extract - Apply's too - tries once more: the user may have answered
+    Excel's dialog meanwhile."""
     before = getattr(_SCOPE, "since", None)
+    down = getattr(_SCOPE, "down", None)
     _SCOPE.since = _cancels()
+    _SCOPE.down = None
     try:
         yield
     finally:
         _SCOPE.since = before
+        _SCOPE.down = down
 
 
-def _register_excel_pid(app) -> Optional[int]:
-    """The PID behind an Excel.Application COM object. Returns None
-    outside Windows, when pywin32 is absent, or when the hwnd cannot
-    be read (DispatchEx without a visible window — rare)."""
+def _excel_down(why: str) -> ExcelOpenError:
+    """Excel could not be started (or refuses every call) for `why`. The
+    message names no workbook: the Ledger puts every workbook it left unread
+    on one line (source_extract._extract_one; ``down`` says it is this)."""
+    again = "extract" if getattr(_SCOPE, "since", None) is not None else "try"
+    err = ExcelOpenError(
+        f"Excel could not be started: {why} — open Excel once yourself (it may be "
+        f"asking you to accept its license), then {again} again", kind="unavailable")
+    err.down = why
+    return err
+
+
+def _excel_failed(exc, path: Path, cancels: int) -> ExcelOpenError:
+    """Excel could not be started, or refused a call, with `exc`: the error to
+    raise. Inside a Ledger extract it is remembered, so the extract's other
+    workbooks fail at once (cancel_scope). A Cancel pressed meanwhile is
+    raised instead (_stop_if_cancelled) and nothing is remembered."""
+    _stop_if_cancelled(path, cancels)
+    why = (_com_error_description(exc) or repr(exc)).rstrip(". ")[:200]
+    if getattr(_SCOPE, "since", None) is not None:
+        _SCOPE.down = why
+    return _excel_down(why)
+
+
+#: How long app.Hwnd is asked again while Excel refuses calls. It was read
+#: once: an Excel refusing calls (its license agreement up) was neither tied
+#: to this process nor registered for Cancel (review, 2026-10-20).
+_HWND_WAIT_S = 2.0
+
+
+def _excel_pid(app, wait: Optional[float] = None) -> Optional[int]:
+    """The PID behind an Excel.Application COM object, from its window -
+    asked again for `wait` seconds (_HWND_WAIT_S) while Excel refuses the
+    call. None outside Windows, when pywin32 is absent, when the window
+    cannot be read (a fake, an Excel still refusing) or names no process."""
+    import time
     try:
         import win32process
-        hwnd = int(getattr(app, "Hwnd", 0))
-        if not hwnd:
-            return None
-        _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
-        if not pid:
-            return None
-        with _ACTIVE_EXCEL_LOCK:
-            _ACTIVE_EXCEL_PIDS.add(int(pid))
-        return int(pid)
-    except Exception:                                       # noqa: BLE001
+    except ImportError:
         return None
+    end = time.monotonic() + (_HWND_WAIT_S if wait is None else wait)
+    while True:
+        try:
+            hwnd = int(app.Hwnd)
+            if not hwnd:
+                return None
+            return int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
+        except Exception as e:                              # noqa: BLE001
+            if not _refused(e) or time.monotonic() >= end:
+                return None
+        time.sleep(0.1)
+
+
+def _register_excel_pid(pid: Optional[int]) -> Optional[int]:
+    """Note `pid`, a hidden Excel this process started, for the Ledger's
+    Cancel (kill_active_excels)."""
+    if not pid:
+        return None
+    with _ACTIVE_EXCEL_LOCK:
+        _ACTIVE_EXCEL_PIDS.add(int(pid))
+    return int(pid)
 
 
 def _unregister_excel_pid(pid: Optional[int]) -> None:
@@ -1142,6 +1213,10 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         raise ExcelOpenError(
             f"{path.name} has a password to open; open it in Excel, save a "
             "copy without the password, and add that copy", kind="password")
+    if getattr(_SCOPE, "down", None):
+        # Excel could not be started earlier in this extract: not again for
+        # every workbook, ~93 s each (review, 2026-10-20)
+        raise _excel_down(_SCOPE.down)
     com = None
     if app_factory is None:
         if not excel_available():
@@ -1169,19 +1244,43 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     watchdog = None
     stopped = []
     pid: Optional[int] = None
+    held = None                     # a handle to this read's Excel (_hold_excel)
+    answered = False                # its window said its PID
     try:
-        app = app_factory()
-        _tie_excel(app)
-        pid = _register_excel_pid(app)   # so the Ledger's Cancel can kill it
+        before = _excel_processes() if com is not None else None
+        try:
+            app = app_factory()
+        except Exception as e:
+            # 'Server execution failed', after ~93 s here (its license
+            # agreement waiting): said so, and not tried again by the rest
+            # of the extract (review, 2026-10-20)
+            raise _excel_failed(e, path, cancels) from e
+        started = _new_excel(before) if before is not None else None
+        pid = _tie_excel(app)
+        answered, created = pid is not None, None
+        if pid is None and started is not None:
+            # It refuses every call, app.Hwnd too: it was neither tied nor
+            # registered for Cancel, and a refused Quit left it running - a
+            # hidden Excel sat on its license agreement for half an hour
+            # (review, 2026-10-20). Found as the one Excel that started.
+            pid, created = started
+            tie_to_this_process(pid)
+        if com is not None and pid is not None:
+            held = _hold_excel(pid, created)
+        _register_excel_pid(pid)             # so the Ledger's Cancel can kill it
         _stop_if_cancelled(path, cancels)    # ...pressed before the PID was there
-        watchdog = _watchdog(app, timeout, stopped) if com is not None else None
+        watchdog = _watchdog(app, timeout, stopped, pid) if com is not None else None
+        refused = None
         for attr, val in (("Visible", False), ("DisplayAlerts", False),
                           ("AskToUpdateLinks", False), ("EnableEvents", False),
                           ("ScreenUpdating", False), ("AutomationSecurity", 3)):
             try:
                 setattr(app, attr, val)
-            except Exception:
-                pass
+            except Exception as e:
+                refused = refused or (e if _refused(e) else None)
+        if refused is not None:
+            # macros not turned off, among the rest: nothing is opened in it
+            raise _excel_failed(refused, path, cancels) from refused
         _stop_if_cancelled(path, cancels)
         try:
             # A password the workbook does not have, so a protected file fails
@@ -1193,6 +1292,8 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                                       Notify=False, Password="council-no-password",
                                       WriteResPassword="council-no-password")
         except Exception as e:
+            if _refused(e) and not stopped:
+                raise _excel_failed(e, path, cancels) from e
             raise classify_open_failure(e, path, timeout, stopped) from e
         if watchdog is not None:
             watchdog.cancel()          # opened: copying a big workbook out may take a while
@@ -1310,12 +1411,18 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 book.Close(SaveChanges=False)
             except Exception:
                 pass
+        quit_refused = False
         if app is not None:
             try:
                 app.Quit()
             except Exception:
-                pass
+                quit_refused = True
         book = app = None
+        if held is not None:
+            # Quit refused ('Call was rejected by callee': its license
+            # agreement waiting), or an Excel that never answered: ended,
+            # not left running hidden (review, 2026-10-20)
+            _let_go(held, end=quit_refused or not answered)
         _unregister_excel_pid(pid)
         try:
             # careful: only when nothing else was put there since the last
@@ -1384,25 +1491,157 @@ def tie_to_this_process(pid: int) -> bool:
     return True
 
 
-def _tie_excel(app) -> None:
-    """The hidden Excel `app` dies with this process (tie_to_this_process)."""
-    try:
-        import win32process
-        pid = win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]
-    except Exception:
-        return
-    tie_to_this_process(pid)
+def _tie_excel(app) -> Optional[int]:
+    """The hidden Excel `app` dies with this process (tie_to_this_process).
+    Its PID (_excel_pid: asked again for a moment while Excel refuses
+    calls), or None when its window would not say."""
+    pid = _excel_pid(app)
+    if pid is not None:
+        tie_to_this_process(pid)
+    return pid
 
 
-def _watchdog(app, timeout: float, stopped: list):
-    """Stop THIS hidden Excel (by its process id, never another Excel) if it
-    has not finished within `timeout` seconds."""
-    import threading
-    try:
-        import win32process
-        pid = win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]
-    except Exception:
+# ── the Excel a read started, found by its process ──────────────────────
+_KERNEL32 = None
+_PROCESS_TERMINATE, _PROCESS_QUERY_LIMITED = 0x0001, 0x1000
+
+
+def _k32():
+    """kernel32 with this module's own argtypes (ctypes.windll's are shared
+    with other modules)."""
+    global _KERNEL32
+    if _KERNEL32 is None:
+        import ctypes
+        from ctypes import wintypes as wt
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.restype = wt.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+        k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [wt.HANDLE, ctypes.c_void_p]
+        k.OpenProcess.restype = wt.HANDLE
+        k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        k.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.c_void_p] * 4
+        k.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+        k.CloseHandle.argtypes = [wt.HANDLE]
+        _KERNEL32 = k
+    return _KERNEL32
+
+
+def _created_at(handle) -> Optional[int]:
+    """When the process behind `handle` started (a FILETIME), or None."""
+    import ctypes
+    t = [ctypes.c_ulonglong() for _ in range(4)]
+    if _k32().GetProcessTimes(handle, *[ctypes.byref(x) for x in t]):
+        return int(t[0].value)
+    return None
+
+
+def _processes_named(image: str) -> Optional[set]:
+    """(pid, start time) of every process of image `image` ('EXCEL.EXE')
+    running now - the start time tells a PID Windows gave to a new process
+    from the one before - or None when they cannot be listed (not Windows)."""
+    if os.name != "nt":
         return None
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+
+        class Entry(ctypes.Structure):                    # PROCESSENTRY32W
+            _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                        ("th32ProcessID", wt.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+                        ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wt.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        k = _k32()
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return None
+        pids = []
+        try:
+            e = Entry()
+            e.dwSize = ctypes.sizeof(Entry)
+            more = k.Process32FirstW(snap, ctypes.byref(e))
+            while more:
+                if e.szExeFile.lower() == image.lower():
+                    pids.append(int(e.th32ProcessID))
+                more = k.Process32NextW(snap, ctypes.byref(e))
+        finally:
+            k.CloseHandle(snap)
+        out = set()
+        for pid in pids:
+            h = k.OpenProcess(_PROCESS_QUERY_LIMITED, False, pid)
+            try:
+                out.add((pid, _created_at(h) if h else None))
+            finally:
+                if h:
+                    k.CloseHandle(h)
+        return out
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _excel_processes() -> Optional[set]:
+    return _processes_named("EXCEL.EXE")
+
+
+def _new_excel(before: Optional[set]) -> Optional[Tuple[int, Optional[int]]]:
+    """(pid, start time) of the one EXCEL.EXE running now that was not in
+    `before` (_excel_processes, taken just before DispatchEx): the Excel
+    that call started - a new process each time - whose window would not
+    say (it refuses calls). None when there is none, or more than one
+    (another started meanwhile: which is this read's cannot be told). One
+    another read of this process registered is never it."""
+    after = _excel_processes()
+    if before is None or after is None:
+        return None
+    with _ACTIVE_EXCEL_LOCK:
+        others = set(_ACTIVE_EXCEL_PIDS)
+    new = [p for p in after - before if p[0] not in others]
+    return new[0] if len(new) == 1 else None
+
+
+def _hold_excel(pid: Optional[int], created: Optional[int] = None):
+    """A handle to Excel process `pid`, taken while it is known to be the
+    one this read started (started at `created`, when given): ending it
+    through the handle can never end another process Windows has given the
+    PID since (Cancel's kill, or the watchdog's, may have ended it first).
+    None when it cannot be opened."""
+    if os.name != "nt" or not pid:
+        return None
+    try:
+        k = _k32()
+        h = k.OpenProcess(_PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED, False, int(pid))
+        if h and created is not None and _created_at(h) != created:
+            k.CloseHandle(h)
+            return None
+        return h or None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _let_go(held, end: bool) -> None:
+    """Close `held` (_hold_excel), first ending its process when `end`."""
+    try:
+        k = _k32()
+        try:
+            if end:
+                k.TerminateProcess(held, 1)
+        finally:
+            k.CloseHandle(held)
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _watchdog(app, timeout: float, stopped: list, pid: Optional[int] = None):
+    """Stop THIS hidden Excel (by its process id `pid`, else the one its
+    window names - never another Excel) if it has not finished within
+    `timeout` seconds."""
+    import threading
+    if pid is None:
+        try:
+            import win32process
+            pid = win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]
+        except Exception:
+            return None
 
     def stop():
         stopped.append(pid)

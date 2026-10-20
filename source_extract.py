@@ -2068,6 +2068,19 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
             break
 
 
+def _excel_down_line(problems: List[str], msg: str, name: str) -> None:
+    """Excel could not be started (excel_open: the rest of the extract does
+    not try again): one problem line for the run - `msg`, the same for every
+    workbook - naming each workbook it left unread, not one line per
+    workbook (review, 2026-10-20)."""
+    head = f"{msg} (not read: "
+    for i, p in enumerate(problems):
+        if p.startswith(head) and p.endswith(")"):
+            problems[i] = f"{p[:-1]}, {name})"
+            return
+    problems.append(f"{head}{name})")
+
+
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, label: str = "",
                  part_finder=None) -> None:
@@ -2086,14 +2099,18 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             # follows used to escape and lose the whole run (review,
             # 2026-10-19)
             raise _Cancelled() from e
-        run.problems.append(str(e) if isinstance(e, LedgerError)
-                            else f"{src.name}: could not be read ({e!r})")
+        msg = (str(e) if isinstance(e, LedgerError)
+               else f"{src.name}: could not be read ({e!r})")
         # Keep the Excel-open-failure category so the Ledger log can
         # summarize the batch: "N files failed to open - K rights, ...".
         cause = e.__cause__ if isinstance(e, LedgerError) else e
         kind = (getattr(cause, "kind", "unknown")
                 if cause is not None and type(cause).__name__ == "ExcelOpenError"
                 else "other")
+        if kind == "unavailable" and getattr(cause, "down", ""):
+            _excel_down_line(run.problems, msg, label or src.name)
+        else:
+            run.problems.append(msg)
         run.open_failures.append((label or src.name, kind))
         _secs = _time.monotonic() - _t0
         run.timings.append((label or src.name, _secs))
