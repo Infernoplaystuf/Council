@@ -54,6 +54,19 @@ And what a review of those fixes found (review, 2026-10-19):
 - a review path of 260+ characters failed the Extract with a raw
   FileNotFoundError after every workbook was read.
 
+And the layouts of the user's real workbooks (review, 2026-10-20):
+- a Pre-Conceal grid and a Post-Conceal grid side by side on one sheet: the
+  right one's readings were filed under the left one's field, and their
+  per-inspector copies pre-accepted;
+- 'Part Number: LMM3EF305' over a second block of the sheet: its readings
+  were put on the first block's LMM3EF304, pre-accepted;
+- 'Eddy Current Response' merged over 'Pre-Conceal' | 'Post-Conceal': the
+  Post column was filed as Pre-Conceal;
+- '47/JB', '48 - JB', '49 JB' were kept as text, the heading's MK's,
+  pre-accepted;
+- 'EC — 2026-09-22' (Eva Chen) was no heading: her readings got the one
+  above.
+
 Synthetic data only (tests/ledger_fixtures.py).
 """
 from __future__ import annotations
@@ -1040,3 +1053,276 @@ def test_a_sample_number_names_the_part(ledger, tmp_path):
             ws["A3"], ws["B3"] = "Frequency (kHz)", 50
         _, dec = _decided(schema, wb, tmp_path / f"sample_{layout}.xlsx")
         assert [(d.obs.part, d.accept) for d in dec] == [("LMM1AB101", True)], layout
+
+
+# ── layouts of the user's real workbooks (review, 2026-10-20) ───────────
+FPI = "NDE Inspection: FPI"
+
+
+def _grid(ws, top, lc, codes, label, values):
+    """'Flaw #' at (top, lc), the codes to its right, one label row under."""
+    ws.cell(top, lc, "Flaw #")
+    ws.cell(top + 1, lc, label)
+    for i, (it, v) in enumerate(zip(codes, values)):
+        ws.cell(top, lc + 1 + i, it)
+        ws.cell(top + 1, lc + 1 + i, v)
+
+
+def _by_field(dec):
+    return {(d.obs.field, d.obs.item): d for d in dec}
+
+
+def test_tables_side_by_side_read_their_own_labels(ledger, tmp_path):
+    """A Pre-Conceal grid in B:E and a Post-Conceal grid in H:K on the same
+    header rows, each under its own inspector: the right one's readings
+    were filed under the left one's field, and their '[JB]' copies were
+    pre-accepted."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"] = "Part No.: LMM3EF301"
+    ws["A3"], ws["G3"] = "Inspector: MK", "Inspector: JB"
+    for k, b in enumerate("ABC"):
+        codes = [f"{i}{b}" for i in (1, 2, 3)]
+        _grid(ws, 4 + 3 * k, 2, codes, "EC Pre-Conceal", [40 + k, 41 + k, 42 + k])
+        _grid(ws, 4 + 3 * k, 8, codes, "EC Post-Conceal", [10 + k, 11 + k, 12 + k])
+    run, dec = _decided(schema, wb, tmp_path / "LMM3EF301 recheck.xlsx")
+    got = {(o.field, o.item): (o.value, o.inspector) for o in run.obs}
+    for k, b in enumerate("ABC"):
+        assert got[(PRE, f"1{b}")] == (str(40 + k), "MK")
+        assert got[(POST, f"1{b}")] == (str(10 + k), "JB")
+    assert len([o for o in run.obs if o.field == PRE]) == 9
+    assert len([o for o in run.obs if o.field == POST]) == 9
+    by = _by_field(dec)
+    assert (f"{PRE} [JB]", "1A") not in by                 # never JB's Pre-Conceal
+    assert by[(f"{POST} [JB]", "1A")].accept and by[(POST, "1A")].accept
+    assert not any(d.conflict for d in dec)
+    assert not run.unmatched                    # 'EC Post-Conceal' is no label to map
+
+
+def test_a_table_beside_another_with_no_labels_of_its_own_is_never_pre_accepted(
+        ledger, tmp_path):
+    """Its own 'Flaw #' header but no label column: its field is a guess
+    (the table beside it's), offered amber and said so. One table running
+    on over an empty spacer column is still one table."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Number: LMM3EF301"
+    ws["A3"] = "Inspector: MK"
+    _grid(ws, 4, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [40, 41, 42])
+    ws["G4"] = "Flaw #"
+    for i, it in enumerate(["1B", "2B", "3B"]):
+        ws.cell(4, 8 + i, it)
+        ws.cell(5, 8 + i, 50 + i)
+    _, dec = _decided(schema, wb, tmp_path / "beside.xlsx")
+    beside = [d for d in dec if d.obs.where.endswith(("!H5", "!I5", "!J5"))]
+    assert len(beside) == 6 and not any(d.accept for d in beside)   # and the [MK] copies
+    assert all(se._BESIDE_NOTE in d.obs.note for d in beside)
+    left = [d for d in dec if d.obs.where.endswith(("!C5", "!D5", "!E5"))]
+    assert len(left) == 6 and all(d.accept for d in left)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Number: LMM3EF301"
+    _grid(ws, 4, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [40, 41, 42])
+    for i, it in enumerate(["1B", "2B", "3B"]):            # after a spacer column
+        ws.cell(4, 7 + i, it)
+        ws.cell(5, 7 + i, 50 + i)
+    _, dec = _decided(schema, wb, tmp_path / "spacer.xlsx")
+    assert sorted((d.obs.item, d.obs.value, d.accept) for d in dec if d.obs.field == PRE) == [
+        ("1A", "40", True), ("1B", "50", True), ("2A", "41", True), ("2B", "51", True),
+        ("3A", "42", True), ("3B", "52", True)]
+
+
+def test_a_second_part_label_lower_down_starts_that_parts_block(ledger, tmp_path):
+    """'Part Number: LMM3EF304' over one block, 'Part Number: LMM3EF305'
+    over the next: the second coupon's readings were put on the first, and
+    its '[JB]' copies pre-accepted."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"], ws["A2"] = "Part Number: LMM3EF304", "Inspector: MK"
+    _grid(ws, 3, 2, lf.ITEMS, "Eddy Current Response Pre-Conceal", range(70, 79))
+    ws["A7"], ws["A8"] = "Part Number: LMM3EF305", "Inspector: JB"
+    _grid(ws, 9, 2, lf.ITEMS, "Eddy Current Response Pre-Conceal", range(80, 89))
+    src = tmp_path / "Two coupons on one sheet.xlsx"
+    run, dec = _decided(schema, wb, src)
+    got = {(o.part, o.item): (o.value, o.inspector) for o in run.obs}
+    assert got[("LMM3EF304", "1A")] == ("70", "MK")
+    assert got[("LMM3EF305", "1A")] == ("80", "JB")
+    assert {o.part for o in run.obs if o.where.endswith("10")} == {"LMM3EF305"}
+    assert {o.part for o in run.obs if o.where.endswith("4")} == {"LMM3EF304"}
+    assert all(d.accept for d in dec) and not any(d.conflict for d in dec)
+    assert ("LMM3EF304", f"{PRE} [JB]") not in {(d.obs.part, d.obs.field) for d in dec}
+    pv = se.preview_workbook(src, schema)
+    assert "LMM3EF305 from row 7" in pv.sheets[0].part_how
+
+
+@pytest.mark.parametrize("layout", ["listed", "same_row", "tbd"])
+def test_two_part_labels_without_clear_blocks_are_never_pre_accepted(ledger, tmp_path,
+                                                                      layout):
+    """Two part labels one under the other over one table, side by side on
+    one row, or a lower one naming no part yet ('TBD'): which values are
+    whose is not clear, so none is pre-accepted, and the Part from says so."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Number: LMM3EF304"
+    ws["A3"] = "Inspector: MK"
+    _grid(ws, 4, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [70, 71, 72])
+    if layout == "listed":
+        ws["A2"] = "Part Number: LMM3EF305"
+    elif layout == "same_row":
+        ws["H1"] = "Part Number: LMM3EF305"
+        _grid(ws, 4, 8, ["1A", "2A", "3A"], "EC Pre-Conceal", [80, 81, 82])
+    else:
+        ws["A8"] = "Part Number: TBD"
+        _grid(ws, 9, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [80, 81, 82])
+    _, dec = _decided(schema, wb, tmp_path / f"parts_{layout}.xlsx")
+    assert dec and not any(d.accept for d in dec)
+    if layout == "same_row":                               # each its own, to check
+        assert {d.obs.part for d in dec if d.obs.where.endswith(("!I5", "!J5", "!K5"))} \
+            == {"LMM3EF305"}
+    if layout == "tbd":                                    # never the first part's
+        assert {d.obs.part for d in dec if d.obs.where.endswith("10")} == {""}
+    assert all(se.SHEET_PARTS_HOW in d.obs.part_how for d in dec)
+
+
+def test_a_serial_number_under_the_part_number_is_not_another_part(ledger, tmp_path):
+    """Another of the part's labels ('Serial No.') under the Part Number
+    names the same part: the sheet keeps its one part, pre-accepted."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"], ws["A2"] = "Part Number: LMM3EF304", "Serial No.: SN-0042"
+    ws["A3"] = "Inspector: MK"
+    _grid(ws, 4, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [70, 71, 72])
+    _, dec = _decided(schema, wb, tmp_path / "serial.xlsx")
+    assert {(d.obs.part, d.accept) for d in dec} == {("LMM3EF304", True)}
+
+
+def test_a_two_row_header_under_a_merged_parent_reads_both_rows(ledger, tmp_path):
+    """'Eddy Current Response' merged over 'Pre-Conceal' | 'Post-Conceal':
+    both columns read 'Eddy Current Response', and the Post column was filed
+    as Pre-Conceal. A title merged over a whole table is not a parent."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Results"
+    ws["A1"] = "Part Number: LMM3EF306"
+    ws["A3"] = "Inspector: KP"
+    ws["A4"], ws["B4"], ws["D4"] = "Flaw", "Eddy Current Response", "FPI"
+    ws.merge_cells("B4:C4")
+    ws["B5"], ws["C5"] = "Pre-Conceal", "Post-Conceal"
+    for i, it in enumerate(lf.ITEMS):
+        ws.cell(6 + i, 1, it)
+        ws.cell(6 + i, 2, 33 + i)
+        ws.cell(6 + i, 3, 5 + i)
+        ws.cell(6 + i, 4, "IND" if it == "1A" else "NRI")
+    run, dec = _decided(schema, wb, tmp_path / "LMM3EF306 results.xlsx")
+    got = {(o.field, o.item): (o.value, o.inspector) for o in run.obs}
+    assert got[(PRE, "1A")] == ("33", "KP") and got[(POST, "1A")] == ("5", "KP")
+    assert got[(FPI, "1A")] == ("IND", "KP")
+    assert sorted(int(o.value) for o in run.obs if o.field == POST) == list(range(5, 14))
+    assert not any(d.conflict for d in dec)
+    assert not run.unmatched                    # 'Pre-Conceal' is no label to map
+    by = _by_field(dec)
+    assert by[(POST, "1A")].accept and by[(PRE, "1A")].accept
+
+    wb = openpyxl.Workbook()                               # a title merged over A:C
+    ws = wb.active
+    ws["A1"] = "Part Number: LMM3EF306"
+    ws["A3"] = "NDE results"
+    ws.merge_cells("A3:C3")
+    ws["A4"], ws["B4"], ws["C4"] = "Flaw", "EC Pre-Conceal", "EC Post-Conceal"
+    ws["A5"], ws["B5"], ws["C5"] = "1A", 33, 5
+    run, _ = _decided(schema, wb, tmp_path / "title.xlsx")
+    assert sorted((o.field, o.value) for o in run.obs) == [(POST, "5"), (PRE, "33")]
+
+
+def test_a_reading_signed_after_a_slash_a_dash_or_a_space(ledger, tmp_path):
+    """'47/JB', '48 - JB', '49 JB' were kept as the text, put down to the
+    heading's MK and pre-accepted. A unit or a result after the number is
+    no signer."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"] = "Part Number: LMM9ZZ911"
+    ws["A2"] = "Inspector: MK"
+    typed = ["46", "47/JB", "48 - JB", "49 JB", "50 / J.B.", "51-JB", "52 JB.",
+             "53 MM", "54 NG"]
+    _grid(ws, 4, 2, lf.ITEMS, "Eddy Current Response Pre-Conceal", typed)
+    ws["A8"], ws["B8"] = "Power (W)", "285/JB"             # a field nobody signs
+    run, dec = _decided(schema, wb, tmp_path / "signed.xlsx")
+    main = {o.item: (o.value, o.inspector) for o in run.obs if o.field == PRE}
+    assert main == {"1A": ("46", "MK"), "2A": ("47", "JB"), "3A": ("48", "JB"),
+                    "1B": ("49", "JB"), "2B": ("50", "JB"), "3B": ("51", "JB"),
+                    "1C": ("52", "JB"), "2C": ("53 MM", "MK"), "3C": ("54 NG", "MK")}
+    by = _by_field(dec)
+    assert by[(f"{PRE} [JB]", "1B")].accept and (f"{PRE} [MK]", "1B") not in by
+    assert [o.value for o in run.obs if o.field == "Power (W)"] == ["285/JB"]
+
+
+def test_a_reading_ending_in_initials_no_one_signs_with_is_not_pre_accepted(
+        ledger, tmp_path):
+    """'49 JB' after a bare space on a sheet where no one signs as JB: JB,
+    or a unit? Kept as typed and offered amber, never pre-accepted as the
+    heading's MK's."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Part Number: LMM9ZZ912"
+    ws["A2"] = "Inspector: MK"
+    _grid(ws, 4, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", ["46", "49 JB", "45 HRC"])
+    _, dec = _decided(schema, wb, tmp_path / "unsure.xlsx")
+    by = _by_field(dec)
+    assert by[(PRE, "1A")].accept and by[(f"{PRE} [MK]", "1A")].accept
+    for it, typed in (("2A", "49 JB"), ("3A", "45 HRC")):
+        for f in (PRE, f"{PRE} [MK]"):
+            d = by[(f, it)]
+            assert d.obs.value == typed and not d.accept, (f, it)
+            assert se.UNSURE_SIGNER_NOTE in d.obs.note
+
+
+@pytest.mark.parametrize("layout", ["heading", "inline", "initials_column"])
+def test_ec_is_eva_chens_initials(ledger, tmp_path, layout):
+    """'EC — 2026-09-22' over a table, 'Inspector: EC', an 'Inspector
+    Initials' cell 'EC': Eva Chen. Her readings got the heading above
+    (JB's), or no one, as 'EC' spells out 'eddy current'. A bare 'EC' over
+    a table and a sheet named 'EC' are the method."""
+    schema, _ = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "NDE"
+    ws["A1"] = "Part Number: 101"
+    if layout == "heading":
+        ws["B3"] = "JB — 2026-09-18"
+        ws["B4"], ws["C4"] = "Flaw", "EC Pre"
+        ws["B5"], ws["C5"] = "1A", 60
+        ws["B9"] = "EC — 2026-09-22"
+        top = 10
+    else:
+        ws["B3"], ws["C3"] = (("Inspector: EC", None) if layout == "inline"
+                              else ("Inspector Initials", "EC"))
+        top = 4
+    ws.cell(top, 2, "Flaw")
+    ws.cell(top, 3, "EC Post")
+    ws.cell(top + 1, 2, "1A")
+    ws.cell(top + 1, 3, 70)
+    run, dec = _decided(schema, wb, tmp_path / f"ec_{layout}.xlsx")
+    assert [(o.value, o.inspector) for o in run.obs if o.field == POST] == [("70", "EC")]
+    assert "EC" in se.review_initials(dec)
+
+    wb = openpyxl.Workbook()                               # the method, no one
+    ws = wb.active
+    ws.title = "EC"
+    ws["A1"] = "Part Number: 101"
+    ws["B3"] = "EC"
+    ws["B4"], ws["C4"] = "Flaw", "EC Post"
+    ws["B5"], ws["C5"] = "1A", 70
+    run, _ = _decided(schema, wb, tmp_path / "ec_method.xlsx")
+    assert [(o.value, o.inspector) for o in run.obs if o.field == POST] == [("70", "")]
