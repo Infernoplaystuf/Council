@@ -931,3 +931,527 @@ def test_real_excel_password_xls_is_refused_at_once_and_excel_is_not_started(
             break
         time.sleep(0.5)
     assert not _excel_running(started[0])
+
+
+# ── an Excel that cannot start, or refuses every call (review, 2026-10-20) ──
+_DOWN = ("Excel could not be started: {} — open Excel once yourself (it may be asking "
+         "you to accept its license), then {} again")
+_REFUSING = ("Excel started but refuses every call: {} — open Excel once yourself (it may "
+             "be asking you to accept its license), then {} again")
+
+
+def _server_execution_failed():
+    """DispatchEx's error when Excel never comes up (~93 s on this PC, its
+    license agreement waiting), shaped like pywintypes.com_error."""
+    return Exception(-2146959355, "Server execution failed", None, None)
+
+
+def _call_rejected():
+    return Exception(_RPC_E_CALL_REJECTED, "Call was rejected by callee.", None, None)
+
+
+class _RefusingApp:
+    """An Excel.Application whose own dialog (its license agreement) is up:
+    every call is refused - app.Hwnd for its first `hwnd_refusals` reads
+    (then it answers 77), every property set, Workbooks and Quit."""
+
+    def __init__(self, log, hwnd_refusals=10 ** 6):
+        object.__setattr__(self, "log", log)
+        object.__setattr__(self, "left", hwnd_refusals)
+        object.__setattr__(self, "registered", [])
+
+    def __getattr__(self, name):
+        self.log.append(("get", name))
+        if name == "Hwnd" and self.left <= 0:
+            return 77
+        if name == "Hwnd":
+            object.__setattr__(self, "left", self.left - 1)
+        if name == "Workbooks" and self.left <= 0:
+            class Books:
+                @staticmethod
+                def Open(path, **kw):
+                    return type("Book", (), {"Worksheets": [], "Close": lambda s, **k: None})()
+            return Books()
+        raise _call_rejected()
+
+    def __setattr__(self, name, value):
+        # what Cancel could end while the read runs
+        self.registered.append(set(excel_open._ACTIVE_EXCEL_PIDS))
+        if self.left > 0:
+            raise _call_rejected()
+
+    def Quit(self):
+        self.log.append("quit")
+        raise _call_rejected()
+
+
+def test_an_excel_that_cannot_start_is_tried_once_per_extract(tmp_path):
+    """Each .xls / .xlsb cost ~93 s of 'Server execution failed', at Extract
+    and again at Apply: now the extract's first says why and the rest fail
+    at once. The next extract tries again; reads outside one (the knowledge
+    graph's) are not stopped by it."""
+    files = []
+    for n in ("a.xls", "b.xlsb"):
+        (tmp_path / n).write_bytes(OLE_MAGIC)
+        files.append(tmp_path / n)
+    tries = []
+
+    def factory():
+        tries.append(1)
+        raise _server_execution_failed()
+    with excel_open.cancel_scope():
+        for f in files:
+            with pytest.raises(ExcelOpenError) as e:
+                read_with_excel(f, want_pictures=False, app_factory=factory)
+            assert e.value.kind == "unavailable" and e.value.down == "Server execution failed"
+            assert str(e.value) == _DOWN.format("Server execution failed", "extract")
+    assert len(tries) == 1
+    with excel_open.cancel_scope():                      # Apply's extract: once more
+        with pytest.raises(ExcelOpenError):
+            read_with_excel(files[0], want_pictures=False, app_factory=factory)
+    assert len(tries) == 2
+    for f in files:                                      # no extract: each its own
+        with pytest.raises(ExcelOpenError) as e:
+            read_with_excel(f, want_pictures=False, app_factory=factory)
+        assert str(e.value) == _DOWN.format("Server execution failed", "try")
+    assert len(tries) == 4
+
+
+def test_an_excel_refusing_every_call_opens_nothing_and_is_not_asked_again(
+        tmp_path, monkeypatch):
+    """'Call was rejected by callee' (a dialog of its own up): its macro
+    setting refused too, so nothing is opened in it; the extract's other
+    workbooks do not start another Excel."""
+    monkeypatch.setattr(excel_open, "_REFUSED_WAIT_S", 0.3, raising=False)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log, apps = [], []
+
+    def factory():
+        apps.append(_RefusingApp(log))
+        return apps[-1]
+    with excel_open.cancel_scope():
+        for _ in range(2):
+            with pytest.raises(ExcelOpenError) as e:
+                read_with_excel(f, want_pictures=False, app_factory=factory)
+            assert e.value.kind == "unavailable"
+            # it did start: not 'could not be started' (review, 2026-10-20)
+            assert str(e.value) == _REFUSING.format("Call was rejected by callee", "extract")
+    assert len(apps) == 1
+    assert ("get", "Workbooks") not in log and log[-1] == "quit"
+    assert log.count(("get", "Hwnd")) > 1               # asked again, not once
+
+
+def _dispatch(monkeypatch, app, snapshots, log=None, dispatch=None):
+    """read_with_excel's own DispatchEx path, Excel being `app` (or what
+    `dispatch` does): the EXCEL.EXE processes it sees are `snapshots`
+    (before, after DispatchEx), every one started by COM for automation,
+    and what it would do to the process - tie, hold, end - is logged to
+    `log` (app.log), never done."""
+    pytest.importorskip("pythoncom")
+    win32com_client = pytest.importorskip("win32com.client")
+    win32process = pytest.importorskip("win32process")
+    log = app.log if log is None else log
+    monkeypatch.setattr(excel_open, "excel_available", lambda: True)
+    monkeypatch.setattr(win32com_client, "DispatchEx", dispatch or (lambda name: app))
+    monkeypatch.setattr(win32process, "GetWindowThreadProcessId",
+                        lambda hwnd: (1, 4242) if hwnd == 77 else (0, 0))
+    monkeypatch.setattr(excel_open, "_REFUSED_WAIT_S", 0.5, raising=False)
+    shots = iter(snapshots)
+    patch = dict(raising=False)          # so the same test shows what came before
+    monkeypatch.setattr(excel_open, "_excel_processes", lambda: next(shots), **patch)
+    monkeypatch.setattr(excel_open, "_for_automation", lambda pid: True, **patch)
+    monkeypatch.setattr(excel_open, "tie_to_this_process", lambda pid: log.append(("tied", pid)))
+    monkeypatch.setattr(excel_open, "_hold_excel",
+                        lambda pid, created=None: log.append(("held", pid, created)) or "H",
+                        **patch)
+    monkeypatch.setattr(excel_open, "_let_go",
+                        lambda held, end: log.append(("let go", held, end)), **patch)
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+
+
+def test_an_excel_refusing_every_call_is_found_tied_registered_and_ended(tmp_path, monkeypatch):
+    """Its window (app.Hwnd) was read once: refused, so the Excel was neither
+    tied to this process nor registered for Cancel, and its refused Quit
+    left it running - a hidden Excel sat on its license agreement for half
+    an hour (review, 2026-10-20). It is now the one EXCEL.EXE that started
+    during DispatchEx, and is ended through a handle taken then."""
+    app = _RefusingApp([])
+    _dispatch(monkeypatch, app, [{(100, 1)}, {(100, 1), (4242, 9)}])
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    with pytest.raises(ExcelOpenError) as e:
+        read_with_excel(f, want_pictures=False, timeout=30)
+    assert e.value.kind == "unavailable"
+    steps = [x for x in app.log if x[0] != "get"]
+    assert steps == [("tied", 4242), ("held", 4242, 9), "quit", ("let go", "H", True)]
+    assert app.registered and app.registered[0] == {4242}       # Cancel could end it
+    assert excel_open._ACTIVE_EXCEL_PIDS == set()
+
+
+def test_an_excel_whose_window_answers_late_is_tied_and_ended_when_quit_is_refused(
+        tmp_path, monkeypatch):
+    """Refusing calls for a moment, then answering: its window is asked again,
+    so it is tied and registered by it; Quit refused, it is ended."""
+    app = _RefusingApp([], hwnd_refusals=2)
+    _dispatch(monkeypatch, app, [{(100, 1)}, {(100, 1)}])
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    book = read_with_excel(f, want_pictures=False, timeout=30)
+    assert book.sheets == []
+    steps = [x for x in app.log if x[0] != "get"]
+    assert steps == [("tied", 4242), ("held", 4242, None), "quit", ("let go", "H", True)]
+    assert app.registered and app.registered[0] == {4242}
+
+
+def test_two_excels_starting_at_once_are_not_guessed_at(tmp_path, monkeypatch):
+    """Another EXCEL.EXE started during DispatchEx too: which is this read's
+    cannot be told, so neither is tied, held or ended - and the problem line
+    says one may be left running (review, 2026-10-20)."""
+    app = _RefusingApp([])
+    _dispatch(monkeypatch, app, [{(100, 1)}, {(100, 1), (4242, 9), (5150, 9)}])
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    with pytest.raises(ExcelOpenError) as e:
+        read_with_excel(f, want_pictures=False, timeout=30)
+    assert [x for x in app.log if x[0] != "get"] == ["quit"]
+    assert str(e.value) == _REFUSING.format(
+        "Call was rejected by callee (a hidden Excel it started may still be running: "
+        "Task Manager can end it)", "try")
+
+
+def test_the_process_this_read_started_is_held_and_ended_by_handle(tmp_path):
+    """The process helpers on a real process (a Python child standing in for
+    EXCEL.EXE): found as the one new process of its image; a handle is not
+    taken when the start time differs (the PID given to another process
+    since); ending it through the handle ends it."""
+    import subprocess
+    if sys.platform != "win32":
+        pytest.skip("Windows processes")
+    image = Path(sys.executable).name
+    before = excel_open._processes_named(image)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        new = set()
+        for _ in range(50):
+            new = {p for p in excel_open._processes_named(image) - before if p[0] == child.pid}
+            if new:
+                break
+            import time
+            time.sleep(0.1)
+        (pid, created), = new
+        assert excel_open._hold_excel(pid, created + 1) is None
+        held = excel_open._hold_excel(pid, created)
+        assert held
+        excel_open._let_go(held, end=True)
+        assert child.wait(10) == 1
+    finally:
+        child.kill()
+
+
+def test_an_extract_whose_excel_cannot_start_says_so_on_one_line(tmp_path, monkeypatch):
+    """One 93-s failure and one line per .xls / .xlsb ('could not be read
+    (com_error(...))'): now one try, and one line naming every workbook it
+    left unread. Apply's extract tries once more."""
+    import source_extract as se
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    olds = [tmp_path / n for n in ("b.xls", "c.xls", "d.xlsb")]
+    for f in olds:
+        f.write_bytes(OLE_MAGIC)
+    tries = []
+
+    def factory():
+        tries.append(1)
+        raise _server_execution_failed()
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=factory))
+    run = se.extract(schema, [a, *olds], use_images=False)
+    assert run.obs and len(tries) == 1                   # a.xlsx read; Excel tried once
+    said = [p for p in run.problems if any(f.name in p for f in olds)]
+    assert said == [_DOWN.format("Server execution failed", "extract")
+                    + " (not read: b.xls, c.xls, d.xlsb)"]
+    assert [k for _n, k in run.open_failures] == ["unavailable"] * 3
+    se.extract(schema, [a, *olds], use_images=False)     # Apply reads them again
+    assert len(tries) == 2
+
+
+
+# ── a refusal that passes; pywin32's own object; a start that failed ─────
+#: RPC_E_SERVERCALL_RETRYLATER (0x8001010A): 'the application is busy'
+_RPC_E_SERVERCALL_RETRYLATER = -2147417846
+
+
+class _BusyOnceApp(_App):
+    """A new Excel answering 'the application is busy' once - to the
+    property set or the call named `busy` ('Visible', 'Open') - and then
+    working."""
+
+    def __init__(self, log, busy=None):
+        object.__setattr__(self, "busy", busy)
+        super().__init__(log)
+        app, open_ = self, self.Workbooks.Open
+
+        class Books:
+            def Open(self, path, **kw):
+                app._busy("Open")
+                return open_(path, **kw)
+        object.__setattr__(self, "Workbooks", Books())
+
+    def _busy(self, name):
+        if self.busy == name:
+            object.__setattr__(self, "busy", None)
+            self.log.append(("busy", name))
+            raise Exception(_RPC_E_SERVERCALL_RETRYLATER, "The message filter indicated "
+                            "that the application is busy.", None, None)
+
+    def __setattr__(self, k, v):
+        self._busy(k)
+        super().__setattr__(k, v)
+
+
+@pytest.mark.parametrize("busy", ["Visible", "AutomationSecurity", "Open"])
+def test_an_excel_busy_for_a_moment_is_asked_again_not_given_up(tmp_path, busy):
+    """One 'application is busy' reply (a new Excel still loading) to a
+    property set or to Workbooks.Open marked Excel down for the whole
+    extract: that workbook and every .xls / .xlsb after it were left unread,
+    'Excel could not be started' (review, 2026-10-20). The call is asked
+    again; the macro setting is still in place before anything is opened."""
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log, apps = [], []
+
+    def factory():
+        apps.append(_BusyOnceApp(log, busy=None if apps else busy))
+        return apps[-1]
+    with excel_open.cancel_scope():
+        for _ in range(2):
+            assert read_with_excel(f, want_pictures=False, app_factory=factory).sheets
+        assert getattr(excel_open._SCOPE, "down", None) is None
+    assert len(apps) == 2 and log.count(("busy", busy)) == 1
+    first = log[:log.index(("quit",)) + 1]               # the busy Excel's read
+    opened = next(i for i, e in enumerate(first) if e[0] == "open")
+    assert first.index(("set", "AutomationSecurity", 3)) < opened
+
+
+def test_an_extract_whose_excel_is_busy_once_reads_every_workbook(tmp_path, monkeypatch):
+    """The extract end to end: the first Excel's Workbooks.Open answered
+    'busy' once, and b.xls, c.xls and d.xls were all left unread on one
+    'could not be started' line (review, 2026-10-20). All are read now."""
+    import source_extract as se
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    olds = [tmp_path / n for n in ("b.xls", "c.xls", "d.xls")]
+    for f in olds:
+        f.write_bytes(OLE_MAGIC)
+    apps = []
+
+    def factory():
+        apps.append(_BusyOnceApp([], busy=None if apps else "Open"))
+        return apps[-1]
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=factory))
+    run = se.extract(schema, [a, *olds], use_images=False)
+    assert run.open_failures == [] and not [p for p in run.problems if "Excel" in p]
+    assert {o.where.split(" ")[0] for o in run.obs} >= {"a.xlsx", "b.xls", "c.xls", "d.xls"}
+    assert len(apps) == 3
+
+
+class _ExcelIDispatch:
+    """Excel.Application's own IDispatch, for pywin32 to wrap as DispatchEx
+    does (win32com.client.Dispatch; no makepy cache for Excel, as on this
+    PC: a late-bound CDispatch). A call `refuse` says yes to - type info,
+    a name lookup, an Invoke - is refused with a real pywintypes.com_error
+    RPC_E_CALL_REJECTED, as Excel's message filter refuses with a dialog of
+    its own up; the rest are answered as Excel would. Each call is logged:
+    ('lookup', name), ('invoke', name, flags, *args), refused ones as
+    ('refused', ...)."""
+    NAMES = ("Hwnd", "Visible", "DisplayAlerts", "AskToUpdateLinks", "EnableEvents",
+             "ScreenUpdating", "AutomationSecurity", "Workbooks", "Quit")
+
+    def __init__(self, log, refuse=lambda what: True):
+        self.log, self.refuse = log, refuse
+        self.books = _App(log).Workbooks
+
+    def _call(self, *what):
+        import pywintypes
+        if self.refuse(what):
+            self.log.append(("refused",) + what)
+            raise pywintypes.com_error(_RPC_E_CALL_REJECTED, "Call was rejected by callee.",
+                                       None, None)
+        self.log.append(what)
+
+    def GetTypeInfo(self, *a):
+        import pywintypes
+        self._call("GetTypeInfo")
+        raise pywintypes.com_error(-2147467263, "Not implemented", None, None)
+
+    def GetIDsOfNames(self, lcid, name):
+        import pywintypes
+        self._call("lookup", name)
+        if name not in self.NAMES:
+            raise pywintypes.com_error(-2147352570, "Unknown name.", None, None)
+        return self.NAMES.index(name) + 1
+
+    def Invoke(self, dispid, lcid, flags, want, *args):
+        import pywintypes
+        name = self.NAMES[dispid - 1]
+        self._call("invoke", name, flags, *args)
+        if name == "Hwnd":
+            return 77
+        if name == "Workbooks":
+            return self.books
+        if name == "Quit" and flags == 2:                # read as a property: a method
+            raise pywintypes.com_error(-2147352573, "Member not found.", None, None)
+        return None
+
+    def InvokeTypes(self, *a):
+        import pywintypes
+        raise pywintypes.com_error(-2147467263, "Not implemented", None, None)
+
+
+def _pywin32(idispatch):
+    """`idispatch` in pywin32's own object, as DispatchEx gives Excel."""
+    return pytest.importorskip("win32com.client").Dispatch(idispatch)
+
+
+def test_an_excel_refusing_through_pywin32s_own_object_is_seen_refusing(tmp_path, monkeypatch):
+    """pywin32's late-bound object turns a refused name lookup into a bare
+    AttributeError ('<unknown>.Workbooks'), and a refused property set into
+    'can not be set': an Excel refusing every call was taken for any other
+    failure - Hwnd not asked again, 'Excel could not open a.xls', kind
+    'unknown', nothing remembered - so every workbook started an Excel of
+    its own (review, 2026-10-20). Seen refusing now, through a real
+    CDispatch over an IDispatch refusing with a real com_error."""
+    pytest.importorskip("pywintypes")
+    log, started = [], []
+
+    def dispatch(name):
+        started.append(name)
+        return _pywin32(_ExcelIDispatch(log))
+    _dispatch(monkeypatch, None, [{(100, 1)}, {(100, 1), (4242, 9)}], log=log,
+              dispatch=dispatch)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    with excel_open.cancel_scope():
+        for _ in range(2):
+            with pytest.raises(ExcelOpenError) as e:
+                read_with_excel(f, want_pictures=False, timeout=30)
+            assert e.value.kind == "unavailable"
+            assert str(e.value) == _REFUSING.format("Call was rejected by callee", "extract")
+    assert len(started) == 1                             # the second: no Excel at all
+    assert log.count(("refused", "lookup", "Hwnd")) > 2  # asked again, not once
+    assert not [x for x in log if "Workbooks" in x]      # macros not off: nothing opened
+    assert [x for x in log if x[0] in ("tied", "held", "let go")] == [
+        ("tied", 4242), ("held", 4242, 9), ("let go", "H", True)]
+
+
+def _first(n):
+    """refuse: the first `n` calls, whatever they are."""
+    left = [n]
+
+    def refuse(what):
+        left[0] -= 1
+        return left[0] >= 0
+    return refuse
+
+
+def _once(*what):
+    """refuse: the first call that is `what`."""
+    done = []
+
+    def refuse(call):
+        if not done and call[:len(what)] == what:
+            done.append(call)
+            return True
+        return False
+    return refuse
+
+
+@pytest.mark.parametrize("refuse", [lambda: _first(4),
+                                    lambda: _once("invoke", "AutomationSecurity", 4),
+                                    lambda: _once("lookup", "Workbooks")],
+                         ids=["lookups", "macro-setting", "workbooks"])
+def test_an_excel_busy_for_a_moment_through_pywin32s_own_object_is_read(
+        tmp_path, monkeypatch, refuse):
+    """The same object refusing for a moment - its window's lookup, the
+    macro setting's Invoke (pywin32 itself would swallow that refusal, the
+    macro setting silently not made), Workbooks' lookup - and then
+    answering: asked again, read, and macros are off before it opens."""
+    pytest.importorskip("pywintypes")
+    log, refuse = [], refuse()
+    _dispatch(monkeypatch, None, [{(100, 1)}, {(100, 1), (4242, 9)}], log=log,
+              dispatch=lambda name: _pywin32(_ExcelIDispatch(log, refuse)))
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    with excel_open.cancel_scope():
+        assert read_with_excel(f, want_pictures=False, timeout=30).sheets
+        assert getattr(excel_open._SCOPE, "down", None) is None
+    assert any(x[0] == "refused" for x in log)
+    secured = log.index(("invoke", "AutomationSecurity", 4, 3))
+    assert secured < next(i for i, x in enumerate(log) if x[0] == "open")
+    assert [x for x in log if x[0] in ("tied", "held", "let go")] == [
+        ("tied", 4242), ("held", 4242, None), ("let go", "H", False)]   # it quit itself
+
+
+@pytest.mark.parametrize("after, other, ended", [
+    ({(100, 1), (4242, 9)}, False, True),
+    ({(100, 1), (4242, 9), (5150, 9)}, False, False),    # which is it: cannot be told
+    ({(100, 1), (4242, 9)}, True, False),                # another read was starting one
+    ({(100, 1)}, False, None),                           # none left running
+], ids=["one", "two", "another-read", "none"])
+def test_an_excel_a_failed_start_left_running_is_ended(tmp_path, monkeypatch, after, other,
+                                                        ended):
+    """DispatchEx failing - 'Server execution failed', ~93 s here - left the
+    EXCEL.EXE COM started running hidden on its license agreement, never
+    tied, registered or ended: one more each extract (review, 2026-10-20).
+    The one new automation Excel is ended; when which one cannot be told,
+    the problem line says one may be left running."""
+    log = []
+
+    def dispatch(name):
+        if other:
+            excel_open._STARTING["ever"] += 1
+        raise _server_execution_failed()
+    _dispatch(monkeypatch, None, [{(100, 1)}, after], log=log, dispatch=dispatch)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    with pytest.raises(ExcelOpenError) as e:
+        read_with_excel(f, want_pictures=False, timeout=30)
+    note = (" (a hidden Excel it started may still be running: Task Manager can end it)"
+            if ended is False else "")
+    assert str(e.value) == _DOWN.format("Server execution failed" + note, "try")
+    assert log == ([("held", 4242, 9), ("let go", "H", True)] if ended else [])
+    assert excel_open._STARTING["now"] == 0
+
+
+def test_only_an_excel_com_started_for_automation_is_taken_for_this_reads(tmp_path, monkeypatch):
+    """Found by its process alone, an Excel is taken for the one DispatchEx
+    started - tied, ended - only when COM started it for automation
+    ('/automation -Embedding' on its command line): never an Excel the user
+    opened meanwhile, which no longer makes the read's own ambiguous either
+    (review, 2026-10-20). Real processes: Python children standing in for
+    EXCEL.EXE."""
+    import subprocess
+    if sys.platform != "win32":
+        pytest.skip("Windows processes")
+    code = "import time; time.sleep(60)"
+    com = subprocess.Popen([sys.executable, "-c", code, "/automation", "-Embedding"])
+    user = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "book.xlsx")])
+    try:
+        assert "/automation -Embedding" in excel_open._command_line(com.pid)
+        assert excel_open._for_automation(com.pid)
+        assert not excel_open._for_automation(user.pid)
+    finally:
+        com.kill()
+        user.kill()
+    shots = iter([{(com.pid, 7), (user.pid, 8)}])
+    monkeypatch.setattr(excel_open, "_excel_processes", lambda: next(shots))
+    monkeypatch.setattr(excel_open, "_for_automation", lambda pid: pid == com.pid)
+    assert excel_open._new_excel(set()) == (com.pid, 7)
