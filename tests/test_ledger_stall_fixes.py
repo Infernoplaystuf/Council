@@ -400,3 +400,38 @@ def test_a_folder_scan_does_not_follow_a_junction(tmp_path):
     lf.make_laser_log(root / "real" / "a.xlsx")
     _winapi.CreateJunction(str(root / "real"), str(root / "loop"))
     assert [p.name for p in se.workbook_files(root)] == ["a.xlsx"]
+
+
+# ---------------------------------------------- huge padded cells (end-to-end test, 2026-10-19)
+
+@pytest.mark.parametrize("cell", ["NOTE:" + " " * 32000 + "x", "MK" + " " * 32000,
+                                  "  EC  Pre " + " " * 20000 + "(%FSH)"])
+def test_normalizing_a_cell_padded_to_excels_limit_is_instant(cell):
+    import sample_ledger as sl
+    t0 = time.perf_counter()
+    sl.normalize_label(cell)
+    sl._split_unit(cell)
+    assert time.perf_counter() - t0 < 0.2                  # was 2.5-3.8 s holding the GIL
+
+
+@pytest.mark.parametrize("label,want", [("Flaw Length (in)", "flaw length"),
+                                        ("  EC   Pre  (%FSH) ", "ec pre"),
+                                        ("Power (W)", "power"), ("Notes:", "notes")])
+def test_normalize_label_gives_the_same_names(label, want):
+    import sample_ledger as sl
+    assert sl.normalize_label(label) == want
+
+
+def test_a_sheet_of_padded_cells_extracts_in_seconds(tmp_path, ledger):
+    _csv, schema = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in range(1, 41):
+        ws.cell(r, 1, "NOTE:" + " " * 8000 + f"x{r}")
+        ws.cell(r, 2, "MK" + " " * 8000)
+    ws["D1"], ws["E1"] = "Power (W)", 280
+    wb.save(tmp_path / "padded.xlsx")
+    t0 = time.perf_counter()
+    run = se.extract(schema, [tmp_path / "padded.xlsx"], use_images=False)
+    assert time.perf_counter() - t0 < 10                  # was minutes, GUI frozen
+    assert any(o.field.startswith("Power") for o in run.obs)
