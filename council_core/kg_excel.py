@@ -1344,9 +1344,14 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         except se.LedgerError as exc:
             # openpyxl refusing the bytes is for good, and so is a password;
             # Excel failing otherwise may not be (busy, asking to sign in),
-            # so that is tried again next time.
+            # so that is tried again next time. Not when Excel said these
+            # bytes are no workbook ('the file format or file extension is
+            # not valid') or the file is empty (ExcelOpenError.for_good): a
+            # hidden Excel was started for it on every rebuild, unchanged or
+            # not (review, 2026-10-20).
             raise Unreadable(str(exc), permanent=not via_excel or bool(
-                re.search(r"(?i)password", str(exc)))) from exc
+                re.search(r"(?i)password", str(exc))) or bool(
+                getattr(exc.__cause__, "for_good", False))) from exc
         except Exception as exc:
             if not via_excel:
                 raise

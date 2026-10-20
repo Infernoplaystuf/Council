@@ -172,3 +172,40 @@ def test_corrupt_keeps_excels_description(tmp_path):
     exc = _fake_com_error(-2146827284, "The file format and extension don't match")
     err = classify_open_failure(exc, p)
     assert err.kind == "corrupt" and "don't match" in str(err)
+
+
+# ------------------------------------------------------------- (review, 2026-10-20)
+
+def test_a_file_excel_cannot_find_names_the_path_limit_this_excel_has(tmp_path):
+    """The message said Excel accepts 218 characters; Excel 365 here opens
+    255 (measured: 256-259 fail)."""
+    p = tmp_path / "moved.xls"
+    p.write_bytes(b"\xd0\xcf\x11\xe0")
+    exc = _fake_com_error(-2146827284, "Sorry, we couldn't find moved.xls.")
+    msg = str(classify_open_failure(exc, p))
+    assert "(255 characters: " in msg and "218" not in msg
+
+
+def test_only_excel_saying_the_format_is_not_valid_is_for_good(tmp_path):
+    """A file Excel says is no workbook ('the file format or file extension
+    is not valid') is refused again for the same bytes: for good, so the
+    knowledge graph stops starting Excel for it on every rebuild. Its
+    catch-all 'Open method of Workbooks class failed' (a path too long gave
+    it too) and a Trust Center block (a setting) are not."""
+    p = tmp_path / "notes.xlsx"
+    p.write_bytes(b"this is not a workbook")
+    said = {
+        "Excel cannot open the file 'notes.xlsx' because the file format or file extension "
+        "is not valid. Verify that the file has not been corrupted and that the file "
+        "extension matches the format of the file.": True,
+        "Open method of Workbooks class failed": False,
+        "You are attempting to open a file type (Excel 4.0 Worksheets) that has been "
+        "blocked by your File Block settings in the Trust Center.": False,
+    }
+    for words, for_good in said.items():
+        err = classify_open_failure(_fake_com_error(-2147352567, "Exception occurred.",
+                                                    excepinfo_desc=words,
+                                                    excepinfo_scode=-2146827284), p)
+        assert err.kind == "corrupt" and err.for_good is for_good, words
+    assert summarize_open_failures([("a.xls", "path"), ("b.xls", "empty")]) == (
+        "2 files failed to open — 1 path too long, 1 empty file (0 bytes)")

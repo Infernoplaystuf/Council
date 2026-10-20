@@ -752,6 +752,53 @@ def test_an_excel_failure_is_tried_again_next_time(tmp_path, monkeypatch):
     assert any(e[0] == "open" for e in log)
 
 
+def test_a_file_excel_says_is_no_workbook_is_not_opened_again_while_unchanged(
+        tmp_path, monkeypatch):
+    """A file Excel refuses with 'the file format or file extension is not
+    valid' was opened through a new hidden Excel on EVERY rebuild, unchanged
+    or not (review, 2026-10-20); a 0-byte .xls was 'read' as an empty sheet.
+    Both are remembered by content hash now. Excel's catch-all 'Open method
+    of Workbooks class failed' is still asked again next time."""
+    v = _vault(tmp_path)
+    (v / "data_in" / "notes.xlsx").write_bytes(b"this is not a workbook\r\n" * 20)
+    (v / "data_in" / "cut.xls").write_bytes(excel_open.OLE_MAGIC + b"\0" * 504)
+    (v / "data_in" / "empty.xls").write_bytes(b"")
+    opened = []
+
+    class Refusing(_App):
+        def __init__(self, log):
+            super().__init__(log, [])
+
+            class Books:
+                def Open(self, path, **kw):
+                    name = Path(path).name
+                    opened.append(name)
+                    said = (f"Excel cannot open the file '{name}' because the file format or "
+                            "file extension is not valid. Verify that the file has not been "
+                            "corrupted and that the file extension matches the format of the "
+                            "file." if name == "notes.xlsx"
+                            else "Open method of Workbooks class failed")
+                    raise Exception(-2147352567, "Exception occurred.", (
+                        0, "Microsoft Excel", said, "xlmain11.chm", 0, -2146827284), None)
+            object.__setattr__(self, "Workbooks", Books())
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "excel_available", lambda: True)
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, want_pictures=True, **kw:
+                        real(path, want_pictures=want_pictures,
+                             app_factory=lambda: Refusing([])))
+    kg = _kg(v)
+    stats = kg.seed()
+    said = sorted(u.split(":", 1)[0] for u in stats["unreadable"])
+    assert said == ["cut.xls", "empty.xls", "notes.xlsx"], stats["unreadable"]
+    assert "empty.xls: empty.xls: empty file (0 bytes) — there is nothing in it to read" in (
+        stats["unreadable"])
+    assert sorted(opened) == ["cut.xls", "notes.xlsx"]           # no Excel for the empty one
+    opened.clear()
+    stats = kg.seed()
+    assert opened == ["cut.xls"]                                   # only the catch-all again
+    assert len(stats["unreadable"]) == 3                           # still said why
+
+
 # ── free text, incremental rebuilds, safety ─────────────────────────────
 def test_workbook_notes_feed_the_gazetteer_and_the_free_text_pass(tmp_path):
     v = _vault(tmp_path)

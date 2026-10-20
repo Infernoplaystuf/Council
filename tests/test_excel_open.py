@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import weakref
 from pathlib import Path
 
 import openpyxl
@@ -1455,3 +1456,352 @@ def test_only_an_excel_com_started_for_automation_is_taken_for_this_reads(tmp_pa
     monkeypatch.setattr(excel_open, "_excel_processes", lambda: next(shots))
     monkeypatch.setattr(excel_open, "_for_automation", lambda pid: pid == com.pid)
     assert excel_open._new_excel(set()) == (com.pid, 7)
+
+
+# ── while the workbook is read; paths; empty files (review, 2026-10-20) ──
+#: RPC_S_SERVER_UNAVAILABLE (0x800706BA): Excel gone in the middle of a call
+_RPC_S_SERVER_UNAVAILABLE = -2147023174
+
+
+def _server_unavailable():
+    return Exception(_RPC_S_SERVER_UNAVAILABLE, "The RPC server is unavailable.", None, None)
+
+
+class _RefusingWhileReadApp(_App):
+    """An Excel answering until the workbook is open, then refusing every
+    call from the one named `start` on ('Worksheets', 'Name', 'UsedRange',
+    'Value', 'Shapes', ...) - its license agreement came up while the
+    workbook was copied out (~0.7-1.7 s after it starts, measured here) -
+    `times` times (default: for good), with `error` (default
+    RPC_E_CALL_REJECTED). Close and Quit are refused as well while it is."""
+
+    def __init__(self, log, start="Worksheets", times=10 ** 6, error=None):
+        super().__init__(log)
+        object.__setattr__(self, "gate", {"start": start, "on": False, "left": times,
+                                          "error": error or _call_rejected})
+        app, sheet = self, _Sheet()
+
+        class Gated:
+            def __init__(self, obj):
+                object.__setattr__(self, "obj", obj)
+
+            def __getattr__(self, name):
+                app._gate(name)
+                v = getattr(object.__getattribute__(self, "obj"), name)
+                return Gated(v) if name in ("UsedRange", "Shapes") else v
+
+        class Book:
+            @property
+            def Worksheets(self):
+                app._gate("Worksheets")
+                return [Gated(sheet)]
+
+            def Close(self, SaveChanges=True):
+                app._gate("Close")
+                app.log.append(("close", SaveChanges))
+        object.__setattr__(self, "_book", Book())
+
+    def _gate(self, name):
+        g = self.gate
+        g["on"] = g["on"] or name == g["start"]
+        if g["on"] and g["left"] > 0:
+            g["left"] -= 1
+            self.log.append(("refused", name))
+            raise g["error"]()
+
+    def Quit(self):
+        self._gate("Quit")
+        super().Quit()
+
+
+@pytest.mark.parametrize("start", ["Worksheets", "Name", "UsedRange", "Value", "Shapes"])
+def test_an_excel_refusing_while_the_workbook_is_read_is_said_once_per_extract(
+        tmp_path, monkeypatch, start):
+    """Excel's license agreement came up after Workbooks.Open: the raw
+    'Call was rejected by callee' escaped as 'could not be read
+    (com_error(...))', kind 'other', and every workbook after it started an
+    Excel of its own (review, 2026-10-20). Now it is asked again for a
+    moment, then said as an Excel refusing before the workbook opened is:
+    once per extract, the rest not tried."""
+    monkeypatch.setattr(excel_open, "_REFUSED_WAIT_S", 0.3, raising=False)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log, apps = [], []
+
+    def factory():
+        apps.append(_RefusingWhileReadApp(log, start))
+        return apps[-1]
+    with excel_open.cancel_scope():
+        for _ in range(2):
+            with pytest.raises(ExcelOpenError) as e:
+                read_with_excel(f, want_pictures=False, app_factory=factory)
+            assert e.value.kind == "unavailable"
+            assert str(e.value) == _REFUSING.format("Call was rejected by callee", "extract")
+    assert len(apps) == 1                                # the second: no Excel at all
+    assert log.count(("refused", start)) > 1             # asked again, not once
+
+
+@pytest.mark.parametrize("start", ["Worksheets", "UsedRange", "Value", "Shapes"])
+def test_an_excel_busy_for_a_moment_while_the_workbook_is_read_reads_it(tmp_path, start):
+    """'The application is busy' once while the workbook is copied out: asked
+    again, and the workbook is read - not given up, nor Excel marked down
+    for the extract."""
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log = []
+    busy = lambda: Exception(_RPC_E_SERVERCALL_RETRYLATER, "The message filter "  # noqa: E731
+                             "indicated that the application is busy.", None, None)
+    with excel_open.cancel_scope():
+        book = read_with_excel(f, want_pictures=False, app_factory=lambda: _RefusingWhileReadApp(
+            log, start, times=1, error=busy))
+        assert getattr(excel_open._SCOPE, "down", None) is None
+    (name, cells), = book.sheets
+    assert name == "EC" and cells[(2, 2)] == 2041
+    assert [e.name for e in book.extras] == ["EC › text box 1", "EC › chart 2"]
+    assert log.count(("refused", start)) == 1 and log[-1] == ("quit",)
+
+
+def test_an_excel_gone_while_the_workbook_is_read_fails_that_workbook_only(tmp_path):
+    """Excel closed or crashed while the workbook was copied out (RPC server
+    unavailable): a raw com_error before; now said in words, for this
+    workbook - the next one starts an Excel of its own."""
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    log, apps = [], []
+
+    def factory():
+        apps.append(_RefusingWhileReadApp(log, "UsedRange", error=_server_unavailable))
+        return apps[-1]
+    with excel_open.cancel_scope():
+        for _ in range(2):
+            with pytest.raises(ExcelOpenError) as e:
+                read_with_excel(f, want_pictures=False, app_factory=factory)
+            assert e.value.kind == "unavailable" and not e.value.down
+            assert str(e.value) == ("a.xls: Excel stopped while the workbook was being read (The "
+                                    "RPC server is unavailable) — it may have closed or crashed "
+                                    "on it")
+        assert getattr(excel_open._SCOPE, "down", None) is None
+    assert len(apps) == 2
+
+
+def test_an_extract_whose_excel_refuses_while_reading_says_so_on_one_line(tmp_path, monkeypatch):
+    """The Ledger end to end, as the tester's: each .xls read 'could not be
+    read (com_error(-2147418111, ...))', kind 'other', an Excel started for
+    each. Now one line naming the workbooks left unread, kind
+    'unavailable', one Excel."""
+    import source_extract as se
+    from council_core.ledger_ingest import summarize_open_failures
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    monkeypatch.setattr(excel_open, "_REFUSED_WAIT_S", 0.3, raising=False)
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    olds = [tmp_path / n for n in ("b.xls", "c.xlsb")]
+    for f in olds:
+        f.write_bytes(OLE_MAGIC)
+    apps = []
+
+    def factory():
+        apps.append(_RefusingWhileReadApp([], "Value"))
+        return apps[-1]
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=factory))
+    run = se.extract(schema, [a, *olds], use_images=False)
+    assert run.obs and len(apps) == 1                    # a.xlsx read; one Excel
+    said = [p for p in run.problems if any(f.name in p for f in olds)]
+    assert said == [_REFUSING.format("Call was rejected by callee", "extract")
+                    + " (not read: b.xls, c.xlsb)"]
+    assert run.open_failures == [("b.xls", "unavailable"), ("c.xlsb", "unavailable")]
+    assert summarize_open_failures(run.open_failures) == (
+        "2 files failed to open — 2 Excel COM not available")
+
+
+def _at_length(tmp_path: Path, n: int, suffix: str = ".xls") -> Path:
+    """A valid-looking workbook whose full path is `n` characters."""
+    base = tmp_path.resolve() / "src"
+    base.mkdir(exist_ok=True)
+    p = base / ("p" * (n - len(str(base)) - 1 - len(suffix)) + suffix)
+    p.write_bytes(OLE_MAGIC + b"\0" * 504)
+    assert len(str(p.resolve())) == n
+    return p
+
+
+class _PathLimitedApp(_App):
+    """Excel 365 on this PC: a workbook whose path is over 255 characters
+    is not opened, and Excel says only 'Open method of Workbooks class
+    failed' (measured at 256-259)."""
+
+    def __init__(self, log):
+        super().__init__(log)
+        app, open_ = self, self.Workbooks.Open
+
+        class Books:
+            def Open(self, path, **kw):
+                if len(str(path)) > 255:
+                    app.log.append(("open", Path(path).name, kw))
+                    raise Exception(-2147352567, "Exception occurred.", (
+                        0, "Microsoft Excel", "Open method of Workbooks class failed",
+                        "xlmain11.chm", 0, -2146827284), None)
+                return open_(path, **kw)
+        object.__setattr__(self, "Workbooks", Books())
+
+
+@pytest.mark.parametrize("n", [255, 256, 259])
+def test_a_path_longer_than_excel_opens_is_said_before_excel_starts(tmp_path, n):
+    """A valid .xls 256-259 characters deep was 'corrupt' - 'Excel refused to
+    open the file ... corrupt, HTML saved with an .xls extension ...' - and
+    the code's own limit said 218 (review, 2026-10-20). Excel here opens 255
+    and no more: past that it is said for what it is, no Excel started."""
+    f = _at_length(tmp_path, n)
+    log, apps = [], []
+
+    def factory():
+        apps.append(_PathLimitedApp(log))
+        return apps[-1]
+    if n <= 255:                                         # opened, as before
+        assert read_with_excel(f, want_pictures=False, app_factory=factory).sheets
+        assert len(apps) == 1
+        return
+    with pytest.raises(ExcelOpenError) as e:
+        read_with_excel(f, want_pictures=False, app_factory=factory)
+    assert e.value.kind == "path" and apps == []
+    assert str(e.value) == (f"{f.name}: path too long for Excel: {n} characters (Excel opens "
+                            "paths of up to 255) — move the folder or shorten its name")
+
+
+def test_an_extract_counts_a_path_too_long_for_excel_as_such(tmp_path, monkeypatch):
+    """The Ledger's roll-up: '1 corrupt / wrong format / blocked' for a valid
+    .xls 258 characters deep; now '1 path too long'."""
+    import source_extract as se
+    from council_core.ledger_ingest import summarize_open_failures
+    from ledger_fixtures import make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    deep = _at_length(tmp_path, 258)
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=lambda: _PathLimitedApp([])))
+    run = se.extract(schema, [deep], use_images=False)
+    assert run.open_failures == [(deep.name, "path")]
+    assert run.problems == [f"{deep.name}: path too long for Excel: 258 characters (Excel opens "
+                            "paths of up to 255) — move the folder or shorten its name"]
+    assert summarize_open_failures(run.open_failures) == "1 files failed to open — 1 path too long"
+
+
+@pytest.mark.parametrize("name", ["empty.xls", "empty.xlsx", "empty.xlsb"])
+def test_a_0_byte_workbook_is_said_empty_and_excel_is_not_started(tmp_path, name):
+    """Excel 'read' a 0-byte .xls as one blank sheet and the run said nothing
+    of it (review, 2026-10-20): it is an empty file, said so before any
+    Excel starts - and for good (the knowledge graph does not ask again)."""
+    f = tmp_path / name
+    f.write_bytes(b"")
+    with pytest.raises(ExcelOpenError) as e:
+        read_with_excel(f, want_pictures=False, app_factory=lambda: pytest.fail("Excel started"))
+    assert e.value.kind == "empty" and e.value.for_good
+    assert str(e.value) == f"{name}: empty file (0 bytes) — there is nothing in it to read"
+
+
+def test_an_extract_reports_0_byte_workbooks(tmp_path, monkeypatch):
+    import source_extract as se
+    from council_core.ledger_ingest import summarize_open_failures
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    empties = [tmp_path / n for n in ("e.xls", "e.xlsx")]
+    for f in empties:
+        f.write_bytes(b"")
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=lambda: pytest.fail("Excel started")))
+    run = se.extract(schema, [a, *empties], use_images=False)
+    assert run.obs                                       # a.xlsx still read
+    assert run.open_failures == [("e.xls", "empty"), ("e.xlsx", "empty")]
+    assert [p for p in run.problems if "empty file" in p] == [
+        f"{n}: empty file (0 bytes) — there is nothing in it to read" for n in ("e.xls", "e.xlsx")]
+    assert summarize_open_failures(run.open_failures) == (
+        "2 files failed to open — 2 empty file (0 bytes)")
+
+
+# Excel objects that hold nothing else (no reference cycles), so what is
+# still alive is what the read itself kept
+class _PlainBook:
+    def __init__(self, refusing=False):
+        self.refusing = refusing
+
+    @property
+    def Worksheets(self):
+        if self.refusing:                   # its license agreement came up
+            raise _call_rejected()
+        return []
+
+    def Close(self, SaveChanges=True):
+        pass
+
+
+class _PlainBooks:
+    def __init__(self, how, made):
+        self.how, self.made = how, made
+
+    def Open(self, path, **kw):
+        if self.how == "refused":
+            raise Exception(-2147352567, "Exception occurred.", (
+                0, "Microsoft Excel", "Open method of Workbooks class failed",
+                "xlmain11.chm", 0, -2146827284), None)
+        book = _PlainBook(refusing=self.how == "refusing")
+        self.made.append(weakref.ref(book))
+        return book
+
+
+class _PlainApp:
+    Hwnd = 77
+
+    def __init__(self, how, made):
+        self.Workbooks = _PlainBooks(how, made)
+
+    def Quit(self):
+        pass
+
+
+@pytest.mark.parametrize("how", ["refused", "read", "refusing"])
+def test_no_excel_object_outlives_com_on_the_thread(tmp_path, monkeypatch, how):
+    """The Workbooks collection Excel would not open a workbook with (kept
+    in an error's frames and in the read's own) was let go only after
+    CoUninitialize: that hidden Excel, told to quit, ran on for a minute
+    after the extract (4 of 6 at +15 s), and COM's memory was left corrupt -
+    the next workbook's Excel crashed the Council, an access violation in
+    pywin32 (3 runs in 3 on the Ledger's worker thread, measured here;
+    review, 2026-10-20). Nothing of Excel is alive when COM is closed now:
+    a workbook it would not open, one read, one it refused to go on with."""
+    pythoncom = pytest.importorskip("pythoncom")
+    import gc
+    made = []
+
+    def dispatch(name):
+        app = _PlainApp(how, made)
+        made.extend([weakref.ref(app), weakref.ref(app.Workbooks)])
+        return app
+    _dispatch(monkeypatch, None, [{(100, 1)}, {(100, 1), (4242, 9)}], log=[],
+              dispatch=dispatch)
+    monkeypatch.setattr(excel_open, "_REFUSED_WAIT_S", 0.2, raising=False)
+    alive = []
+    real = pythoncom.CoUninitialize
+
+    def uninit():
+        alive.append([r() for r in made if r() is not None])
+        real()
+    monkeypatch.setattr(pythoncom, "CoUninitialize", uninit)
+    f = tmp_path / "a.xls"
+    f.write_bytes(OLE_MAGIC)
+    gc.disable()                                         # what refcounts free, not gc
+    try:
+        if how == "read":
+            read_with_excel(f, want_pictures=False, timeout=30)
+        else:
+            with pytest.raises(ExcelOpenError):
+                read_with_excel(f, want_pictures=False, timeout=30)
+    finally:
+        gc.enable()
+    assert len(made) == (2 if how == "refused" else 3)
+    assert alive == [[]], alive
