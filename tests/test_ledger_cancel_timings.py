@@ -131,6 +131,75 @@ def test_a_read_that_starts_after_a_cancel_is_not_stopped(tmp_path, monkeypatch)
     assert book.sheets == [] and log == ["open", "close", "quit"]
 
 
+def test_inside_an_extract_a_cancel_before_the_read_began_stops_it(tmp_path, monkeypatch):
+    """The read counted Cancels only from when it was called: one pressed
+    earlier in the extract was missed (review, 2026-10-19). Inside the
+    extract's scope no Excel is started at all."""
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+    f = tmp_path / "a.xls"
+    f.write_bytes(excel_open.OLE_MAGIC)
+    started = []
+    with excel_open.cancel_scope():
+        excel_open.kill_active_excels()              # Cancel, on another step of the run
+        with pytest.raises(excel_open.ExcelOpenError) as e:
+            excel_open.read_with_excel(f, want_pictures=False,
+                                       app_factory=lambda: started.append(1))
+    assert e.value.kind == "cancelled" and started == []
+
+
+def test_cancel_while_the_extract_checks_the_file_stops_its_excel_read(tmp_path, monkeypatch):
+    """Cancel pressed while load_workbook_grids' kind_of was reading the .xls
+    (up to 8 MB; far longer on a share or a cold cache), with 'opening
+    b.xls through Excel (up to 2 min)' already showing: it found no PID, the
+    read had not noted the count yet, and Excel opened the workbook - read in
+    full, or a rights-protected one waited the 2-minute watchdog (review,
+    2026-10-19)."""
+    import source_extract as se
+    from ledger_fixtures import make_laser_log, make_template
+    from sample_ledger import read_template
+    schema = read_template(make_template(tmp_path / "t.xlsx"))
+    a = make_laser_log(tmp_path / "a.xlsx")
+    b = tmp_path / "b.xls"
+    b.write_bytes(excel_open.OLE_MAGIC)
+    monkeypatch.setattr(excel_open, "_ACTIVE_EXCEL_PIDS", set())
+    cancel, log = threading.Event(), []
+    real_kind = excel_open.kind_of
+
+    def kind_of(path):
+        if Path(path).name == "b.xls" and not log:
+            cancel.set()                             # the tab's Cancel button...
+            log.append(("killed", excel_open.kill_active_excels()))   # ...and its kill
+        return real_kind(path)
+
+    class Book:
+        Worksheets = []
+
+        def Close(self, SaveChanges=True):
+            log.append("close")
+
+    class App:
+        class Workbooks:
+            @staticmethod
+            def Open(path, **kw):
+                log.append("open")
+                return Book()
+
+        def Quit(self):
+            log.append("quit")
+
+    def factory():
+        log.append("excel")
+        return App()
+    monkeypatch.setattr(excel_open, "kind_of", kind_of)
+    real = excel_open.read_with_excel
+    monkeypatch.setattr(excel_open, "read_with_excel", lambda path, **kw: real(
+        path, want_pictures=False, app_factory=factory))
+    run = se.extract(schema, [a, b], use_images=False, cancel=cancel)
+    assert run.cancelled and run.obs                 # a's values kept
+    assert any("while reading 'b.xls'" in p for p in run.problems)
+    assert log == [("killed", 0)]                    # no Excel started, nothing opened
+
+
 def test_cancel_while_excel_starts_ends_the_extract_without_opening(tmp_path, monkeypatch):
     import source_extract as se
     from ledger_fixtures import make_laser_log, make_template

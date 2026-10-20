@@ -192,6 +192,66 @@ def test_an_encrypted_package_is_found_past_the_first_8_mb(tmp_path):
     assert kind_of(tmp_path / "big.xlsx") == "password"
 
 
+def _cfb_with_storage(streams: dict, storage: str, inner: dict) -> bytes:
+    """A compound file with `streams` in its root and a storage `storage`
+    holding `inner` - an embedded object's, as an .xls keeps one ('MBD0001').
+    Each stream a whole number of 512-byte sectors, 4096 bytes or more (none
+    in the mini stream)."""
+    import struct
+    end, free, fatsect, none = 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD, 0xFFFFFFFF
+    blobs = list(streams.values()) + list(inner.values())
+    assert all(len(b) >= 4096 and len(b) % 512 == 0 for b in blobs)
+    fat, first, s = [fatsect], [], 1                 # sector 0: the FAT
+    for b in blobs:
+        first.append(s)
+        fat += [s + i + 1 for i in range(len(b) // 512 - 1)] + [end]
+        s += len(b) // 512
+
+    def entry(name, typ, right, child, at, size):
+        nm = name.encode("utf-16-le") + b"\0\0"
+        return (nm.ljust(64, b"\0") + struct.pack("<HBBIII", len(nm), typ, 1, none, right, child)
+                + b"\0" * 36 + struct.pack("<IQ", at, size))
+    n, m = len(streams), len(inner)
+    d = entry("Root Entry", 5, none, 1, end, 0)
+    for i, (name, b) in enumerate(streams.items()):    # root's children, the storage last
+        d += entry(name, 2, i + 2, none, first[i], len(b))
+    d += entry(storage, 1, none, n + 2 if m else none, 0, 0)
+    for j, (name, b) in enumerate(inner.items()):
+        d += entry(name, 2, n + 3 + j if j + 1 < m else none, none, first[n + j], len(b))
+    d = d.ljust(-(-len(d) // 512) * 512, b"\0")
+    dir_at = s
+    fat += [dir_at + i + 1 for i in range(len(d) // 512 - 1)] + [end]
+    assert len(fat) <= 128
+    fat += [free] * (128 - len(fat))
+    head = (OLE_MAGIC + b"\0" * 16 + struct.pack("<HHHHH", 0x3E, 3, 0xFFFE, 9, 6)
+            + b"\0" * 6 + struct.pack("<9I", 0, 1, dir_at, 0, 4096, end, 0, end, 0)
+            + struct.pack("<109I", 0, *([free] * 108)))
+    return head.ljust(512, b"\0") + struct.pack("<128I", *fat) + b"".join(blobs) + d
+
+
+def test_an_encrypted_embedded_object_does_not_lock_the_workbook(tmp_path):
+    """The scan of the first 8 MB for 'EncryptedPackage' ran before the
+    directory was read, so an .xls holding a password-protected document as
+    an embedded object was refused as 'password' - and the knowledge graph
+    marked it unreadable for good - though Excel opens it without asking
+    (review, 2026-10-19). Only a stream in the root counts."""
+    book = _biff(BOF, (0x00E1, b"\xb0\x04"), EOF).ljust(4096, b"\0")
+    sealed = {"EncryptionInfo": b"\x04\x00\x04\x00".ljust(4096, b"\0"),
+              "EncryptedPackage": b"\0" * 4096}
+    embedded = tmp_path / "embedded.xls"
+    embedded.write_bytes(_cfb_with_storage({"Workbook": book}, "MBD0001", sealed))
+    assert kind_of(embedded) == "legacy"
+    # the same streams in the root: the file itself is encrypted
+    locked = tmp_path / "locked.xlsx"
+    locked.write_bytes(_cfb_with_storage(sealed, "MBD0001", {"Workbook": book}))
+    assert kind_of(locked) == "password"
+    # an embedded password .xls (FILEPASS in ITS Workbook stream) is that object's too
+    inner = _biff(BOF, (0x002F, FILEPASS_PASSWORD), EOF).ljust(4096, b"\0")
+    host = tmp_path / "host.xls"
+    host.write_bytes(_cfb_with_storage({"Workbook": book}, "MBD0002", {"Workbook": inner}))
+    assert kind_of(host) == "legacy"
+
+
 # ── text boxes and charts as tables ─────────────────────────────────────
 def test_text_box_lines_become_label_value_cells():
     assert text_cells("Scan Speed (mm/s): 1800\r\nSpot Size (mm): 0.05\n") == {
@@ -352,51 +412,77 @@ def test_excel_is_driven_read_only_with_macros_off_and_closed_unsaved(tmp_path):
 class _GridSheet:
     """A sheet of text cells, some of them merged, that counts what Excel is
     asked: MergeCells is True / False / None (all / none / some of the range
-    merged), as Excel answers."""
+    merged), as Excel answers. `asked` counts the MergeCells questions,
+    `calls` every call into Excel (each costs ~1-1.6 ms in a real one).
+    `data` ({(r, c): value}) replaces the text grid."""
     Name = "Grid"
 
-    def __init__(self, rows, cols, merged=()):
+    def __init__(self, rows, cols, merged=(), data=None):
         self.merged = list(merged)                       # (r1, c1, r2, c2)
-        self.asked = 0
+        self.asked = self.calls = 0
+        self.at = {(r, c): a for a in self.merged
+                   for r in range(a[0], a[2] + 1) for c in range(a[1], a[3] + 1)}
         sheet = self
-        data = [[f"t{r}.{c}" for c in range(1, cols + 1)] for r in range(1, rows + 1)]
-        for r1, c1, r2, c2 in self.merged:               # only the top-left keeps a value
-            for r in range(r1, r2 + 1):
-                for c in range(c1, c2 + 1):
-                    if (r, c) != (r1, c1):
-                        data[r - 1][c - 1] = None
+        if data is None:
+            data = {(r, c): f"t{r}.{c}" for r in range(1, rows + 1) for c in range(1, cols + 1)
+                    if (r, c) not in self.at or self.at[(r, c)][:2] == (r, c)}
+        grid = tuple(tuple(data.get((r, c)) for c in range(1, cols + 1))
+                     for r in range(1, rows + 1))
+
+        def counted(f):
+            def get(self):
+                sheet.calls += 1
+                return f(self)
+            return property(get)
 
         class Rng:
             def __init__(self, r1, c1, r2, c2, value=None):
-                self.Row, self.Column, self.Value = r1, c1, value
-                self.box = (r1, c1, r2, c2)
-                self.Rows = type("n", (), {"Count": r2 - r1 + 1})()
-                self.Columns = type("n", (), {"Count": c2 - c1 + 1})()
+                self.box, self.Value = (r1, c1, r2, c2), value
 
-            @property
+            Row = counted(lambda self: self.box[0])
+            Column = counted(lambda self: self.box[1])
+            Rows = counted(lambda self: _GridSheet._n(sheet, self.box[2] - self.box[0] + 1))
+            Columns = counted(lambda self: _GridSheet._n(sheet, self.box[3] - self.box[1] + 1))
+
+            @counted
+            def Address(self):
+                from openpyxl.utils.cell import get_column_letter as col
+                r1, c1, r2, c2 = self.box
+                a = f"${col(c1)}${r1}"
+                return a if (r1, c1) == (r2, c2) else f"{a}:${col(c2)}${r2}"
+
+            @counted
             def MergeCells(self):
                 sheet.asked += 1
                 r1, c1, r2, c2 = self.box
-                inside = [sheet._area(r, c) is not None for r in range(r1, r2 + 1)
+                inside = [(r, c) in sheet.at for r in range(r1, r2 + 1)
                           for c in range(c1, c2 + 1)]
                 return True if all(inside) else (False if not any(inside) else None)
 
-            @property
+            @counted
             def MergeArea(self):
-                a = sheet._area(self.Row, self.Column)
+                a = sheet.at.get(self.box[:2])
                 return Rng(*a) if a else self
         self._Rng = Rng
-        self.UsedRange = Rng(1, 1, rows, cols, tuple(tuple(r) for r in data))
+        self.UsedRange = Rng(1, 1, rows, cols, grid)
         self.Shapes = _Coll([])
 
-    def _area(self, r, c):
-        return next((a for a in self.merged if a[0] <= r <= a[2] and a[1] <= c <= a[3]), None)
+    @staticmethod
+    def _n(sheet, n):
+        class N:
+            @property
+            def Count(self):
+                sheet.calls += 1
+                return n
+        return N()
 
     def Cells(self, r, c):
+        self.calls += 1
         return self._Rng(r, c, r, c)
 
     def Range(self, address):
         from openpyxl.utils.cell import range_boundaries
+        self.calls += 1
         c1, r1, c2, r2 = range_boundaries(address)
         return self._Rng(r1, c1, r2, c2)
 
@@ -424,6 +510,76 @@ def test_merged_labels_are_found_without_asking_cell_by_cell(tmp_path):
             for r in range(a[0], a[2] + 1) for c in range(a[1], a[3] + 1) if (r, c) != a[:2]}
     assert fill == want                                          # the same labels as before
     assert sheet.asked < 150, sheet.asked                        # not ~2,400
+
+
+def test_a_merged_cell_in_every_row_takes_a_handful_of_questions(tmp_path):
+    """A Remarks column merged G:H in every row, and a form (A:B label, C
+    value, D:E label, F value): halving the rows found every half mixed down
+    to single rows - about one question per text cell, sometimes more - and
+    each merged cell's extent took 7-8 more calls. Such a table still took
+    tens of seconds (review, 2026-10-19)."""
+    table = [(r, 7, r, 8) for r in range(1, 301)]
+    form = [a for r in range(1, 301) for a in ((r, 1, r, 2), (r, 4, r, 5))]
+    for cols, areas in ((8, table), (6, form)):
+        sheet = _GridSheet(300, cols, areas)
+        cells = _read_sheet(tmp_path, sheet)
+        texts = sum(isinstance(v, str) for v in cells.values())
+        fill = {k: v for k, v in cells.items() if isinstance(v, tuple)}
+        assert fill == {(a[0], a[3]): ("__merged__", f"t{a[0]}.{a[1]}") for a in areas}
+        assert texts >= 1200 and sheet.asked <= 20, (texts, sheet.asked)
+        # each range's extent from its address: Cells, MergeArea, Address
+        assert sheet.calls <= 3 * len(areas) + 60, sheet.calls
+
+
+def test_merged_cells_never_cost_much_more_than_asking_cell_by_cell(tmp_path):
+    """Halving asked up to twice as many questions as there are text cells
+    on a sheet merged every which way (review, 2026-10-19). Past one per text
+    cell and _MERGE_SLACK more, the rest is asked cell by cell."""
+    # two-cell ranges, staggered from row to row: halves are mixed both ways
+    areas = [(r, c, r, c + 1) for r in range(1, 41) for c in range(1 + 2 * (r % 2), 15, 4)]
+    sheet = _GridSheet(40, 16, areas)
+    cells = _read_sheet(tmp_path, sheet)
+    texts = sum(isinstance(v, str) for v in cells.values())
+    assert sheet.asked <= texts + excel_open._MERGE_SLACK, (sheet.asked, texts)
+    assert {k for k, v in cells.items() if isinstance(v, tuple)} == {(a[0], a[3]) for a in areas}
+
+
+def test_merged_labels_match_asking_every_text_cell():
+    """The labels the per-cell loop gave, on random sheets: some merged
+    ranges keep a value in more than their first cell (written by something
+    other than Excel), numbers are never repeated, and a range is asked
+    about once however many text cells it holds."""
+    import random
+    rnd = random.Random(19)
+    for _ in range(200):
+        rows, cols = rnd.randint(1, 30), rnd.randint(1, 12)
+        taken, areas = set(), []
+        for _ in range(rnd.randint(0, 20)):
+            r1, c1 = rnd.randint(1, rows), rnd.randint(1, cols)
+            r2, c2 = min(rows, r1 + rnd.randint(0, 3)), min(cols, c1 + rnd.randint(0, 3))
+            box = {(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)}
+            if len(box) > 1 and not box & taken:
+                taken |= box
+                areas.append((r1, c1, r2, c2))
+        data = {}
+        for r in range(1, rows + 1):
+            for c in range(1, cols + 1):
+                x = rnd.random()
+                if x < 0.5:
+                    data[(r, c)] = f"t{r}.{c}"
+                elif x < 0.7:
+                    data[(r, c)] = float(r * c)
+        sheet = _GridSheet(rows, cols, areas, data)
+        got = dict(data)
+        excel_open._fill_merged(sheet, sheet.UsedRange, got)
+        want = dict(data)                        # the loop it replaced
+        for (r, c), v in data.items():
+            if isinstance(v, str) and (r, c) in sheet.at:
+                r1, c1, r2, c2 = sheet.at[(r, c)]
+                for rr in range(r1, r2 + 1):
+                    for cc in range(c1, c2 + 1):
+                        want.setdefault((rr, cc), ("__merged__", v))
+        assert got == want, areas
 
 
 def test_a_picture_that_cannot_be_saved_is_reported_and_the_run_goes_on(tmp_path, monkeypatch):
@@ -527,6 +683,30 @@ def test_copy_picture_says_when_the_clipboard_was_busy(monkeypatch):
     assert excel_open._copy_picture(Refused()) is None and excel_open._COPY_WHY.why == "busy"
     monkeypatch.setattr(excel_open, "_clipboard_busy", lambda timeout=0.5: False)
     assert excel_open._copy_picture(Refused()) is None and excel_open._COPY_WHY.why == ""
+
+
+def test_a_busy_clipboard_is_not_tried_again_through_imagegrab(monkeypatch):
+    """_clipboard_dib waited 5 s for the clipboard and gave up ('busy');
+    ImageGrab then tried again, holding the GIL - one more freeze of the
+    whole app per workbook, for a copy that could not succeed (review,
+    2026-10-19)."""
+    from PIL import ImageGrab
+    grabbed = []
+    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda *a, **kw: grabbed.append(1))
+
+    def never_opens(timeout=5.0):
+        excel_open._COPY_WHY.why = "busy"
+        return None
+
+    class Copied:
+        def CopyPicture(self, **kw):
+            pass
+    monkeypatch.setattr(excel_open, "_clipboard_dib", never_opens)
+    assert excel_open._copy_picture(Copied()) is None
+    assert excel_open._COPY_WHY.why == "busy" and grabbed == []
+    # it opened but held no bitmap: ImageGrab is still asked, as before
+    monkeypatch.setattr(excel_open, "_clipboard_dib", lambda timeout=5.0: None)
+    assert excel_open._copy_picture(Copied()) is None and grabbed == [1]
 
 
 def test_a_clipboard_that_never_opens_is_busy(monkeypatch):
@@ -651,6 +831,52 @@ def test_real_excel_xls_xlsb_text_box_chart_and_password(tmp_path, monkeypatch):
     assert not left, f"{len(left)} of the {len(started)} hidden Excels left running: {left}"
 
 
+#: RPC_E_CALL_REJECTED (0x80010001) as pywintypes.com_error reports it
+_RPC_E_CALL_REJECTED = -2147418111
+
+
+def test_an_excel_that_will_not_quit_is_ended_after_building_a_workbook(tmp_path, monkeypatch):
+    """ledger_bench._excel_save, which the real-Excel tests build their
+    workbooks with, gave up when Quit was refused ('Call was rejected by
+    callee': Excel's license agreement waiting) and left that hidden Excel
+    running, showing the dialog on the user's desktop (review, 2026-10-19).
+    It is now tied to this process and ended by its process id."""
+    pytest.importorskip("pythoncom")
+    win32process = pytest.importorskip("win32process")
+    import subprocess
+    import win32com.client
+    import ledger_bench
+    log = []
+
+    class Book:
+        def SaveAs(self, path, **kw):
+            Path(path).write_bytes(b"saved")
+
+        def Close(self, SaveChanges=True):
+            log.append("close")
+
+    class App:
+        Hwnd = 77
+
+        class Workbooks:
+            @staticmethod
+            def Open(path):
+                return Book()
+
+        def Quit(self):
+            log.append("quit")
+            raise Exception(_RPC_E_CALL_REJECTED, "Call was rejected by callee.", None, None)
+    monkeypatch.setattr(win32com.client, "DispatchEx", lambda name: App())
+    monkeypatch.setattr(win32process, "GetWindowThreadProcessId",
+                        lambda hwnd: (1, 4242) if hwnd == 77 else (0, 0))
+    monkeypatch.setattr(excel_open, "tie_to_this_process", lambda pid: log.append(("tied", pid)))
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: log.append(cmd))
+    (tmp_path / "s.xlsx").write_bytes(b"PK")
+    ledger_bench._excel_save(tmp_path / "s.xlsx", tmp_path / "out.xls", 56)
+    assert log == [("tied", 4242), "close", "quit", ["taskkill", "/F", "/T", "/PID", "4242"]]
+    assert (tmp_path / "out.xls").read_bytes() == b"saved"
+
+
 @real_excel
 def test_real_excel_password_xls_is_refused_at_once_and_excel_is_not_started(
         tmp_path, monkeypatch):
@@ -676,8 +902,16 @@ def test_real_excel_password_xls_is_refused_at_once_and_excel_is_not_started(
     def merge_and_protect(sheet):
         sheet.Range("A3:C3").Merge()
         sheet.Parent.Protect("x", True, False)           # the workbook's structure
-    locked = [made("pw.xls", 56, password="x"), made("pw.xlsb", 50, password="x")]
-    protected = made("prot.xls", 56, edit=merge_and_protect)
+    try:
+        locked = [made("pw.xls", 56, password="x"), made("pw.xlsb", 50, password="x")]
+        protected = made("prot.xls", 56, edit=merge_and_protect)
+    except Exception as e:
+        # _excel_save ended that Excel; a dialog of its own (its license
+        # agreement, measured) makes it refuse every call until answered
+        if excel_open._com_error_hresult(e) == _RPC_E_CALL_REJECTED:
+            pytest.skip("Excel refuses automation calls here ('Call was rejected by callee'): "
+                        "a dialog of its own is waiting - open Excel once and answer it")
+        raise
     started = _record_excel_pids(monkeypatch)
     for f in locked:
         assert kind_of(f) == "password"

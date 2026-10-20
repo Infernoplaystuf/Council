@@ -36,6 +36,7 @@ import re
 import struct
 import threading
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -238,15 +239,27 @@ def kind_of(path) -> str:
     names inside the OLE container (MS-OFFCRYPTO): IRM uses the
     DRMEncrypted data space, a password the StrongEncryption one. An .xls
     with a password to open is told by the FILEPASS record at the start of
-    its Workbook stream (_ole_kind)."""
+    its Workbook stream (_ole_kind).
+
+    The directory is read first: the scan of the first 8 MB for the stream
+    names ran before it and found an 'EncryptedPackage' anywhere - an .xls
+    whose only encrypted thing is an embedded document (a password .docx
+    in an object's storage) was refused as 'password', and the knowledge
+    graph marked it unreadable for good, though Excel opens it without
+    asking (review, 2026-10-19). The scan is kept for a container whose
+    directory this reader does not understand."""
     p = Path(path)
     with open(p, "rb") as fh:
         head = fh.read(8)
         if head == OLE_MAGIC:
-            body = head + fh.read(8 << 20)
+            kind = _ole_kind(fh)
+            if kind is not None:
+                return kind
+            fh.seek(0)
+            body = fh.read(8 << 20)
             if "EncryptedPackage".encode("utf-16-le") in body:
                 return "rights" if "DRMEncrypted".encode("utf-16-le") in body else "password"
-            return _ole_kind(fh)
+            return "legacy"
     if zipfile.is_zipfile(p):
         return "zip"
     return "unknown"
@@ -372,19 +385,25 @@ class _Ole:
         return bytes(buf[:want])
 
 
-def _ole_kind(fh) -> str:
+def _ole_kind(fh) -> Optional[str]:
     """'password', 'rights' or 'legacy' for an OLE container, from its
-    directory. A password-to-open .xls made Excel show a VISIBLE 'Password'
+    directory; None when the directory cannot be read (kind_of then scans
+    the bytes). A password-to-open .xls made Excel show a VISIBLE 'Password'
     dialog on the user's desktop - Password= in Workbooks.Open does not stop
     that for .xls - and the read sat on it for the 2-minute watchdog and was
     called a sign-in timeout (review, 2026-10-19). An encrypted .xlsx /
-    .xlsb whose directory lies past the first 8 MB is found here too.
-    Anything not understood stays 'legacy': Excel is asked, as before."""
+    .xlsb whose directory lies past the first 8 MB is found here too. Only
+    the root's streams count: one inside an embedded object's storage is
+    that object's. A Workbook stream not understood stays 'legacy': Excel is
+    asked, as before."""
     try:
         ole = _Ole(fh)
         names = ole.root_names()
-        if "EncryptedPackage" in names or "EncryptionInfo" in names:
-            return "rights" if any("DRMEncrypted" in e[0] for e in ole.entries) else "password"
+    except Exception:                                       # noqa: BLE001
+        return None
+    if "EncryptedPackage" in names or "EncryptionInfo" in names:
+        return "rights" if any("DRMEncrypted" in e[0] for e in ole.entries) else "password"
+    try:
         for stream in ("Workbook", "Book"):              # BIFF8 / BIFF5
             if stream in names:
                 fp = _filepass(ole.read(names[stream], 8192))
@@ -738,19 +757,41 @@ _ACTIVE_EXCEL_PIDS: "set[int]" = set()
 _ACTIVE_EXCEL_LOCK = threading.Lock()
 
 #: How many times kill_active_excels (the Ledger's Cancel) has run. A read
-#: notes it before it starts Excel and looks again once its PID is
-#: registered: Cancel pressed in the ~0.5 s DispatchEx takes found no PID to
-#: end, and the read went on to the end or to the 2-minute watchdog
+#: notes it when it is called - inside a Ledger extract, when the extract
+#: began (cancel_scope) - and looks again before it starts Excel and once its
+#: PID is registered: Cancel pressed in the ~0.5 s DispatchEx takes found no
+#: PID to end, and the read went on to the end or to the 2-minute watchdog
 #: (review, 2026-10-19). A count rather than a flag left set until the next
 #: extract: the knowledge graph's reads that start after a Cancel are not
 #: stopped by it. Read and bumped under _ACTIVE_EXCEL_LOCK, so a Cancel
 #: either sees the PID or is seen by the read.
 _CANCELS = 0
 
+#: The Cancel count when this thread's Ledger extract began (cancel_scope).
+_SCOPE = threading.local()
+
 
 def _cancels() -> int:
     with _ACTIVE_EXCEL_LOCK:
         return _CANCELS
+
+
+@contextmanager
+def cancel_scope():
+    """A Ledger extract (source_extract.extract) on this thread: a read inside
+    it is stopped by a Cancel pressed at any time since the scope began, not
+    only by one pressed after that read started. A read noted the count when
+    it was called, after kind_of had read the file (up to 8 MB, longer on a
+    share) and the 'through Excel' line was showing: a Cancel then found no
+    PID, was not seen by the read, and the workbook was opened all the same
+    (review, 2026-10-19). Reads on other threads - the knowledge graph's -
+    still count from their own start."""
+    before = getattr(_SCOPE, "since", None)
+    _SCOPE.since = _cancels()
+    try:
+        yield
+    finally:
+        _SCOPE.since = before
 
 
 def _register_excel_pid(app) -> Optional[int]:
@@ -813,10 +854,11 @@ def kill_active_excels() -> int:
 
 def _stop_if_cancelled(path: Path, cancels: int) -> None:
     """Raise ExcelOpenError('cancelled') when kill_active_excels ran since
-    the read noted `cancels`; read_with_excel's finally then quits its
-    Excel, before any workbook is opened in it."""
+    the read (or its extract: cancel_scope) noted `cancels`; read_with_excel's
+    finally then quits its Excel, if it has one, before any workbook is
+    opened in it."""
     if _cancels() != cancels:
-        raise ExcelOpenError(f"{path.name}: cancelled while Excel was starting",
+        raise ExcelOpenError(f"{path.name}: cancelled before it was opened",
                              kind="cancelled")
 
 
@@ -933,6 +975,12 @@ def _a1(row: int, col: int) -> str:
     return f"{letters}{row}"
 
 
+#: How many questions _merged_text_cells may ask beyond one per text cell
+#: (what asking cell by cell cost); a sheet with fewer text cells than this
+#: is asked at most twice as many as it has.
+_MERGE_SLACK = 32
+
+
 def _merged_text_cells(ws, used, cells: Cells) -> List[Tuple[int, int]]:
     """The text cells of sheet `ws` that are part of a merged range. Two COM
     calls per text cell (Cells(r, c).MergeCells) took 24-39 s for a
@@ -940,46 +988,129 @@ def _merged_text_cells(ws, used, cells: Cells) -> List[Tuple[int, int]]:
     (review, 2026-10-19). Now one question for the whole used range -
     Excel's MergeCells is False when nothing in a range is merged, True when
     all of it is, None when some is - and only when some is, the same
-    question for halves of it, down to the text cells that are merged."""
+    question for halves of it, down to the text cells that are merged.
+
+    Halving only the longer side did no better than cell by cell, and often
+    worse, on a table with a merged cell in every row (a Remarks column G:H)
+    or a form (A:B label, C value, D:E label, F value): every half of the
+    rows was mixed, down to single rows (review, 2026-10-19). Now when both
+    halves along one side are mixed the other side is tried too, columns
+    winning when both are: such a sheet takes a handful of questions. And
+    the questions are counted - past one per text cell plus _MERGE_SLACK,
+    what is left is asked cell by cell, so it never costs much more than
+    the old loop."""
     texts = [k for k, v in cells.items() if isinstance(v, str)]
     if not texts:
         return []
+    budget = len(texts) + min(_MERGE_SLACK, len(texts))
+    count = {"asked": 1, "left": len(texts)}      # questions; text cells not yet settled
     try:
         whole = used.MergeCells
     except Exception:
         whole = None
 
-    def asked(pts):
+    def ask(pts):
         """MergeCells of the box around `pts`; '?' when it cannot be asked."""
+        count["asked"] += 1
         r1, r2 = min(p[0] for p in pts), max(p[0] for p in pts)
         c1, c2 = min(p[1] for p in pts), max(p[1] for p in pts)
         try:
+            if (r1, c1) == (r2, c2):
+                return ws.Cells(r1, c1).MergeCells
             return ws.Range(f"{_a1(r1, c1)}:{_a1(r2, c2)}").MergeCells
         except Exception:
             return "?"
+
+    def halves(pts, axis):
+        lo, hi = min(p[axis] for p in pts), max(p[axis] for p in pts)
+        if lo == hi:
+            return None
+        mid = (lo + hi) // 2
+        return [p for p in pts if p[axis] <= mid], [p for p in pts if p[axis] > mid]
+
+    def room() -> bool:
+        """Two more questions keep the total within the budget, whatever
+        they answer (cell by cell, each costs what it settles)."""
+        return count["asked"] + count["left"] + 2 <= budget
     found: set = set()
     todo = [(texts, whole)]
     while todo:
         pts, merged = todo.pop()
         if merged is not None and merged != "?":
+            count["left"] -= len(pts)
             if merged:                           # every cell in the box is merged
                 found.update(pts)
             continue
-        if len(pts) == 1 or merged == "?":       # cell by cell, as before
-            for r, c in pts:
-                try:
-                    if ws.Cells(r, c).MergeCells:
-                        found.add((r, c))
-                except Exception:
-                    pass
+        if len(pts) > 1 and merged != "?" and room():
+            by_row, by_col = halves(pts, 0), halves(pts, 1)
+            rows = max(p[0] for p in pts) - min(p[0] for p in pts)
+            cols = max(p[1] for p in pts) - min(p[1] for p in pts)
+            tried = []                           # (by columns?, [(half, answer)])
+            for split in ((by_row, by_col) if rows >= cols else (by_col, by_row)):
+                if split is None or (tried and not room()):
+                    continue
+                tried.append((split is by_col, [(h, ask(h)) for h in split]))
+                if any(a is not None for _h, a in tried[-1][1]):
+                    break                        # a half settled: split this way
+            settled = [t for t in tried if any(a is not None for _h, a in t[1])]
+            # every half mixed, both ways: by columns
+            chosen = settled[0] if settled else max(tried, key=lambda t: t[0])
+            todo.extend(chosen[1])
             continue
-        rows = max(p[0] for p in pts) - min(p[0] for p in pts)
-        cols = max(p[1] for p in pts) - min(p[1] for p in pts)
-        axis = 0 if rows >= cols else 1         # halve the longer side
-        mid = (max(p[axis] for p in pts) + min(p[axis] for p in pts)) // 2
-        for half in ([p for p in pts if p[axis] <= mid], [p for p in pts if p[axis] > mid]):
-            todo.append((half, asked(half)))
+        for p in pts:                            # cell by cell, as before
+            count["left"] -= 1
+            a = ask([p])
+            if a and a != "?":
+                found.add(p)
     return [k for k in texts if k in found]
+
+
+_A1_AREA = re.compile(r"\$?([A-Z]{1,3})\$?(\d+)(?::\$?([A-Z]{1,3})\$?(\d+))?")
+
+
+def _col_of(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def _merged_area(ws, r: int, c: int) -> Tuple[int, int, int, int]:
+    """(first row, first column, last row, last column) of the merged range
+    holding cell (r, c): its address ('$G$2:$H$2') in one call, parsed.
+    Row, Column, Rows.Count and Columns.Count were 7 calls and more for each
+    merged text cell (review, 2026-10-19); they are asked only for an
+    address not of that form (a whole row, '$3:$3')."""
+    area = ws.Cells(r, c).MergeArea
+    try:
+        m = _A1_AREA.fullmatch(str(area.Address))
+    except Exception:
+        m = None
+    if m:
+        r1, c1 = int(m[2]), _col_of(m[1])
+        return (r1, c1, int(m[4]), _col_of(m[3])) if m[3] else (r1, c1, r1, c1)
+    r1, c1 = int(area.Row), int(area.Column)
+    return r1, c1, r1 + int(area.Rows.Count) - 1, c1 + int(area.Columns.Count) - 1
+
+
+def _fill_merged(ws, used, cells: Cells) -> None:
+    """A merged label reads the same from every cell it covers: each cell of
+    a merged range whose text it holds gets ('__merged__', text), unless it
+    has a value of its own. A range is asked about once, for its first text
+    cell (by rows) - the others in it add nothing."""
+    filled: set = set()
+    for r, c in _merged_text_cells(ws, used, cells):
+        if (r, c) in filled:
+            continue
+        v = cells[(r, c)]
+        try:
+            r1, c1, r2, c2 = _merged_area(ws, r, c)
+        except Exception:
+            continue
+        for rr in range(r1, r2 + 1):
+            for cc in range(c1, c2 + 1):
+                cells.setdefault((rr, cc), ("__merged__", v))
+                filled.add((rr, cc))
 
 
 #: How long Excel may take to open one workbook before it is stopped. A
@@ -1001,8 +1132,12 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     the rebuild ran - no more pictures are copied (each is listed with no
     data, and a note says why) and the clipboard is left as it is, not put
     back over what the user copied."""
-    cancels = _cancels()            # a Cancel after this stops the read (_CANCELS)
+    # a Cancel after this stops the read (_CANCELS) - inside a Ledger extract,
+    # one since the extract began (cancel_scope)
+    since = getattr(_SCOPE, "since", None)
+    cancels = _cancels() if since is None else since
     path = Path(path).resolve()
+    _stop_if_cancelled(path, cancels)       # pressed already: no Excel at all
     if kind_of(path) == "password":
         raise ExcelOpenError(
             f"{path.name} has a password to open; open it in Excel, save a "
@@ -1077,17 +1212,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     v = _plain(v)
                     if v is not None:
                         cells[(r0 + i, c0 + j)] = v
-            # a merged label reads the same from every cell it covers
-            for r, c in _merged_text_cells(ws, used, cells):
-                v = cells[(r, c)]
-                try:
-                    area = ws.Cells(r, c).MergeArea
-                    for rr in range(int(area.Row), int(area.Row) + int(area.Rows.Count)):
-                        for cc in range(int(area.Column),
-                                        int(area.Column) + int(area.Columns.Count)):
-                            cells.setdefault((rr, cc), ("__merged__", v))
-                except Exception:
-                    pass
+            _fill_merged(ws, used, cells)     # a merged label, in every cell it covers
             out.sheets.append((name, cells))
             n = 0
             for k in range(1, int(ws.Shapes.Count) + 1):
@@ -1366,6 +1491,11 @@ def _copy_picture(shape) -> Optional[bytes]:
                 img = BmpImagePlugin.DibImageFile(io.BytesIO(dib))
         except Exception:
             img = None
+        if img is None and getattr(_COPY_WHY, "why", "") == "busy":
+            # the clipboard never opened in 5 s: ImageGrab's own retry could
+            # not do better, and it holds the GIL while it tries - the whole
+            # app froze once more per workbook (review, 2026-10-19)
+            return None
         if img is None:
             img = ImageGrab.grabclipboard()
         if isinstance(img, Image.Image):

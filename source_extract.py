@@ -1771,7 +1771,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     dropped, the workbooks before it are kept. The Ledger tab's Cancel
     button sets it and also calls ``excel_open.kill_active_excels()`` to
     unblock a Workbooks.Open sitting on a modal Excel dialog (a read whose
-    Excel is still starting stops itself once it has one).
+    Excel is still starting, or that has not started one yet, stops itself:
+    excel_open.cancel_scope).
 
     ``log``: where the stall watchdog's stack dump goes (the Ledger log);
     it is also written to <app dir>/logs/ledger_stalls.txt by faulthandler,
@@ -1813,9 +1814,13 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             raise _Cancelled()
         _wd.beat()
         prog.update(here["what"])
+    import excel_open
     try:
-        _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
-                     m, codes, mask_re, part, schema, _time, part_finder)
+        # a Cancel (kill_active_excels) at any time from here stops this
+        # run's Excel reads, also one pressed before a read began
+        with excel_open.cancel_scope():
+            _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                         m, codes, mask_re, part, schema, _time, part_finder)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
