@@ -335,6 +335,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         else:
             prog.stage("asking Council's model about the labels left over")
             ledger_llm.place_labels(run, ledger.schema, chat, report)
+            if cancel is not None and cancel.is_set():
+                # pressed while the model was asked: a cancelled run - it
+                # said 'Review written…' and that the model did not answer
+                # ('stopped by the caller', review 2026-10-20)
+                run.cancelled = True
+                run.problems.append("Cancelled by user while Council's model was asked "
+                                    "about the labels left over; every value the rules "
+                                    "found is in this review.")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
     dec = decide(run, ledger.schema)

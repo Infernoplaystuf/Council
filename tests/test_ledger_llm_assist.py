@@ -536,6 +536,56 @@ def test_cancel_is_not_a_broken_model():
     assert not rep.unavailable and not rep.problems
 
 
+def _stopped_by_cancel(cancel, on):
+    """A model that Cancel stops while it answers the question ``on`` is
+    in ('Which part' or the labels), as council_engine's does."""
+    def chat(prompt, _schema):
+        if ("Which part" in prompt) == (on == "part"):
+            cancel.set()                                   # pressed while it answers
+            raise se.LedgerError("granite3.3:8b (Ollama) did not answer: stopped by the "
+                                 "caller")
+        return json.dumps({"part": "", "evidence": ""}), "granite3.3:8b"
+    return chat
+
+
+def test_cancel_while_the_model_is_asked_about_the_labels_is_a_cancelled_run(tmp_path, ledger):
+    """The run stopped, but it was not a cancelled one: the tab said 'Review
+    written…' and the log that the model had not answered - 'Council's
+    model (none answered)', '... did not answer: stopped by the caller'
+    (review, 2026-10-20)."""
+    import threading
+    csv, _schema = ledger
+    src = _unlabelled_book(tmp_path / "untitled.xlsx")
+    cancel = threading.Event()
+    s = li._extract(str(csv), [str(src)], tmp_path / "review.xlsx", "", False, None,
+                    _NoProg(), None, cancel, None, True, _stopped_by_cancel(cancel, "labels"))
+    assert s.cancelled and s.values and Path(s.review).exists()
+    text = s.describe()
+    assert text.startswith("CANCELLED")
+    assert "did not answer" not in text and "none answered" not in text
+    assert s.assist == ("Council's model: Cancel stopped it while it was asked about the "
+                        "labels left over, so nothing in the review is its suggestion.")
+    assert "Cancelled by user while Council's model was asked about the labels left over; " \
+           "every value the rules found is in this review." in s.problems
+
+
+def test_cancel_while_the_model_is_asked_for_a_part_is_not_its_failure(tmp_path, ledger):
+    import threading
+    csv, _schema = ledger
+    wb = openpyxl.Workbook()
+    wb.active["A1"], wb.active["B1"] = "Power (W)", 280      # no part anywhere
+    wb.save(tmp_path / "nopart.xlsx")
+    cancel = threading.Event()
+    s = li._extract(str(csv), [str(tmp_path / "nopart.xlsx")], tmp_path / "review.xlsx", "",
+                    False, None, _NoProg(), None, cancel, None, True,
+                    _stopped_by_cancel(cancel, "part"))
+    assert s.cancelled
+    text = s.describe()
+    assert "did not answer" not in text and "none answered" not in text
+    assert s.assist == ("Council's model: Cancel stopped it while it was asked about "
+                        "nopart.xlsx, so nothing in the review is its suggestion.")
+
+
 def test_a_missing_ollama_model_says_how_to_install_it(monkeypatch):
     """'... in the Models tab.. Is Ollama running?' for a model Ollama - which
     had answered - does not have (review, 2026-10-19)."""
