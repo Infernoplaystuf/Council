@@ -9,7 +9,8 @@ supported — were deleted. These tests pin the fix (the graph phase scans
 every usable document's cached lines), the counters, the workbook locator
 (one mention per reference, not a wiki-link one and a gazetteer one), the
 Obsidian ``#heading`` / ``^block`` / ``![[embed]]`` forms, and the person
-inference for initials, accents and 'Last, First'.
+inference for initials, accents and 'Last, First' - and that a Title Case
+topic ('Root Cause') is not a person without positive evidence of one.
 
 Every vault is a tmp_path; no model, no network, no Tesseract.
 """
@@ -291,6 +292,99 @@ def test_titles_and_fragments_do_not_infer_as_person(surface):
 def test_codes_still_infer_as_parts():
     assert kgm._infer_wikilink_type("ABC-123") == "PART"
     assert kgm._infer_wikilink_type("P 101") == "PART"
+
+
+# ─────────────────────────────── a PERSON needs positive evidence
+# (review, 2026-10-19): the shape alone - two Capitalised words - made every
+# topic a person, so the People filter listed 'Root Cause' and 'Eddy Current'.
+
+@pytest.mark.parametrize("surface", [
+    "Root Cause",
+    "Eddy Current",
+    "First Article",
+    "Turbine Blade",
+    "Atlas Pump Retrofit",
+    "Corrective Action",
+    "Heat Treatment",
+    "Night Owl",
+    "ABC DEF",
+    "SAM Registration",          # an acronym, though 'Sam' is a given name
+])
+def test_an_unknown_title_case_topic_is_a_project(surface):
+    assert kgm._infer_wikilink_type(surface) == "PROJECT", surface
+
+
+@pytest.mark.parametrize("surface", [
+    "Dana Whitfield",
+    "Mara Kim",
+    "José García",
+    "Tomás Echeverría",
+    "Casey Morgan",
+    "Riley Chen",
+    "Priya Raman",
+    "MARA KIM",
+])
+def test_a_known_given_name_is_a_person(surface):
+    assert kgm._infer_wikilink_type(surface) == "PERSON", surface
+
+
+def test_the_graphs_own_people_are_evidence():
+    # 'Xochitl' is in no built-in list: a person only when the graph
+    # already knows someone of that first name, or that very person.
+    assert kgm._infer_wikilink_type("Xochitl Mendoza") == "PROJECT"
+    assert kgm._infer_wikilink_type("Xochitl Mendoza",
+                                    given_names={"xochitl"}) == "PERSON"
+    assert kgm._infer_wikilink_type("Mendoza, Xochitl") == "PERSON"
+    assert kgm._infer_wikilink_type("Xochitl Mendoza Jr.") == "PROJECT"
+    assert kgm._infer_wikilink_type(
+        "Xochitl Mendoza Jr.", known_people={"xochitl mendoza"}) == "PERSON"
+
+
+def test_topics_stay_out_of_the_people_end_to_end(tmp_path):
+    v = _vault_with(tmp_path, {
+        "status.md": "Project: Atlas\nProgram Lead: Xochitl Ramírez\n",
+        "topics.md": ("Review: [[Atlas Pump Retrofit]], [[Root Cause]], [[Eddy Current]],"
+                      " [[First Article]], [[Turbine Blade]].\n"
+                      "Owner: [[Jordan Blake]]. Ask [[Xochitl Mendoza]] too.\n"),
+    })
+    _seed(v)
+    with _graph(v) as kg:
+        types = {r["name"]: r["type"] for r in kg.db.execute(
+            "SELECT name, type FROM entities WHERE type != 'DOCUMENT'"
+            " AND merged_into IS NULL")}
+        people = [h["name"] for h in kg.search("Root", "PERSON")]
+    for topic in ("Atlas Pump Retrofit", "Root Cause", "Eddy Current",
+                  "First Article", "Turbine Blade"):
+        assert types.get(topic) == "PROJECT", (topic, types)
+    assert types.get("Jordan Blake") == "PERSON"
+    # A record named a Xochitl: her first name is evidence for the next one.
+    assert types.get("Xochitl Ramírez") == "PERSON"
+    assert types.get("Xochitl Mendoza") == "PERSON"
+    assert people == []
+
+
+def test_a_stale_person_does_not_vouch_for_itself(tmp_path):
+    # A graph built by the old rule holds PERSON 'Root Cause'. Its first
+    # word must not count as a given name on the next rebuild, or the old
+    # mistake would keep itself alive.
+    v = _vault_with(tmp_path, {"topics.md": "See [[Root Cause]].\n"})
+    _seed(v)
+    with _graph(v) as kg:
+        with kg.db:
+            eid = kgm.entity_id("PERSON", kgm.entity_key("PERSON", "Root Cause"))
+            # OR IGNORE: under the old rule the first rebuild made it.
+            kg.db.execute("INSERT OR IGNORE INTO entities (id, type, key, name,"
+                          " created_ts) VALUES (?, 'PERSON', ?, 'Root Cause', 0)",
+                          (eid, kgm.entity_key("PERSON", "Root Cause")))
+            kg.db.execute("INSERT OR IGNORE INTO aliases VALUES"
+                          " (?, 'Root Cause', ?, 'inferred')",
+                          (eid, kgm.fold("Root Cause")))
+    _write(v, "topics.md", "See [[Root Cause]] again.\n")
+    _seed(v)
+    with _graph(v) as kg:
+        got = sorted((r["type"], r["name"]) for r in kg.db.execute(
+            "SELECT type, name FROM entities WHERE type != 'DOCUMENT'"))
+    assert got == [("PROJECT", "Root Cause")]
 
 
 def test_an_accented_name_lands_as_one_person_end_to_end(tmp_path):

@@ -81,7 +81,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 3
 STORE_DIR = ".knowledge_graph"
@@ -1068,6 +1068,78 @@ _NOT_NAME_WORDS = frozenset((
 _NAME_PARTICLES = frozenset(
     "de da del della der den di du la le van von bin ibn al dos das".split())
 
+#: Common given names across cultures (folded), so an unknown ``[[Jordan
+#: Blake]]`` is a PERSON while ``[[Root Cause]]`` and ``[[Eddy Current]]``
+#: are not. Left out on purpose: names that are also everyday or shop words,
+#: months, places or product names (Mark, Will, Max, Jack, Grant, Chase,
+#: Rose, June, Austin, Phoenix, Aurora, Nova, Eddy, Nick, Jan, Otto, Maya,
+#: Julian, Victor, Kim...) - such a person still lands as a PERSON when the
+#: graph knows them (see _infer_wikilink_type), and the user can relabel.
+_GIVEN_NAMES = frozenset((
+    # English-speaking
+    "aaron adam adrian aiden alan albert alex alexander alexandra alice alicia"
+    " allison amanda amy andrea andrew andy angela ann anna anne annie anthony"
+    " arthur audrey barbara barry becky ben benjamin beth betty bob brandon"
+    " brenda brian bruce bryan caleb cameron carl carol caroline casey"
+    " catherine charles charlotte chloe chris christina christine christopher"
+    " claire colin connor craig cynthia dan dana daniel danny darren dave david"
+    " deb deborah denise dennis derek diana diane donald donna dorothy doug"
+    " douglas dylan edward eleanor elizabeth ellen emily emma eric erica erin"
+    " ethan evan evelyn fiona gary george gordon greg gregory hannah harold"
+    " harry heather helen henry howard ian isaac jacob james jamie jane janet"
+    " jared jason jeff jeffrey jen jennifer jenny jeremy jessica jim joan joe"
+    " joel john jon jonathan jordan joseph josh joshua julia julie justin karen"
+    " kate katherine kathleen katie keith kelly ken kenneth kevin kimberly kyle"
+    " larry laura lauren lawrence leonard leslie liam linda lisa liz logan lori"
+    " lucy luke margaret marie martha mary matt matthew megan melissa michael"
+    " michelle mike mitchell molly monica morgan nancy natalie nathan neil"
+    " nicholas nicole noah olivia owen pamela patricia patrick paul pete peter"
+    " phil philip rachel ralph rebecca richard rick riley rob robert roger ron"
+    " ronald russell ruth ryan sally sam samantha samuel sandra sarah scott sean"
+    " sharon shirley simon sophia stephanie stephen steve steven stuart susan"
+    " ted teresa theresa thomas tim timothy todd tom tony travis trevor tyler"
+    " valerie vanessa vincent walter wayne wendy william zachary zoe"
+    # Irish and Scottish
+    " aoife ciara conor declan eamon fergus niamh seamus siobhan sinead"
+    # Spanish and Portuguese
+    " alejandro ana andres antonio beatriz camila carlos carmen catalina diego"
+    " eduardo elena enrique esteban fernando francisco gabriel guadalupe"
+    " gustavo hector ines isabel javier joao jorge jose juan julio lucia luis"
+    " manuel marco marcos maria mariana mario marta miguel pablo pedro rafael"
+    " ramon raul ricardo roberto rodrigo sergio sofia thiago tomas valentina"
+    " ximena"
+    # French, German, Dutch, Nordic, Italian, Greek
+    " amelie anders antoine astrid bjorn camille celine dieter dimitris emile"
+    " erik florian francois friedrich georgios giovanni giulia giuseppe"
+    " guillaume hans heinrich helene helmut ingrid jacques jean jens johan"
+    " johannes julien jurgen karl klaus lars laurent lorenzo luca lukas ludwig"
+    " magnus manon mathieu matteo matthias michel nathalie niels nikos nils"
+    " olivier paolo philippe pierre rene sabine salvatore sebastien sigrid"
+    " stefan stefano sven sylvie thierry ulrich ursula uwe wolfgang yannis yves"
+    # Slavic and Eastern European
+    " agnieszka aleksandr alexei anastasia andrei boris dmitri dmitry igor"
+    " irina ivan katarina krzysztof marek natasha nikolai oksana olga pavel"
+    " piotr sergei svetlana tatiana tomasz vladimir yuri zofia"
+    # South Asian
+    " aarav aditya amit anil anita anjali arjun arun deepak divya ganesh kavita"
+    " lakshmi manish meera neha nikhil pooja prakash pranav priya rahul raj"
+    " rajesh ravi rohan sanjay shreya sunil suresh vijay vikram"
+    # East and Southeast Asian
+    " aiko akira daisuke haruto hiroshi keiko kenji kenta naoko satoshi"
+    " takeshi yuki yoko jisoo jiwoo minjun seoyeon hyun wei jing ming mei"
+    " xin anh minh linh tuan thanh"
+    # Arabic, Turkish, Persian, Hebrew
+    " abdullah ahmad ahmed aisha amir amira ayesha fatima farah hamza hassan"
+    " hussein ibrahim karim khalid layla leila mahmoud mariam maryam mehmet"
+    " mohamed mohammad mohammed muhammad mustafa nadia omar rania reza samir"
+    " sara tariq yasmin yousef youssef zainab zeynep avi eitan moshe noa"
+    " shira tamar yael yosef"
+    # African
+    " abena adebayo amara ayodele chidi chinedu chioma emeka femi kofi kwame"
+    " ngozi nnamdi oluwaseun tendai thabo zanele"
+    # Short and shared
+    " ava eli ella eva leah lena mara mia nina nora tara vera").split())
+
 
 def _name_word(tok: str) -> bool:
     """'Blake', "O'Brien", 'Jean-Luc', 'García', 'Ångström': a capital and
@@ -1081,21 +1153,39 @@ def _name_initial(tok: str) -> bool:
     return len(tok) == 2 and tok[1] == "." and tok[0].isalpha() and tok[0].isupper()
 
 
-def _looks_like_person(surface: str) -> bool:
-    """A loose check for "this looks like a human name" so an unresolved
-    ``[[Jordan Blake]]`` lands as a PERSON: two to four Capitalised words
-    (any script: 'José García'), the last a whole word, the others whole
-    words or initials ('Jordan R. Blake', 'J. Blake'), with lower-case
-    particles between ('Ludwig van Beethoven'). 'Last, First' is read the
-    way person_display reads it ('Blake, Jordan R.'), and a trailing 'Jr.'
-    or 'PhD' is not counted. A word that names a thing, not a person
-    ('Program', 'Inspection', 'Line' - _NOT_NAME_WORDS), makes it a title.
+def _given_name(tok: str, names: Collection[str]) -> bool:
+    """Is this first word a given name in ``names`` (folded)? 'Jean-Luc'
+    by 'jeanluc' or its first part 'jean'; 'José' as 'jose'."""
+    f = fold(tok)
+    return bool(f) and (f.replace(" ", "") in names or f.split()[0] in names)
 
-    It only had ASCII letters and no initials (review, 2026-10-19):
+
+def _looks_like_person(surface: str, given_names: Collection[str] = ()) -> bool:
+    """Does an unresolved ``[[surface]]`` name a human? Two things must hold.
+
+    The SHAPE of a name: two to four Capitalised words (any script: 'José
+    García'), the last a whole word, the others whole words or initials
+    ('Jordan R. Blake', 'J. Blake'), with lower-case particles between
+    ('Ludwig van Beethoven'). 'Last, First' is read the way person_display
+    reads it ('Blake, Jordan R.'), and a trailing 'Jr.' or 'PhD' is not
+    counted. A word that names a thing, not a person ('Program',
+    'Inspection', 'Line' - _NOT_NAME_WORDS), makes it a title.
+
+    And POSITIVE evidence it is a person: written 'Last, First', an initial,
+    a name particle, or a first word that is a given name - a common one
+    (_GIVEN_NAMES) or the first name of a person the graph already knows
+    (``given_names``). An all-caps first word in a mixed-case surface ('SAM
+    Registration') is an acronym, not a name.
+
+    The shape alone made a PERSON of every two Capitalised words (review,
+    2026-10-19): [[Root Cause]], [[Eddy Current]], [[First Article]],
+    [[Turbine Blade]] and [[Atlas Pump Retrofit]] landed in the People
+    filter and the gazetteer searched the text for them as people. Before
+    that it only had ASCII letters and no initials (review, 2026-10-19):
     'Jordan R. Blake', 'J. Blake' and 'José García' became PROJECTs.
-    Still loose: a two-word all-caps string like ``ABC DEF`` is a PERSON
-    (``looks_like_code`` runs first on anything with a digit)."""
+    (``looks_like_code`` runs first on anything with a digit.)"""
     s = person_display(surface)
+    flipped = s != " ".join(str(surface or "").split())     # 'Blake, Jordan'
     if "," in s:
         left, right = (x.strip() for x in s.split(",", 1))
         if fold(right) not in _SUFFIXES:
@@ -1110,21 +1200,35 @@ def _looks_like_person(surface: str) -> bool:
         return False
     if any(fold(t) in _NOT_NAME_WORDS for t in named):
         return False
-    return _name_word(named[-1]) and all(_name_word(t) or _name_initial(t)
-                                         for t in named[:-1])
+    if not (_name_word(named[-1]) and all(_name_word(t) or _name_initial(t)
+                                          for t in named[:-1])):
+        return False
+    if flipped or len(named) < len(toks) or any(_name_initial(t) for t in named):
+        return True
+    if named[0].isupper() and not s.isupper():
+        return False                # 'SAM Registration': an acronym
+    return _given_name(named[0], _GIVEN_NAMES) or _given_name(named[0], given_names)
 
 
-def _infer_wikilink_type(surface: str) -> str:
+def _infer_wikilink_type(surface: str, known_people: Collection[str] = (),
+                         given_names: Collection[str] = ()) -> str:
     """Pick an entity type for an unresolved ``[[surface]]``.
+
+    ``known_people``: the person keys (person_key) of the people the graph
+    already knows; ``given_names``: their first names, folded (see
+    KnowledgeGraph._known_people).
 
     Order:
       1. Looks like a code (``[A-Za-z]{1,8}[-_ ]?\\d[\\w\\-/.]*``) → PART.
-      2. Looks like a human name (_looks_like_person) → PERSON.
-      3. Fallback → PROJECT (the KG's catch-all for named things)."""
+      2. Is a person the graph knows ('Jordan Blake Jr.' for Jordan Blake)
+         or looks like a human name (_looks_like_person) → PERSON.
+      3. Fallback → PROJECT (the KG's catch-all for named things): an
+         unknown Title Case phrase with no sign of a person in it."""
     s = (surface or "").strip()
     if looks_like_code(s):
         return "PART"
-    if _looks_like_person(s):
+    if (known_people and person_key(s) in known_people) \
+            or _looks_like_person(s, given_names):
         return "PERSON"
     return "PROJECT"
 
@@ -1679,6 +1783,29 @@ class KnowledgeGraph:
             return None
         return (row["entity_id"], row["type"])
 
+    def _known_people(self) -> Tuple[set, set]:
+        """The people the graph knows, as the wiki-link pass's evidence that
+        an unresolved ``[[Name]]`` is a person: their person keys, and the
+        folded first word of every full name ('Priya Raman' -> 'priya').
+
+        During a rebuild only the people THIS run supports (records, Ledger
+        people, the user's) count: a stale PERSON 'Root Cause', typed by the
+        old shape-only rule (review, 2026-10-19), must not vouch for itself."""
+        keys: set = set()
+        firsts: set = set()
+        live = self._live
+        for r in self.db.execute("SELECT id, key, name FROM entities"
+                                 " WHERE type='PERSON' AND merged_into IS NULL"):
+            if live is not None and r["id"] not in live:
+                continue
+            if r["key"]:
+                keys.add(r["key"])
+            toks = person_display(r["name"] or "").split()
+            # A one-word name may be a surname ('Blake'), or initials.
+            if len(toks) >= 2 and _name_word(toks[0]):
+                firsts.add(fold(toks[0]).replace(" ", ""))
+        return keys, firsts
+
     def _wikilink_refs(self, did: str, h: str, p: Path) -> List[WikiLinkRef]:
         """Every ``[[…]]`` in one document's text lines: the lines the
         gazetteer searches (doc_cache when it holds this version, else the
@@ -1722,6 +1849,9 @@ class KnowledgeGraph:
         not in the graph before; one that was (a wiki-link's own entity from
         the last rebuild, kept until the clean-up at the end) is matched."""
         surfaces = set()
+        # Taken once, before any wiki-link adds a person: the type of a
+        # reference must not depend on which document was read first.
+        known_people, given_names = self._known_people()
         for p, did, h in usable:
             try:
                 refs = self._wikilink_refs(did, h, p)
@@ -1739,7 +1869,8 @@ class KnowledgeGraph:
                     eid, _etype = match
                     stats["wikilinks_matched"] += 1
                 else:
-                    etype = _infer_wikilink_type(ref.surface)
+                    etype = _infer_wikilink_type(ref.surface, known_people,
+                                                 given_names)
                     known = self.db.execute(
                         "SELECT 1 FROM entities WHERE id=?",
                         (entity_id(etype, entity_key(etype, ref.surface)),)

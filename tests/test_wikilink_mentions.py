@@ -62,11 +62,12 @@ def test_other_shapes_fall_back_to_project():
     # Two Capitalized words that are not a name used to infer as PERSON
     # ("Night Line"). Since review, 2026-10-19 a word that names a thing,
     # not a person (Line, Program, Inspection, ... - _NOT_NAME_WORDS),
-    # makes it a title. Two Capitalized words with no such word are still
-    # a PERSON: a documented limit (the user can relabel), fixed here so a
-    # refactor does not silently change it.
+    # makes it a title. Two Capitalized words with no such word were still
+    # a PERSON ("Night Owl" was pinned as one); since the second review,
+    # 2026-10-19, a PERSON needs positive evidence (a known given name, an
+    # initial, 'Last, First', a particle), so "Night Owl" is a PROJECT.
     assert kgm._infer_wikilink_type("Night Line") == "PROJECT"
-    assert kgm._infer_wikilink_type("Night Owl") == "PERSON"
+    assert kgm._infer_wikilink_type("Night Owl") == "PROJECT"
 
 
 # ---------------------------------------------- end-to-end seed + mentions
