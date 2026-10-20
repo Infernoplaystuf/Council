@@ -797,9 +797,32 @@ SPACED_CASES = [  # (the cell, the model's answer, the part found) - none of the
     ("QRS6TU789", "QRS 6TU 789", "QRS6TU789"),          # the other way round
     ("S/N AB12 CD34", "S/N AB12 CD34", "AB12 CD34"),    # the label is not the id
     ("S/N XYZ9AB123-R2  (rev B)", "XYZ9AB123-R2 (rev B)", "XYZ9AB123-R2"),
+    # a model that copies the cell: the words next to the id are not of it -
+    # they were glued to it, one sample split in two (second review, 2026-10-19)
+    ("JD ABC1DE234", "JD ABC1DE234", "ABC1DE234"),      # an inspector's initials
+    ("ABC1DE234 TOP", "ABC1DE234 TOP", "ABC1DE234"),    # a side
+    ("UT ABC1DE234", "UT ABC1DE234", "ABC1DE234"),      # a method
+    ("ABC1DE234 PASS", "ABC1DE234 PASS", "ABC1DE234"),
+    ("ABC1DE234 Rev B", "ABC1DE234 Rev B", "ABC1DE234"),
+    ("ABC1DE234 XYZ9AB123", "ABC1DE234 XYZ9AB123", "ABC1DE234"),   # a second id
+    ("UT QRS 6TU 789 A", "UT QRS 6TU 789 A", "QRS 6TU 789"),
+    ("QRS 6TU 789 Rev B", "QRS 6TU 789 Rev B", "QRS 6TU 789"),
+    # ... nor do they make the id with spaces a piece of a longer one: dropped
+    ("QRS 6TU 789 A", "QRS 6TU 789", "QRS 6TU 789"),
+    ("QRS 6TU 789 A", "QRS6TU789", "QRS 6TU 789"),
+    ("QRS 6TU 789 TOP", "QRS 6TU 789", "QRS 6TU 789"),
+    ("UT QRS 6TU 789", "QRS 6TU 789", "QRS 6TU 789"),
+    ("Tag QRS 6TU 789", "QRS 6TU 789", "QRS 6TU 789"),
+    ("COUPON QRS 6TU 789", "QRS 6TU 789", "QRS 6TU 789"),
 ]
 SPACED_NON_IDS = ["Oct 5 2026", "2026 10 05", "12 345", "280 W", "61.35 mm", "Sheet 1",
-                  "Laser build 3", "Power 280"]
+                  "Laser build 3", "Power 280",
+                  # a label and its number, a standard, a quarter, a day, a time, axes:
+                  # all passed as ids with spaces (second review, 2026-10-19)
+                  "ISO 9001", ("Spec: ASTM E1444 / AMS 2644", "AMS 2644"), "NAS 410",
+                  "EN 4179", "CH 12", "OP 20", "GAIN 40", "Qty 12", "WK 42", "Q3 2026",
+                  "FY 2026", "2026 Q3", "REV A 2026", "12 Oct", "10 30 AM", "PASS 2 OF 3",
+                  "X1 Y2", "X12 Y34", "CH1 CH2", "Lab 3 Bay 12"]
 
 
 @pytest.mark.parametrize("cell,answer,part", SPACED_CASES)
@@ -822,12 +845,85 @@ def test_an_id_written_with_spaces_is_kept_whole(tmp_path, cell, answer, part):
 @pytest.mark.parametrize("text", SPACED_NON_IDS)
 def test_spaces_do_not_make_a_value_or_a_title_a_part(tmp_path, text):
     """The identifier rules still hold for an id written with spaces: a
-    date, a number in groups, a value with its unit, 'Sheet 1', a title."""
-    src = _one_value_book(tmp_path / "insp.xlsx", text, None, sheet="Record")
+    date, a number in groups, a value with its unit, 'Sheet 1', a title,
+    a label with its number. Two workbooks with 'CH 12' merged into one
+    phantom part 'CH 12' (second review, 2026-10-19)."""
+    cell, answer = text if isinstance(text, tuple) else (text, text)
+    src = _one_value_book(tmp_path / "insp.xlsx", cell, None, sheet="Record")
     grids, _imgs = se.load_workbook_grids(src, [])
     rep = ledger_llm.AssistReport()
-    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(text), rep) == ("", "")
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(answer), rep) == ("", "")
     assert not rep.parts_found and any("dropped" in p for p in rep.problems)
+
+
+@pytest.mark.parametrize("answer", ["12 345", "12345"])
+def test_a_number_in_groups_is_not_a_part_of_an_all_digit_pattern(answer):
+    """'#####' matched 'Freq 12 345' with its spaces left out (second
+    review, 2026-10-19): a number written in groups is a value."""
+    grids = [se.Grid("insp.xlsx", "Record", {(1, 1): "Freq 12 345"})]
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part("insp.xlsx", grids, "#####", _stub(answer), rep) == ("", "")
+    assert not rep.parts_found
+
+
+FRAGMENTS = [  # (the cell, the model's answer, the user's pattern) - a piece of the id
+    ("AB12 CD34 EF56", "AB12 CD34", None),
+    ("AB12 CD34 EF56", "AB12", None),
+    ("ABC1 DE23 4XY", "ABC1 DE23", "@@@#@@###"),
+    ("QRS 6TU 789", "QRS 6TU", "@@@#@@###"),
+    ("QRS 6TU 789", "6TU 789", "@@@#@@###"),
+]
+
+
+@pytest.mark.parametrize("cell,answer,mask", FRAGMENTS)
+def test_a_piece_of_an_id_written_with_spaces_is_not_the_part(cell, answer, mask):
+    """'AB12 CD34' of a cell 'AB12 CD34 EF56' was rejected as a piece, and
+    then its own piece 'AB12' was given as the part: the cut the first fix
+    was for (second review, 2026-10-19). Dropped, not cut."""
+    grids = [se.Grid("insp.xlsx", "Record", {(1, 1): cell})]
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part("insp.xlsx", grids, mask, _stub(answer), rep) == ("", "")
+    assert not rep.parts_found and any("dropped" in p for p in rep.problems)
+
+
+def test_the_part_is_given_as_the_model_wrote_it_when_the_workbook_has_both():
+    """With 'QRS 6TU 789' in A1 and 'QRS6TU789' in A2, the answer
+    'QRS6TU789' was given as A1 writes it: the ledger compares ids with
+    their spaces, so one sample became two (second review, 2026-10-19)."""
+    grids = [se.Grid("insp.xlsx", "Record", {(1, 1): "QRS 6TU 789", (2, 1): "QRS6TU789"})]
+    for answer, row in (("QRS6TU789", 2), ("qrs6tu789", 2), ("QRS 6TU 789", 1)):
+        assert ledger_llm.find_part("insp.xlsx", grids, "@@@#@@###", _stub(answer),
+                                    ledger_llm.AssistReport()) == (
+            ("QRS6TU789", "QRS 6TU 789")[row == 1], f"insp.xlsx › Record!A{row}")
+
+
+def test_words_copied_with_the_id_do_not_split_a_sample_in_the_review(tmp_path, ledger):
+    """End to end, a model that answers with the cell's text: 'ABC1DE234 TOP'
+    and 'ABC1DE234' were two parts in the review, and two workbooks with
+    'CH 12' one phantom part (second review, 2026-10-19)."""
+    csv, _schema = ledger
+    cells = {"top.xlsx": "ABC1DE234 TOP", "bot.xlsx": "ABC1DE234", "one.xlsx": "JD ABC1DE234",
+             "p.xlsx": "CH 12", "q.xlsx": "CH 12", "u.xlsx": "QRS 6TU 789 A"}
+    for i, (name, a1) in enumerate(cells.items()):
+        _one_value_book(tmp_path / name, a1, None, sheet="Sheet1")
+        wb = openpyxl.load_workbook(tmp_path / name)
+        wb["Sheet1"]["A3"], wb["Sheet1"]["B3"] = "Power (W)", 100 + i
+        wb.save(tmp_path / name)
+
+    def echo(prompt, schema):                  # the first cell, as the model saw it
+        if "Which part" not in prompt:
+            return json.dumps({"mappings": []}), "echo"
+        name = prompt.split("File name: ", 1)[1].split("\n", 1)[0]
+        part = cells[name] if name != "u.xlsx" else "QRS 6TU 789"
+        return json.dumps({"part": part, "evidence": "A1"}), "echo"
+    s = li._extract(str(csv), [str(tmp_path / n) for n in cells], None, "", False, None,
+                    _NoProg(), "@@@#@@###", None, None, True, echo)
+    rows = [dict(zip(se.VAL_HEAD, r)) for r in openpyxl.load_workbook(s.review)[
+        "Values"].iter_rows(min_row=2, values_only=True)]
+    by_book = {r["Source"].split(" › ", 1)[0]: r["Part"] for r in rows}
+    assert by_book == {"top.xlsx": "ABC1DE234", "bot.xlsx": "ABC1DE234",
+                       "one.xlsx": "ABC1DE234", "p.xlsx": None, "q.xlsx": None,
+                       "u.xlsx": "QRS 6TU 789"}
 
 
 def test_spaces_inside_an_id_only_as_a_cell_writes_them(tmp_path):
@@ -1044,6 +1140,23 @@ def test_the_summary_does_not_add_a_full_stop_after_a_question_mark():
     assert rep.describe().endswith("not asked again: " + why)
     rep = ledger_llm.AssistReport(parts_asked=1, model="m")
     assert rep.describe().endswith("check them.")
+
+
+def test_the_summary_cuts_a_long_error_between_clauses_not_inside_a_word():
+    """council_engine's own timeout words ended '... the request was canc.'
+    in the summary: cut at 200 characters (second review, 2026-10-19). The
+    problem line keeps it all."""
+    why = "granite3.3:8b (Ollama) did not answer: " + _NO_START
+    rep = ledger_llm.AssistReport(unavailable=why, timed_out=True, stopped_on="b0.xlsx")
+    assert rep.describe().endswith(
+        "did not start answering within 300 s (loading or prefilling the model; "
+        "COUNCIL_OLLAMA_LOAD_TIMEOUT raises the limit).")
+    rep = ledger_llm.AssistReport(unavailable=why, timed_out=True, parts_asked=2,
+                                  model="granite3.3:8b", parts_found=[("a.xlsx", "ABC1DE234")])
+    assert rep.describe().endswith("COUNCIL_OLLAMA_LOAD_TIMEOUT raises the limit).")
+    # no clause to end at: at a word, and said to go on
+    rep = ledger_llm.AssistReport(unavailable=" ".join(["overloaded"] * 40))
+    assert rep.describe().endswith(": " + " ".join(["overloaded"] * 18) + "…")
 
 
 @pytest.mark.parametrize("name", ["zephyr:7b", "openhermes:7b", "neural-chat:7b",
