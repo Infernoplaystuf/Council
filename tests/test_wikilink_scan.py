@@ -103,7 +103,8 @@ def test_a_tables_escaped_pipe_is_not_part_of_the_name():
 # ------------------------------------------------------- a field's value
 # (review, 2026-10-19): 'Part Number: [[PN-1002]]' made a part '[[PN-1002]]'
 # beside PN-1002, and 'Owner: [[Jordan Blake]]. Tracked as [[PRJ-0915]].' a
-# person of the whole sentence. A field's value is its first link's target.
+# person of the whole sentence. A field's value is the target of the link it
+# starts with.
 
 @pytest.mark.parametrize("value, line, want", [
     ("[[PN-1002]]", "", "PN-1002"),
@@ -127,9 +128,56 @@ def test_a_tables_escaped_pipe_is_not_part_of_the_name():
     ("Carol]]", "Attendees: [[Ann McCarol]]; [[Lee, Carol]]", "Lee, Carol"),
     ("[[Priya Raman\\", r"| Owner | [[Priya Raman\|Priya]] |", "Priya Raman"),
     ("[[Lee", "", "Lee"),                                  # the line lost: unbracketed
+    # (review, 2026-10-19) A value that starts with text is that text: the link
+    # after it is a cross-reference, not the field's value.
+    ("Priya Raman (backup [[Jordan Blake]])", "", "Priya Raman"),
+    ("PN-1002 per [[ECO-77]]", "", "PN-1002"),
+    ("PN-1002 (see [[Pump Spec]])", "", "PN-1002"),
+    ("PRJ-0915 ([[Helios Turbine Upgrade]])", "", "PRJ-0915"),
+    ("PN-1002 - [[Drawing 7]]", "", "PN-1002"),
+    ("cc [[Jordan Blake]]", "", ""),                       # only a remark: no value
+    ("see [[PN-1002 Drawing]]", "", ""),
+    ("**[[Priya Raman]]**", "", "Priya Raman"),            # emphasis is not text
+    ("([[Priya Raman]])", "", "Priya Raman"),
+    # ... and so is a cut link: the end of a cross-reference is no value.
+    ("Priya Raman (backup [[Lee", "Owner: Priya Raman (backup [[Lee, Carol]])",
+     "Priya Raman"),
+    ("Carol]])", "Owner: Priya Raman (backup [[Lee, Carol]])", ""),
+    ("cc [[Lee", "Owner: Priya Raman, cc [[Lee, Carol]]", ""),
+    ("Carol]]", "Owner: Priya Raman, cc [[Lee, Carol]]", ""),
+    ("Carol]]", "Owner: Priya Raman and [[Lee, Carol]]", "Lee, Carol"),
+    # A link that names nothing is taken out, and the rest kept.
+    ("PN-1002 [[#Specs]]", "", "PN-1002"),
+    ("Priya Raman ![[p.png]]", "", "Priya Raman"),
+    ("Priya Raman ![[Lee", "Owner: Priya Raman ![[Lee, Carol.png]]", "Priya Raman"),
+    ("![[Lee", "Owner: ![[Lee, Carol.png]]", ""),
+    # A link written as a path is to the note at its end (see _link_note_name).
+    ("[[People/Priya Raman|Priya]]", "", "Priya Raman"),
+    ("[[Priya Raman.md]]", "", "Priya Raman"),
+    ("[[PN-1002.md]]", "", "PN-1002"),
 ])
 def test_a_fields_value_is_its_first_links_target(value, line, want):
     assert field_link_value(value, line) == want
+
+
+# (review, 2026-10-19): Obsidian writes a link as a path ('Absolute path in
+# vault', 'Relative path') and may keep the '.md'; each made a second person
+# 'People/Priya Raman' or 'Priya Raman.md'.
+@pytest.mark.parametrize("text, surface, display", [
+    ("[[People/Priya Raman]]", "Priya Raman", "Priya Raman"),
+    ("[[People/Priya Raman|Priya]]", "Priya Raman", "Priya"),
+    ("[[../People/Priya Raman#Contact]]", "Priya Raman", "Priya Raman"),
+    ("[[Priya Raman.md]]", "Priya Raman", "Priya Raman"),
+    ("[[People/Priya Raman.MD|PR]]", "Priya Raman", "PR"),
+    ("[[Parts/PN-1002]]", "PN-1002", "PN-1002"),
+    # A part code with its revision after the slash is one name.
+    ("[[PN-1234/A]]", "PN-1234/A", "PN-1234/A"),
+    ("[[BRG-77/2]]", "BRG-77/2", "BRG-77/2"),
+    ("[[PN-1234/Rev B]]", "PN-1234/Rev B", "PN-1234/Rev B"),
+])
+def test_a_link_written_as_a_path_names_the_note_at_its_end(text, surface, display):
+    assert scan_wikilinks(_lines((None, 1, f"Owner: {text}"))) == [
+        WikiLinkRef(page=None, line=1, surface=surface, display=display)]
 
 
 # ------------------------------------------------------- summary line integration

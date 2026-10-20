@@ -232,6 +232,51 @@ def test_a_field_holding_two_links_takes_the_first(tmp_path):
     assert [m["method"] for m in tracked] == ["wikilink"]
 
 
+# (review, 2026-10-19): the fix above took a field's first link wherever it
+# stood. 'Owner: Priya Raman (backup [[Jordan Blake]])' made Jordan Blake the
+# owner - a firm (seeded) link nobody wrote - and Priya Raman vanished; 'PN-1002
+# per [[ECO-77]]' made ECO-77 the part. A value beside an embed or a
+# [[#heading]] was dropped whole: 'Owner' lost its part and fell back to the
+# project rule, a wrong seeded LEADS. A link written as a path made a person
+# 'People/Priya Raman' or 'Priya Raman.md'.
+@pytest.mark.parametrize("note, project, other", [
+    ("Project: Atlas\nPart Number: PN-1002\n"
+     "Owner: Priya Raman (backup [[Jordan Blake]])\n", "Atlas", "Jordan Blake"),
+    ("Project: Atlas\nPart Number: PN-1002\n"
+     "Owner: Priya Raman, cc [[Jordan Blake]]\n", "Atlas", "Jordan Blake"),
+    ("Project: Atlas\nPart Number: PN-1002 per [[ECO-77]]\n"
+     "Owner: Priya Raman\n", "Atlas", "ECO-77"),
+    ("Project: Atlas\nPart Number: PN-1002 (see [[Pump Spec]])\n"
+     "Owner: Priya Raman\n", "Atlas", "Pump Spec"),
+    ("Project: PRJ-0915 ([[Helios Turbine Upgrade]])\nPart Number: PN-1002\n"
+     "Owner: Priya Raman\n", "PRJ-0915", "Helios Turbine Upgrade"),
+    ("Project: Atlas\nPart Number: PN-1002 [[#Specs]]\nOwner: Priya Raman\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: PN-1002\nOwner: Priya Raman ![[priya.png]]\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: [[PN-1002.md]]\nOwner: [[Priya Raman.md]]\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: [[Parts/PN-1002]]\n"
+     "Owner: [[People/Priya Raman|Priya]]\n", "Atlas", None),
+], ids=["owner-backup", "owner-cc", "part-per", "part-see", "project-code",
+        "value-heading", "value-embed", "md-extension", "folder-path"])
+def test_a_fields_value_is_the_text_before_a_cross_reference(tmp_path, note,
+                                                            project, other):
+    v = _vault_with(tmp_path, {"t.md": note})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+        cross = _mentions_for(kg, other) if other else []
+    assert rels == [(project, "USES_PART", "PN-1002", "seeded"),
+                    ("Priya Raman", "OWNS", "PN-1002", "seeded")]
+    assert [n for t, n in ents if t == "PERSON" and n != other] == ["Priya Raman"]
+    assert [n for t, n in ents if t == "PART" and n != other] == ["PN-1002"]
+    assert not [n for _t, n in ents if "[[" in n or "/" in n or ".md" in n], ents
+    # The cross-reference is the wiki-link pass's, as any link in the text is.
+    if other:
+        assert [m["method"] for m in cross] == ["wikilink"]
+
+
 def test_a_link_the_value_splitter_cut_is_read_whole(tmp_path):
     # 'Last, First' inside a link: the comma cut it into '[[Lee' and 'Carol]]'.
     v = _vault_with(tmp_path, {
@@ -242,6 +287,24 @@ def test_a_link_the_value_splitter_cut_is_read_whole(tmp_path):
     assert [n for t, n in ents if t == "PERSON"] == ["Carol Lee", "Tomas Echeverria"]
     assert rels == [("Carol Lee", "WORKS_ON", "Atlas", "seeded"),
                     ("Tomas Echeverria", "WORKS_ON", "Atlas", "seeded")]
+
+
+def test_a_cut_link_past_the_snippets_200_characters_is_read_whole(tmp_path):
+    # (review, 2026-10-19) The cut link was found in the cited snippet, which
+    # stops at 200 characters: on a long attendee line '[[Lee, Carol]]' past
+    # it was two people, Lee and Carol. The whole line is read.
+    names = ["Ann Stone", "Bob Hale", "Dana Whitfield", "Evan Ross", "Faith Moore",
+             "Gina Park", "Hank Doyle", "Iris Kemp", "Jack Ford", "Kara Lind",
+             "Liam Shaw", "Mona Reyes", "Nora Price", "Owen Brooks"]
+    line = "Attendees: " + ", ".join(f"[[{n}]]" for n in names) + ", [[Lee, Carol]]"
+    assert line.index("[[Lee, Carol]]") > 200
+    v = _vault_with(tmp_path, {"m.md": f"Project: Atlas\n{line}\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+    assert [n for t, n in ents if t == "PERSON"] == sorted(names + ["Carol Lee"])
+    assert rels == sorted((n, "WORKS_ON", "Atlas", "seeded")
+                          for n in names + ["Carol Lee"])
 
 
 # ---------------------------------------------- initials: a wiki-link's person

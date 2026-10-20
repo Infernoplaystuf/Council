@@ -583,13 +583,30 @@ def _text_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     # Read ONCE for every rule: field_value_locations read and parsed the
     # file again per rule — MEASURED 16 reads of each PDF per rebuild.
     pages = fs.document_pages(p)
+    page_lines: Dict[int, List[str]] = {}
+
+    def source_line(loc) -> str:
+        # The whole line, not the snippet: that is cut at 200 characters, and
+        # a long attendee line's '[[Lee, Carol]]' past it made two people
+        # (review, 2026-10-19).
+        pno, ln = (loc.get("page") or 1) - 1, loc.get("line")
+        if ln and 0 <= pno < len(pages):
+            lines = page_lines.get(pno)
+            if lines is None:
+                lines = page_lines[pno] = pages[pno].splitlines()
+            if ln <= len(lines):
+                return lines[ln - 1]
+        return loc.get("snippet", "")
+
     for r in rules:
         for loc in fs.field_value_locations(p, r.label, kind=r.type, exact=True,
                                             pages=pages):
             # 'Owner: [[Priya Raman]]' is Priya Raman (see field_link_value).
-            value = field_link_value(loc["value"], loc.get("snippet", ""))
+            value = loc["value"]
+            if isinstance(value, str) and ("[[" in value or "]]" in value):
+                value = field_link_value(value, source_line(loc))
             if loc["value"] and not value:
-                continue                    # an embed, a [[#heading]]: names nothing
+                continue        # only an embed, a [[#heading]], a 'see [[…]]'
             key = (loc.get("page"), loc.get("line"), value)
             prev = best.get(key)
             if prev is None or len(r.label) > len(prev.rule.label):
@@ -1030,7 +1047,9 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
     embed, ``![[diagram.png]]``, shows a file inline: not a reference to an
     entity, so it is skipped. In a markdown table the pipe is written
     ``\\|`` (``| Owner | [[Priya Raman\\|Priya]] |``): the backslash is not
-    part of the name."""
+    part of the name. A link written as a path, ``[[People/Priya Raman]]``
+    or ``[[Priya Raman.md]]``, is to the note Priya Raman (see
+    _link_note_name)."""
     out: List[WikiLinkRef] = []
     for page, line_no, text in lines:
         if "[[" not in text:
@@ -1044,7 +1063,7 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
             target, _, display = inside.partition("|")
             if "|" in inside and target.endswith("\\"):
                 target = target[:-1]        # a table's escaped '\|'
-            surface = _WIKILINK_ANCHOR_RE.split(target, 1)[0].strip()
+            surface = _link_note_name(_WIKILINK_ANCHOR_RE.split(target, 1)[0])
             display = (display.strip() or surface) if "|" in inside else surface
             if surface:
                 out.append(WikiLinkRef(page=page, line=line_no,
@@ -1055,14 +1074,69 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
 #: Where a wiki-link's target ends and its anchor starts: ``#heading``,
 #: ``#^block`` (and a bare ``^block``).
 _WIKILINK_ANCHOR_RE = re.compile(r"[#^]")
+#: A part code with its revision after a slash ('PN-1234/A', 'BRG-77/2',
+#: 'PN-1234/Rev B'): one name, not a folder and a note.
+_CODE_REVISION_RE = re.compile(r"^[^/]*\d\s*/\s*(?:rev\.?\s*)?[A-Za-z0-9]{1,3}$", re.I)
+
+
+def _link_note_name(target: str) -> str:
+    """The note a link's target names. Obsidian writes a link as a path
+    under its 'Absolute path in vault' and 'Relative path' settings
+    ('[[People/Priya Raman]]', '[[../People/Priya Raman]]') and a link can
+    keep the file's '.md': read as written they made a PERSON 'People/Priya
+    Raman' or 'Priya Raman.md' beside Priya Raman (review, 2026-10-19). A
+    part code with a revision after its slash ('[[PN-1234/A]]') is kept
+    whole: 'A' names nothing."""
+    t = str(target or "").strip()
+    md = t.lower().endswith(".md")
+    if md:
+        t = t[:-3].rstrip()
+    if "/" in t and (md or not _CODE_REVISION_RE.match(t)):
+        t = t.rstrip("/").rsplit("/", 1)[-1].strip()
+    return t
+
+
+#: A link that names nothing, inside a field's value: an embed (``![[…]]``)
+#: or a link to a heading or block of the note it is in (``[[#Specs]]``).
+_UNNAMED_LINK_RE = re.compile(r"!" + WIKILINK_RE.pattern + r"|\[\[\s*[#^][^\[\]\n]*\]\]")
+#: What may stand before a link that IS a field's value: quotes, brackets,
+#: emphasis, list punctuation, a list's 'and' (what an embed before it left:
+#: '![[diagram.png]] and [[Priya Raman]]') or a title ('Dr. [[Priya
+#: Raman]]').
+_LINK_LEAD_RE = re.compile(
+    r"(?:[\s\"'“”‘’(\[{*_,;&+–—-]"
+    r"|\b(?:and|dr|mrs?|ms|mx|prof|sir|dame|capt)\b\.?)*", re.I)
+#: What a value ends with when a link after it is a cross-reference: 'PN-1002
+#: (see [[Pump Spec]])', 'PN-1002 per [[ECO-77]]', 'Priya Raman, cc
+#: [[Jordan Blake]]', 'PN-1002 - [[Drawing]]'.
+_LINK_REMARK_RE = re.compile(
+    r"(?:[\s\"'“”‘’(\[{*_,;:&+/–—-]"
+    r"|\b(?:see|also|per|cc|bcc|via|ref|re|backup|aka|and|or)\b\.?)*$", re.I)
+#: Where the value before a link starts, in its line: after a field's ':', a
+#: list's ',' ';' 'and', a table's '|', or the link before it.
+_LINK_LIST_SEP_RE = re.compile(r"[:;,|=\t]|\]\]|\s(?:and|&)\s", re.I)
+
+
+def _value_before_link(lead: str) -> Optional[str]:
+    """``lead``, the text a field's value has before its first link: None
+    when the link IS the value (only quotes, brackets, a title before it),
+    else the value the text holds - '' when it is only a remark ('see',
+    'cc'). An opening bracket the link is inside is cut with what follows
+    it: 'Priya Raman (backup [[Jordan Blake]])' is Priya Raman."""
+    if _LINK_LEAD_RE.fullmatch(lead):
+        return None
+    cut = max(lead.rfind("("), lead.rfind("["))
+    if cut >= 0 and not any(c in lead[cut:] for c in ")]"):
+        lead = lead[:cut]
+    return _LINK_REMARK_RE.sub("", lead).strip().strip("\"'“”‘’").strip()
 
 
 def field_link_value(value: str, line: str = "") -> str:
     """A labelled field's value with its wiki-link syntax taken off: the
-    target of its first ``[[…]]`` - not the ``|alias``, not the ``#anchor``,
-    not the quotes YAML front matter needs round a link (``owner: "[[Priya
-    Raman]]"``). A value with no link is given back as it is; '' when its
-    only links name nothing (an embed, a ``[[#heading]]``).
+    target of the link the value starts with - not the ``|alias``, not the
+    ``#anchor``, not the quotes YAML front matter needs round a link
+    (``owner: "[[Priya Raman]]"``). A value with no link is given back as
+    it is.
 
     Read as written, 'Part Number: [[PN-1002]]' made a part '[[PN-1002]]'
     beside PN-1002, 'Owner: [[Priya Raman]]' renamed Priya Raman to the
@@ -1071,29 +1145,56 @@ def field_link_value(value: str, line: str = "") -> str:
     (review, 2026-10-19). The links after the first are the wiki-link
     pass's (_seed_wikilinks), as every link in the text is.
 
-    ``line``: the line the value was read from. A link the value splitter
-    cut in two ('[[Lee, Carol]]' read as '[[Lee' and 'Carol]]') is found
-    whole there."""
+    A value that starts with plain text is that text, and a link after it a
+    cross-reference: taking the link made 'Priya Raman (backup [[Jordan
+    Blake]])' Jordan Blake and 'PN-1002 per [[ECO-77]]' a part ECO-77, each
+    with a firm (seeded) link that was not written (review, 2026-10-19).
+    A link that names nothing - an embed, a ``[[#heading]]`` - is taken out
+    and the rest kept: 'PN-1002 [[#Specs]]' is PN-1002; '' only when
+    nothing is left.
+
+    ``line``: the full line the value was read from. A link the value
+    splitter cut in two ('[[Lee, Carol]]' read as '[[Lee' and 'Carol]]') is
+    found whole there."""
     s = str(value or "")
     if "[[" not in s and "]]" not in s:
         return s
     s = s.strip()
-    refs = scan_wikilinks([(None, 0, s)])
-    if refs:
-        return refs[0].surface
-    if WIKILINK_RE.search(s):
-        return ""                       # an embed, or a link into this note
-    head = s[s.find("[["):] if "[[" in s else ""
-    tail = s[:s.rfind("]]") + 2] if "]]" in s else ""
-    for m in WIKILINK_RE.finditer(line or ""):
+    if _UNNAMED_LINK_RE.search(s):
+        s = " ".join(_UNNAMED_LINK_RE.sub(" ", s).split())
+    if "[[" not in s and "]]" not in s:
+        return s.strip("\"'“”‘’").strip()
+    opens, closes = s.find("[["), s.find("]]")
+    m = WIKILINK_RE.search(s)
+    if opens >= 0 and (closes < 0 or opens < closes):
+        # The value starts with a link, or with text and a link after it.
+        embed = opens > 0 and s[opens - 1] == "!"      # the start of a cut embed
+        plain = _value_before_link(s[:opens - 1] if embed else s[:opens])
+        if plain is not None:
+            return plain
+        if embed:
+            return ""
+        if m and m.start() == opens:
+            refs = scan_wikilinks([(None, 0, m.group(0))])
+            return refs[0].surface if refs else ""
+    head = s[opens:] if opens >= 0 and (closes < 0 or opens < closes) else ""
+    tail = s[:closes + 2] if closes >= 0 and not head else ""
+    line = line or ""
+    for m in WIKILINK_RE.finditer(line):
         whole = m.group(0)
         # Cut at a separator: '[[Lee' is not the start of '[[Leeds Upgrade]]'.
         if (head and whole.startswith(head) and not whole[len(head)].isalnum()) or \
                 (tail and whole.endswith(tail) and not whole[-len(tail) - 1].isalnum()):
+            if tail:
+                lead, sep = line[:m.start()], None
+                for sep in _LINK_LIST_SEP_RE.finditer(lead):
+                    pass
+                if _value_before_link(lead[sep.end():] if sep else lead) is not None:
+                    return ""       # the end of a cross-reference link
             # From the character before it: an embed's '!' is kept.
             refs = scan_wikilinks([(None, 0, line[max(m.start() - 1, 0):m.end()])])
             return refs[0].surface if refs else ""
-    return s.replace("[[", "").replace("]]", "").strip().strip("\"'").strip()
+    return s.replace("[[", "").replace("]]", "").strip().strip("\"'()[]").strip()
 
 
 #: Words that make a run of Capitalised words a title, not a person:
