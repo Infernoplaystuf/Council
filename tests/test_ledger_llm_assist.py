@@ -789,6 +789,77 @@ def test_real_part_numbers_still_pass():
         assert looks(s), s
 
 
+SPACED_CASES = [  # (the cell, the model's answer, the part found) - none of them ''
+    ("QRS 6TU 789", "QRS 6TU 789", "QRS 6TU 789"),      # gemma3, granite3.3, llama3.1, phi4
+    ("QRS 6TU 789", "QRS6TU789", "QRS 6TU 789"),        # the answer without the spaces
+    ("QRS 6TU 789", "qrs6tu789", "QRS 6TU 789"),        # ... as the cell writes it
+    ("QRS 6TU 789", "Part QRS 6TU 789", "QRS 6TU 789"),  # a word around it
+    ("QRS6TU789", "QRS 6TU 789", "QRS6TU789"),          # the other way round
+    ("S/N AB12 CD34", "S/N AB12 CD34", "AB12 CD34"),    # the label is not the id
+    ("S/N XYZ9AB123-R2  (rev B)", "XYZ9AB123-R2 (rev B)", "XYZ9AB123-R2"),
+]
+SPACED_NON_IDS = ["Oct 5 2026", "2026 10 05", "12 345", "280 W", "61.35 mm", "Sheet 1",
+                  "Laser build 3", "Power 280"]
+
+
+@pytest.mark.parametrize("cell,answer,part", SPACED_CASES)
+def test_an_id_written_with_spaces_is_kept_whole(tmp_path, cell, answer, part):
+    """'QRS 6TU 789' in a cell was cut to '6TU' or dropped - an identifier
+    had no spaces - and the model's 'QRS6TU789' for it was dropped as not
+    written there (review, 2026-10-19). The whole answer is compared
+    ignoring the spaces inside it, and given as the cell writes it."""
+    src = _one_value_book(tmp_path / "insp.xlsx", "Inspection record", None, sheet="Record")
+    wb = openpyxl.load_workbook(src)
+    wb["Record"]["A2"] = cell
+    wb.save(src)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(answer), rep) == (
+        part, "insp.xlsx › Record!A2")
+    assert rep.parts_found == [(src.name, part)] and not rep.problems
+
+
+@pytest.mark.parametrize("text", SPACED_NON_IDS)
+def test_spaces_do_not_make_a_value_or_a_title_a_part(tmp_path, text):
+    """The identifier rules still hold for an id written with spaces: a
+    date, a number in groups, a value with its unit, 'Sheet 1', a title."""
+    src = _one_value_book(tmp_path / "insp.xlsx", text, None, sheet="Record")
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(text), rep) == ("", "")
+    assert not rep.parts_found and any("dropped" in p for p in rep.problems)
+
+
+def test_spaces_inside_an_id_only_as_a_cell_writes_them(tmp_path):
+    """A sheet or file name with spaces in it is not taken as a spaced id;
+    one written without them still is, in its own case."""
+    src = _one_value_book(tmp_path / "insp.xlsx", "Pulse freq", 61.35, sheet="QRS 6TU 789")
+    grids, _imgs = se.load_workbook_grids(src, [])
+    for answer in ("QRS 6TU 789", "QRS6TU789"):
+        assert ledger_llm.find_part(src.name, grids, None, _stub(answer),
+                                    ledger_llm.AssistReport()) == ("", "")
+    src = _one_value_book(tmp_path / "insp2.xlsx", "Pulse freq", 61.35, sheet="EFG5HJ678")
+    grids, _imgs = se.load_workbook_grids(src, [])
+    assert ledger_llm.find_part(src.name, grids, None, _stub("efg5hj 678"),
+                                ledger_llm.AssistReport()) == (
+        "EFG5HJ678", "sheet name 'EFG5HJ678'")
+
+
+def test_a_spaced_id_reaches_the_review_whole(tmp_path, ledger):
+    """End to end: the review's Part column holds the id as the cell writes it."""
+    csv, _schema = ledger
+    src = _unlabelled_book(tmp_path / "untitled.xlsx")
+    wb = openpyxl.load_workbook(src)
+    wb["Sheet1"]["A1"] = "QRS 6TU 789"
+    wb.save(src)
+    s = li._extract(str(csv), [str(src)], None, "", False, None, _NoProg(), "@@@#@@###",
+                    None, None, True, FakeModel(part="QRS6TU789"))
+    parts = {r[1] for r in openpyxl.load_workbook(s.review)["Values"].iter_rows(
+        min_row=2, values_only=True)}
+    assert parts == {"QRS 6TU 789"}
+    assert "untitled.xlsx → QRS 6TU 789" in s.describe()
+
+
 def _sent(grids, mask):
     model = FakeModel(part="")
     ledger_llm.find_part("big.xlsx", grids, mask, model, ledger_llm.AssistReport())
@@ -845,16 +916,22 @@ def test_skip_patterns_do_not_leak_from_one_ledger_into_another(tmp_path):
         tab.deleteLater()
 
 
-def test_one_timeout_does_not_stop_the_model():
-    """The breaker tripped on any failure: a timeout on one big workbook and
-    no other workbook or label was asked, and the summary called an
-    answering model unavailable (review, 2026-10-19)."""
+#: A question that failed at once - Ollama's own words when its runner died
+#: on one request - not a timeout: the model is asked again.
+_ONE_FAILED = "Ollama (granite3.3:8b): llama runner process has terminated: exit status 2"
+
+
+def test_one_failed_question_does_not_stop_the_model():
+    """The breaker tripped on any failure: one failed question and no other
+    workbook or label was asked, and the summary called an answering model
+    unavailable (review, 2026-10-19). A timeout does stop it at once:
+    test_a_timeout_stops_the_model_at_once."""
     calls = []
 
     def flaky(prompt, schema):
         calls.append(prompt)
         if "first.xlsx" in prompt:
-            raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+            raise RuntimeError(_ONE_FAILED)
         return json.dumps({"part": "ABC1DE234", "evidence": "A1"}), "granite3.3:8b"
     rep = ledger_llm.AssistReport()
     ask = ledger_llm.one_shot(flaky, rep)
@@ -864,25 +941,97 @@ def test_one_timeout_does_not_stop_the_model():
     assert len(calls) == 3 and got == ["", "ABC1DE234", "ABC1DE234"]
     assert not rep.unavailable
     assert "unavailable" not in rep.describe()
-    assert sum("sent nothing" in p for p in rep.problems) == 1
+    assert sum("runner process has terminated" in p for p in rep.problems) == 1
 
 
 def test_a_model_that_fails_twice_in_a_row_is_not_asked_again():
     calls = []
 
-    def slow(prompt, schema):
+    def broken(prompt, schema):
         calls.append(prompt)
-        raise TimeoutError("Ollama (granite3.3:8b) sent nothing for 120 s.")
+        raise RuntimeError(_ONE_FAILED)
     rep = ledger_llm.AssistReport()
-    ask = ledger_llm.one_shot(slow, rep)
+    ask = ledger_llm.one_shot(broken, rep)
     for n in ("a.xlsx", "b.xlsx", "c.xlsx", "d.xlsx"):
         ledger_llm.find_part(n, [se.Grid(n, "Data", {(1, 1): "ABC1DE234"})], None, ask, rep)
     assert len(calls) == 2
-    assert sum("sent nothing" in p for p in rep.problems) == 1      # said once
+    assert sum("runner process" in p for p in rep.problems) == 1     # said once
     assert rep.describe() == (
         "Council's model did not answer twice in a row and was not asked again, so "
-        "nothing in the review is its suggestion: Ollama (granite3.3:8b) sent nothing "
-        "for 120 s.")
+        "nothing in the review is its suggestion: " + _ONE_FAILED + ".")
+
+
+#: council_engine's own words when Ollama does not start answering in time.
+_NO_START = ("Ollama (granite3.3:8b) did not start answering within 300 s (loading or "
+             "prefilling the model; COUNCIL_OLLAMA_LOAD_TIMEOUT raises the limit); the "
+             "request was cancelled, not re-sent.")
+
+
+def test_a_timeout_stops_the_model_at_once(tmp_path, ledger, monkeypatch):
+    """In the real app every part-less workbook waited the full 300 s
+    Ollama timeout again after the model had already timed out: the breaker
+    stopped only after two failures in a row (review, 2026-10-19). Through
+    the Ledger's own path - the picked Ollama model, chat_for, council_engine
+    raising its LocalChatTimeout after a wait - the second workbook and the
+    labels are not asked, and the summary says why."""
+    import time
+    import council_engine as ce
+    csv, _schema = ledger
+    books = [_unlabelled_book(tmp_path / f"untitled_{i}.xlsx") for i in range(3)]
+    calls = []
+
+    def times_out(messages, **kw):
+        calls.append(messages[0]["content"])
+        time.sleep(0.3)                                 # the wait, shortened
+        raise ce.LocalChatTimeout(_NO_START)
+    monkeypatch.setattr(ce, "local_chat", times_out)
+    s = li._extract(str(csv), [str(b) for b in books], None, "", False, None, _NoProg(),
+                    "@@@#@@###", None, None, "ollama:granite3.3:8b")
+    # one wait, not one per workbook - and the labels were not asked either
+    assert len(calls) == 1 and "File name: untitled_0.xlsx" in calls[0]
+    stopped = [p for p in s.problems if "ran out of time" in p]
+    assert len(stopped) == 1 and "did not start answering within 300 s" in stopped[0]
+    assert stopped[0].startswith("Council's model ran out of time on untitled_0.xlsx and was "
+                                 "not asked again in this run (each later question could "
+                                 "have waited as long): ")
+    assert s.assist.startswith(
+        "Council's model ran out of time on untitled_0.xlsx and was not asked again in this "
+        "run (each later question could have waited as long), so nothing in the review is "
+        "its suggestion: granite3.3:8b (Ollama) did not answer: Ollama (granite3.3:8b) did "
+        "not start answering within 300 s")
+    assert "unavailable" not in s.assist and "Is Ollama running" not in s.assist
+
+
+@pytest.mark.parametrize("error", [
+    TimeoutError("timed out"),                                       # a socket timeout
+    __import__("urllib.error").error.URLError(TimeoutError("timed out")),
+    RuntimeError("Ollama (granite3.3:8b): timed out waiting for llama runner to start"),
+    se.LedgerError("granite3.3:8b (Ollama) did not answer: Ollama (granite3.3:8b) sent "
+                   "nothing for 120 s; the request was cancelled, not re-sent"),
+])
+def test_every_kind_of_timeout_stops_the_model_and_covers_the_labels(ledger, error):
+    """After the parts the labels are asked too (place_labels): a timeout
+    on a part stops that question as well, and one on the labels says so."""
+    _csv, schema = ledger
+    calls = []
+
+    def slow(prompt, schema_):
+        calls.append(prompt)
+        raise error
+    rep = ledger_llm.AssistReport()
+    ask = ledger_llm.one_shot(slow, rep)
+    grids = [se.Grid("big.xlsx", "Data", {(1, 1): "ABC1DE234"})]
+    assert ledger_llm.find_part("big.xlsx", grids, None, ask, rep) == ("", "")
+    assert ledger_llm.find_part("next.xlsx", grids, None, ask, rep) == ("", "")
+    run = se.Extraction(sources=["x.xlsx"])
+    run.unmatched.append(se.Obs("", "", "", "55", 0.0, "none", "Zorp rate", "x.xlsx › Data!B1"))
+    ledger_llm.place_labels(run, schema, ask, rep)
+    assert len(calls) == 1 and rep.timed_out and rep.stopped_on == "big.xlsx"
+    assert len(rep.problems) == 1 and "ran out of time on big.xlsx" in rep.problems[0]
+    # a timeout on the labels question itself names it
+    rep, calls[:] = ledger_llm.AssistReport(), []
+    ledger_llm.place_labels(run, schema, ledger_llm.one_shot(slow, rep), rep)
+    assert len(calls) == 1 and "ran out of time on the labels left over" in rep.describe()
 
 
 def test_the_summary_does_not_add_a_full_stop_after_a_question_mark():
