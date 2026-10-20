@@ -521,3 +521,198 @@ def test_a_sheet_of_padded_cells_extracts_in_seconds(tmp_path, ledger):
     run = se.extract(schema, [tmp_path / "padded.xlsx"], use_images=False)
     assert time.perf_counter() - t0 < 10                  # was minutes, GUI frozen
     assert any(o.field.startswith("Power") for o in run.obs)
+
+
+# ---------------------------------------------- worst-case padded cells (review, 2026-10-20)
+
+_MOST = 32767                                   # Excel's most characters in a cell
+
+
+def _worst_cells():
+    """Cells that made a pattern backtrack with the GIL held: runs of
+    spaces (leading, trailing, inside), tabs and line breaks, and runs of
+    ':', '*' and '(' - each as long as Excel lets a cell be."""
+    n, h = _MOST, _MOST // 2
+    return {
+        "leading spaces": " " * (n - 4) + "NOTE",
+        "trailing spaces": "NOTE" + " " * (n - 4),
+        "spaces x spaces y": " " * h + "x" + " " * (n - h - 2) + "y",
+        "spaces inspected by spaces x": " " * h + "inspected by" + " " * (n - h - 13) + "x",
+        "Inspector spaces x": "Inspector" + " " * (n - 10) + "x",
+        "Inspector: spaces x line y": "Inspector: " + " " * (n - 14) + "x\ny",
+        "Run spaces x": "Run" + " " * (n - 4) + "x",
+        "Response spaces x": "Response" + " " * (n - 9) + "x",
+        "tabs": "\t" * (n - 4) + "NOTE",
+        "line breaks": "\n" * (n - 4) + "NOTE",
+        "mixed whitespace": (" \t\r\n" * n)[:n - 4] + "NOTE",
+        "colons then x": ":" * (n - 1) + "x",
+        "colon space pairs": (": " * n)[:n - 1] + "x",
+        "stars then x": "*" * (n - 1) + "x",
+        "open brackets": "(" * (n - 2) + "x)",
+        "open bracket pairs": ("( " * n)[:n],
+    }
+
+
+def test_split_inline_reads_as_the_pattern_did():
+    """_split_inline is read without a pattern over the whole cell now: the
+    same labels and values as '^\\s*([^:=]{1,60}?)\\s*[:=]\\s*(.+)$'."""
+    assert se._split_inline("Operator: AK") == ("Operator", "AK")
+    assert se._split_inline("  Inspector  =  JB  \n") == ("Inspector", "JB")
+    assert se._split_inline("Operator: ") == ("Operator", "")
+    assert se._split_inline("Operator:") == ("Operator:", "")
+    assert se._split_inline("Notes: a\nb") == ("Notes: a\nb", "")     # a value on one line
+    assert se._split_inline("Path: /x") == ("Path: /x", "")
+    assert se._split_inline("x" * 61 + ": y") == ("x" * 61 + ": y", "")
+    assert se._split_inline("x" * 60 + ": y") == ("x" * 60, "y")
+    assert se._split_inline("10:30") == ("10:30", "")
+
+
+@pytest.mark.parametrize("name", sorted(_worst_cells()))
+def test_every_pattern_reads_a_worst_case_cell_at_once(name, ledger):
+    """Each pattern the extract and the knowledge graph try on a cell's
+    text, on cells padded to Excel's limit: _split_inline took 2 s on 4,000
+    leading spaces and 63 s on 20,000, 'Inspector' and spaces held the GIL
+    for seconds, and nothing could be pressed (review, 2026-10-20)."""
+    import sample_ledger as sl
+    from council_core import kg_excel as kx
+    from council_core import knowledge_graph as kgm
+    _csv, schema = ledger
+    cell = _worst_cells()[name]
+    m = se.Matcher(schema)
+    part = next(r for r in kgm.DEFAULT_FIELD_RULES if r.label == "Part Number")
+    calls = {
+        "_split_inline": se._split_inline, "_WHO_INLINE": se._WHO_INLINE.match,
+        "_WHO_BY": se._WHO_BY.match, "_WHO_HEAD": se._WHO_HEAD.match,
+        "_RUN_HEAD": se._RUN_HEAD.match, "_VALUE_HEAD": se._VALUE_HEAD.match,
+        "match": m.match, "is_label": m.is_label, "is_item_header": m.is_item_header,
+        "is_placeholder": se.is_placeholder, "_initials": se._initials,
+        "normalize_label": sl.normalize_label,
+        "kg _label_text": kx._label_text, "kg _who_head": kx._who_head,
+        "kg _who_inline": kx._who_inline, "kg split_people": kx.split_people,
+        "kg _split": lambda v: kx._split(v, part),
+        "kg plausible": lambda v: kx.plausible(part, v),
+    }
+    slow = {}
+    for what, fn in calls.items():
+        t0 = time.perf_counter()
+        fn(cell)
+        took = time.perf_counter() - t0
+        if took >= 0.05:
+            slow[what] = round(took, 3)
+    assert not slow, slow
+
+
+def _place_everywhere(cell):
+    """A Grid's cells with ``cell`` where a label, a value, a header, a
+    heading, an item grid's label and a long log's stage go."""
+    c = {(1, 1): cell, (1, 2): 12.5,                         # a label beside a number
+         (3, 1): "Notes", (3, 2): cell, (4, 1): "Inspector", (4, 2): cell,
+         (6, 1): "Flaw", (6, 2): cell, (6, 3): "EC Pre"}      # a header
+    for i, it in enumerate(("1A", "1B")):
+        c[(7 + i, 1)], c[(7 + i, 2)], c[(7 + i, 3)] = it, 1.0 + i, cell
+    c[(10, 2)] = cell                                         # a heading over a table
+    c[(11, 2)], c[(11, 3)] = "Flaw", "EC Pre"
+    c[(12, 2)], c[(12, 3)] = "1A", 50
+    c[(14, 1)], c[(14, 2)], c[(14, 3)], c[(14, 4)] = "Flaw #", "1A", "1B", "2A"
+    c[(15, 1)], c[(15, 2)], c[(15, 3)], c[(15, 4)] = cell, 1, 2, 3   # an item grid
+    c[(16, 1)], c[(16, 2)], c[(16, 3)], c[(16, 4)] = "EC Pre", cell, 4, 5
+    c[(18, 1)], c[(18, 2)], c[(18, 3)] = "Flaw", "Stage", "Response"  # a long log
+    c[(19, 1)], c[(19, 2)], c[(19, 3)] = "1A", cell, cell
+    c[(20, 1)], c[(20, 2)], c[(20, 3)] = "1A", "EC Pre", 6
+    return c
+
+
+@pytest.mark.parametrize("name", sorted(_worst_cells()))
+def test_a_worst_case_cell_is_read_in_milliseconds_wherever_it_is(name, ledger):
+    _csv, schema = ledger
+    m, codes = se.Matcher(schema), se.ItemCodes(schema.items)
+    cell = _worst_cells()[name]
+    cells = _place_everywhere(cell)
+    places = sum(1 for v in cells.values() if v is cell)
+    ex = se._Extractor(se.Grid("w.xlsx", "Notes", cells), m, codes, "", None)
+    t0 = time.perf_counter()
+    ex.find_part()
+    ex.find_inspectors()
+    ex.item_grids()
+    ex.tables()
+    ex.forms()
+    each = (time.perf_counter() - t0) / places
+    assert each < 0.05, f"{each * 1000:.0f} ms a cell"
+
+
+def _worst_book(path: Path) -> Path:
+    """40 worst-case cells: alone on their rows, labels with a value beside
+    them, values beside a label, in a header row and under it."""
+    shapes = list(_worst_cells().values())
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Notes"
+    ws["A1"], ws["B1"] = "Laser Power (W)", 280
+    r = 3
+    for k in range(8):
+        ws.cell(r, 1, shapes[k])
+        r += 1
+    for k in range(14):
+        ws.cell(r, 1, shapes[(k + 8) % len(shapes)])
+        ws.cell(r, 2, 10 + k)
+        r += 1
+    for k in range(14):
+        ws.cell(r, 1, ("Notes", "Inspector", "Frequency (kHz)", "Operator")[k % 4])
+        ws.cell(r, 2, shapes[(k + 6) % len(shapes)])
+        r += 1
+    r += 1
+    ws.cell(r, 1, "Flaw")
+    ws.cell(r, 2, shapes[0])
+    ws.cell(r, 3, "EC Pre")
+    ws.cell(r, 4, shapes[5])
+    ws.cell(r + 1, 1, "1A")
+    ws.cell(r + 1, 2, shapes[2])
+    ws.cell(r + 1, 3, 61)
+    ws.cell(r + 1, 4, shapes[11])
+    wb.save(path)
+    return path
+
+
+def test_a_sheet_of_40_worst_case_cells_extracts_in_seconds(tmp_path, ledger):
+    """The Ledger tab's whole Extract (the review written) and the knowledge
+    graph's read of the same workbook: minutes before, the GUI frozen."""
+    from council_core import kg_excel as kx
+    from council_core import knowledge_graph as kgm
+    csv, _schema = ledger
+    src = _worst_book(tmp_path / "worst.xlsx")
+    t0 = time.perf_counter()
+    s = li.run_extract(str(csv), [str(src)], tmp_path / "review.xlsx", use_images=False)
+    took = time.perf_counter() - t0
+    assert took < 5, f"extract took {took:.1f}s"
+    assert s.values and Path(s.review).exists()
+    t0 = time.perf_counter()
+    kx.read_workbook(src, "worst.xlsx", kgm.DEFAULT_FIELD_RULES)
+    took = time.perf_counter() - t0
+    assert took < 5, f"knowledge graph read took {took:.1f}s"
+
+
+def test_cancel_during_a_sheet_of_padded_cells_ends_the_run_at_once(tmp_path, ledger):
+    """Cancel is seen every few hundred cells - in the part search too -
+    and no cell holds the GIL for long: pressed at +1 s, it was seen at
+    +9.9 s, once the sheet was read, and the review was written anyway
+    (review, 2026-10-20)."""
+    _csv, schema = ledger
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Notes"
+    for r in range(1, 601):
+        ws.cell(r, 1, " " * 4000 + f"NOTE {r}")
+        ws.cell(r, 2, " " * 2000 + "inspected by" + " " * 2000 + "x")
+    wb.save(tmp_path / "padded.xlsx")
+    cancel = threading.Event()
+    pressed = {}
+
+    class _PressOnce(_Prog):
+        def update(self, what="", **k):
+            if "reading sheet" in str(what) and not cancel.is_set():
+                pressed["at"] = time.perf_counter()
+                cancel.set()
+    run = se.extract(schema, [tmp_path / "padded.xlsx"], use_images=False, cancel=cancel,
+                     progress=_PressOnce(cancel, ""))
+    assert run.cancelled and not run.obs
+    assert time.perf_counter() - pressed["at"] < 2
