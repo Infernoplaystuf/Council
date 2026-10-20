@@ -407,6 +407,54 @@ def test_search_matches_word_starts_and_initials_not_mid_word(tmp_path):
         assert names("de") == []                             # letters: word starts only
 
 
+def test_lower_case_letters_search_as_a_name_before_initials(tmp_path):
+    """The search box searches on every keystroke: 'al' listed Anna Lopez
+    (A.L.) in among Alex Kim and David Allen Nash at the same rank (review,
+    2026-10-19). Lower-case letters are a piece of a name first; the people
+    whose initials they spell come after every name hit. Typed as initials
+    ('AL', 'a.l.') they rank with a later word's start, as before."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Alex Kim", "Anna Lopez", "David Allen Nash", "Zed Allard",
+                     "Dana Whitfield", "Jordan Blake"):
+            kg.add_person(name)
+
+        def names(text):
+            return [h["name"] for h in kg.search(text)]
+        assert names("al") == ["Alex Kim", "David Allen Nash", "Zed Allard",
+                               "Anna Lopez"]
+        assert names("dan") == ["Dana Whitfield", "David Allen Nash"]
+        assert names("AL") == ["Alex Kim", "Anna Lopez", "David Allen Nash",
+                               "Zed Allard"]
+        assert names("a.l.") == ["Anna Lopez"]
+        assert names("jb") == ["Jordan Blake"]             # still found, nothing ahead
+        assert names("Dan") == ["Dana Whitfield"]          # a capitalised word is a name
+
+
+def test_an_exact_search_gives_only_the_entry_of_that_name(tmp_path):
+    """The 'Same as…' merge needs the one entry the user named: 'JB' (an
+    initials-only person) also brings in Jordan Blake and Jill Brown by their
+    initials, and 'D. Whitfield' the Whitfields it fits (review, 2026-10-19)."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Jordan Blake", "Jill Brown", "Dana Whitfield", "Dan Whitfield"):
+            kg.add_person(name)
+        with kg.db:
+            kg._entity("PERSON", "JB", alias_source="user")
+            kg._entity("PERSON", "D. Whitfield", alias_source="user")
+
+        def names(text, exact=False):
+            return [h["name"] for h in kg.search(text, "PERSON", exact=exact)]
+        assert names("JB") == ["JB", "Jill Brown", "Jordan Blake"]
+        assert names("JB", exact=True) == ["JB"] == names("jb", exact=True)
+        assert len(names("D. Whitfield")) == 3
+        assert names("D. Whitfield", exact=True) == ["D. Whitfield"]
+        assert names("Whitfield, Dana", exact=True) == ["Dana Whitfield"]
+        assert names("Whit", exact=True) == []
+
+
 def test_gazetteer_finds_unlabelled_mentions(tmp_path):
     v, _key = _vault(tmp_path)
     kg = _graph(v)

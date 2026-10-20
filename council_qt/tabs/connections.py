@@ -999,6 +999,15 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if not text:
             return
         hits = [h for h in self._kg.search(text, cur["type"]) if h["id"] != self._current]
+        if len(hits) > 1:
+            # The one entry whose name or alias IS what was typed is the one
+            # meant: 'JB' (a person of their own) beside a Jill Brown whose
+            # initials are also JB was '2 entries match', and nothing more
+            # of the name could be typed (review, 2026-10-19).
+            exact = [h for h in self._kg.search(text, cur["type"], exact=True)
+                     if h["id"] != self._current]
+            if len(exact) == 1:
+                hits = exact
         if len(hits) != 1:
             self.status.setText(f"{len(hits)} entries match '{text}' — type more of the name.")
             return

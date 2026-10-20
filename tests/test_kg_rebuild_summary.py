@@ -110,27 +110,31 @@ def test_the_summary_says_zero_links_when_nothing_was_seeded():
 
 
 def test_the_summary_includes_seeded_and_suggested_counts():
-    # Updated on purpose (review, 2026-10-19): the total counts the
-    # suggested links too ('5 links (7 suggested)' read as 7 of the 5).
+    # Updated on purpose (review, 2026-10-19): the suggested links are added
+    # on ('5 links (7 suggested)' read as 7 of the 5).
     stats = _stats(documents=10, workbooks=10,
                    relations={"seeded": 3, "accepted": 2, "suggested": 7})
     line = rebuild_summary_line(stats)
-    assert "12 links (7 of them suggested)" in line
+    assert "; 5 links + 7 suggested" in line
 
 
-def test_the_suggested_links_are_counted_in_the_total_not_out_of_it():
+def test_the_suggested_links_are_added_on_not_part_of_the_links():
     """20 seeded + 5 suggested said '20 links (5 suggested)': it read as 5
-    of the 20 (review, 2026-10-19)."""
+    of the 20. 'Links' are the seeded and accepted ones, as the coverage
+    line counts them ('20 links, 5 waiting for you') - a total with the
+    suggested ones in it put a second link count on screen (review,
+    2026-10-19)."""
     line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 20,
                                                                 "suggested": 5}))
-    assert "25 links (5 of them suggested)" in line
-    assert "20 links" not in line
+    assert "; 20 links + 5 suggested" in line
+    assert "(5 suggested)" not in line and "25 links" not in line
     line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 20}))
     assert line.endswith("; 20 links.")
     line = rebuild_summary_line(_stats(documents=3, relations={"suggested": 4}))
-    assert "4 links (all suggested)" in line
-    line = rebuild_summary_line(_stats(documents=3, relations={"suggested": 1}))
-    assert "1 link (suggested)" in line
+    assert "; 0 links + 4 suggested" in line
+    line = rebuild_summary_line(_stats(documents=3, relations={"seeded": 1,
+                                                                "suggested": 1}))
+    assert "; 1 link + 1 suggested" in line
 
 
 def test_an_unchanged_rebuild_says_so_and_claims_no_new_entities():
@@ -143,7 +147,7 @@ def test_an_unchanged_rebuild_says_so_and_claims_no_new_entities():
     line = rebuild_summary_line(stats)
     assert "nothing changed since the last rebuild" in line
     assert "new entit" not in line and "matched existing" not in line
-    assert "25 links (5 of them suggested)" in line         # the graph as it stands
+    assert "; 20 links + 5 suggested" in line               # the graph as it stands
     # a rebuild that worked the graph out again still says what it found
     stats["graph_unchanged"] = False
     line = rebuild_summary_line(stats)

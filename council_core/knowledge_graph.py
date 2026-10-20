@@ -671,8 +671,8 @@ def rebuild_summary_line(stats) -> str:
 
     Shape: ``"Rebuilt from N document(s) in X.Xs — W workbooks,
     L ledgers, O other docs; U unreadable (needs pypdf: 10, ...);
-    R links (S of them suggested)"``. Keeps zeros out so a healthy run
-    reads cleanly."""
+    R links + S suggested"``. Keeps zeros out so a healthy run reads
+    cleanly."""
     seconds = float(stats.get("seconds", 0) or 0)
     unchanged = bool(stats.get("graph_unchanged"))
     bits = [f"Rebuilt from {stats.get('documents', 0)} document(s) in "
@@ -724,14 +724,14 @@ def rebuild_summary_line(stats) -> str:
     seeded = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
     suggested = int(rels.get("suggested") or 0)
     if seeded or suggested:
-        # The suggested ones counted IN the total: '20 links (5 suggested)'
-        # read as 5 of the 20 when there were 25 (review, 2026-10-19).
-        total = seeded + suggested
-        extra = f"; {total} link" + ("s" if total != 1 else "")
-        if suggested == total:
-            extra += " (all suggested)" if total != 1 else " (suggested)"
-        elif suggested:
-            extra += f" ({suggested} of them suggested)"
+        # The suggested ones are added ON: '20 links (5 suggested)' read as 5
+        # of the 20 when there were 25. 'Links' stays the seeded + accepted
+        # ones, as the coverage line and the progress finish line count them
+        # ('20 links, 5 waiting for you'); a total with the suggested ones in
+        # it put two link counts on screen at once (review, 2026-10-19).
+        extra = f"; {seeded} link" + ("s" if seeded != 1 else "")
+        if suggested:
+            extra += f" + {suggested} suggested"
         bits.append(extra)
     else:
         bits.append("; 0 links found")
@@ -3491,14 +3491,20 @@ class KnowledgeGraph:
             "SELECT alias FROM aliases WHERE entity_id=? ORDER BY alias", (eid,))]
         return d
 
-    def search(self, text: str, etype: Optional[str] = None, limit: int = 50
-               ) -> List[Dict[str, Any]]:
+    def search(self, text: str, etype: Optional[str] = None, limit: int = 50,
+               exact: bool = False) -> List[Dict[str, Any]]:
         """Entities whose name or any alias has a word starting with ``text``
         (accent- and case-insensitive), best first: exact, then prefix, then
         a later word's start. A query with a digit in it is a piece of a code
         ('7720' of BRG-7720, a serial's tail) and matches anywhere in one.
         Initials ('AK', 'A.K.') also find the people whose initials they are,
-        and 'D. Whitfield' the people that initial and surname fit."""
+        and 'D. Whitfield' the people that initial and surname fit; letters
+        typed in lower case ('al', 'jb') are a piece of a name first, so the
+        people whose initials they spell come after every name hit.
+
+        ``exact``: only the entries whose name or an alias IS ``text`` - for
+        a lookup that wants the one entry meant, not a list (the 'Same as…'
+        merge)."""
         from council_core import kg_excel
         # 'Lee, Carol' also searches as 'Carol Lee', whichever was seen.
         forms = {f for f in (fold(text), fold(person_display(text))) if f}
@@ -3531,10 +3537,15 @@ class KnowledgeGraph:
                 norm = r["alias_norm"]
                 hit(r, 0 if norm == ft else 1 if norm.startswith(ft)
                     else 2 if f" {ft}" in f" {norm}" else 3)
-        if etype in (None, "PERSON"):
+        if etype in (None, "PERSON") and not exact:
             # Initials: every word's first letter, or the first and last
             # name's (as the initials questions offer their candidates).
+            # Typed as initials ('AK', 'J.B.') they rank with a later word's
+            # start; in lower case ('al', 'dan') they are a name fragment
+            # first, and Anna Lopez came in among the Al... names at the same
+            # rank, on every keystroke (review, 2026-10-19).
             if kg_excel.is_initials(text, loose=True):
+                rank = 2 if kg_excel.is_initials(text) else 3
                 want = kg_excel.initials_key(text).lower()
                 if len(want) >= 2:
                     for r in self.db.execute(
@@ -3543,7 +3554,7 @@ class KnowledgeGraph:
                             " AND key LIKE '% %'", (f"{want[0]}%",)):
                         toks = r["key"].split()
                         if want in ("".join(t[0] for t in toks), toks[0][0] + toks[-1][0]):
-                            hit(r, 2)
+                            hit(r, rank)
             key = person_key(text)
             if is_initial_form(key):
                 for eid in self.initial_candidates(key):
@@ -3552,6 +3563,8 @@ class KnowledgeGraph:
                     if r is not None:
                         hit(r, 2)
         ranked = sorted(best.values(), key=lambda x: (x[0], x[1]["name"].lower()))
+        if exact:
+            ranked = [x for x in ranked if x[0] == 0]
         return [d for _s, d in ranked[:limit]]
 
     def neighbors(self, eid: str, *, include_rejected: bool = False,
