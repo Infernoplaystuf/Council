@@ -809,7 +809,9 @@ class ParentCSV:
         """Merge rows in by key, then save in sample order.
 
         Row keys may be the CSV header or any spelling that normalizes the
-        same ('laser power' for 'Laser Power (W)')."""
+        same ('laser power' for 'Laser Power (W)'). A row's own source_file,
+        when it has one, is written for it instead of `source` (the
+        workbooks its values came from - source_extract.rows_from)."""
         res = AddResult()
         # a fuzzy spelling finds a template column, never one person's copy of it
         by_name = {normalize_label(c): c for c in self.columns
@@ -820,6 +822,7 @@ class ParentCSV:
 
         for incoming in rows:
             mapped: Dict[str, str] = {}
+            src = xl_text(_text(incoming.get(SOURCE_COL))) or source
             for k, v in incoming.items():
                 if self.schema and self.schema.inspector_base(str(k)):
                     # exact only: normalize_label reads "[JB]" as a unit and
@@ -846,7 +849,7 @@ class ParentCSV:
             if existing is None:
                 row = {c: "" for c in self.columns}
                 row.update(mapped)
-                row[SOURCE_COL], row[UPDATED_COL] = source, now
+                row[SOURCE_COL], row[UPDATED_COL] = src, now
                 self.rows.append(row)
                 index[key] = row
                 res.added.append(label)
@@ -862,7 +865,7 @@ class ParentCSV:
                 else:
                     res.conflicts.append((label, col, old, val))
             if changed:
-                existing[SOURCE_COL], existing[UPDATED_COL] = source, now
+                existing[SOURCE_COL], existing[UPDATED_COL] = src, now
                 res.updated.append(label)
             else:
                 res.unchanged.append(label)

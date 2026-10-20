@@ -404,14 +404,15 @@ def _decode(raw: bytes) -> str:
     return raw.decode("latin-1", "replace")
 
 
-#: (the review's sources as the CSV's source_file says them, part, item,
-#: field, value) -> 'nde.xlsx › Part 101!C4'
+#: (the review's sources as the CSV's source_file says them - or one
+#: workbook of them, part, item, field, value) -> 'nde.xlsx › Part 101!C4'
 Provenance = Dict[Tuple[str, str, str, str, str], str]
 
 
 def _applied_as(meta: Dict[str, Any]) -> str:
-    """What apply_review writes in the CSV's source_file for this review's
-    rows: its sources' names, joined, cut at 200 characters."""
+    """What apply_review wrote in the CSV's source_file for this review's
+    rows until 2026-10-20: its sources' names, joined, cut at 200
+    characters. Since then each row names its own workbooks."""
     return ", ".join(Path(str(s)).name for s in meta.get("sources", []))[:200]
 
 
@@ -465,9 +466,17 @@ def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
             for row in wb["Values"].iter_rows(min_row=2, values_only=True):
                 if len(row) < 9 or str(row[0] or "").strip().upper() != "Y" or not row[8]:
                     continue
-                key = (applied, _text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
-                       _text(row[4]))
-                index.setdefault(key, str(row[8]))
+                rest = (_text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
+                        _text(row[4]))
+                index.setdefault((applied,) + rest, str(row[8]))
+                # Apply now names each row's own workbooks (source_extract.
+                # rows_from), not the whole run's (review, 2026-10-20): the
+                # value is also found by the workbook it was at - its cell,
+                # or a cell its note says it is 'also at'
+                note = str(row[10] or "") if len(row) > 10 else ""
+                for w in [str(row[8])] + [p[8:] for p in note.split("; ")
+                                          if p.startswith("also at ")]:
+                    index.setdefault((w.split(" › ", 1)[0],) + rest, w)
         finally:
             wb.close()
     return index, n, notes
@@ -577,9 +586,15 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
 
         def where(field: str, value: str) -> str:
             # a part-level value sits on every flaw row of its part, but the
-            # review lists it once, under no flaw
-            return (prov.get((sources, part.lower(), item, field, value))
-                    or prov.get((sources, part.lower(), "", field, value)) or "")
+            # review lists it once, under no flaw. The row's sources as one
+            # review's whole run first (an older Apply wrote that), then each
+            # workbook it names (_provenance)
+            for s in [sources] + [b for b in sources.split(", ") if b and b != sources]:
+                w = (prov.get((s, part.lower(), item, field, value))
+                     or prov.get((s, part.lower(), "", field, value)))
+                if w:
+                    return w
+            return ""
 
         def add_person(who: str, col: str, shown: str, src_key: Tuple[str, str]):
             nonlocal located

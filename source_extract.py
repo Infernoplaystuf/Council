@@ -73,8 +73,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sample_ledger import (INITIALS_SUFFIX, INSPECTOR_COL, LedgerError, ParentCSV,
-                           TemplateField, TemplateSchema, _text, fill_template,
+from sample_ledger import (INITIALS_SUFFIX, INSPECTOR_COL, SOURCE_COL, LedgerError,
+                           ParentCSV, TemplateField, TemplateSchema, _text, fill_template,
                            inspector_column, normalize_label, sample_sort_key,
                            schema_path_for, xl_text)
 
@@ -2656,11 +2656,19 @@ def _join(a: str, b: str) -> str:
     return f"{a}; {b}" if a else b
 
 
-def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dict[str, str]]:
+def rows_from(decisions: Iterable[Decision], schema: TemplateSchema,
+              sources: bool = False) -> List[Dict[str, str]]:
     """Accepted values -> parent-CSV rows. A part-level value lands on every
-    item row of its part, as the parent CSV keeps it."""
+    item row of its part, as the parent CSV keeps it.
+
+    ``sources``: each row also names the workbooks its values came from, as
+    the review names them (source_file): Apply wrote every workbook of the
+    run on every row (review, 2026-10-20). A part-level value's workbook is
+    on each row of its part; a row with no value of its own names the
+    part's workbooks."""
     part_vals: Dict[str, Dict[str, str]] = defaultdict(dict)
     item_vals: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
+    books: Dict[Tuple[str, str], List[str]] = defaultdict(list)    # (part, item) ->
     for d in decisions:
         if not d.accept or not d.obs.part or not d.obs.field:
             continue
@@ -2670,15 +2678,26 @@ def rows_from(decisions: Iterable[Decision], schema: TemplateSchema) -> List[Dic
         initials = f.field + INITIALS_SUFFIX
         if f.inspector and f.item and schema.takes_inspectors(f.field):
             target.setdefault(initials, f.inspector)    # whose value went in
+        book = f.where.split(" › ", 1)[0]
+        for key in ((f.part, f.item), (f.part, None)):  # None: any of the part's
+            if book and book not in books[key]:
+                books[key].append(book)
+
+    def named(p, it) -> Dict[str, str]:
+        if not sources:
+            return {}
+        mine = list(dict.fromkeys(books.get((p, it), []) + books.get((p, ""), [])))
+        return {SOURCE_COL: ", ".join(mine or books.get((p, None), []))[:200]}
     rows = []
     parts = sorted(set(part_vals) | {p for p, _ in item_vals}, key=sample_sort_key)
     for p in parts:
         if not schema.item_field:
-            rows.append({schema.id_field: p, **part_vals[p]})
+            rows.append({schema.id_field: p, **part_vals[p], **named(p, "")})
             continue
         for it in schema.items:
             row = {schema.id_field: p, schema.item_field: it, **part_vals[p]}
             row.update(item_vals.get((p, it), {}))
+            row.update(named(p, it))
             rows.append(row)
     return rows
 
@@ -3182,9 +3201,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                                           "", cells[0]), True))
     accepted, notes = _one_value_per_cell(decisions, schema, no_part)
 
-    rows = rows_from(decisions, schema)
+    rows = rows_from(decisions, schema, sources=True)       # each row: its workbooks
     prog.stage("writing the parent CSV", total=len(rows), unit="rows")
-    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in meta["sources"])[:200])
+    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in read)[:200])
     prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:

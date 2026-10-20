@@ -375,3 +375,38 @@ def test_people_count_each_reading_once_at_its_signers_cell(tmp_path, ledger):
     people = se.review_initials(dec)
     assert people["MK"] == (3, "mk.xlsx › EC!C4")        # not 6, not JB's cell
     assert people["JB"] == (3, "jb.xlsx › EC!C4")
+
+
+# ── each row names its own workbooks ────────────────────────────────────
+def _signed_book(path: Path, part: str, who: str) -> Path:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Part {part}"
+    ws["A1"], ws["B3"], ws["B4"] = f"Inspector: {who}", "Flaw", "EC Pre (%FSH)"
+    for i, item in enumerate(lf.ITEMS):
+        ws.cell(3, 3 + i, item)
+        ws.cell(4, 3 + i, 60 + i)
+    wb.save(path)
+    return path
+
+
+def test_each_row_names_the_workbooks_its_values_came_from(tmp_path, ledger):
+    from council_core import kg_excel
+    from council_core import knowledge_graph as kgm
+    csv_path, _schema = ledger
+    a = _signed_book(tmp_path / "nde_101.xlsx", "101", "JB")
+    b = _signed_book(tmp_path / "nde_102.xlsx", "102", "MK")
+    s = li.run_extract(csv_path, [a, b], tmp_path / "review_1.xlsx", use_images=False)
+    wb, rows = _values(s.review)
+    for r in rows:
+        wb["Values"].cell(r["row"], 1).value = "Y"
+    wb.save(s.review)
+    li.run_apply(s.review, use_images=False)
+    got = {(r["Part Number"], r["source_file"]) for r in _csv_rows(csv_path)}
+    assert got == {("101", "nde_101.xlsx"), ("102", "nde_102.xlsx")}
+    # the knowledge graph still traces each value to its cell
+    reading = kg_excel.read_ledger(csv_path, "lmm_parent.csv",
+                                   list(kgm.DEFAULT_FIELD_RULES))
+    froms = {v.locator.get("from") for rec in reading.records for v in rec.values
+             if v.locator.get("item") == "Flaw # 1A" and v.locator.get("from")}
+    assert froms == {"nde_101.xlsx › Part 101!C4", "nde_102.xlsx › Part 102!C4"}
