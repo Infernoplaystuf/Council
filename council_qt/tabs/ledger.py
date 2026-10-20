@@ -10,6 +10,10 @@ The four steps, top to bottom, are the pipeline's own order:
   4. Apply the saved review -> the parent CSV, and optionally one filled
      template per part.
 
+Beside step 2, "Teach from a sample workbook…" (ledger_teach_dialog.py):
+Council guesses what each thing in one workbook is, the user answers, and
+the answers are kept so the next Extract places them by itself.
+
 Every step runs on a worker thread (a workbook of many pictures takes a while) and the buttons are
 disabled until it finishes; the summary line and the log say what it found.
 Everything stays on this machine: the work is council_core/ledger_ingest.py,
@@ -23,8 +27,8 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QCompleter,
+                               QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QPlainTextEdit,
                                QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
@@ -62,10 +66,14 @@ class LedgerActions:
     (a stand-in image reader, no Excel, no file dialogs)."""
 
     def __init__(self, image_reader=None, opener: Optional[Callable] = None,
-                 rebuild_kg: Optional[Callable] = None):
+                 rebuild_kg: Optional[Callable] = None, connections=None):
         self.image_reader = image_reader
         self.opener = opener or ledger_ingest.open_path
         self._rebuild_kg_override = rebuild_kg
+        #: the Connections vault Teach ticks the graph's field rules in (a
+        #: ConnectionsActions or a vault path). None: the Connections tab's
+        #: when it is built, else the default vault's. Tests pass a temp one.
+        self.connections = connections
 
     def create_parent(self, template, csv):
         return ledger_ingest.create_parent(template, csv or None)
@@ -98,6 +106,37 @@ class LedgerActions:
             reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
                                        image_reader=reader, progress=progress)
+
+    def teach_guess(self, csv, workbook, *, model_id: Optional[str] = None,
+                    use_images: bool = True, vision_model: Optional[str] = None,
+                    pattern_mask: Optional[str] = None, cancel=None, progress=None):
+        """Council's guess for Teach (council_core.ledger_teach.guess): the
+        workbook read exactly as Extract reads it, pictures through this
+        tab's image reader; Council's model ('ollama:<name>' or a GGUF
+        path, US-origin only) asked where the rules stop. Worker thread."""
+        from council_core import ledger_teach
+        reader = self.image_reader
+        if reader is None and use_images and vision_model:
+            from source_extract import ollama_vision_reader
+            reader = ollama_vision_reader(vision_model)
+        return ledger_teach.guess(csv, workbook, model_id=model_id or None,
+                                  use_images=use_images, image_reader=reader,
+                                  pattern_mask=pattern_mask or None, cancel=cancel,
+                                  progress=progress)
+
+    def teach_learn(self, csv, session, answers, people=None, *, part=None,
+                    save_pattern: bool = False, connections=None):
+        """Keep the user's Teach answers (council_core.ledger_teach.learn)
+        and tick the knowledge graph's field rules they prove, in
+        ``connections`` (else this one's, else the default vault's). Worker
+        thread: it opens the graph."""
+        from council_core import ledger_teach
+        vault = connections or self.connections
+        if vault is None:
+            from council_qt.tabs.connections import ConnectionsActions
+            vault = ConnectionsActions()
+        return ledger_teach.learn(csv, session, answers, people, part=part,
+                                  save_pattern=save_pattern, connections_vault=vault)
 
     def open(self, path) -> None:
         self.opener(path)
@@ -164,6 +203,14 @@ class LedgerTab(ViewHelpers, QWidget):
         #: Skip patterns typed while there was no parent CSV to save them
         #: beside: saved when one is set.
         self._ignore_unsaved = False
+        #: (parent CSV, whether its schema is beside it): looked up when the
+        #: path is set, not on every keystroke (a CSV on a network share can
+        #: take seconds to answer). Teach needs the schema.
+        self._schema_known = ("", False)
+        #: The open Teach dialog, and how its Browse… picks one workbook
+        #: (tests replace it: no file dialogs).
+        self.teach_dialog = None
+        self._pick_workbook = self._browse_one_workbook
         self._build()
         self._refresh_reader_choices()
         self._refresh_enabled()
@@ -212,13 +259,24 @@ class LedgerTab(ViewHelpers, QWidget):
         self._step_button(row, "Add folder…", self.browse_folder)
         self._step_button(row, "Remove selected", self.remove_selected)
         self._step_button(row, "Clear", self.clear_sources)
-        preview = self._step_button(row, "Preview a workbook…",
+        # one workbook at a time, on a row of their own: beside the source
+        # buttons the row grew wider than a laptop's screen
+        one_row = QHBoxLayout()
+        preview = self._step_button(one_row, "Preview a workbook…",
                                     self.on_preview_workbook)
         preview.setToolTip(
             "Dry-run against one source workbook so you can see which "
             "columns the matcher recognizes, which inspectors it finds, "
             "and which labels it can't match. Fix the labels or add a "
             "schema alias BEFORE running a long batch.")
+        self.teach_btn = self._step_button(one_row, "Teach from a sample workbook…",
+                                           self.on_teach_workbook)
+        self.teach_btn.setToolTip(
+            "Pick one workbook: Council guesses what each label, picture, part number "
+            "and inspector's initials in it are, you correct the guesses, and the Ledger "
+            "keeps your answers - the next Extract places them by itself, and Council's "
+            "model learns from them. Needs a parent CSV with its schema (step 1).")
+        one_row.addStretch(1)
         row.addWidget(QLabel("Part number (if not in them):"))
         self.part = QLineEdit()
         self.part.setFixedWidth(120)
@@ -240,8 +298,10 @@ class LedgerTab(ViewHelpers, QWidget):
             self._on_reader_changed)
         row.addStretch(1)
         v2.addLayout(row)
-        # Pattern hint — not persisted; held for this session only. A follow-up
-        # could save it next to the parent CSV like aliases.
+        v2.addLayout(one_row)
+        # Pattern hint — what is typed is held for this session only; the
+        # patterns Teach saved beside the parent CSV are offered, and the
+        # newest is used when the field is left empty.
         mask_row = QHBoxLayout()
         mask_row.addWidget(QLabel("Part name pattern (optional):"))
         self.pattern_mask = QLineEdit()
@@ -250,7 +310,14 @@ class LedgerTab(ViewHelpers, QWidget):
         self.pattern_mask.setToolTip(
             "A shape used when the sample number is not labelled.\n"
             "@ matches any letter, # any digit, anything else matches itself.\n"
-            "Example: @@@#@@### finds ABC1DE234 in a filename.")
+            "Example: @@@#@@### finds ABC1DE234 in a filename.\n"
+            "Left empty, the pattern Teach saved for this Ledger is used.")
+        # the patterns Teach saved for this Ledger, offered as you type
+        # (_load_saved_patterns)
+        self._pattern_completer = QCompleter([], self.pattern_mask)
+        self._pattern_completer.setCompletionMode(
+            QCompleter.CompletionMode.UnfilteredPopupCompletion)
+        self.pattern_mask.setCompleter(self._pattern_completer)
         mask_row.addWidget(self.pattern_mask, 1)
         # Label matching alone is never enough on real workbooks (user,
         # 2026-10-19): Council's model is asked about what the rules left.
@@ -364,8 +431,45 @@ class LedgerTab(ViewHelpers, QWidget):
     def _on_csv_changed(self) -> None:
         """Re-sync tab state that depends on the parent CSV path:
         ignore-pattern field is populated from the aliases file so the
-        user sees their saved patterns as soon as they pick the CSV."""
+        user sees their saved patterns as soon as they pick the CSV; the
+        part-name patterns Teach saved are offered; Teach is enabled when
+        the CSV has its schema."""
         self._load_ignore_patterns()
+        self._check_schema()
+        self._load_saved_patterns()
+
+    def _check_schema(self) -> None:
+        """Whether the parent CSV and its schema are there (Teach needs
+        both); kept for _refresh_enabled."""
+        csv = self.csv.text().strip()
+        ok = False
+        if csv:
+            try:
+                from sample_ledger import schema_path_for
+                ok = Path(csv).is_file() and schema_path_for(csv).is_file()
+            except (OSError, ValueError):
+                ok = False
+        self._schema_known = (csv, ok)
+        self._refresh_enabled()
+
+    def _load_saved_patterns(self) -> None:
+        """Offer the part-name patterns Teach saved for this Ledger in the
+        pattern field (newest first), and say in its placeholder that the
+        newest is used when the field is left empty - Extract and Teach do
+        (ledger_ingest, ledger_teach)."""
+        if not hasattr(self, "pattern_mask"):
+            return
+        csv = self.csv.text().strip()
+        try:
+            from source_extract import load_patterns
+            saved = load_patterns(csv) if csv else []
+        except Exception:                                    # noqa: BLE001
+            saved = []
+        self._pattern_completer.model().setStringList(saved)
+        hint = "@ letter, # digit, other characters literal"
+        self.pattern_mask.setPlaceholderText(
+            f"empty: this Ledger's saved pattern {saved[0]} is used   — {hint}" if saved
+            else f"@@@#@@###   — {hint}")
 
     def _refresh_enabled(self) -> None:
         if not hasattr(self, "progress"):
@@ -381,6 +485,8 @@ class LedgerTab(ViewHelpers, QWidget):
         csv = self.csv.text().strip()
         self.create_btn.setEnabled(bool(self.template.text().strip()))
         self.extract_btn.setEnabled(bool(csv) and bool(self.source_paths()))
+        # the schema was looked up when this path was set (_check_schema)
+        self.teach_btn.setEnabled(bool(csv) and self._schema_known == (csv, True))
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
@@ -615,6 +721,75 @@ class LedgerTab(ViewHelpers, QWidget):
                                     pick_model=self._pick_model, ignore=ignore,
                                     part=self.part.text().strip())
         dlg.exec()
+
+    def on_teach_workbook(self) -> None:
+        """Teach from a sample workbook (user, 2026-10-20: "taking a sample
+        workbook from the folder and I line up where they match the
+        templates ... First I want an LLM guess to be made, then I give an
+        answer"): the dialog reads ONE workbook as Extract does with this
+        tab's image reader and pattern, Council guesses what each thing in
+        it is, the user answers, and Save keeps the answers for the next
+        Extract and the knowledge graph. Needs a parent CSV with a schema.
+
+        Window-modal and not waited for: the guess runs on the dialog's own
+        worker, and no Extract or Apply can write the aliases file while
+        the answers are saved."""
+        csv_path = self.csv.text().strip()
+        if not csv_path:
+            self.status.setText("Set the parent CSV first — Teach needs its schema.")
+            return
+        self._check_schema()
+        if not self._schema_known[1]:
+            self.status.setText(
+                "That parent CSV has no schema beside it — run Create first.")
+            return
+        from .ledger_teach_dialog import TeachDialog
+        images, vision = self.use_images.isChecked(), self._selected_vision_model()
+        mask = self.pattern_mask.text().strip()
+        actions = self.actions
+        conn = self._connections_tab()
+        vault = getattr(actions, "connections", None) or (
+            conn.actions if conn is not None else None)
+        old = self.teach_dialog
+        if old is not None:
+            try:
+                if not old.busy:
+                    old.deleteLater()
+            except RuntimeError:                          # already gone
+                pass
+        dlg = TeachDialog(
+            csv_path, sources=self.source_paths(),
+            prefer=[i.text() for i in self.sources.selectedItems()],
+            ignore_patterns=self._typed_ignore_patterns(),
+            template_path=self.template.text().strip() or None,
+            guess=lambda csv, wb, **kw: actions.teach_guess(
+                csv, wb, use_images=images, vision_model=vision, pattern_mask=mask, **kw),
+            learn=lambda csv, s, answers, people, **kw: actions.teach_learn(
+                csv, s, answers, people, connections=vault, **kw),
+            pick_model=self._pick_model, browse=self._pick_workbook,
+            log=self._say, on_learned=self._after_teach, pattern_mask=mask, parent=self)
+        self.teach_dialog = dlg
+        self._say(f"── Teach from a sample workbook ({Path(csv_path).name})")
+        dlg.open()
+
+    def _after_teach(self, report) -> None:
+        """Teach saved its answers: the pattern field offers a pattern it
+        saved, and the knowledge graph wants a rebuild when the Ledger's
+        inspectors or people changed (kg_excel reads them)."""
+        self._load_saved_patterns()
+        if report.who_labels or report.not_who or report.people:
+            self._kg_dirty = True
+            self.status.setText("Teach saved your answers. Press Rebuild knowledge graph "
+                                "so the graph reads the inspectors the new way.")
+        else:
+            self.status.setText("Teach saved your answers; the next Extract uses them.")
+        self._refresh_enabled()
+
+    def _browse_one_workbook(self, parent=None) -> str:
+        """Teach's Browse…: one workbook, '' when cancelled."""
+        p, _ = QFileDialog.getOpenFileName(parent or self, "Pick ONE sample workbook",
+                                           self._start_dir(), XLSX)
+        return p
 
     def on_cancel(self) -> None:
         """Signal the running step to stop. The event is checked between

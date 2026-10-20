@@ -570,6 +570,20 @@ def test_the_graphs_part_rules_are_ticked(tmp_path, ledger):
     assert any("ticked 'S/N'" in k for k in rep2.kg)
 
 
+def test_the_templates_own_part_rule_is_ticked_once(tmp_path, ledger):
+    """'Part Number' answered as the part number is the graph's own rule:
+    ticked, and said, once (the Ledger log said it twice)."""
+    csv, _schema = ledger
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    s = lt.guess(csv, _labelled_book(tmp_path / "s.xlsx"), use_images=False)
+    pn = _row(s, "Part Number")
+    rep = lt.learn(csv, s, {pn.key: lt.ROLE_PART}, connections_vault=vault)
+    assert rep.kg == ["ticked 'Part Number' (a part number)"]
+    with kgm.KnowledgeGraph(vault) as kg:
+        assert dict((r.label, st) for r, st in kg.field_rules())["Part Number"] == "confirmed"
+
+
 def test_a_field_named_like_a_confirmed_rule_gets_the_label_as_a_synonym(tmp_path):
     """A template field 'Project' (a graph rule the user ticked): a label
     mapped to it is added as that rule's other name."""

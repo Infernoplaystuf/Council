@@ -1202,6 +1202,10 @@ def _teach_graph(vault: Any, schema: TemplateSchema, part_labels: Sequence[str],
                         kg.set_rule_status(rule.label, "confirmed")
                         rules[k] = (rule, "confirmed")
                         out.append(f"ticked {rule.label!r} (a part number)")
+                        if base is not None and base[0].label == rule.label:
+                            # the template's own rule: not ticked twice (the
+                            # Ledger log said so twice)
+                            base = (rule, "confirmed")
                     continue
                 if base is None:
                     out.append(f"no part-number rule to add {label!r} to")
