@@ -244,6 +244,41 @@ def test_a_link_the_value_splitter_cut_is_read_whole(tmp_path):
                     ("Tomas Echeverria", "WORKS_ON", "Atlas", "seeded")]
 
 
+# ---------------------------------------------- initials: a wiki-link's person
+# (review, 2026-10-19): the initials questions' candidates were worked out
+# before the wiki-link pass, so 'Who is RT?' did not offer a Rita Tan only a
+# [[Rita Tan]] names.
+
+def test_the_initials_question_offers_a_person_only_a_wikilink_names(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    v = _vault_with(tmp_path, {"rita.md": "[[Rita Tan]] runs the lift tests.\n"})
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Part Number", "Inspector"])
+    ws.append(["SN-5501", "RT"])
+    wb.save(v / "data_in" / "lift.xlsx")
+
+    def question():
+        with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+            kg.confirm_all_rules()
+            stats = kg.seed()
+            (q,) = [r for r in kg.reviews() if r["kind"] == "initials"]
+            inspected = [k for k in _shape(kg)[1] if k[1] == "INSPECTED"]
+        return stats, q, inspected
+
+    stats, q, inspected = question()
+    assert q["surface"] == "RT"
+    assert [c["name"] for c in q["candidates"]] == ["Rita Tan"]
+    assert inspected == []                  # offered, never picked
+    # A rebuild that works the graph out again offers her too.
+    (v / "data_in" / "rita.md").write_text("[[Rita Tan]] runs the lift tests again.\n",
+                                           encoding="utf-8")
+    stats, q, inspected = question()
+    assert stats["graph_unchanged"] is False
+    assert [c["name"] for c in q["candidates"]] == ["Rita Tan"]
+    assert inspected == []
+
+
 # ---------------------------------------------- summary line matched/created
 
 def test_the_summary_line_breaks_down_matched_and_created():

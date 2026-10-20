@@ -2549,7 +2549,6 @@ class KnowledgeGraph:
                 # field mentions) - flushed before it.
                 self._memo["buffer"] = {"evidence": [], "mentions": []}
                 self._seed_records(kept, run_id)
-                self._finish_initials()
                 if use_collections:
                     prog.update("Collections")
                     stats["collections"] = self._seed_collections(run_id)
@@ -2561,6 +2560,10 @@ class KnowledgeGraph:
                 # a brand-new PERSON a wiki-link named).
                 prog.update("[[wiki-links]]")
                 self._seed_wikilinks(usable, run_id, stats)
+                # The initials questions' answers to choose from, AFTER the
+                # wiki-link pass: a person only a [[Rita Tan]] names was never
+                # offered for 'RT' (review, 2026-10-19).
+                self._finish_initials()
                 if gazetteer:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
@@ -2822,9 +2825,9 @@ class KnowledgeGraph:
         q["docs"].add(did)
 
     def _finish_initials(self) -> None:
-        """Each initials question, once every record is read: the people
-        whose initials these are (to choose from, never chosen), and how
-        often the initials were seen."""
+        """Each initials question, once every record and wiki-link is read:
+        the people whose initials these are (to choose from, never chosen),
+        and how often the initials were seen."""
         if not self._asked:
             return
         people = []
