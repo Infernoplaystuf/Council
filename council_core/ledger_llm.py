@@ -240,15 +240,32 @@ def _gguf_llm(path: str):
             try:
                 from llama_cpp import Llama
             except Exception as exc:                       # noqa: BLE001
-                raise _cannot(se.LedgerError(
-                    "this Council install cannot run GGUF files (llama-cpp-python "
-                    f"would not load: {exc}). Pick an Ollama model instead.")) from exc
+                raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
             llm = Llama(model_path=path, n_ctx=8192, n_gpu_layers=-1, verbose=False)
         except Exception as exc:                           # noqa: BLE001
-            raise _cannot(se.LedgerError(
-                f"{os.path.basename(path)} could not be loaded: {exc}")) from exc
+            raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
         _GGUF["key"], _GGUF["llm"] = key, llm
         return llm
+
+
+def _gguf_failed(path: str, exc: BaseException) -> str:
+    """What to say when the picked GGUF would not load: the reason in a few
+    words and what to do. llama-cpp-python's own words were the whole
+    message - 'Failed to load shared library ...\\llama.dll': Could not find
+    module ... Try using the full path with constructor syntax.' - with no
+    way out (review, 2026-10-20)."""
+    import os
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    missing = bool(re.search(r"(?i)llama[-_]cpp[-_]python is not installed|No module named "
+                             r"'?llama_cpp", text))
+    if missing:
+        why = "llama-cpp-python is not installed"
+    elif re.search(r"(?i)shared library|\.dll\b|\.so\b|\.dylib\b|DLL load failed", text):
+        why = "llama-cpp-python's llama library, or one it needs, would not load"
+    else:
+        why = _clip(text.split(". Install with")[0].rstrip(" .:"), 120)
+    return (f"{os.path.basename(path)} could not be loaded ({why}) — pick an Ollama model "
+            f"instead, or {'install' if missing else 'reinstall'} llama-cpp-python")
 
 
 def _gpu_ok() -> None:
@@ -380,6 +397,16 @@ class AssistReport:
     parts_asked: int = 0
     parts_found: List[Tuple[str, str]] = field(default_factory=list)   # (workbook, part)
     problems: List[str] = field(default_factory=list)
+    #: What the summary says it was asked and did (review, 2026-10-20: 'part
+    #: numbers for 7 workbook(s)' listed the 3 it found). Answers dropped by
+    #: the checks (workbook, answer); answers with no part; labels it gave a
+    #: field; values left on Labels to map (a per-item field, no item).
+    parts_dropped: List[Tuple[str, str]] = field(default_factory=list)
+    parts_none: int = 0
+    labels_mapped: int = 0
+    values_held: int = 0
+    #: The template's item field ('Flaw #'), for what values_held says.
+    item_field: str = ""
     #: Why the model stopped being asked (one_shot), '' while it answers.
     unavailable: str = ""
     #: It stopped being asked after failing twice in a row, not because it
@@ -414,18 +441,43 @@ class AssistReport:
             return f"{lead}, so nothing in the review is its suggestion: {_end(down)}"
         if not (self.labels_asked or self.parts_asked):
             return "Council's model: nothing it needed to be asked."
-        bits = [f"Council's model ({self.model or 'none answered'}):"]
-        if self.labels_asked:
-            bits.append(f"placed {self.values_placed} value(s) from "
-                        f"{self.labels_asked} unplaced label(s)")
+        # what it was asked, what it answered, what was used and what was
+        # dropped: 'part numbers for 7 workbook(s): <3 listed> — all amber'
+        # read as 7 found, and 'Council's model (Council's model)' named
+        # nothing (review, 2026-10-20)
+        name = "" if self.model in ("", "Council's model") else self.model
+        bits = []
         if self.parts_asked:
-            got = ", ".join(f"{w} → {p}" for w, p in self.parts_found) or "none found"
-            bits.append(f"part numbers for {self.parts_asked} workbook(s): {got}")
+            found, dropped = len(self.parts_found), len(self.parts_dropped)
+            said = [f"{found} found" + (" (" + ", ".join(f"{w} → {p}" for w, p in
+                                                         self.parts_found) + ")"
+                                        if found else "")]
+            if dropped:
+                said.append(f"{dropped} answer(s) dropped as not a part number written "
+                            "there (see the problems)")
+            if self.parts_none:
+                said.append(f"{self.parts_none} with no part in its answer")
+            silent = self.parts_asked - found - dropped - self.parts_none
+            if silent > 0:
+                said.append(f"{silent} not answered")
+            bits.append(f"asked which part {self.parts_asked} workbook(s) are about: "
+                        + ", ".join(said))
+        if self.labels_asked:
+            said = [f"{self.labels_mapped} given a field", f"{self.values_placed} value(s) "
+                    "placed"]
+            if self.values_held:
+                item = self.item_field or "item"
+                said.append(f"{self.values_held} value(s) left on Labels to map (their field "
+                            f"is kept per {item} and they have no {item})")
+            bits.append(f"asked which field {self.labels_asked} unplaced label(s) are: "
+                        + ", ".join(said))
+        what = ("all amber in the review: check them" if self.values_placed or self.parts_found
+                else "nothing in the review is its suggestion")
         stopped = (self._ran_out() if self.timed_out else
                    "stopped answering and was not asked again")
         tail = (f". Then it {stopped}: {down}" if down else "")
-        return _end(" ".join(bits[:1]) + " " + "; ".join(bits[1:]) +
-                    " — all amber in the review: check them" + tail)
+        return _end("Council's model" + (f" ({name})" if name else "") + ": "
+                    + "; ".join(bits) + f" — {what}" + tail)
 
 
 def _end(text: str) -> str:
@@ -560,7 +612,8 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat
 def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
     """Values under labels no rule placed: ask which field each label is and
     add those values as suggested rows (via 'model'), in place of their
-    'Labels to map' rows."""
+    'Labels to map' rows - except a value with no item for a field kept
+    per item (source_extract.needs_item), which stays there with a note."""
     import source_extract as se
     if report.unavailable:                                 # one_shot: not asked again
         return
@@ -582,16 +635,38 @@ def place_labels(run, schema, chat: Chat, report: AssistReport) -> None:
     except Exception as exc:                               # noqa: BLE001
         report.problems.append(f"Council's model was not asked about labels: {exc}")
         return
+    report.labels_mapped = sum(1 for f in mapping.values() if f)
     placed = set()
+    held: Dict[Tuple[str, str], int] = {}
     for o in list(run.unmatched):
         fname = mapping.get((o.label or "").strip())
         if not fname:
+            continue
+        if se.needs_item(schema, fname, o.item):
+            # A field kept per item (per flaw) for a value with no item: it
+            # was placed with no flaw code - a 9-way red clash, and the one
+            # accepted went to EVERY flaw row of the part (review,
+            # 2026-10-20). It stays on 'Labels to map', the model's field
+            # in its note.
+            o.note = se._join(o.note, f"Council's model suggests {fname!r}, a field kept "
+                                      f"per {schema.item_field}; this value has no "
+                                      f"{schema.item_field}, so it was not placed")
+            key = ((o.label or "").strip(), fname)
+            held[key] = held.get(key, 0) + 1
+            report.values_held += 1
             continue
         run.obs.append(replace(o, field=fname, score=MODEL_SCORE, via="model",
                                note=se._join(o.note, f"field suggested by {report.model}"
                                                      " — check it")))
         placed.add(id(o))
         report.values_placed += 1
+    if held:
+        report.item_field = schema.item_field
+    for (label, fname), n in held.items():
+        report.problems.append(
+            f"Council's model suggested {fname!r} for label {label!r}, a field kept per "
+            f"{schema.item_field}, but {n} value(s) under it have no {schema.item_field} "
+            "beside them — left on 'Labels to map', not placed")
     # a placed value is no longer one to map: it also stayed on 'Labels to
     # map', with the rules' guesses contradicting the model's field, and was
     # counted as unmatched (review, 2026-10-19)
@@ -631,6 +706,16 @@ _GENERIC = re.compile(
     r"(?i:sheet|page|tab|table|chart|graph|plot|fig(?:ure)?|run|data(?:set)?|series"
     r"|row|col(?:umn)?|step|item|trial|test|rev(?:ision)?|ver(?:sion)?|log|scan|report"
     r"|file|book|workbook|untitled|image|img|photo|pic|dsc)[\s_\-#.]*\d+")
+#: A spec or standard's number ('AMS2750', 'ASTM E1444', 'ISO 9001',
+#: 'MIL-STD-1916', 'NAS410', 'AWS D17.1', 'BS EN 10204'): written in many
+#: inspection workbooks and not a part. Taken as the part, part-less
+#: workbooks merged into one phantom part 'AMS2750' (review, 2026-10-20).
+#: The user's own pattern still wins (_part_test, _spaced_part).
+_STANDARD = re.compile(
+    r"(?i:AMS|ASTM|ISO|MIL|NAS|AWS|ASME|SAE|ANSI|DIN|EN|BS|ARP)"
+    r"(?:[\s\-/]*(?i:EN|ISO)(?=[\s\-/]))*"                 # 'BS EN 10204', 'DIN EN ISO 9712'
+    r"(?:\d|[\s\-/]+(?:[A-Za-z]{1,4}[\s\-/]?)?\d)"         # 'AMS2750', 'ASTM E1444', 'MIL-STD-1'
+    r"[\w.\-:/]*")
 #: What is trimmed off a word before it is judged ('(XYZ9AB123),').
 _TRIM = "()[],;:"
 #: A word of an id written with spaces ('QRS 6TU 789'): letters, digits,
@@ -694,7 +779,7 @@ def _part_test(pattern_mask: Optional[str]) -> Callable[[str], bool]:
         if _NUMBER.fullmatch(s) or _YEAR.fullmatch(s) or _DATE.fullmatch(s):
             return False
         if (_measured(s) or _TIME.fullmatch(s) or _MONTH_DATE.fullmatch(s)
-                or _ISO_DT.fullmatch(s) or _GENERIC.fullmatch(s)):
+                or _ISO_DT.fullmatch(s) or _GENERIC.fullmatch(s) or _STANDARD.fullmatch(s)):
             return False
         return not (s.isdigit() and len(s) < 5 and not digits_mask)
     return test
@@ -741,6 +826,9 @@ def _spaced_part(text: str, is_part: Callable[[str], bool], rx) -> bool:
     if (len(words) < 2 or len(joined) < 6 or joined.isdigit() or not is_part(joined)
             or _MEASURE.fullmatch(spaced) or _MONTH_DATE.fullmatch(spaced)):
         return False
+    if any(_STANDARD.fullmatch(" ".join(words[a:b])) for a in range(len(words))
+           for b in range(a + 1, len(words) + 1)):
+        return False                                       # 'AWS D17.1 rev G' (2026-10-20)
     if any(_GENERIC.fullmatch(f"{u} {v}") for u, v in zip(words, words[1:])):
         return False                                       # 'Run 3 of 5', 'X7 Rev 2'
     if any(_alone(w, is_part, rx) for w in words):
@@ -874,7 +962,14 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
         return "", ""
     got = _json(text)
     answer = str((got or {}).get("part") or "").strip() if isinstance(got, dict) else ""
-    if not answer or len(answer) > 60:
+    if not answer:
+        report.parts_none += 1
+        return "", ""
+    if len(answer) > 60:
+        report.parts_dropped.append((file_name, answer))
+        report.problems.append(f"{file_name}: Council's model named a part of "
+                               f"{len(answer)} characters, too long for a part number "
+                               "— dropped")
         return "", ""
     # The quote check: it must look like an identifier and be written there
     # as a whole word - compared ignoring case and the spaces inside it, and
@@ -907,59 +1002,107 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
                      if rx is not None and _mask_whole(s, rx)), key=len, reverse=True)
     pieces = sorted((p for p in re.split(r"[\s()\[\],;:]+", answer) if len(p) >= 3),
                     key=len, reverse=True)
+    # what the user's pattern matches inside a word: 'GHJ7KL890' of the
+    # stem 'wb07_GHJ7KL890' (review, 2026-10-20)
+    inside = [m.group(0) for m in rx.finditer(answer)] if rx is not None else []
     tries = [p for p in dict.fromkeys([" ".join(words), " ".join(words[i:j])] + masked
-                                      + pieces) if p]
+                                      + pieces + inside) if p]
     looks = any(ok(p) for p in tries)
-    # judged as the workbook writes it: 'efg5hj 678' for a sheet 'EFG5HJ678'
-    for part in (p for p in tries if ok(p) or ok("".join(p.split()))):
-        where, written = _written_at(part, file_name, sheets, grids, ok, rx)
-        if where:
-            report.parts_found.append((file_name, written))
-            return written, where
+    # judged as the workbook writes it: 'efg5hj 678' for a sheet 'EFG5HJ678'.
+    # Only when nothing is written as the model wrote it, the separators
+    # aside: 'ABC1DE234' for a cell 'ABC-1DE-234' was dropped (review,
+    # 2026-10-20) - and is given as the cell writes it.
+    for modes in ((True, False), ("sep",)):
+        for part in (p for p in tries if ok(p) or ok("".join(p.split()))):
+            where, written = _written_at(part, file_name, sheets, grids, ok, rx, modes)
+            if where:
+                report.parts_found.append((file_name, written))
+                return written, where
     why = ("is not written in the workbook as a whole word" if looks else
            "does not look like a part number (a title, label, value, date, sheet or "
-           "file name?)")
+           "file name, a standard's number?)")
+    report.parts_dropped.append((file_name, answer))
     report.problems.append(f"{file_name}: Council's model named part {answer!r}, which "
                            f"{why} — dropped")
     return "", ""
 
 
 def _named_file(part: str, file_name: str, pattern_mask: Optional[str]) -> bool:
-    """``part`` is the workbook's whole file name, made of words
-    ('inspection_run_3'): a file's name, not a part number - it passed, '_'
-    being a word boundary (review, 2026-10-19). A stem that is one code
-    ('AB12CD345.xlsx') can be the part, and so can whatever the user's
-    pattern matches whole."""
-    from pathlib import Path
-    if part.casefold() != Path(file_name).stem.casefold():
+    """``part`` is the workbook's file name, not a part number in it: the
+    whole name with its extension ('wb08.xlsx'), or the whole stem when it
+    is not one code (_one_code: 'inspection_run_3', 'EC_log_week41',
+    'wb08', 'Copy of …'). They passed - '_' being a word boundary, and
+    'wb08' or 'EC_log_week41' having no word of 4+ letters - and seven
+    workbooks had their own file name as the part (llama3.2:1b, review,
+    2026-10-20). A stem that is one code ('AB12CD345.xlsx') can be the part,
+    and so can whatever the user's pattern matches whole."""
+    import os
+    from pathlib import PurePath
+    folded = part.casefold()
+    if folded in (file_name.casefold(), PurePath(file_name).name.casefold()):
+        return True
+    stems = {os.path.splitext(file_name)[0].casefold(), PurePath(file_name).stem.casefold()}
+    if folded not in stems:
         return False
     rx = _mask_re(pattern_mask)
     if rx is not None and rx.fullmatch(part):
         return False
-    return any(len(w) >= 4 and w.isalpha() for w in re.split(r"[\s_\-.]+", part))
+    return not _one_code(part)
+
+
+def _one_code(stem: str) -> bool:
+    """Can a file's whole stem be the part? One code - groups of letters
+    and digits joined by '-' at most ('AB12CD345', 'XYZ9AB123-R2',
+    'RST-4UV-567') - with 6+ of them, letters and digits both, and no run
+    of 4+ letters (a word: 'Results2026', 'week41'), nor a default name
+    ('book12345', 'data_2')."""
+    if not re.fullmatch(r"[^\W_]+(?:-[^\W_]+)*", stem):
+        return False                                       # words: '_', spaces, '.'
+    joined = stem.replace("-", "")
+    return (len(joined) >= 6 and _mixed(joined) and not re.search(r"[^\W\d_]{4,}", joined)
+            and not _GENERIC.fullmatch(stem))
 
 
 def _squash(text: Any) -> str:
     return "".join(str(text).split()).casefold()
 
 
+#: What the separator pass of _whole_word lets differ between the model's
+#: answer and the cell: spaces, '-', '_', '.', '/'.
+_SEPS = re.compile(r"[\s\-_./]+")
+
+
 def _whole_word(part: str, text: Any, ok: Optional[Callable[[str], bool]] = None,
-                rx=None, exact: bool = True) -> str:
+                rx=None, exact: Any = True) -> str:
     """``part`` as it is written in ``text`` as a whole word - no letter or
     digit right before or after it; case and runs of spaces aside, and with
     ``exact`` False the spaces inside it too ('QRS 6TU 789' for
-    'QRS6TU789', and the other way round) - or ''. ``ok`` judges how it is
-    written there. A plain substring took 'efg5hj67' from 'efg5hj678'
-    (review, 2026-10-19)."""
-    chars = "".join(part.split())
+    'QRS6TU789', and the other way round) - or ''. With ``exact`` 'sep'
+    the separators inside it too ('ABC-1DE-234' for the answer
+    'ABC1DE234': a model that left them out was dropped - review,
+    2026-10-20). ``ok`` judges how it is written there. A plain substring
+    took 'efg5hj67' from 'efg5hj678' (review, 2026-10-19)."""
     text = str(text)
-    if not chars or _squash(chars) not in _squash(text):   # most cells: no regex
-        return ""
-    body = (r"\s+".join(re.escape(w) for w in part.split()) if exact else
-            r"\s*".join(re.escape(ch) for ch in chars))
+    if exact == "sep":
+        chars = _SEPS.sub("", part)
+        if not chars or chars.casefold() not in _SEPS.sub("", text).casefold():
+            return ""
+        # ... and never a piece of an id written with them: 'ABC1DE' is
+        # not 'ABC-1DE' of 'ABC-1DE-234'
+        body = (r"(?<![^\W_][\-./])" + r"[\s\-_./]*".join(re.escape(ch) for ch in chars)
+                + r"(?![\-./][^\W_])")
+    else:
+        chars = "".join(part.split())
+        if not chars or _squash(chars) not in _squash(text):   # most cells: no regex
+            return ""
+        body = (r"\s+".join(re.escape(w) for w in part.split()) if exact else
+                r"\s*".join(re.escape(ch) for ch in chars))
     for m in re.finditer(r"(?<![^\W_])" + body + r"(?![^\W_])", text, re.IGNORECASE):
         got = m.group(0)
         if _inside_a_value(text, m.start(), m.end()) or (ok is not None and not ok(got)):
+            continue
+        if _in_a_standard(text, m.start(), m.end()) and not (rx is not None
+                                                              and rx.fullmatch(got)):
             continue
         if ok is not None and _more_of_it(text, m.start(), m.end(), ok, rx):
             continue
@@ -988,6 +1131,18 @@ def _more_of_it(text: str, start: int, end: int, ok: Callable[[str], bool], rx) 
     return any(ok(" ".join(span)) for word, span in ((before[-1:], before[-1:] + [mid]),
                                                      (after[:1], [mid] + after[:1]))
                if word and any(ch.isdigit() for ch in word[0]))
+
+
+def _in_a_standard(text: str, start: int, end: int) -> bool:
+    """Is text[start:end] the number of a standard written there with its
+    name before it - 'E1444' of 'ASTM E1444', '10204' of 'BS EN 10204',
+    'AS9100' of 'SAE AS9100' (review, 2026-10-20)?"""
+    head = text[:start]
+    if not head or not (head[-1].isspace() or head[-1] in "-/"):
+        return False
+    first = start + len(text[start:end].split()[0])         # 'E1444' of 'E1444 rev G'
+    words = list(re.finditer(r"\S+", head))[-3:]
+    return any(_STANDARD.fullmatch(" ".join(text[w.start():first].split())) for w in words)
 
 
 def _inside_a_value(text: str, start: int, end: int) -> bool:
@@ -1020,18 +1175,27 @@ def _a_value(s: str) -> bool:
 
 
 def _written_at(part: str, file_name: str, sheets: Sequence[str], grids,
-                ok: Optional[Callable[..., bool]] = None, rx=None) -> Tuple[str, str]:
+                ok: Optional[Callable[..., bool]] = None, rx=None,
+                modes: Sequence[Any] = (True, False)) -> Tuple[str, str]:
     """(where ``part`` is written as a whole word, how it is written there),
     or ('', ''). ``ok(written, in_cell)`` judges how it is written: an id
     with spaces inside is taken only as a cell writes it. Written as the
     model wrote it first, anywhere, and only then with other spaces inside:
     with 'QRS 6TU 789' in A1 and 'QRS6TU789' in A2, the answer 'QRS6TU789'
     was given as A1 writes it - the ledger compares ids with their spaces,
-    so one sample became two (second review, 2026-10-19)."""
+    so one sample became two (second review, 2026-10-19). ``modes``: how
+    _whole_word compares, in turn.
+
+    In the file name, only the name without its extension is read: the
+    piece '2026.xlsx' of 'Inspection Results 2026.xlsx' was the part
+    (review, 2026-10-20)."""
+    import os
+    named = os.path.splitext(file_name)[0]
+
     def fits(in_cell: bool) -> Optional[Callable[[str], bool]]:
         return None if ok is None else (lambda s: ok(s, in_cell))
-    for exact in (True, False):
-        got = _whole_word(part, file_name, fits(False), rx, exact)
+    for exact in modes:
+        got = _whole_word(part, named, fits(False), rx, exact)
         if got:
             return f"file name {file_name!r}", got
         for s in sheets:

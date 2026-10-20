@@ -64,6 +64,22 @@ def test_within_a_family_a_longer_tag_wins():
     assert pick == (OLLAMA, "granite3.3:8b-instruct")
 
 
+def test_within_a_family_the_larger_model_wins():
+    """granite3.3:2b was picked over granite3.3:8b: the same tag length,
+    and '2' sorts first (review, 2026-10-20)."""
+    assert first_us_text_model(["granite3.3:2b", "granite3.3:8b"]) == (OLLAMA, "granite3.3:8b")
+    assert first_us_text_model(["granite3.3:8b", "granite3.3:2b"]) == (OLLAMA, "granite3.3:8b")
+    assert first_us_text_model(["phi4-mini:3.8b", "phi4:14b"]) == (OLLAMA, "phi4:14b")
+    # ... not an embedding model, which cannot chat, whatever its tag
+    assert first_us_text_model(["granite-embedding:30m", "granite3.3:2b"]) == (
+        OLLAMA, "granite3.3:2b")
+    # ... nor one too big for the GPU while a smaller one is there
+    assert first_us_text_model(["llama3.1:70b", "llama3.1:8b"]) == (OLLAMA, "llama3.1:8b")
+    assert first_us_text_model(["llama3.1:70b"]) == (OLLAMA, "llama3.1:70b")
+    # a family's prefix alone is not a US model: 'llama-pro' is Tencent's
+    assert first_us_text_model(["llama-pro:8b", "llama3.2:1b"]) == (OLLAMA, "llama3.2:1b")
+
+
 # ------------------------------------------------- multi-host picking
 
 def test_localhost_wins_when_both_hosts_have_a_us_model():

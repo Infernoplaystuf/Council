@@ -521,8 +521,9 @@ def test_a_model_that_cannot_answer_is_asked_once(tmp_path, ledger, monkeypatch)
     assert len(calls) == 1
     assert sum("llama-cpp-python" in p for p in s.problems) == 1
     assert s.assist == ("Council's model was unavailable, so nothing in the review is its "
-                        "suggestion: granite.gguf could not be loaded: llama-cpp-python is "
-                        "not installed.")
+                        "suggestion: granite.gguf could not be loaded (llama-cpp-python is "
+                        "not installed) — pick an Ollama model instead, or install "
+                        "llama-cpp-python.")
 
 
 def test_cancel_is_not_a_broken_model():
@@ -1139,6 +1140,8 @@ def test_the_summary_does_not_add_a_full_stop_after_a_question_mark():
                                   parts_found=[("a.xlsx", "ABC1DE234")])
     assert rep.describe().endswith("not asked again: " + why)
     rep = ledger_llm.AssistReport(parts_asked=1, model="m")
+    assert rep.describe().endswith("nothing in the review is its suggestion.")
+    rep = ledger_llm.AssistReport(parts_asked=1, model="m", parts_found=[("a.xlsx", "X1Y2Z3")])
     assert rep.describe().endswith("check them.")
 
 
@@ -1193,3 +1196,324 @@ def test_the_ledger_and_connections_use_one_rule_for_an_unknown_ollama_model(mon
                       "C:/m/qwen.gguf": False}
     with pytest.raises(se.LedgerError, match="cannot tell where mystery:1b comes from"):
         ledger_llm.chat_for("ollama:mystery:1b")
+
+
+# ---------------------------------------------- wave 3 review (2026-10-20, real models)
+
+FILE_NAME_CASES = [  # (the workbook's file name, the model's answer, the part kept)
+    ("wb08.xlsx", "wb08.xlsx", ""),                       # the file name, extension and all
+    ("wb08.xlsx", "wb08", ""),                            # a generic stem
+    ("EC_log_week41.xlsx", "EC_log_week41.xlsx", ""),
+    ("EC_log_week41.xlsx", "EC_log_week41", ""),          # words, no 4+-letter one alone
+    ("laser_run2.xlsx", "laser_run2.xlsx", ""),
+    ("Inspection Results 2026.xlsx", "Inspection Results 2026.xlsx", ""),   # not '2026.xlsx'
+    ("data_2.xlsx", "data_2", ""),
+    ("book1.xlsx", "book1", ""),
+    ("Copy of run 7.xlsx", "Copy of run 7", ""),
+    ("Results2026.xlsx", "Results2026", ""),
+    # an identifier in the stem is still the part, as the name writes it
+    ("Copy of AB12CD345.xlsx", "AB12CD345", "AB12CD345"),
+    ("Copy of AB12CD345.xlsx", "Copy of AB12CD345", "AB12CD345"),
+    ("AB12CD345.xlsx", "AB12CD345", "AB12CD345"),
+    ("RST-4UV-567.xlsx", "RST-4UV-567", "RST-4UV-567"),
+    ("LMM3EF306 results.xlsx", "LMM3EF306", "LMM3EF306"),
+    ("wb07_GHJ7KL890.xlsx", "wb07_GHJ7KL890", "GHJ7KL890"),   # what the pattern matches in it
+]
+
+
+@pytest.mark.parametrize("name,answer,part", FILE_NAME_CASES)
+def test_the_file_name_is_never_the_part_only_an_identifier_in_its_stem(tmp_path, name,
+                                                                        answer, part):
+    """llama3.2:1b answered each workbook's own file name and all seven
+    were accepted: the name with its extension ('wb08.xlsx'), a stem with
+    no word of 4+ letters ('EC_log_week41'), and '2026.xlsx' cut from
+    'Inspection Results 2026.xlsx' (review, 2026-10-20)."""
+    src = _one_value_book(tmp_path / name, "Pulse freq", 61.35)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    got = ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(answer), rep)
+    if part:
+        assert got == (part, f"file name {name!r}") and rep.parts_found == [(name, part)]
+    else:
+        assert got == ("", "") and not rep.parts_found
+        assert any("dropped" in p for p in rep.problems)
+
+
+STANDARDS = ["AMS2750", "AMS 2750", "ASTM E1444", "ISO 9001", "ISO9001:2015",
+             "MIL-STD-1916", "NAS410", "AWS D17.1", "ASME Y14.5", "SAE AS9100",
+             "BS EN 10204", "EN4179", "ARP1923"]
+
+
+@pytest.mark.parametrize("spec", STANDARDS)
+def test_a_standards_number_is_not_a_part(tmp_path, spec):
+    """'Spec AMS2750 rev G' in a part-less workbook: llama3.1:8b, granite3.3:2b
+    and gemma3:1b answered 'AMS2750' and it was kept (review, 2026-10-20)."""
+    src = _one_value_book(tmp_path / "furnace.xlsx", f"Spec {spec} rev G", None)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    for answer in (spec, f"Spec {spec} rev G"):
+        rep = ledger_llm.AssistReport()
+        assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(answer),
+                                    rep) == ("", ""), answer
+        assert not rep.parts_found and any("dropped" in p for p in rep.problems)
+
+
+def test_a_standards_number_is_a_part_when_the_users_pattern_says_so(tmp_path):
+    src = _one_value_book(tmp_path / "furnace.xlsx", "Spec AMS2750 rev G", None)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    assert ledger_llm.find_part(src.name, grids, "@@@####", _stub("AMS2750"),
+                                ledger_llm.AssistReport())[0] == "AMS2750"
+    for real in ("ENG4471", "NASA123", "MILL123", "ISOLATOR-3", "ABC1DE234"):
+        assert ledger_llm.looks_like_part(real), real
+
+
+def test_part_less_workbooks_do_not_merge_into_a_standards_number(tmp_path, ledger):
+    """The phantom part: two furnace logs with no part, the model's 'AMS2750'
+    for both, every value one sample's (review, 2026-10-20)."""
+    csv, _schema = ledger
+    books = []
+    for name, watt in (("furnace_A.xlsx", 289.1), ("furnace_B.xlsx", 301.7)):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A3"] = "Spec AMS2750 rev G"
+        ws["A5"], ws["B5"] = "Power (W)", watt
+        wb.save(tmp_path / name)
+        books.append(str(tmp_path / name))
+    s = li._extract(str(csv), books, None, "", False, None, _NoProg(), "@@@#@@###", None,
+                    None, True, FakeModel(part="AMS2750"))
+    rows = [dict(zip(se.VAL_HEAD, r)) for r in openpyxl.load_workbook(s.review)[
+        "Values"].iter_rows(min_row=2, values_only=True)]
+    assert rows and not any(r["Part"] for r in rows)
+    assert not any(r["Other values offered"] for r in rows)          # no clash of two books
+
+
+@pytest.mark.parametrize("cell,answer,part", [
+    ("Tag RST-4UV-567", "RST4UV567", "RST-4UV-567"),       # the tester's wb04_separators
+    ("RST_4UV_567", "rst4uv567", "RST_4UV_567"),
+    ("RST.4UV.567", "RST-4UV-567", "RST.4UV.567"),
+    ("RST4UV567", "RST-4UV-567", "RST4UV567"),             # the other way round
+])
+def test_an_answer_without_the_separators_is_given_as_the_cell_writes_it(tmp_path, cell,
+                                                                         answer, part):
+    """'RST4UV567' for a cell 'Tag RST-4UV-567' was dropped as not written
+    in the workbook (review, 2026-10-20)."""
+    src = _one_value_book(tmp_path / "insp.xlsx", "Inspection record", None, sheet="Record")
+    wb = openpyxl.load_workbook(src)
+    wb["Record"]["A2"] = cell
+    wb.save(src)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    rep = ledger_llm.AssistReport()
+    assert ledger_llm.find_part(src.name, grids, "@@@#@@###", _stub(answer), rep) == (
+        part, "insp.xlsx › Record!A2")
+
+
+@pytest.mark.parametrize("cell,answer", [("ABC-1DE-234", "ABC1DE"),
+                                         ("ABC-1DE-234", "1DE234"),
+                                         ("2026-10-05", "20261005")])
+def test_separators_aside_a_piece_of_an_id_or_a_date_is_still_not_the_part(tmp_path, cell,
+                                                                          answer):
+    src = _one_value_book(tmp_path / "insp.xlsx", "Inspection record", None, sheet="Record")
+    wb = openpyxl.load_workbook(src)
+    wb["Record"]["A2"] = cell
+    wb.save(src)
+    grids, _imgs = se.load_workbook_grids(src, [])
+    assert ledger_llm.find_part(src.name, grids, None, _stub(answer),
+                                ledger_llm.AssistReport()) == ("", "")
+
+
+def _probe_book(path: Path) -> Path:
+    """A part the rules find, a per-flaw reading under a label with no flaw
+    code beside it, and a part-level one."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Build"
+    ws["A1"], ws["B1"] = "Part Number", "KTV4MW517"
+    ws["A3"], ws["B3"] = "Probe gain dB", 46
+    ws["A4"], ws["B4"] = "Zorp rate", 55
+    wb.save(path)
+    return path
+
+
+def _flaw_rows(csv, schema, fname):
+    return {r.get(schema.item_field): r.get(fname) for r in ParentCSV(csv).rows
+            if r.get(schema.id_field) == "KTV4MW517"}
+
+
+def test_a_per_flaw_field_is_not_placed_on_a_value_with_no_flaw(tmp_path, ledger):
+    """Council's model placed values under labels with no flaw code: a
+    9-way red clash for a per-flaw field, and the one accepted went to
+    every flaw row (review, 2026-10-20). It stays on 'Labels to map', the
+    model's field in its note; a part-level field is still placed."""
+    csv, schema = ledger
+    src = _probe_book(tmp_path / "probe.xlsx")
+    post = _field(schema, "Post-Conceal")
+    freq = _field(schema, "Frequency")
+    model = FakeModel(mapping={"Probe gain dB": post, "Zorp rate": freq})
+    s = li._extract(str(csv), [str(src)], None, "", False, None, _NoProg(), None, None,
+                    None, True, model)
+    wb = openpyxl.load_workbook(s.review)
+    rows = [dict(zip(se.VAL_HEAD, r)) for r in wb["Values"].iter_rows(min_row=2,
+                                                                      values_only=True)]
+    assert not [r for r in rows if r["Source label"] == "Probe gain dB"]
+    assert [r["Field"] for r in rows if r["Source label"] == "Zorp rate"] == [freq]
+    lab = [r for r in wb["Labels to map"].iter_rows(min_row=2, values_only=True)
+           if r[2] == "Probe gain dB"]
+    assert lab and post in str(lab[0][-1]) and "not placed" in str(lab[0][-1])
+    assert any("'Probe gain dB'" in p and "left on 'Labels to map'" in p for p in s.problems)
+    assert "1 value(s) left on Labels to map" in s.assist
+    # accepting everything in the review writes nothing to the flaw rows
+    for r in range(2, wb["Values"].max_row + 1):
+        wb["Values"].cell(r, 1, "Y")
+    wb.save(s.review)
+    li.run_apply(s.review, use_images=False)
+    assert not any(_flaw_rows(csv, schema, post).values())
+
+
+def test_a_label_mapped_by_hand_to_a_per_flaw_field_is_not_written_to_every_flaw(tmp_path,
+                                                                                ledger):
+    """The same through 'Labels to map': mapped there, Apply put the one
+    reading on all nine flaw rows, and the next extract pre-accepted it
+    (review, 2026-10-20)."""
+    csv, schema = ledger
+    src = _probe_book(tmp_path / "probe.xlsx")
+    post = _field(schema, "Post-Conceal")
+    s = li._extract(str(csv), [str(src)], tmp_path / "r1.xlsx", "", False, None, _NoProg(),
+                    None, None, None, False)
+    wb = openpyxl.load_workbook(s.review)
+    for row in wb["Labels to map"].iter_rows(min_row=2):
+        if row[2].value == "Probe gain dB":
+            row[0].value = post
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert not any(_flaw_rows(csv, schema, post).values())
+    assert any(f"value(s) of {post!r} not written" in p for p in a.problems)
+    # the next extract: the learned mapping offers it, in amber, saying why
+    s = li._extract(str(csv), [str(src)], tmp_path / "r2.xlsx", "", False, None, _NoProg(),
+                    None, None, None, False)
+    wb = openpyxl.load_workbook(s.review)
+    rows = [dict(zip(se.VAL_HEAD, r)) for r in wb["Values"].iter_rows(min_row=2,
+                                                                      values_only=True)]
+    probe = [r for r in rows if r["Source label"] == "Probe gain dB"]
+    assert probe and probe[0]["Field"] == post and probe[0]["Accept"] != "Y"
+    assert schema.item_field in (probe[0]["Note"] or "")
+    # accepted anyway: not written, and Apply says so
+    for r in range(2, wb["Values"].max_row + 1):
+        if wb["Values"].cell(r, 8).value == "Probe gain dB":
+            wb["Values"].cell(r, 1, "Y")
+    wb.save(s.review)
+    a = li.run_apply(s.review, use_images=False)
+    assert not any(_flaw_rows(csv, schema, post).values())
+    assert any("type it in the review's Item column" in p for p in a.problems)
+    # ... and with its flaw typed in, it goes to that flaw alone
+    for r in range(2, wb["Values"].max_row + 1):
+        if wb["Values"].cell(r, 8).value == "Probe gain dB":
+            wb["Values"].cell(r, 3, "2B")
+    wb.save(s.review)
+    li.run_apply(s.review, use_images=False)
+    assert {k: v for k, v in _flaw_rows(csv, schema, post).items() if v} == {"2B": "46"}
+
+
+def test_the_model_is_not_asked_for_a_workbook_whose_rows_name_their_part(tmp_path, ledger):
+    """summary.xlsx has a Part Number column: every value had its part, yet
+    the model was asked which part the workbook is, and its '101' became a
+    problem line (review, 2026-10-20). A sheet beside it with values of no
+    part is still asked about, and only those values get the answer."""
+    csv, _schema = ledger
+    src = lf.make_summary(tmp_path / "summary.xlsx")
+    model = FakeModel(part="101")
+    s = li._extract(str(csv), [str(src)], None, "", False, None, _NoProg(), None, None,
+                    None, True, model)
+    assert not any("Which part" in p for p in model.prompts)
+    assert not any("Council's model" in p for p in s.problems)
+    wb = openpyxl.load_workbook(src)
+    notes = wb.create_sheet("Notes")
+    notes["A1"] = "Serial: XYZ9AB123-R2"
+    notes["A3"], notes["B3"] = "Scan Speed", 1200
+    wb.save(src)
+    model = FakeModel()
+    s = li._extract(str(csv), [str(src)], None, "", False, None, _NoProg(), None, None,
+                    None, True, model)
+    assert sum("Which part" in p for p in model.prompts) == 1
+    rows = [dict(zip(se.VAL_HEAD, r)) for r in openpyxl.load_workbook(s.review)[
+        "Values"].iter_rows(min_row=2, values_only=True)]
+    parts = {(r["Field"], r["Part"]) for r in rows}
+    assert ("Scan Speed (mm/s)", "XYZ9AB123-R2") in parts
+    assert {p for f, p in parts if f == "Power (W)"} == {"101", "102"}
+
+
+def test_a_gguf_that_will_not_load_says_what_to_do(monkeypatch, tmp_path):
+    """llama-cpp-python's own words were the whole message: 'Failed to load
+    shared library ...llama.dll': Could not find module ... Try using the
+    full path with constructor syntax.' (review, 2026-10-20)."""
+    import council_engine as ce
+    dll = r"C:\Python312\Lib\site-packages\llama_cpp\lib\llama.dll"
+
+    def broken(path, **kw):
+        raise RuntimeError(f"Failed to load shared library '{dll}': Could not find module "
+                           f"'{dll}' (or one of its dependencies). Try using the full path "
+                           "with constructor syntax.")
+    monkeypatch.setattr(ce, "_load_gguf", broken)
+    monkeypatch.setattr(ledger_llm, "_GGUF", {"key": None, "llm": None})
+    monkeypatch.delenv("COUNCIL_GGUF_PATH", raising=False)
+    with pytest.raises(se.LedgerError) as e:
+        ledger_llm.chat_for(str(tmp_path / "granite.gguf"))("p", ledger_llm._PART_SCHEMA)
+    assert str(e.value) == ("granite.gguf could not be loaded (llama-cpp-python's llama "
+                            "library, or one it needs, would not load) — pick an Ollama "
+                            "model instead, or reinstall llama-cpp-python")
+    assert getattr(e.value, "cannot_answer", False)
+
+    def corrupt(path, **kw):
+        raise ValueError("Failed to load model from file: granite.gguf")
+    monkeypatch.setattr(ce, "_load_gguf", corrupt)
+    with pytest.raises(se.LedgerError, match=r"^granite\.gguf could not be loaded \(Failed to "
+                                             r"load model from file: granite\.gguf\) — pick "
+                                             r"an Ollama model instead"):
+        ledger_llm.chat_for(str(tmp_path / "granite.gguf"))("p", ledger_llm._PART_SCHEMA)
+
+
+class _PerBook:
+    """Answers the part question by the workbook's file name."""
+    def __init__(self, answers):
+        self.answers = answers
+
+    def __call__(self, prompt, schema):
+        if "Which part" in prompt:
+            name = prompt.split("File name: ", 1)[1].splitlines()[0].strip()
+            return (json.dumps({"part": self.answers.get(name, ""), "evidence": ""}),
+                    "fake-granite")
+        return json.dumps({"mappings": []}), "fake-granite"
+
+
+def test_the_assist_summary_says_what_was_asked_answered_placed_and_dropped(tmp_path,
+                                                                           ledger):
+    """'part numbers for 7 workbook(s): <the 3 it found> — all amber' read as
+    seven parts found, and Council's own route was 'Council's model
+    (Council's model)' (review, 2026-10-20)."""
+    csv, _schema = ledger
+    books = []
+    for name, cell in (("found.xlsx", "KTV4MW517"), ("dropped.xlsx", None),
+                       ("nopart.xlsx", None)):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "Laser build record"
+        if cell:
+            ws["A2"] = cell
+        ws["A5"], ws["B5"] = "Power (W)", 280
+        wb.save(tmp_path / name)
+        books.append(str(tmp_path / name))
+    model = _PerBook({"found.xlsx": "KTV4MW517", "dropped.xlsx": "QQQ1QQ999"})
+    s = li._extract(str(csv), books, None, "", False, None, _NoProg(), None, None, None,
+                    True, model)
+    assert s.assist == (
+        "Council's model (fake-granite): asked which part 3 workbook(s) are about: 1 found "
+        "(found.xlsx → KTV4MW517), 1 answer(s) dropped as not a part number written there "
+        "(see the problems), 1 with no part in its answer — all amber in the review: "
+        "check them.")
+    rep = ledger_llm.AssistReport(model="Council's model", parts_asked=2,
+                                  labels_asked=3, labels_mapped=1, values_placed=2)
+    assert rep.describe() == (
+        "Council's model: asked which part 2 workbook(s) are about: 0 found, 2 not "
+        "answered; asked which field 3 unplaced label(s) are: 1 given a field, 2 value(s) "
+        "placed — all amber in the review: check them.")
+    rep = ledger_llm.AssistReport(model="m", parts_asked=1, parts_none=1)
+    assert rep.describe().endswith("1 with no part in its answer — nothing in the review is "
+                                   "its suggestion.")
