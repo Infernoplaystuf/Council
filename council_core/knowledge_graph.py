@@ -529,7 +529,9 @@ def _json_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     import field_search as fs
     by_norm = _rule_index(rules)
     try:
-        text = p.read_text(encoding="utf-8", errors="replace")
+        # As a text document is read (fs.decode_text): an ANSI file's accents
+        # were U+FFFD, and a BOM made json.loads refuse the whole file.
+        text = fs.decode_text(p.read_bytes())
         data = json.loads(text)
     except Exception:
         return []
@@ -1386,7 +1388,7 @@ class KnowledgeGraph:
                         elif isinstance(o, list):
                             for v in o:
                                 keys(v)
-                    keys(json.loads(p.read_text(encoding="utf-8", errors="replace")))
+                    keys(json.loads(fs.decode_text(p.read_bytes())))
                 else:
                     for _pg, _i, ln in document_lines(p):
                         for k, _v in fs._kv_pairs(ln):

@@ -1031,6 +1031,36 @@ def _pdf_pages(p: Path) -> List[str]:
         return []
 
 
+def decode_text(raw: bytes) -> str:
+    """A plain-text file's bytes as text: UTF-8 (a BOM dropped), a UTF-16
+    file by its BOM (Notepad's 'Unicode', Excel's 'Unicode Text'), else
+    Windows-1252 (Notepad's 'ANSI', most older Windows tools), else latin-1.
+
+    It was UTF-8 with errors='replace' (review, 2026-10-19): an ANSI note's
+    'Tomás Echeverría' read with U+FFFD for each accent, and the knowledge
+    graph made a second, garbled person of him. A UTF-8 file with a damaged byte or
+    two (it holds more good multi-byte characters than bad bytes) stays
+    UTF-8 - read as cp1252 every accent in it would turn to 'Ã©'."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    lenient = raw.decode("utf-8-sig", errors="replace")
+    bad = lenient.count("�")
+    non_ascii = len(lenient) - len(lenient.encode("ascii", "ignore"))
+    if non_ascii - bad > bad:
+        return lenient
+    try:
+        return raw.decode("cp1252")
+    except UnicodeDecodeError:          # 0x81, 0x8D, 0x8F, 0x90, 0x9D
+        return raw.decode("latin-1")
+
+
 def _read_text(p: Path, max_chars: int = 400000) -> str:
     suf = p.suffix.lower()
     if suf in _EXTRACTABLE:
@@ -1040,7 +1070,7 @@ def _read_text(p: Path, max_chars: int = 400000) -> str:
         except Exception:
             return ""
     try:
-        return p.read_text(encoding="utf-8", errors="replace")[:max_chars]
+        return decode_text(p.read_bytes())[:max_chars]
     except Exception:
         return ""
 
