@@ -671,9 +671,10 @@ def rebuild_summary_line(stats) -> str:
 
     Shape: ``"Rebuilt from N document(s) in X.Xs — W workbooks,
     L ledgers, O other docs; U unreadable (needs pypdf: 10, ...);
-    R links (S suggested)"``. Keeps zeros out so a healthy run reads
-    cleanly."""
+    R links (S of them suggested)"``. Keeps zeros out so a healthy run
+    reads cleanly."""
     seconds = float(stats.get("seconds", 0) or 0)
+    unchanged = bool(stats.get("graph_unchanged"))
     bits = [f"Rebuilt from {stats.get('documents', 0)} document(s) in "
             f"{seconds:.1f}s"]
     kinds = []
@@ -692,12 +693,17 @@ def rebuild_summary_line(stats) -> str:
                      + ("s" if stats['documents_other'] != 1 else ""))
     if kinds:
         bits.append(" — " + ", ".join(kinds))
+    if unchanged:
+        # The graph that was there is the answer: no entity is new this run.
+        # It used to repeat the last run's '(23 matched existing, 18 new
+        # entities)' with nothing saying so (review, 2026-10-19).
+        bits.append("; nothing changed since the last rebuild")
     if stats.get("wikilink_mentions"):
         wm = stats["wikilink_mentions"]
         tail = ""
         matched = stats.get("wikilinks_matched") or 0
         created = stats.get("wikilinks_created") or 0
-        if matched or created:
+        if (matched or created) and not unchanged:
             parts = []
             if matched:
                 parts.append(f"{matched} matched existing")
@@ -718,9 +724,14 @@ def rebuild_summary_line(stats) -> str:
     seeded = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
     suggested = int(rels.get("suggested") or 0)
     if seeded or suggested:
-        extra = f"; {seeded} link" + ("s" if seeded != 1 else "")
-        if suggested:
-            extra += f" ({suggested} suggested)"
+        # The suggested ones counted IN the total: '20 links (5 suggested)'
+        # read as 5 of the 20 when there were 25 (review, 2026-10-19).
+        total = seeded + suggested
+        extra = f"; {total} link" + ("s" if total != 1 else "")
+        if suggested == total:
+            extra += " (all suggested)" if total != 1 else " (suggested)"
+        elif suggested:
+            extra += f" ({suggested} of them suggested)"
         bits.append(extra)
     else:
         bits.append("; 0 links found")
