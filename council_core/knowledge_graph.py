@@ -586,10 +586,14 @@ def _text_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     for r in rules:
         for loc in fs.field_value_locations(p, r.label, kind=r.type, exact=True,
                                             pages=pages):
-            key = (loc.get("page"), loc.get("line"), loc["value"])
+            # 'Owner: [[Priya Raman]]' is Priya Raman (see field_link_value).
+            value = field_link_value(loc["value"], loc.get("snippet", ""))
+            if loc["value"] and not value:
+                continue                    # an embed, a [[#heading]]: names nothing
+            key = (loc.get("page"), loc.get("line"), value)
             prev = best.get(key)
             if prev is None or len(r.label) > len(prev.rule.label):
-                best[key] = Value(r, loc["value"], loc, loc.get("snippet", ""))
+                best[key] = Value(r, value, loc, loc.get("snippet", ""))
     if not best:
         return []
     vals = sorted(best.values(), key=lambda v: (v.locator.get("page") or 0,
@@ -1024,7 +1028,9 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
     is cut off the target - it made a 'Jordan Blake#Contact' entity. A
     ``[[#Heading]]`` points into the note it is in and names nothing. An
     embed, ``![[diagram.png]]``, shows a file inline: not a reference to an
-    entity, so it is skipped."""
+    entity, so it is skipped. In a markdown table the pipe is written
+    ``\\|`` (``| Owner | [[Priya Raman\\|Priya]] |``): the backslash is not
+    part of the name."""
     out: List[WikiLinkRef] = []
     for page, line_no, text in lines:
         if "[[" not in text:
@@ -1036,6 +1042,8 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
             if not inside:
                 continue
             target, _, display = inside.partition("|")
+            if "|" in inside and target.endswith("\\"):
+                target = target[:-1]        # a table's escaped '\|'
             surface = _WIKILINK_ANCHOR_RE.split(target, 1)[0].strip()
             display = (display.strip() or surface) if "|" in inside else surface
             if surface:
@@ -1047,6 +1055,45 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
 #: Where a wiki-link's target ends and its anchor starts: ``#heading``,
 #: ``#^block`` (and a bare ``^block``).
 _WIKILINK_ANCHOR_RE = re.compile(r"[#^]")
+
+
+def field_link_value(value: str, line: str = "") -> str:
+    """A labelled field's value with its wiki-link syntax taken off: the
+    target of its first ``[[…]]`` - not the ``|alias``, not the ``#anchor``,
+    not the quotes YAML front matter needs round a link (``owner: "[[Priya
+    Raman]]"``). A value with no link is given back as it is; '' when its
+    only links name nothing (an embed, a ``[[#heading]]``).
+
+    Read as written, 'Part Number: [[PN-1002]]' made a part '[[PN-1002]]'
+    beside PN-1002, 'Owner: [[Priya Raman]]' renamed Priya Raman to the
+    bracketed form (a person keeps the fullest name), and 'Owner: [[Jordan
+    Blake]]. Tracked as [[PRJ-0915]].' made a person of the whole sentence
+    (review, 2026-10-19). The links after the first are the wiki-link
+    pass's (_seed_wikilinks), as every link in the text is.
+
+    ``line``: the line the value was read from. A link the value splitter
+    cut in two ('[[Lee, Carol]]' read as '[[Lee' and 'Carol]]') is found
+    whole there."""
+    s = str(value or "")
+    if "[[" not in s and "]]" not in s:
+        return s
+    s = s.strip()
+    refs = scan_wikilinks([(None, 0, s)])
+    if refs:
+        return refs[0].surface
+    if WIKILINK_RE.search(s):
+        return ""                       # an embed, or a link into this note
+    head = s[s.find("[["):] if "[[" in s else ""
+    tail = s[:s.rfind("]]") + 2] if "]]" in s else ""
+    for m in WIKILINK_RE.finditer(line or ""):
+        whole = m.group(0)
+        # Cut at a separator: '[[Lee' is not the start of '[[Leeds Upgrade]]'.
+        if (head and whole.startswith(head) and not whole[len(head)].isalnum()) or \
+                (tail and whole.endswith(tail) and not whole[-len(tail) - 1].isalnum()):
+            # From the character before it: an embed's '!' is kept.
+            refs = scan_wikilinks([(None, 0, line[max(m.start() - 1, 0):m.end()])])
+            return refs[0].surface if refs else ""
+    return s.replace("[[", "").replace("]]", "").strip().strip("\"'").strip()
 
 
 #: Words that make a run of Capitalised words a title, not a person:

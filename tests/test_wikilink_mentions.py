@@ -165,6 +165,85 @@ def test_withdrawing_a_wikilink_removes_its_mention_on_the_next_rebuild(tmp_path
     assert row[0] == 0
 
 
+# ---------------------------------------------- a labelled field written as a link
+# (review, 2026-10-19): a field took its value as written, brackets and all -
+# a PART '[[PN-1002]]' beside PN-1002, Priya Raman renamed '[[Priya Raman]]'
+# (a person keeps the fullest form of the name), and a PERSON called
+# '[[Jordan Blake]]. Tracked as [[PRJ-0915]]'.
+
+_PLAIN = "Project: Atlas Pump Retrofit\nOwner: Priya Raman\nPart Number: PN-1002\n"
+
+
+def _shape(kg):
+    """(live entities, relations) by name."""
+    names = {r["id"]: r["name"] for r in kg.db.execute("SELECT id, name FROM entities")}
+    ents = sorted((r["type"], r["name"]) for r in kg.db.execute(
+        "SELECT type, name FROM entities WHERE type != 'DOCUMENT'"
+        " AND merged_into IS NULL"))
+    rels = sorted((names[r["subject_id"]], r["predicate"], names[r["object_id"]],
+                   r["status"]) for r in kg.db.execute(
+                       "SELECT subject_id, predicate, object_id, status FROM relations"))
+    return ents, rels
+
+
+@pytest.mark.parametrize("linked", [
+    "Project: [[Atlas Pump Retrofit]]\nOwner: [[Priya Raman]]\n"
+    "Part Number: [[PN-1002]]\n",
+    # YAML front matter: Obsidian needs the quotes round a link there.
+    '---\nproject: "[[Atlas Pump Retrofit]]"\nowner: "[[Priya Raman]]"\n---\n'
+    "Part Number: [[PN-1002|the pump part]]\n",
+    # A table: an anchor, and the alias pipe a table escapes.
+    "| Project | [[Atlas Pump Retrofit#Scope]] |\n| Owner | [[Priya Raman\\|Priya]] |\n"
+    "| Part Number | [[PN-1002]] |\n",
+], ids=["fields", "front-matter", "table"])
+def test_a_field_written_as_a_wikilink_reads_as_the_plain_field(tmp_path, linked):
+    plain = _vault_with(tmp_path / "plain", {"a.md": _PLAIN})
+    both = _vault_with(tmp_path / "both", {"a.md": _PLAIN, "b.md": linked})
+    with _graph(plain) as kg:
+        kg.seed()
+        want = _shape(kg)
+    with _graph(both) as kg:
+        stats = kg.seed()
+        got = _shape(kg)
+        people = [h["name"] for h in kg.search("Priya", "PERSON")]
+    assert want == ([("PART", "PN-1002"), ("PERSON", "Priya Raman"),
+                     ("PROJECT", "Atlas Pump Retrofit")],
+                    [("Atlas Pump Retrofit", "USES_PART", "PN-1002", "seeded"),
+                     ("Priya Raman", "OWNS", "PN-1002", "seeded")])
+    # One PART PN-1002, one person named 'Priya Raman', the same links.
+    assert got == want
+    assert people == ["Priya Raman"]
+    # Each link still resolves to the field's entity: none is made anew.
+    assert stats["wikilink_mentions"] == 3 and stats["wikilinks_created"] == 0
+
+
+def test_a_field_holding_two_links_takes_the_first(tmp_path):
+    v = _vault_with(tmp_path, {
+        "d.md": "Owner: [[Jordan Blake]]. Tracked as [[PRJ-0915]].\n"
+                "Part Number: PN-1002\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+        tracked = _mentions_for(kg, "PRJ-0915")
+    assert ("PERSON", "Jordan Blake") in ents
+    assert not [n for _t, n in ents if "[[" in n or "Tracked" in n], ents
+    assert rels == [("Jordan Blake", "OWNS", "PN-1002", "seeded")]
+    # The second link is the wiki-link pass's, as any link in the text is.
+    assert [m["method"] for m in tracked] == ["wikilink"]
+
+
+def test_a_link_the_value_splitter_cut_is_read_whole(tmp_path):
+    # 'Last, First' inside a link: the comma cut it into '[[Lee' and 'Carol]]'.
+    v = _vault_with(tmp_path, {
+        "m.md": "Project: Atlas\nAttendees: [[Lee, Carol]], [[Tomas Echeverria]]\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+    assert [n for t, n in ents if t == "PERSON"] == ["Carol Lee", "Tomas Echeverria"]
+    assert rels == [("Carol Lee", "WORKS_ON", "Atlas", "seeded"),
+                    ("Tomas Echeverria", "WORKS_ON", "Atlas", "seeded")]
+
+
 # ---------------------------------------------- summary line matched/created
 
 def test_the_summary_line_breaks_down_matched_and_created():
