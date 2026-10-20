@@ -19,6 +19,7 @@ All reads are bounded and read-only. Optional deps degrade gracefully.
 """
 from __future__ import annotations
 
+import codecs
 import json
 import re
 from pathlib import Path
@@ -980,20 +981,16 @@ def _csv_frame(p: Path, sep: str):
     plain "CSV" save) raised UnicodeDecodeError and the caller saw no rows at
     all; skip_blank_lines and on_bad_lines='skip' shifted every later row
     number (a lead on row 5 was cited as row 3) and dropped a malformed row
-    without a word. Here the bytes are decoded as UTF-8 (BOM allowed), else
-    cp1252, else latin-1; blank rows are counted but hold no data; a row with
-    more non-empty cells than the header is skipped and its number recorded
-    in ``attrs["skipped_rows"]``."""
+    without a word. Here the bytes are decoded as a text note's are
+    (decode_text: UTF-8, BOM allowed, a byte UTF-8 cannot read as cp1252 -
+    the whole file as cp1252 turned a UTF-8 CSV with ANSI rows appended to
+    mojibake, review, 2026-10-19); blank rows are counted but hold no data;
+    a row with more non-empty cells than the header is skipped and its
+    number recorded in ``attrs["skipped_rows"]``."""
     import csv as _csv
     import io as _io
     import pandas as pd
-    raw = p.read_bytes()
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
+    text = decode_text(p.read_bytes())
     header: Optional[List[str]] = None
     rows: List[List[Optional[str]]] = []
     index: List[int] = []
@@ -1031,6 +1028,53 @@ def _pdf_pages(p: Path) -> List[str]:
         return []
 
 
+def _ansi_bytes(err: UnicodeError) -> Tuple[str, int]:
+    """codecs error handler (_ANSI): each byte a decode could not read, as
+    Windows-1252 - or latin-1 for the five bytes cp1252 leaves undefined
+    (0x81, 0x8D, 0x8F, 0x90, 0x9D)."""
+    if not isinstance(err, UnicodeDecodeError):
+        raise err
+    return "".join(bytes((b,)).decode("cp1252", "ignore") or chr(b)
+                   for b in err.object[err.start:err.end]), err.end
+
+
+_ANSI = "council-ansi-bytes"
+codecs.register_error(_ANSI, _ansi_bytes)
+
+
+def decode_text(raw: bytes) -> str:
+    """A plain-text file's bytes as text: UTF-8 (a BOM dropped), a UTF-16
+    file by its BOM (Notepad's 'Unicode', Excel's 'Unicode Text'), and any
+    byte that is not UTF-8 as Windows-1252 (Notepad's 'ANSI', most older
+    Windows tools; latin-1 for the five bytes cp1252 leaves undefined).
+
+    It was UTF-8 with errors='replace' (review, 2026-10-19): an ANSI note's
+    'Tomás Echeverría' read with U+FFFD for each accent, and the knowledge
+    graph made a second, garbled person of him. Then the whole file was
+    read one way or the other (review, 2026-10-19): a UTF-8 note or log
+    with a line added by an ANSI tool kept U+FFFD in that line (the
+    garbled person again) or, with as many bad bytes as accents, turned
+    every UTF-8 accent to 'Ã©'. Now each byte UTF-8 cannot read is read
+    as cp1252 and the rest stays UTF-8, so both halves of such a file are
+    right; a UTF-8 file with one damaged byte keeps its accents. (Left:
+    two ANSI characters that happen to make valid UTF-8 - an upper-half
+    letter such as 'Ã'-'ß' and then a curly quote or dash, 'ß“' - read
+    as the one UTF-8 character.)"""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        # By its BOM even when cut short (an odd last byte is U+FFFD):
+        # read on as cp1252 every other character was a NUL.
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    if raw.decode("utf-8", errors="ignore").isascii():
+        # No UTF-8 in it at all: a plain ANSI file, read at C speed (the
+        # handler below is a Python call per byte).
+        return raw.decode("cp1252", errors=_ANSI)
+    return raw.decode("utf-8-sig", errors=_ANSI)
+
+
 def _read_text(p: Path, max_chars: int = 400000) -> str:
     suf = p.suffix.lower()
     if suf in _EXTRACTABLE:
@@ -1040,7 +1084,7 @@ def _read_text(p: Path, max_chars: int = 400000) -> str:
         except Exception:
             return ""
     try:
-        return p.read_text(encoding="utf-8", errors="replace")[:max_chars]
+        return decode_text(p.read_bytes())[:max_chars]
     except Exception:
         return ""
 

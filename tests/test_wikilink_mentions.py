@@ -59,12 +59,15 @@ def test_two_capitalized_words_infer_as_person():
 def test_other_shapes_fall_back_to_project():
     assert kgm._infer_wikilink_type("project with lower") == "PROJECT"
     assert kgm._infer_wikilink_type("Jordan") == "PROJECT"           # single Capitalized word → not a confident person
-    # Two Capitalized words that are not a name (e.g. "Night Line") still
-    # infer as PERSON because the regex cannot tell them apart from a
-    # person's name without extra context; this is a documented limit
-    # (user can relabel), and the test fixes it so future refactors do not
-    # silently change the behavior.
-    assert kgm._infer_wikilink_type("Night Line") == "PERSON"
+    # Two Capitalized words that are not a name used to infer as PERSON
+    # ("Night Line"). Since review, 2026-10-19 a word that names a thing,
+    # not a person (Line, Program, Inspection, ... - _NOT_NAME_WORDS),
+    # makes it a title. Two Capitalized words with no such word were still
+    # a PERSON ("Night Owl" was pinned as one); since the second review,
+    # 2026-10-19, a PERSON needs positive evidence (a known given name, an
+    # initial, 'Last, First', a particle), so "Night Owl" is a PROJECT.
+    assert kgm._infer_wikilink_type("Night Line") == "PROJECT"
+    assert kgm._infer_wikilink_type("Night Owl") == "PROJECT"
 
 
 # ---------------------------------------------- end-to-end seed + mentions
@@ -160,6 +163,183 @@ def test_withdrawing_a_wikilink_removes_its_mention_on_the_next_rebuild(tmp_path
         row = kg.db.execute(
             "SELECT COUNT(*) FROM mentions WHERE method='wikilink'").fetchone()
     assert row[0] == 0
+
+
+# ---------------------------------------------- a labelled field written as a link
+# (review, 2026-10-19): a field took its value as written, brackets and all -
+# a PART '[[PN-1002]]' beside PN-1002, Priya Raman renamed '[[Priya Raman]]'
+# (a person keeps the fullest form of the name), and a PERSON called
+# '[[Jordan Blake]]. Tracked as [[PRJ-0915]]'.
+
+_PLAIN = "Project: Atlas Pump Retrofit\nOwner: Priya Raman\nPart Number: PN-1002\n"
+
+
+def _shape(kg):
+    """(live entities, relations) by name."""
+    names = {r["id"]: r["name"] for r in kg.db.execute("SELECT id, name FROM entities")}
+    ents = sorted((r["type"], r["name"]) for r in kg.db.execute(
+        "SELECT type, name FROM entities WHERE type != 'DOCUMENT'"
+        " AND merged_into IS NULL"))
+    rels = sorted((names[r["subject_id"]], r["predicate"], names[r["object_id"]],
+                   r["status"]) for r in kg.db.execute(
+                       "SELECT subject_id, predicate, object_id, status FROM relations"))
+    return ents, rels
+
+
+@pytest.mark.parametrize("linked", [
+    "Project: [[Atlas Pump Retrofit]]\nOwner: [[Priya Raman]]\n"
+    "Part Number: [[PN-1002]]\n",
+    # YAML front matter: Obsidian needs the quotes round a link there.
+    '---\nproject: "[[Atlas Pump Retrofit]]"\nowner: "[[Priya Raman]]"\n---\n'
+    "Part Number: [[PN-1002|the pump part]]\n",
+    # A table: an anchor, and the alias pipe a table escapes.
+    "| Project | [[Atlas Pump Retrofit#Scope]] |\n| Owner | [[Priya Raman\\|Priya]] |\n"
+    "| Part Number | [[PN-1002]] |\n",
+], ids=["fields", "front-matter", "table"])
+def test_a_field_written_as_a_wikilink_reads_as_the_plain_field(tmp_path, linked):
+    plain = _vault_with(tmp_path / "plain", {"a.md": _PLAIN})
+    both = _vault_with(tmp_path / "both", {"a.md": _PLAIN, "b.md": linked})
+    with _graph(plain) as kg:
+        kg.seed()
+        want = _shape(kg)
+    with _graph(both) as kg:
+        stats = kg.seed()
+        got = _shape(kg)
+        people = [h["name"] for h in kg.search("Priya", "PERSON")]
+    assert want == ([("PART", "PN-1002"), ("PERSON", "Priya Raman"),
+                     ("PROJECT", "Atlas Pump Retrofit")],
+                    [("Atlas Pump Retrofit", "USES_PART", "PN-1002", "seeded"),
+                     ("Priya Raman", "OWNS", "PN-1002", "seeded")])
+    # One PART PN-1002, one person named 'Priya Raman', the same links.
+    assert got == want
+    assert people == ["Priya Raman"]
+    # Each link still resolves to the field's entity: none is made anew.
+    assert stats["wikilink_mentions"] == 3 and stats["wikilinks_created"] == 0
+
+
+def test_a_field_holding_two_links_takes_the_first(tmp_path):
+    v = _vault_with(tmp_path, {
+        "d.md": "Owner: [[Jordan Blake]]. Tracked as [[PRJ-0915]].\n"
+                "Part Number: PN-1002\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+        tracked = _mentions_for(kg, "PRJ-0915")
+    assert ("PERSON", "Jordan Blake") in ents
+    assert not [n for _t, n in ents if "[[" in n or "Tracked" in n], ents
+    assert rels == [("Jordan Blake", "OWNS", "PN-1002", "seeded")]
+    # The second link is the wiki-link pass's, as any link in the text is.
+    assert [m["method"] for m in tracked] == ["wikilink"]
+
+
+# (review, 2026-10-19): the fix above took a field's first link wherever it
+# stood. 'Owner: Priya Raman (backup [[Jordan Blake]])' made Jordan Blake the
+# owner - a firm (seeded) link nobody wrote - and Priya Raman vanished; 'PN-1002
+# per [[ECO-77]]' made ECO-77 the part. A value beside an embed or a
+# [[#heading]] was dropped whole: 'Owner' lost its part and fell back to the
+# project rule, a wrong seeded LEADS. A link written as a path made a person
+# 'People/Priya Raman' or 'Priya Raman.md'.
+@pytest.mark.parametrize("note, project, other", [
+    ("Project: Atlas\nPart Number: PN-1002\n"
+     "Owner: Priya Raman (backup [[Jordan Blake]])\n", "Atlas", "Jordan Blake"),
+    ("Project: Atlas\nPart Number: PN-1002\n"
+     "Owner: Priya Raman, cc [[Jordan Blake]]\n", "Atlas", "Jordan Blake"),
+    ("Project: Atlas\nPart Number: PN-1002 per [[ECO-77]]\n"
+     "Owner: Priya Raman\n", "Atlas", "ECO-77"),
+    ("Project: Atlas\nPart Number: PN-1002 (see [[Pump Spec]])\n"
+     "Owner: Priya Raman\n", "Atlas", "Pump Spec"),
+    ("Project: PRJ-0915 ([[Helios Turbine Upgrade]])\nPart Number: PN-1002\n"
+     "Owner: Priya Raman\n", "PRJ-0915", "Helios Turbine Upgrade"),
+    ("Project: Atlas\nPart Number: PN-1002 [[#Specs]]\nOwner: Priya Raman\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: PN-1002\nOwner: Priya Raman ![[priya.png]]\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: [[PN-1002.md]]\nOwner: [[Priya Raman.md]]\n",
+     "Atlas", None),
+    ("Project: Atlas\nPart Number: [[Parts/PN-1002]]\n"
+     "Owner: [[People/Priya Raman|Priya]]\n", "Atlas", None),
+], ids=["owner-backup", "owner-cc", "part-per", "part-see", "project-code",
+        "value-heading", "value-embed", "md-extension", "folder-path"])
+def test_a_fields_value_is_the_text_before_a_cross_reference(tmp_path, note,
+                                                            project, other):
+    v = _vault_with(tmp_path, {"t.md": note})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+        cross = _mentions_for(kg, other) if other else []
+    assert rels == [(project, "USES_PART", "PN-1002", "seeded"),
+                    ("Priya Raman", "OWNS", "PN-1002", "seeded")]
+    assert [n for t, n in ents if t == "PERSON" and n != other] == ["Priya Raman"]
+    assert [n for t, n in ents if t == "PART" and n != other] == ["PN-1002"]
+    assert not [n for _t, n in ents if "[[" in n or "/" in n or ".md" in n], ents
+    # The cross-reference is the wiki-link pass's, as any link in the text is.
+    if other:
+        assert [m["method"] for m in cross] == ["wikilink"]
+
+
+def test_a_link_the_value_splitter_cut_is_read_whole(tmp_path):
+    # 'Last, First' inside a link: the comma cut it into '[[Lee' and 'Carol]]'.
+    v = _vault_with(tmp_path, {
+        "m.md": "Project: Atlas\nAttendees: [[Lee, Carol]], [[Tomas Echeverria]]\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+    assert [n for t, n in ents if t == "PERSON"] == ["Carol Lee", "Tomas Echeverria"]
+    assert rels == [("Carol Lee", "WORKS_ON", "Atlas", "seeded"),
+                    ("Tomas Echeverria", "WORKS_ON", "Atlas", "seeded")]
+
+
+def test_a_cut_link_past_the_snippets_200_characters_is_read_whole(tmp_path):
+    # (review, 2026-10-19) The cut link was found in the cited snippet, which
+    # stops at 200 characters: on a long attendee line '[[Lee, Carol]]' past
+    # it was two people, Lee and Carol. The whole line is read.
+    names = ["Ann Stone", "Bob Hale", "Dana Whitfield", "Evan Ross", "Faith Moore",
+             "Gina Park", "Hank Doyle", "Iris Kemp", "Jack Ford", "Kara Lind",
+             "Liam Shaw", "Mona Reyes", "Nora Price", "Owen Brooks"]
+    line = "Attendees: " + ", ".join(f"[[{n}]]" for n in names) + ", [[Lee, Carol]]"
+    assert line.index("[[Lee, Carol]]") > 200
+    v = _vault_with(tmp_path, {"m.md": f"Project: Atlas\n{line}\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        ents, rels = _shape(kg)
+    assert [n for t, n in ents if t == "PERSON"] == sorted(names + ["Carol Lee"])
+    assert rels == sorted((n, "WORKS_ON", "Atlas", "seeded")
+                          for n in names + ["Carol Lee"])
+
+
+# ---------------------------------------------- initials: a wiki-link's person
+# (review, 2026-10-19): the initials questions' candidates were worked out
+# before the wiki-link pass, so 'Who is RT?' did not offer a Rita Tan only a
+# [[Rita Tan]] names.
+
+def test_the_initials_question_offers_a_person_only_a_wikilink_names(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    v = _vault_with(tmp_path, {"rita.md": "[[Rita Tan]] runs the lift tests.\n"})
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Part Number", "Inspector"])
+    ws.append(["SN-5501", "RT"])
+    wb.save(v / "data_in" / "lift.xlsx")
+
+    def question():
+        with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+            kg.confirm_all_rules()
+            stats = kg.seed()
+            (q,) = [r for r in kg.reviews() if r["kind"] == "initials"]
+            inspected = [k for k in _shape(kg)[1] if k[1] == "INSPECTED"]
+        return stats, q, inspected
+
+    stats, q, inspected = question()
+    assert q["surface"] == "RT"
+    assert [c["name"] for c in q["candidates"]] == ["Rita Tan"]
+    assert inspected == []                  # offered, never picked
+    # A rebuild that works the graph out again offers her too.
+    (v / "data_in" / "rita.md").write_text("[[Rita Tan]] runs the lift tests again.\n",
+                                           encoding="utf-8")
+    stats, q, inspected = question()
+    assert stats["graph_unchanged"] is False
+    assert [c["name"] for c in q["candidates"]] == ["Rita Tan"]
+    assert inspected == []
 
 
 # ---------------------------------------------- summary line matched/created

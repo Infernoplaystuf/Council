@@ -81,7 +81,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 3
 STORE_DIR = ".knowledge_graph"
@@ -537,7 +537,9 @@ def _json_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     import field_search as fs
     by_norm = _rule_index(rules)
     try:
-        text = p.read_text(encoding="utf-8", errors="replace")
+        # As a text document is read (fs.decode_text): an ANSI file's accents
+        # were U+FFFD, and a BOM made json.loads refuse the whole file.
+        text = fs.decode_text(p.read_bytes())
         data = json.loads(text)
     except Exception:
         return []
@@ -589,13 +591,34 @@ def _text_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     # Read ONCE for every rule: field_value_locations read and parsed the
     # file again per rule — MEASURED 16 reads of each PDF per rebuild.
     pages = fs.document_pages(p)
+    page_lines: Dict[int, List[str]] = {}
+
+    def source_line(loc) -> str:
+        # The whole line, not the snippet: that is cut at 200 characters, and
+        # a long attendee line's '[[Lee, Carol]]' past it made two people
+        # (review, 2026-10-19).
+        pno, ln = (loc.get("page") or 1) - 1, loc.get("line")
+        if ln and 0 <= pno < len(pages):
+            lines = page_lines.get(pno)
+            if lines is None:
+                lines = page_lines[pno] = pages[pno].splitlines()
+            if ln <= len(lines):
+                return lines[ln - 1]
+        return loc.get("snippet", "")
+
     for r in rules:
         for loc in fs.field_value_locations(p, r.label, kind=r.type, exact=True,
                                             pages=pages):
-            key = (loc.get("page"), loc.get("line"), loc["value"])
+            # 'Owner: [[Priya Raman]]' is Priya Raman (see field_link_value).
+            value = loc["value"]
+            if isinstance(value, str) and ("[[" in value or "]]" in value):
+                value = field_link_value(value, source_line(loc))
+            if loc["value"] and not value:
+                continue        # only an embed, a [[#heading]], a 'see [[…]]'
+            key = (loc.get("page"), loc.get("line"), value)
             prev = best.get(key)
             if prev is None or len(r.label) > len(prev.rule.label):
-                best[key] = Value(r, loc["value"], loc, loc.get("snippet", ""))
+                best[key] = Value(r, value, loc, loc.get("snippet", ""))
     if not best:
         return []
     vals = sorted(best.values(), key=lambda v: (v.locator.get("page") or 0,
@@ -1070,17 +1093,33 @@ class WikiLinkRef:
 
 def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
                    ) -> List[WikiLinkRef]:
-    """Pure function over document_lines output; no DB access."""
+    """Pure function over document_lines output; no DB access.
+
+    Obsidian's own forms are read the way Obsidian reads them (review,
+    2026-10-19): ``[[Jordan Blake#Contact]]`` and ``[[Jordan Blake#^a1b2]]``
+    link to Jordan Blake (a heading or a block IN that note), so the anchor
+    is cut off the target - it made a 'Jordan Blake#Contact' entity. A
+    ``[[#Heading]]`` points into the note it is in and names nothing. An
+    embed, ``![[diagram.png]]``, shows a file inline: not a reference to an
+    entity, so it is skipped. In a markdown table the pipe is written
+    ``\\|`` (``| Owner | [[Priya Raman\\|Priya]] |``): the backslash is not
+    part of the name. A link written as a path, ``[[People/Priya Raman]]``
+    or ``[[Priya Raman.md]]``, is to the note Priya Raman (see
+    _link_note_name)."""
     out: List[WikiLinkRef] = []
     for page, line_no, text in lines:
         if "[[" not in text:
             continue
         for m in WIKILINK_RE.finditer(text):
+            if m.start() > 0 and text[m.start() - 1] == "!":
+                continue                    # an embed
             inside = m.group(1).strip()
             if not inside:
                 continue
-            surface, _, display = inside.partition("|")
-            surface = surface.strip()
+            target, _, display = inside.partition("|")
+            if "|" in inside and target.endswith("\\"):
+                target = target[:-1]        # a table's escaped '\|'
+            surface = _link_note_name(_WIKILINK_ANCHOR_RE.split(target, 1)[0])
             display = (display.strip() or surface) if "|" in inside else surface
             if surface:
                 out.append(WikiLinkRef(page=page, line=line_no,
@@ -1088,29 +1127,439 @@ def scan_wikilinks(lines: Sequence[Tuple[Optional[int], int, str]]
     return out
 
 
-#: A loose check for "this looks like a human name" so an unresolved
-#: ``[[Jordan Blake]]`` lands as a PERSON. Two or more tokens, each
-#: starting with a capital and containing only letters, apostrophes and
-#: hyphens — so ``O'Brien``, ``McDonald`` and ``Jean-Luc`` all qualify.
-#: Deliberately loose: a two-word all-caps string like ``ABC DEF`` also
-#: lands as PERSON (``looks_like_code`` runs first on anything with a
-#: digit, so ``ABC-123`` still goes to PART).
-_HUMAN_NAME_RE = __import__("re").compile(
-    r"^[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)+$")
+#: Where a wiki-link's target ends and its anchor starts: ``#heading``,
+#: ``#^block`` (and a bare ``^block``).
+_WIKILINK_ANCHOR_RE = re.compile(r"[#^]")
+#: A part code with its revision after a slash ('PN-1234/A', 'BRG-77/2',
+#: 'PN-1234/Rev B'): one name, not a folder and a note.
+_CODE_REVISION_RE = re.compile(r"^[^/]*\d\s*/\s*(?:rev\.?\s*)?[A-Za-z0-9]{1,3}$", re.I)
 
 
-def _infer_wikilink_type(surface: str) -> str:
+def _link_note_name(target: str) -> str:
+    """The note a link's target names. Obsidian writes a link as a path
+    under its 'Absolute path in vault' and 'Relative path' settings
+    ('[[People/Priya Raman]]', '[[../People/Priya Raman]]') and a link can
+    keep the file's '.md': read as written they made a PERSON 'People/Priya
+    Raman' or 'Priya Raman.md' beside Priya Raman (review, 2026-10-19). A
+    part code with a revision after its slash ('[[PN-1234/A]]') is kept
+    whole: 'A' names nothing."""
+    t = str(target or "").strip()
+    md = t.lower().endswith(".md")
+    if md:
+        t = t[:-3].rstrip()
+    if "/" in t and (md or not _CODE_REVISION_RE.match(t)):
+        t = t.rstrip("/").rsplit("/", 1)[-1].strip()
+    return t
+
+
+#: A link that names nothing, inside a field's value: an embed (``![[…]]``)
+#: or a link to a heading or block of the note it is in (``[[#Specs]]``).
+_UNNAMED_LINK_RE = re.compile(r"!" + WIKILINK_RE.pattern + r"|\[\[\s*[#^][^\[\]\n]*\]\]")
+#: What may stand before a link that IS a field's value: quotes, brackets,
+#: emphasis, list punctuation, a list's 'and' (what an embed before it left:
+#: '![[diagram.png]] and [[Priya Raman]]') or a title ('Dr. [[Priya
+#: Raman]]').
+_LINK_LEAD_RE = re.compile(
+    r"(?:[\s\"'“”‘’(\[{*_,;&+–—-]"
+    r"|\b(?:and|dr|mrs?|ms|mx|prof|sir|dame|capt)\b\.?)*", re.I)
+#: What a value ends with when a link after it is a cross-reference: 'PN-1002
+#: (see [[Pump Spec]])', 'PN-1002 per [[ECO-77]]', 'Priya Raman, cc
+#: [[Jordan Blake]]', 'PN-1002 - [[Drawing]]'.
+_LINK_REMARK_RE = re.compile(
+    r"(?:[\s\"'“”‘’(\[{*_,;:&+/–—-]"
+    r"|\b(?:see|also|per|cc|bcc|via|ref|re|backup|aka|and|or)\b\.?)*$", re.I)
+#: Where the value before a link starts, in its line: after a field's ':', a
+#: list's ',' ';' 'and', a table's '|', or the link before it.
+_LINK_LIST_SEP_RE = re.compile(r"[:;,|=\t]|\]\]|\s(?:and|&)\s", re.I)
+
+
+def _value_before_link(lead: str) -> Optional[str]:
+    """``lead``, the text a field's value has before its first link: None
+    when the link IS the value (only quotes, brackets, a title before it),
+    else the value the text holds - '' when it is only a remark ('see',
+    'cc'). An opening bracket the link is inside is cut with what follows
+    it: 'Priya Raman (backup [[Jordan Blake]])' is Priya Raman."""
+    if _LINK_LEAD_RE.fullmatch(lead):
+        return None
+    cut = max(lead.rfind("("), lead.rfind("["))
+    if cut >= 0 and not any(c in lead[cut:] for c in ")]"):
+        lead = lead[:cut]
+    return _LINK_REMARK_RE.sub("", lead).strip().strip("\"'“”‘’").strip()
+
+
+def field_link_value(value: str, line: str = "") -> str:
+    """A labelled field's value with its wiki-link syntax taken off: the
+    target of the link the value starts with - not the ``|alias``, not the
+    ``#anchor``, not the quotes YAML front matter needs round a link
+    (``owner: "[[Priya Raman]]"``). A value with no link is given back as
+    it is.
+
+    Read as written, 'Part Number: [[PN-1002]]' made a part '[[PN-1002]]'
+    beside PN-1002, 'Owner: [[Priya Raman]]' renamed Priya Raman to the
+    bracketed form (a person keeps the fullest name), and 'Owner: [[Jordan
+    Blake]]. Tracked as [[PRJ-0915]].' made a person of the whole sentence
+    (review, 2026-10-19). The links after the first are the wiki-link
+    pass's (_seed_wikilinks), as every link in the text is.
+
+    A value that starts with plain text is that text, and a link after it a
+    cross-reference: taking the link made 'Priya Raman (backup [[Jordan
+    Blake]])' Jordan Blake and 'PN-1002 per [[ECO-77]]' a part ECO-77, each
+    with a firm (seeded) link that was not written (review, 2026-10-19).
+    A link that names nothing - an embed, a ``[[#heading]]`` - is taken out
+    and the rest kept: 'PN-1002 [[#Specs]]' is PN-1002; '' only when
+    nothing is left.
+
+    ``line``: the full line the value was read from. A link the value
+    splitter cut in two ('[[Lee, Carol]]' read as '[[Lee' and 'Carol]]') is
+    found whole there."""
+    s = str(value or "")
+    if "[[" not in s and "]]" not in s:
+        return s
+    s = s.strip()
+    if _UNNAMED_LINK_RE.search(s):
+        s = " ".join(_UNNAMED_LINK_RE.sub(" ", s).split())
+    if "[[" not in s and "]]" not in s:
+        return s.strip("\"'“”‘’").strip()
+    opens, closes = s.find("[["), s.find("]]")
+    m = WIKILINK_RE.search(s)
+    if opens >= 0 and (closes < 0 or opens < closes):
+        # The value starts with a link, or with text and a link after it.
+        embed = opens > 0 and s[opens - 1] == "!"      # the start of a cut embed
+        plain = _value_before_link(s[:opens - 1] if embed else s[:opens])
+        if plain is not None:
+            return plain
+        if embed:
+            return ""
+        if m and m.start() == opens:
+            refs = scan_wikilinks([(None, 0, m.group(0))])
+            return refs[0].surface if refs else ""
+    head = s[opens:] if opens >= 0 and (closes < 0 or opens < closes) else ""
+    tail = s[:closes + 2] if closes >= 0 and not head else ""
+    line = line or ""
+    for m in WIKILINK_RE.finditer(line):
+        whole = m.group(0)
+        # Cut at a separator: '[[Lee' is not the start of '[[Leeds Upgrade]]'.
+        if (head and whole.startswith(head) and not whole[len(head)].isalnum()) or \
+                (tail and whole.endswith(tail) and not whole[-len(tail) - 1].isalnum()):
+            if tail:
+                lead, sep = line[:m.start()], None
+                for sep in _LINK_LIST_SEP_RE.finditer(lead):
+                    pass
+                if _value_before_link(lead[sep.end():] if sep else lead) is not None:
+                    return ""       # the end of a cross-reference link
+            # From the character before it: an embed's '!' is kept.
+            refs = scan_wikilinks([(None, 0, line[max(m.start() - 1, 0):m.end()])])
+            return refs[0].surface if refs else ""
+    return s.replace("[[", "").replace("]]", "").strip().strip("\"'()[]").strip()
+
+
+#: Words that make a run of Capitalised words a title, not a person:
+#: 'Blade Inspection Program', 'Engine Upgrade Plan', 'Night Line'. Folded
+#: forms; only words that are (nearly) never a given name or a surname.
+#: The shop's own teams and companies too ('Quality Team', 'First Shift',
+#: 'Dana Corporation'): an Owner or Approved-by column often holds one, and
+#: as a PERSON its first word vouched for topics (review, 2026-10-19:
+#: 'Owner: Quality Team' made [[Quality Escape]] a person).
+_NOT_NAME_WORDS = frozenset((
+    "program programme project projects upgrade upgrades inspection inspections"
+    " line lines plan plans report reports review reviews test tests testing"
+    " system systems process procedure meeting meetings notes team group phase"
+    " schedule spec specs specification manual design analysis study initiative"
+    " board committee lab laboratory center centre department division office"
+    " unit assembly module engine calibration maintenance overhaul repair build"
+    " release roadmap proposal budget contract requirements guide training"
+    " workshop audit survey log policy standard summary checklist template"
+    " results data minutes agenda the of and for inc llc ltd corp company"
+    " shift shifts crew staff quality engineering production purchasing"
+    " supplier suppliers vendor vendors customer customers operations"
+    " management logistics shipping receiving warehouse facility facilities"
+    " corporation incorporated industries enterprises holdings manufacturing"
+    " technologies solutions services international associates partners"
+    " award awards").split())
+
+#: Lower-case particles a name may hold between its first and last word:
+#: 'Ludwig van Beethoven', 'Maria de la Cruz'.
+_NAME_PARTICLES = frozenset(
+    "de da del della der den di du la le van von bin ibn al dos das".split())
+
+#: The particles that on their own say "a person": 'Pieter van Dijk',
+#: 'Ursula von der Leyen'. 'de', 'del', 'la' and the rest name companies,
+#: plants and places as often ('Aceros de Monterrey', 'Planta de Juarez',
+#: 'Rio de Janeiro'), and 'bin' is a shop word ('Kanban bin'): with one of
+#: those a name still needs its given name (review, 2026-10-19).
+_PERSON_PARTICLES = frozenset("van von ibn".split())
+
+#: Common given names across cultures (folded), so an unknown ``[[Jordan
+#: Blake]]`` is a PERSON while ``[[Root Cause]]`` and ``[[Eddy Current]]``
+#: are not. The US Social Security lists' top names for people born from the
+#: 1940s on lead, as most users are US shops: a short list left out Frank,
+#: Ashley, Martin, Raymond and Debra (review, 2026-10-19), and a person the
+#: graph did not know became a PROJECT. Left out on purpose: names that are
+#: also everyday or shop words, months, places, brands or units (Mark, Will,
+#: Max, Jack, Grant, Chase, Rose, June, Jun, Austin, Phoenix, Aurora, Nova,
+#: Eddy, Nick, Jan, Otto, Maya, Julian, Victor, Kim, Ray, Lee, Allen, Lewis,
+#: Stanley, Parker, Taylor, Reed, Lance, Warren, Troy, Grace, Amber, Crystal,
+#: Dawn, Chad, Virginia, Madison, Florence, Dev, Min, Al...) - such a person
+#: still lands as a PERSON when the graph knows them (see
+#: _infer_wikilink_type), and the user can relabel.
+_GIVEN_NAMES = frozenset((
+    # English-speaking (US Social Security top names, 1940s to now)
+    "aaliyah aaron abby abigail adam adrian adrienne agnes aidan aiden alan"
+    " albert alberta alec alex alexa alexander alexandra alexandria alexis"
+    " alfred alice alicia alison alissa allison alma alvin alyssa amanda"
+    " amelia amy andre andrea andrew andy angela angelica angelina angie anita"
+    " ann anna anne annette annie anthony arlene arnold arthur ashlee ashley"
+    " aubrey audrey ava barbara barry beatrice becky belinda ben benjamin"
+    " bernadette bernard bernice beth bethany betsy betty beverly bill billie"
+    " billy blake bob bobbie bobby bonnie brad bradley brady brandi brandon"
+    " brenda brendan brent brett brian briana brianna bridget brittany"
+    " brittney brooke bruce bryan bryce byron caitlin caleb calvin cameron"
+    " camille candace cara carl carla carlton carmen carol carole caroline"
+    " carolyn carrie casey cassandra cassidy catherine cathy cecil cecilia"
+    " cedric celeste charlene charles charlie charlotte chelsea cheryl chester"
+    " chloe chris christian christie christina christine christopher christy"
+    " cindy claire clara clarence claude claudia clayton clifford clint clyde"
+    " cody colby colin colleen connie connor constance corey cory courtney"
+    " craig cristina curtis cynthia dale damon dan dana daniel danielle danny"
+    " darin darla darlene darnell darrell darren darryl daryl dave david dean"
+    " deanna deb debbie debora deborah debra delores denise dennis derek"
+    " derrick desiree devin dewayne diana diane dianne dolores dominic don"
+    " donald donna donnie dora doreen doris dorothy doug douglas duane dustin"
+    " dwayne dwight dylan earl ed eddie edgar edith edna edward edwin eileen"
+    " elaine eleanor elijah elisa elise eliza elizabeth ella ellen ellie elmer"
+    " eloise elsie emily emma eric erica erik erika erin ernest esther ethan"
+    " ethel eugene eva evan evelyn faye felicia felix fiona floyd frances"
+    " francis frank franklin fred freddie frederick gabriel gabrielle gail"
+    " gary gavin gayle gene geoffrey george gerald geraldine gilbert gina"
+    " gladys glen glenda glenn gloria gordon greg gregg gregory gretchen gwen"
+    " gwendolyn hailey haley hannah harold harriet harry harvey hayden heather"
+    " heidi helen henry herbert herman hilda howard hubert ian ida irene irma"
+    " isaac isabel isabella isaiah ivan jackie jacob jacqueline jacquelyn"
+    " jaime jake jamal james jamie jana jane janet janice janie jared jasmine"
+    " jason jay jayden jean jeanette jeanne jeff jeffery jeffrey jen jenna"
+    " jennifer jenny jeremiah jeremy jerome jerry jesse jessica jessie jill"
+    " jillian jim jimmie jimmy jo joan joann joanna joanne jocelyn jodi jody"
+    " joe joel joey johanna john johnnie johnny jon jonathan jordan joseph"
+    " josephine josh joshua joyce juanita judith judy julia julie justin kara"
+    " karen kari karl kate katelyn katherine kathleen kathryn kathy katie"
+    " katrina kay kayla kaylee keith kelley kelli kellie kelly kelsey ken"
+    " kendra kenneth kenny kerry kevin kimberly kirk kristen kristi kristie"
+    " kristin kristina kristine kristy krystal kurt kyle lacey lamar larry"
+    " latasha latoya laura lauren laurie lawrence leah leigh lena leo leon"
+    " leonard leroy leslie lester leticia liam lillian linda lindsay lindsey"
+    " lisa liz lloyd logan lois lonnie lora loretta lori lorraine louis louise"
+    " lucas lucille lucy luke lydia lyle lynda lynn lynne mabel mackenzie"
+    " madeline mandy marc marcia marcus margaret margie maria marian marie"
+    " marilyn marion marjorie marla marlene marsha martha martin marvin mary"
+    " maryann matt matthew maureen maurice maxine megan melanie melinda"
+    " melissa melvin meredith mia michael micheal michele michelle mickey mike"
+    " mildred milton mindy miranda mitchell molly monica monique morgan muriel"
+    " myra nadine nancy naomi natalie natasha nathan nathaniel neil nellie"
+    " nicholas nicole nina noah nora norma norman olga oliver olivia oscar"
+    " owen paige pam pamela patricia patrick patsy patty paul paula pauline"
+    " peggy perry pete peter phil philip phillip phyllis preston priscilla"
+    " rachael rachel ralph ramona randall randy raymond rebecca regina"
+    " reginald renee rhonda richard rick ricky riley rita rob robert roberta"
+    " robin robyn rochelle rodney roger roland ron ronald ronnie rosa rosalie"
+    " roxanne roy rudy russell ruth ryan sabrina sally sam samantha samuel"
+    " sandra sandy sara sarah scott sean seth shane shanna shannon shari"
+    " sharon shawn shawna sheila shelia shelley shelly sheri sherri sherry"
+    " shirley sidney simon sonia sonya sophia sophie spencer stacey stacy"
+    " stella stephanie stephen steve steven stuart sue susan susie suzanne"
+    " sylvia tabitha tamara tami tammy tanya tara tasha ted teresa teri"
+    " terrance terrence terri terry thelma theodore theresa thomas tiffany tim"
+    " timothy tina toby todd tom tommy toni tony tonya tracey traci tracy"
+    " travis trevor tricia trisha tyler tyrone ursula valerie vanessa vera"
+    " vernon veronica vicki vickie vicky victoria vincent virgil vivian"
+    " wallace walter wanda wayne wendell wendy wesley whitney wilbur willard"
+    " william willie wilma winston yolanda yvette yvonne zachary zoe"
+    # Irish and Scottish
+    " aoife ciara conor declan eamon fergus niamh seamus sinead siobhan"
+    # Spanish and Portuguese
+    " adolfo adriana agustin alberto alejandra alejandro alfredo ana andres"
+    " antonio armando arturo beatriz benito blanca camila carlos catalina"
+    " cesar consuelo cristian daniela diego eduardo efrain elena emilio"
+    " enrique ernesto esperanza esteban estela eugenio fabiola federico felipe"
+    " fernanda fernando fidel francisco gabriela gerardo gilberto gonzalo"
+    " graciela guadalupe guillermo gustavo hector heriberto humberto ignacio"
+    " ines isidro javier jesus jimena joao joaquin jorge jose josefina josue"
+    " juan juana julio leobardo leonardo leonel liliana lorena lourdes lucia"
+    " luis lupe luz manuel manuela marcela marco marcos margarita mariana"
+    " maribel maricela mario marisol marta mateo mauricio miguel moises"
+    " natalia nestor noemi octavio osvaldo pablo paola patricio pedro pilar"
+    " rafael ramiro ramon raquel raul rebeca reynaldo ricardo rigoberto"
+    " roberto rocio rodolfo rodrigo rogelio rolando rosario ruben salvador"
+    " santiago santos saul sergio silvia socorro sofia teodoro thiago tomas"
+    " ulises valentina valeria wilfredo ximena yadira yesenia"
+    # French, German, Dutch, Nordic, Italian, Greek
+    " alain alessandro amelie anders andreas anke antoine antonella astrid"
+    " benoit bernd birgit bjorn bram camille celine chiara christoph"
+    " christophe daan dieter dimitris dirk dominique eleni emile emmanuel"
+    " fabien fabio federica florian francesca francois francoise friedrich"
+    " georgios gilles giovanni giulia giuseppe guillaume gunnar gunter hans"
+    " heike heinrich helene helmut henrik ingrid isabelle jacques jens johan"
+    " johannes jonas joost jorg julien jurgen katrin kerstin klaus"
+    " konstantinos kristian lars laurent leif lorenzo luca ludwig luigi lukas"
+    " magnus manfred manon marcello markus martine massimo mathieu matteo"
+    " matthias michel monika nathalie nicolas niels nikos nils olaf olivier"
+    " paolo patrice petra philippe pierre pieter rainer ralf rasmus reinhard"
+    " rene sabine salvatore sandrine sanne sebastien sigrid silke simone soren"
+    " stefan stefano stephane sven sylvie thierry thorsten torsten ulrich uwe"
+    " vasilis vittorio volker werner willem wolfgang yannis yves"
+    # Slavic and Eastern European
+    " agnieszka aleksandr alexei alexey anastasia andrei andrzej anya boris"
+    " dmitri dmitry dragan ekaterina galina goran igor irina jakub jiri"
+    " katarina katarzyna krzysztof lukasz lyudmila magdalena marcin marek"
+    " michal mikhail milos natasha nikola nikolai oksana oleg pavel pawel petr"
+    " piotr ruslan sergei svetlana tatiana tomasz vadim viktor vladimir"
+    " wojciech yelena yuri zofia zoran"
+    # South Asian
+    " aarav abhishek aditi aditya ajay akash amit anand ananya anil anita"
+    " anjali ankit arjun arnav arun ashish ashok deepak divya ganesh gaurav"
+    " harish ishaan kavita kiran krishna kunal lakshmi lata mahesh manish"
+    " manoj meera mohan mukesh naveen neha nikhil nikita nisha pankaj pooja"
+    " pradeep prakash pranav praveen preeti priya radha rahul raj rajan rajesh"
+    " rajiv rakesh ramesh ravi rekha ritu rohan rohit sachin sameer sandeep"
+    " sanjana sanjay sanjeev santosh shalini shilpa shreya siddharth sneha"
+    " srinivas sudhir sunil sunita suresh swati tarun uma usha varun venkat"
+    " vijay vikram vinod vishal vivek"
+    # East and Southeast Asian
+    " aiko akira anh bao binh cuong daisuke duc eun hai hana hanh hao haruka"
+    " haruto hien hieu hiro hiroko hiroshi hoa hoang hui huong huy hye hyun"
+    " jae jian jie jin jing jisoo jiwoo jiyoung joon kaori kazuo keiko kenichi"
+    " kenji kenta khanh kyung lei liang lin ling linh loan mai mariko masato"
+    " megumi mei ming minh minjun naoko nga ngoc nhung phong phuc phuong qiang"
+    " qing quang quoc rui ryo sakura satoshi seoyeon seung soo takashi takeshi"
+    " taro thanh thao thuy tien tomoko trang trinh trung tuan vinh wei xiao"
+    " xin xue yan ying yoko yong yoshi yuki yuko yumi yun zhen zhi zhong"
+    # Arabic, Turkish, Persian, Hebrew
+    " abdullah ahmad ahmed aisha ali amir amira avi ayesha eitan farah fatima"
+    " hamza hasan hassan huda hussein ibrahim jamal karim khaled khalid layla"
+    " leila mahmoud malik mariam maryam mehmet mohamed mohammad mohammed mona"
+    " moshe muhammad mustafa nadia noa nour omar rami rana rania reza salma"
+    " samir sara shira tamar tariq walid yael yasmin yosef yousef youssef"
+    " yusuf zainab zeynep ziad"
+    # African
+    " abena adebayo akua ama amara ayodele chidi chinedu chinonso chioma emeka"
+    " esi femi ifeoma kehinde kofi kwabena kwame kwesi lindiwe ngozi nnamdi"
+    " obinna oluwaseun sipho taiwo tendai thabo tunde zanele"
+    # Short and shared
+    " eli mara").split())
+
+
+def _name_word(tok: str) -> bool:
+    """'Blake', "O'Brien", 'Jean-Luc', 'García', 'Ångström': a capital and
+    then letters (any script's), apostrophes and hyphens; 2+ letters."""
+    core = tok.replace("'", "").replace("’", "").replace("-", "")
+    return len(core) >= 2 and core.isalpha() and tok[0].isupper()
+
+
+def _name_initial(tok: str) -> bool:
+    """'R.' in 'Jordan R. Blake', 'J.' in 'J. Blake'."""
+    return len(tok) == 2 and tok[1] == "." and tok[0].isalpha() and tok[0].isupper()
+
+
+def _given_name(tok: str, names: Collection[str]) -> bool:
+    """Is this first word a given name in ``names`` (folded)? 'Jean-Luc'
+    by 'jeanluc' or its first part 'jean'; 'José' as 'jose'."""
+    f = fold(tok)
+    return bool(f) and (f.replace(" ", "") in names or f.split()[0] in names)
+
+
+def _name_shape(surface: str) -> Optional[Tuple[List[str], List[str]]]:
+    """The SHAPE of a human name, or None: ``(words, named)`` - its words
+    (a trailing 'Jr.' or 'PhD' dropped) and those of them that are not
+    particles.
+
+    Two to four Capitalised words (any script: 'José García'), the last a
+    whole word, the others whole words or initials ('Jordan R. Blake',
+    'J. Blake'), with lower-case particles between ('Ludwig van
+    Beethoven'). 'Last, First' is read the way person_display reads it
+    ('Blake, Jordan R.'). A word that names a thing, a team or a company,
+    not a person ('Program', 'Inspection', 'Team', 'Shift' -
+    _NOT_NAME_WORDS), makes it a title.
+
+    Both _looks_like_person and KnowledgeGraph._known_people ask it: the
+    graph's own people vouched for first names without it (review,
+    2026-10-19: an Owner column's 'Quality Team' made 'quality' a given
+    name, and [[Quality Escape]] a person)."""
+    s = person_display(surface)
+    if "," in s:
+        left, right = (x.strip() for x in s.split(",", 1))
+        if fold(right) not in _SUFFIXES:
+            return None             # a comma that is not 'Last, First' or ', Jr.'
+        s = left
+    toks = s.split()
+    while toks and fold(toks[-1]) in _SUFFIXES:
+        toks.pop()                  # 'Jordan Blake Jr.'
+    named = [t for t in toks if t not in _NAME_PARTICLES]
+    if not 2 <= len(named) <= 4 or toks[0] in _NAME_PARTICLES \
+            or toks[-1] in _NAME_PARTICLES:
+        return None
+    if any(fold(t) in _NOT_NAME_WORDS for t in named):
+        return None
+    if not (_name_word(named[-1]) and all(_name_word(t) or _name_initial(t)
+                                          for t in named[:-1])):
+        return None
+    return toks, named
+
+
+def _acronym_first(toks: List[str]) -> bool:
+    """An all-caps first word in a mixed-case name ('SAM Registration',
+    'QA Lead') is an acronym, not a given name; 'MARA KIM' is all caps."""
+    return toks[0].isupper() and not " ".join(toks).isupper()
+
+
+def _looks_like_person(surface: str, given_names: Collection[str] = ()) -> bool:
+    """Does an unresolved ``[[surface]]`` name a human? Two things must hold:
+    the SHAPE of a name (_name_shape), and POSITIVE evidence it is a person -
+    an initial ('J. Blake', 'Jordan R. Blake'), a particle only a person's
+    name holds ('van', 'von', 'ibn' - _PERSON_PARTICLES), or a first word
+    that is a given name: a common one (_GIVEN_NAMES) or the first name of
+    a person the graph already knows (``given_names``). An all-caps first
+    word in a mixed-case surface is an acronym, not a name.
+
+    The shape alone made a PERSON of every two Capitalised words (review,
+    2026-10-19): [[Root Cause]], [[Eddy Current]], [[First Article]],
+    [[Turbine Blade]] and [[Atlas Pump Retrofit]] landed in the People
+    filter and the gazetteer searched the text for them as people. 'Last,
+    First' and any particle were evidence on their own too (review,
+    2026-10-19): 'Valve, Check' and 'Bearing, Ball' (a parts list's 'Noun,
+    Modifier') and 'Aceros de Monterrey' became people. Before that it only
+    had ASCII letters and no initials (review, 2026-10-19): 'Jordan R.
+    Blake', 'J. Blake' and 'José García' became PROJECTs.
+    (``looks_like_code`` runs first on anything with a digit.)"""
+    shape = _name_shape(surface)
+    if shape is None:
+        return False
+    toks, named = shape
+    if any(_name_initial(t) for t in named) \
+            or any(t in _PERSON_PARTICLES for t in toks):
+        return True
+    if _acronym_first(toks):
+        return False                # 'SAM Registration'
+    return _given_name(named[0], _GIVEN_NAMES) or _given_name(named[0], given_names)
+
+
+def _infer_wikilink_type(surface: str, known_people: Collection[str] = (),
+                         given_names: Collection[str] = ()) -> str:
     """Pick an entity type for an unresolved ``[[surface]]``.
+
+    ``known_people``: the person keys (person_key) of the people the graph
+    already knows; ``given_names``: their first names, folded (see
+    KnowledgeGraph._known_people).
 
     Order:
       1. Looks like a code (``[A-Za-z]{1,8}[-_ ]?\\d[\\w\\-/.]*``) → PART.
-      2. Looks like a human name (two or more Capitalized tokens, no digits)
-         → PERSON.
-      3. Fallback → PROJECT (the KG's catch-all for named things)."""
+      2. Is a person the graph knows ('Jordan Blake Jr.' for Jordan Blake)
+         or looks like a human name (_looks_like_person) → PERSON.
+      3. Fallback → PROJECT (the KG's catch-all for named things): an
+         unknown Title Case phrase with no sign of a person in it."""
     s = (surface or "").strip()
     if looks_like_code(s):
         return "PART"
-    if _HUMAN_NAME_RE.match(s):
+    if (known_people and person_key(s) in known_people) \
+            or _looks_like_person(s, given_names):
         return "PERSON"
     return "PROJECT"
 
@@ -1374,7 +1823,7 @@ class KnowledgeGraph:
                         elif isinstance(o, list):
                             for v in o:
                                 keys(v)
-                    keys(json.loads(p.read_text(encoding="utf-8", errors="replace")))
+                    keys(json.loads(fs.decode_text(p.read_bytes())))
                 else:
                     for _pg, _i, ln in document_lines(p):
                         for k, _v in fs._kv_pairs(ln):
@@ -1744,48 +2193,132 @@ class KnowledgeGraph:
             return None
         return (row["entity_id"], row["type"])
 
-    def _seed_wikilinks(self, run_id: str, stats: Dict[str, Any]) -> None:
-        """Create (or resolve) an entity for every pending ``[[Name]]`` and
-        write a mention linking that entity to the document it appeared in.
+    def _known_people(self) -> Tuple[set, set]:
+        """The people the graph knows, as the wiki-link pass's evidence that
+        an unresolved ``[[Name]]`` is a person: their person keys, and the
+        folded first word of every full name ('Priya Raman' -> 'priya').
+
+        During a rebuild only the people THIS run supports (records, Ledger
+        people, the user's) count: a stale PERSON 'Root Cause', typed by the
+        old shape-only rule (review, 2026-10-19), must not vouch for itself.
+        And a first name only from a value shaped like a name (_name_shape):
+        an Owner or Approved-by column often holds a team ('Quality Team',
+        'First Shift'), and its first word made [[Quality Escape]] and
+        [[First Article]] people (review, 2026-10-19)."""
+        keys: set = set()
+        firsts: set = set()
+        live = self._live
+        for r in self.db.execute("SELECT id, key, name FROM entities"
+                                 " WHERE type='PERSON' AND merged_into IS NULL"):
+            if live is not None and r["id"] not in live:
+                continue
+            if r["key"]:
+                keys.add(r["key"])
+            # A one-word name may be a surname ('Blake'), or initials; an
+            # initial ('J. Blake') or an acronym ('QA Lead') is no first name.
+            shape = _name_shape(r["name"] or "")
+            if shape is None:
+                continue
+            toks, named = shape
+            if _name_word(named[0]) and not _acronym_first(toks):
+                firsts.add(fold(named[0]).replace(" ", ""))
+        return keys, firsts
+
+    def _wikilink_refs(self, did: str, h: str, p: Path) -> List[WikiLinkRef]:
+        """Every ``[[…]]`` in one document's text lines: the lines the
+        gazetteer searches (doc_cache when it holds this version, else the
+        file). A CSV is read by column and has none.
+
+        Only a cached reading that holds a ``[[`` past its own opening
+        ``[[`` is parsed: the lines are JSON ``[[page, line, "text"], …]``,
+        so any later ``[[`` is inside a line's text - and most documents
+        hold no wiki-link at all."""
+        if p.suffix.lower() in _CSV:
+            return []
+        row = self.db.execute(
+            "SELECT content_hash, CASE WHEN instr(substr(lines, 3), '[[') > 0"
+            " THEN lines END AS lines FROM doc_cache WHERE document_id=?",
+            (did,)).fetchone()
+        if row is not None and row["content_hash"] == h:
+            if row["lines"] is None:
+                return []
+            return scan_wikilinks([tuple(x) for x in json.loads(row["lines"])])
+        return scan_wikilinks(document_lines(p))
+
+    def _seed_wikilinks(self, usable: Sequence[Tuple[Path, str, str]], run_id: str,
+                        stats: Dict[str, Any]) -> None:
+        """Create (or resolve) an entity for every ``[[Name]]`` in every
+        usable document and write a mention linking that entity to the
+        document it appeared in.
+
+        The references are found HERE, in every document's cached lines -
+        not queued while documents were read: an unchanged document is not
+        read, and the graph phase clears every mention and every non-user
+        alias before this runs, so its wiki-links (and the entities only
+        they supported) were deleted whenever ANOTHER document changed
+        (review, 2026-10-19). One source for every document, re-read or not,
+        so none is counted twice; the counters cover them all.
 
         An existing-entity match stays with the entity's type; an unresolved
         name is classified by ``_infer_wikilink_type`` and inserted at the
         inferred type with ``alias_source='inferred'`` (wiped on next
         rebuild and rebuilt from the same documents, so withdrawn wiki-links
-        disappear cleanly)."""
-        pending = getattr(self, "_pending_wikilinks", None) or []
-        if not pending:
-            self._pending_wikilinks = []
-            return
-        for did, ref in pending:
-            match = self._lookup_entity_by_name(ref.surface)
-            if match is not None:
-                eid, _etype = match
-                stats["wikilinks_matched"] += 1
-            else:
-                etype = _infer_wikilink_type(ref.surface)
-                # The entity's name is the SURFACE (left of the pipe) — the
-                # user's canonical reference. ref.display is only the local
-                # alias used in that one line, so it is not passed as the
-                # entity's display name here.
-                eid = self._entity(etype, ref.surface,
-                                   alias_source="inferred")
-                stats["wikilinks_created"] += 1
-            loc = {"line": int(ref.line)}
-            if ref.page is not None:
-                loc["page" if isinstance(ref.page, int) else "sheet"] = ref.page
-            snippet = f"[[{ref.surface}]]"
+        disappear cleanly). ``wikilinks_created`` counts entities that were
+        not in the graph before; one that was (a wiki-link's own entity from
+        the last rebuild, kept until the clean-up at the end) is matched."""
+        surfaces = set()
+        # Taken once, before any wiki-link adds a person: the type of a
+        # reference must not depend on which document was read first.
+        known_people, given_names = self._known_people()
+        for p, did, h in usable:
             try:
-                self._mention(eid, did, loc, ref.surface, snippet,
-                              "wikilink", run_id)
+                refs = self._wikilink_refs(did, h, p)
             except Exception as exc:                              # noqa: BLE001
-                # A mention row that is already there (same entity + doc +
-                # loc + method) is INSERT OR IGNORE's job; a plain Exception
-                # here means something more wrong than that, and the rebuild
-                # should keep going.
-                print(f"[wikilinks] skipped mention for {ref.surface!r}: {exc!r}",
-                      flush=True)
-        self._pending_wikilinks = []
+                # One document's lines that cannot be had (a damaged cache
+                # row, a file that went between the phases) must not stop
+                # the graph being built: it is in one transaction.
+                print(f"[wikilinks] skipped {self._rel(p)}: {exc!r}", flush=True)
+                continue
+            for ref in refs:
+                stats["wikilink_mentions"] += 1
+                surfaces.add(ref.surface.lower())
+                match = self._lookup_entity_by_name(ref.surface)
+                if match is not None:
+                    eid, _etype = match
+                    stats["wikilinks_matched"] += 1
+                else:
+                    etype = _infer_wikilink_type(ref.surface, known_people,
+                                                 given_names)
+                    known = self.db.execute(
+                        "SELECT 1 FROM entities WHERE id=?",
+                        (entity_id(etype, entity_key(etype, ref.surface)),)
+                    ).fetchone() is not None
+                    # The entity's name is the SURFACE (left of the pipe) — the
+                    # user's canonical reference. ref.display is only the local
+                    # alias used in that one line, so it is not passed as the
+                    # entity's display name here.
+                    eid = self._entity(etype, ref.surface,
+                                       alias_source="inferred")
+                    stats["wikilinks_matched" if known else "wikilinks_created"] += 1
+                # The gazetteer's locator for the same line ('page' is a
+                # workbook's sheet too): with 'sheet' here, _has_mention
+                # missed it and one reference got two mentions (review,
+                # 2026-10-19).
+                loc: Dict[str, Any] = {"line": int(ref.line)}
+                if ref.page is not None:
+                    loc["page"] = ref.page
+                snippet = f"[[{ref.surface}]]"
+                try:
+                    self._mention(eid, did, loc, ref.surface, snippet,
+                                  "wikilink", run_id)
+                except Exception as exc:                              # noqa: BLE001
+                    # A mention row that is already there (same entity + doc +
+                    # loc + method) is INSERT OR IGNORE's job; a plain Exception
+                    # here means something more wrong than that, and the rebuild
+                    # should keep going.
+                    print(f"[wikilinks] skipped mention for {ref.surface!r}: {exc!r}",
+                          flush=True)
+        stats["wikilink_unique"] = len(surfaces)
 
     def _alias(self, eid: str, alias: str, source: str) -> None:
         eid = self.resolve(eid)          # a merged entity's names live on its survivor
@@ -1990,9 +2523,6 @@ class KnowledgeGraph:
                                  "wikilinks_matched": 0,
                                  "wikilinks_created": 0,
                                  "unreadable_reasons": {}}
-        #: Per-rebuild list of (did, WikiLinkRef) collected during reading
-        #: and consumed by the graph phase; cleared at the end of _seed.
-        self._pending_wikilinks: List[Tuple[str, WikiLinkRef]] = []
         for r in gone_roots:
             stats["notes"].append(f"{r['path']}: this added folder is not there now; its "
                                   "documents count as gone until it is back")
@@ -2079,16 +2609,9 @@ class KnowledgeGraph:
                             lines = list(reading.lines)
                         else:
                             lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
-                        # Obsidian-style [[Name]] references: parsed now
-                        # and queued for the graph phase, which creates (or
-                        # resolves) entities and writes mentions.
-                        _wl_refs = scan_wikilinks(lines)
-                        if _wl_refs:
-                            stats["wikilink_mentions"] += len(_wl_refs)
-                            stats["wikilink_unique"] += len({
-                                r.surface.lower() for r in _wl_refs})
-                            self._pending_wikilinks.extend(
-                                (did, r) for r in _wl_refs)
+                        # Obsidian-style [[Name]] references are found in
+                        # these lines by the graph phase (_seed_wikilinks),
+                        # for every document - read now or unchanged.
                         self.db.execute(
                             "INSERT OR REPLACE INTO doc_cache VALUES (?,?,?,?,?,?)",
                             (did, h, sig, _records_json(recs, reading),
@@ -2293,7 +2816,6 @@ class KnowledgeGraph:
                 # field mentions) - flushed before it.
                 self._memo["buffer"] = {"evidence": [], "mentions": []}
                 self._seed_records(kept, run_id)
-                self._finish_initials()
                 if use_collections:
                     prog.update("Collections")
                     stats["collections"] = self._seed_collections(run_id)
@@ -2303,7 +2825,12 @@ class KnowledgeGraph:
                 # that matches a record-created entity resolves to it) and
                 # BEFORE the gazetteer (which can then find other mentions of
                 # a brand-new PERSON a wiki-link named).
-                self._seed_wikilinks(run_id, stats)
+                prog.update("[[wiki-links]]")
+                self._seed_wikilinks(usable, run_id, stats)
+                # The initials questions' answers to choose from, AFTER the
+                # wiki-link pass: a person only a [[Rita Tan]] names was never
+                # offered for 'RT' (review, 2026-10-19).
+                self._finish_initials()
                 if gazetteer:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
@@ -2344,7 +2871,11 @@ class KnowledgeGraph:
             last = self.db.execute("SELECT stats FROM runs WHERE kind='seed' AND finished_ts"
                                    " IS NOT NULL ORDER BY finished_ts DESC LIMIT 1").fetchone()
             before = json.loads(last["stats"]) if last and last["stats"] else {}
-            for k in ("collections", "gazetteer_mentions", "records", "skipped_rows"):
+            # The wiki-link counters too: they read 0 on every unchanged
+            # rebuild (review, 2026-10-19).
+            for k in ("collections", "gazetteer_mentions", "records", "skipped_rows",
+                      "wikilink_mentions", "wikilink_unique", "wikilinks_matched",
+                      "wikilinks_created"):
                 if k in before:
                     stats[k] = before[k]
             stats.update(self.counts())
@@ -2561,9 +3092,9 @@ class KnowledgeGraph:
         q["docs"].add(did)
 
     def _finish_initials(self) -> None:
-        """Each initials question, once every record is read: the people
-        whose initials these are (to choose from, never chosen), and how
-        often the initials were seen."""
+        """Each initials question, once every record and wiki-link is read:
+        the people whose initials these are (to choose from, never chosen),
+        and how often the initials were seen."""
         if not self._asked:
             return
         people = []
