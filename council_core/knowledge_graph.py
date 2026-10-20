@@ -1052,6 +1052,10 @@ _WIKILINK_ANCHOR_RE = re.compile(r"[#^]")
 #: Words that make a run of Capitalised words a title, not a person:
 #: 'Blade Inspection Program', 'Engine Upgrade Plan', 'Night Line'. Folded
 #: forms; only words that are (nearly) never a given name or a surname.
+#: The shop's own teams and companies too ('Quality Team', 'First Shift',
+#: 'Dana Corporation'): an Owner or Approved-by column often holds one, and
+#: as a PERSON its first word vouched for topics (review, 2026-10-19:
+#: 'Owner: Quality Team' made [[Quality Escape]] a person).
 _NOT_NAME_WORDS = frozenset((
     "program programme project projects upgrade upgrades inspection inspections"
     " line lines plan plans report reports review reviews test tests testing"
@@ -1061,84 +1065,182 @@ _NOT_NAME_WORDS = frozenset((
     " unit assembly module engine calibration maintenance overhaul repair build"
     " release roadmap proposal budget contract requirements guide training"
     " workshop audit survey log policy standard summary checklist template"
-    " results data minutes agenda the of and for inc llc ltd corp company").split())
+    " results data minutes agenda the of and for inc llc ltd corp company"
+    " shift shifts crew staff quality engineering production purchasing"
+    " supplier suppliers vendor vendors customer customers operations"
+    " management logistics shipping receiving warehouse facility facilities"
+    " corporation incorporated industries enterprises holdings manufacturing"
+    " technologies solutions services international associates partners"
+    " award awards").split())
 
 #: Lower-case particles a name may hold between its first and last word:
 #: 'Ludwig van Beethoven', 'Maria de la Cruz'.
 _NAME_PARTICLES = frozenset(
     "de da del della der den di du la le van von bin ibn al dos das".split())
 
+#: The particles that on their own say "a person": 'Pieter van Dijk',
+#: 'Ursula von der Leyen'. 'de', 'del', 'la' and the rest name companies,
+#: plants and places as often ('Aceros de Monterrey', 'Planta de Juarez',
+#: 'Rio de Janeiro'), and 'bin' is a shop word ('Kanban bin'): with one of
+#: those a name still needs its given name (review, 2026-10-19).
+_PERSON_PARTICLES = frozenset("van von ibn".split())
+
 #: Common given names across cultures (folded), so an unknown ``[[Jordan
 #: Blake]]`` is a PERSON while ``[[Root Cause]]`` and ``[[Eddy Current]]``
-#: are not. Left out on purpose: names that are also everyday or shop words,
-#: months, places or product names (Mark, Will, Max, Jack, Grant, Chase,
-#: Rose, June, Austin, Phoenix, Aurora, Nova, Eddy, Nick, Jan, Otto, Maya,
-#: Julian, Victor, Kim...) - such a person still lands as a PERSON when the
-#: graph knows them (see _infer_wikilink_type), and the user can relabel.
+#: are not. The US Social Security lists' top names for people born from the
+#: 1940s on lead, as most users are US shops: a short list left out Frank,
+#: Ashley, Martin, Raymond and Debra (review, 2026-10-19), and a person the
+#: graph did not know became a PROJECT. Left out on purpose: names that are
+#: also everyday or shop words, months, places, brands or units (Mark, Will,
+#: Max, Jack, Grant, Chase, Rose, June, Jun, Austin, Phoenix, Aurora, Nova,
+#: Eddy, Nick, Jan, Otto, Maya, Julian, Victor, Kim, Ray, Lee, Allen, Lewis,
+#: Stanley, Parker, Taylor, Reed, Lance, Warren, Troy, Grace, Amber, Crystal,
+#: Dawn, Chad, Virginia, Madison, Florence, Dev, Min, Al...) - such a person
+#: still lands as a PERSON when the graph knows them (see
+#: _infer_wikilink_type), and the user can relabel.
 _GIVEN_NAMES = frozenset((
-    # English-speaking
-    "aaron adam adrian aiden alan albert alex alexander alexandra alice alicia"
-    " allison amanda amy andrea andrew andy angela ann anna anne annie anthony"
-    " arthur audrey barbara barry becky ben benjamin beth betty bob brandon"
-    " brenda brian bruce bryan caleb cameron carl carol caroline casey"
-    " catherine charles charlotte chloe chris christina christine christopher"
-    " claire colin connor craig cynthia dan dana daniel danny darren dave david"
-    " deb deborah denise dennis derek diana diane donald donna dorothy doug"
-    " douglas dylan edward eleanor elizabeth ellen emily emma eric erica erin"
-    " ethan evan evelyn fiona gary george gordon greg gregory hannah harold"
-    " harry heather helen henry howard ian isaac jacob james jamie jane janet"
-    " jared jason jeff jeffrey jen jennifer jenny jeremy jessica jim joan joe"
-    " joel john jon jonathan jordan joseph josh joshua julia julie justin karen"
-    " kate katherine kathleen katie keith kelly ken kenneth kevin kimberly kyle"
-    " larry laura lauren lawrence leonard leslie liam linda lisa liz logan lori"
-    " lucy luke margaret marie martha mary matt matthew megan melissa michael"
-    " michelle mike mitchell molly monica morgan nancy natalie nathan neil"
-    " nicholas nicole noah olivia owen pamela patricia patrick paul pete peter"
-    " phil philip rachel ralph rebecca richard rick riley rob robert roger ron"
-    " ronald russell ruth ryan sally sam samantha samuel sandra sarah scott sean"
-    " sharon shirley simon sophia stephanie stephen steve steven stuart susan"
-    " ted teresa theresa thomas tim timothy todd tom tony travis trevor tyler"
-    " valerie vanessa vincent walter wayne wendy william zachary zoe"
+    # English-speaking (US Social Security top names, 1940s to now)
+    "aaliyah aaron abby abigail adam adrian adrienne agnes aidan aiden alan"
+    " albert alberta alec alex alexa alexander alexandra alexandria alexis"
+    " alfred alice alicia alison alissa allison alma alvin alyssa amanda"
+    " amelia amy andre andrea andrew andy angela angelica angelina angie anita"
+    " ann anna anne annette annie anthony arlene arnold arthur ashlee ashley"
+    " aubrey audrey ava barbara barry beatrice becky belinda ben benjamin"
+    " bernadette bernard bernice beth bethany betsy betty beverly bill billie"
+    " billy blake bob bobbie bobby bonnie brad bradley brady brandi brandon"
+    " brenda brendan brent brett brian briana brianna bridget brittany"
+    " brittney brooke bruce bryan bryce byron caitlin caleb calvin cameron"
+    " camille candace cara carl carla carlton carmen carol carole caroline"
+    " carolyn carrie casey cassandra cassidy catherine cathy cecil cecilia"
+    " cedric celeste charlene charles charlie charlotte chelsea cheryl chester"
+    " chloe chris christian christie christina christine christopher christy"
+    " cindy claire clara clarence claude claudia clayton clifford clint clyde"
+    " cody colby colin colleen connie connor constance corey cory courtney"
+    " craig cristina curtis cynthia dale damon dan dana daniel danielle danny"
+    " darin darla darlene darnell darrell darren darryl daryl dave david dean"
+    " deanna deb debbie debora deborah debra delores denise dennis derek"
+    " derrick desiree devin dewayne diana diane dianne dolores dominic don"
+    " donald donna donnie dora doreen doris dorothy doug douglas duane dustin"
+    " dwayne dwight dylan earl ed eddie edgar edith edna edward edwin eileen"
+    " elaine eleanor elijah elisa elise eliza elizabeth ella ellen ellie elmer"
+    " eloise elsie emily emma eric erica erik erika erin ernest esther ethan"
+    " ethel eugene eva evan evelyn faye felicia felix fiona floyd frances"
+    " francis frank franklin fred freddie frederick gabriel gabrielle gail"
+    " gary gavin gayle gene geoffrey george gerald geraldine gilbert gina"
+    " gladys glen glenda glenn gloria gordon greg gregg gregory gretchen gwen"
+    " gwendolyn hailey haley hannah harold harriet harry harvey hayden heather"
+    " heidi helen henry herbert herman hilda howard hubert ian ida irene irma"
+    " isaac isabel isabella isaiah ivan jackie jacob jacqueline jacquelyn"
+    " jaime jake jamal james jamie jana jane janet janice janie jared jasmine"
+    " jason jay jayden jean jeanette jeanne jeff jeffery jeffrey jen jenna"
+    " jennifer jenny jeremiah jeremy jerome jerry jesse jessica jessie jill"
+    " jillian jim jimmie jimmy jo joan joann joanna joanne jocelyn jodi jody"
+    " joe joel joey johanna john johnnie johnny jon jonathan jordan joseph"
+    " josephine josh joshua joyce juanita judith judy julia julie justin kara"
+    " karen kari karl kate katelyn katherine kathleen kathryn kathy katie"
+    " katrina kay kayla kaylee keith kelley kelli kellie kelly kelsey ken"
+    " kendra kenneth kenny kerry kevin kimberly kirk kristen kristi kristie"
+    " kristin kristina kristine kristy krystal kurt kyle lacey lamar larry"
+    " latasha latoya laura lauren laurie lawrence leah leigh lena leo leon"
+    " leonard leroy leslie lester leticia liam lillian linda lindsay lindsey"
+    " lisa liz lloyd logan lois lonnie lora loretta lori lorraine louis louise"
+    " lucas lucille lucy luke lydia lyle lynda lynn lynne mabel mackenzie"
+    " madeline mandy marc marcia marcus margaret margie maria marian marie"
+    " marilyn marion marjorie marla marlene marsha martha martin marvin mary"
+    " maryann matt matthew maureen maurice maxine megan melanie melinda"
+    " melissa melvin meredith mia michael micheal michele michelle mickey mike"
+    " mildred milton mindy miranda mitchell molly monica monique morgan muriel"
+    " myra nadine nancy naomi natalie natasha nathan nathaniel neil nellie"
+    " nicholas nicole nina noah nora norma norman olga oliver olivia oscar"
+    " owen paige pam pamela patricia patrick patsy patty paul paula pauline"
+    " peggy perry pete peter phil philip phillip phyllis preston priscilla"
+    " rachael rachel ralph ramona randall randy raymond rebecca regina"
+    " reginald renee rhonda richard rick ricky riley rita rob robert roberta"
+    " robin robyn rochelle rodney roger roland ron ronald ronnie rosa rosalie"
+    " roxanne roy rudy russell ruth ryan sabrina sally sam samantha samuel"
+    " sandra sandy sara sarah scott sean seth shane shanna shannon shari"
+    " sharon shawn shawna sheila shelia shelley shelly sheri sherri sherry"
+    " shirley sidney simon sonia sonya sophia sophie spencer stacey stacy"
+    " stella stephanie stephen steve steven stuart sue susan susie suzanne"
+    " sylvia tabitha tamara tami tammy tanya tara tasha ted teresa teri"
+    " terrance terrence terri terry thelma theodore theresa thomas tiffany tim"
+    " timothy tina toby todd tom tommy toni tony tonya tracey traci tracy"
+    " travis trevor tricia trisha tyler tyrone ursula valerie vanessa vera"
+    " vernon veronica vicki vickie vicky victoria vincent virgil vivian"
+    " wallace walter wanda wayne wendell wendy wesley whitney wilbur willard"
+    " william willie wilma winston yolanda yvette yvonne zachary zoe"
     # Irish and Scottish
-    " aoife ciara conor declan eamon fergus niamh seamus siobhan sinead"
+    " aoife ciara conor declan eamon fergus niamh seamus sinead siobhan"
     # Spanish and Portuguese
-    " alejandro ana andres antonio beatriz camila carlos carmen catalina diego"
-    " eduardo elena enrique esteban fernando francisco gabriel guadalupe"
-    " gustavo hector ines isabel javier joao jorge jose juan julio lucia luis"
-    " manuel marco marcos maria mariana mario marta miguel pablo pedro rafael"
-    " ramon raul ricardo roberto rodrigo sergio sofia thiago tomas valentina"
-    " ximena"
+    " adolfo adriana agustin alberto alejandra alejandro alfredo ana andres"
+    " antonio armando arturo beatriz benito blanca camila carlos catalina"
+    " cesar consuelo cristian daniela diego eduardo efrain elena emilio"
+    " enrique ernesto esperanza esteban estela eugenio fabiola federico felipe"
+    " fernanda fernando fidel francisco gabriela gerardo gilberto gonzalo"
+    " graciela guadalupe guillermo gustavo hector heriberto humberto ignacio"
+    " ines isidro javier jesus jimena joao joaquin jorge jose josefina josue"
+    " juan juana julio leobardo leonardo leonel liliana lorena lourdes lucia"
+    " luis lupe luz manuel manuela marcela marco marcos margarita mariana"
+    " maribel maricela mario marisol marta mateo mauricio miguel moises"
+    " natalia nestor noemi octavio osvaldo pablo paola patricio pedro pilar"
+    " rafael ramiro ramon raquel raul rebeca reynaldo ricardo rigoberto"
+    " roberto rocio rodolfo rodrigo rogelio rolando rosario ruben salvador"
+    " santiago santos saul sergio silvia socorro sofia teodoro thiago tomas"
+    " ulises valentina valeria wilfredo ximena yadira yesenia"
     # French, German, Dutch, Nordic, Italian, Greek
-    " amelie anders antoine astrid bjorn camille celine dieter dimitris emile"
-    " erik florian francois friedrich georgios giovanni giulia giuseppe"
-    " guillaume hans heinrich helene helmut ingrid jacques jean jens johan"
-    " johannes julien jurgen karl klaus lars laurent lorenzo luca lukas ludwig"
-    " magnus manon mathieu matteo matthias michel nathalie niels nikos nils"
-    " olivier paolo philippe pierre rene sabine salvatore sebastien sigrid"
-    " stefan stefano sven sylvie thierry ulrich ursula uwe wolfgang yannis yves"
+    " alain alessandro amelie anders andreas anke antoine antonella astrid"
+    " benoit bernd birgit bjorn bram camille celine chiara christoph"
+    " christophe daan dieter dimitris dirk dominique eleni emile emmanuel"
+    " fabien fabio federica florian francesca francois francoise friedrich"
+    " georgios gilles giovanni giulia giuseppe guillaume gunnar gunter hans"
+    " heike heinrich helene helmut henrik ingrid isabelle jacques jens johan"
+    " johannes jonas joost jorg julien jurgen katrin kerstin klaus"
+    " konstantinos kristian lars laurent leif lorenzo luca ludwig luigi lukas"
+    " magnus manfred manon marcello markus martine massimo mathieu matteo"
+    " matthias michel monika nathalie nicolas niels nikos nils olaf olivier"
+    " paolo patrice petra philippe pierre pieter rainer ralf rasmus reinhard"
+    " rene sabine salvatore sandrine sanne sebastien sigrid silke simone soren"
+    " stefan stefano stephane sven sylvie thierry thorsten torsten ulrich uwe"
+    " vasilis vittorio volker werner willem wolfgang yannis yves"
     # Slavic and Eastern European
-    " agnieszka aleksandr alexei anastasia andrei boris dmitri dmitry igor"
-    " irina ivan katarina krzysztof marek natasha nikolai oksana olga pavel"
-    " piotr sergei svetlana tatiana tomasz vladimir yuri zofia"
+    " agnieszka aleksandr alexei alexey anastasia andrei andrzej anya boris"
+    " dmitri dmitry dragan ekaterina galina goran igor irina jakub jiri"
+    " katarina katarzyna krzysztof lukasz lyudmila magdalena marcin marek"
+    " michal mikhail milos natasha nikola nikolai oksana oleg pavel pawel petr"
+    " piotr ruslan sergei svetlana tatiana tomasz vadim viktor vladimir"
+    " wojciech yelena yuri zofia zoran"
     # South Asian
-    " aarav aditya amit anil anita anjali arjun arun deepak divya ganesh kavita"
-    " lakshmi manish meera neha nikhil pooja prakash pranav priya rahul raj"
-    " rajesh ravi rohan sanjay shreya sunil suresh vijay vikram"
+    " aarav abhishek aditi aditya ajay akash amit anand ananya anil anita"
+    " anjali ankit arjun arnav arun ashish ashok deepak divya ganesh gaurav"
+    " harish ishaan kavita kiran krishna kunal lakshmi lata mahesh manish"
+    " manoj meera mohan mukesh naveen neha nikhil nikita nisha pankaj pooja"
+    " pradeep prakash pranav praveen preeti priya radha rahul raj rajan rajesh"
+    " rajiv rakesh ramesh ravi rekha ritu rohan rohit sachin sameer sandeep"
+    " sanjana sanjay sanjeev santosh shalini shilpa shreya siddharth sneha"
+    " srinivas sudhir sunil sunita suresh swati tarun uma usha varun venkat"
+    " vijay vikram vinod vishal vivek"
     # East and Southeast Asian
-    " aiko akira daisuke haruto hiroshi keiko kenji kenta naoko satoshi"
-    " takeshi yuki yoko jisoo jiwoo minjun seoyeon hyun wei jing ming mei"
-    " xin anh minh linh tuan thanh"
+    " aiko akira anh bao binh cuong daisuke duc eun hai hana hanh hao haruka"
+    " haruto hien hieu hiro hiroko hiroshi hoa hoang hui huong huy hye hyun"
+    " jae jian jie jin jing jisoo jiwoo jiyoung joon kaori kazuo keiko kenichi"
+    " kenji kenta khanh kyung lei liang lin ling linh loan mai mariko masato"
+    " megumi mei ming minh minjun naoko nga ngoc nhung phong phuc phuong qiang"
+    " qing quang quoc rui ryo sakura satoshi seoyeon seung soo takashi takeshi"
+    " taro thanh thao thuy tien tomoko trang trinh trung tuan vinh wei xiao"
+    " xin xue yan ying yoko yong yoshi yuki yuko yumi yun zhen zhi zhong"
     # Arabic, Turkish, Persian, Hebrew
-    " abdullah ahmad ahmed aisha amir amira ayesha fatima farah hamza hassan"
-    " hussein ibrahim karim khalid layla leila mahmoud mariam maryam mehmet"
-    " mohamed mohammad mohammed muhammad mustafa nadia omar rania reza samir"
-    " sara tariq yasmin yousef youssef zainab zeynep avi eitan moshe noa"
-    " shira tamar yael yosef"
+    " abdullah ahmad ahmed aisha ali amir amira avi ayesha eitan farah fatima"
+    " hamza hasan hassan huda hussein ibrahim jamal karim khaled khalid layla"
+    " leila mahmoud malik mariam maryam mehmet mohamed mohammad mohammed mona"
+    " moshe muhammad mustafa nadia noa nour omar rami rana rania reza salma"
+    " samir sara shira tamar tariq walid yael yasmin yosef yousef youssef"
+    " yusuf zainab zeynep ziad"
     # African
-    " abena adebayo amara ayodele chidi chinedu chioma emeka femi kofi kwame"
-    " ngozi nnamdi oluwaseun tendai thabo zanele"
+    " abena adebayo akua ama amara ayodele chidi chinedu chinonso chioma emeka"
+    " esi femi ifeoma kehinde kofi kwabena kwame kwesi lindiwe ngozi nnamdi"
+    " obinna oluwaseun sipho taiwo tendai thabo tunde zanele"
     # Short and shared
-    " ava eli ella eva leah lena mara mia nina nora tara vera").split())
+    " eli mara").split())
 
 
 def _name_word(tok: str) -> bool:
@@ -1160,36 +1262,28 @@ def _given_name(tok: str, names: Collection[str]) -> bool:
     return bool(f) and (f.replace(" ", "") in names or f.split()[0] in names)
 
 
-def _looks_like_person(surface: str, given_names: Collection[str] = ()) -> bool:
-    """Does an unresolved ``[[surface]]`` name a human? Two things must hold.
+def _name_shape(surface: str) -> Optional[Tuple[List[str], List[str]]]:
+    """The SHAPE of a human name, or None: ``(words, named)`` - its words
+    (a trailing 'Jr.' or 'PhD' dropped) and those of them that are not
+    particles.
 
-    The SHAPE of a name: two to four Capitalised words (any script: 'José
-    García'), the last a whole word, the others whole words or initials
-    ('Jordan R. Blake', 'J. Blake'), with lower-case particles between
-    ('Ludwig van Beethoven'). 'Last, First' is read the way person_display
-    reads it ('Blake, Jordan R.'), and a trailing 'Jr.' or 'PhD' is not
-    counted. A word that names a thing, not a person ('Program',
-    'Inspection', 'Line' - _NOT_NAME_WORDS), makes it a title.
+    Two to four Capitalised words (any script: 'José García'), the last a
+    whole word, the others whole words or initials ('Jordan R. Blake',
+    'J. Blake'), with lower-case particles between ('Ludwig van
+    Beethoven'). 'Last, First' is read the way person_display reads it
+    ('Blake, Jordan R.'). A word that names a thing, a team or a company,
+    not a person ('Program', 'Inspection', 'Team', 'Shift' -
+    _NOT_NAME_WORDS), makes it a title.
 
-    And POSITIVE evidence it is a person: written 'Last, First', an initial,
-    a name particle, or a first word that is a given name - a common one
-    (_GIVEN_NAMES) or the first name of a person the graph already knows
-    (``given_names``). An all-caps first word in a mixed-case surface ('SAM
-    Registration') is an acronym, not a name.
-
-    The shape alone made a PERSON of every two Capitalised words (review,
-    2026-10-19): [[Root Cause]], [[Eddy Current]], [[First Article]],
-    [[Turbine Blade]] and [[Atlas Pump Retrofit]] landed in the People
-    filter and the gazetteer searched the text for them as people. Before
-    that it only had ASCII letters and no initials (review, 2026-10-19):
-    'Jordan R. Blake', 'J. Blake' and 'José García' became PROJECTs.
-    (``looks_like_code`` runs first on anything with a digit.)"""
+    Both _looks_like_person and KnowledgeGraph._known_people ask it: the
+    graph's own people vouched for first names without it (review,
+    2026-10-19: an Owner column's 'Quality Team' made 'quality' a given
+    name, and [[Quality Escape]] a person)."""
     s = person_display(surface)
-    flipped = s != " ".join(str(surface or "").split())     # 'Blake, Jordan'
     if "," in s:
         left, right = (x.strip() for x in s.split(",", 1))
         if fold(right) not in _SUFFIXES:
-            return False            # a comma that is not 'Last, First' or ', Jr.'
+            return None             # a comma that is not 'Last, First' or ', Jr.'
         s = left
     toks = s.split()
     while toks and fold(toks[-1]) in _SUFFIXES:
@@ -1197,16 +1291,49 @@ def _looks_like_person(surface: str, given_names: Collection[str] = ()) -> bool:
     named = [t for t in toks if t not in _NAME_PARTICLES]
     if not 2 <= len(named) <= 4 or toks[0] in _NAME_PARTICLES \
             or toks[-1] in _NAME_PARTICLES:
-        return False
+        return None
     if any(fold(t) in _NOT_NAME_WORDS for t in named):
-        return False
+        return None
     if not (_name_word(named[-1]) and all(_name_word(t) or _name_initial(t)
                                           for t in named[:-1])):
+        return None
+    return toks, named
+
+
+def _acronym_first(toks: List[str]) -> bool:
+    """An all-caps first word in a mixed-case name ('SAM Registration',
+    'QA Lead') is an acronym, not a given name; 'MARA KIM' is all caps."""
+    return toks[0].isupper() and not " ".join(toks).isupper()
+
+
+def _looks_like_person(surface: str, given_names: Collection[str] = ()) -> bool:
+    """Does an unresolved ``[[surface]]`` name a human? Two things must hold:
+    the SHAPE of a name (_name_shape), and POSITIVE evidence it is a person -
+    an initial ('J. Blake', 'Jordan R. Blake'), a particle only a person's
+    name holds ('van', 'von', 'ibn' - _PERSON_PARTICLES), or a first word
+    that is a given name: a common one (_GIVEN_NAMES) or the first name of
+    a person the graph already knows (``given_names``). An all-caps first
+    word in a mixed-case surface is an acronym, not a name.
+
+    The shape alone made a PERSON of every two Capitalised words (review,
+    2026-10-19): [[Root Cause]], [[Eddy Current]], [[First Article]],
+    [[Turbine Blade]] and [[Atlas Pump Retrofit]] landed in the People
+    filter and the gazetteer searched the text for them as people. 'Last,
+    First' and any particle were evidence on their own too (review,
+    2026-10-19): 'Valve, Check' and 'Bearing, Ball' (a parts list's 'Noun,
+    Modifier') and 'Aceros de Monterrey' became people. Before that it only
+    had ASCII letters and no initials (review, 2026-10-19): 'Jordan R.
+    Blake', 'J. Blake' and 'José García' became PROJECTs.
+    (``looks_like_code`` runs first on anything with a digit.)"""
+    shape = _name_shape(surface)
+    if shape is None:
         return False
-    if flipped or len(named) < len(toks) or any(_name_initial(t) for t in named):
+    toks, named = shape
+    if any(_name_initial(t) for t in named) \
+            or any(t in _PERSON_PARTICLES for t in toks):
         return True
-    if named[0].isupper() and not s.isupper():
-        return False                # 'SAM Registration': an acronym
+    if _acronym_first(toks):
+        return False                # 'SAM Registration'
     return _given_name(named[0], _GIVEN_NAMES) or _given_name(named[0], given_names)
 
 
@@ -1790,7 +1917,11 @@ class KnowledgeGraph:
 
         During a rebuild only the people THIS run supports (records, Ledger
         people, the user's) count: a stale PERSON 'Root Cause', typed by the
-        old shape-only rule (review, 2026-10-19), must not vouch for itself."""
+        old shape-only rule (review, 2026-10-19), must not vouch for itself.
+        And a first name only from a value shaped like a name (_name_shape):
+        an Owner or Approved-by column often holds a team ('Quality Team',
+        'First Shift'), and its first word made [[Quality Escape]] and
+        [[First Article]] people (review, 2026-10-19)."""
         keys: set = set()
         firsts: set = set()
         live = self._live
@@ -1800,10 +1931,14 @@ class KnowledgeGraph:
                 continue
             if r["key"]:
                 keys.add(r["key"])
-            toks = person_display(r["name"] or "").split()
-            # A one-word name may be a surname ('Blake'), or initials.
-            if len(toks) >= 2 and _name_word(toks[0]):
-                firsts.add(fold(toks[0]).replace(" ", ""))
+            # A one-word name may be a surname ('Blake'), or initials; an
+            # initial ('J. Blake') or an acronym ('QA Lead') is no first name.
+            shape = _name_shape(r["name"] or "")
+            if shape is None:
+                continue
+            toks, named = shape
+            if _name_word(named[0]) and not _acronym_first(toks):
+                firsts.add(fold(named[0]).replace(" ", ""))
         return keys, firsts
 
     def _wikilink_refs(self, did: str, h: str, p: Path) -> List[WikiLinkRef]:

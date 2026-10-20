@@ -323,6 +323,16 @@ def test_an_unknown_title_case_topic_is_a_project(surface):
     "Riley Chen",
     "Priya Raman",
     "MARA KIM",
+    # Common US names a short list left out, so a person the graph did not
+    # know became a PROJECT (review, 2026-10-19).
+    "Ashley Brooks",
+    "Martin Lopez",
+    "Raymond Hughes",
+    "Frank Miller",
+    "Debra Lane",
+    "Cheryl Wu",
+    "Kristen Ward",
+    "Louis Hart",
 ])
 def test_a_known_given_name_is_a_person(surface):
     assert kgm._infer_wikilink_type(surface) == "PERSON", surface
@@ -334,10 +344,70 @@ def test_the_graphs_own_people_are_evidence():
     assert kgm._infer_wikilink_type("Xochitl Mendoza") == "PROJECT"
     assert kgm._infer_wikilink_type("Xochitl Mendoza",
                                     given_names={"xochitl"}) == "PERSON"
-    assert kgm._infer_wikilink_type("Mendoza, Xochitl") == "PERSON"
+    # 'Last, First' is no evidence on its own (a parts list writes 'Valve,
+    # Check'): the flipped name needs its given name like any other.
+    assert kgm._infer_wikilink_type("Mendoza, Xochitl") == "PROJECT"
+    assert kgm._infer_wikilink_type("Mendoza, Xochitl",
+                                    given_names={"xochitl"}) == "PERSON"
     assert kgm._infer_wikilink_type("Xochitl Mendoza Jr.") == "PROJECT"
     assert kgm._infer_wikilink_type(
         "Xochitl Mendoza Jr.", known_people={"xochitl mendoza"}) == "PERSON"
+
+
+# 'Last, First' and a particle were evidence on their own (review,
+# 2026-10-19): a parts list's 'Noun, Modifier' and a Spanish company, plant
+# or place name became people.
+
+@pytest.mark.parametrize("surface", [
+    "Valve, Check",
+    "Bearing, Ball",
+    "Pump, Hydraulic",
+    "Seal, Shaft",
+    "Aceros de Monterrey",
+    "Industrias de Mexico",
+    "Planta de Juarez",
+    "Rio de Janeiro",
+    "Casa de Campo",
+    "Dana Corporation",
+    "Ben Franklin Award",
+])
+def test_noun_modifier_and_company_names_are_projects(surface):
+    assert kgm._infer_wikilink_type(surface) == "PROJECT", surface
+
+
+@pytest.mark.parametrize("surface", [
+    "Blake, J.",                 # 'Last, First' with an initial
+    "Pieter van Dijk",           # 'van' / 'von' say "a person" on their own
+    "Ursula von der Leyen",
+    "Maria de la Cruz",          # 'de' does not, but 'Maria' does
+    "Leonardo da Vinci",
+])
+def test_an_initial_or_a_persons_particle_is_still_evidence(surface):
+    assert kgm._infer_wikilink_type(surface) == "PERSON", surface
+
+
+def test_a_team_in_a_person_column_vouches_for_no_one(tmp_path):
+    # An Owner or Approved-by column often holds a team. As a PERSON its
+    # first word counted as a given name, so [[Quality Escape]] and
+    # [[First Article]] became people again (review, 2026-10-19).
+    assert kgm._name_shape("Quality Team") is None
+    assert kgm._name_shape("First Shift") is None
+    v = _vault_with(tmp_path, {
+        "plan.md": ("Project: Atlas\nOwner: Quality Team\n"
+                    "Approved by: Engineering Department\n"),
+        "plan2.md": "Project: Nimbus\nOwner: First Shift\n",
+        "topics.md": ("See [[Quality Escape]], [[Engineering Change]] and"
+                      " [[First Article]].\n"),
+    })
+    _seed(v)
+    with _graph(v) as kg:
+        types = {r["name"]: r["type"] for r in kg.db.execute(
+            "SELECT name, type FROM entities WHERE type != 'DOCUMENT'"
+            " AND merged_into IS NULL")}
+        people = [h["name"] for h in kg.search("Quality", "PERSON")]
+    for topic in ("Quality Escape", "Engineering Change", "First Article"):
+        assert types.get(topic) == "PROJECT", (topic, types)
+    assert "Quality Escape" not in people
 
 
 def test_topics_stay_out_of_the_people_end_to_end(tmp_path):
