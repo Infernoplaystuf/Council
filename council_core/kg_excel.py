@@ -264,10 +264,21 @@ def split_people(s: Any) -> List[str]:
     return out
 
 
-def _who_head(v) -> bool:
+def _who_head(v, taught: Any = None) -> bool:
     """A label the Ledger reads as 'who logged this' (Inspector, Initials,
-    Operator, Inspected by ...): source_extract's own pattern."""
-    return isinstance(v, str) and bool(_se()._WHO_HEAD.match(v))
+    Operator, Inspected by ...): source_extract's own pattern - and, for a
+    Ledger, the labels its Teach learned are an inspector's or are no one
+    (``taught``: source_extract.Taught; council_core.ledger_teach)."""
+    if not isinstance(v, str):
+        return False
+    if taught is not None and (taught.who or taught.not_who):
+        from sample_ledger import normalize_label
+        key = normalize_label(_label_text(v))
+        if key in {normalize_label(x) for x in taught.not_who}:
+            return False
+        if key in {normalize_label(x) for x in taught.who}:
+            return True
+    return bool(_se()._WHO_HEAD.match(v))
 
 
 def _who_inline(v) -> List[str]:
@@ -391,6 +402,13 @@ def ledger_fingerprint(csv_path: Path) -> bytes:
         out += schema_path(csv_path).read_bytes()
     except OSError:
         out += b"no schema"
+    # the labels Teach learned are (or are not) an inspector's: a column of
+    # this Ledger reads as a person by them (read_ledger). Only when some
+    # are: a Ledger with none keeps the reading it has.
+    taught = _se().load_taught(csv_path)
+    if taught.who or taught.not_who:
+        out += ("\0who\0" + json.dumps([sorted(taught.who), sorted(taught.not_who)])
+                ).encode("utf-8")
     for x in _reviews_of(csv_path):
         st = x.stat()
         out += f"\0{x.name}\0{st.st_size}\0{st.st_mtime_ns}".encode("utf-8")
@@ -529,6 +547,9 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     schema = load_schema(p)
     by_norm = kgm._rule_index(rules)
     fields = {f.name: f for f in schema.fields}
+    # the labels this Ledger's Teach learned are an inspector's ('Tech Sig')
+    # or no one's: its person columns follow them (user, 2026-10-20)
+    taught = _se().load_taught(p)
     prov, n_reviews, notes = _provenance(p)
     sink = _Sink()
     try:
@@ -583,7 +604,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                     if r is not None:
                         roles[i] = ("rule", r)
                         rule_cols.append(col)
-                    elif f is not None and _who_head(_label_text(f.label)):
+                    elif f is not None and _who_head(_label_text(f.label), taught):
                         roles[i] = ("person", None)
                         person_cols.append(col)
             if id_i is None:
