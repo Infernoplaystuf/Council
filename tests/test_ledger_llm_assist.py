@@ -587,7 +587,7 @@ def test_a_model_that_answers_despite_cancel_says_its_values_are_in(tmp_path, le
     s = li._extract(str(csv), [str(src)], tmp_path / "review.xlsx", "", False, None,
                     _NoProg(), None, cancel, None, True, chat)
     assert s.cancelled and s.read_all
-    assert "placed 1 value(s) from 2 unplaced label(s)" in s.assist
+    assert "asked which field 2 unplaced label(s) are: 1 given a field, 1 value(s) placed" in s.assist
     assert "all amber in the review: check them" in s.assist
     assert ("Cancelled by user while Council's model was asked about the labels left over, "
             "but it answered first; every value the rules found is in this review, and the "
