@@ -40,7 +40,7 @@ from council_core import knowledge_graph as kgm
 from council_core import paths
 
 from .. import theme
-from ..view import ViewHelpers, amp
+from ..view import ViewHelpers, _alive, amp
 from .connections_dialogs import FieldsDialog, FoldersDialog, WhyNoLinksDialog
 
 TYPE_FILTERS = (("Everything", None), ("People", "PERSON"),
@@ -138,6 +138,12 @@ class ConnectionsActions:
         """KnowledgeGraph.why_no_links, with its own connection (a worker's)."""
         with self.open_graph() as kg:
             return kg.why_no_links()
+
+    def tick_rules(self, labels) -> List[str]:
+        """KnowledgeGraph.confirm_rules, with its own connection (a worker's):
+        the labels ticked."""
+        with self.open_graph() as kg:
+            return kg.confirm_rules(labels)
 
     def context(self, rel_path: str, locator: Any, quote: str = ""):
         return kgm.source_context(self.root, rel_path, locator, quote=quote)
@@ -250,6 +256,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._current: Optional[str] = None
         self._selected: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
+        #: 'Why no links?': its one dialog (tests reach it here), and whether
+        #: its worker is still working it out.
+        self._why_dialog: Optional[WhyNoLinksDialog] = None
+        self._why_running = False
         from .. import dialogs as _dialogs
         self.ask_string = ask_string or _dialogs.askstring
         self.ask_yes_no = ask_yes_no or _dialogs.askyesno
@@ -709,6 +719,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status.setText(f"The {who} tab is rebuilding the graph…")
         return True
 
+    def graph_in_use(self) -> bool:
+        """Whether this tab has the graph's store for a while - its rebuild,
+        one it holds for, Suggest links, the label harvest, a tick: another
+        tab that would write to it waits for it (LedgerTab._register)."""
+        return self._busy
+
     def rebuild_done_elsewhere(self, stats: Optional[Dict[str, Any]],
                                exc: Optional[BaseException]) -> None:
         """The rebuild hold_for_rebuild waited for ended: reopen and show
@@ -897,10 +913,13 @@ class ConnectionsTab(ViewHelpers, QWidget):
         """What the graph read and why it has no links, in a dialog with
         Copy. Worked out on a worker with its own connection: it reads the
         rebuild's cache (and a CSV's header row)."""
+        if self._why_running:
+            return              # a double click started two workers, two dialogs (review)
         if self._busy:
             self.status.setText("The graph is busy (a rebuild, or reading labels): ask "
                                 "'Why no links?' again when it finishes.")
             return
+        self._why_running = True
         self.status.setText("Working out why…")
 
         def work() -> None:
@@ -915,6 +934,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         threading.Thread(target=work, name="kg-why", daemon=True).start()
 
     def _show_why(self, diag: Optional[Dict[str, Any]], err: str = "") -> None:
+        self._why_running = False
         if diag is None:
             self.status.setText(f"Could not work out why: {err}.")
             return
@@ -927,9 +947,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
         rules = diag["rules"]
         if not diag["links"] or not rules["confirmed"]:
             self._offer_rules(rules["proposed_seen"])
-        dlg = WhyNoLinksDialog(diag["text"], self)
-        self._why_dialog = dlg              # tests reach it here
+        # One dialog, its text brought up to date: each ask used to leave
+        # another one open behind it (review, 2026-10-20). Closed, it is
+        # gone (WA_DeleteOnClose) and the next ask makes a new one.
+        dlg = self._why_dialog
+        if dlg is not None and _alive(dlg):
+            dlg.set_text(diag["text"])
+        else:
+            dlg = self._why_dialog = WhyNoLinksDialog(diag["text"], self)
         dlg.show()                          # not modal: the tab stays usable beside it
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _offer_rules(self, labels) -> bool:
         """Offer to tick these proposed field rules (the documents use their
@@ -950,7 +978,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         labels = list(self._to_tick)
         if not labels:
             return
-        if self._busy or self._kg is None:
+        if self._busy:
             self.status.setText("The graph is busy: tick the suggested field rules when it "
                                 "finishes.")
             return
@@ -964,14 +992,38 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 parent=self):
             self.status.setText("Nothing ticked. Fields… lets you choose them one by one.")
             return
-        current = {r.label: s for r, s in self._kg.field_rules()}
-        ticked = 0
-        for label in labels:
-            if current.get(label) == "proposed":
-                self._kg.set_rule_status(label, "confirmed")
-                ticked += 1
+        # On a worker, all in one transaction: on the GUI thread a store held
+        # elsewhere froze the window ~7 s, then 'database is locked' went
+        # uncaught with some rules ticked and the rest not (review,
+        # 2026-10-20).
+        self._busy = True
+        self.tick_btn.setEnabled(False)
+        self.status.setText(f"Ticking {len(labels)} field rule(s)…")
+
+        def work() -> None:
+            try:
+                ticked, err = self.actions.tick_rules(labels), ""
+            except kgm.KnowledgeGraphBusy:
+                ticked, err = None, "busy"
+            except Exception as exc:                      # noqa: BLE001
+                ticked, err = None, ("busy" if kgm._busy(exc) else
+                                     str(exc) or exc.__class__.__name__)
+            self._to_ui(self._ticked, ticked, err)
+
+        threading.Thread(target=work, name="kg-tick", daemon=True).start()
+
+    def _ticked(self, ticked: Optional[List[str]], err: str = "") -> None:
+        self._busy = False
+        self.tick_btn.setEnabled(True)
+        if ticked is None:
+            # still on offer: nothing was ticked
+            self.status.setText(
+                "The graph is busy (being rebuilt or written elsewhere): nothing was ticked. "
+                "Press 'Tick the suggested field rules' again in a moment." if err == "busy"
+                else f"Nothing was ticked: {err}.")
+            return
         self._offer_rules([])
-        self.status.setText(f"Ticked {ticked} field rule(s). Rebuilding…")
+        self.status.setText(f"Ticked {len(ticked)} field rule(s). Rebuilding…")
         self.on_rebuild()
 
     def on_questions(self) -> None:

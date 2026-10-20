@@ -815,28 +815,64 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
             "Press ⟳ Rebuild graph. It reads the vault's data_in folder, the folders added "
             "in Connections › Folders… and the Ledgers made in the Ledger tab.")
         return out
-    if not docs["read"] + docs["unreadable"] and not led["waiting"]:
-        why("no_documents", "no documents to read — put some in data_in, or add a folder "
-            "(Connections › Folders…)",
+    n_docs = docs["read"] + docs["unreadable"]
+    # Nothing to read - unless a Ledger the graph knows is the reason: one
+    # that moved said 'put some in data_in' (review, 2026-10-20)
+    if not n_docs and not led["waiting"] and not led["not_there"]:
+        why("no_documents", "no documents to read — put some in data_in, add a folder "
+            "(Connections › Folders…) or pick your Ledger in the Ledger tab",
             "Put documents in the vault's data_in folder, add a folder in Connections › "
-            "Folders…, or create or apply a Ledger in the Ledger tab; then ⟳ Rebuild graph.")
+            "Folders…, or pick, create or apply a Ledger in the Ledger tab; then ⟳ Rebuild "
+            "graph.")
+    if led["not_there"]:
+        k = led["not_there"]
+        # Not under Spreadsheets…: it lists the documents read or tried, and
+        # a file that is not there is neither (review, 2026-10-20)
+        why("ledger_gone", f"{ledgers(k)} {'is' if k == 1 else 'are'} not where "
+            f"{'it was' if k == 1 else 'they were'} — put {'it' if k == 1 else 'them'} back, "
+            f"or pick {'it' if k == 1 else 'them'} again in the Ledger tab",
+            "The graph reads a Ledger where the Ledger tab made it. It was moved or renamed, "
+            "or its drive is unplugged: put it back, or pick its parent CSV where it is now "
+            "in the Ledger tab (that adds it there); then ⟳ Rebuild graph. Connections › "
+            "Folders… lists where the graph looks.")
     if led["waiting"]:
         k = led["waiting"]
         why("ledger_not_read", f"{ledgers(k)} {'has' if k == 1 else 'have'} not been read "
             "yet — ⟳ Rebuild graph",
             f"The Ledger tab added {'it' if k == 1 else 'them'} after the last rebuild: press "
             "⟳ Rebuild graph here (or Rebuild knowledge graph in the Ledger tab).")
+    if led["not_ledger"]:
+        # its schema.json went: read as a plain table, and 'not read yet -
+        # Rebuild' was never true (review, 2026-10-20)
+        k = led["not_ledger"]
+        why("ledger_no_schema", ("the Ledger's schema file is" if k == 1 and led["known"] == 1
+                                 else f"the schema files of {_plural(k, 'Ledger')} are")
+            + " missing — read as a plain table",
+            "A Ledger is its parent CSV and the '.schema.json' file the Ledger tab made "
+            "beside it. Put that file back beside the CSV, or press Create / extend parent "
+            "CSV in the Ledger tab with its template to make it again; then ⟳ Rebuild graph.")
     if docs["unreadable"] and not docs["read"]:
         why("all_unreadable", "none of the documents could be read",
             "The rebuild's line and Connections › Spreadsheets… say why for each: a reader "
             "package that is not installed, a password, Excel not available on this PC.")
-    elif led["unreadable"] or led["not_there"]:
-        k = led["unreadable"] + led["not_there"]
+    elif led["unreadable"]:
+        k = led["unreadable"]
         why("ledger_unreadable", f"{ledgers(k)} could not be read — Connections › "
             "Spreadsheets… says why",
-            "Connections › Spreadsheets… lists it under Not read, with why. A Ledger that is "
-            "not there now was moved, or its drive is unplugged: put it back, or create it "
-            "again in the Ledger tab.")
+            f"Connections › Spreadsheets… lists {'it' if k == 1 else 'them'} under Not read, "
+            "with why.")
+    if not led["known"] and n_docs:
+        # The tester's case (user, 2026-10-20): a Ledger made with an earlier
+        # build is not added until it is picked, applied or rebuilt in the
+        # Ledger tab, and with other documents in data_in nothing said so -
+        # 'no field rules ticked' came first. Above the field rules: a
+        # Ledger needs none.
+        why("no_ledger", "no Ledger is known to the graph — if you made one, pick its "
+            "parent CSV in the Ledger tab",
+            "A Ledger made with an earlier Council is not added to the graph by itself. In "
+            "the Ledger tab, pick its parent CSV (Parent CSV › Browse…): that adds it, as "
+            "Apply and Rebuild knowledge graph there do. Then ⟳ Rebuild graph here. If you "
+            "do not use the Ledger, this is not the reason.")
     if d["initials_waiting"]:
         k = d["initials_waiting"]
         why("initials_unnamed", ("an inspector's initials have" if k == 1 else
@@ -943,7 +979,9 @@ def why_no_links_text(d: Dict[str, Any]) -> str:
         line = f"  Ledgers (parent CSVs): {led['known']} known to the graph, {led['read']} read"
         bad = [f"{led[k]} {w}" for k, w in (("waiting", "waiting for a rebuild"),
                                             ("unreadable", "not readable"),
-                                            ("not_there", "not there now")) if led[k]]
+                                            ("not_there", "not there now"),
+                                            ("not_ledger", "read as a plain table: no "
+                                                           "schema file")) if led[k]]
         out.append(line + (f" ({', '.join(bad)})" if bad else ""))
         if led["read"]:
             out.append(f"    {_plural(led['rows'], 'row')}, {_plural(led['parts'], 'part')}, "
@@ -959,8 +997,8 @@ def why_no_links_text(d: Dict[str, Any]) -> str:
             out.append(line)
     else:
         out.append("  Ledgers (parent CSVs): none known to the graph. A Ledger is added when "
-                   "it is created or applied in the Ledger tab (or by its Rebuild knowledge "
-                   "graph).")
+                   "it is picked, created or applied in the Ledger tab (or by its Rebuild "
+                   "knowledge graph).")
     out.append(f"  Inspector initials waiting for a name: {d['initials_waiting']}")
     out.append(f"  Field rules: {rules['confirmed']} ticked, {rules['proposed']} proposed "
                "(a proposed rule is not read until it is ticked)")
@@ -1974,6 +2012,21 @@ class KnowledgeGraph:
             if st == "proposed":
                 self.set_rule_status(r.label, "confirmed")
 
+    def confirm_rules(self, labels: Iterable[str]) -> List[str]:
+        """Tick these field rules - the ones still proposed - in ONE
+        transaction: all of them, or none when the store is busy. One commit
+        per rule left some ticked and the rest not when the store was held
+        elsewhere (review, 2026-10-20). Returns the labels ticked."""
+        want = list(dict.fromkeys(str(x) for x in labels))
+        current = {r.label: s for r, s in self.field_rules()}
+        ticked = [x for x in want if current.get(x) == "proposed"]
+        with self.db:
+            for label in ticked:
+                self.db.execute("UPDATE field_rules SET status='confirmed' WHERE label=?",
+                                (label,))
+                self._decide("field_rule", {"label": label, "status": "confirmed"})
+        return ticked
+
     def add_label_synonym(self, label: str, means: str) -> FieldRule:
         """The user confirmed that ``label`` (e.g. 'POC') means the existing
         rule ``means`` ('Point of Contact'). Stored confirmed."""
@@ -2688,13 +2741,17 @@ class KnowledgeGraph:
         # ticked yet (a first run: raw workbooks gave 1 link with every rule
         # proposed, and 25 once ticked - user, 2026-10-20): the proposed rules
         # the documents use, for the Connections tab to offer to tick. Never
-        # fails the rebuild: it only explains it.
+        # fails the rebuild: it only explains it. With links and no rule
+        # ticked, only when something besides a Ledger was read: a Ledger
+        # needs no rule, and a Ledger-only vault paid ~1 s per rebuild for an
+        # offer it never needs (review, 2026-10-20).
         links = int(rels.get("seeded") or 0) + int(rels.get("accepted") or 0)
-        if not links or not stats.get("rules"):
+        others = int(stats.get("workbooks") or 0) + int(stats.get("documents_other") or 0)
+        if not links or (not stats.get("rules") and others):
             prog.update("working out why there are no links" if not links else
                         "looking for the field labels your documents use", force=True)
             try:
-                why = self.why_no_links(stats)
+                why = self.why_no_links(stats, keep_labels=True)
             except Exception:
                 why = None
             if why is not None:
@@ -4489,7 +4546,8 @@ class KnowledgeGraph:
                 "last_run": last["finished_ts"] if last else None}
 
     # ── why no links ──
-    def why_no_links(self, stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def why_no_links(self, stats: Optional[Dict[str, Any]] = None, *,
+                     keep_labels: bool = False) -> Dict[str, Any]:
         """Why the graph has no links - or not more of them - as plain
         facts, and the most likely reason first with what to do about it.
 
@@ -4508,7 +4566,11 @@ class KnowledgeGraph:
         status), documents, ledgers, initials_waiting, questions, rules
         (confirmed, proposed, proposed_seen, confirmed_seen), reasons
         ([{code, short, todo}], most likely first), reason (the first, or
-        None) and text."""
+        None) and text.
+
+        ``keep_labels``: keep the labels the documents use in the store for
+        the next ask of this same graph (_labels_seen) - the rebuild's own
+        call, which holds the store; a 'Why no links?' only reads them."""
         import field_search as fs
         import sample_ledger as sl
         from council_core import kg_excel
@@ -4525,10 +4587,13 @@ class KnowledgeGraph:
                                            or unreadable_breakdown(stats.get("unreadable")
                                                                    or []))}
         led: Dict[str, Any] = {"known": 0, "read": 0, "waiting": 0, "unreadable": 0,
-                               "not_there": 0, "rows": 0, "parts": 0, "people": 0,
-                               "person_columns": [], "reading_columns": 0, "empty": 0,
-                               "no_inspectors": 0, "no_signers": 0}
+                               "not_there": 0, "not_ledger": 0, "rows": 0, "parts": 0,
+                               "people": 0, "person_columns": [], "reading_columns": 0,
+                               "empty": 0, "no_inspectors": 0, "no_signers": 0}
         known = set()
+        #: The CSVs in added folders that were read, but not as a Ledger: an
+        #: added Ledger among them lost its schema file.
+        plain = set()
         for d in q(f"SELECT d.path, d.status, {_HEAD_SQL} AS records FROM documents d"
                    " LEFT JOIN doc_cache c ON c.document_id=d.id"
                    " WHERE d.status != 'missing'").fetchall():
@@ -4547,6 +4612,8 @@ class KnowledgeGraph:
                 continue
             if kind != "ledger":
                 docs["text"] += 1
+                if d["path"].lower().endswith(".csv") and self._EXTRA_RE.match(d["path"]):
+                    plain.add(_real(self.abs_path(d["path"])))
                 continue
             docs["ledgers"] += 1
             known.add(_real(self.abs_path(d["path"])))
@@ -4569,21 +4636,25 @@ class KnowledgeGraph:
             elif pcols and not summary.get("people"):
                 led["no_signers"] += 1
         # The Ledgers the Ledger tab added (add_ledger) that no rebuild has
-        # read yet, or that are not there now.
+        # read yet, that are not there now, or that the last rebuild read as
+        # a plain table (their schema file went: a rebuild never makes them
+        # a Ledger again - review, 2026-10-20).
         for r in self.extra_roots():
             for f in r["files"] or []:
                 p = Path(r["path"]) / f
-                if _real(p) in known:
+                real = _real(p)
+                if real in known:
                     continue
-                known.add(_real(p))
-                led["waiting" if p.is_file() else "not_there"] += 1
+                known.add(real)
+                led["not_ledger" if real in plain else
+                    "waiting" if p.is_file() else "not_there"] += 1
         led["known"] = len(known)
         initials = q("SELECT COUNT(DISTINCT surface) FROM review WHERE kind='initials'"
                      " AND status='open'").fetchone()[0]
         confirmed = [r for r, _s in self.field_rules("confirmed")]
         proposed = [r for r, _s in self.field_rules("proposed")]
-        seen = self._labels_seen({fs._norm_key(r.label) for r in confirmed + proposed}) \
-            if last is not None else set()
+        seen = self._labels_seen({fs._norm_key(r.label) for r in confirmed + proposed},
+                                 keep=keep_labels) if last is not None else set()
         rules = {"confirmed": len(confirmed), "proposed": len(proposed),
                  "proposed_seen": [r.label for r in proposed
                                    if fs._norm_key(r.label) in seen],
@@ -4600,14 +4671,48 @@ class KnowledgeGraph:
         out["text"] = why_no_links_text(out)
         return out
 
-    def _labels_seen(self, want: Collection[str] = (), max_lines: int = 200_000) -> set:
+    #: meta key: the last _labels_seen answer, as JSON {"key", "seen"}.
+    LABELS_SEEN_KEY = "labels_seen"
+
+    def _labels_seen(self, want: Collection[str] = (), max_lines: int = 200_000,
+                     keep: bool = False) -> set:
         """The labels the documents use (column headers, 'Label:' keys,
         a table's header cells), folded as field_search compares them -
         from the last rebuild's cache: a workbook's and a Ledger's labels
         (not the Ledger's own ID / item / bookkeeping columns), a text
         document's lines; a CSV's header row is read from the file (its
         first 64 KB only). Stops once every label in ``want`` is seen, and
-        reads at most ``max_lines`` text lines in all."""
+        reads at most ``max_lines`` text lines in all.
+
+        The answer for this graph (its graph_sig: every document's content
+        and reading, and the rules) and this ``want`` is kept in the store
+        when ``keep`` (the rebuild's call) and given again without reading:
+        an unchanged rebuild of 1,800 documents spent a third of its 3.2 s
+        here (review, 2026-10-20)."""
+        sig = self.meta("graph_sig")
+        key = hashlib.sha256(json.dumps([sig, sorted(want), max_lines]).encode(
+            "utf-8")).hexdigest() if sig else None
+        if key is not None:
+            try:
+                kept = json.loads(self.meta(self.LABELS_SEEN_KEY) or "{}")
+            except ValueError:
+                kept = {}
+            if isinstance(kept, dict) and kept.get("key") == key:
+                return set(kept.get("seen") or [])
+        seen = self._scan_labels(want, max_lines)
+        if keep and key is not None:
+            try:
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                                    (self.LABELS_SEEN_KEY,
+                                     json.dumps({"key": key, "seen": sorted(seen)},
+                                                ensure_ascii=False)))
+            except sqlite3.Error:
+                pass                     # only a shortcut: read again next time
+        return seen
+
+    def _scan_labels(self, want: Collection[str], max_lines: int) -> set:
+        """_labels_seen's reading, uncached."""
         import field_search as fs
         import sample_ledger as sl
         want, seen, left = set(want), set(), max_lines
