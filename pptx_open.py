@@ -66,8 +66,10 @@ class TextShape:
     lines: List[str]
     box: Box
     title: bool = False
-    colour: str = ""
+    colour: str = ""              # its fill
     colours: List[str] = field(default_factory=list)      # per line (a highlighted run)
+    outline: str = ""             # its line's colour
+    groups: Tuple[int, ...] = ()  # the groups it is in, outermost first
 
 
 @dataclass
@@ -76,7 +78,21 @@ class TableShape:
     fills: Dict[Tuple[int, int], str]
     box: Box
     name: str = ""
+    borders: set = field(default_factory=set)              # its cells' border colours
+    groups: Tuple[int, ...] = ()
 
+    @property
+    def marks(self) -> set:
+        """The colours a text box may share with it to say it belongs to it."""
+        return set(self.fills.values()) | set(self.borders)
+
+
+#: how a text box was paired with its table(s)
+BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY = "group", "colour", "title", "only table"
+BY_PLACE, BY_SLIDE = "place", "slide"
+#: the pairings that are the user's own (a group, a shared colour) or not a
+#: guess at all; any other pairing on a slide of several tables is a guess
+SURE_PAIRINGS = (BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY)
 
 @dataclass
 class PictureShape:
@@ -93,6 +109,22 @@ class SlideSheet:
     cells: Dict[Tuple[int, int], str]
     colours: Dict[Tuple[int, int], str] = field(default_factory=dict)
     slide: int = 0
+    #: lines put above this table only by where they sit on the slide (one
+    #: table of several): (row, col) -> why ("nearest to it")
+    guessed: Dict[Tuple[int, int], str] = field(default_factory=dict)
+
+    @property
+    def place_note(self) -> str:
+        """Said on every value of a table whose text was paired by place."""
+        if not self.guessed:
+            return ""
+        texts = ", ".join(f"'{self.cells[k]}'" for k in sorted(self.guessed)[:3])
+        return f"{texts} {PLACE_NOTE}"
+
+
+#: on a value whose table's heading or signer came from where a text box sits
+PLACE_NOTE = ("was matched to this table by its place on the slide: group the text box "
+              "with its table in PowerPoint (or give them the same colour) to say so")
 
 
 @dataclass
@@ -105,10 +137,36 @@ class SlidePicture:
 
 
 @dataclass
+class Pairing:
+    slide: int
+    text: str                     # the text box's first line
+    tables: List[str]             # the sheets it went above; [] = the whole slide's
+    how: str                      # BY_*
+
+    @property
+    def guessed(self) -> bool:
+        return self.how not in SURE_PAIRINGS
+
+    def describe(self) -> str:
+        to = ", ".join(self.tables) if self.tables else "every table on the slide"
+        why = {BY_GROUP: "grouped with it", BY_COLOUR: "the same colour",
+               BY_TITLE: "the slide's title", BY_ONLY: "the slide's only table",
+               BY_PLACE: "nearest to it — a guess", BY_SLIDE: "over or away from the "
+               "tables — a guess"}.get(self.how, self.how)
+        return f"Slide {self.slide}: '{self.text}' → {to} ({why})"
+
+
+@dataclass
 class Deck:
     sheets: List[SlideSheet] = field(default_factory=list)
     pictures: List[SlidePicture] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    pairings: List[Pairing] = field(default_factory=list)
+
+    def guesses(self, name: str = "") -> List[str]:
+        """Lines for the log: each text box paired with a table by place."""
+        return [f"{name + ' › ' if name else ''}{p.describe()}: group them (or colour "
+                "them alike) to say so" for p in self.pairings if p.guessed]
 
 
 class PptxError(Exception):
@@ -233,6 +291,7 @@ def _split_joined(lines: List[str], colours: List[str]) -> Tuple[List[str], List
 def _table(tbl: ET.Element, box: Box, theme) -> TableShape:
     rows: List[List[str]] = []
     fills: Dict[Tuple[int, int], str] = {}
+    borders: set = set()
     n = 0
     for i, tr in enumerate(tbl.findall("a:tr", NS)):
         row: List[str] = []
@@ -249,18 +308,26 @@ def _table(tbl: ET.Element, box: Box, theme) -> TableShape:
             k = _colour(pr.find("a:solidFill", NS), theme) if pr is not None else ""
             if k:
                 fills[(i, j)] = k
+            if pr is not None:
+                for side in ("lnL", "lnR", "lnT", "lnB"):
+                    ln = pr.find(f"a:{side}", NS)
+                    b = _colour(ln.find("a:solidFill", NS), theme) if ln is not None else ""
+                    if b and b != "000000":
+                        borders.add(b)
         rows.append(row)
-    return TableShape(rows, fills, box)
+    return TableShape(rows, fills, box, borders=borders)
 
 
 def _shapes(tree: ET.Element, z: zipfile.ZipFile, rels: Dict[str, str], theme,
-            notes: List[str], label: str, scale=(0, 0, 1.0, 1.0, 0, 0)):
+            notes: List[str], label: str, scale=(0, 0, 1.0, 1.0, 0, 0),
+            groups: Tuple[int, ...] = (), counter: Optional[List[int]] = None):
     """Text boxes, tables and pictures of a shape tree, groups flattened
     (their children placed on the slide)."""
     texts: List[TextShape] = []
     tables: List[TableShape] = []
     pics: List[PictureShape] = []
     ox, oy, sx, sy, cx0, cy0 = scale
+    counter = counter if counter is not None else [0]
 
     def place(b: Box) -> Box:
         if not b.known:
@@ -279,9 +346,11 @@ def _shapes(tree: ET.Element, z: zipfile.ZipFile, rels: Dict[str, str], theme,
             title = ph is not None and ph.get("type") in ("title", "ctrTitle")
             sppr = node.find("p:spPr", NS)
             fill = _colour(sppr.find("a:solidFill", NS), theme) if sppr is not None else ""
+            ln = sppr.find("a:ln", NS) if sppr is not None else None
+            outline = _colour(ln.find("a:solidFill", NS), theme) if ln is not None else ""
             texts.append(TextShape(lines, place(_xfrm(sppr.find("a:xfrm", NS)
                                                       if sppr is not None else None)),
-                                   title, fill, cols))
+                                   title, fill, cols, outline, groups))
         elif tag == "graphicFrame":
             data = node.find("a:graphic/a:graphicData", NS)
             box = place(_xfrm(node.find("p:xfrm", NS)))
@@ -292,6 +361,7 @@ def _shapes(tree: ET.Element, z: zipfile.ZipFile, rels: Dict[str, str], theme,
                 tbl = data.find("a:tbl", NS)
                 if tbl is not None:
                     t = _table(tbl, box, theme)
+                    t.groups = groups
                     name = node.find("p:nvGraphicFramePr/p:cNvPr", NS)
                     t.name = name.get("name", "") if name is not None else ""
                     tables.append(t)
@@ -324,7 +394,9 @@ def _shapes(tree: ET.Element, z: zipfile.ZipFile, rels: Dict[str, str], theme,
                                   int(ext.get("cx", 0)), int(ext.get("cy", 0)), True))
                     inner = (o.x, o.y, o.w / gw, o.h / gh, int(coff.get("x", 0)),
                              int(coff.get("y", 0)))
-            t2, tb2, p2 = _shapes(node, z, rels, theme, notes, label, inner)
+            counter[0] += 1
+            t2, tb2, p2 = _shapes(node, z, rels, theme, notes, label, inner,
+                                  groups + (counter[0],), counter)
             texts += t2
             tables += tb2
             pics += p2
@@ -341,25 +413,44 @@ def _distance(t: Box, b: Box) -> float:
     return dx + dy
 
 
-def _owners(text: TextShape, tables: List[TableShape], slide_h: int) -> List[int]:
-    """The tables a text box belongs to: [] for the slide's own text (its
-    title, text far from every table, text over several tables)."""
-    if text.title or not text.box.known or not tables:
-        return []
+def _owners(text: TextShape, tables: List[TableShape], slide_h: int
+            ) -> Tuple[List[int], str]:
+    """The tables a text box belongs to, and how that was told ([] = the
+    whole slide's). The user's own say first: a text box GROUPED with tables
+    belongs to them; one filled or outlined in a colour a table has (a cell's
+    fill or border) belongs to it. Then the title, the only table, and last
+    where it sits: nearest, above and to the left first - a guess."""
+    if text.title:
+        return [], BY_TITLE
+    if not tables:
+        return [], BY_SLIDE
+    for g in reversed(text.groups):                       # the innermost group first
+        mine = [i for i, t in enumerate(tables) if g in t.groups]
+        if mine:
+            return mine, BY_GROUP
+    marks = {k for k in (text.colour, text.outline) if k} | {k for k in text.colours if k}
+    if marks:
+        mine = [i for i, t in enumerate(tables) if marks & t.marks]
+        if mine:
+            return mine, BY_COLOUR
+    if len(tables) == 1:
+        return [0], BY_ONLY
+    if not text.box.known:
+        return [], BY_SLIDE
     known = [i for i, t in enumerate(tables) if t.box.known]
     if not known:
-        return []
+        return [], BY_SLIDE
     # over several tables side by side: the whole slide's
     above = [i for i in known if text.box.y + text.box.h <= tables[i].box.y + 1]
     spans = [i for i in above if text.box.x <= tables[i].box.x + tables[i].box.w / 2
              <= text.box.x + text.box.w]
     if len(spans) >= 2 and len({tables[i].box.y // max(1, slide_h // 20) for i in spans}) == 1:
-        return []
+        return [], BY_SLIDE
     dist = {i: _distance(text.box, tables[i].box) for i in known}
     best = min(dist, key=dist.get)
     if dist[best] > FAR * max(slide_h, 1):
-        return []
-    return [best]
+        return [], BY_SLIDE
+    return [best], BY_PLACE
 
 
 def _slide_size(z: zipfile.ZipFile) -> Tuple[int, int]:
@@ -418,17 +509,24 @@ def read_pptx(path, want_pictures: bool = True) -> Deck:
             tables.sort(key=lambda t: (t.box.y, t.box.x))
             owned: Dict[int, List[TextShape]] = {}
             slide_wide: List[TextShape] = []
+            how: Dict[int, str] = {}                       # id(text) -> how it was paired
+            names = [label if len(tables) == 1 else f"{label} table {i + 1}"
+                     for i in range(len(tables))]
             for t in texts:
-                own = _owners(t, tables, slide_h)
+                own, h = _owners(t, tables, slide_h)
+                how[id(t)] = h
                 if not own:
                     slide_wide.append(t)
                 for i in own:
                     owned.setdefault(i, []).append(t)
+                if tables:
+                    deck.pairings.append(Pairing(n, t.lines[0][:60], [names[i] for i in own],
+                                                 h))
             if not tables and slide_wide:
-                deck.sheets.append(_lay_out(label, slide_wide, [], None, n))
+                deck.sheets.append(_lay_out(label, slide_wide, [], None, n, how))
             for i, table in enumerate(tables):
-                name = label if len(tables) == 1 else f"{label} table {i + 1}"
-                deck.sheets.append(_lay_out(name, slide_wide, owned.get(i, []), table, n))
+                deck.sheets.append(_lay_out(names[i], slide_wide, owned.get(i, []), table, n,
+                                            how))
             if want_pictures:
                 title = next((" ".join(t.lines) for t in texts if t.title), "")
                 for k, pic in enumerate(pics, start=1):
@@ -450,16 +548,21 @@ def _nearest_text(box: Box, texts: List[TextShape], slide_h: int) -> str:
 
 
 def _lay_out(name: str, slide_wide: List[TextShape], owned: List[TextShape],
-             table: Optional[TableShape], slide: int) -> SlideSheet:
+             table: Optional[TableShape], slide: int,
+             how: Optional[Dict[int, str]] = None) -> SlideSheet:
     cells: Dict[Tuple[int, int], str] = {}
     colours: Dict[Tuple[int, int], str] = {}
+    guessed: Dict[Tuple[int, int], str] = {}
     r = 1
     for t in slide_wide + owned:
+        h = (how or {}).get(id(t), "")
         for line, hl in zip(t.lines, t.colours or [""] * len(t.lines)):
             cells[(r, 1)] = line
             k = hl or t.colour
             if k:
                 colours[(r, 1)] = k
+            if table is not None and h not in SURE_PAIRINGS and h:
+                guessed[(r, 1)] = h
             r += 1
     if table is not None:
         if r > 1:
@@ -471,4 +574,4 @@ def _lay_out(name: str, slide_wide: List[TextShape], owned: List[TextShape],
                 k = table.fills.get((i, j))
                 if k:
                     colours[(r + i, 1 + j)] = k
-    return SlideSheet(name, cells, colours, slide)
+    return SlideSheet(name, cells, colours, slide, guessed)

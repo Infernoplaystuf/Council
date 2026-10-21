@@ -71,7 +71,7 @@ Chat = Callable[[str, Dict[str, Any]], Tuple[str, str]]
 
 RECIPE_VERSION = 1
 #: bump when what a cached file holds changes: older caches are read again
-READER_VERSION = 2
+READER_VERSION = 3
 #: the parent CSV's columns after the fields (before source_file, updated_at)
 SHEET_COL, ROW_COL, TABLE_COL = "source_sheet", "source_row", "source_table"
 
@@ -509,6 +509,8 @@ class SheetData:
     cells: Dict[Tuple[int, int], Any]
     colours: Dict[Tuple[int, int], str] = field(default_factory=dict)
     order: int = 0                # the sheet's place in its workbook
+    #: a slide's text put over its table only by where it sits: cell -> how
+    guessed: Dict[Tuple[int, int], str] = field(default_factory=dict)
 
 
 def read_book(path, notes: Optional[List[str]] = None) -> List[SheetData]:
@@ -553,8 +555,10 @@ def _read_pptx(path: Path, notes: Optional[List[str]]) -> List[SheetData]:
         raise LedgerError(str(e)) from e
     if notes is not None:
         notes.extend(deck.notes)
+        notes.extend(deck.guesses(path.name))
     return [SheetData(path.name, str(path), s.name, {k: _num(v) for k, v in s.cells.items()},
-                      dict(s.colours), order=i) for i, s in enumerate(deck.sheets)]
+                      dict(s.colours), order=i, guessed=dict(s.guessed))
+            for i, s in enumerate(deck.sheets)]
 
 
 def _read_csv(path: Path) -> List[SheetData]:
@@ -688,7 +692,9 @@ class BookCache:
             return [SheetData(path.name, str(path), s["name"],
                               {(r, c): v for r, c, v in s["cells"]},
                               {(r, c): k2 for r, c, k2 in s.get("colours", [])},
-                              order=s.get("order", 0)) for s in data["sheets"]]
+                              order=s.get("order", 0),
+                              guessed={(r, c): h for r, c, h in s.get("guessed", [])})
+                    for s in data["sheets"]]
         except Exception:                                   # noqa: BLE001
             return None
 
@@ -703,7 +709,8 @@ class BookCache:
             data = {"file": str(path), "sheets": [
                 {"name": s.name, "order": s.order,
                  "cells": [[r, c, v] for (r, c), v in s.cells.items()],
-                 "colours": [[r, c, v] for (r, c), v in s.colours.items()]}
+                 "colours": [[r, c, v] for (r, c), v in s.colours.items()],
+                 "guessed": [[r, c, v] for (r, c), v in s.guessed.items()]}
                 for s in sheets]}
             tmp = self.folder / f"{k}.tmp"
             tmp.write_bytes(gzip.compress(json.dumps(data, default=str).encode("utf-8"), 5))
@@ -1681,7 +1688,8 @@ def _distance(r: int, c: int, box: Tuple[int, int, int, int]) -> int:
 
 
 def _label_for(hits: List[Tuple[Any, int, int, str]], box: Tuple[int, int, int, int],
-               boxes: Sequence[Tuple[int, int, int, int]]) -> Optional[Tuple[Any, str]]:
+               boxes: Sequence[Tuple[int, int, int, int]]
+               ) -> Optional[Tuple[Any, str, Tuple[int, int]]]:
     """The labelled value that belongs to this table: one label on the sheet
     belongs to every table on it ('Inspector: MK' over the whole sheet); of
     several (a grid of tables, each with its own), the one nearest this
@@ -1689,11 +1697,11 @@ def _label_for(hits: List[Tuple[Any, int, int, str]], box: Tuple[int, int, int, 
     if not hits:
         return None
     if len(hits) == 1:
-        return hits[0][0], hits[0][3]
+        return hits[0][0], hits[0][3], (hits[0][1], hits[0][2])
     mine = [h for h in hits
             if _distance(h[1], h[2], box) <= min(_distance(h[1], h[2], b) for b in boxes)]
     pick = min(mine or hits, key=lambda h: _distance(h[1], h[2], box))
-    return pick[0], pick[3]
+    return pick[0], pick[3], (pick[1], pick[2])
 
 
 # ── the model ───────────────────────────────────────────────────────────
@@ -2163,7 +2171,7 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
     mapped = {m.field: m for m in u.maps}
     # per sheet: the labelled values beside the table (form fields, and
     # fields this table has no column for)
-    near: Dict[str, Tuple[Any, str]] = {}
+    near: Dict[str, Tuple[Any, str, Tuple[int, int]]] = {}
     skip = set()
     if sheet is not None:
         for other in tables_here:
@@ -2200,9 +2208,18 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
             elif check:
                 run.decisions[check].records += 1
             rec.values[m.field] = Val(v, m.how, where0 + t.where(i, m.j), m.note, check)
-        for fname, (v, at) in near.items():
+        for fname, (v, at, cell) in near.items():
+            check = ""
+            if sheet is not None and cell in sheet.guessed:
+                # a slide's text box put over this table by where it sits
+                check = run.decide(Decision(
+                    f"P|{t.file}|{t.sheet}|{fname}", "place", fname,
+                    f"'{cell_text(sheet.cells.get(cell))}' was matched to {t.sheet}'s table "
+                    "by its place on the slide; group the text box with its table in "
+                    "PowerPoint (or give them the same colour) to say so",
+                    cell_text(v)))
             rec.values[fname] = Val(v, "label", f"{where0}{at}",
-                                    "the value beside its label on the sheet")
+                                    "the value beside its label on the sheet", check)
         for f in tt.all_fields:
             rule = recipe.sources.get(f.name)
             if not rule or f.formula:
@@ -2839,7 +2856,25 @@ def teach(csv_path, workbooks: Sequence, progress=None, cancel=None) -> str:
         raise LedgerError("no sample workbook to teach from")
     with Progress("ledger teach", listener=progress) as prog:
         run = extract(csv_path, files, progress=prog, cancel=cancel)
-    return describe_run(run)
+    return describe_run(run) + _pairings_text(files)
+
+
+def _pairings_text(files: Sequence[Path]) -> str:
+    """Which text box went with which table on each slide of the decks, and
+    how that was told, for the user to check (and fix by grouping)."""
+    import pptx_open
+    out: List[str] = []
+    for f in files:
+        if Path(f).suffix.lower() not in pptx_open.SUFFIXES:
+            continue
+        try:
+            deck = pptx_open.read_pptx(f, want_pictures=False)
+        except pptx_open.PptxError:
+            continue
+        if deck.pairings:
+            out.append(f"Text boxes and tables in {Path(f).name}:")
+            out += [f"  {p.describe()}" for p in deck.pairings]
+    return ("\n" + "\n".join(out)) if out else ""
 
 
 def describe_run(run: RecordRun, examples: int = 3) -> str:

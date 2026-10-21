@@ -242,3 +242,146 @@ def test_a_deck_of_record_tables_with_a_label_per_slide(tmp_path):
                    ("Woopentide", "Woop #1", 4000)]
     assert all(r.accept == "Y" for r in run.records)
     assert lr.load_recipe(csv).aliases["hp"] == "Health"
+
+
+# ── telling which text goes with which table (user, 2026-10-21) ─────────
+def group_with(slide, *shapes):
+    """Group shapes already on the slide (python-pptx adds no table to a
+    group, so the elements are moved in, as PowerPoint's Group does)."""
+    grp = slide.shapes.add_group_shape()
+    for sh in shapes:
+        grp._element.append(sh._element)
+    grp._element.recalculate_extents()
+    return grp
+
+
+def nde_slide(prs, annotate=None):
+    """Two NDE tables side by side, each with its operator's text box."""
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "NDE"
+    for k, (who, base) in enumerate((("TS", 60), ("AL", 70))):
+        tb = textbox(s, 0.3 + 4.8 * k, 1.3, 4.4, 0.4,
+                     f"Eddy Current Response (%FSH) — Operator: {who}")
+        frame = s.shapes.add_table(3, 4, Inches(0.3 + 4.8 * k), Inches(1.8), Inches(4.4),
+                                   Inches(0.9))
+        rows = [["Flaw", "1A", "2A", "3A"], ["Pre-Conceal"] + [base + i for i in range(3)],
+                ["Post-Conceal"] + [base - 40 + i for i in range(3)]]
+        for i, row in enumerate(rows):
+            for j, v in enumerate(row):
+                frame.table.cell(i, j).text = str(v)
+        if annotate == "group":
+            group_with(s, tb, frame)
+        elif annotate == "colour":
+            rgb = RGBColor(0xFF, 0xC0, 0x00) if k == 0 else RGBColor(0x00, 0xB0, 0xF0)
+            tb.fill.solid()
+            tb.fill.fore_color.rgb = rgb
+            frame.table.cell(0, 0).fill.solid()
+            frame.table.cell(0, 0).fill.fore_color.rgb = rgb
+    return s
+
+
+def nde_deck(path, annotate=None):
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Part 101"
+    textbox(s, 1, 2, 4, 1, "P/N: 101")
+    nde_slide(prs, annotate)
+    prs.save(path)
+    return path
+
+
+@pytest.mark.parametrize("annotate,how", [(None, pptx_open.BY_PLACE),
+                                          ("group", pptx_open.BY_GROUP),
+                                          ("colour", pptx_open.BY_COLOUR)])
+def test_a_group_or_a_shared_colour_says_which_table(tmp_path, annotate, how):
+    deck = pptx_open.read_pptx(nde_deck(tmp_path / "d.pptx", annotate))
+    ops = [p for p in deck.pairings if p.text.startswith("Eddy")]
+    assert [(p.tables, p.how) for p in ops] == [(["Slide 2 table 1"], how),
+                                                (["Slide 2 table 2"], how)]
+    t1, t2 = [s for s in deck.sheets if s.name.startswith("Slide 2")]
+    assert "Operator: TS" in lines_of(t1) and "Operator: AL" not in lines_of(t1)
+    assert bool(t1.guessed) == (annotate is None)
+    assert bool(deck.guesses()) == (annotate is None)
+
+
+def nde_values(tmp_path, annotate):
+    src = tmp_path / "src"
+    src.mkdir()
+    nde_deck(src / "part101.pptx", annotate)
+    tpl = make_template(tmp_path / "LMM Template.xlsx")
+    csv = Path(li.create_parent(tpl, tmp_path / "lmm.csv").csv)
+    ex = li.run_extract(csv, [src], use_images=False)
+    wb = openpyxl.load_workbook(ex.review)
+    # each operator's own copy ('… [TS]'): the one field takes one value, and
+    # two operators who read the same flaws differ there (a clash, as ever)
+    rows = [r for r in wb["Values"].iter_rows(min_row=2, values_only=True)
+            if str(r[3]).startswith("NDE Inspection: Eddy Current Response Pre-Conceal [")]
+    return ex, rows
+
+
+def test_values_paired_only_by_place_wait_for_the_user(tmp_path):
+    ex, rows = nde_values(tmp_path, None)
+    assert {r[4] for r in rows} == {"60", "61", "62", "70", "71", "72"}
+    assert {r[12] for r in rows} == {"TS", "AL"}             # each table its own signer
+    assert all(r[0] is None for r in rows)                  # amber: paired by place
+    assert all("its place on the slide" in (r[10] or "") for r in rows)
+    assert any("'Eddy Current Response (%FSH)' → Slide 2 table 1 (nearest to it — a guess)"
+               in p for p in ex.problems)
+
+
+def test_grouped_text_and_tables_are_pre_accepted(tmp_path):
+    ex, rows = nde_values(tmp_path, "group")
+    assert {r[12] for r in rows} == {"TS", "AL"}
+    assert all(r[0] == "Y" for r in rows)
+    assert not any("a guess" in p for p in ex.problems)
+
+
+def test_the_table_ledger_asks_once_per_slide(tmp_path):
+    from openpyxl.styles import Border, Side
+    wb = openpyxl.Workbook()
+    for c, f in enumerate(["Tame", "Name", "Health"], start=1):
+        wb.active.cell(1, c, f)
+        wb.active.cell(2, c).border = Border(bottom=Side(style="thin"))
+    tpl = tmp_path / "T.xlsx"
+    wb.save(tpl)
+    csv = tmp_path / "T.csv"
+    lr.create_ledger(tpl, csv)
+    for annotate in (None, "group"):
+        prs = Presentation()
+        s = prs.slides.add_slide(prs.slide_layouts[6])
+        for k, tame in enumerate(("Spider", "Woop")):
+            tb = textbox(s, 0.3 + 4.8 * k, 0.8, 4, 0.4, f"Tame: {tame}")
+            frame = s.shapes.add_table(3, 2, Inches(0.3 + 4.8 * k), Inches(1.4), Inches(4),
+                                       Inches(0.9))
+            for i, row in enumerate([["Name", "Health"], [f"{tame} 1", 1], [f"{tame} 2", 2]]):
+                for j, v in enumerate(row):
+                    frame.table.cell(i, j).text = str(v)
+            if annotate:
+                group_with(s, tb, frame)
+        deck = tmp_path / f"{annotate}.pptx"
+        prs.save(deck)
+        run = lr.extract(csv, [deck])
+        tames = {r.values["Name"].value: r.values["Tame"].value for r in run.records}
+        assert tames == {"Spider 1": "Spider", "Spider 2": "Spider", "Woop 1": "Woop",
+                         "Woop 2": "Woop"}
+        if annotate:
+            assert all(r.accept == "Y" for r in run.records) and not run.decisions
+        else:
+            assert sorted(run.decisions) == ["P|None.pptx|Slide 1 table 1|Tame",
+                                             "P|None.pptx|Slide 1 table 2|Tame"]
+            assert all(r.accept == "" for r in run.records)
+
+
+def test_teach_lists_the_pairings_of_each_slide(tmp_path):
+    from openpyxl.styles import Border, Side
+    wb = openpyxl.Workbook()
+    for c, f in enumerate(["Name", "Health"], start=1):
+        wb.active.cell(1, c, f)
+        wb.active.cell(2, c).border = Border(bottom=Side(style="thin"))
+    tpl = tmp_path / "T.xlsx"
+    wb.save(tpl)
+    csv = tmp_path / "T.csv"
+    lr.create_ledger(tpl, csv)
+    text = lr.teach(csv, [nde_deck(tmp_path / "d.pptx", "colour")])
+    assert "Text boxes and tables in d.pptx:" in text
+    assert "→ Slide 2 table 1 (the same colour)" in text

@@ -135,6 +135,26 @@ dependency). Folder scans now include decks, and the tab's file picker offers th
   runs are colours, so the highlighter works in PowerPoint too.
 - **Old .ppt files** are refused with "save it as .pptx".
 
+**Which text goes with which table.** Pairings are decided in this order (`pptx_open._owners`):
+
+1. The slide's title belongs to every table on the slide.
+2. A text box **grouped** with tables (PowerPoint's Group) belongs to them.
+3. A text box **filled or outlined in a colour a table has** (a cell's fill or
+   border) belongs to that table.
+4. On a slide with a single table, text belongs to that table.
+5. Otherwise it goes by **place**, and that is a guess: the nearest table (above
+   and left first). Text over several tables, or far from all of them, goes to
+   the whole slide.
+
+What a guess (rule 5) does:
+- Every value of a table whose heading or signer came from a guess carries a note
+  and is never pre-accepted. In the sample Ledger it is amber with the note. In the
+  table Ledger, the label value waits on one Decisions row per table
+  (`P|file|sheet|field`).
+- The Extract log and the review's Problems list each guess with the fix: "group
+  them (or colour them alike) to say so".
+- Teach in table mode lists every slide's pairings and how each was decided.
+
 **Per-person slots** (`source_extract._Extractor._person_slots`, sample Ledger):
 - **When it applies:** a per-flaw "Result"/"Value" table under a heading that
   names a template section whose fields are numbered person slots ("Visual

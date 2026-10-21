@@ -671,6 +671,7 @@ UNSURE_SIGNER_NOTE = "ends in initials or a unit: who signed it? check it"
 #: The note on a reading of a table beside another that has no label column
 #: of its own: the field is the other table's label, a guess (review,
 #: 2026-10-20).
+_PLACE_NOTE = "matched to this table by its place on the slide"
 _BESIDE_NOTE = "a table beside another, with no labels of its own: which field? check it"
 #: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
 _NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
@@ -816,6 +817,10 @@ class Grid:
     sheet: str
     cells: Dict[Tuple[int, int], object]
     from_image: str = ""             # image file name when read from an image
+    #: a slide's table whose heading or signer was paired with it only by
+    #: where the text box sits (pptx_open): said on each of its values, which
+    #: are then never pre-accepted
+    place_note: str = ""
 
     def __post_init__(self):
         # Text with a control character (read through Excel: '216' +
@@ -1266,7 +1271,9 @@ def _grids_from_pptx(path: Path, notes: Optional[List[str]], want_pictures: bool
         raise LedgerError(str(e)) from e
     if notes is not None:
         notes.extend(deck.notes)
-    grids = [Grid(path.name, s.name, dict(s.cells)) for s in deck.sheets]
+        notes.extend(deck.guesses(path.name))
+    grids = [Grid(path.name, s.name, dict(s.cells), place_note=s.place_note)
+             for s in deck.sheets]
     images = [SourceImage(path.name, p.sheet, p.anchor, p.data, p.fmt)
               for p in deck.pictures]
     return grids, images
@@ -3330,6 +3337,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             o.part_how = o.part_how or ex.part_how
             if o.part != part and mask_strict:       # not the Part you typed
                 o.part_how = _fit_mask(o.part, o.part_how, mask_re)
+        if ex.g.place_note:
+            for o in ex.out:
+                o.note = _join(o.note, ex.g.place_note)
         n = len(ex.out)
         run.obs.extend(ex.out)
         # a label on the ignore list is not one to map: it was listed on
@@ -3450,6 +3460,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   # nor a reading ending in initials no one signs with here
                   # ('49 JB'), nor one of a table with no labels of its own
                   and UNSURE_SIGNER_NOTE not in o.note and _BESIDE_NOTE not in o.note
+                  # nor one of a slide's table whose text was paired with it
+                  # only by where it sits (pptx_open, user 2026-10-21)
+                  and _PLACE_NOTE not in o.note
                   and not o.part_how.startswith(MODEL_PART_HOW)
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
