@@ -29,8 +29,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from council_core import knowledge_graph as kgm
 
@@ -286,7 +285,6 @@ def context(kg: kgm.KnowledgeGraph, question: str, *, hops: int = 2, max_facts: 
             if p not in sources:
                 sources.append(p)
     for chain in paths:
-        a, b = chain[0], chain[-1]
         lines.append("How they connect: " + " → ".join(f"[{f.n}]" for f in chain)
                      + f" ({len(chain)} links)")
     return {"entities": ents, "facts": facts, "paths": paths,
@@ -322,7 +320,7 @@ def gather(vault: Any, question: str, graphs: Optional[Sequence[str]] = None, *,
     out = []
     for gid, name in _graphs(vault, graphs):
         try:
-            with gl.open(gid) as kg:
+            with gl.open(gid, readonly=True) as kg:
                 ctx = context(kg, question, hops=hops, max_facts=max_facts,
                               graph_name=name if gid != kgg.MAIN else "")
         except (kgm.KnowledgeGraphBusy, kgm.KnowledgeGraphDamaged, KeyError, ValueError):

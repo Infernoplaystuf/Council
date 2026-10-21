@@ -145,3 +145,18 @@ def test_a_big_neighbourhood_is_capped(tmp_path):
 ])
 def test_a_link_reads_from_each_end(pred, way, want):
     assert kq.phrase(pred, way) == want
+
+
+def test_asking_only_reads_the_store(vault):
+    """Asked on every Council question: opened read-only - no schema script,
+    no whole-file check, nothing written."""
+    store = kgm.store_path(vault)
+    before = store.read_bytes()
+    assert kq.block(vault, "who is Ngozi Okafor?") is not None
+    assert store.read_bytes() == before
+    with kgm.KnowledgeGraph(vault, readonly=True) as kg:
+        assert kg.search("Ngozi")[0]["name"] == "Ngozi Okafor"
+        with pytest.raises(Exception):
+            kg.db.execute("DELETE FROM entities")
+    with pytest.raises(kgm.KnowledgeGraphDamaged):
+        kgm.KnowledgeGraph(vault / "elsewhere", readonly=True)

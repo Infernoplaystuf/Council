@@ -269,3 +269,12 @@ def test_building_never_changes_the_documents(tmp_path):
         kg.write_exports()
     assert tree() == before
     assert not any(Path(v / "data_in").rglob(".knowledge_graph"))
+
+
+def test_one_thing_named_twice_is_one_entity():
+    text = "Okafor, Ngozi signed it. Later Ngozi Okafor checked it again."
+    raw = {"entities": [{"name": "Okafor, Ngozi", "type": "person"},
+                        {"name": "Ngozi Okafor", "type": "person", "description": "checker"}],
+           "relationships": []}
+    ents, _l, _r = kx.check_open(raw, text, [])
+    assert [(e.name, e.description) for e in ents] == [("Okafor, Ngozi", "checker")]

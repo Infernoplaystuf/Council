@@ -44,6 +44,26 @@ def oracle(calls=None):
     return chat
 
 
+def open_oracle(calls=None):
+    """oracle() for the open, Morphik-like build: the same sentences, given as
+    the entities they name and the relationship between them."""
+    closed = oracle()
+    types = {n: t for _k, (t, n, _a) in kg_corpus.ENTITIES.items()}
+
+    def chat(messages, **kw):
+        links = json.loads(closed(messages))["links"]
+        if calls is not None:
+            calls.append(threading.current_thread().name)
+        ents = {}
+        for l in links:
+            for n in (l["subject"], l["object"]):
+                ents[n] = {"name": n, "type": types.get(n, "CONCEPT")}
+        return json.dumps({"entities": list(ents.values()), "relationships": [
+            {"source": l["subject"], "relation": l["predicate"], "target": l["object"],
+             "quote": l["quote"]} for l in links]})
+    return chat
+
+
 @pytest.fixture
 def kg(tmp_path):
     v = tmp_path / "vault"
@@ -321,3 +341,20 @@ def test_model_links_wait_for_the_user_when_set(kg):
     assert _model_links(kg)[("PRJ-0915", "USES_PART", "BRG-7720")][0] == "seeded"
     # a link labels support too was never only the model's: it stays seeded
     assert [d["action"] for d in kg.decisions()][-2:] == ["model_links", "model_links"]
+
+
+@needs_all
+def test_the_open_build_finds_every_free_text_link_too(kg):
+    """The open, Morphik-like build (extract_from_text) reads every passage;
+    given the same sentences it finds the same free-text links, in the graph
+    at once, cited at their line."""
+    stats = kg.extract_from_text({"this PC": open_oracle()}, model="oracle")
+    assert stats["errors"] == 0
+    got = _model_links(kg)
+    for s, p, o, _f in FREE:
+        key = (NAMES[s], p, NAMES[o])
+        assert key in got and got[key][0] == "seeded", key
+    status, ev = got[("PRJ-0915", "USES_PART", "BRG-7720")]
+    assert ev["path"].endswith("helios_status_2026-03.md") and ev["locator"] == {"line": 11}
+    # every passage was read, not only those naming two known things
+    assert stats["chunks"] >= len(kg.text_chunks())

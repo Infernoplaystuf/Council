@@ -1901,7 +1901,7 @@ class KnowledgeGraph:
 
     def __init__(self, vault: Any, root: Any = None,
                  image_reader: Any = DEFAULT_IMAGE_READER, *, store: Any = None,
-                 scope: Optional[Dict[str, Any]] = None) -> None:
+                 scope: Optional[Dict[str, Any]] = None, readonly: bool = False) -> None:
         self.vault = Path(vault)
         self.root = Path(root) if root is not None else self.vault / "data_in"
         # A named graph (council_core.kg_graphs): its own store, and only the
@@ -1925,6 +1925,9 @@ class KnowledgeGraph:
         #: length. MEASURED (review, 2026-10-16): 560,000 SQLite calls, 18 of
         #: 40 s, for a 20,000-row workbook rebuilt unchanged.
         self._memo: Optional[Dict[str, Any]] = None
+        if readonly:
+            self._open_readonly()
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existed = self.path.exists()
         if existed:
@@ -1977,6 +1980,35 @@ class KnowledgeGraph:
             raise KnowledgeGraphDamaged(
                 f"the knowledge graph store {self.path} could not be read "
                 f"({exc}); it was left untouched") from exc
+
+    def _open_readonly(self) -> None:
+        """For reading only - the Council's answers ask the graph on every
+        question (kg_query): no schema script, no quick_check of the whole
+        file (seconds on a big store, every turn), nothing written. A store
+        that is not there, or a newer one, is refused as on a normal open."""
+        self.db = None
+        if not self.path.exists():
+            raise KnowledgeGraphDamaged(f"{self.path} has not been built")
+        uri = "file:" + "".join(
+            ch if ch.isascii() and ch.isalnum() else
+            "".join(f"%{b:02X}" for b in ch.encode("utf-8"))
+            for ch in str(self.path.resolve())) + "?mode=ro"
+        try:
+            self.db = sqlite3.connect(uri, uri=True, timeout=self.BUSY_TIMEOUT_S)
+            self.db.row_factory = sqlite3.Row
+            row = self.db.execute("SELECT value FROM meta WHERE key='schema_version'"
+                                  ).fetchone()
+            ver = int(row[0]) if row else None
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            if self.db is not None:
+                self.db.close()
+            if _busy(exc):
+                raise KnowledgeGraphBusy("the knowledge graph is being rebuilt") from exc
+            raise KnowledgeGraphDamaged(f"the knowledge graph store {self.path} could "
+                                        f"not be read ({exc})") from exc
+        if ver is None or ver > SCHEMA_VERSION:
+            self.db.close()
+            raise KnowledgeGraphDamaged(f"{self.path} is not a store this Council reads")
 
     def _check_before_writing(self) -> None:
         """An existing store is checked over a READ-ONLY connection before
@@ -4476,7 +4508,8 @@ class KnowledgeGraph:
         return loc
 
     def _open_chunks(self, d, lines, ments, doc_ents, max_lines: int,
-                     overlap: int) -> List[Dict[str, Any]]:
+                     overlap: int, index: Optional[Dict[str, Any]] = None
+                     ) -> List[Dict[str, Any]]:
         """Every passage of a document (~40 lines, a small overlap; a PDF
         page at most): the open extraction reads them all, as Morphik read
         every chunk - not only the ones a known name was found in."""
@@ -4501,6 +4534,9 @@ class KnowledgeGraph:
                     ents = set()
                     for line, _t in window:
                         ents |= by_spot.get((page, line), set())
+                    if index is not None:
+                        # a project named by a word of its name ('Atlas sync')
+                        ents |= self._projects_named(wtext, index)
                     out.append({"document_id": d["id"], "path": d["path"],
                                 "content_hash": d["content_hash"], "chunk": n,
                                 "page": page, "first_line": window[0][0],
@@ -4590,6 +4626,7 @@ class KnowledgeGraph:
 
         run_id = str(uuid.uuid4())
         status = self.model_link_status()
+        index = self._project_index()
         todo: List[Dict[str, Any]] = []
         read = skipped = 0
         prog = progress_now()
@@ -4615,7 +4652,8 @@ class KnowledgeGraph:
                     continue
                 read += 1
                 ments, doc_ents = self._doc_context(d)
-                chunks = self._open_chunks(d, lines, ments, doc_ents, max_lines, overlap)
+                chunks = self._open_chunks(d, lines, ments, doc_ents, max_lines, overlap,
+                                           index)
                 self.db.execute("INSERT OR REPLACE INTO extraction_docs VALUES (?,?,?)",
                                 (d["id"], sig, json.dumps([c["chunk"] for c in chunks])))
                 for c in chunks:

@@ -643,10 +643,6 @@ def check_open(raw: Dict[str, Any], text: str, known: Sequence[Known]
         if len(name) > 80:
             rejected.append(Rejected(e, "too long for a name"))
             continue
-        line = _named_line(text, name, etype)
-        if line is None:
-            rejected.append(Rejected(e, f"the text never names {name}"))
-            continue
         k = None
         if etype == "PERSON" and kgm.is_initial_form(kgm.person_key(name)):
             # 'D. Whitfield': the graph's person only when exactly one fits;
@@ -662,11 +658,20 @@ def check_open(raw: Dict[str, Any], text: str, known: Sequence[Known]
         if k is not None and k.type in CORE_TYPES and etype in CORE_TYPES \
                 and k.type != etype:
             k = None                       # a PERSON is never a PART of one name
+        line = _named_line(text, name, etype)
+        if line is None and k is not None:
+            # the graph's name for something the passage calls by another
+            # of its names ('PRJ-0915' for "the Helios rig")
+            line = next((i for i, ln in enumerate(text.splitlines(), 1)
+                         if named_in(ln, k)), 1 if named_in(text, k) else None)
+        if line is None:
+            rejected.append(Rejected(e, f"the text never names {name}"))
+            continue
         if k is not None:
             etype = k.type
         fd = Found(name, etype, " ".join(str(e.get("description") or "").split())[:160],
                    k, line)
-        dup = next((x for x in by_form.get(next(iter(forms(name, etype))), [])
+        dup = next((x for fm in sorted(forms(name, etype)) for x in by_form.get(fm, [])
                     if x.type == etype or (x.known and k and x.known.key == k.key)), None)
         if dup is not None:
             if not dup.description and fd.description:

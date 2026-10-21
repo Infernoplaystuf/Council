@@ -11,10 +11,10 @@ from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
-                               QDialogButtonBox, QGroupBox, QHBoxLayout,
-                               QLabel, QListWidget, QListWidgetItem,
-                               QPlainTextEdit, QPushButton, QScrollArea,
-                               QVBoxLayout, QWidget)
+                               QDialogButtonBox, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QPlainTextEdit, QPushButton,
+                               QRadioButton, QScrollArea, QVBoxLayout, QWidget)
 
 from ..view import amp
 
@@ -153,9 +153,10 @@ class FoldersDialog(QDialog):
 class FieldsDialog(QDialog):
     """Which labels the graph reads, and which drifted labels mean the same.
 
-    Rules start 'proposed' — guesses about this vault's vocabulary — and are
-    read only once ticked. Suggested synonyms ('POC' for 'Point of Contact')
-    come ticked only at confidence >= 0.85; nothing is assumed."""
+    The default rules start ticked (user, 2026-10-21: a build should need
+    no set-up, as Morphik's does); untick any that do not fit this vault.
+    Suggested synonyms ('POC' for 'Point of Contact') come ticked only at
+    confidence >= 0.85; nothing is assumed."""
 
     def __init__(self, rules, suggestions, parent=None):
         super().__init__(parent)
@@ -211,3 +212,122 @@ class FieldsDialog(QDialog):
         rules = {lbl: cb.isChecked() for lbl, cb in self.rule_boxes.items()}
         syns = [(s["label"], s["means"]) for s, cb in self.syn_boxes if cb.isChecked()]
         return rules, syns
+
+
+class GraphDialog(QDialog):
+    """A new named graph, or a graph's settings (Morphik's create_graph and
+    its prompt override): its name, the folders and file types it reads (new
+    graphs only - make another graph to read other folders), what a model
+    should look for in its documents, where a model's links go, and whether
+    the Council's answers use it.
+
+    ``pick()`` asks for a folder (None = cancelled). ``values()`` gives
+    {name, folders, suffixes, focus, model_links ('graph' | 'review'),
+    use_in_answers}."""
+
+    def __init__(self, *, new: bool, pick: Callable[[], Optional[str]] = lambda: None,
+                 name: str = "", folders: Optional[List[str]] = None,
+                 suffixes: Optional[List[str]] = None, focus: str = "",
+                 model_links: str = "graph", use_in_answers: bool = True,
+                 is_main: bool = False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New knowledge graph" if new else "Graph settings")
+        self.resize(600, 520)
+        self._pick = pick
+        self._new = new
+        outer = QVBoxLayout(self)
+        if new:
+            intro = QLabel("A graph of its own over the folders you choose - inside the "
+                           "vault's data_in, or anywhere else (only ever read). Build it "
+                           "with ⟳ Build graph.")
+            intro.setWordWrap(True)
+            outer.addWidget(intro)
+        form = QFormLayout()
+        self.name = QLineEdit(name)
+        self.name.setEnabled(not is_main)
+        form.addRow("Name", self.name)
+        outer.addLayout(form)
+        box = QGroupBox("Folders it reads")
+        bl = QVBoxLayout(box)
+        self.folders = QListWidget()
+        for f in folders or []:
+            self.folders.addItem(f)
+        if is_main:
+            self.folders.addItem("data_in, the folders added in Folders…, and your Ledgers")
+        bl.addWidget(self.folders)
+        row = QHBoxLayout()
+        self.add_btn = QPushButton("Add a folder…")
+        self.add_btn.clicked.connect(self.on_add)
+        row.addWidget(self.add_btn)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.clicked.connect(self.on_remove)
+        row.addWidget(self.remove_btn)
+        row.addStretch(1)
+        bl.addLayout(row)
+        self.add_btn.setVisible(new)
+        self.remove_btn.setVisible(new)
+        tf = QFormLayout()
+        self.suffixes = QLineEdit(", ".join(suffixes or []))
+        self.suffixes.setPlaceholderText("every type it can read (or e.g. pdf, docx, md)")
+        self.suffixes.setEnabled(not is_main)
+        tf.addRow("File types", self.suffixes)
+        bl.addLayout(tf)
+        outer.addWidget(box)
+        fbox = QGroupBox("What a model should look for")
+        fl = QVBoxLayout(fbox)
+        self.focus = QPlainTextEdit(focus)
+        self.focus.setPlaceholderText("e.g. 'heat-treatment furnaces, the parts run in them "
+                                      "and who operates them' - left empty, it looks for "
+                                      "people, organisations, projects, parts, places …")
+        self.focus.setMaximumHeight(80)
+        fl.addWidget(self.focus)
+        outer.addWidget(fbox)
+        lbox = QGroupBox("Links a model finds")
+        ll = QVBoxLayout(lbox)
+        self.links_graph = QRadioButton("go in the graph at once (you can still reject any)")
+        self.links_review = QRadioButton("wait for me to accept each one")
+        (self.links_review if model_links == "review" else self.links_graph).setChecked(True)
+        ll.addWidget(self.links_graph)
+        ll.addWidget(self.links_review)
+        outer.addWidget(lbox)
+        self.use_in_answers = QCheckBox("Use this graph in the Council's answers")
+        self.use_in_answers.setChecked(use_in_answers)
+        outer.addWidget(self.use_in_answers)
+        self.message = QLabel("")
+        self.message.setWordWrap(True)
+        outer.addWidget(self.message)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.on_ok)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+
+    def on_add(self) -> None:
+        path = self._pick()
+        if path:
+            self.folders.addItem(str(path))
+
+    def on_remove(self) -> None:
+        item = self.folders.currentItem()
+        if item is not None:
+            self.folders.takeItem(self.folders.row(item))
+
+    def values(self) -> Dict[str, object]:
+        return {"name": " ".join(self.name.text().split()),
+                "folders": [self.folders.item(i).text() for i in range(self.folders.count())]
+                if self._new else [],
+                "suffixes": [x.strip() for x in self.suffixes.text().replace(";", ",")
+                             .split(",") if x.strip()],
+                "focus": " ".join(self.focus.toPlainText().split()),
+                "model_links": "review" if self.links_review.isChecked() else "graph",
+                "use_in_answers": self.use_in_answers.isChecked()}
+
+    def on_ok(self) -> None:
+        v = self.values()
+        if self._new and not v["name"]:
+            self.message.setText("Give the graph a name.")
+            return
+        if self._new and not v["folders"]:
+            self.message.setText("Add at least one folder for it to read.")
+            return
+        self.accept()

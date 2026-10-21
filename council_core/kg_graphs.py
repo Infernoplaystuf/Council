@@ -199,13 +199,16 @@ class GraphList:
 
     def open(self, gid: str = MAIN, root: Any = None, **kw) -> kgm.KnowledgeGraph:
         """The graph's store. A named graph's folders outside data_in are
-        added to it (read-only) the first time it is opened."""
+        added to it (read-only) the first time it is opened for writing.
+        ``readonly=True``: for reading only (kg_query) - nothing is written."""
         if gid == MAIN:
             return kgm.KnowledgeGraph(self.vault, root, **kw)
         info = self.get(gid)
         kg = kgm.KnowledgeGraph(self.vault, root, store=self.store_dir(gid) / kgm.STORE_NAME,
                                 scope={"folders": info.folders, "suffixes": info.suffixes},
                                 **kw)
+        if kw.get("readonly"):
+            return kg
         try:
             have = {kgm._real(r["path"]) for r in kg.extra_roots()}
             for f in info.folders:

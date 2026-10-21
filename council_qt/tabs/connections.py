@@ -1,27 +1,37 @@
 """
-council_qt.tabs.connections — people, parts and projects, and why they link.
+council_qt.tabs.connections — knowledge graphs built from the vault's documents.
 
-Search a person, part or project; see everything linked to it, grouped by how
-("leads", "uses part", "superseded by"), and under each link the evidence: the
-file, the sheet/row or page/line, and the quoted text. Click a piece of
-evidence to read that spot of the document here, without leaving the app (a
-PDF or workbook viewer cannot jump to a line); "Open file" opens it in its own
-program. Double-click a linked item to go to it.
+Works the way Morphik's graphs do (user, 2026-10-21: "I would like the
+connections tab to function very similar to morphik"): pick a graph (All
+documents, or a named one made over chosen folders with New graph…), press
+⟳ Build graph, and the documents are read - labelled fields, tables, Ledgers
+and Collections without a model, and, when a model is chosen, every passage
+of free text by that model, which names the people, organisations, projects,
+parts, places and other things in it and how they relate. Then:
 
-The graph lives in council_core.knowledge_graph; this view only reads it,
-except for three things the user does on purpose: Rebuild (re-reads the
-documents, on a worker), Fields (which labels mean a person / part / project,
-and which drifted labels such as 'POC' mean the same as a confirmed one) and
-Accept / Reject on a link. Nothing here deletes or edits a document.
+  * search anything the graph holds; see everything linked to it, grouped by
+    how ("leads", "supplies", "← located in"), each link with its evidence: the
+    file, the sheet/row or page/line, and the quoted text. Click a piece of
+    evidence to read that spot here; "Open file" opens it in its own program;
+  * Picture: the entity and what is around it (or the whole graph) as dots
+    and arrows; click a dot to open it, double-click to centre on it;
+  * Ask: a question answered from the graph's facts, each cited (the
+    Council's own answers use the graphs marked for answers, through
+    council_core.kg_query).
 
-Rebuild and the label harvest run on worker threads with their own SQLite
-connection (a connection belongs to the thread that made it); the view's own
-connection is reopened when they finish. Listing the installed models asks
-Ollama over HTTP (GET /api/tags on this PC), so it runs on a worker too —
-building the tab never waits on a model server. It does still ASK it, as it
-is built: a test that builds the tab stubs ConnectionsActions.local_models
-and pi_nodes (test_connections_tab, and the window fixture of
-test_council_qt_foundation), or it reaches the real Ollama port.
+A model's links go in the graph at once, or wait for ✓ Accept, as each graph
+is set (Graph settings…). Nothing here deletes or edits a document; deleting
+a named graph removes only what building it made.
+
+Rebuild, the model's reading, the label harvest, the picture's layout and
+Ask run on worker threads with their own SQLite connection (a connection
+belongs to the thread that made it); the view's own connection is reopened
+when they finish. Listing the installed models asks Ollama over HTTP (GET
+/api/tags on this PC), so it runs on a worker too — building the tab never
+waits on a model server. It does still ASK it, as it is built: a test that
+builds the tab stubs ConnectionsActions.local_models and pi_nodes
+(test_connections_tab, and the window fixture of test_council_qt_foundation),
+or it reaches the real Ollama port.
 """
 from __future__ import annotations
 
@@ -33,31 +43,35 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
-                               QPlainTextEdit, QSplitter, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QSpinBox, QSplitter, QTabWidget,
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from council_core import kg_graphs as kgg
 from council_core import knowledge_graph as kgm
 from council_core import paths
+from council_core.kg_query import phrase
 
 from .. import theme
 from ..view import ViewHelpers, _alive, amp
-from .connections_dialogs import FieldsDialog, FoldersDialog, WhyNoLinksDialog
+from ..widgets.kg_canvas import KnowledgeGraphCanvas, type_colour
+from .connections_dialogs import (FieldsDialog, FoldersDialog, GraphDialog,
+                                  WhyNoLinksDialog)
 
+#: The type filter's fixed entries; the types a graph holds besides these
+#: (ORGANIZATION, LOCATION … a model named) are added after a build.
 TYPE_FILTERS = (("Everything", None), ("People", "PERSON"),
                 ("Parts", "PART"), ("Projects", "PROJECT"))
+TYPE_ICON = {"PERSON": "👤", "PART": "⚙", "PROJECT": "📁", "DOCUMENT": "📄",
+             "ORGANIZATION": "🏢", "LOCATION": "📍", "EQUIPMENT": "🔧",
+             "MATERIAL": "🧪", "PROCESS": "🔁", "REPORT": "📑", "EVENT": "📅",
+             "CONCEPT": "💡"}
+#: The model list's last entry: build without a model (labelled fields,
+#: tables, Ledgers and Collections only).
+NO_MODEL = ""
 
-#: How a link reads from each end.
-PHRASES = {
-    "LEADS": ("leads", "led by"),
-    "CONTACT_FOR": ("point of contact for", "point of contact"),
-    "WORKS_ON": ("works on", "worked on by"),
-    "OWNS": ("owns", "owned by"),
-    "USES_PART": ("uses part", "used in"),
-    "SUPERSEDES": ("supersedes", "superseded by"),
-    "DOCUMENTED_IN": ("documents (Collection)", "in Collection of"),
-    "INSPECTED": ("inspected", "inspected by"),
-}
-TYPE_ICON = {"PERSON": "👤", "PART": "⚙", "PROJECT": "📁", "DOCUMENT": "📄"}
+
+def type_icon(etype: str) -> str:
+    return TYPE_ICON.get(etype, "◆")
 
 
 def _us_origin(model: str) -> bool:
@@ -73,7 +87,7 @@ def _us_origin(model: str) -> bool:
 #: have).
 METHOD_WORDS = {
     "ledger": "Ledger row (accepted)", "sheet": "workbook cell",
-    "picture": "picture (OCR)",
+    "picture": "picture (OCR)", "model": "model",
 }
 #: The tree shows this much of a big neighbourhood; the rest is counted
 #: ("… and 87 more"). An inspector of 3,000 parts has 3,000 links, each
@@ -109,11 +123,6 @@ def display_name(ent: Optional[Dict[str, Any]]) -> str:
     return name
 
 
-def phrase(predicate: str, direction: str) -> str:
-    out, inn = PHRASES.get(predicate, (predicate.lower(), predicate.lower()))
-    return out if direction == "out" else inn
-
-
 class ConnectionsActions:
     """What the Connections tab asks of the application. Tests pass their own
     vault; nothing else here knows where the vault is."""
@@ -121,9 +130,62 @@ class ConnectionsActions:
     def __init__(self, vault_dir: Optional[Path] = None, root: Optional[Path] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self.root = Path(root) if root else self.vault_dir / "data_in"
+        #: The graph the tab shows (kg_graphs.MAIN = all documents). The
+        #: Ledger tab's own ConnectionsActions stays on the main graph.
+        self.graph_id = kgg.MAIN
 
     def open_graph(self) -> kgm.KnowledgeGraph:
-        return kgm.KnowledgeGraph(self.vault_dir, self.root)
+        return kgg.GraphList(self.vault_dir).open(self.graph_id, self.root)
+
+    # -- graphs (named, over chosen folders) --
+    def graphs(self) -> List[kgg.GraphInfo]:
+        return kgg.GraphList(self.vault_dir).all()
+
+    def create_graph(self, values: Dict[str, Any]) -> kgg.GraphInfo:
+        gl = kgg.GraphList(self.vault_dir)
+        info = gl.create(values["name"], values["folders"], values.get("suffixes") or (),
+                         use_in_answers=bool(values.get("use_in_answers", True)),
+                         focus=str(values.get("focus") or ""))
+        if values.get("model_links") == "review":
+            with gl.open(info.id, self.root) as kg:
+                kg.set_model_links("review")
+        return info
+
+    def update_graph(self, gid: str, values: Dict[str, Any]) -> None:
+        gl = kgg.GraphList(self.vault_dir)
+        gl.update(gid, name=values.get("name") or None,
+                  use_in_answers=values.get("use_in_answers"),
+                  suffixes=None if gid == kgg.MAIN else values.get("suffixes"))
+        with gl.open(gid, self.root) as kg:
+            if kg.focus() != values.get("focus", ""):
+                kg.set_focus(values.get("focus", ""))
+            want = values.get("model_links", "graph")
+            if (kg.model_link_status() == "suggested") != (want == "review"):
+                kg.set_model_links(want)
+
+    def delete_graph(self, gid: str) -> None:
+        kgg.GraphList(self.vault_dir).delete(gid)
+
+    # -- the picture and questions --
+    def picture(self, center: Optional[str], hops: int):
+        """(nodes, edges, positions) to draw (council_core.kg_layout)."""
+        from council_core import kg_layout
+        with self.open_graph() as kg:
+            nodes, edges = kg_layout.subgraph(kg, center, hops=hops)
+        return nodes, edges, kg_layout.layout(nodes, edges)
+
+    def chat_for(self, model: str):
+        from council_core import kg_extract as kx
+        if not model:
+            return None
+        return kx.gguf_chat(model) if kx.is_gguf(model) else kx.ollama_chat(model)
+
+    def ask(self, question: str, model: str) -> Dict[str, Any]:
+        """council_core.kg_query.ask on this graph, with ``model`` ('' = none:
+        the cited facts only)."""
+        from council_core import kg_query
+        return kg_query.ask(self.vault_dir, question, self.chat_for(model),
+                            graphs=[self.graph_id])
 
     def rebuild(self, on_progress=None, listener=None) -> Dict[str, Any]:
         """The rebuild; its progress lines also go to the terminal."""
@@ -216,10 +278,11 @@ class ConnectionsActions:
         """(name, model) of the Pi nodes left out: not a US-origin model."""
         return self.pi_nodes()[1]
 
-    def suggest(self, model: str, use_pis: bool, on_progress, should_stop):
-        """Each worker reads with its OWN model (a Pi has a smaller one), and
-        the run is named by the bare model: 'extract:' is added once, by the
-        graph (it was added here too: 'extract:extract:gemma3:12b')."""
+    def read_text(self, model: str, use_pis: bool, on_progress, should_stop):
+        """The model's part of a build: every passage of free text read by
+        ``model`` (and the Pis' models, when ticked) - entities of any type
+        and the links between them (KnowledgeGraph.extract_from_text). Each
+        worker reads with its OWN model (a Pi has a smaller one)."""
         from council_core import kg_extract as kx
         if kx.is_gguf(model):
             name = Path(model).name
@@ -231,7 +294,7 @@ class ConnectionsActions:
                 if _us_origin(pmodel):                     # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
         with self.open_graph() as kg:
-            return kg.suggest_from_text(workers, model=Path(model).name if kx.is_gguf(model)
+            return kg.extract_from_text(workers, model=Path(model).name if kx.is_gguf(model)
                                         else model,
                                         on_progress=on_progress, should_stop=should_stop)
 
@@ -245,7 +308,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
                  auto_refresh: bool = True, ask_string=None, ask_yes_no=None,
-                 ask_choice=None, ask_folder=None):
+                 ask_choice=None, ask_folder=None, ask_graph=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -256,6 +319,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._current: Optional[str] = None
         self._selected: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
+        #: ⟳ Build graph: after the documents are read, the chosen model
+        #: reads the free text (a Rebuild for another reason - an answer, a
+        #: split - only reads the documents again).
+        self._read_text_after = False
+        self._picture_token = None
+        self._asking = False
         #: 'Why no links?': its one dialog (tests reach it here), and whether
         #: its worker is still working it out.
         self._why_dialog: Optional[WhyNoLinksDialog] = None
@@ -270,8 +339,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
                                          _dialogs.askdirectory(
                                              "Add a folder for the graph to read",
                                              parent=self))
+        #: ask_graph(new, current settings) -> the dialog's values, or None
+        self.ask_graph = ask_graph or self._graph_dialog
         self._build()
         if auto_refresh:
+            self._fill_graphs()
             self._reopen()
             self.on_search()
             self.refresh_models()
@@ -281,22 +353,46 @@ class ConnectionsTab(ViewHelpers, QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
 
+        # 1. which graph, and building it
+        grow = QHBoxLayout()
+        grow.addWidget(QLabel("Graph"))
+        self.graph_box = QComboBox()
+        self.graph_box.setMinimumWidth(180)
+        self.graph_box.activated.connect(lambda _i: self.on_graph_changed())
+        grow.addWidget(self.graph_box)
+        self.new_graph_btn = self._button(grow, "New graph…", self.on_new_graph)
+        self.graph_settings_btn = self._button(grow, "Graph settings…", self.on_graph_settings)
+        self.delete_graph_btn = self._button(grow, "Delete graph", self.on_delete_graph)
+        grow.addSpacing(12)
+        grow.addWidget(QLabel("Read the text with"))
+        self.model_box = QComboBox()
+        self.model_box.setToolTip("The local model that reads every passage of free text and "
+                                  "names what is in it and how it connects. Without one, only "
+                                  "labelled fields, tables, Ledgers and Collections are read.")
+        grow.addWidget(self.model_box, 1)
+        self.pis_box = QCheckBox("and my Pi nodes")
+        grow.addWidget(self.pis_box)
+        self.rebuild_btn = self._button(grow, "⟳ Build graph", self.on_build)
+        self.stop_btn = self._button(grow, "Stop", self.on_stop_suggest)
+        self.stop_btn.setEnabled(False)
+        outer.addLayout(grow)
+
+        # 2. finding things, and the graph's other lists
         row = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search a person, part or project…")
+        self.search.setPlaceholderText("Search a person, part, project, organisation, place…")
         self.search.textChanged.connect(lambda _t: self.on_search())
         row.addWidget(self.search, 2)
         self.type_box = QComboBox()
-        for title, _t in TYPE_FILTERS:
-            self.type_box.addItem(title)
+        for title, t in TYPE_FILTERS:
+            self.type_box.addItem(title, t)
         self.type_box.currentIndexChanged.connect(lambda _i: self.on_search())
         row.addWidget(self.type_box)
-        self.rebuild_btn = self._button(row, "⟳ Rebuild graph", self.on_rebuild)
-        self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         self.answers_btn = self._button(row, "Your answers", self.on_answers)
         self.sources_btn = self._button(row, "Spreadsheets", self.on_sources)
         self.folders_btn = self._button(row, "Folders…", self.on_folders)
+        self.fields_btn = self._button(row, "Fields…", self.on_fields)
         # Always there: most useful at 0 links (user, 2026-10-20)
         self.why_btn = self._button(row, "Why no links?", self.on_why)
         self.why_btn.setToolTip("What the graph read and the most likely reason it has no "
@@ -304,21 +400,21 @@ class ConnectionsTab(ViewHelpers, QWidget):
                                 "counts and labels only, nothing from inside a document.")
         outer.addLayout(row)
 
-        srow = QHBoxLayout()
-        srow.addWidget(QLabel("Suggest links from free text with"))
-        self.model_box = QComboBox()
-        srow.addWidget(self.model_box, 1)
-        self.pis_box = QCheckBox("and my Pi nodes")
-        srow.addWidget(self.pis_box)
-        self.suggest_btn = self._button(srow, "Suggest links", self.on_suggest)
-        self.stop_btn = self._button(srow, "Stop", self.on_stop_suggest)
-        self.stop_btn.setEnabled(False)
-        outer.addLayout(srow)
+        # 3. asking the graph
+        arow = QHBoxLayout()
+        self.ask_edit = QLineEdit()
+        self.ask_edit.setPlaceholderText("Ask the graph, e.g. 'who works on the Falcon "
+                                         "retrofit?' or 'how is Nordic Forge connected to "
+                                         "KA-101?'")
+        self.ask_edit.returnPressed.connect(self.on_ask)
+        arow.addWidget(self.ask_edit, 1)
+        self.ask_btn = self._button(arow, "Ask", self.on_ask)
+        outer.addLayout(arow)
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
-        # First-run help: offered when a rebuild finds proposed field rules
+        # First-run help: offered when a rebuild finds unticked field rules
         # the documents use (on_tick_suggested); hidden otherwise.
         orow = QHBoxLayout()
         self.tick_btn = self._button(orow, "Tick the suggested field rules",
@@ -338,6 +434,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.results.currentItemChanged.connect(self._on_result)
         split.addWidget(self.results)
 
+        self.views = QTabWidget()
         self.tree = QTreeWidget()
         self.tree.setColumnCount(3)
         self.tree.setHeaderLabels(["Linked item / evidence", "Status", "Where"])
@@ -345,7 +442,46 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.tree.setColumnWidth(1, 80)
         self.tree.currentItemChanged.connect(self._on_tree)
         self.tree.itemDoubleClicked.connect(self._on_tree_double)
-        split.addWidget(self.tree)
+        self.views.addTab(self.tree, "Links")
+
+        pic = QWidget()
+        pl = QVBoxLayout(pic)
+        pl.setContentsMargins(0, 4, 0, 0)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Links out"))
+        self.hops_box = QSpinBox()
+        self.hops_box.setRange(1, 3)
+        self.hops_box.setValue(2)
+        self.hops_box.valueChanged.connect(lambda _v: self.refresh_picture())
+        prow.addWidget(self.hops_box)
+        self.whole_btn = self._button(prow, "Whole graph", lambda: self.refresh_picture(whole=True))
+        self.legend = QLabel("")
+        self.legend.setWordWrap(True)
+        prow.addWidget(self.legend, 1)
+        pl.addLayout(prow)
+        self.canvas = KnowledgeGraphCanvas()
+        self.canvas.entity_clicked.connect(self._on_canvas_click)
+        self.canvas.entity_activated.connect(self._on_canvas_centre)
+        pl.addWidget(self.canvas, 1)
+        self.views.addTab(pic, "Picture")
+
+        ans = QSplitter(Qt.Orientation.Vertical)
+        self.answer = QPlainTextEdit()
+        self.answer.setReadOnly(True)
+        self.answer.setPlaceholderText("Ask the graph a question (above): the answer comes "
+                                       "from the graph's facts, each cited; the facts are "
+                                       "listed below - click one to see where it was found.")
+        ans.addWidget(self.answer)
+        self.facts = QTreeWidget()
+        self.facts.setColumnCount(3)
+        self.facts.setHeaderLabels(["Fact / evidence", "Status", "Where"])
+        self.facts.setColumnWidth(0, 330)
+        self.facts.currentItemChanged.connect(self._on_tree)
+        ans.addWidget(self.facts)
+        ans.setSizes([200, 260])
+        self.views.addTab(ans, "Answer")
+        self.views.currentChanged.connect(self._on_view_changed)
+        split.addWidget(self.views)
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -386,7 +522,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         mrow.addStretch(1)
         rl.addLayout(mrow)
         split.addWidget(right)
-        split.setSizes([230, 520, 420])
+        split.setSizes([230, 560, 400])
         outer.addWidget(split, 1)
         self._enable_actions()
 
@@ -397,6 +533,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self._kg = None
         try:
             self._kg = self.actions.open_graph()
+        except (KeyError, kgg.GraphListDamaged) as exc:
+            # the graph shown was deleted (or the list damaged) elsewhere:
+            # back to all documents
+            if self.actions.graph_id == kgg.MAIN:
+                self.status.setText(str(exc))
+                return
+            self.actions.graph_id = kgg.MAIN
+            self._fill_graphs(kgg.MAIN)
+            self.status.setText("That graph is gone; showing all documents.")
+            self._reopen()
+            return
         except kgm.KnowledgeGraphBusy as exc:
             # held by a rebuild elsewhere (the agent's tools, another
             # window): not damage - the buttons stay, try again shortly
@@ -417,18 +564,24 @@ class ConnectionsTab(ViewHelpers, QWidget):
         confirmed = len(kg.field_rules("confirmed"))
         n_q = counts["open_reviews"]
         self.questions_btn.setText(amp(f"Questions ({n_q})"))
+        self._fill_types(counts["entities"])
         if cov["last_run"] is None:
-            self.coverage.setText("The graph has not been built yet. Choose the "
-                                  "labels it should read (Fields…), then Rebuild.")
+            self.coverage.setText("The graph has not been built yet. Choose a model to read "
+                                  "the text with, then ⟳ Build graph.")
             return
         ents = counts["entities"]
         rels = counts["relations"]
+        others = sum(v for k, v in ents.items() if k not in kgm.CORE_TYPES + ("DOCUMENT",))
+        model = kg.model_read()
         text = (f"{cov['documents']} document(s) read, {cov['with_facts']} gave a "
                 f"link, {cov['with_mentions']} mention something. "
                 f"{ents.get('PERSON', 0)} people, {ents.get('PART', 0)} parts, "
-                f"{ents.get('PROJECT', 0)} projects; "
+                f"{ents.get('PROJECT', 0)} projects"
+                + (f", {others} other entities" if others else "") + "; "
                 f"{rels.get('seeded', 0) + rels.get('accepted', 0)} links, "
-                f"{rels.get('suggested', 0)} waiting for you.")
+                f"{rels.get('suggested', 0)} waiting for you. "
+                f"Text read by a model: {model['documents']} of "
+                f"{model['text_documents']} document(s).")
         if cov["unreadable"]:
             text += (f" NOT READ: {len(cov['unreadable'])} file(s) — "
                      + "; ".join(cov["unreadable"][:3])
@@ -445,8 +598,26 @@ class ConnectionsTab(ViewHelpers, QWidget):
                          "picture(s) read")
             text += " (Spreadsheets… says what each gave)."
         if not confirmed:
-            text += " No field labels are ticked yet (Fields…)."
+            text += " No field labels are ticked (Fields…)."
         self.coverage.setText(text)
+
+    def _fill_types(self, ents: Dict[str, int]) -> None:
+        """The type filter: the fixed entries, then every other type this
+        graph holds (a model's ORGANIZATION, LOCATION …)."""
+        want = [t for t in sorted(ents) if t not in kgm.CORE_TYPES + ("DOCUMENT",)]
+        have = [self.type_box.itemData(i) for i in range(len(TYPE_FILTERS),
+                                                          self.type_box.count())]
+        if have == want:
+            return
+        cur = self.type_box.currentData()
+        self.type_box.blockSignals(True)
+        while self.type_box.count() > len(TYPE_FILTERS):
+            self.type_box.removeItem(self.type_box.count() - 1)
+        for t in want:
+            self.type_box.addItem(f"{type_icon(t)} {t.replace('_', ' ').title()}", t)
+        i = self.type_box.findData(cur)
+        self.type_box.setCurrentIndex(max(0, i))
+        self.type_box.blockSignals(False)
 
     # ------------------------------------------------------------------
     def on_search(self) -> None:
@@ -455,7 +626,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kg is None:
             return
         text = self.search.text().strip()
-        etype = TYPE_FILTERS[self.type_box.currentIndex()][1]
+        etype = self.type_box.currentData()
         if text:
             hits = kg.search(text, etype)
         else:
@@ -470,7 +641,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             if h["type"] == "DOCUMENT":
                 continue
             ent = kg.entity(h["id"])
-            item = QListWidgetItem(f"{TYPE_ICON.get(h['type'], '')} {display_name(ent)}")
+            item = QListWidgetItem(f"{type_icon(h['type'])} {display_name(ent)}")
             item.setData(ROLE_DATA, h["id"])
             self.results.addItem(item)
 
@@ -489,7 +660,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if ent is None:
             return
         aliases = [a for a in ent["aliases"] if a != ent["name"]]
-        self.status.setText(f"{TYPE_ICON.get(ent['type'], '')} {display_name(ent)}"
+        self.status.setText(f"{type_icon(ent['type'])} {display_name(ent)}"
+                            + (f" ({ent['type'].replace('_', ' ').lower()})"
+                               if ent["type"] not in kgm.CORE_TYPES else "")
+                            + (f" — {ent['description']}" if ent.get("description") else "")
                             + (f"   also written: {', '.join(aliases)}" if aliases else ""))
         groups: Dict[str, QTreeWidgetItem] = {}
         shown: Dict[str, int] = {}
@@ -513,7 +687,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 groups[label] = g
             shown[label] = shown.get(label, 0) + 1
             other = n["other"] or {}
-            icon = TYPE_ICON.get(other.get("type", ""), "")
+            icon = type_icon(other.get("type", ""))
             name = display_name(other) if other.get("type") != "DOCUMENT" else other.get("name", "")
             total = n.get("evidence_total", len(n["evidence"]))
             r_item = QTreeWidgetItem([f"{icon} {name}", n["status"], f"{total} source(s)"])
@@ -559,6 +733,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.tree.topLevelItem(i).setExpanded(True)
         self._selected = None
         self._enable_actions()
+        if self.views.currentWidget() is not self.tree:
+            if self.views.currentIndex() == 1:
+                self.refresh_picture()
+            else:
+                self.views.setCurrentWidget(self.tree)
 
     def _on_tree(self, item, _prev=None) -> None:
         if item is None:
@@ -743,7 +922,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._rebuild_token = None
         self.rebuild_btn.setEnabled(True)
         self._reopen()
+        read_text, self._read_text_after = self._read_text_after, False
         if exc is not None:
+            self.stop_btn.setEnabled(False)
             self.status.setText(f"The rebuild failed: {exc}")
             return
         # The view is refreshed FIRST: show_entity writes the open item's
@@ -775,13 +956,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 print(f"  {line}", flush=True)
         else:
             self.status.setToolTip("")
+        if read_text and not self._stop.is_set():
+            self.on_suggest()                   # the model's part of ⟳ Build graph
+        else:
+            self.stop_btn.setEnabled(False)
+            self.refresh_picture()
 
     def refresh_models(self) -> None:
         """List the installed US-origin models and the Pi nodes, on a worker:
         it asks Ollama over HTTP, which the tab's constructor used to do on
         the GUI thread (and every test that built the tab reached the real
         Ollama port)."""
-        self.suggest_btn.setEnabled(False)
 
         def work() -> None:
             try:
@@ -806,6 +991,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.model_box.addItem(m, m)
         for label, path in ggufs:                    # GGUF files on this PC too
             self.model_box.addItem(label, path)
+        self.model_box.addItem("No model — labelled fields and tables only", NO_MODEL)
+        if not models and not ggufs:
+            self.model_box.setToolTip(
+                "No local model is installed, so the sentences of reports and notes are "
+                "not read. Install a US-origin model yourself (gemma3:12b reads best: "
+                "'ollama pull gemma3:12b') and reopen the tab.")
         self.pis_box.setEnabled(bool(pis))
         tip = (", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
                "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
@@ -814,58 +1005,306 @@ class ConnectionsTab(ViewHelpers, QWidget):
             tip += "\n" + "\n".join(f"{n} skipped: {m} is not a US-origin model"
                                     for n, m in skipped)
         self.pis_box.setToolTip(tip)
-        self.suggest_btn.setEnabled(self.model_box.count() > 0 and not self._busy)
+
+    def on_build(self) -> None:
+        """⟳ Build graph (Morphik's "create graph"): read the documents, then
+        - with a model chosen - have it read every passage of free text.
+        Both resume where a stopped build left off."""
+        if self._busy:
+            return
+        self._stop.clear()
+        self._read_text_after = bool(self.model_box.currentData())
+        self.stop_btn.setEnabled(True)
+        self.on_rebuild()
 
     def on_suggest(self) -> None:
-        """Ask the chosen model (and Pis, if ticked) for links in the free
-        text. Everything it finds lands as 'suggested' for you to accept."""
+        """The model's part of a build on its own: every passage of free text
+        read by the chosen model (and Pis, if ticked); what it finds goes in
+        the graph at once, or waits for you, as the graph is set."""
         model = self.model_box.currentData()
         if self._busy or not model:
             return
         self._busy = True
         self._stop.clear()
-        self.suggest_btn.setEnabled(False)
+        self.rebuild_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         use_pis = self.pis_box.isChecked()
-        self.status.setText(f"Reading free text with {Path(str(model)).name}…")
+        self.status.setText(f"Reading the text with {Path(str(model)).name}…")
         if self._kg is not None:
             self._kg.close()
             self._kg = None
 
         def progress(done, total, worker):
             self._to_ui(self.status.setText,
-                        f"Suggesting links: {done} of {total} passages (last by {worker})")
+                        f"Reading the text: {done} of {total} passages (last by {worker})")
 
         def work() -> None:
             try:
-                stats = self.actions.suggest(model, use_pis, progress, self._stop.is_set)
+                stats = self.actions.read_text(model, use_pis, progress, self._stop.is_set)
                 self._to_ui(self._suggested, stats, None)
             except Exception as exc:                      # noqa: BLE001
                 self._to_ui(self._suggested, None, exc)
 
-        threading.Thread(target=work, name="kg-suggest", daemon=True).start()
+        threading.Thread(target=work, name="kg-read-text", daemon=True).start()
 
     def on_stop_suggest(self) -> None:
         self._stop.set()
-        self.status.setText("Stopping after the passages in progress — run again to continue.")
+        self._read_text_after = False
+        self.status.setText("Stopping after the passages in progress — ⟳ Build graph again "
+                            "to continue where it stopped.")
 
     def _suggested(self, stats, exc) -> None:
         self._busy = False
-        self.suggest_btn.setEnabled(True)
+        self.rebuild_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._reopen()
         if exc is not None:
-            self.status.setText(f"Suggesting failed: {exc}")
+            self.status.setText(f"Reading the text failed: {exc}")
             return
-        word = "Stopped" if stats["stopped"] else "Done"
-        self.status.setText(
-            f"{word}: {stats['done']} of {stats['chunks']} passages read, {stats['links']} "
-            f"link(s) suggested, {stats['rejected']} rejected by the checks"
-            + (f", {stats['errors']} unreadable answer(s)" if stats["errors"] else "")
-            + ". Suggested links wait for you (✓ Accept / ✗ Reject).")
+        word = "Stopped" if stats["stopped"] else "Built"
+        waits = self._kg is not None and self._kg.model_link_status() == "suggested"
+        text = (f"{word}: the model read {stats['done']} of {stats['chunks']} new passage(s) "
+                f"and found {stats['entities']} entities ({stats.get('new_entities', 0)} new) "
+                f"and {stats['links']} link(s); {stats['rejected']} claim(s) the text does "
+                "not support were left out"
+                + (f"; {stats['errors']} passage(s) got no usable answer "
+                   f"({stats.get('first_error', '')})" if stats["errors"] else "")
+                + (". Its links wait for you (✓ Accept / ✗ Reject)." if waits else "."))
+        if not stats["chunks"]:
+            text = "Built. The model had read every passage already."
+        # The view first: show_entity writes the open item's header into the
+        # status line (as after a rebuild - review, 2026-10-19)
         self.on_search()
         if self._current:
             self.show_entity(self._current)
+        self.status.setText(text)
+        self.refresh_picture()
+
+    # -- graphs ------------------------------------------------------------
+    def _fill_graphs(self, select: Optional[str] = None) -> None:
+        try:
+            graphs = self.actions.graphs()
+        except kgg.GraphListDamaged as exc:
+            self.status.setText(str(exc))
+            graphs = [kgg.GraphInfo(kgg.MAIN, kgg.MAIN_NAME)]
+        want = select or self.actions.graph_id
+        self.graph_box.blockSignals(True)
+        self.graph_box.clear()
+        for g in graphs:
+            self.graph_box.addItem(g.name, g.id)
+        i = self.graph_box.findData(want)
+        self.graph_box.setCurrentIndex(max(0, i))
+        self.graph_box.blockSignals(False)
+        self.actions.graph_id = self.graph_box.currentData() or kgg.MAIN
+        self.delete_graph_btn.setEnabled(self.actions.graph_id != kgg.MAIN)
+
+    def on_graph_changed(self) -> None:
+        gid = self.graph_box.currentData() or kgg.MAIN
+        if self._busy:
+            self._fill_graphs(self.actions.graph_id)      # one graph at a time
+            self.status.setText("The graph is busy: choose another when it finishes.")
+            return
+        self.actions.graph_id = gid
+        self.delete_graph_btn.setEnabled(gid != kgg.MAIN)
+        self._current = None
+        self.tree.clear()
+        self._reopen()
+        self.on_search()
+        self.refresh_picture()
+        self.status.setText(f"Graph: {self.graph_box.currentText()}.")
+
+    def _graph_dialog(self, new: bool, current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        from .. import dialogs as _dialogs
+        if _dialogs.disabled():
+            return None
+        dlg = GraphDialog(new=new, pick=self.ask_folder, parent=self, **current)
+        self._graph_dialog_open = dlg          # tests reach it here
+        return dlg.values() if dlg.exec() == QDialog.DialogCode.Accepted else None
+
+    def on_new_graph(self) -> None:
+        if self._busy:
+            return
+        got = self.ask_graph(True, {})
+        if not got:
+            return
+        try:
+            info = self.actions.create_graph(got)
+        except (ValueError, kgg.GraphListDamaged) as exc:
+            self.status.setText(f"No graph made: {exc}")
+            return
+        self._fill_graphs(info.id)
+        self.on_graph_changed()
+        self.status.setText(f"Made the graph '{info.name}'. Choose a model and ⟳ Build graph "
+                            "to read its documents.")
+
+    def on_graph_settings(self) -> None:
+        if self._busy or self._kg is None:
+            return
+        gid = self.actions.graph_id
+        try:
+            info = next(g for g in self.actions.graphs() if g.id == gid)
+        except (StopIteration, kgg.GraphListDamaged):
+            return
+        current = {"name": info.name, "folders": list(info.folders),
+                   "suffixes": list(info.suffixes), "focus": self._kg.focus(),
+                   "model_links": "review" if self._kg.model_link_status() == "suggested"
+                   else "graph", "use_in_answers": info.use_in_answers,
+                   "is_main": info.is_main}
+        got = self.ask_graph(False, current)
+        if not got:
+            return
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+        try:
+            self.actions.update_graph(gid, got)
+        except (ValueError, KeyError, kgg.GraphListDamaged, kgm.KnowledgeGraphBusy) as exc:
+            self.status.setText(f"Settings not saved: {exc}")
+        else:
+            changed_focus = (got.get("focus", "") != current["focus"])
+            self.status.setText("Settings saved." + (
+                " The model reads the text again with the new focus at the next ⟳ Build "
+                "graph." if changed_focus else ""))
+        self._fill_graphs(gid)
+        self._reopen()
+        self.on_search()
+
+    def on_delete_graph(self) -> None:
+        gid = self.actions.graph_id
+        if self._busy or gid == kgg.MAIN:
+            return
+        name = self.graph_box.currentText()
+        if not self.ask_yes_no("Delete graph?", f"Delete the graph '{name}'? What building it "
+                               "made (its entities, links and your decisions on them) goes; "
+                               "no document is touched.", parent=self):
+            return
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+        try:
+            self.actions.delete_graph(gid)
+        except (ValueError, KeyError, OSError, kgg.GraphListDamaged) as exc:
+            self.status.setText(f"Not deleted: {exc}")
+            self._reopen()
+            return
+        self.actions.graph_id = kgg.MAIN
+        self._fill_graphs(kgg.MAIN)
+        self.on_graph_changed()
+        self.status.setText(f"Deleted the graph '{name}'.")
+
+    # -- the picture ---------------------------------------------------------
+    def _on_view_changed(self, index: int) -> None:
+        if index == 1:
+            self.refresh_picture()
+
+    def refresh_picture(self, whole: bool = False) -> None:
+        """Lay out what to draw on a worker: the entity open in the tab and
+        what is within the chosen number of links of it - or, with nothing
+        open (or Whole graph), the best-connected entities."""
+        if self.views.currentIndex() != 1 or self._busy:
+            return
+        center = None if whole else self._current
+        hops = self.hops_box.value()
+        self._picture_token = token = object()
+
+        def work() -> None:
+            try:
+                got, err = self.actions.picture(center, hops), ""
+            except Exception as exc:                      # noqa: BLE001
+                got, err = None, str(exc) or exc.__class__.__name__
+            self._to_ui(self._show_picture, token, got, err, center)
+
+        threading.Thread(target=work, name="kg-picture", daemon=True).start()
+
+    def _show_picture(self, token, got, err: str, center) -> None:
+        if token is not self._picture_token:
+            return
+        if got is None:
+            self.canvas.set_graph([], [], {}, f"The picture could not be made: {err}")
+            return
+        nodes, edges, pos = got
+        msg = ("Nothing linked yet. ⟳ Build graph (with a model, to read the text too)."
+               if center is None else "")
+        self.canvas.set_graph(nodes, edges, pos, msg)
+        types = self.canvas.types()
+        self.legend.setText("  ".join(
+            f"<span style='color:{type_colour(t)}'>●</span> {t.replace('_', ' ').lower()}"
+            for t in types[:10]) + (f"  ({len(nodes)} shown)" if nodes else ""))
+
+    def _on_canvas_click(self, eid: str) -> None:
+        if eid and self._kg is not None and self._kg.entity(eid) is not None:
+            self._current = eid
+            # the links of what was clicked, without leaving the picture
+            idx = self.views.currentIndex()
+            self.show_entity(eid)
+            self.views.setCurrentIndex(idx)
+
+    def _on_canvas_centre(self, eid: str) -> None:
+        self._on_canvas_click(eid)
+        self.refresh_picture()
+
+    # -- asking the graph ------------------------------------------------------
+    def on_ask(self) -> None:
+        question = " ".join(self.ask_edit.text().split())
+        if not question or self._asking:
+            return
+        model = self.model_box.currentData() or NO_MODEL
+        self._asking = True
+        self.ask_btn.setEnabled(False)
+        self.views.setCurrentIndex(2)
+        self.answer.setPlainText("Looking in the graph…" + (
+            f" ({Path(str(model)).name} answers from what it finds)" if model else ""))
+        self.facts.clear()
+
+        def work() -> None:
+            try:
+                got, err = self.actions.ask(question, model), ""
+            except Exception as exc:                      # noqa: BLE001
+                got, err = None, str(exc) or exc.__class__.__name__
+            self._to_ui(self._show_answer, question, got, err)
+
+        threading.Thread(target=work, name="kg-ask", daemon=True).start()
+
+    def _show_answer(self, question: str, got: Optional[Dict[str, Any]], err: str) -> None:
+        self._asking = False
+        self.ask_btn.setEnabled(True)
+        self.facts.clear()
+        if got is None:
+            self.answer.setPlainText(f"Could not ask the graph: {err}")
+            return
+        parts = [f"Q: {question}", ""]
+        if got.get("answer"):
+            parts.append(got["answer"])
+        elif got.get("error"):
+            parts.append(f"({got['error'][0].upper()}{got['error'][1:]}.)")
+        elif got.get("text"):
+            parts.append("No model chosen: here is what the graph holds - the facts below.")
+        self.answer.setPlainText("\n".join(parts))
+        for ctx in got.get("contexts") or []:
+            names = ", ".join(display_name(e) for e in ctx["entities"])
+            g = QTreeWidgetItem([f"About {names}", "", ""])
+            g.setFirstColumnSpanned(True)
+            f = g.font(0)
+            f.setBold(True)
+            g.setFont(0, f)
+            self.facts.addTopLevelItem(g)
+            for fact in ctx["facts"]:
+                item = QTreeWidgetItem([
+                    f"[{fact.n}] {display_name(fact.subject)} — {phrase(fact.predicate, 'out')}"
+                    f" → {display_name(fact.object)}", fact.status, ""])
+                item.setData(0, ROLE_KIND, "relation")
+                item.setData(0, ROLE_DATA, {"relation_id": fact.relation_id,
+                                            "status": fact.status, "evidence": fact.evidence,
+                                            "other": fact.object})
+                g.addChild(item)
+                for ev in fact.evidence:
+                    e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"]),
+                                              f"{ev.get('file', ev['path'])} · {ev['where']}"])
+                    e_item.setToolTip(0, ev["quote"])
+                    e_item.setData(0, ROLE_KIND, "evidence")
+                    e_item.setData(0, ROLE_DATA, ev)
+                    item.addChild(e_item)
+            g.setExpanded(True)
 
     def on_fields(self) -> None:
         if self._busy or self._kg is None:
@@ -904,7 +1343,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 kg.set_rule_status(label, want)
         for label, means in synonyms:
             kg.add_label_synonym(label, means)
-        self.status.setText("Fields saved. Rebuild to read the documents with them.")
+        self.status.setText("Fields saved. ⟳ Build graph to read the documents with them.")
         self._offer_rules([])                 # chosen one by one: nothing to offer
         self._show_coverage()
 
@@ -1065,7 +1504,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._folders_dialog = dlg          # tests reach it here
         dlg.exec()
         if dlg.changed:
-            self.status.setText("Folders changed. Rebuild to read them.")
+            self.status.setText("Folders changed. ⟳ Build graph to read them.")
 
     def add_folder(self, path: str) -> str:
         """'' when added, else why not (in words)."""

@@ -48,10 +48,10 @@ class StubActions(ConnectionsActions):
     def pi_workers(self):
         return []
 
-    def suggest(self, model, use_pis, on_progress, should_stop):
-        from tests.test_kg_suggest import oracle
+    def read_text(self, model, use_pis, on_progress, should_stop):
+        from tests.test_kg_suggest import open_oracle
         with self.open_graph() as kg:
-            return kg.suggest_from_text({f"this PC ({model})": oracle()},
+            return kg.extract_from_text({f"this PC ({model})": open_oracle()},
                                         model=model, on_progress=on_progress,
                                         should_stop=should_stop)
 
@@ -153,7 +153,16 @@ def test_factory_takes_a_window(qapp, monkeypatch):
         qapp.processEvents()
 
 
-def test_before_any_fields_nothing_is_read(qapp, tab):
+def test_a_first_build_reads_the_labelled_fields(qapp, tab):
+    """No set-up first (user, 2026-10-21): the default rules start ticked."""
+    tab.on_rebuild()
+    drive(qapp, tab)
+    assert "No field labels are ticked" not in tab.coverage.text()
+    assert tab.results.count() >= 15
+
+
+def test_with_every_rule_unticked_only_collections_are_read(qapp, tab):
+    tab.apply_fields({r.label: False for r, _s in tab._kg.field_rules()}, [])
     tab.on_rebuild()
     drive(qapp, tab)
     assert "No field labels are ticked" in tab.coverage.text()
@@ -331,22 +340,51 @@ def test_phrases_and_names():
     assert display_name(ent) == "PRJ-0915 — Helios Turbine Upgrade"
 
 
-def test_model_suggestions_arrive_as_suggested_links(qapp, tab):
-    _rebuilt(qapp, tab)
+def test_build_reads_the_documents_then_the_text_with_the_model(qapp, tab):
+    """⟳ Build graph (Morphik's create graph): the documents, then every
+    passage read by the chosen model; its links are in the graph at once."""
     _wait_threads(qapp)                    # the models are listed on a worker
     assert tab.model_box.currentData() == "llama3.1:8b"
+    assert tab.model_box.itemData(tab.model_box.count() - 1) == ""   # 'No model'
     assert not tab.pis_box.isEnabled()                     # no Pi nodes registered
+    tab.apply_fields({}, [("POC", "Point of Contact")])
+    tab.on_build()
+    drive(qapp, tab)
+    if tab._busy is False and "Built" not in tab.status.text():
+        drive(qapp, tab)
+    assert tab.status.text().startswith("Built: the model read"), tab.status.text()
+    assert "Text read by a model: 6 of 6" in tab.coverage.text()
+    tab.search.setText("BRG-7720")
+    tab.results.setCurrentRow(0)
+    used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
+    assert used_in.text(1) == "seeded"
+    ev = used_in.child(0)
+    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
+    tab.tree.setCurrentItem(used_in)
+    assert tab.reject_btn.isEnabled()                      # still the user's to reject
+    tab.reject_btn.click()
+    with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
+        st = {r["status"] for r in kg.all_relations(include_rejected=True)
+              if r["object"]["name"] == "BRG-7720" and r["subject"]["name"] == "PRJ-0915"}
+    assert st == {"rejected"}
+    tab.on_build()                                         # nothing new to read
+    drive(qapp, tab)
+    drive(qapp, tab)
+    assert tab.status.text() == "Built. The model had read every passage already."
+
+
+def test_a_graph_set_to_review_keeps_the_models_links_waiting(qapp, tab):
+    _wait_threads(qapp)
+    _rebuilt(qapp, tab)
+    tab._kg.set_model_links("review")
     tab.on_suggest()
     drive(qapp, tab)
-    assert "link(s) suggested" in tab.status.text()
+    assert "Its links wait for you" in tab.status.text()
     tab.search.setText("BRG-7720")
     tab.results.setCurrentRow(0)
     used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
     assert used_in.text(1) == "suggested"
-    ev = used_in.child(0)
-    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
     tab.tree.setCurrentItem(used_in)
-    assert tab.accept_btn.isEnabled()
     tab.accept_btn.click()
     with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
         st = {r["status"] for r in kg.all_relations()
@@ -358,13 +396,13 @@ def test_suggest_runs_off_the_gui_thread_and_can_stop(qapp, tab, monkeypatch):
     _rebuilt(qapp, tab)
     _wait_threads(qapp)
     seen = []
-    real = tab.actions.suggest
+    real = tab.actions.read_text
 
     def spy(model, use_pis, on_progress, should_stop):
         seen.append(threading.current_thread() is threading.main_thread())
         tab._stop.set()                     # as if Stop were pressed at once
         return real(model, use_pis, on_progress, should_stop)
-    monkeypatch.setattr(tab.actions, "suggest", spy)
+    monkeypatch.setattr(tab.actions, "read_text", spy)
     tab.on_suggest()
     drive(qapp, tab)
     assert seen == [False] and "Stopped" in tab.status.text()
@@ -482,12 +520,12 @@ def test_pi_workers_are_us_origin_only(qapp, vault, monkeypatch):
 
 def test_suggest_gives_each_worker_its_own_model_and_no_double_prefix(qapp, vault, monkeypatch):
     from council_core import kg_extract as kx
-    from tests.test_kg_suggest import oracle
+    from tests.test_kg_suggest import open_oracle
     made = []
 
     def fake_chat(model, host=None):
         made.append((model, host))
-        return oracle()
+        return open_oracle()
     monkeypatch.setattr(kx, "ollama_chat", fake_chat)
     monkeypatch.setenv("COUNCIL_REMOTE_NODES", "1")
     _registry(vault, [{"name": "NodePrimus", "host": "192.0.2.10", "model": "qwen2.5:3b"},
@@ -496,14 +534,14 @@ def test_suggest_gives_each_worker_its_own_model_and_no_double_prefix(qapp, vaul
     with acts.open_graph() as kg:
         kg.confirm_all_rules()
         kg.seed()
-    stats = acts.suggest("gemma3:12b", True, None, lambda: False)
+    stats = acts.read_text("gemma3:12b", True, None, lambda: False)
     assert made == [("gemma3:12b", None), ("llama3.2:3b", "http://192.0.2.12:11434")]
     assert stats["done"] == stats["chunks"] > 0
     with acts.open_graph() as kg:
-        kinds = [r[0] for r in kg.db.execute("SELECT kind FROM runs WHERE kind LIKE 'extract%'")]
+        kinds = [r[0] for r in kg.db.execute("SELECT kind FROM runs WHERE kind LIKE 'build%'")]
         models = {r[0] for r in kg.db.execute("SELECT model FROM extraction_done")}
-    assert kinds == ["extract:gemma3:12b"]
-    assert models <= {"gemma3:12b", "llama3.2:3b"}
+    assert kinds == ["build:gemma3:12b"]
+    assert models <= {"open|gemma3:12b", "open|llama3.2:3b"}
 
 
 def test_models_are_listed_off_the_gui_thread(qapp, vault):
@@ -516,7 +554,7 @@ def test_models_are_listed_off_the_gui_thread(qapp, vault):
     view = ConnectionsTab(actions=Spy(vault))
     try:
         _wait_threads(qapp)
-        assert seen == [False] and view.model_box.count() == 1
+        assert seen == [False] and view.model_box.count() == 2     # and 'No model'
     finally:
         view.close()
         view.deleteLater()
