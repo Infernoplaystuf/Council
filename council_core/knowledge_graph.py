@@ -83,11 +83,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
 ENTITY_TYPES = ("PERSON", "PART", "PROJECT", "DOCUMENT")
+#: The types labelled fields and the Ledger give. A model reading free text
+#: may name any other (ORGANIZATION, LOCATION, EQUIPMENT ... - user,
+#: 2026-10-21: "function very similar to Morphik"); DOCUMENT is only ever a
+#: file the graph read.
+CORE_TYPES = ("PERSON", "PART", "PROJECT")
 #: INSPECTED (person -> part) comes only from the Ledger's columns and
 #: reader (council_core/kg_excel.py): who signed a part's readings. A model
 #: is never asked for it (kg_extract.SIGNATURES does not list it).
@@ -198,6 +203,15 @@ CREATE TABLE IF NOT EXISTS extraction_docs (
 -- rebuild resumes. reader_sig covers the confirmed field rules and the
 -- reading code: either changing reads every document again. A row goes when
 -- its document is deleted or can no longer be read (it holds the text).
+-- v4: what a model said an entity is in a document ('description'), kept with
+-- the document version it read (a changed document's go at the next rebuild).
+CREATE TABLE IF NOT EXISTS entity_props (
+    entity_id TEXT NOT NULL, document_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+    name TEXT NOT NULL, value TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL,
+    PRIMARY KEY (entity_id, document_id, name, value)
+);
+CREATE INDEX IF NOT EXISTS entity_props_entity ON entity_props(entity_id);
 CREATE TABLE IF NOT EXISTS doc_cache (
     document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
     reader_sig TEXT NOT NULL, records TEXT NOT NULL, lines TEXT NOT NULL,
@@ -357,7 +371,10 @@ def entity_key(etype: str, raw: str) -> str:
         return code_key(raw)
     if etype == "PROJECT":
         return code_key(raw) if looks_like_code(raw) else fold(raw)
-    return str(raw)
+    if etype == "DOCUMENT":
+        return str(raw)
+    # any type a model named: a code as a code, a name folded
+    return code_key(raw) if looks_like_code(raw) else fold(raw)
 
 
 def entity_id(etype: str, key: str) -> str:
@@ -812,7 +829,7 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
         return "the Ledger" if k == 1 and led["known"] == 1 else _plural(k, "Ledger")
     if not d["built"]:
         why("not_built", "the graph has not been built yet",
-            "Press ⟳ Rebuild graph. It reads the vault's data_in folder, the folders added "
+            "Press ⟳ Build graph. It reads the vault's data_in folder, the folders added "
             "in Connections › Folders… and the Ledgers made in the Ledger tab.")
         return out
     n_docs = docs["read"] + docs["unreadable"]
@@ -833,14 +850,14 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
             f"or pick {'it' if k == 1 else 'them'} again in the Ledger tab",
             "The graph reads a Ledger where the Ledger tab made it. It was moved or renamed, "
             "or its drive is unplugged: put it back, or pick its parent CSV where it is now "
-            "in the Ledger tab (that adds it there); then ⟳ Rebuild graph. Connections › "
+            "in the Ledger tab (that adds it there); then ⟳ Build graph. Connections › "
             "Folders… lists where the graph looks.")
     if led["waiting"]:
         k = led["waiting"]
         why("ledger_not_read", f"{ledgers(k)} {'has' if k == 1 else 'have'} not been read "
-            "yet — ⟳ Rebuild graph",
+            "yet — ⟳ Build graph",
             f"The Ledger tab added {'it' if k == 1 else 'them'} after the last rebuild: press "
-            "⟳ Rebuild graph here (or Rebuild knowledge graph in the Ledger tab).")
+            "⟳ Build graph here (or Rebuild knowledge graph in the Ledger tab).")
     if led["not_ledger"]:
         # its schema.json went: read as a plain table, and 'not read yet -
         # Rebuild' was never true (review, 2026-10-20)
@@ -850,7 +867,7 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
             + " missing — read as a plain table",
             "A Ledger is its parent CSV and the '.schema.json' file the Ledger tab made "
             "beside it. Put that file back beside the CSV, or press Create / extend parent "
-            "CSV in the Ledger tab with its template to make it again; then ⟳ Rebuild graph.")
+            "CSV in the Ledger tab with its template to make it again; then ⟳ Build graph.")
     if docs["unreadable"] and not docs["read"]:
         why("all_unreadable", "none of the documents could be read",
             "The rebuild's line and Connections › Spreadsheets… say why for each: a reader "
@@ -861,24 +878,12 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
             "Spreadsheets… says why",
             f"Connections › Spreadsheets… lists {'it' if k == 1 else 'them'} under Not read, "
             "with why.")
-    if not led["known"] and n_docs:
-        # The tester's case (user, 2026-10-20): a Ledger made with an earlier
-        # build is not added until it is picked, applied or rebuilt in the
-        # Ledger tab, and with other documents in data_in nothing said so -
-        # 'no field rules ticked' came first. Above the field rules: a
-        # Ledger needs none.
-        why("no_ledger", "no Ledger is known to the graph — if you made one, pick its "
-            "parent CSV in the Ledger tab",
-            "A Ledger made with an earlier Council is not added to the graph by itself. In "
-            "the Ledger tab, pick its parent CSV (Parent CSV › Browse…): that adds it, as "
-            "Apply and Rebuild knowledge graph there do. Then ⟳ Rebuild graph here. If you "
-            "do not use the Ledger, this is not the reason.")
     if d["initials_waiting"]:
         k = d["initials_waiting"]
         why("initials_unnamed", ("an inspector's initials have" if k == 1 else
                                  f"{k} inspectors' initials have") + " no name yet",
             "Say who each one is in Connections › Questions, or type the full names on the "
-            "People sheet of the Ledger's review and Apply it again; then ⟳ Rebuild graph. "
+            "People sheet of the Ledger's review and Apply it again; then ⟳ Build graph. "
             "Initials are never guessed.")
     if led["empty"]:
         k = led["empty"]
@@ -900,6 +905,19 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
             + " empty",
             "No accepted row names an inspector: accept (Y) the inspectors' initials in the "
             "review too - or type them in - and Apply again.")
+    model = d.get("model") or {}
+    if model.get("prose_documents") and not model.get("passages"):
+        # A vault of reports and notes: what is in their sentences comes only
+        # from a model reading them (Morphik's way) - the most likely reason
+        # by far for a prose vault (verified 2026-10-21: one notes file naming
+        # a lead, a part and a supplier gave 0 links and nothing said why but
+        # 'no Ledger is known').
+        why("text_not_read", "no model has read the text yet — choose a model and "
+            "⟳ Build graph",
+            "Labelled fields and tables give links without a model; the sentences of "
+            "reports, notes and PDFs need one. Choose an installed model in Connections "
+            "(gemma3:12b reads best; install one with 'ollama pull gemma3:12b') and press "
+            "⟳ Build graph.")
     seen = rules["proposed_seen"]
     if seen:
         k = len(seen)
@@ -909,13 +927,26 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
         why("rules_unticked", short + " — Connections › Fields…",
             "Connections › Fields…: tick the labels that mean a person, part or project ("
             + ", ".join(seen[:8]) + (" …" if k > 8 else "") + ") - or press 'Tick the "
-            "suggested field rules' - then ⟳ Rebuild graph. Only ticked labels are read.")
-    elif docs["workbooks"] + docs["text"] and not rules["confirmed_seen"]:
+            "suggested field rules' - then ⟳ Build graph. Only ticked labels are read.")
+    elif docs["workbooks"] + docs["text"] and not rules["confirmed_seen"] \
+            and not model.get("passages"):
         why("rules_not_seen", "no field label the graph knows is in your documents — "
             "Connections › Fields…",
             "Connections › Fields… also lists labels your documents use that may mean the "
-            "same ('POC' for 'Point of Contact'): tick those, then ⟳ Rebuild graph. Suggest "
-            "links can read free text with a model.")
+            "same ('POC' for 'Point of Contact'): tick those, then ⟳ Build graph. A model "
+            "reads the free text when one is chosen.")
+    if not led["known"] and n_docs and not d["links"]:
+        # The tester's case (user, 2026-10-20): a Ledger made with an earlier
+        # build is not added until it is picked, applied or rebuilt in the
+        # Ledger tab. Last of the causes, and only at 0 links: it was the
+        # first reason given for every vault without a Ledger, ahead of the
+        # one that applied (review, 2026-10-21).
+        why("no_ledger", "if you made a Ledger, the graph does not know it — pick its "
+            "parent CSV in the Ledger tab",
+            "A Ledger made with an earlier Council is not added to the graph by itself. In "
+            "the Ledger tab, pick its parent CSV (Parent CSV › Browse…): that adds it, as "
+            "Apply and Rebuild knowledge graph there do. Then ⟳ Build graph here. If you "
+            "do not use the Ledger, this is not the reason.")
     if not d["links"] and d["suggested"]:
         k = d["suggested"]
         why("only_suggested", f"{_plural(k, 'suggested link')} {'waits' if k == 1 else 'wait'} "
@@ -928,12 +959,12 @@ def _no_links_reasons(d: Dict[str, Any]) -> List[Dict[str, str]]:
                 "or document",
                 "A link needs two of them together: a part and its owner in one row, a "
                 "project and its lead in one document. Tick a part or project label beside "
-                "the people in Connections › Fields…, or Suggest links from free text.")
+                "the people in Connections › Fields…, or ⟳ Build graph with a model.")
         else:
             why("nothing_named", "nothing in the documents was read as a person, part or "
                 "project",
-                "Connections › Fields…: tick the labels your documents use, then ⟳ Rebuild "
-                "graph.")
+                "Connections › Fields…: tick the labels your documents use, then ⟳ Build "
+                "graph with a model chosen, so the sentences are read too.")
     return out
 
 
@@ -1011,9 +1042,16 @@ def why_no_links_text(d: Dict[str, Any]) -> str:
         out.append("  Links by status: " + ", ".join(
             f"{s} {rels.get(s, 0)}" for s in ("seeded", "accepted", "suggested", "rejected")))
         ents = d["entities"]
+        others = sum(v for k, v in ents.items() if k not in CORE_TYPES)
         out.append(f"  Found: {_plural(ents.get('PERSON', 0), 'person', 'people')}, "
                    f"{_plural(ents.get('PART', 0), 'part')}, "
-                   f"{_plural(ents.get('PROJECT', 0), 'project')}")
+                   f"{_plural(ents.get('PROJECT', 0), 'project')}"
+                   + (f", {_plural(others, 'other entity', 'other entities')}"
+                      if others else ""))
+        model = d.get("model") or {}
+        out.append(f"  Text read by a model: {model.get('documents', 0)} of "
+                   f"{model.get('text_documents', 0)} text document(s), "
+                   f"{_plural(model.get('passages', 0), 'passage')}")
         out.append(f"  Open questions: {d['questions']} (Connections › Questions)")
     return "\n".join(out)
 
@@ -1862,10 +1900,16 @@ class KnowledgeGraph:
     DEFAULT_IMAGE_READER = "default"
 
     def __init__(self, vault: Any, root: Any = None,
-                 image_reader: Any = DEFAULT_IMAGE_READER) -> None:
+                 image_reader: Any = DEFAULT_IMAGE_READER, *, store: Any = None,
+                 scope: Optional[Dict[str, Any]] = None) -> None:
         self.vault = Path(vault)
         self.root = Path(root) if root is not None else self.vault / "data_in"
-        self.path = store_path(self.vault)
+        # A named graph (council_core.kg_graphs): its own store, and only the
+        # documents inside its folders (and of its file types).
+        self.path = Path(store) if store is not None else store_path(self.vault)
+        scope = scope or {}
+        self._scope_folders = [str(f) for f in scope.get("folders") or []]
+        self._scope_suffixes = {str(x).lower() for x in scope.get("suffixes") or []}
         self._image_reader_arg = image_reader
         #: During seed(): the entities this run supports (see seed).
         self._live: Optional[set] = None
@@ -1882,7 +1926,8 @@ class KnowledgeGraph:
         #: 40 s, for a 20,000-row workbook rebuilt unchanged.
         self._memo: Optional[Dict[str, Any]] = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
+        existed = self.path.exists()
+        if existed:
             self._check_before_writing()
         self.db = None
         try:
@@ -1905,9 +1950,23 @@ class KnowledgeGraph:
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'"
                                 " AND CAST(value AS INTEGER) < ?",
                                 (str(SCHEMA_VERSION), SCHEMA_VERSION))
+                # The default rules are ON (user, 2026-10-21: "field rules
+                # first" was a wrong assumption - Morphik needs no set-up
+                # before a build). Fields… still unticks any of them.
                 for r in DEFAULT_FIELD_RULES:
                     self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
-                                    "(?, ?, 'proposed')", (r.label, r.to_json()))
+                                    "(?, ?, 'confirmed')", (r.label, r.to_json()))
+                # A store made while they started proposed: ticked once, unless
+                # the user ever ticked or unticked a rule (their choice stands).
+                if existed and self.db.execute(
+                        "SELECT 1 FROM meta WHERE key='rules_on_by_default'").fetchone() is None:
+                    if self.db.execute("SELECT 1 FROM decisions WHERE action='field_rule'"
+                                       " LIMIT 1").fetchone() is None:
+                        self.db.executemany(
+                            "UPDATE field_rules SET status='confirmed' WHERE label=? AND"
+                            " status='proposed'", [(r.label,) for r in DEFAULT_FIELD_RULES])
+                self.db.execute("INSERT OR IGNORE INTO meta VALUES ('rules_on_by_default',"
+                                " '1')")
         except sqlite3.DatabaseError as exc:
             if self.db is not None:
                 self.db.close()
@@ -2320,7 +2379,17 @@ class KnowledgeGraph:
                 if _real(p) not in seen:
                     seen.add(_real(p))
                     out.append(p)
+        if self._scope_folders or self._scope_suffixes:
+            out = [p for p in out if self._in_scope(p)]
         return out
+
+    def _in_scope(self, p: Path) -> bool:
+        """A named graph reads only the documents inside its folders, of its
+        file types."""
+        if self._scope_suffixes and p.suffix.lower() not in self._scope_suffixes:
+            return False
+        return not self._scope_folders or any(
+            _overlaps(p, f, inside_only=True) for f in self._scope_folders)
 
     def _walk_added(self, base: Path, others: Sequence[Path]) -> List[Path]:
         """An added folder's files. Links and junctions are not followed and
@@ -3059,9 +3128,11 @@ class KnowledgeGraph:
                 stats["records"] = n_records
                 # Derived rows are rebuilt; decisions and user statuses are kept.
                 self.db.execute("DELETE FROM evidence WHERE method != 'model'")
-                self.db.execute("DELETE FROM mentions")
+                # What a model read (its entities' mentions and names) stays,
+                # as its links' evidence does: cleared below when stale.
+                self.db.execute("DELETE FROM mentions WHERE method != 'model'")
                 self.db.execute("DELETE FROM review WHERE status='open'")
-                self.db.execute("DELETE FROM aliases WHERE source != 'user'")
+                self.db.execute("DELETE FROM aliases WHERE source NOT IN ('user', 'model')")
                 # Every derived status is worked out again from THIS run's
                 # evidence: a link once 'seeded' stayed seeded after its document
                 # came to name several projects, so the user was never asked.
@@ -3099,6 +3170,21 @@ class KnowledgeGraph:
                 self.db.execute(
                     "DELETE FROM extraction_docs WHERE document_id NOT IN"
                     " (SELECT id FROM documents WHERE status != 'missing')")
+                # A model's mentions, names and descriptions go with what it
+                # read: the document changed or went.
+                self.db.execute(
+                    "DELETE FROM mentions WHERE method='model' AND document_id NOT IN"
+                    " (SELECT document_id FROM extraction_done)")
+                self.db.execute(
+                    "DELETE FROM entity_props WHERE content_hash !="
+                    " (SELECT content_hash FROM documents d WHERE d.id=entity_props.document_id)"
+                    " OR document_id IN (SELECT id FROM documents WHERE status='missing')")
+                self.db.execute(
+                    "DELETE FROM aliases WHERE source='model' AND entity_id NOT IN"
+                    " (SELECT entity_id FROM mentions WHERE method='model')")
+                # what a model read still stands: its entities are this run's
+                self._live |= {r[0] for r in self.db.execute(
+                    "SELECT entity_id FROM mentions WHERE method='model'")}
                 prog.update(f"linking {n_records} records", force=True)
                 # Evidence and mentions are gathered, then written in batches;
                 # nothing reads them until the gazetteer (which checks the
@@ -3128,9 +3214,13 @@ class KnowledgeGraph:
                 # proposed (KG2 evidence is kept across runs) is a suggestion; the
                 # rest - the document changed or the rule was withdrawn - go. The
                 # user's accepted/rejected ones stay.
+                # (Only a model's evidence can be left on a pending link.) In
+                # the graph at once, or waiting for the user - the graph's
+                # setting (model_link_status).
                 self.db.execute(
-                    f"UPDATE relations SET status='suggested' WHERE status='{_PENDING}'"
-                    " AND id IN (SELECT relation_id FROM evidence)")
+                    f"UPDATE relations SET status=? WHERE status='{_PENDING}'"
+                    " AND id IN (SELECT relation_id FROM evidence)",
+                    (self.model_link_status(),))
                 self.db.execute(
                     "DELETE FROM relations WHERE status IN ('seeded','suggested',"
                     f" '{_PENDING}') AND id NOT IN (SELECT relation_id FROM evidence)")
@@ -3146,6 +3236,8 @@ class KnowledgeGraph:
                     "                WHERE merged_into IS NOT NULL)"
                     " AND id NOT IN (SELECT entity_id FROM aliases WHERE source='user')")
                 self.db.execute("DELETE FROM aliases WHERE entity_id NOT IN"
+                                " (SELECT id FROM entities)")
+                self.db.execute("DELETE FROM entity_props WHERE entity_id NOT IN"
                                 " (SELECT id FROM entities)")
                 stats.update(self.counts())
                 stats["graph_unchanged"] = False
@@ -3615,7 +3707,7 @@ class KnowledgeGraph:
         terms: List[Tuple[re.Pattern, str, str]] = []
         for r in self.db.execute(
                 "SELECT a.entity_id, a.alias FROM aliases a JOIN entities e"
-                " ON e.id=a.entity_id WHERE e.type IN ('PERSON','PART','PROJECT')"
+                " ON e.id=a.entity_id WHERE e.type != 'DOCUMENT'"
                 " AND e.merged_into IS NULL"):
             alias = r["alias"]
             if len(alias) < 4 or len(alias.split()) == 1 and not looks_like_code(alias):
@@ -4132,13 +4224,14 @@ class KnowledgeGraph:
             cands += index["by_token"].get(tok, [])
         return {pid for rx, pid in cands if rx.search(text)}
 
-    def known_entities(self, ids: Iterable[str]):
-        """kg_extract.Known for these entity ids (merged ones resolved)."""
+    def known_entities(self, ids: Iterable[str], every_type: bool = False):
+        """kg_extract.Known for these entity ids (merged ones resolved):
+        people, parts and projects, or ``every_type`` but documents."""
         from council_core import kg_extract as kx
         out = []
         for eid in dict.fromkeys(self.resolve(i) for i in ids):
             e = self.entity(eid)
-            if e and e["type"] in ("PERSON", "PART", "PROJECT"):
+            if e and (e["type"] in CORE_TYPES or every_type and e["type"] != "DOCUMENT"):
                 out.append(kx.Known(eid, e["type"], e["name"], list(e["aliases"])))
         return out
 
@@ -4274,7 +4367,8 @@ class KnowledgeGraph:
                     if c["page"] is not None:
                         loc["page"] = c["page"]
                     quote = link.quote + (f"  [{link.fixed}]" if link.fixed else "")
-                    self._relate(link.subject, link.predicate, link.object, "suggested",
+                    self._relate(link.subject, link.predicate, link.object,
+                                 self.model_link_status(),
                                  doc_id=c["document_id"], content_hash=c["content_hash"],
                                  locator=loc, quote=quote, method="model", run_id=run_id,
                                  model=f"{wmodel} @ {name}")
@@ -4296,6 +4390,323 @@ class KnowledgeGraph:
             self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
                             (time.time(), json.dumps(stats), run_id))
         return stats
+
+    # ── open extraction: what a model reads in every passage (Morphik-like) ──
+    #: meta keys: where a model's links go ('graph' = in the graph at once,
+    #: 'review' = suggested until accepted) and the graph's "what to look
+    #: for" (Morphik's prompt override for entity extraction).
+    MODEL_LINKS_KEY = "model_links"
+    FOCUS_KEY = "focus"
+
+    def model_link_status(self) -> str:
+        """The status a model's link gets: 'seeded' (in the graph at once -
+        the default, user 2026-10-21: "in the graph at once") or 'suggested'
+        (this graph waits for the user's ✓ Accept)."""
+        return "suggested" if self.meta(self.MODEL_LINKS_KEY) == "review" else "seeded"
+
+    def set_model_links(self, where: str) -> None:
+        """'graph' or 'review'. Links already found move with it (the user's
+        own accepted / rejected ones stay as they are)."""
+        if where not in ("graph", "review"):
+            raise ValueError(where)
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.MODEL_LINKS_KEY, where))
+            new = "seeded" if where == "graph" else "suggested"
+            # links that only a model's evidence holds up
+            self.db.execute(
+                "UPDATE relations SET status=?, updated_ts=? WHERE status IN"
+                " ('seeded','suggested') AND id IN (SELECT relation_id FROM evidence"
+                " WHERE method='model') AND id NOT IN (SELECT relation_id FROM evidence"
+                " WHERE method != 'model')", (new, time.time()))
+            self._decide("model_links", {"where": where})
+
+    def focus(self) -> str:
+        return self.meta(self.FOCUS_KEY) or ""
+
+    def set_focus(self, text: str) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.FOCUS_KEY, " ".join(str(text or "").split())[:500]))
+
+    def properties(self, eid: str) -> List[Dict[str, Any]]:
+        """What models said this entity is, per document."""
+        return [{"name": r["name"], "value": r["value"], "model": r["model"],
+                 "path": r["path"], "file": self.display_path(r["path"])}
+                for r in self.db.execute(
+                    "SELECT p.*, d.path FROM entity_props p JOIN documents d ON"
+                    " d.id=p.document_id WHERE p.entity_id=? ORDER BY d.path",
+                    (self.resolve(eid),))]
+
+    def _match_entity(self, name: str, etype: str) -> Optional[str]:
+        """The graph's entity a model's name means, when exactly one fits:
+        its own id (same type and key); else one whose name or alias is this
+        name - of the same type, or of any type unless both are people,
+        parts or projects of different types (Morphik merged a PERSON and a
+        PART of one name: never here)."""
+        eid = entity_id(etype, entity_key(etype, name))
+        row = self.db.execute("SELECT id FROM entities WHERE id=?", (eid,)).fetchone()
+        if row is not None:
+            return self.resolve(eid)
+        norms = {fold(name)}
+        if etype == "PERSON":
+            norms.add(person_key(name))
+        norms.discard("")
+        if not norms:
+            return None
+        marks = ",".join("?" * len(norms))
+        cands = {(self.resolve(r[0]), r[1]) for r in self.db.execute(
+            "SELECT a.entity_id, e.type FROM aliases a JOIN entities e ON e.id=a.entity_id"
+            f" WHERE a.alias_norm IN ({marks}) AND e.type != 'DOCUMENT'", tuple(norms))}
+        same = {c for c in cands if c[1] == etype}
+        if len(same) == 1:
+            return next(iter(same))[0]
+        if same:
+            return None
+        ok = {c for c in cands if not (c[1] in CORE_TYPES and etype in CORE_TYPES)}
+        return next(iter(ok))[0] if len(ok) == 1 else None
+
+    def _chunk_loc(self, c: Dict[str, Any], k: Optional[int]) -> Dict[str, Any]:
+        nos = c.get("line_nos") or []
+        i = (k or 1) - 1
+        line = nos[i] if 0 <= i < len(nos) else (c["first_line"] + i)
+        loc: Dict[str, Any] = {"line": line}
+        if c["page"] is not None:
+            loc["page"] = c["page"]
+        return loc
+
+    def _open_chunks(self, d, lines, ments, doc_ents, max_lines: int,
+                     overlap: int) -> List[Dict[str, Any]]:
+        """Every passage of a document (~40 lines, a small overlap; a PDF
+        page at most): the open extraction reads them all, as Morphik read
+        every chunk - not only the ones a known name was found in."""
+        out: List[Dict[str, Any]] = []
+        by_spot: Dict[Tuple[Optional[int], int], set] = {}
+        for eid, locj in ments:
+            loc = json.loads(locj)
+            if loc.get("line"):
+                by_spot.setdefault((loc.get("page"), int(loc["line"])), set()).add(eid)
+        groups: Dict[Optional[int], List[Tuple[int, str]]] = {}
+        for page, line, text in lines:
+            groups.setdefault(page, []).append((line, text))
+        n = 0
+        for page, plines in groups.items():
+            step = max(1, max_lines - overlap)
+            for start in range(0, max(1, len(plines)), step):
+                window = plines[start:start + max_lines]
+                if not window:
+                    break
+                wtext = "\n".join(t for _l, t in window)
+                if wtext.strip():
+                    ents = set()
+                    for line, _t in window:
+                        ents |= by_spot.get((page, line), set())
+                    out.append({"document_id": d["id"], "path": d["path"],
+                                "content_hash": d["content_hash"], "chunk": n,
+                                "page": page, "first_line": window[0][0],
+                                "line_nos": [ln for ln, _t in window], "text": wtext,
+                                "entities": (sorted(ents) + sorted(doc_ents - ents))[:60]})
+                n += 1
+                if start + max_lines >= len(plines):
+                    break
+        return out
+
+    def _model_entity(self, f, c: Dict[str, Any], run_id: str, model: str) -> str:
+        """Write one entity a model found in passage ``c``: the graph's own
+        when the name fits one, else a new one; its name as written, a
+        mention at the line naming it, and what the model said it is."""
+        if f.known is not None:
+            eid = self.resolve(f.known.key)
+        else:
+            eid = next((m for m in (self._match_entity(n, f.type)
+                                    for n in [f.name] + list(f.aliases)) if m), None) \
+                or self._entity(f.type, f.name, alias_source="model")
+        for n in [f.name] + list(f.aliases):
+            self._alias(eid, n, "model")
+        loc = self._chunk_loc(c, f.line)
+        lines = c["text"].splitlines()
+        text = lines[f.line - 1] if f.line and 0 < f.line <= len(lines) else f.name
+        self._mention(eid, c["document_id"], loc, f.name, _snip(text), "model", run_id)
+        if f.description:
+            self.db.execute("INSERT OR IGNORE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                            (self.resolve(eid), c["document_id"], c["content_hash"],
+                             "description", f.description, model, run_id))
+        return self.resolve(eid)
+
+    def extract_from_text(self, workers: Dict[str, Any], *, model: str,
+                          focus: Optional[str] = None, on_progress=None,
+                          should_stop=lambda: False, only_new: bool = True,
+                          max_lines: int = 40, overlap: int = 5) -> Dict[str, Any]:
+        """_extract_from_text, with progress lines in the terminal."""
+        from progress_report import Progress
+        with Progress(f"kg build ({model})") as prog:
+            token = _PROGRESS.set(prog)
+            try:
+                stats = self._extract_from_text(
+                    workers, model=model, focus=focus, on_progress=on_progress,
+                    should_stop=should_stop, only_new=only_new, max_lines=max_lines,
+                    overlap=overlap)
+            finally:
+                _PROGRESS.reset(token)
+            prog.finish(f"{stats['done']} of {stats['chunks']} passages read, "
+                        f"{stats['entities']} entities, {stats['links']} link(s)"
+                        + (" - stopped, run again to continue" if stats["stopped"] else ""))
+            return stats
+
+    def _extract_from_text(self, workers: Dict[str, Any], *, model: str,
+                           focus: Optional[str], on_progress, should_stop,
+                           only_new: bool, max_lines: int, overlap: int) -> Dict[str, Any]:
+        """Morphik's graph build, done the Council's way: a model reads EVERY
+        passage of every text document (workbook notes, text boxes and
+        pictures included; CSV and JSON tables give theirs through their
+        columns), names the entities in it - of any type - and the
+        relationships between them (kg_extract.extract_open, which checks
+        each against the passage). Entities are matched to the graph's by
+        rules (_match_entity); links go in the graph at once or wait for the
+        user, as this graph is set (model_link_status). Everything is cited
+        at its page and line, with the model's name.
+
+        Resumable as suggest_from_text is: a passage is done when a model of
+        this run read this version of it without an error (recorded as
+        'open|<model>'); a stopped build continues where it stopped, and an
+        unchanged document with the same "what to look for" is not read
+        again. ``workers``: as suggest_from_text."""
+        import queue as _queue
+        import threading as _threading
+        from council_core import kg_extract as kx
+
+        focus = self.focus() if focus is None else focus
+        wk: Dict[str, Tuple[Any, str]] = {
+            name: (w, model) if callable(w) else (w[0], str(w[1]))
+            for name, w in workers.items()}
+        keys = sorted({f"open|{m}" for _c, m in wk.values()})
+        marks = ",".join("?" * len(keys))
+
+        def is_done(doc_id: str, h: str, chunk: int) -> bool:
+            return self.db.execute(
+                "SELECT 1 FROM extraction_done WHERE document_id=? AND content_hash=? AND"
+                f" chunk=? AND error='' AND model IN ({marks})",
+                (doc_id, h, chunk, *keys)).fetchone() is not None
+
+        run_id = str(uuid.uuid4())
+        status = self.model_link_status()
+        todo: List[Dict[str, Any]] = []
+        read = skipped = 0
+        prog = progress_now()
+        docs = self._text_documents()
+        if prog is not None:
+            prog.stage("finding passages", total=len(docs), unit="documents")
+        with self.db:
+            for d in docs:
+                if prog is not None:
+                    prog.advance(what=self.display_path(d["path"]))
+                sig = hashlib.sha256("\0".join(
+                    ["open", d["content_hash"], focus, str(max_lines), str(overlap)])
+                    .encode("utf-8")).hexdigest()
+                prev = self.db.execute("SELECT sig, chunks FROM extraction_docs WHERE"
+                                       " document_id=?", (d["id"],)).fetchone()
+                if (only_new and prev is not None and prev["sig"] == sig
+                        and all(is_done(d["id"], d["content_hash"], n)
+                                for n in json.loads(prev["chunks"]))):
+                    skipped += 1
+                    continue
+                lines = self._doc_lines(d)
+                if lines is None:
+                    continue
+                read += 1
+                ments, doc_ents = self._doc_context(d)
+                chunks = self._open_chunks(d, lines, ments, doc_ents, max_lines, overlap)
+                self.db.execute("INSERT OR REPLACE INTO extraction_docs VALUES (?,?,?)",
+                                (d["id"], sig, json.dumps([c["chunk"] for c in chunks])))
+                for c in chunks:
+                    if only_new and is_done(c["document_id"], c["content_hash"], c["chunk"]):
+                        continue
+                    c["known"] = self.known_entities(c["entities"], every_type=True)
+                    todo.append(c)
+        stats = {"chunks": len(todo), "done": 0, "entities": 0, "new_entities": 0,
+                 "links": 0, "rejected": 0, "errors": 0, "stopped": False,
+                 "by_worker": {}, "documents_read": read, "documents_skipped": skipped,
+                 "first_error": ""}
+        with self.db:
+            self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
+                            (run_id, f"build:{model}", time.time()))
+        if prog is not None:
+            prog.stage("asking the model", total=len(todo), unit="passages")
+        jobs: "_queue.Queue" = _queue.Queue()
+        for c in todo:
+            jobs.put(c)
+        results: "_queue.Queue" = _queue.Queue()
+
+        def work(name, chat, wmodel):
+            while not should_stop():
+                try:
+                    c = jobs.get_nowait()
+                except _queue.Empty:
+                    return
+                res = kx.extract_open(c["text"], c["known"], chat, focus)
+                results.put((name, wmodel, c, res))
+
+        threads = [_threading.Thread(target=work, args=(n, ch, m), name=f"kg-build-{n}",
+                                     daemon=True) for n, (ch, m) in wk.items()]
+        for t in threads:
+            t.start()
+        while any(t.is_alive() for t in threads) or not results.empty():
+            try:
+                name, wmodel, c, res = results.get(timeout=0.2)
+            except _queue.Empty:
+                continue
+            label = f"{wmodel} @ {name}"
+            with self.db:
+                before = self.db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+                ids: Dict[int, str] = {}
+                for f in res.entities:
+                    ids[id(f)] = self._model_entity(f, c, run_id, label)
+                stats["new_entities"] += (self.db.execute(
+                    "SELECT COUNT(*) FROM entities").fetchone()[0] - before)
+                for link in res.links:
+                    s, o = ids.get(id(link.subject)), ids.get(id(link.object))
+                    if not s or not o:
+                        continue
+                    quote = link.quote + (f"  [{link.fixed}]" if link.fixed else "")
+                    self._relate(s, link.predicate, o, status,
+                                 doc_id=c["document_id"], content_hash=c["content_hash"],
+                                 locator=self._chunk_loc(c, link.line), quote=quote,
+                                 method="model", run_id=run_id, model=label)
+                self.db.execute(
+                    "INSERT OR REPLACE INTO extraction_done VALUES (?,?,?,?,?,?,?)",
+                    (c["document_id"], c["content_hash"], c["chunk"], f"open|{wmodel}",
+                     time.time(), len(res.links), res.error))
+            stats["done"] += 1
+            stats["entities"] += len(res.entities)
+            stats["links"] += len(res.links)
+            stats["rejected"] += len(res.rejected)
+            if res.error:
+                stats["errors"] += 1
+                stats["first_error"] = stats["first_error"] or res.error
+            stats["by_worker"][name] = stats["by_worker"].get(name, 0) + 1
+            if prog is not None:
+                prog.advance(what=f"{self.display_path(c['path'])} read by {name}")
+            if on_progress:
+                on_progress(stats["done"], stats["chunks"], name)
+        stats["stopped"] = stats["done"] < stats["chunks"]
+        with self.db:
+            self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
+                            (time.time(), json.dumps(stats), run_id))
+        return stats
+
+    def model_read(self) -> Dict[str, int]:
+        """How much of the text a model has read: passages read, and the
+        documents with at least one."""
+        q = self.db.execute
+        return {"passages": q("SELECT COUNT(*) FROM extraction_done WHERE error=''")
+                .fetchone()[0],
+                "documents": q("SELECT COUNT(DISTINCT document_id) FROM extraction_done"
+                               " WHERE error=''").fetchone()[0],
+                "text_documents": len(self._text_documents()),
+                # reports, notes, PDFs: what has sentences (a workbook's notes
+                # count above, but a workbook vault needs no model to link)
+                "prose_documents": sum(1 for d in self._text_documents()
+                                       if Path(d["path"]).suffix.lower() not in _WORKBOOK)}
 
     # ── reading the graph ──
     def counts(self) -> Dict[str, Any]:
@@ -4319,6 +4730,10 @@ class KnowledgeGraph:
             d["name"] = doc["path"] if doc else d["name"]
         d["aliases"] = [a["alias"] for a in self.db.execute(
             "SELECT alias FROM aliases WHERE entity_id=? ORDER BY alias", (eid,))]
+        desc = self.db.execute("SELECT value FROM entity_props WHERE entity_id=? AND"
+                               " name='description' ORDER BY length(value) DESC LIMIT 1",
+                               (eid,)).fetchone()
+        d["description"] = desc[0] if desc else ""
         return d
 
     def search(self, text: str, etype: Optional[str] = None, limit: int = 50,
@@ -4665,6 +5080,7 @@ class KnowledgeGraph:
             "links": links, "suggested": rels.get("suggested", 0), "relations": rels,
             "documents": docs, "ledgers": led, "initials_waiting": int(initials),
             "questions": int(counts["open_reviews"]), "rules": rules,
+            "model": self.model_read(),
             "entities": {k: v for k, v in counts["entities"].items() if k != "DOCUMENT"}}
         out["reasons"] = _no_links_reasons(out)
         out["reason"] = out["reasons"][0] if out["reasons"] else None
@@ -4788,6 +5204,8 @@ class KnowledgeGraph:
             "review": [dict(r) for r in q("SELECT * FROM review ORDER BY id")],
             "decisions": [dict(r) for r in q("SELECT * FROM decisions ORDER BY id")],
             "field_rules": [dict(r) for r in q("SELECT * FROM field_rules ORDER BY label")],
+            "entity_props": [dict(r) for r in q("SELECT * FROM entity_props ORDER BY"
+                                                " entity_id, document_id, name")],
         }
 
     def export_relations_csv(self) -> str:

@@ -39,9 +39,14 @@ def _vault(tmp_path, name="v"):
 
 
 def _kg(v, reader=None, confirm=True):
+    """``confirm=False``: every field rule unticked by the user (the default
+    rules start ticked since 2026-10-21)."""
     kg = kgm.KnowledgeGraph(v, image_reader=reader)
     if confirm:
         kg.confirm_all_rules()
+    else:
+        for r, _s in kg.field_rules():
+            kg.set_rule_status(r.label, "proposed")
     return kg
 
 
@@ -256,7 +261,7 @@ def test_ledger_columns_are_read_by_the_schema_not_guessed(tmp_path):
                          ("PRJ-7", "USES_PART", "2041"): "seeded"}
     assert _names(kg, "PERSON") == ["Dana Whitfield"]
     assert kg.reviews() == []
-    # Not confirmed: 'Project' is just a column.
+    # Unticked: 'Project' is just a column.
     v2 = _vault(tmp_path, "v2")
     led2 = ParentCSV.create(v2 / "data_in" / "parts_parent.csv", schema)
     led2.add_samples([{"Part Number": "2041", "Project": "PRJ-7"}])
@@ -831,7 +836,7 @@ def test_workbook_notes_feed_the_gazetteer_and_the_free_text_pass(tmp_path):
     owns = [n for n in kg.neighbors(dana["id"]) if n["predicate"] == "OWNS"]
     (ev,) = [e for n in owns for e in n["evidence"] if e["method"] == "model"]
     assert ev["path"] == "notes.xlsx" and ev["where"] == "sheet Log, row 9"
-    assert owns[0]["status"] == "suggested"
+    assert owns[0]["status"] == "seeded"              # in the graph at once
 
 
 def test_an_unchanged_workbook_is_skipped_and_a_changed_one_replaces_its_own(tmp_path,

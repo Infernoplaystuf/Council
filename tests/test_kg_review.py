@@ -177,7 +177,10 @@ def test_a_link_only_a_model_supports_is_a_suggestion(kg):
     # too; then the label rules are withdrawn. The desktop's seed() kept it
     # 'seeded' with only the model's evidence - firm, and never put to the
     # user. (Fixed by the laptop's re-derived statuses, kept in the merge.)
+    # Since 2026-10-21 a model's links are in the graph at once unless the
+    # graph is set to wait for the user: this is that setting.
     import json as _json
+    kg.set_model_links("review")
     note = kg.root / "ironbridge" / "notes" / "helios_contact.txt"
     sent = "Carol Lee is the point of contact for the Helios Turbine Upgrade and PRJ-0915."
     note.write_text("Helios contacts\n" + sent + "\n", encoding="utf-8")

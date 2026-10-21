@@ -39,6 +39,9 @@ def _graph(v, *, confirm=True, poc=False):
     kg = kgm.KnowledgeGraph(v)
     if confirm:
         kg.confirm_all_rules()
+    else:
+        for r, _s in kg.field_rules():
+            kg.set_rule_status(r.label, "proposed")
     if poc:
         kg.add_label_synonym("POC", "Point of Contact")
     return kg
@@ -159,7 +162,38 @@ def test_inferred_name_link_stays_suggested(tmp_path):
     assert st[("PRJ-2", "CONTACT_FOR")] == "suggested"
 
 
-def test_proposed_rules_are_not_used_until_confirmed(tmp_path):
+def test_the_default_rules_start_ticked(tmp_path):
+    """User, 2026-10-21: needing the field rules ticked before anything was
+    read was a wrong assumption - a first build reads the labelled fields."""
+    v, key = _vault(tmp_path)
+    kg = kgm.KnowledgeGraph(v)
+    assert {s for _r, s in kg.field_rules()} == {"confirmed"}
+    kg.seed()
+    labelled = _truth(key, evidence={"row", "record"}) - {
+        ("bob", "CONTACT_FOR", "northwind"), ("marcus", "CONTACT_FOR", "bands")}
+    assert labelled <= set(_found(kg, key))
+
+
+def test_an_older_store_gets_the_default_rules_ticked_unless_the_user_chose(tmp_path):
+    v, _key = _vault(tmp_path)
+    for name, user_chose in (("untouched", False), ("chosen", True)):
+        store = tmp_path / name
+        store.mkdir()
+        kg = kgm.KnowledgeGraph(store)
+        if user_chose:
+            kg.set_rule_status("Owner", "confirmed")
+        # as an earlier Council left it: every rule proposed, no marker
+        with kg.db:
+            kg.db.execute("UPDATE field_rules SET status='proposed'")
+            kg.db.execute("DELETE FROM meta WHERE key='rules_on_by_default'")
+        kg.close()
+        kg = kgm.KnowledgeGraph(store)
+        got = {s for _r, s in kg.field_rules()}
+        assert got == ({"proposed"} if user_chose else {"confirmed"}), name
+        kg.close()
+
+
+def test_unticked_rules_are_not_read(tmp_path):
     v, _key = _vault(tmp_path)
     kg = _graph(v, confirm=False)
     assert {s for _r, s in kg.field_rules()} == {"proposed"}

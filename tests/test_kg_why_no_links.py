@@ -126,7 +126,15 @@ def _plain_ledger(tmp_path: Path, folder: Path, rows) -> Path:
 
 
 def _kg(v):
-    return kgm.KnowledgeGraph(v, image_reader=None)
+    """The field rules as a store made before 2026-10-21 left them: all
+    unticked - the case these reasons and the one-click tick are for (the
+    default rules start ticked now; a user may untick them)."""
+    kg = kgm.KnowledgeGraph(v, image_reader=None)
+    if kg.meta("unticked_for_test") is None:
+        with kg.db:
+            kg.db.execute("UPDATE field_rules SET status='proposed'")
+            kg.db.execute("INSERT INTO meta VALUES ('unticked_for_test', '1')")
+    return kg
 
 
 def _links(stats) -> int:
@@ -141,7 +149,7 @@ def test_a_graph_never_built_says_so(tmp_path):
         d = kg.why_no_links()
     assert not d["built"] and d["reason"]["code"] == "not_built"
     assert "Most likely: the graph has not been built yet." in d["text"]
-    assert "Press ⟳ Rebuild graph" in d["text"]
+    assert "Press ⟳ Build graph" in d["text"]
 
 
 def test_no_documents_is_the_reason_and_the_summary_says_it(tmp_path):
@@ -173,7 +181,7 @@ def test_a_ledger_added_since_the_last_rebuild_is_known_but_not_read(tmp_path):
         assert d["ledgers"]["known"] == 1 and d["ledgers"]["read"] == 0
         assert d["ledgers"]["waiting"] == 1
         assert d["reason"]["code"] == "ledger_not_read"
-        assert d["reason"]["short"] == "the Ledger has not been read yet — ⟳ Rebuild graph"
+        assert d["reason"]["short"] == "the Ledger has not been read yet — ⟳ Build graph"
         assert "Ledgers (parent CSVs): 1 known to the graph, 0 read (1 waiting for a " \
                "rebuild)" in d["text"]
         stats = kg.seed()
@@ -323,26 +331,25 @@ def test_a_ledger_that_lost_its_schema_is_not_waiting_for_a_rebuild(tmp_path):
 
 
 def test_unticked_rules_the_documents_use_are_named_and_ticking_them_gives_links(tmp_path):
-    """The tester's raw workbooks: with every rule proposed, no link; the
-    rebuild names the reasons and the rules to tick - and ticks none. No
-    Ledger known comes first: the tester's own Ledger was made with an
-    earlier build, and 'no field rules ticked' sent them to Fields…
-    instead (review, 2026-10-20)."""
+    """The tester's raw workbooks: with every rule unticked, no link; the
+    rebuild names the reasons and the rules to tick - and ticks none. The
+    unticked rules come first, 'no Ledger known' last: it led for every
+    vault without a Ledger (review, 2026-10-21)."""
     v = _vault(tmp_path)
     _tracker(v)
     with _kg(v) as kg:
         stats = kg.seed()
         assert _links(stats) == 0
         assert kg.field_rules("confirmed") == []                 # nothing ticked silently
-        assert stats["no_links"]["code"] == "no_ledger"
+        assert stats["no_links"]["code"] == "rules_unticked"
         assert sorted(stats["rules_to_tick"]) == ["Owner", "Part Number", "Project"]
-        assert ("; 0 links found: no Ledger is known to the graph — if you made one, pick "
-                "its parent CSV in the Ledger tab.") in kgm.rebuild_summary_line(stats)
+        assert ("; 0 links found: no field rules ticked — Connections › Fields…"
+                ) in kgm.rebuild_summary_line(stats)
         d = kg.why_no_links()
-        assert [r["code"] for r in d["reasons"]] == ["no_ledger", "rules_unticked"]
-        assert "Most likely: no Ledger is known to the graph" in d["text"]
+        assert [r["code"] for r in d["reasons"]] == ["rules_unticked", "no_ledger"]
+        assert "Most likely: no field rules ticked — Connections › Fields…" in d["text"]
         assert "If you do not use the Ledger, this is not the reason." in d["text"]
-        assert "  • no field rules ticked — Connections › Fields…" in d["text"]
+        assert "  • if you made a Ledger, the graph does not know it" in d["text"]
         assert "proposed labels your documents use: 3 — Owner, Part Number, Project" in d["text"]
         assert "ticked labels your documents use: 0" in d["text"]
         for value in ("PN-100", "Dana Whitfield", "PRJ-7", "tracker"):
@@ -375,7 +382,7 @@ def test_ticked_rules_no_document_uses_point_at_fields(tmp_path):
         kg.confirm_all_rules()
         stats = kg.seed()
         d = kg.why_no_links()
-    assert [r["code"] for r in d["reasons"]] == ["no_ledger", "rules_not_seen"]
+    assert [r["code"] for r in d["reasons"]] == ["rules_not_seen", "no_ledger"]
     assert stats["rules_to_tick"] == []                         # every rule is ticked
 
 
@@ -650,7 +657,7 @@ def test_a_ledger_from_an_earlier_build_is_added_when_it_is_picked(qapp, tmp_pat
     ps = li.create_parent(lf.make_template(tmp_path / "Documents" / "lmm template.xlsx"))
     with _kg(vault) as kg:
         kg.seed()
-        assert kg.why_no_links()["reason"]["code"] == "no_ledger"
+        assert "no_ledger" in [r["code"] for r in kg.why_no_links()["reasons"]]
     asked = []
     acts = LedgerActions(opener=lambda p: None, connections=Actions(vault_dir=vault))
     real = acts.register_ledger
@@ -803,12 +810,13 @@ def test_the_suggested_field_rules_are_ticked_in_one_click_after_asking(qapp, tm
         ran_on.append(threading.current_thread().name)
         return real(labels)
     acts.tick_rules = spy
+    _kg(v).close()                                       # every rule unticked
     tab = ConnectionsTab(actions=acts, ask_yes_no=ask)
     try:
         tab.on_rebuild()
         _wait(qapp, tab)
         status = tab.status.text()
-        assert "; 0 links found: no Ledger is known to the graph" in status
+        assert "; 0 links found: no field rules ticked" in status
         assert ("Your documents use 3 labels the graph does not read yet: 'Tick the "
                 "suggested field rules' reads them.") in status
         assert tab.tick_btn.isVisibleTo(tab)
@@ -838,6 +846,7 @@ def test_a_busy_store_ticks_nothing_and_never_freezes_the_tab(qapp, tmp_path, mo
     monkeypatch.setattr(kgm.KnowledgeGraph, "BUSY_TIMEOUT_S", 0.5)
     v = _vault(tmp_path)
     _tracker(v)
+    _kg(v).close()                                       # every rule unticked
     tab = ConnectionsTab(actions=Actions(v), ask_yes_no=lambda *a, **k: True)
     hold = None
     try:
@@ -903,8 +912,7 @@ def test_the_why_dialog_offers_the_tick_on_a_first_run(qapp, tmp_path):
         _wait(qapp, tab)
         assert tab.tick_btn.isVisibleTo(tab)
         assert "no field rules ticked" in tab._why_dialog.text.toPlainText()
-        assert tab.status.text() == ("No links: no Ledger is known to the graph — if you made "
-                                     "one, pick its parent CSV in the Ledger tab.")
+        assert tab.status.text() == "No links: no field rules ticked — Connections › Fields…"
         tab._busy = True                                       # a rebuild elsewhere
         tab.on_tick_suggested()
         assert "busy" in tab.status.text() and tab._kg.field_rules("confirmed") == []

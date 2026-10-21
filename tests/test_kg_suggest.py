@@ -79,7 +79,9 @@ def test_the_documents_project_is_offered_even_by_a_one_word_name(kg):
 
 
 @needs_all
-def test_free_text_links_arrive_as_suggestions_with_their_line(kg):
+def test_free_text_links_arrive_in_the_graph_with_their_line(kg):
+    """In the graph at once (user, 2026-10-21); a graph set to 'review'
+    keeps them suggested (test_model_links_wait_for_the_user_when_set)."""
     stats = kg.suggest_from_text({"this PC": oracle()}, model="oracle")
     assert stats["errors"] == 0 and stats["links"] >= 4
     got = _model_links(kg)
@@ -87,7 +89,7 @@ def test_free_text_links_arrive_as_suggestions_with_their_line(kg):
         key = (NAMES[s], p, NAMES[o])
         assert key in got, key
     status, ev = got[("PRJ-0915", "USES_PART", "BRG-7720")]
-    assert status == "suggested"
+    assert status == "seeded"
     assert ev["path"].endswith("helios_status_2026-03.md") and ev["locator"] == {"line": 11}
     assert ev["model"] == "oracle @ this PC"
     _st, pdf_ev = got[("PRJ-0944", "USES_PART", "PN-1234/B")]
@@ -305,3 +307,17 @@ def test_a_file_locked_for_one_rebuild_keeps_its_model_links(kg):
     kg.seed()
     assert DAN in _model_links(kg)
     assert kg.suggest_from_text({"pc": oracle()}, model="oracle")["chunks"] == 0
+
+
+@needs_all
+def test_model_links_wait_for_the_user_when_set(kg):
+    kg.set_model_links("review")
+    kg.suggest_from_text({"this PC": oracle()}, model="oracle")
+    got = _model_links(kg)
+    assert got[("PRJ-0915", "USES_PART", "BRG-7720")][0] == "suggested"
+    kg.seed()                                    # a rebuild keeps the setting
+    assert _model_links(kg)[("PRJ-0915", "USES_PART", "BRG-7720")][0] == "suggested"
+    kg.set_model_links("graph")                  # ... and switching moves them
+    assert _model_links(kg)[("PRJ-0915", "USES_PART", "BRG-7720")][0] == "seeded"
+    # a link labels support too was never only the model's: it stays seeded
+    assert [d["action"] for d in kg.decisions()][-2:] == ["model_links", "model_links"]
