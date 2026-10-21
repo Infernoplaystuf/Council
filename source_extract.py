@@ -292,6 +292,19 @@ class Matcher:
         #: (part, section) -> who took Inspector 1, 2 ... of that section, in
         #: the order their tables were read (_Extractor._person_slots)
         self.person_slots: Dict[Tuple[str, str], List[str]] = {}
+        #: label words -> (field, the explanation) from the user's documents
+        #: (docs_open.explanations_for): a suggestion when the rules are unsure
+        self.explained: Dict[str, Tuple[str, Any]] = {}
+
+    def use_explanations(self, explanations: Sequence[Any]) -> None:
+        import docs_open
+        self.explained = docs_open.explanations_for(
+            explanations, [(f.name, [f.label, f.key, f.name.split(": ", 1)[-1]])
+                           for f in self.schema.fields])
+
+    def explained_note(self, label: Any) -> str:
+        hit = self.explained.get(re.sub(r"[^a-z0-9]+", " ", str(label).lower()).strip())
+        return f"{EXPLAINED_NOTE} {hit[1].describe()}" if hit else ""
 
     def slot_fields(self) -> Dict[str, List[Target]]:
         """Section -> its per-person fields in number order ('Visual
@@ -414,6 +427,26 @@ class Matcher:
                      ["defect"], ["defect", "number"], ["feature"], ["item"])
 
     def match(self, label, context: Sequence[str] = (), per_item: Optional[bool] = None) -> Match:
+        """per_item: True inside an item grid/table, False outside, None = any.
+        When the rules are not sure, what the user's documents say the label
+        means is a suggestion (via 'explained', never pre-accepted); it never
+        overrides a label taught, ignored, or someone's."""
+        mt = self._match_rules(label, context, per_item)
+        if mt.sure or not self.explained or not isinstance(label, str):
+            return mt
+        key = normalize_label(label)
+        if not key or key in self.ignore or key in self.who or key in self.item_heads \
+                or key in self.aliases:
+            return mt
+        hit = self.explained.get(re.sub(r"[^a-z0-9]+", " ", label.lower()).strip())
+        t = self.by_name.get(hit[0]) if hit else None
+        if t is None or (per_item is not None and t.per_item != per_item and not t.is_id):
+            return mt
+        return Match(t, EXPLAINED_SCORE, [(t.name, EXPLAINED_SCORE)]
+                     + [g for g in mt.guesses if g[0] != t.name][:2], via="explained")
+
+    def _match_rules(self, label, context: Sequence[str] = (),
+                     per_item: Optional[bool] = None) -> Match:
         """per_item: True inside an item grid/table, False outside, None = any."""
         if not isinstance(label, str) or (len(label) > LABEL_MAX and not _words(label)):
             # a note or a padded cell is no label: scored against every
@@ -672,6 +705,11 @@ UNSURE_SIGNER_NOTE = "ends in initials or a unit: who signed it? check it"
 #: of its own: the field is the other table's label, a guess (review,
 #: 2026-10-20).
 _PLACE_NOTE = "matched to this table by its place on the slide"
+#: a value read from a text document (docs_open)
+_DOC_NOTE = "read from a text document"
+#: a label placed by what the user's documents say it means (docs_open)
+EXPLAINED_NOTE = "explained in"
+EXPLAINED_SCORE = 0.75
 _BESIDE_NOTE = "a table beside another, with no labels of its own: which field? check it"
 #: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
 _NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
@@ -1050,7 +1088,11 @@ def preview_workbook(path, schema, aliases=None,
 #: Excel opens .xls, .xlsb and rights-protected files (excel_open.py).
 #: what a folder scan reads: workbooks, and PowerPoint decks (pptx_open lays
 #: each slide's tables out as sheets, user 2026-10-21)
-WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm")
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm",
+                     # text documents (docs_open): their tables and 'Label: value'
+                     # lines are data, their explanations of labels help the
+                     # matcher (user 2026-10-21)
+                     ".docx", ".docm", ".txt", ".text", ".md", ".pdf", ".doc", ".rtf")
 
 
 _SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
@@ -1201,6 +1243,9 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     path = Path(path)
     if path.suffix.lower() in pptx_open.SUFFIXES and path.exists():
         return _grids_from_pptx(path, notes, want_pictures)
+    import docs_open
+    if path.suffix.lower() in docs_open.SUFFIXES and path.exists():
+        return _grids_from_doc(path, notes, want_pictures)
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
         n = path_too_long(path)
@@ -1257,6 +1302,46 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
         # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
     return grids, images
+
+
+def _grids_from_doc(path: Path, notes: Optional[List[str]], want_pictures: bool = True
+                    ) -> Tuple[List[Grid], List["SourceImage"]]:
+    """A text document (docs_open): its short lines and headings as one
+    sheet, each table as a sheet with the headings and lines above it, its
+    pictures for the image reader. Its explanations of labels are read by
+    extract() before any workbook (document_explanations)."""
+    import docs_open
+    try:
+        doc = docs_open.read_document(path, want_pictures=want_pictures)
+    except docs_open.DocError as e:
+        raise LedgerError(str(e)) from e
+    if notes is not None:
+        notes.extend(doc.notes)
+    # a text document is looser than a workbook (a readme's 'Date: ...' in a
+    # folder of reports): its values are suggestions, never pre-accepted
+    note = f"{_DOC_NOTE} ({path.name}): check it"
+    grids = [Grid(path.name, s.name, dict(s.cells), place_note=note) for s in doc.sheets]
+    images = [SourceImage(path.name, p.sheet, p.anchor, p.data, p.fmt) for p in doc.pictures]
+    return grids, images
+
+
+def document_explanations(sources: Sequence) -> Tuple[List[Any], List[str]]:
+    """Every explanation of a label in the text documents among ``sources``
+    ('HP — health points'), and a problem line per document not read."""
+    import docs_open
+    out: List[Any] = []
+    problems: List[str] = []
+    for s in sources:
+        p = Path(s)
+        if p.suffix.lower() not in docs_open.SUFFIXES or not p.is_file():
+            continue
+        try:
+            out += docs_open.read_document(p, want_pictures=False).explanations
+        except docs_open.DocError:
+            continue                    # said when the document itself is read
+        except Exception as e:                              # noqa: BLE001
+            problems.append(f"{p.name}: its explanations could not be read ({e})")
+    return out, problems
 
 
 def _grids_from_pptx(path: Path, notes: Optional[List[str]], want_pictures: bool = True
@@ -1453,6 +1538,8 @@ class _Extractor:
                     note = f"unit {src_unit!r} vs template {match.target.unit!r}: not converted"
         if unsure:
             note = _join(note, UNSURE_SIGNER_NOTE)
+        if match.via == "explained":
+            note = _join(note, self.m.explained_note(label))
         score = match.score * (IMAGE_PENALTY if self.g.from_image else 1.0)
         o = Obs(part=part or "", item=item or "", field=fname if match.target else "",
                 value=txt, score=round(score, 2),
@@ -2986,6 +3073,9 @@ class Extraction:
     #: a label mapped in such a workbook had no part and was dropped
     #: (review, 2026-10-20); it is given these parts again.
     model_parts: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    #: what the text documents among the sources say labels mean (docs_open):
+    #: the matcher's suggestions, and notes for Council's model
+    explanations: List[Any] = field(default_factory=list)
 
 
 class _Cancelled(Exception):
@@ -3054,6 +3144,11 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     m = Matcher(schema, aliases, ignore, taught=taught)
     codes = ItemCodes(schema.items)
     run = Extraction([str(s) for s in sources], read=[])
+    # what the text documents say labels mean, before any workbook is read
+    run.explanations, said = document_explanations(sources)
+    run.problems += said
+    if run.explanations:
+        m.use_explanations(run.explanations)
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
     # The watchdog dumps every thread's stack when nothing has moved for
@@ -3462,7 +3557,7 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   and UNSURE_SIGNER_NOTE not in o.note and _BESIDE_NOTE not in o.note
                   # nor one of a slide's table whose text was paired with it
                   # only by where it sits (pptx_open, user 2026-10-21)
-                  and _PLACE_NOTE not in o.note
+                  and _PLACE_NOTE not in o.note and _DOC_NOTE not in o.note
                   and not o.part_how.startswith(MODEL_PART_HOW)
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
@@ -4222,7 +4317,8 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         reviewed.append((cells, c[3], _text(item), c))
         # accepting an unsure match teaches it, like a mapping on Labels to map;
         # a one-word label ("Date") is too generic to remember
-        if yes and fname in valid and label and via in ("match", "ambiguous", "model") \
+        if yes and fname in valid and label and via in ("match", "ambiguous", "model",
+                                                        "explained") \
                 and not judge.is_generic(str(label)) and (_num(score) or 0) < ACCEPT_AT:
             learned.setdefault(normalize_label(label), str(fname))
     wb.close()
@@ -4565,12 +4661,15 @@ def _council_chat(prompt: str, *, timeout: float
     except Exception:                                       # noqa: BLE001
         return None
     try:
-        text = ce.local_chat(
-            [{"role": "user", "content": prompt}],
-            temperature=0.0,
-            num_predict=2048,
-            json_schema=_MAPPING_SCHEMA,
-            timeout=int(max(5, timeout)))
+        # the model's own limits, as every Ledger call (council_core.ledger_llm)
+        from council_core import ledger_llm
+        with ce.model_window(ledger_llm.ledger_window()):
+            text = ce.local_chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                num_predict=ledger_llm.fill_reply(),
+                json_schema=_MAPPING_SCHEMA,
+                timeout=int(max(5, timeout)))
     except Exception:                                       # noqa: BLE001
         return None
     # local_chat returns the raw text; its stats carry the model name,

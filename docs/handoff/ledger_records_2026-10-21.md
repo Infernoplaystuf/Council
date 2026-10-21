@@ -204,6 +204,63 @@ and a deck read from the cache is read again when they change.
 - Saved links are the user's own answers, so what they place is pre-accepted.
 - Colour highlights keep working beside them.
 
+**Several cells at once.** Drag over template cells, then over as many sample
+cells; they link one to one in reading order (left to right, top to bottom), for
+example a row of the template's headers to a row of a sample's. Template cells that
+are one field repeated (a grid row across its flaws) count once. When the numbers
+differ, nothing is linked and the window says so (`ledger_linking.link_cells`).
+
+## Text documents (both Ledgers)
+
+`docs_open.py` reads .docx/.docm (Word's XML, standard library), .txt/.md/.text,
+and .pdf (pypdf, text only; it is already in Council's requirements). Folder
+scans and the file pickers include them. An old .doc or .rtf is refused with
+"save it as .docx".
+
+**What a document gives as data**
+- A "Text" sheet of its headings and short lines (`Part Number: 101`,
+  `Inspected by JB`). Long prose is left out.
+- A "Table N" sheet per table (Word tables, Markdown `| a | b |` tables, blocks
+  of tab-separated lines). The document's headings and the short lines since the
+  table before go above each table, then a blank row, as with a slide's text box.
+- Pictures in a Word document go to the image reader.
+
+**Explanations are never data.** These lines say what a label means:
+- `TERM means / stands for / is short for … TEXT`;
+- `TERM — TEXT`, `TERM - TEXT` or `TERM = TEXT` with three or more words;
+- `TERM: TEXT` with a sentence after it;
+- the rows of a two-column table headed like Term | Meaning.
+
+`docs_open.explanations_for` turns them into label → field suggestions:
+- the field the explanation names (the longest name wins; two named equally,
+  none);
+- the other way round, `Health: written "HP" in the old logs` teaches HP.
+
+**How each Ledger uses them**
+- **Sample-ID Ledger:** `Matcher.match` asks the documents only when its own
+  rules aren't sure, and never over a taught, ignored or inspector label. Values
+  are amber (`via="explained"`) with a note quoting the document line; accepting
+  one in the review teaches the label.
+- **Table Ledger:** a header the documents explain is a guess (`how="explained"`)
+  with one Decisions row; a Y teaches it.
+- **Council's model** gets the relevant explanations in its questions about
+  labels and header layouts (`docs_open.notes_text`).
+
+## The Ledger's model uses its own limits
+
+Every Ledger model call (labels, part numbers, header layouts, label-mapping
+suggestions) uses the model's own maximum instead of the council's chat defaults:
+
+- **Ollama:** sent the model's own context length, via
+  `council_engine.model_window()`, a per-call override of the slot window.
+- **A GGUF the user picks:** loaded with as much of its trained length as fits the
+  card (`_load_gguf(n_ctx_max=…)` replaces the 32K cap; the VRAM ladder still
+  applies). Council's main model keeps the window it was loaded with.
+- **The reply:** may use all the prompt leaves of the window
+  (`ledger_llm.reply_budget`), never less than 1,024 tokens. The stall limit is 300 s.
+- **Overrides** for a machine that needs less: `COUNCIL_LEDGER_NUM_CTX` caps the
+  window, `COUNCIL_LEDGER_NUM_PREDICT` fixes the reply length.
+
 ## Measured (this container, synthetic data)
 
 - **BTB:** reproduces `BTB_Template_filled.xlsx` cell for cell, colours included

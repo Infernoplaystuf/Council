@@ -34,7 +34,8 @@ from sample_ledger import LedgerError
 #: the tints: a template cell that is a field; the field picked now; a cell
 #: linked in this window; a sample cell in a table Council found
 FIELD_TINT, PICKED_TINT, LINKED_TINT, TABLE_TINT = "#DDEBF7", "#9BC2E6", "#FFE699", "#F2F2F2"
-SOURCES = "Workbooks and decks (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.csv)"
+SOURCES = ("Workbooks, decks and documents (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.csv "
+           "*.docx *.txt *.md *.pdf)")
 
 
 def _letters(c: int) -> str:
@@ -84,6 +85,18 @@ class SheetModel(QAbstractTableModel):
         self.endResetModel()
 
 
+class DrawTable(QTableView):
+    """A sheet's table that hands over the cells drawn over (one click is a
+    drawing of one cell) when the mouse is let go."""
+    drawn = Signal(object)                  # [(row, col), ...], 1-based, reading order
+
+    def mouseReleaseEvent(self, event) -> None:            # noqa: N802
+        super().mouseReleaseEvent(event)
+        cells = sorted((i.row() + 1, i.column() + 1) for i in self.selectedIndexes())
+        if cells:
+            self.drawn.emit(cells)
+
+
 class LinkDialog(QDialog):
     _template_read = Signal(object, str)    # (TemplateView or None, error)
     _sample_read = Signal(object, str)      # (SampleView or None, error)
@@ -102,6 +115,9 @@ class LinkDialog(QDialog):
         self.template: Optional[ll.TemplateView] = None
         self.sample: Optional[ll.SampleView] = None
         self.picked: str = ""                    # the field the next sample click links
+        #: the fields of the template cells drawn over, in reading order: the
+        #: next sample drawing of as many cells links them one to one
+        self.picked_many: List[str] = []
         self.links: List[ll.Link] = []
         self.busy = False
         self._template_models: List[SheetModel] = []
@@ -120,7 +136,9 @@ class LinkDialog(QDialog):
         self.help = QLabel(
             "1. Click the template cell where a value goes (or pick its field in the list). "
             "2. Click the sample cell it comes from: a column's header or any of its values, "
-            "or a labelled value. Each link is listed below; Save teaches the next Extract.")
+            "or a labelled value. Or drag over several template cells, then over as many "
+            "sample cells: they link one to one, in order. Each link is listed below; Save "
+            "teaches the next Extract.")
         self.help.setWordWrap(True)
         outer.addWidget(self.help)
         split = QSplitter(Qt.Horizontal)
@@ -199,15 +217,15 @@ class LinkDialog(QDialog):
         outer.addLayout(row)
         self._refresh_buttons()
 
-    def _table_view(self, model: SheetModel, on_click) -> QTableView:
-        view = QTableView()
+    def _table_view(self, model: SheetModel, on_draw) -> QTableView:
+        view = DrawTable()
         view.setModel(model)
-        view.setSelectionMode(QAbstractItemView.SingleSelection)
+        view.setSelectionMode(QAbstractItemView.ContiguousSelection)
         view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         view.horizontalHeader().setDefaultSectionSize(90)
         view.verticalHeader().setDefaultSectionSize(22)
-        view.clicked.connect(lambda idx: on_click(model, idx.row() + 1, idx.column() + 1))
+        view.drawn.connect(lambda cells: on_draw(model, cells))
         return view
 
     # ── reading (worker threads) ────────────────────────────────────────
@@ -250,7 +268,7 @@ class LinkDialog(QDialog):
         for sheet in view.sheets:
             m = SheetModel(sheet, self)
             self._template_models.append(m)
-            self.template_tabs.addTab(self._table_view(m, self.on_template_click), sheet.name)
+            self.template_tabs.addTab(self._table_view(m, self.on_template_drawn), sheet.name)
         self._retint()
         if not self.busy:
             self.status.setText("Click the template cell where a value goes.")
@@ -267,7 +285,7 @@ class LinkDialog(QDialog):
         for sheet in view.sheets:
             m = SheetModel(sheet, self)
             self._sample_models.append(m)
-            self.sample_tabs.addTab(self._table_view(m, self.on_sample_click), sheet.name)
+            self.sample_tabs.addTab(self._table_view(m, self.on_sample_drawn), sheet.name)
         if view.pairings:
             self.sample_tabs.addTab(self._pairings_table(view), "Text boxes")
         self._retint()
@@ -318,10 +336,60 @@ class LinkDialog(QDialog):
 
     def pick(self, name: str) -> None:
         self.picked = name
+        self.picked_many = [name]
         self._retint()
         self._refresh_buttons()
         self.status.setText(f"{name}: now click where it comes from in the sample"
                             + (" (the column to look it up in)" if self._lookup_mode else ""))
+
+    def on_template_drawn(self, model: SheetModel, cells) -> None:
+        """One cell: its field. Several: their fields in reading order, for
+        the next sample drawing of as many cells."""
+        if len(cells) == 1:
+            self.on_template_click(model, *cells[0])
+            return
+        fields = ll.template_fields(model.sheet, cells)
+        if not fields:
+            self.status.setText("None of those cells is one the Ledger fills: draw over "
+                                "the tinted cells where values go.")
+            return
+        self.picked, self.picked_many = fields[0], fields
+        self._retint()
+        self._refresh_buttons()
+        distinct = list(dict.fromkeys(fields))
+        self.status.setText(
+            f"{len(fields)} template cell(s): {', '.join(distinct[:6])}"
+            + (" …" if len(distinct) > 6 else "")
+            + f". Now draw over {len(distinct) if len(distinct) > 1 else len(fields)} "
+            "sample cell(s), in the same order.")
+
+    def on_sample_drawn(self, model: SheetModel, cells) -> None:
+        if len(cells) == 1 and len(set(self.picked_many)) <= 1:
+            self.on_sample_click(model, *cells[0])
+            return
+        if self.sample is None or self.template is None:
+            return
+        if not self.picked_many:
+            self.status.setText("First draw over the template cells (or pick the field) "
+                                "these values go to.")
+            return
+        if self._lookup_mode:
+            self.status.setText("A lookup takes one column: click one cell of it.")
+            return
+        if len(set(self.picked_many)) == 1 and len(self.picked_many) == 1:
+            self.status.setText(f"One template field ({self.picked}) and {len(cells)} sample "
+                                "cells: draw over as many template cells, or click one "
+                                "sample cell.")
+            return
+        try:
+            links = ll.link_cells(self.template.kind, self.picked_many, self.sample,
+                                  model.sheet.name, cells)
+        except LedgerError as e:
+            self.status.setText(f"Not linked: {e}")
+            return
+        for link in links:
+            self.add_link(link)
+        self.status.setText(f"Linked {len(links)}: " + "; ".join(k.sentence for k in links)[:300])
 
     def on_template_click(self, model: SheetModel, r: int, c: int) -> None:
         name = model.sheet.fields.get((r, c))
@@ -410,7 +478,7 @@ class LinkDialog(QDialog):
         for m in self._template_models:
             tints = {}
             for rc, f in m.sheet.fields.items():
-                tints[rc] = PICKED_TINT if f == self.picked else (
+                tints[rc] = PICKED_TINT if f in (self.picked_many or [self.picked]) else (
                     LINKED_TINT if f in linked_fields else FIELD_TINT)
             m.set_tints(tints)
         for m in self._sample_models:

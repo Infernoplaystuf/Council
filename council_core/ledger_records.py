@@ -71,7 +71,7 @@ Chat = Callable[[str, Dict[str, Any]], Tuple[str, str]]
 
 RECIPE_VERSION = 1
 #: bump when what a cached file holds changes: older caches are read again
-READER_VERSION = 3
+READER_VERSION = 4
 #: the parent CSV's columns after the fields (before source_file, updated_at)
 SHEET_COL, ROW_COL, TABLE_COL = "source_sheet", "source_row", "source_table"
 
@@ -511,6 +511,8 @@ class SheetData:
     order: int = 0                # the sheet's place in its workbook
     #: a slide's text put over its table only by where it sits: cell -> how
     guessed: Dict[Tuple[int, int], str] = field(default_factory=dict)
+    #: a text document's (docs_open): its records wait for the user
+    document: bool = False
 
 
 def read_book(path, notes: Optional[List[str]] = None) -> List[SheetData]:
@@ -525,6 +527,9 @@ def read_book(path, notes: Optional[List[str]] = None) -> List[SheetData]:
         return _read_csv(path)
     if suffix in (".pptx", ".pptm"):
         return _read_pptx(path, notes)
+    import docs_open
+    if suffix in docs_open.SUFFIXES:
+        return _read_doc(path, notes)
     if suffix in (".xlsx", ".xlsm"):
         try:
             return _read_xlsx(path, notes)
@@ -559,6 +564,19 @@ def _read_pptx(path: Path, notes: Optional[List[str]]) -> List[SheetData]:
     return [SheetData(path.name, str(path), s.name, {k: _num(v) for k, v in s.cells.items()},
                       dict(s.colours), order=i, guessed=dict(s.guessed))
             for i, s in enumerate(deck.sheets)]
+
+
+def _read_doc(path: Path, notes: Optional[List[str]]) -> List[SheetData]:
+    """A text document: its lines and each table as sheets (docs_open)."""
+    import docs_open
+    try:
+        doc = docs_open.read_document(path, want_pictures=False)
+    except docs_open.DocError as e:
+        raise LedgerError(str(e)) from e
+    if notes is not None:
+        notes.extend(doc.notes)
+    return [SheetData(path.name, str(path), s.name, {k: _num(v) for k, v in s.cells.items()},
+                      order=i, document=True) for i, s in enumerate(doc.sheets)]
 
 
 def _read_csv(path: Path) -> List[SheetData]:
@@ -701,7 +719,8 @@ class BookCache:
                               {(r, c): v for r, c, v in s["cells"]},
                               {(r, c): k2 for r, c, k2 in s.get("colours", [])},
                               order=s.get("order", 0),
-                              guessed={(r, c): h for r, c, h in s.get("guessed", [])})
+                              guessed={(r, c): h for r, c, h in s.get("guessed", [])},
+                              document=bool(s.get("document")))
                     for s in data["sheets"]]
         except Exception:                                   # noqa: BLE001
             return None
@@ -718,7 +737,8 @@ class BookCache:
                 {"name": s.name, "order": s.order,
                  "cells": [[r, c, v] for (r, c), v in s.cells.items()],
                  "colours": [[r, c, v] for (r, c), v in s.colours.items()],
-                 "guessed": [[r, c, v] for (r, c), v in s.guessed.items()]}
+                 "guessed": [[r, c, v] for (r, c), v in s.guessed.items()],
+                 "document": s.document}
                 for s in sheets]}
             tmp = self.folder / f"{k}.tmp"
             tmp.write_bytes(gzip.compress(json.dumps(data, default=str).encode("utf-8"), 5))
@@ -1269,6 +1289,8 @@ class RecordRun:
     timings: List[Tuple[str, float]] = field(default_factory=list)
     model: str = ""
     model_asked: int = 0
+    #: what the text documents among the sources say labels mean (docs_open)
+    explanations: List[Any] = field(default_factory=list)
     cancelled: bool = False
     key_fields: List[str] = field(default_factory=list)
 
@@ -1311,18 +1333,21 @@ def _similar(a: str, b: str) -> float:
 
 
 def map_table(t: Table, fields: Sequence[RField], recipe: Recipe,
-              memo: Optional[Dict[tuple, List[ColMap]]] = None) -> List[ColMap]:
+              memo: Optional[Dict[tuple, List[ColMap]]] = None,
+              explained: Optional[Dict[str, Tuple[str, Any]]] = None) -> List[ColMap]:
     """See _map_table; ``memo`` keeps the answer per header layout (the same
-    report from a thousand workbooks is matched once)."""
+    report from a thousand workbooks is matched once). ``explained``: what
+    the user's documents say header words mean (docs_open.explanations_for)."""
     if memo is None:
-        return _map_table(t, fields, recipe)
+        return _map_table(t, fields, recipe, explained)
     key = (tuple(tuple(k) for k in t.keys), t.signature)
     if key not in memo:
-        memo[key] = _map_table(t, fields, recipe)
+        memo[key] = _map_table(t, fields, recipe, explained)
     return [ColMap(m.field, m.j, m.how, m.score, m.note, m.check) for m in memo[key]]
 
 
-def _map_table(t: Table, fields: Sequence[RField], recipe: Recipe) -> List[ColMap]:
+def _map_table(t: Table, fields: Sequence[RField], recipe: Recipe,
+               explained: Optional[Dict[str, Tuple[str, Any]]] = None) -> List[ColMap]:
     """Each field's column in ``t`` (one column per field, one field per
     column), the surest first: the user's own words (taught, highlighted,
     accepted) and exact header words are sure; the same words in another
@@ -1347,6 +1372,9 @@ def _map_table(t: Table, fields: Sequence[RField], recipe: Recipe) -> List[ColMa
                     m = ColMap(f.name, j, "header", 0.99)
                 elif any(_words(k) == _words(x) for x in fkeys):
                     m = ColMap(f.name, j, "words", 0.95)
+                elif explained and explained.get(vnorm(k), ("",))[0] == f.name:
+                    m = ColMap(f.name, j, "explained", 0.7,
+                               f"explained in {explained[vnorm(k)][1].describe()}")
                 elif model.get(k) == f.name:
                     m = ColMap(f.name, j, "model", 0.6,
                                f"Council's model read '{t.headers[j]}' as {f.name}")
@@ -1714,7 +1742,8 @@ def _label_for(hits: List[Tuple[Any, int, int, str]], box: Tuple[int, int, int, 
 
 # ── the model ───────────────────────────────────────────────────────────
 def ask_model_headers(t: Table, unmapped_j: Sequence[int], free_fields: Sequence[str],
-                      chat: Chat, recipe: Recipe) -> Tuple[Dict[str, Optional[str]], str]:
+                      chat: Chat, recipe: Recipe, notes: Sequence[Any] = ()
+                      ) -> Tuple[Dict[str, Optional[str]], str]:
     """Which field each of the table's unplaced headers is, with a few of
     its values: only header words, field names and up to MODEL_EXAMPLES
     values per column go to the (local) model. Its answers are guesses."""
@@ -1739,6 +1768,7 @@ def ask_model_headers(t: Table, unmapped_j: Sequence[int], free_fields: Sequence
               "Reply with JSON only: {\"mappings\": [{\"header\": ..., \"field\": ...}]}.\n\n"
               + ("The user answered these before; follow them:\n" + "\n".join(examples)
                  + "\n\n" if examples else "")
+              + __import__("docs_open").notes_text(notes, [h[1] for h in heads])
               + f"Template fields:\n{json.dumps(fields)}\n\nHeaders (with example values):\n"
               + "\n".join(f"- {json.dumps(h[0])} (written {json.dumps(h[1])}): "
                           f"{json.dumps(h[2])}" for h in heads))
@@ -1835,6 +1865,15 @@ def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress
                 run.problems.append(f"lookup for {fname}: {Path(lp).name}: {e}")
     if run.cancelled:
         return run
+    # what the text documents among the sources say header words mean
+    import docs_open
+    import source_extract as se
+    explanations, said = se.document_explanations(files)
+    run.problems += said
+    run.explanations = explanations
+    explained = docs_open.explanations_for(
+        explanations, [(f.name, list(f.keys) + [f.label]) for f in tt.all_fields]) \
+        if explanations else {}
     # 2. the user's highlights
     prog.stage("reading your highlights")
     before = json.dumps(asdict(recipe), sort_keys=True, default=str)
@@ -1886,7 +1925,7 @@ def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress
             uses.append(TableUse(t, "skipped", "the sheet's table reads the right way up"))
             prog.advance(1)
             continue
-        maps = map_table(t, col_fields, recipe, memo)
+        maps = map_table(t, col_fields, recipe, memo, explained)
         if t.orient == "rows" and _qualifies(maps, len(col_fields)):
             upright.add((t.path, t.sheet))
         score = sum(m.score for m in maps) + 0.001 * len(t.rows)
@@ -1898,7 +1937,7 @@ def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress
     _weak_tables(uses, col_fields, run)
     # 5. the model, for headers nothing placed (once per header layout)
     if chat is not None and not run.cancelled:
-        _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report)
+        _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report, explained)
     # 6. profiles: a column whose values look unlike the field's elsewhere
     _profiles(uses, recipe, run)
     # 7. records
@@ -1994,7 +2033,8 @@ def _weak_tables(uses: List[TableUse], col_fields, run: RecordRun) -> None:
                 + ", ".join(h for h in t.headers if h)[:200], f"{t.file} › {t.sheet}")
 
 
-def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report) -> None:
+def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report,
+               explained=None) -> None:
     asked = 0
     tried: Set[str] = set()
     names = [f.name for f in col_fields]
@@ -2025,7 +2065,8 @@ def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report) -> No
             break
         prog.update(f"asking Council's model about {t.file} › {t.sheet}")
         try:
-            got, model = ask_model_headers(t, todo, free, chat, recipe)
+            got, model = ask_model_headers(t, todo, free, chat, recipe,
+                                           notes=run.explanations)
         except Exception as e:                              # noqa: BLE001
             from council_core import ledger_llm
             if isinstance(e, ledger_llm.ModelUnavailable):
@@ -2047,7 +2088,7 @@ def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report) -> No
         for u in uses:
             if u.use == "lookup" or u.why == "the sheet's table reads the right way up":
                 continue
-            u.maps = map_table(u.table, col_fields, recipe, memo)
+            u.maps = map_table(u.table, col_fields, recipe, memo, explained)
             u.score = sum(m.score for m in u.maps) + 0.001 * len(u.table.rows)
             if u.use == "skipped" and _qualifies(u.maps, len(col_fields)) and \
                     not u.why.startswith("the same cells"):
@@ -2211,6 +2252,11 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
         if u.check:
             rec.checks.append(u.check)
             run.decisions[u.check].records += 1
+        if sheet is not None and sheet.document:
+            # a text document is looser than a workbook: its records wait
+            rec.checks.append(run.decide(Decision(
+                f"D|{t.file}", "document", "",
+                f"records read from the text document {t.file}", t.sheet)))
         for m in u.maps:
             v = row[m.j]
             if v is None:

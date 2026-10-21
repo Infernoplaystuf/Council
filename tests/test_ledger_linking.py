@@ -128,3 +128,19 @@ def test_a_deck_text_box_goes_where_the_user_says(tmp_path):
     assert all(r[0] == "Y" for r in rows)
     assert not any("a guess" in p for p in ex.problems)
     del nde_values
+
+
+def test_cells_link_one_to_one_in_reading_order(plain_btb):
+    csv, src = plain_btb
+    spider = ll.sample_view(src / "BTB_Spider.xlsx", csv)
+    sheet = ll.template_view(csv).sheets[0]
+    fields = ll.template_fields(sheet, [(1, 4), (1, 2), (1, 3)])   # drawn right to left
+    assert fields == ["Name", "Health", "Stam"]
+    links = ll.link_cells("records", fields, spider, "Sheet", [(2, 3), (2, 1), (2, 2)])
+    assert [(k.field, k.detail["header"]) for k in links] == [
+        ("Name", "Name"), ("Health", "HP"), ("Stam", "Stam")]
+    # a grid row: one field across its flaws, against as many sample cells
+    assert [k.field for k in ll.link_cells("records", ["Health"] * 3, spider, "Sheet",
+                                           [(3, 2), (4, 2), (5, 2)])] == ["Health"]
+    with pytest.raises(se.LedgerError, match="draw as many on each side"):
+        ll.link_cells("records", ["Name", "Health"], spider, "Sheet", [(2, 1)])

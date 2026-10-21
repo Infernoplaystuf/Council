@@ -60,7 +60,8 @@ from sample_ledger import LedgerError
 from .. import theme
 from ..view import ViewHelpers, amp
 
-XLSX = "Workbooks and decks (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm)"
+XLSX = ("Workbooks, decks and documents (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.docx "
+        "*.txt *.md *.pdf)")
 TEMPLATE = "Excel workbook (*.xlsx)"
 
 
