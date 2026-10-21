@@ -289,6 +289,21 @@ class Matcher:
         self._tok = {t.name: tokens(t.text) for t in self.targets}
         self._sec = {t.name: set(tokens(t.section)) for t in self.targets}
         self._id_tok = set(tokens(schema.id_field or ""))
+        #: (part, section) -> who took Inspector 1, 2 ... of that section, in
+        #: the order their tables were read (_Extractor._person_slots)
+        self.person_slots: Dict[Tuple[str, str], List[str]] = {}
+
+    def slot_fields(self) -> Dict[str, List[Target]]:
+        """Section -> its per-person fields in number order ('Visual
+        Inspection' -> Inspector 1, Inspector 2): one reading per person,
+        numbered, per flaw."""
+        got: Dict[str, Dict[int, Target]] = {}
+        for t in self.targets:
+            m = _SLOT_LABEL.match(t.text or "")
+            if m and t.per_item and t.section:
+                got.setdefault(t.section, {})[int(m.group("n"))] = t
+        return {sec: [d[k] for k in sorted(d)] for sec, d in got.items()
+                if sorted(d) == list(range(1, len(d) + 1))}
 
     def is_generic(self, label: str) -> bool:
         """A one-word label shared by 3+ fields ("Date", "Notes")."""
@@ -588,6 +603,12 @@ _WHO_HEAD = _OnWords(
 #: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
 _RUN_HEAD = _OnWords(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
 #: The column holding the reading in a long log, beside one naming what it is.
+#: a per-person slot of a section: 'Inspector 1', 'Operator #2', 'Reader 3'
+_SLOT_LABEL = re.compile(r"(?i)^\s*(?:inspector|operator|technician|tech|reader|examiner|"
+                         r"inspection|viewer)\s*#?\s*(?P<n>\d{1,2})\s*$")
+#: section words that say too little to pick one (most sections are inspections)
+_SECTION_FILLER = {"inspection", "inspections", "result", "results", "data", "report",
+                   "summary", "attributes", "record", "records", "test", "tests"}
 _VALUE_HEAD = _OnWords(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
                        r"measurement)\s*(?:\([^)]*\))?\s*$")
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
@@ -650,6 +671,7 @@ UNSURE_SIGNER_NOTE = "ends in initials or a unit: who signed it? check it"
 #: The note on a reading of a table beside another that has no label column
 #: of its own: the field is the other table's label, a guess (review,
 #: 2026-10-20).
+_PLACE_NOTE = "matched to this table by its place on the slide"
 _BESIDE_NOTE = "a table beside another, with no labels of its own: which field? check it"
 #: A number with its unit in brackets: '0.3 (kW)', '12 (IPM)', '50 [%FSH]'.
 _NUM_PAREN_UNIT = re.compile(r"^(?P<n>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[\(\[]\s*"
@@ -795,6 +817,10 @@ class Grid:
     sheet: str
     cells: Dict[Tuple[int, int], object]
     from_image: str = ""             # image file name when read from an image
+    #: a slide's table whose heading or signer was paired with it only by
+    #: where the text box sits (pptx_open): said on each of its values, which
+    #: are then never pre-accepted
+    place_note: str = ""
 
     def __post_init__(self):
         # Text with a control character (read through Excel: '216' +
@@ -1022,7 +1048,9 @@ def preview_workbook(path, schema, aliases=None,
 
 #: Workbook files the reader takes: openpyxl reads .xlsx/.xlsm; the installed
 #: Excel opens .xls, .xlsb and rights-protected files (excel_open.py).
-WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+#: what a folder scan reads: workbooks, and PowerPoint decks (pptx_open lays
+#: each slide's tables out as sheets, user 2026-10-21)
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm")
 
 
 _SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
@@ -1169,7 +1197,10 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
+    import pptx_open
     path = Path(path)
+    if path.suffix.lower() in pptx_open.SUFFIXES and path.exists():
+        return _grids_from_pptx(path, notes, want_pictures)
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
         n = path_too_long(path)
@@ -1225,6 +1256,26 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
         # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
+    return grids, images
+
+
+def _grids_from_pptx(path: Path, notes: Optional[List[str]], want_pictures: bool = True
+                     ) -> Tuple[List[Grid], List["SourceImage"]]:
+    """A PowerPoint deck: each slide's tables as sheets, with the slide's
+    title and the text boxes that belong to each table above it (headings
+    and labels the matcher reads), its pictures for the image reader."""
+    import pptx_open
+    try:
+        deck = pptx_open.read_pptx(path, want_pictures=want_pictures)
+    except pptx_open.PptxError as e:
+        raise LedgerError(str(e)) from e
+    if notes is not None:
+        notes.extend(deck.notes)
+        notes.extend(deck.guesses(path.name))
+    grids = [Grid(path.name, s.name, dict(s.cells), place_note=s.place_note)
+             for s in deck.sheets]
+    images = [SourceImage(path.name, p.sheet, p.anchor, p.data, p.fmt)
+              for p in deck.pictures]
     return grids, images
 
 
@@ -2182,6 +2233,9 @@ class _Extractor:
         stage_col = self._stage_col(heads, data_rows, ctx) \
             if per_item and value_col is not None else None
         matched = [c for c, (_, mt) in heads.items() if mt.target]
+        if per_item and value_col is not None and stage_col is None and not matched \
+                and self._person_slots(r, cols, item_col, value_col, who_col, data_rows, ctx):
+            return
         if len(matched) + (item_col is not None) + (id_col is not None or lookalike) \
                 + (stage_col is not None) < 2:
             return
@@ -2236,6 +2290,76 @@ class _Extractor:
             for c in (id_col, item_col, who_col, run_col):
                 if c:
                     self.used.add((d, c))
+
+    def _person_slots(self, r, cols, item_col, value_col, who_col, data_rows, ctx) -> bool:
+        """One person's results per flaw ('Defect | Result' under 'Inspector:
+        JB', a heading 'Visual Inspection' above) where the template keeps
+        each person's in a numbered slot (Visual Inspection: Inspector 1,
+        Inspector 2): the first person who signs that section of a part takes
+        Inspector 1, the next Inspector 2 (user, 2026-10-21: "Visual
+        Inspection from various operators", a slide per operator's table).
+        Their initials go to the slot's Inspector Initials. The slot is
+        inferred from the order the tables were read: amber, never
+        pre-accepted. False when no section above names one with slots."""
+        slots = self.m.slot_fields()
+        if not slots:
+            return False
+        words = set()
+        for x in ctx:
+            words |= set(tokens(str(x)))
+        best, hit = None, 0
+        for sec in slots:
+            own = set(tokens(sec)) - _SECTION_FILLER
+            n = len(own & words)
+            if own and n > hit:
+                best, hit = sec, n
+        if best is None:
+            return False
+        targets = slots[best]
+        first = data_rows[0] if data_rows else r + 1
+        who_here = (_initials(self.g.cells.get((first, who_col))) if who_col else "") \
+            or self.inspector_for(first, value_col)
+        took = False
+        for d in data_rows:
+            self._tick()
+            item = self.codes.canon(self.g.cells.get((d, item_col)))
+            v = self.g.cells.get((d, value_col))
+            if not item or v is None:
+                continue
+            who = (_initials(self.g.cells.get((d, who_col))) if who_col else "") or who_here
+            part, part_how = self.part_at(d, cols[0])
+            order = self.m.person_slots.setdefault((part, best), [])
+            if who not in order:
+                order.append(who)
+            n = order.index(who)
+            if n >= len(targets):
+                continue                                   # more people than slots
+            t = targets[n]
+            label = self.g.text(r, value_col) or "Result"
+            note = (f"{t.text}: {who or 'the unsigned table'} is person {n + 1} to sign "
+                    f"{best} for this part, in the order the tables were read - check it")
+            # via 'slot': its own kind - never pre-accepted, and never learned as
+            # 'Result' meaning Inspector 1 (the next person's table is Inspector 2)
+            o = self.emit(part, item, label, r, value_col, v, Match(t, 0.75, [], via="slot"),
+                          field_name=t.fields[0], vr=d, vc=value_col)
+            if o is not None:
+                o.note = _join(o.note, note)
+                if part_how:
+                    o.part_how = part_how
+                took = True
+            comp = self.m.by_name.get(f"{t.fields[0]}{INITIALS_SUFFIX}")
+            if comp is not None and who:
+                o2 = self.emit(part, item, "initials", r, value_col, who,
+                               Match(comp, 0.75, [], via="slot"), field_name=comp.fields[0],
+                               vr=d, vc=value_col)
+                if o2 is not None:
+                    o2.note = _join(o2.note, note)
+            self.used.add((d, value_col))
+            self.used.add((d, item_col))
+        if took:
+            for c in cols:
+                self.used.add((r, c))
+        return took
 
     def _row_part(self, d, id_col) -> Tuple[str, str]:
         """(part, how) of table row d from its Part Number cell. A placeholder
@@ -3213,6 +3337,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             o.part_how = o.part_how or ex.part_how
             if o.part != part and mask_strict:       # not the Part you typed
                 o.part_how = _fit_mask(o.part, o.part_how, mask_re)
+        if ex.g.place_note:
+            for o in ex.out:
+                o.note = _join(o.note, ex.g.place_note)
         n = len(ex.out)
         run.obs.extend(ex.out)
         # a label on the ignore list is not one to map: it was listed on
@@ -3333,6 +3460,9 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                   # nor a reading ending in initials no one signs with here
                   # ('49 JB'), nor one of a table with no labels of its own
                   and UNSURE_SIGNER_NOTE not in o.note and _BESIDE_NOTE not in o.note
+                  # nor one of a slide's table whose text was paired with it
+                  # only by where it sits (pptx_open, user 2026-10-21)
+                  and _PLACE_NOTE not in o.note
                   and not o.part_how.startswith(MODEL_PART_HOW)
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
@@ -4109,13 +4239,16 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         read = [sources[i] for i in read if isinstance(i, int) and 0 <= i < len(sources)]
     else:
         read = sources                                  # all read, or an older review
-    run = extract(schema, read, mapping, ignore, image_reader=image_reader,
-                  use_images=use_images, progress=prog,
-                  pattern_mask=meta.get("pattern_mask") or None,
-                  pattern_strict=not meta.get("pattern_hint"),
-                  part=meta.get("part") or "",
-                  part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
-                  labels=source_labels(sources), taught=load_taught(csv_path))
+    import pptx_open
+    with pptx_open.user_pairings(csv_path):           # as the extract read the decks
+        run = extract(schema, read, mapping, ignore, image_reader=image_reader,
+                      use_images=use_images, progress=prog,
+                      pattern_mask=meta.get("pattern_mask") or None,
+                      pattern_strict=not meta.get("pattern_hint"),
+                      part=meta.get("part") or "",
+                      part_finder=(lambda name, _grids: found.get(name, ("", "")))
+                      if found else None,
+                      labels=source_labels(sources), taught=load_taught(csv_path))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     mapped: List[Decision] = []
@@ -4628,7 +4761,8 @@ def main(argv=None) -> int:
                 f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
             mapping, ignore = load_aliases(args.csv)
             from progress_report import Progress
-            with Progress("ledger extract") as prog:
+            import pptx_open
+            with Progress("ledger extract") as prog, pptx_open.user_pairings(args.csv):
                 run = extract(ledger.schema, files, mapping, ignore,
                               image_dir=out.with_name(out.stem + "_images"),
                               part=args.part, use_images=not args.no_images, progress=prog,

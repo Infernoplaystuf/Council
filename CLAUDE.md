@@ -46,3 +46,5 @@ same list.
   progress; it was written for the desktop's `knowledge-graph` branch).
 - The graph's Excel / Ledger sources, inspector initials and outside folders:
   `docs/handoff/kg_excel_2026-10-16.md`.
+- The Ledger for table templates (one row per record, highlights, lookups, the
+  model per header layout): `docs/handoff/ledger_records_2026-10-21.md`.

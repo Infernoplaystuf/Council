@@ -124,21 +124,48 @@ class ParentSummary:
     samples: int
     rows: int
     description: str
+    #: a table template (council_core.ledger_records): one row per record
+    records_mode: bool = False
 
     def describe(self) -> str:
+        if self.records_mode:
+            return self.description
         verb = "created" if self.created else "extended"
         return (f"Parent CSV {verb}: {self.csv}\n{self.fields} fields, {self.items} items; "
                 f"{self.samples} samples / {self.rows} rows so far.")
 
 
-def create_parent(template, csv_path=None, id_field: Optional[str] = None) -> ParentSummary:
-    schema = read_template(template, id_field)
+def create_parent(template, csv_path=None, id_field: Optional[str] = None,
+                  mode: str = "auto") -> ParentSummary:
+    """``mode``: 'samples' - one workbook is one sample (sample_ledger);
+    'records' - the template is a table and each of its rows is a record,
+    many per workbook (council_core.ledger_records); 'auto' - a table Ledger
+    stays one, and a template with a table but no sample-ID field (the BTB
+    example, user 2026-10-20) makes one."""
+    from council_core import ledger_records
     csv_path = Path(csv_path) if csv_path else default_csv_for(template)
+    if mode == "records" or (mode == "auto" and ledger_records.is_record_ledger(csv_path)):
+        return _create_records(template, csv_path)
+    try:
+        schema = read_template(template, id_field)
+    except LedgerError as e:
+        if mode == "auto" and not id_field and "no sample-ID field" in str(e) \
+                and ledger_records.is_record_template(template):
+            return _create_records(template, csv_path)
+        raise
     existed = csv_path.exists()
     ledger = ParentCSV.create(csv_path, schema)
     return ParentSummary(str(ledger.path), not existed, len(schema.fields),
                          len(schema.items), len(ledger.sample_ids()), len(ledger.rows),
                          schema.describe())
+
+
+def _create_records(template, csv_path: Path) -> ParentSummary:
+    from council_core import ledger_records
+    r = ledger_records.create_ledger(template, csv_path)
+    _cols, rows = ledger_records._read_rows(Path(r.csv))
+    return ParentSummary(r.csv, r.created, len(r.fields) + len(r.forms), 0,
+                         len(rows), len(rows), r.describe(), records_mode=True)
 
 
 # ── step 2: sources -> review workbook ──────────────────────────────────
@@ -178,8 +205,15 @@ class ExtractSummary:
     #: saved one (Teach saved it; the pattern field was empty).
     pattern: str = ""
     pattern_saved: bool = False
+    #: a table Ledger's run: records found, the guesses waiting for a Y on
+    #: its Decisions sheet, and what it learned (the user's highlights)
+    records: int = -1
+    decisions: int = 0
+    learned: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
+        if self.records >= 0:
+            return self._describe_records()
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
@@ -191,6 +225,25 @@ class ExtractSummary:
             s += (f"\nPart-name pattern {self.pattern!r}: this Ledger's saved one (the "
                   "pattern field was empty) — a hint for file and sheet names and "
                   "titles; a part of another shape is still pre-accepted")
+        if self.skipped:
+            s += "\n" + summarize_skipped(self.skipped)
+        if self.assist:
+            s += "\n" + self.assist
+        if self.open_failures:
+            s += "\n" + summarize_open_failures(self.open_failures)
+        if self.timings:
+            s += "\n" + summarize_slowest(self.timings)
+        return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
+
+
+    def _describe_records(self) -> str:
+        s = (f"{self.files} files: {self.records} records, {self.values} values found, "
+             f"{self.pre_accepted} pre-accepted, {self.to_review} to review"
+             + (f", {self.decisions} guesses to decide on the Decisions sheet"
+                if self.decisions else ""))
+        if self.cancelled:
+            s = "CANCELLED — " + s
+        s += "".join(f"\n{line}" for line in self.learned)
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
         if self.assist:
@@ -288,6 +341,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              log: Optional[Callable[[str], None]] = None,
              assist: Any = False, chat=None) -> ExtractSummary:
     say = prog.update
+    from council_core import ledger_records
+    if ledger_records.is_record_ledger(csv_path):
+        return _extract_records(csv_path, sources, review_path, prog, cancel, assist, chat)
     ledger = ParentCSV(csv_path)
     if ledger.schema is None:
         raise LedgerError(f"{Path(csv_path).name} has no schema beside it; "
@@ -361,11 +417,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
                                         examples=part_examples)
-    run = extract(ledger.schema, files, mapping, ignore,
-                  image_dir=out.with_name(out.stem + "_images"),
-                  image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
-                  part_finder=part_finder, taught=taught, pattern_strict=not pattern_saved)
+    import pptx_open
+    with pptx_open.user_pairings(csv_path):           # your text box <-> table links
+        run = extract(ledger.schema, files, mapping, ignore,
+                      image_dir=out.with_name(out.stem + "_images"),
+                      image_reader=image_reader, part=part, use_images=use_images,
+                      progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
+                      part_finder=part_finder, taught=taught,
+                      pattern_strict=not pattern_saved)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -418,6 +477,59 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           pattern=pattern_mask or "", pattern_saved=pattern_saved)
 
 
+def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
+                     chat=None) -> ExtractSummary:
+    """A table Ledger's Extract (council_core.ledger_records): the same
+    sources, Skip patterns and model choice as the sample Ledger's."""
+    from council_core import ledger_records
+    from source_extract import load_ignore_files
+    recipe = ledger_records.load_recipe(csv_path)
+    why_skipped: Dict[Path, str] = {}
+    files, skipped_files = collect_sources(sources,
+                                           ignore_patterns=load_ignore_files(csv_path),
+                                           template_path=recipe.template.get("path"),
+                                           reasons=why_skipped)
+    if not files:
+        raise LedgerError("no source workbooks: add .xlsx files or a folder of them"
+                          + (f" ({len(skipped_files)} left out by the Skip patterns or as "
+                             "the Ledger's own files)" if skipped_files else ""))
+    missing = [f.name for f in files if not f.exists() and not path_too_long(f)]
+    if missing:
+        raise LedgerError(f"source workbooks not found: {missing}")
+    out = Path(review_path) if review_path else default_review_for(csv_path)
+    n = too_long_to_write(out)
+    if n:
+        raise LedgerError(REVIEW_TOO_LONG.format(n=n))
+    report = None
+    if assist:
+        from council_core import ledger_llm
+        report = ledger_llm.AssistReport()
+        stop = cancel.is_set if cancel is not None else None
+        chat = ledger_llm.one_shot(chat or (ledger_llm.chat_for(assist, should_stop=stop)
+                                            if isinstance(assist, str) else
+                                            ledger_llm.council_chat(should_stop=stop)),
+                                   report, stop)
+    run = ledger_records.extract(csv_path, files, chat=chat, progress=prog, cancel=cancel,
+                                 report=report)
+    if report is not None:
+        run.problems.extend(report.problems)
+    prog.stage("writing the review workbook")
+    ledger_records.write_review(out, run, str(csv_path), [str(f) for f in files])
+    cells, pre = run.cells, run.cells_pre_accepted
+    assist_line = ""
+    if assist:
+        assist_line = (f"Council's model ({run.model or 'not answering'}) was asked about "
+                       f"{run.model_asked} header layout(s); its answers are amber")
+    return ExtractSummary(str(out), len(files), cells, pre, cells - pre,
+                          sum(1 for u in run.tables if u.use == "skipped"), 0, 0,
+                          list(run.problems), list(run.open_failures), list(run.timings),
+                          bool(run.cancelled), assist=assist_line,
+                          skipped=[(p.name, why_skipped.get(p, "left out"))
+                                   for p in skipped_files],
+                          records=len(run.records), decisions=len(run.decisions),
+                          learned=list(run.learned))
+
+
 # ── step 3: review -> parent CSV (+ filled templates) ───────────────────
 @dataclass
 class ApplySummary:
@@ -447,6 +559,13 @@ def run_apply(review_path, fill_dir=None, use_images: bool = True,
               image_reader: Optional[ImageReader] = None,
               progress: Optional[Listener] = None) -> ApplySummary:
     from progress_report import Progress
+    from council_core import ledger_records
+    if ledger_records.is_record_review(review_path):
+        with Progress("ledger apply", listener=progress) as prog:
+            r = ledger_records.apply_review(review_path, fill_dir or None, progress=prog)
+            prog.finish(f"{r.records} records accepted -> {r.rows} rows: {r.csv_result}")
+            return ApplySummary(r.accepted, r.rows, r.csv_result, dict(r.learned),
+                                list(r.ignored), list(r.filled), list(r.warnings))
     with Progress("ledger apply", listener=progress) as prog:
         if use_images and image_reader is None:
             prog.update("starting the local image reader…")

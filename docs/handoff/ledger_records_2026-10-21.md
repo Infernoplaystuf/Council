@@ -1,0 +1,224 @@
+# Ledger: table templates (one row per record)
+
+Module: `council_core/ledger_records.py` (no Qt). Reached through the Ledger tab's
+usual buttons via `council_core/ledger_ingest.py`; nothing else changes for a
+sample-ID Ledger.
+
+## When it is used
+
+- **Create** makes a *table Ledger* when the template has a table (a row of two or
+  more column headers with rows under it) and no sample-ID field: the BTB example.
+  The tab's **Each table row is a record** box (or `create_parent(..., mode="records")`)
+  forces it for a template that has a sample-ID column but whose workbooks hold many
+  records each.
+- A table Ledger is marked by `<parent>.records.json` (the recipe) beside its CSV.
+  Extract and Apply route to this module by that file and by the review's document
+  properties (`council-ledger-records-review`).
+
+## What Extract does
+
+1. **Reads** every sheet of every workbook (openpyxl read-only; .xls/.xlsb through
+   `source_extract.load_workbook_grids`; .csv). Charts and pictures are not read.
+   A sheet stops after 2,000 empty rows following its last value. Each file is
+   cached in `<parent>.records_cache/` (gzip JSON, by path, size and modification
+   time), so a rerun reads only changed files.
+2. **Finds tables** by shape: header rows of words, their records down to a blank
+   row or the next table's header. It skips total and average rows and headers
+   repeated after a page break. It keeps group headings above merged headers and
+   also reads the sheet sideways (records across).
+3. **Learns the user's highlights.** The same fill colour in the template and a
+   workbook links them (theme colours are resolved with their tint):
+   - painted columns of a record table: those fields' header words (sure);
+   - a single painted column in a table with no other painted field: a **lookup**
+     for that field;
+   - a template colour found in no workbook: the **file name** (or the sheet name),
+     amber until the user confirms it.
+4. **Maps columns to fields**, one to one:
+   - **sure:** the user's own words (taught, highlighted, accepted), exact header
+     words, or the same words in another order;
+   - **guesses (amber):** similar words, or **Council's model**. The model is asked
+     only about headers nothing else placed, once per header layout, at most 40
+     layouts per run. Only header words, field names and three example values per
+     column are sent, and the answers are cached in the recipe.
+5. **Checks each column's values against the field.** A column holding numbers
+   where the field's other columns hold words (or values outside the few a field
+   takes, such as M/F) turns amber.
+6. **Fills fields that are not columns:**
+   - the file or sheet name (a pattern, inferred or taught by example);
+   - a lookup: exact key, then the longest key the value starts with on whole
+     words, then confirmed answers, then a similar key (amber); a key listed twice
+     with different values is amber;
+   - a label beside the table (`Inspector: MK`);
+   - a constant;
+   - a template formula, which is carried down and never read.
+7. **Reads a grid of tables** (blocks side by side, stacked, staggered, or touching
+   with no empty column) as one table per block:
+   - headers are found per block, not per row;
+   - a form line over a block (`Tank: 3`, `Inspector: | AL`) ends the block above
+     it and is never taken for a header;
+   - each block's labels are the nearest ones that belong to it, while a single
+     label over the whole sheet goes to every block;
+   - a bare block title ("North tank") is learned from the user's highlight as
+     "the cell at this place over each table".
+8. **Identifies records.** Key fields default to the name-derived fields plus the
+   first text column unique within each table (BTB: Tame + Name). A grid's block
+   labels join the key when they differ between blocks (Tank + Inspector + Position).
+   The same record from two workbooks is dropped if identical, and red (clash) if
+   different. Blocks of one workbook are never compared: they may share names (P1).
+
+## The review workbook
+
+| Sheet | What it holds |
+|---|---|
+| Records | One row per record. Amber cells are guesses; a comment says where each came from. |
+| Decisions | One Y/N per guess (a column, a value check, a rule, a fuzzy lookup), covering every record it touches. |
+| Tables | Every table found: read as records, used as a lookup, or skipped, and why. |
+| Problems | What went wrong or could not be found. |
+| `_run` | Hidden run details. |
+| Values | An empty sheet, so Council never reads the review back as a source. |
+
+Apply takes a record when its Accept is Y. A record with Accept left blank is taken
+when every guess in it has a Y on Decisions and it has no clash.
+
+What Decisions teach:
+- A Y on a column guess becomes an alias; an N is remembered, and that column is
+  never read as that field again.
+- A Y on a rule confirms it.
+- A Y on a fuzzy lookup saves that key's answer.
+
+## Apply
+
+- The parent CSV gets one row per record: the fields, then `source_sheet`,
+  `source_table` (where its table starts), `source_row`, `source_file` and
+  `updated_at`. The same record (source + key fields) is updated in place. Where
+  those match more than one record (a grid's blocks), the table's place tells them
+  apart, so one block never overwrites another.
+- The schema beside the CSV is a `sample_ledger` schema, so the knowledge graph
+  reads the CSV as a Ledger.
+- With a fill folder, the template is filled with every record:
+  - rows past the ones the template laid out take that layout's formatting
+    (banded rows keep their bands);
+  - formulas are carried down;
+  - data validation and conditional formats are stretched;
+  - rows are inserted when something sits under the table;
+  - form fields are filled when every record agrees.
+
+## Command line
+
+    python -m council_core.ledger_records create  BTB_Template.xlsx
+    python -m council_core.ledger_records teach   BTB_Template_parent.csv samples/BTB_Woopentide.xlsx samples/BTB_Saddle_BP.xlsx
+    python -m council_core.ledger_records extract BTB_Template_parent.csv samples/ [--model ollama:granite3.3:8b]
+    python -m council_core.ledger_records apply   review_….xlsx --fill-dir filled/
+    python -m council_core.ledger_records source  CSV Tame filename --example BTB_Spider.xlsx Spider
+    python -m council_core.ledger_records source  CSV "Saddle BP" lookup --file BTB_Saddle_BP.xlsx --key-header "Tame Saddle" --join Name
+
+## PowerPoint decks (both Ledgers)
+
+`pptx_open.py` reads .pptx/.pptm with the standard library only (no new
+dependency). Folder scans now include decks, and the tab's file picker offers them.
+
+- **Each table on a slide becomes a sheet of its own.** Above it go the slide's
+  title, the slide-wide text, then the text boxes that belong to that table, one
+  line per paragraph, then a blank row.
+  - A text box belongs to its nearest table (above and to the left count first).
+  - Text over several tables, the title, and text far from every table belong to
+    the whole slide, so they go above every table on it.
+- **Readers need no new rules for this layout.** The sample Ledger already takes
+  a heading above a table as its section and "Inspector: JB" as who signed it; the
+  table Ledger takes "Tame: Spider" as that block's label.
+- **Joined lines are split.** "Eddy Current Response (%FSH) — Operator: TS"
+  becomes a heading and a signature.
+- **Pictures** go to the sample Ledger's image reader, named "Slide 2 · <title> ·
+  <nearest text>" so the section word reaches the matcher.
+- **Charts are not read.** Hidden slides are skipped.
+- **Fills count as highlights.** Table-cell fills, text-box fills and highlighted
+  runs are colours, so the highlighter works in PowerPoint too.
+- **Old .ppt files** are refused with "save it as .pptx".
+
+**Which text goes with which table.** Pairings are decided in this order (`pptx_open._owners`):
+
+1. The slide's title belongs to every table on the slide.
+2. A text box **grouped** with tables (PowerPoint's Group) belongs to them.
+3. A text box **filled or outlined in a colour a table has** (a cell's fill or
+   border) belongs to that table.
+4. On a slide with a single table, text belongs to that table.
+5. Otherwise it goes by **place**, and that is a guess: the nearest table (above
+   and left first). Text over several tables, or far from all of them, goes to
+   the whole slide.
+
+What a guess (rule 5) does:
+- Every value of a table whose heading or signer came from a guess carries a note
+  and is never pre-accepted. In the sample Ledger it is amber with the note. In the
+  table Ledger, the label value waits on one Decisions row per table
+  (`P|file|sheet|field`).
+- The Extract log and the review's Problems list each guess with the fix: "group
+  them (or colour them alike) to say so".
+- Teach in table mode lists every slide's pairings and how each was decided.
+
+**Per-person slots** (`source_extract._Extractor._person_slots`, sample Ledger):
+- **When it applies:** a per-flaw "Result"/"Value" table under a heading that
+  names a template section whose fields are numbered person slots ("Visual
+  Inspection: Inspector 1, Inspector 2").
+- **What it does:** the first person to sign that section of a part takes slot
+  1, the next slot 2, and so on. Their initials go to the slot's
+  "— Inspector Initials" field. People beyond the last slot are not placed.
+- **Never pre-accepted, never learned:** these values have their own kind
+  (`via="slot"`), because the order comes from the order the tables were read.
+  Accepting them does not teach "Result" as an alias.
+
+## Link by clicking (both Ledgers)
+
+The Ledger tab's **Link by clicking…** button opens the window
+(`council_qt/tabs/ledger_link_dialog.py`; the data side is
+`council_core/ledger_linking.py`, with no Qt). The template is on the left, a
+sample workbook or deck on the right, and the tab's sources are its samples.
+
+**The template side**
+- Cells the Ledger fills are tinted; a field list with a search box sits above.
+- Click a template cell, or pick a field in the list, then the sample cell it
+  comes from.
+
+**What a sample click teaches**
+
+| Ledger | Sample cell clicked | What is learned |
+|---|---|---|
+| Sample-ID | any cell | The words that name the cell: itself if it is a label, else the nearest label to its left, else its column's header. Saved as a label mapping (`aliases.json`). |
+| Table | a cell in a table (header or value) | That column's header words (recipe alias). |
+| Table | a labelled value beside a table | The label. |
+| Table | a bare cell over a table | Its place over each table (a `near` rule). |
+
+**Buttons on the sample side**
+- **From the file name…** asks which part of the file name the value is.
+- **Look it up here**, then a column click, makes a lookup rule.
+- Both are table-Ledger only.
+
+**Decks:** a **Text boxes** tab lists each text box with a "Goes with" choice and
+how it was told (a guess is marked). A choice saves to `<parent>.pairings.json`.
+Extract, Apply and Teach read decks with those pairings (`pptx_open.user_pairings`),
+and a deck read from the cache is read again when they change.
+
+**Saving**
+- Every link is shown as a sentence and can be removed.
+- Nothing is kept until **Save links**. Linking the same field again replaces its
+  link.
+- Saved links are the user's own answers, so what they place is pre-accepted.
+- Colour highlights keep working beside them.
+
+## Measured (this container, synthetic data)
+
+- **BTB:** reproduces `BTB_Template_filled.xlsx` cell for cell, colours included
+  (0 mismatches over 620 cells with `reference_check.py`).
+- **Speed:** 300 workbooks / 15,000 records / 95,000 values took 13 s on the first
+  Extract and 4.5 s from the cache.
+
+## Not done yet
+
+- Flaw-grid templates stay with the sample-ID Ledger; a template holding both a
+  record table and a flaw grid is read as one or the other.
+- Pictures of tables are not read in table mode (the sample Ledger's image reader
+  is not wired in).
+- The `.records_cache` folder is not pruned.
+- Free-sentence hints in a text box ("John checked these by eye") are only
+  headings: no model reads them yet for who or what. A local model reading a
+  slide's text for the fields it names would sit beside `ask_model_headers`.
+- Pictures on slides are not read in table mode (as in workbooks).
