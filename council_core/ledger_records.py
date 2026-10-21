@@ -521,6 +521,8 @@ def read_book(path, notes: Optional[List[str]] = None) -> List[SheetData]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         return _read_csv(path)
+    if suffix in (".pptx", ".pptm"):
+        return _read_pptx(path, notes)
     if suffix in (".xlsx", ".xlsm"):
         try:
             return _read_xlsx(path, notes)
@@ -539,6 +541,20 @@ def read_book(path, notes: Optional[List[str]] = None) -> List[SheetData]:
                              {k: (str(v) if type(v).__name__ == "_Merged" else v)
                               for k, v in g.cells.items()}, order=i))
     return out
+
+
+def _read_pptx(path: Path, notes: Optional[List[str]]) -> List[SheetData]:
+    """A deck: each slide's tables as sheets, the text that belongs to each
+    above it (pptx_open), cell and text box fills as colours."""
+    import pptx_open
+    try:
+        deck = pptx_open.read_pptx(path, want_pictures=False)
+    except pptx_open.PptxError as e:
+        raise LedgerError(str(e)) from e
+    if notes is not None:
+        notes.extend(deck.notes)
+    return [SheetData(path.name, str(path), s.name, {k: _num(v) for k, v in s.cells.items()},
+                      dict(s.colours), order=i) for i, s in enumerate(deck.sheets)]
 
 
 def _read_csv(path: Path) -> List[SheetData]:
@@ -1454,6 +1470,9 @@ def learn_colours(tt: TableTemplate, tables: Sequence[Table], recipe: Recipe,
                 continue
             if headed & (set(f.keys) | {norm(f.name)}):
                 continue                                  # a workbook has its column
+            fkeys = (set(f.keys) | {norm(f.name)}) - {""}
+            if any(_labelled_values(sh, fkeys, set()) for sh in sheets):
+                continue                                  # a workbook labels it ('Tame: Spider')
             recipe.sources[f.name] = {
                 "kind": "name", "pattern": "", "confirmed": False, "how": "colour",
                 "why": f"{f.name} is highlighted in the template, but nothing in the "

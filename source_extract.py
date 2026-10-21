@@ -289,6 +289,21 @@ class Matcher:
         self._tok = {t.name: tokens(t.text) for t in self.targets}
         self._sec = {t.name: set(tokens(t.section)) for t in self.targets}
         self._id_tok = set(tokens(schema.id_field or ""))
+        #: (part, section) -> who took Inspector 1, 2 ... of that section, in
+        #: the order their tables were read (_Extractor._person_slots)
+        self.person_slots: Dict[Tuple[str, str], List[str]] = {}
+
+    def slot_fields(self) -> Dict[str, List[Target]]:
+        """Section -> its per-person fields in number order ('Visual
+        Inspection' -> Inspector 1, Inspector 2): one reading per person,
+        numbered, per flaw."""
+        got: Dict[str, Dict[int, Target]] = {}
+        for t in self.targets:
+            m = _SLOT_LABEL.match(t.text or "")
+            if m and t.per_item and t.section:
+                got.setdefault(t.section, {})[int(m.group("n"))] = t
+        return {sec: [d[k] for k in sorted(d)] for sec, d in got.items()
+                if sorted(d) == list(range(1, len(d) + 1))}
 
     def is_generic(self, label: str) -> bool:
         """A one-word label shared by 3+ fields ("Date", "Notes")."""
@@ -588,6 +603,12 @@ _WHO_HEAD = _OnWords(
 #: "Run #", "Pass", "Cycle No." - numbers the runs of a repeating block.
 _RUN_HEAD = _OnWords(r"(?i)^\s*(?:run|pass|cycle|batch)\s*(?:#|no\.?|num(?:ber)?)?\s*$")
 #: The column holding the reading in a long log, beside one naming what it is.
+#: a per-person slot of a section: 'Inspector 1', 'Operator #2', 'Reader 3'
+_SLOT_LABEL = re.compile(r"(?i)^\s*(?:inspector|operator|technician|tech|reader|examiner|"
+                         r"inspection|viewer)\s*#?\s*(?P<n>\d{1,2})\s*$")
+#: section words that say too little to pick one (most sections are inspections)
+_SECTION_FILLER = {"inspection", "inspections", "result", "results", "data", "report",
+                   "summary", "attributes", "record", "records", "test", "tests"}
 _VALUE_HEAD = _OnWords(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
                        r"measurement)\s*(?:\([^)]*\))?\s*$")
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
@@ -1022,7 +1043,9 @@ def preview_workbook(path, schema, aliases=None,
 
 #: Workbook files the reader takes: openpyxl reads .xlsx/.xlsm; the installed
 #: Excel opens .xls, .xlsb and rights-protected files (excel_open.py).
-WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+#: what a folder scan reads: workbooks, and PowerPoint decks (pptx_open lays
+#: each slide's tables out as sheets, user 2026-10-21)
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm")
 
 
 _SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
@@ -1169,7 +1192,10 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     import openpyxl
     from openpyxl.utils import get_column_letter
     import excel_open
+    import pptx_open
     path = Path(path)
+    if path.suffix.lower() in pptx_open.SUFFIXES and path.exists():
+        return _grids_from_pptx(path, notes, want_pictures)
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
         n = path_too_long(path)
@@ -1225,6 +1251,24 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
         # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
+    return grids, images
+
+
+def _grids_from_pptx(path: Path, notes: Optional[List[str]], want_pictures: bool = True
+                     ) -> Tuple[List[Grid], List["SourceImage"]]:
+    """A PowerPoint deck: each slide's tables as sheets, with the slide's
+    title and the text boxes that belong to each table above it (headings
+    and labels the matcher reads), its pictures for the image reader."""
+    import pptx_open
+    try:
+        deck = pptx_open.read_pptx(path, want_pictures=want_pictures)
+    except pptx_open.PptxError as e:
+        raise LedgerError(str(e)) from e
+    if notes is not None:
+        notes.extend(deck.notes)
+    grids = [Grid(path.name, s.name, dict(s.cells)) for s in deck.sheets]
+    images = [SourceImage(path.name, p.sheet, p.anchor, p.data, p.fmt)
+              for p in deck.pictures]
     return grids, images
 
 
@@ -2182,6 +2226,9 @@ class _Extractor:
         stage_col = self._stage_col(heads, data_rows, ctx) \
             if per_item and value_col is not None else None
         matched = [c for c, (_, mt) in heads.items() if mt.target]
+        if per_item and value_col is not None and stage_col is None and not matched \
+                and self._person_slots(r, cols, item_col, value_col, who_col, data_rows, ctx):
+            return
         if len(matched) + (item_col is not None) + (id_col is not None or lookalike) \
                 + (stage_col is not None) < 2:
             return
@@ -2236,6 +2283,76 @@ class _Extractor:
             for c in (id_col, item_col, who_col, run_col):
                 if c:
                     self.used.add((d, c))
+
+    def _person_slots(self, r, cols, item_col, value_col, who_col, data_rows, ctx) -> bool:
+        """One person's results per flaw ('Defect | Result' under 'Inspector:
+        JB', a heading 'Visual Inspection' above) where the template keeps
+        each person's in a numbered slot (Visual Inspection: Inspector 1,
+        Inspector 2): the first person who signs that section of a part takes
+        Inspector 1, the next Inspector 2 (user, 2026-10-21: "Visual
+        Inspection from various operators", a slide per operator's table).
+        Their initials go to the slot's Inspector Initials. The slot is
+        inferred from the order the tables were read: amber, never
+        pre-accepted. False when no section above names one with slots."""
+        slots = self.m.slot_fields()
+        if not slots:
+            return False
+        words = set()
+        for x in ctx:
+            words |= set(tokens(str(x)))
+        best, hit = None, 0
+        for sec in slots:
+            own = set(tokens(sec)) - _SECTION_FILLER
+            n = len(own & words)
+            if own and n > hit:
+                best, hit = sec, n
+        if best is None:
+            return False
+        targets = slots[best]
+        first = data_rows[0] if data_rows else r + 1
+        who_here = (_initials(self.g.cells.get((first, who_col))) if who_col else "") \
+            or self.inspector_for(first, value_col)
+        took = False
+        for d in data_rows:
+            self._tick()
+            item = self.codes.canon(self.g.cells.get((d, item_col)))
+            v = self.g.cells.get((d, value_col))
+            if not item or v is None:
+                continue
+            who = (_initials(self.g.cells.get((d, who_col))) if who_col else "") or who_here
+            part, part_how = self.part_at(d, cols[0])
+            order = self.m.person_slots.setdefault((part, best), [])
+            if who not in order:
+                order.append(who)
+            n = order.index(who)
+            if n >= len(targets):
+                continue                                   # more people than slots
+            t = targets[n]
+            label = self.g.text(r, value_col) or "Result"
+            note = (f"{t.text}: {who or 'the unsigned table'} is person {n + 1} to sign "
+                    f"{best} for this part, in the order the tables were read - check it")
+            # via 'slot': its own kind - never pre-accepted, and never learned as
+            # 'Result' meaning Inspector 1 (the next person's table is Inspector 2)
+            o = self.emit(part, item, label, r, value_col, v, Match(t, 0.75, [], via="slot"),
+                          field_name=t.fields[0], vr=d, vc=value_col)
+            if o is not None:
+                o.note = _join(o.note, note)
+                if part_how:
+                    o.part_how = part_how
+                took = True
+            comp = self.m.by_name.get(f"{t.fields[0]}{INITIALS_SUFFIX}")
+            if comp is not None and who:
+                o2 = self.emit(part, item, "initials", r, value_col, who,
+                               Match(comp, 0.75, [], via="slot"), field_name=comp.fields[0],
+                               vr=d, vc=value_col)
+                if o2 is not None:
+                    o2.note = _join(o2.note, note)
+            self.used.add((d, value_col))
+            self.used.add((d, item_col))
+        if took:
+            for c in cols:
+                self.used.add((r, c))
+        return took
 
     def _row_part(self, d, id_col) -> Tuple[str, str]:
         """(part, how) of table row d from its Part Number cell. A placeholder

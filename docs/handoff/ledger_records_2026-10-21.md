@@ -112,6 +112,40 @@ What Decisions teach:
     python -m council_core.ledger_records source  CSV Tame filename --example BTB_Spider.xlsx Spider
     python -m council_core.ledger_records source  CSV "Saddle BP" lookup --file BTB_Saddle_BP.xlsx --key-header "Tame Saddle" --join Name
 
+## PowerPoint decks (both Ledgers)
+
+`pptx_open.py` reads .pptx/.pptm with the standard library only (no new
+dependency). Folder scans now include decks, and the tab's file picker offers them.
+
+- **Each table on a slide becomes a sheet of its own.** Above it go the slide's
+  title, the slide-wide text, then the text boxes that belong to that table, one
+  line per paragraph, then a blank row.
+  - A text box belongs to its nearest table (above and to the left count first).
+  - Text over several tables, the title, and text far from every table belong to
+    the whole slide, so they go above every table on it.
+- **Readers need no new rules for this layout.** The sample Ledger already takes
+  a heading above a table as its section and "Inspector: JB" as who signed it; the
+  table Ledger takes "Tame: Spider" as that block's label.
+- **Joined lines are split.** "Eddy Current Response (%FSH) — Operator: TS"
+  becomes a heading and a signature.
+- **Pictures** go to the sample Ledger's image reader, named "Slide 2 · <title> ·
+  <nearest text>" so the section word reaches the matcher.
+- **Charts are not read.** Hidden slides are skipped.
+- **Fills count as highlights.** Table-cell fills, text-box fills and highlighted
+  runs are colours, so the highlighter works in PowerPoint too.
+- **Old .ppt files** are refused with "save it as .pptx".
+
+**Per-person slots** (`source_extract._Extractor._person_slots`, sample Ledger):
+- **When it applies:** a per-flaw "Result"/"Value" table under a heading that
+  names a template section whose fields are numbered person slots ("Visual
+  Inspection: Inspector 1, Inspector 2").
+- **What it does:** the first person to sign that section of a part takes slot
+  1, the next slot 2, and so on. Their initials go to the slot's
+  "— Inspector Initials" field. People beyond the last slot are not placed.
+- **Never pre-accepted, never learned:** these values have their own kind
+  (`via="slot"`), because the order comes from the order the tables were read.
+  Accepting them does not teach "Result" as an alias.
+
 ## Measured (this container, synthetic data)
 
 - **BTB:** reproduces `BTB_Template_filled.xlsx` cell for cell, colours included
@@ -129,3 +163,7 @@ What Decisions teach:
 - Pictures of tables are not read in table mode (the sample Ledger's image reader
   is not wired in).
 - The `.records_cache` folder is not pruned.
+- Free-sentence hints in a text box ("John checked these by eye") are only
+  headings: no model reads them yet for who or what. A local model reading a
+  slide's text for the fields it names would sit beside `ask_model_headers`.
+- Pictures on slides are not read in table mode (as in workbooks).
