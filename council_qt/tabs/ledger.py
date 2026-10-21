@@ -81,8 +81,15 @@ class LedgerActions:
         self.connections = connections
         self._register_kg_override = register_kg
 
-    def create_parent(self, template, csv):
-        return ledger_ingest.create_parent(template, csv or None)
+    def create_parent(self, template, csv, mode: str = "auto"):
+        return ledger_ingest.create_parent(template, csv or None, mode=mode)
+
+    def teach_records(self, csv, workbooks, progress=None, cancel=None) -> str:
+        """A table Ledger's Teach (council_core.ledger_records): learn the
+        user's highlights in these sample workbooks and say how the next
+        Extract reads them. Worker thread."""
+        from council_core import ledger_records
+        return ledger_records.teach(csv, workbooks, progress=progress, cancel=cancel)
 
     #: Set by the tab: where an extract's stall dump goes (its log).
     stall_log: Optional[Callable[[str], None]] = None
@@ -327,6 +334,14 @@ class LedgerTab(ViewHelpers, QWidget):
         self.csv.editingFinished.connect(self._on_csv_changed)
         row = QHBoxLayout()
         self.create_btn = self._step_button(row, "Create / extend parent CSV", self.on_create)
+        # a table template whose rows are records (council_core.ledger_records):
+        # found by itself when the template has no sample-ID column
+        self.records_mode = QCheckBox("Each table row is a record")
+        self.records_mode.setToolTip(
+            "Tick when the template is a table to fill with many records (one row each), "
+            "read from the tables of every workbook. Left unticked, Council decides: a "
+            "table with no sample-ID column is read this way too.")
+        row.addWidget(self.records_mode)
         row.addStretch(1)
         grid.addLayout(row, 2, 1)
         outer.addWidget(g1)
@@ -334,6 +349,9 @@ class LedgerTab(ViewHelpers, QWidget):
         g2 = QGroupBox("2 · Source workbooks")
         v2 = QVBoxLayout(g2)
         self.sources = QListWidget()
+        # several at once: a table Ledger's Teach reads a sample with its
+        # lookup workbook; Remove selected removes them all
+        self.sources.setSelectionMode(QListWidget.ExtendedSelection)
         self.sources.setMaximumHeight(120)
         v2.addWidget(self.sources)
         row = QHBoxLayout()
@@ -872,6 +890,10 @@ class LedgerTab(ViewHelpers, QWidget):
             self.status.setText(
                 "That parent CSV has no schema beside it — run Create first.")
             return
+        from council_core import ledger_records
+        if ledger_records.is_record_ledger(csv_path):
+            self._teach_records(csv_path)
+            return
         from .ledger_teach_dialog import TeachDialog
         images, vision = self.use_images.isChecked(), self._selected_vision_model()
         mask = self.pattern_mask.text().strip()
@@ -900,6 +922,30 @@ class LedgerTab(ViewHelpers, QWidget):
         self.teach_dialog = dlg
         self._say(f"── Teach from a sample workbook ({Path(csv_path).name})")
         dlg.open()
+
+    def _teach_records(self, csv_path: str) -> None:
+        """A table Ledger learns from the user's highlights: the sources
+        selected in the list (a sample and, say, its lookup workbook), else
+        one workbook picked now. It says what the next Extract will read."""
+        picked = [i.text() for i in self.sources.selectedItems()]
+        if not picked:
+            one = self._pick_workbook(self)
+            if not one:
+                return
+            picked = [one]
+        teach = getattr(self.actions, "teach_records", None)
+        if teach is None:
+            self.status.setText("Teach is not available for a table Ledger here.")
+            return
+        self._say(f"── Teach from {len(picked)} sample workbook(s) ({Path(csv_path).name})")
+
+        def done(text) -> None:
+            self._say(text)
+            self.status.setText("Teach read your highlights; the next Extract uses them. "
+                                "The log says what it will read.")
+        self._run("Reading your highlights",
+                  lambda p: teach(csv_path, picked, progress=p, cancel=self._cancel), done,
+                  cancellable=True)
 
     def _after_teach(self, report) -> None:
         """Teach saved its answers: the pattern field offers a pattern it
@@ -969,6 +1015,8 @@ class LedgerTab(ViewHelpers, QWidget):
     # ── step 1 ──────────────────────────────────────────────────────────
     def on_create(self) -> None:
         template, csv = self.template.text().strip(), self.csv.text().strip()
+        # only when ticked, so an actions stand-in without the option works
+        more = {"mode": "records"} if self.records_mode.isChecked() else {}
 
         def done(s) -> None:
             self.csv.setText(s.csv)
@@ -977,7 +1025,7 @@ class LedgerTab(ViewHelpers, QWidget):
             self._register(s.csv, again=True)
             self._on_csv_changed()          # setText is not editingFinished
         self._run("Reading the template",
-                  lambda _p: self.actions.create_parent(template, csv), done)
+                  lambda _p: self.actions.create_parent(template, csv, **more), done)
 
     # ── the Connections graph reads this Ledger (user, 2026-10-20) ──────
     def _register(self, csv, again: bool = False) -> None:
