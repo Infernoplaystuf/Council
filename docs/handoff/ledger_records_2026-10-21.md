@@ -51,9 +51,20 @@ sample-ID Ledger.
    - a label beside the table (`Inspector: MK`);
    - a constant;
    - a template formula, which is carried down and never read.
-7. **Identifies records.** Key fields default to the name-derived fields plus the
-   first text column unique within each table (BTB: Tame + Name). The same record
-   from two workbooks is dropped if identical, and red (clash) if different.
+7. **Reads a grid of tables** (blocks side by side, stacked, staggered, or touching
+   with no empty column) as one table per block:
+   - headers are found per block, not per row;
+   - a form line over a block (`Tank: 3`, `Inspector: | AL`) ends the block above
+     it and is never taken for a header;
+   - each block's labels are the nearest ones that belong to it, while a single
+     label over the whole sheet goes to every block;
+   - a bare block title ("North tank") is learned from the user's highlight as
+     "the cell at this place over each table".
+8. **Identifies records.** Key fields default to the name-derived fields plus the
+   first text column unique within each table (BTB: Tame + Name). A grid's block
+   labels join the key when they differ between blocks (Tank + Inspector + Position).
+   The same record from two workbooks is dropped if identical, and red (clash) if
+   different. Blocks of one workbook are never compared: they may share names (P1).
 
 ## The review workbook
 
@@ -78,8 +89,10 @@ What Decisions teach:
 ## Apply
 
 - The parent CSV gets one row per record: the fields, then `source_sheet`,
-  `source_row`, `source_file` and `updated_at`. The same record (source + key
-  fields) is updated in place.
+  `source_table` (where its table starts), `source_row`, `source_file` and
+  `updated_at`. The same record (source + key fields) is updated in place. Where
+  those match more than one record (a grid's blocks), the table's place tells them
+  apart, so one block never overwrites another.
 - The schema beside the CSV is a `sample_ledger` schema, so the knowledge graph
   reads the CSV as a Ledger.
 - With a fill folder, the template is filled with every record:

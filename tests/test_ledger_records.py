@@ -677,3 +677,114 @@ def test_a_lookup_painted_on_two_columns(tmp_path):
     assert rule["key_header"] == "tame saddle" and rule["value_header"] == "wood"
     greg = next(r for r in run.records if r.values["Name"].value == "Greg #1")
     assert greg.values["Saddle BP"].value == 35
+
+
+# ── a grid of tables on one sheet ───────────────────────────────────────
+GRID_FIELDS = ("Tank", "Inspector", "Position", "Reading", "Result")
+
+
+def grid_block(ws, top, left, tank, insp, n=4, title=None):
+    if title is None:
+        ws.cell(top, left, f"Tank: {tank}")
+    else:
+        ws.cell(top, left, title)
+    ws.cell(top + 1, left, "Inspector:")
+    ws.cell(top + 1, left + 1, insp)
+    for j, h in enumerate(["Position", "Reading", "Result"]):
+        ws.cell(top + 2, left + j, h)
+    for i in range(n):
+        ws.cell(top + 3 + i, left, f"P{i + 1}")
+        ws.cell(top + 3 + i, left + 1, 10 * tank + i)
+        ws.cell(top + 3 + i, left + 2, "OK")
+
+
+def grid_book(path, gap_cols=1, gap_rows=2, stagger=0, titles=None):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    right = 4 + gap_cols
+    below = 8 + gap_rows
+    places = [(1, 1), (1 + stagger, right), (below, 1), (below + stagger, right)]
+    for n, ((top, left), insp) in enumerate(zip(places, ["JB", "MK", "AL", "TS"]), start=1):
+        grid_block(ws, top, left, n, insp, title=titles[n - 1] if titles else None)
+    wb.save(path)
+    return path
+
+
+GRID_EXPECT = sorted((str(t), i, f"P{p + 1}", 10 * t + p) for t, i in
+                     zip(range(1, 5), ["JB", "MK", "AL", "TS"]) for p in range(4))
+
+
+@pytest.mark.parametrize("layout", [
+    dict(gap_cols=1, gap_rows=2), dict(gap_cols=1, gap_rows=1), dict(gap_cols=0, gap_rows=2),
+    dict(gap_cols=1, gap_rows=2, stagger=2), dict(gap_cols=3, gap_rows=4, stagger=1)],
+    ids=["spaced", "one-blank-row", "touching-columns", "staggered", "wide-gaps"])
+def test_a_grid_of_tables_is_one_block_each(tmp_path, layout):
+    tpl, csv = simple_ledger(tmp_path, fields=GRID_FIELDS)
+    p = grid_book(tmp_path / "grid.xlsx", **layout)
+    run = lr.extract(csv, [p])
+    got = sorted((cell_or_none(r, "Tank"), cell_or_none(r, "Inspector"),
+                  r.values["Position"].value, r.values["Reading"].value) for r in run.records)
+    assert got == GRID_EXPECT
+    assert all(r.accept == "Y" and not r.flags for r in run.records)
+    assert run.key_fields[:2] == ["Tank", "Inspector"]
+
+
+def cell_or_none(rec, name):
+    v = rec.values.get(name)
+    return lr.cell_text(v.value) if v else None
+
+
+def test_a_grid_applies_without_one_block_overwriting_another(tmp_path):
+    tpl, csv = simple_ledger(tmp_path, fields=("Position", "Reading", "Result"))
+    p = grid_book(tmp_path / "grid.xlsx")
+    out = tmp_path / "r.xlsx"
+    lr.write_review(out, lr.extract(csv, [p]), csv, [p])
+    assert lr.apply_review(out).rows == 16              # P1..P4 four times, all kept
+    again = lr.apply_review(out)
+    assert again.rows == 16 and "16 updated" in again.csv_result
+    rows = lr._read_rows(csv)[1]
+    assert {r["source_table"] for r in rows} == {"A3", "E3", "A12", "E12"}
+
+
+def test_one_label_over_the_whole_sheet_goes_to_every_block(tmp_path):
+    tpl, csv = simple_ledger(tmp_path, fields=("Lot", "Position", "Reading"))
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Lot: L-77"
+    for n, (top, left) in enumerate([(3, 1), (3, 6), (12, 1)], start=1):
+        grid_block(ws, top, left, n, "JB")
+    p = tmp_path / "g.xlsx"
+    wb.save(p)
+    run = lr.extract(csv, [p])
+    assert len(run.records) == 12 and {r.values["Lot"].value for r in run.records} == {"L-77"}
+
+
+def test_a_painted_block_title_is_learned_by_its_place(tmp_path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for c, (f, rgb) in enumerate([("Tank", BLUE), ("Position", GREEN), ("Reading", GREEN)],
+                                 start=1):
+        ws.cell(1, c, f)
+        paint(ws.cell(1, c), rgb)
+        paint(ws.cell(2, c), rgb)
+    tpl = tmp_path / "T.xlsx"
+    wb.save(tpl)
+    csv = tmp_path / "T.csv"
+    lr.create_ledger(tpl, csv)
+    titles = ["North tank", "South tank", "East tank", "West tank"]
+    sample = grid_book(tmp_path / "a.xlsx", titles=titles)
+    wb = openpyxl.load_workbook(sample)
+    paint(wb.active["A1"], BLUE)                        # the user paints ONE block's title
+    for c in (1, 2):
+        paint(wb.active.cell(3, c), GREEN)
+    wb.save(sample)
+    other = grid_book(tmp_path / "b.xlsx", stagger=2, titles=["Tank A", "Tank B", "Tank C",
+                                                              "Tank D"])
+    run = lr.extract(csv, [sample, other])
+    assert lr.load_recipe(csv).sources["Tank"]["kind"] == "near"
+    by_file = {}
+    for r in run.records:
+        by_file.setdefault(r.file, set()).add(r.values["Tank"].value)
+    assert by_file == {"a.xlsx": set(titles), "b.xlsx": {"Tank A", "Tank B", "Tank C",
+                                                         "Tank D"}}
+    assert all(r.accept == "Y" for r in run.records)

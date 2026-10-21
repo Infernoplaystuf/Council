@@ -73,7 +73,7 @@ RECIPE_VERSION = 1
 #: bump when what a cached file holds changes: older caches are read again
 READER_VERSION = 2
 #: the parent CSV's columns after the fields (before source_file, updated_at)
-SHEET_COL, ROW_COL = "source_sheet", "source_row"
+SHEET_COL, ROW_COL, TABLE_COL = "source_sheet", "source_row", "source_table"
 
 #: a sheet is read until this many empty rows follow its last value (a
 #: formatted cell at row 1,048,576 must not cost a million rows)
@@ -104,7 +104,8 @@ SUMMARY_WORDS = {"total", "totals", "sum", "average", "avg", "mean", "median", "
 
 #: how a value or a column was placed, and whether that is pre-accepted
 SURE_HOWS = {"header", "words", "taught", "colour", "rule", "exact", "starts with",
-             "your answer", "label", "formula", "constant", "file name", "sheet name"}
+             "your answer", "label", "formula", "constant", "file name", "sheet name",
+             "near"}
 AMBER = "FFF2CC"
 RED = "F8CBAD"
 GREY = "D9D9D9"
@@ -736,6 +737,12 @@ class Table:
     def column(self, j: int) -> List[Any]:
         return [row[j] for row in self.values]
 
+    def box(self) -> Tuple[int, int, int, int]:
+        """(top, left, bottom, right) on the sheet, its header included."""
+        r1, r2 = self.header_at, max(self.rows) if self.rows else self.header_at
+        c1, c2 = self.cols[0], self.cols[-1]
+        return (r1, c1, r2, c2) if self.orient == "rows" else (c1, r1, c2, r2)
+
     def cell_set(self) -> Set[Tuple[int, int]]:
         """The sheet cells of its header and records, the sheet's way up."""
         out = set()
@@ -772,20 +779,56 @@ def _tables(sheet: SheetData, cells: Dict[Tuple[int, int], Any], orient: str) ->
         if len(header_like) >= MAX_HEADER_ROWS:
             break
     out: List[Table] = []
-    taken: Set[int] = set()
+    # the cells a table already holds as records, by its columns: a row of
+    # them is data of that table, not another header. Only the SAME columns
+    # are passed over - a table beside it, or staggered against it (a grid of
+    # tables), starts wherever its own header is
+    taken: Dict[Tuple[int, ...], Set[int]] = {}
     colours = sheet.colours if orient == "rows" else {(c, r): k for (r, c), k
                                                       in sheet.colours.items()}
     for r in header_like:
-        if r in taken:
-            continue
         row = by_row[r]
-        texts = sorted(c for c, v in row.items() if is_text(v))
+        labels = _label_cols(row)
+        texts = sorted(c for c, v in row.items() if is_text(v) and c not in labels)
         for run in _header_runs(texts, by_row, r):
+            if r in taken.get(tuple(run), ()):
+                continue
             t = _body(sheet, by_row, r, run, orient, colours)
             if t is None:
                 continue
             out.append(t)
-            taken.update(t.rows)
+            taken.setdefault(tuple(run), set()).update(t.rows)
+    return out
+
+
+_LABEL_VALUE = re.compile(r"^\s*([^:]{1,60}?)\s*:\s*(\S.*)$")
+
+
+def _is_label(v: Any) -> bool:
+    """'Inspector:' or 'Inspector: MK' - a label and its value, not a
+    column's header."""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    return (t.endswith(":") and len(t) > 1) or bool(
+        _LABEL_VALUE.match(t) and re.search(r"[A-Za-z]", t.split(":", 1)[0])
+        and not re.match(r"^\d{1,2}:\d{2}", t))
+
+
+def _label_cols(row: Dict[int, Any]) -> Set[int]:
+    """The columns of a row that hold labels ('Inspector:') and the value
+    right after one: a form above a table, not its headers."""
+    out: Set[int] = set()
+    labels = [c for c, v in row.items() if _is_label(v)]
+    texts = [c for c, v in row.items() if is_text(v)]
+    # a header row may end its names with ':' ('Weight:'); a form line is
+    # mostly labels ('Inspector: | JB | Inspector: | MK')
+    if not labels or 2 * len(labels) < len(texts):
+        return out
+    for c in labels:
+        out.add(c)
+        if str(row[c]).strip().endswith(":") and (c + 1) in row:
+            out.add(c + 1)
     return out
 
 
@@ -800,7 +843,27 @@ def _header_runs(texts: List[int], by_row, r: int) -> List[List[int]]:
             runs[-1] += [c - 1, c]
         else:
             runs.append([c])
-    return [x for x in runs if sum(1 for c in x if is_text(by_row[r].get(c))) >= 2]
+    out: List[List[int]] = []
+    for run in runs:
+        out += _split_repeats(run, by_row[r])
+    return [x for x in out if sum(1 for c in x if is_text(by_row[r].get(c))) >= 2]
+
+
+def _split_repeats(run: List[int], head: Dict[int, Any]) -> List[List[int]]:
+    """Tables side by side with no empty column between: the first header
+    coming back starts the next one ('Position Reading Position Reading')."""
+    keys = [norm(head.get(c)) for c in run]
+    first = keys[0]
+    if not first:
+        return [run]
+    cuts = [i for i in range(2, len(run)) if keys[i] == first]
+    if not cuts:
+        return [run]
+    out, start = [], 0
+    for i in cuts + [len(run)]:
+        out.append(run[start:i])
+        start = i
+    return out
 
 
 def _has_below(by_row, r: int, c: int) -> bool:
@@ -831,8 +894,15 @@ def _body(sheet: SheetData, by_row, r: int, run: List[int], orient: str,
             continue
         if blank == 1 and rows and _new_header(vals, numeric_cols, run):
             break
+        if rows and _form_row(row, lo, hi, len(run)):
+            break                                         # 'Tank: 3' - the next block's labels
+        if blank == 1 and rows and len(filled) < max(1, len(run) // 2) \
+                and _typical_fill(values) > len(filled):
+            break                                         # after a gap, not this table's shape
         texts = [v for v in vals if is_text(v)]
         if [norm(v) for v in vals] == header_keys:
+            if blank:
+                break                                     # another table like it, below it
             skipped += 1                                  # the header again (a page break)
             x += 1
             blank = 0
@@ -859,6 +929,8 @@ def _body(sheet: SheetData, by_row, r: int, run: List[int], orient: str,
         return None
     # parents: a sparse row of words over the headers (a merged group heading)
     above = by_row.get(r - 1, {})
+    not_parent = _label_cols(above)
+    above = {c: v for c, v in above.items() if c not in not_parent}
     parent_texts = [(c, above.get(c)) for c in range(lo, hi + 1) if is_text(above.get(c))]
     parents: Dict[int, str] = {}
     if parent_texts and len(parent_texts) < len(run):
@@ -885,6 +957,21 @@ def _body(sheet: SheetData, by_row, r: int, run: List[int], orient: str,
         cols_colour.append(k)
     return Table(sheet.file, sheet.path, sheet.name, orient, r, list(run), headers, keys,
                  rows, values, cols_colour, order=sheet.order, skipped_rows=skipped)
+
+
+def _form_row(row: Dict[int, Any], lo: int, hi: int, width: int) -> bool:
+    """A row of labels over the table's columns ('Tank: 3', 'Inspector: | AL'):
+    the next block's form, not a record."""
+    inside = {c: v for c, v in row.items() if lo <= c <= hi}
+    if not inside:
+        return False
+    first = inside[min(inside)]
+    return _is_label(first) and len(inside) <= max(2, width // 2)
+
+
+def _typical_fill(values: List[List[Any]]) -> int:
+    counts = sorted(sum(v is not None for v in row) for row in values[-20:])
+    return counts[len(counts) // 2] if counts else 0
 
 
 def _summary_row(vals) -> bool:
@@ -973,7 +1060,8 @@ def save_recipe(csv_path, recipe: Recipe) -> None:
 
 
 def csv_columns(tt: TableTemplate) -> List[str]:
-    return [f.name for f in tt.all_fields] + [SHEET_COL, ROW_COL, SOURCE_COL, UPDATED_COL]
+    return [f.name for f in tt.all_fields] + [SHEET_COL, TABLE_COL, ROW_COL, SOURCE_COL,
+                                              UPDATED_COL]
 
 
 def _schema_for(tt: TableTemplate, id_field: str) -> TemplateSchema:
@@ -1259,7 +1347,7 @@ def _qualifies(maps: List[ColMap], n_fields: int) -> bool:
 
 # ── learning from the user's highlights ─────────────────────────────────
 def learn_colours(tt: TableTemplate, tables: Sequence[Table], recipe: Recipe,
-                  all_files: Sequence[str]) -> List[str]:
+                  all_files: Sequence[str], sheets: Sequence[SheetData] = ()) -> List[str]:
     """What the user's highlights say (the same fill in the template and a
     workbook means 'this is that'): each painted column of a workbook's
     record table is the field of its colour (by name among fields of one
@@ -1355,6 +1443,7 @@ def learn_colours(tt: TableTemplate, tables: Sequence[Table], recipe: Recipe,
                 recipe.sources[f.name] = rule
                 said.append(f"Learned from your highlights: {f.name} is looked up in "
                             f"{t.file} › {t.sheet}, column '{t.headers[j]}'")
+    seen_group |= _learn_painted_cells(groups, seen_group, tables, sheets, recipe, said)
     stems = {Path(x).stem for x in all_files}
     headed = {k for t in tables for ks in t.keys for k in ks if k}
     for gi, (gc, fs) in enumerate(groups):
@@ -1375,6 +1464,68 @@ def learn_colours(tt: TableTemplate, tables: Sequence[Table], recipe: Recipe,
                         + ("" if len(stems) > 1 else " (one file only so far)")
                         + " — check it in the review (Decisions)")
     return said
+
+
+def _learn_painted_cells(groups, seen_group: Set[int], tables: Sequence[Table],
+                         sheets: Sequence[SheetData], recipe: Recipe,
+                         said: List[str]) -> Set[int]:
+    """A painted cell outside every table names its table (a grid's block
+    title): 'Vessel: 3' teaches the label 'Vessel'; '3' beside the label
+    'Vessel' teaches it too; a bare 'Tank 3' teaches its place over the
+    table (the same place over every table, in every workbook)."""
+    found: Set[int] = set()
+    in_tables: Dict[Tuple[str, str], Set[Tuple[int, int]]] = {}
+    for t in tables:
+        in_tables.setdefault((t.path, t.sheet), set()).update(t.cell_set())
+    for sh in sheets:
+        if not sh.colours:
+            continue
+        mine = [t for t in tables if t.path == sh.path and t.sheet == sh.name]
+        inside = in_tables.get((sh.path, sh.name), set())
+        for (r, c), k in sorted(sh.colours.items()):
+            v = sh.cells.get((r, c))
+            if v is None or (r, c) in inside:
+                continue
+            for gi, (gc, fs) in enumerate(groups):
+                if gi in seen_group or gi in found or len(fs) != 1 or not same_colour(gc, k):
+                    continue
+                f = fs[0]
+                label = ""
+                text = str(v).strip()
+                if _is_label(text) and ":" in text.rstrip(":"):
+                    label = text.split(":", 1)[0]
+                elif isinstance(sh.cells.get((r, c - 1)), str) and \
+                        _is_label(sh.cells[(r, c - 1)]):
+                    label = str(sh.cells[(r, c - 1)]).rstrip(": ")
+                if label:
+                    if norm(label) not in set(f.keys) | {norm(f.name)}:
+                        recipe.aliases[norm(label)] = f.name
+                    said.append(f"Learned from your highlights in {sh.file} › {sh.name}: "
+                                f"{f.name} is the value labelled '{label}' beside each table")
+                    found.add(gi)
+                    continue
+                if not mine:
+                    continue
+                t = min(mine, key=lambda t: _distance(r, c, t.box()))
+                top, left = t.box()[:2]
+                recipe.sources[f.name] = {"kind": "near", "dr": r - top, "dc": c - left,
+                                          "confirmed": True, "how": "colour"}
+                said.append(f"Learned from your highlights in {sh.file} › {sh.name}: {f.name}"
+                            f" is the cell {_a1(r, c)} ('{text[:40]}'), "
+                            f"{_offset_words(r - top, c - left)} each table")
+                found.add(gi)
+    return found
+
+
+def _offset_words(dr: int, dc: int) -> str:
+    parts = []
+    if dr:
+        parts.append(f"{abs(dr)} row{'s' if abs(dr) > 1 else ''} "
+                     + ("above" if dr < 0 else "below"))
+    if dc:
+        parts.append(f"{abs(dc)} column{'s' if abs(dc) > 1 else ''} "
+                     + ("left of" if dc < 0 else "right of"))
+    return " and ".join(parts) + (" the start of" if parts else "at the start of")
 
 
 def _mostly_text(vals: Sequence[Any]) -> bool:
@@ -1469,33 +1620,61 @@ class LookupIndex:
         return None, "", f"no entry for '{v}'"
 
 
-def _find_value_near(sheet: SheetData, keys: Set[str], skip: Set[Tuple[int, int]]
-                     ) -> Optional[Tuple[Any, str]]:
-    """A labelled value on a sheet: 'Inspector:' with the value to its right
-    (or below), or 'Inspector: MK' in one cell. ``skip``: the cells of the
-    tables' headers and records (a header is not a label)."""
-    best = None
+def _labelled_values(sheet: SheetData, keys: Set[str], skip: Set[Tuple[int, int]]
+                     ) -> List[Tuple[Any, int, int, str]]:
+    """Every labelled value on a sheet for these label words: 'Inspector:'
+    with the value to its right (or below), or 'Inspector: MK' in one cell,
+    as (value, label row, label column, where the value is). ``skip``: the
+    cells of the tables' headers and records (a header is not a label)."""
+    out: List[Tuple[Any, int, int, str]] = []
     for (r, c), v in sheet.cells.items():
         if not isinstance(v, str) or (r, c) in skip:
             continue
-        s = v.strip()
-        if ":" in s:
-            head, _, tail = s.partition(":")
+        t = v.strip()
+        if ":" in t:
+            head, _, tail = t.partition(":")
             if norm(head) in keys and tail.strip():
-                return tail.strip(), _a1(r, c)
-        if norm(s) in keys:
+                out.append((tail.strip(), r, c, _a1(r, c)))
+                continue
+        if norm(t) in keys:
             for dc in (1, 2, 3):
                 x = sheet.cells.get((r, c + dc))
                 if (r, c + dc) in skip:
                     break
                 if x is not None and not (isinstance(x, str) and norm(x) in keys):
-                    best = best or (x, _a1(r, c + dc))
+                    out.append((x, r, c, _a1(r, c + dc)))
                     break
             else:
                 x = sheet.cells.get((r + 1, c))
                 if x is not None and (r + 1, c) not in skip:
-                    best = best or (x, _a1(r + 1, c))
-    return best
+                    out.append((x, r, c, _a1(r + 1, c)))
+    return out
+
+
+def _distance(r: int, c: int, box: Tuple[int, int, int, int]) -> int:
+    """How far a label is from a table (rows, columns); a label is looked for
+    above and to the left of its table first, so below and right count
+    double."""
+    r1, c1, r2, c2 = box
+    dr = 0 if r1 <= r <= r2 else (r1 - r if r < r1 else 2 * (r - r2))
+    dc = 0 if c1 <= c <= c2 else (c1 - c if c < c1 else 2 * (c - c2))
+    return dr + dc
+
+
+def _label_for(hits: List[Tuple[Any, int, int, str]], box: Tuple[int, int, int, int],
+               boxes: Sequence[Tuple[int, int, int, int]]) -> Optional[Tuple[Any, str]]:
+    """The labelled value that belongs to this table: one label on the sheet
+    belongs to every table on it ('Inspector: MK' over the whole sheet); of
+    several (a grid of tables, each with its own), the one nearest this
+    table and nearer to it than to any other."""
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0][0], hits[0][3]
+    mine = [h for h in hits
+            if _distance(h[1], h[2], box) <= min(_distance(h[1], h[2], b) for b in boxes)]
+    pick = min(mine or hits, key=lambda h: _distance(h[1], h[2], box))
+    return pick[0], pick[3]
 
 
 # ── the model ───────────────────────────────────────────────────────────
@@ -1614,7 +1793,8 @@ def extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress=
     # 2. the user's highlights
     prog.stage("reading your highlights")
     before = json.dumps(asdict(recipe), sort_keys=True, default=str)
-    run.learned += learn_colours(tt, tables, recipe, [str(f) for f in files])
+    run.learned += learn_colours(tt, tables, recipe, [str(f) for f in files],
+                                 list(sheets.values()))
     # 3. lookups: their tables are not records
     lookups: Dict[str, LookupIndex] = {}
     lookup_tables: Set[str] = set()
@@ -1646,7 +1826,7 @@ def extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress=
     prog.stage("matching columns", total=len(tables), unit="tables")
     col_fields = [f for f in tt.all_fields if not f.formula and not f.is_form
                   and recipe.sources.get(f.name, {}).get("kind") not in
-                  ("filename", "sheetname", "name", "lookup", "constant")]
+                  ("filename", "sheetname", "name", "lookup", "constant", "near")]
     uses: List[TableUse] = []
     memo: Dict[tuple, List[ColMap]] = {}
     upright: Set[Tuple[str, str]] = set()       # sheets with a table read the right way up
@@ -1695,7 +1875,7 @@ def extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress=
             order += 1
             run.records.append(rec)
     # 8. who is who: the same record in two workbooks
-    run.key_fields = _key_fields(recipe, tt, rec_tables)
+    run.key_fields = _key_fields(recipe, tt, rec_tables, run.records)
     _duplicates(run)
     for rec in run.records:
         if rec.accept != "N":
@@ -1971,12 +2151,13 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
             skip |= other.cell_set()
         for f in tt.all_fields:
             if f.name in mapped or f.formula or recipe.sources.get(f.name, {}).get("kind") \
-                    in ("filename", "sheetname", "lookup", "constant"):
+                    in ("filename", "sheetname", "lookup", "constant", "near"):
                 continue
             keys = set(f.keys or [f.key]) | {norm(f.name)} | {
                 k for k, v in recipe.aliases.items() if v == f.name}
             keys.discard("")
-            got = _find_value_near(sheet, keys, skip)
+            got = _label_for(_labelled_values(sheet, keys, skip), t.box(),
+                             [x.box() for x in tables_here])
             if got is not None:
                 near[f.name] = got
     where0 = f"{t.file} › {t.sheet}!"
@@ -2023,6 +2204,13 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
                                          rule.get("pattern", ""), check)
             elif kind == "constant":
                 rec.values[f.name] = Val(rule.get("value", ""), "constant")
+            elif kind == "near" and sheet is not None:
+                top, left = t.box()[:2]
+                at = (top + int(rule.get("dr", 0)), left + int(rule.get("dc", 0)))
+                v = sheet.cells.get(at)
+                if v is not None and at not in skip:
+                    rec.values[f.name] = Val(v, "near", f"{where0}{_a1(*at)}",
+                                             "the cell in its place over the table")
             elif kind == "lookup" and f.name in lookups:
                 idx = lookups[f.name]
                 join = rule.get("join")
@@ -2055,10 +2243,24 @@ def _records(u: TableUse, tt: TableTemplate, recipe: Recipe, run: RecordRun,
             yield rec
 
 
-def _key_fields(recipe: Recipe, tt: TableTemplate, rec_tables: List[TableUse]) -> List[str]:
+#: how a value that names a whole table (not one record) was found
+CONTEXT_HOWS = ("label", "near", "file name", "sheet name")
+
+
+def _key_fields(recipe: Recipe, tt: TableTemplate, rec_tables: List[TableUse],
+                records: Sequence[Record] = ()) -> List[str]:
     if recipe.key_fields:
         return list(recipe.key_fields)
     keys = [f for f, r in recipe.sources.items() if r.get("kind") in ("filename", "sheetname")]
+    # what names each block of a grid ('Tank: 3' above it), when the blocks differ
+    per_table: Dict[str, Dict[str, str]] = {}
+    for rec in records:
+        for f, v in rec.values.items():
+            if v.how in CONTEXT_HOWS and f not in keys:
+                per_table.setdefault(f, {})[rec.table] = cell_text(v.value)
+    for f in tt.all_fields:
+        if f.name in per_table and len(set(per_table[f.name].values())) > 1:
+            keys.append(f.name)
     for f in tt.fields:
         cols = [(u, m) for u in rec_tables for m in u.maps if m.field == f.name]
         if not cols:
@@ -2079,9 +2281,10 @@ def _key_fields(recipe: Recipe, tt: TableTemplate, rec_tables: List[TableUse]) -
 
 
 def _duplicates(run: RecordRun) -> None:
-    """The same record (its key fields) from two places: identical, the
+    """The same record (its key fields) from two workbooks: identical, the
     first is kept and the others left out (said); different, every one is
-    red for the user to pick."""
+    red for the user to pick. Two tables of ONE workbook (a grid of blocks,
+    a sheet per tank) are different things that may share names ('P1')."""
     keys = [k for k in run.key_fields]
     if not keys:
         return
@@ -2096,6 +2299,8 @@ def _duplicates(run: RecordRun) -> None:
             continue
         first = recs[0]
         for other in recs[1:]:
+            if other.path == first.path:
+                continue
             fields = set(first.values) | set(other.values)
             differ = [f for f in fields if cell_text(first.values.get(f, Val(None, "")).value)
                       != cell_text(other.values.get(f, Val(None, "")).value)]
@@ -2169,20 +2374,20 @@ def write_review(out, run: RecordRun, csv_path, sources: Sequence) -> Path:
         ws.append([])
         ws.append(["Records are told apart by: " + ", ".join(run.key_fields)])
 
-    meta_cols = ["Accept", "Source", "Sheet", "Row"]
+    meta_cols = ["Accept", "Source", "Sheet", "Table", "Row"]
     tail = ["Notes", "_table", "_checks"]
     chunk = SHEET_ROWS
     parts = [run.records[i:i + chunk] for i in range(0, max(1, len(run.records)), chunk)] \
         or [[]]
     for pi, part in enumerate(parts):
         ws = wb.create_sheet("Records" if pi == 0 else f"Records {pi + 1}")
-        ws.freeze_panes = "E2"
+        ws.freeze_panes = "F2"
         ws.column_dimensions[_col_letter(len(meta_cols) + len(names) + 2)].hidden = True
         ws.column_dimensions[_col_letter(len(meta_cols) + len(names) + 3)].hidden = True
-        head(ws, meta_cols + names + tail, [8, 28, 14, 6] + [14] * len(names) + [50])
+        head(ws, meta_cols + names + tail, [8, 28, 14, 8, 6] + [14] * len(names) + [50])
         for rec in part:
             checks = sorted({v.check for v in rec.values.values() if v.check} | set(rec.checks))
-            row = [rec.accept, rec.file, rec.sheet, rec.row]
+            row = [rec.accept, rec.file, rec.sheet, table_anchor(rec.table), rec.row]
             for n in names:
                 v = rec.values.get(n)
                 cell = WriteOnlyCell(ws, value=_cell_value(v.value) if v else None)
@@ -2243,6 +2448,16 @@ def write_review(out, run: RecordRun, csv_path, sources: Sequence) -> Path:
     wb.save(tmp)
     os.replace(tmp, out)
     return out
+
+
+def table_anchor(table_id: str) -> str:
+    """Where a table starts on its sheet ('E12'), from Table.id."""
+    try:
+        _f, _s, orient, at, col = table_id.rsplit("|", 4)
+        r, c = int(at), int(col)
+        return _a1(r, c) if orient == "rows" else _a1(c, r)
+    except ValueError:
+        return ""
 
 
 def _cell_value(v: Any) -> Any:
@@ -2336,6 +2551,7 @@ def apply_review(review, fill_dir=None, progress=None) -> ApplyResult:
                 rec[SOURCE_COL] = str(get("Source") or "")
                 rec[SHEET_COL] = str(get("Sheet") or "")
                 rec[ROW_COL] = cell_text(get("Row"))
+                rec[TABLE_COL] = str(get("Table") or "")
                 cells += sum(1 for f in tt.all_fields if rec.get(f.name))
                 taken.append(rec)
     finally:
@@ -2353,12 +2569,26 @@ def apply_review(review, fill_dir=None, progress=None) -> ApplyResult:
         [c for c in cols if c not in want] + [SOURCE_COL, UPDATED_COL]
     keys = list(meta.get("key_fields") or recipe.key_fields)
 
-    def ident(r: Dict[str, str]) -> Tuple[str, ...]:
+    # a record is the same one again by its workbook, sheet and key fields; when
+    # that is not enough (the blocks of a grid share names), by its table's
+    # place too - never by a guess that would write one record over another
+    def base(r: Dict[str, str]) -> Tuple[str, ...]:
         k = tuple(vnorm(r.get(x, "")) for x in keys)
+        where = (vnorm(r.get(SOURCE_COL, "")), vnorm(r.get(SHEET_COL, "")))
         if keys and all(k):
-            return ("k", vnorm(r.get(SOURCE_COL, "")), vnorm(r.get(SHEET_COL, ""))) + k
-        return ("r", vnorm(r.get(SOURCE_COL, "")), vnorm(r.get(SHEET_COL, "")),
-                str(r.get(ROW_COL, "")))
+            return ("k",) + where + k
+        return ("r",) + where + (str(r.get(TABLE_COL, "")), str(r.get(ROW_COL, "")))
+
+    def full(r: Dict[str, str]) -> Tuple[str, ...]:
+        b = base(r)
+        return b if b[0] == "r" else b + ("@", str(r.get(TABLE_COL, "")))
+    from collections import Counter
+    many = {k for k, n in Counter(base(r) for r in taken).items() if n > 1}
+    many |= {k for k, n in Counter(base(r) for r in rows).items() if n > 1}
+
+    def ident(r: Dict[str, str]) -> Tuple[str, ...]:
+        b = base(r)
+        return full(r) if b in many else b
     at = {ident(r): i for i, r in enumerate(rows)}
     now = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
     added = updated = 0
