@@ -204,6 +204,27 @@ and a deck read from the cache is read again when they change.
 - Saved links are the user's own answers, so what they place is pre-accepted.
 - Colour highlights keep working beside them.
 
+**Several cells at once.** Drag over template cells, then over as many sample
+cells; they link one to one in reading order (left to right, top to bottom), for
+example a row of the template's headers to a row of a sample's. Template cells that
+are one field repeated (a grid row across its flaws) count once. When the numbers
+differ, nothing is linked and the window says so (`ledger_linking.link_cells`).
+
+## The Ledger's model uses its own limits
+
+Every Ledger model call (labels, part numbers, header layouts, label-mapping
+suggestions) uses the model's own maximum instead of the council's chat defaults:
+
+- **Ollama:** sent the model's own context length, via
+  `council_engine.model_window()`, a per-call override of the slot window.
+- **A GGUF the user picks:** loaded with as much of its trained length as fits the
+  card (`_load_gguf(n_ctx_max=…)` replaces the 32K cap; the VRAM ladder still
+  applies). Council's main model keeps the window it was loaded with.
+- **The reply:** may use all the prompt leaves of the window
+  (`ledger_llm.reply_budget`), never less than 1,024 tokens. The stall limit is 300 s.
+- **Overrides** for a machine that needs less: `COUNCIL_LEDGER_NUM_CTX` caps the
+  window, `COUNCIL_LEDGER_NUM_PREDICT` fixes the reply length.
+
 ## Measured (this container, synthetic data)
 
 - **BTB:** reproduces `BTB_Template_filled.xlsx` cell for cell, colours included

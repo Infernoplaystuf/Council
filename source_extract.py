@@ -4565,12 +4565,15 @@ def _council_chat(prompt: str, *, timeout: float
     except Exception:                                       # noqa: BLE001
         return None
     try:
-        text = ce.local_chat(
-            [{"role": "user", "content": prompt}],
-            temperature=0.0,
-            num_predict=2048,
-            json_schema=_MAPPING_SCHEMA,
-            timeout=int(max(5, timeout)))
+        # the model's own limits, as every Ledger call (council_core.ledger_llm)
+        from council_core import ledger_llm
+        with ce.model_window(ledger_llm.ledger_window()):
+            text = ce.local_chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                num_predict=ledger_llm.fill_reply(),
+                json_schema=_MAPPING_SCHEMA,
+                timeout=int(max(5, timeout)))
     except Exception:                                       # noqa: BLE001
         return None
     # local_chat returns the raw text; its stats carry the model name,

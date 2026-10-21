@@ -135,3 +135,37 @@ def test_the_tab_opens_it(qapp, plain_btb):  # noqa: F811
         str(src / "BTB_Saddle_BP.xlsx"), str(src / "BTB_Spider.xlsx")]
     settle(dlg, lambda: dlg.template is not None and dlg.sample is not None)
     dlg.close()
+
+
+def draw(tabs, tab_name, r1, c1, r2, c2):
+    """Drag over cells (r1, c1)..(r2, c2): the rectangle selected, the mouse
+    let go on its last cell."""
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+    i = next(i for i in range(tabs.count()) if tabs.tabText(i) == tab_name)
+    tabs.setCurrentIndex(i)
+    view = tabs.widget(i)
+    m = view.model()
+    view.selectionModel().select(QItemSelection(m.index(r1 - 1, c1 - 1), m.index(r2 - 1, c2 - 1)),
+                                 QItemSelectionModel.ClearAndSelect)
+    rect = view.visualRect(m.index(r2 - 1, c2 - 1))
+    QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, rect.center())
+    QApplication.processEvents()
+
+
+def test_a_row_portion_links_to_a_row_portion(qapp, plain_btb):  # noqa: F811
+    csv, src = plain_btb
+    dlg = LinkDialog(str(csv), [str(src / "BTB_Spider.xlsx")])
+    dlg.show()
+    settle(dlg, lambda: dlg.template is not None and dlg.sample is not None)
+    draw(dlg.template_tabs, "Sheet", 1, 2, 1, 4)           # Name, Health, Stam
+    assert dlg.picked_many == ["Name", "Health", "Stam"]
+    assert "Now draw over 3 sample cell(s)" in dlg.status.text()
+    draw(dlg.sample_tabs, "Sheet", 2, 1, 2, 2)             # two cells only
+    assert "draw as many on each side" in dlg.status.text() and not dlg.links
+    draw(dlg.sample_tabs, "Sheet", 2, 1, 2, 3)             # Name, HP, Stam
+    assert [(k.field, k.detail["header"]) for k in dlg.links] == [
+        ("Name", "Name"), ("Health", "HP"), ("Stam", "Stam")]
+    assert all(dlg._sample_models[0].tints[(2, c)] == LINKED_TINT for c in (1, 2, 3))
+    dlg.save_btn.click()
+    assert lr.load_recipe(csv).aliases["hp"] == "Health"
+    dlg.close()

@@ -1077,7 +1077,7 @@ def _gpu_diag_line() -> str:
 
 def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
                kv_budget_bytes: Optional[int] = None,
-               is_main: bool = True):
+               is_main: bool = True, n_ctx_max: Optional[int] = None):
     """Load one GGUF and return the Llama. Knows nothing about slots.
 
     ``n_gpu_layers_cap`` 0 puts this model on the CPU (the slot planner's
@@ -1085,6 +1085,10 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     context to its share of VRAM. Only the MAIN model records the n_ctx the UI
     shows and gets the optional vision adapter — both were written for one
     model and describe the one the user picked.
+
+    ``n_ctx_max`` replaces COUNCIL_GGUF_N_CTX_MAX as the most the ladder may
+    pick (the Ledger passes the model's own trained length: it uses all the
+    model has that fits the card, user 2026-10-21).
     """
     try:
         from llama_cpp import Llama
@@ -1206,7 +1210,8 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     # Pre-compute the absolute cap + parse metadata once — used by rungs
     # 2 and 3 below.
     try:
-        n_ctx_cap = int(os.environ.get("COUNCIL_GGUF_N_CTX_MAX", "32768"))
+        n_ctx_cap = int(n_ctx_max) if n_ctx_max else \
+            int(os.environ.get("COUNCIL_GGUF_N_CTX_MAX", "32768"))
     except Exception:
         n_ctx_cap = 32768
     metadata: Dict[str, Any] = {}
@@ -2365,6 +2370,10 @@ def prompt_room(slot: str = "main", *, frame: str = "",
             "room": max(0, budget - frame_tokens), "count": count}
 
 
+#: the least a FILL reply (num_predict 0) is left before the prompt is trimmed
+FILL_FLOOR = 1024
+
+
 def _clamp_messages_to_ctx(
     messages: List[Dict[str, str]], num_predict: int,
     model_n_ctx: Optional[int] = None,
@@ -2436,6 +2445,15 @@ def _clamp_messages_to_ctx(
     # tokens and llama-cpp cut the 2400-token reply to 2101. 64 + 8 per
     # message keeps a 2-message call within 16 tokens of the old budget.
     margin = _template_margin(len(messages))
+    if int(num_predict) <= 0:
+        # FILL (num_predict 0, the Ledger's calls): the reply may have all the
+        # window the prompt leaves - no half-window cap - and the prompt is
+        # trimmed only when it leaves less than FILL_FLOOR for the reply
+        # (user, 2026-10-21: the Ledger's model uses its max tokens)
+        left = n_ctx - margin - sum(_est(m.get("content", "")) for m in messages)
+        if left >= FILL_FLOOR:
+            return [dict(m) for m in messages], left
+        num_predict = FILL_FLOOR
     reply = max(16, min(int(num_predict), max(16, (n_ctx - margin) // 2)))
     prompt_budget = max(64, n_ctx - reply - margin)
 
@@ -3248,7 +3266,16 @@ def _fallback_to_ollama(slot: str, exc: BaseException) -> str:
 
 def _ollama_num_ctx(slot: str, entry: Optional[Dict[str, Any]]) -> int:
     """The slot's window (its n_ctx, else COUNCIL_OLLAMA_NUM_CTX, else 8192),
-    never more than the model's own context length."""
+    never more than the model's own context length. Inside model_window()
+    the caller's window instead: the model's whole context, or the size it
+    gave (still never more than the model's own)."""
+    ctx = (entry or {}).get("context_length")
+    asked = _WINDOW.get()
+    if asked is not None:
+        if isinstance(ctx, int) and ctx > 0:
+            return max(512, min(asked, ctx) if asked > 0 else ctx)
+        if asked > 0:
+            return max(512, int(asked))
     want = None
     try:
         s = _slot_config().slots.get(slot)
@@ -3271,6 +3298,24 @@ _THINK_LEVEL_FAMILIES = ("gptoss", "gpt-oss")
 
 import contextvars as _contextvars
 from contextlib import contextmanager as _contextmanager
+
+#: The window the CURRENT call asked for, set by model_window(): 0 = the
+#: model's whole context length; None = the slot's (the default).
+_WINDOW: "_contextvars.ContextVar[Optional[int]]" = \
+    _contextvars.ContextVar("council_model_window", default=None)
+
+
+@_contextmanager
+def model_window(n_ctx: int = 0):
+    """Ollama calls made inside this block are sent ``n_ctx`` as their
+    window - 0: the model's own whole context length - not the slot's (the
+    Ledger's model uses all it has, user 2026-10-21). A GGUF keeps the
+    window it was loaded with."""
+    token = _WINDOW.set(max(0, int(n_ctx or 0)))
+    try:
+        yield
+    finally:
+        _WINDOW.reset(token)
 
 #: The thinking effort the CURRENT call asked for ("low" / "medium" /
 #: "high"), set by PersonalityModel.respond(think=...) for the duration of
@@ -3721,10 +3766,11 @@ def _ollama_local_gated(
         _OLLAMA_THINKS[slot] = (
             dict(entry) if "thinking" in (entry.get("capabilities") or [])
             else False)
-    if think not in (None, False):
+    if think not in (None, False) and int(num_predict) > 0:
         # Thinking tokens count against num_predict: without room for them
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
-        # tokens thinking on a short warm call, measured).
+        # tokens thinking on a short warm call, measured). A FILL reply (0)
+        # has all the window already.
         num_predict = int(num_predict) + _think_headroom(think)
     model_name = entry["name"]
     wanted_predict = num_predict

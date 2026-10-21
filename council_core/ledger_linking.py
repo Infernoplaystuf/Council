@@ -251,6 +251,44 @@ def link_cell(kind: str, field_name: str, view: SampleView, sheet: str, r: int, 
                 f"(learned from {name} › {sheet})")
 
 
+def template_fields(sheet: ViewSheet, cells: Sequence[Tuple[int, int]]) -> List[str]:
+    """The fields of the template cells drawn over, in reading order (left to
+    right, top to bottom); cells that are no field's are passed over."""
+    return [sheet.fields[rc] for rc in sorted(cells) if rc in sheet.fields]
+
+
+def link_cells(kind: str, fields: Sequence[str], view: SampleView, sheet: str,
+               cells: Sequence[Tuple[int, int]]) -> List[Link]:
+    """Template cells drawn over, linked to the same number of sample cells
+    drawn over, one to one in reading order (user, 2026-10-21: "a portion of a
+    row that lines up to a portion of a row in the template"): a row of the
+    template's headers to a row of a sample's, say. When the template cells
+    are one field repeated (a grid row across its flaws) they count once
+    each. Raises LedgerError when the numbers differ."""
+    order = sorted(cells)
+    fields = list(fields)
+    if len(fields) != len(order):
+        distinct = list(dict.fromkeys(fields))
+        if len(distinct) == len(order):
+            fields = distinct
+        elif len(distinct) == 1:
+            fields = distinct * len(order)                 # one field, many places of it
+        else:
+            raise LedgerError(
+                f"{len(fields)} template cell(s) ({len(distinct)} field(s)) and "
+                f"{len(order)} sample cell(s): draw as many on each side")
+    out: List[Link] = []
+    for f, (r, c) in zip(fields, order):
+        link = link_cell(kind, f, view, sheet, r, c)
+        link.detail["_at"] = (view.path, sheet, r, c)
+        out.append(link)
+    # one answer per field: the same field drawn twice keeps its last
+    seen: Dict[Tuple, Link] = {}
+    for link in out:
+        seen[link.key] = link
+    return list(seen.values())
+
+
 def link_file_name(field_name: str, file_name: str, value: str) -> Link:
     stem = Path(file_name).stem
     rule = lr.name_rule_from_example(stem, value)

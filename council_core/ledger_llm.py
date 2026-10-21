@@ -143,17 +143,84 @@ def mask_example(mask: str) -> str:
     return "".join(out)
 
 
-def council_chat(timeout: float = 120,
+# ── the model's own limits (user, 2026-10-21: "the model inside of ledger
+# should be able to use its max tokens and not the default set by the rest of
+# the council") ────────────────────────────────────────────────────────────
+#: The Ledger's model works with ALL its window: an Ollama model is sent its
+#: own context length (council_engine.model_window), a GGUF of the user's is
+#: loaded with as much of its trained length as fits the card, and every
+#: reply may use whatever the prompt leaves of the window (num_predict 0:
+#: council_engine sizes it on the model's own tokenizer, FILL). A machine
+#: that needs less sets COUNCIL_LEDGER_NUM_CTX (the window) or
+#: COUNCIL_LEDGER_NUM_PREDICT (the reply).
+#: tokens left free when the reply is sized (the chat template, rounding)
+REPLY_MARGIN = 256
+#: a reply never gets less than this, however long the prompt
+REPLY_FLOOR = 1024
+#: seconds with no new output before a call is given up (a long reply is
+#: streamed, so this is a stall limit, not the whole reply's)
+LEDGER_TIMEOUT = 300
+
+
+def _env_int(name: str) -> int:
+    import os
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 0
+
+
+def ledger_window(model_max: int = 0) -> int:
+    """The window the Ledger's model is given: COUNCIL_LEDGER_NUM_CTX when
+    set (never more than the model's own), else the model's own; 0 =
+    unknown (the model's whole context, told by Ollama itself)."""
+    cap = _env_int("COUNCIL_LEDGER_NUM_CTX")
+    if cap and model_max:
+        return min(cap, model_max)
+    return cap or model_max
+
+
+def reply_budget(prompt: str, window: int) -> int:
+    """How long a reply may be: what the prompt leaves of the window (its
+    tokens told from its length, generously), COUNCIL_LEDGER_NUM_PREDICT
+    when set, never under REPLY_FLOOR."""
+    fixed = _env_int("COUNCIL_LEDGER_NUM_PREDICT")
+    if fixed:
+        return fixed
+    prompt_tokens = len(prompt) // 3 + 64
+    return max(REPLY_FLOOR, int(window) - prompt_tokens - REPLY_MARGIN) if window \
+        else REPLY_FLOOR * 8
+
+
+def _ollama_context(name: str, host: Optional[str] = None) -> int:
+    """An Ollama model's own context length (0: not known)."""
+    try:
+        from council_core import local_models
+        entry = local_models.ollama_model(name, host, max_age=60.0) or {}
+        ctx = entry.get("context_length")
+        return int(ctx) if isinstance(ctx, int) and ctx > 0 else 0
+    except Exception:                                       # noqa: BLE001
+        return 0
+
+
+def fill_reply() -> int:
+    """num_predict for a call through council_engine.local_chat: 0 (FILL -
+    the engine gives the reply all the prompt leaves, counted on the model's
+    own tokenizer), or COUNCIL_LEDGER_NUM_PREDICT when set."""
+    return _env_int("COUNCIL_LEDGER_NUM_PREDICT")
+
+
+def council_chat(timeout: float = LEDGER_TIMEOUT,
                  should_stop: Optional[Callable[[], bool]] = None) -> Chat:
     """The default backend: Council's local_chat (GGUF or role Ollama), then
-    a US-origin Ollama model (source_extract's host search)."""
+    a US-origin Ollama model (source_extract's host search). Both with the
+    model's own limits, not the council's chat defaults."""
     def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
         try:
             import council_engine as ce
-            text = ce.local_chat([{"role": "user", "content": prompt}],
-                                 temperature=0.0, num_predict=1024,
-                                 json_schema=schema, timeout=int(max(5, timeout)),
-                                 should_stop=should_stop)
+            with ce.model_window(ledger_window()):
+                text = ce.local_chat([{"role": "user", "content": prompt}],
+                                     temperature=0.0, num_predict=fill_reply(),
+                                     json_schema=schema, timeout=int(max(5, timeout)),
+                                     should_stop=should_stop)
             if text and text.strip():
                 return text, "Council's model"
         except Exception:                                  # noqa: BLE001
@@ -168,10 +235,20 @@ def council_chat(timeout: float = 120,
         host, model = pick
         out = se._ollama("/api/chat", {
             "model": model, "stream": False, "format": schema,
-            "options": {"temperature": 0},
+            "options": _ollama_options(prompt, model, host),
             "messages": [{"role": "user", "content": prompt}]}, timeout=timeout, host=host)
         return out["message"]["content"], f"{model} @ {host}"
     return chat
+
+
+def _ollama_options(prompt: str, model: str, host: Optional[str] = None) -> Dict[str, Any]:
+    """A direct Ollama call's options: the model's whole window, the reply
+    all the prompt leaves of it."""
+    window = ledger_window(_ollama_context(model, host))
+    opts: Dict[str, Any] = {"temperature": 0, "num_predict": reply_budget(prompt, window)}
+    if window:
+        opts["num_ctx"] = window
+    return opts
 
 
 # ── the user picks the model (user, 2026-10-19: "ask the user to select what
@@ -242,13 +319,23 @@ def _gguf_llm(path: str):
         try:
             from pathlib import Path
             import council_engine as ce
-            llm = ce._load_gguf(Path(path), is_main=False)  # its VRAM-aware sizing
+            # its VRAM-aware sizing, up to the model's own trained length
+            # (not the council's 32K cap) or COUNCIL_LEDGER_NUM_CTX
+            try:
+                trained = ce._gguf_max_context_from_metadata(
+                    ce.read_gguf_metadata(Path(path)))
+            except Exception:                              # noqa: BLE001
+                trained = None
+            llm = ce._load_gguf(Path(path), is_main=False,
+                                n_ctx_max=ledger_window(trained or 0) or None)
         except (ImportError, AttributeError, TypeError):
             try:
                 from llama_cpp import Llama
             except Exception as exc:                       # noqa: BLE001
                 raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
-            llm = Llama(model_path=path, n_ctx=8192, n_gpu_layers=-1, verbose=False)
+            # n_ctx 0: the model's own trained length
+            llm = Llama(model_path=path, n_ctx=_env_int("COUNCIL_LEDGER_NUM_CTX"),
+                        n_gpu_layers=-1, verbose=False)
         except Exception as exc:                           # noqa: BLE001
             raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
         _GGUF["key"], _GGUF["llm"] = key, llm
@@ -317,7 +404,7 @@ def _is_main_gguf(path: str) -> bool:
         os.path.normcase(os.path.realpath(path))
 
 
-def chat_for(model_id: str, timeout: float = 120,
+def chat_for(model_id: str, timeout: float = LEDGER_TIMEOUT,
              should_stop: Optional[Callable[[], bool]] = None) -> Chat:
     """A Chat on the model the user picked: an Ollama model ('ollama:<name>')
     through Council's local_chat, a GGUF file in process (Council's main
@@ -339,14 +426,15 @@ def chat_for(model_id: str, timeout: float = 120,
         def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
             try:
                 import council_engine as ce
-                text = ce.local_chat([{"role": "user", "content": prompt}],
-                                     temperature=0.0, num_predict=1024, json_schema=schema,
-                                     timeout=int(max(5, timeout)), model=model_id,
-                                     should_stop=should_stop)
+                with ce.model_window(ledger_window()):
+                    text = ce.local_chat([{"role": "user", "content": prompt}],
+                                         temperature=0.0, num_predict=fill_reply(),
+                                         json_schema=schema, timeout=int(max(5, timeout)),
+                                         model=model_id, should_stop=should_stop)
             except ImportError:
                 out = se._ollama("/api/chat", {
                     "model": name, "stream": False, "format": schema,
-                    "options": {"temperature": 0},
+                    "options": _ollama_options(prompt, name),
                     "messages": [{"role": "user", "content": prompt}]}, timeout=timeout)
                 text = out["message"]["content"]
             except Exception as exc:                       # noqa: BLE001
@@ -361,8 +449,8 @@ def chat_for(model_id: str, timeout: float = 120,
             import council_engine as ce
             try:
                 return ce.local_chat([{"role": "user", "content": prompt}],
-                                     temperature=0.0, num_predict=1024, json_schema=schema,
-                                     timeout=int(max(5, timeout)),
+                                     temperature=0.0, num_predict=fill_reply(),
+                                     json_schema=schema, timeout=int(max(5, timeout)),
                                      should_stop=should_stop), label
             except Exception as exc:                       # noqa: BLE001
                 raise se.LedgerError(f"{label} did not answer: {exc}") from exc
@@ -370,8 +458,18 @@ def chat_for(model_id: str, timeout: float = 120,
 
     def gguf_chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
         llm = _gguf_llm(path)
+        try:
+            window = int(llm.n_ctx())
+        except Exception:                                  # noqa: BLE001
+            window = 0
+        try:                                               # its own tokenizer's count
+            used = len(llm.tokenize(prompt.encode("utf-8", errors="ignore"))) + 64
+        except Exception:                                  # noqa: BLE001
+            used = len(prompt) // 3 + 64
+        fixed = _env_int("COUNCIL_LEDGER_NUM_PREDICT")
         kw = dict(messages=[{"role": "user", "content": prompt}], temperature=0.0,
-                  max_tokens=1024)
+                  max_tokens=fixed or (max(REPLY_FLOOR, window - used - REPLY_MARGIN)
+                                       if window else REPLY_FLOOR * 8))
         with _GGUF_LOCK:
             try:
                 out = llm.create_chat_completion(
