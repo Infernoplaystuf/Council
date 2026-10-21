@@ -678,7 +678,15 @@ class BookCache:
             st = path.stat()
         except OSError:
             return None
-        return _sha(f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{READER_VERSION}", 24)
+        extra = ""
+        if path.suffix.lower() in (".pptx", ".pptm"):
+            # a deck is laid out by your text box <-> table links: read again
+            # when they change
+            import pptx_open
+            mine = (getattr(pptx_open._LOCAL, "pairings", None) or {}).get(path.name) or {}
+            extra = json.dumps(mine, sort_keys=True)
+        return _sha(f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{READER_VERSION}|{extra}",
+                    24)
 
     def get(self, path: Path) -> Optional[List[SheetData]]:
         if self.folder is None:
@@ -1755,6 +1763,16 @@ def ask_model_headers(t: Table, unmapped_j: Sequence[int], free_fields: Sequence
 # ── Extract ─────────────────────────────────────────────────────────────
 def extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress=None,
             cancel=None, use_cache: bool = True, report=None) -> RecordRun:
+    """See _extract: decks are read with this Ledger's text box <-> table
+    links (pptx_open.user_pairings)."""
+    import pptx_open
+    with pptx_open.user_pairings(csv_path):
+        return _extract(csv_path, files, chat=chat, progress=progress, cancel=cancel,
+                        use_cache=use_cache, report=report)
+
+
+def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress=None,
+             cancel=None, use_cache: bool = True, report=None) -> RecordRun:
     """Read every workbook's tables and turn them into records for the
     review: see the module docstring. ``chat``: Council's model, asked about
     headers nothing else placed (once per header layout; its answers are
@@ -2856,10 +2874,10 @@ def teach(csv_path, workbooks: Sequence, progress=None, cancel=None) -> str:
         raise LedgerError("no sample workbook to teach from")
     with Progress("ledger teach", listener=progress) as prog:
         run = extract(csv_path, files, progress=prog, cancel=cancel)
-    return describe_run(run) + _pairings_text(files)
+    return describe_run(run) + _pairings_text(files, csv_path)
 
 
-def _pairings_text(files: Sequence[Path]) -> str:
+def _pairings_text(files: Sequence[Path], csv_path=None) -> str:
     """Which text box went with which table on each slide of the decks, and
     how that was told, for the user to check (and fix by grouping)."""
     import pptx_open
@@ -2868,7 +2886,8 @@ def _pairings_text(files: Sequence[Path]) -> str:
         if Path(f).suffix.lower() not in pptx_open.SUFFIXES:
             continue
         try:
-            deck = pptx_open.read_pptx(f, want_pictures=False)
+            with pptx_open.user_pairings(csv_path):
+                deck = pptx_open.read_pptx(f, want_pictures=False)
         except pptx_open.PptxError:
             continue
         if deck.pairings:

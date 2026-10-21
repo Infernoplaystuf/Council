@@ -851,10 +851,12 @@ def guess(csv_path, workbook, *, model_id: Optional[str] = None,
             image_reader = se.default_image_reader()
         readers: List[_Reader] = []
         # the Ledger's saved pattern is a hint, as Extract reads it
-        run = se.extract(schema, [wb], mapping, ignore, image_reader=image_reader,
-                         use_images=use_images, progress=prog, pattern_mask=mask or None,
-                         pattern_strict=not saved, cancel=cancel, taught=taught,
-                         reader_cls=_Reader, readers=readers)
+        import pptx_open
+        with pptx_open.user_pairings(csv_path):
+            run = se.extract(schema, [wb], mapping, ignore, image_reader=image_reader,
+                             use_images=use_images, progress=prog, pattern_mask=mask or None,
+                             pattern_strict=not saved, cancel=cancel, taught=taught,
+                             reader_cls=_Reader, readers=readers)
         # not the review's 'N values have no Part Number - fill the Part
         # column in the review': Teach asks for the part itself
         s.problems += [p for p in run.problems if "fill the Part column" not in p]

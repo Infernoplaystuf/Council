@@ -4239,13 +4239,16 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         read = [sources[i] for i in read if isinstance(i, int) and 0 <= i < len(sources)]
     else:
         read = sources                                  # all read, or an older review
-    run = extract(schema, read, mapping, ignore, image_reader=image_reader,
-                  use_images=use_images, progress=prog,
-                  pattern_mask=meta.get("pattern_mask") or None,
-                  pattern_strict=not meta.get("pattern_hint"),
-                  part=meta.get("part") or "",
-                  part_finder=(lambda name, _grids: found.get(name, ("", ""))) if found else None,
-                  labels=source_labels(sources), taught=load_taught(csv_path))
+    import pptx_open
+    with pptx_open.user_pairings(csv_path):           # as the extract read the decks
+        run = extract(schema, read, mapping, ignore, image_reader=image_reader,
+                      use_images=use_images, progress=prog,
+                      pattern_mask=meta.get("pattern_mask") or None,
+                      pattern_strict=not meta.get("pattern_hint"),
+                      part=meta.get("part") or "",
+                      part_finder=(lambda name, _grids: found.get(name, ("", "")))
+                      if found else None,
+                      labels=source_labels(sources), taught=load_taught(csv_path))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     mapped: List[Decision] = []
@@ -4758,7 +4761,8 @@ def main(argv=None) -> int:
                 f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
             mapping, ignore = load_aliases(args.csv)
             from progress_report import Progress
-            with Progress("ledger extract") as prog:
+            import pptx_open
+            with Progress("ledger extract") as prog, pptx_open.user_pairings(args.csv):
                 run = extract(ledger.schema, files, mapping, ignore,
                               image_dir=out.with_name(out.stem + "_images"),
                               part=args.part, use_images=not args.no_images, progress=prog,

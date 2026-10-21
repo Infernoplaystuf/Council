@@ -24,9 +24,12 @@ format) is not read; save it as .pptx.
 """
 from __future__ import annotations
 
+import json
 import posixpath
 import re
+import threading
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -90,9 +93,57 @@ class TableShape:
 #: how a text box was paired with its table(s)
 BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY = "group", "colour", "title", "only table"
 BY_PLACE, BY_SLIDE = "place", "slide"
-#: the pairings that are the user's own (a group, a shared colour) or not a
-#: guess at all; any other pairing on a slide of several tables is a guess
-SURE_PAIRINGS = (BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY)
+BY_USER = "your link"         # set in the Ledger's click-to-link window
+#: the pairings that are the user's own (a group, a shared colour, a link)
+#: or not a guess at all; any other pairing on a slide of several tables is
+#: a guess
+SURE_PAIRINGS = (BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY, BY_USER)
+
+
+# ── the user's own pairings (the click-to-link window) ──────────────────
+#: deck file name -> slide number (as text) -> text key -> the tables (1, 2
+#: ...) it goes with; [] = the whole slide's
+Pairings = Dict[str, Dict[str, Dict[str, List[int]]]]
+_LOCAL = threading.local()
+
+
+def pairings_path_for(csv_path) -> Path:
+    return Path(csv_path).with_suffix(".pairings.json")
+
+
+def load_pairings(csv_path) -> Pairings:
+    p = pairings_path_for(csv_path)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                                       # noqa: BLE001
+        return {}
+    return data.get("decks", {}) if isinstance(data, dict) else {}
+
+
+def save_pairings(csv_path, pairings: Pairings) -> None:
+    from sample_ledger import _atomic_write_text
+    _atomic_write_text(pairings_path_for(csv_path),
+                       json.dumps({"version": 1, "decks": pairings}, indent=1,
+                                  ensure_ascii=False))
+
+
+@contextmanager
+def user_pairings(csv_path):
+    """Decks read inside this (on this thread) use the Ledger's own
+    pairings: Extract, Apply and Teach each read under it."""
+    old = getattr(_LOCAL, "pairings", None)
+    _LOCAL.pairings = load_pairings(csv_path) if csv_path else {}
+    try:
+        yield _LOCAL.pairings
+    finally:
+        _LOCAL.pairings = old
+
+
+def text_key(lines: List[str]) -> str:
+    """A text box as the pairings know it: its words, lower case."""
+    return re.sub(r"[^a-z0-9]+", " ", " ".join(lines).lower()).strip()[:160]
 
 @dataclass
 class PictureShape:
@@ -142,6 +193,9 @@ class Pairing:
     text: str                     # the text box's first line
     tables: List[str]             # the sheets it went above; [] = the whole slide's
     how: str                      # BY_*
+    key: str = ""                 # text_key of the text box
+    numbers: List[int] = field(default_factory=list)       # its tables, 1, 2 ...
+    choices: List[str] = field(default_factory=list)       # every table of the slide
 
     @property
     def guessed(self) -> bool:
@@ -152,7 +206,7 @@ class Pairing:
         why = {BY_GROUP: "grouped with it", BY_COLOUR: "the same colour",
                BY_TITLE: "the slide's title", BY_ONLY: "the slide's only table",
                BY_PLACE: "nearest to it — a guess", BY_SLIDE: "over or away from the "
-               "tables — a guess"}.get(self.how, self.how)
+               "tables — a guess", BY_USER: "your link"}.get(self.how, self.how)
         return f"Slide {self.slide}: '{self.text}' → {to} ({why})"
 
 
@@ -479,9 +533,14 @@ def _slide_parts(z: zipfile.ZipFile) -> List[str]:
 
 
 # ── the deck ────────────────────────────────────────────────────────────
-def read_pptx(path, want_pictures: bool = True) -> Deck:
+def read_pptx(path, want_pictures: bool = True, pairings: Optional[Pairings] = None) -> Deck:
+    """``pairings``: the user's own (load_pairings); by default the ones of
+    the Ledger being read (user_pairings)."""
     path = Path(path)
     deck = Deck()
+    if pairings is None:
+        pairings = getattr(_LOCAL, "pairings", None) or {}
+    mine_all = pairings.get(path.name, {})
     try:
         z = zipfile.ZipFile(path)
     except zipfile.BadZipFile as e:
@@ -512,8 +571,13 @@ def read_pptx(path, want_pictures: bool = True) -> Deck:
             how: Dict[int, str] = {}                       # id(text) -> how it was paired
             names = [label if len(tables) == 1 else f"{label} table {i + 1}"
                      for i in range(len(tables))]
+            yours = mine_all.get(str(n), {})
             for t in texts:
                 own, h = _owners(t, tables, slide_h)
+                said = yours.get(text_key(t.lines))
+                if said is not None and tables and not t.title:
+                    own = [i - 1 for i in said if 1 <= i <= len(tables)]
+                    h = BY_USER
                 how[id(t)] = h
                 if not own:
                     slide_wide.append(t)
@@ -521,7 +585,8 @@ def read_pptx(path, want_pictures: bool = True) -> Deck:
                     owned.setdefault(i, []).append(t)
                 if tables:
                     deck.pairings.append(Pairing(n, t.lines[0][:60], [names[i] for i in own],
-                                                 h))
+                                                 h, text_key(t.lines), [i + 1 for i in own],
+                                                 list(names)))
             if not tables and slide_wide:
                 deck.sheets.append(_lay_out(label, slide_wide, [], None, n, how))
             for i, table in enumerate(tables):

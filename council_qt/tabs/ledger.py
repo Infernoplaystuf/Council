@@ -286,6 +286,7 @@ class LedgerTab(ViewHelpers, QWidget):
         #: The open Teach dialog, and how its Browse… picks one workbook
         #: (tests replace it: no file dialogs).
         self.teach_dialog = None
+        self.link_dialog = None
         self._pick_workbook = self._browse_one_workbook
         #: (CSV, line) the log said about the Connections graph reading a
         #: Ledger: each said once.
@@ -376,6 +377,11 @@ class LedgerTab(ViewHelpers, QWidget):
             "and inspector's initials in it are, you correct the guesses, and the Ledger "
             "keeps your answers - the next Extract places them by itself, and Council's "
             "model learns from them. Needs a parent CSV with its schema (step 1).")
+        self.link_btn = self._step_button(one_row, "Link by clicking…", self.on_link_window)
+        self.link_btn.setToolTip(
+            "The template beside a sample workbook or deck: click where a value goes, then "
+            "where it comes from. For a deck, also which table each text box goes with. "
+            "Save teaches the next Extract - no colours to paint.")
         one_row.addStretch(1)
         row.addWidget(QLabel("Part number (if not in them):"))
         self.part = QLineEdit()
@@ -634,6 +640,8 @@ class LedgerTab(ViewHelpers, QWidget):
         # pressed: the button stayed off until Enter or Tab, and clicking it
         # did not move the focus (review, 2026-10-20)
         self.teach_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
+        if hasattr(self, "link_btn"):
+            self.link_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
@@ -922,6 +930,36 @@ class LedgerTab(ViewHelpers, QWidget):
         self.teach_dialog = dlg
         self._say(f"── Teach from a sample workbook ({Path(csv_path).name})")
         dlg.open()
+
+    def on_link_window(self) -> None:
+        """The click-to-link window (ledger_link_dialog): the sources listed
+        here are its samples, the selected one first. Not modal: Extract
+        can run while it is open; its Save writes only the Ledger's own
+        files."""
+        csv_path = self.csv.text().strip()
+        if not csv_path:
+            self.status.setText("Set the parent CSV first — linking needs its schema.")
+            return
+        self._check_schema()
+        if not self._schema_known[1]:
+            self.status.setText("That parent CSV has no schema beside it — run Create first.")
+            return
+        from council_core.ledger_ingest import collect_sources
+        from .ledger_link_dialog import LinkDialog
+        picked = [i.text() for i in self.sources.selectedItems()]
+        try:
+            files, _ = collect_sources(picked + [p for p in self.source_paths()
+                                                 if p not in picked],
+                                       template_path=self.template.text().strip() or None)
+        except Exception:                                 # noqa: BLE001
+            files = []
+        dlg = LinkDialog(csv_path, [str(f) for f in files[:500]], parent=self, log=self._say,
+                         on_saved=lambda _said: self.status.setText(
+                             "Links saved; the next Extract uses them."),
+                         browse=self._pick_workbook)
+        self.link_dialog = dlg
+        self._say(f"── Link by clicking ({Path(csv_path).name})")
+        dlg.show()
 
     def _teach_records(self, csv_path: str) -> None:
         """A table Ledger learns from the user's highlights: the sources

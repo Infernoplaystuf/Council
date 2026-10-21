@@ -166,6 +166,44 @@ What a guess (rule 5) does:
   (`via="slot"`), because the order comes from the order the tables were read.
   Accepting them does not teach "Result" as an alias.
 
+## Link by clicking (both Ledgers)
+
+The Ledger tab's **Link by clicking…** button opens the window
+(`council_qt/tabs/ledger_link_dialog.py`; the data side is
+`council_core/ledger_linking.py`, with no Qt). The template is on the left, a
+sample workbook or deck on the right, and the tab's sources are its samples.
+
+**The template side**
+- Cells the Ledger fills are tinted; a field list with a search box sits above.
+- Click a template cell, or pick a field in the list, then the sample cell it
+  comes from.
+
+**What a sample click teaches**
+
+| Ledger | Sample cell clicked | What is learned |
+|---|---|---|
+| Sample-ID | any cell | The words that name the cell: itself if it is a label, else the nearest label to its left, else its column's header. Saved as a label mapping (`aliases.json`). |
+| Table | a cell in a table (header or value) | That column's header words (recipe alias). |
+| Table | a labelled value beside a table | The label. |
+| Table | a bare cell over a table | Its place over each table (a `near` rule). |
+
+**Buttons on the sample side**
+- **From the file name…** asks which part of the file name the value is.
+- **Look it up here**, then a column click, makes a lookup rule.
+- Both are table-Ledger only.
+
+**Decks:** a **Text boxes** tab lists each text box with a "Goes with" choice and
+how it was told (a guess is marked). A choice saves to `<parent>.pairings.json`.
+Extract, Apply and Teach read decks with those pairings (`pptx_open.user_pairings`),
+and a deck read from the cache is read again when they change.
+
+**Saving**
+- Every link is shown as a sentence and can be removed.
+- Nothing is kept until **Save links**. Linking the same field again replaces its
+  link.
+- Saved links are the user's own answers, so what they place is pre-accepted.
+- Colour highlights keep working beside them.
+
 ## Measured (this container, synthetic data)
 
 - **BTB:** reproduces `BTB_Template_filled.xlsx` cell for cell, colours included
@@ -175,9 +213,6 @@ What a guess (rule 5) does:
 
 ## Not done yet
 
-- Teach in the tab writes a text report to the log. It has no side-by-side window
-  yet: the highlighter window (spec step 4) would sit on top of `learn_colours`
-  and `set_source`.
 - Flaw-grid templates stay with the sample-ID Ledger; a template holding both a
   record table and a flaw grid is read as one or the other.
 - Pictures of tables are not read in table mode (the sample Ledger's image reader

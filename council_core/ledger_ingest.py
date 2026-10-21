@@ -417,11 +417,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
                                         examples=part_examples)
-    run = extract(ledger.schema, files, mapping, ignore,
-                  image_dir=out.with_name(out.stem + "_images"),
-                  image_reader=image_reader, part=part, use_images=use_images,
-                  progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
-                  part_finder=part_finder, taught=taught, pattern_strict=not pattern_saved)
+    import pptx_open
+    with pptx_open.user_pairings(csv_path):           # your text box <-> table links
+        run = extract(ledger.schema, files, mapping, ignore,
+                      image_dir=out.with_name(out.stem + "_images"),
+                      image_reader=image_reader, part=part, use_images=use_images,
+                      progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
+                      part_finder=part_finder, taught=taught,
+                      pattern_strict=not pattern_saved)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
