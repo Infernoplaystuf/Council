@@ -757,8 +757,8 @@ def _examples_text(examples: Sequence[LabelExample], fields: Sequence[str]) -> s
 
 
 def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat,
-               examples: Optional[Sequence[LabelExample]] = None
-               ) -> Tuple[Dict[str, Optional[str]], str]:
+               examples: Optional[Sequence[LabelExample]] = None,
+               notes: str = "") -> Tuple[Dict[str, Optional[str]], str]:
     """{label: field or None} from the model, and which model answered.
 
     Asked as a LIST of {label, field} with both constrained to the given
@@ -780,7 +780,7 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat,
               "Reply with JSON only, shaped like "
               "{\"mappings\": [{\"label\": <a label below>, \"field\": <a template field "
               "below, or null>}]}.\n\n"
-              + _examples_text(examples or (), fields) +
+              + _examples_text(examples or (), fields) + (notes or "") +
               f"Template fields:\n{json.dumps(fields)}\n\nLabels:\n{json.dumps(labels)}")
     text, model = chat(prompt, schema)
     got = _json(text)
@@ -820,8 +820,11 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
     report.labels_asked = len(labels)
     report.asking = "the labels left over"
     try:
-        mapping, report.model = map_labels(labels, fields, chat,
-                                           examples=pick_examples(examples or (), labels))
+        import docs_open
+        mapping, report.model = map_labels(
+            labels, fields, chat, examples=pick_examples(examples or (), labels),
+            # what the user's documents say these labels mean (docs_open)
+            notes=docs_open.notes_text(getattr(run, "explanations", None) or [], labels))
     except ModelUnavailable:
         report.labels_failed = True
         return                                             # said once, by one_shot

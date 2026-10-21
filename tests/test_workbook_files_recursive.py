@@ -34,7 +34,8 @@ def _touch(path: Path) -> Path:
 def test_a_flat_folder_still_lists_its_workbooks(tmp_path):
     a = _touch(tmp_path / "a.xlsx")
     b = _touch(tmp_path / "b.xlsm")
-    _touch(tmp_path / "readme.txt")                              # not a workbook
+    # not a source (a .txt is one since text documents are read, 2026-10-21)
+    _touch(tmp_path / "readme.json")
     found = workbook_files(tmp_path)
     assert found == [a, b]
 
@@ -95,7 +96,7 @@ def test_an_empty_folder_returns_nothing(tmp_path):
 
 
 def test_a_folder_with_only_non_workbooks_returns_nothing(tmp_path):
-    _touch(tmp_path / "notes.txt")
+    _touch(tmp_path / "notes.json")                              # .txt is a source now
     _touch(tmp_path / "sub" / "image.png")
     assert workbook_files(tmp_path) == []
 

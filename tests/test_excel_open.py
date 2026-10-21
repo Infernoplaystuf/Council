@@ -732,7 +732,7 @@ def test_an_excel_failure_says_what_happened(tmp_path):
 
 def test_folders_bring_every_workbook_kind(tmp_path):
     from council_core.ledger_ingest import collect_sources
-    for n in ("a.xlsx", "b.xlsm", "c.xls", "d.xlsb", "~$a.xlsx", "notes.txt"):
+    for n in ("a.xlsx", "b.xlsm", "c.xls", "d.xlsb", "~$a.xlsx", "notes.json"):
         (tmp_path / n).write_bytes(b"")
     kept, _ignored = collect_sources([tmp_path])
     assert sorted(p.name for p in kept) == [

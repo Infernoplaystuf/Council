@@ -34,7 +34,8 @@ from sample_ledger import LedgerError
 #: the tints: a template cell that is a field; the field picked now; a cell
 #: linked in this window; a sample cell in a table Council found
 FIELD_TINT, PICKED_TINT, LINKED_TINT, TABLE_TINT = "#DDEBF7", "#9BC2E6", "#FFE699", "#F2F2F2"
-SOURCES = "Workbooks and decks (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.csv)"
+SOURCES = ("Workbooks, decks and documents (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.csv "
+           "*.docx *.txt *.md *.pdf)")
 
 
 def _letters(c: int) -> str:
