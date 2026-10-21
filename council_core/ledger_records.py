@@ -1935,6 +1935,9 @@ def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress
         prog.advance(1)
     _one_per_place(uses)
     _weak_tables(uses, col_fields, run)
+    # 4b. learn by example: columns no rule placed, whose values are one
+    # field's in a filled copy of the template's table or the parent CSV
+    _learn_by_example(uses, col_fields, recipe, csv_path, run)
     # 5. the model, for headers nothing placed (once per header layout)
     if chat is not None and not run.cancelled:
         _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report, explained)
@@ -2012,6 +2015,98 @@ def _one_per_place(uses: List[TableUse]) -> None:
                 u.use, u.why = "skipped", f"the same cells read better as {clash.table.span()}"
             else:
                 kept.append(u)
+
+
+#: a table read as a filled copy of the template's: this share of its fields
+#: placed by their own headers
+COPY_SHARE = 0.8
+
+
+def _learn_by_example(uses: List[TableUse], col_fields, recipe: Recipe, csv_path,
+                      run: RecordRun) -> None:
+    """Worked answers - the records of tables that are filled copies of the
+    template's (its own headers) and the parent CSV's - lined up with every
+    other table by the record's key (its name): a column that holds one
+    field's values for the same records is that field, as a suggestion
+    (how 'example', amber; a Y on its Decisions row teaches it). A key
+    column renamed too ('Creature' for Name) is found by the names it holds.
+    (council_core.ledger_examples, user 2026-10-21.)"""
+    from council_core import ledger_examples as lx
+    names = [f.name for f in col_fields]
+    if not names:
+        return
+    copies = [u for u in uses if u.use == "records" and u.table.orient == "rows"
+              and sum(1 for m in u.maps if m.how in ("header", "words"))
+              >= max(2, COPY_SHARE * len(names))]
+    rows: List[Tuple[Dict[str, Any], str]] = []
+    for u in copies:
+        t = u.table
+        for vals in t.values:
+            rows.append(({m.field: vals[m.j] for m in u.maps if vals[m.j] is not None},
+                         f"{t.file} › {t.sheet}"))
+    try:
+        _cols, csv_rows = _read_rows(Path(csv_path)) if Path(csv_path).is_file() else ([], [])
+    except Exception:                                       # noqa: BLE001
+        csv_rows = []
+    rows += [({f: r.get(f) for f in names if r.get(f)}, "the parent CSV") for r in csv_rows]
+    if not rows:
+        return
+    key = next((k for k in recipe.key_fields if k in names), None)
+    if key is None:
+        for f in names:                                     # a name each record has its own
+            vals = [v for v in (cell_text(r.get(f)) for r, _ in rows) if v]
+            if len(vals) >= 2 and _mostly_text(vals) and len(set(vals)) >= 0.9 * len(vals):
+                key = f
+                break
+    if key is None:
+        return
+    ex = lx.Examples()
+    for r, where in rows:
+        if r.get(key) not in (None, ""):
+            ex.add(r[key], "", r, where)
+    if not ex:
+        return
+    copy_ids = {u.table.id for u in copies}
+    for u in uses:
+        t = u.table
+        if t.id in copy_ids or u.use == "lookup" or t.orient != "rows" or \
+                u.why.startswith("the same cells") or \
+                u.why == "the sheet's table reads the right way up":
+            continue
+        mapped_f = {m.field for m in u.maps}
+        mapped_j = {m.j for m in u.maps}
+        added: List[ColMap] = []
+        key_j = next((m.j for m in u.maps if m.field == key), None)
+        if key_j is None:
+            hit = lx.key_column([(j, t.column(j)) for j in range(len(t.cols))
+                                 if j not in mapped_j], ex)
+            if hit is None:
+                continue
+            key_j = hit[0]
+            added.append(ColMap(key, key_j, "example", lx.EXAMPLE_SCORE,
+                                f"{lx.EXAMPLE_NOTE}: '{t.headers[key_j]}' holds the "
+                                f"{key}s of {hit[1]} of their records"))
+            mapped_j.add(key_j)
+            mapped_f.add(key)
+        keys = t.column(key_j)
+        free = [f for f in names if f not in mapped_f]
+        for j in range(len(t.cols)):
+            if j in mapped_j or not free:
+                continue
+            got = lx.learn_column(t.column(j), keys, ex, free)
+            if got is None:
+                continue
+            added.append(ColMap(got.field, j, "example", lx.EXAMPLE_SCORE,
+                                got.note(t.headers[j] or f"column {j + 1}")))
+            free.remove(got.field)
+        if not added:
+            continue
+        u.maps += added
+        u.score = sum(m.score for m in u.maps) + 0.001 * len(t.rows)
+        if u.use == "skipped" and len(u.maps) >= 2:
+            u.use, u.why = "records", "its columns learned from your filled copies (check them)"
+        run.learned.append(f"Learned by example in {t.file} › {t.sheet}: " + ", ".join(
+            f"'{t.headers[m.j]}' is {m.field}" for m in added))
 
 
 def _weak_tables(uses: List[TableUse], col_fields, run: RecordRun) -> None:
@@ -2401,14 +2496,19 @@ def _duplicates(run: RecordRun) -> None:
         for other in recs[1:]:
             if other.path == first.path:
                 continue
-            fields = set(first.values) | set(other.values)
-            differ = [f for f in fields if cell_text(first.values.get(f, Val(None, "")).value)
-                      != cell_text(other.values.get(f, Val(None, "")).value)]
-            if not differ:
+            # a clash is two values for one field; a field one of them lacks
+            # is no disagreement (a filled copy with more columns than a log)
+            both = set(first.values) & set(other.values)
+            differ = [f for f in both if cell_text(first.values[f].value)
+                      != cell_text(other.values[f].value)]
+            if not differ and set(other.values) <= set(first.values):
                 other.accept = "N"
                 other.flags.append("duplicate")
                 other.notes.append(f"the same record as {first.file} › {first.sheet} row "
                                    f"{first.row}: left out")
+            elif not differ:
+                other.notes.append(f"also in {first.file} › {first.sheet} row {first.row}, "
+                                   "which agrees where both have a value")
             else:
                 for r in (first, other):
                     if "clash" not in r.flags:

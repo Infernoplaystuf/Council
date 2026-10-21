@@ -246,6 +246,49 @@ scans and the file pickers include them. An old .doc or .rtf is refused with
 - **Council's model** gets the relevant explanations in its questions about
   labels and header layouts (`docs_open.notes_text`).
 
+## Learning by example from filled copies (both Ledgers)
+
+`council_core/ledger_examples.py`. A filled copy of the template is a worked
+answer; so is every record already accepted into the parent CSV.
+
+**Where the worked answers come from**
+- **Sample-ID Ledger:** a source sheet with at least 80% of the template's own
+  words in the same cells (`is_filled_copy`) is a filled copy. Its values are read
+  by the template's own cells (`filled_rows`), keyed by part and flaw. The parent
+  CSV's rows are passed in as well (`extract(examples=…)`, from Extract and from
+  Apply alike).
+- **Table Ledger:** a table placed by at least 80% of its fields' own headers is a
+  filled copy of the template's table. Its records and the parent CSV's are keyed
+  by the record's key field (Name).
+
+**What is learned**
+- **Sample-ID Ledger:** for a label no rule placed, its values are compared with
+  the answers for the same part (and flaw).
+- **Table Ledger:** each table is lined up with the answers by its key column; a
+  renamed key column ("Creature") is found by the names it holds. Each unplaced
+  column is compared value by value.
+- **The evidence rule** (`_decide`):
+  - most of the compared values agree with one field, and no other field as much;
+  - at least one agreeing value is distinctive (not 0, 1, Yes, OK, M…), or at
+    least 4 common values agree with none disagreeing;
+  - a single agreeing value counts only when nothing disagreed.
+
+**What happens to it**
+- Learned labels and columns are applied to every workbook in the run, including
+  the parts and records with no filled copy. That is the point: a few filled
+  copies teach thousands of messy files.
+- Learned values are always amber (`via` / `how` = `"example"`), with a note
+  naming the filled copy.
+- A Y on such a value (sample-ID Ledger) or on its Decisions row (table Ledger)
+  teaches the label for good.
+- A value equal to the filled copy's own merges with its row and teaches nothing:
+  only a Y on a learned suggestion does.
+
+**Duplicates (table Ledger):** two records from different workbooks clash only
+when a field has two different values. One that only lacks fields the other has,
+and agrees on the rest, is left out as a duplicate. One with extra fields is kept,
+noted "also in …".
+
 ## The Ledger's model uses its own limits
 
 Every Ledger model call (labels, part numbers, header layouts, label-mapping
