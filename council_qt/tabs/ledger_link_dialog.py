@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QFileDialo
 from council_core import ledger_linking as ll
 from sample_ledger import LedgerError
 
+from ..view import hand_to_qt
+
 #: the tints: a template cell that is a field; the field picked now; a cell
 #: linked in this window; a sample cell in a table Council found
 FIELD_TINT, PICKED_TINT, LINKED_TINT, TABLE_TINT = "#DDEBF7", "#9BC2E6", "#FFE699", "#F2F2F2"
@@ -124,6 +126,7 @@ class LinkDialog(QDialog):
         self._sample_models: List[SheetModel] = []
         self._lookup_mode = False
         self._build(sources)
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
         self._template_read.connect(self._got_template)
         self._sample_read.connect(self._got_sample)
         self._read_template()

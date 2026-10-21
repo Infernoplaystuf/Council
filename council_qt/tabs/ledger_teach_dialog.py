@@ -46,6 +46,8 @@ import source_extract as se
 from council_core import ledger_teach as lt
 from sample_ledger import LedgerError
 
+from ..view import hand_to_qt
+
 XLSX = "Excel workbooks (*.xlsx *.xlsm *.xls *.xlsb)"
 #: Workbooks listed from the sources, at most: a share of thousands would
 #: make the dropdown useless; Browse… reaches the rest.
@@ -169,6 +171,7 @@ class TeachDialog(QDialog):
         self._guessed.connect(self._on_guessed)
         self._learned.connect(self._on_learned_result)
         self._build(pattern_mask)
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
         self._list_sources(list(sources), list(ignore_patterns), template_path)
         self._refresh()
 

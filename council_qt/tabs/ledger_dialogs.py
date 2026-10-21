@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
 
 from council_core import ollama_install
 
+from ..view import hand_to_qt
+
 
 class _Signals(QObject):
     progress = Signal(object)
@@ -86,6 +88,7 @@ class InstallVisionModelDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
 
         self._load_catalog()
 
@@ -252,6 +255,7 @@ class PickModelDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         root.addWidget(self.buttons)
         self._listed.connect(self._fill)
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
         self._refresh()
         lister = lister or self._default_lister
 
@@ -417,6 +421,7 @@ class PreviewWorkbookDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
 
         self._start_worker(path, schema, aliases, pattern_mask, ignore, part)
 

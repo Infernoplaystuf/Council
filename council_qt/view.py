@@ -48,6 +48,33 @@ def amp(text: str) -> str:
     return str(text).replace("&", "&&")
 
 
+def hand_to_qt(root: QObject) -> None:
+    """Make every Python-built child of ``root`` owned by its Qt parent.
+
+    PYSIDE6 6.12 LEAVES A WIDGET PYTHON-OWNED WHEN IT IS ADDED TO A LAYOUT THAT
+    HAS NO WIDGET YET (``row = QHBoxLayout(); row.addWidget(b);
+    outer.addLayout(row)``). Qt reparents it all the same, so it then has two
+    owners. A view freed by Python's garbage collector (one closure over
+    ``self`` is enough for a cycle) is taken apart in no fixed order: when the
+    parent's C++ side goes first it deletes the child, and then the child's
+    wrapper deletes it again - a segfault in QObject::~QObject. Seen as
+    crashes of the Ledger's Qt tests under 6.12 only, at whichever garbage
+    collection came next (2026-10-21). 6.10 hands such a widget to the parent.
+
+    ``setParent`` with the parent it already has is what gives the parent the
+    ownership: Qt itself returns early (nothing is hidden or moved), PySide
+    records the new owner. Call it once a view's widgets are built.
+    """
+    try:
+        import shiboken6
+    except Exception:                                     # noqa: BLE001
+        return
+    for child in root.findChildren(QObject):
+        parent = child.parent()
+        if parent is not None and shiboken6.ownedByPython(child):
+            child.setParent(parent)
+
+
 def _on_gui_thread() -> bool:
     """Whether the caller is the thread that owns the widgets.
 

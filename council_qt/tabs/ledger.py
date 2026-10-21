@@ -58,7 +58,7 @@ from council_core import ledger_ingest
 from sample_ledger import LedgerError
 
 from .. import theme
-from ..view import ViewHelpers, amp
+from ..view import ViewHelpers, amp, hand_to_qt
 
 XLSX = ("Workbooks, decks and documents (*.xlsx *.xlsm *.xls *.xlsb *.pptx *.pptm *.docx "
         "*.txt *.md *.pdf)")
@@ -299,6 +299,7 @@ class LedgerTab(ViewHelpers, QWidget):
         self._kg_known: set = set()
         self._kg_pending: List[str] = []
         self._build()
+        hand_to_qt(self)          # PySide6 6.12: see view.hand_to_qt
         self._kg_timer = QTimer(self)
         self._kg_timer.setSingleShot(True)
         self._kg_timer.setInterval(self.KG_RETRY_MS)
