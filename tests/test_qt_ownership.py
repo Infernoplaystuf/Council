@@ -1,8 +1,9 @@
-"""PySide6 6.12 leaves a widget Python-owned when it is added to a layout that
-has no widget yet, though Qt has given it a parent: two owners, and a segfault
-in QObject::~QObject when the garbage collector takes the view apart in the
-wrong order (council_qt.view.hand_to_qt). Every Ledger view hands its
-children to Qt once they are built."""
+"""PySide6 6.12 leaves a widget owned twice - by Python and by its Qt
+parent - when the layout holding it is added to a layout already on a widget:
+a segfault in QObject::~QObject when the garbage collector takes the view
+apart in the wrong order. council_qt.qt_ownership hands such widgets to their
+parent at every layout-into-layout call, installed when council_qt is
+imported."""
 from __future__ import annotations
 
 import os
@@ -15,12 +16,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 shiboken6 = pytest.importorskip("shiboken6")
 from PySide6.QtCore import QObject  # noqa: E402
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayout, QWidget  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QFormLayout, QGridLayout,  # noqa: E402
+                               QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from council_qt.tabs.ledger import LedgerActions, LedgerTab  # noqa: E402
 from council_qt.tabs.ledger_link_dialog import LinkDialog  # noqa: E402
-from council_qt.view import hand_to_qt  # noqa: E402
 from test_ledger_link_dialog import settle  # noqa: E402
 from test_ledger_linking import plain_btb  # noqa: E402,F401
 
@@ -46,16 +47,30 @@ def double_owned(root) -> list:
                   and shiboken6.ownedByPython(o) and under_root(o))
 
 
-def test_hand_to_qt_gives_the_parent_the_child(qapp):
+ATTACHES = {
+    "QBoxLayout.addLayout": lambda w, row: QVBoxLayout(w).addLayout(row),
+    "QBoxLayout.insertLayout": lambda w, row: QHBoxLayout(w).insertLayout(0, row),
+    "QGridLayout.addLayout": lambda w, row: QGridLayout(w).addLayout(row, 0, 1),
+    "QFormLayout.addRow(label, layout)": lambda w, row: QFormLayout(w).addRow("a", row),
+    "QFormLayout.addRow(layout)": lambda w, row: QFormLayout(w).addRow(row),
+    "QFormLayout.insertRow": lambda w, row: QFormLayout(w).insertRow(0, "a", row),
+    "QFormLayout.setLayout": lambda w, row: QFormLayout(w).setLayout(
+        0, QFormLayout.ItemRole.FieldRole, row),
+    "QWidget.setLayout": lambda w, row: w.setLayout(row),
+}
+
+
+@pytest.mark.parametrize("attach", list(ATTACHES))
+def test_a_row_added_to_an_attached_layout_is_owned_once(qapp, attach):
     w = QWidget()
-    outer = QVBoxLayout(w)
     row = QHBoxLayout()
-    b = QPushButton("x")
+    b, inner = QPushButton("x"), QHBoxLayout()
     row.addWidget(b)                    # a layout with no widget yet
-    outer.addLayout(row)
-    assert b.parent() is w
-    hand_to_qt(w)
-    assert not shiboken6.ownedByPython(b) and b.parent() is w and double_owned(w) == []
+    inner.addWidget(QLabel("deeper"))
+    row.addLayout(inner)
+    ATTACHES[attach](w, row)
+    assert b.parent() is w and not shiboken6.ownedByPython(b)
+    assert double_owned(w) == []
 
 
 def test_the_ledger_tab_owns_nothing_twice(qapp):
