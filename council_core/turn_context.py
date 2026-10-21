@@ -32,7 +32,7 @@ THE EDITS THE MOVE MADE (everything else was byte-for-byte):
   * `_inject_file_contents` takes `extra_blocks` (default None: no change),
     placed at a new priority band PRIO_EXTRA between the folder listings
     and the vault search — where prepare_turn hands in the knowledge graph's
-    block (KG4; `knowledge_graph_block`, not built yet).
+    block (KG4; `knowledge_graph_block`).
 These edits are marked "[turn_context]" in the code, apart from the
 `_vault()` reads (search for `_vault()`).
 """
@@ -3705,18 +3705,22 @@ class ContextBlock:
 
 def knowledge_graph_block(question: str,
                           state: TurnState) -> Optional[ContextBlock]:
-    """KG4 — NOT BUILT. The knowledge graph's cited neighbourhood for a
-    question that names a known person, part or project
-    (docs/handoff/knowledge_graph_desktop.md, KG4): the linked items and,
-    for each link, where it was found (file, row or line).
+    """KG4 - the knowledge graph's cited neighbourhood for a question that
+    names something a graph knows (council_core.kg_query.block): the
+    entities named, their links two hops out, the chain between two named
+    ones, each fact with its file, row or line and quote. Every graph the
+    user marked "use in answers" (Connections; council_core.kg_graphs) is
+    read; one never built is skipped and none is created.
 
-    Returns None: no block. When KG4 lands, this reads the graph
-    (council_core.knowledge_graph, the store in ``state.vault_dir``) and
-    returns a ContextBlock; prepare_turn already puts it in front of the
-    question with the vault blocks, inside the same window budget, and cites
-    its files under the answer. It must not raise for an ordinary reason (a
-    missing or locked store is "no block"); prepare_turn catches what does."""
-    return None
+    None: no block (nothing named, no graph, or a store busy with a
+    rebuild). It must not raise for an ordinary reason; prepare_turn
+    catches what does."""
+    from council_core import kg_query
+    got = kg_query.block(state.vault_dir, question)
+    if got is None:
+        return None
+    text, sources = got
+    return ContextBlock(text=text, sources=list(sources))
 
 
 _FORGET_RE = _re.compile(r"^\s*forget\s+(.+?)\s*$", _re.IGNORECASE)
@@ -4181,7 +4185,7 @@ def _prepare(question, state, prepared, say, *, n_ctx, pinned_files,
               f"{exc!r}")
         room = None
     pins = state.current_pins() if pinned_files is None else pinned_files
-    # The knowledge graph's block (KG4; None until it is built) goes into
+    # The knowledge graph's block (KG4; None when no graph knows the question) goes into
     # the same assembly as the vault blocks.
     try:
         graph = knowledge_graph_block(question, state)

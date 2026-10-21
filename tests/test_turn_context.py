@@ -600,10 +600,12 @@ def test_the_folder_renderers_protect_the_vault_s_own_folders(vault_env):
 
 
 # ============================================================
-# The seam's hook for the knowledge graph's block (KG4, not built)
+# The knowledge graph's block (KG4)
 # ============================================================
 
-def test_the_knowledge_graph_hook_adds_nothing_until_kg4_is_built(vault_env):
+def test_the_knowledge_graph_hook_adds_nothing_without_a_graph(vault_env):
+    """No graph built: no block - and asking makes no store."""
+    from council_core import knowledge_graph as kgm
     from council_core import turn_context as tc
     vault, _fake = vault_env
     state = tc.TurnState(vault)
@@ -612,6 +614,30 @@ def test_the_knowledge_graph_hook_adds_nothing_until_kg4_is_built(vault_env):
                                   state=state)
     labels = [label for label, _ in prepared.breakdown.get("costs", [])]
     assert tc.KNOWLEDGE_GRAPH_LABEL not in labels, labels
+    assert not kgm.store_path(vault).exists()
+
+
+def test_a_question_naming_what_the_graph_knows_gets_its_cited_links(vault_env):
+    """KG4 built (user, 2026-10-21: "Answers in the Council"): a question
+    naming a person the graph knows gets their links, two hops out, each
+    cited, in front of the question; the cited file is a source."""
+    from council_core import knowledge_graph as kgm
+    from council_core import turn_context as tc
+    vault, _fake = vault_env
+    tracker = vault / "data_in" / "tracker.csv"
+    tracker.write_text("Project,Part Number,Owner\nKA-101,WG-2201,Ngozi Okafor\n"
+                       "KA-102,LG-0310,Jens Halvorsen\n", encoding="utf-8")
+    with kgm.KnowledgeGraph(vault) as kg:
+        kg.seed()
+    prepared, _said, _ = _prepare(vault, "what does ngozi okafor work on?")
+    labels = [label for label, _ in prepared.breakdown["costs"]]
+    assert tc.KNOWLEDGE_GRAPH_LABEL in labels
+    head, _sep, _tail = prepared.text.partition("what does ngozi okafor work on?")
+    assert "Ngozi Okafor (person) — owns → WG-2201 (part)" in head
+    assert "KA-101 (project) — uses part → WG-2201 (part)" in head        # hop 2
+    assert "tracker.csv, row 2" in head
+    assert "Jens Halvorsen" not in head                    # not linked to her
+    assert tracker in prepared.source_paths
 
 
 def test_a_knowledge_graph_block_goes_in_front_of_the_question(vault_env,
