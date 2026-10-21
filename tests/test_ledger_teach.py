@@ -883,6 +883,9 @@ def test_the_graphs_part_rules_are_ticked(tmp_path, ledger):
     s = lt.guess(csv, book, use_images=False)
     sn = _row(s, "S/N")
     assert sn.kind == "part" and sn.guess.via == lt.VIA_RULE
+    # the default rules start ticked (2026-10-21): one the user unticked
+    with kgm.KnowledgeGraph(vault) as kg:
+        kg.set_rule_status("S/N", "proposed")
     rep2 = lt.learn(csv, s, {sn.key: lt.ROLE_PART}, connections_vault=vault)
     assert rep2.unchanged == 1 and rep2.part_labels == ["S/N"]
     with kgm.KnowledgeGraph(vault) as kg:
@@ -892,16 +895,22 @@ def test_the_graphs_part_rules_are_ticked(tmp_path, ledger):
 
 def test_the_templates_own_part_rule_is_ticked_once(tmp_path, ledger):
     """'Part Number' answered as the part number is the graph's own rule:
-    ticked, and said, once (the Ledger log said it twice)."""
+    ticked, and said, once (the Ledger log said it twice). The default rules
+    start ticked (2026-10-21): here the user had unticked it; ticked
+    already, nothing is said (below)."""
     csv, _schema = ledger
     vault = tmp_path / "vault"
     (vault / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(vault) as kg:
+        kg.set_rule_status("Part Number", "proposed")
     s = lt.guess(csv, _labelled_book(tmp_path / "s.xlsx"), use_images=False)
     pn = _row(s, "Part Number")
     rep = lt.learn(csv, s, {pn.key: lt.ROLE_PART}, connections_vault=vault)
     assert rep.kg == ["ticked 'Part Number' (a part number)"]
     with kgm.KnowledgeGraph(vault) as kg:
         assert dict((r.label, st) for r, st in kg.field_rules())["Part Number"] == "confirmed"
+    again = lt.learn(csv, s, {pn.key: lt.ROLE_PART}, connections_vault=vault)
+    assert again.kg == []
 
 
 def test_a_field_named_like_a_confirmed_rule_gets_the_label_as_a_synonym(tmp_path):

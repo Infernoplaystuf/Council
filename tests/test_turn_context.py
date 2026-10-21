@@ -632,11 +632,14 @@ def test_a_question_naming_what_the_graph_knows_gets_its_cited_links(vault_env):
     prepared, _said, _ = _prepare(vault, "what does ngozi okafor work on?")
     labels = [label for label, _ in prepared.breakdown["costs"]]
     assert tc.KNOWLEDGE_GRAPH_LABEL in labels
-    head, _sep, _tail = prepared.text.partition("what does ngozi okafor work on?")
+    # the question itself is last (a task memo above may quote it too)
+    head, _sep, _tail = prepared.text.rpartition("what does ngozi okafor work on?")
     assert "Ngozi Okafor (person) — owns → WG-2201 (part)" in head
     assert "KA-101 (project) — uses part → WG-2201 (part)" in head        # hop 2
     assert "tracker.csv, row 2" in head
-    assert "Jens Halvorsen" not in head                    # not linked to her
+    block = tc.knowledge_graph_block("what does ngozi okafor work on?", tc.TurnState(vault))
+    assert "Ngozi Okafor (person) — owns → WG-2201 (part)" in block.text
+    assert "Jens Halvorsen" not in block.text               # not linked to her
     assert tracker in prepared.source_paths
 
 
