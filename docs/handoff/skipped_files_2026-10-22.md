@@ -99,3 +99,33 @@ The reading thread sees the asking thread's state:
   the Windows Job Object) would free it at once, at the price of passing each
   file's result back as JSON.
 - **A file-size gate** before reading.
+
+## Diagnose a file (added the same day)
+
+User: "the ledger stalls out and breaks consistently on one excel file. I'd like
+there to maybe add an output so we can diagnose the cause and I can report back
+on it."
+
+The Ledger tab's **Diagnose a file…** (beside Retry skipped files) runs
+`council_core/ledger_diagnose.py` in a separate process
+(`python -m council_core.ledger_diagnose <args.json>`, through `child_proc.run`).
+That way a file that freezes or crashes the reader cannot take the app down. It
+writes `<app dir>/logs/diagnostics/<stamp>_<name>/report.txt` and opens it. The
+report holds:
+
+- the file's anatomy, from the zip directory only: sheets and their used
+  range, pictures, charts, OLE objects, external links, pivots, macros, style
+  counts, and the biggest parts;
+- each step with its time and memory: the table reader, the sample reader with
+  pictures, then a whole Extract into the current parent CSV. The review it
+  writes goes in the diagnosis folder;
+- every thread's stack after each 30 s without a new line (faulthandler's C
+  thread, so a C call holding the GIL is caught), and a crash's stack;
+- the outcome (finished, crashed with the exit code named, killed after
+  `COUNCIL_DIAGNOSE_TIME_LIMIT_S` (default 20 min), or Cancel), the last step
+  reached, and the tail of `logs/ledger_stalls.txt`.
+
+The child reads past the skip list and never changes it: no entry added, no
+"reading now" note. The report says whether the file is on the list.
+Tests: `tests/test_ledger_diagnose.py`, plus the tab test in
+`tests/test_ledger_tab.py`.

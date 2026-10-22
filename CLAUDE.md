@@ -58,3 +58,7 @@ same list.
 - Skipping files that stall the app (Ledger, Connections, Vault; the skip list,
   the time limit, "Retry skipped files"): `docs/handoff/skipped_files_2026-10-22.md`.
   A new bulk reader goes through `council_core.file_guard.read`.
+- The Ledger's "Review by clicking…" window (each value beside its highlighted
+  template and source cells, answers saved into the review workbook):
+  `docs/handoff/ledger_review_2026-10-22.md`. "Diagnose a file…" is in
+  `docs/handoff/skipped_files_2026-10-22.md`.

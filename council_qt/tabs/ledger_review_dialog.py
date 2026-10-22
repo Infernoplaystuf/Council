@@ -1,0 +1,491 @@
+"""
+The Ledger tab's "Review by clicking…" window (user, 2026-10-22: "For L1 can
+we do something similar to the existing link by clicking? That just be more
+easily readable and viewable. Highlight the cells in question in that").
+
+The review workbook's items on the left, the ones that need a decision first.
+Pick one: the template above shows where its value goes, the source workbook
+below shows the cell it was read from, both highlighted and scrolled to. Say
+Right or Wrong (or correct the value) and the next item comes up. Save writes
+the answers into the review workbook's own Accept and value cells
+(council_core.ledger_review), so Apply, and checking it in Excel, are as
+before.
+
+Reads run on worker threads; their results come back through Qt signals.
+"""
+from __future__ import annotations
+
+import threading
+import traceback
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QColor
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+                               QSplitter, QTableView, QTableWidget, QTableWidgetItem,
+                               QTabWidget, QVBoxLayout, QWidget)
+
+from council_core import ledger_linking as ll
+from council_core import ledger_review as lv
+from sample_ledger import LedgerError
+
+from .ledger_link_dialog import FIELD_TINT, PICKED_TINT, SheetModel
+
+#: the source: the cell the value came from; the rest of a record's row; a clash
+CELL_TINT, ROW_TINT, CLASH_TINT = "#FFC000", "#FFE699", "#F8CBAD"
+#: the list: an answer given here, not saved yet
+ANSWER_TINT = "#E2EFDA"
+
+SHOW_NEEDS, SHOW_ALL = "Needs a decision", "Everything"
+
+
+class ReviewDialog(QDialog):
+    _template_read = Signal(object, str)        # (TemplateView or None, error)
+    _source_read = Signal(str, object, str)     # (path, SampleView or None, error)
+
+    def __init__(self, review: lv.Review, parent=None,
+                 log: Optional[Callable[[str], None]] = None,
+                 opener: Optional[Callable[[str], None]] = None,
+                 on_saved: Optional[Callable[[int], None]] = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Review by clicking — {Path(review.path).name}")
+        self.resize(1400, 860)
+        self.review = review
+        self.log = log or (lambda _s: None)
+        self.opener = opener
+        self.on_saved = on_saved
+        self.template: Optional[ll.TemplateView] = None
+        #: (field, item) -> (sheet, cell): the one template cell a value goes in
+        self._exact: Dict[Tuple[str, str], Tuple[str, Tuple[int, int]]] = {}
+        self.sources: Dict[str, Optional[ll.SampleView]] = {}
+        self._reading: set = set()
+        self.answers: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self.shown: List[lv.Item] = []
+        self.current: Optional[lv.Item] = None
+        self._template_models: List[SheetModel] = []
+        self._template_views: List[QTableView] = []
+        self._source_models: List[SheetModel] = []
+        self._source_views: List[QTableView] = []
+        self._source_shown = ""
+        self._build()
+        self._template_read.connect(self._got_template)
+        self._source_read.connect(self._got_source)
+        self._fill_list()
+        if review.csv:
+            self._read_template()
+        else:
+            self.template_note.setText("The review does not say which parent CSV it is "
+                                       "for: the template cannot be shown.")
+        if self.shown:
+            self.items.selectRow(0)
+
+    # ── layout ──────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        outer = QVBoxLayout(self)
+        help_ = QLabel(
+            "Pick an item: the template shows where its value goes, the source shows the "
+            "cell it was read from, both highlighted. Press Right or Wrong (or correct the "
+            "value) and the next one comes up. Save writes your answers into the review "
+            "workbook; then press Apply in the Ledger tab.")
+        help_.setWordWrap(True)
+        outer.addWidget(help_)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Show:"))
+        self.show_choice = QComboBox()
+        self.show_choice.addItems([SHOW_NEEDS, SHOW_ALL])
+        self.show_choice.currentIndexChanged.connect(lambda _i: self._fill_list())
+        row.addWidget(self.show_choice)
+        self.counts = QLabel("")
+        row.addWidget(self.counts, 1)
+        outer.addLayout(row)
+
+        split = QSplitter(Qt.Horizontal)
+        self.items = QTableWidget(0, 3)
+        self.items.setHorizontalHeaderLabels(["Accept", "Item", "From"])
+        self.items.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.items.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.items.verticalHeader().setVisible(False)
+        self.items.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.items.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.items.itemSelectionChanged.connect(self._picked)
+        split.addWidget(self.items)
+
+        right = QSplitter(Qt.Vertical)
+        top = QWidget()
+        tv = QVBoxLayout(top)
+        tv.setContentsMargins(0, 0, 0, 0)
+        self.template_note = QLabel("<b>Template</b> — where the value goes. Reading it…")
+        tv.addWidget(self.template_note)
+        self.template_tabs = QTabWidget()
+        tv.addWidget(self.template_tabs, 1)
+        right.addWidget(top)
+        bottom = QWidget()
+        bv = QVBoxLayout(bottom)
+        bv.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        self.source_note = QLabel("<b>Source</b> — where it was read from")
+        self.source_note.setWordWrap(True)
+        row.addWidget(self.source_note, 1)
+        self.open_btn = QPushButton("Open file")
+        self.open_btn.setToolTip("Open the source workbook in its own program")
+        self.open_btn.clicked.connect(self._open_source)
+        row.addWidget(self.open_btn)
+        bv.addLayout(row)
+        self.source_tabs = QTabWidget()
+        bv.addWidget(self.source_tabs, 1)
+        right.addWidget(bottom)
+        right.setSizes([330, 430])
+        split.addWidget(right)
+        split.setSizes([460, 940])
+        outer.addWidget(split, 1)
+
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.detail.setMinimumHeight(70)
+        self.detail.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        outer.addWidget(self.detail)
+        row = QHBoxLayout()
+        self.value_label = QLabel("Value:")
+        row.addWidget(self.value_label)
+        self.value_edit = QLineEdit()
+        self.value_edit.setPlaceholderText("Correct the value here if it was read wrong")
+        self.value_edit.returnPressed.connect(self.on_right)
+        row.addWidget(self.value_edit, 1)
+        self.right_btn = QPushButton("✓ Right — accept")
+        self.right_btn.setToolTip("Accept = Y: this value goes into the parent CSV "
+                                  "(with your correction, if you typed one)")
+        self.right_btn.clicked.connect(self.on_right)
+        row.addWidget(self.right_btn)
+        self.wrong_btn = QPushButton("✗ Wrong — leave out")
+        self.wrong_btn.setToolTip("Accept = N: this value does not go into the parent CSV")
+        self.wrong_btn.clicked.connect(self.on_wrong)
+        row.addWidget(self.wrong_btn)
+        outer.addLayout(row)
+        row = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        row.addWidget(self.status, 1)
+        self.save_btn = QPushButton("Save answers")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self.on_save)
+        row.addWidget(self.save_btn)
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        outer.addLayout(row)
+        self._refresh_buttons()
+
+    def _sheet_view(self, model: SheetModel) -> QTableView:
+        view = QTableView()
+        view.setModel(model)
+        view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        view.setSelectionMode(QAbstractItemView.NoSelection)
+        view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        view.horizontalHeader().setDefaultSectionSize(90)
+        view.verticalHeader().setDefaultSectionSize(22)
+        return view
+
+    # ── the list ────────────────────────────────────────────────────────
+    def _accept_of(self, item: lv.Item) -> str:
+        a = self.answers.get((item.sheet, item.row))
+        return a["accept"] if a and "accept" in a else item.accept
+
+    def _fill_list(self) -> None:
+        keep = self.current
+        everything = self.show_choice.currentText() == SHOW_ALL
+        self.shown = [i for i in self.review.items if everything or i.needs]
+        self.items.blockSignals(True)
+        self.items.setRowCount(len(self.shown))
+        for n, it in enumerate(self.shown):
+            self._fill_row(n, it)
+        self.items.blockSignals(False)
+        needs = sum(i.needs for i in self.review.items)
+        self.counts.setText(f"{needs} of {len(self.review.items)} need a decision; "
+                            f"{len(self.answers)} answered here, not saved yet"
+                            if self.answers else
+                            f"{needs} of {len(self.review.items)} need a decision")
+        if keep in self.shown:
+            self.items.selectRow(self.shown.index(keep))
+
+    def _fill_row(self, n: int, it: lv.Item) -> None:
+        answered = (it.sheet, it.row) in self.answers
+        cells = [self._accept_of(it) or "?", it.title,
+                 Path(it.where.split(" › ", 1)[0]).name if it.where else ""]
+        tint = (ANSWER_TINT if answered else CLASH_TINT if it.clash
+                else "#FFF2CC" if it.needs else None)
+        for c, text in enumerate(cells):
+            cell = QTableWidgetItem(text)
+            if c == 1:
+                cell.setToolTip(it.detail)
+            if tint:
+                cell.setBackground(QBrush(QColor(tint)))
+                cell.setForeground(QBrush(QColor("#000000")))
+            self.items.setItem(n, c, cell)
+
+    def _picked(self) -> None:
+        rows = self.items.selectionModel().selectedRows()
+        if not rows:
+            return
+        n = rows[0].row()
+        if not 0 <= n < len(self.shown):
+            return
+        it = self.current = self.shown[n]
+        a = self.answers.get((it.sheet, it.row), {})
+        self.detail.setText(it.detail)
+        editable = bool(it.value_col)
+        self.value_label.setVisible(editable)
+        self.value_edit.setVisible(editable)
+        self.value_edit.setText(str(a.get("value", it.value)) if editable else "")
+        self._tint_template()
+        self._show_source()
+        self._refresh_buttons()
+
+    def select(self, item: lv.Item) -> None:
+        """Pick ``item`` in the list (tests, and the next one after an answer)."""
+        if item not in self.shown:
+            self.show_choice.setCurrentText(SHOW_ALL)
+        self.items.selectRow(self.shown.index(item))
+
+    # ── answers ─────────────────────────────────────────────────────────
+    def _answer(self, accept: str) -> None:
+        it = self.current
+        if it is None:
+            return
+        a: Dict[str, Any] = {"accept": accept}
+        if it.value_col:
+            typed = self.value_edit.text().strip()
+            if typed != it.value:
+                a.update(value=typed, value_col=it.value_col)
+        self.answers[(it.sheet, it.row)] = a
+        n = self.shown.index(it)
+        self._fill_row(n, it)
+        self._fill_list()
+        self.status.setText(f"{'Accepted' if accept == 'Y' else 'Left out'}: {it.title}. "
+                            "Not saved yet.")
+        nxt = next((i for i in self.shown[n + 1:] if (i.sheet, i.row) not in self.answers),
+                   None)
+        if nxt is not None:
+            self.items.selectRow(self.shown.index(nxt))
+        self._refresh_buttons()
+
+    def on_right(self) -> None:
+        self._answer("Y")
+
+    def on_wrong(self) -> None:
+        self._answer("N")
+
+    def on_save(self) -> bool:
+        if not self.answers:
+            self.status.setText("Nothing to save: no answers given here yet.")
+            return True
+        try:
+            n = lv.save(self.review.path, self.answers)
+        except LedgerError as e:
+            self.status.setText(f"Not saved: {e}")
+            return False
+        for it in self.review.items:
+            a = self.answers.get((it.sheet, it.row))
+            if a:
+                it.accept = a["accept"]
+                if "value" in a:
+                    it.value = a["value"]
+        self.answers.clear()
+        self._fill_list()
+        self.status.setText(f"Saved {n} answer(s) into {Path(self.review.path).name}. "
+                            "Press Apply in the Ledger tab to put them in the parent CSV.")
+        self.log(f"Review by clicking: saved {n} answer(s) into {self.review.path}")
+        if self.on_saved is not None:
+            self.on_saved(n)
+        return True
+
+    def reject(self) -> None:                                # noqa: D401
+        if self.answers and not _no_dialogs():
+            got = QMessageBox.question(
+                self, "Unsaved answers",
+                f"Save your {len(self.answers)} answer(s) into the review before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if got == QMessageBox.Cancel:
+                return
+            if got == QMessageBox.Save and not self.on_save():
+                return
+        super().reject()
+
+    def _refresh_buttons(self) -> None:
+        on = self.current is not None
+        self.right_btn.setEnabled(on)
+        self.wrong_btn.setEnabled(on)
+        self.open_btn.setEnabled(bool(on and self.current.source_file
+                                      and self.opener is not None))
+        self.save_btn.setEnabled(bool(self.answers))
+
+    # ── the template ────────────────────────────────────────────────────
+    def _read_template(self) -> None:
+        csv = self.review.csv
+
+        def work() -> None:
+            try:
+                view = ll.template_view(csv)
+                if view.kind == "samples":
+                    self._exact = lv.template_cells(csv)
+                self._template_read.emit(view, "")
+            except LedgerError as e:
+                self._template_read.emit(None, str(e))
+            except Exception:                              # noqa: BLE001
+                self._template_read.emit(None, traceback.format_exc(limit=3))
+        threading.Thread(target=work, name="ledger-review-template", daemon=True).start()
+
+    def _got_template(self, view, err: str) -> None:
+        if view is None:
+            self.template_note.setText(f"<b>Template</b> — could not be read: {err}")
+            return
+        self.template = view
+        self.template_tabs.clear()
+        self._template_models, self._template_views = [], []
+        for sheet in view.sheets:
+            m = SheetModel(sheet, self)
+            v = self._sheet_view(m)
+            self._template_models.append(m)
+            self._template_views.append(v)
+            self.template_tabs.addTab(v, sheet.name)
+        self._tint_template()
+
+    def _tint_template(self) -> None:
+        if self.template is None:
+            return
+        it = self.current
+        want = set(it.fields) if it is not None else set()
+        # the one cell this value goes in (a flaw's row of a grid), when known
+        exact = (self._exact.get((it.fields[0], it.item)) if it is not None and it.fields
+                 else None)
+        first: Optional[Tuple[int, Tuple[int, int]]] = None
+        for i, m in enumerate(self._template_models):
+            tints = {}
+            for rc, f in m.sheet.fields.items():
+                if f in want:
+                    tints[rc] = PICKED_TINT
+                    if first is None or (i, rc) < first:
+                        first = (i, rc)
+                else:
+                    tints[rc] = FIELD_TINT
+            if exact is not None and exact[0] == m.sheet.name:
+                tints[exact[1]] = CELL_TINT
+                first = (i, exact[1])
+            m.set_tints(tints)
+        if first is not None:
+            i, (r, c) = first
+            self.template_tabs.setCurrentIndex(i)
+            self._scroll(self._template_views[i], self._template_models[i], r, c)
+            self.template_note.setText("<b>Template</b> — where the value goes: "
+                                       + ", ".join(sorted(want))[:300])
+        elif want:
+            self.template_note.setText("<b>Template</b> — "
+                                       + ", ".join(sorted(want))[:200]
+                                       + " has no cell of its own on the template")
+        else:
+            self.template_note.setText("<b>Template</b> — this item has no field")
+
+    @staticmethod
+    def _scroll(view: QTableView, model: SheetModel, r: int, c: int) -> None:
+        idx = model.index(r - 1, c - 1)
+        if idx.isValid():
+            view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+
+    # ── the source ──────────────────────────────────────────────────────
+    def _show_source(self) -> None:
+        it = self.current
+        if it is None:
+            return
+        path = it.source_file
+        if not path:
+            self.source_note.setText(f"<b>Source</b> — {it.where or 'unknown'}: the review "
+                                     "does not say where that file is")
+            self._clear_source()
+            return
+        if path in self.sources:
+            self._draw_source(path)
+            return
+        self.source_note.setText(f"<b>Source</b> — reading {Path(path).name}…")
+        if path in self._reading:
+            return
+        self._reading.add(path)
+        csv = self.review.csv or None
+
+        def work() -> None:
+            try:
+                self._source_read.emit(path, ll.sample_view(path, csv), "")
+            except LedgerError as e:
+                self._source_read.emit(path, None, str(e))
+            except Exception:                              # noqa: BLE001
+                self._source_read.emit(path, None, traceback.format_exc(limit=3))
+        threading.Thread(target=work, name="ledger-review-source", daemon=True).start()
+
+    def _got_source(self, path: str, view, err: str) -> None:
+        self._reading.discard(path)
+        self.sources[path] = view
+        if view is None:
+            self.log(f"Review by clicking: could not read {Path(path).name}: {err}")
+        if self.current is not None and self.current.source_file == path:
+            self._draw_source(path, err)
+
+    def _clear_source(self) -> None:
+        self.source_tabs.clear()
+        self._source_models, self._source_views = [], []
+        self._source_shown = ""
+
+    def _draw_source(self, path: str, err: str = "") -> None:
+        view = self.sources.get(path)
+        it = self.current
+        if view is None:
+            self._clear_source()
+            self.source_note.setText(f"<b>Source</b> — {Path(path).name} could not be read"
+                                     + (f": {err.splitlines()[0]}" if err else ""))
+            return
+        if self._source_shown != path:
+            self._clear_source()
+            for sheet in view.sheets:
+                m = SheetModel(sheet, self)
+                v = self._sheet_view(m)
+                self._source_models.append(m)
+                self._source_views.append(v)
+                self.source_tabs.addTab(v, sheet.name)
+            self._source_shown = path
+        cells = (lv.record_row_cells(view, it) if self.review.kind == "records"
+                 else list(it.source_cells))
+        exact = set(it.source_cells) if self.review.kind != "records" else set()
+        on = None
+        for i, m in enumerate(self._source_models):
+            if m.sheet.name == it.source_sheet and cells:
+                tints = {rc: ROW_TINT for rc in cells}
+                for rc in exact:
+                    tints[rc] = CLASH_TINT if it.clash else CELL_TINT
+                m.set_tints(tints)
+                on = i
+            else:
+                m.set_tints({})
+        name = Path(path).name
+        if on is None:
+            why = ("it was read from a picture" if "image" in it.where else
+                   f"the sheet {it.source_sheet!r} is not shown" if it.source_sheet else
+                   "the review gives no cell")
+            self.source_note.setText(f"<b>Source</b> — {name}: {why}")
+            return
+        r, c = cells[0]
+        self.source_tabs.setCurrentIndex(on)
+        self._scroll(self._source_views[on], self._source_models[on], r, c)
+        self.source_note.setText(f"<b>Source</b> — {it.where}"
+                                 if self.review.kind != "records" else
+                                 f"<b>Source</b> — {name} › {it.source_sheet}, row {r}")
+
+    def _open_source(self) -> None:
+        if self.current is not None and self.current.source_file and self.opener:
+            self.opener(self.current.source_file)
+
+
+def _no_dialogs() -> bool:
+    import os
+    return os.environ.get("COUNCIL_NO_DIALOGS", "") not in ("", "0")
