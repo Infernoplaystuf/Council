@@ -322,6 +322,14 @@ defaults, but each call is given only the window it needs (changed 2026-10-22):
   the run is over. "Labels to map" keeps one example per label and sheet as they
   stream past, not every value.
 - **Smaller records:** `Obs` is a slots dataclass.
+- **The review is written streaming:** `source_extract.write_review` uses openpyxl's
+  write-only mode (`_StreamSheet`): widths and frozen header before the first row,
+  fills and bold set as each cell is written, row counts kept for the drop-down lists
+  and the filter. Built in memory it was the peak of a long Extract. For 80 messy
+  workbooks it was 322 MB at the end; streamed it is 79 MB, and the run stays near
+  70 MB throughout. The workbook is the same cell for cell: values, fills, bold,
+  widths, frozen panes, filters, lists, sheet order and hidden sheets
+  (`tests/test_review_streamed.py`). The table Ledger's review already streamed.
 - **GPU choice:** a GGUF goes on one GPU, the discrete card, instead of llama.cpp's
   default split over every GPU. An Intel iGPU beside an NVIDIA card (a Vulkan build
   sees both) took layers into system RAM. See `council_engine._one_gpu`;
