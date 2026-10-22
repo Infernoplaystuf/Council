@@ -258,3 +258,25 @@ def test_sources_can_be_removed_and_cleared(qapp, books):
 
 def test_registry_factory(qapp):
     assert isinstance(build_ledger(None), LedgerTab)
+
+
+def test_diagnose_a_file_runs_it_apart_and_opens_the_report(qapp, books, monkeypatch, tmp_path):
+    """"Diagnose a file…" (council_core.ledger_diagnose): the file picked is
+    read in a separate process, each line shows in the log as it comes, and
+    the report is opened to send back."""
+    monkeypatch.setenv("COUNCIL_APP_DIR", str(tmp_path / "app"))
+    template, src, _ = books
+    tab, opened = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    picked = src / "laser_log.xlsx"
+    monkeypatch.setattr(tab, "_browse_diagnose_file", lambda start: str(picked))
+    assert tab.diagnose_btn.isEnabled()
+    tab.on_diagnose()
+    assert tab.wait(300)
+    log = tab.log.toPlainText()
+    assert "== step: table reader" in log
+    assert "Diagnosis of laser_log.xlsx: finished normally" in log
+    assert opened and Path(opened[-1]).name == "report.txt"
+    assert "whole Extract into" in Path(opened[-1]).read_text(encoding="utf-8")

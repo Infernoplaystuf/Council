@@ -110,6 +110,16 @@ class LedgerActions:
                                          cancel=cancel, log=self.stall_log,
                                          assist=assist)
 
+    def diagnose(self, file, csv, use_images, on_line,
+                 vision_model: Optional[str] = None, cancel=None, assist=False):
+        """One file read the way Extract reads it, in a separate process,
+        with a report to send back (council_core.ledger_diagnose)."""
+        from council_core import ledger_diagnose
+        return ledger_diagnose.run(file, csv, use_images=use_images,
+                                   vision_model=vision_model, assist=assist,
+                                   on_line=on_line,
+                                   should_stop=cancel.is_set if cancel is not None else None)
+
     def apply(self, review, fill_dir, use_images, progress,
               vision_model: Optional[str] = None):
         # Apply reads the sources again: with the vision model the extract
@@ -480,6 +490,15 @@ class LedgerTab(ViewHelpers, QWidget):
         from ..widgets.skipped_files import RetrySkippedButton
         self.retry_skipped_btn = RetrySkippedButton(self._say)
         row.addWidget(self.retry_skipped_btn)
+        # one file that stalls or breaks Extract, read in a separate process
+        # with a report to send back (council_core.ledger_diagnose)
+        self.diagnose_btn = self._step_button(row, "Diagnose a file…", self.on_diagnose)
+        self.diagnose_btn.setToolTip(
+            "Read ONE file the way Extract does, in a separate process, so a file "
+            "that stalls or crashes cannot take the app down. Writes a report of "
+            "what is inside the file, how long each step took, where it got "
+            "stuck, and how it ended - send that report back. Changes nothing "
+            "in your Ledger or the skip list.")
         row.addStretch(1)
         grid3.addLayout(row, 1, 1)
         outer.addWidget(g3)
@@ -1214,6 +1233,46 @@ class LedgerTab(ViewHelpers, QWidget):
                                                  vision_model=vision,
                                                  cancel=self._cancel, **more), done,
                   cancellable=True)
+
+    def on_diagnose(self) -> None:
+        sources = self.source_paths()
+        picked = [p for p in sources if Path(p).is_file()]
+        start = picked[0] if len(picked) == 1 else self._start_dir()
+        file = self._browse_diagnose_file(start)
+        if not file:
+            return
+        csv, images = self.csv.text().strip(), self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {}
+        if self.ask_model.isChecked():
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not diagnosed: no model picked. Untick "
+                                    "\"Ask Council's model about the rest\" to run without one.")
+                return
+            more = {"assist": model_id}
+
+        def line(text: str) -> None:
+            self._to_ui(lambda: self._say(text))
+
+        def done(d) -> None:
+            self.status.setText(f"Diagnosis: {d.outcome}. Report: {d.report}")
+            self._say(d.describe())
+            try:
+                self.actions.open(d.report)
+            except Exception as e:                        # noqa: BLE001
+                self._say(f"(could not open the report: {e})")
+        self._run(f"Diagnosing {Path(file).name}",
+                  lambda p: self.actions.diagnose(file, csv, images, line,
+                                                  vision_model=vision,
+                                                  cancel=self._cancel, **more),
+                  done, cancellable=True)
+
+    def _browse_diagnose_file(self, start: str) -> str:
+        """The file to diagnose, '' when cancelled."""
+        p, _ = QFileDialog.getOpenFileName(self, "Pick the file that stalls the Ledger",
+                                           start, XLSX)
+        return p
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()
