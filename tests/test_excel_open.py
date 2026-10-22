@@ -623,6 +623,9 @@ def _busy_clipboard(monkeypatch) -> list:
     monkeypatch.setattr(excel_open, "_copy_picture", busy)
     monkeypatch.setattr(excel_open, "_clip_text", lambda: None)
     monkeypatch.setattr(excel_open, "_clip_restore", lambda text: None)   # the real one stays
+    # the fake Excel saves no copy: the clipboard, carefully, is the fallback
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (True, ""))
+    monkeypatch.setattr(excel_open, "_clip_seq", lambda: 1)
     return tried
 
 
@@ -1963,3 +1966,72 @@ def test_no_excel_object_outlives_com_when_busy_through_pywin32s_own_object(
         gc.enable()
     assert any(x[0] == "refused" for x in log)
     assert alive == [[]], alive
+
+
+# ── pictures without the clipboard (user, 2026-10-22: "There may be a
+# clipboard issue where stuff can't be copied because the clip board is
+# consumed somewhere") ───────────────────────────────────────────────────
+def _xlsx_with_pictures(path, sheet="EC", at=("E2", "E2", "B7")):
+    import openpyxl
+    from openpyxl.drawing.image import Image as XLImage
+    from PIL import Image
+    wb = openpyxl.Workbook()
+    wb.active.title = sheet
+    for i, cell in enumerate(at):
+        png = path.with_name(f"p{i}.png")
+        Image.new("RGB", (4 + i, 4), "red").save(png)
+        wb.active.add_image(XLImage(str(png)), cell)
+    wb.save(path)
+    return path
+
+
+def test_zip_pictures_reads_them_by_sheet_and_cell(tmp_path):
+    pics = excel_open.zip_pictures(_xlsx_with_pictures(tmp_path / "b.xlsx"))
+    assert sorted(pics) == [("EC", "B7"), ("EC", "E2")]
+    assert len(pics[("EC", "E2")]) == 2 and pics[("EC", "B7")][0][1] == "png"
+    assert excel_open.zip_pictures(tmp_path / "missing.xlsx") == {}
+
+
+def test_pictures_come_from_a_copy_excel_saves_never_the_clipboard(tmp_path, monkeypatch):
+    clipboard = []
+    monkeypatch.setattr(excel_open, "_copy_picture", lambda shape: clipboard.append(1))
+    monkeypatch.setattr(excel_open, "_clip_text", lambda: clipboard.append("read") or None)
+    monkeypatch.setattr(excel_open, "_clip_restore", lambda text: clipboard.append("put"))
+    app = _picture_app(2)
+    saved = []
+
+    def save_as(path, fmt):
+        saved.append((Path(path), fmt))
+        _xlsx_with_pictures(Path(path), at=("E2", "E2"))
+    app._book.SaveAs = save_as
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    book = read_with_excel(f, app_factory=lambda: app)
+    assert [(p.sheet, p.anchor, p.ext) for p in book.pictures] == [("EC", "E2", "png")] * 2
+    assert all(p.data.startswith(b"\x89PNG") for p in book.pictures)
+    assert clipboard == []                                      # never touched
+    (copy, fmt), = saved
+    assert fmt == 51 and copy.suffix == ".xlsx" and copy.parent != tmp_path
+    assert not copy.parent.exists()                             # cleaned up after
+    assert f.read_bytes() == OLE_MAGIC                          # the original as it was
+
+
+def test_no_copy_means_the_careful_clipboard_and_never_over_what_you_copied(tmp_path,
+                                                                            monkeypatch):
+    """Excel would not save a copy (rights protection): the clipboard is used
+    as the knowledge graph's rebuild uses it - and not at all when it holds
+    something besides text."""
+    tried = _busy_clipboard(monkeypatch)
+    monkeypatch.setattr(excel_open, "clipboard_safe",
+                        lambda: (False, "the clipboard holds something besides plain text"))
+    app = _picture_app(1)
+
+    def refuse(path, fmt):
+        raise Exception("SaveAs method of Workbook class failed")
+    app._book.SaveAs = refuse
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    book = read_with_excel(f, app_factory=lambda: app)
+    assert [p.data for p in book.pictures] == [b""] and tried == []
+    assert any("Excel would not save a copy" in n and "besides plain text" in n
+               for n in book.notes)
