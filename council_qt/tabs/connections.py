@@ -292,6 +292,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.type_box.currentIndexChanged.connect(lambda _i: self.on_search())
         row.addWidget(self.type_box)
         self.rebuild_btn = self._button(row, "⟳ Rebuild graph", self.on_rebuild)
+        # files skipped as too slow, or that stalled the app before
+        # (council_core.file_guard): read again on the next rebuild
+        from ..widgets.skipped_files import RetrySkippedButton
+        self.retry_skipped_btn = RetrySkippedButton(lambda t: self.status.setText(t))
+        row.addWidget(self.retry_skipped_btn)
         self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         self.answers_btn = self._button(row, "Your answers", self.on_answers)
@@ -742,6 +747,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._busy = False
         self._rebuild_token = None
         self.rebuild_btn.setEnabled(True)
+        self.retry_skipped_btn.refresh()
         self._reopen()
         if exc is not None:
             self.status.setText(f"The rebuild failed: {exc}")

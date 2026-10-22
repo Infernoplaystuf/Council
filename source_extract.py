@@ -1344,8 +1344,10 @@ def document_explanations(sources: Sequence) -> Tuple[List[Any], List[str]]:
         if p.suffix.lower() not in docs_open.SUFFIXES or not p.is_file():
             continue
         try:
-            out += docs_open.read_document(p, want_pictures=False).explanations
-        except docs_open.DocError:
+            from council_core import file_guard
+            out += file_guard.read(p, lambda p=p: docs_open.read_document(
+                p, want_pictures=False), tab="Ledger").explanations
+        except (docs_open.DocError, file_guard.Skipped):
             continue                    # said when the document itself is read
         except Exception as e:                              # noqa: BLE001
             problems.append(f"{p.name}: its explanations could not be read ({e})")
@@ -3307,7 +3309,12 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                 force=via_excel)
     _wd.beat()
     try:
-        grids, images = load_workbook_grids(src, run.problems)
+        # a file that takes too long, or stalled the app before, is skipped
+        # (council_core.file_guard): the run goes on without it
+        from council_core import file_guard
+        grids, images = file_guard.read(
+            src, lambda: load_workbook_grids(src, run.problems), tab="Ledger",
+            should_stop=cancel.is_set if cancel is not None else None)
         _wd.beat()
     except Exception as e:                    # noqa: BLE001
         if cancel is not None and cancel.is_set():
@@ -3323,6 +3330,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         kind = (getattr(cause, "kind", "unknown")
                 if cause is not None and type(cause).__name__ == "ExcelOpenError"
                 else "other")
+        if type(e).__name__ == "Skipped":
+            msg, kind = f"{src.name}: {e}", "slow"
         if kind == "unavailable" and getattr(cause, "down", ""):
             _excel_down_line(run.problems, msg, label or src.name)
         else:

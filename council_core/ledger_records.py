@@ -1839,9 +1839,17 @@ def _extract(csv_path, files: Sequence, *, chat: Optional[Chat] = None, progress
             run.from_cache += 1
         else:
             try:
-                got = read_book(p, notes)
+                # too slow, or stalled the app before: skipped, the run goes
+                # on (council_core.file_guard)
+                from council_core import file_guard
+                got = file_guard.read(p, lambda p=p, notes=notes: read_book(p, notes),
+                                      tab="Ledger", should_stop=stopped)
             except Exception as e:                          # noqa: BLE001
-                kind = getattr(getattr(e, "__cause__", None), "kind", "") or "other"
+                if stopped():
+                    run.cancelled = True
+                    break
+                kind = ("slow" if type(e).__name__ == "Skipped" else
+                        getattr(getattr(e, "__cause__", None), "kind", "") or "other")
                 run.open_failures.append((p.name, kind))
                 run.problems.append(f"{p.name}: {e}")
                 prog.advance(1)

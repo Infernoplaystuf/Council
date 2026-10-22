@@ -105,6 +105,11 @@ SURE_PAIRINGS = (BY_GROUP, BY_COLOUR, BY_TITLE, BY_ONLY, BY_USER)
 #: ...) it goes with; [] = the whole slide's
 Pairings = Dict[str, Dict[str, Dict[str, List[int]]]]
 _LOCAL = threading.local()
+try:        # a guarded read runs on a thread of its own (council_core.file_guard)
+    from council_core import file_guard as _file_guard
+    _file_guard.carry(_LOCAL)
+except Exception:                                           # noqa: BLE001
+    pass
 
 
 def pairings_path_for(csv_path) -> Path:
