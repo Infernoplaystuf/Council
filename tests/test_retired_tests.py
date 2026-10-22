@@ -23,6 +23,13 @@ RETIRED = {
         "compared council_qt.host.StandaloneHost with the Tk "
         "council_modules.StandaloneHost; needs tkinter. Its Qt-only checks "
         "live on as test_the_standalone_host_surface.",
+    "test_the_tk_console_applies_them":
+        "ran the Tk console's _load_backend_settings (imports "
+        "council_gui_engine). The Qt launch's own engine-settings tests "
+        "in test_launch.py stay.",
+    "test_the_tk_console_applies_them_through_the_same_function":
+        "read council_gui_engine.py's source to check the Tk console "
+        "applies engine settings like the Qt launch does.",
 }
 
 
