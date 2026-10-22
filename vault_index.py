@@ -1618,6 +1618,21 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
     return False
 
 
+def _index_file_guarded(p: Path, prefetched_stat=None) -> Optional[Dict[str, Any]]:
+    """_index_file, unless the file is too slow or stalled the app before
+    (council_core.file_guard): then None, as for a file it cannot read."""
+    try:
+        from council_core import file_guard
+    except Exception:                                   # noqa: BLE001
+        return _index_file(p, prefetched_stat)
+    try:
+        return file_guard.read(p, lambda: _index_file(p, prefetched_stat),
+                               tab="Vault", note_after=2.0)
+    except file_guard.Skipped as exc:
+        print(f"[VaultIndex] {p.name}: {exc}", flush=True)
+        return None
+
+
 def _index_file(p: Path, prefetched_stat=None) -> Optional[Dict[str, Any]]:
     suffix = p.suffix.lower()
     if suffix == ".csv":
@@ -2220,7 +2235,7 @@ the vocabulary list. Lowercase only. Single line only.
                         progress(i, total, p.name)
                     except Exception:
                         pass
-                rec = _index_file(p, _st)
+                rec = _index_file_guarded(p, _st)
                 if rec:
                     self.records[spath] = rec
                     n_updated += 1
@@ -2235,7 +2250,7 @@ the vocabulary list. Lowercase only. Single line only.
             done = 0
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="vault-index") as ex:
-                futures = {ex.submit(_index_file, p, st): p for p, st in to_index}
+                futures = {ex.submit(_index_file_guarded, p, st): p for p, st in to_index}
                 for fut in as_completed(futures):
                     done += 1
                     p = futures[fut]

@@ -475,6 +475,11 @@ class LedgerTab(ViewHelpers, QWidget):
         row = QHBoxLayout()
         self.extract_btn = self._step_button(row, "Extract → review workbook", self.on_extract)
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
+        # files skipped as too slow, or that stalled the app before
+        # (council_core.file_guard): read again on the next run
+        from ..widgets.skipped_files import RetrySkippedButton
+        self.retry_skipped_btn = RetrySkippedButton(self._say)
+        row.addWidget(self.retry_skipped_btn)
         row.addStretch(1)
         grid3.addLayout(row, 1, 1)
         outer.addWidget(g3)
@@ -1027,6 +1032,7 @@ class LedgerTab(ViewHelpers, QWidget):
     def _finish(self, title, result, err, done, after=None) -> None:
         self._worker = None
         self.progress.setVisible(False)
+        self.retry_skipped_btn.refresh()
         try:
             if err:
                 self.status.setText(err.splitlines()[0])

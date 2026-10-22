@@ -375,6 +375,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.rebuild_btn = self._button(grow, "⟳ Build graph", self.on_build)
         self.stop_btn = self._button(grow, "Stop", self.on_stop_suggest)
         self.stop_btn.setEnabled(False)
+        # files skipped as too slow, or that stalled the app before
+        # (council_core.file_guard): read again on the next build
+        from ..widgets.skipped_files import RetrySkippedButton
+        self.retry_skipped_btn = RetrySkippedButton(lambda t: self.status.setText(t))
+        grow.addWidget(self.retry_skipped_btn)
         outer.addLayout(grow)
 
         # 2. finding things, and the graph's other lists
@@ -921,6 +926,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._busy = False
         self._rebuild_token = None
         self.rebuild_btn.setEnabled(True)
+        self.retry_skipped_btn.refresh()
         self._reopen()
         read_text, self._read_text_after = self._read_text_after, False
         if exc is not None:

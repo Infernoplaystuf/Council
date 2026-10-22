@@ -55,3 +55,6 @@ same list.
 - The Connections tab working like Morphik (any entity type, a model reading every
   passage, named graphs, Ask, the picture, the graph in the Council's answers; which
   earlier decisions it supersedes): `docs/handoff/kg_morphik_2026-10-21.md`.
+- Skipping files that stall the app (Ledger, Connections, Vault; the skip list,
+  the time limit, "Retry skipped files"): `docs/handoff/skipped_files_2026-10-22.md`.
+  A new bulk reader goes through `council_core.file_guard.read`.

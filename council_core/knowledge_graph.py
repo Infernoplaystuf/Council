@@ -83,6 +83,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from council_core import file_guard
+
 SCHEMA_VERSION = 4
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
@@ -688,6 +690,9 @@ def _categorize_unreadable_reason(text: str) -> str:
         return "corrupt / wrong format"
     if "needs the openpyxl" in t or "needs openpyxl" in t:
         return "needs openpyxl"
+    # council_core.file_guard: too slow, or stalled the app before
+    if "took longer than" in t or "stopped while reading it" in t:
+        return "too slow / stalled"
     if "password-protected" in t or "has a password" in t:
         return "password-protected"
     if "rights-protected" in t or "sensitivity label" in t:
@@ -1858,7 +1863,16 @@ def _infer_wikilink_type(surface: str, known_people: Collection[str] = (),
 def document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
     """Every text line of a document as ``(page or None, line, text)`` —
     for the gazetteer pass. A workbook's free text (notes cells, text
-    boxes, pictures) is ``(sheet name, row, text)``; a CSV has none."""
+    boxes, pictures) is ``(sheet name, row, text)``; a CSV has none.
+    Nothing for a file too slow to read, or that stalled the app before
+    (council_core.file_guard): the rebuild says so where it reads it."""
+    try:
+        return file_guard.read(p, lambda: _document_lines(p), tab="Connections")
+    except file_guard.Skipped:
+        return []
+
+
+def _document_lines(p: Path) -> List[Tuple[Optional[int], int, str]]:
     import field_search as fs
     suf = p.suffix.lower()
     out: List[Tuple[Optional[int], int, str]] = []
@@ -2374,7 +2388,11 @@ class KnowledgeGraph:
             if "labels" in got:
                 return list(got["labels"])
         from council_core import kg_excel
-        return list(kg_excel.read_workbook(p, rel, []).labels)
+        try:            # too slow, or stalled the app: none (council_core.file_guard)
+            return list(file_guard.read(p, lambda: kg_excel.read_workbook(p, rel, []),
+                                        tab="Connections").labels)
+        except file_guard.Skipped:
+            return []
 
     # ── documents ──
     def document_files(self) -> List[Path]:
@@ -2983,7 +3001,12 @@ class KnowledgeGraph:
                         else:
                             prog.update(f"reading {rel}")
                         try:
-                            recs = read_records(p, rel, rules)
+                            # too slow, or stalled the app before: skipped,
+                            # the rebuild goes on (council_core.file_guard);
+                            # never cached, so Retry reads it again
+                            recs = file_guard.read(
+                                p, lambda p=p, rel=rel: read_records(p, rel, rules),
+                                tab="Connections")
                         except kg_excel.Unreadable as exc:
                             if exc.permanent:
                                 self.db.execute(
@@ -3021,7 +3044,8 @@ class KnowledgeGraph:
                     # were deleted (review, 2026-10-07: locked once, its links
                     # were gone for good). A workbook says why in words.
                     stats["unreadable"].append(
-                        f"{rel}: {exc}" if isinstance(exc, kg_excel.Unreadable)
+                        f"{rel}: {exc}" if isinstance(exc, (kg_excel.Unreadable,
+                                                            file_guard.Skipped))
                         else f"{rel}: {exc.__class__.__name__}")
                     said = "not read"
                     seen_paths.add(rel)
@@ -3057,13 +3081,16 @@ class KnowledgeGraph:
                         try:
                             token = _IMAGE_READER.set(reader)
                             try:
-                                fallback[did] = [r for r in read_records(p, self._rel(p), rules)
-                                                 if r.kind != "reading"]
+                                fallback[did] = [r for r in file_guard.read(
+                                    p, lambda p=p: read_records(p, self._rel(p), rules),
+                                    tab="Connections") if r.kind != "reading"]
                             finally:
                                 _IMAGE_READER.reset(token)
                         except Exception as exc:
                             stats["unreadable"].append(
-                                f"{self._rel(p)}: {exc.__class__.__name__}")
+                                f"{self._rel(p)}: {exc}"
+                                if isinstance(exc, file_guard.Skipped)
+                                else f"{self._rel(p)}: {exc.__class__.__name__}")
                             continue
                     usable.append((p, did, h))
                     reading = _reading_load(head["head"] if head is not None else None)

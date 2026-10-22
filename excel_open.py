@@ -878,6 +878,11 @@ _CANCELS = 0
 #: and why Excel could not be started in it, or refuses every call
 #: (``down``: _excel_down's arguments; None while it can).
 _SCOPE = threading.local()
+try:        # a guarded read runs on a thread of its own (council_core.file_guard)
+    from council_core import file_guard as _file_guard
+    _file_guard.carry(_SCOPE)
+except Exception:                                           # noqa: BLE001
+    pass
 
 #: Hidden Excels this process is starting now (DispatchEx waiting) and has
 #: ever started: an EXCEL.EXE a failed DispatchEx left behind is ended only
