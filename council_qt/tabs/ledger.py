@@ -484,6 +484,13 @@ class LedgerTab(ViewHelpers, QWidget):
         self.review = self._path_row(grid3, 0, "Review workbook:", self.browse_review)
         row = QHBoxLayout()
         self.extract_btn = self._step_button(row, "Extract → review workbook", self.on_extract)
+        # each value beside the template and source cells it links, highlighted
+        # (ledger_review_dialog): the review workbook, easier to read
+        self.review_btn = self._step_button(row, "Review by clicking…", self.on_review_window)
+        self.review_btn.setToolTip(
+            "Check the review one item at a time: the template cell the value goes in "
+            "and the source cell it was read from, both highlighted. Right / Wrong / a "
+            "corrected value are saved into the review workbook; then Apply.")
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
         # files skipped as too slow, or that stalled the app before
         # (council_core.file_guard): read again on the next run
@@ -669,6 +676,8 @@ class LedgerTab(ViewHelpers, QWidget):
             self.link_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
         self.open_btn.setEnabled(has_review)
+        if hasattr(self, "review_btn"):
+            self.review_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
         if hasattr(self, "rebuild_kg_btn"):
             # Always clickable while idle; dirtiness only affects weight.
@@ -1273,6 +1282,30 @@ class LedgerTab(ViewHelpers, QWidget):
         p, _ = QFileDialog.getOpenFileName(self, "Pick the file that stalls the Ledger",
                                            start, XLSX)
         return p
+
+    def on_review_window(self) -> None:
+        """The click-through review (ledger_review_dialog), over the review
+        workbook above. Not modal; read on a worker (a big review takes a
+        moment)."""
+        path = self.review.text().strip()
+        if not path or not Path(path).is_file():
+            self.status.setText("No review workbook yet: run Extract first.")
+            return
+        from council_core import ledger_review
+
+        def done(review) -> None:
+            from .ledger_review_dialog import ReviewDialog
+            needs = sum(i.needs for i in review.items)
+            dlg = ReviewDialog(review, parent=self, log=self._say, opener=self.actions.open,
+                               on_saved=lambda n: self.status.setText(
+                                   f"{n} answer(s) saved into the review. Apply puts the "
+                                   "accepted values into the parent CSV."))
+            self.review_dialog = dlg
+            self._say(f"── Review by clicking ({Path(path).name}): {len(review.items)} "
+                      f"item(s), {needs} need a decision")
+            self.status.setText("Reviewing: answers are saved into the review workbook.")
+            dlg.show()
+        self._run("Reading the review", lambda _p: ledger_review.load(path), done)
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()

@@ -280,3 +280,24 @@ def test_diagnose_a_file_runs_it_apart_and_opens_the_report(qapp, books, monkeyp
     assert "Diagnosis of laser_log.xlsx: finished normally" in log
     assert opened and Path(opened[-1]).name == "report.txt"
     assert "whole Extract into" in Path(opened[-1]).read_text(encoding="utf-8")
+
+
+def test_review_by_clicking_opens_over_the_review(qapp, books):
+    """After Extract, "Review by clicking…" reads the review workbook and
+    opens the click-through window over it (ledger_review_dialog)."""
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    assert not tab.review_btn.isEnabled()
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.on_extract()
+    assert tab.wait(120)
+    assert tab.review_btn.isEnabled()
+    tab.on_review_window()
+    assert tab.wait(60)
+    dlg = tab.review_dialog
+    assert dlg.review.path == tab.review.text()
+    assert "need a decision" in tab.log.toPlainText()
+    dlg.close()
