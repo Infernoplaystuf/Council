@@ -62,3 +62,6 @@ same list.
   template and source cells, answers saved into the review workbook):
   `docs/handoff/ledger_review_2026-10-22.md`. "Diagnose a file…" is in
   `docs/handoff/skipped_files_2026-10-22.md`.
+- The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
+  each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
+  `docs/handoff/typhon_recreate_2026-10-22.md`.
