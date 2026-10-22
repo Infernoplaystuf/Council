@@ -1406,7 +1406,7 @@ class _Merged(str):
 
 
 # ── observations ────────────────────────────────────────────────────────
-@dataclass
+@dataclass(slots=True)        # one per value found: a run holds 100,000s
 class Obs:
     part: str
     item: str
@@ -1425,6 +1425,136 @@ class Obs:
     @property
     def key(self) -> Tuple[str, str, str, str]:
         return (self.part, self.item, self.field, self.where)
+
+
+#: unmatched values kept in memory before the rest go to a temporary file
+SPOOL_KEEP = 5000
+_OBS_FIELDS = None
+
+
+class ObsSpool:
+    """An Extraction's unmatched values - one per label cell no rule placed,
+    in every workbook read: thousands a messy workbook, 100,000s a batch.
+    Kept in a list they were the run's memory build-up (user, 2026-10-22:
+    "for files that have already been processed lets no longer keep them in
+    memory to free up RAM"), so past SPOOL_KEEP they go to a temporary file
+    of JSON lines (deleted when closed, never pickle) and are read back, in
+    order, when the run is over: 'Labels to map', learning by example.
+
+    Acts as the list it replaces for what the Ledger does with it: append,
+    extend, len, iterate, ``del spool[n:]`` (a Cancel rolls a workbook
+    back). A value read back is a copy: change it, then put it in a new
+    spool (``learn_labels``, ``suggest_with_llm``)."""
+
+    def __init__(self, items=()):
+        from array import array
+        self._mem: List["Obs"] = []
+        self._file = None
+        self._offsets = array("q")          # where each value on disk starts
+        self.extend(items)
+
+    # the list it replaces
+    def append(self, o: "Obs") -> None:
+        self._mem.append(o)
+        if len(self._mem) >= SPOOL_KEEP:
+            self._spill()
+
+    def extend(self, items) -> None:
+        for o in items:
+            self.append(o)
+
+    def __len__(self) -> int:
+        return len(self._offsets) + len(self._mem)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __iter__(self):
+        if self._file is not None and self._offsets:
+            self._file.flush()
+            end = self._file.seek(0, 2)
+            self._file.seek(0)
+            pos = 0
+            while pos < end:
+                line = self._file.readline()
+                pos += len(line)
+                yield self._decode(line)
+            self._file.seek(0, 2)
+        yield from list(self._mem)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return list(self)[i]
+        n = len(self)
+        i = i + n if i < 0 else i
+        if not 0 <= i < n:
+            raise IndexError(i)
+        if i >= len(self._offsets):
+            return self._mem[i - len(self._offsets)]
+        return next(o for k, o in enumerate(self) if k == i)
+
+    def __delitem__(self, i) -> None:
+        if not isinstance(i, slice) or i.stop is not None or i.step not in (None, 1):
+            raise TypeError("an ObsSpool drops only its end: del spool[n:]")
+        start = i.start or 0
+        start = max(0, start + len(self) if start < 0 else start)
+        on_disk = len(self._offsets)
+        if start >= on_disk:
+            del self._mem[start - on_disk:]
+            return
+        self._mem.clear()
+        self._file.truncate(self._offsets[start])
+        self._file.seek(0, 2)
+        del self._offsets[start:]
+
+    def __eq__(self, other) -> bool:
+        return list(self) == list(other)
+
+    def __add__(self, other) -> List["Obs"]:
+        return list(self) + list(other)
+
+    def __radd__(self, other) -> List["Obs"]:
+        return list(other) + list(self)
+
+    def __repr__(self) -> str:
+        return f"ObsSpool({len(self)} values, {len(self._offsets)} on disk)"
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    # the file
+    def _spill(self) -> None:
+        import json
+        import tempfile
+        if self._file is None:
+            self._file = tempfile.TemporaryFile("w+b")
+        f = self._file
+        f.seek(0, 2)
+        for o in self._mem:
+            self._offsets.append(f.tell())
+            f.write(json.dumps(self._encode(o), ensure_ascii=False).encode("utf-8") + b"\n")
+        self._mem.clear()
+
+    @staticmethod
+    def _names() -> List[str]:
+        global _OBS_FIELDS
+        if _OBS_FIELDS is None:
+            from dataclasses import fields
+            _OBS_FIELDS = [f.name for f in fields(Obs)]
+        return _OBS_FIELDS
+
+    @classmethod
+    def _encode(cls, o: "Obs") -> list:
+        return [getattr(o, n) for n in cls._names()]
+
+    @classmethod
+    def _decode(cls, line: bytes) -> "Obs":
+        import json
+        o = Obs(*json.loads(line.decode("utf-8")))
+        o.guesses = [tuple(g) for g in o.guesses]
+        return o
 
 
 class _Extractor:
@@ -3058,7 +3188,8 @@ class ImageNote:
 class Extraction:
     sources: List[str]
     obs: List[Obs] = field(default_factory=list)
-    unmatched: List[Obs] = field(default_factory=list)
+    #: past SPOOL_KEEP, on disk (ObsSpool): the run's memory build-up
+    unmatched: "ObsSpool" = field(default_factory=lambda: ObsSpool())
     images: List[ImageNote] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
     #: One entry per workbook that Excel could not open: ``(name, kind)``
@@ -3903,20 +4034,28 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
 
     lab = wb.create_sheet("Labels to map", 2)
     lab.append(LAB_HEAD)
-    grouped: Dict[Tuple[str, str], List[Obs]] = defaultdict(list)
+    # one row per label and sheet: its first value, how many, the first
+    # note - kept as the values stream past, not every value (ObsSpool)
+    grouped: Dict[Tuple[str, str], List[Any]] = {}
     keys: Dict[str, str] = {}          # one label per column of rows: read once
     for o in run.unmatched:
         k = keys.get(o.label)
         if k is None:
             k = keys[o.label] = normalize_label(o.label)
-        grouped[(k, o.where.split("!")[0])].append(o)
-    for n_lab, ((_, _), obs) in enumerate(sorted(grouped.items()), start=2):
-        o = obs[0]
+        g = grouped.get((k, o.where.split("!")[0]))
+        if g is None:
+            grouped[(k, o.where.split("!")[0])] = [o, 1, o.note]
+        else:
+            g[1] += 1
+            if not g[2] and o.note:
+                g[2] = o.note
+    for n_lab, ((_, _), (o, count, first_note)) in enumerate(sorted(grouped.items()),
+                                                             start=2):
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
         # the note says why Council's model's field was not used (review,
         # 2026-10-20: a per-flaw field for values with no flaw)
-        put(lab, ["", "", o.label, o.value, len(obs), guess, o.where, o.part, o.item,
-                  next((x.note for x in obs if x.note), "")])
+        put(lab, ["", "", o.label, o.value, count, guess, o.where, o.part, o.item,
+                  first_note or ""])
         if o.part_how.startswith(MODEL_PART_HOW):
             lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
@@ -4718,7 +4857,7 @@ def _council_chat(prompt: str, *, timeout: float
     try:
         # the model's own limits, as every Ledger call (council_core.ledger_llm)
         from council_core import ledger_llm
-        with ce.model_window(ledger_llm.ledger_window()):
+        with ce.model_window(ledger_llm.ledger_window(0, prompt)):
             text = ce.local_chat(
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
@@ -4876,10 +5015,14 @@ def suggest_with_llm(run: Extraction, schema: TemplateSchema,
     except LedgerError as exc:
         run.problems.append(f"local model suggestion skipped: {exc}")
         return
+    kept = ObsSpool()                       # a value read back is a copy
     for o in run.unmatched:
         s = sugg.get(o.label)
         if s is not None:
             o.guesses = [(f"{s} [model]", 0.0)] + o.guesses
+        kept.append(o)
+    run.unmatched.close()
+    run.unmatched = kept
 
 
 # ── command line ────────────────────────────────────────────────────────

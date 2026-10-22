@@ -289,20 +289,44 @@ when a field has two different values. One that only lacks fields the other has,
 and agrees on the rest, is left out as a duplicate. One with extra fields is kept,
 noted "also in …".
 
-## The Ledger's model uses its own limits
+## The Ledger's model uses its own limits — the window each call needs
 
 Every Ledger model call (labels, part numbers, header layouts, label-mapping
-suggestions) uses the model's own maximum instead of the council's chat defaults:
+suggestions) may use up to the model's own maximum instead of the council's chat
+defaults, but each call is given only the window it needs (changed 2026-10-22):
 
-- **Ollama:** sent the model's own context length, via
-  `council_engine.model_window()`, a per-call override of the slot window.
-- **A GGUF the user picks:** loaded with as much of its trained length as fits the
-  card (`_load_gguf(n_ctx_max=…)` replaces the 32K cap; the VRAM ladder still
-  applies). Council's main model keeps the window it was loaded with.
+- **Why not the whole window:** sending an Ollama model its whole context length
+  (128K for granite3.3, llama3.1, gpt-oss) on every call made Ollama reserve memory
+  for all of it, about 16 GB of KV cache for an 8B model. That does not fit a GPU, so
+  layers moved to the CPU and system RAM. The user saw high RAM and low CPU and GPU
+  use in the Ledger. Every switch between the council's 8K window and the Ledger's
+  also reloaded the model.
+- **Ollama:** a call gets the smallest of 8K / 16K / 32K / 64K / 128K / 256K
+  (`ledger_llm.WINDOW_STEPS`) that holds its prompt and 4,096 tokens for the answer,
+  never more than the model's own. It goes through `council_engine.model_window()`,
+  a per-call override of the slot window.
+- **A GGUF the user picks:** loaded once with up to 32K (`GGUF_WINDOW`; the VRAM
+  ladder still sizes it to the card). Council's main model keeps the window it was
+  loaded with.
 - **The reply:** may use all the prompt leaves of the window
   (`ledger_llm.reply_budget`), never less than 1,024 tokens. The stall limit is 300 s.
-- **Overrides** for a machine that needs less: `COUNCIL_LEDGER_NUM_CTX` caps the
-  window, `COUNCIL_LEDGER_NUM_PREDICT` fixes the reply length.
+- **Overrides:** `COUNCIL_LEDGER_NUM_CTX` sets the window outright, still never past
+  the model's own (also a GGUF's load window). `COUNCIL_LEDGER_NUM_PREDICT` fixes the
+  reply length.
+
+## Memory over a long Extract (2026-10-22)
+
+- **Unmatched values on disk:** a run keeps one record per label cell no rule
+  placed, thousands per messy workbook. Past 5,000 they go to a temporary file of
+  JSON lines (`source_extract.ObsSpool`, deleted when closed) and are read back once
+  the run is over. "Labels to map" keeps one example per label and sheet as they
+  stream past, not every value.
+- **Smaller records:** `Obs` is a slots dataclass.
+- **GPU choice:** a GGUF goes on one GPU, the discrete card, instead of llama.cpp's
+  default split over every GPU. An Intel iGPU beside an NVIDIA card (a Vulkan build
+  sees both) took layers into system RAM. See `council_engine._one_gpu`;
+  `COUNCIL_GGUF_MAIN_GPU` (a number, or `all`) overrides it.
+- **Files that eat memory:** see `docs/handoff/skipped_files_2026-10-22.md`.
 
 ## Measured (this container, synthetic data)
 

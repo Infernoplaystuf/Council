@@ -41,6 +41,18 @@ For each file:
      small files would otherwise cost two writes each. So an instant crash in
      a Vault read is not caught.
 
+4. **Too big → not opened, or left behind** (added the same day, "Add a memory cap
+   for files that eat RAM"):
+   - **Before opening:** an Office file is a zip whose own directory says what it
+     unpacks to. Past `COUNCIL_FILE_UNPACKED_LIMIT_MB` (default 1,024; 0 = off) it
+     is not opened at all.
+   - **While reading:** the app's memory is watched (working set on Windows,
+     resident on Linux). A read that adds more than `COUNCIL_FILE_MEMORY_LIMIT_MB`
+     (default 4,096; 0 = off) is left behind like a slow one.
+   - **Caveats:** the memory is the whole process's, so another tab's work at the
+     same time counts too; the limit is generous for that. And a read left behind
+     keeps its memory until it ends, because a thread cannot be stopped.
+
 A Cancel (the Ledger's) stops the wait without blaming the file.
 
 The reading thread sees the asking thread's state:
@@ -82,8 +94,8 @@ The reading thread sees the asking thread's state:
 
 ## Not done
 
-- **A file that eats memory** (a zip bomb) is not capped, only timed. A reader
-  in a child process with a memory cap (`council_core/child_proc.py` already
-  has the Windows Job Object) would cover that, at the price of passing each
+- **A read that eats memory is only left behind, not stopped.** A reader in a
+  child process with a hard memory cap (`council_core/child_proc.py` already has
+  the Windows Job Object) would free it at once, at the price of passing each
   file's result back as JSON.
 - **A file-size gate** before reading.

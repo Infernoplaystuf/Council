@@ -283,7 +283,7 @@ def learn_labels(run, schema, examples: Examples) -> Dict[str, Learned]:
             learned[lab] = Learned(got[0], got[1], compared[lab], where[lab])
     if not learned:
         return learned
-    keep = []
+    keep = se.ObsSpool()                    # what stays, on disk past its limit
     for o in run.unmatched:
         hit = learned.get(_norm(o.label))
         if hit is None or se.needs_item(schema, hit.field, o.item):
@@ -291,6 +291,8 @@ def learn_labels(run, schema, examples: Examples) -> Dict[str, Learned]:
             continue
         run.obs.append(replace(o, field=hit.field, score=EXAMPLE_SCORE, via="example",
                                note=se._join(o.note, hit.note(o.label))))
+    if hasattr(run.unmatched, "close"):
+        run.unmatched.close()
     run.unmatched = keep
     return learned
 

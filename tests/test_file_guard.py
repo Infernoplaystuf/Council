@@ -165,3 +165,36 @@ def test_the_ledger_s_thread_locals_are_carried():
     import pptx_open
     assert any(x is pptx_open._LOCAL for x in fg._CARRIED)
     assert any(x is excel_open._SCOPE for x in fg._CARRIED)
+
+
+def test_an_office_file_that_unpacks_too_big_is_not_opened(tmp_path, monkeypatch, guard):
+    import zipfile
+    bomb = tmp_path / "huge.xlsx"
+    with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("xl/worksheets/sheet1.xml", b"0" * 3_000_000)   # 3 MB, packs tiny
+    assert bomb.stat().st_size < 50_000 and fg.unpacked_mb(bomb) == pytest.approx(3.0)
+    monkeypatch.setenv("COUNCIL_FILE_UNPACKED_LIMIT_MB", "2")
+    opened = []
+    with pytest.raises(fg.Skipped, match="unpacks to 3 MB, more than 2 MB"):
+        fg.read(bomb, lambda: opened.append(1), tab="Ledger")
+    assert opened == [] and fg.skipped(bomb) is not None
+    assert fg.unpacked_mb(guard) is None                      # not a zip: not asked
+
+
+def test_a_read_that_eats_memory_is_left_behind(guard, monkeypatch):
+    if fg.process_memory_mb() is None:
+        pytest.skip("this system's memory cannot be read")
+    monkeypatch.setenv("COUNCIL_FILE_MEMORY_LIMIT_MB", "50")
+    release = threading.Event()
+    held = []
+
+    def hog():
+        held.append(bytearray(200_000_000))                   # 200 MB, touched
+        for i in range(0, len(held[0]), 4096):
+            held[0][i] = 1
+        release.wait(30)
+    with pytest.raises(fg.Skipped, match="more than 50 MB of memory"):
+        fg.read(guard, hog, tab="Connections")
+    assert "memory" in fg.entries()[0].reason
+    release.set()
+    held.clear()

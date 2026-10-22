@@ -1,6 +1,9 @@
 """The Ledger's model uses the model's own limits, not the council's chat
 defaults (user, 2026-10-21: "the model inside of ledger should be able to use
-its max tokens and not the default set by the rest of the council")."""
+its max tokens and not the default set by the rest of the council") - but
+each call only the window it needs: the whole 128K one, sent every call, put
+the model in system RAM (user, 2026-10-22: "High RAM usage and lower CPU and
+GPU usage in the ledger")."""
 from __future__ import annotations
 
 
@@ -31,15 +34,23 @@ def test_the_reply_gets_what_the_prompt_leaves(monkeypatch):
     assert ledger_llm.reply_budget(prompt, 131072) == 4096
 
 
-def test_the_window_can_be_capped_for_a_small_card(monkeypatch):
+def test_a_call_gets_the_window_it_needs_not_the_whole_one(monkeypatch):
     monkeypatch.delenv("COUNCIL_LEDGER_NUM_CTX", raising=False)
-    assert ledger_llm.ledger_window(131072) == 131072
+    assert ledger_llm.ledger_window(131072, "a short prompt") == 8192
+    assert ledger_llm.ledger_window(0, "a short prompt") == 8192
+    assert ledger_llm.ledger_window(131072, "x" * 60000) == 32768     # ~20K tokens
+    assert ledger_llm.ledger_window(131072, "x" * 600000) == 131072   # never past its own
+    assert ledger_llm.ledger_window(4096, "a short prompt") == 4096
+
+
+def test_the_window_can_be_set_outright(monkeypatch):
     monkeypatch.setenv("COUNCIL_LEDGER_NUM_CTX", "16384")
-    assert ledger_llm.ledger_window(131072) == 16384
+    assert ledger_llm.ledger_window(131072, "a short prompt") == 16384
     assert ledger_llm.ledger_window(8192) == 8192
+    assert ledger_llm.gguf_window(131072) == 16384
 
 
-def test_an_ollama_model_is_asked_with_its_whole_window(monkeypatch):
+def test_an_ollama_model_is_asked_with_the_window_the_call_needs(monkeypatch):
     monkeypatch.delenv("COUNCIL_LEDGER_NUM_CTX", raising=False)
     monkeypatch.delenv("COUNCIL_LEDGER_NUM_PREDICT", raising=False)
     seen = {}
@@ -54,10 +65,12 @@ def test_an_ollama_model_is_asked_with_its_whole_window(monkeypatch):
     monkeypatch.setattr(local_models, "maker_and_origin", lambda name: ("IBM", "US"))
     chat = ledger_llm.chat_for("ollama:granite3.3:8b")
     chat("a short prompt", {"type": "object"})
-    # the whole window (0), the reply filling it (0): the engine sizes both
-    # from the model it serves, no extra question to Ollama
-    assert seen["window"] == 0 and seen["sent_ctx"] == 131072
+    # 8K, not the model's whole 128K: the model stays on the GPU; the reply
+    # fills what the prompt leaves (0: the engine sizes it)
+    assert seen["window"] == 8192 and seen["sent_ctx"] == 8192
     assert seen["num_predict"] == 0
+    chat("x" * 60000, {"type": "object"})                  # a long document: more
+    assert seen["sent_ctx"] == 32768
     monkeypatch.setenv("COUNCIL_LEDGER_NUM_CTX", "16384")
     monkeypatch.setenv("COUNCIL_LEDGER_NUM_PREDICT", "4096")
     chat("a short prompt", {"type": "object"})
@@ -78,7 +91,8 @@ def test_a_fill_reply_has_all_the_window_the_prompt_leaves():
     assert reply == ce.FILL_FLOOR and "trimmed" in out[0]["content"]
 
 
-def test_a_gguf_is_loaded_with_its_trained_length(monkeypatch, tmp_path):
+def test_a_gguf_is_loaded_with_the_council_s_cap_not_its_trained_length(monkeypatch,
+                                                                          tmp_path):
     monkeypatch.delenv("COUNCIL_LEDGER_NUM_CTX", raising=False)
     got = {}
 
@@ -102,6 +116,8 @@ def test_a_gguf_is_loaded_with_its_trained_length(monkeypatch, tmp_path):
     model.write_bytes(b"GGUF")
     chat = ledger_llm.chat_for(str(model))
     chat("a short prompt", {"type": "object"})
-    assert got["n_ctx_max"] == 131072                       # not the council's 32K cap
-    assert got["max_tokens"] > 60000                        # all the window leaves
+    # a 128K window's KV cache does not fit a card: 32K at most (the loader
+    # sizes it to the card too); the reply still gets all the window leaves
+    assert got["n_ctx_max"] == ledger_llm.GGUF_WINDOW == 32768
+    assert got["max_tokens"] > 60000
     ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
