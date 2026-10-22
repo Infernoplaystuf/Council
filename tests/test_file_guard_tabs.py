@@ -52,7 +52,7 @@ def test_the_ledger_skips_a_stuck_workbook_and_reads_the_rest(guard, tmp_path, m
     ex = li.run_extract(csv, [src], use_images=False)
     assert time.monotonic() - t0 < 30
     text = ex.describe()
-    assert "1 too slow / stalled the app" in text
+    assert "1 too slow, too big or stalled the app" in text
     assert any("stuck.xlsx: skipped: took longer than 0.5 s" in p for p in ex.problems)
     assert [Path(e.path).name for e in fg.entries()] == ["stuck.xlsx"]
     # the next Extract does not wait for it at all
@@ -92,7 +92,7 @@ def test_the_connections_graph_skips_it_and_what_the_ledger_skipped(guard, tmp_p
     assert "stuck.txt: skipped: took longer than 0.5 s" in bad
     assert "ledger_hit.txt: skipped: took longer than 180 s" in bad
     assert "good.txt" not in bad
-    assert kgm.unreadable_breakdown(stats["unreadable"]) == {"too slow / stalled": 2}
+    assert kgm.unreadable_breakdown(stats["unreadable"]) == {"too slow / too big / stalled": 2}
 
 
 def test_the_vault_indexes_skip_it(guard, tmp_path, monkeypatch):

@@ -1,8 +1,9 @@
 """
 council_qt.widgets.skipped_files — "Retry skipped files (N)".
 
-The files council_core.file_guard skips - too slow to read, or they stalled
-or crashed the app before - are skipped by every tab until they change. This
+The files council_core.file_guard skips - too slow or too big to read, or
+they stalled or crashed the app before - are skipped by every tab until they
+change. This
 button, beside the Ledger's Extract and the Connections graph's Rebuild,
 says how many there are (which, in its tooltip) and takes them off the list:
 the next run reads them again.
@@ -45,13 +46,14 @@ class RetrySkippedButton(QPushButton):
             if n > SHOWN:
                 lines.append(f"…and {n - SHOWN} more")
             self.setToolTip(
-                "These files were skipped because reading them took too long, or they "
-                "stalled or crashed the Council before. Every tab skips them until they "
+                "These files were skipped because reading them took too long or too "
+                "much memory, or they stalled or crashed the Council before. Every tab skips them until they "
                 "change. Click to read them again on the next run:\n" + "\n".join(lines))
         else:
             self.setToolTip("No file is skipped. A file that takes longer than "
-                            f"{file_guard.time_limit():g} s to read, or stalls the "
-                            "Council, is skipped from then on and listed here.")
+                            f"{file_guard.time_limit():g} s or more than "
+                            f"{file_guard.memory_limit_mb():,} MB of memory to read, or "
+                            "stalls the Council, is skipped from then on and listed here.")
         return n
 
     def retry(self) -> None:

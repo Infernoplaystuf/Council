@@ -269,7 +269,7 @@ _OPEN_FAILURE_LABELS = {
     "unavailable": "Excel COM not available",
     # council_core.file_guard (user 2026-10-22): took too long or stalled
     # the app before - skipped until it changes
-    "slow": "too slow / stalled the app (skipped until it changes)",
+    "slow": "too slow, too big or stalled the app (skipped until it changes)",
     "unknown": "unknown reason",
     "other": "other error",
 }

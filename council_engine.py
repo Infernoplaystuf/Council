@@ -1035,6 +1035,104 @@ def _load_tuning(n_gpu_layers: int, n_threads_batch: int) -> Dict[str, Any]:
     return out
 
 
+#: llama.cpp's LLAMA_SPLIT_MODE_NONE: the whole model on ``main_gpu``
+_SPLIT_MODE_NONE = 0
+#: a GPU named so is the card the hardware scan sized the models for
+_DISCRETE_GPU_HINTS = ("nvidia", "geforce", "rtx", "quadro", "tesla")
+#: a GPU named so shares the system's RAM
+_INTEGRATED_GPU_HINTS = ("intel", "uhd", "iris", "hd graphics",
+                         "radeon(tm) graphics", "radeon graphics")
+
+
+def _gguf_gpu_devices() -> List[Dict[str, Any]]:
+    """llama.cpp's GPU devices, in the order it gives the model them (its
+    ``main_gpu`` counts in this list): ``[{name, description, total}]``.
+    [] when they cannot be listed - an older llama-cpp-python, no GPU
+    backend - or an RPC server is among them (it goes first and would shift
+    the count)."""
+    try:
+        import ctypes
+        from llama_cpp import _ggml                       # type: ignore
+        lib = _ggml.libggml
+        vp, sz = ctypes.c_void_p, ctypes.c_size_t
+        lib.ggml_backend_dev_count.restype = sz
+        lib.ggml_backend_dev_get.argtypes, lib.ggml_backend_dev_get.restype = [sz], vp
+        lib.ggml_backend_dev_type.argtypes, lib.ggml_backend_dev_type.restype = [vp], ctypes.c_int
+        for fn in (lib.ggml_backend_dev_name, lib.ggml_backend_dev_description):
+            fn.argtypes, fn.restype = [vp], ctypes.c_char_p
+        lib.ggml_backend_dev_memory.argtypes = [vp, ctypes.POINTER(sz), ctypes.POINTER(sz)]
+        lib.ggml_backend_dev_backend_reg.argtypes = [vp]
+        lib.ggml_backend_dev_backend_reg.restype = vp
+        lib.ggml_backend_reg_name.argtypes, lib.ggml_backend_reg_name.restype = [vp], ctypes.c_char_p
+        out: List[Dict[str, Any]] = []
+        for i in range(int(lib.ggml_backend_dev_count())):
+            dev = lib.ggml_backend_dev_get(i)
+            # 1 = GPU in every ggml (CPU 0; later builds list an integrated
+            # GPU as a type of its own, used only when there is no other)
+            if lib.ggml_backend_dev_type(dev) != 1:
+                continue
+            reg = lib.ggml_backend_reg_name(lib.ggml_backend_dev_backend_reg(dev)) or b""
+            if reg.decode("utf-8", "replace").upper() == "RPC":
+                return []
+            free, total = sz(0), sz(0)
+            lib.ggml_backend_dev_memory(dev, ctypes.byref(free), ctypes.byref(total))
+            out.append({"name": (lib.ggml_backend_dev_name(dev) or b"").decode("utf-8", "replace"),
+                        "description": (lib.ggml_backend_dev_description(dev) or b"")
+                        .decode("utf-8", "replace"),
+                        "total": int(total.value)})
+        return out
+    except Exception:                                     # noqa: BLE001
+        return []
+
+
+def _pick_gguf_gpu(devices: List[Dict[str, Any]]) -> Optional[int]:
+    """Which of llama.cpp's GPUs the whole model goes on, when it has a
+    choice: the NVIDIA card (the one the hardware scan sized the models
+    for), else the largest that is not an integrated GPU; None to leave
+    llama.cpp alone (one GPU, or no telling them apart)."""
+    if len(devices) < 2:
+        return None
+
+    def named(d, hints):
+        text = f"{d.get('name', '')} {d.get('description', '')}".lower()
+        return any(h in text for h in hints)
+    best = [i for i, d in enumerate(devices) if named(d, _DISCRETE_GPU_HINTS)]
+    if not best:
+        best = [i for i, d in enumerate(devices) if not named(d, _INTEGRATED_GPU_HINTS)]
+        if not best or len(best) == len(devices):
+            return None
+    return max(best, key=lambda i: int(devices[i].get("total") or 0))
+
+
+def _one_gpu(n_gpu_layers: int) -> Dict[str, Any]:
+    """The Llama() kwargs that put the model on ONE GPU - the discrete
+    card - instead of llama.cpp's default of splitting its layers over
+    every GPU it finds. On a laptop with an Intel GPU beside the NVIDIA
+    one (a Vulkan build sees both) the Intel GPU, whose 'free memory' is
+    the system's RAM, took a large share of the layers: the model ran in
+    RAM, the NVIDIA card the models were sized for sat idle (user,
+    2026-10-22). COUNCIL_GGUF_MAIN_GPU: a device number to use instead, or
+    'all' for llama.cpp's own split."""
+    if n_gpu_layers == 0:
+        return {}
+    raw = os.environ.get("COUNCIL_GGUF_MAIN_GPU", "").strip().lower()
+    if raw in ("all", "split"):
+        return {}
+    if raw.isdigit():
+        return {"split_mode": _SPLIT_MODE_NONE, "main_gpu": int(raw)}
+    devices = _gguf_gpu_devices()
+    pick = _pick_gguf_gpu(devices)
+    if pick is None:
+        return {}
+    others = ", ".join(d.get("description") or d.get("name") or "?"
+                       for i, d in enumerate(devices) if i != pick)
+    print(f"[GGUF] {len(devices)} GPUs: the model goes on "
+          f"{devices[pick].get('description') or devices[pick].get('name')} only "
+          f"(not {others}). COUNCIL_GGUF_MAIN_GPU=all splits it as llama.cpp would.",
+          flush=True)
+    return {"split_mode": _SPLIT_MODE_NONE, "main_gpu": pick}
+
+
 _GPU_DIAG: Optional[str] = None
 
 
@@ -1418,6 +1516,9 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             print(warning, flush=True)
 
     tuning = _load_tuning(n_gpu_layers, n_threads_batch)
+    # the discrete GPU only, not an integrated one beside it (retried
+    # without, like the rest of the tuning, if the build refuses it)
+    tuning.update(_one_gpu(n_gpu_layers))
     print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx:,}, n_threads={n_threads}, "
           f"n_threads_batch={n_threads_batch}, n_gpu_layers={n_gpu_layers}, "
           f"flash_attn={'on' if tuning.get('flash_attn') else 'off'})"

@@ -146,13 +146,28 @@ def mask_example(mask: str) -> str:
 # ── the model's own limits (user, 2026-10-21: "the model inside of ledger
 # should be able to use its max tokens and not the default set by the rest of
 # the council") ────────────────────────────────────────────────────────────
-#: The Ledger's model works with ALL its window: an Ollama model is sent its
-#: own context length (council_engine.model_window), a GGUF of the user's is
-#: loaded with as much of its trained length as fits the card, and every
-#: reply may use whatever the prompt leaves of the window (num_predict 0:
-#: council_engine sizes it on the model's own tokenizer, FILL). A machine
-#: that needs less sets COUNCIL_LEDGER_NUM_CTX (the window) or
-#: COUNCIL_LEDGER_NUM_PREDICT (the reply).
+#: The Ledger's model may use up to ALL its window, but each call is given the
+#: window it needs, not the whole one. Sending an Ollama model its whole
+#: context length on every call (128K for granite3.3, llama3.1, gpt-oss) made
+#: Ollama reserve memory for all of it - ~16 GB of KV cache for an 8B model -
+#: which does not fit a GPU: layers moved to the CPU and system RAM, and the
+#: Ledger ran with high RAM and low CPU and GPU use (user, 2026-10-22). And
+#: every switch between the council's 8K window and the Ledger's reloaded the
+#: model. Now a call gets the smallest of WINDOW_STEPS that holds its prompt
+#: and REPLY_ROOM for the answer - never more than the model's own - so a
+#: typical call stays on the GPU and a long document still gets a long window.
+#: A GGUF is loaded once: with GGUF_WINDOW at most (the council's own cap; its
+#: loader also sizes it to the card). Each reply may use whatever the prompt
+#: leaves of the window (num_predict 0: council_engine sizes it on the
+#: model's own tokenizer, FILL). COUNCIL_LEDGER_NUM_CTX sets the window
+#: outright (never past the model's own); COUNCIL_LEDGER_NUM_PREDICT the
+#: reply.
+#: windows a call may be given, smallest first
+WINDOW_STEPS = (8192, 16384, 32768, 65536, 131072, 262144)
+#: room kept for the answer when a window is chosen
+REPLY_ROOM = 4096
+#: the most a GGUF of the user's is loaded with (unless COUNCIL_LEDGER_NUM_CTX)
+GGUF_WINDOW = 32768
 #: tokens left free when the reply is sized (the chat template, rounding)
 REPLY_MARGIN = 256
 #: a reply never gets less than this, however long the prompt
@@ -168,14 +183,30 @@ def _env_int(name: str) -> int:
     return int(raw) if raw.isdigit() and int(raw) > 0 else 0
 
 
-def ledger_window(model_max: int = 0) -> int:
-    """The window the Ledger's model is given: COUNCIL_LEDGER_NUM_CTX when
-    set (never more than the model's own), else the model's own; 0 =
-    unknown (the model's whole context, told by Ollama itself)."""
+def _prompt_tokens(prompt: str) -> int:
+    """A prompt's tokens told from its length, generously."""
+    return len(prompt or "") // 3 + 64
+
+
+def ledger_window(model_max: int = 0, prompt: str = "") -> int:
+    """The window a call with ``prompt`` is given: the smallest of
+    WINDOW_STEPS holding it and REPLY_ROOM, never past ``model_max`` (the
+    model's own, 0 = not known: the engine keeps it under the model's own).
+    COUNCIL_LEDGER_NUM_CTX instead when set."""
     cap = _env_int("COUNCIL_LEDGER_NUM_CTX")
-    if cap and model_max:
-        return min(cap, model_max)
-    return cap or model_max
+    if cap:
+        return min(cap, model_max) if model_max else cap
+    need = _prompt_tokens(prompt) + REPLY_ROOM + REPLY_MARGIN
+    window = next((w for w in WINDOW_STEPS if w >= need), WINDOW_STEPS[-1])
+    return min(window, model_max) if model_max else window
+
+
+def gguf_window(trained: int = 0) -> int:
+    """The window a GGUF of the user's is loaded with (once, for every
+    call): COUNCIL_LEDGER_NUM_CTX when set, else GGUF_WINDOW; never past the
+    model's trained length."""
+    want = _env_int("COUNCIL_LEDGER_NUM_CTX") or GGUF_WINDOW
+    return min(want, trained) if trained else want
 
 
 def reply_budget(prompt: str, window: int) -> int:
@@ -185,7 +216,7 @@ def reply_budget(prompt: str, window: int) -> int:
     fixed = _env_int("COUNCIL_LEDGER_NUM_PREDICT")
     if fixed:
         return fixed
-    prompt_tokens = len(prompt) // 3 + 64
+    prompt_tokens = _prompt_tokens(prompt)
     return max(REPLY_FLOOR, int(window) - prompt_tokens - REPLY_MARGIN) if window \
         else REPLY_FLOOR * 8
 
@@ -216,7 +247,7 @@ def council_chat(timeout: float = LEDGER_TIMEOUT,
     def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
         try:
             import council_engine as ce
-            with ce.model_window(ledger_window()):
+            with ce.model_window(ledger_window(0, prompt)):
                 text = ce.local_chat([{"role": "user", "content": prompt}],
                                      temperature=0.0, num_predict=fill_reply(),
                                      json_schema=schema, timeout=int(max(5, timeout)),
@@ -244,7 +275,7 @@ def council_chat(timeout: float = LEDGER_TIMEOUT,
 def _ollama_options(prompt: str, model: str, host: Optional[str] = None) -> Dict[str, Any]:
     """A direct Ollama call's options: the model's whole window, the reply
     all the prompt leaves of it."""
-    window = ledger_window(_ollama_context(model, host))
+    window = ledger_window(_ollama_context(model, host), prompt)
     opts: Dict[str, Any] = {"temperature": 0, "num_predict": reply_budget(prompt, window)}
     if window:
         opts["num_ctx"] = window
@@ -319,22 +350,21 @@ def _gguf_llm(path: str):
         try:
             from pathlib import Path
             import council_engine as ce
-            # its VRAM-aware sizing, up to the model's own trained length
-            # (not the council's 32K cap) or COUNCIL_LEDGER_NUM_CTX
+            # its VRAM-aware sizing, up to gguf_window() (COUNCIL_LEDGER_NUM_CTX
+            # for more): a whole 128K window's KV cache does not fit a card
             try:
                 trained = ce._gguf_max_context_from_metadata(
                     ce.read_gguf_metadata(Path(path)))
             except Exception:                              # noqa: BLE001
                 trained = None
             llm = ce._load_gguf(Path(path), is_main=False,
-                                n_ctx_max=ledger_window(trained or 0) or None)
+                                n_ctx_max=gguf_window(trained or 0))
         except (ImportError, AttributeError, TypeError):
             try:
                 from llama_cpp import Llama
             except Exception as exc:                       # noqa: BLE001
                 raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
-            # n_ctx 0: the model's own trained length
-            llm = Llama(model_path=path, n_ctx=_env_int("COUNCIL_LEDGER_NUM_CTX"),
+            llm = Llama(model_path=path, n_ctx=gguf_window(),
                         n_gpu_layers=-1, verbose=False)
         except Exception as exc:                           # noqa: BLE001
             raise _cannot(se.LedgerError(_gguf_failed(path, exc))) from exc
@@ -426,7 +456,7 @@ def chat_for(model_id: str, timeout: float = LEDGER_TIMEOUT,
         def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
             try:
                 import council_engine as ce
-                with ce.model_window(ledger_window()):
+                with ce.model_window(ledger_window(0, prompt)):
                     text = ce.local_chat([{"role": "user", "content": prompt}],
                                          temperature=0.0, num_predict=fill_reply(),
                                          json_schema=schema, timeout=int(max(5, timeout)),
@@ -839,11 +869,15 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
             report.problems.append(f"Council's model was not asked about labels: {exc}")
         return
     report.labels_mapped = sum(1 for f in mapping.values() if f)
-    placed = set()
     held: Dict[Tuple[str, str], int] = {}
-    for o in list(run.unmatched):
+    # one pass, into a new list: past its limit the old one is on disk and
+    # gives copies (source_extract.ObsSpool) - a note added to one, or one
+    # left out by identity, did not stick
+    kept = se.ObsSpool()
+    for o in run.unmatched:
         fname = mapping.get((o.label or "").strip())
         if not fname:
+            kept.append(o)
             continue
         if se.needs_item(schema, fname, o.item):
             # A field kept per item (per flaw) for a value with no item: it
@@ -857,11 +891,11 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
             key = ((o.label or "").strip(), fname)
             held[key] = held.get(key, 0) + 1
             report.values_held += 1
+            kept.append(o)
             continue
         run.obs.append(replace(o, field=fname, score=MODEL_SCORE, via="model",
                                note=se._join(o.note, f"field suggested by {report.model}"
                                                      " — check it")))
-        placed.add(id(o))
         report.values_placed += 1
     if held:
         report.item_field = schema.item_field
@@ -873,8 +907,9 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
     # a placed value is no longer one to map: it also stayed on 'Labels to
     # map', with the rules' guesses contradicting the model's field, and was
     # counted as unmatched (review, 2026-10-19)
-    if placed:
-        run.unmatched[:] = [o for o in run.unmatched if id(o) not in placed]
+    if hasattr(run.unmatched, "close"):
+        run.unmatched.close()
+    run.unmatched = kept
 
 
 #: Not part numbers, however they are written: a measured value (61.35,

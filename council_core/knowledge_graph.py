@@ -691,8 +691,9 @@ def _categorize_unreadable_reason(text: str) -> str:
     if "needs the openpyxl" in t or "needs openpyxl" in t:
         return "needs openpyxl"
     # council_core.file_guard: too slow, or stalled the app before
-    if "took longer than" in t or "stopped while reading it" in t:
-        return "too slow / stalled"
+    if "took longer than" in t or "stopped while reading it" in t \
+            or "mb of memory to read" in t or "unpacks to" in t:
+        return "too slow / too big / stalled"
     if "password-protected" in t or "has a password" in t:
         return "password-protected"
     if "rights-protected" in t or "sensitivity label" in t:

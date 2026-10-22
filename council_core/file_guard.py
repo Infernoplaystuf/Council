@@ -53,6 +53,15 @@ from typing import Any, Callable, Dict, List, Optional
 #: Excel cannot open is said as that.
 DEFAULT_TIME_LIMIT_S = 180.0
 
+#: MB a file's read may add to the app's memory, unless
+#: COUNCIL_FILE_MEMORY_LIMIT_MB says otherwise (0 = no limit)
+DEFAULT_MEMORY_LIMIT_MB = 4096
+#: MB an Office file (a zip) may unpack to before it is opened at all, unless
+#: COUNCIL_FILE_UNPACKED_LIMIT_MB says otherwise (0 = no limit): its sheets'
+#: XML becomes ~10x as much memory in a reader
+DEFAULT_UNPACKED_LIMIT_MB = 1024
+_ZIPPED = (".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".potx", ".docx", ".dotx")
+
 SKIP_NAME = "skipped_files.json"
 READING_NAME = "reading_now.json"
 
@@ -119,6 +128,70 @@ def time_limit() -> float:
         return max(0.0, float(raw)) if raw else DEFAULT_TIME_LIMIT_S
     except ValueError:
         return DEFAULT_TIME_LIMIT_S
+
+
+def _env_mb(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return max(0, int(float(raw))) if raw else default
+    except ValueError:
+        return default
+
+
+def memory_limit_mb() -> int:
+    return _env_mb("COUNCIL_FILE_MEMORY_LIMIT_MB", DEFAULT_MEMORY_LIMIT_MB)
+
+
+def unpacked_limit_mb() -> int:
+    return _env_mb("COUNCIL_FILE_UNPACKED_LIMIT_MB", DEFAULT_UNPACKED_LIMIT_MB)
+
+
+def process_memory_mb() -> Optional[float]:
+    """This process's memory now (working set / resident), MB; None when it
+    cannot be told."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            c = Counters()
+            c.cb = ctypes.sizeof(c)
+            k32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                                                   wintypes.DWORD]
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+                return c.WorkingSetSize / 1e6
+            return None
+        with open("/proc/self/statm", "rb") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def unpacked_mb(path) -> Optional[float]:
+    """What an Office file (a zip) unpacks to, MB, from its own directory -
+    nothing is unpacked to tell. None for any other file, or a broken zip
+    (its reader says why)."""
+    if Path(str(path)).suffix.lower() not in _ZIPPED:
+        return None
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            return sum(i.file_size for i in z.infolist()) / 1e6
+    except Exception:                                     # noqa: BLE001
+        return None
 
 
 def _key(path) -> str:
@@ -340,6 +413,17 @@ def read(path, fn: Callable[[], Any], *, tab: str = "",
     if on_list is not None:
         raise Skipped(path, f"skipped: {on_list.reason} (Retry skipped files to read it again)")
     limit = time_limit() if limit is None else limit
+    # an Office file that would unpack to more than the app can hold is not
+    # opened at all (a 'zip bomb', or sheets with millions of formatted cells)
+    cap_unpacked = unpacked_limit_mb()
+    if cap_unpacked:
+        size = unpacked_mb(path)
+        if size is not None and size > cap_unpacked:
+            reason = f"unpacks to {size:,.0f} MB, more than {cap_unpacked:,} MB"
+            add(path, reason, tab)
+            raise Skipped(path, f"skipped: {reason} - not opened")
+    cap_memory = memory_limit_mb()
+    start_mb = process_memory_mb() if cap_memory else None
     token = uuid.uuid4().hex
     noted = note_after <= 0
     if noted:
@@ -380,6 +464,13 @@ def read(path, fn: Callable[[], Any], *, tab: str = "",
                 add(path, f"took longer than {limit:g} s to read", tab)
                 raise Skipped(path, f"skipped: took longer than {limit:g} s to read - "
                                     "left behind; skipped from now on until it changes")
+            if start_mb is not None:
+                now_mb = process_memory_mb()
+                if now_mb is not None and now_mb - start_mb > cap_memory:
+                    reason = f"used more than {cap_memory:,} MB of memory to read"
+                    add(path, reason, tab)
+                    raise Skipped(path, f"skipped: {reason} - left behind; skipped from "
+                                        "now on until it changes")
     finally:
         if noted:
             _unnote(token)
