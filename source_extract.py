@@ -2872,13 +2872,22 @@ TESSERACT_ENV = "COUNCIL_TESSERACT"
 
 
 def find_tesseract() -> Optional[Path]:
-    """The tesseract executable: $COUNCIL_TESSERACT, PATH, the usual Windows
-    install folders, or a conda env named 'tesseract'. Never downloaded."""
+    """The tesseract executable: $COUNCIL_TESSERACT, the one located in the
+    Models tab, PATH, the usual Windows install folders, or a conda env named
+    'tesseract'. Never downloaded by the Council itself (the Models tab asks
+    the system's installer, when the user clicks: tesseract_install)."""
     import os
     import shutil
     env = os.environ.get(TESSERACT_ENV, "").strip()
     if env:
         return Path(env) if Path(env).is_file() else None
+    try:                    # located in the Models tab (council_core.tesseract_install)
+        from council_core import tesseract_install
+        saved = tesseract_install.saved_path()
+        if saved is not None:
+            return saved
+    except Exception:                                       # noqa: BLE001
+        pass
     hit = shutil.which("tesseract")
     if hit:
         return Path(hit)
@@ -3537,7 +3546,8 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                 note.text = "(no text found)"
         else:
             note.reader = "none installed"
-            note.text = "not read: install Tesseract (local OCR) to read images"
+            note.text = ("not read: install Tesseract (local OCR) to read images - Models tab, "
+                         "Install Tesseract")
         run.images.append(note)
 
     layout = getattr(m, "layout", None)

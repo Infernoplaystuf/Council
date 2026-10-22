@@ -69,6 +69,24 @@ class ModelsActions:
             row, self.vault_dir, on_progress=on_progress,
             should_cancel=should_cancel)
 
+    # ── Tesseract, the image reader (council_core.tesseract_install) ──
+    def tesseract_status(self) -> str:
+        from council_core import tesseract_install
+        return tesseract_install.status()
+
+    def tesseract_plan(self):
+        from council_core import tesseract_install
+        return tesseract_install.plan()
+
+    def install_tesseract(self, plan, *, on_line=None, should_stop=None):
+        """BLOCKING - the tab runs it on a worker."""
+        from council_core import tesseract_install
+        return tesseract_install.install(plan, on_line=on_line, should_stop=should_stop)
+
+    def locate_tesseract(self, path):
+        from council_core import tesseract_install
+        return tesseract_install.locate(path)
+
     def check_this_pc(self, *, on_progress=None, should_stop=None):
         """The "Check this PC" benchmark (council_core.llm_bench, wired in
         through model_jobs.check_this_pc). BLOCKING — the tab runs it on a
@@ -171,6 +189,22 @@ class ModelsTab(ViewHelpers, QWidget):
         actions.addWidget(self.progress)
         outer.addLayout(actions)
 
+        # Tesseract, the image reader of the Ledger and the Connections graph:
+        # installed through the system's own installer when the user clicks
+        # (user, 2026-10-22: "an easy way to install tesseract")
+        ocr = QHBoxLayout()
+        self.tesseract = QLabel("Tesseract: checking…")
+        self.tesseract.setWordWrap(True)
+        ocr.addWidget(self.tesseract, 1)
+        self.tesseract_btn = self._button(ocr, "Install Tesseract", self.on_install_tesseract)
+        self.tesseract_btn.setToolTip(
+            "Tesseract reads the text and tables in pictures (classic OCR, US origin) for "
+            "the Ledger and the Connections graph. Installed by Windows' own installer "
+            "(winget), conda, or Homebrew - only when you click and confirm.")
+        self._button(ocr, "Locate…", self.on_locate_tesseract)
+        outer.addLayout(ocr)
+        self._tesseract_worker: Optional[threading.Thread] = None
+
         # Which model answers for each role — the per-role slots.
         from ..widgets.role_models import RoleModelsPanel
         self.roles = RoleModelsPanel(self.role_actions, parent=self)
@@ -181,6 +215,11 @@ class ModelsTab(ViewHelpers, QWidget):
         """Probe on a worker. Nearly six seconds, measured."""
         def work() -> None:
             hardware = self.actions.detect()
+            try:
+                ocr = self.actions.tesseract_status()
+            except Exception as exc:                      # noqa: BLE001
+                ocr = f"Tesseract: could not be checked ({exc})"
+            self._to_ui(self._show_tesseract, ocr)
 
             def show() -> None:
                 self._hardware = hardware
@@ -191,6 +230,73 @@ class ModelsTab(ViewHelpers, QWidget):
             self._to_ui(show)
 
         threading.Thread(target=work, name="model-detect", daemon=True).start()
+
+    def _show_tesseract(self, line: str) -> None:
+        self.tesseract.setText(amp(line))
+        installed = "not installed" not in line and "could not be checked" not in line
+        self.tesseract_btn.setText("Reinstall Tesseract" if installed else "Install Tesseract")
+
+    def on_install_tesseract(self) -> None:
+        if self._tesseract_worker is not None:
+            return
+        plan = self.actions.tesseract_plan()
+        if not plan.runnable:
+            self.status.setText(amp(plan.manual))
+            if not dialogs.disabled():
+                dialogs.showinfo("Install Tesseract", plan.manual, parent=self)
+            return
+        if not dialogs.confirm("Install Tesseract",
+                               plan.says + "\n\nThis needs the internet once. Go ahead?",
+                               parent=self):
+            return
+        self.tesseract_btn.setEnabled(False)
+        self.tesseract.setText(amp(f"Installing Tesseract ({plan.kind})…"))
+
+        def line(text: str) -> None:
+            self._to_ui(self.status.setText, amp(text[-200:]))
+
+        def work() -> None:
+            try:
+                result = self.actions.install_tesseract(plan, on_line=line)
+                said, ok = result.message, result.ok
+            except Exception as exc:                      # noqa: BLE001
+                said, ok = f"Tesseract was not installed: {exc}", False
+            try:
+                ocr = self.actions.tesseract_status()
+            except Exception:                             # noqa: BLE001
+                ocr = "Tesseract: could not be checked"
+            self._to_ui(self._tesseract_done, said, ok, ocr)
+
+        # "model-" is a drain prefix: the window waits for it on close
+        self._tesseract_worker = threading.Thread(target=work, name="model-tesseract-install",
+                                                  daemon=True)
+        self._tesseract_worker.start()
+
+    def _tesseract_done(self, said: str, ok: bool, ocr: str) -> None:
+        self._tesseract_worker = None
+        self.tesseract_btn.setEnabled(True)
+        self._show_tesseract(ocr)
+        self.status.setText(amp(said))
+        if not ok and not dialogs.disabled():
+            dialogs.showwarning("Install Tesseract", said, parent=self)
+
+    def on_locate_tesseract(self) -> None:
+        if dialogs.disabled():
+            return
+        path = dialogs.askopenfilename(
+            title="Where is tesseract?",
+            filetypes=[("tesseract", "tesseract.exe tesseract"), ("All files", "*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            exe = self.actions.locate_tesseract(path)
+        except ValueError as exc:
+            self.status.setText(amp(str(exc)))
+            return
+        self._show_tesseract(self.actions.tesseract_status())
+        self.status.setText(amp(f"The Ledger and the Connections graph read pictures with "
+                                f"{exe} now."))
 
     def selected_row(self) -> Optional[model_jobs.ModelRow]:
         index = self.results.indexOfTopLevelItem(self.results.currentItem())
