@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QApplication
 
 from council_core import paths, startup
 
-from . import theme
+from . import gui_gc, theme
 from .splash import NoSplash, show_splash
 from .window import CouncilWindow
 
@@ -64,6 +64,9 @@ def build(argv: Optional[list] = None, *,
     _apply_engine_settings(vault)
 
     app = QApplication.instance() or QApplication(list(argv or sys.argv))
+    # Before the first worker: garbage (a widget among it) collected on a
+    # worker thread hung the launch - see gui_gc.
+    gui_gc.install(app)
     theme.apply(app, "dark")
 
     # NOTHING SLOW BEFORE THE FIRST PIXEL. The readiness check can ask a
