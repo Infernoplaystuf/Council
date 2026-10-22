@@ -3966,24 +3966,40 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
                  csv_path: str, pattern_mask: str = "", part: str = "",
                  pattern_hint: bool = False) -> None:
     """``pattern_hint``: ``pattern_mask`` is the Ledger's saved pattern,
-    read as a hint (extract's pattern_strict=False); Apply reads it so."""
+    read as a hint (extract's pattern_strict=False); Apply reads it so.
+
+    Written STREAMING (openpyxl write-only): each row goes to the file as it
+    is made. Built in memory first, the review was the peak of a long
+    Extract - every cell an object, ~2.6 MB a workbook of a messy batch at
+    the end (user, 2026-10-22: "High RAM usage"). So each sheet's widths and
+    frozen header are set before its first row, a fill or bold goes on the
+    cell as it is written, and row counts are kept here for the drop-down
+    lists and the filter."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill
     from openpyxl.worksheet.datavalidation import DataValidation
-    wb = openpyxl.Workbook()
+    wb = openpyxl.Workbook(write_only=True)
     bold = Font(bold=True)
     amber = PatternFill("solid", fgColor="FFF2CC")
     red = PatternFill("solid", fgColor="F8CBAD")
 
-    def put(sheet, row) -> None:
-        # no control character: one cell read through Excel holding CHAR(1)
-        # raised IllegalCharacterError here and no review was written
-        # (review, 2026-10-20)
-        sheet.append([xl_text(v) for v in row])
-
     read = None if run.read is None else {str(Path(s)) for s in run.read}
-    info = wb.active
-    info.title = "Read me"
+    # the sheets in the order the review has always had them; each written
+    # to the end before the file is saved (a write-only sheet streams)
+    info = _StreamSheet(wb, "Read me", widths=[120], freeze=False)
+    ws = _StreamSheet(wb, "Values", VAL_HEAD, bold,
+                      [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28, 10])
+    lab = _StreamSheet(wb, "Labels to map", LAB_HEAD, bold,
+                       [44, 8, 34, 18, 7, 60, 50, 10, 7, 60])
+    ppl = _StreamSheet(wb, "People", PEOPLE_HEAD, bold, [10, 32, 7, 50])
+    miss = _StreamSheet(wb, "Missing", ["Part", "Field", "Items with no value", "Of"], bold,
+                        [10, 60, 40, 6])
+    im = _StreamSheet(wb, "Images", ["File", "Sheet", "Anchor", "Saved as", "Read by",
+                                     "Values used", "Text read"], bold,
+                      [28, 16, 8, 60, 26, 10, 80])
+    fields_ws = _StreamSheet(wb, "Fields", freeze=False, filter=False)
+    meta = _StreamSheet(wb, "_run", freeze=False, filter=False)
+
     lines = [
         "Review of extracted values",
         "",
@@ -4008,42 +4024,28 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
                       "   (not read: nothing from it is in this review, and Apply leaves it out)")
          for s in run.sources] + ([""] + ["Problems:"] +
                                   [f"  {p}" for p in run.problems] if run.problems else [])
-    for i, line in enumerate(lines, start=1):
-        info.cell(i, 1, xl_text(line))
-    info["A1"].font = Font(bold=True, size=14)
-    info.column_dimensions["A"].width = 120
+    for i, line in enumerate(lines):
+        info.append([line], font=Font(bold=True, size=14) if i == 0 else None)
+    info.finish(filter=False)
 
-    fields_ws = wb.create_sheet("Fields")
-    for i, f in enumerate(schema.fields, start=1):
-        fields_ws.cell(i, 1, xl_text(f.name))
-    fields_ws.sheet_state = "hidden"
+    for f in schema.fields:
+        fields_ws.append([f.name])
+    fields_ws.ws.sheet_state = "hidden"
+    fields_ws.finish()
     field_list = f"=Fields!$A$1:$A${len(schema.fields)}"
 
-    ws = wb.create_sheet("Values", 1)
-    ws.append(VAL_HEAD)
-    # the row number is counted, not asked: ws.max_row / ws[n] measure the
-    # whole sheet each time - 16,000 rows took over a minute (review,
-    # 2026-10-19)
-    row_n = 1
     for d in decisions:
         o = d.obs
-        put(ws, ["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
-                 o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector])
-        row_n += 1
         fill = red if d.conflict else (amber if not d.accept else None)
-        if fill is not None:
-            for col in range(1, len(VAL_HEAD) + 1):
-                ws.cell(row_n, col).fill = fill
+        ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
+                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector],
+                  fill=fill)
     yn = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
-    ws.add_data_validation(yn)
-    yn.add(f"A2:A{max(ws.max_row, 2) + 200}")
+    yn.add(f"A2:A{max(ws.rows, 2) + 200}")
     fdv = DataValidation(type="list", formula1=field_list, allow_blank=True)
-    ws.add_data_validation(fdv)
-    fdv.add(f"D2:D{max(ws.max_row, 2) + 200}")
-    _style(ws, bold, [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28, 10])
+    fdv.add(f"D2:D{max(ws.rows, 2) + 200}")
+    ws.finish([yn, fdv])
 
-    lab = wb.create_sheet("Labels to map", 2)
-    lab.append(LAB_HEAD)
     # one row per label and sheet: its first value, how many, the first
     # note - kept as the values stream past, not every value (ObsSpool)
     grouped: Dict[Tuple[str, str], List[Any]] = {}
@@ -4059,25 +4061,30 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             g[1] += 1
             if not g[2] and o.note:
                 g[2] = o.note
-    for n_lab, ((_, _), (o, count, first_note)) in enumerate(sorted(grouped.items()),
-                                                             start=2):
+    for (_, _), (o, count, first_note) in sorted(grouped.items()):
         guess = ", ".join(f"{g} ({s})" for g, s in o.guesses[:3])
         # the note says why Council's model's field was not used (review,
-        # 2026-10-20: a per-flaw field for values with no flaw)
-        put(lab, ["", "", o.label, o.value, count, guess, o.where, o.part, o.item,
-                  first_note or ""])
-        if o.part_how.startswith(MODEL_PART_HOW):
-            lab.cell(n_lab, 8).fill = amber    # to check, as on Values (_place_mapped)
+        # 2026-10-20: a per-flaw field for values with no flaw); an amber
+        # Part is to check, as on Values (_place_mapped)
+        lab.append(["", "", o.label, o.value, count, guess, o.where, o.part, o.item,
+                    first_note or ""],
+                   fills={8: amber} if o.part_how.startswith(MODEL_PART_HOW) else None)
+    grouped.clear()
     dv2 = DataValidation(type="list", formula1=field_list, allow_blank=True)
-    lab.add_data_validation(dv2)
-    dv2.add(f"A2:A{max(lab.max_row, 2) + 100}")
+    dv2.add(f"A2:A{max(lab.rows, 2) + 100}")
     yn2 = DataValidation(type="list", formula1='"Y"', allow_blank=True)
-    lab.add_data_validation(yn2)
-    yn2.add(f"B2:B{max(lab.max_row, 2) + 100}")
-    _style(lab, bold, [44, 8, 34, 18, 7, 60, 50, 10, 7, 60])
+    yn2.add(f"B2:B{max(lab.rows, 2) + 100}")
+    lab.finish([dv2, yn2])
 
-    miss = wb.create_sheet("Missing", 3)
-    miss.append(["Part", "Field", "Items with no value", "Of"])
+    # Who each inspector's initials are. The knowledge graph never guesses
+    # a person from 'JB', and nothing let the user say who JB is, so a
+    # Ledger gave parts but no people and no links (review, 2026-10-19).
+    known = load_people(csv_path)
+    for key, (n, first) in sorted(review_initials(decisions).items()):
+        ppl.append([key, known.get(key, ""), n, first],
+                   fills=None if known.get(key) else {2: amber})
+    ppl.finish()
+
     have = defaultdict(set)
     for d in decisions:
         have[(d.obs.part, d.obs.field)].add(d.obs.item)
@@ -4090,30 +4097,15 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             if f.per_item:
                 gap = [it for it in schema.items if it in f.cells and it not in got]
                 if gap:
-                    put(miss, [p, f.name, _span(gap, schema.items), len(f.cells)])
+                    miss.append([p, f.name, _span(gap, schema.items), len(f.cells)])
             elif not got:
-                put(miss, [p, f.name, "", ""])
-    _style(miss, bold, [10, 60, 40, 6])
+                miss.append([p, f.name, "", ""])
+    miss.finish()
 
-    im = wb.create_sheet("Images", 4)
-    im.append(["File", "Sheet", "Anchor", "Saved as", "Read by", "Values used", "Text read"])
     for n in run.images:
-        put(im, [n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
-    _style(im, bold, [28, 16, 8, 60, 26, 10, 80])
+        im.append([n.file, n.sheet, n.anchor, n.saved_as, n.reader, n.values, n.text])
+    im.finish()
 
-    # Who each inspector's initials are. The knowledge graph never guesses
-    # a person from 'JB', and nothing let the user say who JB is, so a
-    # Ledger gave parts but no people and no links (review, 2026-10-19).
-    ppl = wb.create_sheet("People", 3)
-    ppl.append(PEOPLE_HEAD)
-    known = load_people(csv_path)
-    for key, (n, first) in sorted(review_initials(decisions).items()):
-        put(ppl, [key, known.get(key, ""), n, first])
-        if not known.get(key):
-            ppl.cell(ppl.max_row, 2).fill = amber
-    _style(ppl, bold, [10, 32, 7, 50])
-
-    meta = wb.create_sheet("_run")
     data: Dict[str, Any] = {"csv": str(csv_path), "sources": run.sources,
                             "pattern_mask": pattern_mask or "", "part": part or ""}
     if pattern_mask and pattern_hint:
@@ -4126,25 +4118,64 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             data["read"] = idx
     if run.model_parts:                   # and the parts the model gave them
         data["model_parts"] = {k: list(v) for k, v in run.model_parts.items()}
-    meta["A1"] = json.dumps(data)
-    meta.sheet_state = "hidden"
+    meta.append([json.dumps(data)], text=False)
+    meta.ws.sheet_state = "hidden"
+    meta.finish()
     wb.active = 1
     _save_wb(wb, Path(path))
+
+
+class _StreamSheet:
+    """A write-only review sheet: widths and the frozen header set before
+    its first row (they are written ahead of the rows), styles given as each
+    cell is written, its rows counted (a write-only sheet cannot be asked)."""
+
+    def __init__(self, wb, title: str, head: Optional[Sequence[str]] = None, bold=None,
+                 widths: Sequence[float] = (), *, freeze: bool = True, filter: bool = True):
+        from openpyxl.utils import get_column_letter
+        self.ws = wb.create_sheet(title)
+        self.rows = 0
+        self.cols = 0
+        self._filter = filter
+        for i, w in enumerate(widths, start=1):
+            self.ws.column_dimensions[get_column_letter(i)].width = w
+        if freeze:
+            self.ws.freeze_panes = "A2"
+        if head is not None:
+            self.append(list(head), font=bold)
+
+    def append(self, values, *, fill=None, fills=None, font=None, text: bool = True) -> None:
+        """One row: ``fill`` on every cell, ``fills`` {column: fill} (1-based),
+        ``font`` on every cell. Values pass through xl_text (no control
+        character: one read through Excel holding CHAR(1) raised
+        IllegalCharacterError and no review was written - review,
+        2026-10-20)."""
+        from openpyxl.cell import WriteOnlyCell
+        row = []
+        for col, v in enumerate(values, start=1):
+            c = WriteOnlyCell(self.ws, value=xl_text(v) if text else v)
+            f = (fills or {}).get(col, fill)
+            if f is not None:
+                c.fill = f
+            if font is not None:
+                c.font = font
+            row.append(c)
+        self.ws.append(row)
+        self.rows += 1
+        self.cols = max(self.cols, len(values))
+
+    def finish(self, validations=(), filter: Optional[bool] = None) -> None:
+        """Its drop-down lists, and the filter over its rows."""
+        from openpyxl.utils import get_column_letter
+        for dv in validations:
+            self.ws.data_validations.append(dv)
+        if (self._filter if filter is None else filter) and self.rows > 1:
+            self.ws.auto_filter.ref = f"A1:{get_column_letter(self.cols)}{self.rows}"
 
 
 def _span(gap: List[str], items: List[str]) -> str:
     return ", ".join(gap) if len(gap) <= 12 else f"{len(gap)} items ({gap[0]} .. {gap[-1]})"
 
-
-def _style(ws, bold, widths) -> None:
-    from openpyxl.utils import get_column_letter
-    for c in ws[1]:
-        c.font = bold
-    ws.freeze_panes = "A2"
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    if ws.max_row > 1:
-        ws.auto_filter.ref = ws.dimensions
 
 
 def _save_wb(wb, path: Path) -> None:
