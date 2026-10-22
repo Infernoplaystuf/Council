@@ -499,6 +499,36 @@ def test_a_second_launch_in_one_process_leaves_the_app_dressed(qapp,
     assert styles == [], f"the app was dressed again: {styles}"
 
 
+def test_garbage_is_collected_on_the_gui_thread_only(qapp):
+    """A collection on a worker destroyed a window an earlier build left in a
+    cycle, and ~QWidget waited for the GUI thread - which was joining that
+    worker: this file hung in its second build (council_qt.gui_gc)."""
+    import gc
+    import threading
+
+    build()
+    on_gui = []
+
+    def note(phase, _info):
+        if phase == "start":
+            on_gui.append(threading.current_thread() is threading.main_thread())
+    gc.callbacks.append(note)
+    try:
+        def churn():                     # far past the first threshold
+            for _ in range(50_000):
+                cycle = []
+                cycle.append(cycle)
+        worker = threading.Thread(target=churn)
+        worker.start()
+        worker.join()
+        assert False not in on_gui, "garbage was collected on a worker"
+        assert _pump_until(qapp, lambda: on_gui, seconds=5), (
+            "nothing collects the garbage")
+        assert all(on_gui)
+    finally:
+        gc.callbacks.remove(note)
+
+
 def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
     """A launch that resolves a vault path and then fails on every read because
     nothing made the directory is a worse first run than no vault at all."""
