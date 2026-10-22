@@ -24,3 +24,10 @@ See docs/qt_full_port_scope.md for the phases and what is done.
 from __future__ import annotations
 
 __all__ = ["bridge", "dialogs", "theme", "window"]
+
+# PySide6 6.12 leaves a widget owned twice when its layout is added to a
+# layout already on a widget - a segfault at garbage collection. Fixed for
+# every view at once, before any is built: see qt_ownership.
+from . import qt_ownership as _qt_ownership  # noqa: E402
+
+_qt_ownership.install()

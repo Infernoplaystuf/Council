@@ -1325,6 +1325,14 @@ def _grids_from_doc(path: Path, notes: Optional[List[str]], want_pictures: bool 
     return grids, images
 
 
+def _csv_rows(csv_path) -> List[Dict[str, str]]:
+    """The parent CSV's rows (worked answers), [] when it cannot be read."""
+    try:
+        return list(ParentCSV(csv_path).rows)
+    except Exception:                                       # noqa: BLE001
+        return []
+
+
 def document_explanations(sources: Sequence) -> Tuple[List[Any], List[str]]:
     """Every explanation of a label in the text documents among ``sources``
     ('HP — health points'), and a problem line per document not read."""
@@ -3076,6 +3084,11 @@ class Extraction:
     #: what the text documents among the sources say labels mean (docs_open):
     #: the matcher's suggestions, and notes for Council's model
     explanations: List[Any] = field(default_factory=list)
+    #: the rows of each filled copy of the template among the sources, and
+    #: where: worked answers to learn by example (council_core.ledger_examples)
+    filled_copies: List[Tuple[List[Dict[str, str]], str]] = field(default_factory=list)
+    #: what was learned in this run, one line each (learn by example)
+    learned: List[str] = field(default_factory=list)
 
 
 class _Cancelled(Exception):
@@ -3093,7 +3106,8 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             taught: Optional["Taught"] = None,
             reader_cls: Optional[type] = None,
             readers: Optional[List["_Extractor"]] = None,
-            pattern_strict: bool = True
+            pattern_strict: bool = True,
+            examples: Optional[Sequence[Dict[str, Any]]] = None
             ) -> Extraction:
     """`progress`: a progress_report.Progress; each workbook is one step, and
     what it is doing (opening through Excel, reading picture 3 of 7) is shown.
@@ -3149,6 +3163,14 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     run.problems += said
     if run.explanations:
         m.use_explanations(run.explanations)
+    # filled copies of the template among the sources are worked answers
+    # (council_core.ledger_examples): their sheets are told by the template's
+    # own words in the same cells, as each workbook is read (_extract_one)
+    from council_core import ledger_examples
+    try:
+        m.layout = ledger_examples.template_layout(getattr(schema, "template_path", ""))
+    except Exception:                                       # noqa: BLE001
+        m.layout = {}
     reader = image_reader if image_reader is not None else (
         default_image_reader() if use_images else None)
     # The watchdog dumps every thread's stack when nothing has moved for
@@ -3193,6 +3215,18 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     # review 'Cancelled… partial review' (review, 2026-10-19). One that cut
     # a read short in a way the read swallowed is caught after the read
     # and after the model's question (_extract_one).
+    # learn by example: labels no rule placed, whose values are one field's
+    # in a filled copy of the template or the parent CSV, for the same part
+    ex = ledger_examples.Examples()
+    if (examples or run.filled_copies) and not run.cancelled:
+        ledger_examples.sample_examples(schema, examples or (), "the parent CSV", into=ex)
+        for rows, where in run.filled_copies:
+            ledger_examples.sample_examples(schema, rows, where, into=ex)
+    if ex:
+        learned = ledger_examples.learn_labels(run, schema, ex)
+        run.learned += [f"Learned by example: '{lab}' is {hit.field} "
+                        f"({hit.agree} of {hit.compared} values agree)"
+                        for lab, hit in sorted(learned.items())]
     return run
 
 
@@ -3366,6 +3400,16 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             note.text = "not read: install Tesseract (local OCR) to read images"
         run.images.append(note)
 
+    layout = getattr(m, "layout", None)
+    if layout:
+        from council_core import ledger_examples
+        for g in grids:
+            if g.from_image:
+                continue
+            sheet = ledger_examples.is_filled_copy(g.cells, layout)
+            rows = ledger_examples.filled_rows(g.cells, schema, sheet) if sheet else []
+            if rows:
+                run.filled_copies.append((rows, f"{src.name} › {g.sheet}"))
     prog.update(f"{src.name}: finding values on {len(grids)} sheets/tables")
     # pass 1: part numbers per sheet; then a workbook-wide fallback
     exs = [(reader_cls or _Extractor)(g, m, codes, "", mask_re) for g in grids]
@@ -4318,7 +4362,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
         # accepting an unsure match teaches it, like a mapping on Labels to map;
         # a one-word label ("Date") is too generic to remember
         if yes and fname in valid and label and via in ("match", "ambiguous", "model",
-                                                        "explained") \
+                                                        "explained", "example") \
                 and not judge.is_generic(str(label)) and (_num(score) or 0) < ACCEPT_AT:
             learned.setdefault(normalize_label(label), str(fname))
     wb.close()
@@ -4344,7 +4388,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                       part=meta.get("part") or "",
                       part_finder=(lambda name, _grids: found.get(name, ("", "")))
                       if found else None,
-                      labels=source_labels(sources), taught=load_taught(csv_path))
+                      labels=source_labels(sources), taught=load_taught(csv_path),
+                      # the same worked answers the extract learned from
+                      examples=_csv_rows(csv_path))
     prog.stage("matching your choices")
     decisions = decide(run, schema)
     mapped: List[Decision] = []

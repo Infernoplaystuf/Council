@@ -22,8 +22,10 @@ requests>=2.31
 # ---- The UI ----
 # The Qt app (council_qt.py) is what the run-* launchers start. Without
 # PySide6 they fall back to the classic Tk app (council_gui_engine.py),
-# which needs nothing from here. 6.10 is the version the Qt port is tested
-# against.
+# which needs nothing from here. The Qt port is tested against 6.10 and
+# 6.12. 6.12 leaves a widget owned twice (by Python and its Qt parent) when
+# its layout is added to an attached one, which crashed at garbage
+# collection; council_qt.qt_ownership hands such widgets to Qt (2026-10-21).
 PySide6>=6.6
 
 # ---- Data ingestion / display ----

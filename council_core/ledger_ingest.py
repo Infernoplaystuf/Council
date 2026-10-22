@@ -221,6 +221,7 @@ class ExtractSummary:
         if self.cancelled:
             s = ("CANCELLED after every workbook was read — " if self.read_all else
                  "CANCELLED — ") + s
+        s += "".join(f"\n{line}" for line in self.learned)
         if self.pattern_saved:
             s += (f"\nPart-name pattern {self.pattern!r}: this Ledger's saved one (the "
                   "pattern field was empty) — a hint for file and sheet names and "
@@ -424,7 +425,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                       image_reader=image_reader, part=part, use_images=use_images,
                       progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                       part_finder=part_finder, taught=taught,
-                      pattern_strict=not pattern_saved)
+                      pattern_strict=not pattern_saved,
+                      # the records already accepted are worked answers too
+                      examples=ledger.rows)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -474,7 +477,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           assist=report.describe() if report is not None else "",
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files],
-                          pattern=pattern_mask or "", pattern_saved=pattern_saved)
+                          pattern=pattern_mask or "", pattern_saved=pattern_saved,
+                          learned=list(getattr(run, "learned", []) or []))
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
