@@ -23,6 +23,10 @@ same list.
   (`tests/test_council_qt_foundation.py`): compared the Qt `StandaloneHost` with
   the Tk one and needed tkinter. Its Qt-only checks are now
   `test_the_standalone_host_surface`.
+- `test_the_tk_console_applies_them` and
+  `test_the_tk_console_applies_them_through_the_same_function`
+  (`tests/test_launch.py`): ran, and read the source of, the Tk console's
+  engine-settings loader. The Qt launch's own engine-settings tests stay.
 
 ## Standing rules (all branches)
 
