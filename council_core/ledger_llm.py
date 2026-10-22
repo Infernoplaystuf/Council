@@ -991,12 +991,20 @@ def _measured(s: str) -> bool:
     return not (num.isdigit() and len(unit) == 1 and unit.isascii() and unit.isalpha())
 
 
+#: A loose pattern's regex -> the same pattern taken exactly: words joined
+#: into one part are held to the exact shape (_mask_whole). Loose, 'Lab 3
+#: Bay 12' was a part for @@@#@@###.
+_EXACT: Dict[str, Any] = {}
+
+
 def _mask_re(pattern_mask: Optional[str]):
     if not pattern_mask:
         return None
     try:
         import source_extract as se
-        return se.mask_to_regex(pattern_mask)
+        rx = se.mask_to_regex(pattern_mask)
+        _EXACT.setdefault(rx.pattern, se.mask_to_regex(pattern_mask, exact=True))
+        return rx
     except Exception:                                      # noqa: BLE001
         return None
 
@@ -1046,7 +1054,8 @@ def _mask_whole(text: str, rx) -> bool:
     spaced = " ".join(words)
     if rx.fullmatch(spaced):
         return True
-    return (len(words) > 1 and bool(rx.fullmatch("".join(words)))
+    exact = _EXACT.get(rx.pattern, rx)
+    return (len(words) > 1 and bool(exact.fullmatch("".join(words)))
             and not _GROUPED.fullmatch(spaced) and not any(_YEAR.fullmatch(w) for w in words))
 
 
@@ -1209,8 +1218,11 @@ def find_part(file_name: str, grids, pattern_mask: Optional[str], chat: Chat,
     cells = _cells_text(grids, pattern_mask)
     shape = ""
     if pattern_mask:
-        shape = (f"The user's part numbers often look like {pattern_mask!r} ('@' a letter, "
-                 f"'#' a digit), for example {mask_example(pattern_mask)!r}, but other formats "
+        import source_extract as se
+        shapes = se.mask_shapes(pattern_mask) or [pattern_mask]
+        shape = (f"The user's part numbers often look like "
+                 + " or ".join(repr(m) for m in shapes) + " ('@' a letter, "
+                 f"'#' a digit), for example {mask_example(shapes[0])!r}, but other formats "
                  "also occur (separators, prefixes, revision suffixes, shorter or longer "
                  "variants). ")
     shape += _parts_text(examples or ())
