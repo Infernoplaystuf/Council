@@ -219,7 +219,9 @@ class ChatWindow(QMainWindow):
 
     def _sidebar(self) -> QWidget:
         w = QWidget()
-        form = QFormLayout(w)
+        side = QVBoxLayout(w)
+        form = QFormLayout()
+        side.addLayout(form)
         self.kind = QComboBox()
         self.kind.addItems([EchoBackend.name, OllamaBackend.name,
                             GgufBackend.name])
@@ -248,18 +250,19 @@ class ChatWindow(QMainWindow):
                                    value=512)
         form.addRow("Max reply tokens", self.max_tokens)
 
-        form.addRow(QLabel("System prompt"))
-        self.system_prompt = QPlainTextEdit("You are a helpful assistant. Answer "
-                                     "briefly.")
+        side.addWidget(QLabel("System prompt"))
+        self.system_prompt = QPlainTextEdit("You are a helpful assistant. "
+                                            "Answer briefly.")
         self.system_prompt.setMaximumHeight(110)
-        form.addRow(self.system_prompt)
+        side.addWidget(self.system_prompt)
 
         new = QPushButton("New chat")
         new.clicked.connect(self.new_chat)
         save = QPushButton("Save chat…")
         save.clicked.connect(self.save_chat)
-        form.addRow(new)
-        form.addRow(save)
+        side.addWidget(new)
+        side.addWidget(save)
+        side.addStretch(1)            # keep the controls together at the top
         return w
 
     def _conversation(self) -> QWidget:

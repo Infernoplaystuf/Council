@@ -416,7 +416,7 @@ class MainWindow(QMainWindow):
         self.greeting = QLabel()
         self.greeting.setStyleSheet("font-size: 16pt;")
         v.addWidget(self.greeting)
-        self.summary = QLabel(wordWrap=True)
+        self.summary = QLabel(wordWrap=True, alignment=Qt.AlignTop)
         v.addWidget(self.summary, 1)
         open_btn = QPushButton("Settings…")
         open_btn.clicked.connect(self.edit_settings)
