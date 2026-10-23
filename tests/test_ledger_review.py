@@ -246,3 +246,19 @@ def test_one_workbooks_readings_are_one_first_and_the_rest_set_aside(tmp_path):
     run.obs = [obs("12", "a.xlsx › S!C5"), obs("12.0", "b.xlsx › S!C5")]
     (one,) = se.decide(run, schema)
     assert one.accept and not one.conflict
+
+
+def test_an_operator_is_their_initials_or_their_name():
+    """user, 2026-10-23: 'For operator sometimes its initials sometimes its
+    a name'."""
+    import source_extract as se
+    assert se.parse_prefer("JB, Alex King; mk") == ["JB", "Alex King", "mk"]
+    for a, b in (("JB", "Jane Brown"), ("Jane Brown", "J.B."), ("jb", "JB"),
+                 ("Brown", "Jane Brown"), ("jane brown", "Jane Brown"),
+                 ("Mary-Jo Smith", "MJS")):
+        assert se.same_person(a, b) and se.same_person(b, a), (a, b)
+    for a, b in (("JB", "Alex King"), ("JB", "AK"), ("Jane Brown", "John Brownlee"), ("", "JB")):
+        assert not se.same_person(a, b), (a, b)
+    assert se._prefer_rank("Jane Brown", ["AK", "JB"]) == 1
+    assert se._prefer_rank("AK/JB", ["Jane Brown"]) == 0
+    assert se._prefer_rank("MK", ["Jane Brown"]) is None

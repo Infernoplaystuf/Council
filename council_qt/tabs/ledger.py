@@ -470,11 +470,12 @@ class LedgerTab(ViewHelpers, QWidget):
         prefer_row = QHBoxLayout()
         prefer_row.addWidget(QLabel("Operator to prefer (optional):"))
         self.prefer_operator = QLineEdit()
-        self.prefer_operator.setPlaceholderText("initials, e.g. JB, AK")
+        self.prefer_operator.setPlaceholderText("initials or names, e.g. JB, Alex King")
         self.prefer_operator.setToolTip(
             "When a workbook has several readings of one value (an EC response measured\n"
             "by more than one operator) and the template keeps one: the reading of the\n"
-            "first operator listed here who has one is used. Left empty, or none of them\n"
+            "first operator listed here who has one is used - initials or a name, either\n"
+            "matches the other (JB is Jane Brown). Left empty, or none of them\n"
             "read it: the first reading in the workbook is used. The others are set aside\n"
             "(N in the review). Values two workbooks disagree on are still yours to choose.")
         prefer_row.addWidget(self.prefer_operator, 1)
