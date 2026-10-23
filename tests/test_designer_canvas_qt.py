@@ -80,12 +80,6 @@ def test_every_palette_kind_has_a_renderer():
     assert not missing, f"no renderer for: {missing}"
 
 
-def test_gui_canvas_still_exports_the_table():
-    """The Tk build imports it from there."""
-    import gui_canvas
-    assert len(gui_canvas.RENDERERS) == len(paint.RENDERERS)
-
-
 # ============================================================
 # Painting
 # ============================================================

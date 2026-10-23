@@ -55,7 +55,7 @@ echo === Verifying critical runtime deps are importable ===
 REM Catch missing wheels BEFORE PyInstaller spends 5 minutes on the
 REM analysis pass. Each missing module is reported individually.
 set "_DEP_FAIL="
-for %%M in (llama_cpp pandas numpy openpyxl tkinter yaml requests) do (
+for %%M in (llama_cpp pandas numpy openpyxl PySide6 yaml requests) do (
     python -c "import %%M" >NUL 2>NUL
     if errorlevel 1 (
         echo   missing: %%M

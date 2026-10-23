@@ -156,7 +156,7 @@ esac
 say "STEP 6/7  — installing remaining Council deps"
 pip install -q --upgrade-strategy only-if-needed \
     PyYAML requests pandas openpyxl xlrd pyarrow h5py \
-    matplotlib plotly tkinterweb \
+    matplotlib plotly \
     chromadb "sentence-transformers>=2.7,<5" "transformers>=4.44,<5" huggingface_hub \
     pypdf python-docx duckdb pymongo "SQLAlchemy>=2.0,<3.0" \
     beautifulsoup4 lxml html2text \

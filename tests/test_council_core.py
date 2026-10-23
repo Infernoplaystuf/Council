@@ -45,32 +45,13 @@ def test_council_core_imports_no_toolkit(module):
     assert not banned, f"council_core/{module} imports {banned}"
 
 
-def test_both_front_ends_call_the_same_function():
-    """The extraction is only worth anything if BOTH sides use it.
-
-    Asserted on the source rather than by running two GUIs: what matters is
-    that neither front end has its own copy of what indexing means, and that is
-    a property of the code, not of a run."""
-    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+def test_the_qt_tab_indexes_through_vault_ops():
+    """The extraction is only worth anything if the front end uses it rather
+    than keeping its own copy of what indexing means. (The Tk shell, the other
+    half of this check, was retired 2026-10-23.)"""
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
-    for src, who in ((tk_src, "the Tk shell"), (qt_src, "the Qt tab")):
-        assert "vault_ops" in src, f"{who} does not use council_core.vault_ops"
-        assert "build_keyword_index" in src
-
-    # And the Tk shell may not still be doing the work itself. Bounded by the
-    # AST rather than by a character count: the next method along
-    # (_vmgr_build_descriptions) legitimately calls rebuild-like APIs of its
-    # own, and a fixed window reaches into it.
-    tree = ast.parse(tk_src)
-    method = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_vmgr_build_keyword_index")
-    body = ast.get_source_segment(tk_src, method) or ""
-    assert "vault_ops.build_keyword_index" in body
-    assert ".rebuild(" not in body, (
-        "the Tk shell still calls rebuild() directly — the extraction did not "
-        "take")
+    assert "vault_ops" in qt_src, "the Qt tab does not use council_core.vault_ops"
+    assert "build_keyword_index" in qt_src
 
 
 # --------------------------------------------------------- build_keyword_index
@@ -426,31 +407,17 @@ def test_build_stats_reports_a_failure():
     assert not result.ok and "stats build failed" in result.message
 
 
-# ======================================================= both sides, every op
+# ============================================================== every op
 
 @pytest.mark.parametrize("operation", [
     "build_keyword_index", "build_descriptions", "build_embeddings",
     "clone", "pull", "build_stats",
 ])
-def test_every_extracted_operation_is_used_by_both_front_ends(operation):
+def test_the_qt_tab_uses_every_extracted_operation(operation):
     """The extraction only pays if nobody keeps a private copy."""
-    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
-    assert operation in tk_src, f"the Tk shell does not call {operation}"
     assert operation in qt_src, f"the Qt tab does not call {operation}"
 
-
-def test_the_engine_no_longer_carries_its_own_clone_implementation():
-    """_vmgr_clone_repo was 88 lines of git-and-copy with no Tk in it — shared
-    logic living in the shell by accident. It is now a delegation."""
-    src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    fn = next(n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name == "_vmgr_clone_repo")
-    body = ast.get_source_segment(src, fn) or ""
-    assert "vault_ops.clone_repo" in body
-    assert "git clone" not in body, "the engine still runs git itself"
-    assert fn.end_lineno - fn.lineno < 30, "the 88-line copy is still there"
 
 
 # ================================================================ vault_import
@@ -557,38 +524,6 @@ def test_an_empty_zip_folder_says_so_rather_than_failing(tmp_path):
     result = vault_import.import_zip_folder(folder, input_dir=tmp_path / "out")
     assert result.ok
     assert "No .zip files found" in result.message
-
-
-def test_the_engine_no_longer_carries_the_import_helpers():
-    """152 lines of filtering that had no Tk in them, moved out."""
-    src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    assert "_vmgr_extract_zip" not in defined
-    assert "_vmgr_copy_folder" not in defined
-    assert "from council_core.vault_import import" in src
-
-
-def test_the_import_workers_no_longer_touch_tk_variables():
-    """They used to call self._vmgr_zip_var.set("") from inside the worker — a
-    Tk variable written off the UI thread. The clear now goes through the
-    queue, like every other UI update from a worker."""
-    src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    cls = next(n for n in tree.body
-               if isinstance(n, ast.ClassDef) and n.name == "CouncilConsole")
-    for name in ("_vmgr_import_zip", "_vmgr_import_zip_folder",
-                 "_vmgr_import_folder"):
-        method = next(n for n in cls.body
-                      if isinstance(n, ast.FunctionDef) and n.name == name)
-        body = ast.get_source_segment(src, method) or ""
-        worker = body.split("def worker", 1)[-1]
-        # Comments stripped: the replacement carries a comment QUOTING the old
-        # off-thread call so the reason survives, and a naive text search finds
-        # its own explanation.
-        code = "\n".join(line.split("#", 1)[0] for line in worker.splitlines())
-        assert "_var.set(" not in code, (
-            f"{name}'s worker still writes a Tk variable directly")
 
 
 # ================================================================== vault_data
@@ -766,19 +701,17 @@ def test_one_bad_dump_does_not_stop_the_batch(tmp_path, monkeypatch):
     assert len(calls) == 3 and len(seen) == 3
 
 
-# -- both sides ---------------------------------------------------------------
+# -- the front end ---------------------------------------------------------------
 
 @pytest.mark.parametrize("operation", [
     "pending_tasks", "set_task_status", "all_collections", "delete_collection",
     "delete_path", "read_misses", "convert_mongo",
 ])
-def test_the_data_operations_are_used_by_both_front_ends(operation):
-    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+def test_the_qt_tab_uses_the_data_operations(operation):
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
     # The Qt tab reaches them through its actions object, which names them the
     # same way; delete_path is spelled `delete` there.
     alias = {"delete_path": "delete"}.get(operation, operation)
-    assert operation in tk_src, f"the Tk shell does not use {operation}"
     assert alias in qt_src, f"the Qt tab does not use {alias}"
 
 
@@ -899,25 +832,11 @@ def test_a_found_term_does_not_explain_itself(tmp_path):
     assert result.message == "1 match(es)"
 
 
-# -- both sides ---------------------------------------------------------------
+# -- the front end ---------------------------------------------------------------
 
-def test_both_front_ends_search_through_the_shared_module():
-    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+def test_the_qt_tab_searches_through_the_shared_module():
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
-    for src, who in ((tk_src, "the Tk shell"), (qt_src, "the Qt tab")):
-        assert "vault_search.search_vault(" in src, f"{who} searches on its own"
-
-
-def test_the_engine_keeps_the_names_the_smoke_suite_uses():
-    """tests/smoke_test.py reaches for cge._search_vault_filenames and the two
-    pattern helpers. Moving the bodies must not break the names."""
-    import importlib
-    spec = importlib.util.find_spec("council_gui_engine")
-    assert spec is not None
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    for name in ("_search_vault_filenames", "_compile_name_pattern",
-                 "_name_matches_pattern"):
-        assert f"as {name}," in source, f"{name} is no longer importable"
+    assert "vault_search.search_vault(" in qt_src, "the Qt tab searches on its own"
 
 
 # ================================================================= vault_jobs
@@ -1095,14 +1014,12 @@ def test_candidate_files_use_forward_slashes(tmp_path, monkeypatch):
     assert found == ["q3/sales.csv"]
 
 
-# -- both sides ---------------------------------------------------------------
+# -- the front end ---------------------------------------------------------------
 
 @pytest.mark.parametrize("operation", ["run_deferred_task",
                                        "summarize_collection"])
-def test_the_jobs_are_used_by_both_front_ends(operation):
-    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+def test_the_qt_tab_uses_the_jobs(operation):
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
-    assert f"vault_jobs.{operation}(" in tk_src
     assert f"vault_jobs.{operation}(" in qt_src
 
 

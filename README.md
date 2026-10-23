@@ -59,9 +59,9 @@ This is the home build. No licensing, no trials, no telemetry, no phone-home. If
 > ```
 >
 > Neither path downloads a model on your behalf. After install, the
-> in-app Tk wizard either reuses a `.gguf` it finds in `~/models`,
-> `~/Downloads`, or `~/.cache/huggingface`, or shows the US-origin
-> catalog with one-click HF download links. All recommended models are
+> launchers pick up a `.gguf` they find in `~/models` (or `.\models`),
+> and the app's Models tab lets you choose another; the US-origin catalog
+> has the HF download links. All recommended models are
 > from US providers (IBM, Meta, Microsoft, Google, AllenAI, OpenAI).
 
 > **Never used WSL or a Linux terminal before?** Skip ahead to
@@ -423,12 +423,9 @@ python council_qt.py
 ```
 
 `run-windows.bat` (or `run-linux.sh` / `run-wsl.sh`) does the same with the
-environment already resolved. The Qt app is the default UI; the classic Tk
-app is still there — `run-windows.bat --tk`, `COUNCIL_UI=tk`, or
-`python council_gui_engine.py` — and the launchers fall back to it on their
-own if PySide6 is not installed.
-
-The `.exe` build below still packages the classic Tk app.
+environment already resolved. The Qt app is the only UI: the classic Tk app
+was retired on 2026-10-23, so `--tk` and `COUNCIL_UI=tk` now just start the
+Qt app, and a launcher stops with an install hint if PySide6 is missing.
 
 For a packaged `.exe`:
 

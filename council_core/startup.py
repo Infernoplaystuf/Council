@@ -131,8 +131,8 @@ def onboarding_needed(vault_dir: Any) -> tuple:
     """(needed, reason). Never raises — a broken vault must not stop a launch.
 
     NEEDED MEANS NO MODEL CAN ANSWER. This used to ask
-    onboarding.needs_onboarding, i.e. "is vault/.onboarded missing" — a marker
-    only the Tk wizard writes. setup_council.py installs and Qt-first users
+    needs_onboarding, i.e. "is vault/.onboarded missing" — a marker only
+    the retired Tk wizard wrote. setup_council.py installs and Qt-first users
     never have one, so they were told "Setup needed" with a model working; a
     vault that had one but no model left was told nothing. council_core.
     model_ready asks the question the notice is for, the engine's way.
