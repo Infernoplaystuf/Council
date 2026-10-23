@@ -62,3 +62,8 @@ same list.
   template and source cells, answers saved into the review workbook):
   `docs/handoff/ledger_review_2026-10-22.md`. "Diagnose a file…" is in
   `docs/handoff/skipped_files_2026-10-22.md`.
+- The example Qt apps the models read when they write Qt code (ten at most;
+  each passes the generated-app gate; the Code tab's "Qt app builder" gets
+  the best match whole): `examples/qt_apps/README.md`, read by
+  `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
+  (`gui_examples.py`).
