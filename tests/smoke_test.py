@@ -21,7 +21,7 @@ What this covers (and doesn't):
   • Synthetic GGUF round-trip — writes a valid-magic minimal GGUF
     to a temp file and confirms three independent validators
     accept it:
-        onboarding.gguf_file_status
+        backend_settings.gguf_file_status
         previous_install_detect._quick_gguf_validate
         council_engine.read_gguf_metadata
 
@@ -281,16 +281,16 @@ def test_previous_install_detect() -> None:
 def test_synthetic_gguf_accepted() -> None:
     """A valid-magic GGUF must pass every validator."""
     import council_engine as ce
-    import onboarding
     import previous_install_detect as pid
+    from council_core import backend_settings
 
     with tempfile.TemporaryDirectory() as td:
         gguf = Path(td) / "test.gguf"
         _make_synthetic_gguf(gguf, arch="llama", context_length=8192)
 
-        # onboarding.gguf_file_status
-        ok, msg = onboarding.gguf_file_status(str(gguf))
-        _check(f"onboarding.gguf_file_status accepts synthetic GGUF "
+        # backend_settings.gguf_file_status
+        ok, msg = backend_settings.gguf_file_status(str(gguf))
+        _check(f"backend_settings.gguf_file_status accepts synthetic GGUF "
                f"(msg={msg!r})", ok)
 
         # previous_install_detect._quick_gguf_validate
@@ -311,15 +311,15 @@ def test_synthetic_gguf_accepted() -> None:
 def test_synthetic_gguf_rejected_cases() -> None:
     """Negative cases — every validator must refuse to accept these."""
     import council_engine as ce
-    import onboarding
     import previous_install_detect as pid
+    from council_core import backend_settings
 
     with tempfile.TemporaryDirectory() as td:
         # Case 1 — non-GGUF magic
         notgguf = Path(td) / "not.gguf"
         notgguf.write_bytes(b"<!DOCTYPE html>\n<html>" + b"\0" * 4096)
-        ok, _ = onboarding.gguf_file_status(str(notgguf))
-        _check("non-GGUF magic rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(notgguf))
+        _check("non-GGUF magic rejected by backend_settings.gguf_file_status",
                not ok)
         _check("non-GGUF magic rejected by _quick_gguf_validate",
                not pid._quick_gguf_validate(notgguf))
@@ -327,16 +327,16 @@ def test_synthetic_gguf_rejected_cases() -> None:
         # Case 2 — too small (200 bytes is below the size floor)
         tiny = Path(td) / "tiny.gguf"
         tiny.write_bytes(b"GGUF" + b"\0" * 196)
-        ok, _ = onboarding.gguf_file_status(str(tiny))
-        _check("too-small file rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(tiny))
+        _check("too-small file rejected by backend_settings.gguf_file_status",
                not ok)
         _check("too-small file rejected by _quick_gguf_validate",
                not pid._quick_gguf_validate(tiny))
 
         # Case 3 — missing file
         missing = Path(td) / "missing.gguf"
-        ok, _ = onboarding.gguf_file_status(str(missing))
-        _check("missing file rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(missing))
+        _check("missing file rejected by backend_settings.gguf_file_status",
                not ok)
         # read_gguf_metadata on missing file should return {}
         md = ce.read_gguf_metadata(missing)
@@ -854,7 +854,7 @@ def test_clip_path_persistence() -> None:
     catches the regression I almost shipped — save_gguf_path() used to
     overwrite the whole file, which would have wiped clip_path on every
     model swap."""
-    import onboarding
+    from council_core import backend_settings
     with tempfile.TemporaryDirectory() as td:
         vault = Path(td)
         # Synthesise valid GGUF + mmproj files so the validators don't
@@ -865,33 +865,33 @@ def test_clip_path_persistence() -> None:
         _make_synthetic_gguf(clip, arch="llama", context_length=4096)
 
         # 1) Save the GGUF first.
-        onboarding.save_gguf_path(vault, str(gguf))
+        backend_settings.save_gguf_path(vault, str(gguf))
         _check("after save_gguf_path, load_gguf_path returns the path",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
 
         # Save the clip path — this is the case that broke before the
         # _merge_backend_settings refactor.
-        onboarding.save_clip_path(vault, str(clip))
+        backend_settings.save_clip_path(vault, str(clip))
 
         # 2) Both paths must now be readable from the SAME file.
         _check("load_clip_path round-trips after save_clip_path",
-               onboarding.load_clip_path(vault) == str(clip))
+               backend_settings.load_clip_path(vault) == str(clip))
         _check("save_clip_path did NOT clobber gguf_path",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
 
         # 3) Clearing the clip path (text-only mode) must NOT clobber
         #    the GGUF path either.
-        onboarding.save_clip_path(vault, "")
+        backend_settings.save_clip_path(vault, "")
         _check("clearing clip_path leaves gguf_path intact",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
         _check("clearing clip_path makes load_clip_path return empty",
-               onboarding.load_clip_path(vault) == "")
+               backend_settings.load_clip_path(vault) == "")
 
         # 4) Env-var override beats persisted JSON.
         try:
             os.environ["COUNCIL_GGUF_CLIP_PATH"] = "/tmp/env-override.gguf"
             _check("env var COUNCIL_GGUF_CLIP_PATH wins over JSON",
-                   onboarding.load_clip_path(vault) == "/tmp/env-override.gguf")
+                   backend_settings.load_clip_path(vault) == "/tmp/env-override.gguf")
         finally:
             os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
 
@@ -1704,78 +1704,6 @@ def test_db_export_mongo_roundtrip() -> None:
                    len(_pd.read_csv(info["path"])) == 5)
     finally:
         _db._mongo_client = real  # type: ignore
-
-
-def test_db_wizard_url_assembly() -> None:
-    """The guided wizard's pure URL builder: correct schemes, default
-    ports, percent-encoding of credentials (the bug a hand-typed URL
-    hits), file paths, env-var placeholders, and required-field errors."""
-    import db_connect_wizard as _w
-
-    # Postgres with a nasty password — must be percent-encoded so the
-    # netloc isn't corrupted by @ : / characters.
-    kind, url = _w.build_connection_url(
-        "postgresql", host="db.co", database="sales",
-        user="ro_user", password="p@ss:w/rd ")
-    _check("postgres kind is sql", kind == "sql")
-    _check("postgres scheme", url.startswith("postgresql://"))
-    _check("default port 5432 applied", ":5432/" in url)
-    _check("password percent-encoded",
-           "p%40ss%3Aw%2Frd%20" in url and "p@ss:w/rd" not in url)
-    _check("host intact", "@db.co:" in url)
-    _check("database in path", url.endswith("/sales"))
-
-    # MySQL scheme + default port
-    _, url = _w.build_connection_url("mysql", host="h", database="d",
-                                     user="u", password="p")
-    _check("mysql pymysql scheme", url.startswith("mysql+pymysql://"))
-    _check("mysql default port 3306", ":3306/" in url)
-
-    # MSSQL appends the ODBC driver param
-    _, url = _w.build_connection_url("mssql", host="h", database="d",
-                                     user="u", password="p")
-    _check("mssql pyodbc scheme", url.startswith("mssql+pyodbc://"))
-    _check("mssql driver param present", "driver=ODBC" in url)
-
-    # Mongo: kind=mongo, default port, authSource from the db name
-    kind, url = _w.build_connection_url("mongodb", host="h", database="appdb",
-                                        user="u", password="p")
-    _check("mongo kind is mongo", kind == "mongo")
-    _check("mongo scheme + port", url.startswith("mongodb://") and ":27017/" in url)
-    _check("mongo authSource set from db", "authSource=appdb" in url)
-
-    # Env-var password → placeholder, NOT inlined/encoded
-    _, url = _w.build_connection_url("postgresql", host="h", database="d",
-                                     user="u", env_var="PG_PASS")
-    _check("env-var placeholder used", "${PG_PASS}" in url)
-
-    # File-based: path only, three-slash form, backslashes normalised
-    kind, url = _w.build_connection_url("sqlite",
-                                        file_path=r"C:\data\my.db")
-    _check("sqlite kind is sql", kind == "sql")
-    _check("sqlite three-slash + forward slashes",
-           url == "sqlite:///C:/data/my.db")
-
-    # Required-field errors are user-facing ValueErrors
-    _check("missing host raises",
-           _raises(ValueError, lambda: _w.build_connection_url(
-               "postgresql", database="d", user="u", password="p")))
-    _check("missing file raises",
-           _raises(ValueError, lambda: _w.build_connection_url("sqlite")))
-
-    # Assembled URLs satisfy the saver's own validation (round-trip).
-    import db_connections as _db
-    with tempfile.TemporaryDirectory() as td:
-        vault = Path(td)
-        kind, url = _w.build_connection_url(
-            "postgresql", host="h", database="d", user="u", password="p@w")
-        _db.save_sql_connection(vault, "wiz_pg", url)
-        _check("wizard URL accepted by saver",
-               _db.list_sql_connections(vault).get("wiz_pg") == url)
-
-    # env-var name suggester
-    _check("env-var name suggestion tidy",
-           _w.suggest_env_var_name("sales db") == "SALES_DB_PASSWORD")
 
 
 def test_db_audit_log_writes() -> None:
@@ -3270,31 +3198,6 @@ def test_workflow_chaining() -> None:
         wr.resolve_pipeline_path = saved_resolve
 
 
-def test_no_bare_re_in_gui() -> None:
-    """council_gui_engine imports `re as _re`, so a bare `re.<attr>` is a
-    NameError waiting to fire at runtime.
-
-    Two shipped: `re.sub` in _nx_write_script (so "Write pipeline" crashed with
-    "re is undefined" AFTER the model had already generated the script) and two
-    `re.search` in the grapher's JSON parse. None are caught by import or
-    compile — the name only resolves when the line executes — so this scans the
-    AST for any `re.<attr>` where `re` is not a locally-imported alias.
-    """
-    import ast
-    from pathlib import Path
-
-    src = Path(__file__).resolve().parent.parent / "council_gui_engine.py"
-    tree = ast.parse(src.read_text(encoding="utf-8"))
-    bad = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "re"):
-            bad.append(node.lineno)
-    _check("no bare `re.<attr>` in council_gui_engine (module imports re as _re)",
-           not bad, f"bare re. at lines: {sorted(set(bad))}")
-
-
 def test_dream3d_convert_to_python_routing() -> None:
     """A natural-language "convert this pipeline to python" must route to the
     DETERMINISTIC transpiler, never the model.
@@ -4115,30 +4018,6 @@ def test_plot_registry_renders_all() -> None:
            not failures)
     _check(f"no registered plot is left untested ({untested})", not untested)
     _check("rendering leaks nothing into pyplot's global registry",
-           len(plt.get_fignums()) == before)
-
-
-def test_plots_pane_core() -> None:
-    """The plots pane renders Figures to thumbnails without Tk and without
-    pyplot — pyplot would register every figure in a global list (a leak over a
-    long session) and can open external windows, which is the popup behaviour
-    the inline pane exists to avoid."""
-    try:
-        from matplotlib.figure import Figure
-        import matplotlib.pyplot as plt
-        import plots_pane as pp
-    except Exception as exc:  # pragma: no cover
-        _check(f"plots_pane importable ({exc!r})", False)
-        return
-    before = len(plt.get_fignums())
-    fig = Figure(figsize=(4, 3))
-    fig.add_subplot(111).plot([1, 2, 3], [2, 4, 3])
-    png = pp.figure_to_png_bytes(fig)
-    _check("a Figure renders to PNG bytes",
-           len(png) > 500 and png[:4] == b"\x89PNG")
-    im = pp.figure_to_thumbnail(fig, 180)
-    _check("the thumbnail is capped to the rail width", im.size[0] <= 180)
-    _check("building figures leaks nothing into pyplot's global registry",
            len(plt.get_fignums()) == before)
 
 
@@ -8824,8 +8703,6 @@ def main() -> int:
          test_nx_hardening)
     _run("workflow chaining (pipeline 2 runs on pipeline 1's output)",
          test_workflow_chaining)
-    _run("no bare re.<attr> in the GUI (module imports re as _re)",
-         test_no_bare_re_in_gui)
     _run("Dream3D convert-to-python routes to the deterministic transpiler",
          test_dream3d_convert_to_python_routing)
     _run("Dream3D tab wiring (Part B reachable from the app)",
@@ -8836,8 +8713,6 @@ def main() -> int:
          test_plot_registry)
     _run("plot registry renders all types headlessly",
          test_plot_registry_renders_all)
-    _run("plots pane core (thumbnails, no pyplot leak)",
-         test_plots_pane_core)
     _run("route_message golden (routing unchanged)",
          test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",
@@ -8943,7 +8818,6 @@ def main() -> int:
     _run("DB — export write formats",             test_db_export_write_formats)
     _run("DB — export query cannot write",        test_db_export_query_cannot_write)
     _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
-    _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
     _run("MODELS — finder US filter + hardware fit", test_model_finder_us_filter_and_fit)

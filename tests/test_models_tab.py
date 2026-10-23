@@ -21,6 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from council_core import backend_settings  # noqa: E402
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
 
@@ -306,9 +308,9 @@ def test_a_download_that_lands_but_cannot_switch_says_where_the_file_is(
     target.write_text("x")
     monkeypatch.setitem(sys.modules, "model_downloader",
                         faithful_downloader(target))
-    monkeypatch.setitem(sys.modules, "onboarding", types.SimpleNamespace(
-        save_gguf_path=lambda *a, **k: (_ for _ in ()).throw(
-            OSError("read-only vault"))))
+    monkeypatch.setattr(backend_settings, "save_gguf_path",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError("read-only vault")))
     row = mj.to_row(REAL_ENTRY)
     result = mj.download_and_switch(row, tmp_path)
     assert not result.ok
@@ -327,8 +329,8 @@ def test_a_switch_that_could_not_be_saved_says_so(tmp_path, monkeypatch):
     target.write_text("x")
     monkeypatch.setitem(sys.modules, "model_downloader",
                         faithful_downloader(target))
-    monkeypatch.setitem(sys.modules, "onboarding", types.SimpleNamespace(
-        save_gguf_path=lambda *a, **k: "settings.json could not be read"))
+    monkeypatch.setattr(backend_settings, "save_gguf_path",
+                        lambda *a, **k: "settings.json could not be read")
     monkeypatch.setitem(sys.modules, "council_engine", types.SimpleNamespace(
         refresh_backend_config=lambda: None))
     result = mj.download_and_switch(mj.to_row(REAL_ENTRY), tmp_path)

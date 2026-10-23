@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from council_core import backend_settings
 from council_core import local_models
 from council_core import model_slots as ms
 from tests.fake_ollama import DEFAULT_TAGS, tag
@@ -169,8 +170,8 @@ def test_a_saved_ollama_slot_is_selected_on_reload(make, tmp_path):
 def test_save_with_the_writer_on_ollama_leaves_the_gguf_path_alone(
         tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setitem(sys.modules, "onboarding", SimpleNamespace(
-        save_gguf_path=lambda v, p: calls.append(("main", p))))
+    monkeypatch.setattr(backend_settings, "save_gguf_path",
+                        lambda v, p: calls.append(("main", p)))
     monkeypatch.setitem(sys.modules, "council_engine", SimpleNamespace(
         refresh_backend_config=lambda: calls.append(("refresh",))))
     files = {r: "ollama:llama3.1:8b" for r in ms.COUNCIL_ROLES}

@@ -181,16 +181,6 @@ OPTIONAL_FEATURES: List[FeatureSpec] = [
         impact="med",
     ),
     FeatureSpec(
-        name="Plotly HTML viewer inside Tk",
-        modules=["tkinterweb"],
-        install="pip install tkinterweb",
-        description=(
-            "Render interactive Plotly charts in the Grapher tab. Without "
-            "this, Plotly opens charts in your default browser instead."
-        ),
-        impact="med",
-    ),
-    FeatureSpec(
         name="Fast JSON parser (orjson)",
         modules=["orjson"],
         install="pip install orjson",
