@@ -262,3 +262,64 @@ def test_an_operator_is_their_initials_or_their_name():
     assert se._prefer_rank("Jane Brown", ["AK", "JB"]) == 1
     assert se._prefer_rank("AK/JB", ["Jane Brown"]) == 0
     assert se._prefer_rank("MK", ["Jane Brown"]) is None
+
+
+# ── the filled template (user, 2026-10-23) ──────────────────────────────
+def test_extract_writes_the_template_filled_in_and_tinted_by_confidence(sample_review):
+    import openpyxl
+    review, csv, src = sample_review
+    folder = lv.filled_dir(review)
+    assert sorted(p.name for p in folder.iterdir()) == ["101.xlsx"]
+    ws = openpyxl.load_workbook(folder / "101.xlsx").active
+    exact = lv.template_cells(csv)
+    sheet, (r, c) = exact[("Power (W)", "")]
+    cell = ws.cell(r, c)
+    assert cell.value == 285 and cell.fill.start_color.rgb.endswith(lv.TINT_HIGH[1:])
+    assert "laser_log.xlsx › Build!C5" in cell.comment.text
+    fod = next(i for i in lv.load(review).items if i.item == "2A" and "FOD" in i.fields[0])
+    sheet, (r, c) = exact[(fod.fields[0], "2A")]
+    assert ws.cell(r, c).fill.start_color.rgb.endswith(lv.confidence_tint(fod)[1:])
+    assert lv.confidence_tint(fod) == lv.TINT_MID                # score 0.83
+
+
+def test_cell_candidates_put_the_accepted_value_first():
+    a = lv.Item("Values", 2, "", True, True, "a", "", fields=["F"], value="1", part="P",
+                score=0.95)
+    b = lv.Item("Values", 3, "Y", False, True, "b", "", fields=["F"], value="2", part="P",
+                score=0.6)
+    no = lv.Item("Values", 4, "N", False, False, "c", "", fields=["F"], value="3", part="P",
+                 score=1.0)
+    exact = {("F", ""): ("Sheet", (1, 1))}
+    got = lv.cell_candidates([a, b, no], exact, "P")
+    assert got == {("Sheet", (1, 1)): [b, a]}
+    assert lv.cell_candidates([a, b], exact, "P", accept_of=lambda it: "N" if it is b
+                              else it.accept) == {("Sheet", (1, 1)): [a]}
+    assert lv.confidence_tint(a) == lv.TINT_CLASH
+
+
+def test_the_filled_template_window_shows_a_cells_source(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import CELL_TINT, FilledTemplateDialog
+    review, csv, src = sample_review
+    opened = []
+    dlg = FilledTemplateDialog(lv.load(review), opener=opened.append)
+    assert dlg.part == "101"
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    dlg._tint_template()
+    sheet, rc = dlg._exact[("Power (W)", "")]
+    m = next(m for m in dlg._template_models if m.sheet.name == sheet)
+    assert m.texts[rc] == "285" and "Build!C5" in m.tips[rc]
+    assert dlg.click_cell(sheet, rc)
+    assert [i.fields for i in dlg.shown] == [["Power (W)"]]
+    assert dlg.current.value == "285" and m.tints[rc] == CELL_TINT
+    assert wait_for(qapp, lambda: any(sm.tints.get((5, 3)) == CELL_TINT
+                                      for sm in dlg._source_models))
+    dlg.on_wrong()                                          # said wrong: the cell empties
+    assert rc not in m.texts
+    assert dlg.on_save()
+    assert next(i for i in lv.load(review).items if i.fields == ["Power (W)"]).accept == "N"
+    assert not dlg.click_cell(sheet, (1, 1))
+    path = dlg.on_export()
+    assert path and opened == [path] and Path(path).name == "101.xlsx"
+    dlg.show_whole_part()
+    assert len(dlg.shown) == sum(1 for i in dlg.review.items if i.part == "101")
+    dlg.close()

@@ -352,3 +352,24 @@ def test_a_filled_example_is_picked_and_saved_with_the_ledger(qapp, books, monke
     assert ledger_examples.load_filled_example(tab.csv.text()) == str(example)
     tab.forget_example_btn.click()
     assert tab.filled_example.text() == "" and not tab.forget_example_btn.isEnabled()
+
+
+def test_the_filled_template_opens_after_extract(qapp, books):
+    """user, 2026-10-23: 'a pop-out of the output filled in template excel
+    so I can click on cells and see their source'."""
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    assert not tab.filled_btn.isEnabled()
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.on_extract()
+    assert tab.wait(120)
+    assert "The template filled in for" in tab.log.toPlainText()
+    assert tab.filled_btn.isEnabled()
+    tab.on_filled_window()
+    assert tab.wait(60)
+    dlg = tab.filled_dialog
+    assert dlg.part and dlg.review.path == tab.review.text()
+    dlg.close()

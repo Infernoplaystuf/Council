@@ -40,3 +40,23 @@ It finds the source paths in the hidden `_run` sheet.
   is still corrected in Excel.
 
 Tests: `tests/test_ledger_review.py`, plus the tab test in `tests/test_ledger_tab.py`.
+
+## The filled template (2026-10-23)
+
+Andy: "have the ledger output the template filled out with the values
+entered into it highlighted by their confidence values ... a pop-out of the
+output filled in template excel so I can click on cells and see their
+source".
+
+- Extract writes `<review>_filled/<part>.xlsx` beside the review: a copy of
+  the template with each part's values in their cells, tinted by
+  `ledger_review.confidence_tint` (green score ≥ 0.85, yellow 0.6–0.85,
+  orange under 0.6, red when sources disagree), with a cell note giving
+  the source cell, the score and any other values offered
+  (`ledger_review.write_filled` / `write_all_filled`). Sample Ledgers only.
+- The Ledger tab's "Filled template…" opens `FilledTemplateDialog`
+  (`council_qt/tabs/ledger_review_dialog.py`, a `ReviewDialog`): pick a
+  part, click a filled cell, and the values offered for it are listed with
+  the source cell highlighted below. Right / Wrong / a correction are saved
+  into the review like Review by clicking; "Open as Excel" writes and opens
+  that part's filled template.

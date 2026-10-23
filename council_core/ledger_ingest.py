@@ -213,6 +213,10 @@ class ExtractSummary:
     #: why the values to review were not pre-accepted, counted
     #: (source_extract.summarize_review_reasons; user, 2026-10-23)
     review_reasons: str = ""
+    #: the folder of filled templates, one per part, values tinted by
+    #: confidence (ledger_review.write_all_filled; user, 2026-10-23)
+    filled: str = ""
+    filled_count: int = 0
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -239,6 +243,10 @@ class ExtractSummary:
             s += "\n" + summarize_slowest(self.timings)
         if self.review_reasons:
             s += "\n" + self.review_reasons
+        if self.filled_count:
+            s += (f"\nThe template filled in for {self.filled_count} part(s), each value "
+                  f"tinted by how sure it is (green sure, yellow fairly, orange unsure, red "
+                  f"disagreeing): {self.filled}")
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
@@ -507,6 +515,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     write_review(out, run, dec, ledger.schema, str(csv_path),
                  pattern_mask=pattern_mask or "", part=part or "",
                  pattern_hint=pattern_saved, prefer=prefer)
+    filled: List[str] = []
+    if not run.cancelled:
+        prog.stage("filling in the template for each part")
+        try:
+            from council_core import ledger_review
+            filled = ledger_review.write_all_filled(ledger_review.load(out), say)
+        except Exception as e:                              # noqa: BLE001
+            run.problems.append(f"the filled templates were not written: {e}")
     ok = sum(d.accept for d in dec)
     aside = sum(bool(d.alternate) for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
@@ -525,7 +541,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                     f"{ledger.schema.id_field} in it, or it is not there)"]
                                    if example else [])
                           + list(getattr(run, "learned", []) or []),
-                          review_reasons=summarize_review_reasons(dec, ledger.schema))
+                          review_reasons=summarize_review_reasons(dec, ledger.schema),
+                          filled=str(Path(filled[0]).parent) if filled else "",
+                          filled_count=len(filled))
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
