@@ -62,3 +62,7 @@ same list.
   template and source cells, answers saved into the review workbook):
   `docs/handoff/ledger_review_2026-10-22.md`. "Diagnose a file…" is in
   `docs/handoff/skipped_files_2026-10-22.md`.
+- Saved Ledgers (runs kept, named and grouped by template and/or project) and
+  "Update with new files" (only new or changed files; what the Ledger holds is
+  accepted again, a value that differs is flagged):
+  `docs/handoff/ledger_saved_2026-10-23.md`.
