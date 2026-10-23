@@ -16,6 +16,15 @@ field - 'HP' held 6300, 4480 and 7980 where the filled copy has Health
     Examples                         the worked answers, by part/record and field
     learn_labels(run, schema, ex)    the sample Ledger's unplaced labels, learned
     learn_column(...)                which field one column of a table is
+    load/save_filled_example(csv)    the Ledger's own filled example (its own input)
+    filled_example_rows(csv, schema) its rows, as worked answers
+    filled_example_text(rows, ...)   what Council's model is shown of it
+
+The filled example (user, 2026-10-23: "a filled version of the template
+needs to be directly specified in the file input so that the model can see
+it to start with to use as guidance") is a filled copy picked on its own,
+not among the sources: it is never read as one, its rows are worked
+answers, and Council's model sees each field's value in it and its part.
 
 What is learned is only ever a suggestion (via / how 'example', amber,
 noted with the example it came from): accepting it teaches the label, as
@@ -81,6 +90,88 @@ def distinctive(v: Any) -> bool:
     if not k or k in TRIVIAL or k in ("0.0", "1.0"):
         return False
     return len(k) >= 2
+
+
+# ── the Ledger's filled example ─────────────────────────────────────────
+#: the section of the Ledger's aliases file (source_extract.aliases_path_for)
+FILLED_KEY = "filled_example"
+#: the longest value of the filled example shown to Council's model
+EXAMPLE_VALUE_CHARS = 60
+
+
+def load_filled_example(csv_path) -> str:
+    """The filled example saved for this Ledger ('' when none)."""
+    import json
+    import source_extract as se
+    p = se.aliases_path_for(csv_path)
+    try:
+        return str((json.loads(p.read_text(encoding="utf-8")) or {}).get(FILLED_KEY) or "")
+    except Exception:                                       # noqa: BLE001
+        return ""
+
+
+def save_filled_example(csv_path, path: str) -> None:
+    """Keep ``path`` ('' forgets it) as this Ledger's filled example,
+    beside its label mappings; the file's other sections are kept.
+    Written atomically."""
+    import json
+    import os
+    import source_extract as se
+    p = se.aliases_path_for(csv_path)
+    data: Dict[str, Any] = {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) or {}
+    except Exception:                                       # noqa: BLE001
+        data = {}
+    if path:
+        data[FILLED_KEY] = str(path)
+    else:
+        data.pop(FILLED_KEY, None)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def filled_example_rows(path, schema) -> List[Dict[str, str]]:
+    """The filled example's rows, read by the template's own cells
+    (sample_ledger.read_filled), each marked with the file it came from;
+    [] when there is none, it cannot be read, or it names no part."""
+    if not path or not Path(path).is_file():
+        return []
+    try:
+        from sample_ledger import read_filled
+        rows = read_filled(schema, path)
+    except Exception:                                       # noqa: BLE001
+        return []
+    id_field = getattr(schema, "id_field", "")
+    name = f"the filled example {Path(path).name}"
+    return [dict(r, source_file=name) for r in rows if str(r.get(id_field) or "").strip()]
+
+
+def filled_example_text(rows: Sequence[Dict[str, Any]], fields: Sequence[str]) -> str:
+    """For Council's model: each template field with its value in the
+    filled example (the first one given), as guidance for what each field
+    holds. '' when the example has none of them."""
+    seen: Dict[str, str] = {}
+    for row in rows:
+        for f in fields:
+            v = str(row.get(f) or "").strip()
+            if v and f not in seen:
+                seen[f] = v[:EXAMPLE_VALUE_CHARS]
+    if not seen:
+        return ""
+    import json
+    lines = [f"- {json.dumps(f, ensure_ascii=False)}: {json.dumps(v, ensure_ascii=False)}"
+             for f, v in seen.items()]
+    return ("A filled example of the template, from the user, for one sample - what each "
+            "field holds there (a guide to what the fields mean, not this workbook's "
+            "values):\n" + "\n".join(lines) + "\n\n")
+
+
+def filled_example_parts(rows: Sequence[Dict[str, Any]], id_field: str) -> List[str]:
+    """The part numbers the filled example is for."""
+    return list(dict.fromkeys(str(r.get(id_field) or "").strip() for r in rows
+                              if str(r.get(id_field) or "").strip()))
 
 
 # ── a filled copy of the template ───────────────────────────────────────

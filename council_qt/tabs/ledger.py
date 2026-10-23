@@ -495,6 +495,27 @@ class LedgerTab(ViewHelpers, QWidget):
         self.ignore_files.textEdited.connect(self._on_ignore_edited)
         ignore_row.addWidget(self.ignore_files, 1)
         v2.addLayout(ignore_row)
+        # a filled copy of the template, picked on its own (user, 2026-10-23):
+        # worked answers and Council's model's guide, never a source
+        example_row = QHBoxLayout()
+        example_row.addWidget(QLabel("Filled example (optional):"))
+        self.filled_example = QLineEdit()
+        self.filled_example.setReadOnly(True)
+        self.filled_example.setPlaceholderText(
+            "a copy of the template filled in for one sample")
+        self.filled_example.setToolTip(
+            "A copy of your template filled in by hand for one sample. It is not read\n"
+            "as a source: its values teach which source labels are which field (for the\n"
+            "same sample in the sources), and Council's model is shown what each field\n"
+            "holds there and what its part number looks like. Saved with this Ledger.")
+        example_row.addWidget(self.filled_example, 1)
+        self.example_btn = QPushButton("Pick…")
+        self.example_btn.clicked.connect(self.on_pick_filled_example)
+        example_row.addWidget(self.example_btn)
+        self.forget_example_btn = QPushButton("Forget")
+        self.forget_example_btn.clicked.connect(lambda: self._set_filled_example(""))
+        example_row.addWidget(self.forget_example_btn)
+        v2.addLayout(example_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -609,7 +630,63 @@ class LedgerTab(ViewHelpers, QWidget):
         self._load_ignore_patterns()
         self._check_schema()
         self._load_saved_patterns()
+        self._load_filled_example()
         self._register(self.csv.text().strip())
+
+    def _load_filled_example(self) -> None:
+        """Show the filled example saved for the parent CSV."""
+        if not hasattr(self, "filled_example"):
+            return
+        csv = self.csv.text().strip()
+        path = ""
+        if csv:
+            from council_core import ledger_examples
+            path = ledger_examples.load_filled_example(csv)
+        self.filled_example.setText(path)
+        self.forget_example_btn.setEnabled(bool(path))
+
+    def _browse_filled_example(self) -> str:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick a copy of the template filled in for one sample",
+            self._start_dir(), XLSX)
+        return p
+
+    def on_pick_filled_example(self) -> None:
+        if not self.csv.text().strip():
+            self.status.setText("Create or pick the parent CSV first: the filled example "
+                                "is saved with it.")
+            return
+        p = self._browse_filled_example()
+        if p:
+            self._set_filled_example(p)
+
+    def _set_filled_example(self, path: str) -> None:
+        csv = self.csv.text().strip()
+        if not csv:
+            return
+        from council_core import ledger_examples
+        try:
+            ledger_examples.save_filled_example(csv, path)
+        except OSError as e:
+            self._say(f"The filled example could not be saved beside {Path(csv).name}: {e}")
+            return
+        self._load_filled_example()
+        if not path:
+            self._say("Filled example forgotten for this Ledger.")
+            return
+        rows = []
+        try:
+            from sample_ledger import ParentCSV
+            schema = ParentCSV(csv).schema
+            rows = ledger_examples.filled_example_rows(path, schema) if schema else []
+        except Exception:                                    # noqa: BLE001
+            rows = []
+        self._say(f"Filled example {Path(path).name}: "
+                  + (f"{len(rows)} row(s) for "
+                     + ", ".join(ledger_examples.filled_example_parts(
+                         rows, schema.id_field)) + " — used by Extract from now on"
+                     if rows else "no part number found in the template's part cell — "
+                     "is it a filled copy of this Ledger's template?"))
 
     def _check_schema(self) -> None:
         """Whether the parent CSV and its schema are there (Teach needs

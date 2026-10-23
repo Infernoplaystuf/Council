@@ -880,7 +880,8 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat,
 
 
 def place_labels(run, schema, chat: Chat, report: AssistReport,
-                 examples: Optional[Sequence[LabelExample]] = None) -> None:
+                 examples: Optional[Sequence[LabelExample]] = None,
+                 guide: str = "") -> None:
     """Values under labels no rule placed: ask which field each label is and
     add those values as suggested rows (via 'model'), in place of their
     'Labels to map' rows - except a value with no item for a field kept
@@ -904,7 +905,10 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
         mapping, report.model = map_labels(
             labels, fields, chat, examples=pick_examples(examples or (), labels),
             # what the user's documents say these labels mean (docs_open)
-            notes=docs_open.notes_text(getattr(run, "explanations", None) or [], labels))
+            notes=docs_open.notes_text(getattr(run, "explanations", None) or [], labels)
+            # the Ledger's filled example: what each field holds
+            # (ledger_examples.filled_example_text, user 2026-10-23)
+            + (guide or ""))
     except ModelUnavailable:
         report.labels_failed = True
         return                                             # said once, by one_shot

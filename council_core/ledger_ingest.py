@@ -347,6 +347,13 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
         return s
 
 
+def _same_file(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
              cancel: Optional[Any] = None,
@@ -367,6 +374,20 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                            ignore_patterns=ignore_patterns,
                                            template_path=ledger.schema.template_path,
                                            reasons=why_skipped)
+    # the Ledger's filled example (ledger_examples, user 2026-10-23): worked
+    # answers and the model's guide - never a source to read values from
+    from council_core import ledger_examples
+    example = ledger_examples.load_filled_example(csv_path)
+    example_rows = ledger_examples.filled_example_rows(example, ledger.schema)
+    if example:
+        keep = []
+        for f in files:
+            if _same_file(f, example):
+                skipped_files.append(f)
+                why_skipped[f] = "the filled example"
+            else:
+                keep.append(f)
+        files = keep
     if not files:
         if skipped_files and not sources:
             raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
@@ -424,7 +445,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    report, stop)
         # the user's answers in Teach go in as examples (few-shot)
         label_examples = ledger_teach.label_examples(csv_path, ledger.schema)
-        part_examples = ledger_teach.part_examples(csv_path)
+        part_examples = ledger_teach.part_examples(csv_path) + [
+            (p, ledger.schema.id_field) for p in
+            ledger_examples.filled_example_parts(example_rows, ledger.schema.id_field)]
 
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
@@ -437,8 +460,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                       progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                       part_finder=part_finder, taught=taught,
                       pattern_strict=not pattern_saved,
-                      # the records already accepted are worked answers too
-                      examples=ledger.rows)
+                      # the records already accepted are worked answers too,
+                      # and the filled example's
+                      examples=list(ledger.rows) + example_rows)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -453,8 +477,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    f"labels left over; {rules}.")
         else:
             prog.stage("asking Council's model about the labels left over")
-            ledger_llm.place_labels(run, ledger.schema, chat, report,
-                                    examples=label_examples)
+            ledger_llm.place_labels(
+                run, ledger.schema, chat, report, examples=label_examples,
+                guide=ledger_examples.filled_example_text(
+                    example_rows, [f.name for f in ledger.schema.fields
+                                   if f.name != ledger.schema.id_field]))
             if cancel is not None and cancel.is_set():
                 # pressed while the model was asked: a cancelled run - it
                 # said 'Review written…' and that the model did not answer
@@ -490,7 +517,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files],
                           pattern=pattern_mask or "", pattern_saved=pattern_saved,
-                          learned=list(getattr(run, "learned", []) or []),
+                          learned=([f"Filled example {Path(example).name}: "
+                                    f"{len(example_rows)} row(s) used as worked answers"
+                                    + (" and shown to Council's model" if assist else "")]
+                                   if example_rows else
+                                   [f"Filled example {Path(example).name}: not read (no "
+                                    f"{ledger.schema.id_field} in it, or it is not there)"]
+                                   if example else [])
+                          + list(getattr(run, "learned", []) or []),
                           review_reasons=summarize_review_reasons(dec, ledger.schema))
 
 

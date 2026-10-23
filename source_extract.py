@@ -3436,6 +3436,13 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     return run
 
 
+def _filled_example_rows(csv_path, schema) -> List[Dict[str, str]]:
+    """The Ledger's filled example's rows (council_core.ledger_examples)."""
+    from council_core import ledger_examples
+    return ledger_examples.filled_example_rows(
+        ledger_examples.load_filled_example(csv_path), schema)
+
+
 def source_labels(sources: Sequence) -> Dict[str, str]:
     """How each source is named in the review: its file name, or - when
     two picked workbooks share one (a folder per sample, each with its
@@ -4790,7 +4797,7 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                       if found else None,
                       labels=source_labels(sources), taught=load_taught(csv_path),
                       # the same worked answers the extract learned from
-                      examples=_csv_rows(csv_path))
+                      examples=_csv_rows(csv_path) + _filled_example_rows(csv_path, schema))
     prog.stage("matching your choices")
     decisions = decide(run, schema, prefer=meta.get("prefer") or ())
     mapped: List[Decision] = []
