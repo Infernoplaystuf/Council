@@ -30,8 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (REVIEW_TOO_LONG, ImageReader, apply_review, decide,
                             default_image_reader, extract, load_aliases, load_taught,
-                            path_too_long, too_long_to_write, workbook_files,
-                            write_review)
+                            path_too_long, summarize_review_reasons, too_long_to_write,
+                            workbook_files, write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -210,6 +210,9 @@ class ExtractSummary:
     records: int = -1
     decisions: int = 0
     learned: List[str] = field(default_factory=list)
+    #: why the values to review were not pre-accepted, counted
+    #: (source_extract.summarize_review_reasons; user, 2026-10-23)
+    review_reasons: str = ""
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -234,6 +237,8 @@ class ExtractSummary:
             s += "\n" + summarize_open_failures(self.open_failures)
         if self.timings:
             s += "\n" + summarize_slowest(self.timings)
+        if self.review_reasons:
+            s += "\n" + self.review_reasons
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
@@ -481,7 +486,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files],
                           pattern=pattern_mask or "", pattern_saved=pattern_saved,
-                          learned=list(getattr(run, "learned", []) or []))
+                          learned=list(getattr(run, "learned", []) or []),
+                          review_reasons=summarize_review_reasons(dec, ledger.schema))
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
