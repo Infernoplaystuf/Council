@@ -3817,8 +3817,35 @@ def parse_prefer(text: str) -> List[str]:
     return [w.strip() for w in re.split(r"[,;|/\n]+", text or "") if w.strip()]
 
 
+#: decide: a value the parent CSV already holds for its part, item and field
+IN_LEDGER_NOTE = "already in the Ledger"
+#: decide: a value other than the one the parent CSV holds - the reviewer's
+#: to choose; accepted, Apply puts it in place of the old one
+LEDGER_DIFFERS_NOTE = "differs from the Ledger, which has"
+
+
+def ledger_values(ledger) -> Callable[[str, str, str], str]:
+    """What a parent CSV (sample_ledger.ParentCSV) already holds:
+    ``held(part, item, field)``, '' when nothing. A part-level field (item
+    '') is read from the part's first row; its rows repeat it."""
+    exact: Dict[Tuple[str, ...], Dict[str, str]] = {}
+    first: Dict[str, Dict[str, str]] = {}
+    for r in ledger.rows:
+        k = ledger._key(r)
+        exact.setdefault(k, r)
+        first.setdefault(k[0], r)
+
+    def held(part: str, item: str, field: str) -> str:
+        sid = str(part).strip().lower()
+        r = (exact.get((sid, str(item).strip().lower())) if item and len(ledger.keys) > 1
+             else first.get(sid))
+        return str((r or {}).get(field, "") or "").strip()
+    return held
+
+
 def decide(run: Extraction, schema: TemplateSchema,
-           prefer: Sequence[str] = ()) -> List[Decision]:
+           prefer: Sequence[str] = (),
+           known: Optional[Callable[[str, str, str], str]] = None) -> List[Decision]:
     """Pick one value per (part, item, field); a clash between sources is never
     pre-accepted.
 
@@ -3833,7 +3860,12 @@ def decide(run: Extraction, schema: TemplateSchema,
     A reading someone signed (an EC response with initials) is offered twice:
     in that person's own column, "<field> [JB]", where it is the only value
     and can be pre-accepted; and as a candidate for the template's single
-    cell, where readings that disagree clash - the reviewer accepts one."""
+    cell, where readings that disagree clash - the reviewer accepts one.
+
+    ``known``: what the Ledger already holds (ledger_values). A value it
+    holds is pre-accepted - it was accepted before; another value for the
+    same cell is the reviewer's to choose, never pre-accepted (user,
+    2026-10-23: a Ledger run again as its folders gain files)."""
     groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
     seq: Dict[int, int] = {}                 # each reading's place in the run
     for i, o in enumerate(run.obs):
@@ -3925,6 +3957,14 @@ def decide(run: Extraction, schema: TemplateSchema,
                   and MISFIT_PART_HOW not in o.part_how
                   # nor one of a sheet whose parts' blocks are not clear
                   and SHEET_PARTS_HOW not in o.part_how)
+            held = known(part, item, fname) if known is not None and part else ""
+            if held and not alternate:
+                if k == _value_key(held):
+                    ok = True
+                    o.note = _join(o.note, IN_LEDGER_NOTE)
+                else:
+                    ok = False
+                    o.note = _join(o.note, f"{LEDGER_DIFFERS_NOTE} {held}")
             if needs_item(schema, o.field, o.item):
                 # a per-flaw value with no flaw: Apply would put it on every
                 # flaw row (review, 2026-10-20)
@@ -3950,6 +3990,7 @@ def review_reason(d: Decision, schema: TemplateSchema) -> str:
     o = d.obs
     how = o.part_how or ""
     checks = (
+        (LEDGER_DIFFERS_NOTE in o.note, "differs from the value already in the Ledger"),
         (bool(d.conflict), "different workbooks disagree on the value"),
         (not o.part, "no part number found"),
         (needs_item(schema, o.field, o.item), f"no {schema.item_field} found for it"),
@@ -4822,7 +4863,8 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                       # the same worked answers the extract learned from
                       examples=_csv_rows(csv_path) + _filled_example_rows(csv_path, schema))
     prog.stage("matching your choices")
-    decisions = decide(run, schema, prefer=meta.get("prefer") or ())
+    decisions = decide(run, schema, prefer=meta.get("prefer") or (),
+                       known=ledger_values(ledger))
     mapped: List[Decision] = []
     # a per-flaw value with no flaw is not written: it went to every flaw
     # row of its part (review, 2026-10-20) - (field, mapped on 'Labels to
@@ -4873,7 +4915,19 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
 
     rows = rows_from(decisions, schema, sources=True)       # each row: its workbooks
     prog.stage("writing the parent CSV", total=len(rows), unit="rows")
-    res = ledger.add_samples(rows, source=", ".join(Path(s).name for s in read)[:200])
+    source = ", ".join(Path(s).name for s in read)[:200]
+    res = ledger.add_samples(rows, source=source)
+    # a value the review flagged as differing from the Ledger, accepted: it
+    # replaces the old one (said so), every other cell is never overwritten
+    instead = [d for d in decisions if d.accept and LEDGER_DIFFERS_NOTE in d.obs.note]
+    if instead:
+        ledger.add_samples(rows_from(instead, schema, sources=True), source=source,
+                           overwrite=True)
+        now = {" / ".join(r.get(k, "") for k in ledger.keys): r for r in ledger.rows}
+        res.conflicts = [c for c in res.conflicts
+                         if (now.get(c[0]) or {}).get(c[1], "") != c[3]]
+        notes.append(f"{len(instead)} value(s) you accepted in place of the Ledger's "
+                     "earlier one(s) were written over them")
     prog.advance(len(rows))
     filled, warnings = [], []
     if fill_dir:

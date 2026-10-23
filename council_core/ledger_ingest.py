@@ -29,9 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (REVIEW_TOO_LONG, ImageReader, apply_review, decide,
-                            default_image_reader, extract, load_aliases, load_taught,
-                            path_too_long, summarize_review_reasons, too_long_to_write,
-                            workbook_files, write_review)
+                            default_image_reader, extract, ledger_values, load_aliases,
+                            load_taught, path_too_long, summarize_review_reasons,
+                            too_long_to_write, workbook_files, write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -362,6 +362,23 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
         return s
 
 
+def source_files(csv_path, sources: Sequence) -> List[Path]:
+    """The files an Extract of this Ledger would read from ``sources``
+    (folders scanned, the Skip patterns and the Ledger's own files left
+    out), as _extract and _extract_records find them - for an update, which
+    then reads only the new or changed ones (council_core.ledger_saved)."""
+    from council_core import ledger_records
+    from source_extract import load_ignore_files
+    if ledger_records.is_record_ledger(csv_path):
+        template = ledger_records.load_recipe(csv_path).template.get("path")
+    else:
+        schema = ParentCSV(csv_path).schema
+        template = schema.template_path if schema is not None else None
+    files, _ = collect_sources(sources, ignore_patterns=load_ignore_files(csv_path),
+                               template_path=template)
+    return files
+
+
 def _same_file(a, b) -> bool:
     try:
         return Path(a).resolve() == Path(b).resolve()
@@ -515,7 +532,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                         "them).")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
-    dec = decide(run, ledger.schema, prefer=prefer)
+    # what the Ledger holds already: pre-accepted again, and a value other
+    # than it flagged (a Ledger run again on folders that gained files)
+    dec = decide(run, ledger.schema, prefer=prefer, known=ledger_values(ledger))
     # the mask and Part override go with the review: Apply reads the
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)

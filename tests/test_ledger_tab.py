@@ -413,3 +413,67 @@ def test_re_run_with_my_answers(qapp, books):
     assert tab.filled_dialog is not dlg and tab.filled_dialog.review.path == again
     assert tab.filled_dialog.part == dlg.part
     tab.filled_dialog.close()
+
+
+def test_a_saved_ledger_is_picked_again_and_updated_with_new_files(qapp, tmp_path):
+    """user, 2026-10-23: 'the folders it was run on get more data in them I
+    want to be able to rerun from that stage'; runs 'saved, catergorized,
+    and named by the council', grouped 'by template and or project'."""
+    from council_core import ledger_saved
+    from council_qt.tabs.ledger_runs_dialog import LedgerRunsDialog
+    src = tmp_path / "sources"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    make_nde_book(src / "NDE results.xlsx")
+    template = make_template(tmp_path / "LMM Template.xlsx")
+    tab, _ = make_tab(qapp)
+    assert not tab.update_btn.isEnabled() and not tab.runs_btn.isEnabled()
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.prefer_operator.setText("JB")
+    tab.on_extract()
+    assert tab.wait(120)
+    csv = tab.csv.text()
+    assert "Saved as \"LMM Template · sources ·" in tab.log.toPlainText()
+    assert tab.update_btn.isEnabled() and tab.runs_btn.isEnabled()
+    tab.ledger_project.setText("Apollo")
+    tab._save_details()
+    tab.group_by.setCurrentIndex(list(ledger_saved.GROUPS).index("project"))
+    texts = [tab.saved_choice.itemText(i) for i in range(tab.saved_choice.count())]
+    assert texts[0] == "Apollo" and texts[1].strip().startswith("LMM Template")
+    assert tab.saved_choice.currentIndex() == 1
+    accept(tab.review.text(), [(None, None, None, None)])
+    tab.apply_btn.click()
+    assert tab.wait(60)
+
+    tab.on_update()                                          # nothing new yet
+    assert tab.wait(60)
+    assert tab.status.text().startswith("Nothing new")
+
+    other, _ = make_tab(qapp)                                # another day: pick it
+    assert other.load_saved(csv)
+    assert other.source_paths() == [str(src)] and other.prefer_operator.text() == "JB"
+    assert other.template.text() == str(template) and other.ledger_project.text() == "Apollo"
+    make_summary(src / "summary.xlsx")
+    other.on_update()
+    assert other.wait(120)
+    assert other.status.text().startswith("Updated with 1 new and 0 changed file(s)")
+    assert other.stat["values"].text() == "4"                # the new file's values only
+    assert other.wait(60)
+    dlg = other.filled_dialog
+    assert dlg.review.path == other.review.text() and "already in the Ledger" in \
+        dlg.template_note.text()
+    dlg.close()
+    led = ledger_saved.load(csv)
+    assert [(r.kind, r.files, r.new_files) for r in led.runs] == [("extract", 2, 0),
+                                                                 ("update", 1, 1)]
+    assert led.runs[-1].name.endswith("· 1 new file")
+
+    runs = LedgerRunsDialog(csv, open_filled=lambda r: None, opener=lambda r: None)
+    assert runs.table.rowCount() == 2 and runs.table.item(0, 2).text() == \
+        "Update with new files"
+    runs.rename(0, "October summary")
+    assert ledger_saved.load(csv).runs[-1].name == "October summary"
+    runs.close()
