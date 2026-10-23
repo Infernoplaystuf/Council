@@ -323,3 +323,46 @@ def test_the_filled_template_window_shows_a_cells_source(qapp, sample_review):
     dlg.show_whole_part()
     assert len(dlg.shown) == sum(1 for i in dlg.review.items if i.part == "101")
     dlg.close()
+
+
+def test_answers_carry_into_a_new_review_of_the_same_sources(sample_review):
+    """Re-run with my answers: what was said Right or Wrong is not asked
+    again, and a correction stays."""
+    import shutil
+    review, csv, src = sample_review
+    new = review.with_name("review_again.xlsx")
+    shutil.copy(review, new)
+    old = lv.load(review)
+    held = [i for i in old.items if i.needs and not i.clash]
+    green = next(i for i in old.items if i.accept == "Y" and not i.needs)
+    right, fixed = held[0], held[1]
+    lv.save(review, {(right.sheet, right.row): {"accept": "Y"},
+                     (fixed.sheet, fixed.row): {"accept": "Y", "value": "999",
+                                                "value_col": fixed.value_col},
+                     (green.sheet, green.row): {"accept": "N"}})
+    assert lv.carry_answers(lv.load(review), lv.load(new)) == 3
+    got = {(i.sheet, i.row): i for i in lv.load(new).items}
+    assert got[(right.sheet, right.row)].accept == "Y"
+    assert (got[(fixed.sheet, fixed.row)].accept, got[(fixed.sheet, fixed.row)].value) == \
+        ("Y", "999")
+    assert got[(green.sheet, green.row)].accept == "N"      # said Wrong stays Wrong
+    untouched = held[2]
+    assert got[(untouched.sheet, untouched.row)].accept == ""
+    assert lv.carry_answers(lv.load(review), lv.load(new)) == 0   # already carried
+
+
+def test_the_filled_template_window_re_runs_with_the_answers(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    review, csv, src = sample_review
+    assert FilledTemplateDialog(lv.load(review)).rerun_btn.isHidden()
+    asked = []
+    dlg = FilledTemplateDialog(lv.load(review), on_rerun=lambda r, p: asked.append((r, p)))
+    assert not dlg.rerun_btn.isHidden()
+    held = next(i for i in dlg.review.items if i.needs and not i.clash)
+    dlg.select(held)
+    dlg.on_right()
+    assert dlg.on_rerun_clicked()
+    assert asked == [(str(review), dlg.part)]
+    busy = FilledTemplateDialog(lv.load(review), on_rerun=lambda r, p: False)
+    assert not busy.on_rerun_clicked() and busy.isVisible() is False   # never shown
+    assert next(i for i in lv.load(review).items if i.row == held.row).accept == "Y"

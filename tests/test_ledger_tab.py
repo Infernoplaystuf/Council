@@ -373,3 +373,43 @@ def test_the_filled_template_opens_after_extract(qapp, books):
     dlg = tab.filled_dialog
     assert dlg.part and dlg.review.path == tab.review.text()
     dlg.close()
+
+
+def test_re_run_with_my_answers(qapp, books):
+    """user, 2026-10-23: 'look at a few values and then give an answer and
+    have it rerun and fill things in more confidently'."""
+    from council_core import ledger_review as lv
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.on_extract()
+    assert tab.wait(120)
+    first = tab.review.text()
+    held = [i for i in lv.load(first).items if i.needs]
+    tab.on_filled_window()
+    assert tab.wait(60)
+    dlg = tab.filled_dialog
+    fod = [i for i in held if i.part == "101" and i.fields[0].startswith("Flaw Attributes")]
+    date = next(i for i in held if i.part == "101" and i.fields == ["Date"])
+    assert len(fod) == 9
+    for it in fod[:3] + [date]:                       # a few values said Right
+        dlg.select(it)
+        dlg.on_right()
+    assert dlg.on_rerun_clicked()
+    assert tab.wait(180)
+    again = tab.review.text()
+    assert again != first and Path(first).exists()     # a new review; the old one kept
+    assert ParentCSV(tab.csv.text()).get("101", "")["Date"] == "2026-10-01"
+    now = {(i.part, i.item, tuple(i.fields), i.where): i for i in lv.load(again).items}
+    # learned from the three: every reading of that label is pre-accepted now
+    assert all(now[(i.part, i.item, tuple(i.fields), i.where)].accept == "Y" for i in fod)
+    assert now[("101", "", ("Date",), date.where)].accept == "Y"     # not asked again
+    assert int(tab.stat["to_review"].text()) < len(held)
+    assert "Re-run with your answers" in tab.log.toPlainText()
+    assert tab.wait(60)
+    assert tab.filled_dialog is not dlg and tab.filled_dialog.review.path == again
+    assert tab.filled_dialog.part == dlg.part
+    tab.filled_dialog.close()

@@ -131,6 +131,43 @@ class LedgerActions:
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
                                        image_reader=reader, progress=progress)
 
+    def rerun(self, review, fill_dir, use_images, progress,
+              vision_model: Optional[str] = None, cancel=None, assist=False, prefer=()):
+        """Re-run with my answers (user, 2026-10-23: "look at a few values
+        and then give an answer and have it rerun and fill things in more
+        confidently"): the saved review applied - its accepted values go in
+        the parent CSV, where the next run learns from them as worked
+        answers - then Extract run again on the review's own sources, part,
+        pattern and operators, and the review's answers carried into the new
+        one (ledger_review.carry_answers). Returns (ApplySummary,
+        ExtractSummary or None when cancelled between the two, how many
+        answers were carried)."""
+        from council_core import kg_excel
+        meta = kg_excel._review_meta(Path(review)) or {}
+        csv, sources = meta.get("csv"), list(meta.get("sources") or [])
+        if not csv or not sources:
+            raise LedgerError(f"{Path(review).name} does not say which parent CSV and "
+                              "sources it was made from; run Extract instead")
+        applied = self.apply(review, fill_dir, use_images, progress, vision_model=vision_model)
+        if cancel is not None and cancel.is_set():
+            return applied, None, 0
+        # a saved pattern only hinted at: left out, so it is a hint again
+        mask = "" if meta.get("pattern_hint") else (meta.get("pattern_mask") or "")
+        extracted = self.extract(csv, sources, meta.get("part") or "", use_images, progress,
+                                 pattern_mask=mask, vision_model=vision_model, cancel=cancel,
+                                 assist=assist, prefer=tuple(prefer or meta.get("prefer") or ()))
+        # what was said Right or Wrong is not asked again
+        from council_core import ledger_review
+        new, carried = getattr(extracted, "review", ""), 0
+        if new and Path(new).is_file() and not ledger_ingest._same_file(new, review):
+            fresh = ledger_review.load(new)
+            carried = ledger_review.carry_answers(ledger_review.load(review), fresh)
+            if carried:
+                progress(f"{carried} answer(s) carried into the new review; filling in "
+                         "the template again")
+                ledger_review.write_all_filled(ledger_review.load(new), progress)
+        return applied, extracted, carried
+
     def teach_guess(self, csv, workbook, *, model_id: Optional[str] = None,
                     use_images: bool = True, vision_model: Optional[str] = None,
                     pattern_mask: Optional[str] = None, cancel=None, progress=None):
@@ -1322,35 +1359,37 @@ class LedgerTab(ViewHelpers, QWidget):
         if prefer:                         # only then, as with the model
             more["prefer"] = prefer
 
-        def done(s) -> None:
-            self.review.setText(s.review)
-            self.stat["values"].setText(str(s.values))
-            self.stat["pre_accepted"].setText(str(s.pre_accepted))
-            self.stat["to_review"].setText(str(s.to_review))
-            self.stat["images"].setText(f"{s.images_read} / {s.images}")
-            self.stat["problems"].setText(str(len(s.problems)))
-            if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
-                # before or while Council's model was asked: the same words
-                # for both, and not 'partial' (second review, 2026-10-20)
-                self.status.setText(
-                    "Cancelled after every workbook was read: every value the rules found "
-                    "is in the review. Open it, check the amber and red rows, map the "
-                    "leftover labels, save it, then Apply.")
-            elif getattr(s, "cancelled", False):
-                self.status.setText(
-                    "Cancelled. The partial review was still written — "
-                    "open it to see what landed, or clear it and run again.")
-            else:
-                self.status.setText(
-                    "Review written. Open it, check the amber and red rows, "
-                    "map the leftover labels, save it, then Apply.")
-            self._say(s.describe())
         self._run("Extracting",
                   lambda p: self.actions.extract(csv, sources, part, images, p,
                                                  pattern_mask=mask,
                                                  vision_model=vision,
-                                                 cancel=self._cancel, **more), done,
-                  cancellable=True)
+                                                 cancel=self._cancel, **more),
+                  self._show_extract, cancellable=True)
+
+    def _show_extract(self, s) -> None:
+        """An Extract's summary in the stats, the status line and the log."""
+        self.review.setText(s.review)
+        self.stat["values"].setText(str(s.values))
+        self.stat["pre_accepted"].setText(str(s.pre_accepted))
+        self.stat["to_review"].setText(str(s.to_review))
+        self.stat["images"].setText(f"{s.images_read} / {s.images}")
+        self.stat["problems"].setText(str(len(s.problems)))
+        if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
+            # before or while Council's model was asked: the same words
+            # for both, and not 'partial' (second review, 2026-10-20)
+            self.status.setText(
+                "Cancelled after every workbook was read: every value the rules found "
+                "is in the review. Open it, check the amber and red rows, map the "
+                "leftover labels, save it, then Apply.")
+        elif getattr(s, "cancelled", False):
+            self.status.setText(
+                "Cancelled. The partial review was still written — "
+                "open it to see what landed, or clear it and run again.")
+        else:
+            self.status.setText(
+                "Review written. Open it, check the amber and red rows, "
+                "map the leftover labels, save it, then Apply.")
+        self._say(s.describe())
 
     def on_diagnose(self) -> None:
         sources = self.source_paths()
@@ -1416,9 +1455,9 @@ class LedgerTab(ViewHelpers, QWidget):
             dlg.show()
         self._run("Reading the review", lambda _p: ledger_review.load(path), done)
 
-    def on_filled_window(self) -> None:
+    def on_filled_window(self, part: str = "") -> None:
         """The filled template window (ledger_review_dialog.FilledTemplateDialog)
-        over the review workbook above."""
+        over the review workbook above, on ``part`` when it has one."""
         path = self.review.text().strip()
         if not path or not Path(path).is_file():
             self.status.setText("No review workbook yet: run Extract first.")
@@ -1435,12 +1474,69 @@ class LedgerTab(ViewHelpers, QWidget):
                                        opener=self.actions.open,
                                        on_saved=lambda n: self.status.setText(
                                            f"{n} answer(s) saved into the review. Apply puts "
-                                           "the accepted values into the parent CSV."))
+                                           "the accepted values into the parent CSV."),
+                                       on_rerun=self.on_rerun_with_answers, part=part)
             self.filled_dialog = dlg
             self._say(f"── Filled template ({Path(path).name}): "
                       f"{len(ledger_review.parts(review))} part(s)")
             dlg.show()
         self._run("Reading the review", lambda _p: ledger_review.load(path), done)
+
+    def on_rerun_with_answers(self, review: str, part: str = "") -> bool:
+        """The filled template window's "Re-run with my answers" (its answers
+        already saved): Apply, then Extract again on the review's sources
+        (LedgerActions.rerun), then the window again on the new review, at
+        the same part. The values said Right are in the parent CSV by then,
+        so the run learns from them; a new review is written, the old one
+        kept. False when it did not start."""
+        if self.busy:
+            self.status.setText("Not re-run: wait for the current step to finish.")
+            return False
+        fill = self.fill_dir.text().strip()
+        images = self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {"vision_model": vision} if images and vision else {}
+        if self.ask_model.isChecked():
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not re-run: no model picked. Untick \"Ask Council's "
+                                    "model about the rest\" to run without one.")
+                return False
+            more["assist"] = model_id
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:                         # typed here: these, else the review's
+            more["prefer"] = prefer
+        tab_csv = self.csv.text().strip()
+
+        def step(p):
+            applied, extracted, carried = self.actions.rerun(review, fill, images, p,
+                                                             cancel=self._cancel, **more)
+            csv = getattr(self.actions, "applied_csv", lambda _r: None)(review)
+            return applied, extracted, carried, csv or tab_csv
+
+        def done(result) -> None:
+            applied, extracted, carried, csv = result
+            self._say(applied.describe())
+            self._register(csv, again=True)
+            self._kg_dirty = True
+            if extracted is None:
+                self.stat["problems"].setText(str(len(applied.problems)))
+                self.status.setText(f"{applied.accepted} values accepted into the parent "
+                                    "CSV; cancelled before Extract ran again.")
+                return
+            self._show_extract(extracted)
+            if not getattr(extracted, "cancelled", False):
+                line = (f"Re-run with your answers: {applied.accepted} values accepted into "
+                        f"the parent CSV; the new review pre-accepts {extracted.pre_accepted} "
+                        f"of {extracted.values} values, {extracted.to_review} held back"
+                        + (f" ({carried} of them already answered by you)" if carried
+                           else "") + ".")
+                self._say(line)
+                self.on_filled_window(part)
+                self.status.setText(line)
+        self._run("Re-running with your answers", step, done, cancellable=True)
+        return True
 
     def on_open_review(self) -> None:
         path = self.review.text().strip()
