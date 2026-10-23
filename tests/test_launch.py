@@ -656,9 +656,11 @@ def test_the_engine_settings_saved_in_the_vault_are_applied(qapp, tmp_path,
     _engine_settings(tmp_path, n_ctx="16384", gpu_layers="20",
                      embed_device="cuda")
     build()
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "20"
     assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cuda"
+    # The saved context size is the Tk era's fixed window: the engine sizes
+    # the window to the model now (user, 2026-10-23), so it is not applied.
+    assert "COUNCIL_GGUF_N_CTX" not in os.environ
 
 
 def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
@@ -670,7 +672,6 @@ def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
     monkeypatch.setenv("COUNCIL_GGUF_GPU_LAYERS", "0")
     build()
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "0"
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
 
 
 def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):

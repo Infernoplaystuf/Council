@@ -48,6 +48,7 @@ import council_engine as ce
 import data_index
 
 from . import paths as _paths
+from . import token_budget
 
 # ============================================================
 # The vault, and the session a turn is prepared for
@@ -3317,7 +3318,7 @@ def _run_analyst_step_impl(query):
                     messages=[{'role': 'user', 'content': prompt + feedback}],
                     role="coder",
                     temperature=0.0,
-                    num_predict=700,
+                    num_predict=token_budget.reply("answer", 700),
                     timeout=120,
                 )
         except Exception as _e:
@@ -3906,11 +3907,13 @@ def writer_budget(augmented: str, room: Dict[str, Any]) -> Dict[str, Any]:
             "model_max_ctx": most, "tokenizer": "estimate"}
 
 
-def window_setting() -> str:
+def window_setting() -> Optional[str]:
     """The setting that sizes the main model's window, as the engine reads
     it (council_engine._ollama_num_ctx / effective_n_ctx): when Ollama serves
     the main model, the main slot's own "n_ctx" in model_slots.json if it has
-    one, else COUNCIL_OLLAMA_NUM_CTX; otherwise COUNCIL_GGUF_N_CTX. Never
+    one, else COUNCIL_OLLAMA_NUM_CTX. None for a GGUF: its window is already
+    the largest that fits this PC (the loader's ladder), with no setting to
+    raise — COUNCIL_GGUF_N_CTX is no longer read (user, 2026-10-23). Never
     loads a model."""
     try:
         if ce._ollama_will_serve("main"):
@@ -3923,7 +3926,7 @@ def window_setting() -> str:
             return "COUNCIL_OLLAMA_NUM_CTX"
     except Exception:                                     # noqa: BLE001
         pass
-    return "COUNCIL_GGUF_N_CTX"
+    return None
 
 
 def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
@@ -3943,7 +3946,10 @@ def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
     kept = f", and keeps {answer:,} of them for the answer" if answer else ""
     if budget.get("over_window") or used > room:
         most = int(budget.get("model_max_ctx") or 0)
-        if most and most > ctx:
+        if setting is None:
+            hint = (" The model already has the largest window that fits "
+                    "this PC; to fit it, ask about fewer files at once.")
+        elif most and most > ctx:
             hint = (f" This model can read up to {most:,}: start the app "
                     f"with {setting} set to "
                     f"{min(max(16384, ctx * 4), most)} and it will fit.")
@@ -3961,9 +3967,9 @@ def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
                 f"fills what the model can read at once: about {used:,} "
                 f"tokens, {pct:.0f}% of the {room:,} it has for a question "
                 f"(it reads {ctx:,}{kept}). If the model counts a little "
-                f"more than this estimate, part of it will be cut out. "
-                f"Starting the app with {setting} set higher gives it more "
-                f"room.")
+                f"more than this estimate, part of it will be cut out."
+                + (f" Starting the app with {setting} set higher gives it "
+                   f"more room." if setting else ""))
     return None
 
 
@@ -3999,10 +4005,12 @@ def left_out_notice(dropped, n_ctx: int) -> str:
     for label, cost in dropped:
         lines.append(f"  • {_plain_label(label)}  (about {int(cost):,} "
                      f"tokens)")
+    setting = window_setting()
     lines.append(f"A computed answer, the task memo and a \"file not found\" "
                  f"note are never left out; files you named and folder lists "
-                 f"can be. Starting the app with {window_setting()} set "
-                 f"higher keeps more.")
+                 f"can be."
+                 + (f" Starting the app with {setting} set higher keeps more."
+                    if setting else ""))
     return "\n".join(lines)
 
 

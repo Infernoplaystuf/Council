@@ -120,19 +120,11 @@ dist/DatasInferno/
    * creates `~/.council/vault/` and its `data_in/`, `logs/`,
      `workspace/`, etc. subfolders
    * prompts for the model path if `COUNCIL_GGUF_PATH` is unset
-4. (Recommended) Before launching, raise the context window in
-   the environment so big folder dumps don't get clipped:
-
-   ```cmd
-   :: Windows cmd
-   set COUNCIL_GGUF_N_CTX=16384
-
-   :: PowerShell
-   $env:COUNCIL_GGUF_N_CTX = "16384"
-   ```
-
-   Phi-4 supports 16K natively; Llama 3.1 and Granite 3.x go up to
-   128K. KV-cache RAM roughly doubles each time you double `n_ctx`.
+4. The context window sizes itself: the app loads each model with the
+   largest window that fits your GPU memory, up to the model's own
+   limit and `COUNCIL_GGUF_N_CTX_MAX` (default 32768). There is no
+   fixed window to set; the old `COUNCIL_GGUF_N_CTX` is no longer read.
+   Reply lengths grow with the window too.
 
 ---
 

@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import code_map as cm
 from . import project as pj
+from . import token_budget
 from . import worktree as wt
 from .project_tools import Workspace
 
@@ -234,7 +235,8 @@ def make_plan(vault_dir: Path, project: pj.Project, task: str, *,
                            "\n\nThe project has NO test command: use 'gui' "
                            "or 'none' checks.")}]
     raw = chat(msgs, role=role or planner_role(), json_schema=PLAN_SCHEMA,
-               num_predict=2000, temperature=0.1, timeout=600)
+               num_predict=token_budget.reply("long", 2000),
+               temperature=0.1, timeout=600)
     from .council_schemas import _parse
     obj = _parse(raw)
     if not isinstance(obj, dict):
@@ -460,7 +462,8 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
             _trim(messages, budget)
             try:
                 reply = chat_tools(messages, specs, role=role,
-                                   num_predict=1800, timeout=900)
+                                   num_predict=token_budget.reply("long", 1800),
+                                   timeout=900)
             except Exception as exc:                      # noqa: BLE001
                 say("result", f"The model call failed: {exc}")
                 break

@@ -161,7 +161,9 @@ def test_a_gguf_is_not_loaded_with_the_council_s_chat_window(monkeypatch, tmp_pa
     model = tmp_path / "granite.gguf"
     model.write_bytes(b"GGUF")
     ledger_llm.chat_for(str(model))("a short prompt", {"type": "object"})
-    assert got["load"]["use_env_n_ctx"] is False
+    # The loader no longer reads COUNCIL_GGUF_N_CTX at all (user, 2026-10-23;
+    # tests/test_model_slots.py), so there is nothing for the Ledger to skip.
+    assert "use_env_n_ctx" not in got["load"]
     assert got["load"]["n_ctx_max"] == ledger_llm.GGUF_WINDOW
     ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
 
@@ -179,7 +181,7 @@ def test_council_s_own_gguf_is_loaded_by_the_ledger_not_shared(monkeypatch, tmp_
     monkeypatch.setattr(ce, "_SLOT_INSTANCES", {"main": object()})
     monkeypatch.setattr(ce, "_release_slots", lambda: got.setdefault("released", True))
     text, _ = ledger_llm.chat_for(str(model))("a short prompt", {"type": "object"})
-    assert text == "{}" and got["released"] and got["load"]["use_env_n_ctx"] is False
+    assert text == "{}" and got["released"] and "load" in got
     # no model picked: Council's model, the same way
     ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
     monkeypatch.setattr(ledger_llm, "_main_gguf", lambda: str(model))
