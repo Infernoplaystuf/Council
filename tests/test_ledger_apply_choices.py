@@ -656,3 +656,25 @@ def test_a_newer_review_of_a_workbook_of_the_same_name_is_not_cited(tmp_path, le
     froms = {v.locator.get("from") for rec in reading.records for v in rec.values
              if v.locator.get("item") == "Flaw # 1A" and v.raw == "JB"}
     assert froms == {"nde.xlsx › Part 101!C4"}
+
+
+def test_the_models_part_that_the_file_name_also_says_is_pre_accepted(tmp_path, ledger):
+    """user, 2026-10-23: 3659 values to review with 'SBS2FFP268.xlsx ->
+    SBS2FFP268'. The model's part and the file's name agree: two sources,
+    pre-accepted, and Apply gives it the same part. One the name does not
+    say stays to check."""
+    csv_path, _schema = ledger
+    _serial_book(tmp_path)
+    book = tmp_path / "XYZ9AB123-R2 (15 hours concealment).xlsx"
+    (tmp_path / "untitled.xlsx").rename(book)
+    s = li._extract(str(csv_path), [str(book)], tmp_path / "r.xlsx", "", False, None,
+                    _NoProg(), None, None, None, True, FakeModel())
+    _wb, rows = _values(s.review)
+    power = next(r for r in rows if r["Field"] == "Power (W)")
+    assert power["Part from"].startswith(se.AGREED_PART_HOW) and power["Accept"] == "Y"
+    assert "part suggested by the model" not in s.review_reasons
+    li.run_apply(s.review, use_images=False)
+    assert {r["Part Number"]: r["Power (W)"] for r in _csv_rows(csv_path)
+            if r["Power (W)"]} == {"XYZ9AB123-R2": "280"}
+    assert se._in_name("SBS2FFP141-F", "SBS2FFP141-F (18 Hours concealment)_Main")
+    assert not se._in_name("SBS2FFP26", "SBS2FFP268")

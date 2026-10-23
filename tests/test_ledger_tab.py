@@ -301,3 +301,30 @@ def test_review_by_clicking_opens_over_the_review(qapp, books):
     assert dlg.review.path == tab.review.text()
     assert "need a decision" in tab.log.toPlainText()
     dlg.close()
+
+
+def test_the_operator_to_prefer_goes_into_the_extract(qapp, books, monkeypatch):
+    """user, 2026-10-23: one workbook's several readings - the operator
+    typed is used first (source_extract.decide), and the review keeps it."""
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.prefer_operator.setText("jb, AK")
+    from council_core import ledger_ingest
+    seen = {}
+    real = ledger_ingest.run_extract
+
+    def spy(*a, **kw):
+        seen["prefer"] = kw.get("prefer")
+        return real(*a, **kw)
+    monkeypatch.setattr(ledger_ingest, "run_extract", spy)
+    tab.on_extract()
+    assert tab.wait(120)
+    assert seen["prefer"] == ["jb", "AK"]
+    import json
+    import openpyxl
+    meta = json.loads(openpyxl.load_workbook(tab.review.text())["_run"]["A1"].value)
+    assert meta["prefer"] == ["jb", "AK"]

@@ -196,7 +196,9 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
         if cell is None and "image" in where:
             lines.append("from a picture: the cell cannot be shown")
         out.append(Item(
-            sheet="Values", row=i, accept=acc, needs=acc != "Y" or clash, clash=clash,
+            # 'N': set aside for another reading of the same workbook (decide)
+            sheet="Values", row=i, accept=acc, needs=acc not in ("Y", "N") or clash,
+            clash=clash,
             title=" · ".join(x for x in (value, fname, " ".join(y for y in (part, item) if y))
                              if x) or where,
             detail="\n".join(x for x in lines if x),

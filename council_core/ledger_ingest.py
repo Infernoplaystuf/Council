@@ -324,7 +324,7 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 pattern_mask: Optional[str] = None,
                 cancel: Optional[Any] = None,
                 log: Optional[Callable[[str], None]] = None,
-                assist: Any = False) -> ExtractSummary:
+                assist: Any = False, prefer: Sequence[str] = ()) -> ExtractSummary:
     """``log``: where a stall dump goes (the Ledger tab's log). ``assist``:
     ask Council's model about the labels and part numbers the rules could
     not place (council_core.ledger_llm); its answers are suggestions, and
@@ -333,11 +333,14 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     ``pattern_mask`` empty: the Ledger's saved part-name pattern (Teach
     saves one; source_extract.load_patterns) is used as a hint - a part of
     another shape is still pre-accepted (extract's pattern_strict) - and the
-    summary says so (ExtractSummary.pattern_saved)."""
+    summary says so (ExtractSummary.pattern_saved).
+
+    ``prefer``: the operators (initials) whose reading is used when a
+    workbook has several readings of one value (source_extract.decide)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask, cancel, log, assist)
+                     prog, pattern_mask, cancel, log, assist, prefer=prefer)
         tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {tail}")
@@ -348,7 +351,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
              cancel: Optional[Any] = None,
              log: Optional[Callable[[str], None]] = None,
-             assist: Any = False, chat=None) -> ExtractSummary:
+             assist: Any = False, chat=None, prefer: Sequence[str] = ()) -> ExtractSummary:
     say = prog.update
     from council_core import ledger_records
     if ledger_records.is_record_ledger(csv_path):
@@ -470,15 +473,16 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                         "them).")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
-    dec = decide(run, ledger.schema)
+    dec = decide(run, ledger.schema, prefer=prefer)
     # the mask and Part override go with the review: Apply reads the
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)
     write_review(out, run, dec, ledger.schema, str(csv_path),
                  pattern_mask=pattern_mask or "", part=part or "",
-                 pattern_hint=pattern_saved)
+                 pattern_hint=pattern_saved, prefer=prefer)
     ok = sum(d.accept for d in dec)
-    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
+    aside = sum(bool(d.alternate) for d in dec)
+    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
                           list(run.timings), bool(run.cancelled), read_all=read_all,

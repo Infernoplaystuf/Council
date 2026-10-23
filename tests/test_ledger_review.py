@@ -203,7 +203,7 @@ def test_each_hold_back_has_its_reason(tmp_path):
     base = se.Obs(part="P1", item="", field="Power (W)", value="285", score=0.95,
                   via="match", label="Laser Power (W)", where="a.xlsx › S!C5")
     cases = {
-        "sources disagree on the value": se.Decision(base, False, "290"),
+        "different workbooks disagree on the value": se.Decision(base, False, "290"),
         "no part number found": se.Decision(replace(base, part=""), False),
         "read from a picture": se.Decision(replace(base, from_image=True), False),
         "part taken from the file name": se.Decision(
@@ -216,3 +216,33 @@ def test_each_hold_back_has_its_reason(tmp_path):
         assert se.review_reason(d, schema) == why
     text = se.summarize_review_reasons(list(cases.values()), schema)
     assert text.startswith("Why 6 values are to review") and "Power (W) (6)" in text
+
+
+def test_one_workbooks_readings_are_one_first_and_the_rest_set_aside(tmp_path):
+    """user, 2026-10-23: 'multiple readings per sample in the source while
+    in the template it only accepts one reading ... prioritize the first'.
+    Two workbooks that disagree are still the reviewer's; '12' and '12.0'
+    are one reading."""
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    def obs(value, where, inspector=""):
+        return se.Obs(part="P1", item="", field="Power (W)", value=value, score=0.95,
+                      via="match", label="Laser Power (W)", where=where,
+                      inspector=inspector)
+    run = se.Extraction(sources=[])
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "a.xlsx › S!C9", "AK")]
+    first, second = sorted((d for d in se.decide(run, schema) if d.obs.field == "Power (W)"),
+                           key=lambda d: d.obs.value)
+    assert first.accept and not first.conflict and "the first reading" in first.obs.note
+    assert not second.accept and second.alternate.startswith("set aside")
+    text = se.summarize_review_reasons([first, second], schema)
+    assert text.startswith("1 other readings set aside") and "AK (1)" in text
+    assert se.review_reason(second, schema) == ""
+    ak = {d.obs.value: d for d in se.decide(run, schema, prefer=se.parse_prefer("jb, ak"))
+          if d.obs.field == "Power (W)"}
+    assert ak["290"].accept and ak["285"].alternate
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "b.xlsx › S!C5")]
+    assert all(d.conflict and not d.accept for d in se.decide(run, schema))
+    run.obs = [obs("12", "a.xlsx › S!C5"), obs("12.0", "b.xlsx › S!C5")]
+    (one,) = se.decide(run, schema)
+    assert one.accept and not one.conflict

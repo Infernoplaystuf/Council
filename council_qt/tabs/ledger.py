@@ -98,7 +98,7 @@ class LedgerActions:
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
-                cancel=None, assist=False):
+                cancel=None, assist=False, prefer=()):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -108,7 +108,7 @@ class LedgerActions:
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
                                          cancel=cancel, log=self.stall_log,
-                                         assist=assist)
+                                         assist=assist, prefer=prefer)
 
     def diagnose(self, file, csv, use_images, on_line,
                  vision_model: Optional[str] = None, cancel=None, assist=False):
@@ -465,6 +465,20 @@ class LedgerTab(ViewHelpers, QWidget):
             "Accepting a suggested field teaches it for the next run.")
         mask_row.addWidget(self.ask_model)
         v2.addLayout(mask_row)
+        # one workbook's several readings of a value (user, 2026-10-23): the
+        # operator whose reading is used, else the first reading
+        prefer_row = QHBoxLayout()
+        prefer_row.addWidget(QLabel("Operator to prefer (optional):"))
+        self.prefer_operator = QLineEdit()
+        self.prefer_operator.setPlaceholderText("initials, e.g. JB, AK")
+        self.prefer_operator.setToolTip(
+            "When a workbook has several readings of one value (an EC response measured\n"
+            "by more than one operator) and the template keeps one: the reading of the\n"
+            "first operator listed here who has one is used. Left empty, or none of them\n"
+            "read it: the first reading in the workbook is used. The others are set aside\n"
+            "(N in the review). Values two workbooks disagree on are still yours to choose.")
+        prefer_row.addWidget(self.prefer_operator, 1)
+        v2.addLayout(prefer_row)
         # Filename-ignore patterns — persisted next to the aliases file so a
         # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
         ignore_row = QHBoxLayout()
@@ -1216,6 +1230,10 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "\"Ask Council's model about the rest\" to run without one.")
                 return
             more = {"assist": model_id}
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:                         # only then, as with the model
+            more["prefer"] = prefer
 
         def done(s) -> None:
             self.review.setText(s.review)
