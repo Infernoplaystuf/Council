@@ -1,0 +1,55 @@
+{
+  "about": "Typhon described the way a person would describe it, one part of the window at a time. run_typhon_recreate.py hands each part to the Designer's Describe it on a canvas the size of that part, then places the parts where Typhon has them. Nothing here is copied from typhon.gspec into a prompt: the regions only say where a part goes and which of Typhon's shapes it is graded against.",
+  "canvas": {"w": 1504, "h": 1016},
+  "window": {"title": "Typhon", "bg": "#045f80", "fg": "#ffffff"},
+  "sections": [
+    {
+      "id": "header",
+      "name": "Title bar",
+      "region": [0, 0, 1504, 64],
+      "text": "A title bar for a camera capture app called Typhon, in a dark teal window (#045f80) with white text. On the left, the title 'Typhon' in large bold text. On the far right, a small 'Settings ▾' button."
+    },
+    {
+      "id": "camera_settings",
+      "name": "Image folder and camera settings",
+      "region": [0, 64, 496, 400],
+      "text": "At the top, a bold label 'Image folder' with a folder picker under it. Below that, a tabbed panel called 'Camera settings' with one tab, 'Basic'. On the Basic tab, a grid of labelled number boxes and dropdowns, each label above its box: 'Exposure µs (0 = keep)' and 'Gain dB (0 = keep)' side by side; 'FPS (0 = camera default)' and a 'Downsample' dropdown with Off, 2x, 3x, 4x side by side. Then a row with a 'Capture' dropdown (Continuous, Triggered: exact, Triggered: snapshot) and a 'From' dropdown (Software, Timer), each with its label to its left. Then a row with a 'Per trigger' number box and a 'Timer every (s)' dropdown with 0.5, 1, 2, 5, 10, 30, 60. At the bottom of the tab, a note label saying 'Connect a camera to see its settings'."
+    },
+    {
+      "id": "timings",
+      "name": "Bad timings and skipped backends",
+      "region": [0, 464, 496, 312],
+      "text": "On the left, a 'Scan for bad timings' button. Under it, a label 'Frames on a bad timing' over a text box for the count, and a label 'Which frames' over a list. To the right of those, a label 'Backends not searched' over a list of the same height."
+    },
+    {
+      "id": "camera",
+      "name": "Camera connection and capture",
+      "region": [0, 776, 496, 240],
+      "text": "A label 'Camera' at the top left with a 'Camera setup…' button at the top right. Under them, a list of cameras across the full width. Under the list, three buttons in a row: 'Scan for cameras', 'Connect', 'Disconnect'. At the bottom, three buttons in a row: 'Start capture', 'Capture now (F9)', 'Stop capture'."
+    },
+    {
+      "id": "live_view",
+      "name": "Live view and playback",
+      "region": [496, 64, 632, 560],
+      "text": "A label 'Live view' at the top left and an empty label at the top right that shows the current frame's name. Under them, a large image panel that fills most of the area. Under the image, a 'Frame' slider on the left and three buttons on the right: 'Play / Pause', 'PNG / Raw', 'Pop out'."
+    },
+    {
+      "id": "crop_presets",
+      "name": "Crop box, camera area and presets",
+      "region": [496, 624, 632, 392],
+      "text": "Two columns at the top. Left: a label 'Crop box (x, y, w, h)' over a text box, and under it a 'Save cropped frames' button. Right: a label 'Save cropped frames to' over a folder picker, and under it an empty status label. Below the columns, a full-width label \"Camera's ROI (its own area) — set it on the camera\", then two buttons side by side, 'Apply area to camera' and 'Full sensor', then a full-width label \"Camera's area: — (no camera connected)\", then an empty full-width status label. At the bottom, a label 'Presets (settings + area) — pick one, or type a name and Save' over a row with a 'Preset' dropdown, a 'Save preset' button and a 'Camera settings…' button."
+    },
+    {
+      "id": "classifier_library",
+      "name": "Classifier library",
+      "region": [1128, 64, 376, 408],
+      "text": "A label 'Classifier' at the top, then a hint label 'Model — pick one, or type a name'. A row with a 'Model' dropdown and an 'Open' button. A row with a label 'Show' and a 'Filter' dropdown. A row with a 'New name' text box and three small buttons 'Save as', 'Rename', 'Delete'. A row with an 'Export folder' folder picker and an 'Export' button. A full-width button \"Export this app's classifiers\". A row with an 'Import file' file picker and an 'Import' button. A row with a 'Tag' text box and buttons 'Add tag' and 'Remove tag'. At the bottom, an empty label two lines tall that says which classifier labelled the folder."
+    },
+    {
+      "id": "classes",
+      "name": "Classes, training and predictions",
+      "region": [1128, 472, 376, 544],
+      "text": "A row with a label 'New class', a text box and an 'Add class' button. A label 'Classes (pick one, then mark)' over a list. A row with a 'Mark this frame' button and a 'Remove class' button. A row with 'Train' and 'Predict this frame' buttons. An empty status label three lines tall. A full-width 'Classify all frames' button. A label 'Predictions' over a list that fills the rest of the space."
+    }
+  ]
+}
