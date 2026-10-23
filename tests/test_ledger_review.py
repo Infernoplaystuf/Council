@@ -177,3 +177,42 @@ def test_the_window_shows_a_records_row(qapp, records_review):
     assert m.tints == {(5, c): ROW_TINT for c in range(1, 7)}
     assert dlg.value_edit.isHidden()
     dlg.close()
+
+
+# ── why values are to review (user, 2026-10-23: 7312 of 7976 to review) ──
+def test_the_run_says_why_values_are_to_review(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    make_nde_book(src / "NDE results.xlsx")
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    ex = li.run_extract(csv, [src], use_images=False)
+    assert ex.to_review == 9
+    assert ex.review_reasons.splitlines()[:2] == [
+        "Why 9 values are to review (the first reason each was held back):",
+        "       9  label only a loose match for the field"]
+    assert "Fields with the most to review: " in ex.review_reasons
+    assert ex.review_reasons in ex.describe()
+    assert "285" not in ex.review_reasons                  # counts and names, no values
+
+
+def test_each_hold_back_has_its_reason(tmp_path):
+    from dataclasses import replace
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    base = se.Obs(part="P1", item="", field="Power (W)", value="285", score=0.95,
+                  via="match", label="Laser Power (W)", where="a.xlsx › S!C5")
+    cases = {
+        "sources disagree on the value": se.Decision(base, False, "290"),
+        "no part number found": se.Decision(replace(base, part=""), False),
+        "read from a picture": se.Decision(replace(base, from_image=True), False),
+        "part taken from the file name": se.Decision(
+            replace(base, part_how=se.FILE_PART_HOW + " a.xlsx"), False),
+        "label placed by the model": se.Decision(replace(base, via="model"), False),
+        "label only a loose match for the field": se.Decision(replace(base, score=0.6), False),
+        "": se.Decision(base, True),
+    }
+    for why, d in cases.items():
+        assert se.review_reason(d, schema) == why
+    text = se.summarize_review_reasons(list(cases.values()), schema)
+    assert text.startswith("Why 6 values are to review") and "Power (W) (6)" in text

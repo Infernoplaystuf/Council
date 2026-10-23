@@ -3841,6 +3841,60 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     return out
 
 
+def review_reason(d: Decision, schema: TemplateSchema) -> str:
+    """Why decide() did not pre-accept ``d``: the first of its checks that
+    held it back, in a few words - for the count of reasons at the end of a
+    run (user, 2026-10-23: 7312 of 7976 values to review). '' when it was
+    pre-accepted. Words only, never the value or the source."""
+    if d.accept:
+        return ""
+    o = d.obs
+    how = o.part_how or ""
+    checks = (
+        (bool(d.conflict), "sources disagree on the value"),
+        (not o.part, "no part number found"),
+        (needs_item(schema, o.field, o.item), f"no {schema.item_field} found for it"),
+        (o.from_image, "read from a picture"),
+        (how.startswith(MODEL_PART_HOW), "part suggested by the model"),
+        (how.startswith(FILE_PART_HOW), "part taken from the file name"),
+        (how.startswith(TEXT_PART_HOW), "part found in a title"),
+        (MISFIT_PART_HOW in how, "part does not fit the part-name pattern"),
+        (SHEET_PARTS_HOW in how, "more than one part on the sheet"),
+        (o.via == "model", "label placed by the model"),
+        (o.via == "ambiguous", "label could be more than one field"),
+        (o.via not in ("alias", "match"), f"label matched by {o.via or 'nothing'}"),
+        (o.score < ACCEPT_AT, "label only a loose match for the field"),
+        ("not converted" in o.note, "unit not converted"),
+        (UNSURE_SIGNER_NOTE in o.note, "ends in initials: who signed it?"),
+        (_BESIDE_NOTE in o.note, "table with no labels of its own"),
+        (_PLACE_NOTE in o.note, "slide table paired by place"),
+        (_DOC_NOTE in o.note, "read from a text document"),
+    )
+    return next((why for held, why in checks if held), "another value ranked first")
+
+
+def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSchema,
+                             top_fields: int = 5) -> str:
+    """'Why 7312 values are to review: 4100 no part number found, ...' and
+    the fields with the most of them - counts and field names only, so the
+    line can be shared without the data."""
+    reasons: Counter = Counter()
+    fields: Counter = Counter()
+    for d in decisions:
+        why = review_reason(d, schema)
+        if why:
+            reasons[why] += 1
+            fields[d.obs.field] += 1
+    if not reasons:
+        return ""
+    total = sum(reasons.values())
+    lines = [f"Why {total} values are to review (the first reason each was held back):"]
+    lines += [f"  {n:>6}  {why}" for why, n in reasons.most_common()]
+    lines.append("Fields with the most to review: " + ", ".join(
+        f"{f} ({n})" for f, n in fields.most_common(max(1, int(top_fields)))))
+    return "\n".join(lines)
+
+
 #: How a part Council's model suggested is described (never pre-accepted).
 MODEL_PART_HOW = "suggested by Council's model"
 #: How a part read from the workbook's file name is described (never
