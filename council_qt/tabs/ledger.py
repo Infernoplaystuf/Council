@@ -470,11 +470,12 @@ class LedgerTab(ViewHelpers, QWidget):
         prefer_row = QHBoxLayout()
         prefer_row.addWidget(QLabel("Operator to prefer (optional):"))
         self.prefer_operator = QLineEdit()
-        self.prefer_operator.setPlaceholderText("initials, e.g. JB, AK")
+        self.prefer_operator.setPlaceholderText("initials or names, e.g. JB, Alex King")
         self.prefer_operator.setToolTip(
             "When a workbook has several readings of one value (an EC response measured\n"
             "by more than one operator) and the template keeps one: the reading of the\n"
-            "first operator listed here who has one is used. Left empty, or none of them\n"
+            "first operator listed here who has one is used - initials or a name, either\n"
+            "matches the other (JB is Jane Brown). Left empty, or none of them\n"
             "read it: the first reading in the workbook is used. The others are set aside\n"
             "(N in the review). Values two workbooks disagree on are still yours to choose.")
         prefer_row.addWidget(self.prefer_operator, 1)
@@ -530,6 +531,13 @@ class LedgerTab(ViewHelpers, QWidget):
             "Check the review one item at a time: the template cell the value goes in "
             "and the source cell it was read from, both highlighted. Right / Wrong / a "
             "corrected value are saved into the review workbook; then Apply.")
+        # the template filled in per part, tinted by confidence; click a cell
+        # to see its source (user, 2026-10-23)
+        self.filled_btn = self._step_button(row, "Filled template…", self.on_filled_window)
+        self.filled_btn.setToolTip(
+            "The template filled in for one part at a time, each value tinted by how sure "
+            "it is (green sure, yellow fairly, orange unsure, red disagreeing). Click a "
+            "cell to see the source cell it came from, then Right or Wrong.")
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
         # files skipped as too slow, or that stalled the app before
         # (council_core.file_guard): read again on the next run
@@ -773,6 +781,8 @@ class LedgerTab(ViewHelpers, QWidget):
         self.open_btn.setEnabled(has_review)
         if hasattr(self, "review_btn"):
             self.review_btn.setEnabled(has_review)
+        if hasattr(self, "filled_btn"):
+            self.filled_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
         if hasattr(self, "rebuild_kg_btn"):
             # Always clickable while idle; dirtiness only affects weight.
@@ -1403,6 +1413,32 @@ class LedgerTab(ViewHelpers, QWidget):
             self._say(f"── Review by clicking ({Path(path).name}): {len(review.items)} "
                       f"item(s), {needs} need a decision")
             self.status.setText("Reviewing: answers are saved into the review workbook.")
+            dlg.show()
+        self._run("Reading the review", lambda _p: ledger_review.load(path), done)
+
+    def on_filled_window(self) -> None:
+        """The filled template window (ledger_review_dialog.FilledTemplateDialog)
+        over the review workbook above."""
+        path = self.review.text().strip()
+        if not path or not Path(path).is_file():
+            self.status.setText("No review workbook yet: run Extract first.")
+            return
+        from council_core import ledger_review
+
+        def done(review) -> None:
+            from .ledger_review_dialog import FilledTemplateDialog
+            if review.kind != "samples":
+                self.status.setText("The filled template is for a sample Ledger; use "
+                                    "Review by clicking for a table Ledger.")
+                return
+            dlg = FilledTemplateDialog(review, parent=self, log=self._say,
+                                       opener=self.actions.open,
+                                       on_saved=lambda n: self.status.setText(
+                                           f"{n} answer(s) saved into the review. Apply puts "
+                                           "the accepted values into the parent CSV."))
+            self.filled_dialog = dlg
+            self._say(f"── Filled template ({Path(path).name}): "
+                      f"{len(ledger_review.parts(review))} part(s)")
             dlg.show()
         self._run("Reading the review", lambda _p: ledger_review.load(path), done)
 

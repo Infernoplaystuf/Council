@@ -66,6 +66,8 @@ class Item:
     item: str = ""                # a sample item's flaw / item ("1A"), "" part-level
     #: a table record's: field -> its value
     values: Dict[str, Any] = field(default_factory=dict)
+    part: str = ""                # a sample item's part number
+    score: float = 0.0            # how sure the match is (the review's Score)
 
 
 @dataclass
@@ -204,8 +206,16 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
             detail="\n".join(x for x in lines if x),
             source_file=_find(sources, file), source_sheet=sheet,
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
-            value=value, value_col=V_VALUE, where=where, item=item))
+            value=value, value_col=V_VALUE, where=where, item=item, part=part,
+            score=_score(row[V_SCORE - 1])))
     return out
+
+
+def _score(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _records_items(wb, sources: Sequence[str]) -> List[Item]:
@@ -322,3 +332,132 @@ def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
         raise LedgerError(f"{path.name} is open in another program (Excel?): close it "
                           "and save again") from e
     return changed
+
+
+# ── the filled template (user, 2026-10-23: "have the ledger output the
+# template filled out with the values entered into it highlighted by their
+# confidence values ... click on cells and see their source") ─────────────
+#: a match at least this sure is high confidence (source_extract.ACCEPT_AT)
+CONF_HIGH = 0.85
+#: under this, low
+CONF_LOW = 0.6
+TINT_HIGH, TINT_MID, TINT_LOW, TINT_CLASH = "#C6EFCE", "#FFEB9C", "#F8CBAD", "#FF7C80"
+#: what each tint means, for a legend
+LEGEND = [(TINT_HIGH, f"sure (score {CONF_HIGH:g} or more)"),
+          (TINT_MID, f"fairly sure ({CONF_LOW:g}–{CONF_HIGH:g})"),
+          (TINT_LOW, f"unsure (under {CONF_LOW:g})"),
+          (TINT_CLASH, "sources disagree")]
+
+
+def confidence_tint(item: Item) -> str:
+    if item.clash:
+        return TINT_CLASH
+    if item.score >= CONF_HIGH:
+        return TINT_HIGH
+    return TINT_MID if item.score >= CONF_LOW else TINT_LOW
+
+
+def parts(review: Review) -> List[str]:
+    """The parts a sample review has values for, in their review order."""
+    return list(dict.fromkeys(i.part for i in review.items if i.part))
+
+
+def cell_candidates(items: Sequence[Item], exact: Dict[Tuple[str, str], Tuple[str, Cell]],
+                    part: str, accept_of=None) -> Dict[Tuple[str, Cell], List[Item]]:
+    """One part's values by the template cell each goes in: (sheet, cell) ->
+    the items offered for it, the one shown first - an accepted one, then
+    the surest. A value said to be wrong ('N') is left out. ``accept_of``:
+    an item's Accept as the window has it (answers not saved yet)."""
+    acc = accept_of or (lambda it: it.accept)
+    out: Dict[Tuple[str, Cell], List[Item]] = {}
+    for it in items:
+        if it.part != part or not it.fields or acc(it) == "N":
+            continue
+        at = exact.get((it.fields[0], it.item)) or exact.get((it.fields[0], ""))
+        if at is not None:
+            out.setdefault(at, []).append(it)
+    for cands in out.values():
+        cands.sort(key=lambda it: (acc(it) != "Y", -it.score))
+    return out
+
+
+def _cell_value(text: str) -> Any:
+    """A number written as one, so the filled template computes."""
+    try:
+        f = float(text)
+    except (TypeError, ValueError):
+        return text
+    return int(f) if f.is_integer() and "." not in text else f
+
+
+def write_filled(review: Review, part: str, out_path,
+                 exact: Optional[Dict[Tuple[str, str], Tuple[str, Cell]]] = None) -> str:
+    """A copy of the template with ``part``'s values in their cells, each
+    tinted by its confidence (confidence_tint) with a note of where it was
+    read and how sure the match is. The template itself is never written.
+    Atomic. Returns the path."""
+    import shutil
+
+    import openpyxl
+    from openpyxl.comments import Comment
+    from openpyxl.styles import PatternFill
+    from sample_ledger import TemplateSchema, schema_path_for
+    schema = TemplateSchema.load(schema_path_for(review.csv))
+    template = Path(schema.template_path)
+    out = Path(out_path)
+    if out.resolve() == template.resolve():
+        raise LedgerError("refusing to write over the template itself")
+    exact = exact if exact is not None else template_cells(review.csv)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.stem + ".writing" + out.suffix)
+    shutil.copyfile(template, tmp)
+    wb = openpyxl.load_workbook(tmp)
+    try:
+        for (sheet, (r, c)), cands in cell_candidates(review.items, exact, part).items():
+            ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+            it = cands[0]
+            cell = ws.cell(row=r, column=c)
+            cell.value = _cell_value(it.value)
+            tint = confidence_tint(it)[1:]
+            cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+            others = [o.value for o in cands[1:] if o.value != it.value]
+            cell.comment = Comment(
+                f"{it.fields[0]}: {it.value}\nfrom {it.where}\nscore {it.score:g}"
+                + (f" (accepted)" if it.accept == "Y" else "")
+                + (f"\nalso offered: {', '.join(others[:5])}" if others else ""), "Council")
+        wb.save(tmp)
+    finally:
+        wb.close()
+    os.replace(tmp, out)
+    return str(out)
+
+
+def filled_dir(review_path) -> Path:
+    """Where a review's filled templates go: beside it, '<review>_filled'."""
+    p = Path(review_path)
+    return p.with_name(p.stem + "_filled")
+
+
+def _safe_name(part: str) -> str:
+    return re.sub(r"[^\w\-. ]+", "_", part).strip() or "part"
+
+
+def write_all_filled(review: Review, progress=None) -> List[str]:
+    """One filled template per part (write_filled), in filled_dir. A part
+    that cannot be written is skipped."""
+    if review.kind != "samples" or not review.csv:
+        return []
+    exact = template_cells(review.csv)
+    if not exact:
+        return []
+    out = []
+    folder = filled_dir(review.path)
+    names = parts(review)
+    for n, part in enumerate(names, 1):
+        if progress is not None:
+            progress(f"filling the template for {part} ({n}/{len(names)})")
+        try:
+            out.append(write_filled(review, part, folder / f"{_safe_name(part)}.xlsx", exact))
+        except Exception:                                   # noqa: BLE001
+            continue
+    return out
