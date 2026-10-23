@@ -166,17 +166,19 @@ def test_on_a_4k_model_the_same_writer_is_still_capped_and_trimmed(engine):
     assert _fits(call, 4096)
 
 
-def test_the_env_var_still_bounds_the_window(engine, monkeypatch):
-    """Set, it both sizes the load and bounds the clamp — as before."""
+def test_the_old_env_var_no_longer_bounds_the_window(engine, monkeypatch):
+    """COUNCIL_GGUF_N_CTX is the Tk era's fixed window; the window follows
+    the model now (user, 2026-10-23), so a 16k instance is a 16k window."""
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "4096")
     w = _writer(engine)
     w.respond("hello")
     call = engine.state.loaded["main"].calls[-1]
-    assert call.max_tokens == 2008
-    assert MARKER in call.messages[0]["content"]
+    assert call.max_tokens == 16384 // 6
+    assert not any(MARKER in m["content"] for m in call.messages)
 
 
-def test_a_larger_env_var_is_bounded_by_the_instance(monkeypatch):
+def test_the_window_is_the_instance_s_own_whatever_the_old_env_var(
+        monkeypatch):
     import council_engine as ce
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "32768")
     quarter = lambda s: (len(s) + 3) // 4         # not whatever main is loaded
@@ -187,15 +189,15 @@ def test_a_larger_env_var_is_bounded_by_the_instance(monkeypatch):
     assert reply == 2400
     total = sum(quarter(m["content"]) for m in msgs)
     assert MARKER in msgs[1]["content"] and total + reply + margin(2) <= 8192
-    # Without the instance bound the env var's window would have held it.
-    msgs2, _ = ce._clamp_messages_to_ctx(big, 2400, count_tokens=quarter)
-    assert msgs2 == big
+    # With no instance to ask, 4096 — the variable is not read.
+    msgs2, reply2 = ce._clamp_messages_to_ctx(big, 2400, count_tokens=quarter)
+    assert MARKER in msgs2[1]["content"] and reply2 < 2400
 
 
-@pytest.mark.parametrize("raw", ["", "  ", "auto", "0"])
-def test_an_unusable_env_value_is_treated_as_unset(engine, monkeypatch, raw):
-    """The loader's ladder skips blank/unparseable values and llama.cpp reads
-    0 as "the model's own"; either way the instance's n_ctx is the truth."""
+@pytest.mark.parametrize("raw", ["", "  ", "auto", "0", "4096"])
+def test_any_old_env_value_is_ignored(engine, monkeypatch, raw):
+    """COUNCIL_GGUF_N_CTX is not read any more (user, 2026-10-23): whatever
+    it holds, the instance's n_ctx is the truth."""
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", raw)
     engine.ce.local_chat([{"role": "user", "content": "hi"}],
                          num_predict=2400, role="writer")
@@ -349,10 +351,9 @@ def test_the_window_is_asked_without_loading_a_model(engine):
     assert engine.state.loaded == {}
 
 
-def test_with_nothing_loaded_a_gguf_slot_gets_the_env_var_or_4096(engine,
-                                                                  monkeypatch):
-    """Nothing loaded and no load remembered, on GGUF slots: the env var or
-    4096. The slot config IS read now — only it says whether Ollama serves
+def test_with_nothing_loaded_a_gguf_slot_gets_4096(engine, monkeypatch):
+    """Nothing loaded and no load remembered, on GGUF slots: 4096, whatever
+    the old COUNCIL_GGUF_N_CTX says. The slot config IS read now — only it says whether Ollama serves
     the slot (council_engine._ollama_will_serve: "ollama:<name>", or no GGUF
     to load) — and what is read is THIS vault's file. The Dream3D tests used
     to reach effective_n_ctx through nx_ops with no vault set and read
@@ -366,7 +367,7 @@ def test_with_nothing_loaded_a_gguf_slot_gets_the_env_var_or_4096(engine,
     assert nx_ops._n_ctx() == 4096
     assert ce.context_budget_report("hi")["n_ctx"] == 4096
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "8192")
-    assert ce.effective_n_ctx("fast") == 8192
+    assert ce.effective_n_ctx("fast") == 4096
     assert "fast" in model_slots._current.slots
     assert engine.state.loaded == {}
 
@@ -384,13 +385,12 @@ def test_each_slot_reports_the_window_it_loaded_with(engine):
     assert ce.effective_n_ctx("fast") == 8192
 
 
-def test_the_env_var_is_the_window_until_a_model_says_less(engine,
-                                                         monkeypatch):
-    """Nothing loaded: the env var will size the load, so it is the window.
-    Loaded smaller: the instance bounds it, exactly as in the clamp."""
+def test_the_old_env_var_is_not_the_window_before_or_after_a_load(
+        engine, monkeypatch):
+    """The loaded instance says what the window is; before a load, 4096."""
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "32768")
     ce = engine.ce
-    assert ce.effective_n_ctx() == 32768
+    assert ce.effective_n_ctx() == 4096
     ce.local_chat([{"role": "user", "content": "hi"}], role="writer")
     assert ce.effective_n_ctx() == 16384
 

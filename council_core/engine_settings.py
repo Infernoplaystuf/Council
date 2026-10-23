@@ -18,7 +18,10 @@ saved one. Kept exactly, because a launch-time override is how a user gets out
 of a saved setting that crashes the GPU. One consequence worth knowing: the
 run-* launchers export COUNCIL_GGUF_GPU_LAYERS=99 and COUNCIL_EMBED_DEVICE=cpu
 when unset, so under a launcher a SAVED gpu_layers / embed_device never
-applies, in either front end. A saved n_ctx does (no launcher sets it).
+applies, in either front end.
+
+A SAVED n_ctx IS IGNORED (2026-10-23): the engine sizes the window to the
+model, so there is no fixed context size to carry over.
 
 TIMING
 The engine reads these when it LOADS a model, not at import, so any time
@@ -32,8 +35,10 @@ from pathlib import Path
 from typing import Callable, Dict, MutableMapping, Optional, Tuple
 
 #: (key in backend_settings.json, the environment variable the engine reads).
+#: A saved "n_ctx" is NOT among them any more: the window always follows
+#: the model (the loader's VRAM-aware ladder), and COUNCIL_GGUF_N_CTX, the Tk
+#: era's fixed window, is no longer read (user, 2026-10-23).
 KNOBS: Tuple[Tuple[str, str], ...] = (
-    ("n_ctx", "COUNCIL_GGUF_N_CTX"),
     ("gpu_layers", "COUNCIL_GGUF_GPU_LAYERS"),
     ("embed_device", "COUNCIL_EMBED_DEVICE"),
 )

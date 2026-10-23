@@ -6615,51 +6615,44 @@ def test_context_clamp() -> None:
     prompt can never trigger llama-cpp's 'exceeds context window' native abort.
     Works with no model loaded (estimate_tokens falls back to chars/4)."""
     import council_engine as ce
-    prev = os.environ.get("COUNCIL_GGUF_N_CTX")
-    try:
-        os.environ["COUNCIL_GGUF_N_CTX"] = "512"
-        # A short prompt is returned unchanged with a sane reply budget.
-        msgs, reply = ce._clamp_messages_to_ctx(
-            [{"role": "user", "content": "hello there"}], 200)
-        _check("short prompt is untouched",
-               msgs[0]["content"] == "hello there")
-        _check("reply budget is positive and within window",
-               0 < reply < 512)
-        # A huge prompt is trimmed so prompt+reply fits the 512 window.
-        big = "word " * 4000   # ~5000 tokens by chars/4
-        msgs2, reply2 = ce._clamp_messages_to_ctx(
-            [{"role": "system", "content": "be brief"},
-             {"role": "user", "content": big}], 300)
-        total = sum(ce.estimate_tokens(m["content"]) for m in msgs2)
-        _check("oversized prompt is trimmed under the window",
-               total + reply2 <= 512)
-        _check("trim marker is inserted",
-               any("trimmed to fit" in m["content"] for m in msgs2))
-        _check("short system message is preserved",
-               any(m["content"] == "be brief" for m in msgs2))
-        # Never raises on empty / weird input.
-        m3, r3 = ce._clamp_messages_to_ctx([], 100)
-        _check("empty messages handled", m3 == [] and r3 > 0)
+    # The window is passed as the serving instance's n_ctx: the clamp no
+    # longer reads COUNCIL_GGUF_N_CTX (user, 2026-10-23).
+    # A short prompt is returned unchanged with a sane reply budget.
+    msgs, reply = ce._clamp_messages_to_ctx(
+        [{"role": "user", "content": "hello there"}], 200, 512)
+    _check("short prompt is untouched",
+           msgs[0]["content"] == "hello there")
+    _check("reply budget is positive and within window",
+           0 < reply < 512)
+    # A huge prompt is trimmed so prompt+reply fits the 512 window.
+    big = "word " * 4000   # ~5000 tokens by chars/4
+    msgs2, reply2 = ce._clamp_messages_to_ctx(
+        [{"role": "system", "content": "be brief"},
+         {"role": "user", "content": big}], 300, 512)
+    total = sum(ce.estimate_tokens(m["content"]) for m in msgs2)
+    _check("oversized prompt is trimmed under the window",
+           total + reply2 <= 512)
+    _check("trim marker is inserted",
+           any("trimmed to fit" in m["content"] for m in msgs2))
+    _check("short system message is preserved",
+           any(m["content"] == "be brief" for m in msgs2))
+    # Never raises on empty / weird input.
+    m3, r3 = ce._clamp_messages_to_ctx([], 100, 512)
+    _check("empty messages handled", m3 == [] and r3 > 0)
 
-        # TERMINATION guard (regression): the trim loop must always return.
-        # The marker length has to be subtracted from the char target, else a
-        # trimmed block stays at (target + marker) forever and the loop spins.
-        # A tiny window + several huge messages is the worst case; if the
-        # implementation regressed, this test would hang, not fail.
-        os.environ["COUNCIL_GGUF_N_CTX"] = "128"
-        m4, r4 = ce._clamp_messages_to_ctx(
-            [{"role": "user", "content": "x" * 50000},
-             {"role": "user", "content": "y" * 50000},
-             {"role": "system", "content": "z" * 50000}], 400)
-        t4 = sum(ce.estimate_tokens(m["content"]) for m in m4)
-        _check("pathological huge prompt terminates and fits",
-               t4 + r4 <= 128 + 8)  # +8 slack for rounding of estimate_tokens
-        _check("clamp always returns a positive reply budget", r4 > 0)
-    finally:
-        if prev is None:
-            os.environ.pop("COUNCIL_GGUF_N_CTX", None)
-        else:
-            os.environ["COUNCIL_GGUF_N_CTX"] = prev
+    # TERMINATION guard (regression): the trim loop must always return.
+    # The marker length has to be subtracted from the char target, else a
+    # trimmed block stays at (target + marker) forever and the loop spins.
+    # A tiny window + several huge messages is the worst case; if the
+    # implementation regressed, this test would hang, not fail.
+    m4, r4 = ce._clamp_messages_to_ctx(
+        [{"role": "user", "content": "x" * 50000},
+         {"role": "user", "content": "y" * 50000},
+         {"role": "system", "content": "z" * 50000}], 400, 128)
+    t4 = sum(ce.estimate_tokens(m["content"]) for m in m4)
+    _check("pathological huge prompt terminates and fits",
+           t4 + r4 <= 128 + 8)  # +8 slack for rounding of estimate_tokens
+    _check("clamp always returns a positive reply budget", r4 > 0)
 
 
 def test_describe_nontext_routing() -> None:

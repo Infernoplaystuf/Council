@@ -196,10 +196,9 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #                                        instead of all-or-nothing
 #   COUNCIL_GGUF_SEED=1234             fixed seed, for reproducible benches
 # Optional:
-#   COUNCIL_GGUF_N_CTX=4096            context window — explicit override.
-#                                        When unset, picked by the n_ctx
-#                                        ladder (VRAM-aware → GGUF metadata
-#                                        → 4096 fallback).
+#   (the context window is always picked by the n_ctx ladder — VRAM-aware →
+#    GGUF metadata → 4096 fallback. COUNCIL_GGUF_N_CTX, the Tk era's fixed
+#    window, is no longer read: user, 2026-10-23.)
 #   COUNCIL_GGUF_N_CTX_MAX=32768       absolute upper bound for auto-sizing
 #                                        so a model advertising 131K doesn't
 #                                        try to allocate 16 GB of KV cache.
@@ -455,7 +454,7 @@ def n_ctx_status() -> Dict[str, Any]:
     full ladder trace from the most recent model load. The UI calls this
     to surface the window size in the title bar.
 
-    Falls back to the env var value (or 4096) when the model hasn't been
+    Falls back to effective_n_ctx's estimate when the model hasn't been
     loaded yet (lazy load — first chat call triggers the ladder)."""
     if _LAST_N_CTX is not None:
         return {
@@ -464,13 +463,9 @@ def n_ctx_status() -> Dict[str, Any]:
             "ladder": list(_LAST_N_CTX_LADDER),
             "loaded": True,
         }
-    try:
-        env_val = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
-    except Exception:
-        env_val = 4096
     return {
-        "n_ctx":  env_val,
-        "source": "env var (model not loaded yet — preview only)",
+        "n_ctx":  effective_n_ctx("main"),
+        "source": "estimate (model not loaded yet — preview only)",
         "ladder": [],
         "loaded": False,
     }
@@ -1177,8 +1172,7 @@ def _gpu_diag_line() -> str:
 
 def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
                kv_budget_bytes: Optional[int] = None,
-               is_main: bool = True, n_ctx_max: Optional[int] = None,
-               use_env_n_ctx: bool = True):
+               is_main: bool = True, n_ctx_max: Optional[int] = None):
     """Load one GGUF and return the Llama. Knows nothing about slots.
 
     ``n_gpu_layers_cap`` 0 puts this model on the CPU (the slot planner's
@@ -1189,9 +1183,7 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
 
     ``n_ctx_max`` replaces COUNCIL_GGUF_N_CTX_MAX as the most the ladder may
     pick (the Ledger passes the model's own trained length: it uses all the
-    model has that fits the card, user 2026-10-21). ``use_env_n_ctx`` False
-    skips rung 1, COUNCIL_GGUF_N_CTX: the Ledger sizes its own window rather
-    than take the council's chat setting (user, 2026-10-23).
+    model has that fits the card, user 2026-10-21).
     """
     try:
         from llama_cpp import Llama
@@ -1261,13 +1253,14 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     # (read_gguf_metadata): the Balanced fast slot, Llama 3.2 3B, keeps
     # 112 KiB a token — 3.76 GB at 32768, 0.94 GB at 8192; Phi-4 keeps
     # 200 KiB — 3.36 GB at 16384, 1.68 GB at 8192. A CPU load takes rung 3's
-    # blind cap instead. COUNCIL_GGUF_N_CTX, when set, still wins (rung 1).
+    # blind cap instead.
     on_cpu = n_gpu_layers == 0
 
     # ── Auto-detect n_ctx (the ladder) ─────────────────────────────────────
     #
-    # Four rungs of precedence, highest first:
-    #   1. COUNCIL_GGUF_N_CTX env var — explicit user override, always wins.
+    # Three rungs of precedence, highest first. (Rung 1 was the Tk era's
+    # COUNCIL_GGUF_N_CTX, a fixed window that beat the model; it is no longer
+    # read — the window always follows the model, user 2026-10-23.)
     #   2. VRAM-aware sizing: estimate KV-cache cost from GGUF architecture
     #      (block_count, head_count_kv, embedding_length) and pick the
     #      largest power-of-two n_ctx that fits in available VRAM after
@@ -1297,19 +1290,6 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
 
     n_ctx: Optional[int] = None
     n_ctx_source: str = ""
-
-    # Rung 1: explicit env var override.
-    env_n_ctx_raw = (os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
-                     if use_env_n_ctx else "")
-    if env_n_ctx_raw:
-        try:
-            n_ctx = int(env_n_ctx_raw)
-            n_ctx_source = "env var COUNCIL_GGUF_N_CTX"
-            _ladder_log("env_override", value=env_n_ctx_raw, parsed=n_ctx,
-                        chosen=True)
-        except ValueError as exc:
-            _ladder_log("env_override", value=env_n_ctx_raw,
-                        error=repr(exc), chosen=False)
 
     # Pre-compute the absolute cap + parse metadata once — used by rungs
     # 2 and 3 below.
@@ -1410,8 +1390,7 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     # possible guess: Granite 3.3 8B advertises 131,072, which this rung
     # capped to 32,768, and a 32k KV cache on top of 4.6 GB of weights does
     # not fit in an 8 GB card or a modest RAM budget. When we do not know
-    # what we have, ask for little — the user can always raise
-    # COUNCIL_GGUF_N_CTX, and the load message below tells them they can.
+    # what we have, ask for little.
     if n_ctx is None and metadata:
         try:
             model_max = _gguf_max_context_from_metadata(metadata)
@@ -1738,17 +1717,17 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             )
             print(_diagnose_load_failure(p, primary_exc), flush=True)
             raise
-    # Surface the model's advertised max context so the user knows the headroom
-    # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
-    # GGUF metadata doesn't include the field.
+    # Say when the window is smaller than the model was trained for: the
+    # ladder kept it to what fits this machine. A no-op when the GGUF
+    # metadata doesn't include the field.
     try:
         _max = (_gguf_max_context_from_metadata(metadata)
                 if (is_main and metadata) else None)
         if _max and _max > n_ctx:
             print(
-                f"[GGUF] Model advertises max context {_max} tokens — you may "
-                f"raise COUNCIL_GGUF_N_CTX (currently {n_ctx}) up to {_max} "
-                f"if your VRAM allows. Doubling n_ctx roughly doubles KV-cache RAM.",
+                f"[GGUF] Model advertises max context {_max} tokens; loaded "
+                f"at {n_ctx}, what fits this machine "
+                f"({n_ctx_source or 'auto'}).",
                 flush=True,
             )
     except Exception:
@@ -2060,67 +2039,33 @@ def _release_slots() -> None:
 # can report it.
 #
 # Granite 3.0 8B (and most modern GGUFs) advertise their true max context in
-# the GGUF metadata. We surface that too so the user knows how high they can
-# safely raise `COUNCIL_GGUF_N_CTX`.
+# the GGUF metadata. We surface that too.
 # ─────────────────────────────────────────────────────────────────────────────
 
-#: The window assumed when nothing better is known: no COUNCIL_GGUF_N_CTX and
-#: no loaded instance to ask. Also rung 4 of the loader's n_ctx ladder.
+#: The window assumed when nothing better is known: no loaded instance to
+#: ask. Also rung 4 of the loader's n_ctx ladder.
 _DEFAULT_N_CTX = 4096
 
 
 def get_n_ctx() -> int:
-    """Return the configured context window (tokens). Reads
-    `COUNCIL_GGUF_N_CTX` so a launch-time override is reflected immediately.
-
-    This is the CONFIGURED value — 4096 when the env var is unset, which the
-    launchers leave it. It is not what a loaded model has: the VRAM-aware
-    ladder loads Phi-4 at 16384 on a 16 GB card. The prompt clamp therefore
-    does not use it as the window unless the env var is really set; it asks
-    the instance serving the call (see _clamp_messages_to_ctx). Code that
-    SIZES a prompt should ask effective_n_ctx() instead."""
-    try:
-        return int(os.environ.get("COUNCIL_GGUF_N_CTX", str(_DEFAULT_N_CTX)))
-    except Exception:
-        return _DEFAULT_N_CTX
-
-
-def _env_n_ctx() -> Optional[int]:
-    """COUNCIL_GGUF_N_CTX as a window the clamp can use, or None.
-
-    None for blank or unparseable values — the loader's ladder skips those
-    (rung 1 in _load_gguf) and sizes the model itself — and for 0 or less,
-    which is not a window (0 asks llama.cpp for the model's own training
-    context). In each case the loaded instance's n_ctx() is the truth.
-    """
-    raw = os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
+    """The main model's window, for code that sizes a prompt: effective_n_ctx
+    ("main"). It used to be the CONFIGURED value — COUNCIL_GGUF_N_CTX, 4096
+    when unset — so every caller here budgeted for 4096 while the VRAM-aware
+    ladder loaded Phi-4 at 16384. That variable is the Tk era's fixed window
+    and is no longer read (user, 2026-10-23: "This should just auto adjust to
+    the models context now"). Never loads a model."""
+    return effective_n_ctx("main")
 
 
 def _window_for(model_n_ctx: Optional[int]) -> int:
     """The window a prompt must fit on an instance whose n_ctx() is
-    ``model_n_ctx`` (None or 0 when unknown). One rule, used by the clamp AND
-    by effective_n_ctx, so a prompt builder budgets for exactly the window
-    the clamp will enforce:
-      • COUNCIL_GGUF_N_CTX set → that value, bounded by ``model_n_ctx`` (a
-        slot sharing the card may have loaded smaller). The env var sized
-        the load, so this is the behaviour from before the clamp fix.
-      • not set → ``model_n_ctx``, the instance's own window.
-      • neither known → 4096.
-    """
+    ``model_n_ctx`` (None or 0 when unknown): that n_ctx, or 4096 when it is
+    not known. One rule, used by the clamp AND by effective_n_ctx, so a
+    prompt builder budgets for exactly the window the clamp will enforce."""
     try:
         model_ctx = int(model_n_ctx) if model_n_ctx else 0
     except Exception:
         model_ctx = 0
-    env_ctx = _env_n_ctx()
-    if env_ctx is not None:
-        return model_ctx if 0 < model_ctx < env_ctx else env_ctx
     return model_ctx if model_ctx > 0 else _DEFAULT_N_CTX
 
 
@@ -2209,9 +2154,8 @@ def effective_n_ctx(slot: str = "main") -> int:
     """The window a prompt for ``slot`` will be clamped to, for code that
     SIZES a prompt before the call. Never loads a model.
 
-      1. COUNCIL_GGUF_N_CTX when set — bounded by the loaded instance, as the
-         clamp bounds it (_window_for);
-      2. else n_ctx() of the instance ALREADY loaded for ``slot``;
+      1. (was COUNCIL_GGUF_N_CTX, the Tk era's fixed window; no longer read)
+      2. n_ctx() of the instance ALREADY loaded for ``slot``;
       3. else, when ``slot`` runs the file the last main load was for and
          _placement_inputs still match that load's, the n_ctx it chose —
          capped at rung 3's blind 8192. The instance is gone (a refresh
@@ -2234,15 +2178,14 @@ def effective_n_ctx(slot: str = "main") -> int:
     model_slots.current() reads it from paths.vault_dir() and keeps it, as
     the first chat call would.
 
-    get_n_ctx() stays the configured value, because it also sizes the load.
-    It is 4096 with the env var unset, and the builders that sized prompts
-    with it budgeted for 4096 while the clamp let a 16k Phi-4 use its whole
-    window: nx_generate's filter shortlist got (4096 - 900 - 256) × 3.2 =
+    get_n_ctx() used to be the configured value, 4096 with the env var
+    unset, and the builders that sized prompts with it budgeted for 4096
+    while the clamp let a 16k Phi-4 use its whole window: nx_generate's filter shortlist got (4096 - 900 - 256) × 3.2 =
     9,408 chars where (16384 - 1156) × 3.2 = 48,729 fit, and
     context_budget_report called a 5,000-token prompt "over the window".
     """
     # A slot Ollama has served: the num_ctx it was sent (a dict read — no
-    # config read, no network). COUNCIL_GGUF_N_CTX does not apply to it.
+    # config read, no network).
     with _ROUTE_LOCK:
         ollama_window = _OLLAMA_WINDOWS.get(slot or "main")
     if ollama_window:
@@ -2255,9 +2198,8 @@ def effective_n_ctx(slot: str = "main") -> int:
     # this PC's default setup (no llama_cpp, so Ollama serves every call).
     if _ollama_will_serve(slot or "main"):
         return _ollama_num_ctx(slot or "main", None)
-    env_ctx = _env_n_ctx()
     if not _SLOT_INSTANCES and _LAST_N_CTX is None:
-        return env_ctx if env_ctx is not None else _DEFAULT_N_CTX
+        return _DEFAULT_N_CTX
     try:
         cfg = _slot_config()
         name = slot if slot in cfg.slots else "main"
@@ -2281,8 +2223,6 @@ def effective_n_ctx(slot: str = "main") -> int:
             _SLOT_LOAD_LOCK.release()
     if loaded:
         return _window_for(loaded)
-    if env_ctx is not None:
-        return env_ctx
     if key is not None and key == last_key and last and last > 0:
         try:
             same_inputs = last_inputs == _placement_inputs(cfg)
@@ -2496,10 +2436,9 @@ def _clamp_messages_to_ctx(
     or over n_ctx, and silently cuts max_tokens when prompt + reply pass it.)
 
     The WINDOW is the one the model serving this call really has
-    (_window_for): COUNCIL_GGUF_N_CTX when set, bounded by ``model_n_ctx``;
-    else ``model_n_ctx``, the serving instance's own n_ctx(); else 4096.
-    It used to be min(get_n_ctx(), model_n_ctx), and get_n_ctx() is 4096 when
-    the env var is unset — which the launchers leave it. So Phi-4, loaded at
+    (_window_for): ``model_n_ctx``, the serving instance's own n_ctx(); else
+    4096. It used to be min(get_n_ctx(), model_n_ctx), and get_n_ctx() was
+    4096 with COUNCIL_GGUF_N_CTX unset — which the launchers left it. So Phi-4, loaded at
     16384 by the VRAM-aware ladder on an RTX 5080, was clamped to a 4096
     window on every call: the writer's 2400-token reply cut to 2016, its
     prompt budget to ~2016 tokens, and its own role memory trimmed in the

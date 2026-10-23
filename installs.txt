@@ -497,7 +497,6 @@ python tests/smoke_test.py
 #
 #  Optional env-var overrides (no UI needed):
 #    set COUNCIL_GGUF_PATH=C:\models\phi-4-Q4_K_M.gguf
-#    set COUNCIL_GGUF_N_CTX=8192       (context window)
 #    set COUNCIL_GGUF_GPU_LAYERS=99    (0 = CPU only)
 #
 #  Optional SQL drivers (uncomment as needed):

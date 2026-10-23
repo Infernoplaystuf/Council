@@ -367,7 +367,7 @@ def _gguf_llm(path: str):
                     ce.read_gguf_metadata(Path(path)))
             except Exception:                              # noqa: BLE001
                 trained = None
-            llm = ce._load_gguf(Path(path), is_main=False, use_env_n_ctx=False,
+            llm = ce._load_gguf(Path(path), is_main=False,
                                 n_ctx_max=gguf_window(trained or 0))
         except (ImportError, AttributeError, TypeError):
             try:

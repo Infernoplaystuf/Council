@@ -286,7 +286,9 @@ def test_the_context_is_sized_for_the_window_the_model_really_has(
     vault, _fake = vault_env
     monkeypatch.delenv("COUNCIL_GGUF_N_CTX", raising=False)
     monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 16384)
-    assert ce.get_n_ctx() == 4096
+    # get_n_ctx() is the model's window too now (COUNCIL_GGUF_N_CTX, the
+    # configured size, is no longer read: user, 2026-10-23).
+    assert ce.get_n_ctx() == 16384
     prepared, _said, _ = _prepare(vault, f"What is in {vault / 'data_in'} ?")
     assert prepared.breakdown["n_ctx"] == 16384, prepared.breakdown
     labels = [label for label, _ in prepared.breakdown["costs"]]
@@ -295,7 +297,6 @@ def test_the_context_is_sized_for_the_window_the_model_really_has(
 
 
 @pytest.mark.parametrize("ollama,slot_n_ctx,named", [
-    (False, None, "COUNCIL_GGUF_N_CTX"),
     (True, None, "COUNCIL_OLLAMA_NUM_CTX"),
     # The main slot's own window wins over the variable
     # (council_engine._ollama_num_ctx): naming the variable would be advice
@@ -317,6 +318,24 @@ def test_the_notice_names_the_setting_that_sizes_the_window(
                                      "safe_input": 3072,
                                      "pct_of_window": 122.0})
     assert named in text, text
+
+
+def test_a_gguf_notice_names_no_setting_to_raise(monkeypatch):
+    """A GGUF's window is already the largest that fits the PC (the loader's
+    ladder); COUNCIL_GGUF_N_CTX is no longer read, so naming it would be
+    advice that changes nothing."""
+    import council_engine as ce
+    from council_core import turn_context as tc
+    monkeypatch.setattr(ce, "_ollama_will_serve", lambda _slot: False)
+    assert tc.window_setting() is None
+    over = tc.context_window_notice({"input_tokens": 5000, "n_ctx": 4096,
+                                     "over_window": True, "safe_input": 3072})
+    nearly = tc.context_window_notice({"input_tokens": 2900, "n_ctx": 4096,
+                                       "safe_input": 3072})
+    left = tc.left_out_notice([("[FILE: a.csv]", 900)], 4096)
+    for text in (over, nearly, left):
+        assert "COUNCIL_GGUF_N_CTX" not in text and "None" not in text, text
+    assert "fewer files" in over
 
 
 def test_blocks_left_out_to_fit_are_said_in_plain_words(vault_env):
