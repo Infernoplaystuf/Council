@@ -98,7 +98,7 @@ class LedgerActions:
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
-                cancel=None, assist=False):
+                cancel=None, assist=False, prefer=()):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -108,7 +108,7 @@ class LedgerActions:
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
                                          cancel=cancel, log=self.stall_log,
-                                         assist=assist)
+                                         assist=assist, prefer=prefer)
 
     def diagnose(self, file, csv, use_images, on_line,
                  vision_model: Optional[str] = None, cancel=None, assist=False):
@@ -465,6 +465,20 @@ class LedgerTab(ViewHelpers, QWidget):
             "Accepting a suggested field teaches it for the next run.")
         mask_row.addWidget(self.ask_model)
         v2.addLayout(mask_row)
+        # one workbook's several readings of a value (user, 2026-10-23): the
+        # operator whose reading is used, else the first reading
+        prefer_row = QHBoxLayout()
+        prefer_row.addWidget(QLabel("Operator to prefer (optional):"))
+        self.prefer_operator = QLineEdit()
+        self.prefer_operator.setPlaceholderText("initials, e.g. JB, AK")
+        self.prefer_operator.setToolTip(
+            "When a workbook has several readings of one value (an EC response measured\n"
+            "by more than one operator) and the template keeps one: the reading of the\n"
+            "first operator listed here who has one is used. Left empty, or none of them\n"
+            "read it: the first reading in the workbook is used. The others are set aside\n"
+            "(N in the review). Values two workbooks disagree on are still yours to choose.")
+        prefer_row.addWidget(self.prefer_operator, 1)
+        v2.addLayout(prefer_row)
         # Filename-ignore patterns — persisted next to the aliases file so a
         # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
         ignore_row = QHBoxLayout()
@@ -481,6 +495,27 @@ class LedgerTab(ViewHelpers, QWidget):
         self.ignore_files.textEdited.connect(self._on_ignore_edited)
         ignore_row.addWidget(self.ignore_files, 1)
         v2.addLayout(ignore_row)
+        # a filled copy of the template, picked on its own (user, 2026-10-23):
+        # worked answers and Council's model's guide, never a source
+        example_row = QHBoxLayout()
+        example_row.addWidget(QLabel("Filled example (optional):"))
+        self.filled_example = QLineEdit()
+        self.filled_example.setReadOnly(True)
+        self.filled_example.setPlaceholderText(
+            "a copy of the template filled in for one sample")
+        self.filled_example.setToolTip(
+            "A copy of your template filled in by hand for one sample. It is not read\n"
+            "as a source: its values teach which source labels are which field (for the\n"
+            "same sample in the sources), and Council's model is shown what each field\n"
+            "holds there and what its part number looks like. Saved with this Ledger.")
+        example_row.addWidget(self.filled_example, 1)
+        self.example_btn = QPushButton("Pick…")
+        self.example_btn.clicked.connect(self.on_pick_filled_example)
+        example_row.addWidget(self.example_btn)
+        self.forget_example_btn = QPushButton("Forget")
+        self.forget_example_btn.clicked.connect(lambda: self._set_filled_example(""))
+        example_row.addWidget(self.forget_example_btn)
+        v2.addLayout(example_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -595,7 +630,63 @@ class LedgerTab(ViewHelpers, QWidget):
         self._load_ignore_patterns()
         self._check_schema()
         self._load_saved_patterns()
+        self._load_filled_example()
         self._register(self.csv.text().strip())
+
+    def _load_filled_example(self) -> None:
+        """Show the filled example saved for the parent CSV."""
+        if not hasattr(self, "filled_example"):
+            return
+        csv = self.csv.text().strip()
+        path = ""
+        if csv:
+            from council_core import ledger_examples
+            path = ledger_examples.load_filled_example(csv)
+        self.filled_example.setText(path)
+        self.forget_example_btn.setEnabled(bool(path))
+
+    def _browse_filled_example(self) -> str:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick a copy of the template filled in for one sample",
+            self._start_dir(), XLSX)
+        return p
+
+    def on_pick_filled_example(self) -> None:
+        if not self.csv.text().strip():
+            self.status.setText("Create or pick the parent CSV first: the filled example "
+                                "is saved with it.")
+            return
+        p = self._browse_filled_example()
+        if p:
+            self._set_filled_example(p)
+
+    def _set_filled_example(self, path: str) -> None:
+        csv = self.csv.text().strip()
+        if not csv:
+            return
+        from council_core import ledger_examples
+        try:
+            ledger_examples.save_filled_example(csv, path)
+        except OSError as e:
+            self._say(f"The filled example could not be saved beside {Path(csv).name}: {e}")
+            return
+        self._load_filled_example()
+        if not path:
+            self._say("Filled example forgotten for this Ledger.")
+            return
+        rows = []
+        try:
+            from sample_ledger import ParentCSV
+            schema = ParentCSV(csv).schema
+            rows = ledger_examples.filled_example_rows(path, schema) if schema else []
+        except Exception:                                    # noqa: BLE001
+            rows = []
+        self._say(f"Filled example {Path(path).name}: "
+                  + (f"{len(rows)} row(s) for "
+                     + ", ".join(ledger_examples.filled_example_parts(
+                         rows, schema.id_field)) + " — used by Extract from now on"
+                     if rows else "no part number found in the template's part cell — "
+                     "is it a filled copy of this Ledger's template?"))
 
     def _check_schema(self) -> None:
         """Whether the parent CSV and its schema are there (Teach needs
@@ -1216,6 +1307,10 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "\"Ask Council's model about the rest\" to run without one.")
                 return
             more = {"assist": model_id}
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:                         # only then, as with the model
+            more["prefer"] = prefer
 
         def done(s) -> None:
             self.review.setText(s.review)

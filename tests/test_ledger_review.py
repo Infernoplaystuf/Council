@@ -177,3 +177,72 @@ def test_the_window_shows_a_records_row(qapp, records_review):
     assert m.tints == {(5, c): ROW_TINT for c in range(1, 7)}
     assert dlg.value_edit.isHidden()
     dlg.close()
+
+
+# ── why values are to review (user, 2026-10-23: 7312 of 7976 to review) ──
+def test_the_run_says_why_values_are_to_review(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    make_nde_book(src / "NDE results.xlsx")
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    ex = li.run_extract(csv, [src], use_images=False)
+    assert ex.to_review == 9
+    assert ex.review_reasons.splitlines()[:2] == [
+        "Why 9 values are to review (the first reason each was held back):",
+        "       9  label only a loose match for the field"]
+    assert "Fields with the most to review: " in ex.review_reasons
+    assert ex.review_reasons in ex.describe()
+    assert "285" not in ex.review_reasons                  # counts and names, no values
+
+
+def test_each_hold_back_has_its_reason(tmp_path):
+    from dataclasses import replace
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    base = se.Obs(part="P1", item="", field="Power (W)", value="285", score=0.95,
+                  via="match", label="Laser Power (W)", where="a.xlsx › S!C5")
+    cases = {
+        "different workbooks disagree on the value": se.Decision(base, False, "290"),
+        "no part number found": se.Decision(replace(base, part=""), False),
+        "read from a picture": se.Decision(replace(base, from_image=True), False),
+        "part taken from the file name": se.Decision(
+            replace(base, part_how=se.FILE_PART_HOW + " a.xlsx"), False),
+        "label placed by the model": se.Decision(replace(base, via="model"), False),
+        "label only a loose match for the field": se.Decision(replace(base, score=0.6), False),
+        "": se.Decision(base, True),
+    }
+    for why, d in cases.items():
+        assert se.review_reason(d, schema) == why
+    text = se.summarize_review_reasons(list(cases.values()), schema)
+    assert text.startswith("Why 6 values are to review") and "Power (W) (6)" in text
+
+
+def test_one_workbooks_readings_are_one_first_and_the_rest_set_aside(tmp_path):
+    """user, 2026-10-23: 'multiple readings per sample in the source while
+    in the template it only accepts one reading ... prioritize the first'.
+    Two workbooks that disagree are still the reviewer's; '12' and '12.0'
+    are one reading."""
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    def obs(value, where, inspector=""):
+        return se.Obs(part="P1", item="", field="Power (W)", value=value, score=0.95,
+                      via="match", label="Laser Power (W)", where=where,
+                      inspector=inspector)
+    run = se.Extraction(sources=[])
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "a.xlsx › S!C9", "AK")]
+    first, second = sorted((d for d in se.decide(run, schema) if d.obs.field == "Power (W)"),
+                           key=lambda d: d.obs.value)
+    assert first.accept and not first.conflict and "the first reading" in first.obs.note
+    assert not second.accept and second.alternate.startswith("set aside")
+    text = se.summarize_review_reasons([first, second], schema)
+    assert text.startswith("1 other readings set aside") and "AK (1)" in text
+    assert se.review_reason(second, schema) == ""
+    ak = {d.obs.value: d for d in se.decide(run, schema, prefer=se.parse_prefer("jb, ak"))
+          if d.obs.field == "Power (W)"}
+    assert ak["290"].accept and ak["285"].alternate
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "b.xlsx › S!C5")]
+    assert all(d.conflict and not d.accept for d in se.decide(run, schema))
+    run.obs = [obs("12", "a.xlsx › S!C5"), obs("12.0", "b.xlsx › S!C5")]
+    (one,) = se.decide(run, schema)
+    assert one.accept and not one.conflict

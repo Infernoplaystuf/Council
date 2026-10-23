@@ -1177,7 +1177,8 @@ def _gpu_diag_line() -> str:
 
 def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
                kv_budget_bytes: Optional[int] = None,
-               is_main: bool = True, n_ctx_max: Optional[int] = None):
+               is_main: bool = True, n_ctx_max: Optional[int] = None,
+               use_env_n_ctx: bool = True):
     """Load one GGUF and return the Llama. Knows nothing about slots.
 
     ``n_gpu_layers_cap`` 0 puts this model on the CPU (the slot planner's
@@ -1188,7 +1189,9 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
 
     ``n_ctx_max`` replaces COUNCIL_GGUF_N_CTX_MAX as the most the ladder may
     pick (the Ledger passes the model's own trained length: it uses all the
-    model has that fits the card, user 2026-10-21).
+    model has that fits the card, user 2026-10-21). ``use_env_n_ctx`` False
+    skips rung 1, COUNCIL_GGUF_N_CTX: the Ledger sizes its own window rather
+    than take the council's chat setting (user, 2026-10-23).
     """
     try:
         from llama_cpp import Llama
@@ -1296,7 +1299,8 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     n_ctx_source: str = ""
 
     # Rung 1: explicit env var override.
-    env_n_ctx_raw = os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
+    env_n_ctx_raw = (os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
+                     if use_env_n_ctx else "")
     if env_n_ctx_raw:
         try:
             n_ctx = int(env_n_ctx_raw)

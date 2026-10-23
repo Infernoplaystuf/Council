@@ -68,6 +68,7 @@ import difflib
 import errno
 import io
 import json
+import math
 import os
 import re
 import urllib.request
@@ -3435,6 +3436,13 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     return run
 
 
+def _filled_example_rows(csv_path, schema) -> List[Dict[str, str]]:
+    """The Ledger's filled example's rows (council_core.ledger_examples)."""
+    from council_core import ledger_examples
+    return ledger_examples.filled_example_rows(
+        ledger_examples.load_filled_example(csv_path), schema)
+
+
 def source_labels(sources: Sequence) -> Dict[str, str]:
     """How each source is named in the review: its file name, or - when
     two picked workbooks share one (a folder per sample, each with its
@@ -3677,7 +3685,11 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         if cancel is not None and cancel.is_set():
             raise _Cancelled()                # the model's answer was cut short
         if found_part:
-            how = f"{MODEL_PART_HOW} from {where} — check it"
+            # the file name says the same part: two sources agree, and it
+            # may be pre-accepted (user, 2026-10-23: 3659 values to review
+            # with 'SBS2FFP268.xlsx -> SBS2FFP268')
+            how = (f"{AGREED_PART_HOW} {src.name!r}" if _in_name(found_part, src.stem)
+                   else f"{MODEL_PART_HOW} from {where} — check it")
             run.model_parts[label or src.name] = (found_part, where)
             for o in partless:
                 o.part, o.part_how = found_part, how
@@ -3750,18 +3762,59 @@ class Decision:
     obs: Obs
     accept: bool
     conflict: str = ""               # other values offered for the same cell
+    #: why this reading was set aside for another of the same workbook
+    #: (decide; written 'N' in the review, not one to decide on)
+    alternate: str = ""
 
 
-def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
+def _value_key(v: Any) -> str:
+    """One reading however it is written: '12', '12.0' and '12.00' are
+    the same number; text is compared as written, trimmed."""
+    s = str(v).strip()
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    return repr(f) if math.isfinite(f) else s
+
+
+def _prefer_rank(inspector: str, prefer: Sequence[str]) -> Optional[int]:
+    """Where ``inspector`` ('JB', or 'AK/JB' for agreeing ones) is in the
+    operators to prefer, first listed first; None when not there."""
+    who = {w.strip().casefold() for w in (inspector or "").split("/") if w.strip()}
+    for i, p in enumerate(prefer):
+        if p.strip().casefold() in who:
+            return i
+    return None
+
+
+def parse_prefer(text: str) -> List[str]:
+    """'JB, AK' -> ['JB', 'AK']: the operators whose readings to use, in
+    order."""
+    return [w for w in re.split(r"[\s,;|/]+", text or "") if w]
+
+
+def decide(run: Extraction, schema: TemplateSchema,
+           prefer: Sequence[str] = ()) -> List[Decision]:
     """Pick one value per (part, item, field); a clash between sources is never
     pre-accepted.
+
+    Several readings of one value in ONE workbook (an EC response measured
+    more than once, while the template keeps one): the reading of the first
+    operator in ``prefer`` who has one is used, else the first reading in
+    the workbook; the others are set aside ('N', Decision.alternate) - user,
+    2026-10-23: "prioritize the first reading or ... which operator". A
+    value two workbooks disagree on is still the reviewer's to choose.
+    Readings that differ only in how a number is written are one.
 
     A reading someone signed (an EC response with initials) is offered twice:
     in that person's own column, "<field> [JB]", where it is the only value
     and can be pre-accepted; and as a candidate for the template's single
     cell, where readings that disagree clash - the reviewer accepts one."""
     groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
-    for o in run.obs:
+    seq: Dict[int, int] = {}                 # each reading's place in the run
+    for i, o in enumerate(run.obs):
+        seq[id(o)] = i
         # A value with no part is its own workbook's: two part-less workbooks
         # with the same Frequency were one review row ('also at ...'), the
         # reviewer typed one part in it, and the other sample lost the value
@@ -3770,43 +3823,66 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
         groups[(o.part, o.item, o.field, book)].append(o)
         if o.inspector:
             own = replace(o, field=inspector_column(o.field, o.inspector))
+            seq[id(own)] = i
             groups[(o.part, o.item, own.field, book)].append(own)
     out = []
     for (part, item, fname, _book), obs in groups.items():
         obs.sort(key=lambda o: -o.score)
-        values = Counter(o.value for o in obs)
+        values = Counter(_value_key(o.value) for o in obs)
         clash = len(values) > 1
+        chosen = ""                       # the reading used of one workbook's several
+        why_chosen = ""
+        if clash and len({o.where.split(" › ", 1)[0] for o in obs}) == 1:
+            ranked = [(r, seq.get(id(o), 0), o) for o in obs
+                      for r in [_prefer_rank(o.inspector, prefer)] if r is not None]
+            first = (min(ranked, key=lambda t: t[:2])[2] if ranked else
+                     min(obs, key=lambda o: seq.get(id(o), 0)))
+            chosen = _value_key(first.value)
+            why_chosen = (f"{first.inspector}'s reading (an operator to prefer)" if ranked
+                          else "the first reading in the workbook")
         firsts: Dict[str, Obs] = {}
         who: Dict[str, List[str]] = defaultdict(list)
         for o in obs:                     # the same value found twice: one row
-            if o.inspector and o.inspector not in who[o.value]:
-                who[o.value].append(o.inspector)
-            if o.value in firsts:
-                firsts[o.value].note = _join(firsts[o.value].note, f"also at {o.where}")
+            k = _value_key(o.value)
+            if o.inspector and o.inspector not in who[k]:
+                who[k].append(o.inspector)
+            if k in firsts:
+                firsts[k].note = _join(firsts[k].note, f"also at {o.where}")
                 continue
-            firsts[o.value] = o = replace(o)
-        for v, o in firsts.items():        # agreeing inspectors share one row
-            if who[v]:                     # one signer of an unsigned top row too
-                o.inspector = "/".join(sorted(who[v]))
+            firsts[k] = o = replace(o)
+        for k, o in firsts.items():        # agreeing inspectors share one row
+            if who[k]:                     # one signer of an unsigned top row too
+                o.inspector = "/".join(sorted(who[k]))
         obs = list(firsts.values())
         # labelled once per group, and only the first OTHERS_SHOWN listed:
         # thousands of readings under one key (no part number found) made
         # this quadratic and overflowed Excel's 32,767-character cell
         # (review, 2026-10-19)
-        labelled = sorted(((f"{v} ({'/'.join(who[v])})" if who[v] else v), v)
-                          for v in values) if clash else []
+        labelled = sorted(((f"{o.value} ({'/'.join(who[k])})" if who[k] else o.value), k)
+                          for k, o in firsts.items()) if clash else []
         for o in obs:
+            k = _value_key(o.value)
             text = ""
             if clash:
                 others = []
                 for t, v in labelled:
-                    if v != o.value:
+                    if v != k:
                         others.append(t)
                         if len(others) >= OTHERS_SHOWN:
                             break
                 more = len(values) - 1 - len(others)
                 text = ", ".join(others) + (f", and {more} more" if more > 0 else "")
-            ok = (not clash and o is obs[0] and o.score >= ACCEPT_AT and
+            alternate = ""
+            if chosen:
+                if k == chosen:
+                    o.note = _join(o.note, f"used: {why_chosen}; the other readings of it "
+                                           f"there were {text}")
+                else:
+                    alternate = f"set aside: {why_chosen} was used"
+                    o.note = _join(o.note, alternate)
+                text = ""
+            ok = ((not clash or (chosen and k == chosen)) and
+                  (o is obs[0] or bool(chosen)) and o.score >= ACCEPT_AT and
                   o.via in ("alias", "match") and bool(part) and not o.from_image
                   and "not converted" not in o.note
                   # nor a reading ending in initials no one signs with here
@@ -3833,7 +3909,7 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
                 o.note = _join(o.note, f"kept per {schema.item_field}, and no "
                                        f"{schema.item_field} was found for it: type the "
                                        f"{schema.item_field} in Item before accepting it")
-            out.append(Decision(o, ok, text))
+            out.append(Decision(o, bool(ok) and not alternate, text, alternate))
     item_rank = {it: i for i, it in enumerate(schema.items)}
     order = {f.name: i for i, f in enumerate(schema.fields)}
     out.sort(key=lambda d: (sample_sort_key(d.obs.part), item_rank.get(d.obs.item, -1),
@@ -3841,8 +3917,85 @@ def decide(run: Extraction, schema: TemplateSchema) -> List[Decision]:
     return out
 
 
+def review_reason(d: Decision, schema: TemplateSchema) -> str:
+    """Why decide() did not pre-accept ``d``: the first of its checks that
+    held it back, in a few words - for the count of reasons at the end of a
+    run (user, 2026-10-23: 7312 of 7976 values to review). '' when it was
+    pre-accepted. Words only, never the value or the source."""
+    if d.accept or d.alternate:
+        return ""
+    o = d.obs
+    how = o.part_how or ""
+    checks = (
+        (bool(d.conflict), "different workbooks disagree on the value"),
+        (not o.part, "no part number found"),
+        (needs_item(schema, o.field, o.item), f"no {schema.item_field} found for it"),
+        (o.from_image, "read from a picture"),
+        (how.startswith(MODEL_PART_HOW), "part suggested by the model"),
+        (how.startswith(FILE_PART_HOW), "part taken from the file name"),
+        (how.startswith(TEXT_PART_HOW), "part found in a title"),
+        (MISFIT_PART_HOW in how, "part does not fit the part-name pattern"),
+        (SHEET_PARTS_HOW in how, "more than one part on the sheet"),
+        (o.via == "model", "label placed by the model"),
+        (o.via == "ambiguous", "label could be more than one field"),
+        (o.via not in ("alias", "match"), f"label matched by {o.via or 'nothing'}"),
+        (o.score < ACCEPT_AT, "label only a loose match for the field"),
+        ("not converted" in o.note, "unit not converted"),
+        (UNSURE_SIGNER_NOTE in o.note, "ends in initials: who signed it?"),
+        (_BESIDE_NOTE in o.note, "table with no labels of its own"),
+        (_PLACE_NOTE in o.note, "slide table paired by place"),
+        (_DOC_NOTE in o.note, "read from a text document"),
+    )
+    return next((why for held, why in checks if held), "another value ranked first")
+
+
+def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSchema,
+                             top_fields: int = 5) -> str:
+    """'Why 7312 values are to review: 4100 no part number found, ...' and
+    the fields with the most of them - counts and field names only, so the
+    line can be shared without the data."""
+    reasons: Counter = Counter()
+    fields: Counter = Counter()
+    aside = [d for d in decisions if d.alternate]
+    for d in decisions:
+        why = review_reason(d, schema)
+        if why:
+            reasons[why] += 1
+            fields[d.obs.field] += 1
+    lines = []
+    if aside:
+        ops = Counter(w for d in decisions if d.alternate or "used: " in d.obs.note
+                      for w in (d.obs.inspector or "").split("/") if w)
+        lines.append(f"{len(aside)} other readings set aside: a workbook had several "
+                     "readings of one value, and the first one (or an operator to "
+                     "prefer's) was used" + (" — operators in them: " + ", ".join(
+                         f"{w} ({n})" for w, n in ops.most_common(8)) if ops else ""))
+    if reasons:
+        total = sum(reasons.values())
+        lines.append(f"Why {total} values are to review (the first reason each was held "
+                     "back):")
+        lines += [f"  {n:>6}  {why}" for why, n in reasons.most_common()]
+        lines.append("Fields with the most to review: " + ", ".join(
+            f"{f} ({n})" for f, n in fields.most_common(max(1, int(top_fields)))))
+    return "\n".join(lines)
+
+
 #: How a part Council's model suggested is described (never pre-accepted).
 MODEL_PART_HOW = "suggested by Council's model"
+#: How a part Council's model named that is also the file's name, or a word
+#: of it, is described: two sources agree, so it may be pre-accepted.
+AGREED_PART_HOW = "Council's model and the file name agree"
+
+
+def _in_name(part: str, stem: str) -> bool:
+    """Is ``part`` a whole word of the file name ``stem`` ('SBS2FFP268' of
+    'SBS2FFP268', 'SBS2FFP141-F (18 Hours concealment)_Main'), not part of a
+    longer one ('SBS2FFP26' of 'SBS2FFP268')?"""
+    part = (part or "").strip()
+    if len(part) < 3:
+        return False
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(part) + r"(?![A-Za-z0-9])",
+                     stem or "", re.I) is not None
 #: How a part read from the workbook's file name is described (never
 #: pre-accepted either).
 FILE_PART_HOW = "file name"
@@ -4027,7 +4180,7 @@ def review_initials(decisions: Iterable[Decision]) -> Dict[str, Tuple[int, str]]
 
 def write_review(path, run: Extraction, decisions: List[Decision], schema: TemplateSchema,
                  csv_path: str, pattern_mask: str = "", part: str = "",
-                 pattern_hint: bool = False) -> None:
+                 pattern_hint: bool = False, prefer: Sequence[str] = ()) -> None:
     """``pattern_hint``: ``pattern_mask`` is the Ledger's saved pattern,
     read as a hint (extract's pattern_strict=False); Apply reads it so.
 
@@ -4099,8 +4252,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
 
     for d in decisions:
         o = d.obs
-        fill = red if d.conflict else (amber if not d.accept else None)
-        ws.append(["Y" if d.accept else "", o.part, o.item, o.field, o.value, o.score,
+        fill = red if d.conflict else (amber if not (d.accept or d.alternate) else None)
+        ws.append(["Y" if d.accept else "N" if d.alternate else "", o.part, o.item, o.field, o.value, o.score,
                    o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector],
                   fill=fill)
     yn = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
@@ -4173,6 +4326,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
                             "pattern_mask": pattern_mask or "", "part": part or ""}
     if pattern_mask and pattern_hint:
         data["pattern_hint"] = True
+    if prefer:                            # the operators whose readings were used
+        data["prefer"] = list(prefer)
     if read is not None:
         # what Apply reads again (Extraction.read), by place in "sources" (a
         # cell holds 32,767 characters); none given: every source was read
@@ -4642,9 +4797,9 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
                       if found else None,
                       labels=source_labels(sources), taught=load_taught(csv_path),
                       # the same worked answers the extract learned from
-                      examples=_csv_rows(csv_path))
+                      examples=_csv_rows(csv_path) + _filled_example_rows(csv_path, schema))
     prog.stage("matching your choices")
-    decisions = decide(run, schema)
+    decisions = decide(run, schema, prefer=meta.get("prefer") or ())
     mapped: List[Decision] = []
     # a per-flaw value with no flaw is not written: it went to every flaw
     # row of its part (review, 2026-10-20) - (field, mapped on 'Labels to
