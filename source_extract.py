@@ -2752,46 +2752,109 @@ def _part_from_name(name: str, mask_re: "Optional[re.Pattern]" = None) -> str:
     return ""
 
 
-def mask_to_regex(mask: str) -> "re.Pattern":
+#: How much a run of ``@`` or ``#`` may be shorter or longer than typed when
+#: the pattern is loose: '@@@' takes 2 to 4 letters, '###' 2 to 4 digits.
+#: Two was too loose: 'CH1 CH2' and 'Lab 3 Bay 12' read as parts.
+MASK_SLACK = 1
+
+#: A loose pattern also takes a short tail after a dash: '-A', '-2', '-R1'
+#: (user, 2026-10-22: "earlier samples have less letters or number in a row
+#: or say have a -@ or -#"). Not after an underscore: file names are cut up
+#: with them ('ABC1DE234_run3').
+_MASK_TAIL = r"(?:-[A-Za-z0-9]{1,3})?"
+
+#: A pattern starting with this is taken exactly as typed.
+MASK_EXACT = "="
+
+#: What separates several shapes in one pattern field.
+_MASK_SEPARATORS = re.compile(r"\s*[|,;]\s*")
+
+
+def mask_to_regex(mask: str, exact: bool = False) -> "re.Pattern":
     """Compile a user-supplied part-name pattern into a regex.
 
     Grammar is tiny:
-      * ``@``  matches any ASCII letter (case-insensitive).
-      * ``#``  matches any digit.
-      * any other character matches itself LITERALLY (so ``P/N-###`` requires
-        the literal prefix ``P/N-``).
+      * ``@``  matches a letter (case-insensitive), ``#`` a digit; any other
+        character matches itself LITERALLY (``P/N-###`` needs ``P/N-``).
+      * Loose by default (user, 2026-10-22: "the part name pattern is taken
+        as way too strict"): each run of ``@`` or ``#`` takes up to
+        MASK_SLACK fewer or more characters (at least one), and a short tail
+        after a dash ('-A', '-2', '-R1') is part of the name. A shape of
+        digits alone keeps its length (a shorter one was a year, a reading).
+        ``@@@#@@###`` takes ABC1DE234, AB1DE23, ABC1DE234-A.
+      * ``=`` first: exactly as typed, ``=@@@#@@###`` takes ABC1DE234 only
+        (``[A-Za-z]{3}\\d[A-Za-z]{2}\\d{3}``).
+      * Several shapes, separated by ``|``, ``,`` or ``;``: any of them
+        (``@@@#@@### | @@##-#``); each may start with ``=``.
+      * ``exact=True``: every shape as typed (words joined to make a part,
+        ledger_llm._mask_whole: loose, 'Lab 3 Bay 12' was one).
 
-    Runs collapse, so ``@@@#@@###`` compiles to
-    ``[A-Za-z]{3}\\d[A-Za-z]{2}\\d{3}``. The match is bounded on both sides
-    by a non-alphanumeric lookaround so a mask that is all letters and digits
-    does not pick up a longer surrounding run.
+    The match is bounded on both sides by a non-alphanumeric lookaround so a
+    run of letters and digits is never cut out of a longer one.
 
     Raises LedgerError on an empty mask, a mask with no concrete character,
     or a regex that fails to compile."""
     if mask is None or not mask.strip():
         raise LedgerError("part name pattern is empty")
-    parts: List[str] = []
-    i = 0
-    while i < len(mask):
-        ch = mask[i]
-        if ch in "@#":
-            run = 1
-            while i + run < len(mask) and mask[i + run] == ch:
-                run += 1
-            cls = "[A-Za-z]" if ch == "@" else r"\d"
-            parts.append(cls + (f"{{{run}}}" if run > 1 else ""))
-            i += run
-        else:
-            parts.append(re.escape(ch))
-            i += 1
-    body = "".join(parts)
-    if not body:
+    shapes = [m for m in _MASK_SEPARATORS.split(mask.strip()) if m.strip()]
+    bodies = [_mask_body(m, exact) for m in shapes]
+    bodies = [b for b in bodies if b]
+    if not bodies:
         raise LedgerError(f"part name pattern {mask!r} compiles to nothing")
+    body = bodies[0] if len(bodies) == 1 else "(?:" + "|".join(bodies) + ")"
     try:
         return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
                           re.IGNORECASE)
     except re.error as e:
         raise LedgerError(f"part name pattern {mask!r}: {e}") from e
+
+
+def mask_shapes(mask: str) -> List[str]:
+    """The shapes of a pattern as typed, without '=' ('=@@#|@@##' ->
+    ['@@#', '@@##']): what the model is told and what an example is made of."""
+    out = []
+    for m in _MASK_SEPARATORS.split((mask or "").strip()):
+        m = m.strip()
+        m = m[len(MASK_EXACT):].strip() if m.startswith(MASK_EXACT) else m
+        if m:
+            out.append(m)
+    return out
+
+
+def _mask_body(shape: str, exact: bool = False) -> str:
+    """One shape of a pattern as a regex body (mask_to_regex); ``exact``:
+    every shape as typed, '=' or not."""
+    shape = shape.strip()
+    exact = exact or shape.startswith(MASK_EXACT)
+    if shape.startswith(MASK_EXACT):
+        shape = shape[len(MASK_EXACT):].strip()
+    # a shape of digits alone ('#####') keeps its length: shorter, it took
+    # years and readings ('2026', '1002')
+    digits_only = "@" not in shape and not any(c.isalpha() for c in shape)
+    parts: List[str] = []
+    i = 0
+    while i < len(shape):
+        ch = shape[i]
+        if ch in "@#":
+            run = 1
+            while i + run < len(shape) and shape[i + run] == ch:
+                run += 1
+            cls = "[A-Za-z]" if ch == "@" else r"\d"
+            if exact:
+                parts.append(cls + (f"{{{run}}}" if run > 1 else ""))
+            else:
+                if digits_only:
+                    parts.append(cls + (f"{{{run}}}" if run > 1 else ""))
+                else:
+                    parts.append(cls + f"{{{max(1, run - MASK_SLACK)},{run + MASK_SLACK}}}")
+            i += run
+        else:
+            parts.append(re.escape(ch))
+            i += 1
+    body = "".join(parts)
+    if body and not exact and shape[-1] in "@#":
+        body += _MASK_TAIL
+    return body
 
 
 def _num(s) -> Optional[float]:

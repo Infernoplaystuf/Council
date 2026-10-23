@@ -423,11 +423,15 @@ class LedgerTab(ViewHelpers, QWidget):
         mask_row.addWidget(QLabel("Part name pattern (optional):"))
         self.pattern_mask = QLineEdit()
         self.pattern_mask.setPlaceholderText(
-            "@@@#@@###   — @ letter, # digit, other characters literal")
+            "@@@#@@###   — @ letter, # digit, = exact, | several")
         self.pattern_mask.setToolTip(
             "A shape used when the sample number is not labelled.\n"
             "@ matches any letter, # any digit, anything else matches itself.\n"
-            "Example: @@@#@@### finds ABC1DE234 in a filename or a title.\n"
+            "Example: @@@#@@### finds ABC1DE234 in a filename or a title - and,\n"
+            "as it is loose, AB1DE234, ABC1DE23 and ABC1DE234-A or -2 too (each run\n"
+            "one shorter or longer, and a short tail after a dash).\n"
+            "Start with = to take it exactly as typed: =@@@#@@###.\n"
+            "Several shapes: separate them with | or a comma (@@@#@@### | @@-####).\n"
             "A part of another shape is kept but never pre-accepted.\n"
             "Left empty, the pattern Teach saved for this Ledger is used as a hint\n"
             "(parts of another shape are still pre-accepted); Forget saved pattern drops it.")
@@ -622,7 +626,7 @@ class LedgerTab(ViewHelpers, QWidget):
             saved = []
         self._pattern_completer.model().setStringList(saved)
         self._saved_patterns = (csv, list(saved))
-        hint = "@ letter, # digit, other characters literal"
+        hint = "@ letter, # digit, = exact, | several"
         self.pattern_mask.setPlaceholderText(
             f"empty: this Ledger's saved pattern {saved[0]} is used as a hint   — {hint}"
             if saved else f"@@@#@@###   — {hint}")

@@ -25,9 +25,12 @@ HOW EXCEL IS DRIVEN (everything stays on this machine)
     then ends at once, and COM's memory is not left corrupt.
   * a path longer than Excel opens (EXCEL_MAX_PATH) and a 0-byte file are
     said so before Excel starts.
-  * Pictures come out through the clipboard (Excel offers no other way, and
-    rights protection may forbid even that - then the picture is reported, not
-    read). Text on the clipboard beforehand is put back afterwards.
+  * Pictures come from a copy of the workbook Excel saves as .xlsx in a
+    temporary folder, read from its zip (zip_pictures) - not through the
+    clipboard, which took over the user's (2026-10-22). Only when Excel will
+    not save a copy (rights protection may forbid it) are they copied through
+    the clipboard, carefully: not when it holds anything but plain text, and
+    no more once the user copies something; text there beforehand is put back.
 
 TEXT BOXES AND CHARTS
   For .xlsx / .xlsm they are read straight from the file's XML (no Excel
@@ -43,8 +46,10 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import zipfile
 from contextlib import contextmanager
@@ -823,6 +828,84 @@ def _seq(v) -> List:
     return [_plain(v)]
 
 
+def zip_pictures(path) -> Dict[Tuple[str, str], List[Tuple[bytes, str]]]:
+    """Every embedded picture of an .xlsx / .xlsm, by (sheet, top-left cell
+    'D5'), in drawing order: (its bytes, its extension). Read from the zip
+    alone - no workbook is loaded. A linked picture (not in the file) and a
+    drawing it does not understand are skipped; never raises."""
+    out: Dict[Tuple[str, str], List[Tuple[bytes, str]]] = {}
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return out
+    with z:
+        try:
+            wb = ET.fromstring(z.read("xl/workbook.xml"))
+        except Exception:
+            return out
+        names = set(z.namelist())
+        wrels = _rels(z, "xl/workbook.xml")
+        for sh in wb.findall("m:sheets/m:sheet", NS):
+            sheet = sh.get("name", "")
+            part = wrels.get(sh.get(f"{{{NS['r']}}}id"), "")
+            for dpart in _rels(z, part).values():
+                if "/drawings/" not in dpart or dpart not in names:
+                    continue
+                drels = _rels(z, dpart)
+                try:
+                    droot = ET.fromstring(z.read(dpart))
+                except Exception:
+                    continue
+                for anchor in list(droot):
+                    fr = anchor.find("xdr:from", NS)
+                    try:
+                        col = int(fr.find("xdr:col", NS).text)
+                        row = int(fr.find("xdr:row", NS).text)
+                    except Exception:
+                        continue
+                    for pic in anchor.iter(f"{{{NS['xdr']}}}pic"):
+                        blip = pic.find(".//a:blip", NS)
+                        media = drels.get(blip.get(f"{{{NS['r']}}}embed"), "") \
+                            if blip is not None else ""
+                        if media not in names:
+                            continue
+                        try:
+                            data = z.read(media)
+                        except Exception:
+                            continue
+                        ext = media.rsplit(".", 1)[-1].lower() if "." in media else "png"
+                        out.setdefault((sheet, _a1(row + 1, col + 1)), []).append((data, ext))
+    return out
+
+
+def _pictures_from_a_copy(book, path: Path, folder: str) -> Tuple[Optional[Dict], str]:
+    """The open workbook's pictures without the clipboard (user, 2026-10-22:
+    "There may be a clipboard issue where stuff can't be copied because the
+    clip board is consumed somewhere"): Excel saves a copy of it as .xlsx in
+    ``folder`` (the original is never written: it is open read-only, and
+    SaveAs moves the open workbook onto the copy), and the pictures are read
+    from that file's zip (zip_pictures). (None, why) when Excel will not save
+    one - a rights-protected workbook may forbid it - or the copy cannot be
+    read: the caller copies through the clipboard then, carefully."""
+    copy = Path(folder) / "copy.xlsx"
+    try:
+        _ask(lambda: book.SaveAs(str(copy), 51), book, "SaveAs")     # xlOpenXMLWorkbook
+    except Exception as e:                                  # noqa: BLE001
+        why = e.why if isinstance(e, _Refused) else e
+        return None, f"Excel would not save a copy to read them from ({_short(why)})"
+    if not copy.is_file():
+        return None, "Excel saved no copy to read them from"
+    pics = zip_pictures(copy)
+    if not pics and not zipfile.is_zipfile(copy):
+        return None, "the copy Excel saved could not be read (rights protection?)"
+    return pics, ""
+
+
+def _short(e) -> str:
+    return ((_com_error_description(e) if not isinstance(e, str) else e) or repr(e)
+            ).rstrip(". ")[:160]
+
+
 def _clip_text() -> Optional[str]:
     try:
         import win32clipboard
@@ -1435,6 +1518,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         def app_factory():
             return DispatchEx("Excel.Application")
     app = book = None
+    copy_dir = ""                   # where Excel saved the copy the pictures come from
     clip = None
     seq = None                      # careful: the clipboard's counter as last seen
     clip_why = ""                   # careful: why no more pictures are copied
@@ -1519,6 +1603,25 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         if watchdog is not None:
             watchdog.cancel()          # opened: copying a big workbook out may take a while
         out = ExcelBook()
+        # The pictures come from a copy Excel saves as .xlsx, never through
+        # the clipboard, which took over the user's: what they copied while a
+        # workbook was read was overwritten, and only plain text was put back
+        # (user, 2026-10-22). Only when Excel will not save a copy is the
+        # clipboard used - carefully, as the knowledge graph's rebuild does:
+        # not when it holds anything but text, stopped when the user copies.
+        copied: Optional[Dict[Tuple[str, str], List[Tuple[bytes, str]]]] = None
+        if want_pictures:
+            copy_dir = tempfile.mkdtemp(prefix="council-xl-")
+            copied, copy_why = _pictures_from_a_copy(book, path, copy_dir)
+            if copied is None and not careful:
+                careful = True
+                seq = _clip_seq()
+                clip = _clip_text()
+                safe, clip_why = clipboard_safe()
+                if safe and seq is None:
+                    clip_why = "the clipboard could not be checked"
+                if clip_why:
+                    clip_why = f"{copy_why}, and {clip_why}"
         # Each call the copy cannot do without is asked again while Excel
         # refuses it (_ask): its license agreement came up while a workbook
         # was copied out (~0.7-1.7 s after it starts, measured here), and the
@@ -1593,6 +1696,17 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 if typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and not want_pictures:
                     # listed, never copied: no clipboard (the caller counts them)
                     out.pictures.append(Picture(name, anchor, b""))
+                elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and copied is not None:
+                    got = copied.get((name, anchor)) or []
+                    if got:
+                        data, ext = got.pop(0)
+                        out.pictures.append(Picture(name, anchor, data, ext))
+                    else:
+                        # a linked picture, not saved in the file
+                        out.pictures.append(Picture(name, anchor, b""))
+                        out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
+                                         "be read (a linked picture, not saved in the "
+                                         "workbook)")
                 elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and want_pictures:
                     if not locked and not clip_why:
                         # careful does not wait: the other reading changes
@@ -1675,6 +1789,9 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             # not left running hidden (review, 2026-10-20)
             _let_go(held, end=quit_refused or not answered)
         _unregister_excel_pid(pid)
+        if copy_dir:
+            # after Excel let go of it (it held the copy open)
+            shutil.rmtree(copy_dir, ignore_errors=True)
         try:
             # careful: only when nothing else was put there since the last
             # copy (that would be the user's, and stays)
