@@ -486,6 +486,188 @@ class ReviewDialog(QDialog):
             self.opener(self.current.source_file)
 
 
+
+class FilledTemplateDialog(ReviewDialog):
+    """The template filled in for one part, each value in its cell tinted
+    by how sure it is (ledger_review.confidence_tint) - user, 2026-10-23:
+    "a pop-out of the output filled in template excel so I can click on
+    cells and see their source easily to confirm if its right or wrong".
+
+    Click a filled cell: the values offered for it come up on the left, the
+    first picked, and its source cell is shown highlighted below. Right /
+    Wrong / a correction are answers to the review, as in Review by
+    clicking (the same Save)."""
+
+    def __init__(self, review: lv.Review, parent=None,
+                 log: Optional[Callable[[str], None]] = None,
+                 opener: Optional[Callable[[str], None]] = None,
+                 on_saved: Optional[Callable[[int], None]] = None, part: str = ""):
+        self._parts = lv.parts(review)
+        self.part = part if part in self._parts else (self._parts[0] if self._parts else "")
+        #: (template sheet, cell) clicked: the list shows the values offered for it
+        self._cell: Optional[Tuple[str, Tuple[int, int]]] = None
+        super().__init__(review, parent, log, opener, on_saved)
+        self.setWindowTitle(f"Filled template — {Path(review.path).name}")
+
+    def _build(self) -> None:
+        super()._build()
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Part:"))
+        self.part_choice = QComboBox()
+        self.part_choice.addItems(self._parts)
+        self.part_choice.setCurrentText(self.part)
+        self.part_choice.currentTextChanged.connect(self.pick_part)
+        bar.addWidget(self.part_choice)
+        for tint, words in lv.LEGEND:
+            key = QLabel(f" {words} ")
+            key.setStyleSheet(f"background:{tint}; color:#000000; border-radius:3px")
+            bar.addWidget(key)
+        bar.addStretch(1)
+        self.all_btn = QPushButton("All values of this part")
+        self.all_btn.setToolTip("List every value of this part, not only the clicked cell's")
+        self.all_btn.clicked.connect(self.show_whole_part)
+        bar.addWidget(self.all_btn)
+        self.export_btn = QPushButton("Open as Excel")
+        self.export_btn.setToolTip("Write this part's filled template (tinted, with a note of "
+                                   "each value's source) beside the review, and open it")
+        self.export_btn.clicked.connect(self.on_export)
+        bar.addWidget(self.export_btn)
+        self.layout().insertLayout(0, bar)
+        help_ = QLabel("Click a filled cell of the template: its value's source is shown "
+                       "below, highlighted. Say Right or Wrong (or correct it); a cell "
+                       "several sources filled lists each on the left. Save writes your "
+                       "answers into the review workbook; then Apply.")
+        help_.setWordWrap(True)
+        self.layout().insertWidget(1, help_)
+        self.show_choice.setVisible(False)
+
+    # ── which values are listed ─────────────────────────────────────────
+    def _candidates(self) -> Dict[Tuple[str, Tuple[int, int]], List[lv.Item]]:
+        return lv.cell_candidates(self.review.items, self._exact, self.part,
+                                  self._accept_of)
+
+    def _cell_of(self, it: Optional[lv.Item]) -> Optional[Tuple[str, Tuple[int, int]]]:
+        if it is None or not it.fields:
+            return None
+        return self._exact.get((it.fields[0], it.item)) or self._exact.get((it.fields[0], ""))
+
+    def _fill_list(self) -> None:
+        keep = self.current
+        mine = [i for i in self.review.items if i.part == self.part]
+        if self._cell is not None:
+            mine = list(self._candidates().get(self._cell, []))
+        self.shown = mine
+        self.items.blockSignals(True)
+        self.items.setRowCount(len(self.shown))
+        for n, it in enumerate(self.shown):
+            self._fill_row(n, it)
+        self.items.blockSignals(False)
+        part_items = [i for i in self.review.items if i.part == self.part]
+        needs = sum(i.needs for i in part_items)
+        what = (f"{len(self.shown)} value(s) offered for the clicked cell"
+                if self._cell is not None else f"{len(part_items)} value(s)")
+        self.counts.setText(f"{self.part}: {what}; {needs} of the part's need a decision"
+                            + (f"; {len(self.answers)} answered here, not saved yet"
+                               if self.answers else ""))
+        if keep in self.shown:
+            self.items.selectRow(self.shown.index(keep))
+
+    def select(self, item: lv.Item) -> None:
+        if item not in self.shown:
+            self._cell = None
+            if item.part != self.part:
+                self.part_choice.setCurrentText(item.part)
+            self._fill_list()
+        self.items.selectRow(self.shown.index(item))
+
+    def pick_part(self, part: str) -> None:
+        if not part or part == self.part and self.shown:
+            return
+        self.part, self._cell, self.current = part, None, None
+        self._fill_list()
+        self.items.clearSelection()
+        if self.shown:
+            self.items.selectRow(0)
+        else:
+            self._tint_template()
+
+    def show_whole_part(self) -> None:
+        self._cell = None
+        self._fill_list()
+
+    def click_cell(self, sheet: str, rc: Tuple[int, int]) -> bool:
+        """A template cell clicked: list the values offered for it, the first
+        picked. False when no value of this part goes there."""
+        cands = self._candidates().get((sheet, rc))
+        if not cands:
+            self.status.setText("No value of this part goes in that cell.")
+            return False
+        self._cell = (sheet, rc)
+        self._fill_list()
+        self.items.clearSelection()                 # row 0 may be selected already
+        self.items.selectRow(0)
+        return True
+
+    def _got_template(self, view, err: str) -> None:
+        super()._got_template(view, err)
+        for i, v in enumerate(self._template_views):
+            v.clicked.connect(lambda idx, i=i: self.click_cell(
+                self._template_models[i].sheet.name, (idx.row() + 1, idx.column() + 1)))
+
+    def _answer(self, accept: str) -> None:
+        super()._answer(accept)
+        self._tint_template()
+
+    # ── the filled template ─────────────────────────────────────────────
+    def _tint_template(self) -> None:
+        if self.template is None:
+            return
+        cands = self._candidates()
+        at = self._cell_of(self.current)
+        first = None
+        for i, m in enumerate(self._template_models):
+            tints, texts, tips = {}, {}, {}
+            for (sheet, rc), cs in cands.items():
+                if sheet != m.sheet.name:
+                    continue
+                it = cs[0]
+                texts[rc] = it.value
+                tints[rc] = lv.confidence_tint(it)
+                others = [o.value for o in cs[1:] if o.value != it.value]
+                tips[rc] = (f"{it.fields[0]} = {it.value}\nfrom {it.where}\nscore "
+                            f"{it.score:g}" + (" · accepted" if self._accept_of(it) == "Y"
+                                               else "")
+                            + (f"\nalso offered: {', '.join(others[:5])}" if others else ""))
+            if at is not None and at[0] == m.sheet.name:
+                tints[at[1]] = CELL_TINT
+                first = (i, at[1])
+            m.set_tints(tints, texts, tips)
+        n = len(cands)
+        if first is not None:
+            i, (r, c) = first
+            self.template_tabs.setCurrentIndex(i)
+            self._scroll(self._template_views[i], self._template_models[i], r, c)
+        self.template_note.setText(
+            f"<b>Template filled in for {self.part}</b> — {n} cell(s) filled; click one to "
+            "see where its value came from" if self.part else
+            "<b>Template</b> — this review has no parts")
+
+    def on_export(self) -> Optional[str]:
+        if not self.part:
+            return None
+        out = lv.filled_dir(self.review.path) / f"{lv._safe_name(self.part)}.xlsx"
+        try:
+            path = lv.write_filled(self.review, self.part, out, self._exact or None)
+        except (LedgerError, OSError) as e:
+            self.status.setText(f"Not written: {e}")
+            return None
+        self.status.setText(f"Written: {path}"
+                            + (" (answers not saved yet are not in it)" if self.answers else ""))
+        self.log(f"Filled template for {self.part}: {path}")
+        if self.opener is not None:
+            self.opener(path)
+        return path
+
 def _no_dialogs() -> bool:
     import os
     return os.environ.get("COUNCIL_NO_DIALOGS", "") not in ("", "0")

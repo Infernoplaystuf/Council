@@ -3778,20 +3778,43 @@ def _value_key(v: Any) -> str:
     return repr(f) if math.isfinite(f) else s
 
 
+def same_person(a: str, b: str) -> bool:
+    """Is operator ``a`` operator ``b``? Sheets write them as initials or as
+    a name (user, 2026-10-23: "sometimes its initials sometimes its a
+    name"): 'JB' is 'J.B.', 'jb' and 'Jane Brown'; 'Brown' or 'Jane' is
+    'Jane Brown'."""
+    x, y = (_initials(v) or str(v or "").strip() for v in (a, b))
+    if not x or not y:
+        return False
+    if x.casefold() == y.casefold():
+        return True
+    def letters(name: str) -> str:              # 'Jane Brown' -> 'JB'
+        return "".join(w[0] for w in re.split(r"[\s\-]+", name) if w).upper()
+    xi, yi = " " not in x and x.isupper(), " " not in y and y.isupper()
+    if xi != yi:                                # initials and a name
+        ini, name = (x, y) if xi else (y, x)
+        return letters(name) == ini
+    if not xi:                                  # two names: one is part of the other
+        xs, ys = set(x.casefold().split()), set(y.casefold().split())
+        return xs <= ys or ys <= xs
+    return False
+
+
 def _prefer_rank(inspector: str, prefer: Sequence[str]) -> Optional[int]:
-    """Where ``inspector`` ('JB', or 'AK/JB' for agreeing ones) is in the
-    operators to prefer, first listed first; None when not there."""
-    who = {w.strip().casefold() for w in (inspector or "").split("/") if w.strip()}
+    """Where ``inspector`` ('JB', 'Jane Brown', or 'AK/JB' for agreeing
+    ones) is in the operators to prefer, first listed first; None when not
+    there (same_person)."""
+    who = [w.strip() for w in (inspector or "").split("/") if w.strip()]
     for i, p in enumerate(prefer):
-        if p.strip().casefold() in who:
+        if any(same_person(p, w) for w in who):
             return i
     return None
 
 
 def parse_prefer(text: str) -> List[str]:
-    """'JB, AK' -> ['JB', 'AK']: the operators whose readings to use, in
-    order."""
-    return [w for w in re.split(r"[\s,;|/]+", text or "") if w]
+    """'JB, Alex King' -> ['JB', 'Alex King']: the operators whose readings
+    to use, in order - initials or names, between commas."""
+    return [w.strip() for w in re.split(r"[,;|/\n]+", text or "") if w.strip()]
 
 
 def decide(run: Extraction, schema: TemplateSchema,
