@@ -442,6 +442,37 @@ def _safe_name(part: str) -> str:
     return re.sub(r"[^\w\-. ]+", "_", part).strip() or "part"
 
 
+def _answer_key(it: Item) -> Tuple[str, str, Tuple[str, ...], str]:
+    return it.part, it.item, tuple(it.fields), it.where
+
+
+def carry_answers(old: Review, new: Review) -> int:
+    """The answers of an earlier review copied into a new one of the same
+    sources (the Ledger tab's Re-run with my answers): a value read at the
+    same source cell, for the same part, item and field, gets the earlier
+    Y or N - and a corrected value - where the new review left it to decide
+    or had pre-accepted what was said Wrong. Saved into the new review
+    (save); returns how many rows changed. Sample reviews only."""
+    if old.kind != "samples" or new.kind != "samples":
+        return 0
+    said = {_answer_key(it): it for it in old.items
+            if it.sheet == "Values" and it.accept in ("Y", "N")}
+    answers: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for it in new.items:
+        was = said.get(_answer_key(it)) if it.sheet == "Values" else None
+        if was is None:
+            continue
+        if not (it.accept not in ("Y", "N") or it.clash
+                or (was.accept == "N" and it.accept == "Y")):
+            continue
+        a: Dict[str, Any] = {"accept": was.accept}
+        if was.value != it.value and it.value_col:
+            a.update(value=was.value, value_col=it.value_col)
+        if a["accept"] != it.accept or "value" in a:
+            answers[(it.sheet, it.row)] = a
+    return save(new.path, answers)
+
+
 def write_all_filled(review: Review, progress=None) -> List[str]:
     """One filled template per part (write_filled), in filled_dir. A part
     that cannot be written is skipped."""

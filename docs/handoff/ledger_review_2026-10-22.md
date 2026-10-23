@@ -60,3 +60,27 @@ source".
   the source cell highlighted below. Right / Wrong / a correction are saved
   into the review like Review by clicking; "Open as Excel" writes and opens
   that part's filled template.
+
+## Re-run with my answers (2026-10-23)
+
+Andy: "when I viewed the filled out template by the model can I say look at
+a few values and then give an answer and have it rerun and fill things in
+more confidently?"
+
+- The filled template window's "Re-run with my answers" saves the answers,
+  then the Ledger tab (`LedgerTab.on_rerun_with_answers`,
+  `LedgerActions.rerun`) applies the review and runs Extract again on the
+  review's own sources, part, part-name pattern and operators (its `_run`
+  sheet). The window opens again on the new review, at the same part.
+- The values said Right are in the parent CSV by then, so the run learns
+  their labels by example (`ledger_examples`): one label said Right for a
+  few values pre-accepts its other readings.
+- The earlier answers are copied into the new review
+  (`ledger_review.carry_answers`, matched by part, item, field and source
+  cell), so a value said Right or Wrong, or corrected, is not asked again.
+  The filled templates are written again after that.
+- A new review never takes an existing name (`default_review_for` adds
+  `_2`, `_3`…): the old review is kept.
+- Not done (offered, not yet agreed): a Wrong teaching "label X is not field
+  F" for other parts, and re-checking only the uncertain values for speed.
+  The re-run reads every source twice (Apply, then Extract).

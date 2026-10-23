@@ -45,7 +45,14 @@ def default_csv_for(template) -> Path:
 
 
 def default_review_for(csv_path) -> Path:
-    return Path(csv_path).with_name(f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    """A new review's name beside the parent CSV, never one already there
+    (two runs in one second wrote the same name: Re-run with my answers)."""
+    stem = f"review_{datetime.now():%Y%m%d_%H%M%S}"
+    out, n = Path(csv_path).with_name(f"{stem}.xlsx"), 1
+    while out.exists():
+        n += 1
+        out = out.with_name(f"{stem}_{n}.xlsx")
+    return out
 
 
 def is_ledger_output(p: Path, template_path: Optional[str] = None) -> bool:
