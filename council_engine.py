@@ -2764,8 +2764,11 @@ def _grammar_for_schema(schema: Dict[str, Any]) -> Tuple[Any, str]:
         return None, "none"          # not cached: a test may install one
     result: Tuple[Any, str] = (None, "none")
     try:
-        result = (_lg.LlamaGrammar.from_json_schema(json.dumps(schema),
-                                                    verbose=False), "schema")
+        # grammar_safe: an enum value with a quote mark or backslash would
+        # compile to a grammar llama.cpp cannot parse, and that is not
+        # raised here but printed when sampling starts
+        result = (_lg.LlamaGrammar.from_json_schema(
+            json.dumps(_so.grammar_safe(schema)), verbose=False), "schema")
     except Exception as exc:                              # noqa: BLE001
         _LOG.warning(
             "[structured] schema %s could not be compiled to a grammar (%r); "
