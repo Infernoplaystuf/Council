@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from . import token_budget
+
 CATALOG_FILE = "nx_catalog.json"
 SUBFOLDER = "dream3d"
 
@@ -280,7 +282,8 @@ def default_model_call(prompt: str) -> str:
     import council_engine
     return council_engine.local_chat(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2, num_predict=900, timeout=180)
+        temperature=0.2, num_predict=token_budget.reply("answer", 900),
+        timeout=180)
 
 
 def _n_ctx() -> Optional[int]:

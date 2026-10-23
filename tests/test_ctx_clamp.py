@@ -147,7 +147,9 @@ def test_a_16k_writer_keeps_its_reply_and_its_system_prompt(engine, stream):
     cb = (lambda _t: None) if stream else None
     w.respond("hello", token_callback=cb)
     call = engine.state.loaded["main"].calls[-1]
-    assert call.max_tokens == 2400
+    # A "long" reply (council_core.token_budget): a sixth of a 16k window,
+    # more than its old 2400, and the prompt keeps every token.
+    assert call.max_tokens == 16384 // 6 > 2400
     assert call.messages[0]["content"] == w.system_prompt
     assert not any(MARKER in m["content"] for m in call.messages)
     assert _fits(call, 16384)

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from council_core import knowledge_graph as kgm
+from council_core import token_budget
 
 #: How a link reads from each end (the Connections tab shows the same words).
 PHRASES = {
@@ -374,7 +375,8 @@ def ask(vault: Any, question: str, chat: Optional[Callable[..., str]] = None,
             {"role": "user", "content": f"Facts:\n{text}\n\nQuestion: {question}"}]
     try:
         try:
-            out["answer"] = (chat(msgs, num_predict=900, schema=None) or "").strip()
+            out["answer"] = (chat(msgs, num_predict=token_budget.reply("answer", 900),
+                                 schema=None) or "").strip()
         except TypeError:
             out["answer"] = (chat(msgs) or "").strip()
     except Exception as exc:                               # noqa: BLE001

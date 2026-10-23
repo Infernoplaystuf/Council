@@ -55,6 +55,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import node_routing
+from . import token_budget
 
 DIR_NAME = ".council_fanout"
 MAX_UNITS = 8
@@ -313,7 +314,8 @@ def make_plan(task: str, repo: Path, *, chat: Optional[Callable] = None,
                  {"role": "user",
                   "content": f"TASK:\n{task}\n\nTHE FOLDER:\n{index(repo)}"}],
                 role=role or planner_role(), json_schema=PLAN_SCHEMA,
-                num_predict=2000, temperature=0.1, timeout=300)
+                num_predict=token_budget.reply("long", 2000),
+                temperature=0.1, timeout=300)
     return check_plan(_parse_json(text, "planner"), repo, max_units)
 
 
@@ -830,7 +832,8 @@ def _review(task: str, plan: Plan, diff: str, result: JobResult,
                       f"TASK:\n{task}\n\nCONTRACT:\n{plan.contract}\n\n"
                       f"TESTS: {tests}\n\nTHE CHANGE:\n{shown}"}],
                     role="judge", json_schema=REVIEW_SCHEMA,
-                    num_predict=900, temperature=0.1, timeout=300)
+                    num_predict=token_budget.reply("answer", 900),
+                    temperature=0.1, timeout=300)
         obj = _parse_json(text, "judge")
         return {"verdict": str(obj.get("verdict") or "?"),
                 "summary": str(obj.get("summary") or ""),

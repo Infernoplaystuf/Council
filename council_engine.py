@@ -94,6 +94,8 @@ import urllib.request
 _INFERENCE_LOCK = threading.Lock()
 import urllib.error
 
+from council_core import token_budget as _token_budget
+
 
 # Optional dependencies for Phase 3
 try:
@@ -2546,6 +2548,13 @@ def _clamp_messages_to_ctx(
     # tokens and llama-cpp cut the 2400-token reply to 2101. 64 + 8 per
     # message keeps a 2-message call within 16 tokens of the old budget.
     margin = _template_margin(len(messages))
+    if isinstance(num_predict, _token_budget.Reply):
+        # A reply KIND (council_core.token_budget): its floor is the old
+        # fixed number; it grows with THIS window, but only into room the
+        # prompt leaves, so no prompt is trimmed for it (user, 2026-10-23).
+        num_predict = _token_budget.fit(
+            num_predict, n_ctx,
+            sum(_est(m.get("content", "")) for m in messages), margin)
     if int(num_predict) <= 0:
         # FILL (num_predict 0, the Ledger's calls): the reply may have all the
         # window the prompt leaves - no half-window cap - and the prompt is
@@ -3875,7 +3884,7 @@ def _ollama_local_gated(
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
         # tokens thinking on a short warm call, measured). A FILL reply (0)
         # has all the window already.
-        num_predict = int(num_predict) + _think_headroom(think)
+        num_predict = _token_budget.plus(num_predict, _think_headroom(think))
     model_name = entry["name"]
     wanted_predict = num_predict
     cpt = _ollama_cpt(model_name)
@@ -4575,7 +4584,10 @@ class LocalBackendSpec:
         json_schema: Optional[Dict[str, Any]] = None,
     ) -> str:
         temp = self.default_temperature if temperature is None else float(temperature)
-        mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
+        # A token_budget.Reply is kept as it is: the clamp sizes it.
+        mtok = (self.default_max_tokens if max_tokens is None
+                else max_tokens if isinstance(max_tokens, int)
+                else int(max_tokens))
         slot = _slot_for_role(role)
 
         if trace:
@@ -6029,7 +6041,9 @@ class PersonalityModel:
     registry: BackendRegistry
     backend_key: Optional[str] = None
     temperature: float = 0.3
-    max_output_tokens: int = 1400
+    # A normal answer: 1400 tokens at least, more on a model with a big
+    # window (council_core.token_budget).
+    max_output_tokens: int = _token_budget.reply("answer", 1400)
     memory_manager: Optional[RoleMemoryManager] = None
     conversation_store: Optional[ConversationStore] = None
     session_id: Optional[str] = None
@@ -7957,6 +7971,10 @@ ROLE_TOKEN_BUDGETS: Dict[str, int] = {
     "algorithm": 1600,   # retention analysis
 }
 
+#: The reply kind (council_core.token_budget) each budget above grows as on a
+#: model with a big window; a role not named here is "long".
+ROLE_REPLY_KINDS: Dict[str, str] = {"ideator": "answer"}
+
 
 def build_personalities(
     *,
@@ -8048,7 +8066,7 @@ def build_personalities(
         registry=reg,
         backend_key=pins.get("judge", "local_judge_fast"),
         temperature=0.1,
-        max_output_tokens=1200,
+        max_output_tokens=_token_budget.reply("long", 1200),
         memory_manager=memmgr,
         conversation_store=convo,
         session_id=session_id,
@@ -8091,7 +8109,8 @@ def build_personalities(
     # ── Token budget overrides (ROLE_TOKEN_BUDGETS) ───────────────────
     for role, budget in ROLE_TOKEN_BUDGETS.items():
         if role in models:
-            models[role].max_output_tokens = budget
+            models[role].max_output_tokens = _token_budget.reply(
+                ROLE_REPLY_KINDS.get(role, "long"), budget)
 
     return models
 

@@ -48,6 +48,7 @@ import council_engine as ce
 import data_index
 
 from . import paths as _paths
+from . import token_budget
 
 # ============================================================
 # The vault, and the session a turn is prepared for
@@ -3317,7 +3318,7 @@ def _run_analyst_step_impl(query):
                     messages=[{'role': 'user', 'content': prompt + feedback}],
                     role="coder",
                     temperature=0.0,
-                    num_predict=700,
+                    num_predict=token_budget.reply("answer", 700),
                     timeout=120,
                 )
         except Exception as _e:
