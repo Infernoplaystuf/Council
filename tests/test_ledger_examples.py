@@ -185,3 +185,55 @@ def test_a_column_that_agrees_once_in_four_teaches_nothing(btb):
         [r["Name"], r["Health"] if i == 0 else 1 + i] for i, r in enumerate(greg[:4])])})
     run = lr.extract(csv, sorted(src.glob("*.xlsx")))
     assert run.learned == []
+
+
+# ── the Ledger's own filled example (user, 2026-10-23) ──────────────────
+def test_the_filled_example_is_saved_with_the_ledger(lmm):
+    tmp, src, csv, schema = lmm
+    se.save_ignore_files(csv, ["cover*.xlsx"])
+    lx.save_filled_example(csv, str(tmp / "f.xlsx"))
+    assert lx.load_filled_example(csv) == str(tmp / "f.xlsx")
+    assert se.load_ignore_files(csv) == ["cover*.xlsx"]     # the file's other sections kept
+    lx.save_filled_example(csv, "")
+    assert lx.load_filled_example(csv) == ""
+
+
+def test_the_filled_example_teaches_and_guides_the_model_but_is_no_source(lmm):
+    """'a filled version of the template needs to be directly specified in
+    the file input so that the model can see it to start with'."""
+    tmp, src, csv, schema = lmm
+    # the example sits among the sources too: picked as the example, it is
+    # not read as one
+    example = filled_copy(schema, src / "LMM Template_Filling.xlsx", "101",
+                          {"Power (W)": "285", "Scan Speed (mm/s)": "1200"})
+    lx.save_filled_example(csv, str(example))
+    messy(src / "messy_101.xlsx", 101, [("Traverse rate", 1200), ("Zorp", 7)])
+    messy(src / "messy_202.xlsx", 202, [("Traverse rate", 900)])
+    prompts = []
+
+    def model(prompt, schema_):
+        prompts.append(prompt)
+        return '{"mappings": []}', "fake-granite"
+    ex = li._extract(str(csv), [str(src)], tmp / "r.xlsx", "", False, None,
+                     _NoProg(), None, None, None, True, model)
+    assert ("LMM Template_Filling.xlsx", "the filled example") in ex.skipped
+    assert ex.learned[0].startswith("Filled example LMM Template_Filling.xlsx: 9 row(s)")
+    assert any("'traverse rate' is Scan Speed (mm/s)" in x for x in ex.learned)
+    wb = openpyxl.load_workbook(ex.review)
+    wheres = {str(r[8]) for r in wb["Values"].iter_rows(min_row=2, values_only=True)}
+    assert not any("Template_Filling" in w for w in wheres)
+    labels = next(p for p in prompts if "Labels:" in p)
+    assert "A filled example of the template" in labels
+    assert '"Power (W)": "285"' in labels and '"Scan Speed (mm/s)": "1200"' in labels
+    li.run_apply(ex.review, use_images=False)              # Apply reads it the same way
+
+
+class _NoProg:
+    def update(self, *a, **k):
+        pass
+
+    def stage(self, *a, **k):
+        pass
+
+    def advance(self, *a, **k):
+        pass

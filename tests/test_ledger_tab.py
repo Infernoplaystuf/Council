@@ -301,3 +301,54 @@ def test_review_by_clicking_opens_over_the_review(qapp, books):
     assert dlg.review.path == tab.review.text()
     assert "need a decision" in tab.log.toPlainText()
     dlg.close()
+
+
+def test_the_operator_to_prefer_goes_into_the_extract(qapp, books, monkeypatch):
+    """user, 2026-10-23: one workbook's several readings - the operator
+    typed is used first (source_extract.decide), and the review keeps it."""
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.prefer_operator.setText("jb, AK")
+    from council_core import ledger_ingest
+    seen = {}
+    real = ledger_ingest.run_extract
+
+    def spy(*a, **kw):
+        seen["prefer"] = kw.get("prefer")
+        return real(*a, **kw)
+    monkeypatch.setattr(ledger_ingest, "run_extract", spy)
+    tab.on_extract()
+    assert tab.wait(120)
+    assert seen["prefer"] == ["jb", "AK"]
+    import json
+    import openpyxl
+    meta = json.loads(openpyxl.load_workbook(tab.review.text())["_run"]["A1"].value)
+    assert meta["prefer"] == ["jb", "AK"]
+
+
+def test_a_filled_example_is_picked_and_saved_with_the_ledger(qapp, books, monkeypatch,
+                                                              tmp_path):
+    template, _src, _ = books
+    tab, _ = make_tab(qapp)
+    tab.on_pick_filled_example()                           # no parent CSV yet
+    assert "parent CSV first" in tab.status.text()
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    import sample_ledger as sl
+    schema = sl.ParentCSV(tab.csv.text()).schema
+    example = tmp_path / "filled.xlsx"
+    sl.fill_template(schema, [{schema.id_field: "101", schema.item_field: it,
+                               "Power (W)": "285"} for it in schema.items], example)
+    monkeypatch.setattr(tab, "_browse_filled_example", lambda: str(example))
+    tab.on_pick_filled_example()
+    assert tab.filled_example.text() == str(example)
+    assert "9 row(s) for 101" in tab.log.toPlainText()
+    from council_core import ledger_examples
+    assert ledger_examples.load_filled_example(tab.csv.text()) == str(example)
+    tab.forget_example_btn.click()
+    assert tab.filled_example.text() == "" and not tab.forget_example_btn.isEnabled()

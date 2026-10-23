@@ -324,7 +324,7 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 pattern_mask: Optional[str] = None,
                 cancel: Optional[Any] = None,
                 log: Optional[Callable[[str], None]] = None,
-                assist: Any = False) -> ExtractSummary:
+                assist: Any = False, prefer: Sequence[str] = ()) -> ExtractSummary:
     """``log``: where a stall dump goes (the Ledger tab's log). ``assist``:
     ask Council's model about the labels and part numbers the rules could
     not place (council_core.ledger_llm); its answers are suggestions, and
@@ -333,22 +333,32 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     ``pattern_mask`` empty: the Ledger's saved part-name pattern (Teach
     saves one; source_extract.load_patterns) is used as a hint - a part of
     another shape is still pre-accepted (extract's pattern_strict) - and the
-    summary says so (ExtractSummary.pattern_saved)."""
+    summary says so (ExtractSummary.pattern_saved).
+
+    ``prefer``: the operators (initials) whose reading is used when a
+    workbook has several readings of one value (source_extract.decide)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask, cancel, log, assist)
+                     prog, pattern_mask, cancel, log, assist, prefer=prefer)
         tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {tail}")
         return s
 
 
+def _same_file(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
              cancel: Optional[Any] = None,
              log: Optional[Callable[[str], None]] = None,
-             assist: Any = False, chat=None) -> ExtractSummary:
+             assist: Any = False, chat=None, prefer: Sequence[str] = ()) -> ExtractSummary:
     say = prog.update
     from council_core import ledger_records
     if ledger_records.is_record_ledger(csv_path):
@@ -364,6 +374,20 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                            ignore_patterns=ignore_patterns,
                                            template_path=ledger.schema.template_path,
                                            reasons=why_skipped)
+    # the Ledger's filled example (ledger_examples, user 2026-10-23): worked
+    # answers and the model's guide - never a source to read values from
+    from council_core import ledger_examples
+    example = ledger_examples.load_filled_example(csv_path)
+    example_rows = ledger_examples.filled_example_rows(example, ledger.schema)
+    if example:
+        keep = []
+        for f in files:
+            if _same_file(f, example):
+                skipped_files.append(f)
+                why_skipped[f] = "the filled example"
+            else:
+                keep.append(f)
+        files = keep
     if not files:
         if skipped_files and not sources:
             raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
@@ -421,7 +445,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    report, stop)
         # the user's answers in Teach go in as examples (few-shot)
         label_examples = ledger_teach.label_examples(csv_path, ledger.schema)
-        part_examples = ledger_teach.part_examples(csv_path)
+        part_examples = ledger_teach.part_examples(csv_path) + [
+            (p, ledger.schema.id_field) for p in
+            ledger_examples.filled_example_parts(example_rows, ledger.schema.id_field)]
 
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
@@ -434,8 +460,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                       progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                       part_finder=part_finder, taught=taught,
                       pattern_strict=not pattern_saved,
-                      # the records already accepted are worked answers too
-                      examples=ledger.rows)
+                      # the records already accepted are worked answers too,
+                      # and the filled example's
+                      examples=list(ledger.rows) + example_rows)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -450,8 +477,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    f"labels left over; {rules}.")
         else:
             prog.stage("asking Council's model about the labels left over")
-            ledger_llm.place_labels(run, ledger.schema, chat, report,
-                                    examples=label_examples)
+            ledger_llm.place_labels(
+                run, ledger.schema, chat, report, examples=label_examples,
+                guide=ledger_examples.filled_example_text(
+                    example_rows, [f.name for f in ledger.schema.fields
+                                   if f.name != ledger.schema.id_field]))
             if cancel is not None and cancel.is_set():
                 # pressed while the model was asked: a cancelled run - it
                 # said 'Review written…' and that the model did not answer
@@ -470,15 +500,16 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                         "them).")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
-    dec = decide(run, ledger.schema)
+    dec = decide(run, ledger.schema, prefer=prefer)
     # the mask and Part override go with the review: Apply reads the
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)
     write_review(out, run, dec, ledger.schema, str(csv_path),
                  pattern_mask=pattern_mask or "", part=part or "",
-                 pattern_hint=pattern_saved)
+                 pattern_hint=pattern_saved, prefer=prefer)
     ok = sum(d.accept for d in dec)
-    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
+    aside = sum(bool(d.alternate) for d in dec)
+    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
                           list(run.timings), bool(run.cancelled), read_all=read_all,
@@ -486,7 +517,14 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files],
                           pattern=pattern_mask or "", pattern_saved=pattern_saved,
-                          learned=list(getattr(run, "learned", []) or []),
+                          learned=([f"Filled example {Path(example).name}: "
+                                    f"{len(example_rows)} row(s) used as worked answers"
+                                    + (" and shown to Council's model" if assist else "")]
+                                   if example_rows else
+                                   [f"Filled example {Path(example).name}: not read (no "
+                                    f"{ledger.schema.id_field} in it, or it is not there)"]
+                                   if example else [])
+                          + list(getattr(run, "learned", []) or []),
                           review_reasons=summarize_review_reasons(dec, ledger.schema))
 
 
