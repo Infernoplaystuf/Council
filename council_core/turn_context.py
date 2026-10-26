@@ -1581,6 +1581,16 @@ def _named_app_files(text):
             if _named_path_is_app_file(p)]
 
 
+def _without_app_file_paths(text):
+    """``text`` less the app's own files it names, for the vault search: the
+    words of a path that was not read found other files in its place (on
+    Windows a temp folder's 'pytest-12' matched a CSV's 12.5; CI,
+    2026-10-26). The rest of the question is still searched."""
+    for p in _named_app_files(text):
+        text = text.replace(p, " ")
+    return text
+
+
 # ── Session "recently referenced files" registry ────────────────────────────
 # When a command lists files to the user (e.g. "files associated with job 456"),
 # the console records their ABSOLUTE paths here, keyed by lowercase basename. A
@@ -2132,7 +2142,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 import council_engine as _ce_tim
                 with _ce_tim._TimingScope("vault.search"):
                     all_hits, fuzzy_matches = idx.search(
-                        user_text, k=k + TAIL_K, folder=folder_scope,
+                        _without_app_file_paths(user_text), k=k + TAIL_K,
+                        folder=folder_scope,
                         llm_call=_semantic_llm_call,
                     )
                 # Drop any hit that's already explicit (won't happen
