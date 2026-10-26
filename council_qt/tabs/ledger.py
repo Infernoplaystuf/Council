@@ -27,7 +27,7 @@ from __future__ import annotations
 import threading
 import traceback
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QCompleter,
@@ -274,6 +274,20 @@ class LedgerActions:
             stats["ledger_added"] = str(csv)
         return stats
 
+    def lookup_template_fields(self, template) -> List[Dict[str, Any]]:
+        """Where each field of ``template`` is in the files the knowledge
+        graph read (its Contents layer: council_core.kg_contents.
+        field_lookup). Raises LedgerError for a template that cannot be read."""
+        from sample_ledger import read_template
+        fields = read_template(template).fields
+        # looked up by the label as the template writes it ('FPI'), shown by
+        # the parent CSV's name ('NDE Inspection: FPI')
+        labels = list(dict.fromkeys(f.label or f.name for f in fields))
+        with self._connections().open_graph() as kg:
+            found = {x["name"]: x["labels"] for x in kg.lookup_fields(labels)}
+        return [{"name": f.name, "label": f.label or f.name,
+                 "labels": found.get(f.label or f.name, [])} for f in fields]
+
     def _connections(self):
         if self.connections is None:
             from council_qt.tabs.connections import ConnectionsActions
@@ -492,6 +506,14 @@ class LedgerTab(ViewHelpers, QWidget):
             "read from the tables of every workbook. Left unticked, Council decides: a "
             "table with no sample-ID column is read this way too.")
         row.addWidget(self.records_mode)
+        # the template's fields in the files the graph read (its Contents
+        # layer; user, 2026-10-26)
+        self.find_fields_btn = self._step_button(row, "Find these fields in my files…",
+                                                 self.on_find_fields)
+        self.find_fields_btn.setToolTip(
+            "Where each field of the template is in the files the Connections graph read: "
+            "the labels it goes by, which files have it, how many values and what they look "
+            "like. ⟳ Build graph in Connections first.")
         row.addStretch(1)
         grid.addLayout(row, 2, 1)
         outer.addWidget(g1)
@@ -1738,6 +1760,29 @@ class LedgerTab(ViewHelpers, QWidget):
             self._say(f"Workbooks ({len(books)}), a filled-template sheet per part: "
                       + ", ".join(Path(b).name for b in books)
                       + f" in {Path(books[0]).parent}")
+
+    def on_find_fields(self) -> None:
+        """The template's fields, looked up in the graph's contents
+        (ledger_graph_dialog)."""
+        template = self.template.text().strip()
+        if not template or not Path(template).is_file():
+            self.status.setText("Pick the template workbook first (step 1).")
+            return
+        try:
+            found = self.actions.lookup_template_fields(template)
+        except LedgerError as e:
+            self.status.setText(f"Find fields: {e}")
+            return
+        except Exception as e:                            # noqa: BLE001
+            self.status.setText(f"Find fields: the graph could not be read ({e})")
+            return
+        note = ("" if any(f["labels"] for f in found) else
+                "Nothing matched: has the graph been built over these files (Connections, "
+                "⟳ Build graph, and Folders… for files outside the vault)?")
+        from .ledger_graph_dialog import TemplateFieldsDialog
+        self.fields_dialog = TemplateFieldsDialog(Path(template).name, found, parent=self,
+                                                  graph_note=note)
+        self.fields_dialog.show()
 
     def on_groups_window(self, review_parts=()) -> None:
         """The Groups window (ledger_groups_dialog) for the parent CSV shown;

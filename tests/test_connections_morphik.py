@@ -163,7 +163,9 @@ def test_ask_with_no_model_lists_the_facts(qapp, tab):
     tab.on_ask()
     wait(qapp, tab)
     assert "No model chosen" in tab.answer.toPlainText()
-    assert tab.facts.topLevelItemCount() == 1
+    groups = [tab.facts.topLevelItem(i).text(0) for i in range(tab.facts.topLevelItemCount())]
+    assert [g for g in groups if g.startswith("About")] == groups[:1]   # one facts group, first
+    assert set(groups[1:]) <= {"Rows of your files"}
 
 
 def test_a_named_graph_is_made_built_and_deleted_from_the_tab(qapp, tab):

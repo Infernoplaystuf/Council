@@ -4921,6 +4921,18 @@ class KnowledgeGraph:
             return {"rows": [], "fields": [], "words": []}
         return kg_contents.question_rows(self.db, question, max_rows=max_rows)
 
+    def lookup_fields(self, names: Sequence[str]) -> List[Dict[str, Any]]:
+        """Where each template field name is in the files (kg_contents.
+        field_lookup), with display paths ('file')."""
+        if not self.has_contents():
+            return [{"name": n, "labels": []} for n in names]
+        out = kg_contents.field_lookup(self.db, names)
+        for item in out:
+            for lab in item["labels"]:
+                for pl in lab["places"]:
+                    pl["file"] = self.display_path(pl["path"])
+        return out
+
     def search_contents(self, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
         """Files, fields (headers and labels) and values matching ``text``,
         and the cells holding a number typed."""

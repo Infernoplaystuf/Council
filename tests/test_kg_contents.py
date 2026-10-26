@@ -604,3 +604,117 @@ def test_ask_in_the_tab_lists_the_rows_it_used(tmp_path):
         tab.close()
         tab.deleteLater()
         app.processEvents()
+
+
+# ── step 4: a file's picture, and the Ledger's template fields ──────────
+def test_a_files_picture_shows_its_headers_values_and_the_files_sharing_them(tmp_path):
+    from council_core import kg_layout
+    v = _vault(tmp_path)
+    _nde_book(v / "data_in" / "nde.xlsx")
+    (v / "data_in" / "parts.csv").write_text("Part Number,Supplier\nPN-4471,Acme\n",
+                                             encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+        did = next(f["document_id"] for f in kg.contents_files() if f["file"] == "nde.xlsx")
+        nodes, edges = kg_layout.contents_subgraph(kg, did)
+        by_name = {n["name"]: n for n in nodes}
+        assert by_name["nde.xlsx"]["type"] == "FILE" and by_name["nde.xlsx"]["center"]
+        assert by_name["Hardness (HRC) (42.1 to 43)"]["type"] == "NUMBERS"
+        assert by_name["Flaw #"]["type"] == "HEADER"
+        assert by_name["PN-4471"]["type"] == "VALUE"
+        assert by_name["parts.csv"]["type"] == "FILE"      # it holds PN-4471 too
+        named = {(by_id["name"], e["predicate"], by_id2["name"])
+                 for e in edges
+                 for by_id in [next(n for n in nodes if n["id"] == e["source"])]
+                 for by_id2 in [next(n for n in nodes if n["id"] == e["target"])]}
+        assert ("nde.xlsx", "HAS_HEADER", "Part Number") in named
+        assert ("Part Number", "HAS_VALUE", "PN-4471") in named
+        assert ("PN-4471", "ALSO_IN", "parts.csv") in named
+        assert kg_layout.contents_subgraph(kg, "no-such-file") == ([], [])
+
+
+def test_template_field_names_are_found_under_the_labels_the_files_use(tmp_path):
+    v = _vault(tmp_path)
+    _nde_book(v / "data_in" / "a.xlsx")
+    (v / "data_in" / "b.csv").write_text("HRC,Hardness\n50,51\n", encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+        (hard, part, nothing) = kg.lookup_fields(["Hardness (HRC)", "Part No", "Coating"])
+    labels = {lab["label"]: lab for lab in hard["labels"]}
+    assert labels["Hardness (HRC)"]["exact"] and labels["Hardness (HRC)"]["files"] == 1
+    assert kg_contents.lookup_summary(labels["Hardness (HRC)"]) == \
+        "in 1 file, 2 values, 42.1 to 43"
+    # labels that hold its words, or whose words it holds, are offered too
+    assert {"HRC", "Hardness"} <= set(labels) and not labels["HRC"]["exact"]
+    assert labels["HRC"]["places"][0]["file"] == "b.csv"
+    # a near spelling
+    assert [lab["label"] for lab in part["labels"]] == ["Part Number"]
+    assert nothing["labels"] == []
+
+
+def test_draw_this_file_shows_its_contents_in_the_picture(tmp_path):
+    app = _qt()
+    v = _vault(tmp_path)
+    _nde_book(v / "data_in" / "nde.xlsx")
+    tab = _tab(v)
+    try:
+        tab.on_rebuild()
+        _wait(app, tab)
+        view = tab.contents_view
+        f = view.tree.topLevelItem(0)
+        assert not view.draw_btn.isEnabled()
+        view.tree.setCurrentItem(f)
+        assert view.draw_btn.isEnabled()
+        view.draw_btn.click()
+        _wait(app, tab)
+        assert tab.views.currentIndex() == 1
+        names = {n["name"] for n in tab.canvas.nodes.values()}
+        assert {"nde.xlsx", "Flaw #", "PN-4471"} <= names
+        # an entity picked again: the picture follows it, not the file
+        tab.refresh_picture(whole=True)
+        _wait(app, tab)
+        assert "Flaw #" not in {n["name"] for n in tab.canvas.nodes.values()}
+    finally:
+        _wait(app, tab)
+        tab.close()
+        tab.deleteLater()
+        app.processEvents()
+
+
+def test_the_ledger_finds_its_template_fields_in_the_graph(tmp_path):
+    app = _qt()
+    sys.path.insert(0, str(Path(__file__).parent))
+    import ledger_fixtures as lf
+    from council_qt.tabs.connections import ConnectionsActions
+    from council_qt.tabs.ledger import LedgerActions, LedgerTab
+
+    class Conn(ConnectionsActions):
+        def open_graph(self):
+            return kgm.KnowledgeGraph(self.vault_dir, self.root, image_reader=None)
+    v = _vault(tmp_path)
+    (v / "data_in" / "runs.csv").write_text(
+        "Part Number,Power (W),FPI\n101,250,NRI\n102,300,IND\n", encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+    template = lf.make_template(tmp_path / "template.xlsx")
+    tab = LedgerTab(None, LedgerActions(connections=Conn(v)))
+    try:
+        tab.template.setText(str(template))
+        tab.on_find_fields()
+        dlg = tab.fields_dialog
+        tops = {dlg.tree.topLevelItem(i).text(0): dlg.tree.topLevelItem(i)
+                for i in range(dlg.tree.topLevelItemCount())}
+        assert tops["Power (W)"].text(1) == "in 1 file, 2 values, 250 to 300"
+        fpi = tops["NDE Inspection: FPI"]
+        assert fpi.child(0).text(0) == "as 'FPI'"
+        assert fpi.child(0).child(0).text(0) == "runs.csv"
+        assert tops["Concealment 1: Media"].text(1) == "not found in the files the graph read"
+        assert dlg.heading.text().startswith("3 of 31 field(s)")
+        dlg.close()
+        tab.template.setText("")
+        tab.on_find_fields()
+        assert "Pick the template workbook first" in tab.status.text()
+    finally:
+        tab.close()
+        tab.deleteLater()
+        app.processEvents()

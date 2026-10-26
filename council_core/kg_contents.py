@@ -1053,3 +1053,93 @@ def question_rows(db: sqlite3.Connection, question: str, *, max_rows: int = 12,
                 list(fields_hit) + [max_fields]):
             out["fields"].append(dict(_field_dict(r[1:]), path=r[0]))
     return out
+
+
+# ── the Ledger's template fields, looked up (step 4) ─────────────────────
+# Short forms labels often use, so 'Part No' finds 'Part Number'.
+_ABBREV = {"no": "number", "nr": "number", "num": "number", "qty": "quantity",
+           "temp": "temperature", "dia": "diameter", "desc": "description",
+           "ref": "reference", "rev": "revision", "wt": "weight"}
+
+
+def _label_words(norm: str) -> List[str]:
+    return [_ABBREV.get(w, w) for w in norm.split() if w not in _QSTOP]
+
+
+def field_lookup(db: sqlite3.Connection, names: Sequence[str], *, max_labels: int = 6,
+                 max_files: int = 20) -> List[Dict[str, Any]]:
+    """Where each of a template's field names is in the user's files, so a
+    Ledger template is matched to its sources in one look ('Hardness is in
+    143 of 190 workbooks: as Hardness (HRC) in 120, as HRC in 23'). For each
+    name: the labels that match it - the same words first, then labels that
+    hold all its words or whose words it holds, then near spellings - each
+    with the files it is in, how many values, and a few examples.
+    [{name, labels: [{label, exact, files, cells, numeric, num_min, num_max,
+    examples, places: [{path, sheet, n_cells}]}]}]"""
+    import difflib
+    out: List[Dict[str, Any]] = []
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='fields'").fetchone() is None:
+        return [{"name": n, "labels": []} for n in names]
+    norms = [r[0] for r in db.execute(
+        "SELECT DISTINCT label_norm FROM fields WHERE label_norm != ''")]
+    for name in names:
+        key = label_norm(name)
+        words = set(_label_words(key))
+        scored: List[Tuple[float, str]] = []
+        for n in norms:
+            if n == key:
+                scored.append((3.0, n))
+                continue
+            lw = set(_label_words(n))
+            if words and lw and (words <= lw or lw <= words):
+                scored.append((2.0 + len(words & lw) / max(len(words | lw), 1), n))
+                continue
+            if words and len(words) == len(lw) and all(
+                    any(x.startswith(w) or w.startswith(x) for x in lw) for w in words):
+                scored.append((1.9, n))         # 'Part No' / 'Part Number'
+                continue
+            ratio = difflib.SequenceMatcher(None, key, n).ratio()
+            if ratio >= 0.85:
+                scored.append((1.0 + ratio, n))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        labels = []
+        for score, n in scored[:max_labels]:
+            rows = db.execute(
+                "SELECT f.id, f.label, f.sheet, f.n_cells, f.n_numbers, f.num_min, f.num_max,"
+                " d.path FROM fields f JOIN documents d ON d.id=f.document_id"
+                " WHERE f.label_norm=? ORDER BY f.n_cells DESC", (n,)).fetchall()
+            if not rows:
+                continue
+            cells = sum(r[3] for r in rows)
+            numbers = sum(r[4] for r in rows)
+            mins = [r[5] for r in rows if r[5] is not None]
+            maxs = [r[6] for r in rows if r[6] is not None]
+            ids = [r[0] for r in rows[:50]]
+            examples = [t for (t,) in db.execute(
+                f"SELECT text FROM cells WHERE field_id IN ({','.join('?' * len(ids))})"
+                " GROUP BY text ORDER BY count(*) DESC LIMIT 5", ids)]
+            label = max((r[1] for r in rows), key=lambda t: sum(1 for r in rows if r[1] == t))
+            labels.append({
+                "label": label, "norm": n, "exact": score >= 3.0,
+                "files": len({r[7] for r in rows}), "cells": cells,
+                "numeric": bool(cells) and numbers >= NUMERIC_SHARE * cells,
+                "num_min": min(mins) if mins else None, "num_max": max(maxs) if maxs else None,
+                "examples": examples,
+                "places": [{"field_id": r[0], "path": r[7], "sheet": r[2], "label": r[1],
+                            "n_cells": r[3]} for r in rows[:max_files]]})
+        out.append({"name": name, "labels": labels})
+    return out
+
+
+def lookup_summary(lab: Dict[str, Any]) -> str:
+    """'in 143 files, 412 values, 38.2 to 51.7' / '..., e.g. Pass, Fail'."""
+    s = f"in {_plural_n(lab['files'], 'file')}, {_plural_n(lab['cells'], 'value')}"
+    if lab["numeric"] and lab["num_min"] is not None:
+        return f"{s}, {_num(lab['num_min'])} to {_num(lab['num_max'])}"
+    if lab["examples"]:
+        return f"{s}, e.g. " + ", ".join(lab["examples"][:3])
+    return s
+
+
+def _plural_n(n: int, one: str) -> str:
+    return f"{n:,} {one}" + ("" if n == 1 else "s")
