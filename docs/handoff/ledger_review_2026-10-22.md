@@ -110,3 +110,24 @@ actually belongs so I can manually correct things?"
   keeps it.
 - Only values on the Values sheet move cell by cell; a table record does
   not. A cell that is not one of the template's fields offers nothing.
+
+## Files that disagree, side by side (2026-10-26)
+
+Andy: "lets say we have two or more files with conflicting data when we go
+to review and link things I want to see all of those files side by side so
+I can link the right value" — in Review by clicking and the filled template
+window; "I do not want any more buttons to be made".
+
+- Picking a value whose template cell other files (or cells) give another
+  value shows one source pane per value, side by side
+  (`ledger_review.rivals`: the same part, item and field, another value; at
+  most `RIVALS_SHOWN`, 6). Each pane (`SourcePane`) has the file with the
+  value's cell highlighted and a header: the value, the file, its modified
+  date, the label, the score, Accepted / Left out, and the other files the
+  same value is in (`Item.also`, from "also at" in its note). The panes keep
+  their order; the picked one is outlined. Three fit across; more scroll
+  sideways. One value and nothing disagreeing: one pane, as before.
+- Clicking a pane picks its value. No new button: Right accepts it and
+  leaves out every other value for that cell (`_answer`, all of them, not
+  only the shown ones), since Apply keeps none of two accepted values that
+  differ. "Put this value here" (right-click) does the same at its new cell.
