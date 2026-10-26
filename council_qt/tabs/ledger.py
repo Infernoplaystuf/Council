@@ -1528,7 +1528,13 @@ class LedgerTab(ViewHelpers, QWidget):
         self.stat["values"].setText(str(s.values))
         self.stat["pre_accepted"].setText(str(s.pre_accepted))
         self.stat["to_review"].setText(str(s.to_review))
-        self.stat["images"].setText(f"{s.images_read} / {s.images}")
+        blank = getattr(s, "images_blank", 0)
+        self.stat["images"].setText(f"{s.images_read} / {s.images}"
+                                    + (f" (+{blank} no text)" if blank else ""))
+        self.stat["images"].setToolTip(
+            "Pictures whose text was read, of all the pictures found"
+            + (f"; {blank} more were read and had no text in them (a photo)" if blank else "")
+            + (f"\nNot read: {s.images_unread}" if getattr(s, "images_unread", "") else ""))
         self.stat["problems"].setText(str(len(s.problems)))
         if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
             # before or while Council's model was asked: the same words

@@ -224,6 +224,11 @@ class ExtractSummary:
     #: confidence (ledger_review.write_all_filled; user, 2026-10-23)
     filled: str = ""
     filled_count: int = 0
+    #: pictures read that had no text in them (a photo): not failures, so
+    #: not among the ones not read (user, 2026-10-26: "only getting about
+    #: 1/3 to 1/2 of the images read"); and why the others were not read
+    images_blank: int = 0
+    images_unread: str = ""
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -231,7 +236,10 @@ class ExtractSummary:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
-             f"images read")
+             f"images read"
+             + (f" ({self.images_blank} more had no text in them)" if self.images_blank
+                else "")
+             + (f"; not read: {self.images_unread}" if self.images_unread else ""))
         if self.cancelled:
             s = ("CANCELLED after every workbook was read — " if self.read_all else
                  "CANCELLED — ") + s
@@ -331,6 +339,29 @@ def summarize_slowest(timings, top: int = 5) -> str:
 def _images_read(notes) -> int:
     return sum(1 for n in notes if n.reader not in ("", "none installed")
                and not n.text.startswith(("reader failed", "(no text found)")))
+
+
+def _images_blank(notes) -> int:
+    """Pictures read that had no text in them."""
+    return sum(1 for n in notes if n.reader not in ("", "none installed")
+               and n.text.startswith("(no text found)"))
+
+
+def _images_unread(notes) -> str:
+    """Why the pictures not read were not, counted: '3 Excel could not copy
+    out, 1 the reader failed'."""
+    from collections import Counter
+    why: Counter = Counter()
+    for n in notes:
+        if n.text.startswith("(no text found)") or (
+                n.reader not in ("", "none installed") and not n.text.startswith("reader")):
+            continue
+        why["the reader failed" if n.text.startswith("reader failed") else
+            "no image reader installed" if n.reader == "none installed" else
+            "Excel could not copy them out" if "Excel could not copy" in n.text else
+            "EMF/WMF drawings (Windows only)" if "drawing, which" in n.text else
+            "other"] += 1
+    return ", ".join(f"{k} {w}" for w, k in why.most_common())
 
 
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
@@ -581,7 +612,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                               "track were left out (Groups…)"] if untracked else []),
                           review_reasons=summarize_review_reasons(dec, ledger.schema),
                           filled=str(Path(filled[0]).parent) if filled else "",
-                          filled_count=len(filled))
+                          filled_count=len(filled),
+                          images_blank=_images_blank(run.images),
+                          images_unread=_images_unread(run.images))
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
