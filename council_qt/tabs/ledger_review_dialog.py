@@ -765,8 +765,10 @@ class FilledTemplateDialog(ReviewDialog):
         self.all_btn.clicked.connect(self.show_whole_part)
         bar.addWidget(self.all_btn)
         self.export_btn = QPushButton("Open as Excel")
-        self.export_btn.setToolTip("Write this part's filled template (tinted, with a note of "
-                                   "each value's source) beside the review, and open it")
+        self.export_btn.setToolTip("Write every part's filled template into one workbook, a "
+                                   "sheet each in numerical order (tinted, with a note of each "
+                                   "value's source), beside the review, and open it at this "
+                                   "part")
         self.export_btn.clicked.connect(self.on_export)
         bar.addWidget(self.export_btn)
         # user, 2026-10-23: "look at a few values and then give an answer and
@@ -938,15 +940,19 @@ class FilledTemplateDialog(ReviewDialog):
     def on_export(self) -> Optional[str]:
         if not self.part:
             return None
-        out = lv.filled_dir(self.review.path) / f"{lv._safe_name(self.part)}.xlsx"
+        # every part in one workbook, a sheet each, opened at this one (user,
+        # 2026-10-26: "unable to export the full filled out workbook")
         try:
-            path = lv.write_filled(self.review, self.part, out, self._exact or None)
+            path = lv.write_full_filled(self.review, active=self.part)
         except (LedgerError, OSError) as e:
             self.status.setText(f"Not written: {e}")
             return None
+        if not path:
+            self.status.setText("Not written: this review has no parts to fill in.")
+            return None
         self.status.setText(f"Written: {path}"
                             + (" (answers not saved yet are not in it)" if self.answers else ""))
-        self.log(f"Filled template for {self.part}: {path}")
+        self.log(f"Filled workbook (every part, a sheet each): {path}")
         if self.opener is not None:
             self.opener(path)
         return path
