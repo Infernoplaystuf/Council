@@ -116,6 +116,18 @@ RETIRED = {
     "test_no_bare_re_in_gui": "read council_gui_engine.py.",
     "test_plots_pane_core":
         "the Tk plots_pane.py; test_plots_pane_qt.py covers council_core.plots.",
+    # Failed rather than skipped once the Tk shell was gone (2026-10-26, when
+    # CI started running the suite): each checked CouncilConsole itself.
+    "test_dream3d_convert_to_python_routing":
+        "CouncilConsole._PIPELINE_TO_PYTHON_RES, the Tk console's routing.",
+    "test_dream3d_tab_wiring": "the Tk console's Dream3D tab methods.",
+    "test_ui_pump_survives_a_bad_item":
+        "CouncilConsole._poll_ui_queue; the Qt bridge has its own tests.",
+    "test_known_field_names_harvests_real_labels":
+        "CouncilConsole._known_field_names, which the Qt app never ported.",
+    "test_an_adjective_does_not_break_a_field_search":
+        "CouncilConsole._resolve_proposed_field, likewise.",
+    "test_rag_recall_and_coverage": "council_gui_engine.RAG_PER_ANGLE.",
 }
 
 

@@ -1,0 +1,73 @@
+# ============================================================
+# Tests on every change
+# ============================================================
+# Runs the whole suite (tests/ and inferno_local/tests/) on every pull
+# request into qt-migration and every push to it, the same way you run it
+# at home:
+#
+#     python tests/run_all.py
+#
+# one test file per process, four at a time (the suite stalls for hours
+# when run serially in one process). Qt runs offscreen, no dialogs, and the
+# test guards in tests/conftest.py keep every test offline and away from
+# the real vault.
+#
+# Windows and Python 3.11, because that is where Council runs (installs.txt's
+# wizardCouncil env, the .bat launchers, Excel through pywin32). On a Linux
+# runner about twenty test files fail for Linux reasons alone (Windows paths,
+# CRLF launchers, the sandbox fence and /sys/fs/cgroup), which would hide the
+# failures that matter. The .exe is still built by build.yml (push a v* tag
+# on qt-migration).
+#
+# Torch is the CPU wheel, as in build.yml: the CUDA one is ~2 GB and no
+# test uses a GPU.
+# ============================================================
+
+name: Tests
+
+on:
+  pull_request:
+    branches: [qt-migration]
+  push:
+    branches: [qt-migration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same pull request stops the run it replaces.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run the tests
+        run: python tests/run_all.py -j 4 --timeout 900 --logs test-logs
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test-logs
+          retention-days: 14
