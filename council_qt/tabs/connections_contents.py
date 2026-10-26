@@ -23,7 +23,8 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QLabel, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from council_core import kg_contents
 from council_core import knowledge_graph as kgm
@@ -46,6 +47,8 @@ class ContentsView(QWidget):
 
     #: (vault-relative path, locator, where in words, the cell's text)
     preview_requested = Signal(str, object, str, str)
+    #: the document id of a file to draw (the tab's Picture)
+    draw_requested = Signal(str)
 
     def __init__(self, graph: Callable[[], Optional[kgm.KnowledgeGraph]], parent=None):
         super().__init__(parent)
@@ -53,9 +56,17 @@ class ContentsView(QWidget):
         self._query = ""
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 0)
+        top = QHBoxLayout()
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
-        lay.addWidget(self.summary)
+        top.addWidget(self.summary, 1)
+        self.draw_btn = QPushButton("Draw this file")
+        self.draw_btn.setToolTip("A picture of the file chosen: its headers and labels, their "
+                                 "commonest values, and the other files that hold them.")
+        self.draw_btn.setEnabled(False)
+        self.draw_btn.clicked.connect(self._draw)
+        top.addWidget(self.draw_btn)
+        lay.addLayout(top)
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["File / sheet / label / value", "What it holds"])
@@ -260,7 +271,28 @@ class ContentsView(QWidget):
             return None
         return it.data(0, ROLE_DATA)
 
+    def selected_document(self) -> Optional[str]:
+        """The document of what is selected (a file, sheet, field or place)."""
+        it = self.tree.currentItem()
+        if it is None:
+            return None
+        kind, data = it.data(0, ROLE_KIND), it.data(0, ROLE_DATA) or {}
+        if data.get("document_id"):
+            return data["document_id"]
+        if kind == "field":
+            kg = self._graph()
+            f = kg.contents_field(data["field_id"]) if kg is not None else None
+            return f["document_id"] if f else None
+        return None
+
+    def _draw(self) -> None:
+        did = self.selected_document()
+        if did:
+            self.draw_requested.emit(did)
+
     def _on_current(self, item, _prev=None) -> None:
+        self.draw_btn.setEnabled(item is not None and item.data(0, ROLE_KIND) in (
+            "file", "sheet", "field", "place"))
         if item is None or item.data(0, ROLE_KIND) != "place":
             return
         pl = item.data(0, ROLE_DATA) or {}

@@ -92,6 +92,91 @@ def subgraph(kg: kgm.KnowledgeGraph, center: Optional[str] = None, *, hops: int 
     return nodes, edges
 
 
+#: Text values drawn under one header in a file's picture.
+VALUES_PER_FIELD = 4
+#: Headers drawn for one file.
+FIELDS_DRAWN = 30
+
+
+def contents_subgraph(kg: kgm.KnowledgeGraph, document_id: str, *,
+                      max_nodes: int = MAX_NODES
+                      ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(nodes, edges) of one file's contents (council_core/kg_contents.py;
+    user, 2026-10-26: "an excel file has the head node with the file name
+    then lets say stat headers/labels and then that data is connected to the
+    labels"): the file, its headers and labels (a numeric one names its
+    range), each text header's commonest values, and the OTHER files that
+    hold one of those values - the connections no rule had to make. Node
+    ids are 'c:file:<document id>', 'c:field:<id>', 'c:val:<id>'."""
+    from council_core import kg_contents as kgc
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    have: set = set()
+
+    def node(nid: str, name: str, ntype: str, **kw) -> bool:
+        if nid in have:
+            return True
+        if len(nodes) >= max_nodes:
+            return False
+        have.add(nid)
+        nodes.append(dict({"id": nid, "name": name, "type": ntype, "degree": 0,
+                           "hop": None, "description": "", "center": False}, **kw))
+        return True
+
+    def edge(a: str, pred: str, b: str) -> None:
+        eid = f"{a}>{pred}>{b}"
+        if a in have and b in have and not any(e["id"] == eid for e in edges):
+            edges.append({"id": eid, "source": a, "target": b, "predicate": pred,
+                          "status": "seeded"})
+
+    files = {f["document_id"]: f for f in kg.contents_files()}
+    me = files.get(document_id)
+    if me is None:
+        return [], []
+    fid0 = f"c:file:{document_id}"
+    node(fid0, me["file"], "FILE", center=True, hop=0)
+    fields = [f for f in kg.contents_fields(document_id) if f["kind"] != "loose"]
+    sheets = {f["sheet"] for f in fields}
+    for f in fields[:FIELDS_DRAWN]:
+        name = f["label"] if len(sheets) <= 1 or not f["sheet"] else \
+            f"{f['sheet']} › {f['label']}"
+        if f["numeric"] and f["num_min"] is not None:
+            name += f" ({kgc._num(f['num_min'])} to {kgc._num(f['num_max'])})"
+        nid = f"c:field:{f['id']}"
+        if node(nid, name, "NUMBERS" if f["numeric"] else "HEADER", hop=1):
+            edge(fid0, "HAS_HEADER", nid)
+    for f in fields[:FIELDS_DRAWN]:
+        if f["numeric"] or f"c:field:{f['id']}" not in have:
+            continue
+        got = kg.field_values(f["id"], limit=VALUES_PER_FIELD)
+        for v in got["values"]:
+            if v.get("value_id") is None:
+                continue
+            vid = f"c:val:{v['value_id']}"
+            if node(vid, v["text"], "VALUE", hop=2):
+                edge(f"c:field:{f['id']}", "HAS_VALUE", vid)
+    # the other files that hold a value drawn
+    for n in list(nodes):
+        if n["type"] != "VALUE":
+            continue
+        vid = int(n["id"].split(":")[-1])
+        others = {p["document_id"] for p in kg.value_places(value_id=vid, limit=50)}
+        for other in sorted(others - {document_id}):
+            o = files.get(other)
+            if o is None:
+                continue
+            oid = f"c:file:{other}"
+            if node(oid, o["file"], "FILE", hop=3):
+                edge(n["id"], "ALSO_IN", oid)
+    degree: Dict[str, int] = {}
+    for e in edges:
+        degree[e["source"]] = degree.get(e["source"], 0) + 1
+        degree[e["target"]] = degree.get(e["target"], 0) + 1
+    for n in nodes:
+        n["degree"] = degree.get(n["id"], 0)
+    return nodes, edges
+
+
 def layout(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]], *,
            iterations: int = 300, seed: int = 7, size: float = 1000.0
            ) -> Dict[str, Tuple[float, float]]:

@@ -34,6 +34,8 @@ TYPE_COLOURS = {
     "ORGANIZATION": "#b388ff", "LOCATION": "#ffd54f", "EQUIPMENT": "#a98a8a",
     "MATERIAL": "#80cbc4", "PROCESS": "#f48fb1", "REPORT": "#bdbdbd",
     "EVENT": "#ff8a65", "CONCEPT": "#9fa8da",
+    # a file's contents (council_core/kg_layout.contents_subgraph)
+    "FILE": "#eeeeee", "HEADER": "#64b5f6", "NUMBERS": "#4db6ac", "VALUE": "#fff176",
 }
 _SPARE = ("#90caf9", "#ce93d8", "#a5d6a7", "#ffcc80", "#ef9a9a", "#80deea",
           "#e6ee9c", "#bcaaa4")

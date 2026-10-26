@@ -129,3 +129,35 @@ each previewed when picked.
 
 Measured on the 1M-cell workbook above: 1-5 ms per question.
 Tests: seven more in `tests/test_kg_contents.py`.
+The Answer view lists the facts about the named entities first and the rows after
+them (fixed in step 4; step 3 put the rows first, which broke two
+`test_connections_morphik.py` tests).
+
+## Step 4 (2026-10-26): a file's picture and the Ledger's field lookup
+
+**Picture.** `kg_layout.contents_subgraph(kg, document_id)` draws one file: the
+file node, its headers/labels (`FIELDS_DRAWN=30`), up to `VALUES_PER_FIELD=4`
+values per text column, a numeric column as one `NUMBERS` node naming its range,
+and `ALSO_IN` edges to other files holding the same value. Node ids start `c:`
+(`c:file:`, `c:field:`, `c:val:`) so the canvas's entity actions ignore them; a
+double-click on another file's node draws that file. In Connections, the
+Contents tree has **Draw this file** (file, sheet, field or place selected) and
+the tab keeps `_picture_file` until "whole graph" or an entity is shown.
+`kg_canvas.TYPE_COLOURS` has FILE, HEADER, NUMBERS and VALUE.
+
+**Ledger field lookup.** `kg_contents.field_lookup(db, names)` (via
+`KnowledgeGraph.lookup_fields`) finds where each template field name is among the
+headers and labels the files use: exact folded match, then word-set containment,
+then same word count with prefixes or common short forms (`_ABBREV`: no/nr/num ->
+number, qty, temp, dia, desc, ref, rev, wt), then difflib >= 0.85. Each match says
+how many files and values it has (`lookup_summary`). The Ledger's step 1 has
+**Find these fields in my files…**, which reads the template's fields
+(`LedgerActions.lookup_template_fields`) and opens `TemplateFieldsDialog`
+(`council_qt/tabs/ledger_graph_dialog.py`): field -> "as 'Label'" (near matches
+are marked to check) -> file and sheet. It reads only; nothing is written to the
+template.
+
+Tests: four more in `tests/test_kg_contents.py` (33 in all). The graph,
+Connections and Ledger test files all pass; `test_ledger_tab.py`'s
+work-off-the-GUI-thread test can time out when run four files in parallel, and
+passes alone (same on the base branch).

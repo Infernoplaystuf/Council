@@ -168,6 +168,13 @@ class ConnectionsActions:
         kgg.GraphList(self.vault_dir).delete(gid)
 
     # -- the picture and questions --
+    def contents_picture(self, document_id: str):
+        """(nodes, edges, positions) of one file's contents (kg_layout)."""
+        from council_core import kg_layout
+        with self.open_graph() as kg:
+            nodes, edges = kg_layout.contents_subgraph(kg, document_id)
+        return nodes, edges, kg_layout.layout(nodes, edges)
+
     def picture(self, center: Optional[str], hops: int):
         """(nodes, edges, positions) to draw (council_core.kg_layout)."""
         from council_core import kg_layout
@@ -491,6 +498,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
         # (council_core/kg_contents.py; user, 2026-10-26)
         self.contents_view = ContentsView(lambda: self._kg)
         self.contents_view.preview_requested.connect(self._preview_cell)
+        self.contents_view.draw_requested.connect(self.draw_file)
+        #: the file the Picture shows the contents of, or None (entities)
+        self._picture_file: Optional[str] = None
         self.views.addTab(self.contents_view, "Contents")
         self.views.currentChanged.connect(self._on_view_changed)
         split.addWidget(self.views)
@@ -688,6 +698,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kg is None:
             return
         self._current = eid
+        self._picture_file = None          # the Picture follows the entity again
         self.tree.clear()
         ent = kg.entity(eid)
         if ent is None:
@@ -1238,13 +1249,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
         open (or Whole graph), the best-connected entities."""
         if self.views.currentIndex() != 1 or self._busy:
             return
+        if whole:
+            self._picture_file = None
         center = None if whole else self._current
         hops = self.hops_box.value()
+        doc = self._picture_file
         self._picture_token = token = object()
 
         def work() -> None:
             try:
-                got, err = self.actions.picture(center, hops), ""
+                got, err = (self.actions.contents_picture(doc) if doc else
+                            self.actions.picture(center, hops)), ""
             except Exception as exc:                      # noqa: BLE001
                 got, err = None, str(exc) or exc.__class__.__name__
             self._to_ui(self._show_picture, token, got, err, center)
@@ -1266,8 +1281,19 @@ class ConnectionsTab(ViewHelpers, QWidget):
             f"<span style='color:{type_colour(t)}'>●</span> {t.replace('_', ' ').lower()}"
             for t in types[:10]) + (f"  ({len(nodes)} shown)" if nodes else ""))
 
+    def draw_file(self, document_id: str) -> None:
+        """The Picture of one file's contents (the Contents tab's Draw)."""
+        self._picture_file = document_id
+        if self.views.currentIndex() != 1:
+            self.views.setCurrentIndex(1)       # refreshes the picture
+        else:
+            self.refresh_picture()
+
     def _on_canvas_click(self, eid: str) -> None:
+        if eid.startswith("c:"):
+            return                  # a file's contents: double-click a file to draw it
         if eid and self._kg is not None and self._kg.entity(eid) is not None:
+            self._picture_file = None
             self._current = eid
             # the links of what was clicked, without leaving the picture
             idx = self.views.currentIndex()
@@ -1275,6 +1301,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.views.setCurrentIndex(idx)
 
     def _on_canvas_centre(self, eid: str) -> None:
+        if eid.startswith("c:file:"):
+            self.draw_file(eid[len("c:file:"):])
+            return
+        if eid.startswith("c:"):
+            return
         self._on_canvas_click(eid)
         self.refresh_picture()
 
@@ -1316,34 +1347,37 @@ class ConnectionsTab(ViewHelpers, QWidget):
             parts.append("No model chosen: here is what the graph holds - the facts below.")
         self.answer.setPlainText("\n".join(parts))
         for ctx in got.get("contexts") or []:
-            if ctx.get("rows"):
+            if ctx["entities"]:
+                self._answer_facts(ctx)
+            if ctx.get("rows"):                           # after the facts it names
                 self._answer_rows(ctx["rows"])
-            if not ctx["entities"]:
-                continue
-            names = ", ".join(display_name(e) for e in ctx["entities"])
-            g = QTreeWidgetItem([f"About {names}", "", ""])
-            g.setFirstColumnSpanned(True)
-            f = g.font(0)
-            f.setBold(True)
-            g.setFont(0, f)
-            self.facts.addTopLevelItem(g)
-            for fact in ctx["facts"]:
-                item = QTreeWidgetItem([
-                    f"[{fact.n}] {display_name(fact.subject)} — {phrase(fact.predicate, 'out')}"
-                    f" → {display_name(fact.object)}", fact.status, ""])
-                item.setData(0, ROLE_KIND, "relation")
-                item.setData(0, ROLE_DATA, {"relation_id": fact.relation_id,
-                                            "status": fact.status, "evidence": fact.evidence,
-                                            "other": fact.object})
-                g.addChild(item)
-                for ev in fact.evidence:
-                    e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"]),
-                                              f"{ev.get('file', ev['path'])} · {ev['where']}"])
-                    e_item.setToolTip(0, ev["quote"])
-                    e_item.setData(0, ROLE_KIND, "evidence")
-                    e_item.setData(0, ROLE_DATA, ev)
-                    item.addChild(e_item)
-            g.setExpanded(True)
+
+    def _answer_facts(self, ctx: Dict[str, Any]) -> None:
+        """The graph's facts about the entities an answer named."""
+        names = ", ".join(display_name(e) for e in ctx["entities"])
+        g = QTreeWidgetItem([f"About {names}", "", ""])
+        g.setFirstColumnSpanned(True)
+        f = g.font(0)
+        f.setBold(True)
+        g.setFont(0, f)
+        self.facts.addTopLevelItem(g)
+        for fact in ctx["facts"]:
+            item = QTreeWidgetItem([
+                f"[{fact.n}] {display_name(fact.subject)} — {phrase(fact.predicate, 'out')}"
+                f" → {display_name(fact.object)}", fact.status, ""])
+            item.setData(0, ROLE_KIND, "relation")
+            item.setData(0, ROLE_DATA, {"relation_id": fact.relation_id,
+                                        "status": fact.status, "evidence": fact.evidence,
+                                        "other": fact.object})
+            g.addChild(item)
+            for ev in fact.evidence:
+                e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"]),
+                                          f"{ev.get('file', ev['path'])} · {ev['where']}"])
+                e_item.setToolTip(0, ev["quote"])
+                e_item.setData(0, ROLE_KIND, "evidence")
+                e_item.setData(0, ROLE_DATA, ev)
+                item.addChild(e_item)
+        g.setExpanded(True)
 
     def _answer_rows(self, rows: List[Dict[str, Any]]) -> None:
         """The rows of the files an answer used (the Contents layer), each
