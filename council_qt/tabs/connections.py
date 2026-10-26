@@ -54,6 +54,7 @@ from council_core.kg_query import phrase
 from .. import theme
 from ..view import ViewHelpers, _alive, amp
 from ..widgets.kg_canvas import KnowledgeGraphCanvas, type_colour
+from .connections_contents import ContentsView
 from .connections_dialogs import (FieldsDialog, FoldersDialog, GraphDialog,
                                   WhyNoLinksDialog)
 
@@ -385,7 +386,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         # 2. finding things, and the graph's other lists
         row = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search a person, part, project, organisation, place…")
+        self.search.setPlaceholderText("Search a person, part, project, organisation, place "
+                                       "- or any header or value in your files…")
         self.search.textChanged.connect(lambda _t: self.on_search())
         row.addWidget(self.search, 2)
         self.type_box = QComboBox()
@@ -485,6 +487,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
         ans.addWidget(self.facts)
         ans.setSizes([200, 260])
         self.views.addTab(ans, "Answer")
+        # everything fed in: file › sheet › header/label › values
+        # (council_core/kg_contents.py; user, 2026-10-26)
+        self.contents_view = ContentsView(lambda: self._kg)
+        self.contents_view.preview_requested.connect(self._preview_cell)
+        self.views.addTab(self.contents_view, "Contents")
         self.views.currentChanged.connect(self._on_view_changed)
         split.addWidget(self.views)
 
@@ -587,6 +594,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 f"{rels.get('suggested', 0)} waiting for you. "
                 f"Text read by a model: {model['documents']} of "
                 f"{model['text_documents']} document(s).")
+        held = kg.contents_counts()
+        if held["files"]:
+            text += (f" Contents: {held['files']} file(s), {held['cells']:,} value(s) under "
+                     f"{held['fields']:,} header(s) and label(s) (the Contents tab).")
         if cov["unreadable"]:
             text += (f" NOT READ: {len(cov['unreadable'])} file(s) — "
                      + "; ".join(cov["unreadable"][:3])
@@ -631,6 +642,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kg is None:
             return
         text = self.search.text().strip()
+        self._search_contents(text)
         etype = self.type_box.currentData()
         if text:
             hits = kg.search(text, etype)
@@ -649,6 +661,22 @@ class ConnectionsTab(ViewHelpers, QWidget):
             item = QListWidgetItem(f"{type_icon(h['type'])} {display_name(ent)}")
             item.setData(ROLE_DATA, h["id"])
             self.results.addItem(item)
+
+    def _search_contents(self, text: str) -> None:
+        """The Contents view shows what matches, and its tab says how many."""
+        try:
+            n = self.contents_view.search(text)
+        except Exception as exc:                          # noqa: BLE001
+            n = 0
+            self.status.setText(f"The contents could not be searched: {exc}")
+        i = self.views.indexOf(self.contents_view)
+        self.views.setTabText(i, f"Contents ({n} matches)" if text and n else "Contents")
+
+    def _preview_cell(self, path: str, locator: Any, where: str, quote: str) -> None:
+        """A cell picked in the Contents view: previewed, and Open file opens it."""
+        self._selected = {"kind": "cell", "data": {"path": path, "locator": locator}}
+        self._preview(path, locator, where, quote)
+        self._enable_actions()
 
     def _on_result(self, item, _prev=None) -> None:
         if item is None:
@@ -826,7 +854,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.merge_btn.setEnabled(bool(cur and cur["type"] != "DOCUMENT"))
         self.split_btn.setEnabled(bool(cur and self._kg.merged_into_me(self._current)))
         sel = self._selected or {}
-        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question", "source")
+        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question", "source",
+                                       "cell")
         self.open_btn.setEnabled(bool(has_file and getattr(self, "_preview_path", None)))
         is_rel = sel.get("kind") == "relation"
         status = (sel.get("data") or {}).get("status") if is_rel else None

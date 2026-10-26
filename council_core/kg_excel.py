@@ -1366,9 +1366,17 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
                          text_all=is_extra and "text box" in name, sheet=parent or name,
                          budget=budget, sure=sure)
         gr.sink = sink
+        # the graph's Contents layer: every cell, whatever the rules say
+        contents = kgm.contents_now()
+        cg = contents.grid(name, loc_sheet=parent or name, image=image) \
+            if contents is not None else None
         for r, cells in rows:
             gr.feed(r, cells)
+            if cg is not None:
+                cg.feed(r, cells)
         gr.close()
+        if cg is not None:
+            cg.close()
         readers.append((gr, parent or name.split(" › ")[0]))
         if image:
             return

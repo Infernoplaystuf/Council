@@ -45,6 +45,10 @@ What is in the store (schema version ``SCHEMA_VERSION``, documented in
              lines) at its content hash: a rebuild re-reads only changed
              documents, and its reading phase commits in batches so a
              stopped rebuild resumes. Never exported.
+  contents_docs, fields, vals, cells (v5) the Contents layer
+             (council_core/kg_contents.py): every cell of every CSV and
+             workbook under its header or label, whatever the field rules
+             say, with full-text search over it.
 
 Seeding reads "records": a table row, a JSON object, or one document's labelled
 header fields. Two values in one row are a strong link (seeded); values that
@@ -83,9 +87,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from council_core import file_guard
+from council_core import file_guard, kg_contents
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
@@ -523,9 +527,12 @@ def _table_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record
     out: List[Record] = []
     # strict: a table that cannot be read raises, so seed() lists it as
     # unreadable instead of counting it as a document with no facts.
+    sink = contents_now()
     for sheet, frame in fs._table_frames(p, strict=True):
         for rowno in frame.attrs.get("skipped_rows", []):
             out.append(Record(rel, "skipped", [], skipped_row=rowno))
+        if sink is not None:          # every column, not only the rules'
+            sink.frames([(sheet, frame)])
         cols = [(c, by_norm.get(fs._norm_key(c))) for c in frame.columns]
         cols = [(c, r) for c, r in cols if r is not None]
         if not cols:
@@ -1111,6 +1118,17 @@ def records_as_lines_now() -> bool:
     return _AS_LINES.get()
 
 
+#: Set by seed()'s reading phase, one per document: the readers feed it every
+#: cell they read (council_core/kg_contents.py - the Contents layer).
+_CONTENTS: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "kg_contents", default=None)
+
+
+def contents_now():
+    """The kg_contents.Sink of the document being read, or None."""
+    return _CONTENTS.get()
+
+
 def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     """What a document says, as records. A workbook or a Ledger (a parent
     CSV with its schema) is read by council_core/kg_excel.py, and its
@@ -1121,6 +1139,12 @@ def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
         from council_core import kg_excel
         reading = (kg_excel.read_workbook(p, rel, rules, _image_reader_now())
                    if suf in _WORKBOOK else kg_excel.read_ledger(p, rel, rules))
+        sink = contents_now()
+        if sink is not None and suf not in _WORKBOOK:
+            # a Ledger's parent CSV: its every column, as any CSV's (the
+            # Ledger's own reading stands if pandas cannot read it)
+            import field_search as fs
+            sink.frames(fs._table_frames(p))
         return list(reading.records) + [Record(rel, "reading", reading=reading)]
     if suf in _TABULAR:
         return _table_records(p, rel, rules)
@@ -1961,6 +1985,7 @@ class KnowledgeGraph:
             self.db.execute("PRAGMA secure_delete = ON")
             with self.db:
                 self.db.executescript(SCHEMA_SQL)
+                kg_contents.create(self.db)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
                                 "('schema_version', ?)", (str(SCHEMA_VERSION),))
                 # v1 -> v2 -> v3 only ADD tables and an index (created
@@ -2962,6 +2987,9 @@ class KnowledgeGraph:
                 clip["ok"] = bool(excel_open.clipboard_safe()[0])
             return clip["ok"]
         last, n_batch = time.time(), 0
+        #: the Contents layer: folded text -> its value id, for this run
+        contents_values: Dict[str, int] = {}
+        contents_changed = False
         token = _IMAGE_READER.set(reader)
         as_lines = _AS_LINES.set(True)
         prog.stage("reading documents", total=len(files), unit="files")
@@ -2978,6 +3006,15 @@ class KnowledgeGraph:
                     sig = sig_for(p)
                     cached = None if why else self._cached(did, h, sig)
                     if cached is not None and pictures_wait(cached):
+                        cached = None
+                    tabular = p.suffix.lower() in _TABULAR
+                    # read before the Contents layer existed (or its rows
+                    # went): read again, so every cell is in it - not one
+                    # that can never be read (a password: Excel is not
+                    # started for it again)
+                    if cached is not None and tabular and \
+                            not kg_contents.current(self.db, did, h) and \
+                            not _reading_load(cached["records"]).get("error"):
                         cached = None
                     if why:
                         stats["unreadable"].append(f"{rel}: {why}")
@@ -3001,6 +3038,8 @@ class KnowledgeGraph:
                                         force=True)
                         else:
                             prog.update(f"reading {rel}")
+                        sink = kg_contents.Sink() if tabular else None
+                        ctok = _CONTENTS.set(sink)
                         try:
                             # too slow, or stalled the app before: skipped,
                             # the rebuild goes on (council_core.file_guard);
@@ -3008,6 +3047,10 @@ class KnowledgeGraph:
                             recs = file_guard.read(
                                 p, lambda p=p, rel=rel: read_records(p, rel, rules),
                                 tab="Connections")
+                            if sink is not None:
+                                prog.update(f"{rel}: keeping {sink.n_cells:,} cells")
+                                kg_contents.store(self.db, did, h, sink, contents_values)
+                                contents_changed = True
                         except kg_excel.Unreadable as exc:
                             if exc.permanent:
                                 self.db.execute(
@@ -3016,6 +3059,10 @@ class KnowledgeGraph:
                                      time.time()))
                                 failed_keep.append(did)
                             raise
+                        finally:
+                            _CONTENTS.reset(ctok)
+                            if sink is not None:
+                                sink.close()
                         reading = next((r.reading for r in recs if r.kind == "reading"),
                                        None)
                         recs = [r for r in recs if r.kind != "reading"]
@@ -3064,6 +3111,15 @@ class KnowledgeGraph:
         finally:
             _IMAGE_READER.reset(token)
             _AS_LINES.reset(as_lines)
+        # The Contents layer of what could be read; a document gone or not
+        # readable now leaves it. Values are counted again only after a change.
+        keep_contents = {did for p, did, _h in readable if p.suffix.lower() in _TABULAR}
+        held = {r[0] for r in self.db.execute("SELECT document_id FROM contents_docs")}
+        if contents_changed or held - keep_contents:
+            prog.update("counting the values of every file", force=True)
+            with self.db:
+                kg_contents.finish(self.db, keep_contents)
+        stats["contents"] = kg_contents.counts(self.db)
         # ── 2. the graph (one transaction) ──
         try:
             with self.db:
@@ -4775,6 +4831,87 @@ class KnowledgeGraph:
                                        if Path(d["path"]).suffix.lower() not in _WORKBOOK)}
 
     # ── reading the graph ──
+    # ── the Contents layer (council_core/kg_contents.py) ──
+    def has_contents(self) -> bool:
+        """False for a store opened read-only before it had the layer."""
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                               " AND name='contents_docs'").fetchone() is not None
+
+    def contents_counts(self) -> Dict[str, int]:
+        if not self.has_contents():
+            return {"files": 0, "fields": 0, "cells": 0, "values": 0}
+        return kg_contents.counts(self.db)
+
+    def contents_files(self) -> List[Dict[str, Any]]:
+        """Every file in the layer, with its display path ('file')."""
+        if not self.has_contents():
+            return []
+        out = kg_contents.files(self.db)
+        for f in out:
+            f["file"] = self.display_path(f["path"])
+        return out
+
+    def contents_sheets(self, document_id: str) -> List[Dict[str, Any]]:
+        return kg_contents.sheets(self.db, document_id) if self.has_contents() else []
+
+    def contents_fields(self, document_id: str, sheet: Optional[str] = None
+                        ) -> List[Dict[str, Any]]:
+        if not self.has_contents():
+            return []
+        out = kg_contents.fields_of(self.db, document_id, sheet)
+        for f in out:
+            f["summary"] = kg_contents.summary(f)
+        return out
+
+    def contents_field(self, field_id: int) -> Optional[Dict[str, Any]]:
+        f = kg_contents.field(self.db, field_id) if self.has_contents() else None
+        if f is not None:
+            f["summary"] = kg_contents.summary(f)
+        return f
+
+    def field_values(self, field_id: int, limit: int = kg_contents.DRAWN_VALUES
+                     ) -> Dict[str, Any]:
+        return kg_contents.field_values(self.db, field_id, limit)
+
+    def content_value(self, value_id: int) -> Optional[Dict[str, Any]]:
+        return kg_contents.value(self.db, value_id) if self.has_contents() else None
+
+    def value_places(self, *, value_id: Optional[int] = None,
+                     number: Optional[float] = None, field_id: Optional[int] = None,
+                     row: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        """Where a value (or a number, or one cell) is: file, sheet, label,
+        row, locator - with the display path ('file')."""
+        if not self.has_contents():
+            return []
+        out = kg_contents.places(self.db, value_id=value_id, number=number,
+                                 field_id=field_id, row=row, limit=limit)
+        for pl in out:
+            pl["file"] = self.display_path(pl["path"])
+        return out
+
+    def row_cells(self, field_id: int, row: int) -> List[Dict[str, Any]]:
+        return kg_contents.row_cells(self.db, field_id, row) if self.has_contents() else []
+
+    def same_fields(self, field_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+        if not self.has_contents():
+            return []
+        out = kg_contents.same_fields(self.db, field_id, limit)
+        for f in out:
+            f["file"] = self.display_path(f["path"])
+            f["summary"] = kg_contents.summary(f)
+        return out
+
+    def search_contents(self, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
+        """Files, fields (headers and labels) and values matching ``text``,
+        and the cells holding a number typed."""
+        if not self.has_contents():
+            return {"files": [], "fields": [], "values": [], "numbers": []}
+        out = kg_contents.search(self.db, text, limit)
+        for k in ("files", "fields"):
+            for x in out[k]:
+                x["file"] = self.display_path(x["path"])
+        return out
+
     def counts(self) -> Dict[str, Any]:
         q = self.db.execute
         by_type = {r[0]: r[1] for r in q("SELECT type, COUNT(*) FROM entities"
