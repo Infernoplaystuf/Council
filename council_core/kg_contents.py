@@ -32,6 +32,15 @@ Structure, in the graph's own SQLite file (schema v5, ``SCHEMA_SQL``):
                  row is the cells of one sheet's fields with the same row.
   vals_fts, fields_fts  full-text search over the values and the labels.
 
+Text documents (md, txt, PDF, Word, HTML ...) and JSON (step 2, user
+2026-10-26 "begin working on any next steps"): a text document's lines are
+read as one-cell rows of a sheet per PDF page ('page 3'; one sheet with no
+name otherwise), so 'Label: value' lines are labels and the rest are loose
+lines; a line split by '|' or tabs is a row of cells, so a Markdown or
+pasted table gets its headers like a sheet's (``unit`` 'line': a cell is
+cited by page and line). A JSON file: each object is a row, each key a
+field, a scalar under no key is loose (``unit`` 'json': cited by line).
+
 Reading costs nothing extra: the readers the graph already runs feed this
 layer the rows they read (``Sink``, set per document by the rebuild through
 knowledge_graph._CONTENTS). A workbook is fed one row at a time with the next
@@ -82,6 +91,7 @@ CREATE TABLE IF NOT EXISTS fields (
     kind TEXT NOT NULL,                -- column | label | loose
     loc_sheet TEXT NOT NULL DEFAULT '',-- the sheet a citation names
     image TEXT NOT NULL DEFAULT '',    -- a picture's anchor, read by OCR
+    unit TEXT NOT NULL DEFAULT 'cell', -- cell (a grid) | line (text) | json
     first_row INTEGER, col INTEGER,    -- where the header / label is
     ord INTEGER NOT NULL,              -- order found
     n_cells INTEGER NOT NULL, n_numbers INTEGER NOT NULL,
@@ -113,6 +123,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fields_fts USING fts5(
 
 def create(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA_SQL)
+    # v5 -> v6: fields.unit (text and JSON in the layer)
+    cols = {r[1] for r in db.execute("PRAGMA table_info(fields)")}
+    if "unit" not in cols:
+        db.execute("ALTER TABLE fields ADD COLUMN unit TEXT NOT NULL DEFAULT 'cell'")
     if fts_available(db):
         db.executescript(FTS_SQL)
 
@@ -213,11 +227,12 @@ def _wordish(v: Any) -> bool:
 # ── collecting one document ──────────────────────────────────────────────
 class _Field:
     __slots__ = ("idx", "sheet", "label", "kind", "loc_sheet", "image", "first_row",
-                 "col", "n_cells", "n_numbers", "num_min", "num_max", "distinct")
+                 "col", "n_cells", "n_numbers", "num_min", "num_max", "distinct", "unit")
 
-    def __init__(self, idx, sheet, label, kind, loc_sheet, image, first_row, col):
+    def __init__(self, idx, sheet, label, kind, loc_sheet, image, first_row, col,
+                 unit="cell"):
         self.idx, self.sheet, self.label, self.kind = idx, sheet, label, kind
-        self.loc_sheet, self.image = loc_sheet, image
+        self.loc_sheet, self.image, self.unit = loc_sheet, image, unit
         self.first_row, self.col = first_row, col
         self.n_cells = self.n_numbers = 0
         self.num_min: Optional[float] = None
@@ -242,17 +257,20 @@ class Sink:
         self.closed = False
 
     # one sheet / text box / picture of a workbook
-    def grid(self, name: str, loc_sheet: str = "", image: str = "") -> "GridContents":
-        return GridContents(self, name, loc_sheet or name, image)
+    def grid(self, name: str, loc_sheet: str = "", image: str = "",
+             unit: str = "cell") -> "GridContents":
+        return GridContents(self, name, loc_sheet if unit != "cell" else (loc_sheet or name),
+                            image, unit)
 
     def field(self, sheet: str, label: str, kind: str, *, loc_sheet: str = "",
-              image: str = "", row: Optional[int] = None, col: Optional[int] = None
-              ) -> _Field:
+              image: str = "", row: Optional[int] = None, col: Optional[int] = None,
+              unit: str = "cell") -> _Field:
         key = (sheet, label_norm(label) if kind != "loose" else LOOSE, kind)
         f = self._by_key.get(key)
         if f is None:
-            f = _Field(len(self.fields), sheet, label, kind, loc_sheet or sheet, image,
-                       row, col)
+            f = _Field(len(self.fields), sheet, label, kind,
+                       loc_sheet if unit != "cell" else (loc_sheet or sheet), image,
+                       row, col, unit)
             self.fields.append(f)
             self._by_key[key] = f
         return f
@@ -294,6 +312,68 @@ class Sink:
                     continue
                 self.cell(f, int(rowno), c, v)
 
+    def text_lines(self, lines: Iterable[Tuple[Any, int, str]]) -> None:
+        """A text document's lines, ``(page or None, line, text)`` as
+        knowledge_graph.document_lines gives them: a sheet per PDF page."""
+        grid: Optional[GridContents] = None
+        page: Any = object()
+        for pno, ln, text in lines:
+            if pno != page:
+                if grid is not None:
+                    grid.close()
+                page = pno
+                grid = self.grid(f"page {pno}" if pno else "",
+                                 loc_sheet=str(pno) if pno else "", unit="line")
+            cells = _line_cells(text)
+            if cells:
+                grid.feed(int(ln), cells)
+            elif _TABLE_RULE.match(text.strip() or " ") and "-" in text:
+                grid.bridge(int(ln))
+        if grid is not None:
+            grid.close()
+
+    def json_data(self, text: str, data: Any) -> None:
+        """A JSON file: each object a row (numbered in the order found),
+        each scalar key a field, cited by the line it is on."""
+        import field_search as fs
+        cursor = [0]
+        row = [0]
+
+        def line_of(k, v) -> int:
+            try:
+                i, end = fs.json_pair_line(text, k, v, cursor[0])
+            except Exception:
+                return 0
+            if i >= 0:
+                cursor[0] = end
+                return i + 1
+            return 0
+
+        def walk(o, key: str) -> None:
+            if isinstance(o, dict):
+                scalars = [(k, v) for k, v in o.items()
+                           if not isinstance(v, (dict, list)) and v is not None]
+                if scalars:
+                    row[0] += 1
+                    for k, v in scalars:
+                        f = self.field("", str(k), "column", unit="json")
+                        self.cell(f, row[0], line_of(k, v), v)
+                for k, v in o.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, str(k))
+            elif isinstance(o, list):
+                for v in o:
+                    if isinstance(v, (dict, list)):
+                        walk(v, key)
+                    elif v is not None:
+                        row[0] += 1
+                        f = self.field("", key, "column", unit="json") if key else \
+                            self.field("", LOOSE, "loose", unit="json")
+                        self.cell(f, row[0], 0, v)
+            elif o is not None:
+                self.cell(self.field("", LOOSE, "loose", unit="json"), 1, 0, o)
+        walk(data, "")
+
     def frames(self, frames) -> None:
         for sheet, frame in frames:
             self.table(sheet, list(frame.columns),
@@ -318,18 +398,29 @@ class GridContents:
     """One sheet fed row by row (r, {column: value}), in row order, with the
     next row as a look-ahead - as kg_excel._GridReader is fed."""
 
-    def __init__(self, sink: Sink, name: str, loc_sheet: str, image: str):
+    def __init__(self, sink: Sink, name: str, loc_sheet: str, image: str,
+                 unit: str = "cell"):
         self.sink, self.name, self.loc_sheet, self.image = sink, name, loc_sheet, image
+        self.unit = unit
+        #: rows that hold nothing but join their neighbours (a Markdown
+        #: table's '|---|---|' line between its header and its first row)
+        self._bridged: set = set()
         self._pending: Optional[Tuple[int, Dict[int, Any]]] = None
         self._last_r: Optional[int] = None
         #: the running table: column -> field, and its span
         self._cols: Dict[int, _Field] = {}
         self._span: Tuple[int, int] = (0, -1)
 
+    def bridge(self, r: int) -> None:
+        self._bridged.add(r)
+
+    def _next_to(self, a: int, b: int) -> bool:
+        return b == a + 1 or (b > a and all(x in self._bridged for x in range(a + 1, b)))
+
     def feed(self, r: int, cells: Dict[int, Any]) -> None:
         if self._pending is not None:
             pr, pc = self._pending
-            self._row(pr, pc, cells if r == pr + 1 else {})
+            self._row(pr, pc, cells if self._next_to(pr, r) else {})
         self._pending = (r, cells)
 
     def close(self) -> None:
@@ -339,7 +430,7 @@ class GridContents:
 
     def _field(self, label: str, kind: str, r: int, c: int) -> _Field:
         return self.sink.field(self.name, label, kind, loc_sheet=self.loc_sheet,
-                               image=self.image, row=r, col=c)
+                               image=self.image, row=r, col=c, unit=self.unit)
 
     def _is_header(self, cells: Dict[int, Any], nxt: Dict[int, Any]) -> bool:
         real = {c: v for c, v in cells.items() if not _merged(v)}
@@ -361,8 +452,10 @@ class GridContents:
         return True
 
     def _row(self, r: int, cells: Dict[int, Any], nxt: Dict[int, Any]) -> None:
-        if self._last_r is not None and r > self._last_r + 1:
+        if self._last_r is not None and not self._next_to(self._last_r, r):
             self._cols, self._span = {}, (0, -1)     # a blank row ends a table
+        if self.unit == "line" and len(cells) < 2:
+            self._cols, self._span = {}, (0, -1)     # so does a line of prose
         self._last_r = r
         left = dict(cells)
         if self._cols:
@@ -428,6 +521,25 @@ class GridContents:
                 self.sink.cell(self._field(LOOSE, "loose", r, c), r, c, cells[c])
 
 
+_TABLE_RULE = re.compile(r"^[\s|:+\-=]+$")
+
+
+def _line_cells(text: str) -> Dict[int, Any]:
+    """One line of text as cells: split by '|' (a Markdown table row) or by
+    tabs; else the whole line in one cell. A rule line ('|---|---|') and a
+    blank line are no cells."""
+    s = text.strip()
+    if not s or (_TABLE_RULE.match(s) and ("-" in s or "=" in s)):
+        return {}
+    if s.count("|") >= 2 or (s.count("|") == 1 and " | " in s):
+        parts = s.strip("|").split("|")
+    elif "\t" in s:
+        parts = s.split("\t")
+    else:
+        return {1: s}
+    return {i: p.strip() for i, p in enumerate(parts, start=1) if p.strip()}
+
+
 def _valueish(v: Any) -> bool:
     """A cell that reads as a value even though it is a word: a code with a
     digit ('L-3'), initials ('AK'), or not text at all."""
@@ -485,10 +597,10 @@ def store(db: sqlite3.Connection, did: str, content_hash: str, sink: Sink,
             continue
         cur = db.execute(
             "INSERT INTO fields (document_id, sheet, label, label_norm, kind, loc_sheet,"
-            " image, first_row, col, ord, n_cells, n_numbers, n_distinct, num_min, num_max)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " image, unit, first_row, col, ord, n_cells, n_numbers, n_distinct, num_min,"
+            " num_max) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (did, f.sheet, f.label, label_norm(f.label) if f.kind != "loose" else "",
-             f.kind, f.loc_sheet, f.image, f.first_row, f.col, f.idx, f.n_cells,
+             f.kind, f.loc_sheet, f.image, f.unit, f.first_row, f.col, f.idx, f.n_cells,
              f.n_numbers, len(f.distinct), f.num_min, f.num_max))
         ids[f.idx] = cur.lastrowid
         if fts:
@@ -551,10 +663,20 @@ def finish(db: sqlite3.Connection, keep: Iterable[str]) -> None:
 def locator(field: Dict[str, Any], row: int, col: int) -> Dict[str, Any]:
     """Where a cell is, in the graph's locator words (knowledge_graph.
     locator_text, kg_excel.preview): a workbook cell, a CSV row and column,
-    or a picture's row."""
+    a picture's row, a text document's page and line, a JSON file's line."""
+    unit = field.get("unit") or "cell"
+    if unit == "line":
+        loc: Dict[str, Any] = {"line": row}
+        if str(field.get("loc_sheet") or "").isdigit():
+            loc["page"] = int(field["loc_sheet"])
+        if field.get("kind") == "column":
+            loc["column"] = field["label"]
+        return loc
+    if unit == "json":
+        return {"line": col} if col else {}
     if not field.get("sheet") and not field.get("image"):
         return {"row": row, "column": field["label"]}
-    loc: Dict[str, Any] = {"sheet": field.get("loc_sheet") or field["sheet"]}
+    loc = {"sheet": field.get("loc_sheet") or field["sheet"]}
     if field.get("image"):
         loc["image"] = field["image"]
         loc["row"] = row
@@ -590,7 +712,7 @@ def sheets(db: sqlite3.Connection, did: str) -> List[Dict[str, Any]]:
         " GROUP BY sheet ORDER BY min(ord)", (did,))]
 
 
-_FIELD_COLS = ("id, document_id, sheet, label, label_norm, kind, loc_sheet, image,"
+_FIELD_COLS = ("id, document_id, sheet, label, label_norm, kind, loc_sheet, image, unit,"
                " first_row, col, n_cells, n_numbers, n_distinct, num_min, num_max")
 
 

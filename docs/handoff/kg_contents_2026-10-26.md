@@ -82,3 +82,30 @@ values and unmerged numbers, leading-zero codes, same header across files,
 search (prefix, words, FTS syntax typed, no FTS5), the 200 cap, rebuilds
 (unchanged, changed, deleted, a v4 store), read-only store without the layer,
 and the tab offscreen (browse to a row, preview, Open file, search).
+
+## Step 2 (2026-10-26, same day): text, PDF, Word and JSON
+
+User: "merge it and begin working on any next steps". Schema **v6**: `fields.unit`
+(`cell` a grid, `line` a text document, `json`), added to a v5 store by
+`kg_contents.create` (ALTER TABLE).
+
+- Text documents (every `_TEXT` suffix: md, txt, PDF, Word, HTML, XML, YAML ...):
+  their lines (`document_lines`, read once - the gazetteer reuses them) are fed to
+  `Sink.text_lines` as rows of a grid per PDF page (`page 3`; one unnamed sheet
+  otherwise). `Label: value` lines become labels, other lines loose cells, and a
+  line split by `|` or tabs is a row of cells, so Markdown / pasted tables get their
+  headers (the `|---|` rule line bridges the header and the first row; a line of
+  prose ends a table). Cited `{"page", "line"}`.
+- JSON (`_json_records` hook, `Sink.json_data`): each object with scalar keys is a
+  row (numbered in the order found), each key a field, scalars in a list sit under
+  the list's key. Cited by line.
+- The reading phase now gives every supported document a Sink; an unchanged one
+  without contents is read again once (the first rebuild after this change).
+
+Measured: 500 Markdown files of ~200 lines (101,000 lines): first build 39.6 s
+with the layer, 34.7 s without; store 54 MB with, 11 MB without (full-text
+search over every line is most of it).
+
+Tests: five more in `tests/test_kg_contents.py` (labels, a Markdown table and
+lines; a PDF page by page; JSON rows; a value linking a workbook and a text file;
+a v5 store getting `unit`).
