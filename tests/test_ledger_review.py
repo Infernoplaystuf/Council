@@ -366,3 +366,70 @@ def test_the_filled_template_window_re_runs_with_the_answers(qapp, sample_review
     busy = FilledTemplateDialog(lv.load(review), on_rerun=lambda r, p: False)
     assert not busy.on_rerun_clicked() and busy.isVisible() is False   # never shown
     assert next(i for i in lv.load(review).items if i.row == held.row).accept == "Y"
+
+
+def test_a_value_is_put_where_it_belongs_by_right_click(qapp, sample_review):
+    """user, 2026-10-26: 'right click the spot where the data actually
+    belongs so I can manually correct things'."""
+    from council_qt.tabs.ledger_review_dialog import ReviewDialog
+    import source_extract as se
+    review, csv, src = sample_review
+    dlg = ReviewDialog(lv.load(review))
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    freq = dlg._exact[("Frequency (kHz)", "")]
+    dlg.current = None
+    assert not dlg.place_at(*freq)                           # nothing picked
+    power = next(i for i in dlg.review.items if i.fields == ["Power (W)"])
+    dlg.select(power)
+    assert not dlg.place_at(freq[0], (1, 1))                 # not a field's cell
+    there = [i for i in dlg.review.items if i.fields == ["Frequency (kHz)"]
+             and i.part == power.part and i.item == power.item and i.accept == "Y"]
+    assert there                                             # the log's own frequency
+    assert dlg.place_at(*freq, teach=True)
+    assert power.fields == ["Frequency (kHz)"] and "Frequency" in power.title
+    assert all(dlg._accept_of(i) == "N" for i in there)      # the cell takes one value
+    dlg.select(power)
+    dlg.on_wrong()                                           # an answer keeps the move
+    dlg.select(power)
+    dlg.on_right()
+    assert dlg.answers[(power.sheet, power.row)]["field"] == "Frequency (kHz)"
+    assert dlg.on_save()
+    again = next(i for i in lv.load(review).items if i.row == power.row)
+    assert (again.fields, again.accept, again.value) == (["Frequency (kHz)"], "Y", "285")
+    assert all(next(i for i in lv.load(review).items if i.row == o.row).accept == "N"
+               for o in there)
+    mapping, _ = se.load_aliases(csv)
+    assert mapping[se.normalize_label("Laser Power (W)")] == "Frequency (kHz)"
+    dlg.close()
+
+    li.run_apply(review, use_images=False)
+    row = ParentCSV(csv).get("101", "")
+    assert row["Frequency (kHz)"] == "285" and row["Power (W)"] != "285"
+    s = li.run_extract(csv, [src], use_images=False)          # learned for next time
+    moved = [i for i in lv.load(s.review).items if i.where == power.where]
+    assert [i.fields for i in moved] == [["Frequency (kHz)"]]
+
+
+def test_the_filled_template_window_offers_put_it_here(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    review, csv, src = sample_review
+    dlg = FilledTemplateDialog(lv.load(review))
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    sheet, rc = dlg._exact[("Frequency (kHz)", "")]
+    dlg.current = None
+    assert [d for _t, d in dlg.menu_actions(sheet, rc)] == [None]   # pick a value first
+    power = next(i for i in dlg.review.items
+                 if i.fields == ["Power (W)"] and i.part == dlg.part)
+    dlg.select(power)
+    assert [d for _t, d in dlg.menu_actions(sheet, (1, 1))] == [None]
+    acts = dlg.menu_actions(sheet, rc)
+    assert [t for t, _d in acts] == ["Put this value here (Frequency (kHz))",
+                                     "Put it here and always map 'Laser Power (W)' here"]
+    acts[0][1]()
+    assert power.fields == ["Frequency (kHz)"]
+    assert dlg.answers[(power.sheet, power.row)] == {"accept": "Y", "field": "Frequency (kHz)",
+                                                     "item": ""}
+    assert dlg.on_save()
+    from source_extract import load_aliases, normalize_label
+    assert normalize_label("Laser Power (W)") not in load_aliases(csv)[0]   # not taught
+    dlg.close()

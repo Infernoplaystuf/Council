@@ -68,6 +68,7 @@ class Item:
     values: Dict[str, Any] = field(default_factory=dict)
     part: str = ""                # a sample item's part number
     score: float = 0.0            # how sure the match is (the review's Score)
+    label: str = ""               # the label it was read under (a sample item)
 
 
 @dataclass
@@ -207,7 +208,7 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
             source_file=_find(sources, file), source_sheet=sheet,
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
             value=value, value_col=V_VALUE, where=where, item=item, part=part,
-            score=_score(row[V_SCORE - 1])))
+            score=_score(row[V_SCORE - 1]), label=label))
     return out
 
 
@@ -260,6 +261,26 @@ def _records_items(wb, sources: Sequence[str]) -> List[Item]:
     return out
 
 
+def teach_label(csv_path, label: str, fname: str) -> bool:
+    """'Always map this label here': the label's mapping to ``fname`` saved
+    with the Ledger's label mappings (source_extract.save_aliases), so the
+    next Extract places it there by itself. False when there is no label."""
+    from source_extract import load_aliases, normalize_label, save_aliases
+    key = normalize_label(label or "")
+    if not key or not fname:
+        return False
+    mapping, ignore = load_aliases(csv_path)
+    mapping[key] = fname
+    save_aliases(csv_path, mapping, [i for i in ignore if i != key])
+    return True
+
+
+def cell_fields(exact: Dict[Tuple[str, str], Tuple[str, Cell]]
+                ) -> Dict[Tuple[str, Cell], Tuple[str, str]]:
+    """template_cells turned round: (sheet, cell) -> (field, item)."""
+    return {at: key for key, at in exact.items()}
+
+
 def template_cells(csv_path) -> Dict[Tuple[str, str], Tuple[str, Cell]]:
     """A sample Ledger's template: (field, item) -> (sheet, cell) of the one
     cell that value goes in (item "" for a part-level field); {} for a table
@@ -293,9 +314,12 @@ def record_row_cells(view, item: Item) -> List[Cell]:
 
 def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
     """Write the answers into the review workbook: {(sheet, row):
-    {'accept': 'Y'|'N'|'', 'value': str, 'value_col': int}}. Every other
-    cell, fill, list and hidden sheet stays. Atomic: a temporary file, then
-    a replace. Returns how many rows changed."""
+    {'accept': 'Y'|'N'|'', 'value': str, 'value_col': int, 'field': str,
+    'item': str}} - 'field' and 'item' put a value of the Values sheet in
+    another template cell (a right-click on it: Apply takes a row's Field
+    and Item as typed). Every other cell, fill, list and hidden sheet stays.
+    Atomic: a temporary file, then a replace. Returns how many rows
+    changed."""
     import openpyxl
     path = Path(path)
     if not answers:
@@ -314,6 +338,9 @@ def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
                 ws.cell(row=row, column=1).value = a["accept"] or None
             if a.get("value_col") and "value" in a:
                 ws.cell(row=row, column=int(a["value_col"])).value = a["value"]
+            if sheet == "Values" and "field" in a:
+                ws.cell(row=row, column=V_FIELD).value = a["field"]
+                ws.cell(row=row, column=V_ITEM).value = a.get("item") or None
             changed += 1
         tmp = path.with_name(path.stem + ".saving.xlsx")
         try:
