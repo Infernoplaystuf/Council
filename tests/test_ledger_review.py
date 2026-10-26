@@ -433,3 +433,65 @@ def test_the_filled_template_window_offers_put_it_here(qapp, sample_review):
     from source_extract import load_aliases, normalize_label
     assert normalize_label("Laser Power (W)") not in load_aliases(csv)[0]   # not taught
     dlg.close()
+
+
+def test_files_that_disagree_are_shown_side_by_side(qapp, tmp_path):
+    """user, 2026-10-26: 'two or more files with conflicting data when we go
+    to review and link things I want to see all of those files side by side
+    so I can link the right value' - and 'I do not want any more buttons'."""
+    import openpyxl
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog, ReviewDialog
+    src = tmp_path / "src"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    later = make_laser_log(src / "laser_log_rev2.xlsx")
+    wb = openpyxl.load_workbook(later)
+    wb["Build"]["B4"] = 52                                   # the files disagree
+    wb.save(later)
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    review = li.run_extract(csv, [src], use_images=False).review
+
+    dlg = ReviewDialog(lv.load(review))
+    dlg.show()
+    freq = [i for i in dlg.review.items if i.fields == ["Frequency (kHz)"] and i.part == "101"]
+    assert sorted(i.value for i in freq) == ["50", "52"] and all(i.clash for i in freq)
+    fifty, fifty_two = sorted(freq, key=lambda i: i.value)
+    dlg.select(fifty)
+    assert dlg.pane_items == freq
+    shown = [p for p in dlg.panes if p.isVisible()]
+    assert len(shown) == 2
+    assert wait_for(qapp, lambda: all(p.models for p in shown))
+    assert {Path(p.path).name for p in shown} == {"laser_log.xlsx", "laser_log_rev2.xlsx"}
+    for p in shown:                                          # each its own cell lit
+        build = next(m for m in p.models if m.sheet.name == "Build")
+        assert (4, 2) in build.tints
+    other = next(p for p in shown if p.item is fifty_two)
+    assert "52" in other.header.text() and "laser_log_rev2.xlsx" in other.header.text()
+    assert "modified" in other.header.text() and other.header.isVisible()
+    assert "2 sources disagree" in dlg.source_note.text()
+
+    QTest.mouseClick(other, Qt.LeftButton)                   # click the pane: pick it
+    assert dlg.current is fifty_two
+    assert dlg.panes.index(other) == freq.index(fifty_two)   # the panes stay put
+    dlg.on_right()                                           # the others left out
+    assert (dlg._accept_of(fifty_two), dlg._accept_of(fifty)) == ("Y", "N")
+
+    speed = next(i for i in dlg.review.items if i.fields == ["Scan Speed (mm/s)"]
+                 and i.part == "101")
+    dlg.select(speed)                                        # both files agree: one pane
+    assert [p for p in dlg.panes if p.isVisible()] == [dlg.panes[0]]
+    assert not dlg.panes[0].header.isVisible()
+    assert len(speed.also) == 1 and speed.also[0].startswith("laser_log")  # also in
+    assert dlg.on_save()
+    dlg.close()
+    li.run_apply(review, use_images=False)
+    assert ParentCSV(csv).get("101", "")["Frequency (kHz)"] == "52"
+
+    filled = FilledTemplateDialog(lv.load(review))           # the same in the filled one
+    filled.show()
+    assert wait_for(qapp, lambda: filled.template is not None and filled._exact)
+    assert filled.click_cell(*filled._exact[("Frequency (kHz)", "")])
+    assert len([p for p in filled.panes if p.isVisible()]) == 2
+    filled.close()

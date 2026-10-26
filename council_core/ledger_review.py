@@ -69,6 +69,8 @@ class Item:
     part: str = ""                # a sample item's part number
     score: float = 0.0            # how sure the match is (the review's Score)
     label: str = ""               # the label it was read under (a sample item)
+    #: the other cells the same value was found at ('also at …' in its note)
+    also: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -208,7 +210,8 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
             source_file=_find(sources, file), source_sheet=sheet,
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
             value=value, value_col=V_VALUE, where=where, item=item, part=part,
-            score=_score(row[V_SCORE - 1]), label=label))
+            score=_score(row[V_SCORE - 1]), label=label,
+            also=[p[8:] for p in note.split("; ") if p.startswith("also at ")]))
     return out
 
 
@@ -377,6 +380,36 @@ LEGEND = [(TINT_HIGH, f"sure (score {CONF_HIGH:g} or more)"),
           (TINT_LOW, f"unsure (under {CONF_LOW:g})"),
           (TINT_CLASH, "sources disagree"),
           (TINT_LEDGER, "already in the Ledger")]
+
+
+#: at most this many disagreeing readings are shown side by side
+RIVALS_SHOWN = 6
+
+
+def rivals(items: Sequence[Item], it: Item, limit: int = RIVALS_SHOWN) -> List[Item]:
+    """The readings that disagree on ``it``'s template cell, ``it`` among
+    them, in review order: the values of the same part, item and field read
+    elsewhere with another value (user, 2026-10-26: "two or more files with
+    conflicting data ... I want to see all of those files side by side").
+    Only ``it`` when nothing disagrees, for a value with no part, or a
+    table record. At most ``limit`` (0: all), ``it`` always one of them."""
+    if it.sheet != "Values" or not it.part or not it.fields:
+        return [it]
+    out, seen = [], set()
+    for o in items:
+        if o.sheet != "Values" or o.part != it.part or o.item != it.item \
+                or o.fields != it.fields:
+            continue
+        key = " ".join(o.value.split()).casefold()
+        if o is not it and key in seen:
+            continue
+        seen.add(key)
+        out.append(o)
+    if len(out) < 2:
+        return [it]
+    if limit and it in out[limit:]:
+        out = out[:limit - 1] + [it]
+    return out[:limit] if limit else out
 
 
 def confidence_tint(item: Item) -> str:

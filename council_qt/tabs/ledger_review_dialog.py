@@ -22,9 +22,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
-                               QPushButton,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QFrame,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu,
+                               QMessageBox, QPushButton, QScrollArea,
                                QSplitter, QTableView, QTableWidget, QTableWidgetItem,
                                QTabWidget, QVBoxLayout, QWidget)
 
@@ -63,13 +63,17 @@ class ReviewDialog(QDialog):
         self.sources: Dict[str, Optional[ll.SampleView]] = {}
         self._reading: set = set()
         self.answers: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        #: the readings the last Right left out (lv.rivals)
+        self._left_out: List[lv.Item] = []
         self.shown: List[lv.Item] = []
         self.current: Optional[lv.Item] = None
         self._template_models: List[SheetModel] = []
         self._template_views: List[QTableView] = []
-        self._source_models: List[SheetModel] = []
-        self._source_views: List[QTableView] = []
-        self._source_shown = ""
+        #: the source panes: one, or one per disagreeing reading (lv.rivals)
+        self.panes: List[SourcePane] = []
+        #: the items the panes show, in their order
+        self.pane_items: List[lv.Item] = []
+        self._source_errors: Dict[str, str] = {}
         self._build()
         self._template_read.connect(self._got_template)
         self._source_read.connect(self._got_source)
@@ -136,8 +140,16 @@ class ReviewDialog(QDialog):
         self.open_btn.clicked.connect(self._open_source)
         row.addWidget(self.open_btn)
         bv.addLayout(row)
-        self.source_tabs = QTabWidget()
-        bv.addWidget(self.source_tabs, 1)
+        # one pane, or the disagreeing files side by side (user, 2026-10-26)
+        self.pane_area = QScrollArea()
+        self.pane_area.setWidgetResizable(True)
+        self.pane_area.setFrameShape(QFrame.NoFrame)
+        box = QWidget()
+        self.pane_row = QHBoxLayout(box)
+        self.pane_row.setContentsMargins(0, 0, 0, 0)
+        self.pane_area.setWidget(box)
+        bv.addWidget(self.pane_area, 1)
+        self._pane(0)
         right.addWidget(bottom)
         right.setSizes([330, 430])
         split.addWidget(right)
@@ -267,11 +279,20 @@ class ReviewDialog(QDialog):
             if typed != it.value:
                 a.update(value=typed, value_col=it.value_col)
         self.answers[(it.sheet, it.row)] = a
+        # a template cell takes one value: the readings that disagree with
+        # the one said Right are left out, or Apply would keep none
+        self._left_out = [o for o in lv.rivals(self.review.items, it, limit=0)
+                          if o is not it] if accept == "Y" else []
+        for o in self._left_out:
+            b = dict(self.answers.get((o.sheet, o.row)) or {})
+            b["accept"] = "N"
+            self.answers[(o.sheet, o.row)] = b
         n = self.shown.index(it)
         self._fill_row(n, it)
         self._fill_list()
-        self.status.setText(f"{'Accepted' if accept == 'Y' else 'Left out'}: {it.title}. "
-                            "Not saved yet.")
+        self.status.setText(f"{'Accepted' if accept == 'Y' else 'Left out'}: {it.title}"
+                            + (f"; left out {', '.join(o.value for o in self._left_out)}"
+                               if self._left_out else "") + ". Not saved yet.")
         nxt = next((i for i in self.shown[n + 1:] if (i.sheet, i.row) not in self.answers),
                    None)
         if nxt is not None:
@@ -459,17 +480,8 @@ class ReviewDialog(QDialog):
         it.fields, it.item = [fname], item
         it.title = " · ".join(x for x in (it.value, fname, " ".join(
             y for y in (it.part, item) if y)) if x)
-        # the cell takes one value: another accepted for it is said Wrong, or
-        # Apply would keep neither ('2 values accepted … kept none')
-        out = [o for o in self.review.items
-               if o is not it and o.sheet == "Values" and o.part == it.part
-               and o.fields == [fname] and o.item == item and o.value != it.value
-               and self._accept_of(o) == "Y"]
-        for o in out:
-            b = dict(self.answers.get((o.sheet, o.row)) or {})
-            b["accept"] = "N"
-            self.answers[(o.sheet, o.row)] = b
-        self._answer("Y")
+        self._answer("Y")                    # leaves out the cell's other values
+        out = self._left_out
         self.status.setText(f"Put here: {it.value} moved from {old or '(no field)'} to "
                             f"{fname}{' ' + item if item else ''}"
                             + (f"; {', '.join(o.value for o in out)} left out there"
@@ -486,19 +498,19 @@ class ReviewDialog(QDialog):
 
     # ── the source ──────────────────────────────────────────────────────
     def _show_source(self) -> None:
+        """The current item's source file below - and, when other files (or
+        cells) give its template cell another value, each of them beside it
+        (lv.rivals). Files are read on worker threads, once each."""
         it = self.current
         if it is None:
             return
-        path = it.source_file
-        if not path:
-            self.source_note.setText(f"<b>Source</b> — {it.where or 'unknown'}: the review "
-                                     "does not say where that file is")
-            self._clear_source()
-            return
-        if path in self.sources:
-            self._draw_source(path)
-            return
-        self.source_note.setText(f"<b>Source</b> — reading {Path(path).name}…")
+        self.pane_items = lv.rivals(self.review.items, it)
+        for path in dict.fromkeys(o.source_file for o in self.pane_items):
+            if path and path not in self.sources:
+                self._read_source(path)
+        self._draw_panes()
+
+    def _read_source(self, path: str) -> None:
         if path in self._reading:
             return
         self._reading.add(path)
@@ -517,37 +529,167 @@ class ReviewDialog(QDialog):
         self._reading.discard(path)
         self.sources[path] = view
         if view is None:
+            self._source_errors[path] = err
             self.log(f"Review by clicking: could not read {Path(path).name}: {err}")
-        if self.current is not None and self.current.source_file == path:
-            self._draw_source(path, err)
+        if any(i.source_file == path for i in self.pane_items):
+            self._draw_panes()
 
-    def _clear_source(self) -> None:
-        self.source_tabs.clear()
-        self._source_models, self._source_views = [], []
-        self._source_shown = ""
+    # the current item's pane: what the single source view was
+    @property
+    def source_tabs(self) -> QTabWidget:
+        return self._current_pane().tabs
 
-    def _draw_source(self, path: str, err: str = "") -> None:
-        view = self.sources.get(path)
+    @property
+    def _source_models(self) -> List[SheetModel]:
+        return self._current_pane().models
+
+    @property
+    def _source_views(self) -> List[QTableView]:
+        return self._current_pane().views
+
+    def _current_pane(self) -> "SourcePane":
+        n = next((k for k, i in enumerate(self.pane_items) if i is self.current), 0)
+        return self.panes[min(n, len(self.panes) - 1)]
+
+    def _pane(self, n: int) -> "SourcePane":
+        while len(self.panes) <= n:
+            p = SourcePane(self)
+            p.picked.connect(self._pane_picked)
+            self.pane_row.addWidget(p, 1)
+            self.panes.append(p)
+        return self.panes[n]
+
+    def _pane_picked(self, item) -> None:
+        """A pane clicked: its reading becomes the item picked, for Right."""
+        if item is not None and item is not self.current:
+            self.select(item)
+
+    def _draw_panes(self) -> None:
+        """Each pane's file, its reading's cell highlighted; the current
+        one's outlined when several disagree."""
         it = self.current
-        if view is None:
-            self._clear_source()
-            self.source_note.setText(f"<b>Source</b> — {Path(path).name} could not be read"
-                                     + (f": {err.splitlines()[0]}" if err else ""))
+        if it is None or not self.pane_items:
             return
-        if self._source_shown != path:
-            self._clear_source()
+        many = len(self.pane_items) > 1
+        for n, p in enumerate(self.panes):
+            p.setVisible(n < len(self.pane_items))
+        for n, o in enumerate(self.pane_items):
+            p = self._pane(n)
+            p.set_side_by_side(many, o is it)
+            p.item = o
+            if many:
+                p.header.setText(self._pane_header(o))
+            path = o.source_file
+            if not path:
+                p.clear()
+                note = f"{o.where or 'unknown'}: the review does not say where that file is"
+            elif path not in self.sources:
+                note = f"reading {Path(path).name}…"
+            else:
+                note = p.draw(self.sources[path], o, self.review.kind,
+                              self._source_errors.get(path, ""))
+            if many and o is not it and note and note != o.where:   # unread, a picture…
+                p.header.setText(self._pane_header(o) + f"<br><i>{note}</i>")
+            if o is it:
+                lead = (f"<b>{len(self.pane_items)} sources disagree</b> — click one to "
+                        "pick its value, then Right (the others are left out). Picked: "
+                        if many else "<b>Source</b> — ")
+                self.source_note.setText(lead + note)
+
+    def _pane_header(self, o: lv.Item) -> str:
+        bits = [f"<b>{_html(o.value) or '(empty)'}</b>",
+                _html(Path(o.where.split(' › ', 1)[0]).name if o.where else "")]
+        if o.source_file:
+            try:
+                import datetime as _dt
+                when = _dt.datetime.fromtimestamp(Path(o.source_file).stat().st_mtime)
+                bits.append(f"modified {when:%Y-%m-%d %H:%M}")
+            except OSError:
+                pass
+        if o.label:
+            bits.append(f"label {_html(repr(o.label))}")
+        bits.append(f"score {o.score:g}")
+        acc = self._accept_of(o)
+        if acc:
+            bits.append("accepted" if acc == "Y" else "left out")
+        text = " · ".join(b for b in bits if b)
+        if o.also:
+            names = sorted({Path(w.split(" › ", 1)[0]).name for w in o.also})
+            text += "<br>also in " + _html(", ".join(names))
+        return text
+
+    def _open_source(self) -> None:
+        if self.current is not None and self.current.source_file and self.opener:
+            self.opener(self.current.source_file)
+
+
+
+class SourcePane(QFrame):
+    """One source file: a header (when several disagree) and its sheets as
+    tabs, the reading's cell highlighted. Clicking it picks its reading."""
+    picked = Signal(object)                     # the pane's lv.Item
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SourcePane")
+        self.item: Optional[lv.Item] = None
+        self.path = ""
+        self.models: List[SheetModel] = []
+        self.views: List[QTableView] = []
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        self.header = QLabel("")
+        self.header.setWordWrap(True)
+        self.header.setVisible(False)
+        v.addWidget(self.header)
+        self.tabs = QTabWidget()
+        v.addWidget(self.tabs, 1)
+
+    def set_side_by_side(self, many: bool, current: bool = False) -> None:
+        self.header.setVisible(many)
+        self.setMinimumWidth(320 if many else 0)
+        self.setStyleSheet("" if not many else
+                           "#SourcePane { border: 2px solid #FFC000; }" if current else
+                           "#SourcePane { border: 1px solid #BFBFBF; }")
+        self.setCursor(Qt.PointingHandCursor if many and not current else Qt.ArrowCursor)
+
+    def mousePressEvent(self, e) -> None:                    # noqa: N802
+        self.picked.emit(self.item)
+        super().mousePressEvent(e)
+
+    def clear(self) -> None:
+        self.tabs.clear()
+        self.models, self.views, self.path = [], [], ""
+
+    def draw(self, view, it: lv.Item, kind: str, err: str = "") -> str:
+        """``view`` (ll.SampleView, None when unreadable) with ``it``'s cell
+        highlighted and scrolled to; what to say of it."""
+        path = it.source_file
+        name = Path(path).name
+        if view is None:
+            self.clear()
+            return f"{name} could not be read" + (f": {err.splitlines()[0]}" if err else "")
+        if self.path != path:
+            self.clear()
             for sheet in view.sheets:
                 m = SheetModel(sheet, self)
-                v = self._sheet_view(m)
-                self._source_models.append(m)
-                self._source_views.append(v)
-                self.source_tabs.addTab(v, sheet.name)
-            self._source_shown = path
-        cells = (lv.record_row_cells(view, it) if self.review.kind == "records"
+                v = QTableView()
+                v.setModel(m)
+                v.setEditTriggers(QAbstractItemView.NoEditTriggers)
+                v.setSelectionMode(QAbstractItemView.NoSelection)
+                v.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+                v.horizontalHeader().setDefaultSectionSize(90)
+                v.verticalHeader().setDefaultSectionSize(22)
+                v.clicked.connect(lambda _i: self.picked.emit(self.item))
+                self.models.append(m)
+                self.views.append(v)
+                self.tabs.addTab(v, sheet.name)
+            self.path = path
+        cells = (lv.record_row_cells(view, it) if kind == "records"
                  else list(it.source_cells))
-        exact = set(it.source_cells) if self.review.kind != "records" else set()
+        exact = set(it.source_cells) if kind != "records" else set()
         on = None
-        for i, m in enumerate(self._source_models):
+        for i, m in enumerate(self.models):
             if m.sheet.name == it.source_sheet and cells:
                 tints = {rc: ROW_TINT for rc in cells}
                 for rc in exact:
@@ -556,24 +698,20 @@ class ReviewDialog(QDialog):
                 on = i
             else:
                 m.set_tints({})
-        name = Path(path).name
         if on is None:
             why = ("it was read from a picture" if "image" in it.where else
                    f"the sheet {it.source_sheet!r} is not shown" if it.source_sheet else
                    "the review gives no cell")
-            self.source_note.setText(f"<b>Source</b> — {name}: {why}")
-            return
+            return f"{name}: {why}"
         r, c = cells[0]
-        self.source_tabs.setCurrentIndex(on)
-        self._scroll(self._source_views[on], self._source_models[on], r, c)
-        self.source_note.setText(f"<b>Source</b> — {it.where}"
-                                 if self.review.kind != "records" else
-                                 f"<b>Source</b> — {name} › {it.source_sheet}, row {r}")
+        self.tabs.setCurrentIndex(on)
+        ReviewDialog._scroll(self.views[on], self.models[on], r, c)
+        return (it.where if kind != "records" else
+                f"{name} › {it.source_sheet}, row {r}")
 
-    def _open_source(self) -> None:
-        if self.current is not None and self.current.source_file and self.opener:
-            self.opener(self.current.source_file)
 
+def _html(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 class FilledTemplateDialog(ReviewDialog):
