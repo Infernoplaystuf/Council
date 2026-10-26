@@ -1,0 +1,760 @@
+"""The graph's Contents layer: every file, sheet, header, label and value.
+
+User, 2026-10-26: "the connections tab is too strict with the connections
+it is trying to make. Basically ALL of the input data should be in the
+knowledge graph for example an excel file has the head node with the file
+name then lets say stat headers/labels and then that data is connected to
+the labels". The people / parts / projects the field rules give stay as the
+graph's meaning layer; this module keeps what they threw away: every cell of
+every CSV and workbook, under the header or label it sits under.
+
+Agreed with the user (proposal, 2026-10-26):
+  * a numeric column is one summary (count, lowest, highest) that lists its
+    values on request - not a dot per number;
+  * at most ``DRAWN_VALUES`` different values of a column are listed, the
+    rest stay searchable;
+  * the same text value in several files is ONE value (``vals``), so files
+    connect with no rules. Numbers are never merged: every '1' would link
+    everything.
+
+Structure, in the graph's own SQLite file (schema v5, ``SCHEMA_SQL``):
+
+  contents_docs  one row per document read into the layer, at the content
+                 hash it was read at (an unchanged file is not read again).
+  fields         a column header ('column'), a label ('label': 'Inspector:'
+                 beside its value, or 'Inspector: JB' in one cell), or the
+                 cells under no label of a sheet ('loose'); per document and
+                 sheet, with a summary of its values.
+  vals           a distinct text value, folded (case and spacing), shared by
+                 every file that has it.
+  cells          every value: its field, row and column, its text, its
+                 number when it is one, its ``vals`` id when it is text. A
+                 row is the cells of one sheet's fields with the same row.
+  vals_fts, fields_fts  full-text search over the values and the labels.
+
+Reading costs nothing extra: the readers the graph already runs feed this
+layer the rows they read (``Sink``, set per document by the rebuild through
+knowledge_graph._CONTENTS). A workbook is fed one row at a time with the next
+as a look-ahead, as kg_excel's reader is; a sheet's cells go to a temporary
+file, not memory, so a 100k-row sheet holds two rows.
+
+How a grid is read (no rules - any header counts):
+  * a header is a row of two or more short text cells, no 'Label:' among
+    them, with values under at least half of them in the next row. Its
+    table runs until a blank row; a cell under no title is '(column C)'.
+  * outside a table: 'Label:' with a value to its right, 'Label: value' in
+    one cell, or a short word cell with a value right beside it are a label
+    and its value.
+  * anything else is a loose cell of its sheet: kept and searchable.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+#: Different values of one column listed in the Contents tree (the rest are
+#: searchable). User, 2026-10-26: "about 200".
+DRAWN_VALUES = 200
+#: A column is numeric when at least this share of its cells are numbers.
+NUMERIC_SHARE = 0.8
+#: Characters of one cell kept (a pasted report in a cell stays searchable
+#: by its start; the file has the rest).
+MAX_CELL_CHARS = 2000
+#: Words a label may have; longer text is a value or a note.
+MAX_LABEL_WORDS = 6
+LOOSE = "(no label)"
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS contents_docs (
+    document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+    fields INTEGER NOT NULL, cells INTEGER NOT NULL, ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fields (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id TEXT NOT NULL,
+    sheet TEXT NOT NULL,               -- '' for a CSV; 'Visual › picture F2'
+    label TEXT NOT NULL, label_norm TEXT NOT NULL,
+    kind TEXT NOT NULL,                -- column | label | loose
+    loc_sheet TEXT NOT NULL DEFAULT '',-- the sheet a citation names
+    image TEXT NOT NULL DEFAULT '',    -- a picture's anchor, read by OCR
+    first_row INTEGER, col INTEGER,    -- where the header / label is
+    ord INTEGER NOT NULL,              -- order found
+    n_cells INTEGER NOT NULL, n_numbers INTEGER NOT NULL,
+    n_distinct INTEGER NOT NULL, num_min REAL, num_max REAL
+);
+CREATE INDEX IF NOT EXISTS fields_document ON fields(document_id);
+CREATE INDEX IF NOT EXISTS fields_norm ON fields(label_norm);
+CREATE TABLE IF NOT EXISTS vals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    norm TEXT NOT NULL UNIQUE, text TEXT NOT NULL,
+    n INTEGER NOT NULL DEFAULT 0       -- cells that hold it
+);
+CREATE TABLE IF NOT EXISTS cells (
+    field_id INTEGER NOT NULL, row INTEGER NOT NULL, col INTEGER NOT NULL,
+    text TEXT NOT NULL, num REAL, value_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS cells_field_row ON cells(field_id, row);
+CREATE INDEX IF NOT EXISTS cells_value ON cells(value_id) WHERE value_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS cells_num ON cells(num) WHERE num IS NOT NULL;
+"""
+
+FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS vals_fts USING fts5(
+    text, content='vals', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS fields_fts USING fts5(
+    label, sheet, content='fields', content_rowid='id');
+"""
+
+
+def create(db: sqlite3.Connection) -> None:
+    db.executescript(SCHEMA_SQL)
+    if fts_available(db):
+        db.executescript(FTS_SQL)
+
+
+_FTS: Dict[int, bool] = {}
+
+
+def fts_available(db: sqlite3.Connection) -> bool:
+    """SQLite's full-text search is built into the Python that ships with
+    Windows and most Linux; without it search falls back to LIKE."""
+    k = id(db)
+    if k not in _FTS:
+        try:
+            db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp._kg_fts_probe USING fts5(x)")
+            db.execute("DROP TABLE IF EXISTS temp._kg_fts_probe")
+            _FTS[k] = True
+        except sqlite3.Error:
+            _FTS[k] = False
+    return _FTS[k]
+
+
+def _has_fts(db: sqlite3.Connection) -> bool:
+    return db.execute("SELECT 1 FROM sqlite_master WHERE name='vals_fts'").fetchone() \
+        is not None
+
+
+# ── cells as text and numbers ────────────────────────────────────────────
+_NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)?(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def cell_text(v: Any) -> str:
+    from sample_ledger import _text
+    s = _text(v)
+    return s[:MAX_CELL_CHARS]
+
+
+def as_number(v: Any, text: str) -> Optional[float]:
+    """The number a cell holds: an int or float, or text that is only a
+    number ('42.1', '1,250', '-3e-4'). A code with digits ('PN-1234',
+    '0042' with its leading zero kept as typed) is text."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+    s = text.strip()
+    if not s or not any(ch.isdigit() for ch in s):
+        return None
+    if len(s) > 1 and s[0] == "0" and s[1].isdigit():
+        return None                   # '0042' is a code, not 42
+    if not _NUMBER_RE.fullmatch(s):
+        return None
+    try:
+        return float(s.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def fold(text: str) -> str:
+    """One value whatever its case and spacing: 'PN-4471', 'pn-4471 '."""
+    return " ".join(text.casefold().split())
+
+
+def label_norm(label: str) -> str:
+    import field_search as fs
+    return fs._norm_key(label) or fold(label)
+
+
+def col_letter(c: int) -> str:
+    s = ""
+    while c > 0:
+        c, rem = divmod(c - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _merged(v: Any) -> bool:
+    return type(v).__name__ == "_Merged"
+
+
+def _label_text(v: Any) -> str:
+    return " ".join(str(v).split()).rstrip(" :")
+
+
+def _wordish(v: Any) -> bool:
+    """A cell that can be a title or a label: short text with a letter in
+    it, not a number."""
+    if not isinstance(v, str) or _merged(v):
+        return False
+    s = v.strip()
+    if not s or len(s) > 80 or "\n" in s:
+        return False
+    if not re.search(r"[^\W\d_]", s):
+        return False
+    return as_number(v, s) is None and len(s.split()) <= MAX_LABEL_WORDS + 2
+
+
+# ── collecting one document ──────────────────────────────────────────────
+class _Field:
+    __slots__ = ("idx", "sheet", "label", "kind", "loc_sheet", "image", "first_row",
+                 "col", "n_cells", "n_numbers", "num_min", "num_max", "distinct")
+
+    def __init__(self, idx, sheet, label, kind, loc_sheet, image, first_row, col):
+        self.idx, self.sheet, self.label, self.kind = idx, sheet, label, kind
+        self.loc_sheet, self.image = loc_sheet, image
+        self.first_row, self.col = first_row, col
+        self.n_cells = self.n_numbers = 0
+        self.num_min: Optional[float] = None
+        self.num_max: Optional[float] = None
+        #: folded texts seen, up to a bound (a summary, not the store)
+        self.distinct: set = set()
+
+
+class Sink:
+    """Everything one document holds, as fields and cells. Cells are spooled
+    to a temporary file as they come (a sheet of millions of cells does not
+    sit in memory); ``store`` writes them into the graph."""
+
+    #: distinct values a field counts exactly; past it the count says "N+"
+    DISTINCT_CAP = 100_000
+
+    def __init__(self):
+        self.fields: List[_Field] = []
+        self._by_key: Dict[Tuple[str, str, str], _Field] = {}
+        self._spool = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self.n_cells = 0
+        self.closed = False
+
+    # one sheet / text box / picture of a workbook
+    def grid(self, name: str, loc_sheet: str = "", image: str = "") -> "GridContents":
+        return GridContents(self, name, loc_sheet or name, image)
+
+    def field(self, sheet: str, label: str, kind: str, *, loc_sheet: str = "",
+              image: str = "", row: Optional[int] = None, col: Optional[int] = None
+              ) -> _Field:
+        key = (sheet, label_norm(label) if kind != "loose" else LOOSE, kind)
+        f = self._by_key.get(key)
+        if f is None:
+            f = _Field(len(self.fields), sheet, label, kind, loc_sheet or sheet, image,
+                       row, col)
+            self.fields.append(f)
+            self._by_key[key] = f
+        return f
+
+    def cell(self, f: _Field, row: int, col: int, v: Any) -> None:
+        if self.closed:
+            return                     # a read the rebuild left behind
+        text = cell_text(v)
+        if not text:
+            return
+        num = as_number(v, text)
+        f.n_cells += 1
+        if num is not None:
+            f.n_numbers += 1
+            f.num_min = num if f.num_min is None else min(f.num_min, num)
+            f.num_max = num if f.num_max is None else max(f.num_max, num)
+        if len(f.distinct) < self.DISTINCT_CAP:
+            f.distinct.add(fold(text) if num is None else text)
+        self.n_cells += 1
+        self._spool.write(json.dumps([f.idx, row, col, text, num], ensure_ascii=False))
+        self._spool.write("\n")
+
+    def table(self, sheet: Optional[str], columns: Sequence[Any],
+              rows: Iterable[Tuple[int, Sequence[Any]]]) -> None:
+        """A CSV (or any frame): ``columns`` are its header, ``rows`` (row
+        number a person sees, values in column order)."""
+        name = sheet or ""
+        fs_ = []
+        for c, title in enumerate(columns, start=1):
+            t = str(title or "").strip()
+            if not t or t.lower().startswith("unnamed:"):
+                t = f"(column {col_letter(c)})"
+            fs_.append(self.field(name, t, "column", row=1, col=c))
+        for rowno, vals in rows:
+            for c, (f, v) in enumerate(zip(fs_, vals), start=1):
+                if v is None or (isinstance(v, float) and v != v):
+                    continue
+                if isinstance(v, str) and (not v.strip() or v.strip().lower() == "nan"):
+                    continue
+                self.cell(f, int(rowno), c, v)
+
+    def frames(self, frames) -> None:
+        for sheet, frame in frames:
+            self.table(sheet, list(frame.columns),
+                       zip(frame.index, frame.itertuples(index=False, name=None)))
+
+    def cells(self) -> Iterable[list]:
+        self._spool.flush()
+        self._spool.seek(0)
+        for line in self._spool:
+            if line.strip():
+                yield json.loads(line)
+
+    def close(self) -> None:
+        self.closed = True
+        try:
+            self._spool.close()
+        except Exception:
+            pass
+
+
+class GridContents:
+    """One sheet fed row by row (r, {column: value}), in row order, with the
+    next row as a look-ahead - as kg_excel._GridReader is fed."""
+
+    def __init__(self, sink: Sink, name: str, loc_sheet: str, image: str):
+        self.sink, self.name, self.loc_sheet, self.image = sink, name, loc_sheet, image
+        self._pending: Optional[Tuple[int, Dict[int, Any]]] = None
+        self._last_r: Optional[int] = None
+        #: the running table: column -> field, and its span
+        self._cols: Dict[int, _Field] = {}
+        self._span: Tuple[int, int] = (0, -1)
+
+    def feed(self, r: int, cells: Dict[int, Any]) -> None:
+        if self._pending is not None:
+            pr, pc = self._pending
+            self._row(pr, pc, cells if r == pr + 1 else {})
+        self._pending = (r, cells)
+
+    def close(self) -> None:
+        if self._pending is not None:
+            self._row(*self._pending, {})
+            self._pending = None
+
+    def _field(self, label: str, kind: str, r: int, c: int) -> _Field:
+        return self.sink.field(self.name, label, kind, loc_sheet=self.loc_sheet,
+                               image=self.image, row=r, col=c)
+
+    def _is_header(self, cells: Dict[int, Any], nxt: Dict[int, Any]) -> bool:
+        real = {c: v for c, v in cells.items() if not _merged(v)}
+        titles = [c for c, v in real.items() if _wordish(v)]
+        if len(titles) < 2 or 5 * len(titles) < 3 * len(real):
+            return False
+        if any(str(real[c]).strip().endswith(":") for c in titles):
+            return False
+        under = [c for c in titles if nxt.get(c) is not None and not _merged(nxt[c])]
+        if 2 * len(under) < len(titles):
+            return False
+        # 'Part | 101 | Inspector | JB': labels and their values side by
+        # side (a form), not a header - every other cell a word, the cells
+        # between them not all words
+        cols = sorted(real)
+        if len(cols) % 2 == 0 and all(_wordish(real[c]) for c in cols[0::2]) and \
+                not all(_wordish(real[c]) for c in cols[1::2]):
+            return False
+        return True
+
+    def _row(self, r: int, cells: Dict[int, Any], nxt: Dict[int, Any]) -> None:
+        if self._last_r is not None and r > self._last_r + 1:
+            self._cols, self._span = {}, (0, -1)     # a blank row ends a table
+        self._last_r = r
+        left = dict(cells)
+        if self._cols:
+            c0, c1 = self._span
+            for c in [c for c in left if c0 <= c <= c1]:
+                v = left.pop(c)
+                if _merged(v):
+                    continue
+                f = self._cols.get(c)
+                if f is None:
+                    f = self._cols[c] = self._field(f"(column {col_letter(c)})", "column",
+                                                    r, c)
+                self.sink.cell(f, r, c, v)
+        elif self._is_header(cells, nxt):
+            cols = sorted(c for c, v in cells.items() if not _merged(v))
+            self._cols = {}
+            for c in cols:
+                v = cells[c]
+                label = _label_text(v) if _wordish(v) else f"(column {col_letter(c)})"
+                self._cols[c] = self._field(label, "column", r, c)
+            self._span = (cols[0], cols[-1])
+            return
+        if left:
+            self._forms(r, left)
+
+    def _forms(self, r: int, cells: Dict[int, Any]) -> None:
+        """Labels and their values outside a table; the rest loose."""
+        from council_core.kg_excel import _se
+        cols = sorted(cells)
+        used: set = set()
+        for i, c in enumerate(cols):
+            if c in used:
+                continue
+            v = cells[c]
+            if _merged(v):
+                used.add(c)
+                continue
+            s = str(v).strip() if isinstance(v, str) else ""
+            nc = cols[i + 1] if i + 1 < len(cols) else None
+            right = cells.get(nc) if nc is not None and nc - c <= 2 else None
+            if right is not None and _merged(right):
+                right = None
+            # 'Label:' with its value beside it
+            if s.endswith(":") and len(s.split()) <= MAX_LABEL_WORDS and right is not None:
+                self.sink.cell(self._field(_label_text(s), "label", r, c), r, nc, right)
+                used |= {c, nc}
+                continue
+            # 'Label: value' in one cell
+            if s and (":" in s or "=" in s):
+                lab, val = _se()._split_inline(s)
+                if val and len(lab.split()) <= MAX_LABEL_WORDS:
+                    self.sink.cell(self._field(_label_text(lab), "label", r, c), r, c, val)
+                    used.add(c)
+                    continue
+            # a short word cell with a value right beside it: 'Part | 101'
+            if _wordish(v) and right is not None and nc == c + 1 and \
+                    len(s.split()) <= MAX_LABEL_WORDS and not _wordish_title_row(cells):
+                self.sink.cell(self._field(_label_text(s), "label", r, c), r, nc, right)
+                used |= {c, nc}
+                continue
+        for c in cols:
+            if c not in used and not _merged(cells[c]):
+                self.sink.cell(self._field(LOOSE, "loose", r, c), r, c, cells[c])
+
+
+def _valueish(v: Any) -> bool:
+    """A cell that reads as a value even though it is a word: a code with a
+    digit ('L-3'), initials ('AK'), or not text at all."""
+    if not isinstance(v, str):
+        return True
+    s = v.strip()
+    return any(ch.isdigit() for ch in s) or (s.isupper() and len(s) <= 4)
+
+
+def _wordish_title_row(cells: Dict[int, Any]) -> bool:
+    """Three or more word cells side by side with no values: a row of titles
+    no data followed (the last row of a sheet), not label/value pairs.
+    'Lot | L-3 | Operator | AK' is pairs: every other cell reads as a value."""
+    words = [c for c, v in cells.items() if _wordish(v)]
+    if len(words) < 3 or len(words) != len(cells):
+        return False
+    cols = sorted(cells)
+    if len(cols) % 2 == 0 and all(_valueish(cells[c]) for c in cols[1::2]):
+        return False
+    return True
+
+
+# ── writing one document into the store ──────────────────────────────────
+def current(db: sqlite3.Connection, did: str, content_hash: str) -> bool:
+    row = db.execute("SELECT content_hash FROM contents_docs WHERE document_id=?",
+                     (did,)).fetchone()
+    return row is not None and row[0] == content_hash
+
+
+def forget(db: sqlite3.Connection, did: str) -> None:
+    """A document's fields and cells go (its values stay until ``finish``
+    finds nothing holds them)."""
+    fts = _has_fts(db)
+    if fts:
+        for fid, label, sheet in db.execute(
+                "SELECT id, label, sheet FROM fields WHERE document_id=?", (did,)).fetchall():
+            db.execute("INSERT INTO fields_fts(fields_fts, rowid, label, sheet)"
+                       " VALUES('delete', ?, ?, ?)", (fid, label, sheet))
+    db.execute("DELETE FROM cells WHERE field_id IN (SELECT id FROM fields WHERE"
+               " document_id=?)", (did,))
+    db.execute("DELETE FROM fields WHERE document_id=?", (did,))
+    db.execute("DELETE FROM contents_docs WHERE document_id=?", (did,))
+
+
+def store(db: sqlite3.Connection, did: str, content_hash: str, sink: Sink,
+          values: Optional[Dict[str, int]] = None, batch: int = 20_000) -> Dict[str, int]:
+    """Replace what the layer holds for one document with ``sink``'s.
+    ``values`` caches folded text -> vals id across one rebuild."""
+    values = {} if values is None else values
+    fts = _has_fts(db)
+    forget(db, did)
+    ids: Dict[int, int] = {}
+    for f in sink.fields:
+        if not f.n_cells:
+            continue
+        cur = db.execute(
+            "INSERT INTO fields (document_id, sheet, label, label_norm, kind, loc_sheet,"
+            " image, first_row, col, ord, n_cells, n_numbers, n_distinct, num_min, num_max)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (did, f.sheet, f.label, label_norm(f.label) if f.kind != "loose" else "",
+             f.kind, f.loc_sheet, f.image, f.first_row, f.col, f.idx, f.n_cells,
+             f.n_numbers, len(f.distinct), f.num_min, f.num_max))
+        ids[f.idx] = cur.lastrowid
+        if fts:
+            db.execute("INSERT INTO fields_fts(rowid, label, sheet) VALUES (?,?,?)",
+                       (cur.lastrowid, f.label, f.sheet))
+    rows: List[tuple] = []
+    n = 0
+    for fi, row, col, text, num in sink.cells():
+        fid = ids.get(fi)
+        if fid is None:
+            continue
+        vid = None
+        if num is None:
+            key = fold(text)
+            vid = values.get(key)
+            if vid is None:
+                got = db.execute("SELECT id FROM vals WHERE norm=?", (key,)).fetchone()
+                if got is None:
+                    vid = db.execute("INSERT INTO vals (norm, text) VALUES (?,?)",
+                                     (key, text)).lastrowid
+                    if fts:
+                        db.execute("INSERT INTO vals_fts(rowid, text) VALUES (?,?)",
+                                   (vid, text))
+                else:
+                    vid = got[0]
+                values[key] = vid
+        rows.append((fid, row, col, text, num, vid))
+        n += 1
+        if len(rows) >= batch:
+            db.executemany("INSERT INTO cells VALUES (?,?,?,?,?,?)", rows)
+            rows = []
+    if rows:
+        db.executemany("INSERT INTO cells VALUES (?,?,?,?,?,?)", rows)
+    db.execute("INSERT OR REPLACE INTO contents_docs VALUES (?,?,?,?,?)",
+               (did, content_hash, len(ids), n, time.time()))
+    return {"fields": len(ids), "cells": n}
+
+
+def finish(db: sqlite3.Connection, keep: Iterable[str]) -> None:
+    """After a rebuild's reading: documents gone or no longer readable leave
+    the layer, every value's count is worked out again, and values nothing
+    holds go."""
+    keep = set(keep)
+    for (did,) in db.execute("SELECT document_id FROM contents_docs").fetchall():
+        if did not in keep:
+            forget(db, did)
+    # fields left by a document read before contents_docs was written
+    for (did,) in db.execute("SELECT DISTINCT document_id FROM fields WHERE document_id"
+                             " NOT IN (SELECT document_id FROM contents_docs)").fetchall():
+        forget(db, did)
+    db.execute("UPDATE vals SET n = (SELECT count(*) FROM cells WHERE value_id=vals.id)")
+    if _has_fts(db):
+        for vid, text in db.execute("SELECT id, text FROM vals WHERE n=0").fetchall():
+            db.execute("INSERT INTO vals_fts(vals_fts, rowid, text) VALUES('delete', ?, ?)",
+                       (vid, text))
+    db.execute("DELETE FROM vals WHERE n=0")
+
+
+# ── reading it back ──────────────────────────────────────────────────────
+def locator(field: Dict[str, Any], row: int, col: int) -> Dict[str, Any]:
+    """Where a cell is, in the graph's locator words (knowledge_graph.
+    locator_text, kg_excel.preview): a workbook cell, a CSV row and column,
+    or a picture's row."""
+    if not field.get("sheet") and not field.get("image"):
+        return {"row": row, "column": field["label"]}
+    loc: Dict[str, Any] = {"sheet": field.get("loc_sheet") or field["sheet"]}
+    if field.get("image"):
+        loc["image"] = field["image"]
+        loc["row"] = row
+    else:
+        loc["cell"] = f"{col_letter(col)}{row}"
+    if field.get("kind") == "column":
+        loc["column"] = field["label"]
+    return loc
+
+
+def counts(db: sqlite3.Connection) -> Dict[str, int]:
+    one = db.execute("SELECT count(*), coalesce(sum(fields), 0), coalesce(sum(cells), 0)"
+                     " FROM contents_docs").fetchone()
+    vals = db.execute("SELECT count(*) FROM vals").fetchone()[0]
+    return {"files": one[0], "fields": one[1], "cells": one[2], "values": vals}
+
+
+def files(db: sqlite3.Connection) -> List[Dict[str, Any]]:
+    out = []
+    for r in db.execute(
+            "SELECT c.document_id, d.path, c.fields, c.cells,"
+            " (SELECT count(DISTINCT sheet) FROM fields f WHERE f.document_id=c.document_id)"
+            " FROM contents_docs c JOIN documents d ON d.id=c.document_id"
+            " ORDER BY d.path COLLATE NOCASE"):
+        out.append({"document_id": r[0], "path": r[1], "fields": r[2], "cells": r[3],
+                    "sheets": r[4]})
+    return out
+
+
+def sheets(db: sqlite3.Connection, did: str) -> List[Dict[str, Any]]:
+    return [{"sheet": r[0], "fields": r[1], "cells": r[2]} for r in db.execute(
+        "SELECT sheet, count(*), sum(n_cells) FROM fields WHERE document_id=?"
+        " GROUP BY sheet ORDER BY min(ord)", (did,))]
+
+
+_FIELD_COLS = ("id, document_id, sheet, label, label_norm, kind, loc_sheet, image,"
+               " first_row, col, n_cells, n_numbers, n_distinct, num_min, num_max")
+
+
+def _field_dict(r) -> Dict[str, Any]:
+    d = dict(zip([c.strip() for c in _FIELD_COLS.split(",")], r))
+    d["numeric"] = bool(d["n_cells"]) and d["n_numbers"] >= NUMERIC_SHARE * d["n_cells"]
+    return d
+
+
+def field(db: sqlite3.Connection, fid: int) -> Optional[Dict[str, Any]]:
+    r = db.execute(f"SELECT {_FIELD_COLS} FROM fields WHERE id=?", (fid,)).fetchone()
+    return _field_dict(r) if r else None
+
+
+def fields_of(db: sqlite3.Connection, did: str, sheet: Optional[str] = None
+              ) -> List[Dict[str, Any]]:
+    q = f"SELECT {_FIELD_COLS} FROM fields WHERE document_id=?"
+    args: tuple = (did,)
+    if sheet is not None:
+        q += " AND sheet=?"
+        args += (sheet,)
+    return [_field_dict(r) for r in db.execute(q + " ORDER BY ord", args)]
+
+
+def summary(f: Dict[str, Any]) -> str:
+    """'412 values, 38.2 to 51.7' / '96 values, 12 different'."""
+    n = f["n_cells"]
+    words = f"{n:,} value" + ("" if n == 1 else "s")
+    if f["numeric"] and f["num_min"] is not None:
+        return f"{words}, {_num(f['num_min'])} to {_num(f['num_max'])}"
+    k = f["n_distinct"]
+    more = "+" if k >= Sink.DISTINCT_CAP else ""
+    return f"{words}, {k:,}{more} different" if k != n else words
+
+
+def _num(x: float) -> str:
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+def field_values(db: sqlite3.Connection, fid: int, limit: int = DRAWN_VALUES
+                 ) -> Dict[str, Any]:
+    """What a field holds, for the tree: its text values by how often they
+    occur (at most ``limit``), or - numeric - its cells in row order (at
+    most ``limit``). ``more`` = how many are not listed."""
+    f = field(db, fid)
+    if f is None:
+        return {"numeric": False, "values": [], "more": 0}
+    if f["numeric"]:
+        got = [{"text": t, "row": r, "col": c, "value_id": v} for t, r, c, v in db.execute(
+            "SELECT text, row, col, value_id FROM cells WHERE field_id=? ORDER BY row, col"
+            " LIMIT ?", (fid, limit))]
+        return {"numeric": True, "values": got, "more": max(0, f["n_cells"] - len(got))}
+    got = [{"text": t, "value_id": v, "count": n, "row": r, "col": c}
+           for v, t, n, r, c in db.execute(
+               "SELECT value_id, min(text), count(*), min(row), min(col) FROM cells"
+               " WHERE field_id=? GROUP BY coalesce(value_id, -rowid)"
+               " ORDER BY count(*) DESC, min(row) LIMIT ?", (fid, limit))]
+    total = db.execute("SELECT count(DISTINCT coalesce(value_id, -rowid)) FROM cells"
+                       " WHERE field_id=?", (fid,)).fetchone()[0]
+    return {"numeric": False, "values": got, "more": max(0, total - len(got))}
+
+
+def value(db: sqlite3.Connection, vid: int) -> Optional[Dict[str, Any]]:
+    r = db.execute("SELECT id, text, n FROM vals WHERE id=?", (vid,)).fetchone()
+    if r is None:
+        return None
+    files_n = db.execute("SELECT count(DISTINCT f.document_id) FROM cells c JOIN fields f"
+                         " ON f.id=c.field_id WHERE c.value_id=?", (vid,)).fetchone()[0]
+    return {"id": r[0], "text": r[1], "count": r[2], "files": files_n}
+
+
+def places(db: sqlite3.Connection, *, value_id: Optional[int] = None,
+           number: Optional[float] = None, field_id: Optional[int] = None,
+           row: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """Every cell that holds a value (``value_id``), a number (``number``),
+    or one cell (``field_id`` + ``row``), with its file, sheet, label and
+    locator."""
+    if value_id is not None:
+        where, args = "c.value_id=?", (value_id,)
+    elif number is not None:
+        where, args = "c.num=?", (number,)
+    else:
+        where, args = "c.field_id=? AND c.row=?", (field_id, row)
+    out = []
+    for r in db.execute(
+            f"SELECT c.field_id, c.row, c.col, c.text, d.path, {', '.join('f.' + x.strip() for x in _FIELD_COLS.split(','))}"
+            " FROM cells c JOIN fields f ON f.id=c.field_id JOIN documents d"
+            f" ON d.id=f.document_id WHERE {where} ORDER BY d.path, f.ord, c.row LIMIT ?",
+            args + (limit,)):
+        f = _field_dict(r[5:])
+        out.append({"field_id": r[0], "row": r[1], "col": r[2], "text": r[3], "path": r[4],
+                    "document_id": f["document_id"], "sheet": f["sheet"], "label": f["label"],
+                    "kind": f["kind"], "locator": locator(f, r[1], r[2])})
+    return out
+
+
+def row_cells(db: sqlite3.Connection, field_id: int, row: int) -> List[Dict[str, Any]]:
+    """The whole row a cell is in: every field of its sheet with a cell on
+    that row, in column order. A label's value on that row is in it too."""
+    f = field(db, field_id)
+    if f is None:
+        return []
+    return [{"label": lab, "text": t, "col": c, "field_id": fid} for fid, lab, t, c in db.execute(
+        "SELECT f.id, f.label, c.text, c.col FROM fields f JOIN cells c ON c.field_id=f.id"
+        " AND c.row=? WHERE f.document_id=? AND f.sheet=? ORDER BY c.col",
+        (row, f["document_id"], f["sheet"]))]
+
+
+def same_fields(db: sqlite3.Connection, fid: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """The fields of other files with the same label (case, spacing and
+    punctuation aside): 'Hardness (HRC)' in every workbook that has it."""
+    f = field(db, fid)
+    if f is None or not f["label_norm"]:
+        return []
+    return [dict(_field_dict(r[1:]), path=r[0]) for r in db.execute(
+        f"SELECT d.path, {', '.join('f.' + x.strip() for x in _FIELD_COLS.split(','))}"
+        " FROM fields f JOIN documents d ON d.id=f.document_id"
+        " WHERE f.label_norm=? AND f.id != ? ORDER BY d.path LIMIT ?",
+        (f["label_norm"], fid, limit))]
+
+
+def _fts_query(text: str) -> str:
+    toks = re.findall(r"\w+", text, flags=re.UNICODE)
+    return " ".join(f'"{t}"*' for t in toks)
+
+
+def search(db: sqlite3.Connection, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
+    """Files, fields and values whose words start with what was typed (all
+    of the words), and - a number typed - the cells holding that number."""
+    text = (text or "").strip()
+    out: Dict[str, List[Dict[str, Any]]] = {"files": [], "fields": [], "values": [],
+                                            "numbers": []}
+    if not text:
+        return out
+    like = f"%{text.casefold()}%"
+    for r in db.execute(
+            "SELECT c.document_id, d.path, c.cells FROM contents_docs c JOIN documents d"
+            " ON d.id=c.document_id WHERE lower(d.path) LIKE ? ORDER BY d.path LIMIT ?",
+            (like, limit)):
+        out["files"].append({"document_id": r[0], "path": r[1], "cells": r[2]})
+    q = _fts_query(text)
+    cols = ", ".join("f." + x.strip() for x in _FIELD_COLS.split(","))
+    if q and _has_fts(db):
+        frows = db.execute(
+            f"SELECT d.path, {cols} FROM fields_fts s JOIN fields f ON f.id=s.rowid"
+            " JOIN documents d ON d.id=f.document_id WHERE fields_fts MATCH ?"
+            " ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+        vrows = db.execute(
+            "SELECT v.id, v.text, v.n FROM vals_fts s JOIN vals v ON v.id=s.rowid"
+            " WHERE vals_fts MATCH ? ORDER BY v.n DESC, rank LIMIT ?", (q, limit)).fetchall()
+    else:
+        frows = db.execute(
+            f"SELECT d.path, {cols} FROM fields f JOIN documents d ON d.id=f.document_id"
+            " WHERE lower(f.label) LIKE ? OR lower(f.sheet) LIKE ? LIMIT ?",
+            (like, like, limit)).fetchall()
+        vrows = db.execute("SELECT id, text, n FROM vals WHERE norm LIKE ? ORDER BY n DESC"
+                           " LIMIT ?", (like, limit)).fetchall()
+    for r in frows:
+        out["fields"].append(dict(_field_dict(r[1:]), path=r[0]))
+    for vid, t, n in vrows:
+        out["values"].append({"value_id": vid, "text": t, "count": n})
+    num = as_number(text, text)
+    if num is not None:
+        n = db.execute("SELECT count(*) FROM cells WHERE num=?", (num,)).fetchone()[0]
+        if n:
+            out["numbers"].append({"number": num, "text": text, "count": n})
+    return out
