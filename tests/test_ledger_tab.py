@@ -477,3 +477,53 @@ def test_a_saved_ledger_is_picked_again_and_updated_with_new_files(qapp, tmp_pat
     runs.rename(0, "October summary")
     assert ledger_saved.load(csv).runs[-1].name == "October summary"
     runs.close()
+
+
+def test_groups_are_made_in_review_and_apply_writes_their_workbooks(qapp, books):
+    """user, 2026-10-26: sub-groups made in review, each with smaller output
+    workbooks 'in addition to the full workbook', a filled-template sheet per
+    part in numerical order."""
+    import openpyxl
+    from council_core import ledger_groups as lg
+    template, src, tmp = books
+    tab, _ = make_tab(qapp)
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.on_extract()
+    assert tab.wait(120)
+    assert tab.groups_btn.isEnabled()
+    tab.on_filled_window()
+    assert tab.wait(60)
+    filled = tab.filled_dialog
+    assert not filled.groups_btn.isHidden()
+    filled.groups_btn.click()                          # from the review step
+    dlg = tab.groups_dialog
+    assert sorted(dlg.facts) == ["101", "102"]         # the review's parts
+    g = dlg.new_group("Old 101")
+    dlg.set_rule("part", pattern="101")
+    assert dlg.members() == ["101"]
+    dlg.tick("102", True)
+    assert dlg.members() == ["101", "102"] and g.include == ["102"]
+    dlg.tick("102", False)
+    dlg.set_field("Concealment 1: Media", lg.YES_NO, "ceramic")
+    dlg.set_field("Date", lg.OFF)
+    assert dlg.on_save()
+    dlg.close()
+    filled.close()
+    assert [x.name for x in lg.load_groups(tab.csv.text())] == ["Old 101"]
+
+    accept(tab.review.text(), [(None, None, None, None)])
+    tab.fill_dir.setText(str(tmp / "filled"))
+    tab.apply_btn.click()
+    assert tab.wait(60)
+    assert "Workbooks (2), a filled-template sheet per part" in tab.log.toPlainText()
+    out = Path(tab.csv.text()).with_name("LMM_Template_parent_workbooks")
+    full = openpyxl.load_workbook(out / "LMM Template - all parts.xlsx")
+    group = openpyxl.load_workbook(out / "LMM Template - Old 101.xlsx")
+    assert full.sheetnames == ["101", "102"] and group.sheetnames == ["101"]
+    from sample_ledger import TemplateSchema, schema_path_for
+    schema = TemplateSchema.load(schema_path_for(tab.csv.text()))
+    media = next(f for f in schema.fields if f.name == "Concealment 1: Media").cells[""]
+    assert full["101"][media].value == "ceramic" and group["101"][media].value == "Yes"

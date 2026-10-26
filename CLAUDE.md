@@ -119,3 +119,6 @@ same list.
   "Update with new files" (only new or changed files; what the Ledger holds is
   accepted again, a value that differs is flagged):
   `docs/handoff/ledger_saved_2026-10-23.md`.
+- Ledger groups (parts by part name, date or source folder; fields tracked, not
+  tracked or Yes/No) and the full and per-group workbooks, a sheet per part:
+  `docs/handoff/ledger_groups_2026-10-26.md`.

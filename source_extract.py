@@ -4020,7 +4020,9 @@ def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSche
     line can be shared without the data."""
     reasons: Counter = Counter()
     fields: Counter = Counter()
-    aside = [d for d in decisions if d.alternate]
+    # readings of one workbook set aside (decide), not a field a group does
+    # not track (ledger_groups)
+    aside = [d for d in decisions if d.alternate.startswith("set aside")]
     for d in decisions:
         why = review_reason(d, schema)
         if why:
@@ -4028,7 +4030,8 @@ def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSche
             fields[d.obs.field] += 1
     lines = []
     if aside:
-        ops = Counter(w for d in decisions if d.alternate or "used: " in d.obs.note
+        ops = Counter(w for d in decisions
+                      if d.alternate.startswith("set aside") or "used: " in d.obs.note
                       for w in (d.obs.inspector or "").split("/") if w)
         lines.append(f"{len(aside)} other readings set aside: a workbook had several "
                      "readings of one value, and the first one (or an operator to "
