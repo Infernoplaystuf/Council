@@ -319,7 +319,7 @@ def test_the_filled_template_window_shows_a_cells_source(qapp, sample_review):
     assert next(i for i in lv.load(review).items if i.fields == ["Power (W)"]).accept == "N"
     assert not dlg.click_cell(sheet, (1, 1))
     path = dlg.on_export()
-    assert path and opened == [path] and Path(path).name == "101.xlsx"
+    assert path and opened == [path] and Path(path).name == f"{review.stem}_filled.xlsx"
     dlg.show_whole_part()
     assert len(dlg.shown) == sum(1 for i in dlg.review.items if i.part == "101")
     dlg.close()
@@ -495,3 +495,55 @@ def test_files_that_disagree_are_shown_side_by_side(qapp, tmp_path):
     assert filled.click_cell(*filled._exact[("Frequency (kHz)", "")])
     assert len([p for p in filled.panes if p.isVisible()]) == 2
     filled.close()
+
+
+def test_extract_writes_every_parts_filled_template_in_one_workbook(qapp, tmp_path):
+    """user, 2026-10-26: "unable to export the full filled out workbook after
+    the extraction has been run. I can just see the review"."""
+    import openpyxl
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    src = tmp_path / "src"
+    src.mkdir()
+    for part in ("101", "12", "3"):
+        book = make_laser_log(src / f"log_{part}.xlsx")
+        wb = openpyxl.load_workbook(book)
+        wb["Build"]["A3"] = f"P/N: {part}"
+        wb.save(book)
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    s = li.run_extract(csv, [src], use_images=False)
+    full = Path(s.filled_book)
+    assert full == lv.full_filled_path(s.review) and full.is_file()
+    assert "Every part's filled template in one workbook" in s.describe()
+    wb = openpyxl.load_workbook(full)
+    assert wb.sheetnames == ["3", "12", "101"]                # numerical order
+    exact = lv.template_cells(csv)
+    sheet, (r, c) = exact[("Power (W)", "")]
+    cell = wb["12"].cell(row=r, column=c)
+    assert cell.value == 285 and "Build!C5" in cell.comment.text
+    assert cell.fill.start_color.rgb.endswith(lv.confidence_tint(
+        next(i for i in lv.load(s.review).items if i.part == "12"
+             and i.fields == ["Power (W)"]))[1:])
+    wb.close()
+
+    opened = []
+    dlg = FilledTemplateDialog(lv.load(s.review), opener=opened.append, part="12")
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    power = next(i for i in dlg.review.items if i.part == "12" and i.fields == ["Power (W)"])
+    dlg.select(power)
+    dlg.on_wrong()
+    assert dlg.on_save()
+    assert dlg.on_export() == str(full) and opened == [str(full)]   # Open as Excel: the whole
+    wb = openpyxl.load_workbook(full)
+    assert wb.active.title == "12"                           # at the part shown
+    assert wb["12"].cell(row=r, column=c).value is None      # said Wrong: left out now
+    assert wb["101"].cell(row=r, column=c).value == 285
+    wb.close()
+    dlg.close()
+
+    mine = tmp_path / "mine.xlsx"                            # never over a file of yours
+    openpyxl.Workbook().save(mine)
+    other = lv.load(s.review)
+    other.path = str(tmp_path / "mine.xlsx").replace("mine.xlsx", "mine_.xlsx")
+    lv.full_filled_path(other.path).write_bytes(mine.read_bytes())
+    with pytest.raises(Exception, match="the Ledger did not write it"):
+        lv.write_full_filled(other)

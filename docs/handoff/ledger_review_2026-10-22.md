@@ -131,3 +131,22 @@ window; "I do not want any more buttons to be made".
   leaves out every other value for that cell (`_answer`, all of them, not
   only the shown ones), since Apply keeps none of two accepted values that
   differ. "Put this value here" (right-click) does the same at its new cell.
+
+## The full filled workbook after Extract (2026-10-26)
+
+Andy: "I appear to be unable to export the full filled out workbook after the
+extraction has been run. I can just see the review". Apply's full and
+per-group workbooks (`ledger_groups`) come from the parent CSV, so before
+Apply there was only the review and one file per part in `<review>_filled/`.
+
+- Extract (and Re-run with my answers) also writes `<review>_filled.xlsx`
+  beside the review (`ledger_review.write_full_filled`): the template filled
+  in once per part, a sheet each in numerical order, as Apply's full workbook.
+  Each value is tinted by confidence with a note of where it was read
+  (`_fill_part`, shared with `write_filled`). The summary and log name it
+  (`ExtractSummary.filled_book`).
+- The filled template window's "Open as Excel" writes it again with the
+  answers saved so far and opens it at the part shown (`active`). No new
+  button.
+- It is never written over a file the Ledger did not write (`FILLED_MARK`).
+  Apply's workbooks are unchanged: accepted values only, with the groups.

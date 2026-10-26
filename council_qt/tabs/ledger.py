@@ -166,6 +166,10 @@ class LedgerActions:
                 progress(f"{carried} answer(s) carried into the new review; filling in "
                          "the template again")
                 ledger_review.write_all_filled(ledger_review.load(new), progress)
+                try:
+                    ledger_review.write_full_filled(ledger_review.load(new), progress)
+                except LedgerError as e:
+                    progress(f"the filled workbook was not written: {e}")
         return applied, extracted, carried
 
     def update(self, csv, progress, use_images, vision_model: Optional[str] = None,
