@@ -66,7 +66,7 @@ Both scripts:
 1. Wipe `build/` and `dist/`.
 2. Sanity-check that Python + PyInstaller are on PATH.
 3. Probe-import the critical deps (`llama_cpp`, `pandas`, `numpy`,
-   `openpyxl`, `tkinter`, `yaml`, `requests`) — fails fast if any
+   `openpyxl`, `PySide6`, `yaml`, `requests`) — fails fast if any
    are missing, so you don't wait 10 minutes for PyInstaller to
    discover the same thing.
 4. Run `pyinstaller council.spec --noconfirm --clean`.
@@ -87,7 +87,7 @@ dist/DatasInferno/
 │   ├── llama_cpp/                ← native llama.dll + CUDA helpers
 │   ├── pandas/                   ← Python files + pandas C extensions
 │   ├── numpy/, openpyxl/, ...    ← every dep from requirements.txt
-│   ├── tcl/, tk/                 ← Tkinter UI libraries
+│   ├── PySide6/                  ← Qt UI libraries
 │   └── ...
 ├── assets/                       ← icons, splash, sample CSVs
 ├── personality_backends.json    ← model pins per personality

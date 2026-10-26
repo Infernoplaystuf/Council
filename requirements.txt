@@ -20,9 +20,9 @@ PyYAML>=6.0
 requests>=2.31
 
 # ---- The UI ----
-# The Qt app (council_qt.py) is what the run-* launchers start. Without
-# PySide6 they fall back to the classic Tk app (council_gui_engine.py),
-# which needs nothing from here. The Qt port is tested against 6.10 and
+# The Qt app (council_qt.py) is the app: the run-* launchers start it and the
+# .exe packages it. (The classic Tk app they used to fall back to without
+# PySide6 was retired 2026-10-23.) The Qt port is tested against 6.10 and
 # 6.12. 6.12 leaves a widget owned twice (by Python and its Qt parent) when
 # its layout is added to an attached one, which crashed at garbage
 # collection; council_qt.qt_ownership hands such widgets to Qt (2026-10-21).
@@ -80,11 +80,8 @@ seaborn>=0.13            # statistical plots in plot_registry.py (kde, ecdf,
                          # violin, pair, 2-D density). Optional at runtime —
                          # plots needing it are hidden when it's absent.
 #
-# plotly + tkinterweb drive the older interactive HTML chart path. Note
-# tkinterweb (tkhtml3) has NO JavaScript engine, so a Plotly figure cannot
-# actually run inside it; that path is only useful via "Open in browser".
+# plotly drives the interactive HTML chart path ("Open in browser").
 plotly>=5.17
-tkinterweb>=3.24         # Plotly HTML viewer inside Tk (no JS engine)
 #
 # scikit-learn backs the 'pca' plot type, which is user-selectable in the
 # Grapher. It was advertised without being declared, so 'pca' returned a

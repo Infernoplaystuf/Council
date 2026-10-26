@@ -69,17 +69,17 @@ def apply_saved(vault_dir=None,
     """Read vault/backend_settings.json and `apply` it. Never raises: a launch
     must not die over a context size.
 
-    Read through onboarding's reader, the one the main-model setting already
+    Read through backend_settings' reader, the one the main-model setting already
     uses, rather than a second json.loads: it accepts the BOM PowerShell 5.1
     writes and an empty file, and says "unreadable" rather than "empty" for a
-    damaged one (MEASURED 2026-09-29 in onboarding._read_backend_settings).
+    damaged one (MEASURED 2026-09-29 in backend_settings._read_backend_settings).
     """
     try:
         if vault_dir is None:
             from . import paths
             vault_dir = paths.vault_dir()
-        import onboarding
-        settings = onboarding._read_backend_settings(Path(vault_dir))
+        from . import backend_settings
+        settings = backend_settings._read_backend_settings(Path(vault_dir))
         if settings is None:
             if log:
                 log(f"[startup] engine settings: could not read "

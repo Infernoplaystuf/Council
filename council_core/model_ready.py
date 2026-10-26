@@ -2,8 +2,8 @@
 council_core.model_ready — can this launch answer a question at all?
 
 WHAT THIS REPLACES
-The Qt startup's "Setup needed" notice asked `onboarding.needs_onboarding`,
-which looks only for `vault/.onboarded` — a marker the Tk wizard writes and
+The Qt startup's "Setup needed" notice asked `needs_onboarding`, which
+looks only for `vault/.onboarded` — a marker the retired Tk wizard wrote and
 nothing else does. setup.bat / setup_council.py never write it, so a user who
 installed through them, or who started with the Qt app, was told "Setup
 needed" with a working model configured. The other way round, a vault that
@@ -19,7 +19,7 @@ the Judge), through the slot model_slots.json gives that role:
 
   1. The slot's model ("main" follows the main model: the COUNCIL_GGUF_PATH a
      user exported, else the one saved in the app, else the launcher's pick —
-     onboarding.load_gguf_path): a GGUF file that is on disk AND a
+     backend_settings.load_gguf_path): a GGUF file that is on disk AND a
      llama-cpp-python to load it, or an "ollama:<name>" model the local
      Ollama has (no fallback from one of those, as in the engine).
   2. Otherwise the engine's own fallback (council_engine._route_chat): with
@@ -33,8 +33,8 @@ ready with main on a model that was not pulled (the Writer and the Judge use
 main), and a 400 GB model counted on a 32 GB PC. And an Ollama that is not
 running yet is named as such, not as "no model is configured".
 
-The Tk wizard still decides on the marker (onboarding.run_if_needed): that is
-"has this person been walked through setup", a different question.
+The marker (backend_settings.needs_onboarding) answers "has this person been
+walked through setup", a different question.
 
 ONLY METADATA, ONLY LOOPBACK
 Ollama is asked /api/version and /api/tags through local_models, which refuses
@@ -91,8 +91,8 @@ def _off(name: str) -> bool:
 
 def _main_model(vault: Path) -> str:
     try:
-        import onboarding
-        return onboarding.load_gguf_path(vault) or ""
+        from . import backend_settings
+        return backend_settings.load_gguf_path(vault) or ""
     except Exception:                                     # noqa: BLE001
         return os.environ.get("COUNCIL_GGUF_PATH", "").strip()
 

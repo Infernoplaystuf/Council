@@ -1143,163 +1143,6 @@ def test_the_dream3d_chat_without_a_council_takes_typed_text(qapp, d3d,
 
 
 # ============================================================
-# Tk: the same doors, and every other route into _send
-# ============================================================
-
-class FakeText:
-    def __init__(self, text=""):
-        self.text = text
-
-    def get(self, *_a):
-        return self.text
-
-
-@pytest.fixture
-def tk(vault, monkeypatch):
-    """The real Tk methods on a stand-in console; tkinter's askyesno
-    answers ``env.answer`` and records what it was asked."""
-    import tkinter.messagebox
-    import council_gui_engine as cge
-    monkeypatch.setattr(cge, "VAULT_DIR", vault)
-    env = SimpleNamespace(answer=True, asked=[])
-
-    def askyesno(title, text, **kw):
-        env.asked.append((title, text, kw))
-        return env.answer
-    monkeypatch.setattr(tkinter.messagebox, "askyesno", askyesno)
-    C = cge.CouncilConsole
-
-    class Console:
-        _send_typed = C._send_typed
-        _take_over_typed = C._take_over_typed
-        _take_over_confirm = C._take_over_confirm
-        _handle_pipeline_intent = C._handle_pipeline_intent
-        _dream3d_take_over_selected = C._dream3d_take_over_selected
-        _dream3d_send_from_input = C._dream3d_send_from_input
-        _stt_send_to_council = C._stt_send_to_council
-
-        def __init__(self, text=""):
-            self.input = FakeText(text)
-            self.dream3d_input = FakeText()
-            self.stt_out = FakeText()
-            self.nb = SimpleNamespace(select=lambda *_a: None)
-            self.tab_council = None
-            self.said, self.sent, self.typed, self.view = [], [], [], ""
-            self.selection = None
-
-        def _set_text(self, widget, text):
-            widget.text = text
-
-        def _append_transcript(self, who, text, kind="final"):
-            self.said.append((who, text, kind))
-
-        def _send(self):
-            self.sent.append(self.input.text)
-
-        def _set_status(self, *_a):
-            pass
-
-        def _dream3d_refresh_pipelines(self):
-            pass
-
-        def _dream3d_set_view(self, text):
-            self.view = text
-
-        def _nx_selected_pipeline(self):
-            return self.selection
-
-    env.Console = Console
-    return env
-
-
-def said_text(console) -> str:
-    return "\n".join(t for _w, t, _k in console.said)
-
-
-def test_tk_typed_take_over_asks_and_acts_on_yes(tk, vault, dialogs_on):
-    p = put(vault, "pipelines/out/seg_five.py", stamped())
-    c = tk.Console("take over seg_five.py")
-    c._send_typed()
-    [(title, text, kw)] = tk.asked
-    assert title == st.TITLE and kw["default"] == "no"
-    assert "write and delete files anywhere your account can" in text
-    assert p.read_bytes() == USER_CODE.encode()
-    assert "Took over pipelines/out/seg_five.py" in said_text(c)
-    assert c.sent == []                          # never a deliberation
-    assert c.input.text == ""
-
-
-def test_tk_typed_take_over_no_changes_nothing(tk, vault, dialogs_on):
-    p = put(vault, "pipelines/out/seg_five.py", stamped())
-    before = p.read_bytes()
-    tk.answer = False
-    c = tk.Console("take over seg_five.py")
-    c._send_typed()
-    assert len(tk.asked) == 1
-    assert untouched(vault, p, before)
-
-
-def test_tk_under_no_dialogs_never_asks(tk, vault, monkeypatch):
-    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
-    p = put(vault, "pipelines/out/seg_five.py", stamped())
-    before = p.read_bytes()
-    c = tk.Console("take over seg_five.py")
-    c._send_typed()
-    assert tk.asked == []
-    assert untouched(vault, p, before)
-    assert "COUNCIL_NO_DIALOGS" in said_text(c)
-
-
-def test_tk_other_text_goes_on_to_send(tk, dialogs_on):
-    c = tk.Console("take over the world")
-    c._send_typed()
-    assert c.sent == ["take over the world"] and tk.asked == []
-
-
-def test_tk_every_other_route_answers_without_acting(tk, vault, dialogs_on):
-    """_send's own intent handler — behind the history re-ask, the disagree
-    re-run, the CPU retry, Expand and a speech transcription — answers the
-    words and acts on nothing."""
-    p = put(vault, "pipelines/out/seg_five.py", stamped())
-    before = p.read_bytes()
-    c = tk.Console()
-    assert c._handle_pipeline_intent("take over seg_five.py") is True
-    assert c.said == [("Council", st.NOT_HERE, "observation")]
-    assert tk.asked == []
-    assert untouched(vault, p, before)
-
-
-def test_tk_a_transcription_is_not_typed_text(tk, dialogs_on):
-    """Speech-to-text is a model's output: it goes to _send, not the door."""
-    c = tk.Console()
-    c._send_typed = never
-    c.stt_out.text = "take over seg_five.py"
-    c._stt_send_to_council()
-    assert c.sent == ["take over seg_five.py"]
-
-
-def test_tk_the_dream3d_box_is_typed_text(tk, vault, dialogs_on):
-    p = put(vault, "pipelines/out/seg_five.py", stamped())
-    c = tk.Console()
-    c.dream3d_input.text = "take over seg_five.py"
-    c._dream3d_send_from_input()
-    assert len(tk.asked) == 1 and p.read_bytes() == USER_CODE.encode()
-
-
-def test_tk_the_button(tk, vault, dialogs_on):
-    p = put(vault, "pipelines/in/theirs.py", stamped())
-    c = tk.Console()
-    c._dream3d_take_over_selected()
-    assert "Select a model-written script" in c.view and tk.asked == []
-    c.selection = SimpleNamespace(name="theirs.py", path=str(p))
-    c._dream3d_take_over_selected()
-    assert len(tk.asked) == 1 and p.read_bytes() == USER_CODE.encode()
-    assert "Took over pipelines/in/theirs.py" in c.view
-    [rec] = log_records(vault)
-    assert rec["via"] == "the Take over button (Tk Dream3D tab)"
-
-
-# ============================================================
 # The invariant, read from the source
 # ============================================================
 
@@ -1395,9 +1238,6 @@ def test_only_the_doors_can_take_a_script_over():
         ("council_qt/tabs/council.py", "CouncilTab._take_over"),
         ("council_qt/tabs/dream3d.py", "Dream3DTab._take_over_typed"),
         ("council_qt/tabs/dream3d.py", "Dream3DTab.on_take_over"),
-        ("council_gui_engine.py", "CouncilConsole._take_over_typed"),
-        ("council_gui_engine.py",
-         "CouncilConsole._dream3d_take_over_selected"),
     }, acts
 
 
@@ -1422,20 +1262,7 @@ def test_each_door_is_reached_only_from_the_users_send_or_click():
          "take_over_ref"),
         ("council_qt/tabs/dream3d.py", "Dream3DTab._pipeline_side",
          "on_take_over"),
-        # Tk: Send / Ctrl+Enter, the Dream3D box, the button.
-        ("council_gui_engine.py", "CouncilConsole._build_council_tab",
-         "_send_typed"),
-        ("council_gui_engine.py", "CouncilConsole._dream3d_send_from_input",
-         "_send_typed"),
-        ("council_gui_engine.py", "CouncilConsole._send_typed",
-         "_take_over_typed"),
-        ("council_gui_engine.py", "CouncilConsole._take_over_typed",
-         "take_over_ref"),
-        ("council_gui_engine.py", "CouncilConsole._build_dream3d_tab",
-         "_dream3d_take_over_selected"),
         # Answered, never acted on.
-        ("council_gui_engine.py", "CouncilConsole._handle_pipeline_intent",
-         "take_over_ref"),
         ("council_core/pipeline_intent.py", "candidates", "take_over_ref"),
     }, sorted(uses)
 

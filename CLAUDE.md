@@ -2,15 +2,26 @@
 
 ## The Tk shell is retired
 
-The Qt app (`council_qt/`, with `council_core/` behind it) is the only app being
-worked on. Everything that belongs to the old Tk shell is a deprecated relic kept
-only until it is deleted: `council_gui_engine.py`, `council_modules.py`, and any
-module or code path that imports `tkinter`.
+The Qt app (`council_qt/`, with `council_core/` behind it) is the only app. The
+old Tk shell was deleted on 2026-10-23: `council_gui_engine.py`,
+`council_modules.py`, `onboarding.py`, the Tk-only modules beside them and
+`Version_History/` (`tests/test_retired_tests.py` lists them and fails if a
+merge brings one back). The Tk windows that sat in otherwise shared modules
+(`vault_agent.py`, `sage_agent.py`, `apothecary_engine.py`, `gui_wizard.py`,
+`system_panel.py`, `crash_reporter.py`, `branding.py`) were cut out; their pure
+parts stay. The saved-model helpers the Qt app used from `onboarding.py` are
+now `council_core/backend_settings.py`. The launchers' `--tk` /
+`COUNCIL_UI=tk` only print that Tk was retired, and `council.spec` builds
+`council_qt.py`. Git history has the deleted code.
 
-- Don't build on it, import from it, edit it, or port fixes into it.
-- When something useful only exists there, rebuild it in `council_core/` (no
+- Don't bring any of it back, and don't write new code that imports `tkinter`.
+- When something useful only existed there, rebuild it in `council_core/` (no
   tkinter) and use it from the Qt app.
 - Don't write tests that need tkinter or compare the Qt app with the Tk shell.
+- The GUI Designer's Tk *target* (it can generate a tkinter app for the user:
+  `gui_emit.py`, `python_envs.py`) is a feature, not the shell, and stays.
+- Still to clean up: `tests/smoke_test.py` has checks that import
+  `council_gui_engine` and now skip themselves.
 
 ## Retired tests
 
@@ -27,6 +38,48 @@ same list.
   `test_the_tk_console_applies_them_through_the_same_function`
   (`tests/test_launch.py`): ran, and read the source of, the Tk console's
   engine-settings loader. The Qt launch's own engine-settings tests stay.
+- Retired with the Tk shell (2026-10-23), each needing a deleted Tk module
+  (the reasons are in `tests/test_retired_tests.py`):
+  - whole files `tests/test_gui_canvas.py`, `tests/test_gui_tab.py`;
+  - `test_the_tk_entry_applies_it_before_council_engine_is_imported`
+    (`test_saved_model_path.py`); `test_the_cog_is_point_for_point_the_tk_one`,
+    `test_the_flame_is_point_for_point_the_tk_one` (`test_splash.py`);
+    `test_gui_canvas_still_exports_the_table` (`test_designer_canvas_qt.py`);
+    `test_importing_the_tk_module_after_the_pin_keeps_qt_memory`
+    (`test_memory_scope.py`); `test_the_close_work_is_shared_with_the_tk_shell`
+    (`test_council_qt_foundation.py`, now
+    `test_the_qt_entry_does_the_close_work`);
+    `test_the_tk_writer_uses_the_max_path_safe_name_and_the_stamp`
+    (`test_nx_containment.py`);
+  - `test_council_core.py`: `test_both_front_ends_call_the_same_function`,
+    `test_every_extracted_operation_is_used_by_both_front_ends`,
+    `test_the_data_operations_are_used_by_both_front_ends`,
+    `test_both_front_ends_search_through_the_shared_module`,
+    `test_the_jobs_are_used_by_both_front_ends` (their Qt halves are now the
+    `test_the_qt_tab_*` tests), and
+    `test_the_engine_no_longer_carries_its_own_clone_implementation`,
+    `test_the_engine_no_longer_carries_the_import_helpers`,
+    `test_the_import_workers_no_longer_touch_tk_variables`,
+    `test_the_engine_keeps_the_names_the_smoke_suite_uses`;
+  - `test_transcript.py`: `test_the_tk_shell_renders_through_the_shared_module`,
+    `test_every_policy_decision_is_made_in_one_place`,
+    `test_the_tk_shell_no_longer_repaints_an_error_after_writing_it`,
+    `test_both_transcripts_are_configured_from_the_same_description`,
+    `test_the_tk_helpers_apply_segments_without_reinterpreting_them`,
+    `test_the_engine_builds_no_widget_at_import`,
+    `test_the_tk_shell_writes_exactly_what_render_says`,
+    `test_the_two_transcripts_receive_identical_writes`,
+    `test_the_widget_is_left_read_only`,
+    `test_the_deferred_turn_is_still_captured`,
+    `test_phases_and_tokens_stay_out_of_the_stored_conversation`,
+    `test_every_speaker_the_engine_actually_uses_has_a_colour`;
+  - `test_vault_setup.py`: `test_the_tk_engine_calls_the_same_functions`,
+    `test_tk_moves_an_upgraders_files`, `test_tk_sets_up_the_data_folders`;
+  - `test_graph_export.py`: `test_every_export_call_site_handles_the_refusal`,
+    `test_the_tick_is_guarded_by_the_refusal_handler`;
+  - `test_script_takeover.py`: the eight `test_tk_*` door tests;
+  - `smoke_test.py`: `test_db_wizard_url_assembly`, `test_no_bare_re_in_gui`,
+    `test_plots_pane_core`.
 
 ## Standing rules (all branches)
 

@@ -587,11 +587,10 @@ def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
 def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
                                                           monkeypatch):
     """The review's probe, as a test: a model saved the way the app saves one
-    (onboarding.save_gguf_path, model_slots.save), then a Qt launch. On the
+    (backend_settings.save_gguf_path, model_slots.save), then a Qt launch. On the
     base there was no data_in/ at all; with batch 0 both files were copied
     into it and the data index offered them as datasets."""
-    import onboarding
-    from council_core import model_slots
+    from council_core import backend_settings, model_slots
 
     # save_gguf_path also exports the choice; recorded so it is put back.
     monkeypatch.setenv("COUNCIL_GGUF_PATH", "placeholder")
@@ -601,7 +600,7 @@ def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
     model = tmp_path / "models" / "granite.gguf"
     model.parent.mkdir()
     model.write_bytes(b"GGUF" + b"\0" * 64)
-    assert onboarding.save_gguf_path(vault, str(model)) is None
+    assert backend_settings.save_gguf_path(vault, str(model)) is None
     model_slots.save(vault, model_slots.SlotConfig(slots={
         "main": model_slots.Slot("main", str(model)),
         "coding": model_slots.Slot("coding", "ollama:llama3.1:8b")}))

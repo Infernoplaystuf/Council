@@ -2402,8 +2402,8 @@ def role_model(role: str, vault_dir=None) -> str:
         if env:
             return env
         try:
-            import onboarding
-            return onboarding.load_gguf_path(vault) or ""
+            from . import backend_settings
+            return backend_settings.load_gguf_path(vault) or ""
         except Exception:                                 # noqa: BLE001
             return ""
     except Exception:                                     # noqa: BLE001
