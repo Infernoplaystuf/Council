@@ -415,6 +415,35 @@ def test_re_run_with_my_answers(qapp, books):
     tab.filled_dialog.close()
 
 
+def test_re_run_with_my_answers_from_the_tab(qapp, books):
+    """user, 2026-10-26: 'Why don't we put that button in the extract and
+    review section in the tab as well'."""
+    from council_core import ledger_review as lv
+    template, src, _ = books
+    tab, _ = make_tab(qapp)
+    assert not tab.rerun_btn.isEnabled()                    # no review yet
+    tab.template.setText(str(template))
+    tab.on_create()
+    assert tab.wait(60)
+    tab.add_sources([src])
+    tab.on_extract()
+    assert tab.wait(120)
+    first = tab.review.text()
+    assert tab.rerun_btn.isEnabled()
+    held = [i for i in lv.load(first).items if i.needs]
+    date = next(i for i in held if i.part == "101" and i.fields == ["Date"])
+    lv.save(first, {(date.sheet, date.row): {"accept": "Y"}})   # an answer saved
+    assert tab.on_rerun_from_tab()
+    assert tab.wait(180)
+    again = tab.review.text()
+    assert again != first and Path(first).exists()
+    assert ParentCSV(tab.csv.text()).get("101", "")["Date"] == "2026-10-01"
+    now = {(i.part, i.item, tuple(i.fields), i.where): i for i in lv.load(again).items}
+    assert now[("101", "", ("Date",), date.where)].accept == "Y"     # not asked again
+    assert "Re-run with your answers" in tab.log.toPlainText()
+    assert getattr(tab, "filled_dialog", None) is None      # no window opened
+
+
 def test_a_saved_ledger_is_picked_again_and_updated_with_new_files(qapp, tmp_path):
     """user, 2026-10-23: 'the folders it was run on get more data in them I
     want to be able to rerun from that stage'; runs 'saved, catergorized,

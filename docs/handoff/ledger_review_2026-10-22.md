@@ -81,6 +81,10 @@ more confidently?"
   The filled templates are written again after that.
 - A new review never takes an existing name (`default_review_for` adds
   `_2`, `_3`…): the old review is kept.
+- The same button is in the tab's step 3 too (2026-10-26, Andy: "put that
+  button in the extract and review section in the tab as well"):
+  `LedgerTab.on_rerun_from_tab` re-runs the review workbook named there with
+  the answers saved into it, and does not open the filled template window.
 - Not done (offered, not yet agreed): a Wrong teaching "label X is not field
   F" for other parts, and re-checking only the uncertain values for speed.
   The re-run reads every source twice (Apply, then Extract).
