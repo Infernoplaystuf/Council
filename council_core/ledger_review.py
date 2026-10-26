@@ -499,8 +499,6 @@ def write_filled(review: Review, part: str, out_path,
     import shutil
 
     import openpyxl
-    from openpyxl.comments import Comment
-    from openpyxl.styles import PatternFill
     from sample_ledger import TemplateSchema, schema_path_for
     schema = TemplateSchema.load(schema_path_for(review.csv))
     template = Path(schema.template_path)
@@ -515,27 +513,107 @@ def write_filled(review: Review, part: str, out_path,
     shutil.copyfile(template, tmp)
     wb = openpyxl.load_workbook(tmp)
     try:
-        for (sheet, (r, c)), (fname, value) in known.items():
-            ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
-            cell = ws.cell(row=r, column=c)
-            cell.value = _cell_value(value)
-            tint = TINT_LEDGER[1:]
-            cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
-            cell.comment = Comment(f"{fname}: {value}\nalready in the Ledger", "Council")
-        for (sheet, (r, c)), cands in cell_candidates(review.items, exact, part).items():
-            ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
-            it = cands[0]
-            cell = ws.cell(row=r, column=c)
-            cell.value = _cell_value(it.value)
-            was = (known.get((sheet, (r, c))) or ("", ""))[1]
-            tint = (TINT_CLASH if differs(it.value, was) else confidence_tint(it))[1:]
-            cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
-            others = [o.value for o in cands[1:] if o.value != it.value]
-            cell.comment = Comment(
-                f"{it.fields[0]}: {it.value}\nfrom {it.where}\nscore {it.score:g}"
-                + (f" (accepted)" if it.accept == "Y" else "")
-                + (f"\nthe Ledger has {was}" if differs(it.value, was) else "")
-                + (f"\nalso offered: {', '.join(others[:5])}" if others else ""), "Council")
+        _fill_part(lambda sheet: wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0],
+                   review, part, exact, known)
+        wb.save(tmp)
+    finally:
+        wb.close()
+    os.replace(tmp, out)
+    return str(out)
+
+
+def _fill_part(sheet_of: Callable[[str], Any], review: Review, part: str,
+               exact: Dict[Tuple[str, str], Tuple[str, Cell]],
+               known: Dict[Tuple[str, Cell], Tuple[str, str]]) -> None:
+    """``part``'s values written into the template's sheets (``sheet_of``:
+    a template sheet's name -> the worksheet to write), tinted, each with a
+    note of where it was read (write_filled)."""
+    from openpyxl.comments import Comment
+    from openpyxl.styles import PatternFill
+    for (sheet, (r, c)), (fname, value) in known.items():
+        cell = sheet_of(sheet).cell(row=r, column=c)
+        cell.value = _cell_value(value)
+        tint = TINT_LEDGER[1:]
+        cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+        cell.comment = Comment(f"{fname}: {value}\nalready in the Ledger", "Council")
+    for (sheet, (r, c)), cands in cell_candidates(review.items, exact, part).items():
+        it = cands[0]
+        cell = sheet_of(sheet).cell(row=r, column=c)
+        cell.value = _cell_value(it.value)
+        was = (known.get((sheet, (r, c))) or ("", ""))[1]
+        tint = (TINT_CLASH if differs(it.value, was) else confidence_tint(it))[1:]
+        cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+        others = [o.value for o in cands[1:] if o.value != it.value]
+        cell.comment = Comment(
+            f"{it.fields[0]}: {it.value}\nfrom {it.where}\nscore {it.score:g}"
+            + (" (accepted)" if it.accept == "Y" else "")
+            + (f"\nthe Ledger has {was}" if differs(it.value, was) else "")
+            + (f"\nalso offered: {', '.join(others[:5])}" if others else ""), "Council")
+
+
+def full_filled_path(review_path) -> Path:
+    """The whole review's filled workbook: beside it, '<review>_filled.xlsx'."""
+    p = Path(review_path)
+    return p.with_name(p.stem + "_filled.xlsx")
+
+
+def write_full_filled(review: Review, progress=None, active: str = "") -> Optional[str]:
+    """One workbook of the whole review (user, 2026-10-26: "unable to export
+    the full filled out workbook after the extraction has been run. I can
+    just see the review"): the template filled in once per part, a sheet
+    each in numerical order (as Apply's full workbook, ledger_groups), each
+    value tinted by confidence with a note of where it was read
+    (write_filled). Rewritten with the answers saved so far; never over a
+    file the Ledger did not write; atomic. It opens at ``active``'s sheet.
+    None for a table review, or one with no parts or no template cells."""
+    import openpyxl
+    from council_core.ledger_groups import _title
+    from sample_ledger import (FILLED_MARK, TemplateSchema, is_filled_template,
+                               sample_sort_key, schema_path_for)
+    if review.kind != "samples" or not review.csv:
+        return None
+    exact = template_cells(review.csv)
+    names = sorted(parts(review), key=sample_sort_key)
+    if not exact or not names:
+        return None
+    out = full_filled_path(review.path)
+    if out.exists() and not is_filled_template(out):
+        raise LedgerError(f"{out.name} is there already and the Ledger did not write it: "
+                          "move it to write the filled workbook")
+    template = Path(TemplateSchema.load(schema_path_for(review.csv)).template_path)
+    if out.resolve() == template.resolve():
+        raise LedgerError("refusing to write over the template itself")
+    held = ledger_reader(review.csv)
+    wb = openpyxl.load_workbook(template)
+    tmp = out.with_name(out.stem + ".writing" + out.suffix)
+    try:
+        originals = list(wb.worksheets)
+        several = len(originals) > 1
+        used: set = set()
+        opening = None
+        for n, part in enumerate(names, 1):
+            if progress is not None:
+                progress(f"filling the workbook: {part} ({n}/{len(names)})")
+            sheets = {}
+            for ws in originals:
+                copy = wb.copy_worksheet(ws)
+                copy.title = _title(part, ws.title, several, used)
+                sheets[ws.title] = copy
+            first = sheets[originals[0].title]
+            _fill_part(lambda sheet: sheets.get(sheet, first), review, part, exact,
+                       ledger_cells(held, part, exact))
+            if part == active:
+                opening = first
+        for ws in originals:
+            wb.remove(ws)
+        wb.active = wb.worksheets.index(opening) if opening is not None else 0
+        for ws in wb.worksheets:
+            ws.sheet_view.tabSelected = ws is wb.active
+        try:
+            wb.properties.keywords = FILLED_MARK
+        except Exception:                                   # noqa: BLE001
+            pass
+        out.parent.mkdir(parents=True, exist_ok=True)
         wb.save(tmp)
     finally:
         wb.close()

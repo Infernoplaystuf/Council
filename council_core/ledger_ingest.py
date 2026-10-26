@@ -224,6 +224,14 @@ class ExtractSummary:
     #: confidence (ledger_review.write_all_filled; user, 2026-10-23)
     filled: str = ""
     filled_count: int = 0
+    #: every part's filled template in one workbook, a sheet each
+    #: (ledger_review.write_full_filled; user, 2026-10-26)
+    filled_book: str = ""
+    #: pictures read that had no text in them (a photo): not failures, so
+    #: not among the ones not read (user, 2026-10-26: "only getting about
+    #: 1/3 to 1/2 of the images read"); and why the others were not read
+    images_blank: int = 0
+    images_unread: str = ""
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -231,7 +239,10 @@ class ExtractSummary:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
-             f"images read")
+             f"images read"
+             + (f" ({self.images_blank} more had no text in them)" if self.images_blank
+                else "")
+             + (f"; not read: {self.images_unread}" if self.images_unread else ""))
         if self.cancelled:
             s = ("CANCELLED after every workbook was read — " if self.read_all else
                  "CANCELLED — ") + s
@@ -254,6 +265,8 @@ class ExtractSummary:
             s += (f"\nThe template filled in for {self.filled_count} part(s), each value "
                   f"tinted by how sure it is (green sure, yellow fairly, orange unsure, red "
                   f"disagreeing): {self.filled}")
+        if self.filled_book:
+            s += f"\nEvery part's filled template in one workbook: {self.filled_book}"
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
@@ -331,6 +344,29 @@ def summarize_slowest(timings, top: int = 5) -> str:
 def _images_read(notes) -> int:
     return sum(1 for n in notes if n.reader not in ("", "none installed")
                and not n.text.startswith(("reader failed", "(no text found)")))
+
+
+def _images_blank(notes) -> int:
+    """Pictures read that had no text in them."""
+    return sum(1 for n in notes if n.reader not in ("", "none installed")
+               and n.text.startswith("(no text found)"))
+
+
+def _images_unread(notes) -> str:
+    """Why the pictures not read were not, counted: '3 Excel could not copy
+    out, 1 the reader failed'."""
+    from collections import Counter
+    why: Counter = Counter()
+    for n in notes:
+        if n.text.startswith("(no text found)") or (
+                n.reader not in ("", "none installed") and not n.text.startswith("reader")):
+            continue
+        why["the reader failed" if n.text.startswith("reader failed") else
+            "no image reader installed" if n.reader == "none installed" else
+            "Excel could not copy them out" if "Excel could not copy" in n.text else
+            "EMF/WMF drawings (Windows only)" if "drawing, which" in n.text else
+            "other"] += 1
+    return ", ".join(f"{k} {w}" for w, k in why.most_common())
 
 
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
@@ -552,6 +588,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                  pattern_mask=pattern_mask or "", part=part or "",
                  pattern_hint=pattern_saved, prefer=prefer)
     filled: List[str] = []
+    filled_book = ""
     if not run.cancelled:
         prog.stage("filling in the template for each part")
         try:
@@ -559,6 +596,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             filled = ledger_review.write_all_filled(ledger_review.load(out), say)
         except Exception as e:                              # noqa: BLE001
             run.problems.append(f"the filled templates were not written: {e}")
+        try:
+            # every part in one workbook, a sheet each (user, 2026-10-26)
+            filled_book = ledger_review.write_full_filled(ledger_review.load(out), say) or ""
+        except Exception as e:                              # noqa: BLE001
+            run.problems.append(f"the filled workbook was not written: {e}")
     ok = sum(d.accept for d in dec)
     aside = sum(bool(d.alternate) for d in dec)
     return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
@@ -581,7 +623,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                               "track were left out (Groups…)"] if untracked else []),
                           review_reasons=summarize_review_reasons(dec, ledger.schema),
                           filled=str(Path(filled[0]).parent) if filled else "",
-                          filled_count=len(filled))
+                          filled_count=len(filled), filled_book=filled_book,
+                          images_blank=_images_blank(run.images),
+                          images_unread=_images_unread(run.images))
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,

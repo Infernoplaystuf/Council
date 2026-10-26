@@ -1289,16 +1289,19 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
                     if (r, cc) != (rng.min_row, rng.min_col) and isinstance(top, str):
                         cells.setdefault((r, cc), _Merged(top))
         grids.append(Grid(path.name, ws.title, cells))
-        for img in (getattr(ws, "_images", []) if want_pictures else []):
-            try:
-                data = img._data()
-                fr = img.anchor._from
-                anchor = f"{get_column_letter(fr.col + 1)}{fr.row + 1}"
-            except Exception:
-                continue
-            images.append(SourceImage(path.name, ws.title, anchor, data,
-                                      (getattr(img, "format", None) or "png").lower()))
     wb.close()
+    if want_pictures:
+        # from the zip (excel_open.zip_pictures), not openpyxl's: it dropped
+        # pictures in a group, at a fixed position, placed in a cell, EMF /
+        # WMF ones, and a whole sheet's when its drawing held anything it did
+        # not understand (user, 2026-10-26: "only getting about 1/3 to 1/2 of
+        # the images read")
+        order = {ws_name: i for i, ws_name in enumerate(g.sheet for g in grids)}
+        found = excel_open.zip_pictures(io.BytesIO(data) if data is not None else path)
+        for (sheet, anchor), pics in sorted(found.items(),
+                                            key=lambda kv: order.get(kv[0][0], len(order))):
+            for blob, ext in pics:
+                images.append(SourceImage(path.name, sheet, anchor, blob, ext or "png"))
     for ex in excel_open.zip_extras(io.BytesIO(data) if data is not None else path):
         # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
@@ -3229,6 +3232,22 @@ def ollama_vision_reader(model: Optional[str] = None) -> Optional[ImageReader]:
     return read
 
 
+def _as_raster(data: bytes, ext: str) -> Tuple[bytes, str, str]:
+    """An EMF / WMF drawing as a PNG the image readers take: (data, ext, '')
+    - or as it was, with why it could not be (Pillow draws them only on
+    Windows)."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "PNG")
+        return buf.getvalue(), "png", ""
+    except Exception:                                       # noqa: BLE001
+        return data, ext, (f"an {ext.upper()} drawing, which can be turned into a picture to "
+                           "read only on Windows; it is saved as it was")
+
+
 def default_image_reader() -> Optional[ImageReader]:
     """Tesseract when it is installed, else nothing: the images are saved for
     a person to read. A vision model is never chosen on its own."""
@@ -3573,6 +3592,10 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                                         "not read: Excel could not copy it out (see the "
                                         "problems)"))
             continue
+        # an EMF / WMF drawing: the readers take a picture (_as_raster)
+        vector = ""
+        if (img.ext or "").lower() in ("emf", "wmf"):
+            img.data, img.ext, vector = _as_raster(img.data, img.ext)
         if image_dir:
             d = Path(image_dir)
             # every part cleaned: a sheet, anchor or extension may hold
@@ -3603,6 +3626,10 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                     run.problems.append(f"{_PICTURES_TOO_LONG} ({n} characters) — enable "
                                         "Windows long paths or move the folder")
         note = ImageNote(img.file, img.sheet, img.anchor, img.saved_as, "", "")
+        if vector:
+            note.text = f"not read: {vector}"
+            run.images.append(note)
+            continue
         if reader is not None:
             note.reader = getattr(reader, "name", "image reader")
             try:
