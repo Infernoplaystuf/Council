@@ -411,8 +411,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         arow = QHBoxLayout()
         self.ask_edit = QLineEdit()
         self.ask_edit.setPlaceholderText("Ask the graph, e.g. 'who works on the Falcon "
-                                         "retrofit?' or 'how is Nordic Forge connected to "
-                                         "KA-101?'")
+                                         "retrofit?', 'how is Nordic Forge connected to "
+                                         "KA-101?' or 'what was the hardness of PN-4471?'")
         self.ask_edit.returnPressed.connect(self.on_ask)
         arow.addWidget(self.ask_edit, 1)
         self.ask_btn = self._button(arow, "Ask", self.on_ask)
@@ -1316,6 +1316,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
             parts.append("No model chosen: here is what the graph holds - the facts below.")
         self.answer.setPlainText("\n".join(parts))
         for ctx in got.get("contexts") or []:
+            if ctx.get("rows"):
+                self._answer_rows(ctx["rows"])
+            if not ctx["entities"]:
+                continue
             names = ", ".join(display_name(e) for e in ctx["entities"])
             g = QTreeWidgetItem([f"About {names}", "", ""])
             g.setFirstColumnSpanned(True)
@@ -1340,6 +1344,27 @@ class ConnectionsTab(ViewHelpers, QWidget):
                     e_item.setData(0, ROLE_DATA, ev)
                     item.addChild(e_item)
             g.setExpanded(True)
+
+    def _answer_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """The rows of the files an answer used (the Contents layer), each
+        previewed when picked."""
+        g = QTreeWidgetItem(["Rows of your files", "", ""])
+        g.setFirstColumnSpanned(True)
+        f = g.font(0)
+        f.setBold(True)
+        g.setFont(0, f)
+        self.facts.addTopLevelItem(g)
+        for r in rows:
+            cells = " | ".join(f"{c['label']}: {c['text']}" for c in r["cells"])
+            head = r["file"] + (f" › {r['sheet']}" if r.get("sheet") else "")
+            item = QTreeWidgetItem([f"[{r['n']}] {cells}", "", f"{head} · {r['where']}"])
+            item.setToolTip(0, cells)
+            item.setData(0, ROLE_KIND, "evidence")
+            item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
+                                        "where": r["where"], "file": r["file"],
+                                        "quote": (r.get("matched") or [""])[0]})
+            g.addChild(item)
+        g.setExpanded(True)
 
     def on_fields(self) -> None:
         if self._busy or self._kg is None:

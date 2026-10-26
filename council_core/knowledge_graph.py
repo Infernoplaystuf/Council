@@ -48,7 +48,8 @@ What is in the store (schema version ``SCHEMA_VERSION``, documented in
   contents_docs, fields, vals, cells (v5) the Contents layer
              (council_core/kg_contents.py): every cell of every CSV and
              workbook under its header or label, whatever the field rules
-             say, with full-text search over it.
+             say, with full-text search over it. (v6) fields.unit: text
+             documents' lines and JSON objects too.
 
 Seeding reads "records": a table row, a JSON object, or one document's labelled
 header fields. Two values in one row are a strong link (seeded); values that
@@ -89,7 +90,7 @@ from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tu
 
 from council_core import file_guard, kg_contents
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
@@ -570,6 +571,9 @@ def _json_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     except Exception:
         return []
     lines = text.splitlines()
+    sink = contents_now()
+    if sink is not None:          # every key, not only the rules'
+        sink.json_data(text, data)
     out: List[Record] = []
     cursor = [0]
 
@@ -3007,12 +3011,14 @@ class KnowledgeGraph:
                     cached = None if why else self._cached(did, h, sig)
                     if cached is not None and pictures_wait(cached):
                         cached = None
-                    tabular = p.suffix.lower() in _TABULAR
+                    # every document the graph reads goes into the
+                    # Contents layer (tables, text, JSON)
+                    contents_on = p.suffix.lower() in SUPPORTED_SUFFIXES
                     # read before the Contents layer existed (or its rows
                     # went): read again, so every cell is in it - not one
                     # that can never be read (a password: Excel is not
                     # started for it again)
-                    if cached is not None and tabular and \
+                    if cached is not None and contents_on and \
                             not kg_contents.current(self.db, did, h) and \
                             not _reading_load(cached["records"]).get("error"):
                         cached = None
@@ -3038,8 +3044,9 @@ class KnowledgeGraph:
                                         force=True)
                         else:
                             prog.update(f"reading {rel}")
-                        sink = kg_contents.Sink() if tabular else None
+                        sink = kg_contents.Sink() if contents_on else None
                         ctok = _CONTENTS.set(sink)
+                        text_lines = None
                         try:
                             # too slow, or stalled the app before: skipped,
                             # the rebuild goes on (council_core.file_guard);
@@ -3048,6 +3055,10 @@ class KnowledgeGraph:
                                 p, lambda p=p, rel=rel: read_records(p, rel, rules),
                                 tab="Connections")
                             if sink is not None:
+                                if p.suffix.lower() in _TEXT:
+                                    # its lines, read once: the gazetteer's too
+                                    text_lines = document_lines(p)
+                                    sink.text_lines(text_lines)
                                 prog.update(f"{rel}: keeping {sink.n_cells:,} cells")
                                 kg_contents.store(self.db, did, h, sink, contents_values)
                                 contents_changed = True
@@ -3069,7 +3080,8 @@ class KnowledgeGraph:
                         if reading is not None:
                             lines = list(reading.lines)
                         else:
-                            lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
+                            lines = [] if p.suffix.lower() in _TABULAR else (
+                                text_lines if text_lines is not None else document_lines(p))
                         # Obsidian-style [[Name]] references are found in
                         # these lines by the graph phase (_seed_wikilinks),
                         # for every document - read now or unchanged.
@@ -3113,7 +3125,8 @@ class KnowledgeGraph:
             _AS_LINES.reset(as_lines)
         # The Contents layer of what could be read; a document gone or not
         # readable now leaves it. Values are counted again only after a change.
-        keep_contents = {did for p, did, _h in readable if p.suffix.lower() in _TABULAR}
+        keep_contents = {did for p, did, _h in readable
+                         if p.suffix.lower() in SUPPORTED_SUFFIXES}
         held = {r[0] for r in self.db.execute("SELECT document_id FROM contents_docs")}
         if contents_changed or held - keep_contents:
             prog.update("counting the values of every file", force=True)
@@ -4900,6 +4913,13 @@ class KnowledgeGraph:
             f["file"] = self.display_path(f["path"])
             f["summary"] = kg_contents.summary(f)
         return out
+
+    def question_rows(self, question: str, max_rows: int = 12) -> Dict[str, Any]:
+        """The rows of the files a question is about (kg_contents.
+        question_rows): for the Council's answers and Ask the graph."""
+        if not self.has_contents():
+            return {"rows": [], "fields": [], "words": []}
+        return kg_contents.question_rows(self.db, question, max_rows=max_rows)
 
     def search_contents(self, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
         """Files, fields (headers and labels) and values matching ``text``,

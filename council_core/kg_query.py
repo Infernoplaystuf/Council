@@ -19,6 +19,13 @@ found - with the paths between them - to the model beside the retrieved text
   * every fact is numbered and cited: the file, the sheet/row or page/line,
     the quoted text, and whether a model read it there.
 
+The graph's Contents layer (council_core/kg_contents.py; user, 2026-10-26:
+all of the input data in the graph, step 3 "Council answers") adds the rows
+of the user's files a question is about: the values and numbers it names,
+the lines sharing its words, the headers it names - each row whole and
+cited ([R1], [R2] ...), so a question about a value or a column is answered
+from the cells themselves, not only from links between named entities.
+
 ``context`` gives that for one graph; ``block`` for every graph the user
 marked for answers (council_core.kg_graphs), which council_core.turn_context
 puts in front of the Council's question; ``ask`` answers a question from it
@@ -31,6 +38,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from council_core import kg_contents as kgc
 from council_core import knowledge_graph as kgm
 from council_core import token_budget
 
@@ -239,14 +247,17 @@ def _cite(kg: kgm.KnowledgeGraph, ev: Dict[str, Any]) -> str:
 
 
 def context(kg: kgm.KnowledgeGraph, question: str, *, hops: int = 2, max_facts: int = 30,
-            graph_name: str = "") -> Optional[Dict[str, Any]]:
+            graph_name: str = "", max_rows: int = 12) -> Optional[Dict[str, Any]]:
     """What one graph holds about what ``question`` names, as numbered,
-    cited facts: {entities, facts, paths, text, sources}. None when the
-    question names nothing the graph knows."""
+    cited facts and rows of the user's files: {entities, facts, paths, rows,
+    fields, text, sources}. None when the question names nothing the graph
+    knows and matches nothing in its contents."""
     ents = entities_in_text(kg, question)
-    if not ents:
+    found = kg.question_rows(question, max_rows=max_rows)
+    if not ents and not found["rows"] and not found["fields"]:
         return None
-    facts = neighbourhood(kg, [e["id"] for e in ents], hops=hops, max_facts=max_facts)
+    facts = neighbourhood(kg, [e["id"] for e in ents], hops=hops,
+                          max_facts=max_facts) if ents else []
     by_rel = {f.relation_id: f for f in facts}
     paths: List[List[Fact]] = []
     if len(ents) >= 2:
@@ -269,11 +280,12 @@ def context(kg: kgm.KnowledgeGraph, question: str, *, hops: int = 2, max_facts: 
                 paths.append(chain)
     title = f"Knowledge graph \"{graph_name}\"" if graph_name else "Knowledge graph"
     lines = [f"{title} — what it holds about: "
-             + ", ".join(_name(e) for e in ents) + "."]
+             + ", ".join(_name(e) for e in ents) + "."] if ents else [
+        f"{title} — rows of the user's files that match the question."]
     for e in ents:
         if e.get("description"):
             lines.append(f"About {e['name']}: {e['description']}")
-    if not facts:
+    if ents and not facts:
         lines.append("It knows these, but holds no links for them.")
     sources: List[str] = []
     for f in facts:
@@ -288,8 +300,42 @@ def context(kg: kgm.KnowledgeGraph, question: str, *, hops: int = 2, max_facts: 
     for chain in paths:
         lines.append("How they connect: " + " → ".join(f"[{f.n}]" for f in chain)
                      + f" ({len(chain)} links)")
-    return {"entities": ents, "facts": facts, "paths": paths,
-            "text": "\n".join(lines), "sources": sources}
+    rows = found["rows"]
+    if rows:
+        lines.append("Rows of the user's files (every cell of the row, as read)"
+                     + (" - the first rows under the header named:" if rows[0].get("first")
+                        else ":"))
+    for k, r in enumerate(rows, start=1):
+        r["n"] = f"R{k}"
+        r["file"] = kg.display_path(r["path"])
+        r["where"] = kgm.locator_text(r["locator"])
+        head = r["file"] + (f" › {r['sheet']}" if r.get("sheet") and
+                            "sheet" not in r["locator"] else "")
+        cells = " | ".join(f"{c['label']}: {_short(c['text'])}" if c["label"] != _LOOSE
+                           else _short(c["text"]) for c in r["cells"])
+        more = f" | … {r['more_cells']} more cells" if r.get("more_cells") else ""
+        lines.append(f"[{r['n']}] {head}, {r['where']}: {cells}{more}")
+        p = str(kg.abs_path(r["path"]))
+        if p not in sources:
+            sources.append(p)
+    if found["fields"]:
+        lines.append("Headers and labels the question names (what each holds):")
+        for f in found["fields"]:
+            head = kg.display_path(f["path"]) + (f" › {f['sheet']}" if f.get("sheet") else "")
+            lines.append(f"- '{f['label']}' in {head}: {kgc.summary(f)}")
+            p = str(kg.abs_path(f["path"]))
+            if not rows and p not in sources:
+                sources.append(p)
+    return {"entities": ents, "facts": facts, "paths": paths, "rows": rows,
+            "fields": found["fields"], "text": "\n".join(lines), "sources": sources}
+
+
+_LOOSE = kgc.LOOSE
+
+
+def _short(text: str, limit: int = 160) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _graphs(vault: Any, graphs: Optional[Sequence[str]]) -> List[Tuple[str, str]]:
@@ -350,8 +396,8 @@ def block(vault: Any, question: str, *, max_chars: int = 6000
 
 
 ASK_SYSTEM = ("You answer questions from a knowledge graph built from the user's own "
-              "documents. Use ONLY the numbered facts given. Cite the facts you use like "
-              "[2]. If the facts do not answer the question, say so plainly and say what "
+              "documents. Use ONLY the numbered facts and rows given. Cite what you use "
+              "like [2] or [R1]. If the facts do not answer the question, say so plainly and say what "
               "they do show. A fact marked 'suggested' is not confirmed yet - say so when "
               "you rely on one.")
 
@@ -367,7 +413,8 @@ def ask(vault: Any, question: str, chat: Optional[Callable[..., str]] = None,
     out: Dict[str, Any] = {"answer": None, "text": text, "contexts": ctxs, "error": ""}
     if not ctxs:
         out["error"] = ("the question names no person, part, project or other entity the "
-                        "graph knows - try a name as the documents write it")
+                        "graph knows and matches no value or header in its files - try a "
+                        "name, code or header as the documents write it")
         return out
     if chat is None:
         return out

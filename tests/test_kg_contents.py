@@ -264,7 +264,7 @@ def test_a_store_built_before_the_contents_layer_reads_its_files_again(tmp_path)
         st = kg.seed()
         assert st["documents_read"] == 1
         assert [f["file"] for f in kg.contents_files()] == ["parts.csv"]
-        assert kg.meta("schema_version") == str(kgm.SCHEMA_VERSION) == "5"
+        assert kg.meta("schema_version") == str(kgm.SCHEMA_VERSION) == "6"
 
 
 def test_a_read_only_store_without_the_layer_answers_empty(tmp_path):
@@ -295,6 +295,186 @@ def test_the_layer_works_without_full_text_search(tmp_path, monkeypatch):
         kg.seed()
         assert [h["text"] for h in kg.search_contents("forge")["values"]] == ["Nordic Forge"]
         assert [f["label"] for f in kg.search_contents("suppl")["fields"]] == ["Supplier"]
+
+
+# ── text documents and JSON (step 2) ────────────────────────────────────
+def test_a_text_document_gives_its_labels_tables_and_lines(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "notes.md").write_text(
+        "# Weekly NDE notes\n"
+        "Inspector: Jordan Blake\n"
+        "Lot: L-3\n"
+        "\n"
+        "| Flaw # | Depth (mm) | Result |\n"
+        "|---|---|---|\n"
+        "| 1A | 0.42 | Pass |\n"
+        "| 1B | 0.61 | Fail |\n"
+        "The second flaw sits near the weld toe.\n", encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+        fields = _tree(kg)["notes.md"][""]
+        assert fields["Inspector"] == ("label", "1 value", ["Jordan Blake"])
+        assert fields["Lot"][2] == ["L-3"]
+        assert fields["Flaw #"] == ("column", "2 values", ["1A", "1B"])
+        assert fields["Depth (mm)"][1] == "2 values, 0.42 to 0.61"
+        assert fields[kg_contents.LOOSE][2] == [
+            "# Weekly NDE notes", "The second flaw sits near the weld toe."]
+        (hit,) = kg.search_contents("weld toe")["values"]
+        (pl,) = kg.value_places(value_id=hit["value_id"])
+        assert pl["locator"] == {"line": 9}
+        (hit,) = kg.search_contents("1B")["values"]
+        (pl,) = kg.value_places(value_id=hit["value_id"])
+        assert pl["locator"] == {"line": 8, "column": "Flaw #"}
+        assert [(c["label"], c["text"]) for c in kg.row_cells(pl["field_id"], pl["row"])] == [
+            ("Flaw #", "1B"), ("Depth (mm)", "0.61"), ("Result", "Fail")]
+
+
+def test_a_pdf_is_read_page_by_page(tmp_path):
+    pytest.importorskip("pypdf")
+    from council_core import kg_corpus
+    v = _vault(tmp_path)
+    kg_corpus.write_pdf(v / "data_in" / "ecn.pdf",
+                        [["Change notice ECN-14", "Owner: Dana Whitfield"],
+                         ["Part: PN-1234/A", "Supersedes PN-1234"]])
+    with _kg(v) as kg:
+        kg.seed()
+        pages = _tree(kg)["ecn.pdf"]
+        assert sorted(pages) == ["page 1", "page 2"]
+        assert pages["page 1"]["Owner"][2] == ["Dana Whitfield"]
+        assert pages["page 2"]["Part"][2] == ["PN-1234/A"]
+        (hit,) = kg.search_contents("Dana Whitfield")["values"]
+        (pl,) = kg.value_places(value_id=hit["value_id"])
+        assert pl["locator"] == {"page": 1, "line": 2}
+        assert kgm.locator_text(pl["locator"]) == "page 1, line 2"
+
+
+def test_a_json_file_gives_a_row_per_object_and_a_field_per_key(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "runs.json").write_text(
+        '{"project": "Helios",\n'
+        ' "runs": [\n'
+        '  {"run": "R1", "speed": 1200, "operator": "AK"},\n'
+        '  {"run": "R2", "speed": 1350, "operator": "MW"}\n'
+        ' ],\n'
+        ' "tags": ["hot", "retest"]}\n', encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+        fields = _tree(kg)["runs.json"][""]
+        assert fields["project"][2] == ["Helios"]
+        assert fields["run"][2] == ["R1", "R2"]
+        assert fields["speed"][1] == "2 values, 1200 to 1350"
+        assert fields["tags"][2] == ["hot", "retest"]
+        (hit,) = kg.search_contents("MW")["values"]
+        (pl,) = kg.value_places(value_id=hit["value_id"])
+        assert pl["locator"] == {"line": 4}
+        assert [(c["label"], c["text"]) for c in kg.row_cells(pl["field_id"], pl["row"])] == [
+            ("run", "R2"), ("speed", "1350"), ("operator", "MW")]
+
+
+def test_a_value_connects_a_spreadsheet_and_a_text_document(tmp_path):
+    v = _vault(tmp_path)
+    _nde_book(v / "data_in" / "nde.xlsx")
+    (v / "data_in" / "memo.txt").write_text("Part Number: PN-4471\n", encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+        (hit,) = kg.search_contents("PN-4471")["values"]
+        assert sorted({p["file"] for p in kg.value_places(value_id=hit["value_id"])}) == [
+            "memo.txt", "nde.xlsx"]
+
+
+def test_a_store_from_step_one_gets_the_unit_column(tmp_path):
+    v = _vault(tmp_path)
+    (v / "data_in" / "memo.txt").write_text("Owner: Ann\n", encoding="utf-8")
+    with _kg(v) as kg:
+        path = kg.path
+    db = sqlite3.connect(path)          # as schema v5 made it: no 'unit'
+    db.execute("DROP TABLE fields")
+    db.execute(kg_contents.SCHEMA_SQL.split("CREATE TABLE IF NOT EXISTS fields")[1]
+               .split(");")[0].join(["CREATE TABLE fields", ")"])
+               .replace("unit TEXT NOT NULL DEFAULT 'cell', -- cell (a grid) | line (text) | json", ""))
+    db.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+    db.commit()
+    db.close()
+    with _kg(v) as kg:
+        assert "unit" in {r[1] for r in kg.db.execute("PRAGMA table_info(fields)")}
+        kg.seed()
+        assert _tree(kg)["memo.txt"][""]["Owner"][2] == ["Ann"]
+        assert kg.meta("schema_version") == "6"
+
+
+# ── the Council's answers (step 3) ──────────────────────────────────────
+def _qa_vault(tmp_path):
+    v = _vault(tmp_path)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Part 101"
+    ws.append(["Flaw #", "Hardness (HRC)", "Result", "Part Number"])
+    ws.append(["1A", 42.1, "Pass", "PN-4471"])
+    ws.append(["1B", 43.0, "Fail", "PN-4472"])
+    wb.save(v / "data_in" / "nde.xlsx")
+    (v / "data_in" / "memo.md").write_text(
+        "Notes\nThe second flaw sits near the weld toe.\n", encoding="utf-8")
+    with _kg(v) as kg:
+        kg.seed()
+    return v
+
+
+def test_a_question_naming_a_value_gets_its_whole_row_cited(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    text, sources = kg_query.block(v, "What was the hardness of PN-4472?")
+    assert ("[R1] nde.xlsx, sheet Part 101, cell D3 (Part Number): Flaw #: 1B | "
+            "Hardness (HRC): 43 | Result: Fail | Part Number: PN-4472") in text
+    assert "PN-4471" not in text                  # the other row is not about it
+    assert "- 'Hardness (HRC)' in nde.xlsx › Part 101: 2 values, 42.1 to 43" in text
+    assert sources == [str(v / "data_in" / "nde.xlsx")]
+
+
+def test_a_question_naming_a_number_finds_the_cell(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    text, _ = kg_query.block(v, "which flaw read 42.1?")
+    assert "[R1] nde.xlsx, sheet Part 101, cell B2 (Hardness (HRC)): Flaw #: 1A" in text
+
+
+def test_a_question_naming_only_a_header_sees_its_first_rows(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    text, _ = kg_query.block(v, "which flaw failed?")
+    assert "the first rows under the header named" in text
+    assert "Flaw #: 1B | Hardness (HRC): 43 | Result: Fail" in text
+
+
+def test_a_question_sharing_words_with_a_line_gets_the_line(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    text, sources = kg_query.block(v, "what did the notes say about the weld toe")
+    assert "[R1] memo.md, line 2: The second flaw sits near the weld toe." in text
+    assert "line 1: Notes" not in text
+    assert sources == [str(v / "data_in" / "memo.md")]
+
+
+def test_a_question_matching_nothing_gives_no_block(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    assert kg_query.block(v, "what is the capital of France?") is None
+    got = kg_query.ask(v, "what is the capital of France?")
+    assert got["answer"] is None and "matches no value or header" in got["error"]
+
+
+def test_ask_without_a_model_lists_the_rows_and_a_model_cites_them(tmp_path):
+    from council_core import kg_query
+    v = _qa_vault(tmp_path)
+    got = kg_query.ask(v, "What was the hardness of PN-4472?")
+    assert got["answer"] is None and "[R1]" in got["text"]
+    seen = {}
+
+    def chat(msgs, **kw):
+        seen["msgs"] = msgs
+        return "43 HRC [R1]"
+    got = kg_query.ask(v, "What was the hardness of PN-4472?", chat)
+    assert got["answer"] == "43 HRC [R1]"
+    assert "[R1]" in seen["msgs"][0]["content"] and "[R1] nde.xlsx" in seen["msgs"][1]["content"]
 
 
 # ── the Connections tab ──────────────────────────────────────────────────
@@ -397,6 +577,28 @@ def test_the_search_box_also_searches_the_contents(tmp_path):
         tab.search.setText("")
         assert tab.views.tabText(tab.views.indexOf(view)) == "Contents"
         assert view.tree.topLevelItem(0).text(0) == "📄 nde.xlsx"
+    finally:
+        _wait(app, tab)
+        tab.close()
+        tab.deleteLater()
+        app.processEvents()
+
+
+def test_ask_in_the_tab_lists_the_rows_it_used(tmp_path):
+    app = _qt()
+    v = _qa_vault(tmp_path)
+    tab = _tab(v)
+    try:
+        tab.ask_edit.setText("What was the hardness of PN-4472?")
+        tab.on_ask()
+        _wait(app, tab)
+        tops = [tab.facts.topLevelItem(i) for i in range(tab.facts.topLevelItemCount())]
+        rows = next(t for t in tops if t.text(0) == "Rows of your files")
+        (r1,) = _children(rows)
+        assert r1.text(0).startswith("[R1] Flaw #: 1B | Hardness (HRC): 43")
+        tab.facts.setCurrentItem(r1)
+        _wait(app, tab)
+        assert tab.preview_title.text().startswith("nde.xlsx · sheet Part 101, cell D3")
     finally:
         _wait(app, tab)
         tab.close()

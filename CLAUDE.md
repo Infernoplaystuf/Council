@@ -122,6 +122,6 @@ same list.
 - Ledger groups (parts by part name, date or source folder; fields tracked, not
   tracked or Yes/No) and the full and per-group workbooks, a sheet per part:
   `docs/handoff/ledger_groups_2026-10-26.md`.
-- The Connections tab's Contents layer (every cell of every CSV and workbook under
-  its header or label, whatever the field rules; search over it; the Contents tab):
+- The Connections tab's Contents layer (every value of every spreadsheet, text
+  document, PDF, Word and JSON file under its header or label, whatever the field rules; search over it; the Contents tab):
   `docs/handoff/kg_contents_2026-10-26.md`.

@@ -84,8 +84,8 @@ class ContentsView(QWidget):
         n = kg.contents_counts()
         if not n["files"]:
             self.summary.setText("Nothing is in the contents yet: ⟳ Build graph reads every "
-                                 "CSV and workbook into it, every cell under its header or "
-                                 "label.")
+                                 "file into it (spreadsheets, text, PDFs, Word, JSON), every "
+                                 "value under its header or label.")
             return 0
         self.summary.setText(
             f"{_plural(n['files'], 'file')}, {_plural(n['fields'], 'header or label', 'headers and labels')}, "
