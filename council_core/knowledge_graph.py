@@ -4914,6 +4914,13 @@ class KnowledgeGraph:
             f["summary"] = kg_contents.summary(f)
         return out
 
+    def question_rows(self, question: str, max_rows: int = 12) -> Dict[str, Any]:
+        """The rows of the files a question is about (kg_contents.
+        question_rows): for the Council's answers and Ask the graph."""
+        if not self.has_contents():
+            return {"rows": [], "fields": [], "words": []}
+        return kg_contents.question_rows(self.db, question, max_rows=max_rows)
+
     def search_contents(self, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
         """Files, fields (headers and labels) and values matching ``text``,
         and the cells holding a number typed."""

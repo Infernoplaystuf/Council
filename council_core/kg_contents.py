@@ -880,3 +880,176 @@ def search(db: sqlite3.Connection, text: str, limit: int = 50) -> Dict[str, List
         if n:
             out["numbers"].append({"number": num, "text": text, "count": n})
     return out
+
+
+# ── what a question names, for the Council's answers (step 3) ────────────
+#: Words a question is made of that name no value or header on their own.
+_QSTOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are",
+          "was", "were", "be", "been", "who", "what", "which", "where", "when", "how",
+          "why", "does", "do", "did", "it", "its", "this", "that", "these", "those", "me",
+          "us", "show", "list", "all", "any", "about", "tell", "give", "find", "from",
+          "by", "at", "as", "there", "have", "has", "had", "many", "much", "value",
+          "values", "file", "files", "my", "our", "i", "we", "you", "can", "could",
+          "would", "should", "please", "than", "more", "less", "each", "every", "say",
+          "said", "says", "know", "known", "get", "got", "see", "notes", "note"}
+_QTOKEN = re.compile(r"[^\W_][\w./\-#]*", re.UNICODE)
+MAX_QUESTION_WORDS = 6
+#: Rows shown under a header a question names when it names no value.
+FIRST_ROWS = 6
+
+
+def _q_tokens(question: str) -> List[str]:
+    return [t.rstrip(".,;:?!/-").casefold() for t in _QTOKEN.findall(question or "")
+            if t.rstrip(".,;:?!/-")]
+
+
+def question_rows(db: sqlite3.Connection, question: str, *, max_rows: int = 12,
+                  max_fields: int = 8, max_cells: int = 25) -> Dict[str, Any]:
+    """The rows of the user's files a question is about, with no model call:
+    the values it names exactly (any run of up to six words: 'PN-4471',
+    'Nordic Forge'), the numbers it names, the lines that share two or more
+    of its words, and the headers or labels it names ('hardness' -> 'Hardness
+    (HRC)'). A row scores by how many of those it holds (a value a whole
+    column repeats counts for less), and the best ``max_rows`` come back
+    whole: {rows: [{path, sheet, row, field_id, locator, cells, matched}],
+    fields: [field dicts with 'path'], words: what matched}. Headers named
+    but no value: the fields alone (their summaries say what they hold)."""
+    import math
+    out: Dict[str, Any] = {"rows": [], "fields": [], "words": []}
+    toks = _q_tokens(question)
+    if not toks or db.execute("SELECT 1 FROM sqlite_master WHERE name='cells'").fetchone() \
+            is None:
+        return out
+    tokset = set(toks)
+    sig = [t for t in toks if t not in _QSTOP and len(t) >= 2]
+    # 1. headers and labels it names
+    fields_hit: Dict[str, List[str]] = {}
+    for (norm,) in db.execute("SELECT DISTINCT label_norm FROM fields WHERE label_norm != ''"):
+        words = [w for w in norm.split() if w not in _QSTOP]
+        if not words:
+            continue
+        have = [w for w in words if w in tokset]
+        if len(have) == len(words) or (words[0] in tokset and 2 * len(have) >= len(words)):
+            fields_hit[norm] = have
+    # 2. values it names exactly, longest first
+    grams: Dict[str, Tuple[int, int]] = {}
+    for i in range(len(toks)):
+        for j in range(i + 1, min(len(toks), i + MAX_QUESTION_WORDS) + 1):
+            g = " ".join(toks[i:j])
+            if j - i == 1 and (g in _QSTOP or len(g) < 2):
+                continue
+            grams.setdefault(g, (i, j))
+    hits: List[Tuple[int, int, int, str, int]] = []      # i, j, value id, text, n
+    keys = list(grams)
+    for k in range(0, len(keys), 400):
+        part = keys[k:k + 400]
+        for vid, norm, text, n in db.execute(
+                f"SELECT id, norm, text, n FROM vals WHERE norm IN ({','.join('?' * len(part))})",
+                part):
+            i, j = grams[norm]
+            hits.append((i, j, vid, text, n))
+    hits.sort(key=lambda h: (-(h[1] - h[0]), h[0]))
+    used: set = set()
+    weights: Dict[int, float] = {}        # value id -> weight
+    for i, j, vid, text, n in hits:
+        span = set(range(i, j))
+        if span & used:
+            continue
+        used |= span
+        w = 1.0 / math.log(2 + max(n, 1) / 10)
+        if j - i == 1 and not re.search(r"[\d\-/#]", text):
+            w *= 0.3                     # one plain word ('Notes'), not a code
+        weights[vid] = w
+        out["words"].append(text)
+    # 3. numbers it names
+    nums = [as_number(t, t) for t in toks]
+    nums = [x for x in nums if x is not None]
+    # 4. lines sharing two or more of its words (text documents, notes cells)
+    words = sorted({t for t in sig if not any(ch.isdigit() for ch in t) and len(t) >= 3})
+    line_hits: Dict[int, float] = {}
+    if len(words) >= 2 and _has_fts(db):
+        q = " OR ".join(f'"{w}"*' for w in words)
+        for vid, text in db.execute(
+                "SELECT v.id, v.text FROM vals_fts s JOIN vals v ON v.id=s.rowid"
+                " WHERE vals_fts MATCH ? ORDER BY rank LIMIT 40", (q,)):
+            have = {w for w in words if re.search(r"\b" + re.escape(w), text.casefold())}
+            if len(have) >= 2 and vid not in weights:
+                line_hits[vid] = 0.5 * len(have)
+    # rows that hold them
+    score: Dict[Tuple[int, int], float] = {}
+    matched: Dict[Tuple[int, int], List[str]] = {}
+
+    def add(fid: int, row: int, w: float, what: str) -> None:
+        key = (fid, row)
+        score[key] = score.get(key, 0.0) + w
+        matched.setdefault(key, []).append(what)
+    for vid, w in list(weights.items()) + list(line_hits.items()):
+        for fid, row, text in db.execute(
+                "SELECT field_id, row, text FROM cells WHERE value_id=? LIMIT 300", (vid,)):
+            add(fid, row, w, text)
+    for x in nums:
+        for fid, row, text in db.execute(
+                "SELECT field_id, row, text FROM cells WHERE num=? LIMIT 300", (x,)):
+            add(fid, row, 0.8, text)
+    # one row of a sheet, whichever of its cells matched
+    rows: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    fmeta: Dict[int, Dict[str, Any]] = {}
+    for (fid, row), sc in score.items():
+        f = fmeta.get(fid) or fmeta.setdefault(fid, field(db, fid) or {})
+        if not f:
+            continue
+        key = (f["document_id"], f["sheet"], row)
+        r = rows.get(key)
+        if r is None:
+            r = rows[key] = {"document_id": f["document_id"], "sheet": f["sheet"], "row": row,
+                             "field_id": fid, "score": 0.0, "matched": []}
+        r["score"] += sc
+        r["matched"] += matched[(fid, row)]
+    ranked = sorted(rows.values(), key=lambda r: (-r["score"], r["row"]))
+    paths = {}
+    for r in ranked[:max(max_rows * 3, max_rows)]:
+        cells = row_cells(db, r["field_id"], r["row"])
+        labels = {label_norm(c["label"]) for c in cells}
+        if fields_hit and labels & set(fields_hit):
+            r["score"] += 1.0             # it has a header the question names
+        r["cells"] = cells[:max_cells]
+        r["more_cells"] = max(0, len(cells) - max_cells)
+        f = fmeta[r["field_id"]]
+        col = next((c["col"] for c in cells if c["field_id"] == r["field_id"]), f.get("col") or 1)
+        r["locator"] = locator(f, r["row"], col)
+        if r["document_id"] not in paths:
+            got = db.execute("SELECT path FROM documents WHERE id=?",
+                             (r["document_id"],)).fetchone()
+            paths[r["document_id"]] = got[0] if got else ""
+        r["path"] = paths[r["document_id"]]
+    ranked = [r for r in ranked if "cells" in r]
+    ranked.sort(key=lambda r: (-r["score"], r["path"], r["row"]))
+    out["rows"] = ranked[:max_rows]
+    if not out["rows"] and fields_hit:
+        # a header named and no value: the first rows under the busiest one,
+        # so 'which flaw failed' sees the table, not only its summary
+        top = db.execute(
+            f"SELECT id FROM fields WHERE label_norm IN ({','.join('?' * len(fields_hit))})"
+            " ORDER BY n_cells DESC LIMIT 1", list(fields_hit)).fetchone()
+        if top is not None:
+            f = field(db, top[0]) or {}
+            got = db.execute("SELECT path FROM documents WHERE id=?",
+                             (f.get("document_id"),)).fetchone()
+            for (row, col) in db.execute(
+                    "SELECT row, col FROM cells WHERE field_id=? ORDER BY row LIMIT ?",
+                    (top[0], FIRST_ROWS)).fetchall():
+                cells = row_cells(db, top[0], row)
+                out["rows"].append({
+                    "document_id": f["document_id"], "sheet": f["sheet"], "row": row,
+                    "field_id": top[0], "score": 0.0, "matched": [], "first": True,
+                    "cells": cells[:max_cells], "more_cells": max(0, len(cells) - max_cells),
+                    "locator": locator(f, row, col), "path": got[0] if got else ""})
+    if fields_hit:
+        cols = ", ".join("f." + x.strip() for x in _FIELD_COLS.split(","))
+        marks = ",".join("?" * len(fields_hit))
+        for r in db.execute(
+                f"SELECT d.path, {cols} FROM fields f JOIN documents d ON d.id=f.document_id"
+                f" WHERE f.label_norm IN ({marks}) ORDER BY f.n_cells DESC LIMIT ?",
+                list(fields_hit) + [max_fields]):
+            out["fields"].append(dict(_field_dict(r[1:]), path=r[0]))
+    return out
