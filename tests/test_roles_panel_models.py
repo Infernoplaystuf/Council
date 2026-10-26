@@ -212,6 +212,9 @@ def test_the_models_tab_has_a_check_this_pc_button(qapp, tmp_path,
         def upgrade(self, *a, **k):
             return "", None
 
+        def tesseract_status(self):
+            return "Tesseract: installed"
+
         def check_this_pc(self, **kw):
             self.ran = threading.current_thread().name
             return model_jobs.CheckResult(True, "1 model measured")
@@ -219,6 +222,9 @@ def test_the_models_tab_has_a_check_this_pc_button(qapp, tmp_path,
     actions = Quiet(tmp_path)
     tab = ModelsTab(actions=actions, role_actions=Actions(tmp_path))
     pump(qapp, lambda: tab.roles._free is not None)
+    # The first ranking, started when the hardware is known, writes the
+    # status line too: on a slower PC its answer came after the check's.
+    pump(qapp, lambda: tab._hardware is not None and tab.find_btn.isEnabled())
     tab.on_check_pc()
     pump(qapp, lambda: tab.status.text() == "1 model measured")
     assert actions.ran == "model-check-pc"

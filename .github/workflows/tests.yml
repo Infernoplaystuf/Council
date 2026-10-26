@@ -47,6 +47,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The whole history: the Changelog tab's test reads the real
+          # repository's last commits.
+          fetch-depth: 0
+
+      - name: Give git a name to commit with
+        # The Librarian tests commit into temporary repositories, as git on
+        # a PC that has been set up does.
+        run: |
+          git config --global user.name "Council CI"
+          git config --global user.email "ci@council.invalid"
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
