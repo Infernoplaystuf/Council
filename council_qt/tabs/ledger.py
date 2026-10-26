@@ -698,6 +698,15 @@ class LedgerTab(ViewHelpers, QWidget):
             "The template filled in for one part at a time, each value tinted by how sure "
             "it is (green sure, yellow fairly, orange unsure, red disagreeing). Click a "
             "cell to see the source cell it came from, then Right or Wrong.")
+        # the filled template window's re-run, from the tab too: the answers
+        # saved into the review workbook above (user, 2026-10-26)
+        self.rerun_btn = self._step_button(row, "Re-run with my answers",
+                                           self.on_rerun_from_tab)
+        self.rerun_btn.setToolTip(
+            "Apply the answers saved into the review workbook (Right, Wrong, corrected or "
+            "put in another cell), then Extract again on the same sources: the values you "
+            "said Right teach the run, and a new review is written (the old one kept). "
+            "Answers you have not saved yet in an open review window are not used.")
         # sub-groups of the parts, each with a workbook of its own (user,
         # 2026-10-26)
         self.groups_btn = self._step_button(row, "Groups…", self.on_groups_window)
@@ -958,6 +967,8 @@ class LedgerTab(ViewHelpers, QWidget):
             self.review_btn.setEnabled(has_review)
         if hasattr(self, "filled_btn"):
             self.filled_btn.setEnabled(has_review)
+        if hasattr(self, "rerun_btn"):
+            self.rerun_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
         if hasattr(self, "rebuild_kg_btn"):
             # Always clickable while idle; dirtiness only affects weight.
@@ -1931,13 +1942,24 @@ class LedgerTab(ViewHelpers, QWidget):
             dlg.show()
         self._run("Reading the review", lambda _p: ledger_review.load(path), done)
 
-    def on_rerun_with_answers(self, review: str, part: str = "") -> bool:
+    def on_rerun_from_tab(self) -> bool:
+        """Step 3's "Re-run with my answers": the review workbook above, with
+        the answers saved into it, re-run as from the filled template window
+        but without opening it."""
+        path = self.review.text().strip()
+        if not path or not Path(path).is_file():
+            self.status.setText("No review workbook yet: run Extract first.")
+            return False
+        return self.on_rerun_with_answers(path, reopen=False)
+
+    def on_rerun_with_answers(self, review: str, part: str = "",
+                              reopen: bool = True) -> bool:
         """The filled template window's "Re-run with my answers" (its answers
         already saved): Apply, then Extract again on the review's sources
         (LedgerActions.rerun), then the window again on the new review, at
-        the same part. The values said Right are in the parent CSV by then,
-        so the run learns from them; a new review is written, the old one
-        kept. False when it did not start."""
+        the same part (``reopen``). The values said Right are in the parent
+        CSV by then, so the run learns from them; a new review is written,
+        the old one kept. False when it did not start."""
         if self.busy:
             self.status.setText("Not re-run: wait for the current step to finish.")
             return False
@@ -1985,7 +2007,8 @@ class LedgerTab(ViewHelpers, QWidget):
                         + (f" ({carried} of them already answered by you)" if carried
                            else "") + ".")
                 self._say(line)
-                self.on_filled_window(part)
+                if reopen:
+                    self.on_filled_window(part)
                 self.status.setText(line)
         self._run("Re-running with your answers", step, done, cancellable=True)
         return True
