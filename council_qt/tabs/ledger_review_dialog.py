@@ -501,11 +501,18 @@ class FilledTemplateDialog(ReviewDialog):
     def __init__(self, review: lv.Review, parent=None,
                  log: Optional[Callable[[str], None]] = None,
                  opener: Optional[Callable[[str], None]] = None,
-                 on_saved: Optional[Callable[[int], None]] = None, part: str = ""):
+                 on_saved: Optional[Callable[[int], None]] = None, part: str = "",
+                 on_rerun: Optional[Callable[[str, str], None]] = None):
         self._parts = lv.parts(review)
+        #: the Ledger tab's re-run (LedgerTab.on_rerun_with_answers): given
+        #: the review and the part shown, once the answers are saved
+        self.on_rerun = on_rerun
         self.part = part if part in self._parts else (self._parts[0] if self._parts else "")
         #: (template sheet, cell) clicked: the list shows the values offered for it
         self._cell: Optional[Tuple[str, Tuple[int, int]]] = None
+        #: what the Ledger holds already (ledger_review.ledger_reader), read
+        #: when first shown
+        self._held = None
         super().__init__(review, parent, log, opener, on_saved)
         self.setWindowTitle(f"Filled template — {Path(review.path).name}")
 
@@ -532,11 +539,22 @@ class FilledTemplateDialog(ReviewDialog):
                                    "each value's source) beside the review, and open it")
         self.export_btn.clicked.connect(self.on_export)
         bar.addWidget(self.export_btn)
+        # user, 2026-10-23: "look at a few values and then give an answer and
+        # have it rerun and fill things in more confidently"
+        self.rerun_btn = QPushButton("Re-run with my answers")
+        self.rerun_btn.setToolTip(
+            "Save your answers, Apply them (the values said Right go in the parent CSV, "
+            "where the next run learns from them), and run Extract again on the same "
+            "sources. This window opens again on the new review; the old review is kept.")
+        self.rerun_btn.clicked.connect(self.on_rerun_clicked)
+        self.rerun_btn.setVisible(self.on_rerun is not None)
+        bar.addWidget(self.rerun_btn)
         self.layout().insertLayout(0, bar)
         help_ = QLabel("Click a filled cell of the template: its value's source is shown "
                        "below, highlighted. Say Right or Wrong (or correct it); a cell "
                        "several sources filled lists each on the left. Save writes your "
-                       "answers into the review workbook; then Apply.")
+                       "answers into the review workbook; then Apply - or Re-run with "
+                       "my answers, to run Extract again learning from them.")
         help_.setWordWrap(True)
         self.layout().insertWidget(1, help_)
         self.show_choice.setVisible(False)
@@ -600,7 +618,9 @@ class FilledTemplateDialog(ReviewDialog):
         picked. False when no value of this part goes there."""
         cands = self._candidates().get((sheet, rc))
         if not cands:
-            self.status.setText("No value of this part goes in that cell.")
+            had = self._ledger_cells().get((sheet, rc))
+            self.status.setText(f"Already in the Ledger: {had[0]} = {had[1]} (not read this "
+                                "run)." if had else "No value of this part goes in that cell.")
             return False
         self._cell = (sheet, rc)
         self._fill_list()
@@ -619,38 +639,65 @@ class FilledTemplateDialog(ReviewDialog):
         self._tint_template()
 
     # ── the filled template ─────────────────────────────────────────────
+    def _ledger_cells(self) -> Dict[Tuple[str, Tuple[int, int]], Tuple[str, str]]:
+        """This part's values the Ledger holds already, by template cell."""
+        if self._held is None:
+            self._held = lv.ledger_reader(self.review.csv) or (lambda *_a: "")
+        return lv.ledger_cells(self._held, self.part, self._exact or {})
+
     def _tint_template(self) -> None:
         if self.template is None:
             return
         cands = self._candidates()
+        known = self._ledger_cells()
         at = self._cell_of(self.current)
         first = None
         for i, m in enumerate(self._template_models):
             tints, texts, tips = {}, {}, {}
+            for (sheet, rc), (fname, value) in known.items():
+                if sheet == m.sheet.name:
+                    texts[rc], tints[rc] = value, lv.TINT_LEDGER
+                    tips[rc] = f"{fname} = {value}\nalready in the Ledger"
             for (sheet, rc), cs in cands.items():
                 if sheet != m.sheet.name:
                     continue
                 it = cs[0]
+                was = (known.get((sheet, rc)) or ("", ""))[1]
                 texts[rc] = it.value
-                tints[rc] = lv.confidence_tint(it)
+                tints[rc] = lv.TINT_CLASH if lv.differs(it.value, was) else \
+                    lv.confidence_tint(it)
                 others = [o.value for o in cs[1:] if o.value != it.value]
                 tips[rc] = (f"{it.fields[0]} = {it.value}\nfrom {it.where}\nscore "
                             f"{it.score:g}" + (" · accepted" if self._accept_of(it) == "Y"
                                                else "")
+                            + (f"\nthe Ledger has {was}" if lv.differs(it.value, was) else "")
                             + (f"\nalso offered: {', '.join(others[:5])}" if others else ""))
             if at is not None and at[0] == m.sheet.name:
                 tints[at[1]] = CELL_TINT
                 first = (i, at[1])
             m.set_tints(tints, texts, tips)
         n = len(cands)
+        old = len(set(known) - set(cands))
         if first is not None:
             i, (r, c) = first
             self.template_tabs.setCurrentIndex(i)
             self._scroll(self._template_views[i], self._template_models[i], r, c)
         self.template_note.setText(
-            f"<b>Template filled in for {self.part}</b> — {n} cell(s) filled; click one to "
-            "see where its value came from" if self.part else
+            f"<b>Template filled in for {self.part}</b> — {n} cell(s) filled"
+            + (f" (and {old} already in the Ledger)" if old else "")
+            + "; click one to see where its value came from" if self.part else
             "<b>Template</b> — this review has no parts")
+
+    def on_rerun_clicked(self) -> bool:
+        """Save the answers, hand the review to the Ledger tab to re-run,
+        and close (the tab opens the window again on the new review)."""
+        if self.on_rerun is None or not self.on_save():
+            return False
+        if self.on_rerun(self.review.path, self.part) is False:
+            return False                   # not started (the tab says why): stay open
+        self.log(f"Filled template: re-running with the answers in {self.review.path}")
+        self.reject()
+        return True
 
     def on_export(self) -> Optional[str]:
         if not self.part:

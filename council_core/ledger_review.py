@@ -29,7 +29,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError
 
@@ -342,11 +342,14 @@ CONF_HIGH = 0.85
 #: under this, low
 CONF_LOW = 0.6
 TINT_HIGH, TINT_MID, TINT_LOW, TINT_CLASH = "#C6EFCE", "#FFEB9C", "#F8CBAD", "#FF7C80"
+#: a value the parent CSV holds and this run did not read (an update)
+TINT_LEDGER = "#DDEBF7"
 #: what each tint means, for a legend
 LEGEND = [(TINT_HIGH, f"sure (score {CONF_HIGH:g} or more)"),
           (TINT_MID, f"fairly sure ({CONF_LOW:g}–{CONF_HIGH:g})"),
           (TINT_LOW, f"unsure (under {CONF_LOW:g})"),
-          (TINT_CLASH, "sources disagree")]
+          (TINT_CLASH, "sources disagree"),
+          (TINT_LEDGER, "already in the Ledger")]
 
 
 def confidence_tint(item: Item) -> str:
@@ -381,6 +384,39 @@ def cell_candidates(items: Sequence[Item], exact: Dict[Tuple[str, str], Tuple[st
     return out
 
 
+def ledger_reader(csv_path) -> Optional[Callable[[str, str, str], str]]:
+    """What the parent CSV holds (source_extract.ledger_values), None when
+    it cannot be read."""
+    from sample_ledger import ParentCSV
+    from source_extract import ledger_values
+    try:
+        return ledger_values(ParentCSV(csv_path))
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def ledger_cells(held: Optional[Callable[[str, str, str], str]], part: str,
+                 exact: Dict[Tuple[str, str], Tuple[str, Cell]]
+                 ) -> Dict[Tuple[str, Cell], Tuple[str, str]]:
+    """``part``'s values the Ledger holds already, by the template cell each
+    goes in: (sheet, cell) -> (field, value) - so the filled template shows
+    the whole Ledger, not only what a run read (user, 2026-10-23)."""
+    out: Dict[Tuple[str, Cell], Tuple[str, str]] = {}
+    if held is None or not part:
+        return out
+    for (fname, item), at in exact.items():
+        v = held(part, item, fname)
+        if v:
+            out[at] = (fname, v)
+    return out
+
+
+def differs(value: str, held: str) -> bool:
+    """A value other than the one the Ledger holds ('12' is '12.0')."""
+    from source_extract import _value_key
+    return bool(held) and _value_key(value) != _value_key(held)
+
+
 def _cell_value(text: str) -> Any:
     """A number written as one, so the filled template computes."""
     try:
@@ -391,11 +427,15 @@ def _cell_value(text: str) -> Any:
 
 
 def write_filled(review: Review, part: str, out_path,
-                 exact: Optional[Dict[Tuple[str, str], Tuple[str, Cell]]] = None) -> str:
+                 exact: Optional[Dict[Tuple[str, str], Tuple[str, Cell]]] = None,
+                 held: Optional[Callable[[str, str, str], str]] = None) -> str:
     """A copy of the template with ``part``'s values in their cells, each
     tinted by its confidence (confidence_tint) with a note of where it was
-    read and how sure the match is. The template itself is never written.
-    Atomic. Returns the path."""
+    read and how sure the match is; the values the Ledger holds already
+    (``held``, read from the parent CSV when not given) fill the other
+    cells, tinted TINT_LEDGER, and a value read now that differs from the
+    Ledger's is red. The template itself is never written. Atomic. Returns
+    the path."""
     import shutil
 
     import openpyxl
@@ -408,22 +448,33 @@ def write_filled(review: Review, part: str, out_path,
     if out.resolve() == template.resolve():
         raise LedgerError("refusing to write over the template itself")
     exact = exact if exact is not None else template_cells(review.csv)
+    held = held if held is not None else ledger_reader(review.csv)
+    known = ledger_cells(held, part, exact)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.stem + ".writing" + out.suffix)
     shutil.copyfile(template, tmp)
     wb = openpyxl.load_workbook(tmp)
     try:
+        for (sheet, (r, c)), (fname, value) in known.items():
+            ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+            cell = ws.cell(row=r, column=c)
+            cell.value = _cell_value(value)
+            tint = TINT_LEDGER[1:]
+            cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+            cell.comment = Comment(f"{fname}: {value}\nalready in the Ledger", "Council")
         for (sheet, (r, c)), cands in cell_candidates(review.items, exact, part).items():
             ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
             it = cands[0]
             cell = ws.cell(row=r, column=c)
             cell.value = _cell_value(it.value)
-            tint = confidence_tint(it)[1:]
+            was = (known.get((sheet, (r, c))) or ("", ""))[1]
+            tint = (TINT_CLASH if differs(it.value, was) else confidence_tint(it))[1:]
             cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
             others = [o.value for o in cands[1:] if o.value != it.value]
             cell.comment = Comment(
                 f"{it.fields[0]}: {it.value}\nfrom {it.where}\nscore {it.score:g}"
                 + (f" (accepted)" if it.accept == "Y" else "")
+                + (f"\nthe Ledger has {was}" if differs(it.value, was) else "")
                 + (f"\nalso offered: {', '.join(others[:5])}" if others else ""), "Council")
         wb.save(tmp)
     finally:
@@ -442,6 +493,37 @@ def _safe_name(part: str) -> str:
     return re.sub(r"[^\w\-. ]+", "_", part).strip() or "part"
 
 
+def _answer_key(it: Item) -> Tuple[str, str, Tuple[str, ...], str]:
+    return it.part, it.item, tuple(it.fields), it.where
+
+
+def carry_answers(old: Review, new: Review) -> int:
+    """The answers of an earlier review copied into a new one of the same
+    sources (the Ledger tab's Re-run with my answers): a value read at the
+    same source cell, for the same part, item and field, gets the earlier
+    Y or N - and a corrected value - where the new review left it to decide
+    or had pre-accepted what was said Wrong. Saved into the new review
+    (save); returns how many rows changed. Sample reviews only."""
+    if old.kind != "samples" or new.kind != "samples":
+        return 0
+    said = {_answer_key(it): it for it in old.items
+            if it.sheet == "Values" and it.accept in ("Y", "N")}
+    answers: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for it in new.items:
+        was = said.get(_answer_key(it)) if it.sheet == "Values" else None
+        if was is None:
+            continue
+        if not (it.accept not in ("Y", "N") or it.clash
+                or (was.accept == "N" and it.accept == "Y")):
+            continue
+        a: Dict[str, Any] = {"accept": was.accept}
+        if was.value != it.value and it.value_col:
+            a.update(value=was.value, value_col=it.value_col)
+        if a["accept"] != it.accept or "value" in a:
+            answers[(it.sheet, it.row)] = a
+    return save(new.path, answers)
+
+
 def write_all_filled(review: Review, progress=None) -> List[str]:
     """One filled template per part (write_filled), in filled_dir. A part
     that cannot be written is skipped."""
@@ -453,11 +535,13 @@ def write_all_filled(review: Review, progress=None) -> List[str]:
     out = []
     folder = filled_dir(review.path)
     names = parts(review)
+    held = ledger_reader(review.csv)
     for n, part in enumerate(names, 1):
         if progress is not None:
             progress(f"filling the template for {part} ({n}/{len(names)})")
         try:
-            out.append(write_filled(review, part, folder / f"{_safe_name(part)}.xlsx", exact))
+            out.append(write_filled(review, part, folder / f"{_safe_name(part)}.xlsx", exact,
+                                    held))
         except Exception:                                   # noqa: BLE001
             continue
     return out
