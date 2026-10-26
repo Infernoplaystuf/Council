@@ -84,3 +84,25 @@ more confidently?"
 - Not done (offered, not yet agreed): a Wrong teaching "label X is not field
   F" for other parts, and re-checking only the uncertain values for speed.
   The re-run reads every source twice (Apply, then Extract).
+
+## Put this value here (2026-10-26)
+
+Andy: "With the review by clicking can I right click the spot where the data
+actually belongs so I can manually correct things?"
+
+- In Review by clicking and the filled template window, pick a value, then
+  right-click the template cell it belongs in (`ReviewDialog.menu_actions`,
+  `place_at`). "Put this value here (<field>, <item>)" gives the value that
+  cell's field and item and says it Right. "Put it here and always map
+  '<label>' here" also maps its source label to that field at Save
+  (`ledger_review.teach_label`, saved in `<csv>.aliases.json`), so the next
+  Extract puts it there by itself.
+- The cell takes one value: another value accepted for the same part, item
+  and field is said Wrong, or Apply would keep neither ("2 values accepted …
+  kept none").
+- Save writes the move into the review's Field and Item columns
+  (`ledger_review.save`); Apply takes a row edited by hand as typed, so the
+  value goes into the moved field. A Right or Wrong given after the move
+  keeps it.
+- Only values on the Values sheet move cell by cell; a table record does
+  not. A cell that is not one of the template's fields offers nothing.

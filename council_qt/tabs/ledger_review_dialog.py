@@ -23,7 +23,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+                               QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
+                               QPushButton,
                                QSplitter, QTableView, QTableWidget, QTableWidgetItem,
                                QTabWidget, QVBoxLayout, QWidget)
 
@@ -87,7 +88,8 @@ class ReviewDialog(QDialog):
         help_ = QLabel(
             "Pick an item: the template shows where its value goes, the source shows the "
             "cell it was read from, both highlighted. Press Right or Wrong (or correct the "
-            "value) and the next one comes up. Save writes your answers into the review "
+            "value) and the next one comes up; right-click the template cell where a value "
+            "really belongs to put it there. Save writes your answers into the review "
             "workbook; then press Apply in the Ledger tab.")
         help_.setWordWrap(True)
         outer.addWidget(help_)
@@ -256,6 +258,10 @@ class ReviewDialog(QDialog):
         if it is None:
             return
         a: Dict[str, Any] = {"accept": accept}
+        before = self.answers.get((it.sheet, it.row)) or {}
+        for k in ("field", "item", "teach"):            # a value put elsewhere stays there
+            if k in before:
+                a[k] = before[k]
         if it.value_col:
             typed = self.value_edit.text().strip()
             if typed != it.value:
@@ -287,12 +293,19 @@ class ReviewDialog(QDialog):
         except LedgerError as e:
             self.status.setText(f"Not saved: {e}")
             return False
+        taught = []
         for it in self.review.items:
             a = self.answers.get((it.sheet, it.row))
             if a:
                 it.accept = a["accept"]
                 if "value" in a:
                     it.value = a["value"]
+                if a.get("teach") and self.review.csv and \
+                        lv.teach_label(self.review.csv, a["teach"], a.get("field", "")):
+                    taught.append(f"{a['teach']!r} → {a['field']}")
+        if taught:
+            self.log("Review by clicking: label(s) mapped for the next Extract: "
+                     + ", ".join(taught))
         self.answers.clear()
         self._fill_list()
         self.status.setText(f"Saved {n} answer(s) into {Path(self.review.path).name}. "
@@ -346,9 +359,13 @@ class ReviewDialog(QDialog):
         self.template = view
         self.template_tabs.clear()
         self._template_models, self._template_views = [], []
-        for sheet in view.sheets:
+        for i, sheet in enumerate(view.sheets):
             m = SheetModel(sheet, self)
             v = self._sheet_view(m)
+            # right-click where a value really belongs (user, 2026-10-26)
+            v.setContextMenuPolicy(Qt.CustomContextMenu)
+            v.customContextMenuRequested.connect(
+                lambda pos, i=i: self._template_menu(i, pos))
             self._template_models.append(m)
             self._template_views.append(v)
             self.template_tabs.addTab(v, sheet.name)
@@ -388,6 +405,78 @@ class ReviewDialog(QDialog):
                                        + " has no cell of its own on the template")
         else:
             self.template_note.setText("<b>Template</b> — this item has no field")
+
+    # ── putting a value where it belongs (right-click) ───────────────────
+    def _template_menu(self, i: int, pos) -> None:
+        view = self._template_views[i]
+        idx = view.indexAt(pos)
+        if not idx.isValid():
+            return
+        menu = QMenu(view)
+        for text, do in self.menu_actions(self._template_models[i].sheet.name,
+                                          (idx.row() + 1, idx.column() + 1)):
+            if do is None:
+                menu.addAction(text).setEnabled(False)
+            else:
+                menu.addAction(text, do)
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    def menu_actions(self, sheet: str, rc: Tuple[int, int]) -> List[Tuple[str, Any]]:
+        """What right-clicking the template cell (sheet, rc) offers: (text,
+        what it does), None for a line that only explains."""
+        target = lv.cell_fields(self._exact).get((sheet, rc))
+        if self.current is None or target is None:
+            return [("Pick a value first" if self.current is None else
+                     "Not a cell of the template's fields", None)]
+        where = target[0] + (f", {target[1]}" if target[1] else "")
+        acts = [(f"Put this value here ({where})", lambda: self.place_at(sheet, rc))]
+        if self.current.label:
+            acts.append((f"Put it here and always map {self.current.label!r} here",
+                         lambda: self.place_at(sheet, rc, teach=True)))
+        return acts
+
+    def place_at(self, sheet: str, rc: Tuple[int, int], teach: bool = False) -> bool:
+        """The value picked goes in the template cell (sheet, rc): its field
+        and item become that cell's, and it is said Right. ``teach``: its
+        label is mapped to that field for the next Extract too (at Save).
+        False when no value is picked or the cell is not a field's."""
+        it = self.current
+        target = lv.cell_fields(self._exact).get((sheet, rc))
+        if it is None:
+            self.status.setText("Pick a value first, then right-click where it belongs.")
+            return False
+        if target is None or it.sheet != "Values":
+            self.status.setText("That cell is not one of the template's fields." if it.sheet
+                                == "Values" else "A table record is not moved cell by cell.")
+            return False
+        fname, item = target
+        old = ", ".join(it.fields) + (f" {it.item}" if it.item else "")
+        a = dict(self.answers.get((it.sheet, it.row)) or {})
+        a.update(field=fname, item=item)
+        if teach and it.label:
+            a["teach"] = it.label
+        self.answers[(it.sheet, it.row)] = a
+        it.fields, it.item = [fname], item
+        it.title = " · ".join(x for x in (it.value, fname, " ".join(
+            y for y in (it.part, item) if y)) if x)
+        # the cell takes one value: another accepted for it is said Wrong, or
+        # Apply would keep neither ('2 values accepted … kept none')
+        out = [o for o in self.review.items
+               if o is not it and o.sheet == "Values" and o.part == it.part
+               and o.fields == [fname] and o.item == item and o.value != it.value
+               and self._accept_of(o) == "Y"]
+        for o in out:
+            b = dict(self.answers.get((o.sheet, o.row)) or {})
+            b["accept"] = "N"
+            self.answers[(o.sheet, o.row)] = b
+        self._answer("Y")
+        self.status.setText(f"Put here: {it.value} moved from {old or '(no field)'} to "
+                            f"{fname}{' ' + item if item else ''}"
+                            + (f"; {', '.join(o.value for o in out)} left out there"
+                               if out else "")
+                            + (f"; {it.label!r} will be mapped here" if teach and it.label
+                               else "") + ". Not saved yet.")
+        return True
 
     @staticmethod
     def _scroll(view: QTableView, model: SheetModel, r: int, c: int) -> None:
