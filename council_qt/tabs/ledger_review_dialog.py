@@ -502,8 +502,11 @@ class FilledTemplateDialog(ReviewDialog):
                  log: Optional[Callable[[str], None]] = None,
                  opener: Optional[Callable[[str], None]] = None,
                  on_saved: Optional[Callable[[int], None]] = None, part: str = "",
-                 on_rerun: Optional[Callable[[str, str], None]] = None):
+                 on_rerun: Optional[Callable[[str, str], None]] = None,
+                 on_groups: Optional[Callable[[], None]] = None):
         self._parts = lv.parts(review)
+        #: the Ledger tab's Groups window (LedgerTab.on_groups_window)
+        self.on_groups = on_groups
         #: the Ledger tab's re-run (LedgerTab.on_rerun_with_answers): given
         #: the review and the part shown, once the answers are saved
         self.on_rerun = on_rerun
@@ -549,6 +552,12 @@ class FilledTemplateDialog(ReviewDialog):
         self.rerun_btn.clicked.connect(self.on_rerun_clicked)
         self.rerun_btn.setVisible(self.on_rerun is not None)
         bar.addWidget(self.rerun_btn)
+        self.groups_btn = QPushButton("Groups…")
+        self.groups_btn.setToolTip("Slice the parts into groups, each with its own fields and "
+                                   "workbook (user, 2026-10-26)")
+        self.groups_btn.clicked.connect(lambda: self.on_groups and self.on_groups())
+        self.groups_btn.setVisible(self.on_groups is not None)
+        bar.addWidget(self.groups_btn)
         self.layout().insertLayout(0, bar)
         help_ = QLabel("Click a filled cell of the template: its value's source is shown "
                        "below, highlighted. Say Right or Wrong (or correct it); a cell "

@@ -70,6 +70,9 @@ class SavedLedger:
     #: each file read: path -> [size, modified time in ns]
     files: Dict[str, List[int]] = field(default_factory=dict)
     runs: List[Run] = field(default_factory=list)
+    #: sub-groups of its parts, each with its own fields and workbook
+    #: (council_core.ledger_groups)
+    groups: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def title(self) -> str:
@@ -113,7 +116,9 @@ def load(csv) -> Optional[SavedLedger]:
                        name=str(data.get("name") or ""),
                        project=str(data.get("project") or ""),
                        sources=[str(s) for s in data.get("sources") or []],
-                       settings=dict(data.get("settings") or {}), files=files, runs=runs)
+                       settings=dict(data.get("settings") or {}), files=files, runs=runs,
+                       groups=[dict(g) for g in data.get("groups") or []
+                               if isinstance(g, dict)])
 
 
 def save(led: SavedLedger) -> None:

@@ -535,6 +535,16 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     # what the Ledger holds already: pre-accepted again, and a value other
     # than it flagged (a Ledger run again on folders that gained files)
     dec = decide(run, ledger.schema, prefer=prefer, known=ledger_values(ledger))
+    # a field no group of its part tracks is not asked about (ledger_groups,
+    # user 2026-10-26: "datapoints that aren't tracked anymore")
+    from council_core import ledger_groups
+    groups = ledger_groups.load_groups(csv_path)
+    untracked = 0
+    if groups:
+        facts = ledger_groups.facts_from_ledger(ledger)
+        ledger_groups.add_decisions(facts, dec)
+        untracked = ledger_groups.set_aside_untracked(dec, groups, facts, csv_path,
+                                                      ledger.schema)
     # the mask and Part override go with the review: Apply reads the
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)
@@ -566,7 +576,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    [f"Filled example {Path(example).name}: not read (no "
                                     f"{ledger.schema.id_field} in it, or it is not there)"]
                                    if example else [])
-                          + list(getattr(run, "learned", []) or []),
+                          + list(getattr(run, "learned", []) or [])
+                          + ([f"{untracked} value(s) of fields their part's groups do not "
+                              "track were left out (Groups…)"] if untracked else []),
                           review_reasons=summarize_review_reasons(dec, ledger.schema),
                           filled=str(Path(filled[0]).parent) if filled else "",
                           filled_count=len(filled))

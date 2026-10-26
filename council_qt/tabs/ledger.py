@@ -195,6 +195,14 @@ class LedgerActions:
                                  prefer=tuple(prefer or parse_prefer(st.get("prefer") or "")))
         return extracted, new, changed
 
+    def write_workbooks(self, csv, progress=None):
+        """The full workbook and one per group (council_core.ledger_groups);
+        [] for a table Ledger."""
+        from council_core import ledger_groups, ledger_records
+        if not csv or ledger_records.is_record_ledger(csv):
+            return []
+        return ledger_groups.write_all(csv, progress)
+
     def record_run(self, csv, summary, **kw):
         """The run kept in the Ledger's saved runs (council_core.ledger_saved)."""
         from council_core import ledger_saved
@@ -668,6 +676,13 @@ class LedgerTab(ViewHelpers, QWidget):
             "The template filled in for one part at a time, each value tinted by how sure "
             "it is (green sure, yellow fairly, orange unsure, red disagreeing). Click a "
             "cell to see the source cell it came from, then Right or Wrong.")
+        # sub-groups of the parts, each with a workbook of its own (user,
+        # 2026-10-26)
+        self.groups_btn = self._step_button(row, "Groups…", self.on_groups_window)
+        self.groups_btn.setToolTip(
+            "Slice the Ledger's parts into groups - by part name, date or source folder - "
+            "each with its own fields (tracked, not tracked, or Yes/No) and a workbook of its "
+            "own beside the full one: a filled-template sheet per part.")
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
         # files skipped as too slow, or that stalled the app before
         # (council_core.file_guard): read again on the next run
@@ -914,6 +929,8 @@ class LedgerTab(ViewHelpers, QWidget):
         if hasattr(self, "link_btn"):
             self.link_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
+        if hasattr(self, "groups_btn"):
+            self.groups_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         self.open_btn.setEnabled(has_review)
         if hasattr(self, "review_btn"):
             self.review_btn.setEnabled(has_review)
@@ -1705,6 +1722,58 @@ class LedgerTab(ViewHelpers, QWidget):
             self.status.setText(line)
         self._run("Updating with new files", step, done, cancellable=True)
 
+    # ── groups (council_core.ledger_groups) ──────────────────────────────
+    def _workbooks(self, csv, progress):
+        """For a step's worker: the full and group workbooks written, or why
+        not (a str) - the step's own result stands either way."""
+        try:
+            return self.actions.write_workbooks(csv, lambda m: progress(m))
+        except Exception as e:                            # noqa: BLE001
+            return f"the workbooks were not written: {e}"
+
+    def _said_workbooks(self, books) -> None:
+        if isinstance(books, str):
+            self._say(books)
+        elif books:
+            self._say(f"Workbooks ({len(books)}), a filled-template sheet per part: "
+                      + ", ".join(Path(b).name for b in books)
+                      + f" in {Path(books[0]).parent}")
+
+    def on_groups_window(self, review_parts=()) -> None:
+        """The Groups window (ledger_groups_dialog) for the parent CSV shown;
+        ``review_parts``: the open review's parts, the CSV may not have yet."""
+        review_parts = review_parts if isinstance(review_parts, (list, tuple)) else ()
+        csv = self.csv.text().strip()
+        if not csv or not Path(csv).is_file():
+            self.status.setText("No parent CSV yet: create it first (step 1).")
+            return
+        if not review_parts and self.review.text().strip():
+            try:
+                from council_core import ledger_review
+                review_parts = ledger_review.parts(ledger_review.load(self.review.text()))
+            except Exception:                             # noqa: BLE001
+                review_parts = ()
+        from .ledger_groups_dialog import GroupsDialog
+        try:
+            dlg = GroupsDialog(csv, parent=self, review_parts=review_parts, log=self._say,
+                               on_write=self.on_write_workbooks,
+                               template=self.template.text().strip())
+        except LedgerError as e:
+            self.status.setText(f"Groups: {e}")
+            return
+        self.groups_dialog = dlg
+        dlg.show()
+
+    def on_write_workbooks(self) -> None:
+        csv = self.csv.text().strip()
+
+        def done(books) -> None:
+            self._said_workbooks(books)
+            if isinstance(books, list):
+                self.status.setText(f"{len(books)} workbook(s) written." if books else
+                                    "No workbook written: the parent CSV has no parts yet.")
+        self._run("Writing the workbooks", lambda p: self._workbooks(csv, p), done)
+
     def on_runs_window(self) -> None:
         """This Ledger's runs (ledger_runs_dialog): rename one, open its
         filled template or its review."""
@@ -1808,7 +1877,9 @@ class LedgerTab(ViewHelpers, QWidget):
                                        on_saved=lambda n: self.status.setText(
                                            f"{n} answer(s) saved into the review. Apply puts "
                                            "the accepted values into the parent CSV."),
-                                       on_rerun=self.on_rerun_with_answers, part=part)
+                                       on_rerun=self.on_rerun_with_answers, part=part,
+                                       on_groups=lambda: self.on_groups_window(
+                                           [i.part for i in review.items if i.part]))
             self.filled_dialog = dlg
             self._say(f"── Filled template ({Path(path).name}): "
                       f"{len(ledger_review.parts(review))} part(s)")
@@ -1894,10 +1965,11 @@ class LedgerTab(ViewHelpers, QWidget):
             # the CSV the review was applied to (its _run sheet), else the
             # one this tab shows
             applied = getattr(self.actions, "applied_csv", lambda _r: None)(review)
-            return s, applied or tab_csv
+            return s, applied or tab_csv, self._workbooks(applied or tab_csv, p)
 
         def done(result) -> None:
-            s, applied = result
+            s, applied, books = result
+            self._said_workbooks(books)
             self.stat["problems"].setText(str(len(s.problems)))
             self.status.setText(
                 f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "
