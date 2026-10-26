@@ -84,6 +84,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="seconds one file may take (default 900)")
     ap.add_argument("--logs", default="", help="folder for the per-file logs")
     args = ap.parse_args(argv)
+    # A Windows console is cp1252: one replacement character in a failing
+    # file's log would end the summary with a UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     files = ([Path(f).resolve() for f in args.files] if args.files
              else test_files())
