@@ -107,13 +107,19 @@ PREDICATES = ("LEADS", "CONTACT_FOR", "WORKS_ON", "OWNS", "USES_PART",
               "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED",
               # tables as nodes (council_core/kg_tables.py, user 2026-10-27)
               "IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
-              "SHARES_PROJECTS_WITH", "REFERENCES")
+              "SHARES_PROJECTS_WITH", "REFERENCES",
+              # related by meaning (council_core/kg_related.py, user 2026-10-27)
+              "RELATED_TO")
 #: The links tables as nodes give (council_core/kg_tables.py): drawn and
 #: shown, but counted apart from the facts between entities - 'N links' and
 #: "why no links?" are about those.
 TABLE_PREDICATES = ("IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
                     "SHARES_PROJECTS_WITH", "REFERENCES")
-_TABLE_PREDS_SQL = "(" + ",".join(f"'{p}'" for p in TABLE_PREDICATES) + ")"
+#: Not facts between entities either: two documents or tables whose meaning
+#: is close (kg_related). Suggested; counted and walked as table links are.
+RELATED = "RELATED_TO"
+NOT_FACT_PREDICATES = TABLE_PREDICATES + (RELATED,)
+_TABLE_PREDS_SQL = "(" + ",".join(f"'{p}'" for p in NOT_FACT_PREDICATES) + ")"
 STATUSES = ("seeded", "suggested", "accepted", "rejected")
 #: Inside one seed() transaction only: a derived link not yet re-supported by
 #: this run's evidence. Never committed (seed resolves or deletes every one).
@@ -2028,6 +2034,8 @@ class KnowledgeGraph:
             with self.db:
                 self.db.executescript(SCHEMA_SQL)
                 kg_contents.create(self.db)
+                from council_core import kg_related
+                self.db.executescript(kg_related.SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
                                 "('schema_version', ?)", (str(SCHEMA_VERSION),))
                 # v1 -> v2 -> v3 only ADD tables and an index (created
@@ -3323,7 +3331,8 @@ class KnowledgeGraph:
                         n_records += 1
                 stats["records"] = n_records
                 # Derived rows are rebuilt; decisions and user statuses are kept.
-                self.db.execute("DELETE FROM evidence WHERE method != 'model'")
+                # ...and so does what an embedding model found (kg_related)
+                self.db.execute("DELETE FROM evidence WHERE method NOT IN ('model', 'embedding')")
                 # What a model read (its entities' mentions and names) stays,
                 # as its links' evidence does: cleared below when stale.
                 self.db.execute("DELETE FROM mentions WHERE method != 'model'")
@@ -3350,7 +3359,8 @@ class KnowledgeGraph:
                 # stale and goes. A deleted file kept its last content hash,
                 # so its model links lived on with nothing behind them.
                 self.db.execute(
-                    "DELETE FROM evidence WHERE method='model' AND (content_hash !="
+                    "DELETE FROM evidence WHERE method IN ('model', 'embedding') AND"
+                    " (content_hash !="
                     " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)"
                     " OR document_id IN (SELECT id FROM documents WHERE status='missing'))")
                 # ...and what a model READ goes with what it found: those
@@ -3417,6 +3427,16 @@ class KnowledgeGraph:
                 # (Only a model's evidence can be left on a pending link.) In
                 # the graph at once, or waiting for the user - the graph's
                 # setting (model_link_status).
+                # Related by meaning: suggested while both of its ends still
+                # stand as they were embedded (one evidence row per end).
+                self.db.execute(
+                    f"UPDATE relations SET status='suggested' WHERE status='{_PENDING}'"
+                    " AND predicate=? AND id IN (SELECT relation_id FROM evidence"
+                    " GROUP BY relation_id HAVING COUNT(DISTINCT document_id) >= 2)",
+                    (RELATED,))
+                self.db.execute(
+                    f"DELETE FROM evidence WHERE relation_id IN (SELECT id FROM relations"
+                    f" WHERE status='{_PENDING}' AND predicate=?)", (RELATED,))
                 self.db.execute(
                     f"UPDATE relations SET status=? WHERE status='{_PENDING}'"
                     " AND id IN (SELECT relation_id FROM evidence)",
@@ -4726,6 +4746,144 @@ class KnowledgeGraph:
                 " WHERE method != 'model')", (new, time.time()))
             self._decide("model_links", {"where": where})
 
+    #: meta keys: the embedding model that finds related items (kg_related
+    #: id, '' = none) and the cosine a related link needs.
+    EMBED_MODEL_KEY = "embed_model"
+    RELATED_THRESHOLD_KEY = "related_threshold"
+
+    def embed_model(self) -> str:
+        return self.meta(self.EMBED_MODEL_KEY) or ""
+
+    def related_threshold(self) -> float:
+        from council_core import kg_related
+        try:
+            return float(self.meta(self.RELATED_THRESHOLD_KEY) or kg_related.DEFAULT_THRESHOLD)
+        except ValueError:
+            return kg_related.DEFAULT_THRESHOLD
+
+    def set_related(self, model_id: str, threshold: Optional[float] = None) -> None:
+        """The embedding model that finds related items ('' turns it off) and
+        the cosine a link needs."""
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.EMBED_MODEL_KEY, str(model_id or "")))
+            if threshold is not None:
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                                (self.RELATED_THRESHOLD_KEY,
+                                 str(min(0.99, max(0.3, float(threshold))))))
+            self._decide("related", {"model": model_id, "threshold": threshold})
+
+    def find_related(self, embed, *, model: str, threshold: Optional[float] = None,
+                     on_progress=None, should_stop=None) -> Dict[str, Any]:
+        """Related by meaning (council_core/kg_related.py): every document's
+        text, in passages, and every table's card embedded by ``embed`` (a
+        kg_related.Embedder; only what is new or changed since this model
+        last read it), then a suggested RELATED_TO link between every two
+        items close enough. The user's ✓ / ✗ on a link stays; a rejected
+        pair is never suggested again. Stopped, it keeps what it embedded."""
+        import numpy as np
+        from council_core import kg_related as kr
+        from council_core import kg_tables as kt
+        threshold = self.related_threshold() if threshold is None else float(threshold)
+        stats: Dict[str, Any] = {"items": 0, "embedded": 0, "passages": 0, "links": 0,
+                                 "stopped": False}
+        q = self.db.execute
+        docs = {r["id"]: (r["path"], r["content_hash"]) for r in q(
+            "SELECT id, path, content_hash FROM documents WHERE status='ok'")}
+        # what to embed: (item, kind, document, hash, [(locator, text)])
+        items: List[Tuple[str, str, str, str, Any]] = []
+        for r in q("SELECT document_id, content_hash, lines FROM doc_cache"):
+            did = r["document_id"]
+            if did in docs and docs[did][1] == r["content_hash"] and r["lines"] not in ("[]", ""):
+                items.append((did, "document", did, r["content_hash"],
+                              lambda lines=r["lines"]: kr.passages(json.loads(lines))))
+        paths = {did: p for did, (p, _h) in docs.items()}
+        for t in kt.tables(self.db, docs):
+            tid = entity_id("TABLE", t.key_for(paths.get(t.document_id, "")))
+            if q("SELECT 1 FROM entities WHERE id=?", (tid,)).fetchone() is None:
+                continue                         # not in the graph (yet)
+            card = kr.table_card(self.db, t)
+            h = hashlib.sha256((docs[t.document_id][1] + card).encode("utf-8")).hexdigest()
+            items.append((tid, "table", t.document_id, h,
+                          lambda card=card, t=t: [({"sheet": t.loc_sheet,
+                                                    "header": t.header_row}, card)]))
+        stats["items"] = len(items)
+        keep = {it[0] for it in items}
+        with self.db:
+            for (item,) in q("SELECT DISTINCT item FROM embeddings WHERE model=?",
+                             (model,)).fetchall():
+                if item not in keep:
+                    q("DELETE FROM embeddings WHERE item=? AND model=?", (item, model))
+        have = {r[0]: r[1] for r in q("SELECT item, content_hash FROM embeddings"
+                                      " WHERE model=? AND idx=0", (model,))}
+        todo = [it for it in items if have.get(it[0]) != it[3]]
+        for n, (item, kind, did, h, get) in enumerate(todo, 1):
+            if should_stop is not None and should_stop():
+                stats["stopped"] = True
+                break
+            parts = get()
+            if not parts:
+                continue
+            vecs = []
+            for i in range(0, len(parts), kr.BATCH):
+                vecs.append(embed([t for _l, t in parts[i:i + kr.BATCH]]))
+            m = np.vstack(vecs) if vecs else np.zeros((0, 0), np.float32)
+            if len(m) != len(parts):
+                raise RuntimeError(f"the embedding model gave {len(m)} vectors for "
+                                   f"{len(parts)} passages")
+            with self.db:
+                q("DELETE FROM embeddings WHERE item=? AND model=?", (item, model))
+                self.db.executemany(
+                    "INSERT INTO embeddings VALUES (?,?,?,?,?,?,?,?,?)",
+                    [(item, kind, did, h, model, i, kr.loc_json(loc), text, kr.to_blob(v))
+                     for i, ((loc, text), v) in enumerate(zip(parts, m))])
+            stats["embedded"] += 1
+            stats["passages"] += len(parts)
+            if on_progress is not None:
+                on_progress(n, len(todo), docs.get(did, ("", ""))[0])
+        if stats["stopped"]:
+            return stats
+        # the items as their passages' average, then the pairs
+        rows: Dict[str, List[Any]] = {}
+        for r in q("SELECT item, document_id, idx, locator, text, vec FROM embeddings"
+                   " WHERE model=? ORDER BY item, idx", (model,)):
+            rows.setdefault(r["item"], []).append(r)
+        names = sorted(i for i in rows if i in keep)
+        if len(names) < 2:
+            return stats
+        mats = {i: np.vstack([kr.from_blob(r["vec"]) for r in rows[i]]) for i in names}
+        means = kr.normalise(np.vstack([mats[i].mean(axis=0) for i in names]))
+        pairs = kr.related_pairs(means, threshold,
+                                 apart=[rows[i][0]["document_id"] for i in names])
+        now_ids = set()
+        with self.db:
+            # this run's evidence is the evidence (a pair found again gets its
+            # closest passages as they are now)
+            q("DELETE FROM evidence WHERE method='embedding'")
+            for a_i, b_i, score in pairs:
+                a, b = names[a_i], names[b_i]
+                pa, pb, _s = kr.best_pair(mats[a], mats[b])
+                ra, rb = rows[a][pa], rows[b][pb]
+                text = (f"“{kr.quote(ra['text'])}” ≈ “{kr.quote(rb['text'])}”"
+                        f" (closeness {score:.2f})")
+                for r in (ra, rb):              # one evidence row per end
+                    did = r["document_id"]
+                    rid = self._relate(a, RELATED, b, "suggested", doc_id=did,
+                                       content_hash=docs[did][1],
+                                       locator=json.loads(r["locator"]), quote=text,
+                                       method="embedding", run_id="related", model=model)
+                now_ids.add(rid)
+            # the earlier ones these vectors no longer support (the user's
+            # ✓ / ✗ stay)
+            old = [r[0] for r in q("SELECT id FROM relations WHERE predicate=? AND status IN"
+                                   " ('seeded','suggested')", (RELATED,))
+                   if r[0] not in now_ids]
+            for rid in old:
+                q("DELETE FROM evidence WHERE relation_id=?", (rid,))
+                q("DELETE FROM relations WHERE id=?", (rid,))
+        stats["links"] = len(now_ids)
+        return stats
+
     def focus(self) -> str:
         return self.meta(self.FOCUS_KEY) or ""
 
@@ -5128,8 +5286,12 @@ class KnowledgeGraph:
                                            f" predicate NOT IN {_TABLE_PREDS_SQL}"
                                            " GROUP BY status")}
         tables = q("SELECT COUNT(*) FROM relations WHERE status != 'rejected' AND"
-                   f" predicate IN {_TABLE_PREDS_SQL}").fetchone()[0]
+                   f" predicate IN {_TABLE_PREDS_SQL} AND predicate != ?",
+                   (RELATED,)).fetchone()[0]
+        related = q("SELECT COUNT(*) FROM relations WHERE status != 'rejected' AND"
+                    " predicate=?", (RELATED,)).fetchone()[0]
         return {"entities": by_type, "relations": by_status, "table_links": tables,
+                "related_links": related,
                 "mentions": q("SELECT COUNT(*) FROM mentions").fetchone()[0],
                 "open_reviews": q("SELECT COUNT(*) FROM review WHERE status='open'")
                 .fetchone()[0]}

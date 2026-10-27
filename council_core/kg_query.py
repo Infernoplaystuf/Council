@@ -45,7 +45,7 @@ from council_core import token_budget
 #: What tables as nodes link (kg_tables) is not followed for an answer: a
 #: table lists everyone in it, so two hops through one named every row's
 #: people. The rows themselves come from the Contents layer.
-_TABLE_PREDS = "(" + ",".join(f"'{p}'" for p in kgm.TABLE_PREDICATES) + ")"
+_TABLE_PREDS = "(" + ",".join(f"'{p}'" for p in kgm.NOT_FACT_PREDICATES) + ")"
 
 #: How a link reads from each end (the Connections tab shows the same words).
 PHRASES = {
@@ -64,6 +64,8 @@ PHRASES = {
     "SHARES_PEOPLE_WITH": ("shares people with", "shares people with"),
     "SHARES_PROJECTS_WITH": ("shares projects with", "shares projects with"),
     "REFERENCES": ("reads values from", "is read by"),
+    # related by meaning (council_core/kg_related.py)
+    "RELATED_TO": ("related to", "related to"),
 }
 
 

@@ -228,7 +228,8 @@ def test_the_graph_dialog_gives_its_values(qapp, tmp_path):
     dlg.links_review.setChecked(True)
     assert dlg.values() == {"name": "Falcon wing", "folders": [str(tmp_path)],
                             "suffixes": ["pdf", ".MD"], "focus": "spars and their suppliers",
-                            "model_links": "review", "use_in_answers": True}
+                            "model_links": "review", "use_in_answers": True,
+                            "embed_model": "", "related_threshold": 0.75}
     main = GraphDialog(new=False, name="All documents", is_main=True)
     assert not main.name.isEnabled() and not main.add_btn.isVisibleTo(main)
     assert main.values()["folders"] == []

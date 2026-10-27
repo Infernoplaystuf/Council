@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
-                               QDialogButtonBox, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QPlainTextEdit, QPushButton,
                                QRadioButton, QScrollArea, QVBoxLayout, QWidget)
@@ -223,16 +223,20 @@ class GraphDialog(QDialog):
 
     ``pick()`` asks for a folder (None = cancelled). ``values()`` gives
     {name, folders, suffixes, focus, model_links ('graph' | 'review'),
-    use_in_answers}."""
+    use_in_answers, embed_model (a kg_related id, '' = none),
+    related_threshold}. ``embed_models``: (id, label) of the embedding models
+    on this PC (kg_related.available)."""
 
     def __init__(self, *, new: bool, pick: Callable[[], Optional[str]] = lambda: None,
                  name: str = "", folders: Optional[List[str]] = None,
                  suffixes: Optional[List[str]] = None, focus: str = "",
                  model_links: str = "graph", use_in_answers: bool = True,
-                 is_main: bool = False, parent=None):
+                 is_main: bool = False, embed_model: str = "",
+                 embed_models: Optional[List[tuple]] = None,
+                 related_threshold: float = 0.75, parent=None):
         super().__init__(parent)
         self.setWindowTitle("New knowledge graph" if new else "Graph settings")
-        self.resize(600, 520)
+        self.resize(600, 600)
         self._pick = pick
         self._new = new
         outer = QVBoxLayout(self)
@@ -290,6 +294,29 @@ class GraphDialog(QDialog):
         ll.addWidget(self.links_graph)
         ll.addWidget(self.links_review)
         outer.addWidget(lbox)
+        rbox = QGroupBox("Related by meaning")
+        rl = QFormLayout(rbox)
+        self.embed_model = QComboBox()
+        self.embed_model.addItem("No embedding model (no related links)", "")
+        for mid, label in embed_models or []:
+            self.embed_model.addItem(label, mid)
+        if embed_model and self.embed_model.findData(embed_model) < 0:
+            self.embed_model.addItem(f"{embed_model} (not found on this PC)", embed_model)
+        self.embed_model.setCurrentIndex(max(0, self.embed_model.findData(embed_model)))
+        self.embed_model.setToolTip(
+            "A local embedding model already on this PC (the Council never downloads one; "
+            "granite-embedding or nomic-embed-text in Ollama, for example). ⟳ Build graph "
+            "then suggests a link between documents and tables whose meaning is close.")
+        rl.addRow("Find related items with", self.embed_model)
+        self.related_threshold = QDoubleSpinBox()
+        self.related_threshold.setRange(0.30, 0.99)
+        self.related_threshold.setSingleStep(0.05)
+        self.related_threshold.setDecimals(2)
+        self.related_threshold.setValue(float(related_threshold))
+        self.related_threshold.setToolTip("How close two items must be (cosine): higher, "
+                                          "fewer and surer links")
+        rl.addRow("Closeness needed", self.related_threshold)
+        outer.addWidget(rbox)
         self.use_in_answers = QCheckBox("Use this graph in the Council's answers")
         self.use_in_answers.setChecked(use_in_answers)
         outer.addWidget(self.use_in_answers)
@@ -320,7 +347,9 @@ class GraphDialog(QDialog):
                              .split(",") if x.strip()],
                 "focus": " ".join(self.focus.toPlainText().split()),
                 "model_links": "review" if self.links_review.isChecked() else "graph",
-                "use_in_answers": self.use_in_answers.isChecked()}
+                "use_in_answers": self.use_in_answers.isChecked(),
+                "embed_model": str(self.embed_model.currentData() or ""),
+                "related_threshold": round(self.related_threshold.value(), 2)}
 
     def on_ok(self) -> None:
         v = self.values()

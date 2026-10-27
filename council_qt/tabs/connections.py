@@ -147,9 +147,11 @@ class ConnectionsActions:
         info = gl.create(values["name"], values["folders"], values.get("suffixes") or (),
                          use_in_answers=bool(values.get("use_in_answers", True)),
                          focus=str(values.get("focus") or ""))
-        if values.get("model_links") == "review":
-            with gl.open(info.id, self.root) as kg:
+        with gl.open(info.id, self.root) as kg:
+            if values.get("model_links") == "review":
                 kg.set_model_links("review")
+            if values.get("embed_model"):
+                kg.set_related(values["embed_model"], values.get("related_threshold"))
         return info
 
     def update_graph(self, gid: str, values: Dict[str, Any]) -> None:
@@ -163,6 +165,27 @@ class ConnectionsActions:
             want = values.get("model_links", "graph")
             if (kg.model_link_status() == "suggested") != (want == "review"):
                 kg.set_model_links(want)
+            if "embed_model" in values and (
+                    values["embed_model"] != kg.embed_model()
+                    or values.get("related_threshold") != kg.related_threshold()):
+                kg.set_related(values["embed_model"], values.get("related_threshold"))
+
+    def embed_models(self) -> List[tuple]:
+        """(id, label) of the embedding models on this PC (kg_related)."""
+        from council_core import kg_related
+        return kg_related.available()
+
+    def find_related(self, on_progress, should_stop) -> Optional[Dict[str, Any]]:
+        """Related by meaning: the graph's embedding model reads what is new
+        or changed and the close pairs are suggested
+        (KnowledgeGraph.find_related). None when the graph has no model."""
+        from council_core import kg_related
+        with self.open_graph() as kg:
+            model = kg.embed_model()
+            if not model:
+                return None
+            return kg.find_related(kg_related.make(model), model=model,
+                                   on_progress=on_progress, should_stop=should_stop)
 
     def delete_graph(self, gid: str) -> None:
         kgg.GraphList(self.vault_dir).delete(gid)
@@ -331,6 +354,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
         #: reads the free text (a Rebuild for another reason - an answer, a
         #: split - only reads the documents again).
         self._read_text_after = False
+        #: ...and, the graph having an embedding model, related items are
+        #: found last (kg_related).
+        self._related_after = False
         self._picture_token = None
         self._asking = False
         #: 'Why no links?': its one dialog (tests reach it here), and whether
@@ -1004,7 +1030,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.status.setToolTip("")
         if read_text and not self._stop.is_set():
             self.on_suggest()                   # the model's part of ⟳ Build graph
+        elif self._related_after and not self._stop.is_set():
+            self.on_related()                   # the embedding model's part
         else:
+            self._related_after = False
             self.stop_btn.setEnabled(False)
             self.refresh_picture()
 
@@ -1060,6 +1089,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             return
         self._stop.clear()
         self._read_text_after = bool(self.model_box.currentData())
+        self._related_after = bool(self._kg is not None and self._kg.embed_model())
         self.stop_btn.setEnabled(True)
         self.on_rebuild()
 
@@ -1093,9 +1123,62 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="kg-read-text", daemon=True).start()
 
+    def on_related(self) -> None:
+        """Related by meaning, the last part of ⟳ Build graph: the graph's
+        embedding model reads what is new or changed, and close documents and
+        tables get a suggested link (KnowledgeGraph.find_related)."""
+        self._related_after = False
+        if self._busy:
+            return
+        self._busy = True
+        self.rebuild_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status.setText("Finding related items…")
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+
+        def progress(done, total, path):
+            self._to_ui(self.status.setText,
+                        f"Finding related items: read {done} of {total} new or changed "
+                        f"({path})")
+
+        def work() -> None:
+            try:
+                stats = self.actions.find_related(progress, self._stop.is_set)
+                self._to_ui(self._related_done, stats, None)
+            except Exception as exc:                      # noqa: BLE001
+                self._to_ui(self._related_done, None, exc)
+
+        threading.Thread(target=work, name="kg-related", daemon=True).start()
+
+    def _related_done(self, stats, exc) -> None:
+        self._busy = False
+        self.rebuild_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._reopen()
+        if exc is not None:
+            self.status.setText(f"Finding related items failed: {exc}")
+            return
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
+        if stats is None:
+            text = "No embedding model is set for this graph (Graph settings…)."
+        elif stats["stopped"]:
+            text = (f"Stopped after reading {stats['embedded']} item(s) — ⟳ Build graph again "
+                    "to continue.")
+        else:
+            text = (f"Related by meaning: {stats['links']} link(s) suggested between "
+                    f"{stats['items']} documents and tables ({stats['embedded']} read now). "
+                    "✓ Accept or ✗ Reject them in Links.")
+        self.status.setText(text)
+        self.refresh_picture()
+
     def on_stop_suggest(self) -> None:
         self._stop.set()
         self._read_text_after = False
+        self._related_after = False
         self.status.setText("Stopping after the passages in progress — ⟳ Build graph again "
                             "to continue where it stopped.")
 
@@ -1124,6 +1207,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if self._current:
             self.show_entity(self._current)
         self.status.setText(text)
+        if self._related_after and not stats["stopped"] and not self._stop.is_set():
+            self.on_related()                   # the embedding model's part
+            return
+        self._related_after = False
         self.refresh_picture()
 
     # -- graphs ------------------------------------------------------------
@@ -1163,7 +1250,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         from .. import dialogs as _dialogs
         if _dialogs.disabled():
             return None
-        dlg = GraphDialog(new=new, pick=self.ask_folder, parent=self, **current)
+        try:
+            models = self.actions.embed_models()
+        except Exception:                                 # noqa: BLE001
+            models = []
+        dlg = GraphDialog(new=new, pick=self.ask_folder, parent=self, embed_models=models,
+                          **current)
         self._graph_dialog_open = dlg          # tests reach it here
         return dlg.values() if dlg.exec() == QDialog.DialogCode.Accepted else None
 
@@ -1195,7 +1287,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
                    "suffixes": list(info.suffixes), "focus": self._kg.focus(),
                    "model_links": "review" if self._kg.model_link_status() == "suggested"
                    else "graph", "use_in_answers": info.use_in_answers,
-                   "is_main": info.is_main}
+                   "is_main": info.is_main, "embed_model": self._kg.embed_model(),
+                   "related_threshold": self._kg.related_threshold()}
         got = self.ask_graph(False, current)
         if not got:
             return
