@@ -129,3 +129,12 @@ same list.
 - The Connections tab's Contents layer (every value of every spreadsheet, text
   document, PDF, Word and JSON file under its header or label, whatever the field rules; search over it; the Contents tab):
   `docs/handoff/kg_contents_2026-10-26.md`.
+- Fixes from the synthetic Ledger / Connections test (no 500-row limit,
+  off-template sheets held back, edited filled templates read, PDF tables and
+  scans, CSV sources, parts in sheet titles, Q&A part ranking, proposed people
+  rules, unrelated sheets skipped) and what is still open:
+  `docs/handoff/synthetic_test_fixes_2026-10-27.md`.
+- Tables as their own nodes in Connections (LISTS, SHARES_*, REFERENCES), links
+  between documents and tables related by meaning (a local embedding model,
+  suggested), and a model reading each table to propose column rules:
+  `docs/handoff/kg_tables_related_2026-10-27.md`.

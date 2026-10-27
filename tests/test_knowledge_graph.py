@@ -167,7 +167,11 @@ def test_the_default_rules_start_ticked(tmp_path):
     read was a wrong assumption - a first build reads the labelled fields."""
     v, key = _vault(tmp_path)
     kg = kgm.KnowledgeGraph(v)
-    assert {s for _r, s in kg.field_rules()} == {"confirmed"}
+    status = {r.label: s for r, s in kg.field_rules()}
+    assert {status[r.label] for r in kgm.DEFAULT_FIELD_RULES} == {"confirmed"}
+    # the people columns of rosters and logs are offered, not ticked
+    # (synthetic test, 2026-10-27)
+    assert {status[r.label] for r in kgm.PROPOSED_FIELD_RULES} == {"proposed"}
     kg.seed()
     labelled = _truth(key, evidence={"row", "record"}) - {
         ("bob", "CONTACT_FOR", "northwind"), ("marcus", "CONTACT_FOR", "bands")}
@@ -188,8 +192,10 @@ def test_an_older_store_gets_the_default_rules_ticked_unless_the_user_chose(tmp_
             kg.db.execute("DELETE FROM meta WHERE key='rules_on_by_default'")
         kg.close()
         kg = kgm.KnowledgeGraph(store)
-        got = {s for _r, s in kg.field_rules()}
+        defaults = {r.label for r in kgm.DEFAULT_FIELD_RULES}
+        got = {s for r, s in kg.field_rules() if r.label in defaults}
         assert got == ({"proposed"} if user_chose else {"confirmed"}), name
+        assert {s for r, s in kg.field_rules() if r.label not in defaults} == {"proposed"}
         kg.close()
 
 
@@ -757,7 +763,13 @@ def _full_snapshot(kg):
                 " JOIN entities e ON e.id=m.entity_id WHERE m.method != 'collection'")),
             sorted((r[0], r[1], r[2]) for r in q(
                 "SELECT relation_id, locator, method FROM evidence"
-                " WHERE method != 'collection'")),
+                " WHERE method NOT IN ('collection', 'table')")),
+            # a table's links name its document, whose id is the vault's own
+            # (kg_tables, 2026-10-27): compared by name
+            sorted((r[0], r[1], r[2], r[3]) for r in q(
+                "SELECT s.name, r.predicate, o.name, e.locator FROM evidence e"
+                " JOIN relations r ON r.id=e.relation_id JOIN entities s ON s.id=r.subject_id"
+                " JOIN entities o ON o.id=r.object_id WHERE e.method='table'")),
             sorted((r[0], r[1]) for r in q("SELECT kind, surface FROM review"
                                            " WHERE status='open'")))
 

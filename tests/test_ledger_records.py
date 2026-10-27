@@ -166,7 +166,7 @@ def test_btb_reproduces_the_filled_template_cell_for_cell(btb):
     assert isinstance(out.cell(2, 3).value, int)      # 4480.0 in the source, 4480 here
     assert isinstance(out.cell(2, 8).value, float)    # 125.8 stays 125.8
     assert "wood" not in {str(c.value) for row in out.iter_rows() for c in row}
-    assert out.parent.properties.keywords == lr.FILLED_MARK
+    assert out.parent.properties.keywords.startswith(lr.FILLED_MARK)
 
 
 def test_btb_waits_for_the_user_on_what_was_only_inferred(btb):

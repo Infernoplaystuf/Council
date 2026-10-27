@@ -145,7 +145,7 @@ def read_document(path, want_pictures: bool = True) -> Document:
     if suffix in (".docx", ".docm"):
         blocks, pictures = _docx_blocks(path, want_pictures)
     elif suffix == ".pdf":
-        blocks, pictures = _pdf_blocks(path), []
+        blocks, pictures = _pdf_blocks(path, want_pictures)
     else:
         blocks, pictures = _text_blocks(path), []
     doc = _lay_out(path.name, blocks)
@@ -204,7 +204,92 @@ def _text_blocks(path: Path) -> List[Block]:
     return out
 
 
-def _pdf_blocks(path: Path) -> List[Block]:
+#: a scanned page (no text on it) is rendered at this many dots per inch for
+#: the picture reader
+SCAN_DPI = 200
+
+
+def _pdf_blocks(path: Path, want_pictures: bool = True
+                ) -> Tuple[List[Block], List[DocPicture]]:
+    """A PDF's lines and tables, top to bottom, page by page; a page with no
+    text (a scan) as a picture for the image reader. pdfplumber when it is
+    installed: pypdf alone gave a table one cell per line, so a report's
+    flaw table was lost (synthetic test, 2026-10-27: 3 of 53 values read)."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return _pdf_lines_pypdf(path), []
+    try:
+        pdf = pdfplumber.open(str(path))
+    except Exception as e:                                 # noqa: BLE001
+        if "password" in str(e).lower() or type(e).__name__ == "PdfminerException":
+            # an encrypted file pdfplumber will not open: pypdf says why
+            return _pdf_lines_pypdf(path), []
+        raise DocError(f"could not read {path.name}: {e}") from e
+    out: List[Block] = []
+    pictures: List[DocPicture] = []
+    n = 0
+    try:
+        for no, page in enumerate(pdf.pages, start=1):
+            try:
+                found = page.find_tables()
+            except Exception:                              # noqa: BLE001
+                found = []
+            boxes = [t.bbox for t in found]
+
+            def outside(obj, boxes=boxes):
+                x = (obj.get("x0", 0) + obj.get("x1", 0)) / 2
+                y = (obj.get("top", 0) + obj.get("bottom", 0)) / 2
+                return not any(b[0] <= x <= b[2] and b[1] <= y <= b[3] for b in boxes)
+
+            items: List[Tuple[float, Block]] = []
+            try:
+                lines = page.filter(outside).extract_text_lines() if boxes else \
+                    page.extract_text_lines()
+            except Exception:                              # noqa: BLE001
+                lines = []
+            for ln in lines:
+                t = (ln.get("text") or "").strip()
+                if t:
+                    items.append((ln.get("top", 0), ("line", t)))
+                    n += len(t)
+            for t in found:
+                rows = [[(c or "").strip() for c in row] for row in (t.extract() or [])]
+                rows = [r for r in rows if any(r)]
+                if rows:
+                    items.append((t.bbox[1], ("table", rows)))
+                    n += sum(len(c) for r in rows for c in r)
+            if not items and want_pictures and page.images:
+                png = _render_page(path, no - 1)
+                if png:
+                    pictures.append(DocPicture(f"Page {no}", f"page {no}", png, "png"))
+            out += [b for _top, b in sorted(items, key=lambda it: it[0])]
+            if n > MAX_CHARS:
+                break
+    finally:
+        pdf.close()
+    return out, pictures
+
+
+def _render_page(path: Path, index: int) -> bytes:
+    """One page as a PNG (pypdfium2, which pdfplumber brings), b'' when it
+    cannot be rendered."""
+    try:
+        import io
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(path))
+        try:
+            img = doc[index].render(scale=SCAN_DPI / 72).to_pil()
+        finally:
+            doc.close()
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:                                      # noqa: BLE001
+        return b""
+
+
+def _pdf_lines_pypdf(path: Path) -> List[Block]:
     try:
         from pypdf import PdfReader
     except ImportError as e:

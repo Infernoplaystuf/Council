@@ -568,7 +568,7 @@ def write_full_filled(review: Review, progress=None, active: str = "") -> Option
     None for a table review, or one with no parts or no template cells."""
     import openpyxl
     from council_core.ledger_groups import _title
-    from sample_ledger import (FILLED_MARK, TemplateSchema, is_filled_template,
+    from sample_ledger import (FILLED_MARK, TemplateSchema, is_filled_template, mark_filled,
                                sample_sort_key, schema_path_for)
     if review.kind != "samples" or not review.csv:
         return None
@@ -609,10 +609,7 @@ def write_full_filled(review: Review, progress=None, active: str = "") -> Option
         wb.active = wb.worksheets.index(opening) if opening is not None else 0
         for ws in wb.worksheets:
             ws.sheet_view.tabSelected = ws is wb.active
-        try:
-            wb.properties.keywords = FILLED_MARK
-        except Exception:                                   # noqa: BLE001
-            pass
+        mark_filled(wb)
         out.parent.mkdir(parents=True, exist_ok=True)
         wb.save(tmp)
     finally:

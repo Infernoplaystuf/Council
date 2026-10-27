@@ -31,7 +31,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from sample_ledger import (FILLED_MARK, SOURCE_COL, LedgerError, ParentCSV, _typed,
+from sample_ledger import (FILLED_MARK, SOURCE_COL, LedgerError, ParentCSV, _typed, mark_filled,
                            is_filled_template, sample_sort_key, xl_text)
 
 #: how a group takes its parts
@@ -347,10 +347,7 @@ def write_workbook(csv, parts: Sequence[str], out_path, off: Sequence[str] = (),
                         put(f, "", "")
         for ws in originals:
             wb.remove(ws)
-        try:
-            wb.properties.keywords = FILLED_MARK
-        except Exception:                                   # noqa: BLE001
-            pass
+        mark_filled(wb)
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_name(out.stem + ".writing" + out.suffix)
         wb.save(tmp)
