@@ -4329,13 +4329,27 @@ def decide(run: Extraction, schema: TemplateSchema,
     return out
 
 
+#: What review_reasons says when the only doubt about a value is its part:
+#: the review lets the user confirm a file's part once for all its sure
+#: values (ledger_review.same_file_part; user, 2026-10-27).
+PART_REASONS = ("part suggested by the model", "part taken from the file name",
+                "part named in an index workbook", "part found in a title")
+
+
 def review_reason(d: Decision, schema: TemplateSchema) -> str:
     """Why decide() did not pre-accept ``d``: the first of its checks that
     held it back, in a few words - for the count of reasons at the end of a
     run (user, 2026-10-23: 7312 of 7976 values to review). '' when it was
     pre-accepted. Words only, never the value or the source."""
+    got = review_reasons(d, schema)
+    return got[0] if got else ("" if d.accept or d.alternate else "another value ranked first")
+
+
+def review_reasons(d: Decision, schema: TemplateSchema) -> List[str]:
+    """Every check that held ``d`` back, first first ([] when pre-accepted,
+    or when none did: another value ranked first)."""
     if d.accept or d.alternate:
-        return ""
+        return []
     o = d.obs
     how = o.part_how or ""
     checks = (
@@ -4362,7 +4376,7 @@ def review_reason(d: Decision, schema: TemplateSchema) -> str:
         (FEW_FIELDS_NOTE in o.note, "sheet holds few of the template's fields"),
         (ODD_PART_NOTE in o.note, "part number shaped unlike the others"),
     )
-    return next((why for held, why in checks if held), "another value ranked first")
+    return [why for held, why in checks if held]
 
 
 def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSchema,
@@ -4587,7 +4601,7 @@ def _book_list(books: Sequence[str], limit: int = ROW_SOURCES_MAX) -> str:
 # ── the review workbook ─────────────────────────────────────────────────
 VAL_HEAD = ["Accept", "Part", "Item", "Field", "Value", "Confidence", "Matched by",
             "Source label", "Source", "Other values offered", "Note", "Part from",
-            "Inspector"]
+            "Inspector", "Held back because"]
 LAB_HEAD = ["Map to field", "Ignore", "Source label", "Example value", "Count",
             "Best guess", "Source", "Part", "Item", "Note"]
 PEOPLE_HEAD = ["Initials", "Full name", "Values signed", "First seen at"]
@@ -4653,7 +4667,7 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
     # to the end before the file is saved (a write-only sheet streams)
     info = _StreamSheet(wb, "Read me", widths=[120], freeze=False)
     ws = _StreamSheet(wb, "Values", VAL_HEAD, bold,
-                      [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28, 10])
+                      [8, 10, 7, 48, 16, 11, 11, 30, 50, 18, 34, 28, 10, 40])
     lab = _StreamSheet(wb, "Labels to map", LAB_HEAD, bold,
                        [44, 8, 34, 18, 7, 60, 50, 10, 7, 60])
     ppl = _StreamSheet(wb, "People", PEOPLE_HEAD, bold, [10, 32, 7, 50])
@@ -4703,7 +4717,8 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
         o = d.obs
         fill = red if d.conflict else (amber if not (d.accept or d.alternate) else None)
         ws.append(["Y" if d.accept else "N" if d.alternate else "", o.part, o.item, o.field, o.value, o.score,
-                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector],
+                   o.via, o.label, o.where, d.conflict, o.note, o.part_how, o.inspector,
+                   "; ".join(review_reasons(d, schema))],
                   fill=fill)
     yn = DataValidation(type="list", formula1='"Y,N"', allow_blank=True)
     yn.add(f"A2:A{max(ws.rows, 2) + 200}")

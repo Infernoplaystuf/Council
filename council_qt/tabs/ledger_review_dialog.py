@@ -178,6 +178,15 @@ class ReviewDialog(QDialog):
         self.wrong_btn.setToolTip("Accept = N: this value does not go into the parent CSV")
         self.wrong_btn.clicked.connect(self.on_wrong)
         row.addWidget(self.wrong_btn)
+        # where the only doubt is the part, one answer for the whole file
+        # (user, 2026-10-27: "The sure values in the review should not
+        # require a review")
+        self.file_part_btn = QPushButton("✓ Part right for this file")
+        self.file_part_btn.setToolTip("The part is right for every value read from this "
+                                      "file: accept all its sure values whose only doubt "
+                                      "was the part")
+        self.file_part_btn.clicked.connect(self.on_file_part)
+        row.addWidget(self.file_part_btn)
         outer.addLayout(row)
         row = QHBoxLayout()
         self.status = QLabel("")
@@ -227,7 +236,8 @@ class ReviewDialog(QDialog):
 
     def _fill_row(self, n: int, it: lv.Item) -> None:
         answered = (it.sheet, it.row) in self.answers
-        cells = [self._accept_of(it) or "?", it.title,
+        held = it.held if it.held and self._accept_of(it) not in ("Y", "N") else ""
+        cells = [self._accept_of(it) or "?", it.title + (f"  — {held}" if held else ""),
                  Path(it.where.split(" › ", 1)[0]).name if it.where else ""]
         tint = (ANSWER_TINT if answered else CLASH_TINT if it.clash
                 else "#FFF2CC" if it.needs else None)
@@ -265,6 +275,35 @@ class ReviewDialog(QDialog):
         self.items.selectRow(self.shown.index(item))
 
     # ── answers ─────────────────────────────────────────────────────────
+    def on_file_part(self) -> List[lv.Item]:
+        """Accept every sure value of the current item's file whose only
+        doubt was its part (ledger_review.same_file_part). Returns them."""
+        it = self.current
+        if it is None:
+            return []
+        got = lv.same_file_part(self.review.items, it, self._accept_of)
+        left: List[lv.Item] = []
+        for o in got:
+            self.answers[(o.sheet, o.row)] = dict(self.answers.get((o.sheet, o.row)) or {},
+                                                  accept="Y")
+            for r in lv.rivals(self.review.items, o, limit=0):
+                if r is not o and r not in got:
+                    b = dict(self.answers.get((r.sheet, r.row)) or {})
+                    b["accept"] = "N"
+                    self.answers[(r.sheet, r.row)] = b
+                    left.append(r)
+        self._fill_list()
+        self._tint_template()
+        name = Path(it.where.split(" › ", 1)[0]).name
+        self.status.setText(f"Accepted {len(got)} value(s) of {name} for part {it.part}"
+                            + (f"; left out {len(left)} that disagreed" if left else "")
+                            + ". Not saved yet.")
+        nxt = next((i for i in self.shown if (i.sheet, i.row) not in self.answers), None)
+        if nxt is not None:
+            self.items.selectRow(self.shown.index(nxt))
+        self._refresh_buttons()
+        return got
+
     def _answer(self, accept: str) -> None:
         it = self.current
         if it is None:
@@ -353,6 +392,11 @@ class ReviewDialog(QDialog):
         on = self.current is not None
         self.right_btn.setEnabled(on)
         self.wrong_btn.setEnabled(on)
+        n = len(lv.same_file_part(self.review.items, self.current, self._accept_of)) \
+            if on else 0
+        self.file_part_btn.setVisible(bool(n))
+        self.file_part_btn.setText(f"✓ Part {self.current.part} right for this file ({n})"
+                                   if n else "✓ Part right for this file")
         self.open_btn.setEnabled(bool(on and self.current.source_file
                                       and self.opener is not None))
         self.save_btn.setEnabled(bool(self.answers))
@@ -903,7 +947,7 @@ class FilledTemplateDialog(ReviewDialog):
                 was = (known.get((sheet, rc)) or ("", ""))[1]
                 texts[rc] = it.value
                 tints[rc] = lv.TINT_CLASH if lv.differs(it.value, was) else \
-                    lv.confidence_tint(it)
+                    lv.confidence_tint(it, self._accept_of(it))
                 others = [o.value for o in cs[1:] if o.value != it.value]
                 tips[rc] = (f"{it.fields[0]} = {it.value}\nfrom {it.where}\nscore "
                             f"{it.score:g}" + (" · accepted" if self._accept_of(it) == "Y"

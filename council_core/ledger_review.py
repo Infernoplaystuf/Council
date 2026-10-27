@@ -37,7 +37,7 @@ Cell = Tuple[int, int]
 
 #: The sample review's Values columns (source_extract.VAL_HEAD), 1-based.
 V_ACCEPT, V_PART, V_ITEM, V_FIELD, V_VALUE, V_SCORE, V_VIA, V_LABEL, V_SOURCE, \
-    V_OTHERS, V_NOTE, V_PART_FROM, V_INSPECTOR = range(1, 14)
+    V_OTHERS, V_NOTE, V_PART_FROM, V_INSPECTOR, V_HELD = range(1, 15)
 
 #: The table review's leading columns (ledger_records.write_review).
 R_META = ["Accept", "Source", "Sheet", "Table", "Row"]
@@ -71,6 +71,10 @@ class Item:
     label: str = ""               # the label it was read under (a sample item)
     #: the other cells the same value was found at ('also at …' in its note)
     also: List[str] = field(default_factory=list)
+    #: why it was not pre-accepted ('part taken from the file name; …'), as
+    #: the review says (source_extract.review_reasons); '' in an older review
+    held: str = ""
+    part_from: str = ""           # how its part was found (the review's Part from)
 
 
 @dataclass
@@ -175,7 +179,7 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
     out: List[Item] = []
     rows = list(wb["Values"].iter_rows(min_row=2, values_only=True))
     for i, row in enumerate(rows, start=2):
-        row = list(row) + [None] * (13 - len(row))
+        row = list(row) + [None] * (14 - len(row))
         where = _text(row[V_SOURCE - 1])
         if not where:
             continue
@@ -198,6 +202,9 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
         part_from = _text(row[V_PART_FROM - 1])
         if part_from:
             lines.append(f"part from: {part_from}")
+        held = _text(row[V_HELD - 1])
+        if held and acc not in ("Y", "N"):
+            lines.append(f"held back because: {held}")
         if cell is None and "image" in where:
             lines.append("from a picture: the cell cannot be shown")
         out.append(Item(
@@ -211,7 +218,8 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
             value=value, value_col=V_VALUE, where=where, item=item, part=part,
             score=_score(row[V_SCORE - 1]), label=label,
-            also=[p[8:] for p in note.split("; ") if p.startswith("also at ")]))
+            also=[p[8:] for p in note.split("; ") if p.startswith("also at ")],
+            held=held, part_from=part_from))
     return out
 
 
@@ -375,9 +383,9 @@ TINT_HIGH, TINT_MID, TINT_LOW, TINT_CLASH = "#C6EFCE", "#FFEB9C", "#F8CBAD", "#F
 #: a value the parent CSV holds and this run did not read (an update)
 TINT_LEDGER = "#DDEBF7"
 #: what each tint means, for a legend
-LEGEND = [(TINT_HIGH, f"sure (score {CONF_HIGH:g} or more)"),
-          (TINT_MID, f"fairly sure ({CONF_LOW:g}–{CONF_HIGH:g})"),
-          (TINT_LOW, f"unsure (under {CONF_LOW:g})"),
+LEGEND = [(TINT_HIGH, "sure: accepted, nothing to check"),
+          (TINT_MID, "to check: a good match held back for a reason, or fairly sure"),
+          (TINT_LOW, f"unsure (score under {CONF_LOW:g})"),
           (TINT_CLASH, "sources disagree"),
           (TINT_LEDGER, "already in the Ledger")]
 
@@ -412,12 +420,41 @@ def rivals(items: Sequence[Item], it: Item, limit: int = RIVALS_SHOWN) -> List[I
     return out[:limit] if limit else out
 
 
-def confidence_tint(item: Item) -> str:
+def confidence_tint(item: Item, accept: Optional[str] = None) -> str:
+    """By the whole decision, not the label's score alone (user, 2026-10-27:
+    "The sure values in the review should not require a review"): green
+    only for a value accepted - pre-accepted, or said Right - so sure never
+    means "check it". A good match held back (its part from the file name,
+    a text document, a sheet unlike the template) is yellow, its reason in
+    the review. ``accept``: the item's Accept as the window has it."""
+    acc = item.accept if accept is None else accept
     if item.clash:
-        return TINT_CLASH
-    if item.score >= CONF_HIGH:
+        return TINT_CLASH                    # sources disagree: always a look
+    if acc == "Y":
         return TINT_HIGH
     return TINT_MID if item.score >= CONF_LOW else TINT_LOW
+
+
+def same_file_part(items: Sequence[Item], it: Item, accept_of=None) -> List[Item]:
+    """The values to accept when the user says ``it``'s part is right for
+    its file: the sure values (score >= CONF_HIGH, no clash, not answered)
+    of the same file and part, found the same way, whose only doubt was the
+    part (source_extract.PART_REASONS). ``it`` among them; [] when its own
+    doubt is not only the part (user, 2026-10-27: one answer per file where
+    the doubt is per file)."""
+    from source_extract import PART_REASONS
+    acc = accept_of or (lambda o: o.accept)
+
+    def part_only(o: Item) -> bool:
+        why = [w.strip() for w in o.held.split(";") if w.strip()]
+        return bool(why) and all(w in PART_REASONS for w in why)
+    if it.sheet != "Values" or not it.part or not part_only(it):
+        return []
+    file = it.where.split(" › ", 1)[0]
+    return [o for o in items
+            if o.sheet == "Values" and o.where.split(" › ", 1)[0] == file
+            and o.part == it.part and o.part_from == it.part_from and part_only(o)
+            and not o.clash and o.score >= CONF_HIGH and acc(o) not in ("Y", "N")]
 
 
 def parts(review: Review) -> List[str]:
