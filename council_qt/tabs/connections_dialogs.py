@@ -158,8 +158,9 @@ class FieldsDialog(QDialog):
     Suggested synonyms ('POC' for 'Point of Contact') come ticked only at
     confidence >= 0.85; nothing is assumed."""
 
-    def __init__(self, rules, suggestions, parent=None):
+    def __init__(self, rules, suggestions, parent=None, proposed_by=None):
         super().__init__(parent)
+        proposed_by = proposed_by or {}          # label -> tables a model read it in
         self.setWindowTitle("Fields the graph reads")
         self.resize(560, 520)
         outer = QVBoxLayout(self)
@@ -180,7 +181,14 @@ class FieldsDialog(QDialog):
                     continue
                 extra = " (another name for the project)" if rule.alias_of else \
                     " (the part it replaces)" if rule.supersedes else ""
+                where = proposed_by.get(rule.label) or []
+                if where and status == "proposed":
+                    extra += f"  (the model read it so in {where[0]}" + (
+                        f" and {len(where) - 1} more)" if len(where) > 1 else ")")
                 cb = QCheckBox(amp(rule.label + extra))
+                if where:
+                    cb.setToolTip("A model reading these tables said this column holds "
+                                  f"{etype.lower()}s:\n" + "\n".join(where[:20]))
                 cb.setChecked(status == "confirmed")
                 self.rule_boxes[rule.label] = cb
                 bl.addWidget(cb)

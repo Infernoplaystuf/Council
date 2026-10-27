@@ -324,10 +324,19 @@ class ConnectionsActions:
             for name, url, pmodel in self.pi_workers():
                 if _us_origin(pmodel):                     # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
+        name = Path(model).name if kx.is_gguf(model) else model
         with self.open_graph() as kg:
-            return kg.extract_from_text(workers, model=Path(model).name if kx.is_gguf(model)
-                                        else model,
-                                        on_progress=on_progress, should_stop=should_stop)
+            stats = kg.extract_from_text(workers, model=name, on_progress=on_progress,
+                                         should_stop=should_stop)
+            if not stats.get("stopped"):
+                # then each table, by this PC's model: what it records and
+                # which columns hold people, parts or projects (proposed rules)
+                pc_chat = next(iter(workers.values()))[0]
+                stats["tables"] = kg.read_tables(
+                    pc_chat, model=name, should_stop=should_stop,
+                    on_progress=lambda n, total, what: on_progress(
+                        n, total, f"table {what}") if on_progress else None)
+            return stats
 
     def open_file(self, rel_path: str) -> None:
         from .vault import VaultActions
@@ -1201,6 +1210,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 + (". Its links wait for you (✓ Accept / ✗ Reject)." if waits else "."))
         if not stats["chunks"]:
             text = "Built. The model had read every passage already."
+        tables = stats.get("tables") or {}
+        if tables.get("read"):
+            text += (f" It read {tables['read']} table(s)"
+                     + (f" ({tables['errors']} got no usable answer)" if tables["errors"]
+                        else ""))
+            labels = tables.get("labels") or []
+            if labels and self._offer_rules(list(dict.fromkeys(self._to_tick + labels))):
+                text += (f" and proposes reading {len(labels)} column(s) as people, parts "
+                         "or projects: 'Tick the suggested field rules' reads them.")
+            else:
+                text += "."
         # The view first: show_entity writes the open item's header into the
         # status line (as after a rebuild - review, 2026-10-19)
         self.on_search()
@@ -1513,7 +1533,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status.setText("")
         if self._kg is None:
             return
-        dlg = FieldsDialog(self._kg.field_rules(), suggestions, self)
+        dlg = FieldsDialog(self._kg.field_rules(), suggestions, self,
+                           proposed_by=self._kg.model_rule_tables())
         self._fields_dialog = dlg          # tests reach it here
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

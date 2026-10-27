@@ -134,3 +134,7 @@ same list.
   scans, CSV sources, parts in sheet titles, Q&A part ranking, proposed people
   rules, unrelated sheets skipped) and what is still open:
   `docs/handoff/synthetic_test_fixes_2026-10-27.md`.
+- Tables as their own nodes in Connections (LISTS, SHARES_*, REFERENCES), links
+  between documents and tables related by meaning (a local embedding model,
+  suggested), and a model reading each table to propose column rules:
+  `docs/handoff/kg_tables_related_2026-10-27.md`.

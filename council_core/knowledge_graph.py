@@ -4773,6 +4773,99 @@ class KnowledgeGraph:
                                  str(min(0.99, max(0.3, float(threshold))))))
             self._decide("related", {"model": model_id, "threshold": threshold})
 
+    def read_tables(self, chat, *, model: str, on_progress=None,
+                    should_stop=None) -> Dict[str, Any]:
+        """A model reads every table's card (council_core/kg_table_read.py):
+        a sentence on what the table records becomes the TABLE node's
+        description, and the columns it says hold people, parts or projects
+        - once checked against the table - become PROPOSED field rules for
+        the user to tick. A table is read once per version and model; a
+        label that already has a rule (ticked, proposed or rejected) is left
+        as it is. Returns stats with ``labels``: the rules proposed now."""
+        import field_search as fs
+        from council_core import kg_related as kr
+        from council_core import kg_table_read as ktr
+        from council_core import kg_tables as kt
+        stats: Dict[str, Any] = {"tables": 0, "read": 0, "described": 0, "labels": [],
+                                 "rejected": 0, "errors": 0, "first_error": "",
+                                 "stopped": False}
+        q = self.db.execute
+        if q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fields'"
+             ).fetchone() is None:
+            return stats
+        docs = {r["id"]: (r["path"], r["content_hash"]) for r in q(
+            "SELECT id, path, content_hash FROM documents WHERE status='ok'")}
+        todo = []
+        for t in kt.tables(self.db, docs):
+            tid = entity_id("TABLE", t.key_for(docs[t.document_id][0]))
+            if q("SELECT 1 FROM entities WHERE id=?", (tid,)).fetchone() is None:
+                continue                         # not in the graph (yet)
+            stats["tables"] += 1
+            card = kr.table_card(self.db, t)
+            h = hashlib.sha256(card.encode("utf-8")).hexdigest()
+            if q("SELECT 1 FROM entity_props WHERE entity_id=? AND name='model_read' AND"
+                 " value=? AND model=?", (tid, h, model)).fetchone() is None:
+                todo.append((tid, t, card, h))
+        run_id = str(uuid.uuid4())
+        for n, (tid, t, card, h) in enumerate(todo, 1):
+            if should_stop is not None and should_stop():
+                stats["stopped"] = True
+                break
+            cols = {c.label: c for c in t.columns}
+            res = ktr.read(card, list(cols),
+                           lambda label: [v for v, _r, _n in kt.column_values(self.db,
+                                                                              cols[label])],
+                           chat)
+            stats["read"] += 1
+            if res.error:
+                stats["errors"] += 1
+                stats["first_error"] = stats["first_error"] or res.error
+            else:
+                stats["rejected"] += len(res.rejected)
+                known = {fs._norm_key(r.label) for r, _s in self.field_rules()}
+                dh = docs[t.document_id][1]
+                with self.db:
+                    q("DELETE FROM entity_props WHERE entity_id=? AND model=? AND name IN"
+                      " ('description', 'column_meaning', 'model_read')", (tid, model))
+                    if res.description:
+                        q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                          (tid, t.document_id, dh, "description", res.description, model,
+                           run_id))
+                        stats["described"] += 1
+                    for m in res.meanings:
+                        q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                          (tid, t.document_id, dh, "column_meaning",
+                           json.dumps({"column": m.column, "holds": m.type}), model, run_id))
+                        if fs._norm_key(m.column) in known:
+                            continue
+                        known.add(fs._norm_key(m.column))
+                        q("INSERT OR IGNORE INTO field_rules VALUES (?,?,'proposed')",
+                          (m.column, ktr.rule_for(m.column, m.type).to_json()))
+                        self._decide("model_field_rule", {"label": m.column, "type": m.type,
+                                                          "table": t.name, "model": model})
+                        stats["labels"].append(m.column)
+                    q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                      (tid, t.document_id, dh, "model_read", h, model, run_id))
+            if on_progress is not None:
+                on_progress(n, len(todo), t.name)
+        return stats
+
+    def model_rule_tables(self) -> Dict[str, List[str]]:
+        """label -> the tables in which a model read that column as a person,
+        part or project (read_tables), for Fields… to say where a proposed
+        rule came from."""
+        out: Dict[str, List[str]] = {}
+        for name, value in self.db.execute(
+                "SELECT e.name, p.value FROM entity_props p JOIN entities e ON"
+                " e.id=p.entity_id WHERE p.name='column_meaning' ORDER BY e.name"):
+            try:
+                label = json.loads(value)["column"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if name not in out.setdefault(label, []):
+                out[label].append(name)
+        return out
+
     def find_related(self, embed, *, model: str, threshold: Optional[float] = None,
                      on_progress=None, should_stop=None) -> Dict[str, Any]:
         """Related by meaning (council_core/kg_related.py): every document's
@@ -5306,8 +5399,10 @@ class KnowledgeGraph:
             d["name"] = doc["path"] if doc else d["name"]
         d["aliases"] = [a["alias"] for a in self.db.execute(
             "SELECT alias FROM aliases WHERE entity_id=? ORDER BY alias", (eid,))]
+        # a model's sentence before the Council's own "N rows; columns: …"
         desc = self.db.execute("SELECT value FROM entity_props WHERE entity_id=? AND"
-                               " name='description' ORDER BY length(value) DESC LIMIT 1",
+                               " name='description' ORDER BY model != '' DESC,"
+                               " length(value) DESC LIMIT 1",
                                (eid,)).fetchone()
         d["description"] = desc[0] if desc else ""
         return d
