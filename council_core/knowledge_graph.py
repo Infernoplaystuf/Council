@@ -5234,6 +5234,7 @@ class KnowledgeGraph:
                                  doc_id=c["document_id"], content_hash=c["content_hash"],
                                  locator=self._chunk_loc(c, link.line), quote=quote,
                                  method="model", run_id=run_id, model=label)
+                stats["links"] += self._link_doc_part(res.entities, ids, c, run_id, label)
                 self.db.execute(
                     "INSERT OR REPLACE INTO extraction_done VALUES (?,?,?,?,?,?,?)",
                     (c["document_id"], c["content_hash"], c["chunk"], f"open|{wmodel}",
@@ -5255,6 +5256,57 @@ class KnowledgeGraph:
             self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
                             (time.time(), json.dumps(stats), run_id))
         return stats
+
+    #: How a person or project a model found in a document's sentences is
+    #: tied to the one part the document's labelled fields name.
+    DOC_PART_PREDICATE = {"PERSON": "CONTACT_FOR", "PROJECT": "USES_PART"}
+
+    def _doc_part(self, doc_id: str) -> Optional[str]:
+        """The one PART a document's labelled fields name ('Part Number:
+        3013'), or None when they name none or several."""
+        rows = self.db.execute(
+            "SELECT DISTINCT m.entity_id FROM mentions m JOIN entities e ON e.id=m.entity_id"
+            " WHERE m.document_id=? AND m.method='field' AND e.type='PART'",
+            (doc_id,)).fetchall()
+        return self.resolve(rows[0][0]) if len(rows) == 1 else None
+
+    def _link_doc_part(self, found, ids: Dict[int, str], c: Dict[str, Any],
+                       run_id: str, label: str) -> int:
+        """A build sheet says 'Part Number: 3013' and, lines below, 'Prepared
+        by Casey Diaz for Project Ironbark': the sentence never repeats the
+        part, so a model reading it links the person to the project only.
+        Each person and project a model found in a document whose labelled
+        fields name ONE part is tied to that part - suggested (a document-wide
+        guess, as the header says), quoting the line that names them. A
+        project only when something other than a model names it too (a
+        labelled field, the gazetteer, a Collection): a model calls a
+        template's 'Laser Team FOD A' a project."""
+        part = self._doc_part(c["document_id"])
+        if part is None:
+            return 0
+        pname = self.db.execute("SELECT name FROM entities WHERE id=?", (part,)).fetchone()
+        n = 0
+        lines = c["text"].splitlines()
+        for f in found:
+            pred = self.DOC_PART_PREDICATE.get(f.type)
+            eid = ids.get(id(f))
+            if pred is None or not eid or self.resolve(eid) == part:
+                continue
+            if f.type == "PROJECT" and self.db.execute(
+                    "SELECT 1 FROM mentions WHERE entity_id=? AND method != 'model'"
+                    " UNION SELECT 1 FROM relations r JOIN evidence e ON e.relation_id=r.id"
+                    " WHERE (r.subject_id=? OR r.object_id=?) AND e.method != 'model'",
+                    (self.resolve(eid),) * 3).fetchone() is None:
+                continue
+            text = lines[f.line - 1] if f.line and 0 < f.line <= len(lines) else f.name
+            quote = (f"{text.strip()}  [the document's part, "
+                     f"{pname[0] if pname else 'from its fields'}]")
+            if self._relate(eid, pred, part, "suggested", doc_id=c["document_id"],
+                            content_hash=c["content_hash"],
+                            locator=self._chunk_loc(c, f.line), quote=quote,
+                            method="model", run_id=run_id, model=label):
+                n += 1
+        return n
 
     def model_read(self) -> Dict[str, int]:
         """How much of the text a model has read: passages read, and the

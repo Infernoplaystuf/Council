@@ -226,3 +226,17 @@ def test_fields_says_which_table_the_model_read_it_in():
     assert "the model read it so in ec_coupons.xlsx › wk41" in cb.text()
     assert not cb.isChecked()
     dlg.deleteLater()
+
+
+def test_what_a_real_model_got_through_is_refused():
+    # gemma3:12b and gemma4:26b on the synthetic test set, 2026-10-27
+    assert not ktr.fits("PROJECT", ["3x", "2x", "3x"], "Beam Expander")
+    assert not ktr.fits("PROJECT", ["Y", "N", "Y"], "FPI")
+    assert not ktr.fits("PROJECT", ["1A", "2A", "3B"], "Flaw #")
+    assert ktr.fits("PROJECT", ["Halcyon", "PRJ-0915", "KA-101"], "Project")
+    labels = ["Vendor", "Course", "door", "Line item", "Flaw #", "Customer Contact"]
+    got = ktr.check({"columns": [{"column": x, "holds": "PROJECT"} for x in labels[:5]]
+                     + [{"column": "Customer Contact", "holds": "PERSON"}]},
+                    labels, lambda _l: ["Acme Supply", "Dana Ruiz"])
+    assert [m.column for m in got.meanings] == ["Customer Contact"]
+    assert len(got.rejected) == 5
