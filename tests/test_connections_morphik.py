@@ -256,7 +256,9 @@ def test_the_layout_is_stable_and_spreads_the_entities(tmp_path):
     with kgm.KnowledgeGraph(v) as kg:
         kg.seed()
         nodes, edges = kg_layout.subgraph(kg)
-        assert len(nodes) == 34 and edges
+        # 34 entities and the CSV's table node (kg_tables, 2026-10-27)
+        assert len(nodes) == 35 and edges
+        assert [n["name"] for n in nodes if n["type"] == "TABLE"] == ["parts.csv"]
         assert all(e["predicate"] != "DOCUMENTED_IN" for e in edges)
         a = kg_layout.layout(nodes, edges)
         b = kg_layout.layout(nodes, edges)
@@ -267,7 +269,8 @@ def test_the_layout_is_stable_and_spreads_the_entities(tmp_path):
         assert close == 0                                    # nothing on top of another
         centre = kg.search("PN-001")[0]["id"]
         nodes, edges = kg_layout.subgraph(kg, centre, hops=1)
-        assert {n["name"] for n in nodes} == {"PN-001", "KA-1", "Person B"}
+        # and the table that lists it
+        assert {n["name"] for n in nodes} == {"PN-001", "KA-1", "Person B", "parts.csv"}
         pos = kg_layout.layout(nodes, edges)
         assert pos[centre] == (0.0, 0.0)
         assert kg_layout.subgraph(kg, centre, hops=2, max_nodes=5)[0].__len__() == 5

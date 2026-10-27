@@ -42,6 +42,11 @@ from council_core import kg_contents as kgc
 from council_core import knowledge_graph as kgm
 from council_core import token_budget
 
+#: What tables as nodes link (kg_tables) is not followed for an answer: a
+#: table lists everyone in it, so two hops through one named every row's
+#: people. The rows themselves come from the Contents layer.
+_TABLE_PREDS = "(" + ",".join(f"'{p}'" for p in kgm.TABLE_PREDICATES) + ")"
+
 #: How a link reads from each end (the Connections tab shows the same words).
 PHRASES = {
     "LEADS": ("leads", "led by"),
@@ -52,6 +57,13 @@ PHRASES = {
     "SUPERSEDES": ("supersedes", "superseded by"),
     "DOCUMENTED_IN": ("documents (Collection)", "in Collection of"),
     "INSPECTED": ("inspected", "inspected by"),
+    # tables as nodes (council_core/kg_tables.py)
+    "IN_DOCUMENT": ("is a table in", "holds table"),
+    "LISTS": ("lists", "listed in"),
+    "SHARES_PARTS_WITH": ("shares parts with", "shares parts with"),
+    "SHARES_PEOPLE_WITH": ("shares people with", "shares people with"),
+    "SHARES_PROJECTS_WITH": ("shares projects with", "shares projects with"),
+    "REFERENCES": ("reads values from", "is read by"),
 }
 
 
@@ -162,8 +174,8 @@ def neighbourhood(kg: kgm.KnowledgeGraph, seeds: Sequence[str], *, hops: int = 2
         for eid in frontier:
             rows = kg.db.execute(
                 "SELECT * FROM relations WHERE (subject_id=? OR object_id=?) AND"
-                " status != 'rejected' AND predicate != 'DOCUMENTED_IN'", (eid, eid)
-            ).fetchall()
+                " status != 'rejected' AND predicate != 'DOCUMENTED_IN' AND predicate"
+                f" NOT IN {_TABLE_PREDS}", (eid, eid)).fetchall()
             rows.sort(key=lambda r: (_RANK.get(r["status"], 3), r["predicate"]))
             for r in rows[:per_entity]:
                 if r["id"] in seen_rel:
@@ -209,7 +221,8 @@ def path_between(kg: kgm.KnowledgeGraph, a: str, b: str, max_hops: int = 4
         for r in kg.db.execute(
                 "SELECT id, subject_id, predicate, object_id FROM relations WHERE"
                 " (subject_id=? OR object_id=?) AND status != 'rejected' AND"
-                " predicate != 'DOCUMENTED_IN'", (eid, eid)):
+                f" predicate != 'DOCUMENTED_IN' AND predicate NOT IN {_TABLE_PREDS}",
+                (eid, eid)):
             other = r["object_id"] if r["subject_id"] == eid else r["subject_id"]
             if other in seen:
                 continue

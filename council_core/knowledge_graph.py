@@ -104,7 +104,16 @@ CORE_TYPES = ("PERSON", "PART", "PROJECT")
 #: reader (council_core/kg_excel.py): who signed a part's readings. A model
 #: is never asked for it (kg_extract.SIGNATURES does not list it).
 PREDICATES = ("LEADS", "CONTACT_FOR", "WORKS_ON", "OWNS", "USES_PART",
-              "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED")
+              "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED",
+              # tables as nodes (council_core/kg_tables.py, user 2026-10-27)
+              "IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
+              "SHARES_PROJECTS_WITH", "REFERENCES")
+#: The links tables as nodes give (council_core/kg_tables.py): drawn and
+#: shown, but counted apart from the facts between entities - 'N links' and
+#: "why no links?" are about those.
+TABLE_PREDICATES = ("IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
+                    "SHARES_PROJECTS_WITH", "REFERENCES")
+_TABLE_PREDS_SQL = "(" + ",".join(f"'{p}'" for p in TABLE_PREDICATES) + ")"
 STATUSES = ("seeded", "suggested", "accepted", "rejected")
 #: Inside one seed() transaction only: a derived link not yet re-supported by
 #: this run's evidence. Never committed (seed resolves or deletes every one).
@@ -219,6 +228,11 @@ CREATE TABLE IF NOT EXISTS entity_props (
     PRIMARY KEY (entity_id, document_id, name, value)
 );
 CREATE INDEX IF NOT EXISTS entity_props_entity ON entity_props(entity_id);
+-- the file names a workbook's formulas read (kg_tables.external_references),
+-- per version, so an unchanged workbook's zip is not searched again
+CREATE TABLE IF NOT EXISTS doc_refs (
+    document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, refs TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS doc_cache (
     document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
     reader_sig TEXT NOT NULL, records TEXT NOT NULL, lines TEXT NOT NULL,
@@ -835,7 +849,12 @@ def rebuild_summary_line(stats) -> str:
             tail = " (who is " + ", ".join(who[:4]) + ("…" if len(who) > 4 else "") + "?)"
         bits.append(f"; {n_q} question{'s' if n_q != 1 else ''} waiting in "
                     f"Connections › Questions{tail}")
-    return _sentence("".join(bits))
+    # tables as nodes (kg_tables): a sentence of their own, after the links
+    n_tables = int(stats.get("tables") or 0)
+    tables = (f" {n_tables} table" + ("s" if n_tables != 1 else "")
+              + f" as nodes, {int(stats.get('table_links') or 0)} table links."
+              if n_tables else "")
+    return _sentence("".join(bits)) + tables
 
 
 def _sentence(text: str) -> str:
@@ -1274,6 +1293,8 @@ def _excel_available() -> bool:
 #: signature too (see _reader_sig), so this needs bumping only for a change
 #: elsewhere that alters what a document reads as.
 READER_VERSION = 2
+#: How tables are made nodes (kg_tables): a change works the graph out again.
+TABLES_VERSION = 1
 
 #: The modules whose code decides what a document reads as.
 _READER_MODULES = ("field_search", "vault_rag", "source_extract", "excel_open",
@@ -3385,6 +3406,10 @@ class KnowledgeGraph:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
                     stats["gazetteer_mentions"] = self._gazetteer(files, run_id, prog)
+                # Tables as nodes, AFTER every pass that names entities: a
+                # table lists the parts and people the graph knows.
+                prog.update("tables")
+                self._seed_tables(usable, run_id, stats)
                 # Still pending: no document gave evidence this run. One a model
                 # proposed (KG2 evidence is kept across runs) is a suggestion; the
                 # rest - the document changed or the rule was withdrawn - go. The
@@ -3459,7 +3484,8 @@ class KnowledgeGraph:
     def _graph_sig(self, usable, failed_keep, sig_for, use_collections: bool,
                    gazetteer: bool) -> str:
         """Everything the graph phase works the graph out from."""
-        h = hashlib.sha256(f"graph {SCHEMA_VERSION} {READER_VERSION} {use_collections} "
+        h = hashlib.sha256(f"graph {SCHEMA_VERSION} {READER_VERSION} {TABLES_VERSION} "
+                           f"{use_collections} "
                            f"{gazetteer}".encode("utf-8"))
         for p, did, dh in sorted(usable, key=lambda x: x[1]):
             h.update(f"doc|{did}|{dh}|{sig_for(p)}\n".encode("utf-8"))
@@ -3489,6 +3515,110 @@ class KnowledgeGraph:
 
     #: Evidence and mention rows written per batch in a rebuild's linking pass.
     FLUSH_EVERY = 20_000
+
+    def _seed_tables(self, usable: Sequence[Tuple[Path, str, str]], run_id: str,
+                     stats: Dict[str, Any]) -> None:
+        """Every table of the Contents layer as a TABLE node in its document,
+        linked to the entities its values name, to the tables that list the
+        same parts, people or projects, and a workbook to the workbooks its
+        formulas read (council_core/kg_tables.py). Exact values only:
+        seeded."""
+        from council_core import kg_tables as kt
+        stats["tables"] = stats["table_links"] = 0
+        docs = {did: (p, h) for p, did, h in usable}
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                           " AND name='fields'").fetchone() is None:
+            return
+        live = self._live
+        names: Dict[str, set] = {}
+        ph = ",".join("?" * len(kt.LISTED_TYPES))
+        for r in self.db.execute(
+                "SELECT a.alias_norm, a.entity_id, e.type FROM aliases a JOIN entities e"
+                f" ON e.id=a.entity_id WHERE e.merged_into IS NULL AND e.type IN ({ph})",
+                kt.LISTED_TYPES):
+            if live is None or r[1] in live:
+                names.setdefault(r[0], set()).add((r[1], r[2]))
+        listed: Dict[str, Dict[str, set]] = {}
+        where: Dict[str, Any] = {}
+        paths = {did: rel for did, rel in self.db.execute("SELECT id, path FROM documents")}
+        n_links = 0
+        for t in kt.tables(self.db, docs):
+            _p, h = docs[t.document_id]
+            tid = self._entity("TABLE", t.name, key=t.key_for(paths.get(t.document_id, "")))
+            where[tid] = (t, h)
+            labels = [c.label for c in t.columns]
+            self._relate(tid, "IN_DOCUMENT", t.document_id, "seeded", doc_id=t.document_id,
+                         content_hash=h, locator={"sheet": t.loc_sheet, "header": t.header_row},
+                         quote=" | ".join(labels)[:300], method="table", run_id=run_id)
+            self.db.execute("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                            (tid, t.document_id, h, "description",
+                             f"{t.rows} rows; columns: {', '.join(labels)}"[:500], "",
+                             run_id))
+            seen: Dict[str, Tuple[str, int, str, str, int]] = {}
+            for col in t.columns:
+                for text, row, n in kt.column_values(self.db, col):
+                    hit = names.get(fold(text))
+                    if not hit or len(hit) != 1:
+                        continue                 # unknown, or two entities of one name
+                    eid, etype = next(iter(hit))
+                    if eid in seen:
+                        e = seen[eid]
+                        seen[eid] = (e[0], e[1], e[2], e[3], e[4] + n)
+                    else:
+                        seen[eid] = (etype, row, col.label, text, n)
+            for eid, (etype, row, label, text, n) in seen.items():
+                self._relate(tid, "LISTS", eid, "seeded", doc_id=t.document_id,
+                             content_hash=h,
+                             locator={"sheet": t.loc_sheet, "row": row, "column": label,
+                                      "header": t.header_row},
+                             quote=f"{label}: {text}" + (f" ({n} rows)" if n > 1 else ""),
+                             method="table", run_id=run_id)
+                listed.setdefault(tid, {}).setdefault(etype, set()).add(self.resolve(eid))
+                n_links += 1
+        for a, b, etype, shared in kt.shared_pairs(listed):
+            t, h = where[a]
+            if t.document_id == where[b][0].document_id:
+                continue                 # one file's sheets: IN_DOCUMENT ties them
+            shown = sorted(r[0] for r in (self.db.execute(
+                "SELECT name FROM entities WHERE id=?", (e,)).fetchone() for e in shared)
+                if r is not None)
+            words = ", ".join(shown[:10])
+            more = f" and {len(shared) - 10} more" if len(shared) > 10 else ""
+            self._relate(a, kt.SHARE_PREDICATE[etype], b, "seeded", doc_id=t.document_id,
+                         content_hash=h, locator={"sheet": t.loc_sheet, "header": t.header_row},
+                         quote=f"both list {words}{more}", method="table", run_id=run_id)
+            n_links += 1
+        n_links += self._seed_references(usable, run_id)
+        stats["tables"], stats["table_links"] = len(where), n_links
+
+    def _seed_references(self, usable: Sequence[Tuple[Path, str, str]], run_id: str) -> int:
+        """A workbook REFERENCES the workbooks its formulas read."""
+        from council_core import kg_tables as kt
+        paths = {did: rel for rel, did in self.db.execute(
+            "SELECT path, id FROM documents WHERE status='ok'")}
+        by_path = {rel: did for did, rel in paths.items()}
+        all_paths = list(by_path)
+        n = 0
+        for p, did, h in usable:
+            if p.suffix.lower() not in (".xlsx", ".xlsm"):
+                continue
+            row = self.db.execute("SELECT content_hash, refs FROM doc_refs WHERE"
+                                  " document_id=?", (did,)).fetchone()
+            if row is not None and row[0] == h:
+                refs = json.loads(row[1])
+            else:
+                refs = kt.external_references(p)
+                self.db.execute("INSERT OR REPLACE INTO doc_refs VALUES (?,?,?)",
+                                (did, h, json.dumps(refs)))
+            for name in refs:
+                target = kt.resolve_reference(name, paths.get(did, ""), all_paths)
+                if target is None:
+                    continue
+                self._relate(did, "REFERENCES", by_path[target], "seeded", doc_id=did,
+                             content_hash=h, locator={}, quote=f"formulas read [{name}]",
+                             method="table", run_id=run_id)
+                n += 1
+        return n
 
     def _seed_records(self, records, run_id: str) -> None:
         """``records()`` gives (record, document id, content hash) afresh
@@ -4994,9 +5124,12 @@ class KnowledgeGraph:
         q = self.db.execute
         by_type = {r[0]: r[1] for r in q("SELECT type, COUNT(*) FROM entities"
                                          " WHERE merged_into IS NULL GROUP BY type")}
-        by_status = {r[0]: r[1] for r in q("SELECT status, COUNT(*) FROM relations"
+        by_status = {r[0]: r[1] for r in q("SELECT status, COUNT(*) FROM relations WHERE"
+                                           f" predicate NOT IN {_TABLE_PREDS_SQL}"
                                            " GROUP BY status")}
-        return {"entities": by_type, "relations": by_status,
+        tables = q("SELECT COUNT(*) FROM relations WHERE status != 'rejected' AND"
+                   f" predicate IN {_TABLE_PREDS_SQL}").fetchone()[0]
+        return {"entities": by_type, "relations": by_status, "table_links": tables,
                 "mentions": q("SELECT COUNT(*) FROM mentions").fetchone()[0],
                 "open_reviews": q("SELECT COUNT(*) FROM review WHERE status='open'")
                 .fetchone()[0]}
@@ -5095,7 +5228,8 @@ class KnowledgeGraph:
 
     def neighbors(self, eid: str, *, include_rejected: bool = False,
                   evidence_limit: Optional[int] = None,
-                  relation_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                  relation_limit: Optional[int] = None,
+                  include_tables: bool = False) -> List[Dict[str, Any]]:
         """Every relation touching ``eid``, each with its evidence: what a
         person needs to see WHY two things are linked. ``evidence_limit``
         keeps the first N pieces of each (``evidence_total`` is the count):
@@ -5103,14 +5237,20 @@ class KnowledgeGraph:
         Connections tab drew every one on the GUI thread. ``relation_limit``
         keeps the first N links of each kind (predicate and direction);
         neighbor_counts() counts them all. MEASURED (review, 2026-10-16): a
-        person with 4,000 links took 3.4 s here while the tab drew 300."""
+        person with 4,000 links took 3.4 s here while the tab drew 300.
+        ``include_tables``: the links tables as nodes give too (the tab shows
+        them; the agent's tools and the answers keep to the facts)."""
         eid = self.resolve(eid)
         q = ("SELECT * FROM relations WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
+        if not include_tables:
+            q += f" AND predicate NOT IN {_TABLE_PREDS_SQL}"
         out = []
         per_kind: Dict[Tuple[str, str], int] = {}
-        for r in self.db.execute(q + " ORDER BY predicate", (eid, eid)).fetchall():
+        # facts between entities first, what tables list after them
+        for r in self.db.execute(q + f" ORDER BY predicate IN {_TABLE_PREDS_SQL}, predicate",
+                                 (eid, eid)).fetchall():
             kind = (r["predicate"], "out" if r["subject_id"] == eid else "in")
             per_kind[kind] = per_kind.get(kind, 0) + 1
             if relation_limit is not None and per_kind[kind] > relation_limit:
@@ -5126,14 +5266,16 @@ class KnowledgeGraph:
                         "evidence": ev, "evidence_total": total})
         return out
 
-    def neighbor_counts(self, eid: str, *, include_rejected: bool = False
-                        ) -> Dict[Tuple[str, str], int]:
+    def neighbor_counts(self, eid: str, *, include_rejected: bool = False,
+                        include_tables: bool = False) -> Dict[Tuple[str, str], int]:
         """How many links ``eid`` has of each kind: {(predicate, 'out'|'in'): n}."""
         eid = self.resolve(eid)
         q = ("SELECT predicate, subject_id=? AS outward, COUNT(*) FROM relations"
              " WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
+        if not include_tables:
+            q += f" AND predicate NOT IN {_TABLE_PREDS_SQL}"
         return {(r[0], "out" if r[1] else "in"): r[2]
                 for r in self.db.execute(q + " GROUP BY predicate, outward", (eid, eid, eid))}
 
@@ -5460,10 +5602,14 @@ class KnowledgeGraph:
         seen.discard("")
         return seen
 
-    def all_relations(self, include_rejected: bool = False) -> List[Dict[str, Any]]:
-        q = "SELECT * FROM relations"
-        if not include_rejected:
-            q += " WHERE status != 'rejected'"
+    def all_relations(self, include_rejected: bool = False,
+                      include_tables: bool = False) -> List[Dict[str, Any]]:
+        """The links between entities; ``include_tables``: the links tables
+        as nodes give too (TABLE_PREDICATES)."""
+        where = [] if include_rejected else ["status != 'rejected'"]
+        if not include_tables:
+            where.append(f"predicate NOT IN {_TABLE_PREDS_SQL}")
+        q = "SELECT * FROM relations" + (" WHERE " + " AND ".join(where) if where else "")
         return [{"id": r["id"], "subject": self.entity(r["subject_id"]),
                  "predicate": r["predicate"], "object": self.entity(r["object_id"]),
                  "status": r["status"]} for r in self.db.execute(q)]
