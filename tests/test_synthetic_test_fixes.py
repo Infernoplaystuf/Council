@@ -119,3 +119,90 @@ def test_people_columns_are_offered_not_ticked(tmp_path):
     assert status["Employee"] == status["Inspector"] == "proposed"
     assert status["Program Lead"] == "confirmed"
     kg.close()
+
+
+# ── the five gaps the rerun found (Andy approved 1-4, then 5, 2026-10-27) ──
+def _book(path, sheets):
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets.items():
+        ws = wb.create_sheet(title)
+        for r in rows:
+            ws.append(list(r))
+    wb.save(path)
+    return path
+
+
+PRE = "NDE Inspection: Eddy Current Response Pre-Conceal"
+POST = "NDE Inspection: Eddy Current Response Post-Conceal"
+
+
+def _signed(run, field):
+    return {(o.part, o.item, str(o.value), o.inspector) for o in run.obs if o.field == field}
+
+
+def test_initials_named_only_in_the_sheet_name_sign_its_readings(tmp_path, ledger):
+    _tpl, schema = ledger
+    head = ("Part Number", "Flaw #", "Eddy Current Response Pre-Conceal")
+    f = _book(tmp_path / "ec_by_inspector.xlsx", {"EC JB": [head, ("2041", "1A", 41)],
+                                                  "EC MK": [head, ("2041", "1A", 47)]})
+    run = se.extract(schema, [f], use_images=False)
+    assert _signed(run, PRE) == {("2041", "1A", "41", "JB"), ("2041", "1A", "47", "MK")}
+
+
+def test_initials_in_a_column_header_sign_that_column(tmp_path, ledger):
+    _tpl, schema = ledger
+    f = _book(tmp_path / "ec.xlsx", {"EC": [
+        ("Part Number", "Flaw #", "Eddy Current Response Pre-Conceal (JB)",
+         "Eddy Current Response Post-Conceal (MK)"),
+        ("2041", "1A", 41, 52)]})
+    run = se.extract(schema, [f], use_images=False)
+    assert _signed(run, PRE) == {("2041", "1A", "41", "JB")}
+    assert _signed(run, POST) == {("2041", "1A", "52", "MK")}
+
+
+def test_a_stage_named_only_in_the_sheet_name(tmp_path, ledger):
+    _tpl, schema = ledger
+    head = ("Part Number", "Flaw #", "Inspector", "Response")
+    f = _book(tmp_path / "by_stage.xlsx", {"Pre-Conceal": [head, ("2041", "1A", "RT", 41)],
+                                           "Post-Conceal": [head, ("2041", "1A", "RT", 52)]})
+    run = se.extract(schema, [f], use_images=False)
+    # 'Response' beside 'Inspector' in the header row is no one
+    assert _signed(run, PRE) == {("2041", "1A", "41", "RT")}
+    assert _signed(run, POST) == {("2041", "1A", "52", "RT")}
+
+
+def test_a_part_named_only_in_an_index_workbook(tmp_path, ledger):
+    _tpl, schema = ledger
+    _book(tmp_path / "Campaign_index.xlsx", {"Index": [
+        ("Part Number", "Settings file", "Project"),
+        ("2041", "B_settings_1.xlsx", "Ironbark"), ("2042", "B_settings_2.xlsx", "Ironbark")]})
+    for k, p in ((1, 255), (2, 270)):
+        _book(tmp_path / f"B_settings_{k}.xlsx", {"Settings": [("Power (W)", p),
+                                                               ("Frequency (kHz)", 20)]})
+    run = se.extract(schema, sorted(tmp_path.glob("*.xlsx")), use_images=False)
+    got = {(o.part, str(o.value)) for o in run.obs if o.field == "Power (W)"}
+    assert got == {("2041", "255"), ("2042", "270")}
+    o = next(o for o in run.obs if o.field == "Power (W)")
+    assert o.part_how.startswith(se.INDEX_PART_HOW)
+    assert not any("values have no" in p for p in run.problems)
+    # named by another file: checked, never pre-accepted
+    assert not any(d.accept for d in se.decide(run, schema) if d.obs.field == "Power (W)")
+
+
+def test_a_filled_template_edited_outside_excel_is_read_again(tmp_path, ledger):
+    tpl, schema = ledger
+    wb = openpyxl.load_workbook(tpl)
+    wb.properties.lastModifiedBy = "Template Author"     # a template saved in Excel
+    wb.save(tpl)
+    out = tmp_path / "filled.xlsx"
+    fill_template(schema, [{"Part Number": "2041", "Flaw #": "1A", "Power (W)": "255"}],
+                  out, tpl)
+    assert is_filled_template(out)
+    wb = openpyxl.load_workbook(out)                      # opened and saved, unchanged
+    wb.save(out)
+    assert is_filled_template(out)
+    wb = openpyxl.load_workbook(out)                      # a script types a value in;
+    wb.active["C3"] = 270                                 # no last-saved-by is written
+    wb.save(out)
+    assert is_edited_filled_template(out) and not is_filled_template(out)

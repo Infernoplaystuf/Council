@@ -51,16 +51,34 @@ fixes 1-9. The corpus, its answer key and the scripts are in the project files
 - Connections over all 103 files: every person and project found, all 20
   tracker links (lead and part) built.
 
-## Found, not fixed (for Andy to decide)
+## The five gaps the rerun found (fixed; Andy's OK, 2026-10-27)
 
-- A sheet per inspector named only in the sheet name ('EC JB', 'EC MK'): the
-  readings are unsigned, and the first sheet's value is used for the template
-  cell. Reading initials from anywhere in the sheet name fixes it (tried on
-  Part_4001_full_record: 67% to 100% right).
-- Initials in a column header ('EC Pre-Conceal (JB)') do not sign the column.
-- A stage named only in the sheet name ('Pre-Conceal' sheet with a 'Response'
-  column) is not matched to the stage's field.
-- Linked files whose part is only in an index workbook have no part; the
-  Ledger asks for it.
-- A filled template written by a tool other than Excel (no lastModifiedBy)
-  is treated as the Ledger's own output and left out.
+1. **Initials only in the sheet name** ('EC JB', 'EC MK'): one word of
+   initials anywhere in the name signs the sheet's readings when nothing on
+   the sheet says who (`find_inspectors`).
+2. **Initials in a column header** ('EC Pre-Conceal (JB)'): JB signs that
+   column's readings (`_table`, `_who_paren`). '(EC)' or any other word of
+   the template's field names is not someone.
+3. **A stage only in the sheet name** ('Pre-Conceal' sheet, 'Flaw # |
+   Inspector | Response'): the sheet's name is the stage (`_sheet_stage`,
+   read as a long log). Values go to the right field, held for review (a
+   loose label match). 'Response' beside 'Inspector' in a header row is no
+   longer read as an inspector's name.
+4. **A part only in an index workbook** ('Part Number | Settings file'):
+   a file that names no part itself gets the part the index lists it under
+   (`_Extractor.files_named`, `_index_parts`, `INDEX_PART_HOW`). Held for
+   review, never pre-accepted. The data files and the index must be read in
+   one run.
+5. **A filled template edited outside Excel**: every workbook the Ledger
+   writes (`fill_template`, the review's filled templates, Ledger groups,
+   table templates) is marked by `sample_ledger.mark_filled`: the mark, a
+   fingerprint of every cell, and no last-saved-by. A scan leaves it out
+   while its cells match; once anyone types into it, in any program, it is
+   read again. Excel's last-saved-by still counts. A workbook marked before
+   this has no fingerprint and goes by last-saved-by only. The other
+   writers used to keep the template's own last-saved-by, so their output
+   could look edited the moment it was written.
+
+Rerun, batch 2 (as the tab reads the folder, the index workbook included):
+6,587 of 6,591 right (94% → 99.9%), 0 wrong (was 240), 0 wrong values
+pre-accepted. Batch 1 unchanged (11,809 of 11,883).

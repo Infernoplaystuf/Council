@@ -708,6 +708,8 @@ _SECTION_FILLER = {"inspection", "inspections", "result", "results", "data", "re
                    "summary", "attributes", "record", "records", "test", "tests"}
 _VALUE_HEAD = _OnWords(r"(?i)^\s*(?:response|value|reading|result|measured(?: value)?|"
                        r"measurement)\s*(?:\([^)]*\))?\s*$")
+#: A file's name in a cell: what an index workbook lists beside each part.
+_FILE_NAME = re.compile(r"(?i)[^<>:\"|?*\n]{1,200}\.(?:xlsx|xlsm|xls|xlsb|csv|tsv|pdf|docx|pptx)")
 #: A number typed with its unit: "0.245 mm", "45°", '0.028"'.
 _NUM_UNIT = re.compile(r"^\s*(?P<n>[+-]?(?:\d+\.?\d*|\.\d+))\s*(?P<u>°|\"|[A-Za-zµμ/]+)\s*$")
 #: A table heading that is just someone's initials: "JB", "JB — 2026-09-18".
@@ -1810,6 +1812,47 @@ class _Extractor:
             self._signers = got - {""}
         return self._signers
 
+    def files_named(self) -> Dict[str, Tuple[str, int]]:
+        """An index sheet's rows: a part under a Part Number header and, in
+        the same row, a file's name ('B_settings_1.xlsx'). {file name in
+        lower case: (part, row)}. Data workbooks that say no part at all
+        were given none, though the index beside them said which was which
+        (synthetic test, 2026-10-27)."""
+        out: Dict[str, Tuple[str, int]] = {}
+        heads = []
+        for (r, c), v in self.g.cells.items():
+            if isinstance(v, str) and len(v) <= 40 and not isinstance(v, _Merged):
+                mt = self.m.match(v)
+                if mt.target is not None and mt.target.is_id and mt.score >= ACCEPT_AT:
+                    heads.append((r, c))
+        if not heads:
+            return out
+        rows: Dict[int, List[Tuple[int, Any]]] = defaultdict(list)
+        for (r, c), v in self.g.cells.items():
+            rows[r].append((c, v))
+        for hr, hc in heads:
+            for r in sorted(x for x in rows if x > hr):
+                part = _text(self.g.cells.get((r, hc)))
+                if not part or len(part) > 40:
+                    continue
+                for c, v in rows[r]:
+                    t = v.strip() if isinstance(v, str) else ""
+                    if c != hc and _FILE_NAME.fullmatch(t):
+                        name = re.split(r"[\\/]", t)[-1].lower()
+                        out.setdefault(name, (part, r))
+        return out
+
+    def _template_words(self) -> set:
+        """Every word of the template's field names ('EC', 'Pre', 'Conceal'):
+        '(EC)' after a header is the method, not someone's initials."""
+        if getattr(self, "_tpl_words", None) is None:
+            got = set()
+            for t in self.m.targets:
+                got.update(self.m._tok[t.name])
+                got.update(self.m._sec[t.name])
+            self._tpl_words = got
+        return self._tpl_words
+
     # who logged what: markers found before the values are read
     def find_inspectors(self) -> None:
         """'Inspector: JB' cells, an initials label with the initials beside
@@ -1836,6 +1879,11 @@ class _Extractor:
                 (review, 2026-10-20)."""
                 w = _initials(text)
                 if w and set(tokens(w)) & known and not (acronym and _acronym_initials(text)):
+                    return ""
+                if w and len(w) > 4 and (_VALUE_HEAD.match(w) or _RESULT_WORDS & {w.lower()}):
+                    # 'Inspector | Response' in a header row: Response is
+                    # the next column's title, not someone (synthetic test,
+                    # 2026-10-27 - every reading was signed 'Response')
                     return ""
                 if heading and w and self.m.no_one(w):
                     return ""                # taught: 'NDT' is no one's initials
@@ -1886,10 +1934,15 @@ class _Extractor:
                         if not _split_inline(x)[1]:
                             self.used.add((r, c2 + 1))
         if not self.markers:
-            h = re.match(r"^\s*([A-Z]{2,4})\b", self.g.sheet)
-            if h and not set(tokens(h.group(1))) & known and h.group(1) not in ("PART", "NDE") \
-                    and h.group(1).lower() not in NOT_INITIALS and not self.m.no_one(h.group(1)):
-                self.markers.append((0, 0, h.group(1)))
+            # the sheet named for its inspector: 'JB', 'JB 09-18' - or after
+            # the method, 'EC JB' (one sheet per inspector; its readings were
+            # unsigned and one inspector's value pre-accepted over the
+            # other's, synthetic test 2026-10-27). One such word, or none.
+            heads = [w for w in re.findall(r"\b([A-Z]{2,4})\b", self.g.sheet)
+                     if not set(tokens(w)) & known and w not in ("PART", "NDE")
+                     and w.lower() not in NOT_INITIALS and not self.m.no_one(w)]
+            if len(heads) == 1:
+                self.markers.append((0, 0, heads[0]))
 
     def _lone_pair(self, r, c, cx) -> bool:
         """A label at (r, c) and its value at (r, cx) are all row r holds
@@ -2522,6 +2575,7 @@ class _Extractor:
             return
         ctx = self.context(r)
         heads = {}
+        signed_by: Dict[int, str] = {}       # a column its header signs: 'EC Pre (JB)'
         item_col = who_col = run_col = value_col = None
         ids: List[Tuple[float, int]] = []
         lookalike = False
@@ -2539,6 +2593,14 @@ class _Extractor:
                 v = f"{v} {sub[c]}"               # 'Eddy Current Response Post-Conceal'
             elif c in above:
                 v = f"{above[c]} {v}"
+            # 'EC Pre-Conceal (JB)': JB signed the column - its readings were
+            # unsigned, and another inspector's value pre-accepted over
+            # them (synthetic test, 2026-10-27). Not 'Inspector (JB)', which
+            # find_inspectors reads as a heading.
+            plain, by = _who_paren(v)
+            if by and plain and not self.m.who_head(plain) \
+                    and not set(tokens(by)) & self._template_words():
+                v, signed_by[c] = plain, by
             if self.m.is_item_header(v):
                 item_col = c
                 continue
@@ -2582,6 +2644,15 @@ class _Extractor:
         stage_col = self._stage_col(heads, data_rows, ctx) \
             if per_item and value_col is not None else None
         matched = [c for c, (_, mt) in heads.items() if mt.target]
+        sheet_stage = self._sheet_stage(r, value_col, ctx) \
+            if per_item and value_col is not None and stage_col is None and not matched \
+            else ""
+        if sheet_stage:
+            for c in cols:
+                self.used.update(((r, c), (top, c)))
+            self._long_rows(r, data_rows, item_col, id_col, who_col, None, value_col, ctx,
+                            stage_text=sheet_stage)
+            return
         if per_item and value_col is not None and stage_col is None and not matched \
                 and self._person_slots(r, cols, item_col, value_col, who_col, data_rows, ctx):
             return
@@ -2631,8 +2702,8 @@ class _Extractor:
                     fname = mt.target.fields[i]
                 o = self.emit(part, item, label, r, c, self.g.cells[(d, c)], mt,
                               field_name=fname, vr=d, vc=c,
-                              who=_initials(self.g.cells.get((d, who_col))) or None
-                              if who_col else None)
+                              who=(_initials(self.g.cells.get((d, who_col))) if who_col
+                                   else "") or signed_by.get(c) or None)
                 if o is not None and part_how:
                     o.part_how = part_how
                 self.used.add((d, c))
@@ -2755,19 +2826,35 @@ class _Extractor:
                 best = (hits, c)
         return best[1] if best else None
 
+    def _sheet_stage(self, r, value_col, ctx) -> str:
+        """The stage a sheet's name gives a 'Flaw # | Response' table: a
+        'Pre-Conceal' sheet's Response is EC Pre-Conceal. The readings of
+        one sheet per stage were matched to no field (synthetic test,
+        2026-10-27). '' when the name, with the value's header, matches no
+        per-flaw field."""
+        head = self.g.text(r, value_col) or ""
+        name = " ".join(str(self.g.sheet or "").split())
+        if not name or len(name) > 40:
+            return ""
+        mt = self.m.match(f"{head} {name}".strip(), ctx, per_item=True)
+        return name if mt.target is not None and mt.score >= SUGGEST_AT else ""
+
     def _long_rows(self, r, data_rows, item_col, id_col, who_col, stage_col,
-                   value_col, ctx) -> None:
+                   value_col, ctx, stage_text: str = "") -> None:
+        """stage_text: every row's stage, from the sheet's name, when no
+        column says it (stage_col None)."""
         head = self.g.text(r, value_col) or ""
         for d in data_rows:
             item = self.codes.canon(self.g.cells.get((d, item_col)))
-            stage = self.g.text(d, stage_col)
+            stage = self.g.text(d, stage_col) if stage_col is not None else stage_text
             if not item or not stage or (d, value_col) not in self.g.cells:
                 continue
             part, part_how = self._row_part(d, id_col) if id_col \
                 else self.part_at(d, item_col)
             label = f"{head} {stage}".strip()
             mt = self.m.match(label, ctx, per_item=True)
-            o = self.emit(part, item, label, d, stage_col, self.g.cells[(d, value_col)], mt,
+            o = self.emit(part, item, label, d, stage_col or value_col,
+                          self.g.cells[(d, value_col)], mt,
                           vr=d, vc=value_col,
                           who=_initials(self.g.cells.get((d, who_col))) or None
                           if who_col else None)
@@ -3443,6 +3530,10 @@ class Extraction:
     #: a part-name pattern was given: it, not the parts' shapes, says which
     #: part numbers to check (decide's ODD_PART_NOTE)
     pattern_given: bool = False
+    #: an index workbook's rows naming a file and its part ('4014 |
+    #: B_settings_1.xlsx'): file name (lower case) -> (part, the index's
+    #: name). A file that says no part itself is given it (_index_parts).
+    index_parts: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
 
 class _Cancelled(Exception):
@@ -3564,6 +3655,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
             _wd_cm.__exit__(None, None, None)
         except Exception:                                   # noqa: BLE001
             pass
+    _index_parts(run, labels)
     # Cancelled only when a workbook was skipped or cut short (_extract_all
     # says so): a Cancel pressed after the last one was read made a whole
     # review 'Cancelled… partial review' (review, 2026-10-19). One that cut
@@ -3582,6 +3674,31 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
                         f"({hit.agree} of {hit.compared} values agree)"
                         for lab, hit in sorted(learned.items())]
     return run
+
+
+def _index_parts(run: Extraction, labels: Optional[Dict[str, str]] = None) -> None:
+    """Values of a file that says no part, given the part an index workbook
+    among the sources names it under (Extraction.index_parts) - for review,
+    never pre-accepted (INDEX_PART_HOW). Its 'no part' problem line goes
+    when every value has one."""
+    if not run.index_parts:
+        return
+    fixed: Dict[str, int] = defaultdict(int)
+    left: Dict[str, int] = defaultdict(int)
+    for o in run.obs:
+        if o.part:
+            continue
+        src = o.where.split(" › ")[0]
+        hit = run.index_parts.get(Path(src).name.lower())
+        if hit and hit[1] != src:
+            o.part, o.part_how = hit[0], f"{INDEX_PART_HOW} {hit[1]!r} — check it"
+            fixed[src] += 1
+        else:
+            left[src] += 1
+    if fixed:
+        run.problems = [line for line in run.problems
+                        if not any(line.startswith(f"{src}: ") and "values have no" in line
+                                   and not left.get(src) for src in fixed)]
 
 
 def _filled_example_rows(csv_path, schema) -> List[Dict[str, str]]:
@@ -3802,6 +3919,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         here["what"] = f"{src.name}: reading sheet {ex.g.sheet!r}"
         ex.find_part()
         ex.find_inspectors()
+    for ex in exs:
+        for name, (p, _r) in ex.files_named().items():
+            run.index_parts.setdefault(name, (p, label or src.name))
     # a sheet's other parts too: a sheet holding two is no workbook of one
     found = {ex.part for ex in exs if ex.part} | {
         p for ex in exs for _r, _c, p, _h in ex.part_labels if p}
@@ -4171,6 +4291,8 @@ def decide(run: Extraction, schema: TemplateSchema,
                   # a part read from the file name says '— check it': it is
                   # (digits of 'EC_log_week41' were pre-accepted as part 41)
                   and not o.part_how.startswith(FILE_PART_HOW)
+                  # nor one an index workbook names the file under
+                  and not o.part_how.startswith(INDEX_PART_HOW)
                   # nor one your pattern found in a title's words (review,
                   # 2026-10-20)
                   and not o.part_how.startswith(TEXT_PART_HOW)
@@ -4224,6 +4346,7 @@ def review_reason(d: Decision, schema: TemplateSchema) -> str:
         (o.from_image, "read from a picture"),
         (how.startswith(MODEL_PART_HOW), "part suggested by the model"),
         (how.startswith(FILE_PART_HOW), "part taken from the file name"),
+        (how.startswith(INDEX_PART_HOW), "part named in an index workbook"),
         (how.startswith(TEXT_PART_HOW), "part found in a title"),
         (MISFIT_PART_HOW in how, "part does not fit the part-name pattern"),
         (SHEET_PARTS_HOW in how, "more than one part on the sheet"),
@@ -4278,6 +4401,8 @@ def summarize_review_reasons(decisions: Sequence[Decision], schema: TemplateSche
 
 #: How a part Council's model suggested is described (never pre-accepted).
 MODEL_PART_HOW = "suggested by Council's model"
+#: How a part an index workbook names a file under is described.
+INDEX_PART_HOW = "named in the index"
 #: How a part Council's model named that is also the file's name, or a word
 #: of it, is described: two sources agree, so it may be pre-accepted.
 AGREED_PART_HOW = "Council's model and the file name agree"

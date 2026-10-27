@@ -666,23 +666,61 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
     # an inspection workbook (review, 2026-10-19)
     # No last-saved-by: Excel writes one when a person saves the copy, and a
     # copy someone kept typing into is read again (is_filled_template).
-    try:
-        wb.properties.keywords = FILLED_MARK
-        wb.properties.lastModifiedBy = None
-    except Exception:
-        pass
+    mark_filled(wb)
     wb.save(out_path)
     return warnings
 
 
 #: The keyword a filled template carries in its document properties.
 FILLED_MARK = "council-ledger-filled-template"
+#: After the mark: a fingerprint of every cell the workbook held when the
+#: Ledger saved it ('council-ledger-filled-template cells:1f3a…').
+_FP_KEY = "cells:"
+
+
+def _fp_value(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))                 # 285.0 and 285: one value
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def cells_fingerprint(wb) -> str:
+    """Every non-empty cell of every sheet - its sheet, place and value -
+    hashed. The same for a workbook loaded normally or read-only."""
+    import hashlib
+    h = hashlib.sha256()
+    for ws in wb.worksheets:
+        h.update(f"\x00{ws.title}\x00".encode("utf-8"))
+        for row in ws.iter_rows():
+            for c in row:
+                v = getattr(c, "value", None)
+                if v is None or v == "" or not hasattr(c, "row"):
+                    continue
+                h.update(f"{c.row},{c.column}={_fp_value(v)}\n".encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def mark_filled(wb) -> None:
+    """Mark a workbook the Ledger wrote, just before it is saved: the mark,
+    a fingerprint of its cells, and no last-saved-by. A scan leaves it out
+    while its cells are the Ledger's; once anyone has typed into it - in
+    Excel, LibreOffice, a script, anything - its cells differ and it is
+    read again (_filled_state). Only Excel's last-saved-by told before, so
+    a copy edited elsewhere was left out (synthetic test, 2026-10-27)."""
+    try:
+        wb.properties.keywords = f"{FILLED_MARK} {_FP_KEY}{cells_fingerprint(wb)}"
+        wb.properties.lastModifiedBy = None
+    except Exception:                                       # noqa: BLE001
+        pass
 
 
 def _filled_state(p) -> str:
     """'' (not filled by the Ledger), 'filled', or 'edited': filled, then
-    saved by someone else - Excel writes who saved it last (lastModifiedBy),
-    which fill_template leaves out."""
+    changed by someone: Excel's last-saved-by is set (the Ledger leaves it
+    out), or - whatever program saved it - its cells are no longer the
+    ones fingerprinted when the Ledger wrote it (mark_filled)."""
     import zipfile
     p = Path(p)
     if p.suffix.lower() not in (".xlsx", ".xlsm"):
@@ -695,7 +733,21 @@ def _filled_state(p) -> str:
     if FILLED_MARK.encode() not in core:
         return ""
     m = re.search(rb"<cp:lastModifiedBy>([^<]*)</cp:lastModifiedBy>", core)
-    return "edited" if m and m.group(1).strip() else "filled"
+    if m and m.group(1).strip():
+        return "edited"                      # Excel says someone saved it
+    fp = re.search(rb"%s([0-9a-f]{8,64})" % _FP_KEY.encode(), core)
+    if fp:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(p, read_only=True)
+            try:
+                now = cells_fingerprint(wb)
+            finally:
+                wb.close()
+        except Exception:                                   # noqa: BLE001
+            return "edited"                  # cannot tell: read it, never skip it
+        return "filled" if now == fp.group(1).decode() else "edited"
+    return "filled"
 
 
 def is_filled_template(p) -> bool:
