@@ -115,6 +115,7 @@ hidden = [
     "huggingface_hub", "chromadb",
     # ── Document parsing ──
     "pypdf", "docx",                  # python-docx is imported as `docx`
+    "pdfplumber", "pypdfium2",        # PDF tables; scanned pages rendered for OCR
     "bs4", "lxml",                    # vault scraper / web crawl
     # ── Optional integrations ──
     "paramiko",                       # SSH compute nodes

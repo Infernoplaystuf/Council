@@ -167,7 +167,11 @@ def test_the_default_rules_start_ticked(tmp_path):
     read was a wrong assumption - a first build reads the labelled fields."""
     v, key = _vault(tmp_path)
     kg = kgm.KnowledgeGraph(v)
-    assert {s for _r, s in kg.field_rules()} == {"confirmed"}
+    status = {r.label: s for r, s in kg.field_rules()}
+    assert {status[r.label] for r in kgm.DEFAULT_FIELD_RULES} == {"confirmed"}
+    # the people columns of rosters and logs are offered, not ticked
+    # (synthetic test, 2026-10-27)
+    assert {status[r.label] for r in kgm.PROPOSED_FIELD_RULES} == {"proposed"}
     kg.seed()
     labelled = _truth(key, evidence={"row", "record"}) - {
         ("bob", "CONTACT_FOR", "northwind"), ("marcus", "CONTACT_FOR", "bands")}
@@ -188,8 +192,10 @@ def test_an_older_store_gets_the_default_rules_ticked_unless_the_user_chose(tmp_
             kg.db.execute("DELETE FROM meta WHERE key='rules_on_by_default'")
         kg.close()
         kg = kgm.KnowledgeGraph(store)
-        got = {s for _r, s in kg.field_rules()}
+        defaults = {r.label for r in kgm.DEFAULT_FIELD_RULES}
+        got = {s for r, s in kg.field_rules() if r.label in defaults}
         assert got == ({"proposed"} if user_chose else {"confirmed"}), name
+        assert {s for r, s in kg.field_rules() if r.label not in defaults} == {"proposed"}
         kg.close()
 
 

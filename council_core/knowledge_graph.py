@@ -309,6 +309,20 @@ DEFAULT_FIELD_RULES: Tuple[FieldRule, ...] = (
     FieldRule("Attendees", "PERSON", (("PROJECT", "WORKS_ON"),)),
 )
 
+#: People columns rosters, logs and sales sheets use: added PROPOSED, for the
+#: Connections tab to offer (rules_to_tick) - a mixed folder built 0 links
+#: with every default rule on, because none of these had a rule (synthetic
+#: test, 2026-10-27).
+PROPOSED_FIELD_RULES: Tuple[FieldRule, ...] = (
+    FieldRule("Employee", "PERSON", (("PROJECT", "WORKS_ON"),)),
+    FieldRule("Manager", "PERSON", (("PROJECT", "LEADS"),)),
+    FieldRule("Inspector", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Inspected by", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Technician", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Sales Rep", "PERSON", (("PROJECT", "WORKS_ON"),)),
+    FieldRule("Lead", "PERSON", (("PROJECT", "LEADS"),)),
+)
+
 #: Built-in readings, not rules the user ticks: what a Ledger's schema, or
 #: the Ledger's own reader, says a column holds (council_core/kg_excel.py).
 #: Bracketed labels can never be a label in a document, so no document's
@@ -504,7 +518,7 @@ class Record:
 #: Tables read as rows: a CSV by its header; a workbook by the Ledger's
 #: reader (council_core/kg_excel.py), which also gives its text lines.
 _CSV = {".csv", ".tsv"}
-_WORKBOOK = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+_WORKBOOK = {".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm"}
 _TABULAR = _CSV | _WORKBOOK
 _TEXT = {".txt", ".md", ".markdown", ".rst", ".log", ".pdf", ".docx",
          ".html", ".htm", ".xml", ".yaml", ".yml", ".ini", ".cfg"}
@@ -760,6 +774,9 @@ def rebuild_summary_line(stats) -> str:
                      + ("s" if stats['documents_other'] != 1 else ""))
     if kinds:
         bits.append(" — " + ", ".join(kinds))
+    if stats.get("not_read_types"):
+        bits.append("; not read (no reader for the type): " + ", ".join(
+            f"{n} {suf}" for suf, n in stats["not_read_types"].items()))
     if unchanged:
         # The graph that was there is the answer: no entity is new this run.
         # It used to repeat the last run's '(23 matched existing, 18 new
@@ -2003,6 +2020,9 @@ class KnowledgeGraph:
                 for r in DEFAULT_FIELD_RULES:
                     self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
                                     "(?, ?, 'confirmed')", (r.label, r.to_json()))
+                for r in PROPOSED_FIELD_RULES:
+                    self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
+                                    "(?, ?, 'proposed')", (r.label, r.to_json()))
                 # A store made while they started proposed: ticked once, unless
                 # the user ever ticked or unticked a rule (their choice stands).
                 if existed and self.db.execute(
@@ -2876,7 +2896,33 @@ class KnowledgeGraph:
         finally:
             lock.release()
 
+    def unread_types(self) -> Dict[str, int]:
+        """Files under the folders the graph reads that it has no reader for,
+        by type ('.jpg': 6): said in the summary, not left out without a
+        word (synthetic test, 2026-10-27). Dot-folders are not counted."""
+        import os
+        bases = [self.root] if self.root.is_dir() else []
+        bases += [Path(r["path"]) for r in self.extra_roots()
+                  if r["files"] is None and Path(r["path"]).is_dir()]
+        counts: Dict[str, int] = {}
+        for base in bases:
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")
+                               and not _skip_dir(os.path.join(dirpath, d), d)]
+                for f in filenames:
+                    suf = Path(f).suffix.lower()
+                    if f.startswith((".", "~$")) or suf in SUPPORTED_SUFFIXES:
+                        continue
+                    if self._scope_suffixes and suf not in self._scope_suffixes:
+                        continue
+                    counts[suf or "(no type)"] = counts.get(suf or "(no type)", 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
     def _seed_finish(self, stats: Dict[str, Any], prog) -> None:
+        try:
+            stats["not_read_types"] = self.unread_types()
+        except OSError:
+            stats["not_read_types"] = {}
         # the initials nobody has named yet: the summary line says who
         stats["initials_open"] = [r[0] for r in self.db.execute(
             "SELECT DISTINCT surface FROM review WHERE kind='initials'"

@@ -314,7 +314,8 @@ def context(kg: kgm.KnowledgeGraph, question: str, *, hops: int = 2, max_facts: 
         cells = " | ".join(f"{c['label']}: {_short(c['text'])}" if c["label"] != _LOOSE
                            else _short(c["text"]) for c in r["cells"])
         more = f" | … {r['more_cells']} more cells" if r.get("more_cells") else ""
-        lines.append(f"[{r['n']}] {head}, {r['where']}: {cells}{more}")
+        about = (f" (part {r['part']}, from {r['part_how']})" if r.get("part") else "")
+        lines.append(f"[{r['n']}] {head}, {r['where']}{about}: {cells}{more}")
         p = str(kg.abs_path(r["path"]))
         if p not in sources:
             sources.append(p)

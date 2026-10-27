@@ -664,8 +664,11 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
                 put(f, item, row.get(f.name))
     # so a recursive source scan knows this is the Ledger's own output, not
     # an inspection workbook (review, 2026-10-19)
+    # No last-saved-by: Excel writes one when a person saves the copy, and a
+    # copy someone kept typing into is read again (is_filled_template).
     try:
         wb.properties.keywords = FILLED_MARK
+        wb.properties.lastModifiedBy = None
     except Exception:
         pass
     wb.save(out_path)
@@ -676,18 +679,36 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
 FILLED_MARK = "council-ledger-filled-template"
 
 
-def is_filled_template(p) -> bool:
-    """A template the Ledger filled (fill_template), told from its document
-    properties without opening the workbook."""
+def _filled_state(p) -> str:
+    """'' (not filled by the Ledger), 'filled', or 'edited': filled, then
+    saved by someone else - Excel writes who saved it last (lastModifiedBy),
+    which fill_template leaves out."""
     import zipfile
     p = Path(p)
     if p.suffix.lower() not in (".xlsx", ".xlsm"):
-        return False
+        return ""
     try:
         with zipfile.ZipFile(p) as z:
-            return FILLED_MARK.encode() in z.read("docProps/core.xml")
+            core = z.read("docProps/core.xml")
     except Exception:
-        return False
+        return ""
+    if FILLED_MARK.encode() not in core:
+        return ""
+    m = re.search(rb"<cp:lastModifiedBy>([^<]*)</cp:lastModifiedBy>", core)
+    return "edited" if m and m.group(1).strip() else "filled"
+
+
+def is_filled_template(p) -> bool:
+    """A template the Ledger filled (fill_template) and nobody saved since,
+    told from its document properties without opening the workbook. One a
+    person kept typing into is a source again (synthetic test, 2026-10-27:
+    such copies were left out of a folder scan)."""
+    return _filled_state(p) == "filled"
+
+
+def is_edited_filled_template(p) -> bool:
+    """A template the Ledger filled that someone saved since (read again)."""
+    return _filled_state(p) == "edited"
 
 
 def _typed(v):

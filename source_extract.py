@@ -297,6 +297,30 @@ class Matcher:
         #: (docs_open.explanations_for): a suggestion when the rules are unsure
         self.explained: Dict[str, Tuple[str, Any]] = {}
 
+    def template_words(self) -> set:
+        """The words of the template's fields, part label and taught labels,
+        less the ones every sheet has ('date', 'notes', 'number')."""
+        if getattr(self, "_tw", None) is None:
+            words = set(self._id_tok)
+            for toks in self._tok.values():
+                words.update(toks)
+            for key in list(self.aliases) + list(self.item_heads) + list(self.who):
+                words.update(tokens(key))
+            words.update(tokens(self.schema.item_field or ""))
+            self._tw = {w for w in words if len(w) >= 2 and not w.isdigit()} - _COMMON_WORDS
+        return self._tw
+
+    def shares_words(self, text) -> bool:
+        """Does a short text cell use one of the template's words, a slip of
+        one, or its first letters ('Freq', 'Pwr' of 'Power' is not)?"""
+        if not isinstance(text, str) or not _words(text):
+            return False
+        if self.key_of(text) in self.aliases:
+            return True
+        src = [w for w in tokens(text) if len(w) >= 2 and not w.isdigit()]
+        tw = self.template_words()
+        return any(w in tw for w in src) or (bool(src) and _near_typo(src, sorted(tw)))
+
     def use_explanations(self, explanations: Sequence[Any]) -> None:
         import docs_open
         self.explained = docs_open.explanations_for(
@@ -523,6 +547,45 @@ class Matcher:
         if len(scored) > 1 and raw - scored[1][0] < TIE_GAP:
             return Match(best, shown, guesses, via="ambiguous")
         return Match(best, shown, guesses, via="match")
+
+
+#: words too common to say a sheet is about the template (_unrelated_sheet)
+_COMMON_WORDS = frozenset({"date", "dates", "time", "notes", "note", "number", "no", "id",
+                           "name", "total", "type", "status", "result", "results", "comments",
+                           "comment", "description", "value", "values", "amount", "qty"})
+#: rows with something in them looked at to tell an unrelated sheet
+UNRELATED_ROWS = 30
+#: a sheet smaller than this is always read: skipping is for speed
+UNRELATED_MIN_CELLS = 200
+
+
+def _unrelated_sheet(g: "Grid", m: Matcher) -> bool:
+    """A sheet whose name and first UNRELATED_ROWS rows hold no word of the
+    template (a 2,000-row sales sheet): not read cell by cell - it took 17.6
+    s of a 38 s run for no value (synthetic test, 2026-10-27). Pictures are
+    still read."""
+    if len(g.cells) < UNRELATED_MIN_CELLS or g.from_image or m.shares_words(g.sheet):
+        return False             # a small sheet costs nothing: read it (a cover's 'S/N')
+    rows = sorted({r for r, _c in g.cells})[:UNRELATED_ROWS]
+    keep = set(rows)
+    for (r, c), v in g.cells.items():
+        if r in keep and isinstance(v, str) and m.shares_words(v):
+            return False
+    return True
+
+
+def _other_texts(g: "Grid", m: Matcher) -> int:
+    """Different short texts with a word in them (not a code: 'LMM1AB101',
+    'B23') in a sheet's first UNRELATED_ROWS rows that use no word of the
+    template: a stock list's 'Description', 'Cooling fan'."""
+    rows = set(sorted({r for r, _c in g.cells})[:UNRELATED_ROWS])
+    seen = set()
+    for (r, _c), v in g.cells.items():
+        if r in rows and isinstance(v, str) \
+                and re.search(r"(?<![A-Za-z0-9])[A-Za-z]{3,}(?![A-Za-z0-9])", v) \
+                and _words(v, 40) and not m.shares_words(v):
+            seen.add(v.strip().casefold())
+    return len(seen)
 
 
 def _near_typo(src: Sequence[str], field_toks: Sequence[str]) -> bool:
@@ -1093,7 +1156,10 @@ WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm",
                      # text documents (docs_open): their tables and 'Label: value'
                      # lines are data, their explanations of labels help the
                      # matcher (user 2026-10-21)
-                     ".docx", ".docm", ".txt", ".text", ".md", ".pdf", ".doc", ".rtf")
+                     ".docx", ".docm", ".txt", ".text", ".md", ".pdf", ".doc", ".rtf",
+                     # exports as text tables (synthetic test, 2026-10-27: a
+                     # folder's .csv files were neither read nor named)
+                     ".csv", ".tsv")
 
 
 _SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
@@ -1247,6 +1313,8 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     import docs_open
     if path.suffix.lower() in docs_open.SUFFIXES and path.exists():
         return _grids_from_doc(path, notes, want_pictures)
+    if path.suffix.lower() in (".csv", ".tsv") and path.exists():
+        return [_grid_from_csv(path)], []
     kind = excel_open.kind_of(path) if path.exists() else "unknown"
     if not path.exists():
         n = path_too_long(path)
@@ -1306,6 +1374,38 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
         # text boxes and charts
         grids.append(Grid(path.name, ex.name, ex.cells))
     return grids, images
+
+
+def _grid_from_csv(path: Path) -> Grid:
+    """A .csv / .tsv export as one sheet named after the file: numbers as
+    numbers, as a workbook gives them."""
+    import csv as _csv
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if path.suffix.lower() == ".tsv":
+        delim = "\t"
+    else:
+        try:
+            delim = _csv.Sniffer().sniff(text[:4096], delimiters=",;\t|").delimiter
+        except _csv.Error:
+            delim = ","
+    cells: Dict[Tuple[int, int], object] = {}
+    for r, row in enumerate(_csv.reader(io.StringIO(text), delimiter=delim), start=1):
+        for c, v in enumerate(row, start=1):
+            v = v.strip()
+            if not v:
+                continue
+            try:
+                cells[(r, c)] = int(v) if re.fullmatch(r"-?\d+", v) else (
+                    float(v) if re.fullmatch(r"-?\d*\.\d+", v) else v)
+            except ValueError:
+                cells[(r, c)] = v
+    return Grid(path.name, path.stem, cells)
 
 
 def _grids_from_doc(path: Path, notes: Optional[List[str]], want_pictures: bool = True
@@ -2169,6 +2269,24 @@ class _Extractor:
                     out.append((r, c, s))
         return out
 
+    def parts_in_titles(self) -> List[Tuple[int, int, str]]:
+        """(row, col, part) of 'Part 2041', 'Part No: 2041', 'P/N 2041' in a
+        short text cell of the sheet's first rows (a title), whatever the
+        part-name pattern: the title was passed over for the file name
+        (synthetic test, 2026-10-27: 691 values 'part taken from the file
+        name' when the title named it)."""
+        out: List[Tuple[int, int, str]] = []
+        for (r, c), v in sorted(self.g.cells.items()):
+            if r > TITLE_ROWS:
+                break
+            if not isinstance(v, str) or isinstance(v, _Merged) or len(v) > TEXT_PART_CHARS:
+                continue
+            for hit in _TITLE_PART.finditer(v):
+                p = hit.group(1).strip("-_")
+                if p and not self.codes.canon(p) and not is_placeholder(p):
+                    out.append((r, c, p))
+        return out
+
     def _is_table_header(self, r, c) -> bool:
         hits = sum(1 for c2, v in self.row(r)
                    if c2 != c and isinstance(v, str)
@@ -2605,10 +2723,12 @@ class _Extractor:
     def _data_rows(self, r, cols, item_col) -> List[int]:
         """Rows under a header until an empty one. In a flaw table one blank
         row is stepped over when the row after it has a flaw code (a gap left
-        while typing), never into a different table."""
+        while typing), never into a different table. No row cap: a 500-row
+        cap cut a 12,000-row EC log, and past it the Stage column was read as
+        the value with no part (synthetic test, 2026-10-27)."""
         rows: List[int] = []
         rr = r + 1
-        while rr < r + 500:
+        while True:
             if any((rr, c) in self.g.cells for c in cols):
                 rows.append(rr)
             elif rows and item_col is not None \
@@ -3314,6 +3434,15 @@ class Extraction:
     filled_copies: List[Tuple[List[Dict[str, str]], str]] = field(default_factory=list)
     #: what was learned in this run, one line each (learn by example)
     learned: List[str] = field(default_factory=list)
+    #: per 'book › sheet': short texts in its first rows that use no word of
+    #: the template (decide's FEW_FIELDS_NOTE)
+    other_words: Dict[str, int] = field(default_factory=dict)
+    #: sheets not read cell by cell: no word of the template in their first
+    #: rows (_unrelated_sheet)
+    unrelated: List[str] = field(default_factory=list)
+    #: a part-name pattern was given: it, not the parts' shapes, says which
+    #: part numbers to check (decide's ODD_PART_NOTE)
+    pattern_given: bool = False
 
 
 class _Cancelled(Exception):
@@ -3382,7 +3511,7 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     mask_re = mask_to_regex(pattern_mask) if pattern_mask else None
     m = Matcher(schema, aliases, ignore, taught=taught)
     codes = ItemCodes(schema.items)
-    run = Extraction([str(s) for s in sources], read=[])
+    run = Extraction([str(s) for s in sources], read=[], pattern_given=bool(mask_re))
     # what the text documents say labels mean, before any workbook is read
     run.explanations, said = document_explanations(sources)
     run.problems += said
@@ -3580,6 +3709,13 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             g.file = label
         for img in images:
             img.file = label
+    for g in grids:
+        run.other_words[f"{g.file} › {g.sheet}"] = _other_texts(g, m)
+    unrelated = [g for g in grids if _unrelated_sheet(g, m)]
+    if unrelated:
+        skip = {id(g) for g in unrelated}
+        grids = [g for g in grids if id(g) not in skip]
+        run.unrelated.extend(f"{g.file} › {g.sheet}" for g in unrelated)
     for i, img in enumerate(images):
         if cancel is not None and cancel.is_set():
             raise _Cancelled()
@@ -3678,6 +3814,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         # then the file name's other clues
         book_part, how = ("", "") if mask_re is not None and mask_re.search(src.stem) \
             else _text_part(exs)
+        if not book_part:
+            # 'Part 2041' in a title, before the file name's clues
+            book_part, how = _title_part(exs, src.stem)
         if not book_part:
             book_part = _part_from_filename(src.stem, mask_re, strict=mask_strict)
             how = f"{FILE_PART_HOW} {src.name!r} — check it" if book_part else ""
@@ -3870,6 +4009,59 @@ def ledger_values(ledger) -> Callable[[str, str, str], str]:
     return held
 
 
+#: Added to a value of a sheet that holds only one or two of the template's
+#: fields among labels that are mostly not the template's (a stock list with a
+#: 'Part Number' and a 'Power (W)' column): kept, never pre-accepted. An
+#: inventory sheet's 120 W was pre-accepted as part 3005's laser power, and
+#: rows were made for its stock codes (synthetic test, 2026-10-27).
+FEW_FIELDS_NOTE = "a sheet with few of the template's fields — is it about these parts?"
+#: Added to a value whose part is shaped unlike the run's other parts
+#: ('FAN-12' among '2041', '3005' ...) when no part-name pattern was given.
+ODD_PART_NOTE = "part number shaped unlike the other parts — check it"
+
+
+def _sheet_of(where: str) -> str:
+    """'book.xlsx › Sheet!B4' / '... › image x (row 1, col 2)' -> 'book.xlsx › Sheet'."""
+    return re.sub(r"(!.*|\s›\s+image .*)$", "", where or "")
+
+
+def _off_template_sheets(run: "Extraction", schema: TemplateSchema) -> set:
+    """The sheets with at most two template fields and no per-item value,
+    whose other short texts outnumber them by more than two to one (a stock
+    list's 'Description', 'Bin', 'Cooling fan' beside its 'Power (W)'):
+    probably about something else. A summary of parts with only 'Power (W)'
+    and 'Date' is kept as it was."""
+    fields: Dict[str, set] = defaultdict(set)
+    per_item: set = set()
+    skip = {schema.id_field, getattr(schema, "item_field", "")}
+    for o in run.obs:
+        if not o.field or o.field in skip:
+            continue
+        sh = _sheet_of(o.where)
+        fields[sh].add(o.field.split(" [", 1)[0])
+        if o.item:
+            per_item.add(sh)
+    return {sh for sh, f in fields.items() if len(f) <= 2 and sh not in per_item
+            and run.other_words.get(sh, 0) >= max(3, 2 * len(f) + 1)}
+
+
+def _part_shape(part: str) -> str:
+    """'PS-750' -> 'PS-9', 'S-10' -> 'S-9', '2041' -> '9': its letters and
+    signs, any run of digits one 9."""
+    return re.sub(r"\d+", "9", part.strip().upper())
+
+
+def _odd_parts(run: "Extraction") -> set:
+    """Parts whose shape (_part_shape) few of the run's parts have: under a
+    quarter of the commonest shape's count, with 4+ parts."""
+    parts = {o.part for o in run.obs if o.part}
+    if len(parts) < 4:
+        return set()
+    shapes = Counter(_part_shape(p) for p in parts)
+    top = shapes.most_common(1)[0][1]
+    return {p for p in parts if shapes[_part_shape(p)] * 4 < top}
+
+
 def decide(run: Extraction, schema: TemplateSchema,
            prefer: Sequence[str] = (),
            known: Optional[Callable[[str, str, str], str]] = None) -> List[Decision]:
@@ -3895,6 +4087,8 @@ def decide(run: Extraction, schema: TemplateSchema,
     2026-10-23: a Ledger run again as its folders gain files)."""
     groups: Dict[Tuple[str, str, str, str], List[Obs]] = defaultdict(list)
     seq: Dict[int, int] = {}                 # each reading's place in the run
+    off_sheets = _off_template_sheets(run, schema)
+    odd = set() if run.pattern_given else _odd_parts(run)
     for i, o in enumerate(run.obs):
         seq[id(o)] = i
         # A value with no part is its own workbook's: two part-less workbooks
@@ -3984,6 +4178,12 @@ def decide(run: Extraction, schema: TemplateSchema,
                   and MISFIT_PART_HOW not in o.part_how
                   # nor one of a sheet whose parts' blocks are not clear
                   and SHEET_PARTS_HOW not in o.part_how)
+            if off_sheets and _sheet_of(o.where) in off_sheets:
+                ok = False
+                o.note = _join(o.note, FEW_FIELDS_NOTE)
+            if part in odd:
+                ok = False
+                o.note = _join(o.note, ODD_PART_NOTE)
             held = known(part, item, fname) if known is not None and part else ""
             if held and not alternate:
                 if k == _value_key(held):
@@ -4036,6 +4236,8 @@ def review_reason(d: Decision, schema: TemplateSchema) -> str:
         (_BESIDE_NOTE in o.note, "table with no labels of its own"),
         (_PLACE_NOTE in o.note, "slide table paired by place"),
         (_DOC_NOTE in o.note, "read from a text document"),
+        (FEW_FIELDS_NOTE in o.note, "sheet holds few of the template's fields"),
+        (ODD_PART_NOTE in o.note, "part number shaped unlike the others"),
     )
     return next((why for held, why in checks if held), "another value ranked first")
 
@@ -4107,6 +4309,34 @@ MISFIT_PART_HOW = "does not fit the part-name pattern"
 #: the other with no readings between): kept, never pre-accepted (review,
 #: 2026-10-20).
 SHEET_PARTS_HOW = "more than one part number on this sheet"
+
+
+#: a title's rows: where 'Part 2041' names the sheet's part
+TITLE_ROWS = 3
+#: 'Part 2041', 'Part No. 2041', 'Part #: 2041', 'P/N 2041', 'Sample S-12'
+_TITLE_PART = re.compile(r"(?i)(?<![A-Za-z])(?:part|sample|p/n)(?:\s*(?:no\.?|number|#))?"
+                         r"\s*[:#]?\s*([A-Za-z]{0,6}-?\d[\w\-]*)(?![.,]\d)")
+#: How a part named in a title ('Part 2041') is described; when the file
+#: name names the same part, two sources agree and it may be pre-accepted.
+TITLE_PART_HOW = "the title names it"
+TITLE_AGREED_HOW = "the title and the file name agree"
+
+
+def _title_part(exs: Sequence["_Extractor"], stem: str) -> Tuple[str, str]:
+    """(part, how) when the workbook's titles name ONE part ('Part 2041'),
+    else ('', ''). The file name naming it too makes it sure."""
+    hits: Dict[str, Tuple["_Extractor", int, int]] = {}
+    for ex in exs:
+        for r, c, p in ex.parts_in_titles():
+            hits.setdefault(p, (ex, r, c))
+    if len(hits) != 1:
+        return "", ""
+    part, (ex, r, c) = next(iter(hits.items()))
+    ex.part_cell = (r, c)
+    at = ex.g.where(r, c).split(" › ", 1)[-1]
+    if _in_name(part, stem):
+        return part, f"{TITLE_AGREED_HOW} ({at})"
+    return part, f"{TEXT_PART_HOW} {at} ({TITLE_PART_HOW}) — check it"
 
 
 def _text_part(exs: Sequence["_Extractor"]) -> Tuple[str, str]:

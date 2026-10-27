@@ -59,7 +59,10 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from council_core import knowledge_graph as kgm
 
-WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb",
+                     # slides: their tables laid out as sheets (pptx_open), as the
+                     # Ledger reads them (synthetic test, 2026-10-27)
+                     ".pptx", ".pptm")
 
 #: Above this many bytes of uncompressed sheet XML a workbook is STREAMED
 #: (openpyxl read-only, one row at a time) instead of loaded whole. MEASURED
@@ -808,7 +811,10 @@ class _GridReader:
         if not isinstance(v, str) or self._merged(v):
             return None
         r = self.by_norm.get(_norm(v))
-        if r is not None:
+        # A ticked offered rule ('Inspector') does not take a 'who' label
+        # from the Ledger's own reading: the initials still go through the
+        # people list and the links stay suggested.
+        if r is not None and not (r in kgm.PROPOSED_FIELD_RULES and _who_head(v)):
             return r
         return kgm.INSPECTOR if _who_head(v) else None
 

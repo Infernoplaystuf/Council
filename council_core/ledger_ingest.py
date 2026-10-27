@@ -75,7 +75,35 @@ def _ledger_output_kind(p: Path, template_path: Optional[str] = None) -> str:
             pass
     if kg_excel.is_review_workbook(p):
         return "a Ledger review"
+    # a parent CSV (its schema beside it) - now that a scan reads .csv
+    if p.suffix.lower() == ".csv" and p.with_suffix(".schema.json").exists():
+        return PARENT_CSV
     return "a filled template" if is_filled_template(p) else ""
+
+
+#: a parent CSV a folder scan found (_ledger_output_kind): left out, unlisted
+PARENT_CSV = "a Ledger's parent CSV"
+
+
+def unread_files(sources: Sequence) -> Dict[str, int]:
+    """What a folder scan leaves unread because the Ledger has no reader for
+    it, by file type ('.png': 4) - named in the summary, not dropped without
+    a word (synthetic test, 2026-10-27). Hidden folders are not counted."""
+    from source_extract import WORKBOOK_SUFFIXES
+    counts: Dict[str, int] = {}
+    for s in sources:
+        p = Path(s)
+        if not p.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(p):
+            dirnames[:] = [d for d in dirnames if not d.startswith((".", "~$"))]
+            for n in filenames:
+                suf = Path(n).suffix.lower()
+                if n.startswith(("~$", ".")) or suf in WORKBOOK_SUFFIXES \
+                        or suf in (".json",) and n.endswith(".schema.json"):
+                    continue
+                counts[suf or "(no type)"] = counts.get(suf or "(no type)", 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 def collect_sources(paths: Sequence,
@@ -112,6 +140,8 @@ def collect_sources(paths: Sequence,
             pat = next((q for q in patterns if file_matches_ignore(x.name, [q])), None)
             why = f"Skip pattern {pat!r}" if pat is not None else (
                 _ledger_output_kind(x, template_path) if scanned else "")
+            if why == PARENT_CSV:
+                continue          # the Ledger's own CSV beside its sources: not news
             if why:
                 ignored.append(x)
                 if reasons is not None:
@@ -232,6 +262,12 @@ class ExtractSummary:
     #: 1/3 to 1/2 of the images read"); and why the others were not read
     images_blank: int = 0
     images_unread: str = ""
+    #: files a folder scan found that no reader takes, by type ('.png': 4)
+    unread: Dict[str, int] = field(default_factory=dict)
+    #: sheets with no word of the template in their first rows: not read
+    unrelated: List[str] = field(default_factory=list)
+    #: templates the Ledger filled that someone saved since: read as sources
+    read_again: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -253,6 +289,15 @@ class ExtractSummary:
                   "titles; a part of another shape is still pre-accepted")
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
+        if self.read_again:
+            s += (f"\nread again: {len(self.read_again)} template(s) the Ledger filled "
+                  "that someone saved since — " + ", ".join(self.read_again[:10]))
+        if self.unread:
+            s += "\n" + summarize_unread(self.unread)
+        if self.unrelated:
+            s += (f"\n{len(self.unrelated)} sheet(s) not read: no word of the template in "
+                  "their first rows — " + ", ".join(self.unrelated[:8])
+                  + (f", and {len(self.unrelated) - 8} more" if len(self.unrelated) > 8 else ""))
         if self.assist:
             s += "\n" + self.assist
         if self.open_failures:
@@ -315,6 +360,17 @@ def summarize_open_failures(open_failures) -> str:
     parts = [f"{counts[k]} {label}" for k, label in _OPEN_FAILURE_LABELS.items()
              if counts.get(k)]
     return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
+
+
+def summarize_unread(unread: Dict[str, int]) -> str:
+    """'not read (no reader for the type): 6 .jpg, 1 .png, 1 .json'."""
+    return ("not read (no reader for the type): "
+            + ", ".join(f"{n} {suf}" for suf, n in unread.items()))
+
+
+def _is_edited_filled(p) -> bool:
+    from sample_ledger import is_edited_filled_template
+    return is_edited_filled_template(p)
 
 
 def summarize_skipped(skipped, top: int = 10) -> str:
@@ -625,7 +681,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           filled=str(Path(filled[0]).parent) if filled else "",
                           filled_count=len(filled), filled_book=filled_book,
                           images_blank=_images_blank(run.images),
-                          images_unread=_images_unread(run.images))
+                          images_unread=_images_unread(run.images),
+                          unread=unread_files(sources),
+                          unrelated=list(run.unrelated),
+                          read_again=[p.name for p in files
+                                      if _is_edited_filled(p)])
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
