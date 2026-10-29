@@ -193,15 +193,17 @@ def test_nothing_to_speak_says_so():
     assert "nothing to speak" in speech_core.TtsPlayer().speak("  ").message
 
 
-def test_a_build_without_pyttsx3_loses_one_button_and_nothing_else():
+def test_a_build_without_pyttsx3_loses_one_button_and_nothing_else(monkeypatch):
     """The import is optional on purpose; a missing package should cost the
-    Speak function and not the tab."""
+    Speak function and not the tab. The package is taken away here: with it
+    installed, the test spoke "hello" through the PC's speakers (and hung on
+    a Windows CI runner, which has no audio device)."""
+    monkeypatch.setitem(sys.modules, "pyttsx3", None)     # import -> ImportError
     player = speech_core.TtsPlayer()
-    player._engine = None
     result = player.speak("hello")
-    if not player.available:
-        assert not result.ok
-        assert "pyttsx3" in result.message
+    assert not player.available
+    assert not result.ok
+    assert "pyttsx3" in result.message
 
 
 # ============================================================

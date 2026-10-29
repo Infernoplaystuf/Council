@@ -18,6 +18,8 @@
 # ---- Core (always required) ----
 PyYAML>=6.0
 requests>=2.31
+psutil>=5.9              # memory, cores and processes (hardware_detect,
+                         # the analyst's limits, ending a hidden Excel)
 
 # ---- The UI ----
 # The Qt app (council_qt.py) is the app: the run-* launchers start it and the

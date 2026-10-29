@@ -126,15 +126,26 @@ def test_other_values_offered_is_capped(ledger):
 
 
 def test_write_review_with_many_rows_is_fast(tmp_path, ledger):
+    """It grew faster than the rows did (~10 s at 6k, 75 s at 16k). Checked
+    by how it scales - four times the rows may take at most about six times
+    as long - not by a number of seconds, which depends on the machine: a
+    CI runner took 23 s at 6k where a desktop takes a few."""
     csv, schema = ledger
     f = next(x for x in schema.fields if not x.per_item and x.name != schema.id_field)
-    obs = [se.Obs(str(1000 + i), "", f.name, str(i), 0.5, "ambiguous", "x",
-                  f"s.xlsx!B{i}") for i in range(6000)]
-    run = se.Extraction(["s.xlsx"], obs=obs)
-    decs = se.decide(run, schema)
-    t0 = time.perf_counter()
-    se.write_review(tmp_path / "r.xlsx", run, decs, schema, str(csv))
-    assert time.perf_counter() - t0 < 20                   # was ~10 s at 6k, 75 s at 16k
+
+    def write(n: int, name: str) -> float:
+        obs = [se.Obs(str(1000 + i), "", f.name, str(i), 0.5, "ambiguous", "x",
+                      f"s.xlsx!B{i}") for i in range(n)]
+        run = se.Extraction(["s.xlsx"], obs=obs)
+        decs = se.decide(run, schema)
+        t0 = time.perf_counter()
+        se.write_review(tmp_path / name, run, decs, schema, str(csv))
+        return time.perf_counter() - t0
+
+    small = write(1500, "small.xlsx")
+    big = write(6000, "r.xlsx")
+    assert big < 6 * small + 2, (small, big)              # linear is 4x
+    assert big < 120                                       # and never a stall
     ws = openpyxl.load_workbook(tmp_path / "r.xlsx")["Values"]
     assert ws.cell(2, 1).fill.fgColor.rgb.endswith("FFF2CC")   # amber row kept
 

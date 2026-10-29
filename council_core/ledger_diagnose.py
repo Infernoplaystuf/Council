@@ -410,6 +410,13 @@ class _Notes:
     def __init__(self, log_path: str):
         self.fh = open(log_path, "a", encoding="utf-8", buffering=1)
         self.t0 = time.monotonic()
+        # The repeating dump is stopped before the interpreter shuts down,
+        # whichever way the child ends: left armed it fired into a process
+        # being torn down and crashed it (0xC0000005 on Windows; CI,
+        # 2026-10-26).
+        import atexit
+        import faulthandler
+        atexit.register(faulthandler.cancel_dump_traceback_later)
 
     def arm(self) -> None:
         import faulthandler

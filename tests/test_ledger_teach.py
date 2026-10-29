@@ -329,8 +329,11 @@ def test_learning_writes_aliases_ignores_inspectors_people_pattern_and_examples(
             ("Remarks to self", "ignore"), ("Power (W)", "field")} <= by
     assert {e.value for e in ex if e.role != lt.ROLE_PART} == {""}
     assert {e.value for e in ex if e.role == lt.ROLE_PART} == {"XYZ9AB123-R2"}
-    raw = lt.examples_path_for(csv).read_text(encoding="utf-8")
-    assert "call MK" not in raw and "55" not in raw.replace('"ts"', "")
+    # the stored text, less each line's time stamp (19:19:55 has a 55 in it)
+    raw = "".join(json.dumps({k: v for k, v in json.loads(line).items() if k != "ts"})
+                  for line in lt.examples_path_for(csv).read_text(encoding="utf-8")
+                  .splitlines() if line.strip())
+    assert "call MK" not in raw and "55" not in raw
     assert all(e.workbook == "untitled.xlsx" for e in ex)
     text = rep.describe()
     assert "Zorp rate → " in text and "Tech Sig" in text and "@@@#@@###-@#" in text

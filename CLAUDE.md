@@ -23,6 +23,14 @@ now `council_core/backend_settings.py`. The launchers' `--tk` /
 - Still to clean up: `tests/smoke_test.py` has checks that import
   `council_gui_engine` and now skip themselves.
 
+## Running the tests
+
+`python tests/run_all.py` runs the whole suite one file per process, four at
+a time (about 7 minutes; serially in one process it stalls for hours). The
+Tests workflow (`.github/workflows/tests.yml`) runs exactly that on Windows
+with Python 3.11 for every pull request into `qt-migration` and every push to
+it. Keep it green: a failing file there is a failing file on the user's PC.
+
 ## Retired tests
 
 These were deleted on purpose. If a merge from another branch brings one back,
@@ -79,7 +87,13 @@ same list.
     `test_the_tick_is_guarded_by_the_refusal_handler`;
   - `test_script_takeover.py`: the eight `test_tk_*` door tests;
   - `smoke_test.py`: `test_db_wizard_url_assembly`, `test_no_bare_re_in_gui`,
-    `test_plots_pane_core`.
+    `test_plots_pane_core`; and (2026-10-26, they failed instead of skipping)
+    `test_dream3d_convert_to_python_routing`, `test_dream3d_tab_wiring`,
+    `test_ui_pump_survives_a_bad_item`,
+    `test_known_field_names_harvests_real_labels`,
+    `test_an_adjective_does_not_break_a_field_search`,
+    `test_rag_recall_and_coverage`. `test_plain_english_is_not_a_file_path`
+    now checks `council_core.turn_context`, where that code moved.
 
 ## Standing rules (all branches)
 
