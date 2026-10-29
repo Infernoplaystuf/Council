@@ -9,7 +9,10 @@ streamed call, and hands it to the council only when
     long question, a coding or strategy route, or a request for a design,
     plan, comparison or analysis — but a request to EXPLAIN something
     ("explain the boid algorithm", "what is recursion") stays with the
-    first answer unless it also asks for code to be written or changed;
+    first answer unless it also asks for code to be written or changed.
+    One that names a language ("explain boids in Python") is answered as a
+    short tutorial ending in a runnable program (GUIDE), by the Coder when
+    there is one;
   * the Writer says so: its reply is ``ESCALATE: <why>`` instead of an answer;
   * the Writer is not sure: its CONFIDENCE line is at or below
     confidence.LOW.
@@ -62,6 +65,40 @@ _MAKE = re.compile(
     r"debug\w*|rewrite|port|convert|code (me|up)|my code|this code)\b",
     re.IGNORECASE)
 
+#: Languages an explanation can ask for, by how the user writes them. C, R
+#: and Go are common words or letters, so they count only after "in",
+#: "using" or "with" ("explain quicksort in C").
+_LANGUAGES = {
+    "python": "Python", "javascript": "JavaScript", "typescript": "TypeScript",
+    "java": "Java", "c++": "C++", "cpp": "C++", "c#": "C#", "csharp": "C#",
+    "rust": "Rust", "golang": "Go", "ruby": "Ruby", "php": "PHP",
+    "swift": "Swift", "kotlin": "Kotlin", "matlab": "MATLAB",
+    "julia": "Julia", "scala": "Scala", "haskell": "Haskell", "lua": "Lua",
+    "perl": "Perl", "bash": "Bash", "powershell": "PowerShell", "sql": "SQL",
+}
+_LANGUAGE = re.compile(
+    r"(?<![\w+#])(" + "|".join(re.escape(k) for k in sorted(
+        _LANGUAGES, key=len, reverse=True)) + r")(?![\w+#])", re.IGNORECASE)
+_SHORT_LANGUAGE = re.compile(r"\b(?:in|using|with)\s+(c|r|go)\b(?![+#])",
+                             re.IGNORECASE)
+
+#: Added to INSTRUCTION when an explanation names a language (asked
+#: 2026-10-29: "explain conceptually but then also write a Python script
+#: that shows the algorithm. Something similar to a GeeksForGeeks guide").
+GUIDE = (
+    "The user asked for this explained in {lang}. Answer as a short tutorial "
+    "in this order:\n"
+    "1. The idea in plain words, before any code: what it does and why it "
+    "works.\n"
+    "2. How it works, step by step (pseudocode if it helps).\n"
+    "3. ONE complete, runnable {lang} program that shows it, in a single "
+    "code block: standard library only unless the topic needs more, small "
+    "sample input built in, comments on the key lines, and a main entry "
+    "point that prints a result.\n"
+    "4. What it prints when run.\n"
+    "5. Time and space complexity, and a common pitfall or variation.\n"
+    "Keep it to what a reader needs; no filler.")
+
 _ESCALATE = re.compile(r"^\W*escalate\b\s*[:\-—]?\s*(.*)$",
                        re.IGNORECASE | re.DOTALL)
 
@@ -74,7 +111,7 @@ def needs_council(typed: str, route: str = "") -> str:
         return "the question has code in it"
     if len(q) >= DEEP_MIN_CHARS:
         return "a long question"
-    if _EXPLAIN.search(q) and not _MAKE.search(q):
+    if is_explanation(q):
         return ""
     if route in DEEP_ROUTES:
         return ("a coding question" if route in ("ide", "coder")
@@ -82,6 +119,34 @@ def needs_council(typed: str, route: str = "") -> str:
     if _COUNCIL_WORDS.search(q):
         return "it asks for design, analysis or planning"
     return ""
+
+
+def is_explanation(typed: str) -> bool:
+    """A request to explain something, not to make or change code."""
+    q = (typed or "").strip()
+    return bool(_EXPLAIN.search(q)) and not _MAKE.search(q)
+
+
+def guide_language(typed: str) -> str:
+    """The language an explanation asks for ("explain boids in Python" ->
+    "Python"), or "" when it is not an explanation or names none."""
+    q = (typed or "").strip()
+    if "```" in q or not is_explanation(q):
+        return ""
+    m = _LANGUAGE.search(q)
+    if m:
+        return _LANGUAGES[m.group(1).lower()]
+    m = _SHORT_LANGUAGE.search(q)
+    if m:
+        return {"c": "C", "r": "R", "go": "Go"}[m.group(1).lower()]
+    return ""
+
+
+def instruction(typed: str) -> str:
+    """What the first answer is told: INSTRUCTION, and GUIDE when the
+    question asks for an explanation in a language."""
+    lang = guide_language(typed)
+    return INSTRUCTION + ("\n\n" + GUIDE.format(lang=lang) if lang else "")
 
 
 def read_reply(raw: str) -> Tuple[str, str, Optional[int]]:

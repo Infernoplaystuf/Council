@@ -211,3 +211,70 @@ def test_the_single_model_chat_never_hands_on(tmp_path):
     writer.respond = lambda prompt, **_k: "Just the Writer."
     result, _e, _s = _send(actions, "Design a schema")
     assert result.ok and result.answer == "Just the Writer."
+
+
+# ============================================================
+# "Explain it in Python": a tutorial ending in a runnable program
+# ============================================================
+
+@pytest.mark.parametrize("q,lang", [
+    ("explain the boid algorithm in python", "Python"),
+    ("Explain quicksort in C", "C"),
+    ("explain quicksort in C++", "C++"),
+    ("how does a hash map work in Go?", "Go"),
+    ("explain closures using JavaScript", "JavaScript"),
+    ("what is recursion", ""),
+    ("explain go routines", ""),          # "go" is a word here
+    ("explain the C block results", ""),  # and "C" a label
+    ("write boids in python", ""),        # a build ask: the council's
+])
+def test_an_explanation_names_its_language(q, lang):
+    assert front_desk.guide_language(q) == lang
+
+
+def test_the_guide_is_asked_for_only_with_a_language():
+    assert front_desk.instruction("what is recursion") == front_desk.INSTRUCTION
+    told = front_desk.instruction("explain the boid algorithm in python")
+    assert told.startswith(front_desk.INSTRUCTION)
+    assert "runnable Python program" in told
+
+
+class Recording(Writer):
+    def respond(self, prompt, *, extra_context="", token_callback=None, **k):
+        self.kwargs = dict(k, extra_context=extra_context)
+        return super().respond(prompt, extra_context=extra_context,
+                               token_callback=token_callback)
+
+
+def test_the_coder_writes_the_tutorial_when_there_is_one(tmp_path):
+    writer, coder = Recording("unused"), Recording(
+        "Boids flock by three rules.\n```python\nprint(1)\n```\n"
+        "CONFIDENCE: 85% — fine")
+    actions = _actions(tmp_path, writer)
+    actions._models.coder = coder
+    result, events, streamed = _send(actions,
+                                     "explain the boid algorithm in python")
+    assert result.ok and result.route == "direct"
+    assert result.answer.startswith("Boids flock") and "```python" in result.answer
+    assert writer.first == [] and len(coder.first) == 1
+    assert "runnable Python program" in coder.kwargs["extra_context"]
+    assert int(coder.kwargs["max_tokens"]) >= 2400
+    assert events[-1].who == "Coder"
+
+
+def test_without_a_coder_the_writer_writes_it(tmp_path):
+    writer = Recording("The idea, then code.\nCONFIDENCE: 80% — ok")
+    result, _e, _s = _send(_actions(tmp_path, writer),
+                           "explain quicksort in C")
+    assert result.ok and len(writer.first) == 1
+    assert "runnable C program" in writer.kwargs["extra_context"]
+
+
+def test_a_plain_explanation_gets_no_tutorial(tmp_path):
+    writer = Recording("Recursion is a function calling itself.")
+    actions = _actions(tmp_path, writer)
+    actions._models.coder = Recording("unused")
+    result, _e, _s = _send(actions, "what is recursion")
+    assert result.ok and len(writer.first) == 1
+    assert writer.kwargs["extra_context"] == front_desk.INSTRUCTION
+    assert "max_tokens" not in writer.kwargs

@@ -702,6 +702,13 @@ class CouncilActions:
 
         writer = getattr(models, "writer", None)
         can_hand_on = getattr(models, "judge", None) is not None
+        # "Explain boids in Python" is answered as a short tutorial ending in
+        # a runnable program (front_desk.GUIDE): by the Coder when there is
+        # one, since its model is the one set for code.
+        guide = front_desk.guide_language(typed_text)
+        who = "Writer"
+        if guide and getattr(models, "coder", None) is not None:
+            writer, who = models.coder, "Coder"
 
         def hand_on(why: str):
             if on_event is not None:
@@ -720,15 +727,17 @@ class CouncilActions:
             return council_turn.TurnResult(
                 False, message="No writer model is loaded.")
         if on_event is not None:
-            on_event(AgentEvent("Writer", "thought", "Answering…"))
-        gate = (front_desk.StreamGate(lambda token: on_token("Writer", token))
+            on_event(AgentEvent(who, "thought", "Answering…"))
+        gate = (front_desk.StreamGate(lambda token: on_token(who, token))
                 if on_token is not None else None)
+        kwargs = {"extra_context": front_desk.instruction(typed_text)}
+        if guide:
+            from council_core import token_budget
+            kwargs["max_tokens"] = token_budget.reply("long", 2400)
+        if gate is not None:
+            kwargs["token_callback"] = gate
         try:
-            if gate is not None:
-                raw = writer.respond(sent, extra_context=front_desk.INSTRUCTION,
-                                     token_callback=gate)
-            else:
-                raw = writer.respond(sent, extra_context=front_desk.INSTRUCTION)
+            raw = writer.respond(sent, **kwargs)
         except Exception as exc:                          # noqa: BLE001
             return council_turn.TurnResult(
                 False, message=f"The answer failed: {exc!r}", error=exc)
@@ -738,7 +747,7 @@ class CouncilActions:
         if not answer:
             return council_turn.TurnResult(
                 False, message="The Writer gave no answer.")
-        event = AgentEvent("Writer", "final", answer)
+        event = AgentEvent(who, "final", answer)
         if on_event is not None:
             on_event(event)
         return council_turn.TurnResult(
