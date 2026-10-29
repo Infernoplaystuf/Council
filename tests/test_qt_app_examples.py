@@ -21,7 +21,7 @@ import gui_policy  # noqa: E402
 import gui_reference as gr  # noqa: E402
 
 pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtCore import QEventLoop, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, Qt, QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWizard  # noqa: E402
 
 NAMES = gr.names()
@@ -31,6 +31,23 @@ SAMPLE_DATA = ROOT / "assets" / "sample_data"
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _delete_windows():
+    """Each test's windows are deleted by Qt before the next test. Left for
+    the interpreter's shutdown, an undo stack or a worker pool torn down
+    after QApplication crashed the process once every test had passed
+    (segfault on Linux, a failed file on the Windows runner)."""
+    yield
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.topLevelWidgets():
+        w.close()
+        w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
 
 
 def load(name: str):
