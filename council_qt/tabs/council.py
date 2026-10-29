@@ -438,7 +438,7 @@ class CouncilActions:
         asking = models is not None
         sage = getattr(models, "sage", None)
         writer = getattr(models, "writer", None)
-        deliberate = bool(getattr(options, "deliberate", True))
+        deliberate = bool(getattr(options, "deliberate", False))
 
         # 1. council-map's lookups, started side by side: the wait is the
         # slowest step, not the sum. Earlier conversations' decisions only
@@ -645,15 +645,28 @@ class CouncilActions:
         ``typed_text`` is what the Judge routes on and the depth is decided
         on (A5)."""
         from council_core import council_turn
-        if not getattr(options, "deliberate", True):
+        stream = on_token if getattr(options, "stream", True) else None
+        depth = str(getattr(options, "depth", "auto") or "auto")
+        if not getattr(options, "deliberate", False):
             # The fast path: one personality, no panel, no verdict. It is a
             # real answer and it is NOT a deliberation, so it produces no
             # verdict id — which is what keeps the verdict bar honest (A3).
-            # It gets the vault context: the default build is this path, and
-            # without it the default build was a chatbot.
-            return self._direct(
-                sent, models, on_event=on_event,
-                on_token=on_token if getattr(options, "stream", True) else None)
+            # It gets the vault context: without it this path was a chatbot.
+            if self.demo_mode:
+                # The single-model chat: nothing to hand a question on to.
+                return self._direct(sent, models, on_event=on_event,
+                                    on_token=stream)
+            first = self._front_desk(sent, typed_text, models, options,
+                                     on_event=on_event, on_token=stream)
+            if first is not None:
+                return first
+            # Handed on. The council takes it at Standard at least: a Quick
+            # council would be the same one model answering again.
+            if depth == "auto":
+                from council_core.depth import QUICK, decide
+                route = self._route(models, typed_text)
+                if decide(typed_text, route).level == QUICK:
+                    depth = "standard"
 
         enable_tools = bool(getattr(options, "tools", False))
         return council_turn.run_turn(
@@ -661,12 +674,76 @@ class CouncilActions:
             enable_tools=enable_tools,
             tools=self.tools() if enable_tools else None,
             parallel_members=bool(getattr(options, "parallel", False)),
-            depth=str(getattr(options, "depth", "auto") or "auto"),
+            depth=depth,
             extra_ctx=({"judge_evidence": judge_evidence}
                        if judge_evidence else None),
             on_event=on_event,
-            on_token=on_token if getattr(options, "stream", True) else None,
+            on_token=stream,
             route_text=typed_text)
+
+    @staticmethod
+    def _route(models, typed_text: str) -> str:
+        """The Judge's keyword route for the typed question ("" without a
+        Judge, or when it fails)."""
+        judge = getattr(models, "judge", None)
+        try:
+            return (judge.route(typed_text) or "") if judge is not None else ""
+        except Exception:                                 # noqa: BLE001
+            return ""
+
+    def _front_desk(self, sent, typed_text, models, options, *,
+                    on_event=None, on_token=None):
+        """One model answers first (council_core.front_desk). Returns its
+        result, or None when the question goes to the council — said in the
+        transcript, with why. Without a Judge there is no council to hand
+        on to, so the Writer's answer stands."""
+        from council_core import council_turn, front_desk
+        from council_core.deliberation import AgentEvent
+
+        writer = getattr(models, "writer", None)
+        can_hand_on = getattr(models, "judge", None) is not None
+
+        def hand_on(why: str):
+            if on_event is not None:
+                on_event(AgentEvent("Council", "observation",
+                                    f"Handing this to the council: {why}."))
+            return None
+
+        if can_hand_on:
+            why = ("Tools are on, and only the council's members use them"
+                   if getattr(options, "tools", False)
+                   else front_desk.needs_council(
+                       typed_text, self._route(models, typed_text)))
+            if why:
+                return hand_on(why)
+        if writer is None:
+            return council_turn.TurnResult(
+                False, message="No writer model is loaded.")
+        if on_event is not None:
+            on_event(AgentEvent("Writer", "thought", "Answering…"))
+        gate = (front_desk.StreamGate(lambda token: on_token("Writer", token))
+                if on_token is not None else None)
+        try:
+            if gate is not None:
+                raw = writer.respond(sent, extra_context=front_desk.INSTRUCTION,
+                                     token_callback=gate)
+            else:
+                raw = writer.respond(sent, extra_context=front_desk.INSTRUCTION)
+        except Exception as exc:                          # noqa: BLE001
+            return council_turn.TurnResult(
+                False, message=f"The answer failed: {exc!r}", error=exc)
+        answer, why, pct = front_desk.read_reply(raw)
+        if why and can_hand_on:
+            return hand_on(why)
+        if not answer:
+            return council_turn.TurnResult(
+                False, message="The Writer gave no answer.")
+        event = AgentEvent("Writer", "final", answer)
+        if on_event is not None:
+            on_event(event)
+        return council_turn.TurnResult(
+            True, answer=answer, route="direct", events=[event],
+            confidence=pct if pct is not None else 0)
 
     # -- the vault context ---------------------------------------------
     def turn_state(self):

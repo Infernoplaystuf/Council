@@ -226,7 +226,7 @@ def test_send_gives_the_vault_to_the_turn_and_takes_it_back(tmp_path,
         "VAULT CONTEXT:\n[1] notes/pumps.md\nP-200: 40 l/min",
         ["notes/pumps.md"], "keyword")
     events = []
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"          # the debate itself is under test
     result = actions.send("pump size?", options, on_event=events.append)
     assert result.ok, result.message
@@ -256,7 +256,7 @@ def test_with_no_room_left_the_passages_are_left_out_and_said(tmp_path,
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
     events = []
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"
     assert actions.send("pump size?", options, on_event=events.append).ok
     assert not any("P-200" in s for s in models.writer.seen)
@@ -288,7 +288,7 @@ def test_a_passage_from_a_file_already_in_front_is_not_repeated(tmp_path,
     actions.prepare = prepare
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"
     result = actions.send("pump size?", options)
     assert result.ok, result.message
@@ -332,7 +332,7 @@ def test_the_turn_context_is_sized_with_the_blocks_set_before_it(
         at_prepare.append((kw["writer"].extra_context, kw.get("think")))
         return real(*a, **kw)
     actions.prepare = prepare
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.deliberate = deliberate
     options.depth = "deep"
     result = actions.send("which pump for 40 litres per minute?", options)
@@ -352,7 +352,7 @@ def test_the_vault_switch_turns_it_off(tmp_path):
     actions._models = _models()
     asked = []
     actions.vault_brief = lambda q: asked.append(q) or vc.Brief()
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"          # the debate itself is under test
     options.vault = False
     events = []
@@ -408,7 +408,7 @@ def test_the_judge_ranks_and_critiques_with_the_evidence(tmp_path):
     actions._models = models
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     opts.depth = "deep"
     result = actions.send("pump size?", opts)
     assert result.ok, result.message
@@ -431,8 +431,8 @@ def test_no_vault_no_evidence_and_old_judges_still_work(tmp_path):
     models.judge = FakeJudge()             # rank_candidates(user, cands)
     actions._models = models
     actions.vault_brief = lambda q: vc.Brief()
-    result = actions.send("pump size?", council_options.CouncilOptions
-                          .defaults())
+    result = actions.send("pump size?", council_options.CouncilOptions(
+                              deliberate=True))
     assert result.ok, result.message
 
 
@@ -466,7 +466,7 @@ def test_only_the_sage_reads_its_knowledge_for_the_turn(tmp_path):
     actions.vault_brief = lambda q: vc.Brief()
     events = []
     result = actions.send("which pump for 40 litres per minute?",
-                          council_options.CouncilOptions.defaults(),
+                          council_options.CouncilOptions(deliberate=True),
                           on_event=events.append)
     assert result.ok and "sage" in result.panel, result.message
     assert any("Sage: 2 item(s)" in e.text for e in events)
@@ -502,7 +502,7 @@ def test_the_sage_s_knowledge_follows_the_memory_scope(tmp_path, monkeypatch,
     actions.memo_llm = None
     events = []
     result = actions.send("which pump for 40 litres per minute?",
-                          council_options.CouncilOptions.defaults(),
+                          council_options.CouncilOptions(deliberate=True),
                           on_event=events.append)
     assert result.ok and "sage" in result.panel, result.message
     assert models.sage.seen

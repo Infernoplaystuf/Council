@@ -148,6 +148,9 @@ def _qt_ask(qapp, monkeypatch, demo_mode: bool):
     view.reveal_source = shown.append
     try:
         assert view.demo_mode is demo_mode
+        if not demo_mode:
+            # Deliberation on: always the panel, not one model first.
+            view._checkboxes["deliberate"].setChecked(True)
         view.input.setPlainText(QUESTION)
         view.on_send()
         assert _pump(qapp, lambda: not view._turn_active, timeout=300), (
@@ -191,7 +194,7 @@ def test_qt_single_model_chat_gives_the_writer_the_fact_and_cites_it(
 
 def test_qt_full_panel_gives_the_writer_the_fact_and_cites_it(
         qapp, engine, monkeypatch):
-    """The default chat: deliberation is on by default and the panel runs."""
+    """Deliberation on: the panel runs."""
     got = _qt_ask(qapp, monkeypatch, demo_mode=False)
     assert got.route not in (None, "direct", "data"), got.route
     prompts = _writer_prompts(engine.fake)

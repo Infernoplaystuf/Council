@@ -102,7 +102,7 @@ def test_a_council_question_is_recorded(tmp_path):
     actions._models = models
     actions.memo_llm = None
     actions.vault_brief = lambda q: vc.Brief()
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     opts.depth = "deep"
     assert actions.send("which pump for the line?", opts).ok
     lines = vl.read(tmp_path, 0)
