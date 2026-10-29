@@ -7,7 +7,9 @@ streamed call, and hands it to the council only when
 
   * the question plainly needs one (`needs_council`, no model call): code, a
     long question, a coding or strategy route, or a request for a design,
-    plan, comparison or analysis;
+    plan, comparison or analysis — but a request to EXPLAIN something
+    ("explain the boid algorithm", "what is recursion") stays with the
+    first answer unless it also asks for code to be written or changed;
   * the Writer says so: its reply is ``ESCALATE: <why>`` instead of an answer;
   * the Writer is not sure: its CONFIDENCE line is at or below
     confidence.LOW.
@@ -45,6 +47,21 @@ _COUNCIL_WORDS = re.compile(
     r"trade-?offs?|strategy|optimi[sz]\w*|analy[sz]e|investigate|evaluate|"
     r"root cause|pros and cons|implement\w*|migrat\w*)\b", re.IGNORECASE)
 
+#: A request to explain something: the first answer is enough, whatever the
+#: topic. "Explain the boid algorithm" or "what is the difference between a
+#: list and a tuple in Python" went to the council only because the Judge's
+#: keyword route calls anything naming a language a coding question.
+_EXPLAIN = re.compile(
+    r"^\W*(explain|describe|define|tell me about|what (is|are|was|were|does|"
+    r"do)\b|what's|whats|how (does|do|is|are)\b(?!\s+(i|we|you)\b)|"
+    r"why (does|do|is|are)\b|when (should|would|do|does)\b)|"
+    r"\bdifference between\b", re.IGNORECASE)
+#: ...unless it also asks for something to be made or changed.
+_MAKE = re.compile(
+    r"\b(write|build|create|make|generate|fix|refactor\w*|"
+    r"debug\w*|rewrite|port|convert|code (me|up)|my code|this code)\b",
+    re.IGNORECASE)
+
 _ESCALATE = re.compile(r"^\W*escalate\b\s*[:\-—]?\s*(.*)$",
                        re.IGNORECASE | re.DOTALL)
 
@@ -57,8 +74,11 @@ def needs_council(typed: str, route: str = "") -> str:
         return "the question has code in it"
     if len(q) >= DEEP_MIN_CHARS:
         return "a long question"
+    if _EXPLAIN.search(q) and not _MAKE.search(q):
+        return ""
     if route in DEEP_ROUTES:
-        return f"a {route} question"
+        return ("a coding question" if route in ("ide", "coder")
+                else f"a {route} question")
     if _COUNCIL_WORDS.search(q):
         return "it asks for design, analysis or planning"
     return ""

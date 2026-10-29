@@ -29,6 +29,28 @@ def test_plain_questions_are_answered_first(q):
 
 
 @pytest.mark.parametrize("q,route", [
+    # The Judge's keyword route calls these coding questions ("ide"): asked
+    # 2026-10-29, an explanation stays with the first answer.
+    ("explain the boid algorithm", "chat"),
+    ("explain the boid algorithm in python", "ide"),
+    ("what is recursion", "chat"),
+    ("explain big-O notation", "chat"),
+    ("what is the difference between a list and a tuple in python", "ide"),
+    ("explain how to implement quicksort", "ide"),
+    ("what is a design pattern", "chat"),
+    ("how does a hash map work?", "ide"),
+])
+def test_an_explanation_is_answered_first_whatever_the_topic(q, route):
+    assert front_desk.needs_council(q, route) == ""
+
+
+@pytest.mark.parametrize("q,route", [
+    ("write a boids simulation in python", "ide"),
+    ("implement quicksort", "ide"),
+    ("explain and then write quicksort in C", "ide"),
+    ("how do I write a parser in python", "ide"),
+    ("explain this code:\n```py\nx = 1\n```", "chat"),
+    ("how do I design a REST API", "chat"),
     ("Design a schema for the run logs", "chat"),
     ("compare the pros and cons of SQLite and Postgres here", "chat"),
     ("fix this:\n```py\nprint(x\n```", "chat"),
