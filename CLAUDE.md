@@ -140,6 +140,8 @@ same list.
   clipboard a protected workbook's pictures go through (what the user had is
   kept and put back, whose copy it is told by its owner):
   `docs/handoff/ledger_pictures_2026-10-26.md`.
+- The Build tab (files, editor, and the chat beside the code being built in five
+  steps; the agreed design and what each step does): `docs/handoff/build_tab_2026-10-29.md`.
 - The Connections tab's Contents layer (every value of every spreadsheet, text
   document, PDF, Word and JSON file under its header or label, whatever the field rules; search over it; the Contents tab):
   `docs/handoff/kg_contents_2026-10-26.md`.
