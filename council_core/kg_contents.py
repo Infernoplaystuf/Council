@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 import sqlite3
 import tempfile
 import time
@@ -1005,6 +1006,7 @@ def question_rows(db: sqlite3.Connection, question: str, *, max_rows: int = 12,
                              "field_id": fid, "score": 0.0, "matched": []}
         r["score"] += sc
         r["matched"] += matched[(fid, row)]
+    _rank_named_part(db, rows, fmeta, toks)
     ranked = sorted(rows.values(), key=lambda r: (-r["score"], r["row"]))
     paths = {}
     for r in ranked[:max(max_rows * 3, max_rows)]:
@@ -1053,6 +1055,72 @@ def question_rows(db: sqlite3.Connection, question: str, *, max_rows: int = 12,
                 list(fields_hit) + [max_fields]):
             out["fields"].append(dict(_field_dict(r[1:]), path=r[0]))
     return out
+
+
+# ── whose rows: the part a sheet is about ────────────────────────────────
+#: labels that hold a part's number ('Part Number', 'Part No.', 'P/N')
+_PART_LABEL = re.compile(r"^(?:part|sample|specimen|serial)(?: (?:number|no|num|id|#))?$|^p ?n$"
+                         r"|^s ?n$")
+
+
+def _is_part_label(norm: str) -> bool:
+    return bool(_PART_LABEL.match((norm or "").replace(".", "").strip()))
+
+
+def sheet_parts(db: sqlite3.Connection, did: str, sheet: str) -> Tuple[set, str]:
+    """({folded part numbers}, how) a sheet is about, when no column of its
+    rows says: a 'Part Number' label on it, else 'Part 2041' in a title in
+    its first rows, else the part in the file's name. Rows of one sheet
+    showed no part, and an answer about part 2041 was given part 2046's
+    rows (synthetic test, 2026-10-27)."""
+    import source_extract as se
+    got: set = set()
+    for fid, norm, kind in db.execute(
+            "SELECT id, label_norm, kind FROM fields WHERE document_id=? AND sheet=?",
+            (did, sheet)):
+        if kind == "label" and _is_part_label(norm):
+            got |= {fold(t) for (t,) in db.execute(
+                "SELECT text FROM cells WHERE field_id=? LIMIT 5", (fid,))}
+    if got:
+        return got, "its Part Number label"
+    for (t,) in db.execute(
+            "SELECT c.text FROM cells c JOIN fields f ON f.id=c.field_id WHERE f.document_id=?"
+            " AND f.sheet=? AND c.row<=? ORDER BY c.row LIMIT 20", (did, sheet, se.TITLE_ROWS)):
+        for m in se._TITLE_PART.finditer(t):
+            got.add(fold(m.group(1)))
+    if got:
+        return got, "its title"
+    row = db.execute("SELECT path FROM documents WHERE id=?", (did,)).fetchone()
+    stem = Path(row[0]).stem if row and row[0] else ""
+    p = se._part_from_filename(stem) if stem else ""
+    return ({fold(p)} if p else set()), "the file name"
+
+
+def _rank_named_part(db, rows: Dict[Tuple[str, str, int], Dict[str, Any]],
+                     fmeta: Dict[int, Dict[str, Any]], toks: Sequence[str]) -> None:
+    """When the question names a part one of the rows' sheets is about, those
+    rows come first and rows of other parts' sheets go down; each row says
+    which part it is about (``part``) when its own cells do not."""
+    if not rows:
+        return
+    ctx: Dict[Tuple[str, str], Tuple[set, str]] = {}
+    for (did, sheet, _row), r in rows.items():
+        if (did, sheet) not in ctx:
+            ctx[(did, sheet)] = sheet_parts(db, did, sheet)
+    known = set().union(*(p for p, _h in ctx.values())) if ctx else set()
+    named = {t for t in toks if t in known}
+    for (did, sheet, row), r in rows.items():
+        own = {fold(c["text"]) for c in row_cells(db, r["field_id"], row)
+               if _is_part_label(label_norm(c["label"]))}
+        parts, how = (own, "") if own else ctx[(did, sheet)]
+        if parts and not own:
+            r["part"] = ", ".join(sorted(parts))
+            r["part_how"] = how
+        if named and parts:
+            if parts & named:
+                r["score"] += 2.0
+            else:
+                r["score"] *= 0.3
 
 
 # ── the Ledger's template fields, looked up (step 4) ─────────────────────

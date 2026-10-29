@@ -150,3 +150,28 @@ Apply there was only the review and one file per part in `<review>_filled/`.
   button.
 - It is never written over a file the Ledger did not write (`FILLED_MARK`).
   Apply's workbooks are unchanged: accepted values only, with the groups.
+
+## Sure values need no review (2026-10-27)
+
+Andy: "The sure values in the review should not require a review." Green
+meant a good label match, so a value held back for another reason (its part
+from the file name or an index workbook, a text document, a sheet unlike the
+template) was green and still asked about: 111 of them in the synthetic
+batch 2.
+
+- `ledger_review.confidence_tint` goes by the whole decision: green only for
+  a value accepted (pre-accepted, or said Right); a held value is yellow
+  (orange under 0.6), a clash red. The filled templates and both windows use
+  it; the legend says "sure: accepted, nothing to check".
+- The review's Values sheet has a 14th column, "Held back because": every
+  check that held the value back (`source_extract.review_reasons`). The
+  window's list and detail show it. An older review has no such column.
+- When the only doubt is the part (`source_extract.PART_REASONS`: from the
+  model, the file name, an index workbook or a title), "✓ Part N right for
+  this file (k)" accepts all that file's sure values of that part in one go
+  (`ledger_review.same_file_part`; score ≥ 0.85, no clash, not answered).
+  Readings of another file that disagree are left out, as with Right.
+- Synthetic batch 2: 2,137 green values, none needing a decision; 5 files'
+  parts confirmed in 5 clicks cover 60 held values.
+
+Tests: `tests/test_ledger_review_sure.py`.

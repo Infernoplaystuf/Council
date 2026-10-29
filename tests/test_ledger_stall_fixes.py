@@ -714,7 +714,9 @@ def test_cancel_during_a_sheet_of_padded_cells_ends_the_run_at_once(tmp_path, le
     _csv, schema = ledger
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Notes"
+    # named for a template field: a sheet with no word of the template is
+    # not read cell by cell at all (synthetic test, 2026-10-27)
+    ws.title = "Power notes"
     for r in range(1, 601):
         ws.cell(r, 1, " " * 4000 + f"NOTE {r}")
         ws.cell(r, 2, " " * 2000 + "inspected by" + " " * 2000 + "x")

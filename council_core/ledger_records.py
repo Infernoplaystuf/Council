@@ -62,7 +62,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from sample_ledger import (FILLED_MARK, SOURCE_COL, UPDATED_COL, LedgerError,
+from sample_ledger import (FILLED_MARK, SOURCE_COL, UPDATED_COL, LedgerError, mark_filled,
                            TemplateField, TemplateSchema, _atomic_write_text, _clean,
                            _split_unit, _typed, normalize_label, schema_path_for, xl_text)
 
@@ -2944,10 +2944,7 @@ def fill_records(tt: TableTemplate, rows: Sequence[Dict[str, str]], out_path) ->
                             "template's cell is left empty")
     if n > laid:
         _stretch(ws, tt, last, warnings)
-    try:
-        wb.properties.keywords = FILLED_MARK
-    except Exception:                                       # noqa: BLE001
-        pass
+    mark_filled(wb)
     tmp = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
     wb.save(tmp)
     os.replace(tmp, out_path)

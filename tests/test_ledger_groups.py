@@ -93,7 +93,7 @@ def test_a_workbook_has_a_sheet_per_part_in_numerical_order(parts_csv):
     assert wb.sheetnames == ["LMX-7", "S-1", "S-2", "S-10"]
     power = cell_of(parts_csv, "Power (W)")
     assert wb["S-10"][power].value == 300 and wb["S-1"][power].value is None
-    assert wb.properties.keywords == FILLED_MARK
+    assert wb.properties.keywords.startswith(FILLED_MARK)
     lg.write_workbook(parts_csv, ["S-1"], out)                 # its own: written again
     assert openpyxl.load_workbook(out).sheetnames == ["S-1"]
     mine = parts_csv.with_name("mine.xlsx")
