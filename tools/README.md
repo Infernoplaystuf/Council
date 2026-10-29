@@ -7,6 +7,8 @@ by **you** (the operator) to manage the business side of the product.
 |------|--------------|
 | `generate_license.py` | Mint a license blob to email a customer. |
 | `license_server.py`   | Activation server the desktop app talks to once per device. |
+| `council_ab.py`       | Before/after test of the Council chat, Connections links and Ledger speed, on this PC with real models. |
+| `council_fulltest.py` | The whole app on this PC with real models: the test suite, every bench, one report. |
 
 ---
 
@@ -178,3 +180,22 @@ a clean experience when they move machines. A determined attacker who
 extracts `DI_LICENSE_SECRET` from a binary can mint their own keys and
 their own activation tokens. Accepting that trade-off is what lets the
 app stay fully offline after first activation.
+
+---
+
+## Testing on your own PC: `council_fulltest.py` and `council_ab.py`
+
+```bat
+conda activate wizardCouncil
+cd C:\path\to\Council
+python tools\council_fulltest.py --model ollama:gemma3:12b          & rem everything but the slow steps
+python tools\council_fulltest.py --model ollama:gemma3:12b --long   & rem and Typhon, the Code agent, the full council
+python tools\council_ab.py --model ollama:gemma3:12b                & rem only the before/after comparison
+```
+
+Both write everything into one folder (`%USERPROFILE%\council_fulltest\<time>` or
+`%USERPROFILE%\council_ab\<time>`, or `--out`) and end with `report.html`.
+They run against a scratch vault of synthetic files, never your own vault.
+Run the same command with the same `--out` to carry on after a stop. No
+network is needed: the "before" builds are git worktrees of commits already in
+this clone. Each file's docstring lists its steps and options.
