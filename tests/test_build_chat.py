@@ -119,7 +119,8 @@ def test_each_folder_keeps_its_own_conversation(tmp_path):
     model = FakeModel("Use a loop.")
     one = bc.Conversation(vault, str(tmp_path / "one"))
     assert one.ask("How?", bc.Context(path="a.py", text="x"), model) == "Use a loop."
-    assert one.path.parent == vault / "build_chats" and one.path.name.startswith("one-")
+    assert one.path.parent == vault / ".council_build" / "chats"
+    assert one.path.name.startswith("one-")
     again = bc.Conversation(vault, str(tmp_path / "one"))
     assert [(t.role, t.content, t.file) for t in again.turns] == [
         ("user", "How?", "a.py"), ("assistant", "Use a loop.", "a.py")]
@@ -155,6 +156,18 @@ def test_a_failed_call_keeps_the_question_only(tmp_path):
     with pytest.raises(RuntimeError):
         conv.ask("Go", bc.Context(), FakeModel(fail=RuntimeError("no model")))
     assert [t.role for t in bc.Conversation(tmp_path, "f").turns] == ["user"]
+
+
+def test_the_chats_are_kept_where_the_vault_search_does_not_look(tmp_path):
+    from council_core.vault_context import is_app_source
+    conv = bc.Conversation(tmp_path, "f")
+    conv.ask("q", bc.Context(), FakeModel("a"))
+    assert is_app_source(str(conv.path), tmp_path)
+    # a chat the first version kept in build_chats/ is still read
+    old = bc._old_store_path(tmp_path, "g")
+    old.parent.mkdir(parents=True)
+    old.write_text('{"turns": [{"role": "user", "content": "old"}]}', encoding="utf-8")
+    assert [t.content for t in bc.Conversation(tmp_path, "g").turns] == ["old"]
 
 
 def test_a_damaged_file_starts_an_empty_conversation(tmp_path):
