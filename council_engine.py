@@ -4057,6 +4057,7 @@ def local_chat(
     seed: Optional[int] = None,
     stop: Any = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    token_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Blocking chat call. ``role`` picks the model: the slot
     council_core.model_slots assigns it, "main" when it has none (every
@@ -4076,7 +4077,9 @@ def local_chat(
     raises GenerationCancelled. ``model`` "ollama:<name>" overrides the
     role's model for this call (any other value is ignored, as before);
     ``host`` names the Ollama server (loopback only unless remote nodes are
-    enabled).
+    enabled). ``token_callback(text)`` is called with each piece of the reply
+    as it is generated (the Build tab's chat streams with it); the whole
+    reply is still returned.
 
     When ``COUNCIL_AGENT_MEMORY_ENABLE`` is on, the call's
     ``(question, answer)`` is appended to the agent ConversationLog after
@@ -4091,7 +4094,9 @@ def local_chat(
         messages, slot=slot, role=role, temperature=temperature,
         num_predict=num_predict, json_schema=json_schema, seed=seed,
         stop=stop, should_stop=should_stop, timeout=timeout, model=model,
-        host=host)
+        host=host, token_callback=token_callback)
+    if token_callback is not None:
+        answer = answer.strip()
     _finish_stats(role, seq0, t0, answer, json_schema, num_predict)
     if _agent_memory_enabled():
         try:

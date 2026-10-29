@@ -48,11 +48,13 @@ from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPlainTextEdit,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import python_envs as envs
+from council_core import build_chat as bc
 from council_core import build_files as bf
 from council_core import code_highlight as ch
 from council_core import ide_trust, paths
 
 from ..view import ViewHelpers, amp
+from ..widgets.build_chat import ChatPanel
 from ..widgets.code_editor import CodeEditor, FindBar, mono_font
 
 #: How many output lines the Run pane keeps (as the IDE tab's).
@@ -74,7 +76,8 @@ class BuildActions:
                  unsaved_dir: Optional[Path] = None,
                  ask_folder: Optional[Callable[[str], str]] = None,
                  confirm: Optional[Callable[[str, str], bool]] = None,
-                 ask_name: Optional[Callable[[str, str], Optional[str]]] = None):
+                 ask_name: Optional[Callable[[str, str], Optional[str]]] = None,
+                 chat: Optional[Callable[..., str]] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -82,6 +85,7 @@ class BuildActions:
         self.ask_folder = ask_folder or self._ask_folder
         self.confirm = confirm or self._confirm
         self.ask_name = ask_name or self._ask_name
+        self.chat = chat or self._chat
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -106,6 +110,17 @@ class BuildActions:
         from PySide6.QtWidgets import QInputDialog
         text, ok = QInputDialog.getText(None, title, label)
         return text if ok else None
+
+    @staticmethod
+    def _chat(messages, on_token=None, should_stop=None) -> str:
+        """One answer from the Council's local "coder" model (the main
+        model when no model is set for that role), streamed."""
+        import council_engine
+        from council_core import token_budget
+        return council_engine.local_chat(
+            messages, role="coder", temperature=0.2,
+            num_predict=token_budget.reply("long", 1500), timeout=180,
+            token_callback=on_token, should_stop=should_stop)
 
     # -- the workspace -----------------------------------------------------
     def scratch_dir(self) -> Path:
@@ -172,6 +187,7 @@ class BuildTab(ViewHelpers, QWidget):
         self.docs: List[_Doc] = []
         self._stop: Optional[threading.Event] = None
         self._running = False
+        self._run_lines: List[str] = []       # the last run's output, for the chat
         self._build()
         state = self.actions.load_state()
         self.python_box.setCurrentText(envs.display(state.get("python", "")))
@@ -244,7 +260,10 @@ class BuildTab(ViewHelpers, QWidget):
         right.addWidget(self.output)
         right.setSizes([520, 180])
         split.addWidget(right)
-        split.setSizes([240, 860])
+        self.chat_panel = ChatPanel(self.actions.vault_dir, self.actions.chat,
+                                    self.chat_context, bridge=self.bridge)
+        split.addWidget(self.chat_panel)
+        split.setSizes([220, 700, 420])
         outer.addWidget(split, 1)
 
         self.status = QLabel("")
@@ -275,6 +294,7 @@ class BuildTab(ViewHelpers, QWidget):
         self.folder_label.setText(str(folder))
         self.tree.clear()
         self._fill_into(self.tree.invisibleRootItem(), folder)
+        self.chat_panel.set_folder(folder)
         self._remember()
 
     def on_open_folder(self) -> None:
@@ -468,10 +488,13 @@ class BuildTab(ViewHelpers, QWidget):
         self.stop_btn.setEnabled(True)
         self.append(f"[Running {path.name} with {python}]")
         stop = self._stop
+        self._run_lines = []
+
+        def line_out(line: str) -> None:
+            self._to_ui(self._run_line, line)
 
         def work() -> None:
-            outcome = bf.run_file(python, path,
-                                  lambda line: self._to_ui(self.append, line), stop)
+            outcome = bf.run_file(python, path, line_out, stop)
             self._to_ui(self._finished, outcome, path.name)
 
         threading.Thread(target=work, name="build-run", daemon=True).start()
@@ -482,6 +505,42 @@ class BuildTab(ViewHelpers, QWidget):
         self.stop_btn.setEnabled(False)
         self.append(outcome.summary(name))
         self.say("")
+        # a failed run is usually what the next question is about
+        self.chat_panel.use_output.setChecked(
+            outcome.returncode not in (0, None) and not outcome.stopped)
+
+    def _run_line(self, line: str) -> None:
+        self._run_lines.append(line)
+        if len(self._run_lines) > MAX_OUTPUT_LINES:
+            del self._run_lines[:len(self._run_lines) - MAX_OUTPUT_LINES]
+        self.append(line)
+
+    # -- the chat's view of the editor -----------------------------------------
+    def chat_context(self, use_file: bool, use_output: bool) -> bc.Context:
+        """What the chat's model is shown: the open file as edited, the
+        selected lines (or the cursor's), and the last run's output."""
+        ctx = bc.Context(folder=str(self.root or ""))
+        doc = self.current() if use_file else None
+        if doc is not None:
+            ed = doc.editor
+            cur = ed.textCursor()
+            ctx.path = str(doc.path)
+            ctx.text = ed.toPlainText()
+            ctx.language = ch.language(doc.path.name)
+            ctx.cursor_line = cur.blockNumber() + 1
+            if cur.hasSelection():
+                document = ed.document()
+                first = document.findBlock(cur.selectionStart()).blockNumber()
+                end = cur.selectionEnd()
+                last_block = document.findBlock(end)
+                # a selection ending at the start of a line leaves that line out
+                last = last_block.blockNumber()
+                if end == last_block.position() and last > first:
+                    last -= 1
+                ctx.sel_start, ctx.sel_end = first + 1, last + 1
+        if use_output:
+            ctx.output = "\n".join(self._run_lines)
+        return ctx
 
     def on_stop(self) -> None:
         if self._stop is not None:
