@@ -184,9 +184,16 @@ def latest_note(vault_dir: Path, project: pj.Project) -> str:
 
 
 def context(vault_dir: Path, project: pj.Project, focus: str, *,
-            root: Optional[Path] = None, map_chars: int = 6000) -> str:
+            root: Optional[Path] = None, map_chars: int = 6000,
+            example_chars: Optional[int] = None) -> str:
     """What every model call about this project starts from: the brief,
     the code map, the matching references and the last job's handoff note.
+
+    When the references include examples/qt_apps/ (the "Qt app builder"
+    agent's do), the one example app that best matches ``focus`` is added
+    WHOLE, up to ``example_chars``: search_references returns passages, and
+    a passage of a threaded worker without the window that starts it is the
+    half a small model gets wrong. See gui_reference.
 
     The note is one of the PROJECT's files (its notes/ folder, shown in the
     Code tab, what the next job is planned from), not a conversation's
@@ -202,6 +209,11 @@ def context(vault_dir: Path, project: pj.Project, focus: str, *,
         refs = pj.references(project).block(focus)
         if refs:
             parts.append(refs)
+        import gui_reference
+        if gui_reference.attached(project.references):
+            parts.append(gui_reference.for_prompt(
+                focus, max_chars=gui_reference.PROMPT_CHARS
+                if example_chars is None else example_chars))
     note = latest_note(vault_dir, project)
     if note:
         parts.append("THE LAST JOB'S HANDOFF NOTE:\n" + note)
@@ -452,7 +464,8 @@ def run_job(vault_dir: Path, project: pj.Project, rec: JobRecord, *,
              + (f"\n\nYOUR ROLE ON THIS PROJECT:\n{extra_system}"
                 if extra_system else "") + "\n\n" + context(
                 vault_dir, project, focus, root=job.path,
-                map_chars=min(6000, budget // 6))},
+                map_chars=min(6000, budget // 6),
+                example_chars=budget // 4)},
             {"role": "user", "content": "\n\n".join(user)}]
         fixes = nudges = 0
         verdict: Optional[Verdict] = None

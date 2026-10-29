@@ -100,18 +100,18 @@ def _main_model(vault: Path) -> str:
 def answering_roles() -> Tuple[str, ...]:
     """The roles a Council answer cannot do without.
 
-    The Writer always: the default build (DEMO_MODE) answers with one Writer
-    call. The Judge too in the full build, which routes and critiques every
-    turn with it. ANY slot that resolved used to count — found in review: main
+    The Writer always: a single-model build (branding.SINGLE_MODEL_COUNCIL)
+    answers with one Writer call. The Judge too in the full council, which
+    routes and critiques every turn with it. ANY slot that resolved used to count — found in review: main
     on an Ollama model that was not pulled and a "coding" slot that was, and
     the check said ready while every answer failed, since the Writer and the
     Judge are on main."""
     try:
         import branding
-        demo = bool(getattr(branding, "DEMO_MODE", True))
+        single = bool(getattr(branding, "SINGLE_MODEL_COUNCIL", False))
     except Exception:                                     # noqa: BLE001
-        demo = True
-    return ("writer",) if demo else ("writer", "judge")
+        single = False
+    return ("writer",) if single else ("writer", "judge")
 
 
 def check(vault_dir, *, roles: Optional[Sequence[str]] = None,

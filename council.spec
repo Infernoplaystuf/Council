@@ -156,6 +156,9 @@ datas = [
     ("BUILDING.md",               "."),
     ("requirements.txt",          "."),
     ("installs.txt",              "."),
+    # The example Qt apps gui_reference reads as TEXT into a coding agent's
+    # prompt (the Code tab's "Qt app builder"); never imported by the app.
+    ("examples/qt_apps",          "examples/qt_apps"),
     # ── Scripts run by ANOTHER interpreter (the DREAM3D-NX env), so they
     #    must be .py files beside the app, not modules frozen into it:
     #    workflow_runner launches every simplnx and every model-written

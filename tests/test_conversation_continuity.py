@@ -65,7 +65,7 @@ def test_each_run_has_its_own_session(tmp_path):
 
 def test_the_exchange_is_history_before_the_next_question(tmp_path):
     actions, models, store = _actions(tmp_path)
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     result = actions.send("Which pump for 40 l/min?", opts)
     assert result.ok, result.message
     turns = store.load_last(actions.session_id)
@@ -80,8 +80,8 @@ def test_a_failed_answer_is_not_recorded(tmp_path):
     actions, models, store = _actions(tmp_path)
     models.writer.respond = lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("model gone"))
-    result = actions.send("anything", council_options.CouncilOptions
-                          .defaults())
+    result = actions.send("anything", council_options.CouncilOptions(
+                              deliberate=True))
     assert not result.ok
     assert store.load_last(actions.session_id) == []
 
@@ -103,7 +103,7 @@ def test_the_memo_reaches_members_for_the_question_only(tmp_path):
     actions, models, _store = _actions(tmp_path)
     events = []
     actions.send("Only use data_in and do not invent column names: total "
-                 "pump hours", council_options.CouncilOptions.defaults(),
+                 "pump hours", council_options.CouncilOptions(deliberate=True),
                  on_event=events.append)
     assert any("[TASK MEMO" in p for p in models.writer.prompts)
     assert not any("[TASK MEMO" in s for s in models.writer.seen)
@@ -114,7 +114,7 @@ def test_the_memo_reaches_members_for_the_question_only(tmp_path):
 
 def test_a_follow_up_keeps_the_earlier_constraints(tmp_path):
     actions, models, _store = _actions(tmp_path)
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     actions.send("Sum the pump hours, excluding zeros, from data_in only",
                  opts)
     first = actions.task_memory.current()
@@ -182,7 +182,7 @@ def test_a_similar_question_later_recalls_the_decision(tmp_path,
     prompt (memory_scope.uses_other_sessions)."""
     monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", "all")
     actions, models, _store = _actions(tmp_path)
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     first = actions.send("Which pump for 40 litres per minute?", opts)
     assert first.ok and first.critique
     assert pd.recall(tmp_path, "pump 40 litres per minute")
@@ -213,7 +213,7 @@ def test_this_conversation_only_recalls_no_earlier_decision(
         monkeypatch.setenv("COUNCIL_MEMORY_SCOPE", scope)
     monkeypatch.delenv("COUNCIL_DEMO_SILO", raising=False)
     actions, models, _store = _actions(tmp_path)
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     assert actions.send("Which pump for 40 litres per minute?", opts).ok
     assert pd.recall(tmp_path, "pump 40 litres per minute"), "not recorded"
     actions2, models2, _ = _actions(tmp_path)

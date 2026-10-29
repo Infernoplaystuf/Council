@@ -1139,3 +1139,29 @@ def test_a_link_to_the_app_s_memory_is_still_the_app_s(vault_env):
     assert "PLANTMEMORY" not in prepared.text
     assert "PLANTMEMORY" not in named.text
     assert (memory / "memory_writer.md").is_file(), "the target was touched"
+
+
+def test_a_question_about_what_files_say_is_not_a_file_count():
+    """"How many files mention Project Cobalt?" was answered with a census
+    of data_in ("0 file(s)"), labelled exact."""
+    from council_core import turn_context as tc
+    assert tc.looks_like_file_count("how many files are in data_in?")
+    assert tc.looks_like_file_count("How many files do I have")
+    for q in ("How many files mention Project Cobalt?",
+              "how many files contain part 4017",
+              "how many files talk about the C block",
+              "how many files refer to Harper Lane?",
+              "how many files that have a power dip"):
+        assert not tc.looks_like_file_count(q), q
+
+
+def test_the_bundled_samples_are_searched_only_when_asked_for(tmp_path,
+                                                              monkeypatch):
+    """The made-up purchase orders and inventory in assets/sample_data were
+    searched next to the user's own files and turned up in answers."""
+    import data_index
+    monkeypatch.delenv("COUNCIL_SAMPLE_DATA", raising=False)
+    assert data_index.search_roots(tmp_path) == [data_index.input_dir(tmp_path)]
+    monkeypatch.setenv("COUNCIL_SAMPLE_DATA", "1")
+    assert data_index.search_roots(tmp_path) == [
+        data_index.input_dir(tmp_path), data_index.bundled_samples_dir()]

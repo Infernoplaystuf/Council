@@ -123,7 +123,7 @@ def test_a_passed_council_answer_is_kept_with_its_vault_files(tmp_path):
     actions.memo_llm = None
     actions.vault_brief = lambda q: vc.Brief("VAULT CONTEXT:\n[1] manual.md",
                                              ["manual.md"], "keyword")
-    assert actions.send(Q, council_options.CouncilOptions.defaults()).ok
+    assert actions.send(Q, council_options.CouncilOptions(deliberate=True)).ok
     hit = actions.reusable(Q)
     assert hit is not None and hit.answer.startswith("Use EPDM.")
     assert list(hit.sources) == ["manual.md"]
