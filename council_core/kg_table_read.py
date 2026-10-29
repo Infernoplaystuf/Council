@@ -36,7 +36,9 @@ TYPES = ("PERSON", "PART", "PROJECT")
 FIT_SHARE = 0.6
 #: Values of a column looked at when checking the fit.
 FIT_SAMPLE = 50
-NUM_PREDICT = 600
+#: The longest reply SCHEMA allows is about 1,200 tokens (a 300-character
+#: description and 12 columns); 600 could cut a wide table's answer off.
+NUM_PREDICT = 1300
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -97,6 +99,13 @@ _NOT_AN_ENTITY_LABEL = re.compile(
     r"remark|remarks|description|price|cost|qty|quantity|amount|value|length|width|"
     r"height|depth|size|weight|status|result|results|reading|response|total|count|"
     r"percent|file|path|url|units?|orientation|region|location)\b|%)")
+#: Organisations, places, categories and flaws a model called projects (the
+#: local-model run, 2026-10-27: Vendor, Course, door, Line item, and the LMM
+#: template's 'Flaw #', whose column holds the template's own labels). Only
+#: for a part or project: 'Customer Contact' can still hold people.
+_NOT_A_THING_LABEL = re.compile(
+    r"(?i)\b(vendor|supplier|customer|course|door|room|category|account|department|"
+    r"line item|flaw)\b")
 _DATE = re.compile(r"^\d{4}-\d{1,2}(-\d{1,2}([ T].*)?)?$|^\d{1,2}/\d{1,2}/\d{2,4}$")
 _DATE_IN_LABEL = re.compile(r"\d{4}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}")
 _MEASURE = re.compile(r"^[-+]?\d+(\.\d+)?\s*[A-Za-zµ°%\"']{1,4}$")       # 0.245 mm, 2x
@@ -139,9 +148,12 @@ def fits(etype: str, values: Sequence[str], label: str = "") -> bool:
             if _MEASURE.match(v):
                 return False                   # 0.245 mm
         elif etype == "PROJECT":
-            if (len(v.split()) > 6 or _NUMBER.match(v) or kg_excel.is_initials(v)
+            if (len(v.split()) > 6 or _NUMBER.match(v) or _MEASURE.match(v)
+                    or kg_excel.is_initials(v)
                     or not any(ch.isupper() or ch.isdigit() for ch in v)):
-                return False                   # a sentence, a number, 'JB', 'used'
+                return False                   # a sentence, a number, '3x', 'JB', 'used'
+            if len(v) < 4 and not re.search(r"[A-Za-z]{3}", v):
+                return False                   # 'Y', '1A': a flag or a flaw, not a project
         elif any(ch.isdigit() for ch in v):
             return False                       # W-500 is nobody
         return kg_excel.plausible(rule, v)
@@ -172,6 +184,8 @@ def check(data: Dict[str, Any], labels: Sequence[str],
             continue
         elif etype != "PERSON" and _who_head(label):
             out.rejected.append((c, "its label names a person"))
+        elif etype != "PERSON" and _NOT_A_THING_LABEL.search(label):
+            out.rejected.append((c, "its label names an organisation, place or category"))
         elif not fits(etype, values(label), label):
             out.rejected.append((c, f"its values do not read as a {etype.lower()}"))
         else:
