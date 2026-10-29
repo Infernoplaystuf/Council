@@ -45,6 +45,11 @@ What is in the store (schema version ``SCHEMA_VERSION``, documented in
              lines) at its content hash: a rebuild re-reads only changed
              documents, and its reading phase commits in batches so a
              stopped rebuild resumes. Never exported.
+  contents_docs, fields, vals, cells (v5) the Contents layer
+             (council_core/kg_contents.py): every cell of every CSV and
+             workbook under its header or label, whatever the field rules
+             say, with full-text search over it. (v6) fields.unit: text
+             documents' lines and JSON objects too.
 
 Seeding reads "records": a table row, a JSON object, or one document's labelled
 header fields. Two values in one row are a strong link (seeded); values that
@@ -83,9 +88,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from council_core import file_guard
+from council_core import file_guard, kg_contents
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
@@ -99,7 +104,22 @@ CORE_TYPES = ("PERSON", "PART", "PROJECT")
 #: reader (council_core/kg_excel.py): who signed a part's readings. A model
 #: is never asked for it (kg_extract.SIGNATURES does not list it).
 PREDICATES = ("LEADS", "CONTACT_FOR", "WORKS_ON", "OWNS", "USES_PART",
-              "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED")
+              "SUPERSEDES", "DOCUMENTED_IN", "INSPECTED",
+              # tables as nodes (council_core/kg_tables.py, user 2026-10-27)
+              "IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
+              "SHARES_PROJECTS_WITH", "REFERENCES",
+              # related by meaning (council_core/kg_related.py, user 2026-10-27)
+              "RELATED_TO")
+#: The links tables as nodes give (council_core/kg_tables.py): drawn and
+#: shown, but counted apart from the facts between entities - 'N links' and
+#: "why no links?" are about those.
+TABLE_PREDICATES = ("IN_DOCUMENT", "LISTS", "SHARES_PARTS_WITH", "SHARES_PEOPLE_WITH",
+                    "SHARES_PROJECTS_WITH", "REFERENCES")
+#: Not facts between entities either: two documents or tables whose meaning
+#: is close (kg_related). Suggested; counted and walked as table links are.
+RELATED = "RELATED_TO"
+NOT_FACT_PREDICATES = TABLE_PREDICATES + (RELATED,)
+_TABLE_PREDS_SQL = "(" + ",".join(f"'{p}'" for p in NOT_FACT_PREDICATES) + ")"
 STATUSES = ("seeded", "suggested", "accepted", "rejected")
 #: Inside one seed() transaction only: a derived link not yet re-supported by
 #: this run's evidence. Never committed (seed resolves or deletes every one).
@@ -214,6 +234,11 @@ CREATE TABLE IF NOT EXISTS entity_props (
     PRIMARY KEY (entity_id, document_id, name, value)
 );
 CREATE INDEX IF NOT EXISTS entity_props_entity ON entity_props(entity_id);
+-- the file names a workbook's formulas read (kg_tables.external_references),
+-- per version, so an unchanged workbook's zip is not searched again
+CREATE TABLE IF NOT EXISTS doc_refs (
+    document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, refs TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS doc_cache (
     document_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
     reader_sig TEXT NOT NULL, records TEXT NOT NULL, lines TEXT NOT NULL,
@@ -302,6 +327,20 @@ DEFAULT_FIELD_RULES: Tuple[FieldRule, ...] = (
     FieldRule("Originator", "PERSON", (("PROJECT", "WORKS_ON"),)),
     FieldRule("Approved by", "PERSON", (("PROJECT", "WORKS_ON"),)),
     FieldRule("Attendees", "PERSON", (("PROJECT", "WORKS_ON"),)),
+)
+
+#: People columns rosters, logs and sales sheets use: added PROPOSED, for the
+#: Connections tab to offer (rules_to_tick) - a mixed folder built 0 links
+#: with every default rule on, because none of these had a rule (synthetic
+#: test, 2026-10-27).
+PROPOSED_FIELD_RULES: Tuple[FieldRule, ...] = (
+    FieldRule("Employee", "PERSON", (("PROJECT", "WORKS_ON"),)),
+    FieldRule("Manager", "PERSON", (("PROJECT", "LEADS"),)),
+    FieldRule("Inspector", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Inspected by", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Technician", "PERSON", (("PART", "INSPECTED"), ("PROJECT", "WORKS_ON"))),
+    FieldRule("Sales Rep", "PERSON", (("PROJECT", "WORKS_ON"),)),
+    FieldRule("Lead", "PERSON", (("PROJECT", "LEADS"),)),
 )
 
 #: Built-in readings, not rules the user ticks: what a Ledger's schema, or
@@ -499,7 +538,7 @@ class Record:
 #: Tables read as rows: a CSV by its header; a workbook by the Ledger's
 #: reader (council_core/kg_excel.py), which also gives its text lines.
 _CSV = {".csv", ".tsv"}
-_WORKBOOK = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+_WORKBOOK = {".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".pptm"}
 _TABULAR = _CSV | _WORKBOOK
 _TEXT = {".txt", ".md", ".markdown", ".rst", ".log", ".pdf", ".docx",
          ".html", ".htm", ".xml", ".yaml", ".yml", ".ini", ".cfg"}
@@ -523,9 +562,12 @@ def _table_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record
     out: List[Record] = []
     # strict: a table that cannot be read raises, so seed() lists it as
     # unreadable instead of counting it as a document with no facts.
+    sink = contents_now()
     for sheet, frame in fs._table_frames(p, strict=True):
         for rowno in frame.attrs.get("skipped_rows", []):
             out.append(Record(rel, "skipped", [], skipped_row=rowno))
+        if sink is not None:          # every column, not only the rules'
+            sink.frames([(sheet, frame)])
         cols = [(c, by_norm.get(fs._norm_key(c))) for c in frame.columns]
         cols = [(c, r) for c, r in cols if r is not None]
         if not cols:
@@ -563,6 +605,9 @@ def _json_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     except Exception:
         return []
     lines = text.splitlines()
+    sink = contents_now()
+    if sink is not None:          # every key, not only the rules'
+        sink.json_data(text, data)
     out: List[Record] = []
     cursor = [0]
 
@@ -749,6 +794,9 @@ def rebuild_summary_line(stats) -> str:
                      + ("s" if stats['documents_other'] != 1 else ""))
     if kinds:
         bits.append(" — " + ", ".join(kinds))
+    if stats.get("not_read_types"):
+        bits.append("; not read (no reader for the type): " + ", ".join(
+            f"{n} {suf}" for suf, n in stats["not_read_types"].items()))
     if unchanged:
         # The graph that was there is the answer: no entity is new this run.
         # It used to repeat the last run's '(23 matched existing, 18 new
@@ -807,7 +855,12 @@ def rebuild_summary_line(stats) -> str:
             tail = " (who is " + ", ".join(who[:4]) + ("…" if len(who) > 4 else "") + "?)"
         bits.append(f"; {n_q} question{'s' if n_q != 1 else ''} waiting in "
                     f"Connections › Questions{tail}")
-    return _sentence("".join(bits))
+    # tables as nodes (kg_tables): a sentence of their own, after the links
+    n_tables = int(stats.get("tables") or 0)
+    tables = (f" {n_tables} table" + ("s" if n_tables != 1 else "")
+              + f" as nodes, {int(stats.get('table_links') or 0)} table links."
+              if n_tables else "")
+    return _sentence("".join(bits)) + tables
 
 
 def _sentence(text: str) -> str:
@@ -1111,6 +1164,17 @@ def records_as_lines_now() -> bool:
     return _AS_LINES.get()
 
 
+#: Set by seed()'s reading phase, one per document: the readers feed it every
+#: cell they read (council_core/kg_contents.py - the Contents layer).
+_CONTENTS: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "kg_contents", default=None)
+
+
+def contents_now():
+    """The kg_contents.Sink of the document being read, or None."""
+    return _CONTENTS.get()
+
+
 def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
     """What a document says, as records. A workbook or a Ledger (a parent
     CSV with its schema) is read by council_core/kg_excel.py, and its
@@ -1121,6 +1185,12 @@ def read_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]:
         from council_core import kg_excel
         reading = (kg_excel.read_workbook(p, rel, rules, _image_reader_now())
                    if suf in _WORKBOOK else kg_excel.read_ledger(p, rel, rules))
+        sink = contents_now()
+        if sink is not None and suf not in _WORKBOOK:
+            # a Ledger's parent CSV: its every column, as any CSV's (the
+            # Ledger's own reading stands if pandas cannot read it)
+            import field_search as fs
+            sink.frames(fs._table_frames(p))
         return list(reading.records) + [Record(rel, "reading", reading=reading)]
     if suf in _TABULAR:
         return _table_records(p, rel, rules)
@@ -1229,6 +1299,8 @@ def _excel_available() -> bool:
 #: signature too (see _reader_sig), so this needs bumping only for a change
 #: elsewhere that alters what a document reads as.
 READER_VERSION = 2
+#: How tables are made nodes (kg_tables): a change works the graph out again.
+TABLES_VERSION = 1
 
 #: The modules whose code decides what a document reads as.
 _READER_MODULES = ("field_search", "vault_rag", "source_extract", "excel_open",
@@ -1961,6 +2033,9 @@ class KnowledgeGraph:
             self.db.execute("PRAGMA secure_delete = ON")
             with self.db:
                 self.db.executescript(SCHEMA_SQL)
+                kg_contents.create(self.db)
+                from council_core import kg_related
+                self.db.executescript(kg_related.SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
                                 "('schema_version', ?)", (str(SCHEMA_VERSION),))
                 # v1 -> v2 -> v3 only ADD tables and an index (created
@@ -1974,6 +2049,9 @@ class KnowledgeGraph:
                 for r in DEFAULT_FIELD_RULES:
                     self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
                                     "(?, ?, 'confirmed')", (r.label, r.to_json()))
+                for r in PROPOSED_FIELD_RULES:
+                    self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
+                                    "(?, ?, 'proposed')", (r.label, r.to_json()))
                 # A store made while they started proposed: ticked once, unless
                 # the user ever ticked or unticked a rule (their choice stands).
                 if existed and self.db.execute(
@@ -2847,7 +2925,33 @@ class KnowledgeGraph:
         finally:
             lock.release()
 
+    def unread_types(self) -> Dict[str, int]:
+        """Files under the folders the graph reads that it has no reader for,
+        by type ('.jpg': 6): said in the summary, not left out without a
+        word (synthetic test, 2026-10-27). Dot-folders are not counted."""
+        import os
+        bases = [self.root] if self.root.is_dir() else []
+        bases += [Path(r["path"]) for r in self.extra_roots()
+                  if r["files"] is None and Path(r["path"]).is_dir()]
+        counts: Dict[str, int] = {}
+        for base in bases:
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")
+                               and not _skip_dir(os.path.join(dirpath, d), d)]
+                for f in filenames:
+                    suf = Path(f).suffix.lower()
+                    if f.startswith((".", "~$")) or suf in SUPPORTED_SUFFIXES:
+                        continue
+                    if self._scope_suffixes and suf not in self._scope_suffixes:
+                        continue
+                    counts[suf or "(no type)"] = counts.get(suf or "(no type)", 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
     def _seed_finish(self, stats: Dict[str, Any], prog) -> None:
+        try:
+            stats["not_read_types"] = self.unread_types()
+        except OSError:
+            stats["not_read_types"] = {}
         # the initials nobody has named yet: the summary line says who
         stats["initials_open"] = [r[0] for r in self.db.execute(
             "SELECT DISTINCT surface FROM review WHERE kind='initials'"
@@ -2962,6 +3066,9 @@ class KnowledgeGraph:
                 clip["ok"] = bool(excel_open.clipboard_safe()[0])
             return clip["ok"]
         last, n_batch = time.time(), 0
+        #: the Contents layer: folded text -> its value id, for this run
+        contents_values: Dict[str, int] = {}
+        contents_changed = False
         token = _IMAGE_READER.set(reader)
         as_lines = _AS_LINES.set(True)
         prog.stage("reading documents", total=len(files), unit="files")
@@ -2978,6 +3085,17 @@ class KnowledgeGraph:
                     sig = sig_for(p)
                     cached = None if why else self._cached(did, h, sig)
                     if cached is not None and pictures_wait(cached):
+                        cached = None
+                    # every document the graph reads goes into the
+                    # Contents layer (tables, text, JSON)
+                    contents_on = p.suffix.lower() in SUPPORTED_SUFFIXES
+                    # read before the Contents layer existed (or its rows
+                    # went): read again, so every cell is in it - not one
+                    # that can never be read (a password: Excel is not
+                    # started for it again)
+                    if cached is not None and contents_on and \
+                            not kg_contents.current(self.db, did, h) and \
+                            not _reading_load(cached["records"]).get("error"):
                         cached = None
                     if why:
                         stats["unreadable"].append(f"{rel}: {why}")
@@ -3001,6 +3119,9 @@ class KnowledgeGraph:
                                         force=True)
                         else:
                             prog.update(f"reading {rel}")
+                        sink = kg_contents.Sink() if contents_on else None
+                        ctok = _CONTENTS.set(sink)
+                        text_lines = None
                         try:
                             # too slow, or stalled the app before: skipped,
                             # the rebuild goes on (council_core.file_guard);
@@ -3008,6 +3129,14 @@ class KnowledgeGraph:
                             recs = file_guard.read(
                                 p, lambda p=p, rel=rel: read_records(p, rel, rules),
                                 tab="Connections")
+                            if sink is not None:
+                                if p.suffix.lower() in _TEXT:
+                                    # its lines, read once: the gazetteer's too
+                                    text_lines = document_lines(p)
+                                    sink.text_lines(text_lines)
+                                prog.update(f"{rel}: keeping {sink.n_cells:,} cells")
+                                kg_contents.store(self.db, did, h, sink, contents_values)
+                                contents_changed = True
                         except kg_excel.Unreadable as exc:
                             if exc.permanent:
                                 self.db.execute(
@@ -3016,13 +3145,18 @@ class KnowledgeGraph:
                                      time.time()))
                                 failed_keep.append(did)
                             raise
+                        finally:
+                            _CONTENTS.reset(ctok)
+                            if sink is not None:
+                                sink.close()
                         reading = next((r.reading for r in recs if r.kind == "reading"),
                                        None)
                         recs = [r for r in recs if r.kind != "reading"]
                         if reading is not None:
                             lines = list(reading.lines)
                         else:
-                            lines = [] if p.suffix.lower() in _TABULAR else document_lines(p)
+                            lines = [] if p.suffix.lower() in _TABULAR else (
+                                text_lines if text_lines is not None else document_lines(p))
                         # Obsidian-style [[Name]] references are found in
                         # these lines by the graph phase (_seed_wikilinks),
                         # for every document - read now or unchanged.
@@ -3064,6 +3198,16 @@ class KnowledgeGraph:
         finally:
             _IMAGE_READER.reset(token)
             _AS_LINES.reset(as_lines)
+        # The Contents layer of what could be read; a document gone or not
+        # readable now leaves it. Values are counted again only after a change.
+        keep_contents = {did for p, did, _h in readable
+                         if p.suffix.lower() in SUPPORTED_SUFFIXES}
+        held = {r[0] for r in self.db.execute("SELECT document_id FROM contents_docs")}
+        if contents_changed or held - keep_contents:
+            prog.update("counting the values of every file", force=True)
+            with self.db:
+                kg_contents.finish(self.db, keep_contents)
+        stats["contents"] = kg_contents.counts(self.db)
         # ── 2. the graph (one transaction) ──
         try:
             with self.db:
@@ -3187,7 +3331,8 @@ class KnowledgeGraph:
                         n_records += 1
                 stats["records"] = n_records
                 # Derived rows are rebuilt; decisions and user statuses are kept.
-                self.db.execute("DELETE FROM evidence WHERE method != 'model'")
+                # ...and so does what an embedding model found (kg_related)
+                self.db.execute("DELETE FROM evidence WHERE method NOT IN ('model', 'embedding')")
                 # What a model read (its entities' mentions and names) stays,
                 # as its links' evidence does: cleared below when stale.
                 self.db.execute("DELETE FROM mentions WHERE method != 'model'")
@@ -3214,7 +3359,8 @@ class KnowledgeGraph:
                 # stale and goes. A deleted file kept its last content hash,
                 # so its model links lived on with nothing behind them.
                 self.db.execute(
-                    "DELETE FROM evidence WHERE method='model' AND (content_hash !="
+                    "DELETE FROM evidence WHERE method IN ('model', 'embedding') AND"
+                    " (content_hash !="
                     " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)"
                     " OR document_id IN (SELECT id FROM documents WHERE status='missing'))")
                 # ...and what a model READ goes with what it found: those
@@ -3270,6 +3416,10 @@ class KnowledgeGraph:
                     prog.stage("finding known names in the text", total=len(files),
                                unit="files")
                     stats["gazetteer_mentions"] = self._gazetteer(files, run_id, prog)
+                # Tables as nodes, AFTER every pass that names entities: a
+                # table lists the parts and people the graph knows.
+                prog.update("tables")
+                self._seed_tables(usable, run_id, stats)
                 # Still pending: no document gave evidence this run. One a model
                 # proposed (KG2 evidence is kept across runs) is a suggestion; the
                 # rest - the document changed or the rule was withdrawn - go. The
@@ -3277,6 +3427,16 @@ class KnowledgeGraph:
                 # (Only a model's evidence can be left on a pending link.) In
                 # the graph at once, or waiting for the user - the graph's
                 # setting (model_link_status).
+                # Related by meaning: suggested while both of its ends still
+                # stand as they were embedded (one evidence row per end).
+                self.db.execute(
+                    f"UPDATE relations SET status='suggested' WHERE status='{_PENDING}'"
+                    " AND predicate=? AND id IN (SELECT relation_id FROM evidence"
+                    " GROUP BY relation_id HAVING COUNT(DISTINCT document_id) >= 2)",
+                    (RELATED,))
+                self.db.execute(
+                    f"DELETE FROM evidence WHERE relation_id IN (SELECT id FROM relations"
+                    f" WHERE status='{_PENDING}' AND predicate=?)", (RELATED,))
                 self.db.execute(
                     f"UPDATE relations SET status=? WHERE status='{_PENDING}'"
                     " AND id IN (SELECT relation_id FROM evidence)",
@@ -3344,7 +3504,8 @@ class KnowledgeGraph:
     def _graph_sig(self, usable, failed_keep, sig_for, use_collections: bool,
                    gazetteer: bool) -> str:
         """Everything the graph phase works the graph out from."""
-        h = hashlib.sha256(f"graph {SCHEMA_VERSION} {READER_VERSION} {use_collections} "
+        h = hashlib.sha256(f"graph {SCHEMA_VERSION} {READER_VERSION} {TABLES_VERSION} "
+                           f"{use_collections} "
                            f"{gazetteer}".encode("utf-8"))
         for p, did, dh in sorted(usable, key=lambda x: x[1]):
             h.update(f"doc|{did}|{dh}|{sig_for(p)}\n".encode("utf-8"))
@@ -3374,6 +3535,110 @@ class KnowledgeGraph:
 
     #: Evidence and mention rows written per batch in a rebuild's linking pass.
     FLUSH_EVERY = 20_000
+
+    def _seed_tables(self, usable: Sequence[Tuple[Path, str, str]], run_id: str,
+                     stats: Dict[str, Any]) -> None:
+        """Every table of the Contents layer as a TABLE node in its document,
+        linked to the entities its values name, to the tables that list the
+        same parts, people or projects, and a workbook to the workbooks its
+        formulas read (council_core/kg_tables.py). Exact values only:
+        seeded."""
+        from council_core import kg_tables as kt
+        stats["tables"] = stats["table_links"] = 0
+        docs = {did: (p, h) for p, did, h in usable}
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                           " AND name='fields'").fetchone() is None:
+            return
+        live = self._live
+        names: Dict[str, set] = {}
+        ph = ",".join("?" * len(kt.LISTED_TYPES))
+        for r in self.db.execute(
+                "SELECT a.alias_norm, a.entity_id, e.type FROM aliases a JOIN entities e"
+                f" ON e.id=a.entity_id WHERE e.merged_into IS NULL AND e.type IN ({ph})",
+                kt.LISTED_TYPES):
+            if live is None or r[1] in live:
+                names.setdefault(r[0], set()).add((r[1], r[2]))
+        listed: Dict[str, Dict[str, set]] = {}
+        where: Dict[str, Any] = {}
+        paths = {did: rel for did, rel in self.db.execute("SELECT id, path FROM documents")}
+        n_links = 0
+        for t in kt.tables(self.db, docs):
+            _p, h = docs[t.document_id]
+            tid = self._entity("TABLE", t.name, key=t.key_for(paths.get(t.document_id, "")))
+            where[tid] = (t, h)
+            labels = [c.label for c in t.columns]
+            self._relate(tid, "IN_DOCUMENT", t.document_id, "seeded", doc_id=t.document_id,
+                         content_hash=h, locator={"sheet": t.loc_sheet, "header": t.header_row},
+                         quote=" | ".join(labels)[:300], method="table", run_id=run_id)
+            self.db.execute("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                            (tid, t.document_id, h, "description",
+                             f"{t.rows} rows; columns: {', '.join(labels)}"[:500], "",
+                             run_id))
+            seen: Dict[str, Tuple[str, int, str, str, int]] = {}
+            for col in t.columns:
+                for text, row, n in kt.column_values(self.db, col):
+                    hit = names.get(fold(text))
+                    if not hit or len(hit) != 1:
+                        continue                 # unknown, or two entities of one name
+                    eid, etype = next(iter(hit))
+                    if eid in seen:
+                        e = seen[eid]
+                        seen[eid] = (e[0], e[1], e[2], e[3], e[4] + n)
+                    else:
+                        seen[eid] = (etype, row, col.label, text, n)
+            for eid, (etype, row, label, text, n) in seen.items():
+                self._relate(tid, "LISTS", eid, "seeded", doc_id=t.document_id,
+                             content_hash=h,
+                             locator={"sheet": t.loc_sheet, "row": row, "column": label,
+                                      "header": t.header_row},
+                             quote=f"{label}: {text}" + (f" ({n} rows)" if n > 1 else ""),
+                             method="table", run_id=run_id)
+                listed.setdefault(tid, {}).setdefault(etype, set()).add(self.resolve(eid))
+                n_links += 1
+        for a, b, etype, shared in kt.shared_pairs(listed):
+            t, h = where[a]
+            if t.document_id == where[b][0].document_id:
+                continue                 # one file's sheets: IN_DOCUMENT ties them
+            shown = sorted(r[0] for r in (self.db.execute(
+                "SELECT name FROM entities WHERE id=?", (e,)).fetchone() for e in shared)
+                if r is not None)
+            words = ", ".join(shown[:10])
+            more = f" and {len(shared) - 10} more" if len(shared) > 10 else ""
+            self._relate(a, kt.SHARE_PREDICATE[etype], b, "seeded", doc_id=t.document_id,
+                         content_hash=h, locator={"sheet": t.loc_sheet, "header": t.header_row},
+                         quote=f"both list {words}{more}", method="table", run_id=run_id)
+            n_links += 1
+        n_links += self._seed_references(usable, run_id)
+        stats["tables"], stats["table_links"] = len(where), n_links
+
+    def _seed_references(self, usable: Sequence[Tuple[Path, str, str]], run_id: str) -> int:
+        """A workbook REFERENCES the workbooks its formulas read."""
+        from council_core import kg_tables as kt
+        paths = {did: rel for rel, did in self.db.execute(
+            "SELECT path, id FROM documents WHERE status='ok'")}
+        by_path = {rel: did for did, rel in paths.items()}
+        all_paths = list(by_path)
+        n = 0
+        for p, did, h in usable:
+            if p.suffix.lower() not in (".xlsx", ".xlsm"):
+                continue
+            row = self.db.execute("SELECT content_hash, refs FROM doc_refs WHERE"
+                                  " document_id=?", (did,)).fetchone()
+            if row is not None and row[0] == h:
+                refs = json.loads(row[1])
+            else:
+                refs = kt.external_references(p)
+                self.db.execute("INSERT OR REPLACE INTO doc_refs VALUES (?,?,?)",
+                                (did, h, json.dumps(refs)))
+            for name in refs:
+                target = kt.resolve_reference(name, paths.get(did, ""), all_paths)
+                if target is None:
+                    continue
+                self._relate(did, "REFERENCES", by_path[target], "seeded", doc_id=did,
+                             content_hash=h, locator={}, quote=f"formulas read [{name}]",
+                             method="table", run_id=run_id)
+                n += 1
+        return n
 
     def _seed_records(self, records, run_id: str) -> None:
         """``records()`` gives (record, document id, content hash) afresh
@@ -4481,6 +4746,237 @@ class KnowledgeGraph:
                 " WHERE method != 'model')", (new, time.time()))
             self._decide("model_links", {"where": where})
 
+    #: meta keys: the embedding model that finds related items (kg_related
+    #: id, '' = none) and the cosine a related link needs.
+    EMBED_MODEL_KEY = "embed_model"
+    RELATED_THRESHOLD_KEY = "related_threshold"
+
+    def embed_model(self) -> str:
+        return self.meta(self.EMBED_MODEL_KEY) or ""
+
+    def related_threshold(self) -> float:
+        from council_core import kg_related
+        try:
+            return float(self.meta(self.RELATED_THRESHOLD_KEY) or kg_related.DEFAULT_THRESHOLD)
+        except ValueError:
+            return kg_related.DEFAULT_THRESHOLD
+
+    def set_related(self, model_id: str, threshold: Optional[float] = None) -> None:
+        """The embedding model that finds related items ('' turns it off) and
+        the cosine a link needs."""
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            (self.EMBED_MODEL_KEY, str(model_id or "")))
+            if threshold is not None:
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                                (self.RELATED_THRESHOLD_KEY,
+                                 str(min(0.99, max(0.3, float(threshold))))))
+            self._decide("related", {"model": model_id, "threshold": threshold})
+
+    def read_tables(self, chat, *, model: str, on_progress=None,
+                    should_stop=None) -> Dict[str, Any]:
+        """A model reads every table's card (council_core/kg_table_read.py):
+        a sentence on what the table records becomes the TABLE node's
+        description, and the columns it says hold people, parts or projects
+        - once checked against the table - become PROPOSED field rules for
+        the user to tick. A table is read once per version and model; a
+        label that already has a rule (ticked, proposed or rejected) is left
+        as it is. Returns stats with ``labels``: the rules proposed now."""
+        import field_search as fs
+        from council_core import kg_related as kr
+        from council_core import kg_table_read as ktr
+        from council_core import kg_tables as kt
+        stats: Dict[str, Any] = {"tables": 0, "read": 0, "described": 0, "labels": [],
+                                 "rejected": 0, "errors": 0, "first_error": "",
+                                 "stopped": False}
+        q = self.db.execute
+        if q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fields'"
+             ).fetchone() is None:
+            return stats
+        docs = {r["id"]: (r["path"], r["content_hash"]) for r in q(
+            "SELECT id, path, content_hash FROM documents WHERE status='ok'")}
+        todo = []
+        for t in kt.tables(self.db, docs):
+            tid = entity_id("TABLE", t.key_for(docs[t.document_id][0]))
+            if q("SELECT 1 FROM entities WHERE id=?", (tid,)).fetchone() is None:
+                continue                         # not in the graph (yet)
+            stats["tables"] += 1
+            card = kr.table_card(self.db, t)
+            h = hashlib.sha256(card.encode("utf-8")).hexdigest()
+            if q("SELECT 1 FROM entity_props WHERE entity_id=? AND name='model_read' AND"
+                 " value=? AND model=?", (tid, h, model)).fetchone() is None:
+                todo.append((tid, t, card, h))
+        run_id = str(uuid.uuid4())
+        for n, (tid, t, card, h) in enumerate(todo, 1):
+            if should_stop is not None and should_stop():
+                stats["stopped"] = True
+                break
+            cols = {c.label: c for c in t.columns}
+            res = ktr.read(card, list(cols),
+                           lambda label: [v for v, _r, _n in kt.column_values(self.db,
+                                                                              cols[label])],
+                           chat)
+            stats["read"] += 1
+            if res.error:
+                stats["errors"] += 1
+                stats["first_error"] = stats["first_error"] or res.error
+            else:
+                stats["rejected"] += len(res.rejected)
+                known = {fs._norm_key(r.label) for r, _s in self.field_rules()}
+                dh = docs[t.document_id][1]
+                with self.db:
+                    q("DELETE FROM entity_props WHERE entity_id=? AND model=? AND name IN"
+                      " ('description', 'column_meaning', 'model_read')", (tid, model))
+                    if res.description:
+                        q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                          (tid, t.document_id, dh, "description", res.description, model,
+                           run_id))
+                        stats["described"] += 1
+                    for m in res.meanings:
+                        q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                          (tid, t.document_id, dh, "column_meaning",
+                           json.dumps({"column": m.column, "holds": m.type}), model, run_id))
+                        if fs._norm_key(m.column) in known:
+                            continue
+                        known.add(fs._norm_key(m.column))
+                        q("INSERT OR IGNORE INTO field_rules VALUES (?,?,'proposed')",
+                          (m.column, ktr.rule_for(m.column, m.type).to_json()))
+                        self._decide("model_field_rule", {"label": m.column, "type": m.type,
+                                                          "table": t.name, "model": model})
+                        stats["labels"].append(m.column)
+                    q("INSERT OR REPLACE INTO entity_props VALUES (?,?,?,?,?,?,?)",
+                      (tid, t.document_id, dh, "model_read", h, model, run_id))
+            if on_progress is not None:
+                on_progress(n, len(todo), t.name)
+        return stats
+
+    def model_rule_tables(self) -> Dict[str, List[str]]:
+        """label -> the tables in which a model read that column as a person,
+        part or project (read_tables), for Fields… to say where a proposed
+        rule came from."""
+        out: Dict[str, List[str]] = {}
+        for name, value in self.db.execute(
+                "SELECT e.name, p.value FROM entity_props p JOIN entities e ON"
+                " e.id=p.entity_id WHERE p.name='column_meaning' ORDER BY e.name"):
+            try:
+                label = json.loads(value)["column"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if name not in out.setdefault(label, []):
+                out[label].append(name)
+        return out
+
+    def find_related(self, embed, *, model: str, threshold: Optional[float] = None,
+                     on_progress=None, should_stop=None) -> Dict[str, Any]:
+        """Related by meaning (council_core/kg_related.py): every document's
+        text, in passages, and every table's card embedded by ``embed`` (a
+        kg_related.Embedder; only what is new or changed since this model
+        last read it), then a suggested RELATED_TO link between every two
+        items close enough. The user's ✓ / ✗ on a link stays; a rejected
+        pair is never suggested again. Stopped, it keeps what it embedded."""
+        import numpy as np
+        from council_core import kg_related as kr
+        from council_core import kg_tables as kt
+        threshold = self.related_threshold() if threshold is None else float(threshold)
+        stats: Dict[str, Any] = {"items": 0, "embedded": 0, "passages": 0, "links": 0,
+                                 "stopped": False}
+        q = self.db.execute
+        docs = {r["id"]: (r["path"], r["content_hash"]) for r in q(
+            "SELECT id, path, content_hash FROM documents WHERE status='ok'")}
+        # what to embed: (item, kind, document, hash, [(locator, text)])
+        items: List[Tuple[str, str, str, str, Any]] = []
+        for r in q("SELECT document_id, content_hash, lines FROM doc_cache"):
+            did = r["document_id"]
+            if did in docs and docs[did][1] == r["content_hash"] and r["lines"] not in ("[]", ""):
+                items.append((did, "document", did, r["content_hash"],
+                              lambda lines=r["lines"]: kr.passages(json.loads(lines))))
+        paths = {did: p for did, (p, _h) in docs.items()}
+        for t in kt.tables(self.db, docs):
+            tid = entity_id("TABLE", t.key_for(paths.get(t.document_id, "")))
+            if q("SELECT 1 FROM entities WHERE id=?", (tid,)).fetchone() is None:
+                continue                         # not in the graph (yet)
+            card = kr.table_card(self.db, t)
+            h = hashlib.sha256((docs[t.document_id][1] + card).encode("utf-8")).hexdigest()
+            items.append((tid, "table", t.document_id, h,
+                          lambda card=card, t=t: [({"sheet": t.loc_sheet,
+                                                    "header": t.header_row}, card)]))
+        stats["items"] = len(items)
+        keep = {it[0] for it in items}
+        with self.db:
+            for (item,) in q("SELECT DISTINCT item FROM embeddings WHERE model=?",
+                             (model,)).fetchall():
+                if item not in keep:
+                    q("DELETE FROM embeddings WHERE item=? AND model=?", (item, model))
+        have = {r[0]: r[1] for r in q("SELECT item, content_hash FROM embeddings"
+                                      " WHERE model=? AND idx=0", (model,))}
+        todo = [it for it in items if have.get(it[0]) != it[3]]
+        for n, (item, kind, did, h, get) in enumerate(todo, 1):
+            if should_stop is not None and should_stop():
+                stats["stopped"] = True
+                break
+            parts = get()
+            if not parts:
+                continue
+            vecs = []
+            for i in range(0, len(parts), kr.BATCH):
+                vecs.append(embed([t for _l, t in parts[i:i + kr.BATCH]]))
+            m = np.vstack(vecs) if vecs else np.zeros((0, 0), np.float32)
+            if len(m) != len(parts):
+                raise RuntimeError(f"the embedding model gave {len(m)} vectors for "
+                                   f"{len(parts)} passages")
+            with self.db:
+                q("DELETE FROM embeddings WHERE item=? AND model=?", (item, model))
+                self.db.executemany(
+                    "INSERT INTO embeddings VALUES (?,?,?,?,?,?,?,?,?)",
+                    [(item, kind, did, h, model, i, kr.loc_json(loc), text, kr.to_blob(v))
+                     for i, ((loc, text), v) in enumerate(zip(parts, m))])
+            stats["embedded"] += 1
+            stats["passages"] += len(parts)
+            if on_progress is not None:
+                on_progress(n, len(todo), docs.get(did, ("", ""))[0])
+        if stats["stopped"]:
+            return stats
+        # the items as their passages' average, then the pairs
+        rows: Dict[str, List[Any]] = {}
+        for r in q("SELECT item, document_id, idx, locator, text, vec FROM embeddings"
+                   " WHERE model=? ORDER BY item, idx", (model,)):
+            rows.setdefault(r["item"], []).append(r)
+        names = sorted(i for i in rows if i in keep)
+        if len(names) < 2:
+            return stats
+        mats = {i: np.vstack([kr.from_blob(r["vec"]) for r in rows[i]]) for i in names}
+        means = kr.normalise(np.vstack([mats[i].mean(axis=0) for i in names]))
+        pairs = kr.related_pairs(means, threshold,
+                                 apart=[rows[i][0]["document_id"] for i in names])
+        now_ids = set()
+        with self.db:
+            # this run's evidence is the evidence (a pair found again gets its
+            # closest passages as they are now)
+            q("DELETE FROM evidence WHERE method='embedding'")
+            for a_i, b_i, score in pairs:
+                a, b = names[a_i], names[b_i]
+                pa, pb, _s = kr.best_pair(mats[a], mats[b])
+                ra, rb = rows[a][pa], rows[b][pb]
+                text = (f"“{kr.quote(ra['text'])}” ≈ “{kr.quote(rb['text'])}”"
+                        f" (closeness {score:.2f})")
+                for r in (ra, rb):              # one evidence row per end
+                    did = r["document_id"]
+                    rid = self._relate(a, RELATED, b, "suggested", doc_id=did,
+                                       content_hash=docs[did][1],
+                                       locator=json.loads(r["locator"]), quote=text,
+                                       method="embedding", run_id="related", model=model)
+                now_ids.add(rid)
+            # the earlier ones these vectors no longer support (the user's
+            # ✓ / ✗ stay)
+            old = [r[0] for r in q("SELECT id FROM relations WHERE predicate=? AND status IN"
+                                   " ('seeded','suggested')", (RELATED,))
+                   if r[0] not in now_ids]
+            for rid in old:
+                q("DELETE FROM evidence WHERE relation_id=?", (rid,))
+                q("DELETE FROM relations WHERE id=?", (rid,))
+        stats["links"] = len(now_ids)
+        return stats
+
     def focus(self) -> str:
         return self.meta(self.FOCUS_KEY) or ""
 
@@ -4738,6 +5234,7 @@ class KnowledgeGraph:
                                  doc_id=c["document_id"], content_hash=c["content_hash"],
                                  locator=self._chunk_loc(c, link.line), quote=quote,
                                  method="model", run_id=run_id, model=label)
+                stats["links"] += self._link_doc_part(res.entities, ids, c, run_id, label)
                 self.db.execute(
                     "INSERT OR REPLACE INTO extraction_done VALUES (?,?,?,?,?,?,?)",
                     (c["document_id"], c["content_hash"], c["chunk"], f"open|{wmodel}",
@@ -4760,6 +5257,57 @@ class KnowledgeGraph:
                             (time.time(), json.dumps(stats), run_id))
         return stats
 
+    #: How a person or project a model found in a document's sentences is
+    #: tied to the one part the document's labelled fields name.
+    DOC_PART_PREDICATE = {"PERSON": "CONTACT_FOR", "PROJECT": "USES_PART"}
+
+    def _doc_part(self, doc_id: str) -> Optional[str]:
+        """The one PART a document's labelled fields name ('Part Number:
+        3013'), or None when they name none or several."""
+        rows = self.db.execute(
+            "SELECT DISTINCT m.entity_id FROM mentions m JOIN entities e ON e.id=m.entity_id"
+            " WHERE m.document_id=? AND m.method='field' AND e.type='PART'",
+            (doc_id,)).fetchall()
+        return self.resolve(rows[0][0]) if len(rows) == 1 else None
+
+    def _link_doc_part(self, found, ids: Dict[int, str], c: Dict[str, Any],
+                       run_id: str, label: str) -> int:
+        """A build sheet says 'Part Number: 3013' and, lines below, 'Prepared
+        by Casey Diaz for Project Ironbark': the sentence never repeats the
+        part, so a model reading it links the person to the project only.
+        Each person and project a model found in a document whose labelled
+        fields name ONE part is tied to that part - suggested (a document-wide
+        guess, as the header says), quoting the line that names them. A
+        project only when something other than a model names it too (a
+        labelled field, the gazetteer, a Collection): a model calls a
+        template's 'Laser Team FOD A' a project."""
+        part = self._doc_part(c["document_id"])
+        if part is None:
+            return 0
+        pname = self.db.execute("SELECT name FROM entities WHERE id=?", (part,)).fetchone()
+        n = 0
+        lines = c["text"].splitlines()
+        for f in found:
+            pred = self.DOC_PART_PREDICATE.get(f.type)
+            eid = ids.get(id(f))
+            if pred is None or not eid or self.resolve(eid) == part:
+                continue
+            if f.type == "PROJECT" and self.db.execute(
+                    "SELECT 1 FROM mentions WHERE entity_id=? AND method != 'model'"
+                    " UNION SELECT 1 FROM relations r JOIN evidence e ON e.relation_id=r.id"
+                    " WHERE (r.subject_id=? OR r.object_id=?) AND e.method != 'model'",
+                    (self.resolve(eid),) * 3).fetchone() is None:
+                continue
+            text = lines[f.line - 1] if f.line and 0 < f.line <= len(lines) else f.name
+            quote = (f"{text.strip()}  [the document's part, "
+                     f"{pname[0] if pname else 'from its fields'}]")
+            if self._relate(eid, pred, part, "suggested", doc_id=c["document_id"],
+                            content_hash=c["content_hash"],
+                            locator=self._chunk_loc(c, f.line), quote=quote,
+                            method="model", run_id=run_id, model=label):
+                n += 1
+        return n
+
     def model_read(self) -> Dict[str, int]:
         """How much of the text a model has read: passages read, and the
         documents with at least one."""
@@ -4775,13 +5323,120 @@ class KnowledgeGraph:
                                        if Path(d["path"]).suffix.lower() not in _WORKBOOK)}
 
     # ── reading the graph ──
+    # ── the Contents layer (council_core/kg_contents.py) ──
+    def has_contents(self) -> bool:
+        """False for a store opened read-only before it had the layer."""
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                               " AND name='contents_docs'").fetchone() is not None
+
+    def contents_counts(self) -> Dict[str, int]:
+        if not self.has_contents():
+            return {"files": 0, "fields": 0, "cells": 0, "values": 0}
+        return kg_contents.counts(self.db)
+
+    def contents_files(self) -> List[Dict[str, Any]]:
+        """Every file in the layer, with its display path ('file')."""
+        if not self.has_contents():
+            return []
+        out = kg_contents.files(self.db)
+        for f in out:
+            f["file"] = self.display_path(f["path"])
+        return out
+
+    def contents_sheets(self, document_id: str) -> List[Dict[str, Any]]:
+        return kg_contents.sheets(self.db, document_id) if self.has_contents() else []
+
+    def contents_fields(self, document_id: str, sheet: Optional[str] = None
+                        ) -> List[Dict[str, Any]]:
+        if not self.has_contents():
+            return []
+        out = kg_contents.fields_of(self.db, document_id, sheet)
+        for f in out:
+            f["summary"] = kg_contents.summary(f)
+        return out
+
+    def contents_field(self, field_id: int) -> Optional[Dict[str, Any]]:
+        f = kg_contents.field(self.db, field_id) if self.has_contents() else None
+        if f is not None:
+            f["summary"] = kg_contents.summary(f)
+        return f
+
+    def field_values(self, field_id: int, limit: int = kg_contents.DRAWN_VALUES
+                     ) -> Dict[str, Any]:
+        return kg_contents.field_values(self.db, field_id, limit)
+
+    def content_value(self, value_id: int) -> Optional[Dict[str, Any]]:
+        return kg_contents.value(self.db, value_id) if self.has_contents() else None
+
+    def value_places(self, *, value_id: Optional[int] = None,
+                     number: Optional[float] = None, field_id: Optional[int] = None,
+                     row: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        """Where a value (or a number, or one cell) is: file, sheet, label,
+        row, locator - with the display path ('file')."""
+        if not self.has_contents():
+            return []
+        out = kg_contents.places(self.db, value_id=value_id, number=number,
+                                 field_id=field_id, row=row, limit=limit)
+        for pl in out:
+            pl["file"] = self.display_path(pl["path"])
+        return out
+
+    def row_cells(self, field_id: int, row: int) -> List[Dict[str, Any]]:
+        return kg_contents.row_cells(self.db, field_id, row) if self.has_contents() else []
+
+    def same_fields(self, field_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+        if not self.has_contents():
+            return []
+        out = kg_contents.same_fields(self.db, field_id, limit)
+        for f in out:
+            f["file"] = self.display_path(f["path"])
+            f["summary"] = kg_contents.summary(f)
+        return out
+
+    def question_rows(self, question: str, max_rows: int = 12) -> Dict[str, Any]:
+        """The rows of the files a question is about (kg_contents.
+        question_rows): for the Council's answers and Ask the graph."""
+        if not self.has_contents():
+            return {"rows": [], "fields": [], "words": []}
+        return kg_contents.question_rows(self.db, question, max_rows=max_rows)
+
+    def lookup_fields(self, names: Sequence[str]) -> List[Dict[str, Any]]:
+        """Where each template field name is in the files (kg_contents.
+        field_lookup), with display paths ('file')."""
+        if not self.has_contents():
+            return [{"name": n, "labels": []} for n in names]
+        out = kg_contents.field_lookup(self.db, names)
+        for item in out:
+            for lab in item["labels"]:
+                for pl in lab["places"]:
+                    pl["file"] = self.display_path(pl["path"])
+        return out
+
+    def search_contents(self, text: str, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
+        """Files, fields (headers and labels) and values matching ``text``,
+        and the cells holding a number typed."""
+        if not self.has_contents():
+            return {"files": [], "fields": [], "values": [], "numbers": []}
+        out = kg_contents.search(self.db, text, limit)
+        for k in ("files", "fields"):
+            for x in out[k]:
+                x["file"] = self.display_path(x["path"])
+        return out
+
     def counts(self) -> Dict[str, Any]:
         q = self.db.execute
         by_type = {r[0]: r[1] for r in q("SELECT type, COUNT(*) FROM entities"
                                          " WHERE merged_into IS NULL GROUP BY type")}
-        by_status = {r[0]: r[1] for r in q("SELECT status, COUNT(*) FROM relations"
+        by_status = {r[0]: r[1] for r in q("SELECT status, COUNT(*) FROM relations WHERE"
+                                           f" predicate NOT IN {_TABLE_PREDS_SQL}"
                                            " GROUP BY status")}
-        return {"entities": by_type, "relations": by_status,
+        tables = q("SELECT COUNT(*) FROM relations WHERE status != 'rejected' AND"
+                   f" predicate IN {_TABLE_PREDS_SQL} AND predicate != ?",
+                   (RELATED,)).fetchone()[0]
+        related = q("SELECT COUNT(*) FROM relations WHERE status != 'rejected' AND"
+                    " predicate=?", (RELATED,)).fetchone()[0]
+        return {"entities": by_type, "relations": by_status, "table_links": tables,
+                "related_links": related,
                 "mentions": q("SELECT COUNT(*) FROM mentions").fetchone()[0],
                 "open_reviews": q("SELECT COUNT(*) FROM review WHERE status='open'")
                 .fetchone()[0]}
@@ -4796,8 +5451,10 @@ class KnowledgeGraph:
             d["name"] = doc["path"] if doc else d["name"]
         d["aliases"] = [a["alias"] for a in self.db.execute(
             "SELECT alias FROM aliases WHERE entity_id=? ORDER BY alias", (eid,))]
+        # a model's sentence before the Council's own "N rows; columns: …"
         desc = self.db.execute("SELECT value FROM entity_props WHERE entity_id=? AND"
-                               " name='description' ORDER BY length(value) DESC LIMIT 1",
+                               " name='description' ORDER BY model != '' DESC,"
+                               " length(value) DESC LIMIT 1",
                                (eid,)).fetchone()
         d["description"] = desc[0] if desc else ""
         return d
@@ -4880,7 +5537,8 @@ class KnowledgeGraph:
 
     def neighbors(self, eid: str, *, include_rejected: bool = False,
                   evidence_limit: Optional[int] = None,
-                  relation_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                  relation_limit: Optional[int] = None,
+                  include_tables: bool = False) -> List[Dict[str, Any]]:
         """Every relation touching ``eid``, each with its evidence: what a
         person needs to see WHY two things are linked. ``evidence_limit``
         keeps the first N pieces of each (``evidence_total`` is the count):
@@ -4888,14 +5546,20 @@ class KnowledgeGraph:
         Connections tab drew every one on the GUI thread. ``relation_limit``
         keeps the first N links of each kind (predicate and direction);
         neighbor_counts() counts them all. MEASURED (review, 2026-10-16): a
-        person with 4,000 links took 3.4 s here while the tab drew 300."""
+        person with 4,000 links took 3.4 s here while the tab drew 300.
+        ``include_tables``: the links tables as nodes give too (the tab shows
+        them; the agent's tools and the answers keep to the facts)."""
         eid = self.resolve(eid)
         q = ("SELECT * FROM relations WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
+        if not include_tables:
+            q += f" AND predicate NOT IN {_TABLE_PREDS_SQL}"
         out = []
         per_kind: Dict[Tuple[str, str], int] = {}
-        for r in self.db.execute(q + " ORDER BY predicate", (eid, eid)).fetchall():
+        # facts between entities first, what tables list after them
+        for r in self.db.execute(q + f" ORDER BY predicate IN {_TABLE_PREDS_SQL}, predicate",
+                                 (eid, eid)).fetchall():
             kind = (r["predicate"], "out" if r["subject_id"] == eid else "in")
             per_kind[kind] = per_kind.get(kind, 0) + 1
             if relation_limit is not None and per_kind[kind] > relation_limit:
@@ -4911,14 +5575,16 @@ class KnowledgeGraph:
                         "evidence": ev, "evidence_total": total})
         return out
 
-    def neighbor_counts(self, eid: str, *, include_rejected: bool = False
-                        ) -> Dict[Tuple[str, str], int]:
+    def neighbor_counts(self, eid: str, *, include_rejected: bool = False,
+                        include_tables: bool = False) -> Dict[Tuple[str, str], int]:
         """How many links ``eid`` has of each kind: {(predicate, 'out'|'in'): n}."""
         eid = self.resolve(eid)
         q = ("SELECT predicate, subject_id=? AS outward, COUNT(*) FROM relations"
              " WHERE (subject_id=? OR object_id=?)")
         if not include_rejected:
             q += " AND status != 'rejected'"
+        if not include_tables:
+            q += f" AND predicate NOT IN {_TABLE_PREDS_SQL}"
         return {(r[0], "out" if r[1] else "in"): r[2]
                 for r in self.db.execute(q + " GROUP BY predicate, outward", (eid, eid, eid))}
 
@@ -5245,10 +5911,14 @@ class KnowledgeGraph:
         seen.discard("")
         return seen
 
-    def all_relations(self, include_rejected: bool = False) -> List[Dict[str, Any]]:
-        q = "SELECT * FROM relations"
-        if not include_rejected:
-            q += " WHERE status != 'rejected'"
+    def all_relations(self, include_rejected: bool = False,
+                      include_tables: bool = False) -> List[Dict[str, Any]]:
+        """The links between entities; ``include_tables``: the links tables
+        as nodes give too (TABLE_PREDICATES)."""
+        where = [] if include_rejected else ["status != 'rejected'"]
+        if not include_tables:
+            where.append(f"predicate NOT IN {_TABLE_PREDS_SQL}")
+        q = "SELECT * FROM relations" + (" WHERE " + " AND ".join(where) if where else "")
         return [{"id": r["id"], "subject": self.entity(r["subject_id"]),
                  "predicate": r["predicate"], "object": self.entity(r["object_id"]),
                  "status": r["status"]} for r in self.db.execute(q)]

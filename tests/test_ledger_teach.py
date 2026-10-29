@@ -197,7 +197,9 @@ def test_the_model_guesses_where_the_rules_stop(tmp_path, ledger):
     model = FakeModel({"Zorp rate": freq, "Tech Sig": INSPECTOR,
                        "Remarks to self": NOT_DATA})
     src = _unlabelled_book(tmp_path / "untitled.xlsx")
-    s = lt.guess(csv, src, chat=model, use_images=False, pattern_mask="@@@#@@###")
+    # exact: loose, the rules read 'XYZ9AB123-R2' themselves
+    # (test_a_loose_pattern_takes_a_dash_tail)
+    s = lt.guess(csv, src, chat=model, use_images=False, pattern_mask="=@@@#@@###")
     assert s.model == "fake-granite"
     zorp, tech, note = _row(s, "Zorp rate"), _row(s, "Tech Sig"), _row(s, "Remarks to self")
     assert (zorp.guess.key, zorp.guess.via, zorp.guess.score) == (
@@ -327,8 +329,11 @@ def test_learning_writes_aliases_ignores_inspectors_people_pattern_and_examples(
             ("Remarks to self", "ignore"), ("Power (W)", "field")} <= by
     assert {e.value for e in ex if e.role != lt.ROLE_PART} == {""}
     assert {e.value for e in ex if e.role == lt.ROLE_PART} == {"XYZ9AB123-R2"}
-    raw = lt.examples_path_for(csv).read_text(encoding="utf-8")
-    assert "call MK" not in raw and "55" not in raw.replace('"ts"', "")
+    # the stored text, less each line's time stamp (19:19:55 has a 55 in it)
+    raw = "".join(json.dumps({k: v for k, v in json.loads(line).items() if k != "ts"})
+                  for line in lt.examples_path_for(csv).read_text(encoding="utf-8")
+                  .splitlines() if line.strip())
+    assert "call MK" not in raw and "55" not in raw
     assert all(e.workbook == "untitled.xlsx" for e in ex)
     text = rep.describe()
     assert "Zorp rate → " in text and "Tech Sig" in text and "@@@#@@###-@#" in text
@@ -492,12 +497,15 @@ def test_the_pattern_finds_a_part_written_only_in_a_title(tmp_path, ledger):
     assert (again.part.value, again.part.via) == ("LMM1AB101", lt.VIA_ALIAS)
     assert again.part.where == "Build!A1" and "your part-name pattern" in again.part.how
     assert "LMM1AB101 is now read by the rules" in lt.improvement(first, again)
-    # only a whole word: 'XYZ9AB123' of 'Serial: XYZ9AB123-R2' is no part;
-    # two parts in titles: no guess
-    ex = se._Extractor(se.Grid("x", "S", {(1, 1): "Serial: XYZ9AB123-R2"}),
-                       se.Matcher(schema), se.ItemCodes(schema.items), "",
-                       se.mask_to_regex("@@@#@@###"))
-    assert ex.parts_in_text() == []
+    # only a whole word: 'XYZ9AB123' of 'Serial: XYZ9AB123-R2' is no part for
+    # the exact shape; the loose one takes it with its tail (user,
+    # 2026-10-22: "have a -@ or -#"); two parts in titles: no guess
+    def parts(mask):
+        return se._Extractor(se.Grid("x", "S", {(1, 1): "Serial: XYZ9AB123-R2"}),
+                             se.Matcher(schema), se.ItemCodes(schema.items), "",
+                             se.mask_to_regex(mask)).parts_in_text()
+    assert parts("=@@@#@@###") == []
+    assert parts("@@@#@@###") == [(1, 1, "XYZ9AB123-R2")]
     two = se._Extractor(se.Grid("x", "S", {(1, 1): "LMM1AB101 build", (2, 1): "LMM1AB102"}),
                         se.Matcher(schema), se.ItemCodes(schema.items), "",
                         se.mask_to_regex("@@@#@@###"))

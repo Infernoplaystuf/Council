@@ -27,13 +27,13 @@ from __future__ import annotations
 import threading
 import traceback
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QCompleter,
-                               QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QPlainTextEdit,
-                               QProgressBar, QPushButton, QVBoxLayout, QWidget)
+                               QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QLineEdit, QListWidget, QPlainTextEdit,
+                               QProgressBar, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 
 class _VisionReaderCombo(QComboBox):
@@ -98,7 +98,7 @@ class LedgerActions:
     def extract(self, csv, sources, part, use_images, progress,
                 pattern_mask: Optional[str] = None,
                 vision_model: Optional[str] = None,
-                cancel=None, assist=False):
+                cancel=None, assist=False, prefer=()):
         reader = self.image_reader
         if reader is None and use_images and vision_model:
             # Explicit opt-in: the user picked a vision model in the dropdown.
@@ -108,7 +108,7 @@ class LedgerActions:
                                          image_reader=reader, progress=progress,
                                          pattern_mask=pattern_mask or None,
                                          cancel=cancel, log=self.stall_log,
-                                         assist=assist)
+                                         assist=assist, prefer=prefer)
 
     def diagnose(self, file, csv, use_images, on_line,
                  vision_model: Optional[str] = None, cancel=None, assist=False):
@@ -130,6 +130,87 @@ class LedgerActions:
             reader = ollama_vision_reader(vision_model)
         return ledger_ingest.run_apply(review, fill_dir or None, use_images=use_images,
                                        image_reader=reader, progress=progress)
+
+    def rerun(self, review, fill_dir, use_images, progress,
+              vision_model: Optional[str] = None, cancel=None, assist=False, prefer=()):
+        """Re-run with my answers (user, 2026-10-23: "look at a few values
+        and then give an answer and have it rerun and fill things in more
+        confidently"): the saved review applied - its accepted values go in
+        the parent CSV, where the next run learns from them as worked
+        answers - then Extract run again on the review's own sources, part,
+        pattern and operators, and the review's answers carried into the new
+        one (ledger_review.carry_answers). Returns (ApplySummary,
+        ExtractSummary or None when cancelled between the two, how many
+        answers were carried)."""
+        from council_core import kg_excel
+        meta = kg_excel._review_meta(Path(review)) or {}
+        csv, sources = meta.get("csv"), list(meta.get("sources") or [])
+        if not csv or not sources:
+            raise LedgerError(f"{Path(review).name} does not say which parent CSV and "
+                              "sources it was made from; run Extract instead")
+        applied = self.apply(review, fill_dir, use_images, progress, vision_model=vision_model)
+        if cancel is not None and cancel.is_set():
+            return applied, None, 0
+        # a saved pattern only hinted at: left out, so it is a hint again
+        mask = "" if meta.get("pattern_hint") else (meta.get("pattern_mask") or "")
+        extracted = self.extract(csv, sources, meta.get("part") or "", use_images, progress,
+                                 pattern_mask=mask, vision_model=vision_model, cancel=cancel,
+                                 assist=assist, prefer=tuple(prefer or meta.get("prefer") or ()))
+        # what was said Right or Wrong is not asked again
+        from council_core import ledger_review
+        new, carried = getattr(extracted, "review", ""), 0
+        if new and Path(new).is_file() and not ledger_ingest._same_file(new, review):
+            fresh = ledger_review.load(new)
+            carried = ledger_review.carry_answers(ledger_review.load(review), fresh)
+            if carried:
+                progress(f"{carried} answer(s) carried into the new review; filling in "
+                         "the template again")
+                ledger_review.write_all_filled(ledger_review.load(new), progress)
+                try:
+                    ledger_review.write_full_filled(ledger_review.load(new), progress)
+                except LedgerError as e:
+                    progress(f"the filled workbook was not written: {e}")
+        return applied, extracted, carried
+
+    def update(self, csv, progress, use_images, vision_model: Optional[str] = None,
+               cancel=None, assist=False, prefer=()):
+        """Update with new files (user, 2026-10-23: "the folders it was run on
+        get more data in them I want to be able to rerun from that stage"):
+        the saved Ledger's folders scanned again and only the files new or
+        changed since they were read given to Extract, with its saved part,
+        pattern and operators. What the Ledger holds already is pre-accepted
+        again and a value other than it flagged (source_extract.decide).
+        Returns (ExtractSummary, new, changed); the summary None when
+        nothing is new."""
+        from council_core import ledger_saved
+        led = ledger_saved.load(csv)
+        if led is None or not led.sources:
+            raise LedgerError(f"{Path(csv).name} has no saved run to update from: run "
+                              "Extract on it once first")
+        files = ledger_ingest.source_files(csv, led.sources)
+        new, changed, _same = ledger_saved.changed_files(led, files)
+        if not new and not changed:
+            return None, [], []
+        st = led.settings
+        from source_extract import parse_prefer
+        extracted = self.extract(csv, new + changed, st.get("part") or "", use_images,
+                                 progress, pattern_mask=st.get("pattern_mask") or None,
+                                 vision_model=vision_model, cancel=cancel, assist=assist,
+                                 prefer=tuple(prefer or parse_prefer(st.get("prefer") or "")))
+        return extracted, new, changed
+
+    def write_workbooks(self, csv, progress=None):
+        """The full workbook and one per group (council_core.ledger_groups);
+        [] for a table Ledger."""
+        from council_core import ledger_groups, ledger_records
+        if not csv or ledger_records.is_record_ledger(csv):
+            return []
+        return ledger_groups.write_all(csv, progress)
+
+    def record_run(self, csv, summary, **kw):
+        """The run kept in the Ledger's saved runs (council_core.ledger_saved)."""
+        from council_core import ledger_saved
+        return ledger_saved.record_run(csv, summary, **kw)
 
     def teach_guess(self, csv, workbook, *, model_id: Optional[str] = None,
                     use_images: bool = True, vision_model: Optional[str] = None,
@@ -196,6 +277,20 @@ class LedgerActions:
         if added is not None:
             stats["ledger_added"] = str(csv)
         return stats
+
+    def lookup_template_fields(self, template) -> List[Dict[str, Any]]:
+        """Where each field of ``template`` is in the files the knowledge
+        graph read (its Contents layer: council_core.kg_contents.
+        field_lookup). Raises LedgerError for a template that cannot be read."""
+        from sample_ledger import read_template
+        fields = read_template(template).fields
+        # looked up by the label as the template writes it ('FPI'), shown by
+        # the parent CSV's name ('NDE Inspection: FPI')
+        labels = list(dict.fromkeys(f.label or f.name for f in fields))
+        with self._connections().open_graph() as kg:
+            found = {x["name"]: x["labels"] for x in kg.lookup_fields(labels)}
+        return [{"name": f.name, "label": f.label or f.name,
+                 "labels": found.get(f.label or f.name, [])} for f in fields]
 
     def _connections(self):
         if self.connections is None:
@@ -308,12 +403,16 @@ class LedgerTab(ViewHelpers, QWidget):
         self._kg_running: set = set()
         self._kg_known: set = set()
         self._kg_pending: List[str] = []
+        #: the saved Ledger of the parent CSV shown (council_core.ledger_saved)
+        self._saved = None
+        self.runs_dialog = None
         self._build()
         self._kg_timer = QTimer(self)
         self._kg_timer.setSingleShot(True)
         self._kg_timer.setInterval(self.KG_RETRY_MS)
         self._kg_timer.timeout.connect(self._register_pending)
         self._refresh_reader_choices()
+        self.refresh_saved()
         self._refresh_enabled()
 
     # ── layout ──────────────────────────────────────────────────────────
@@ -334,8 +433,65 @@ class LedgerTab(ViewHelpers, QWidget):
         return edit
 
     def _build(self) -> None:
-        outer = QVBoxLayout(self)
+        # in a scroll area: with Saved Ledgers on top the tab no longer fit a
+        # laptop's screen
+        page = QVBoxLayout(self)
+        page.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        scroll.setWidget(body)
+        page.addWidget(scroll)
+        outer = QVBoxLayout(body)
         outer.setContentsMargins(10, 8, 10, 8)
+
+        # Ledgers saved with their sources and runs, named, grouped by
+        # template and/or project (council_core.ledger_saved, user 2026-10-23)
+        from council_core import ledger_saved
+        g0 = QGroupBox("Saved Ledgers")
+        grid0 = QGridLayout(g0)
+        grid0.addWidget(QLabel("Saved Ledger:"), 0, 0)
+        self.saved_choice = QComboBox()
+        self.saved_choice.setMinimumContentsLength(36)
+        self.saved_choice.setToolTip("Pick a Ledger you ran before: its template, parent "
+                                     "CSV, folders and settings are filled in.")
+        self.saved_choice.activated.connect(self._on_saved_picked)
+        grid0.addWidget(self.saved_choice, 0, 1)
+        row0 = QHBoxLayout()
+        row0.addWidget(QLabel("Group by:"))
+        self.group_by = QComboBox()
+        for key, words in ledger_saved.GROUPS.items():
+            self.group_by.addItem(words, key)
+        self.group_by.currentIndexChanged.connect(lambda _i: self.refresh_saved())
+        row0.addWidget(self.group_by)
+        self.update_btn = self._step_button(row0, "Update with new files", self.on_update)
+        self.update_btn.setToolTip(
+            "Read only the files that are new or changed in this Ledger's folders since its "
+            "last run. Values the Ledger already holds are accepted again; a value that "
+            "differs from one you accepted is flagged for you, never written over it.")
+        self.runs_btn = self._step_button(row0, "Runs…", self.on_runs_window)
+        self.runs_btn.setToolTip("This Ledger's runs: their names, counts, reviews and "
+                                 "filled templates")
+        self.forget_saved_btn = self._step_button(row0, "Take off the list",
+                                                  self.on_forget_saved)
+        self.forget_saved_btn.setToolTip("Take this Ledger off the list. Nothing is deleted: "
+                                         "pick its parent CSV again to bring it back.")
+        row0.addStretch(1)
+        grid0.addLayout(row0, 0, 2)
+        grid0.addWidget(QLabel("Name:"), 1, 0)
+        self.ledger_name = QLineEdit()
+        self.ledger_name.setPlaceholderText("named after the template if left empty")
+        self.ledger_name.editingFinished.connect(self._save_details)
+        grid0.addWidget(self.ledger_name, 1, 1)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Project / program:"))
+        self.ledger_project = QLineEdit()
+        self.ledger_project.setPlaceholderText("optional: to group Ledgers by")
+        self.ledger_project.editingFinished.connect(self._save_details)
+        prow.addWidget(self.ledger_project)
+        grid0.addLayout(prow, 1, 2)
+        outer.addWidget(g0)
 
         g1 = QGroupBox("1 · Template and parent CSV")
         grid = QGridLayout(g1)
@@ -354,6 +510,14 @@ class LedgerTab(ViewHelpers, QWidget):
             "read from the tables of every workbook. Left unticked, Council decides: a "
             "table with no sample-ID column is read this way too.")
         row.addWidget(self.records_mode)
+        # the template's fields in the files the graph read (its Contents
+        # layer; user, 2026-10-26)
+        self.find_fields_btn = self._step_button(row, "Find these fields in my files…",
+                                                 self.on_find_fields)
+        self.find_fields_btn.setToolTip(
+            "Where each field of the template is in the files the Connections graph read: "
+            "the labels it goes by, which files have it, how many values and what they look "
+            "like. ⟳ Build graph in Connections first.")
         row.addStretch(1)
         grid.addLayout(row, 2, 1)
         outer.addWidget(g1)
@@ -423,11 +587,15 @@ class LedgerTab(ViewHelpers, QWidget):
         mask_row.addWidget(QLabel("Part name pattern (optional):"))
         self.pattern_mask = QLineEdit()
         self.pattern_mask.setPlaceholderText(
-            "@@@#@@###   — @ letter, # digit, other characters literal")
+            "@@@#@@###   — @ letter, # digit, = exact, | several")
         self.pattern_mask.setToolTip(
             "A shape used when the sample number is not labelled.\n"
             "@ matches any letter, # any digit, anything else matches itself.\n"
-            "Example: @@@#@@### finds ABC1DE234 in a filename or a title.\n"
+            "Example: @@@#@@### finds ABC1DE234 in a filename or a title - and,\n"
+            "as it is loose, AB1DE234, ABC1DE23 and ABC1DE234-A or -2 too (each run\n"
+            "one shorter or longer, and a short tail after a dash).\n"
+            "Start with = to take it exactly as typed: =@@@#@@###.\n"
+            "Several shapes: separate them with | or a comma (@@@#@@### | @@-####).\n"
             "A part of another shape is kept but never pre-accepted.\n"
             "Left empty, the pattern Teach saved for this Ledger is used as a hint\n"
             "(parts of another shape are still pre-accepted); Forget saved pattern drops it.")
@@ -461,6 +629,21 @@ class LedgerTab(ViewHelpers, QWidget):
             "Accepting a suggested field teaches it for the next run.")
         mask_row.addWidget(self.ask_model)
         v2.addLayout(mask_row)
+        # one workbook's several readings of a value (user, 2026-10-23): the
+        # operator whose reading is used, else the first reading
+        prefer_row = QHBoxLayout()
+        prefer_row.addWidget(QLabel("Operator to prefer (optional):"))
+        self.prefer_operator = QLineEdit()
+        self.prefer_operator.setPlaceholderText("initials or names, e.g. JB, Alex King")
+        self.prefer_operator.setToolTip(
+            "When a workbook has several readings of one value (an EC response measured\n"
+            "by more than one operator) and the template keeps one: the reading of the\n"
+            "first operator listed here who has one is used - initials or a name, either\n"
+            "matches the other (JB is Jane Brown). Left empty, or none of them\n"
+            "read it: the first reading in the workbook is used. The others are set aside\n"
+            "(N in the review). Values two workbooks disagree on are still yours to choose.")
+        prefer_row.addWidget(self.prefer_operator, 1)
+        v2.addLayout(prefer_row)
         # Filename-ignore patterns — persisted next to the aliases file so a
         # user's "cover*.xlsx, agenda*.xlsx" set survives across runs.
         ignore_row = QHBoxLayout()
@@ -477,6 +660,27 @@ class LedgerTab(ViewHelpers, QWidget):
         self.ignore_files.textEdited.connect(self._on_ignore_edited)
         ignore_row.addWidget(self.ignore_files, 1)
         v2.addLayout(ignore_row)
+        # a filled copy of the template, picked on its own (user, 2026-10-23):
+        # worked answers and Council's model's guide, never a source
+        example_row = QHBoxLayout()
+        example_row.addWidget(QLabel("Filled example (optional):"))
+        self.filled_example = QLineEdit()
+        self.filled_example.setReadOnly(True)
+        self.filled_example.setPlaceholderText(
+            "a copy of the template filled in for one sample")
+        self.filled_example.setToolTip(
+            "A copy of your template filled in by hand for one sample. It is not read\n"
+            "as a source: its values teach which source labels are which field (for the\n"
+            "same sample in the sources), and Council's model is shown what each field\n"
+            "holds there and what its part number looks like. Saved with this Ledger.")
+        example_row.addWidget(self.filled_example, 1)
+        self.example_btn = QPushButton("Pick…")
+        self.example_btn.clicked.connect(self.on_pick_filled_example)
+        example_row.addWidget(self.example_btn)
+        self.forget_example_btn = QPushButton("Forget")
+        self.forget_example_btn.clicked.connect(lambda: self._set_filled_example(""))
+        example_row.addWidget(self.forget_example_btn)
+        v2.addLayout(example_row)
         outer.addWidget(g2)
 
         g3 = QGroupBox("3 · Extract and review")
@@ -491,6 +695,29 @@ class LedgerTab(ViewHelpers, QWidget):
             "Check the review one item at a time: the template cell the value goes in "
             "and the source cell it was read from, both highlighted. Right / Wrong / a "
             "corrected value are saved into the review workbook; then Apply.")
+        # the template filled in per part, tinted by confidence; click a cell
+        # to see its source (user, 2026-10-23)
+        self.filled_btn = self._step_button(row, "Filled template…", self.on_filled_window)
+        self.filled_btn.setToolTip(
+            "The template filled in for one part at a time, each value tinted by how sure "
+            "it is (green sure, yellow fairly, orange unsure, red disagreeing). Click a "
+            "cell to see the source cell it came from, then Right or Wrong.")
+        # the filled template window's re-run, from the tab too: the answers
+        # saved into the review workbook above (user, 2026-10-26)
+        self.rerun_btn = self._step_button(row, "Re-run with my answers",
+                                           self.on_rerun_from_tab)
+        self.rerun_btn.setToolTip(
+            "Apply the answers saved into the review workbook (Right, Wrong, corrected or "
+            "put in another cell), then Extract again on the same sources: the values you "
+            "said Right teach the run, and a new review is written (the old one kept). "
+            "Answers you have not saved yet in an open review window are not used.")
+        # sub-groups of the parts, each with a workbook of its own (user,
+        # 2026-10-26)
+        self.groups_btn = self._step_button(row, "Groups…", self.on_groups_window)
+        self.groups_btn.setToolTip(
+            "Slice the Ledger's parts into groups - by part name, date or source folder - "
+            "each with its own fields (tracked, not tracked, or Yes/No) and a workbook of its "
+            "own beside the full one: a filled-template sheet per part.")
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
         # files skipped as too slow, or that stalled the app before
         # (council_core.file_guard): read again on the next run
@@ -591,7 +818,64 @@ class LedgerTab(ViewHelpers, QWidget):
         self._load_ignore_patterns()
         self._check_schema()
         self._load_saved_patterns()
+        self._load_filled_example()
+        self._load_saved()
         self._register(self.csv.text().strip())
+
+    def _load_filled_example(self) -> None:
+        """Show the filled example saved for the parent CSV."""
+        if not hasattr(self, "filled_example"):
+            return
+        csv = self.csv.text().strip()
+        path = ""
+        if csv:
+            from council_core import ledger_examples
+            path = ledger_examples.load_filled_example(csv)
+        self.filled_example.setText(path)
+        self.forget_example_btn.setEnabled(bool(path))
+
+    def _browse_filled_example(self) -> str:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Pick a copy of the template filled in for one sample",
+            self._start_dir(), XLSX)
+        return p
+
+    def on_pick_filled_example(self) -> None:
+        if not self.csv.text().strip():
+            self.status.setText("Create or pick the parent CSV first: the filled example "
+                                "is saved with it.")
+            return
+        p = self._browse_filled_example()
+        if p:
+            self._set_filled_example(p)
+
+    def _set_filled_example(self, path: str) -> None:
+        csv = self.csv.text().strip()
+        if not csv:
+            return
+        from council_core import ledger_examples
+        try:
+            ledger_examples.save_filled_example(csv, path)
+        except OSError as e:
+            self._say(f"The filled example could not be saved beside {Path(csv).name}: {e}")
+            return
+        self._load_filled_example()
+        if not path:
+            self._say("Filled example forgotten for this Ledger.")
+            return
+        rows = []
+        try:
+            from sample_ledger import ParentCSV
+            schema = ParentCSV(csv).schema
+            rows = ledger_examples.filled_example_rows(path, schema) if schema else []
+        except Exception:                                    # noqa: BLE001
+            rows = []
+        self._say(f"Filled example {Path(path).name}: "
+                  + (f"{len(rows)} row(s) for "
+                     + ", ".join(ledger_examples.filled_example_parts(
+                         rows, schema.id_field)) + " — used by Extract from now on"
+                     if rows else "no part number found in the template's part cell — "
+                     "is it a filled copy of this Ledger's template?"))
 
     def _check_schema(self) -> None:
         """Whether the parent CSV and its schema are there (Teach needs
@@ -622,7 +906,7 @@ class LedgerTab(ViewHelpers, QWidget):
             saved = []
         self._pattern_completer.model().setStringList(saved)
         self._saved_patterns = (csv, list(saved))
-        hint = "@ letter, # digit, other characters literal"
+        hint = "@ letter, # digit, = exact, | several"
         self.pattern_mask.setPlaceholderText(
             f"empty: this Ledger's saved pattern {saved[0]} is used as a hint   — {hint}"
             if saved else f"@@@#@@###   — {hint}")
@@ -665,6 +949,11 @@ class LedgerTab(ViewHelpers, QWidget):
                                                and bool(saved))
         if not idle:
             return
+        if hasattr(self, "update_btn"):
+            saved = self._saved
+            self.update_btn.setEnabled(saved is not None and bool(saved.sources))
+            self.runs_btn.setEnabled(saved is not None and bool(saved.runs))
+            self.forget_saved_btn.setEnabled(saved is not None)
         self.create_btn.setEnabled(bool(self.template.text().strip()))
         self.extract_btn.setEnabled(bool(csv) and bool(self.source_paths()))
         # off only for a path already looked up and found without its schema
@@ -675,9 +964,15 @@ class LedgerTab(ViewHelpers, QWidget):
         if hasattr(self, "link_btn"):
             self.link_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         has_review = bool(self.review.text().strip())
+        if hasattr(self, "groups_btn"):
+            self.groups_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         self.open_btn.setEnabled(has_review)
         if hasattr(self, "review_btn"):
             self.review_btn.setEnabled(has_review)
+        if hasattr(self, "filled_btn"):
+            self.filled_btn.setEnabled(has_review)
+        if hasattr(self, "rerun_btn"):
+            self.rerun_btn.setEnabled(has_review)
         self.apply_btn.setEnabled(has_review)
         if hasattr(self, "rebuild_kg_btn"):
             # Always clickable while idle; dirtiness only affects weight.
@@ -1212,36 +1507,357 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "\"Ask Council's model about the rest\" to run without one.")
                 return
             more = {"assist": model_id}
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:                         # only then, as with the model
+            more["prefer"] = prefer
 
-        def done(s) -> None:
-            self.review.setText(s.review)
-            self.stat["values"].setText(str(s.values))
-            self.stat["pre_accepted"].setText(str(s.pre_accepted))
-            self.stat["to_review"].setText(str(s.to_review))
-            self.stat["images"].setText(f"{s.images_read} / {s.images}")
-            self.stat["problems"].setText(str(len(s.problems)))
-            if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
-                # before or while Council's model was asked: the same words
-                # for both, and not 'partial' (second review, 2026-10-20)
-                self.status.setText(
-                    "Cancelled after every workbook was read: every value the rules found "
-                    "is in the review. Open it, check the amber and red rows, map the "
-                    "leftover labels, save it, then Apply.")
-            elif getattr(s, "cancelled", False):
-                self.status.setText(
-                    "Cancelled. The partial review was still written — "
-                    "open it to see what landed, or clear it and run again.")
-            else:
-                self.status.setText(
-                    "Review written. Open it, check the amber and red rows, "
-                    "map the leftover labels, save it, then Apply.")
-            self._say(s.describe())
-        self._run("Extracting",
-                  lambda p: self.actions.extract(csv, sources, part, images, p,
-                                                 pattern_mask=mask,
-                                                 vision_model=vision,
-                                                 cancel=self._cancel, **more), done,
-                  cancellable=True)
+        record = self._recorder(csv, "extract", sources=sources,
+                                settings=self._settings(), model_id=more.get("assist", ""))
+
+        def step(p):
+            s = self.actions.extract(csv, sources, part, images, p, pattern_mask=mask,
+                                     vision_model=vision, cancel=self._cancel, **more)
+            return s, record(s)
+
+        def done(result) -> None:
+            s, saved = result
+            self._show_extract(s)
+            self._said_saved(saved)
+        self._run("Extracting", step, done, cancellable=True)
+
+    def _show_extract(self, s) -> None:
+        """An Extract's summary in the stats, the status line and the log."""
+        self.review.setText(s.review)
+        self.stat["values"].setText(str(s.values))
+        self.stat["pre_accepted"].setText(str(s.pre_accepted))
+        self.stat["to_review"].setText(str(s.to_review))
+        blank = getattr(s, "images_blank", 0)
+        self.stat["images"].setText(f"{s.images_read} / {s.images}"
+                                    + (f" (+{blank} no text)" if blank else ""))
+        self.stat["images"].setToolTip(
+            "Pictures whose text was read, of all the pictures found"
+            + (f"; {blank} more were read and had no text in them (a photo)" if blank else "")
+            + (f"\nNot read: {s.images_unread}" if getattr(s, "images_unread", "") else ""))
+        self.stat["problems"].setText(str(len(s.problems)))
+        if getattr(s, "cancelled", False) and getattr(s, "read_all", False):
+            # before or while Council's model was asked: the same words
+            # for both, and not 'partial' (second review, 2026-10-20)
+            self.status.setText(
+                "Cancelled after every workbook was read: every value the rules found "
+                "is in the review. Open it, check the amber and red rows, map the "
+                "leftover labels, save it, then Apply.")
+        elif getattr(s, "cancelled", False):
+            self.status.setText(
+                "Cancelled. The partial review was still written — "
+                "open it to see what landed, or clear it and run again.")
+        else:
+            self.status.setText(
+                "Review written. Open it, check the amber and red rows, "
+                "map the leftover labels, save it, then Apply.")
+        self._say(s.describe())
+
+    # ── saved Ledgers (council_core.ledger_saved) ────────────────────────
+    def _settings(self) -> dict:
+        """What a saved Ledger keeps of this run, to run it again the same way."""
+        return {"part": self.part.text().strip(),
+                "pattern_mask": self.pattern_mask.text().strip(),
+                "prefer": self.prefer_operator.text().strip(),
+                "use_images": self.use_images.isChecked()}
+
+    def _recorder(self, csv: str, kind: str, *, sources=(), settings=None,
+                  model_id: str = "", new_files: int = 0) -> Callable:
+        """``record(summary)`` for the step's worker (made on the GUI thread,
+        which reads the fields): the run kept in the Ledger's saved runs,
+        named by Council's model when one was picked. ``record(summary,
+        csv=..., new_files=...)`` when the step learns them. Returns the
+        Run, None for a cancelled run, or why it was not kept - a run is made
+        whether or not it can be kept."""
+        template = self.template.text().strip()
+        given_csv, given_new = csv, new_files
+
+        def record(summary, csv: str = "", new_files: Optional[int] = None):
+            csv = csv or given_csv
+            new_files = given_new if new_files is None else new_files
+            if summary is None or getattr(summary, "cancelled", False):
+                return None
+            namer = None
+            if model_id:
+                from council_core import ledger_llm, ledger_saved
+
+                def namer(facts, fallback):
+                    return ledger_saved.model_name(ledger_llm.chat_for(model_id), facts,
+                                                   fallback)
+            try:
+                return self.actions.record_run(csv, summary, kind=kind, sources=sources,
+                                               template=template, settings=settings,
+                                               new_files=new_files, namer=namer)
+            except Exception as e:                        # noqa: BLE001
+                return f"this run was not saved: {e}"
+        return record
+
+    def _said_saved(self, saved) -> None:
+        if isinstance(saved, str):
+            self._say(f"(Saved Ledgers: {saved})")
+        elif saved is not None:
+            self._say(f"Saved as \"{saved.name}\" in this Ledger's runs (Runs… to rename it).")
+        self.refresh_saved()
+
+    def refresh_saved(self) -> None:
+        """The Saved Ledger list, grouped as Group by says; the one of the
+        parent CSV shown is picked."""
+        from council_core import ledger_saved
+        by = self.group_by.currentData() or "template"
+        current = self.csv.text().strip()
+        box = self.saved_choice
+        box.blockSignals(True)
+        box.clear()
+        model = box.model()
+        pick = -1
+        groups = ledger_saved.group(ledger_saved.listed(), by)
+        for head, ledgers in groups:
+            box.addItem(head)
+            model.item(box.count() - 1).setEnabled(False)
+            for led in ledgers:
+                last = led.last
+                box.addItem(f"    {led.title}" + (f"  ·  {len(led.runs)} run(s), last "
+                                                  f"{last.at[:10]}" if last else ""), led.csv)
+                if current and ledger_saved.file_key(led.csv) == ledger_saved.file_key(current):
+                    pick = box.count() - 1
+        if not groups:
+            box.addItem("(none yet: a Ledger is saved when Extract runs on it)")
+            model.item(0).setEnabled(False)
+        box.setCurrentIndex(pick if pick >= 0 else -1)
+        box.blockSignals(False)
+        self._load_saved()
+
+    def _load_saved(self) -> None:
+        """The saved Ledger of the parent CSV shown, and its name and
+        project in the fields."""
+        from council_core import ledger_saved
+        csv = self.csv.text().strip()
+        self._saved = ledger_saved.load(csv) if csv else None
+        self.ledger_name.setText(self._saved.name if self._saved else "")
+        self.ledger_project.setText(self._saved.project if self._saved else "")
+        self.ledger_project.setCompleter(QCompleter(ledger_saved.projects(), self))
+        self._refresh_enabled()
+
+    def _on_saved_picked(self, index: int) -> None:
+        csv = self.saved_choice.itemData(index)
+        if csv:
+            self.load_saved(str(csv))
+
+    def load_saved(self, csv: str) -> bool:
+        """A saved Ledger's template, parent CSV, sources and settings filled
+        in, its last run's review as the review workbook."""
+        from council_core import ledger_saved
+        if self.busy:
+            return False
+        led = ledger_saved.load(csv)
+        if led is None:
+            self.status.setText(f"No saved Ledger beside {Path(csv).name}.")
+            return False
+        self.template.setText(led.template)
+        self.csv.setText(led.csv)
+        self.sources.clear()
+        self.add_sources(led.sources)
+        st = led.settings
+        self.part.setText(str(st.get("part") or ""))
+        self.pattern_mask.setText(str(st.get("pattern_mask") or ""))
+        self.prefer_operator.setText(str(st.get("prefer") or ""))
+        if "use_images" in st:
+            self.use_images.setChecked(bool(st["use_images"]))
+        last = led.last
+        if last is not None and Path(last.review).is_file():
+            self.review.setText(last.review)
+        self._on_csv_changed()
+        self.refresh_saved()
+        self.status.setText(
+            f"Saved Ledger \"{led.title}\": {len(led.runs)} run(s)"
+            + (f", the last \"{last.name}\"" if last else "")
+            + ". Update with new files reads only what was added since.")
+        return True
+
+    def _save_details(self) -> None:
+        """The Name and Project / program fields, kept in the saved Ledger
+        (made now when the CSV has none yet)."""
+        from council_core import ledger_saved
+        csv = self.csv.text().strip()
+        if not csv or not Path(csv).is_file():
+            return
+        name, project = self.ledger_name.text().strip(), self.ledger_project.text().strip()
+        led = ledger_saved.load(csv)
+        if led is None:
+            if not name and not project:
+                return
+            led = ledger_saved.SavedLedger(csv=csv, template=self.template.text().strip(),
+                                           sources=self.source_paths(),
+                                           settings=self._settings())
+        if (led.name, led.project) == (name, project):
+            return
+        led.name, led.project = name, project
+        try:
+            ledger_saved.save(led)
+        except OSError as e:
+            self.status.setText(f"Not saved: {e}")
+            return
+        self.refresh_saved()
+
+    def on_forget_saved(self) -> None:
+        from council_core import ledger_saved
+        csv = self.csv.text().strip()
+        if not csv:
+            return
+        ledger_saved.forget(csv)
+        self.refresh_saved()
+        self.status.setText(f"{Path(csv).name} taken off the list of saved Ledgers; nothing "
+                            "was deleted.")
+
+    def on_update(self) -> None:
+        """Update with new files (LedgerActions.update), then the filled
+        template window on the new review."""
+        csv = self.csv.text().strip()
+        if self._saved is None:
+            self.status.setText("No saved Ledger: run Extract once first.")
+            return
+        images = self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {}
+        if self.ask_model.isChecked():
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not updated: no model picked. Untick \"Ask Council's "
+                                    "model about the rest\" to run without one.")
+                return
+            more["assist"] = model_id
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:
+            more["prefer"] = prefer
+
+        record = self._recorder(csv, "update", model_id=more.get("assist", ""))
+
+        def step(p):
+            s, new, changed = self.actions.update(csv, p, images, vision_model=vision,
+                                                  cancel=self._cancel, **more)
+            return s, new, changed, record(s, new_files=len(new) + len(changed))
+
+        def done(result) -> None:
+            s, new, changed, saved = result
+            if s is None:
+                last = self._saved.last if self._saved else None
+                self.status.setText("Nothing new: no file in this Ledger's folders was added "
+                                    "or changed since "
+                                    + (f"\"{last.name}\"." if last else "its last run."))
+                self._say(self.status.text())
+                return
+            self._show_extract(s)
+            self._said_saved(saved)
+            if getattr(s, "cancelled", False):
+                return
+            line = (f"Updated with {len(new)} new and {len(changed)} changed file(s): "
+                    f"{s.pre_accepted} of {s.values} values pre-accepted, {s.to_review} "
+                    "to review.")
+            self._say(line)
+            from council_core import ledger_records
+            if not ledger_records.is_record_ledger(csv):
+                self.on_filled_window()
+            self.status.setText(line)
+        self._run("Updating with new files", step, done, cancellable=True)
+
+    # ── groups (council_core.ledger_groups) ──────────────────────────────
+    def _workbooks(self, csv, progress):
+        """For a step's worker: the full and group workbooks written, or why
+        not (a str) - the step's own result stands either way."""
+        try:
+            return self.actions.write_workbooks(csv, lambda m: progress(m))
+        except Exception as e:                            # noqa: BLE001
+            return f"the workbooks were not written: {e}"
+
+    def _said_workbooks(self, books) -> None:
+        if isinstance(books, str):
+            self._say(books)
+        elif books:
+            self._say(f"Workbooks ({len(books)}), a filled-template sheet per part: "
+                      + ", ".join(Path(b).name for b in books)
+                      + f" in {Path(books[0]).parent}")
+
+    def on_find_fields(self) -> None:
+        """The template's fields, looked up in the graph's contents
+        (ledger_graph_dialog)."""
+        template = self.template.text().strip()
+        if not template or not Path(template).is_file():
+            self.status.setText("Pick the template workbook first (step 1).")
+            return
+        try:
+            found = self.actions.lookup_template_fields(template)
+        except LedgerError as e:
+            self.status.setText(f"Find fields: {e}")
+            return
+        except Exception as e:                            # noqa: BLE001
+            self.status.setText(f"Find fields: the graph could not be read ({e})")
+            return
+        note = ("" if any(f["labels"] for f in found) else
+                "Nothing matched: has the graph been built over these files (Connections, "
+                "⟳ Build graph, and Folders… for files outside the vault)?")
+        from .ledger_graph_dialog import TemplateFieldsDialog
+        self.fields_dialog = TemplateFieldsDialog(Path(template).name, found, parent=self,
+                                                  graph_note=note)
+        self.fields_dialog.show()
+
+    def on_groups_window(self, review_parts=()) -> None:
+        """The Groups window (ledger_groups_dialog) for the parent CSV shown;
+        ``review_parts``: the open review's parts, the CSV may not have yet."""
+        review_parts = review_parts if isinstance(review_parts, (list, tuple)) else ()
+        csv = self.csv.text().strip()
+        if not csv or not Path(csv).is_file():
+            self.status.setText("No parent CSV yet: create it first (step 1).")
+            return
+        if not review_parts and self.review.text().strip():
+            try:
+                from council_core import ledger_review
+                review_parts = ledger_review.parts(ledger_review.load(self.review.text()))
+            except Exception:                             # noqa: BLE001
+                review_parts = ()
+        from .ledger_groups_dialog import GroupsDialog
+        try:
+            dlg = GroupsDialog(csv, parent=self, review_parts=review_parts, log=self._say,
+                               on_write=self.on_write_workbooks,
+                               template=self.template.text().strip())
+        except LedgerError as e:
+            self.status.setText(f"Groups: {e}")
+            return
+        self.groups_dialog = dlg
+        dlg.show()
+
+    def on_write_workbooks(self) -> None:
+        csv = self.csv.text().strip()
+
+        def done(books) -> None:
+            self._said_workbooks(books)
+            if isinstance(books, list):
+                self.status.setText(f"{len(books)} workbook(s) written." if books else
+                                    "No workbook written: the parent CSV has no parts yet.")
+        self._run("Writing the workbooks", lambda p: self._workbooks(csv, p), done)
+
+    def on_runs_window(self) -> None:
+        """This Ledger's runs (ledger_runs_dialog): rename one, open its
+        filled template or its review."""
+        if self._saved is None:
+            return
+        from .ledger_runs_dialog import LedgerRunsDialog
+        dlg = LedgerRunsDialog(self._saved.csv, parent=self, open_filled=self.open_run_filled,
+                               opener=self.actions.open, on_renamed=self.refresh_saved)
+        self.runs_dialog = dlg
+        dlg.show()
+
+    def open_run_filled(self, review: str) -> None:
+        """A past run's filled template window."""
+        if not Path(review).is_file():
+            self.status.setText(f"That run's review is not there any more: {review}")
+            return
+        self.review.setText(review)
+        self.on_filled_window()
 
     def on_diagnose(self) -> None:
         sources = self.source_paths()
@@ -1307,6 +1923,106 @@ class LedgerTab(ViewHelpers, QWidget):
             dlg.show()
         self._run("Reading the review", lambda _p: ledger_review.load(path), done)
 
+    def on_filled_window(self, part: str = "") -> None:
+        """The filled template window (ledger_review_dialog.FilledTemplateDialog)
+        over the review workbook above, on ``part`` when it has one."""
+        path = self.review.text().strip()
+        if not path or not Path(path).is_file():
+            self.status.setText("No review workbook yet: run Extract first.")
+            return
+        from council_core import ledger_review
+
+        def done(review) -> None:
+            from .ledger_review_dialog import FilledTemplateDialog
+            if review.kind != "samples":
+                self.status.setText("The filled template is for a sample Ledger; use "
+                                    "Review by clicking for a table Ledger.")
+                return
+            dlg = FilledTemplateDialog(review, parent=self, log=self._say,
+                                       opener=self.actions.open,
+                                       on_saved=lambda n: self.status.setText(
+                                           f"{n} answer(s) saved into the review. Apply puts "
+                                           "the accepted values into the parent CSV."),
+                                       on_rerun=self.on_rerun_with_answers, part=part,
+                                       on_groups=lambda: self.on_groups_window(
+                                           [i.part for i in review.items if i.part]))
+            self.filled_dialog = dlg
+            self._say(f"── Filled template ({Path(path).name}): "
+                      f"{len(ledger_review.parts(review))} part(s)")
+            dlg.show()
+        self._run("Reading the review", lambda _p: ledger_review.load(path), done)
+
+    def on_rerun_from_tab(self) -> bool:
+        """Step 3's "Re-run with my answers": the review workbook above, with
+        the answers saved into it, re-run as from the filled template window
+        but without opening it."""
+        path = self.review.text().strip()
+        if not path or not Path(path).is_file():
+            self.status.setText("No review workbook yet: run Extract first.")
+            return False
+        return self.on_rerun_with_answers(path, reopen=False)
+
+    def on_rerun_with_answers(self, review: str, part: str = "",
+                              reopen: bool = True) -> bool:
+        """The filled template window's "Re-run with my answers" (its answers
+        already saved): Apply, then Extract again on the review's sources
+        (LedgerActions.rerun), then the window again on the new review, at
+        the same part (``reopen``). The values said Right are in the parent
+        CSV by then, so the run learns from them; a new review is written,
+        the old one kept. False when it did not start."""
+        if self.busy:
+            self.status.setText("Not re-run: wait for the current step to finish.")
+            return False
+        fill = self.fill_dir.text().strip()
+        images = self.use_images.isChecked()
+        vision = self._selected_vision_model()
+        more = {"vision_model": vision} if images and vision else {}
+        if self.ask_model.isChecked():
+            model_id = self._pick_model(self)
+            if not model_id:
+                self.status.setText("Not re-run: no model picked. Untick \"Ask Council's "
+                                    "model about the rest\" to run without one.")
+                return False
+            more["assist"] = model_id
+        from source_extract import parse_prefer
+        prefer = parse_prefer(self.prefer_operator.text())
+        if prefer:                         # typed here: these, else the review's
+            more["prefer"] = prefer
+        tab_csv = self.csv.text().strip()
+        record = self._recorder(tab_csv, "rerun", model_id=more.get("assist", ""))
+
+        def step(p):
+            applied, extracted, carried = self.actions.rerun(review, fill, images, p,
+                                                             cancel=self._cancel, **more)
+            csv = getattr(self.actions, "applied_csv", lambda _r: None)(review) or tab_csv
+            saved = record(extracted, csv=csv)
+            return applied, extracted, carried, csv, saved
+
+        def done(result) -> None:
+            applied, extracted, carried, csv, saved = result
+            self._said_saved(saved)
+            self._say(applied.describe())
+            self._register(csv, again=True)
+            self._kg_dirty = True
+            if extracted is None:
+                self.stat["problems"].setText(str(len(applied.problems)))
+                self.status.setText(f"{applied.accepted} values accepted into the parent "
+                                    "CSV; cancelled before Extract ran again.")
+                return
+            self._show_extract(extracted)
+            if not getattr(extracted, "cancelled", False):
+                line = (f"Re-run with your answers: {applied.accepted} values accepted into "
+                        f"the parent CSV; the new review pre-accepts {extracted.pre_accepted} "
+                        f"of {extracted.values} values, {extracted.to_review} held back"
+                        + (f" ({carried} of them already answered by you)" if carried
+                           else "") + ".")
+                self._say(line)
+                if reopen:
+                    self.on_filled_window(part)
+                self.status.setText(line)
+        self._run("Re-running with your answers", step, done, cancellable=True)
+        return True
+
     def on_open_review(self) -> None:
         path = self.review.text().strip()
         try:
@@ -1327,10 +2043,11 @@ class LedgerTab(ViewHelpers, QWidget):
             # the CSV the review was applied to (its _run sheet), else the
             # one this tab shows
             applied = getattr(self.actions, "applied_csv", lambda _r: None)(review)
-            return s, applied or tab_csv
+            return s, applied or tab_csv, self._workbooks(applied or tab_csv, p)
 
         def done(result) -> None:
-            s, applied = result
+            s, applied, books = result
+            self._said_workbooks(books)
             self.stat["problems"].setText(str(len(s.problems)))
             self.status.setText(
                 f"{s.accepted} values accepted → {s.rows} rows: {s.csv_result}. "

@@ -29,7 +29,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError
 
@@ -37,7 +37,7 @@ Cell = Tuple[int, int]
 
 #: The sample review's Values columns (source_extract.VAL_HEAD), 1-based.
 V_ACCEPT, V_PART, V_ITEM, V_FIELD, V_VALUE, V_SCORE, V_VIA, V_LABEL, V_SOURCE, \
-    V_OTHERS, V_NOTE, V_PART_FROM, V_INSPECTOR = range(1, 14)
+    V_OTHERS, V_NOTE, V_PART_FROM, V_INSPECTOR, V_HELD = range(1, 15)
 
 #: The table review's leading columns (ledger_records.write_review).
 R_META = ["Accept", "Source", "Sheet", "Table", "Row"]
@@ -66,6 +66,15 @@ class Item:
     item: str = ""                # a sample item's flaw / item ("1A"), "" part-level
     #: a table record's: field -> its value
     values: Dict[str, Any] = field(default_factory=dict)
+    part: str = ""                # a sample item's part number
+    score: float = 0.0            # how sure the match is (the review's Score)
+    label: str = ""               # the label it was read under (a sample item)
+    #: the other cells the same value was found at ('also at …' in its note)
+    also: List[str] = field(default_factory=list)
+    #: why it was not pre-accepted ('part taken from the file name; …'), as
+    #: the review says (source_extract.review_reasons); '' in an older review
+    held: str = ""
+    part_from: str = ""           # how its part was found (the review's Part from)
 
 
 @dataclass
@@ -170,7 +179,7 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
     out: List[Item] = []
     rows = list(wb["Values"].iter_rows(min_row=2, values_only=True))
     for i, row in enumerate(rows, start=2):
-        row = list(row) + [None] * (13 - len(row))
+        row = list(row) + [None] * (14 - len(row))
         where = _text(row[V_SOURCE - 1])
         if not where:
             continue
@@ -193,17 +202,32 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
         part_from = _text(row[V_PART_FROM - 1])
         if part_from:
             lines.append(f"part from: {part_from}")
+        held = _text(row[V_HELD - 1])
+        if held and acc not in ("Y", "N"):
+            lines.append(f"held back because: {held}")
         if cell is None and "image" in where:
             lines.append("from a picture: the cell cannot be shown")
         out.append(Item(
-            sheet="Values", row=i, accept=acc, needs=acc != "Y" or clash, clash=clash,
+            # 'N': set aside for another reading of the same workbook (decide)
+            sheet="Values", row=i, accept=acc, needs=acc not in ("Y", "N") or clash,
+            clash=clash,
             title=" · ".join(x for x in (value, fname, " ".join(y for y in (part, item) if y))
                              if x) or where,
             detail="\n".join(x for x in lines if x),
             source_file=_find(sources, file), source_sheet=sheet,
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
-            value=value, value_col=V_VALUE, where=where, item=item))
+            value=value, value_col=V_VALUE, where=where, item=item, part=part,
+            score=_score(row[V_SCORE - 1]), label=label,
+            also=[p[8:] for p in note.split("; ") if p.startswith("also at ")],
+            held=held, part_from=part_from))
     return out
+
+
+def _score(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _records_items(wb, sources: Sequence[str]) -> List[Item]:
@@ -248,6 +272,26 @@ def _records_items(wb, sources: Sequence[str]) -> List[Item]:
     return out
 
 
+def teach_label(csv_path, label: str, fname: str) -> bool:
+    """'Always map this label here': the label's mapping to ``fname`` saved
+    with the Ledger's label mappings (source_extract.save_aliases), so the
+    next Extract places it there by itself. False when there is no label."""
+    from source_extract import load_aliases, normalize_label, save_aliases
+    key = normalize_label(label or "")
+    if not key or not fname:
+        return False
+    mapping, ignore = load_aliases(csv_path)
+    mapping[key] = fname
+    save_aliases(csv_path, mapping, [i for i in ignore if i != key])
+    return True
+
+
+def cell_fields(exact: Dict[Tuple[str, str], Tuple[str, Cell]]
+                ) -> Dict[Tuple[str, Cell], Tuple[str, str]]:
+    """template_cells turned round: (sheet, cell) -> (field, item)."""
+    return {at: key for key, at in exact.items()}
+
+
 def template_cells(csv_path) -> Dict[Tuple[str, str], Tuple[str, Cell]]:
     """A sample Ledger's template: (field, item) -> (sheet, cell) of the one
     cell that value goes in (item "" for a part-level field); {} for a table
@@ -281,9 +325,12 @@ def record_row_cells(view, item: Item) -> List[Cell]:
 
 def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
     """Write the answers into the review workbook: {(sheet, row):
-    {'accept': 'Y'|'N'|'', 'value': str, 'value_col': int}}. Every other
-    cell, fill, list and hidden sheet stays. Atomic: a temporary file, then
-    a replace. Returns how many rows changed."""
+    {'accept': 'Y'|'N'|'', 'value': str, 'value_col': int, 'field': str,
+    'item': str}} - 'field' and 'item' put a value of the Values sheet in
+    another template cell (a right-click on it: Apply takes a row's Field
+    and Item as typed). Every other cell, fill, list and hidden sheet stays.
+    Atomic: a temporary file, then a replace. Returns how many rows
+    changed."""
     import openpyxl
     path = Path(path)
     if not answers:
@@ -302,6 +349,9 @@ def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
                 ws.cell(row=row, column=1).value = a["accept"] or None
             if a.get("value_col") and "value" in a:
                 ws.cell(row=row, column=int(a["value_col"])).value = a["value"]
+            if sheet == "Values" and "field" in a:
+                ws.cell(row=row, column=V_FIELD).value = a["field"]
+                ws.cell(row=row, column=V_ITEM).value = a.get("item") or None
             changed += 1
         tmp = path.with_name(path.stem + ".saving.xlsx")
         try:
@@ -320,3 +370,350 @@ def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
         raise LedgerError(f"{path.name} is open in another program (Excel?): close it "
                           "and save again") from e
     return changed
+
+
+# ── the filled template (user, 2026-10-23: "have the ledger output the
+# template filled out with the values entered into it highlighted by their
+# confidence values ... click on cells and see their source") ─────────────
+#: a match at least this sure is high confidence (source_extract.ACCEPT_AT)
+CONF_HIGH = 0.85
+#: under this, low
+CONF_LOW = 0.6
+TINT_HIGH, TINT_MID, TINT_LOW, TINT_CLASH = "#C6EFCE", "#FFEB9C", "#F8CBAD", "#FF7C80"
+#: a value the parent CSV holds and this run did not read (an update)
+TINT_LEDGER = "#DDEBF7"
+#: what each tint means, for a legend
+LEGEND = [(TINT_HIGH, "sure: accepted, nothing to check"),
+          (TINT_MID, "to check: a good match held back for a reason, or fairly sure"),
+          (TINT_LOW, f"unsure (score under {CONF_LOW:g})"),
+          (TINT_CLASH, "sources disagree"),
+          (TINT_LEDGER, "already in the Ledger")]
+
+
+#: at most this many disagreeing readings are shown side by side
+RIVALS_SHOWN = 6
+
+
+def rivals(items: Sequence[Item], it: Item, limit: int = RIVALS_SHOWN) -> List[Item]:
+    """The readings that disagree on ``it``'s template cell, ``it`` among
+    them, in review order: the values of the same part, item and field read
+    elsewhere with another value (user, 2026-10-26: "two or more files with
+    conflicting data ... I want to see all of those files side by side").
+    Only ``it`` when nothing disagrees, for a value with no part, or a
+    table record. At most ``limit`` (0: all), ``it`` always one of them."""
+    if it.sheet != "Values" or not it.part or not it.fields:
+        return [it]
+    out, seen = [], set()
+    for o in items:
+        if o.sheet != "Values" or o.part != it.part or o.item != it.item \
+                or o.fields != it.fields:
+            continue
+        key = " ".join(o.value.split()).casefold()
+        if o is not it and key in seen:
+            continue
+        seen.add(key)
+        out.append(o)
+    if len(out) < 2:
+        return [it]
+    if limit and it in out[limit:]:
+        out = out[:limit - 1] + [it]
+    return out[:limit] if limit else out
+
+
+def confidence_tint(item: Item, accept: Optional[str] = None) -> str:
+    """By the whole decision, not the label's score alone (user, 2026-10-27:
+    "The sure values in the review should not require a review"): green
+    only for a value accepted - pre-accepted, or said Right - so sure never
+    means "check it". A good match held back (its part from the file name,
+    a text document, a sheet unlike the template) is yellow, its reason in
+    the review. ``accept``: the item's Accept as the window has it."""
+    acc = item.accept if accept is None else accept
+    if item.clash:
+        return TINT_CLASH                    # sources disagree: always a look
+    if acc == "Y":
+        return TINT_HIGH
+    return TINT_MID if item.score >= CONF_LOW else TINT_LOW
+
+
+def same_file_part(items: Sequence[Item], it: Item, accept_of=None) -> List[Item]:
+    """The values to accept when the user says ``it``'s part is right for
+    its file: the sure values (score >= CONF_HIGH, no clash, not answered)
+    of the same file and part, found the same way, whose only doubt was the
+    part (source_extract.PART_REASONS). ``it`` among them; [] when its own
+    doubt is not only the part (user, 2026-10-27: one answer per file where
+    the doubt is per file)."""
+    from source_extract import PART_REASONS
+    acc = accept_of or (lambda o: o.accept)
+
+    def part_only(o: Item) -> bool:
+        why = [w.strip() for w in o.held.split(";") if w.strip()]
+        return bool(why) and all(w in PART_REASONS for w in why)
+    if it.sheet != "Values" or not it.part or not part_only(it):
+        return []
+    file = it.where.split(" › ", 1)[0]
+    return [o for o in items
+            if o.sheet == "Values" and o.where.split(" › ", 1)[0] == file
+            and o.part == it.part and o.part_from == it.part_from and part_only(o)
+            and not o.clash and o.score >= CONF_HIGH and acc(o) not in ("Y", "N")]
+
+
+def parts(review: Review) -> List[str]:
+    """The parts a sample review has values for, in their review order."""
+    return list(dict.fromkeys(i.part for i in review.items if i.part))
+
+
+def cell_candidates(items: Sequence[Item], exact: Dict[Tuple[str, str], Tuple[str, Cell]],
+                    part: str, accept_of=None) -> Dict[Tuple[str, Cell], List[Item]]:
+    """One part's values by the template cell each goes in: (sheet, cell) ->
+    the items offered for it, the one shown first - an accepted one, then
+    the surest. A value said to be wrong ('N') is left out. ``accept_of``:
+    an item's Accept as the window has it (answers not saved yet)."""
+    acc = accept_of or (lambda it: it.accept)
+    out: Dict[Tuple[str, Cell], List[Item]] = {}
+    for it in items:
+        if it.part != part or not it.fields or acc(it) == "N":
+            continue
+        at = exact.get((it.fields[0], it.item)) or exact.get((it.fields[0], ""))
+        if at is not None:
+            out.setdefault(at, []).append(it)
+    for cands in out.values():
+        cands.sort(key=lambda it: (acc(it) != "Y", -it.score))
+    return out
+
+
+def ledger_reader(csv_path) -> Optional[Callable[[str, str, str], str]]:
+    """What the parent CSV holds (source_extract.ledger_values), None when
+    it cannot be read."""
+    from sample_ledger import ParentCSV
+    from source_extract import ledger_values
+    try:
+        return ledger_values(ParentCSV(csv_path))
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def ledger_cells(held: Optional[Callable[[str, str, str], str]], part: str,
+                 exact: Dict[Tuple[str, str], Tuple[str, Cell]]
+                 ) -> Dict[Tuple[str, Cell], Tuple[str, str]]:
+    """``part``'s values the Ledger holds already, by the template cell each
+    goes in: (sheet, cell) -> (field, value) - so the filled template shows
+    the whole Ledger, not only what a run read (user, 2026-10-23)."""
+    out: Dict[Tuple[str, Cell], Tuple[str, str]] = {}
+    if held is None or not part:
+        return out
+    for (fname, item), at in exact.items():
+        v = held(part, item, fname)
+        if v:
+            out[at] = (fname, v)
+    return out
+
+
+def differs(value: str, held: str) -> bool:
+    """A value other than the one the Ledger holds ('12' is '12.0')."""
+    from source_extract import _value_key
+    return bool(held) and _value_key(value) != _value_key(held)
+
+
+def _cell_value(text: str) -> Any:
+    """A number written as one, so the filled template computes."""
+    try:
+        f = float(text)
+    except (TypeError, ValueError):
+        return text
+    return int(f) if f.is_integer() and "." not in text else f
+
+
+def write_filled(review: Review, part: str, out_path,
+                 exact: Optional[Dict[Tuple[str, str], Tuple[str, Cell]]] = None,
+                 held: Optional[Callable[[str, str, str], str]] = None) -> str:
+    """A copy of the template with ``part``'s values in their cells, each
+    tinted by its confidence (confidence_tint) with a note of where it was
+    read and how sure the match is; the values the Ledger holds already
+    (``held``, read from the parent CSV when not given) fill the other
+    cells, tinted TINT_LEDGER, and a value read now that differs from the
+    Ledger's is red. The template itself is never written. Atomic. Returns
+    the path."""
+    import shutil
+
+    import openpyxl
+    from sample_ledger import TemplateSchema, schema_path_for
+    schema = TemplateSchema.load(schema_path_for(review.csv))
+    template = Path(schema.template_path)
+    out = Path(out_path)
+    if out.resolve() == template.resolve():
+        raise LedgerError("refusing to write over the template itself")
+    exact = exact if exact is not None else template_cells(review.csv)
+    held = held if held is not None else ledger_reader(review.csv)
+    known = ledger_cells(held, part, exact)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.stem + ".writing" + out.suffix)
+    shutil.copyfile(template, tmp)
+    wb = openpyxl.load_workbook(tmp)
+    try:
+        _fill_part(lambda sheet: wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0],
+                   review, part, exact, known)
+        wb.save(tmp)
+    finally:
+        wb.close()
+    os.replace(tmp, out)
+    return str(out)
+
+
+def _fill_part(sheet_of: Callable[[str], Any], review: Review, part: str,
+               exact: Dict[Tuple[str, str], Tuple[str, Cell]],
+               known: Dict[Tuple[str, Cell], Tuple[str, str]]) -> None:
+    """``part``'s values written into the template's sheets (``sheet_of``:
+    a template sheet's name -> the worksheet to write), tinted, each with a
+    note of where it was read (write_filled)."""
+    from openpyxl.comments import Comment
+    from openpyxl.styles import PatternFill
+    for (sheet, (r, c)), (fname, value) in known.items():
+        cell = sheet_of(sheet).cell(row=r, column=c)
+        cell.value = _cell_value(value)
+        tint = TINT_LEDGER[1:]
+        cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+        cell.comment = Comment(f"{fname}: {value}\nalready in the Ledger", "Council")
+    for (sheet, (r, c)), cands in cell_candidates(review.items, exact, part).items():
+        it = cands[0]
+        cell = sheet_of(sheet).cell(row=r, column=c)
+        cell.value = _cell_value(it.value)
+        was = (known.get((sheet, (r, c))) or ("", ""))[1]
+        tint = (TINT_CLASH if differs(it.value, was) else confidence_tint(it))[1:]
+        cell.fill = PatternFill("solid", start_color=tint, end_color=tint)
+        others = [o.value for o in cands[1:] if o.value != it.value]
+        cell.comment = Comment(
+            f"{it.fields[0]}: {it.value}\nfrom {it.where}\nscore {it.score:g}"
+            + (" (accepted)" if it.accept == "Y" else "")
+            + (f"\nthe Ledger has {was}" if differs(it.value, was) else "")
+            + (f"\nalso offered: {', '.join(others[:5])}" if others else ""), "Council")
+
+
+def full_filled_path(review_path) -> Path:
+    """The whole review's filled workbook: beside it, '<review>_filled.xlsx'."""
+    p = Path(review_path)
+    return p.with_name(p.stem + "_filled.xlsx")
+
+
+def write_full_filled(review: Review, progress=None, active: str = "") -> Optional[str]:
+    """One workbook of the whole review (user, 2026-10-26: "unable to export
+    the full filled out workbook after the extraction has been run. I can
+    just see the review"): the template filled in once per part, a sheet
+    each in numerical order (as Apply's full workbook, ledger_groups), each
+    value tinted by confidence with a note of where it was read
+    (write_filled). Rewritten with the answers saved so far; never over a
+    file the Ledger did not write; atomic. It opens at ``active``'s sheet.
+    None for a table review, or one with no parts or no template cells."""
+    import openpyxl
+    from council_core.ledger_groups import _title
+    from sample_ledger import (FILLED_MARK, TemplateSchema, is_filled_template, mark_filled,
+                               sample_sort_key, schema_path_for)
+    if review.kind != "samples" or not review.csv:
+        return None
+    exact = template_cells(review.csv)
+    names = sorted(parts(review), key=sample_sort_key)
+    if not exact or not names:
+        return None
+    out = full_filled_path(review.path)
+    if out.exists() and not is_filled_template(out):
+        raise LedgerError(f"{out.name} is there already and the Ledger did not write it: "
+                          "move it to write the filled workbook")
+    template = Path(TemplateSchema.load(schema_path_for(review.csv)).template_path)
+    if out.resolve() == template.resolve():
+        raise LedgerError("refusing to write over the template itself")
+    held = ledger_reader(review.csv)
+    wb = openpyxl.load_workbook(template)
+    tmp = out.with_name(out.stem + ".writing" + out.suffix)
+    try:
+        originals = list(wb.worksheets)
+        several = len(originals) > 1
+        used: set = set()
+        opening = None
+        for n, part in enumerate(names, 1):
+            if progress is not None:
+                progress(f"filling the workbook: {part} ({n}/{len(names)})")
+            sheets = {}
+            for ws in originals:
+                copy = wb.copy_worksheet(ws)
+                copy.title = _title(part, ws.title, several, used)
+                sheets[ws.title] = copy
+            first = sheets[originals[0].title]
+            _fill_part(lambda sheet: sheets.get(sheet, first), review, part, exact,
+                       ledger_cells(held, part, exact))
+            if part == active:
+                opening = first
+        for ws in originals:
+            wb.remove(ws)
+        wb.active = wb.worksheets.index(opening) if opening is not None else 0
+        for ws in wb.worksheets:
+            ws.sheet_view.tabSelected = ws is wb.active
+        mark_filled(wb)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(tmp)
+    finally:
+        wb.close()
+    os.replace(tmp, out)
+    return str(out)
+
+
+def filled_dir(review_path) -> Path:
+    """Where a review's filled templates go: beside it, '<review>_filled'."""
+    p = Path(review_path)
+    return p.with_name(p.stem + "_filled")
+
+
+def _safe_name(part: str) -> str:
+    return re.sub(r"[^\w\-. ]+", "_", part).strip() or "part"
+
+
+def _answer_key(it: Item) -> Tuple[str, str, Tuple[str, ...], str]:
+    return it.part, it.item, tuple(it.fields), it.where
+
+
+def carry_answers(old: Review, new: Review) -> int:
+    """The answers of an earlier review copied into a new one of the same
+    sources (the Ledger tab's Re-run with my answers): a value read at the
+    same source cell, for the same part, item and field, gets the earlier
+    Y or N - and a corrected value - where the new review left it to decide
+    or had pre-accepted what was said Wrong. Saved into the new review
+    (save); returns how many rows changed. Sample reviews only."""
+    if old.kind != "samples" or new.kind != "samples":
+        return 0
+    said = {_answer_key(it): it for it in old.items
+            if it.sheet == "Values" and it.accept in ("Y", "N")}
+    answers: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for it in new.items:
+        was = said.get(_answer_key(it)) if it.sheet == "Values" else None
+        if was is None:
+            continue
+        if not (it.accept not in ("Y", "N") or it.clash
+                or (was.accept == "N" and it.accept == "Y")):
+            continue
+        a: Dict[str, Any] = {"accept": was.accept}
+        if was.value != it.value and it.value_col:
+            a.update(value=was.value, value_col=it.value_col)
+        if a["accept"] != it.accept or "value" in a:
+            answers[(it.sheet, it.row)] = a
+    return save(new.path, answers)
+
+
+def write_all_filled(review: Review, progress=None) -> List[str]:
+    """One filled template per part (write_filled), in filled_dir. A part
+    that cannot be written is skipped."""
+    if review.kind != "samples" or not review.csv:
+        return []
+    exact = template_cells(review.csv)
+    if not exact:
+        return []
+    out = []
+    folder = filled_dir(review.path)
+    names = parts(review)
+    held = ledger_reader(review.csv)
+    for n, part in enumerate(names, 1):
+        if progress is not None:
+            progress(f"filling the template for {part} ({n}/{len(names)})")
+        try:
+            out.append(write_filled(review, part, folder / f"{_safe_name(part)}.xlsx", exact,
+                                    held))
+        except Exception:                                   # noqa: BLE001
+            continue
+    return out

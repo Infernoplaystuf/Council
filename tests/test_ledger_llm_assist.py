@@ -69,7 +69,7 @@ def test_the_model_finds_the_part_and_places_the_label(tmp_path, ledger):
     freq = _field(schema, "Frequency")
     model = FakeModel(mapping={"Zorp rate": freq})
     s = li._extract(str(csv), [str(src)], None, "", False, None,
-                    _NoProg(), "@@@#@@###", None, None, True, model)
+                    _NoProg(), "=@@@#@@###", None, None, True, model)
     # the pattern went in as an example, with a made-up instance of it
     part_prompt = next(p for p in model.prompts if "Which part" in p)
     assert "'@@@#@@###'" in part_prompt and "ABC1DE234" in part_prompt
@@ -1157,7 +1157,7 @@ def test_a_timeout_stops_the_model_at_once(tmp_path, ledger, monkeypatch):
         raise ce.LocalChatTimeout(_NO_START)
     monkeypatch.setattr(ce, "local_chat", times_out)
     s = li._extract(str(csv), [str(b) for b in books], None, "", False, None, _NoProg(),
-                    "@@@#@@###", None, None, "ollama:granite3.3:8b")
+                    "=@@@#@@###", None, None, "ollama:granite3.3:8b")
     # one wait, not one per workbook - and the labels were not asked either
     assert len(calls) == 1 and "File name: untitled_0.xlsx" in calls[0]
     stopped = [p for p in s.problems if "ran out of time" in p]

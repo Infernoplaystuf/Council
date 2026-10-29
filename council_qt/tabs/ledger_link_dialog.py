@@ -50,6 +50,10 @@ class SheetModel(QAbstractTableModel):
         super().__init__(parent)
         self.sheet = sheet
         self.tints: Dict[Tuple[int, int], str] = {}
+        #: text shown in place of the sheet's own, and its tooltip (the
+        #: filled template: ledger_review_dialog.FilledTemplateDialog)
+        self.texts: Dict[Tuple[int, int], str] = {}
+        self.tips: Dict[Tuple[int, int], str] = {}
 
     def rowCount(self, parent=QModelIndex()) -> int:                # noqa: N802
         return 0 if parent.isValid() else self.sheet.rows
@@ -62,6 +66,8 @@ class SheetModel(QAbstractTableModel):
             return None
         rc = (index.row() + 1, index.column() + 1)
         if role == Qt.DisplayRole:
+            if rc in self.texts:
+                return self.texts[rc]
             v = self.sheet.cells.get(rc)
             return None if v is None else str(v)
         if role == Qt.BackgroundRole:
@@ -70,6 +76,8 @@ class SheetModel(QAbstractTableModel):
         if role == Qt.ForegroundRole and rc in self.tints:
             return QBrush(QColor("#000000"))                # readable on the tint, any theme
         if role == Qt.ToolTipRole:
+            if rc in self.tips:
+                return self.tips[rc]
             f = self.sheet.fields.get(rc)
             return f if f and not f.startswith("T") else None
         return None
@@ -79,9 +87,15 @@ class SheetModel(QAbstractTableModel):
             return None
         return _letters(section + 1) if orientation == Qt.Horizontal else str(section + 1)
 
-    def set_tints(self, tints: Dict[Tuple[int, int], str]) -> None:
+    def set_tints(self, tints: Dict[Tuple[int, int], str],
+                  texts: Optional[Dict[Tuple[int, int], str]] = None,
+                  tips: Optional[Dict[Tuple[int, int], str]] = None) -> None:
         self.beginResetModel()
         self.tints = tints
+        if texts is not None:
+            self.texts = texts
+        if tips is not None:
+            self.tips = tips
         self.endResetModel()
 
 

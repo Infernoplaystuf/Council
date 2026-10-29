@@ -580,6 +580,11 @@ def build_open_prompt(text: str, known: Sequence[Known], focus: str = ""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+#: (relationship, the other end's type) a model gives a person that SIGNATURES
+#: refuses, and the one that says it: 'Quinn Patel owns Project Nightjar',
+#: 'Jordan Blake to finish EC on part 2041' (works on).
+_PERSON_REWORDED = {("OWNS", "PROJECT"): "LEADS", ("WORKS_ON", "PART"): "OWNS"}
+
 #: Words that name nothing in particular: a model lists them as entities.
 _GENERIC = {"he", "she", "they", "it", "we", "i", "you", "them", "him", "her", "us",
             "team", "the team", "company", "the company", "project", "the project",
@@ -637,7 +642,11 @@ def check_open(raw: Dict[str, Any], text: str, known: Sequence[Known]
         name = " ".join(str(e.get("name") or "").split()).strip(" .,;:\"'")
         etype = canonical_type(e.get("type"))
         f = kgm.fold(name)
-        if len(f) < 2 or f in _GENERIC or (f.replace(" ", "").isdigit() and len(f) < 5):
+        # a short number is a count or a value - unless the model says it is
+        # a part, or the graph knows it as one ('part 2041')
+        if len(f) < 2 or f in _GENERIC or (
+                f.replace(" ", "").isdigit() and len(f) < 5 and etype != "PART"
+                and getattr(resolve(name, idx), "type", "") != "PART"):
             rejected.append(Rejected(e, "not a particular thing"))
             continue
         if len(name) > 80:
@@ -724,6 +733,13 @@ def check_open(raw: Dict[str, Any], text: str, known: Sequence[Known]
             rejected.append(Rejected(r, "links an entity to itself"))
             continue
         fixed = ""
+        other = o.type if s.type == "PERSON" else s.type if o.type == "PERSON" else ""
+        if (pred, other) in _PERSON_REWORDED:
+            # a person who owns a project leads it; one who works on a part is
+            # responsible for it (MEANINGS)
+            pred, fixed = (_PERSON_REWORDED[(pred, other)],
+                           f"read as {_PERSON_REWORDED[(pred, other)]} (a person "
+                           f"{pred.lower().replace('_', ' ')} a {other.lower()})")
         if pred in SIGNATURES and s.type in CORE_TYPES and o.type in CORE_TYPES:
             st, ot = SIGNATURES[pred]
             if not (s.type in st and o.type in ot):

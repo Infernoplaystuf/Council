@@ -177,3 +177,373 @@ def test_the_window_shows_a_records_row(qapp, records_review):
     assert m.tints == {(5, c): ROW_TINT for c in range(1, 7)}
     assert dlg.value_edit.isHidden()
     dlg.close()
+
+
+# ── why values are to review (user, 2026-10-23: 7312 of 7976 to review) ──
+def test_the_run_says_why_values_are_to_review(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    make_nde_book(src / "NDE results.xlsx")
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    ex = li.run_extract(csv, [src], use_images=False)
+    assert ex.to_review == 9
+    assert ex.review_reasons.splitlines()[:2] == [
+        "Why 9 values are to review (the first reason each was held back):",
+        "       9  label only a loose match for the field"]
+    assert "Fields with the most to review: " in ex.review_reasons
+    assert ex.review_reasons in ex.describe()
+    assert "285" not in ex.review_reasons                  # counts and names, no values
+
+
+def test_each_hold_back_has_its_reason(tmp_path):
+    from dataclasses import replace
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    base = se.Obs(part="P1", item="", field="Power (W)", value="285", score=0.95,
+                  via="match", label="Laser Power (W)", where="a.xlsx › S!C5")
+    cases = {
+        "different workbooks disagree on the value": se.Decision(base, False, "290"),
+        "no part number found": se.Decision(replace(base, part=""), False),
+        "read from a picture": se.Decision(replace(base, from_image=True), False),
+        "part taken from the file name": se.Decision(
+            replace(base, part_how=se.FILE_PART_HOW + " a.xlsx"), False),
+        "label placed by the model": se.Decision(replace(base, via="model"), False),
+        "label only a loose match for the field": se.Decision(replace(base, score=0.6), False),
+        "": se.Decision(base, True),
+    }
+    for why, d in cases.items():
+        assert se.review_reason(d, schema) == why
+    text = se.summarize_review_reasons(list(cases.values()), schema)
+    assert text.startswith("Why 6 values are to review") and "Power (W) (6)" in text
+
+
+def test_one_workbooks_readings_are_one_first_and_the_rest_set_aside(tmp_path):
+    """user, 2026-10-23: 'multiple readings per sample in the source while
+    in the template it only accepts one reading ... prioritize the first'.
+    Two workbooks that disagree are still the reviewer's; '12' and '12.0'
+    are one reading."""
+    import source_extract as se
+    schema = li.read_template(make_template(tmp_path / "T.xlsx"))
+    def obs(value, where, inspector=""):
+        return se.Obs(part="P1", item="", field="Power (W)", value=value, score=0.95,
+                      via="match", label="Laser Power (W)", where=where,
+                      inspector=inspector)
+    run = se.Extraction(sources=[])
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "a.xlsx › S!C9", "AK")]
+    first, second = sorted((d for d in se.decide(run, schema) if d.obs.field == "Power (W)"),
+                           key=lambda d: d.obs.value)
+    assert first.accept and not first.conflict and "the first reading" in first.obs.note
+    assert not second.accept and second.alternate.startswith("set aside")
+    text = se.summarize_review_reasons([first, second], schema)
+    assert text.startswith("1 other readings set aside") and "AK (1)" in text
+    assert se.review_reason(second, schema) == ""
+    ak = {d.obs.value: d for d in se.decide(run, schema, prefer=se.parse_prefer("jb, ak"))
+          if d.obs.field == "Power (W)"}
+    assert ak["290"].accept and ak["285"].alternate
+    run.obs = [obs("285", "a.xlsx › S!C5"), obs("290", "b.xlsx › S!C5")]
+    assert all(d.conflict and not d.accept for d in se.decide(run, schema))
+    run.obs = [obs("12", "a.xlsx › S!C5"), obs("12.0", "b.xlsx › S!C5")]
+    (one,) = se.decide(run, schema)
+    assert one.accept and not one.conflict
+
+
+def test_an_operator_is_their_initials_or_their_name():
+    """user, 2026-10-23: 'For operator sometimes its initials sometimes its
+    a name'."""
+    import source_extract as se
+    assert se.parse_prefer("JB, Alex King; mk") == ["JB", "Alex King", "mk"]
+    for a, b in (("JB", "Jane Brown"), ("Jane Brown", "J.B."), ("jb", "JB"),
+                 ("Brown", "Jane Brown"), ("jane brown", "Jane Brown"),
+                 ("Mary-Jo Smith", "MJS")):
+        assert se.same_person(a, b) and se.same_person(b, a), (a, b)
+    for a, b in (("JB", "Alex King"), ("JB", "AK"), ("Jane Brown", "John Brownlee"), ("", "JB")):
+        assert not se.same_person(a, b), (a, b)
+    assert se._prefer_rank("Jane Brown", ["AK", "JB"]) == 1
+    assert se._prefer_rank("AK/JB", ["Jane Brown"]) == 0
+    assert se._prefer_rank("MK", ["Jane Brown"]) is None
+
+
+# ── the filled template (user, 2026-10-23) ──────────────────────────────
+def test_extract_writes_the_template_filled_in_and_tinted_by_confidence(sample_review):
+    import openpyxl
+    review, csv, src = sample_review
+    folder = lv.filled_dir(review)
+    assert sorted(p.name for p in folder.iterdir()) == ["101.xlsx"]
+    ws = openpyxl.load_workbook(folder / "101.xlsx").active
+    exact = lv.template_cells(csv)
+    sheet, (r, c) = exact[("Power (W)", "")]
+    cell = ws.cell(r, c)
+    assert cell.value == 285 and cell.fill.start_color.rgb.endswith(lv.TINT_HIGH[1:])
+    assert "laser_log.xlsx › Build!C5" in cell.comment.text
+    fod = next(i for i in lv.load(review).items if i.item == "2A" and "FOD" in i.fields[0])
+    sheet, (r, c) = exact[(fod.fields[0], "2A")]
+    assert ws.cell(r, c).fill.start_color.rgb.endswith(lv.confidence_tint(fod)[1:])
+    assert lv.confidence_tint(fod) == lv.TINT_MID                # score 0.83
+
+
+def test_cell_candidates_put_the_accepted_value_first():
+    a = lv.Item("Values", 2, "", True, True, "a", "", fields=["F"], value="1", part="P",
+                score=0.95)
+    b = lv.Item("Values", 3, "Y", False, True, "b", "", fields=["F"], value="2", part="P",
+                score=0.6)
+    no = lv.Item("Values", 4, "N", False, False, "c", "", fields=["F"], value="3", part="P",
+                 score=1.0)
+    exact = {("F", ""): ("Sheet", (1, 1))}
+    got = lv.cell_candidates([a, b, no], exact, "P")
+    assert got == {("Sheet", (1, 1)): [b, a]}
+    assert lv.cell_candidates([a, b], exact, "P", accept_of=lambda it: "N" if it is b
+                              else it.accept) == {("Sheet", (1, 1)): [a]}
+    assert lv.confidence_tint(a) == lv.TINT_CLASH
+
+
+def test_the_filled_template_window_shows_a_cells_source(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import CELL_TINT, FilledTemplateDialog
+    review, csv, src = sample_review
+    opened = []
+    dlg = FilledTemplateDialog(lv.load(review), opener=opened.append)
+    assert dlg.part == "101"
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    dlg._tint_template()
+    sheet, rc = dlg._exact[("Power (W)", "")]
+    m = next(m for m in dlg._template_models if m.sheet.name == sheet)
+    assert m.texts[rc] == "285" and "Build!C5" in m.tips[rc]
+    assert dlg.click_cell(sheet, rc)
+    assert [i.fields for i in dlg.shown] == [["Power (W)"]]
+    assert dlg.current.value == "285" and m.tints[rc] == CELL_TINT
+    assert wait_for(qapp, lambda: any(sm.tints.get((5, 3)) == CELL_TINT
+                                      for sm in dlg._source_models))
+    dlg.on_wrong()                                          # said wrong: the cell empties
+    assert rc not in m.texts
+    assert dlg.on_save()
+    assert next(i for i in lv.load(review).items if i.fields == ["Power (W)"]).accept == "N"
+    assert not dlg.click_cell(sheet, (1, 1))
+    path = dlg.on_export()
+    assert path and opened == [path] and Path(path).name == f"{review.stem}_filled.xlsx"
+    dlg.show_whole_part()
+    assert len(dlg.shown) == sum(1 for i in dlg.review.items if i.part == "101")
+    dlg.close()
+
+
+def test_answers_carry_into_a_new_review_of_the_same_sources(sample_review):
+    """Re-run with my answers: what was said Right or Wrong is not asked
+    again, and a correction stays."""
+    import shutil
+    review, csv, src = sample_review
+    new = review.with_name("review_again.xlsx")
+    shutil.copy(review, new)
+    old = lv.load(review)
+    held = [i for i in old.items if i.needs and not i.clash]
+    green = next(i for i in old.items if i.accept == "Y" and not i.needs)
+    right, fixed = held[0], held[1]
+    lv.save(review, {(right.sheet, right.row): {"accept": "Y"},
+                     (fixed.sheet, fixed.row): {"accept": "Y", "value": "999",
+                                                "value_col": fixed.value_col},
+                     (green.sheet, green.row): {"accept": "N"}})
+    assert lv.carry_answers(lv.load(review), lv.load(new)) == 3
+    got = {(i.sheet, i.row): i for i in lv.load(new).items}
+    assert got[(right.sheet, right.row)].accept == "Y"
+    assert (got[(fixed.sheet, fixed.row)].accept, got[(fixed.sheet, fixed.row)].value) == \
+        ("Y", "999")
+    assert got[(green.sheet, green.row)].accept == "N"      # said Wrong stays Wrong
+    untouched = held[2]
+    assert got[(untouched.sheet, untouched.row)].accept == ""
+    assert lv.carry_answers(lv.load(review), lv.load(new)) == 0   # already carried
+
+
+def test_the_filled_template_window_re_runs_with_the_answers(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    review, csv, src = sample_review
+    assert FilledTemplateDialog(lv.load(review)).rerun_btn.isHidden()
+    asked = []
+    dlg = FilledTemplateDialog(lv.load(review), on_rerun=lambda r, p: asked.append((r, p)))
+    assert not dlg.rerun_btn.isHidden()
+    held = next(i for i in dlg.review.items if i.needs and not i.clash)
+    dlg.select(held)
+    dlg.on_right()
+    assert dlg.on_rerun_clicked()
+    assert asked == [(str(review), dlg.part)]
+    busy = FilledTemplateDialog(lv.load(review), on_rerun=lambda r, p: False)
+    assert not busy.on_rerun_clicked() and busy.isVisible() is False   # never shown
+    assert next(i for i in lv.load(review).items if i.row == held.row).accept == "Y"
+
+
+def test_a_value_is_put_where_it_belongs_by_right_click(qapp, sample_review):
+    """user, 2026-10-26: 'right click the spot where the data actually
+    belongs so I can manually correct things'."""
+    from council_qt.tabs.ledger_review_dialog import ReviewDialog
+    import source_extract as se
+    review, csv, src = sample_review
+    dlg = ReviewDialog(lv.load(review))
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    freq = dlg._exact[("Frequency (kHz)", "")]
+    dlg.current = None
+    assert not dlg.place_at(*freq)                           # nothing picked
+    power = next(i for i in dlg.review.items if i.fields == ["Power (W)"])
+    dlg.select(power)
+    assert not dlg.place_at(freq[0], (1, 1))                 # not a field's cell
+    there = [i for i in dlg.review.items if i.fields == ["Frequency (kHz)"]
+             and i.part == power.part and i.item == power.item and i.accept == "Y"]
+    assert there                                             # the log's own frequency
+    assert dlg.place_at(*freq, teach=True)
+    assert power.fields == ["Frequency (kHz)"] and "Frequency" in power.title
+    assert all(dlg._accept_of(i) == "N" for i in there)      # the cell takes one value
+    dlg.select(power)
+    dlg.on_wrong()                                           # an answer keeps the move
+    dlg.select(power)
+    dlg.on_right()
+    assert dlg.answers[(power.sheet, power.row)]["field"] == "Frequency (kHz)"
+    assert dlg.on_save()
+    again = next(i for i in lv.load(review).items if i.row == power.row)
+    assert (again.fields, again.accept, again.value) == (["Frequency (kHz)"], "Y", "285")
+    assert all(next(i for i in lv.load(review).items if i.row == o.row).accept == "N"
+               for o in there)
+    mapping, _ = se.load_aliases(csv)
+    assert mapping[se.normalize_label("Laser Power (W)")] == "Frequency (kHz)"
+    dlg.close()
+
+    li.run_apply(review, use_images=False)
+    row = ParentCSV(csv).get("101", "")
+    assert row["Frequency (kHz)"] == "285" and row["Power (W)"] != "285"
+    s = li.run_extract(csv, [src], use_images=False)          # learned for next time
+    moved = [i for i in lv.load(s.review).items if i.where == power.where]
+    assert [i.fields for i in moved] == [["Frequency (kHz)"]]
+
+
+def test_the_filled_template_window_offers_put_it_here(qapp, sample_review):
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    review, csv, src = sample_review
+    dlg = FilledTemplateDialog(lv.load(review))
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    sheet, rc = dlg._exact[("Frequency (kHz)", "")]
+    dlg.current = None
+    assert [d for _t, d in dlg.menu_actions(sheet, rc)] == [None]   # pick a value first
+    power = next(i for i in dlg.review.items
+                 if i.fields == ["Power (W)"] and i.part == dlg.part)
+    dlg.select(power)
+    assert [d for _t, d in dlg.menu_actions(sheet, (1, 1))] == [None]
+    acts = dlg.menu_actions(sheet, rc)
+    assert [t for t, _d in acts] == ["Put this value here (Frequency (kHz))",
+                                     "Put it here and always map 'Laser Power (W)' here"]
+    acts[0][1]()
+    assert power.fields == ["Frequency (kHz)"]
+    assert dlg.answers[(power.sheet, power.row)] == {"accept": "Y", "field": "Frequency (kHz)",
+                                                     "item": ""}
+    assert dlg.on_save()
+    from source_extract import load_aliases, normalize_label
+    assert normalize_label("Laser Power (W)") not in load_aliases(csv)[0]   # not taught
+    dlg.close()
+
+
+def test_files_that_disagree_are_shown_side_by_side(qapp, tmp_path):
+    """user, 2026-10-26: 'two or more files with conflicting data when we go
+    to review and link things I want to see all of those files side by side
+    so I can link the right value' - and 'I do not want any more buttons'."""
+    import openpyxl
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog, ReviewDialog
+    src = tmp_path / "src"
+    src.mkdir()
+    make_laser_log(src / "laser_log.xlsx")
+    later = make_laser_log(src / "laser_log_rev2.xlsx")
+    wb = openpyxl.load_workbook(later)
+    wb["Build"]["B4"] = 52                                   # the files disagree
+    wb.save(later)
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    review = li.run_extract(csv, [src], use_images=False).review
+
+    dlg = ReviewDialog(lv.load(review))
+    dlg.show()
+    freq = [i for i in dlg.review.items if i.fields == ["Frequency (kHz)"] and i.part == "101"]
+    assert sorted(i.value for i in freq) == ["50", "52"] and all(i.clash for i in freq)
+    fifty, fifty_two = sorted(freq, key=lambda i: i.value)
+    dlg.select(fifty)
+    assert dlg.pane_items == freq
+    shown = [p for p in dlg.panes if p.isVisible()]
+    assert len(shown) == 2
+    assert wait_for(qapp, lambda: all(p.models for p in shown))
+    assert {Path(p.path).name for p in shown} == {"laser_log.xlsx", "laser_log_rev2.xlsx"}
+    for p in shown:                                          # each its own cell lit
+        build = next(m for m in p.models if m.sheet.name == "Build")
+        assert (4, 2) in build.tints
+    other = next(p for p in shown if p.item is fifty_two)
+    assert "52" in other.header.text() and "laser_log_rev2.xlsx" in other.header.text()
+    assert "modified" in other.header.text() and other.header.isVisible()
+    assert "2 sources disagree" in dlg.source_note.text()
+
+    QTest.mouseClick(other, Qt.LeftButton)                   # click the pane: pick it
+    assert dlg.current is fifty_two
+    assert dlg.panes.index(other) == freq.index(fifty_two)   # the panes stay put
+    dlg.on_right()                                           # the others left out
+    assert (dlg._accept_of(fifty_two), dlg._accept_of(fifty)) == ("Y", "N")
+
+    speed = next(i for i in dlg.review.items if i.fields == ["Scan Speed (mm/s)"]
+                 and i.part == "101")
+    dlg.select(speed)                                        # both files agree: one pane
+    assert [p for p in dlg.panes if p.isVisible()] == [dlg.panes[0]]
+    assert not dlg.panes[0].header.isVisible()
+    assert len(speed.also) == 1 and speed.also[0].startswith("laser_log")  # also in
+    assert dlg.on_save()
+    dlg.close()
+    li.run_apply(review, use_images=False)
+    assert ParentCSV(csv).get("101", "")["Frequency (kHz)"] == "52"
+
+    filled = FilledTemplateDialog(lv.load(review))           # the same in the filled one
+    filled.show()
+    assert wait_for(qapp, lambda: filled.template is not None and filled._exact)
+    assert filled.click_cell(*filled._exact[("Frequency (kHz)", "")])
+    assert len([p for p in filled.panes if p.isVisible()]) == 2
+    filled.close()
+
+
+def test_extract_writes_every_parts_filled_template_in_one_workbook(qapp, tmp_path):
+    """user, 2026-10-26: "unable to export the full filled out workbook after
+    the extraction has been run. I can just see the review"."""
+    import openpyxl
+    from council_qt.tabs.ledger_review_dialog import FilledTemplateDialog
+    src = tmp_path / "src"
+    src.mkdir()
+    for part in ("101", "12", "3"):
+        book = make_laser_log(src / f"log_{part}.xlsx")
+        wb = openpyxl.load_workbook(book)
+        wb["Build"]["A3"] = f"P/N: {part}"
+        wb.save(book)
+    csv = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "l.csv").csv
+    s = li.run_extract(csv, [src], use_images=False)
+    full = Path(s.filled_book)
+    assert full == lv.full_filled_path(s.review) and full.is_file()
+    assert "Every part's filled template in one workbook" in s.describe()
+    wb = openpyxl.load_workbook(full)
+    assert wb.sheetnames == ["3", "12", "101"]                # numerical order
+    exact = lv.template_cells(csv)
+    sheet, (r, c) = exact[("Power (W)", "")]
+    cell = wb["12"].cell(row=r, column=c)
+    assert cell.value == 285 and "Build!C5" in cell.comment.text
+    assert cell.fill.start_color.rgb.endswith(lv.confidence_tint(
+        next(i for i in lv.load(s.review).items if i.part == "12"
+             and i.fields == ["Power (W)"]))[1:])
+    wb.close()
+
+    opened = []
+    dlg = FilledTemplateDialog(lv.load(s.review), opener=opened.append, part="12")
+    assert wait_for(qapp, lambda: dlg.template is not None and dlg._exact)
+    power = next(i for i in dlg.review.items if i.part == "12" and i.fields == ["Power (W)"])
+    dlg.select(power)
+    dlg.on_wrong()
+    assert dlg.on_save()
+    assert dlg.on_export() == str(full) and opened == [str(full)]   # Open as Excel: the whole
+    wb = openpyxl.load_workbook(full)
+    assert wb.active.title == "12"                           # at the part shown
+    assert wb["12"].cell(row=r, column=c).value is None      # said Wrong: left out now
+    assert wb["101"].cell(row=r, column=c).value == 285
+    wb.close()
+    dlg.close()
+
+    mine = tmp_path / "mine.xlsx"                            # never over a file of yours
+    openpyxl.Workbook().save(mine)
+    other = lv.load(s.review)
+    other.path = str(tmp_path / "mine.xlsx").replace("mine.xlsx", "mine_.xlsx")
+    lv.full_filled_path(other.path).write_bytes(mine.read_bytes())
+    with pytest.raises(Exception, match="the Ledger did not write it"):
+        lv.write_full_filled(other)

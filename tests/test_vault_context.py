@@ -209,8 +209,10 @@ def roomy(monkeypatch):
     passages go into what the Writer's call has left after the turn
     context's blocks (CouncilActions._fit_brief), and the test default —
     4,096 tokens, the Writer's ~1,700-token instructions and 2,400-token
-    reply — leaves none."""
-    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "16384")
+    reply — leaves none. (It was COUNCIL_GGUF_N_CTX=16384; that variable is
+    no longer read, the window is the model's.)"""
+    import council_engine as ce
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 16384)
 
 
 def test_send_gives_the_vault_to_the_turn_and_takes_it_back(tmp_path,
@@ -242,7 +244,8 @@ def test_with_no_room_left_the_passages_are_left_out_and_said(tmp_path,
     the transcript says why. The Judge still gets them as evidence."""
     from council_core import council_options
     from council_qt.tabs.council import CouncilActions
-    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "4096")
+    import council_engine as ce
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 4096)
     actions = CouncilActions(vault_dir=tmp_path)
     models = _models()
     models.judge = EvidenceJudge()

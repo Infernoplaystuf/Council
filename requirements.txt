@@ -18,11 +18,13 @@
 # ---- Core (always required) ----
 PyYAML>=6.0
 requests>=2.31
+psutil>=5.9              # memory, cores and processes (hardware_detect,
+                         # the analyst's limits, ending a hidden Excel)
 
 # ---- The UI ----
-# The Qt app (council_qt.py) is what the run-* launchers start. Without
-# PySide6 they fall back to the classic Tk app (council_gui_engine.py),
-# which needs nothing from here. The Qt port is tested against 6.10 and
+# The Qt app (council_qt.py) is the app: the run-* launchers start it and the
+# .exe packages it. (The classic Tk app they used to fall back to without
+# PySide6 was retired 2026-10-23.) The Qt port is tested against 6.10 and
 # 6.12. 6.12 leaves a widget owned twice (by Python and its Qt parent) when
 # its layout is added to an attached one, which crashed at garbage
 # collection; council_qt.qt_ownership hands such widgets to Qt (2026-10-21).
@@ -80,11 +82,8 @@ seaborn>=0.13            # statistical plots in plot_registry.py (kde, ecdf,
                          # violin, pair, 2-D density). Optional at runtime —
                          # plots needing it are hidden when it's absent.
 #
-# plotly + tkinterweb drive the older interactive HTML chart path. Note
-# tkinterweb (tkhtml3) has NO JavaScript engine, so a Plotly figure cannot
-# actually run inside it; that path is only useful via "Open in browser".
+# plotly drives the interactive HTML chart path ("Open in browser").
 plotly>=5.17
-tkinterweb>=3.24         # Plotly HTML viewer inside Tk (no JS engine)
 #
 # scikit-learn backs the 'pca' plot type, which is user-selectable in the
 # Grapher. It was advertised without being declared, so 'pca' returned a
@@ -117,7 +116,6 @@ sentence-transformers>=2.2    # also used by vault_embeddings.py for the
 
 # ---- Context-window optimization env vars (documented here for
 #      visibility — none of these are pip dependencies) ----
-# COUNCIL_GGUF_N_CTX             — explicit n_ctx override (e.g. 32768)
 # COUNCIL_GGUF_N_CTX_MAX         — absolute upper bound (default 32768)
 # COUNCIL_GGUF_KV_VRAM_MARGIN_MB — VRAM headroom for KV cache (default 1024)
 # COUNCIL_GGUF_N_CTX_DEBUG=1     — print full n_ctx ladder trace on load
@@ -135,6 +133,9 @@ huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 
 # ---- File parsing for vault analyst / RAG over docs ----
 pypdf>=4.0
+pdfplumber>=0.11         # PDF tables as tables (docs_open); pulls in pypdfium2,
+                         # which also renders a scanned page for the picture reader.
+                         # Optional: without it a PDF is read as lines (pypdf).
 python-docx>=1.1
 Pillow>=10.0             # image EXIF + dimensions for vault_index._parse_image;
                          # also used by folder_data_summary for image rows.

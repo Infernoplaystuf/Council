@@ -380,6 +380,14 @@ def test_save_keeps_the_answers_and_guess_again_shows_the_rules(qapp, ledger,
             graph_opened_on.append(threading.current_thread().name)
             return kgm.KnowledgeGraph(vault)
     tab, _ = make_tab(qapp, csv, vault, [src], connections=Vault())
+    # picking the CSV adds the Ledger to the graph on a worker; a Save while
+    # that still holds the store says "Save again when it finishes" and
+    # ticks nothing (CI, 2026-10-26), so let it finish first
+    end = time.monotonic() + 30
+    while tab._kg_running and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert not tab._kg_running
     dlg = open_teach(tab)
     choose(dlg, untitled)
     guess(dlg)
@@ -419,7 +427,7 @@ def test_save_keeps_the_answers_and_guess_again_shows_the_rules(qapp, ledger,
     assert set(graph_opened_on) <= {"ledger-teach-learn", "ledger-kg-add"}
     with kgm.KnowledgeGraph(vault) as kg:
         rules = {r.label: st for r, st in kg.field_rules()}
-    assert rules["Serial"] == "confirmed"
+    assert rules.get("Serial") == "confirmed", dlg.result.toPlainText()
     # what was learned: in the dialog and the Ledger log
     learned = dlg.result.toPlainText()
     assert learned.startswith("Learned from untitled.xlsx:") and "Zorp rate → " in learned

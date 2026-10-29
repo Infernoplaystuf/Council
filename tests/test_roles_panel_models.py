@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from council_core import backend_settings
 from council_core import local_models
 from council_core import model_slots as ms
 from tests.fake_ollama import DEFAULT_TAGS, tag
@@ -169,8 +170,8 @@ def test_a_saved_ollama_slot_is_selected_on_reload(make, tmp_path):
 def test_save_with_the_writer_on_ollama_leaves_the_gguf_path_alone(
         tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setitem(sys.modules, "onboarding", SimpleNamespace(
-        save_gguf_path=lambda v, p: calls.append(("main", p))))
+    monkeypatch.setattr(backend_settings, "save_gguf_path",
+                        lambda v, p: calls.append(("main", p)))
     monkeypatch.setitem(sys.modules, "council_engine", SimpleNamespace(
         refresh_backend_config=lambda: calls.append(("refresh",))))
     files = {r: "ollama:llama3.1:8b" for r in ms.COUNCIL_ROLES}
@@ -211,6 +212,9 @@ def test_the_models_tab_has_a_check_this_pc_button(qapp, tmp_path,
         def upgrade(self, *a, **k):
             return "", None
 
+        def tesseract_status(self):
+            return "Tesseract: installed"
+
         def check_this_pc(self, **kw):
             self.ran = threading.current_thread().name
             return model_jobs.CheckResult(True, "1 model measured")
@@ -218,6 +222,9 @@ def test_the_models_tab_has_a_check_this_pc_button(qapp, tmp_path,
     actions = Quiet(tmp_path)
     tab = ModelsTab(actions=actions, role_actions=Actions(tmp_path))
     pump(qapp, lambda: tab.roles._free is not None)
+    # The first ranking, started when the hardware is known, writes the
+    # status line too: on a slower PC its answer came after the check's.
+    pump(qapp, lambda: tab._hardware is not None and tab.find_btn.isEnabled())
     tab.on_check_pc()
     pump(qapp, lambda: tab.status.text() == "1 model measured")
     assert actions.ran == "model-check-pc"

@@ -1,14 +1,12 @@
 """
-council_qt.py — the Qt entry point, and the app the run-* launchers start.
-The Tk one (council_gui_engine.py) is untouched and still runs: the launchers
-use it with --tk / COUNCIL_UI=tk, or when PySide6 is not installed, and the
-.exe build still packages it.
+council_qt.py — the Council's entry point: the app the run-* launchers start
+and the .exe build packages. (The Tk shell it replaced was retired 2026-10-23.)
 
     python council_qt.py
 
-Both entry points read the same vault and the same engine, so run ONE at a time.
-There is no single-instance guard in this project yet (there never was), and two
-copies would mean two chromadb clients on one store and two GGUF loads.
+Run ONE copy at a time. There is no single-instance guard in this project yet
+(there never was), and two copies would mean two chromadb clients on one store
+and two GGUF loads.
 
 The startup chain — crash hooks, splash, reveal, onboarding — lives in
 `council_qt.launch`, over the decisions in `council_core.startup`. It is out of
@@ -41,13 +39,13 @@ def main() -> int:
     # the rest of the startup chain: the app still opens on the guess (and the
     # Models tab can fix it) if this cannot run.
     try:
-        import onboarding
-        onboarding.apply_saved_gguf_path()
+        from council_core import backend_settings
+        backend_settings.apply_saved_gguf_path()
     except Exception as exc:                              # noqa: BLE001
         # apply_saved_gguf_path drops COUNCIL_GGUF_PATH_AUTO whatever it
-        # decides; this path is the one where it never ran (onboarding did
-        # not import). Dropped here too, by its literal name since onboarding
-        # may be what failed: left in os.environ, every child the app spawns
+        # decides; this path is the one where it never ran (backend_settings
+        # did not import). Dropped here too, by its literal name, since that
+        # import may be what failed: left in os.environ, every child the app spawns
         # inherits it, and a `python council_qt.py` started from that
         # environment treats the path it was handed as a launcher's guess
         # and swaps in the saved model.

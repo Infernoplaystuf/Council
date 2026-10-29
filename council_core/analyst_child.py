@@ -71,6 +71,10 @@ from council_core import frame_codec
 #: after we chdir away from it.
 _APP_ROOT = Path(__file__).resolve().parent.parent
 
+#: What pandas' JSON writer raises (a ValueError, not MemoryError) when it
+#: cannot get the memory for a result.
+_NO_MEMORY = "Could not reserve memory block"
+
 #: json's dumps as it was before any model code ran. The code may rebind a
 #: module's attributes inside this process (`json.dumps = …` replaced it,
 #: measured 2026-10-15) — that dies with the process, but it must not
@@ -293,9 +297,15 @@ def main(argv) -> int:
             out_of_memory = True
             out.update(frame=None, table=None)
         except Exception as exc:                          # noqa: BLE001
-            out.update(ok=False, frame=None,
-                       log=f"the result could not be read: {exc}",
-                       note=f"the result could not be read: {exc}")
+            if _NO_MEMORY in str(exc):
+                # pandas' JSON writer says it with a ValueError of its own
+                # when the memory cap stops it (seen on Windows)
+                out_of_memory = True
+                out.update(frame=None, table=None)
+            else:
+                out.update(ok=False, frame=None,
+                           log=f"the result could not be read: {exc}",
+                           note=f"the result could not be read: {exc}")
     text = ""
     if not out_of_memory:
         try:

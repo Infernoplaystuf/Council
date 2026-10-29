@@ -148,3 +148,19 @@ def test_validation_is_cheap():
         so.validate(value, SCHEMA)
     per_call_ms = (time.perf_counter() - t0) * 1000 / 200
     assert per_call_ms < 5.0, per_call_ms
+
+
+def test_enum_values_the_grammar_cannot_hold_are_dropped():
+    """llama-cpp-python's converter leaves backslashes unescaped, so an enum
+    value with a quote mark or backslash compiles to a grammar llama.cpp
+    cannot parse (Ledger labels '"' and '.100"', 2026-10-23)."""
+    schema = {"type": "object", "properties": {
+        "label": {"type": "string", "enum": ['"', ".100\"", "Power"]},
+        "path": {"const": "C:\\x"},
+        "field": {"type": ["string", "null"], "enum": ["Power (W)", "µm", None]}}}
+    safe = so.grammar_safe(schema)
+    assert "enum" not in safe["properties"]["label"]
+    assert "const" not in safe["properties"]["path"]
+    assert safe["properties"]["field"] == schema["properties"]["field"]
+    assert schema["properties"]["label"]["enum"] == ['"', ".100\"", "Power"]   # not changed
+    assert so.grammar_safe(SCHEMA) == SCHEMA

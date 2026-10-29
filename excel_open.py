@@ -25,9 +25,14 @@ HOW EXCEL IS DRIVEN (everything stays on this machine)
     then ends at once, and COM's memory is not left corrupt.
   * a path longer than Excel opens (EXCEL_MAX_PATH) and a 0-byte file are
     said so before Excel starts.
-  * Pictures come out through the clipboard (Excel offers no other way, and
-    rights protection may forbid even that - then the picture is reported, not
-    read). Text on the clipboard beforehand is put back afterwards.
+  * Pictures come from a copy of the workbook Excel saves as .xlsx in a
+    temporary folder, read from its zip (zip_pictures) - not through the
+    clipboard, which took over the user's (2026-10-22). Only when Excel will
+    not save a copy (rights protection may forbid it) are they copied through
+    the clipboard, carefully: what the user had there is kept (ClipSnapshot)
+    and put back while Excel still owns the last copy, and no more are copied
+    once the user copies something (the clipboard's owner is then not this
+    read's Excel).
 
 TEXT BOXES AND CHARTS
   For .xlsx / .xlsm they are read straight from the file's XML (no Excel
@@ -43,8 +48,10 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import zipfile
 from contextlib import contextmanager
@@ -60,6 +67,7 @@ OLE_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
 #: Excel's numeric error codes as COM returns them (#DIV/0!, #N/A, ...)
 _COM_ERRORS = range(-2146826288, -2146826244)
 MSO_PICTURE, MSO_CHART, MSO_TEXTBOX, MSO_LINKED_PICTURE = 13, 3, 17, 11
+MSO_GROUP = 6
 
 
 class ExcelOpenError(Exception):
@@ -823,6 +831,195 @@ def _seq(v) -> List:
     return [_plain(v)]
 
 
+def zip_pictures(path) -> Dict[Tuple[str, str], List[Tuple[bytes, str]]]:
+    """Every embedded picture of an .xlsx / .xlsm, by (sheet, top-left cell
+    'D5'), in drawing order: (its bytes, its extension). Read from the zip
+    alone - no workbook is loaded. ``path`` may be an open file. A linked
+    picture (not in the file) and a drawing it does not understand are
+    skipped; never raises.
+
+    The pictures in a group, in a drawing Excel wrapped for newer versions
+    (mc:AlternateContent), at a fixed position (absoluteAnchor: put at A1),
+    and pictures placed in a cell (Excel's "Place in Cell", which are no
+    drawing at all: _cell_pictures) are all read - openpyxl, which read an
+    .xlsx's pictures before, dropped every one of those, and a whole sheet's
+    pictures when its drawing held anything it did not understand (user,
+    2026-10-26: "I am only getting about 1/3 to 1/2 of the images read")."""
+    out: Dict[Tuple[str, str], List[Tuple[bytes, str]]] = {}
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return out
+    with z:
+        try:
+            wb = ET.fromstring(z.read("xl/workbook.xml"))
+        except Exception:
+            return out
+        names = set(z.namelist())
+        wrels = _rels(z, "xl/workbook.xml")
+        sheets = [(sh.get("name", ""), wrels.get(sh.get(f"{{{NS['r']}}}id"), ""))
+                  for sh in wb.findall("m:sheets/m:sheet", NS)]
+        for sheet, part in sheets:
+            for dpart in _rels(z, part).values():
+                if "/drawings/" not in dpart or dpart not in names:
+                    continue
+                drels = _rels(z, dpart)
+                try:
+                    droot = ET.fromstring(z.read(dpart))
+                except Exception:
+                    continue
+                for anchor in _anchors(droot):
+                    fr = anchor.find("xdr:from", NS)
+                    try:
+                        col = int(fr.find("xdr:col", NS).text) if fr is not None else 0
+                        row = int(fr.find("xdr:row", NS).text) if fr is not None else 0
+                    except Exception:
+                        continue
+                    for pic in anchor.iter(f"{{{NS['xdr']}}}pic"):
+                        blip = pic.find(".//a:blip", NS)
+                        media = drels.get(blip.get(f"{{{NS['r']}}}embed"), "") \
+                            if blip is not None else ""
+                        got = _media(z, names, media)
+                        if got:
+                            out.setdefault((sheet, _a1(row + 1, col + 1)), []).append(got)
+        try:
+            for key, pics in _cell_pictures(z, names, sheets).items():
+                out.setdefault(key, []).extend(pics)
+        except Exception:                                   # noqa: BLE001
+            pass
+    return out
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _anchors(droot) -> List:
+    """A drawing's anchors - one wrapped in mc:AlternateContent as the first
+    of its choices that holds one."""
+    out = []
+    for el in droot:
+        if _local(el.tag) != "AlternateContent":
+            out.append(el)
+            continue
+        for choice in el:
+            found = [a for a in choice if _local(a.tag).endswith("Anchor")]
+            if found:
+                out += found
+                break
+    return out
+
+
+def _media(z, names, media: str) -> Optional[Tuple[bytes, str]]:
+    if media not in names:
+        return None
+    try:
+        data = z.read(media)
+    except Exception:
+        return None
+    return data, (media.rsplit(".", 1)[-1].lower() if "." in media else "png")
+
+
+def _cell_pictures(z, names, sheets) -> Dict[Tuple[str, str], List[Tuple[bytes, str]]]:
+    """Pictures placed in a cell (Excel's "Place in Cell" / IMAGE()), by
+    (sheet, cell). The cell says which value metadata it has (vm, from 1);
+    xl/metadata.xml takes that to a rich value (XLRICHVALUE), whose
+    structure's _rvRel:LocalImageIdentifier names a relation of
+    xl/richData/richValueRel.xml - the picture's file."""
+    rv_part, md_part = "xl/richData/rdrichvalue.xml", "xl/metadata.xml"
+    rel_part = "xl/richData/richValueRel.xml"
+    if not {rv_part, md_part, rel_part} <= names:
+        return {}
+    rid = f"{{{NS['r']}}}id"
+    rrels = _rels(z, rel_part)
+    media = [rrels.get(el.get(rid), "") for el in ET.fromstring(z.read(rel_part))
+             if _local(el.tag) == "rel"]
+    key_at: List[Optional[int]] = []        # each structure: where its picture key is
+    if "xl/richData/rdrichvaluestructure.xml" in names:
+        for st in ET.fromstring(z.read("xl/richData/rdrichvaluestructure.xml")):
+            keys = [k.get("n") for k in st if _local(k.tag) == "k"]
+            key_at.append(keys.index("_rvRel:LocalImageIdentifier")
+                          if "_rvRel:LocalImageIdentifier" in keys else None)
+    value_media: List[str] = []             # each rich value: its picture, or ""
+    for rv in ET.fromstring(z.read(rv_part)):
+        if _local(rv.tag) != "rv":
+            continue
+        s = int(rv.get("s", "0") or 0)
+        at = key_at[s] if s < len(key_at) else None
+        vs = [v.text for v in rv if _local(v.tag) == "v"]
+        m = ""
+        if at is not None and at < len(vs):
+            try:
+                m = media[int(vs[at])]
+            except (ValueError, IndexError, TypeError):
+                m = ""
+        value_media.append(m)
+    md = ET.fromstring(z.read(md_part))
+    types = [t.get("name") for t in md.iter() if _local(t.tag) == "metadataType"]
+    future: List[Optional[int]] = []        # XLRICHVALUE's blocks: their rich value
+    for fm in md:
+        if _local(fm.tag) == "futureMetadata" and fm.get("name") == "XLRICHVALUE":
+            for bk in fm:
+                rvb = next((e for e in bk.iter() if _local(e.tag) == "rvb"), None)
+                future.append(int(rvb.get("i")) if rvb is not None else None)
+    by_vm: List[Optional[int]] = []         # each value metadata block: its rich value
+    for sec in md:
+        if _local(sec.tag) != "valueMetadata":
+            continue
+        for bk in sec:
+            rc = next((e for e in bk if _local(e.tag) == "rc"), None)
+            got = None
+            if rc is not None:
+                t, v = int(rc.get("t", "0")), int(rc.get("v", "0"))
+                if 0 < t <= len(types) and types[t - 1] == "XLRICHVALUE" and v < len(future):
+                    got = future[v]
+            by_vm.append(got)
+    out: Dict[Tuple[str, str], List[Tuple[bytes, str]]] = {}
+    for sheet, part in sheets:
+        if part not in names:
+            continue
+        for _ev, el in ET.iterparse(z.open(part)):
+            if _local(el.tag) == "c" and el.get("vm"):
+                try:
+                    rv = by_vm[int(el.get("vm")) - 1]
+                    got = _media(z, names, value_media[rv]) if rv is not None else None
+                except (ValueError, IndexError):
+                    got = None
+                if got:
+                    out.setdefault((sheet, el.get("r", "A1")), []).append(got)
+            if _local(el.tag) in ("c", "row"):
+                el.clear()
+    return out
+
+
+def _pictures_from_a_copy(book, path: Path, folder: str) -> Tuple[Optional[Dict], str]:
+    """The open workbook's pictures without the clipboard (user, 2026-10-22:
+    "There may be a clipboard issue where stuff can't be copied because the
+    clip board is consumed somewhere"): Excel saves a copy of it as .xlsx in
+    ``folder`` (the original is never written: it is open read-only, and
+    SaveAs moves the open workbook onto the copy), and the pictures are read
+    from that file's zip (zip_pictures). (None, why) when Excel will not save
+    one - a rights-protected workbook may forbid it - or the copy cannot be
+    read: the caller copies through the clipboard then, carefully."""
+    copy = Path(folder) / "copy.xlsx"
+    try:
+        _ask(lambda: book.SaveAs(str(copy), 51), book, "SaveAs")     # xlOpenXMLWorkbook
+    except Exception as e:                                  # noqa: BLE001
+        why = e.why if isinstance(e, _Refused) else e
+        return None, f"Excel would not save a copy to read them from ({_short(why)})"
+    if not copy.is_file():
+        return None, "Excel saved no copy to read them from"
+    pics = zip_pictures(copy)
+    if not pics and not zipfile.is_zipfile(copy):
+        return None, "the copy Excel saved could not be read (rights protection?)"
+    return pics, ""
+
+
+def _short(e) -> str:
+    return ((_com_error_description(e) if not isinstance(e, str) else e) or repr(e)
+            ).rstrip(". ")[:160]
+
+
 def _clip_text() -> Optional[str]:
     try:
         import win32clipboard
@@ -1154,6 +1351,24 @@ def _clip_seq() -> Optional[int]:
         return None
 
 
+def _clip_is(pid: Optional[int]) -> bool:
+    """The clipboard holds what Excel ``pid`` (this read's) put there."""
+    return pid is not None and _clip_owner_pid() == pid
+
+
+def _user_copied(pid: Optional[int], seq: Optional[int], copied: bool) -> bool:
+    """Something else was put on the clipboard since this read last looked
+    (``seq``). Once it has ``copied`` a picture, the clipboard's owner says:
+    anyone but this read's Excel ``pid`` is the user - Excel's own changes
+    (its copy rendered, for Windows' clipboard history too) moved the counter
+    and stopped every protected workbook's pictures after the first. Before,
+    or when the owner cannot be told, the counter says."""
+    owner = _clip_owner_pid() if pid is not None else None
+    if owner is not None and copied:
+        return owner != pid
+    return _clip_seq() != seq and not (owner is not None and owner == pid)
+
+
 def _remote_session() -> bool:
     """This is a Remote Desktop session: its clipboard is shared with the
     computer the user connects from (SM_REMOTESESSION)."""
@@ -1184,13 +1399,14 @@ def cloud_clipboard_on() -> bool:
         return False
 
 
-def clipboard_safe() -> Tuple[bool, str]:
+def clipboard_safe(keeps: bool = False) -> Tuple[bool, str]:
     """(True, '') when pictures may be copied out through the clipboard now;
     else (False, why). Not when Windows syncs the clipboard to other devices
     or this is a Remote Desktop session (a picture could leave the PC), nor
     when the clipboard holds anything but plain text (only text is put back
-    afterwards). Used by the knowledge graph's background rebuild, which the
-    user is not watching; the Ledger's own reads decide for themselves."""
+    afterwards) - unless ``keeps``: everything on it was kept to be put back
+    (_clip_snapshot, the Ledger's reads). Used by the knowledge graph's
+    background rebuild, which the user is not watching, as it is."""
     if os.name != "nt":
         return False, "the pictures come out through the clipboard only on Windows"
     if cloud_clipboard_on():
@@ -1202,13 +1418,18 @@ def clipboard_safe() -> Tuple[bool, str]:
         held = _clipboard_formats()
     except Exception:
         return False, "the clipboard could not be checked"
-    if any(f not in _TEXT_ONLY_FORMATS for f in held):
+    if not keeps and any(f not in _TEXT_ONLY_FORMATS for f in held):
         return False, "the clipboard holds something besides plain text, which copying would " \
                       "replace"
     return True, ""
 
 
-def _clip_restore(text: Optional[str]) -> None:
+def _clip_restore(text) -> None:
+    """The clipboard emptied and ``text`` put back on it: the user's text
+    (_clip_text), or everything they had there (a ClipSnapshot)."""
+    if isinstance(text, ClipSnapshot):
+        _clip_put_back(text)
+        return
     try:
         import win32clipboard
         win32clipboard.OpenClipboard()
@@ -1220,6 +1441,188 @@ def _clip_restore(text: Optional[str]) -> None:
             win32clipboard.CloseClipboard()
     except Exception:
         pass
+
+
+@dataclass
+class ClipSnapshot:
+    """Everything the user had on the clipboard, to put back once pictures
+    were copied out through it (user, 2026-10-26: "the clip board isn't
+    actually clearing itself", and "the clipboard holds something besides
+    plain text" stopped the pictures of every protected workbook): (format,
+    its bytes) - a memory format's own bytes, CF_ENHMETAFILE's bits."""
+    items: List[Tuple[int, bytes]] = field(default_factory=list)
+
+
+#: Registered formats that only tie the clipboard to the program that copied
+#: (OLE's data object): put back without it, they would send a paste to it.
+#: Left out, the paste is made from the formats kept.
+_OLE_ONLY = {"dataobject", "ole private data", "ole clipboard persist on flush"}
+
+#: The most a snapshot keeps; more and the clipboard is not used.
+_CLIP_KEEP_MAX = 64 * 1024 * 1024
+
+_CF_BITMAP, _CF_METAFILEPICT, _CF_DIB, _CF_PALETTE = 2, 3, 8, 9
+_CF_ENHMETAFILE, _CF_DIBV5 = 14, 17
+
+
+def _keep_plan(formats: Sequence[int]) -> Optional[List[int]]:
+    """The clipboard's formats a snapshot keeps, in their order; None when
+    something there could not be put back as it was. Windows makes CF_BITMAP
+    and CF_PALETTE from a DIB, CF_METAFILEPICT from CF_ENHMETAFILE (and the
+    text formats from one another): those are left to it. An owner-drawn or
+    private format, or a GDI object, cannot be kept."""
+    have = set(formats)
+    out: List[int] = []
+    for f in formats:
+        if f in (_CF_BITMAP, _CF_PALETTE):
+            if have & {_CF_DIB, _CF_DIBV5}:
+                continue
+            return None
+        if f == _CF_METAFILEPICT:
+            if _CF_ENHMETAFILE in have:
+                continue
+            return None
+        if f in (0x80, 0x81, 0x82, 0x83, 0x8E) or 0x200 <= f <= 0x3FF:
+            return None
+        out.append(f)
+    return out
+
+
+def _win_clipboard_api():
+    """user32, kernel32 and gdi32 with the clipboard calls' handle types set
+    (64-bit handles, not ints)."""
+    import ctypes
+    from ctypes import wintypes
+    u, k, g = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.gdi32
+    H = ctypes.c_void_p
+    u.OpenClipboard.argtypes, u.OpenClipboard.restype = [wintypes.HWND], wintypes.BOOL
+    u.EnumClipboardFormats.argtypes, u.EnumClipboardFormats.restype = \
+        [wintypes.UINT], wintypes.UINT
+    u.GetClipboardData.argtypes, u.GetClipboardData.restype = [wintypes.UINT], H
+    u.SetClipboardData.argtypes, u.SetClipboardData.restype = [wintypes.UINT, H], H
+    u.EmptyClipboard.restype = u.CloseClipboard.restype = wintypes.BOOL
+    k.GlobalSize.argtypes, k.GlobalSize.restype = [H], ctypes.c_size_t
+    k.GlobalLock.argtypes, k.GlobalLock.restype = [H], H
+    k.GlobalUnlock.argtypes, k.GlobalUnlock.restype = [H], wintypes.BOOL
+    k.GlobalAlloc.argtypes, k.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], H
+    k.GlobalFree.argtypes, k.GlobalFree.restype = [H], H
+    g.GetEnhMetaFileBits.argtypes = [H, wintypes.UINT, ctypes.c_void_p]
+    g.GetEnhMetaFileBits.restype = wintypes.UINT
+    g.SetEnhMetaFileBits.argtypes, g.SetEnhMetaFileBits.restype = \
+        [wintypes.UINT, ctypes.c_void_p], H
+    u.GetClipboardFormatNameW.argtypes = [wintypes.UINT, wintypes.LPWSTR, ctypes.c_int]
+    u.GetClipboardFormatNameW.restype = ctypes.c_int
+    g.DeleteEnhMetaFile.argtypes, g.DeleteEnhMetaFile.restype = [H], wintypes.BOOL
+    return ctypes, u, k, g
+
+
+def _open_clipboard(u, timeout: float = 1.0) -> bool:
+    import time
+    end = time.monotonic() + timeout
+    while not u.OpenClipboard(None):
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _clip_snapshot(limit: int = _CLIP_KEEP_MAX) -> Optional[ClipSnapshot]:
+    """Everything on the clipboard now, to put back (_clip_put_back); None
+    when it cannot be read or something there could not be put back as it
+    was (_keep_plan) - the clipboard is then used only if it holds plain
+    text, as before. An empty clipboard is an empty snapshot."""
+    if os.name != "nt":
+        return None
+    try:
+        ctypes, u, k, g = _win_clipboard_api()
+        if not _open_clipboard(u):
+            return None
+        try:
+            formats, f = [], u.EnumClipboardFormats(0)
+            while f:
+                formats.append(int(f))
+                f = u.EnumClipboardFormats(f)
+            plan = _keep_plan(formats)
+            if plan is None:
+                return None
+            items, total = [], 0
+            for f in plan:
+                if f >= 0xC000:
+                    name = ctypes.create_unicode_buffer(256)
+                    u.GetClipboardFormatNameW(f, name, 256)
+                    if name.value.lower() in _OLE_ONLY:
+                        continue        # the copying program's own link to its data
+                h = u.GetClipboardData(f)
+                if not h:
+                    continue                # its program could not give it any more
+                if f == _CF_ENHMETAFILE:
+                    n = g.GetEnhMetaFileBits(h, 0, None)
+                    buf = ctypes.create_string_buffer(n)
+                    g.GetEnhMetaFileBits(h, n, buf)
+                    data = buf.raw
+                else:
+                    n, p = k.GlobalSize(h), k.GlobalLock(h)
+                    if not p:
+                        continue
+                    try:
+                        data = ctypes.string_at(p, n)
+                    finally:
+                        k.GlobalUnlock(h)
+                total += len(data)
+                if total > limit:
+                    return None
+                items.append((f, data))
+            return ClipSnapshot(items)
+        finally:
+            u.CloseClipboard()
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _clip_put_back(snap: ClipSnapshot) -> None:
+    """The clipboard emptied and the snapshot's formats put back on it."""
+    try:
+        ctypes, u, k, g = _win_clipboard_api()
+        if not _open_clipboard(u):
+            return
+        try:
+            u.EmptyClipboard()
+            for f, data in snap.items:
+                if f == _CF_ENHMETAFILE:
+                    h = g.SetEnhMetaFileBits(len(data), data)
+                    if h and not u.SetClipboardData(f, h):
+                        g.DeleteEnhMetaFile(h)
+                    continue
+                h = k.GlobalAlloc(0x0002, max(len(data), 1))         # GMEM_MOVEABLE
+                if not h:
+                    continue
+                p = k.GlobalLock(h)
+                if not p:
+                    k.GlobalFree(h)
+                    continue
+                ctypes.memmove(p, data, len(data))
+                k.GlobalUnlock(h)
+                if not u.SetClipboardData(f, h):
+                    k.GlobalFree(h)                 # the clipboard did not take it
+        finally:
+            u.CloseClipboard()
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _clip_owner_pid() -> Optional[int]:
+    """The process whose window owns the clipboard now - a hidden Excel this
+    read started, after it copied a picture - or None when that cannot be
+    told (no owner, or not Windows)."""
+    try:
+        import win32clipboard
+        import win32process
+        hwnd = win32clipboard.GetClipboardOwner()
+        if not hwnd:
+            return None
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
+    except Exception:                                       # noqa: BLE001
+        return None
 
 
 def _a1(row: int, col: int) -> str:
@@ -1386,7 +1789,9 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     else put something on the clipboard meanwhile - the user copying while
     the rebuild ran - no more pictures are copied (each is listed with no
     data, and a note says why) and the clipboard is left as it is, not put
-    back over what the user copied."""
+    back over what the user copied. A change this read's own Excel made (its
+    copy rendered, by Windows' clipboard history too) is not the user's: the
+    clipboard's owner says which (_clip_is)."""
     handling = sys.exc_info()[1]            # the caller's, if any (_drop_frames)
     # a Cancel after this stops the read (_CANCELS) - inside a Ledger extract,
     # one since the extract began (cancel_scope)
@@ -1435,6 +1840,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         def app_factory():
             return DispatchEx("Excel.Application")
     app = book = None
+    copy_dir = ""                   # where Excel saved the copy the pictures come from
     clip = None
     seq = None                      # careful: the clipboard's counter as last seen
     clip_why = ""                   # careful: why no more pictures are copied
@@ -1519,6 +1925,31 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         if watchdog is not None:
             watchdog.cancel()          # opened: copying a big workbook out may take a while
         out = ExcelBook()
+        # The pictures come from a copy Excel saves as .xlsx, never through
+        # the clipboard, which took over the user's: what they copied while a
+        # workbook was read was overwritten, and only plain text was put back
+        # (user, 2026-10-22). Only when Excel will not save a copy is the
+        # clipboard used - carefully, as the knowledge graph's rebuild does:
+        # not when it holds anything but text, stopped when the user copies.
+        copied: Optional[Dict[Tuple[str, str], List[Tuple[bytes, str]]]] = None
+        if want_pictures:
+            copy_dir = tempfile.mkdtemp(prefix="council-xl-")
+            copied, copy_why = _pictures_from_a_copy(book, path, copy_dir)
+            if copied is None and not careful:
+                careful = True
+                seq = _clip_seq()
+                # everything the user had there is kept and put back - not
+                # only plain text, which refused every protected workbook
+                # while anything else was on it (user, 2026-10-26)
+                clip = _clip_snapshot()
+                safe, clip_why = clipboard_safe(keeps=True) if clip is not None \
+                    else clipboard_safe()
+                if clip is None:
+                    clip = _clip_text()
+                if safe and seq is None:
+                    clip_why = "the clipboard could not be checked"
+                if clip_why:
+                    clip_why = f"{copy_why}, and {clip_why}"
         # Each call the copy cannot do without is asked again while Excel
         # refuses it (_ask): its license agreement came up while a workbook
         # was copied out (~0.7-1.7 s after it starts, measured here), and the
@@ -1593,7 +2024,22 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 if typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and not want_pictures:
                     # listed, never copied: no clipboard (the caller counts them)
                     out.pictures.append(Picture(name, anchor, b""))
-                elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and want_pictures:
+                elif typ in (MSO_PICTURE, MSO_LINKED_PICTURE) and copied is not None:
+                    got = copied.get((name, anchor)) or \
+                        next((v for (sn, _a), v in copied.items() if sn == name and v), [])
+                    if got:
+                        data, ext = got.pop(0)
+                        out.pictures.append(Picture(name, anchor, data, ext))
+                    else:
+                        # a linked picture, not saved in the file
+                        out.pictures.append(Picture(name, anchor, b""))
+                        out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
+                                         "be read (a linked picture, not saved in the "
+                                         "workbook)")
+                elif (typ in (MSO_PICTURE, MSO_LINKED_PICTURE) or
+                      typ == MSO_GROUP and _holds_picture(sh)) and want_pictures \
+                        and copied is None:
+                    # a group holding a picture is copied out whole
                     if not locked and not clip_why:
                         # careful does not wait: the other reading changes
                         # the clipboard anyway, and its pictures wait
@@ -1602,7 +2048,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                             clip_why = "another reading was using the clipboard"
                         elif not careful:
                             clip = _clip_text() if com is not None else None
-                    if careful and not clip_why and _clip_seq() != seq:
+                    if careful and not clip_why and _user_copied(pid, seq, used_clip):
                         clip_why = "the clipboard changed while the workbook was being read"
                     if clip_why:
                         if not any(n.endswith(clip_why) for n in out.notes):
@@ -1631,6 +2077,11 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                     else:
                         out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
                                          "be copied out (the workbook may forbid copying)")
+        # the copy's pictures no picture shape took: in a group, placed in a
+        # cell (no shape at all), or at a fixed position (zip_pictures)
+        for (sheet, at), rest in (copied or {}).items():
+            for data, ext in rest:
+                out.pictures.append(Picture(sheet, at, data, ext))
         return out
     except Exception as e:
         _drop_frames(e, keep=handling)
@@ -1655,6 +2106,17 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
     finally:
         if watchdog is not None:
             watchdog.cancel()
+        put_back = False
+        try:
+            # Still this Excel's copy on the clipboard: put the user's back
+            # now, before it closes - closing, Excel puts its copy there once
+            # more, the counter moved, and the copy was left there for good
+            # (user, 2026-10-26: "the clip board isn't actually clearing")
+            if used_clip and _clip_is(pid):
+                _clip_restore(clip)
+                put_back = True
+        except Exception:                                   # noqa: BLE001
+            pass
         if book is not None:
             try:
                 book.Close(SaveChanges=False)
@@ -1675,16 +2137,32 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             # not left running hidden (review, 2026-10-20)
             _let_go(held, end=quit_refused or not answered)
         _unregister_excel_pid(pid)
+        if copy_dir:
+            # after Excel let go of it (it held the copy open)
+            shutil.rmtree(copy_dir, ignore_errors=True)
         try:
             # careful: only when nothing else was put there since the last
             # copy (that would be the user's, and stays)
-            if used_clip and (not careful or (seq is not None and _clip_seq() == seq)):
+            owner = _clip_owner_pid() if used_clip and not put_back and pid is not None \
+                else None
+            if used_clip and not put_back and owner is None and \
+                    (not careful or (seq is not None and _clip_seq() == seq)):
                 _clip_restore(clip)
         finally:
             if locked:
                 _CLIPBOARD_LOCK.release()
         if com is not None:
             com.CoUninitialize()
+
+
+def _holds_picture(shape) -> bool:
+    """A group shape with a picture in it (a group was never copied out)."""
+    try:
+        items = shape.GroupItems
+        return any(int(items.Item(i).Type) in (MSO_PICTURE, MSO_LINKED_PICTURE)
+                   for i in range(1, int(items.Count) + 1))
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def _cell_of(shape) -> str:

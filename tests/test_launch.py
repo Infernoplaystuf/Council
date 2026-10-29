@@ -587,11 +587,10 @@ def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
 def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
                                                           monkeypatch):
     """The review's probe, as a test: a model saved the way the app saves one
-    (onboarding.save_gguf_path, model_slots.save), then a Qt launch. On the
+    (backend_settings.save_gguf_path, model_slots.save), then a Qt launch. On the
     base there was no data_in/ at all; with batch 0 both files were copied
     into it and the data index offered them as datasets."""
-    import onboarding
-    from council_core import model_slots
+    from council_core import backend_settings, model_slots
 
     # save_gguf_path also exports the choice; recorded so it is put back.
     monkeypatch.setenv("COUNCIL_GGUF_PATH", "placeholder")
@@ -601,7 +600,7 @@ def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
     model = tmp_path / "models" / "granite.gguf"
     model.parent.mkdir()
     model.write_bytes(b"GGUF" + b"\0" * 64)
-    assert onboarding.save_gguf_path(vault, str(model)) is None
+    assert backend_settings.save_gguf_path(vault, str(model)) is None
     model_slots.save(vault, model_slots.SlotConfig(slots={
         "main": model_slots.Slot("main", str(model)),
         "coding": model_slots.Slot("coding", "ollama:llama3.1:8b")}))
@@ -656,9 +655,11 @@ def test_the_engine_settings_saved_in_the_vault_are_applied(qapp, tmp_path,
     _engine_settings(tmp_path, n_ctx="16384", gpu_layers="20",
                      embed_device="cuda")
     build()
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "20"
     assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cuda"
+    # The saved context size is the Tk era's fixed window: the engine sizes
+    # the window to the model now (user, 2026-10-23), so it is not applied.
+    assert "COUNCIL_GGUF_N_CTX" not in os.environ
 
 
 def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
@@ -670,7 +671,6 @@ def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
     monkeypatch.setenv("COUNCIL_GGUF_GPU_LAYERS", "0")
     build()
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "0"
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
 
 
 def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):

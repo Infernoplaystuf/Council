@@ -6,6 +6,8 @@ the model in system RAM (user, 2026-10-22: "High RAM usage and lower CPU and
 GPU usage in the ledger")."""
 from __future__ import annotations
 
+import pytest
+
 
 
 
@@ -120,4 +122,91 @@ def test_a_gguf_is_loaded_with_the_council_s_cap_not_its_trained_length(monkeypa
     # sizes it to the card too); the reply still gets all the window leaves
     assert got["n_ctx_max"] == ledger_llm.GGUF_WINDOW == 32768
     assert got["max_tokens"] > 60000
+    ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
+
+
+class _FakeGguf:
+    """A loaded GGUF: answers '{}' whole, or streamed in pieces."""
+    def __init__(self, got):
+        self.got = got
+
+    def n_ctx(self):
+        return 32768
+
+    def create_chat_completion(self, **kw):
+        self.got.setdefault("calls", []).append(kw)
+        if kw.get("stream"):
+            return iter([{"choices": [{"delta": {"content": p}}]} for p in ("{", "}")])
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+
+def _fake_loader(monkeypatch, got):
+    def load(p, **kw):
+        got["load"] = kw
+        return _FakeGguf(got)
+    monkeypatch.setattr(ce, "_load_gguf", load)
+    monkeypatch.setattr(ce, "read_gguf_metadata", lambda p: {"llama.context_length": 131072})
+    monkeypatch.setattr(ledger_llm, "_gpu_ok", lambda: None)
+    ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
+
+
+def test_a_gguf_is_not_loaded_with_the_council_s_chat_window(monkeypatch, tmp_path):
+    """user, 2026-10-23: 'It is still using the council base token cap' - the
+    Models tab's n_ctx (COUNCIL_GGUF_N_CTX, 4096 there) won the loader's
+    ladder for the Ledger's GGUF too."""
+    monkeypatch.delenv("COUNCIL_LEDGER_NUM_CTX", raising=False)
+    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "4096")
+    got = {}
+    _fake_loader(monkeypatch, got)
+    model = tmp_path / "granite.gguf"
+    model.write_bytes(b"GGUF")
+    ledger_llm.chat_for(str(model))("a short prompt", {"type": "object"})
+    # The loader no longer reads COUNCIL_GGUF_N_CTX at all (user, 2026-10-23;
+    # tests/test_model_slots.py), so there is nothing for the Ledger to skip.
+    assert "use_env_n_ctx" not in got["load"]
+    assert got["load"]["n_ctx_max"] == ledger_llm.GGUF_WINDOW
+    ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
+
+
+def test_council_s_own_gguf_is_loaded_by_the_ledger_not_shared(monkeypatch, tmp_path):
+    """Council's model was used at its chat window (local_chat); now the
+    Ledger loads it with its own, after letting go of the council's copy."""
+    monkeypatch.delenv("COUNCIL_LEDGER_NUM_CTX", raising=False)
+    model = tmp_path / "granite.gguf"
+    model.write_bytes(b"GGUF")
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", str(model))
+    got = {}
+    _fake_loader(monkeypatch, got)
+    monkeypatch.setattr(ce, "local_chat", lambda *a, **k: pytest.fail("chat window used"))
+    monkeypatch.setattr(ce, "_SLOT_INSTANCES", {"main": object()})
+    monkeypatch.setattr(ce, "_release_slots", lambda: got.setdefault("released", True))
+    text, _ = ledger_llm.chat_for(str(model))("a short prompt", {"type": "object"})
+    assert text == "{}" and got["released"] and "load" in got
+    # no model picked: Council's model, the same way
+    ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
+    monkeypatch.setattr(ledger_llm, "_main_gguf", lambda: str(model))
+    text, who = ledger_llm.council_chat()("a short prompt", {"type": "object"})
+    assert (text, who) == ("{}", "Council's model") and "load" in got
+    ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None
+
+
+def test_council_s_model_is_not_a_gguf_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", str(tmp_path / "missing.gguf"))
+    assert ledger_llm._main_gguf() == ""
+    monkeypatch.delenv("COUNCIL_GGUF_PATH")
+    assert ledger_llm._main_gguf() == ""
+
+
+def test_cancel_stops_a_gguf_reply_between_tokens(monkeypatch, tmp_path):
+    got = {}
+    _fake_loader(monkeypatch, got)
+    model = tmp_path / "granite.gguf"
+    model.write_bytes(b"GGUF")
+    stop = {"now": False}
+    chat = ledger_llm.chat_for(str(model), should_stop=lambda: stop["now"])
+    assert chat("p", {"type": "object"})[0] == "{}"           # streamed, joined
+    assert got["calls"][-1]["stream"] is True
+    stop["now"] = True
+    with pytest.raises(RuntimeError, match="stopped"):
+        chat("p", {"type": "object"})
     ledger_llm._GGUF["key"] = ledger_llm._GGUF["llm"] = None

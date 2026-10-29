@@ -54,6 +54,7 @@ from council_core.kg_query import phrase
 from .. import theme
 from ..view import ViewHelpers, _alive, amp
 from ..widgets.kg_canvas import KnowledgeGraphCanvas, type_colour
+from .connections_contents import ContentsView
 from .connections_dialogs import (FieldsDialog, FoldersDialog, GraphDialog,
                                   WhyNoLinksDialog)
 
@@ -146,9 +147,11 @@ class ConnectionsActions:
         info = gl.create(values["name"], values["folders"], values.get("suffixes") or (),
                          use_in_answers=bool(values.get("use_in_answers", True)),
                          focus=str(values.get("focus") or ""))
-        if values.get("model_links") == "review":
-            with gl.open(info.id, self.root) as kg:
+        with gl.open(info.id, self.root) as kg:
+            if values.get("model_links") == "review":
                 kg.set_model_links("review")
+            if values.get("embed_model"):
+                kg.set_related(values["embed_model"], values.get("related_threshold"))
         return info
 
     def update_graph(self, gid: str, values: Dict[str, Any]) -> None:
@@ -162,11 +165,39 @@ class ConnectionsActions:
             want = values.get("model_links", "graph")
             if (kg.model_link_status() == "suggested") != (want == "review"):
                 kg.set_model_links(want)
+            if "embed_model" in values and (
+                    values["embed_model"] != kg.embed_model()
+                    or values.get("related_threshold") != kg.related_threshold()):
+                kg.set_related(values["embed_model"], values.get("related_threshold"))
+
+    def embed_models(self) -> List[tuple]:
+        """(id, label) of the embedding models on this PC (kg_related)."""
+        from council_core import kg_related
+        return kg_related.available()
+
+    def find_related(self, on_progress, should_stop) -> Optional[Dict[str, Any]]:
+        """Related by meaning: the graph's embedding model reads what is new
+        or changed and the close pairs are suggested
+        (KnowledgeGraph.find_related). None when the graph has no model."""
+        from council_core import kg_related
+        with self.open_graph() as kg:
+            model = kg.embed_model()
+            if not model:
+                return None
+            return kg.find_related(kg_related.make(model), model=model,
+                                   on_progress=on_progress, should_stop=should_stop)
 
     def delete_graph(self, gid: str) -> None:
         kgg.GraphList(self.vault_dir).delete(gid)
 
     # -- the picture and questions --
+    def contents_picture(self, document_id: str):
+        """(nodes, edges, positions) of one file's contents (kg_layout)."""
+        from council_core import kg_layout
+        with self.open_graph() as kg:
+            nodes, edges = kg_layout.contents_subgraph(kg, document_id)
+        return nodes, edges, kg_layout.layout(nodes, edges)
+
     def picture(self, center: Optional[str], hops: int):
         """(nodes, edges, positions) to draw (council_core.kg_layout)."""
         from council_core import kg_layout
@@ -293,10 +324,19 @@ class ConnectionsActions:
             for name, url, pmodel in self.pi_workers():
                 if _us_origin(pmodel):                     # pi_workers filters too
                     workers[f"{name} ({pmodel})"] = (kx.ollama_chat(pmodel, host=url), pmodel)
+        name = Path(model).name if kx.is_gguf(model) else model
         with self.open_graph() as kg:
-            return kg.extract_from_text(workers, model=Path(model).name if kx.is_gguf(model)
-                                        else model,
-                                        on_progress=on_progress, should_stop=should_stop)
+            stats = kg.extract_from_text(workers, model=name, on_progress=on_progress,
+                                         should_stop=should_stop)
+            if not stats.get("stopped"):
+                # then each table, by this PC's model: what it records and
+                # which columns hold people, parts or projects (proposed rules)
+                pc_chat = next(iter(workers.values()))[0]
+                stats["tables"] = kg.read_tables(
+                    pc_chat, model=name, should_stop=should_stop,
+                    on_progress=lambda n, total, what: on_progress(
+                        n, total, f"table {what}") if on_progress else None)
+            return stats
 
     def open_file(self, rel_path: str) -> None:
         from .vault import VaultActions
@@ -323,6 +363,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
         #: reads the free text (a Rebuild for another reason - an answer, a
         #: split - only reads the documents again).
         self._read_text_after = False
+        #: ...and, the graph having an embedding model, related items are
+        #: found last (kg_related).
+        self._related_after = False
         self._picture_token = None
         self._asking = False
         #: 'Why no links?': its one dialog (tests reach it here), and whether
@@ -385,7 +428,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         # 2. finding things, and the graph's other lists
         row = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search a person, part, project, organisation, place…")
+        self.search.setPlaceholderText("Search a person, part, project, organisation, place "
+                                       "- or any header or value in your files…")
         self.search.textChanged.connect(lambda _t: self.on_search())
         row.addWidget(self.search, 2)
         self.type_box = QComboBox()
@@ -409,8 +453,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         arow = QHBoxLayout()
         self.ask_edit = QLineEdit()
         self.ask_edit.setPlaceholderText("Ask the graph, e.g. 'who works on the Falcon "
-                                         "retrofit?' or 'how is Nordic Forge connected to "
-                                         "KA-101?'")
+                                         "retrofit?', 'how is Nordic Forge connected to "
+                                         "KA-101?' or 'what was the hardness of PN-4471?'")
         self.ask_edit.returnPressed.connect(self.on_ask)
         arow.addWidget(self.ask_edit, 1)
         self.ask_btn = self._button(arow, "Ask", self.on_ask)
@@ -485,6 +529,14 @@ class ConnectionsTab(ViewHelpers, QWidget):
         ans.addWidget(self.facts)
         ans.setSizes([200, 260])
         self.views.addTab(ans, "Answer")
+        # everything fed in: file › sheet › header/label › values
+        # (council_core/kg_contents.py; user, 2026-10-26)
+        self.contents_view = ContentsView(lambda: self._kg)
+        self.contents_view.preview_requested.connect(self._preview_cell)
+        self.contents_view.draw_requested.connect(self.draw_file)
+        #: the file the Picture shows the contents of, or None (entities)
+        self._picture_file: Optional[str] = None
+        self.views.addTab(self.contents_view, "Contents")
         self.views.currentChanged.connect(self._on_view_changed)
         split.addWidget(self.views)
 
@@ -587,6 +639,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 f"{rels.get('suggested', 0)} waiting for you. "
                 f"Text read by a model: {model['documents']} of "
                 f"{model['text_documents']} document(s).")
+        held = kg.contents_counts()
+        if held["files"]:
+            text += (f" Contents: {held['files']} file(s), {held['cells']:,} value(s) under "
+                     f"{held['fields']:,} header(s) and label(s) (the Contents tab).")
         if cov["unreadable"]:
             text += (f" NOT READ: {len(cov['unreadable'])} file(s) — "
                      + "; ".join(cov["unreadable"][:3])
@@ -631,6 +687,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kg is None:
             return
         text = self.search.text().strip()
+        self._search_contents(text)
         etype = self.type_box.currentData()
         if text:
             hits = kg.search(text, etype)
@@ -650,6 +707,22 @@ class ConnectionsTab(ViewHelpers, QWidget):
             item.setData(ROLE_DATA, h["id"])
             self.results.addItem(item)
 
+    def _search_contents(self, text: str) -> None:
+        """The Contents view shows what matches, and its tab says how many."""
+        try:
+            n = self.contents_view.search(text)
+        except Exception as exc:                          # noqa: BLE001
+            n = 0
+            self.status.setText(f"The contents could not be searched: {exc}")
+        i = self.views.indexOf(self.contents_view)
+        self.views.setTabText(i, f"Contents ({n} matches)" if text and n else "Contents")
+
+    def _preview_cell(self, path: str, locator: Any, where: str, quote: str) -> None:
+        """A cell picked in the Contents view: previewed, and Open file opens it."""
+        self._selected = {"kind": "cell", "data": {"path": path, "locator": locator}}
+        self._preview(path, locator, where, quote)
+        self._enable_actions()
+
     def _on_result(self, item, _prev=None) -> None:
         if item is None:
             return
@@ -660,6 +733,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if kg is None:
             return
         self._current = eid
+        self._picture_file = None          # the Picture follows the entity again
         self.tree.clear()
         ent = kg.entity(eid)
         if ent is None:
@@ -674,12 +748,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         shown: Dict[str, int] = {}
         hidden: Dict[str, int] = {}
         # Only what is drawn is looked up; the rest of each kind is counted.
-        for (pred, direction), k in kg.neighbor_counts(eid).items():
+        for (pred, direction), k in kg.neighbor_counts(eid, include_tables=True).items():
             if k > RELATIONS_SHOWN:
                 label = phrase(pred, direction)
                 hidden[label] = hidden.get(label, 0) + k - RELATIONS_SHOWN
         for n in kg.neighbors(eid, evidence_limit=EVIDENCE_SHOWN,
-                              relation_limit=RELATIONS_SHOWN):
+                              relation_limit=RELATIONS_SHOWN, include_tables=True):
             label = phrase(n["predicate"], n["direction"])
             g = groups.get(label)
             if g is None:
@@ -826,7 +900,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.merge_btn.setEnabled(bool(cur and cur["type"] != "DOCUMENT"))
         self.split_btn.setEnabled(bool(cur and self._kg.merged_into_me(self._current)))
         sel = self._selected or {}
-        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question", "source")
+        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question", "source",
+                                       "cell")
         self.open_btn.setEnabled(bool(has_file and getattr(self, "_preview_path", None)))
         is_rel = sel.get("kind") == "relation"
         status = (sel.get("data") or {}).get("status") if is_rel else None
@@ -964,7 +1039,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.status.setToolTip("")
         if read_text and not self._stop.is_set():
             self.on_suggest()                   # the model's part of ⟳ Build graph
+        elif self._related_after and not self._stop.is_set():
+            self.on_related()                   # the embedding model's part
         else:
+            self._related_after = False
             self.stop_btn.setEnabled(False)
             self.refresh_picture()
 
@@ -1020,6 +1098,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
             return
         self._stop.clear()
         self._read_text_after = bool(self.model_box.currentData())
+        self._related_after = bool(self._kg is not None and self._kg.embed_model())
         self.stop_btn.setEnabled(True)
         self.on_rebuild()
 
@@ -1053,9 +1132,62 @@ class ConnectionsTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="kg-read-text", daemon=True).start()
 
+    def on_related(self) -> None:
+        """Related by meaning, the last part of ⟳ Build graph: the graph's
+        embedding model reads what is new or changed, and close documents and
+        tables get a suggested link (KnowledgeGraph.find_related)."""
+        self._related_after = False
+        if self._busy:
+            return
+        self._busy = True
+        self.rebuild_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status.setText("Finding related items…")
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+
+        def progress(done, total, path):
+            self._to_ui(self.status.setText,
+                        f"Finding related items: read {done} of {total} new or changed "
+                        f"({path})")
+
+        def work() -> None:
+            try:
+                stats = self.actions.find_related(progress, self._stop.is_set)
+                self._to_ui(self._related_done, stats, None)
+            except Exception as exc:                      # noqa: BLE001
+                self._to_ui(self._related_done, None, exc)
+
+        threading.Thread(target=work, name="kg-related", daemon=True).start()
+
+    def _related_done(self, stats, exc) -> None:
+        self._busy = False
+        self.rebuild_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._reopen()
+        if exc is not None:
+            self.status.setText(f"Finding related items failed: {exc}")
+            return
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
+        if stats is None:
+            text = "No embedding model is set for this graph (Graph settings…)."
+        elif stats["stopped"]:
+            text = (f"Stopped after reading {stats['embedded']} item(s) — ⟳ Build graph again "
+                    "to continue.")
+        else:
+            text = (f"Related by meaning: {stats['links']} link(s) suggested between "
+                    f"{stats['items']} documents and tables ({stats['embedded']} read now). "
+                    "✓ Accept or ✗ Reject them in Links.")
+        self.status.setText(text)
+        self.refresh_picture()
+
     def on_stop_suggest(self) -> None:
         self._stop.set()
         self._read_text_after = False
+        self._related_after = False
         self.status.setText("Stopping after the passages in progress — ⟳ Build graph again "
                             "to continue where it stopped.")
 
@@ -1078,12 +1210,27 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 + (". Its links wait for you (✓ Accept / ✗ Reject)." if waits else "."))
         if not stats["chunks"]:
             text = "Built. The model had read every passage already."
+        tables = stats.get("tables") or {}
+        if tables.get("read"):
+            text += (f" It read {tables['read']} table(s)"
+                     + (f" ({tables['errors']} got no usable answer)" if tables["errors"]
+                        else ""))
+            labels = tables.get("labels") or []
+            if labels and self._offer_rules(list(dict.fromkeys(self._to_tick + labels))):
+                text += (f" and proposes reading {len(labels)} column(s) as people, parts "
+                         "or projects: 'Tick the suggested field rules' reads them.")
+            else:
+                text += "."
         # The view first: show_entity writes the open item's header into the
         # status line (as after a rebuild - review, 2026-10-19)
         self.on_search()
         if self._current:
             self.show_entity(self._current)
         self.status.setText(text)
+        if self._related_after and not stats["stopped"] and not self._stop.is_set():
+            self.on_related()                   # the embedding model's part
+            return
+        self._related_after = False
         self.refresh_picture()
 
     # -- graphs ------------------------------------------------------------
@@ -1123,7 +1270,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         from .. import dialogs as _dialogs
         if _dialogs.disabled():
             return None
-        dlg = GraphDialog(new=new, pick=self.ask_folder, parent=self, **current)
+        try:
+            models = self.actions.embed_models()
+        except Exception:                                 # noqa: BLE001
+            models = []
+        dlg = GraphDialog(new=new, pick=self.ask_folder, parent=self, embed_models=models,
+                          **current)
         self._graph_dialog_open = dlg          # tests reach it here
         return dlg.values() if dlg.exec() == QDialog.DialogCode.Accepted else None
 
@@ -1155,7 +1307,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
                    "suffixes": list(info.suffixes), "focus": self._kg.focus(),
                    "model_links": "review" if self._kg.model_link_status() == "suggested"
                    else "graph", "use_in_answers": info.use_in_answers,
-                   "is_main": info.is_main}
+                   "is_main": info.is_main, "embed_model": self._kg.embed_model(),
+                   "related_threshold": self._kg.related_threshold()}
         got = self.ask_graph(False, current)
         if not got:
             return
@@ -1209,13 +1362,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
         open (or Whole graph), the best-connected entities."""
         if self.views.currentIndex() != 1 or self._busy:
             return
+        if whole:
+            self._picture_file = None
         center = None if whole else self._current
         hops = self.hops_box.value()
+        doc = self._picture_file
         self._picture_token = token = object()
 
         def work() -> None:
             try:
-                got, err = self.actions.picture(center, hops), ""
+                got, err = (self.actions.contents_picture(doc) if doc else
+                            self.actions.picture(center, hops)), ""
             except Exception as exc:                      # noqa: BLE001
                 got, err = None, str(exc) or exc.__class__.__name__
             self._to_ui(self._show_picture, token, got, err, center)
@@ -1237,8 +1394,19 @@ class ConnectionsTab(ViewHelpers, QWidget):
             f"<span style='color:{type_colour(t)}'>●</span> {t.replace('_', ' ').lower()}"
             for t in types[:10]) + (f"  ({len(nodes)} shown)" if nodes else ""))
 
+    def draw_file(self, document_id: str) -> None:
+        """The Picture of one file's contents (the Contents tab's Draw)."""
+        self._picture_file = document_id
+        if self.views.currentIndex() != 1:
+            self.views.setCurrentIndex(1)       # refreshes the picture
+        else:
+            self.refresh_picture()
+
     def _on_canvas_click(self, eid: str) -> None:
+        if eid.startswith("c:"):
+            return                  # a file's contents: double-click a file to draw it
         if eid and self._kg is not None and self._kg.entity(eid) is not None:
+            self._picture_file = None
             self._current = eid
             # the links of what was clicked, without leaving the picture
             idx = self.views.currentIndex()
@@ -1246,6 +1414,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             self.views.setCurrentIndex(idx)
 
     def _on_canvas_centre(self, eid: str) -> None:
+        if eid.startswith("c:file:"):
+            self.draw_file(eid[len("c:file:"):])
+            return
+        if eid.startswith("c:"):
+            return
         self._on_canvas_click(eid)
         self.refresh_picture()
 
@@ -1287,30 +1460,58 @@ class ConnectionsTab(ViewHelpers, QWidget):
             parts.append("No model chosen: here is what the graph holds - the facts below.")
         self.answer.setPlainText("\n".join(parts))
         for ctx in got.get("contexts") or []:
-            names = ", ".join(display_name(e) for e in ctx["entities"])
-            g = QTreeWidgetItem([f"About {names}", "", ""])
-            g.setFirstColumnSpanned(True)
-            f = g.font(0)
-            f.setBold(True)
-            g.setFont(0, f)
-            self.facts.addTopLevelItem(g)
-            for fact in ctx["facts"]:
-                item = QTreeWidgetItem([
-                    f"[{fact.n}] {display_name(fact.subject)} — {phrase(fact.predicate, 'out')}"
-                    f" → {display_name(fact.object)}", fact.status, ""])
-                item.setData(0, ROLE_KIND, "relation")
-                item.setData(0, ROLE_DATA, {"relation_id": fact.relation_id,
-                                            "status": fact.status, "evidence": fact.evidence,
-                                            "other": fact.object})
-                g.addChild(item)
-                for ev in fact.evidence:
-                    e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"]),
-                                              f"{ev.get('file', ev['path'])} · {ev['where']}"])
-                    e_item.setToolTip(0, ev["quote"])
-                    e_item.setData(0, ROLE_KIND, "evidence")
-                    e_item.setData(0, ROLE_DATA, ev)
-                    item.addChild(e_item)
-            g.setExpanded(True)
+            if ctx["entities"]:
+                self._answer_facts(ctx)
+            if ctx.get("rows"):                           # after the facts it names
+                self._answer_rows(ctx["rows"])
+
+    def _answer_facts(self, ctx: Dict[str, Any]) -> None:
+        """The graph's facts about the entities an answer named."""
+        names = ", ".join(display_name(e) for e in ctx["entities"])
+        g = QTreeWidgetItem([f"About {names}", "", ""])
+        g.setFirstColumnSpanned(True)
+        f = g.font(0)
+        f.setBold(True)
+        g.setFont(0, f)
+        self.facts.addTopLevelItem(g)
+        for fact in ctx["facts"]:
+            item = QTreeWidgetItem([
+                f"[{fact.n}] {display_name(fact.subject)} — {phrase(fact.predicate, 'out')}"
+                f" → {display_name(fact.object)}", fact.status, ""])
+            item.setData(0, ROLE_KIND, "relation")
+            item.setData(0, ROLE_DATA, {"relation_id": fact.relation_id,
+                                        "status": fact.status, "evidence": fact.evidence,
+                                        "other": fact.object})
+            g.addChild(item)
+            for ev in fact.evidence:
+                e_item = QTreeWidgetItem([ev["quote"], method_words(ev["method"]),
+                                          f"{ev.get('file', ev['path'])} · {ev['where']}"])
+                e_item.setToolTip(0, ev["quote"])
+                e_item.setData(0, ROLE_KIND, "evidence")
+                e_item.setData(0, ROLE_DATA, ev)
+                item.addChild(e_item)
+        g.setExpanded(True)
+
+    def _answer_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """The rows of the files an answer used (the Contents layer), each
+        previewed when picked."""
+        g = QTreeWidgetItem(["Rows of your files", "", ""])
+        g.setFirstColumnSpanned(True)
+        f = g.font(0)
+        f.setBold(True)
+        g.setFont(0, f)
+        self.facts.addTopLevelItem(g)
+        for r in rows:
+            cells = " | ".join(f"{c['label']}: {c['text']}" for c in r["cells"])
+            head = r["file"] + (f" › {r['sheet']}" if r.get("sheet") else "")
+            item = QTreeWidgetItem([f"[{r['n']}] {cells}", "", f"{head} · {r['where']}"])
+            item.setToolTip(0, cells)
+            item.setData(0, ROLE_KIND, "evidence")
+            item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
+                                        "where": r["where"], "file": r["file"],
+                                        "quote": (r.get("matched") or [""])[0]})
+            g.addChild(item)
+        g.setExpanded(True)
 
     def on_fields(self) -> None:
         if self._busy or self._kg is None:
@@ -1332,7 +1533,8 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.status.setText("")
         if self._kg is None:
             return
-        dlg = FieldsDialog(self._kg.field_rules(), suggestions, self)
+        dlg = FieldsDialog(self._kg.field_rules(), suggestions, self,
+                           proposed_by=self._kg.model_rule_tables())
         self._fields_dialog = dlg          # tests reach it here
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

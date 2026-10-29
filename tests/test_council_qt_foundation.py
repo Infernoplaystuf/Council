@@ -1491,11 +1491,10 @@ def test_the_qt_build_runs_the_close_work_at_all(qapp, tmp_path, monkeypatch):
     assert "_shutdown" in names
 
 
-def test_the_close_work_is_shared_with_the_tk_shell():
+def test_the_qt_entry_does_the_close_work():
     root = Path(__file__).resolve().parent.parent
-    for name in ("council_qt.py", "council_gui_engine.py"):
-        source = (root / name).read_text(encoding="utf-8")
-        assert "close_session(" in source, f"{name} does not use it"
+    source = (root / "council_qt.py").read_text(encoding="utf-8")
+    assert "close_session(" in source, "council_qt.py does not use it"
 
 
 # ============================================================
