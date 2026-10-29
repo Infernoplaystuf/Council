@@ -24,6 +24,12 @@ in the Tk shell and only the second one matters — a hidden checkbox that is
 still honoured would be a bug you could not see. `effective()` applies the
 run-time rule, and it is the function the deliberation path should ask rather
 than reading the raw switch.
+
+"DEMO_MODE" HERE MEANS THE SINGLE-MODEL CHAT
+The ``demo_mode`` these functions take is the Council tab's: one Writer and no
+panel. Since 2026-10-29 the app sets it from branding.SINGLE_MODEL_COUNCIL
+(COUNCIL_CHAT_MODE=single), not from branding.DEMO_MODE, so the home build
+answers with the whole council by default.
 """
 from __future__ import annotations
 
