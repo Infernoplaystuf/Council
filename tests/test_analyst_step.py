@@ -151,7 +151,7 @@ def test_the_result_reaches_every_member_and_the_judge(tmp_path,
     actions.vault_brief = lambda q: vc.Brief()
     actions.memo_llm = None
     events = []
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     opts.depth = "deep"              # the Judge ranks only at depth > quick
     result = actions.send(QUESTION, opts, on_event=events.append)
     assert result.ok, result.message

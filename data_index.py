@@ -111,6 +111,20 @@ def bundled_samples_dir() -> Path:
     return Path(__file__).parent / "assets" / "sample_data"
 
 
+def search_roots(vault_dir: Path) -> List[Path]:
+    """The folders a data index searches: the vault's input folder, and the
+    bundled samples only when COUNCIL_SAMPLE_DATA=1 (a demo with no data of
+    its own). The samples were always searched, so their made-up purchase
+    orders, inventory and suppliers turned up in answers about the user's own
+    files (found 2026-10-29: "which run had a power dip" was given a
+    "Power Strip" inventory row)."""
+    roots = [input_dir(vault_dir)]
+    if os.environ.get("COUNCIL_SAMPLE_DATA", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        roots.append(bundled_samples_dir())
+    return roots
+
+
 #: Where the data index keeps its own files (its column index and its
 #: warm-start cache): a hidden folder in the WRITE root, data_out/.index/.
 #: They were kept in data_in/, the folder the app promises never to write.

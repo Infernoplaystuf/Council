@@ -24,6 +24,12 @@ in the Tk shell and only the second one matters — a hidden checkbox that is
 still honoured would be a bug you could not see. `effective()` applies the
 run-time rule, and it is the function the deliberation path should ask rather
 than reading the raw switch.
+
+"DEMO_MODE" HERE MEANS THE SINGLE-MODEL CHAT
+The ``demo_mode`` these functions take is the Council tab's: one Writer and no
+panel. Since 2026-10-29 the app sets it from branding.SINGLE_MODEL_COUNCIL
+(COUNCIL_CHAT_MODE=single), not from branding.DEMO_MODE, so the home build
+answers with the whole council by default.
 """
 from __future__ import annotations
 
@@ -72,7 +78,14 @@ class Switch:
 #: the models received byte-for-byte the same. Only the Qt tab reads this
 #: table; the Tk toolbar is its own code, and those switches work there.
 SWITCHES: Tuple[Switch, ...] = (
-    Switch("deliberate", "Deliberation", True, shown_in_demo=False),
+    # Off by default: one model answers first and hands the question to the
+    # council when it needs one (council_core.front_desk). On: always the
+    # council.
+    Switch("deliberate", "Deliberation", False, shown_in_demo=False,
+           hint="Always send the question to the whole council. Off, one "
+                "model answers first and hands the question to the council "
+                "only when it needs one (code, a plan or design, an analysis, "
+                "or when it is not sure)."),
     Switch("tools", "Tools", False,
            hint="Lets the members look things up while they work — run and "
                 "test code, check a quote against your vault, compute a "
@@ -157,7 +170,7 @@ class CouncilOptions:
     as the user clicks. `effective()` returns the frozen, rule-applied copy that
     the deliberation path should read.
     """
-    deliberate: bool = True
+    deliberate: bool = False
     tools: bool = False
     vault: bool = True
     fill_ide: bool = True
@@ -176,13 +189,13 @@ class CouncilOptions:
                  profile_enabled: Optional[bool] = None) -> "CouncilOptions":
         """The state the tab opens in.
 
-        ``deliberate`` follows DEMO_MODE, matching
-        ``tk.BooleanVar(value=not _demo)``. ``use_profile`` is read from the
+        ``deliberate`` is off: one model answers first and hands a question
+        on when it needs the council (council_core.front_desk). ``use_profile`` is read from the
         engine rather than hard-coded, because a pre-set COUNCIL_QUIRKS_APPLY
         in the shell is meant to survive into the session.
         """
         return cls(
-            deliberate=not demo_mode,
+            deliberate=False,
             use_profile=True if profile_enabled is None else bool(profile_enabled),
         )
 

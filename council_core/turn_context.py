@@ -2729,10 +2729,7 @@ def _get_data_index():
     try:
         import data_index as _di
         _DATA_INDEX_INSTANCE = _di.DataIndex(
-            search_roots=[
-                _di.input_dir(_vault()),
-                _di.bundled_samples_dir(),
-            ],
+            search_roots=_di.search_roots(_vault()),
             write_root=_di.output_dir(_vault()),
         )
     except Exception as _e:
@@ -2798,8 +2795,14 @@ _FILE_COUNT_TRIGGERS = (
     "how many json", "number of files", "count of files",
     "count the files", "file count", "total files", "how many files are",
 )
-# Intents that need per-file work, not a census: "how many rows in the files".
-_FILE_COUNT_EXCLUSIONS = ("row", "record", "column", "value", "cell")
+# Intents that need per-file work, not a census: "how many rows in the files",
+# and "how many files mention Project Cobalt" — a search of what the files
+# SAY. That one was answered "data_in contains 0 file(s)", labelled exact
+# (found 2026-10-29 on a corpus Connections had read).
+_FILE_COUNT_EXCLUSIONS = ("row", "record", "column", "value", "cell",
+                          "mention", "contain", "refer", "include",
+                          "talk about", " about ", " that ", " which ",
+                          " where ", " with ", " say ", " says ")
 
 
 def looks_like_file_count(query) -> bool:
@@ -2818,7 +2821,7 @@ def looks_like_file_count(query) -> bool:
     when a real field is named, so a generic 'how many files' still falls
     through" - it just had no way to test for it. This is that test.
     """
-    q = str(query or "").lower()
+    q = " " + " ".join(str(query or "").lower().split()) + " "
     return (any(t in q for t in _FILE_COUNT_TRIGGERS)
             and not any(x in q for x in _FILE_COUNT_EXCLUSIONS))
 
@@ -3027,7 +3030,11 @@ def _run_analyst_step_impl(query):
             print('[analyst] folder_file_counts failed: ' + repr(_ce_exc),
                   file=_sys_dbg.stderr)
             counts = None
-        if counts is not None:
+        # An empty input folder is no answer to "how many files": the user's
+        # files may be in the folders Connections reads instead, so the
+        # question goes on to the model with that context rather than an
+        # instant "0 file(s)" presented as exact.
+        if counts is not None and counts.get("total", 0):
             by_ext = counts.get("by_ext", {})
             breakdown = ", ".join(
                 f"{n} {ext}" for ext, n in
@@ -3616,14 +3623,13 @@ class TurnState:
         return self.vault_index
 
     def get_data_index(self):
-        """This conversation's data index (data_in/ + the bundled samples),
+        """This conversation's data index (data_in/, data_index.search_roots),
         built on first use and kept warm."""
         if self.data_index is None:
             try:
                 import data_index as _di
                 self.data_index = _di.DataIndex(
-                    search_roots=[_di.input_dir(self.vault_dir),
-                                  _di.bundled_samples_dir()],
+                    search_roots=_di.search_roots(self.vault_dir),
                     write_root=_di.output_dir(self.vault_dir))
             except Exception as exc:                      # noqa: BLE001
                 import sys as _sys_dbg

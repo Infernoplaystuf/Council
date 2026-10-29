@@ -1277,3 +1277,60 @@ def test_expanding_a_fast_answer_runs_the_whole_council(qapp, tmp_path):
         qapp.processEvents()
         time.sleep(0.01)
     qapp.processEvents()
+
+
+def test_the_single_writer_streams_its_answer(tmp_path):
+    """With one Writer the Stream tokens box did nothing: _direct never
+    passed a token callback, so the answer arrived all at once."""
+    from types import SimpleNamespace as NS
+    from council_core import council_turn as ct
+    from tests.test_council_turn import FakeModel
+
+    class Streaming(FakeModel):
+        def respond(self, prompt, token_callback=None, **kwargs):
+            self.asked.append(prompt)
+            for word in ("an ", "answer"):
+                if token_callback is not None:
+                    token_callback(word)
+            return self.reply
+
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer = Streaming()
+    actions._models = models
+    actions.begin = lambda *a, **k: None
+    actions.prepare = lambda *a, **k: None
+    tokens = []
+    opts = council_options.CouncilOptions.defaults().effective(True)
+    result = actions.send("q", opts, on_token=lambda who, tok:
+                          tokens.append((who, tok)))
+    assert result.ok and result.answer == "an answer"
+    assert tokens == [("Writer", "an "), ("Writer", "answer")]
+
+    tokens.clear()
+    opts.stream = False
+    assert actions.send("q", opts, on_token=lambda who, tok:
+                        tokens.append((who, tok))).ok
+    assert tokens == [], "Stream tokens off still streamed"
+
+
+def test_the_app_builds_the_whole_council_unless_told_single(monkeypatch):
+    """DEMO_MODE (the home build) no longer makes the chat one Writer: that
+    is COUNCIL_CHAT_MODE=single, read into branding.SINGLE_MODEL_COUNCIL."""
+    import importlib
+    import branding
+    from council_core import model_ready
+
+    monkeypatch.delenv("COUNCIL_CHAT_MODE", raising=False)
+    monkeypatch.setenv("DI_DEMO_MODE", "1")
+    try:
+        importlib.reload(branding)
+        assert branding.DEMO_MODE and not branding.SINGLE_MODEL_COUNCIL
+        assert model_ready.answering_roles() == ("writer", "judge")
+        monkeypatch.setenv("COUNCIL_CHAT_MODE", "single")
+        importlib.reload(branding)
+        assert branding.SINGLE_MODEL_COUNCIL
+        assert model_ready.answering_roles() == ("writer",)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(branding)
