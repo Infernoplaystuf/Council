@@ -278,3 +278,78 @@ def test_one_thing_named_twice_is_one_entity():
            "relationships": []}
     ents, _l, _r = kx.check_open(raw, text, [])
     assert [(e.name, e.description) for e in ents] == [("Okafor, Ngozi", "checker")]
+
+
+# ── the local-model run of 2026-10-27 (gemma3:12b, the synthetic corpus) ──
+def test_a_four_digit_part_the_model_names_is_kept():
+    """The model linked 'Jordan Blake' to parts 2041 and 2042; all-digit
+    names under five characters were refused as counts, so the links went."""
+    text = "Project Halcyon: Jordan Blake to finish EC on part 2041 by Friday."
+    raw = {"entities": [{"name": "Jordan Blake", "type": "person"},
+                        {"name": "2041", "type": "part"}, {"name": "12", "type": "quantity"}],
+           "relationships": [{"source": "Jordan Blake", "relation": "works on",
+                              "target": "2041", "quote": text}]}
+    ents, links, rejected = kx.check_open(raw, text, [])
+    assert {e.name for e in ents} == {"Jordan Blake", "2041"}
+    assert [(l.subject.name, l.predicate, l.object.name) for l in links] == [
+        ("Jordan Blake", "OWNS", "2041")]
+    assert [r.why for r in rejected] == ["not a particular thing"]          # the '12'
+
+
+def test_a_person_who_owns_a_project_leads_it():
+    # and one who works on a part owns it (the test above)
+    text = "Project Nightjar is paused until Q1; Quinn Patel owns the restart plan."
+    raw = {"entities": [{"name": "Quinn Patel", "type": "person"},
+                        {"name": "Project Nightjar", "type": "project"}],
+           "relationships": [{"source": "Quinn Patel", "relation": "owns",
+                              "target": "Project Nightjar", "quote": text}]}
+    _e, links, rejected = kx.check_open(raw, text, [])
+    assert not rejected
+    assert [(l.subject.name, l.predicate, l.object.name) for l in links] == [
+        ("Quinn Patel", "LEADS", "Project Nightjar")]
+
+
+BUILD_SHEET = """Build sheet, part 3013
+Part Number: 3013
+Scan Speed (mm/s): 1300
+Prepared by Casey Diaz for Project Ironbark.
+"""
+
+
+def test_people_and_projects_in_a_documents_sentences_meet_its_part(tmp_path):
+    """'Part Number: 3013' above 'Prepared by Casey Diaz for Project
+    Ironbark.': the sentence never repeats the part, so the model links the
+    person to the project only; the document's one part joins them, as a
+    suggestion quoting the line."""
+    v = _vault(tmp_path, BUILD_SHEET + "Laser Team FOD A (um): 120\n", "Build_Sheet_3013.txt")
+    (v / "data_in" / "tracker.csv").write_text(
+        "Project,Project Lead\nProject Ironbark,Morgan Kim\n", encoding="utf-8")
+    answer = {"entities": [{"name": "Casey Diaz", "type": "person"},
+                           {"name": "Project Ironbark", "type": "project"},
+                           {"name": "Laser Team FOD A", "type": "project"}],
+              "relationships": [{"source": "Casey Diaz", "relation": "works on",
+                                 "target": "Project Ironbark",
+                                 "quote": "Prepared by Casey Diaz for Project Ironbark."}]}
+    with kgm.KnowledgeGraph(v) as kg:
+        kg.seed()
+        kg.extract_from_text({"pc": scripted(answer)}, model="m")
+        rels = _rels(kg)
+        assert rels[("Casey Diaz", "WORKS_ON", "Project Ironbark")] == "seeded"
+        assert rels[("Casey Diaz", "CONTACT_FOR", "3013")] == "suggested"
+        assert rels[("Project Ironbark", "USES_PART", "3013")] == "suggested"
+        # a project only the model names is not tied to the part
+        assert not any(s == "Laser Team FOD A" for s, _p, _o in rels)
+        part = kg.search("3013")[0]
+        ev = next(n for n in kg.neighbors(part["id"])
+                  if n["predicate"] == "CONTACT_FOR")["evidence"][0]
+        assert ev["method"] == "model" and "Prepared by Casey Diaz" in ev["quote"]
+
+
+def test_a_document_of_several_parts_ties_nobody_to_them(tmp_path):
+    v = _vault(tmp_path, "Part Number: 3013\nPart Number: 3014\n"
+                         "Prepared by Casey Diaz for Project Ironbark.\n", "two.txt")
+    answer = {"entities": [{"name": "Casey Diaz", "type": "person"}], "relationships": []}
+    with kgm.KnowledgeGraph(v) as kg:
+        kg.seed()
+        kg.extract_from_text({"pc": scripted(answer)}, model="m")
+        assert not any(p == "CONTACT_FOR" for _s, p, _o in _rels(kg))

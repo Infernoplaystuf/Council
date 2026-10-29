@@ -14,7 +14,7 @@
 #
 # What's bundled:
 #   • Python interpreter + every dependency from requirements.txt
-#   • Tkinter (with all submodules)
+#   • The Qt app (council_qt.py, council_qt/, council_core/) and PySide6
 #   • llama-cpp-python native DLLs (so the user doesn't need to
 #     compile anything — the .exe runs GGUF models out of the box)
 #   • pandas / numpy / openpyxl / pyarrow / duckdb data-handling
@@ -42,6 +42,11 @@ from PyInstaller.utils.hooks import (
     collect_submodules,
     collect_data_files,
 )
+
+# The Qt app is the only app: the Tk shell (council_gui_engine.py) was retired
+# 2026-10-23. Its tabs, dialogs and widgets are imported by name or inside
+# functions, which the static analyser cannot follow, so both packages are
+# collected whole.
 
 block_cipher = None
 project_root = Path.cwd()
@@ -72,7 +77,7 @@ except Exception:
 # loads via importlib.resources. PyInstaller's collect_data_files grabs them.
 extra_datas = []
 for pkg in ("pandas", "numpy", "openpyxl", "pyarrow", "duckdb",
-            "matplotlib", "tkinterweb"):
+            "matplotlib"):
     try:
         extra_datas.extend(collect_data_files(pkg))
     except Exception:
@@ -83,10 +88,8 @@ for pkg in ("pandas", "numpy", "openpyxl", "pyarrow", "duckdb",
 # import inside the app, add it here too or the .exe will silently fall back
 # to the "X not available" branch even though the user *did* install it.
 hidden = [
-    # ── Tkinter optional submodules ──
-    "tkinter", "tkinter.filedialog", "tkinter.messagebox",
-    "tkinter.scrolledtext", "tkinter.colorchooser", "tkinter.font",
-    "tkinter.ttk", "tkinter.simpledialog",
+    # ── Qt ──
+    "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "PySide6.QtSvg",
     # ── stdlib used through lazy / runtime imports ──
     "ssl", "json", "csv", "sqlite3", "queue", "threading",
     "urllib.request", "urllib.parse", "urllib.error",
@@ -102,10 +105,9 @@ hidden = [
     "h5py",                          # for .dream3d HDF5 pipelines
     "yaml",                          # personality_config.yaml
     # ── Plotting ──
-    "matplotlib", "matplotlib.backends.backend_tkagg",
+    "matplotlib", "matplotlib.backends.backend_qtagg",
     "matplotlib.backends.backend_agg",
     "plotly", "plotly.graph_objects", "plotly.express",
-    "tkinterweb",
     # ── LLM backend ──
     "llama_cpp", "llama_cpp.llama", "llama_cpp.llama_chat_format",
     # ── RAG / embeddings ──
@@ -113,6 +115,7 @@ hidden = [
     "huggingface_hub", "chromadb",
     # ── Document parsing ──
     "pypdf", "docx",                  # python-docx is imported as `docx`
+    "pdfplumber", "pypdfium2",        # PDF tables; scanned pages rendered for OCR
     "bs4", "lxml",                    # vault scraper / web crawl
     # ── Optional integrations ──
     "paramiko",                       # SSH compute nodes
@@ -122,7 +125,7 @@ hidden = [
     #    defensively so a missing import in an edge code path doesn't kill
     #    the bundle. Add new modules to this list as they're added to the
     #    repo. ──
-    "council_engine", "council_gui_engine", "council_modules",
+    "council_engine",
     "council_agents", "agent_core",
     "coordinator", "coder_agent", "intern_agent", "sage_agent",
     "vault_agent", "apothecary_engine",
@@ -131,14 +134,14 @@ hidden = [
     "conversation_logger", "provenance",
     "pipeline_scanner", "pipeline_editor", "workflow_runner",
     "data_index", "hf_download", "branding",
-    "model_backends", "openai_responses_backend", "phase1_ai_model_council",
-    "graph_engine", "graph_data", "graph_personality", "grapher_app",
-    "tab_grapher",
-    "specialists", "splash", "onboarding",
-    "activation_dialog", "licensing", "device_fingerprint",
+    "model_backends", "openai_responses_backend",
+    "graph_engine", "graph_data", "graph_personality",
+    "specialists",
+    "licensing", "device_fingerprint",
     "crash_reporter", "updater",
     "dream3d_crawl", "dream3d_primer",
-] + llama_hidden + st_hidden + hf_hidden
+] + (collect_submodules("council_qt") + collect_submodules("council_core")
+     + llama_hidden + st_hidden + hf_hidden)
 
 # ---- Data files to ship alongside the executable ----------------------------
 # Source path is relative to project root; destination is relative to the
@@ -147,7 +150,6 @@ hidden = [
 # inside the bundle.
 datas = [
     ("assets",                    "assets"),
-    ("personality_config.yaml",   "."),
     ("personality_backends.json", "."),
     ("README.md",                 "."),
     ("USER_GUIDE.md",             "."),
@@ -179,14 +181,14 @@ excludes = [
     "test", "tests", "unittest",
     "pytest", "py", "_pytest",
     "IPython", "jupyter", "notebook", "ipykernel",
-    "PyQt5", "PyQt6", "PySide2", "PySide6",   # we use Tk, not Qt
+    "PyQt5", "PyQt6", "PySide2",               # the app is PySide6
     "wx",                                       # no wxPython use
     # Large optional ML libs we don't use
     "torchvision", "torchaudio",
 ]
 
 a = Analysis(
-    ["council_gui_engine.py"],
+    ["council_qt.py"],
     pathex=[str(project_root)],
     binaries=llama_binaries + st_binaries + hf_binaries,
     datas=datas,

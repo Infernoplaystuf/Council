@@ -29,9 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sample_ledger import LedgerError, ParentCSV, read_template
 from source_extract import (REVIEW_TOO_LONG, ImageReader, apply_review, decide,
-                            default_image_reader, extract, load_aliases, load_taught,
-                            path_too_long, too_long_to_write, workbook_files,
-                            write_review)
+                            default_image_reader, extract, ledger_values, load_aliases,
+                            load_taught, path_too_long, summarize_review_reasons,
+                            too_long_to_write, workbook_files, write_review)
 
 #: listener(line, fraction or None) - called from the worker thread with every
 #: progress line (also printed in the terminal); the caller hops to its UI.
@@ -45,7 +45,14 @@ def default_csv_for(template) -> Path:
 
 
 def default_review_for(csv_path) -> Path:
-    return Path(csv_path).with_name(f"review_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    """A new review's name beside the parent CSV, never one already there
+    (two runs in one second wrote the same name: Re-run with my answers)."""
+    stem = f"review_{datetime.now():%Y%m%d_%H%M%S}"
+    out, n = Path(csv_path).with_name(f"{stem}.xlsx"), 1
+    while out.exists():
+        n += 1
+        out = out.with_name(f"{stem}_{n}.xlsx")
+    return out
 
 
 def is_ledger_output(p: Path, template_path: Optional[str] = None) -> bool:
@@ -68,7 +75,35 @@ def _ledger_output_kind(p: Path, template_path: Optional[str] = None) -> str:
             pass
     if kg_excel.is_review_workbook(p):
         return "a Ledger review"
+    # a parent CSV (its schema beside it) - now that a scan reads .csv
+    if p.suffix.lower() == ".csv" and p.with_suffix(".schema.json").exists():
+        return PARENT_CSV
     return "a filled template" if is_filled_template(p) else ""
+
+
+#: a parent CSV a folder scan found (_ledger_output_kind): left out, unlisted
+PARENT_CSV = "a Ledger's parent CSV"
+
+
+def unread_files(sources: Sequence) -> Dict[str, int]:
+    """What a folder scan leaves unread because the Ledger has no reader for
+    it, by file type ('.png': 4) - named in the summary, not dropped without
+    a word (synthetic test, 2026-10-27). Hidden folders are not counted."""
+    from source_extract import WORKBOOK_SUFFIXES
+    counts: Dict[str, int] = {}
+    for s in sources:
+        p = Path(s)
+        if not p.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(p):
+            dirnames[:] = [d for d in dirnames if not d.startswith((".", "~$"))]
+            for n in filenames:
+                suf = Path(n).suffix.lower()
+                if n.startswith(("~$", ".")) or suf in WORKBOOK_SUFFIXES \
+                        or suf in (".json",) and n.endswith(".schema.json"):
+                    continue
+                counts[suf or "(no type)"] = counts.get(suf or "(no type)", 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 def collect_sources(paths: Sequence,
@@ -105,6 +140,8 @@ def collect_sources(paths: Sequence,
             pat = next((q for q in patterns if file_matches_ignore(x.name, [q])), None)
             why = f"Skip pattern {pat!r}" if pat is not None else (
                 _ledger_output_kind(x, template_path) if scanned else "")
+            if why == PARENT_CSV:
+                continue          # the Ledger's own CSV beside its sources: not news
             if why:
                 ignored.append(x)
                 if reasons is not None:
@@ -210,6 +247,27 @@ class ExtractSummary:
     records: int = -1
     decisions: int = 0
     learned: List[str] = field(default_factory=list)
+    #: why the values to review were not pre-accepted, counted
+    #: (source_extract.summarize_review_reasons; user, 2026-10-23)
+    review_reasons: str = ""
+    #: the folder of filled templates, one per part, values tinted by
+    #: confidence (ledger_review.write_all_filled; user, 2026-10-23)
+    filled: str = ""
+    filled_count: int = 0
+    #: every part's filled template in one workbook, a sheet each
+    #: (ledger_review.write_full_filled; user, 2026-10-26)
+    filled_book: str = ""
+    #: pictures read that had no text in them (a photo): not failures, so
+    #: not among the ones not read (user, 2026-10-26: "only getting about
+    #: 1/3 to 1/2 of the images read"); and why the others were not read
+    images_blank: int = 0
+    images_unread: str = ""
+    #: files a folder scan found that no reader takes, by type ('.png': 4)
+    unread: Dict[str, int] = field(default_factory=dict)
+    #: sheets with no word of the template in their first rows: not read
+    unrelated: List[str] = field(default_factory=list)
+    #: templates the Ledger filled that someone saved since: read as sources
+    read_again: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -217,7 +275,10 @@ class ExtractSummary:
         s = (f"{self.files} files: {self.values} values found, {self.pre_accepted} "
              f"pre-accepted, {self.to_review} to review, {self.unmatched} values under "
              f"labels that matched no field, {self.images_read} of {self.images} "
-             f"images read")
+             f"images read"
+             + (f" ({self.images_blank} more had no text in them)" if self.images_blank
+                else "")
+             + (f"; not read: {self.images_unread}" if self.images_unread else ""))
         if self.cancelled:
             s = ("CANCELLED after every workbook was read — " if self.read_all else
                  "CANCELLED — ") + s
@@ -228,12 +289,29 @@ class ExtractSummary:
                   "titles; a part of another shape is still pre-accepted")
         if self.skipped:
             s += "\n" + summarize_skipped(self.skipped)
+        if self.read_again:
+            s += (f"\nread again: {len(self.read_again)} template(s) the Ledger filled "
+                  "that someone saved since — " + ", ".join(self.read_again[:10]))
+        if self.unread:
+            s += "\n" + summarize_unread(self.unread)
+        if self.unrelated:
+            s += (f"\n{len(self.unrelated)} sheet(s) not read: no word of the template in "
+                  "their first rows — " + ", ".join(self.unrelated[:8])
+                  + (f", and {len(self.unrelated) - 8} more" if len(self.unrelated) > 8 else ""))
         if self.assist:
             s += "\n" + self.assist
         if self.open_failures:
             s += "\n" + summarize_open_failures(self.open_failures)
         if self.timings:
             s += "\n" + summarize_slowest(self.timings)
+        if self.review_reasons:
+            s += "\n" + self.review_reasons
+        if self.filled_count:
+            s += (f"\nThe template filled in for {self.filled_count} part(s), each value "
+                  f"tinted by how sure it is (green sure, yellow fairly, orange unsure, red "
+                  f"disagreeing): {self.filled}")
+        if self.filled_book:
+            s += f"\nEvery part's filled template in one workbook: {self.filled_book}"
         return s + "".join(f"\n  ! {p}" for p in self.problems) + f"\nreview: {self.review}"
 
 
@@ -284,6 +362,17 @@ def summarize_open_failures(open_failures) -> str:
     return f"{len(open_failures)} files failed to open — " + ", ".join(parts)
 
 
+def summarize_unread(unread: Dict[str, int]) -> str:
+    """'not read (no reader for the type): 6 .jpg, 1 .png, 1 .json'."""
+    return ("not read (no reader for the type): "
+            + ", ".join(f"{n} {suf}" for suf, n in unread.items()))
+
+
+def _is_edited_filled(p) -> bool:
+    from sample_ledger import is_edited_filled_template
+    return is_edited_filled_template(p)
+
+
 def summarize_skipped(skipped, top: int = 10) -> str:
     """'left out 3 file(s): cover_sheet.xlsx (Skip pattern 'cover*'), …'"""
     shown = ", ".join(f"{n} ({why})" for n, why in list(skipped)[:max(1, int(top))])
@@ -313,13 +402,36 @@ def _images_read(notes) -> int:
                and not n.text.startswith(("reader failed", "(no text found)")))
 
 
+def _images_blank(notes) -> int:
+    """Pictures read that had no text in them."""
+    return sum(1 for n in notes if n.reader not in ("", "none installed")
+               and n.text.startswith("(no text found)"))
+
+
+def _images_unread(notes) -> str:
+    """Why the pictures not read were not, counted: '3 Excel could not copy
+    out, 1 the reader failed'."""
+    from collections import Counter
+    why: Counter = Counter()
+    for n in notes:
+        if n.text.startswith("(no text found)") or (
+                n.reader not in ("", "none installed") and not n.text.startswith("reader")):
+            continue
+        why["the reader failed" if n.text.startswith("reader failed") else
+            "no image reader installed" if n.reader == "none installed" else
+            "Excel could not copy them out" if "Excel could not copy" in n.text else
+            "EMF/WMF drawings (Windows only)" if "drawing, which" in n.text else
+            "other"] += 1
+    return ", ".join(f"{k} {w}" for w, k in why.most_common())
+
+
 def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
                 use_images: bool = True, image_reader: Optional[ImageReader] = None,
                 progress: Optional[Listener] = None,
                 pattern_mask: Optional[str] = None,
                 cancel: Optional[Any] = None,
                 log: Optional[Callable[[str], None]] = None,
-                assist: Any = False) -> ExtractSummary:
+                assist: Any = False, prefer: Sequence[str] = ()) -> ExtractSummary:
     """``log``: where a stall dump goes (the Ledger tab's log). ``assist``:
     ask Council's model about the labels and part numbers the rules could
     not place (council_core.ledger_llm); its answers are suggestions, and
@@ -328,22 +440,49 @@ def run_extract(csv_path, sources: Sequence, review_path=None, part: str = "",
     ``pattern_mask`` empty: the Ledger's saved part-name pattern (Teach
     saves one; source_extract.load_patterns) is used as a hint - a part of
     another shape is still pre-accepted (extract's pattern_strict) - and the
-    summary says so (ExtractSummary.pattern_saved)."""
+    summary says so (ExtractSummary.pattern_saved).
+
+    ``prefer``: the operators (initials) whose reading is used when a
+    workbook has several readings of one value (source_extract.decide)."""
     from progress_report import Progress
     with Progress("ledger extract", listener=progress) as prog:
         s = _extract(csv_path, sources, review_path, part, use_images, image_reader,
-                     prog, pattern_mask, cancel, log, assist)
+                     prog, pattern_mask, cancel, log, assist, prefer=prefer)
         tail = "cancelled" if s.cancelled else f"{len(s.problems)} problems"
         prog.finish(f"{s.files} workbooks: {s.values} values found, {s.to_review} to "
                     f"review, {tail}")
         return s
 
 
+def source_files(csv_path, sources: Sequence) -> List[Path]:
+    """The files an Extract of this Ledger would read from ``sources``
+    (folders scanned, the Skip patterns and the Ledger's own files left
+    out), as _extract and _extract_records find them - for an update, which
+    then reads only the new or changed ones (council_core.ledger_saved)."""
+    from council_core import ledger_records
+    from source_extract import load_ignore_files
+    if ledger_records.is_record_ledger(csv_path):
+        template = ledger_records.load_recipe(csv_path).template.get("path")
+    else:
+        schema = ParentCSV(csv_path).schema
+        template = schema.template_path if schema is not None else None
+    files, _ = collect_sources(sources, ignore_patterns=load_ignore_files(csv_path),
+                               template_path=template)
+    return files
+
+
+def _same_file(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def _extract(csv_path, sources, review_path, part, use_images, image_reader,
              prog, pattern_mask: Optional[str] = None,
              cancel: Optional[Any] = None,
              log: Optional[Callable[[str], None]] = None,
-             assist: Any = False, chat=None) -> ExtractSummary:
+             assist: Any = False, chat=None, prefer: Sequence[str] = ()) -> ExtractSummary:
     say = prog.update
     from council_core import ledger_records
     if ledger_records.is_record_ledger(csv_path):
@@ -359,6 +498,20 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                            ignore_patterns=ignore_patterns,
                                            template_path=ledger.schema.template_path,
                                            reasons=why_skipped)
+    # the Ledger's filled example (ledger_examples, user 2026-10-23): worked
+    # answers and the model's guide - never a source to read values from
+    from council_core import ledger_examples
+    example = ledger_examples.load_filled_example(csv_path)
+    example_rows = ledger_examples.filled_example_rows(example, ledger.schema)
+    if example:
+        keep = []
+        for f in files:
+            if _same_file(f, example):
+                skipped_files.append(f)
+                why_skipped[f] = "the filled example"
+            else:
+                keep.append(f)
+        files = keep
     if not files:
         if skipped_files and not sources:
             raise LedgerError("no source workbooks: add .xlsx files or a folder of them")
@@ -416,7 +569,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    report, stop)
         # the user's answers in Teach go in as examples (few-shot)
         label_examples = ledger_teach.label_examples(csv_path, ledger.schema)
-        part_examples = ledger_teach.part_examples(csv_path)
+        part_examples = ledger_teach.part_examples(csv_path) + [
+            (p, ledger.schema.id_field) for p in
+            ledger_examples.filled_example_parts(example_rows, ledger.schema.id_field)]
 
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
@@ -429,8 +584,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                       progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
                       part_finder=part_finder, taught=taught,
                       pattern_strict=not pattern_saved,
-                      # the records already accepted are worked answers too
-                      examples=ledger.rows)
+                      # the records already accepted are worked answers too,
+                      # and the filled example's
+                      examples=list(ledger.rows) + example_rows)
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -445,8 +601,11 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    f"labels left over; {rules}.")
         else:
             prog.stage("asking Council's model about the labels left over")
-            ledger_llm.place_labels(run, ledger.schema, chat, report,
-                                    examples=label_examples)
+            ledger_llm.place_labels(
+                run, ledger.schema, chat, report, examples=label_examples,
+                guide=ledger_examples.filled_example_text(
+                    example_rows, [f.name for f in ledger.schema.fields
+                                   if f.name != ledger.schema.id_field]))
             if cancel is not None and cancel.is_set():
                 # pressed while the model was asked: a cancelled run - it
                 # said 'Review written…' and that the model did not answer
@@ -465,15 +624,42 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                         "them).")
         run.problems.extend(report.problems)
     prog.stage("writing the review workbook")
-    dec = decide(run, ledger.schema)
+    # what the Ledger holds already: pre-accepted again, and a value other
+    # than it flagged (a Ledger run again on folders that gained files)
+    dec = decide(run, ledger.schema, prefer=prefer, known=ledger_values(ledger))
+    # a field no group of its part tracks is not asked about (ledger_groups,
+    # user 2026-10-26: "datapoints that aren't tracked anymore")
+    from council_core import ledger_groups
+    groups = ledger_groups.load_groups(csv_path)
+    untracked = 0
+    if groups:
+        facts = ledger_groups.facts_from_ledger(ledger)
+        ledger_groups.add_decisions(facts, dec)
+        untracked = ledger_groups.set_aside_untracked(dec, groups, facts, csv_path,
+                                                      ledger.schema)
     # the mask and Part override go with the review: Apply reads the
     # sources again and must give its values the same parts (review,
     # 2026-10-19: mapped labels went to a phantom part or were dropped)
     write_review(out, run, dec, ledger.schema, str(csv_path),
                  pattern_mask=pattern_mask or "", part=part or "",
-                 pattern_hint=pattern_saved)
+                 pattern_hint=pattern_saved, prefer=prefer)
+    filled: List[str] = []
+    filled_book = ""
+    if not run.cancelled:
+        prog.stage("filling in the template for each part")
+        try:
+            from council_core import ledger_review
+            filled = ledger_review.write_all_filled(ledger_review.load(out), say)
+        except Exception as e:                              # noqa: BLE001
+            run.problems.append(f"the filled templates were not written: {e}")
+        try:
+            # every part in one workbook, a sheet each (user, 2026-10-26)
+            filled_book = ledger_review.write_full_filled(ledger_review.load(out), say) or ""
+        except Exception as e:                              # noqa: BLE001
+            run.problems.append(f"the filled workbook was not written: {e}")
     ok = sum(d.accept for d in dec)
-    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok,
+    aside = sum(bool(d.alternate) for d in dec)
+    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
                           list(run.timings), bool(run.cancelled), read_all=read_all,
@@ -481,7 +667,25 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                           skipped=[(p.name, why_skipped.get(p, "left out"))
                                    for p in skipped_files],
                           pattern=pattern_mask or "", pattern_saved=pattern_saved,
-                          learned=list(getattr(run, "learned", []) or []))
+                          learned=([f"Filled example {Path(example).name}: "
+                                    f"{len(example_rows)} row(s) used as worked answers"
+                                    + (" and shown to Council's model" if assist else "")]
+                                   if example_rows else
+                                   [f"Filled example {Path(example).name}: not read (no "
+                                    f"{ledger.schema.id_field} in it, or it is not there)"]
+                                   if example else [])
+                          + list(getattr(run, "learned", []) or [])
+                          + ([f"{untracked} value(s) of fields their part's groups do not "
+                              "track were left out (Groups…)"] if untracked else []),
+                          review_reasons=summarize_review_reasons(dec, ledger.schema),
+                          filled=str(Path(filled[0]).parent) if filled else "",
+                          filled_count=len(filled), filled_book=filled_book,
+                          images_blank=_images_blank(run.images),
+                          images_unread=_images_unread(run.images),
+                          unread=unread_files(sources),
+                          unrelated=list(run.unrelated),
+                          read_again=[p.name for p in files
+                                      if _is_edited_filled(p)])
 
 
 def _extract_records(csv_path, sources, review_path, prog, cancel, assist,

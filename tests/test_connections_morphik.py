@@ -163,7 +163,9 @@ def test_ask_with_no_model_lists_the_facts(qapp, tab):
     tab.on_ask()
     wait(qapp, tab)
     assert "No model chosen" in tab.answer.toPlainText()
-    assert tab.facts.topLevelItemCount() == 1
+    groups = [tab.facts.topLevelItem(i).text(0) for i in range(tab.facts.topLevelItemCount())]
+    assert [g for g in groups if g.startswith("About")] == groups[:1]   # one facts group, first
+    assert set(groups[1:]) <= {"Rows of your files"}
 
 
 def test_a_named_graph_is_made_built_and_deleted_from_the_tab(qapp, tab):
@@ -226,7 +228,8 @@ def test_the_graph_dialog_gives_its_values(qapp, tmp_path):
     dlg.links_review.setChecked(True)
     assert dlg.values() == {"name": "Falcon wing", "folders": [str(tmp_path)],
                             "suffixes": ["pdf", ".MD"], "focus": "spars and their suppliers",
-                            "model_links": "review", "use_in_answers": True}
+                            "model_links": "review", "use_in_answers": True,
+                            "embed_model": "", "related_threshold": 0.75}
     main = GraphDialog(new=False, name="All documents", is_main=True)
     assert not main.name.isEnabled() and not main.add_btn.isVisibleTo(main)
     assert main.values()["folders"] == []
@@ -254,7 +257,9 @@ def test_the_layout_is_stable_and_spreads_the_entities(tmp_path):
     with kgm.KnowledgeGraph(v) as kg:
         kg.seed()
         nodes, edges = kg_layout.subgraph(kg)
-        assert len(nodes) == 34 and edges
+        # 34 entities and the CSV's table node (kg_tables, 2026-10-27)
+        assert len(nodes) == 35 and edges
+        assert [n["name"] for n in nodes if n["type"] == "TABLE"] == ["parts.csv"]
         assert all(e["predicate"] != "DOCUMENTED_IN" for e in edges)
         a = kg_layout.layout(nodes, edges)
         b = kg_layout.layout(nodes, edges)
@@ -265,7 +270,8 @@ def test_the_layout_is_stable_and_spreads_the_entities(tmp_path):
         assert close == 0                                    # nothing on top of another
         centre = kg.search("PN-001")[0]["id"]
         nodes, edges = kg_layout.subgraph(kg, centre, hops=1)
-        assert {n["name"] for n in nodes} == {"PN-001", "KA-1", "Person B"}
+        # and the table that lists it
+        assert {n["name"] for n in nodes} == {"PN-001", "KA-1", "Person B", "parts.csv"}
         pos = kg_layout.layout(nodes, edges)
         assert pos[centre] == (0.0, 0.0)
         assert kg_layout.subgraph(kg, centre, hops=2, max_nodes=5)[0].__len__() == 5

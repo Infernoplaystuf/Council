@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import project as pj
+from . import token_budget
 
 DIR_NAME = ".council_agents"
 #: The example Qt apps (gui_reference) the "Qt app builder" reads.
@@ -212,7 +213,8 @@ def run_report(vault_dir: Path, project: pj.Project, profile: AgentProfile,
         if stop():
             break
         reply = chat_tools(messages, specs, role=profile.role,
-                           num_predict=1800, timeout=900)
+                           num_predict=token_budget.reply("long", 1800),
+                           timeout=900)
         calls = reply.get("tool_calls") or []
         if not calls:
             report = str(reply.get("content") or "").strip()
@@ -234,7 +236,8 @@ def run_report(vault_dir: Path, project: pj.Project, profile: AgentProfile,
                              "content": str(msg)[:ca.TOOL_RESULT_CHARS]})
         ca._trim(messages, ca._window_chars(profile.role))
     messages.append({"role": "user", "content": "Write the report now."})
-    reply = chat_tools(messages, [], role=profile.role, num_predict=1800,
+    reply = chat_tools(messages, [], role=profile.role,
+                       num_predict=token_budget.reply("long", 1800),
                        timeout=900)
     report = str(reply.get("content") or "").strip()
     say("note", report)

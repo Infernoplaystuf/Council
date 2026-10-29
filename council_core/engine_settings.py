@@ -18,7 +18,10 @@ saved one. Kept exactly, because a launch-time override is how a user gets out
 of a saved setting that crashes the GPU. One consequence worth knowing: the
 run-* launchers export COUNCIL_GGUF_GPU_LAYERS=99 and COUNCIL_EMBED_DEVICE=cpu
 when unset, so under a launcher a SAVED gpu_layers / embed_device never
-applies, in either front end. A saved n_ctx does (no launcher sets it).
+applies, in either front end.
+
+A SAVED n_ctx IS IGNORED (2026-10-23): the engine sizes the window to the
+model, so there is no fixed context size to carry over.
 
 TIMING
 The engine reads these when it LOADS a model, not at import, so any time
@@ -32,8 +35,10 @@ from pathlib import Path
 from typing import Callable, Dict, MutableMapping, Optional, Tuple
 
 #: (key in backend_settings.json, the environment variable the engine reads).
+#: A saved "n_ctx" is NOT among them any more: the window always follows
+#: the model (the loader's VRAM-aware ladder), and COUNCIL_GGUF_N_CTX, the Tk
+#: era's fixed window, is no longer read (user, 2026-10-23).
 KNOBS: Tuple[Tuple[str, str], ...] = (
-    ("n_ctx", "COUNCIL_GGUF_N_CTX"),
     ("gpu_layers", "COUNCIL_GGUF_GPU_LAYERS"),
     ("embed_device", "COUNCIL_EMBED_DEVICE"),
 )
@@ -64,17 +69,17 @@ def apply_saved(vault_dir=None,
     """Read vault/backend_settings.json and `apply` it. Never raises: a launch
     must not die over a context size.
 
-    Read through onboarding's reader, the one the main-model setting already
+    Read through backend_settings' reader, the one the main-model setting already
     uses, rather than a second json.loads: it accepts the BOM PowerShell 5.1
     writes and an empty file, and says "unreadable" rather than "empty" for a
-    damaged one (MEASURED 2026-09-29 in onboarding._read_backend_settings).
+    damaged one (MEASURED 2026-09-29 in backend_settings._read_backend_settings).
     """
     try:
         if vault_dir is None:
             from . import paths
             vault_dir = paths.vault_dir()
-        import onboarding
-        settings = onboarding._read_backend_settings(Path(vault_dir))
+        from . import backend_settings
+        settings = backend_settings._read_backend_settings(Path(vault_dir))
         if settings is None:
             if log:
                 log(f"[startup] engine settings: could not read "

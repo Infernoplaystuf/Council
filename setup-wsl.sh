@@ -149,7 +149,7 @@ pip install -q --upgrade-strategy only-if-needed \
     html2text huggingface_hub kaleido matplotlib openpyxl paramiko \
     plotly pyarrow pymongo pypdf python-docx PyYAML requests \
     scikit-learn scipy sentence-transformers sounddevice soundfile \
-    SQLAlchemy tkinterweb
+    SQLAlchemy
 # crawl4ai-setup is a separate post-install step.
 crawl4ai-setup >/dev/null 2>&1 || warn "crawl4ai-setup failed (non-fatal)"
 

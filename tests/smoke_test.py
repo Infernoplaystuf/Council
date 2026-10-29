@@ -21,7 +21,7 @@ What this covers (and doesn't):
   • Synthetic GGUF round-trip — writes a valid-magic minimal GGUF
     to a temp file and confirms three independent validators
     accept it:
-        onboarding.gguf_file_status
+        backend_settings.gguf_file_status
         previous_install_detect._quick_gguf_validate
         council_engine.read_gguf_metadata
 
@@ -281,16 +281,16 @@ def test_previous_install_detect() -> None:
 def test_synthetic_gguf_accepted() -> None:
     """A valid-magic GGUF must pass every validator."""
     import council_engine as ce
-    import onboarding
     import previous_install_detect as pid
+    from council_core import backend_settings
 
     with tempfile.TemporaryDirectory() as td:
         gguf = Path(td) / "test.gguf"
         _make_synthetic_gguf(gguf, arch="llama", context_length=8192)
 
-        # onboarding.gguf_file_status
-        ok, msg = onboarding.gguf_file_status(str(gguf))
-        _check(f"onboarding.gguf_file_status accepts synthetic GGUF "
+        # backend_settings.gguf_file_status
+        ok, msg = backend_settings.gguf_file_status(str(gguf))
+        _check(f"backend_settings.gguf_file_status accepts synthetic GGUF "
                f"(msg={msg!r})", ok)
 
         # previous_install_detect._quick_gguf_validate
@@ -311,15 +311,15 @@ def test_synthetic_gguf_accepted() -> None:
 def test_synthetic_gguf_rejected_cases() -> None:
     """Negative cases — every validator must refuse to accept these."""
     import council_engine as ce
-    import onboarding
     import previous_install_detect as pid
+    from council_core import backend_settings
 
     with tempfile.TemporaryDirectory() as td:
         # Case 1 — non-GGUF magic
         notgguf = Path(td) / "not.gguf"
         notgguf.write_bytes(b"<!DOCTYPE html>\n<html>" + b"\0" * 4096)
-        ok, _ = onboarding.gguf_file_status(str(notgguf))
-        _check("non-GGUF magic rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(notgguf))
+        _check("non-GGUF magic rejected by backend_settings.gguf_file_status",
                not ok)
         _check("non-GGUF magic rejected by _quick_gguf_validate",
                not pid._quick_gguf_validate(notgguf))
@@ -327,16 +327,16 @@ def test_synthetic_gguf_rejected_cases() -> None:
         # Case 2 — too small (200 bytes is below the size floor)
         tiny = Path(td) / "tiny.gguf"
         tiny.write_bytes(b"GGUF" + b"\0" * 196)
-        ok, _ = onboarding.gguf_file_status(str(tiny))
-        _check("too-small file rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(tiny))
+        _check("too-small file rejected by backend_settings.gguf_file_status",
                not ok)
         _check("too-small file rejected by _quick_gguf_validate",
                not pid._quick_gguf_validate(tiny))
 
         # Case 3 — missing file
         missing = Path(td) / "missing.gguf"
-        ok, _ = onboarding.gguf_file_status(str(missing))
-        _check("missing file rejected by onboarding.gguf_file_status",
+        ok, _ = backend_settings.gguf_file_status(str(missing))
+        _check("missing file rejected by backend_settings.gguf_file_status",
                not ok)
         # read_gguf_metadata on missing file should return {}
         md = ce.read_gguf_metadata(missing)
@@ -854,7 +854,7 @@ def test_clip_path_persistence() -> None:
     catches the regression I almost shipped — save_gguf_path() used to
     overwrite the whole file, which would have wiped clip_path on every
     model swap."""
-    import onboarding
+    from council_core import backend_settings
     with tempfile.TemporaryDirectory() as td:
         vault = Path(td)
         # Synthesise valid GGUF + mmproj files so the validators don't
@@ -865,33 +865,33 @@ def test_clip_path_persistence() -> None:
         _make_synthetic_gguf(clip, arch="llama", context_length=4096)
 
         # 1) Save the GGUF first.
-        onboarding.save_gguf_path(vault, str(gguf))
+        backend_settings.save_gguf_path(vault, str(gguf))
         _check("after save_gguf_path, load_gguf_path returns the path",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
 
         # Save the clip path — this is the case that broke before the
         # _merge_backend_settings refactor.
-        onboarding.save_clip_path(vault, str(clip))
+        backend_settings.save_clip_path(vault, str(clip))
 
         # 2) Both paths must now be readable from the SAME file.
         _check("load_clip_path round-trips after save_clip_path",
-               onboarding.load_clip_path(vault) == str(clip))
+               backend_settings.load_clip_path(vault) == str(clip))
         _check("save_clip_path did NOT clobber gguf_path",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
 
         # 3) Clearing the clip path (text-only mode) must NOT clobber
         #    the GGUF path either.
-        onboarding.save_clip_path(vault, "")
+        backend_settings.save_clip_path(vault, "")
         _check("clearing clip_path leaves gguf_path intact",
-               onboarding.load_gguf_path(vault) == str(gguf))
+               backend_settings.load_gguf_path(vault) == str(gguf))
         _check("clearing clip_path makes load_clip_path return empty",
-               onboarding.load_clip_path(vault) == "")
+               backend_settings.load_clip_path(vault) == "")
 
         # 4) Env-var override beats persisted JSON.
         try:
             os.environ["COUNCIL_GGUF_CLIP_PATH"] = "/tmp/env-override.gguf"
             _check("env var COUNCIL_GGUF_CLIP_PATH wins over JSON",
-                   onboarding.load_clip_path(vault) == "/tmp/env-override.gguf")
+                   backend_settings.load_clip_path(vault) == "/tmp/env-override.gguf")
         finally:
             os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
 
@@ -1704,78 +1704,6 @@ def test_db_export_mongo_roundtrip() -> None:
                    len(_pd.read_csv(info["path"])) == 5)
     finally:
         _db._mongo_client = real  # type: ignore
-
-
-def test_db_wizard_url_assembly() -> None:
-    """The guided wizard's pure URL builder: correct schemes, default
-    ports, percent-encoding of credentials (the bug a hand-typed URL
-    hits), file paths, env-var placeholders, and required-field errors."""
-    import db_connect_wizard as _w
-
-    # Postgres with a nasty password — must be percent-encoded so the
-    # netloc isn't corrupted by @ : / characters.
-    kind, url = _w.build_connection_url(
-        "postgresql", host="db.co", database="sales",
-        user="ro_user", password="p@ss:w/rd ")
-    _check("postgres kind is sql", kind == "sql")
-    _check("postgres scheme", url.startswith("postgresql://"))
-    _check("default port 5432 applied", ":5432/" in url)
-    _check("password percent-encoded",
-           "p%40ss%3Aw%2Frd%20" in url and "p@ss:w/rd" not in url)
-    _check("host intact", "@db.co:" in url)
-    _check("database in path", url.endswith("/sales"))
-
-    # MySQL scheme + default port
-    _, url = _w.build_connection_url("mysql", host="h", database="d",
-                                     user="u", password="p")
-    _check("mysql pymysql scheme", url.startswith("mysql+pymysql://"))
-    _check("mysql default port 3306", ":3306/" in url)
-
-    # MSSQL appends the ODBC driver param
-    _, url = _w.build_connection_url("mssql", host="h", database="d",
-                                     user="u", password="p")
-    _check("mssql pyodbc scheme", url.startswith("mssql+pyodbc://"))
-    _check("mssql driver param present", "driver=ODBC" in url)
-
-    # Mongo: kind=mongo, default port, authSource from the db name
-    kind, url = _w.build_connection_url("mongodb", host="h", database="appdb",
-                                        user="u", password="p")
-    _check("mongo kind is mongo", kind == "mongo")
-    _check("mongo scheme + port", url.startswith("mongodb://") and ":27017/" in url)
-    _check("mongo authSource set from db", "authSource=appdb" in url)
-
-    # Env-var password → placeholder, NOT inlined/encoded
-    _, url = _w.build_connection_url("postgresql", host="h", database="d",
-                                     user="u", env_var="PG_PASS")
-    _check("env-var placeholder used", "${PG_PASS}" in url)
-
-    # File-based: path only, three-slash form, backslashes normalised
-    kind, url = _w.build_connection_url("sqlite",
-                                        file_path=r"C:\data\my.db")
-    _check("sqlite kind is sql", kind == "sql")
-    _check("sqlite three-slash + forward slashes",
-           url == "sqlite:///C:/data/my.db")
-
-    # Required-field errors are user-facing ValueErrors
-    _check("missing host raises",
-           _raises(ValueError, lambda: _w.build_connection_url(
-               "postgresql", database="d", user="u", password="p")))
-    _check("missing file raises",
-           _raises(ValueError, lambda: _w.build_connection_url("sqlite")))
-
-    # Assembled URLs satisfy the saver's own validation (round-trip).
-    import db_connections as _db
-    with tempfile.TemporaryDirectory() as td:
-        vault = Path(td)
-        kind, url = _w.build_connection_url(
-            "postgresql", host="h", database="d", user="u", password="p@w")
-        _db.save_sql_connection(vault, "wiz_pg", url)
-        _check("wizard URL accepted by saver",
-               _db.list_sql_connections(vault).get("wiz_pg") == url)
-
-    # env-var name suggester
-    _check("env-var name suggestion tidy",
-           _w.suggest_env_var_name("sales db") == "SALES_DB_PASSWORD")
 
 
 def test_db_audit_log_writes() -> None:
@@ -3270,228 +3198,6 @@ def test_workflow_chaining() -> None:
         wr.resolve_pipeline_path = saved_resolve
 
 
-def test_no_bare_re_in_gui() -> None:
-    """council_gui_engine imports `re as _re`, so a bare `re.<attr>` is a
-    NameError waiting to fire at runtime.
-
-    Two shipped: `re.sub` in _nx_write_script (so "Write pipeline" crashed with
-    "re is undefined" AFTER the model had already generated the script) and two
-    `re.search` in the grapher's JSON parse. None are caught by import or
-    compile — the name only resolves when the line executes — so this scans the
-    AST for any `re.<attr>` where `re` is not a locally-imported alias.
-    """
-    import ast
-    from pathlib import Path
-
-    src = Path(__file__).resolve().parent.parent / "council_gui_engine.py"
-    tree = ast.parse(src.read_text(encoding="utf-8"))
-    bad = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "re"):
-            bad.append(node.lineno)
-    _check("no bare `re.<attr>` in council_gui_engine (module imports re as _re)",
-           not bad, f"bare re. at lines: {sorted(set(bad))}")
-
-
-def test_dream3d_convert_to_python_routing() -> None:
-    """A natural-language "convert this pipeline to python" must route to the
-    DETERMINISTIC transpiler, never the model.
-
-    There was no chat intent for it, so the request fell through to the model,
-    which injected the pipeline file plus the converter script and truncated
-    both at the n_ctx fallback (4096) — "converting" nothing. Transpiling is
-    pure UUID→Python string work with no token budget, so it must not touch the
-    model.
-    """
-    try:
-        import council_gui_engine as cge
-    except Exception as exc:  # pragma: no cover
-        _check(f"council_gui_engine importable ({exc!r})", False)
-        return
-    C = cge.CouncilConsole
-
-    def name_of(text):
-        for rx in C._PIPELINE_TO_PYTHON_RES:
-            m = rx.match(text)
-            if m:
-                return m.group(1).strip()
-        return None
-
-    for text, want in (
-            ("convert job.d3dpipeline to python", "job.d3dpipeline"),
-            ("convert my pipeline segmentation to a python script", "segmentation"),
-            ("transpile stats_pipeline", "stats_pipeline"),
-            ("turn grain_analysis into python", "grain_analysis"),
-            ("the python equivalent of surface_mesh", "surface_mesh"),
-            ("python version of job_417", "job_417"),
-            ("segmentation to python", "segmentation")):
-        _check(f"convert phrasing captures the name: {text!r}",
-               name_of(text) == want, f"got {name_of(text)!r}")
-
-    # A qualifier word ("dream3d"/"simplnx") between the article and "python"
-    # must not break the match — this is the most natural way to phrase it, and
-    # it used to miss entirely and fall through to the model.
-    for text in (
-            "convert a dream3d pipeline into a dream3d python script",
-            "convert my segmentation pipeline into a dream3d python script",
-            "turn the grain pipeline into a simplnx python script",
-            "the dream3d python equivalent of surface_mesh"):
-        _check(f"'...dream3d python...' still routes to convert: {text[:44]!r}",
-               name_of(text) is not None)
-
-    # _clean_pipeline_ref reduces a generic reference to no specific name, so a
-    # generic request gets a chooser instead of a wrong guess or a model call.
-    _check("'a dream3d pipeline' cleans to no specific name",
-           C._clean_pipeline_ref(C, "a dream3d pipeline") == "")
-    _check("'my segmentation pipeline' cleans to 'segmentation'",
-           C._clean_pipeline_ref(C, "my segmentation pipeline") == "segmentation")
-    _check("a real name survives cleaning",
-           C._clean_pipeline_ref(C, "job_417.d3dpipeline") == "job_417.d3dpipeline")
-
-    # A real CREATE request has no python/transpile cue and must keep its own
-    # intent (not be eaten by the convert route).
-    _check("'create a pipeline that segments grains' is still a CREATE",
-           bool(C._PIPELINE_CREATE_RE.match("create a pipeline that segments grains")))
-    _check("'list pipelines' is still LIST",
-           bool(C._PIPELINE_LIST_RE.match("list pipelines")))
-
-    # The handler uses the deterministic transpiler and never the model:
-    # verified structurally by reading the method's source (it must call
-    # nx_bridge.transpile and must not call local_chat / self.writer).
-    import inspect
-    src = inspect.getsource(C._pipeline_to_python_response)
-    _check("handler calls the deterministic nx_bridge.transpile",
-           "nx_bridge" in src and ".transpile(" in src)
-    _check("handler does NOT invoke the model",
-           "local_chat" not in src and "self.writer" not in src
-           and "_model_call" not in src)
-
-
-def test_dream3d_tab_wiring() -> None:
-    """The Dream3D tab reaches Part B.
-
-    Until this existed the whole subsystem was library code with tests and no
-    way in from the app. The handlers are bound to a stub here — Tk is never
-    started — so the parts that break silently in a GUI (a wrong helper call,
-    a write outside the vault, work landing on the Tk thread) are caught."""
-    try:
-        import council_gui_engine as cge
-        import data_index
-    except Exception as exc:  # pragma: no cover
-        _check(f"gui engine importable ({exc!r})", False)
-        return
-
-    C = cge.CouncilConsole
-    for name in ("_nx_check_env", "_nx_catalog", "_nx_transpile_selected",
-                 "_nx_write_script", "_nx_show"):
-        _check(f"the tab has {name}", callable(getattr(C, name, None)))
-
-    with tempfile.TemporaryDirectory() as td:
-        vault = Path(td) / "vault"
-        (vault / "data_in").mkdir(parents=True)
-        (vault / "data_out").mkdir()
-        di = data_index.DataIndex(search_roots=[vault / "data_in"],
-                                  write_root=vault / "data_out")
-
-        class _Fake:
-            pass
-
-        f = _Fake()
-        f.data_index = di
-        f.shown = []
-        f.status = []
-        f._nx_show = lambda t: f.shown.append(t)
-
-        class _Var:
-            def __init__(self, v=""):
-                self.v = v
-
-            def set(self, x):
-                f.status.append(x)
-                self.v = x
-
-            def get(self):
-                return self.v
-
-        f._nx_status_var = _Var()
-        f._nx_task_var = _Var()
-        f.after = lambda ms, fn: fn()
-        f._nx_write_script = C._nx_write_script.__get__(f)
-        f._nx_transpile_selected = C._nx_transpile_selected.__get__(f)
-        f._nx_selected_pipeline = C._nx_selected_pipeline.__get__(f)
-        f._dream3d_pipelines_cache = []
-
-        # An empty task must not spawn a thread or reach the model.
-        f._nx_task_var.set("")
-        f._nx_write_script()
-        _check("an empty task is guarded before the model is called",
-               f.shown and "Describe what" in f.shown[-1])
-
-        # Nothing selected must not reach the nx env either.
-        class _LB:
-            def curselection(self):
-                return ()
-
-        f.dream3d_pipeline_list = _LB()
-        f.shown.clear()
-        f._nx_transpile_selected()
-        _check("transpile with nothing selected asks for a selection",
-               f.shown and "Select a pipeline" in f.shown[-1])
-
-        # Generated artefacts go to the vault OUTPUT area, never the inputs.
-        out = di.safe_write_path("nx_catalog.json", subfolder="dream3d")
-        _check("nx artefacts are written under data_out",
-               Path(data_index.output_dir(vault)) in Path(out).parents)
-        _check("the helper used is the instance method, not a module function",
-               not hasattr(data_index, "safe_write_path"))
-
-        # THE selection bug: the listbox shows "name  (format, N steps)", so a
-        # handler that builds a path out of the displayed text looks for a file
-        # called "job.d3dpipeline  (json, 2 steps)" and never finds one. The
-        # cache is the only source of a real path.
-        try:
-            import pipeline_scanner as _ps
-        except Exception:
-            _check("pipeline_scanner importable", False)
-            return
-        import json as _json
-        pin = _ps.vault_pipelines_in_dir(vault)
-        (pin / "job.d3dpipeline").write_text(_json.dumps({
-            "name": "j", "pipeline": [
-                {"filter": {"name": "nx::core::CreateDataArrayFilter",
-                            "uuid": "67041f9b-bdc6-4122-acc6-c9fe9280e90d"},
-                 "args": {"parameters_version": 1}}]}), encoding="utf-8")
-        f._dream3d_pipelines_cache = _ps.scan_pipelines(pin)
-
-        class _LB2:
-            def curselection(self):
-                return (0,)
-
-            def get(self, i):
-                # what the tab really shows — decorated, not a filename
-                pl = f._dream3d_pipelines_cache[i]
-                return f"{pl.name}  ({pl.format}, {len(pl.steps)} steps)"
-
-        f.dream3d_pipeline_list = _LB2()
-        f._nx_selected_pipeline = C._nx_selected_pipeline.__get__(f)
-        sel = f._nx_selected_pipeline()
-        _check("the selection resolves via the cache to a path that EXISTS",
-               sel is not None and Path(sel.path).exists())
-        _check("the displayed row is decorated, so it is NOT a usable path",
-               not (pin / f.dream3d_pipeline_list.get(0)).exists())
-
-        # Nothing selected must not reach the nx env.
-        class _LBNone:
-            def curselection(self):
-                return ()
-
-        f.dream3d_pipeline_list = _LBNone()
-        _check("no selection yields None rather than an index error",
-               f._nx_selected_pipeline() is None)
-
-
 def test_nx_hardening() -> None:
     """Defects an adversarial pass found in Part B, each verified against the
     real code before being fixed."""
@@ -4118,30 +3824,6 @@ def test_plot_registry_renders_all() -> None:
            len(plt.get_fignums()) == before)
 
 
-def test_plots_pane_core() -> None:
-    """The plots pane renders Figures to thumbnails without Tk and without
-    pyplot — pyplot would register every figure in a global list (a leak over a
-    long session) and can open external windows, which is the popup behaviour
-    the inline pane exists to avoid."""
-    try:
-        from matplotlib.figure import Figure
-        import matplotlib.pyplot as plt
-        import plots_pane as pp
-    except Exception as exc:  # pragma: no cover
-        _check(f"plots_pane importable ({exc!r})", False)
-        return
-    before = len(plt.get_fignums())
-    fig = Figure(figsize=(4, 3))
-    fig.add_subplot(111).plot([1, 2, 3], [2, 4, 3])
-    png = pp.figure_to_png_bytes(fig)
-    _check("a Figure renders to PNG bytes",
-           len(png) > 500 and png[:4] == b"\x89PNG")
-    im = pp.figure_to_thumbnail(fig, 180)
-    _check("the thumbnail is capped to the rail width", im.size[0] <= 180)
-    _check("building figures leaks nothing into pyplot's global registry",
-           len(plt.get_fignums()) == before)
-
-
 def test_graph_engine_correctness() -> None:
     """The graph engine must never present a fabricated or mis-aligned result,
     and an interactive chart must render on an air-gapped machine."""
@@ -4554,60 +4236,6 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
-def test_ui_pump_survives_a_bad_item() -> None:
-    """One bad queue item must not kill every UI update for the session.
-
-    _poll_ui_queue caught only queue.Empty, so any exception from any of its
-    ~290 lines of handlers escaped the method — and the self.after(50, ...)
-    reschedule at the bottom never ran. The pump stopped permanently: no
-    transcript, no status, no results, while the worker threads carried on. The
-    app simply looked frozen, with nothing printed and nothing to notice."""
-    try:
-        import queue as _q
-        import council_gui_engine as cge
-    except Exception as exc:  # pragma: no cover
-        _check(f"gui engine importable ({exc!r})", False)
-        return
-
-    class _Fake:
-        pass
-
-    class _Poison:
-        def __getattr__(self, n):
-            raise RuntimeError("poison item")
-
-    f = _Fake()
-    f.ui_q = _q.Queue()
-    f.rescheduled = []
-    f.after = lambda ms, fn: f.rescheduled.append(ms)
-    f._flush_stream_box = lambda: None
-    f._poll_ui_queue = cge.CouncilConsole._poll_ui_queue.__get__(f)
-
-    f.ui_q.put(("live_event", _Poison()))
-    raised = False
-    try:
-        f._poll_ui_queue()
-    except Exception:
-        raised = True
-    _check("a handler blowing up does not escape the pump", not raised)
-    _check("...and the pump still reschedules itself", f.rescheduled == [50])
-
-    f.rescheduled.clear()
-    f._poll_ui_queue()
-    _check("the pump keeps running on later ticks", f.rescheduled == [50])
-
-    # The reschedule lives in `finally`, so even the cleanup failing is safe.
-    f.rescheduled.clear()
-
-    def _boom():
-        raise RuntimeError("flush failed")
-
-    f._flush_stream_box = _boom
-    f._poll_ui_queue()
-    _check("even a failing flush cannot stop the reschedule",
-           f.rescheduled == [50])
-
-
 def test_dependency_check_sees_the_chart_libs() -> None:
     """Diagnostics must be able to see its most visible failure.
 
@@ -4727,77 +4355,6 @@ def test_field_name_drift_candidates() -> None:
            fs.field_name_candidates("", vocab) == [])
     _check("empty vocabulary -> no candidates",
            fs.field_name_candidates("point of contact", []) == [])
-
-
-def test_known_field_names_harvests_real_labels() -> None:
-    """The vault's real field names must come from the index, not 7 constants.
-
-    For a JSON vault, _known_field_names() used to return ONLY 7 hardcoded
-    strings: data_index._profile_json handles only list-of-objects, so a
-    per-record nested-dict JSON is rejected and contributes nothing. Every
-    drift/aggregation route resolves against this set, so on a real JSON vault
-    they had almost no vocabulary to work with. vault_index already captured
-    every real key (incl. drifted "Router_Point_of_Contact" and nested keys)
-    and the method threw them away. It now harvests them — strictly additive,
-    no domain word list.
-    """
-    try:
-        import council_gui_engine as g
-        import vault_index as vi
-    except Exception as exc:  # pragma: no cover
-        _check(f"imports ({exc!r})", False)
-        return
-    import json
-    import shutil
-    import tempfile
-    from pathlib import Path
-
-    scratch = Path(tempfile.mkdtemp(prefix="smoke_harvest_"))
-    saved = g._VAULT_INDEX_INSTANCE
-    try:
-        root = scratch / "data_in"
-        root.mkdir(parents=True)
-        labels = ["Point of Contact", "Router_Point_of_Contact",
-                  "pointOfContact", "Point of Contact (Primary)", "POC"]
-        for i in range(15):
-            d = root / f"job_{i:03d}"
-            d.mkdir()
-            (d / "job.json").write_text(json.dumps({
-                "job_id": f"job_{i:03d}", "material": "IN718",
-                labels[i % len(labels)]: "Bob Smith",
-            }), encoding="utf-8")
-
-        idx = vi.VaultIndex(scratch)
-        idx.rebuild()
-        g._VAULT_INDEX_INSTANCE = idx
-
-        class _Fake(g.CouncilConsole):
-            def __init__(self):
-                pass
-            class _DI:
-                def all_profiles(self):
-                    return []
-            data_index = _DI()
-
-        con = _Fake()
-        known = {k.lower() for k in con._known_field_names()}
-        for lbl in labels:
-            _check(f"real vault label harvested: {lbl!r}",
-                   lbl.lower() in known)
-        # The generic prose fallbacks must still be present (empty-vault case).
-        _check("generic prose labels remain as a fallback",
-               "point of contact" in known and "poc" in known)
-        # And the payoff: the drift routes now have vocabulary on a JSON vault.
-        _check("drift resolver reaches a harvested drifted label",
-               (con._resolve_proposed_field("listed Router_Point_of_Contact")
-                or "").lower() == "router_point_of_contact")
-        _check("aggregation resolves a harvested drifted label",
-               (con._field_from_text(
-                   "how often does each Router_Point_of_Contact appear")
-                or "").lower() == "router_point_of_contact")
-    finally:
-        g._VAULT_INDEX_INSTANCE = saved
-        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def test_field_value_file_rows_and_csv() -> None:
@@ -5077,82 +4634,6 @@ def test_field_value_aggregation() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def test_an_adjective_does_not_break_a_field_search() -> None:
-    """"the LISTED point of contact" must find what "the point of contact" does.
-
-    User-reported: "when I ask for the listed point of contact it breaks but
-    when I ask the point of contact it works". Reproduced exactly — and it was
-    a router bug, not a model one.
-
-    _FILES_VALUE_AS_FIELD_RE captures the field with a greedy (.+?), so a word
-    between "as the" and the field name is swallowed INTO the field:
-
-        "...as the point of contact"         -> field='point of contact'         ok
-        "...as the listed point of contact"  -> field='listed point of contact'  0 files
-        "...as the primary point of contact" -> field='primary point of contact' 0 files
-
-    Nothing has a field called "listed point of contact", so the search
-    returned zero — silently, because "no files found" is a legitimate answer
-    that looks exactly like this. One adjective turned a working question into
-    a confident wrong one.
-
-    The regex ran BEFORE _parse_field_value_fallback, which validates its field
-    against the vault's real vocabulary and parses these correctly — so the
-    unvalidated path was shadowing the one that already worked.
-    """
-    try:
-        import council_gui_engine as g
-    except Exception as exc:  # pragma: no cover
-        _check(f"council_gui_engine importable ({exc!r})", False)
-        return
-    C = g.CouncilConsole
-
-    class _Fake:
-        def __init__(self, known):
-            self._k = known
-        def _known_field_names(self):
-            return self._k
-
-    plain = _Fake({"point of contact", "poc", "owner"})
-    # Not a stopword list — ANY modifier a person might type must work, which
-    # is why this is resolved against the vault's real names instead.
-    for adj in ("listed", "primary", "current", "assigned", "designated",
-                "responsible", "main", "official", "named"):
-        got = C._resolve_proposed_field(plain, f"{adj} point of contact")
-        _check(f"'{adj} point of contact' resolves to the real field",
-               got == "point of contact", f"got {got!r}")
-
-    _check("'listed poc' resolves to poc",
-           C._resolve_proposed_field(plain, "listed poc") == "poc")
-
-    # A phrase naming no real field must resolve to None so the router falls
-    # through to the validated parser, rather than searching for a field that
-    # cannot exist and reporting a confident "none found".
-    _check("a phrase with no known field resolves to None",
-           C._resolve_proposed_field(plain, "blorp of bob") is None)
-    _check("an unknown field phrase resolves to None",
-           C._resolve_proposed_field(plain, "listed sprocket tension") is None)
-
-    # When the drifted name IS the vault's real label, keep it as typed rather
-    # than stripping the modifier on principle.
-    drift = _Fake({"point of contact", "primary point of contact", "poc"})
-    _check("a real drifted label is used as typed, not stripped",
-           C._resolve_proposed_field(drift, "primary point of contact")
-           == "primary point of contact")
-    _check("...even with an extra modifier in front",
-           C._resolve_proposed_field(drift, "listed primary point of contact")
-           == "primary point of contact")
-
-    # And the regex really does capture the adjective — if this ever stops
-    # being true the resolver above is dead code and this test would hide it.
-    m = C._FILES_VALUE_AS_FIELD_RE.match(
-        "which files have Bob Smith as the listed point of contact")
-    _check("the regex still captures the adjective into the field "
-           "(so the resolver is load-bearing)",
-           bool(m) and m.group(2).strip() == "listed point of contact",
-           f"captured {m.group(2)!r}" if m else "no match")
-
-
 def test_vault_index_can_find_a_numbered_job() -> None:
     """"job 412" must find job 412 — the app's single most common question.
 
@@ -5395,7 +4876,10 @@ def test_no_312_only_syntax() -> None:
                                                "(3.12-only)")
                     else:
                         joined = "".join(body)
-                        if quote[0] in joined:
+                        # Inside f"..." any " ends it before 3.12; inside
+                        # f"""...""" a lone " is fine and only """ ends it.
+                        delim = quote[:3] if triple else quote[0]
+                        if any(delim in s for s in body):
                             yield (start.start[0], "enclosing quote reused "
                                                    "inside f-string (3.12-only)")
                         elif "\\" in joined:
@@ -5437,6 +4921,12 @@ def test_no_312_only_syntax() -> None:
             encoding="utf-8")
         _check("the scanner detects the construct that crashed the user",
                any(offenders(probe)))
+        # A lone quote inside a triple-quoted f-string is 3.11 syntax
+        # (gui_classify.repair_prompt) and must not be reported.
+        probe.write_text('x = 1\ns = f"""a {"" if x else "y"} b"""\n',
+                         encoding="utf-8")
+        _check("a lone quote inside f\"\"\"...\"\"\" is not reported",
+               not any(offenders(probe)))
 
 
 def test_plain_english_is_not_a_file_path() -> None:
@@ -5449,11 +4939,13 @@ def test_plain_english_is_not_a_file_path() -> None:
     orders the model to refuse to answer and to say the file isn't on this
     machine. So an ordinary question earned a refusal about a file the user
     never mentioned. Every trigger below is plain English an AM engineer types.
+
+    (Moved with the code from the retired Tk engine to council_core.turn_context.)
     """
     try:
-        import council_gui_engine as g
+        from council_core import turn_context as g
     except Exception as exc:  # pragma: no cover
-        _check(f"council_gui_engine importable ({exc!r})", False)
+        _check(f"council_core.turn_context importable ({exc!r})", False)
         return
 
     for msg in ("Did the tensile bar pass/fail?",
@@ -5956,81 +5448,6 @@ def test_rag_adaptive_window() -> None:
                srcs == rel and st["batches"] == 1)
         _check("the cutoff is reported so the cap is never invisible",
                st["cutoff"] > 0 and "returned" in st)
-
-
-def test_rag_recall_and_coverage() -> None:
-    """The Council's vault retrieval must not silently return an arbitrary
-    slice of the relevant files.
-
-    Measured against known ground truth (12 of 52 files genuinely on-topic):
-    the Council asked each angle for 4 chunks and recalled 4 of the 12 — 33% —
-    and the multi-angle union did NOT rescue it, because when several files are
-    equally relevant every angle returns the SAME arbitrary top-4. A top-N cap
-    over a tie is a coin toss the user cannot see."""
-    try:
-        import re as _re
-        import council_gui_engine as cge
-        import vault_rag as vr
-    except Exception as exc:  # pragma: no cover
-        _check(f"rag modules importable ({exc!r})", False)
-        return
-    backend = getattr(vr, "_TFIDFBackend", None)
-    if backend is None:  # pragma: no cover
-        _check("vault_rag exposes the TF-IDF backend", False)
-        return
-
-    with tempfile.TemporaryDirectory() as td:
-        vault = Path(td) / "vault"
-        vault.mkdir()
-        relevant = set()
-        for i in range(12):
-            name = f"porosity_{i:02d}.txt"
-            relevant.add(name)
-            (vault / name).write_text(
-                "Porosity analysis for the Inconel build. Measured porosity "
-                "fraction across the layer. Lack-of-fusion pores dominate at "
-                "low laser power. Porosity correlates with scan speed. " * 6)
-        for i in range(40):
-            (vault / f"other_{i:02d}.txt").write_text(
-                "Machine maintenance log. The build chamber was cleaned. "
-                "Filter replaced. Calibration on the recoater blade. " * 6)
-        b = backend(vault)
-        b.index_vault(vault)
-
-        # Reproduce the Council's own multi-angle expansion.
-        q = "what drives porosity in the inconel build"
-        stop = {"what", "when", "where", "who", "why", "how", "is", "are",
-                "the", "a", "an", "in", "on", "of", "to", "do", "does", "can",
-                "i", "my", "me", "for", "and", "or", "with", "this", "that"}
-        kw = [w for w in _re.findall(r"[a-zA-Z]{3,}", q.lower())
-              if w not in stop]
-        angles = [q] + kw[:3]
-
-        def recall_at(k):
-            seen = set()
-            for a in angles:
-                seen |= {Path(r["source"]).name
-                         for r in b.search(a, n_results=k)}
-            return len(seen & relevant) / len(relevant), len(seen - relevant)
-
-        r4, _ = recall_at(4)
-        _check("the OLD per-angle breadth (4) really did miss most of them",
-               r4 < 0.5)
-        r_now, junk = recall_at(cge.RAG_PER_ANGLE)
-        _check(f"the shipped breadth ({cge.RAG_PER_ANGLE}) recalls them all",
-               r_now == 1.0)
-        _check("and does not drag in irrelevant files", junk == 0)
-
-        # Coverage must be reported, and the full set reachable.
-        st = {}
-        full = b.search("porosity", n_results=None, stats=st)
-        _check("n_results=None returns the FULL ranked set",
-               len(full) == st["matched"] and st["truncated"] is False)
-        st2 = {}
-        b.search("porosity", n_results=4, stats=st2)
-        _check("a capped search REPORTS that it truncated",
-               st2["truncated"] and st2["returned"] == 4
-               and st2["matched"] > 4)
 
 
 def test_search_value_searches_every_row() -> None:
@@ -6615,51 +6032,44 @@ def test_context_clamp() -> None:
     prompt can never trigger llama-cpp's 'exceeds context window' native abort.
     Works with no model loaded (estimate_tokens falls back to chars/4)."""
     import council_engine as ce
-    prev = os.environ.get("COUNCIL_GGUF_N_CTX")
-    try:
-        os.environ["COUNCIL_GGUF_N_CTX"] = "512"
-        # A short prompt is returned unchanged with a sane reply budget.
-        msgs, reply = ce._clamp_messages_to_ctx(
-            [{"role": "user", "content": "hello there"}], 200)
-        _check("short prompt is untouched",
-               msgs[0]["content"] == "hello there")
-        _check("reply budget is positive and within window",
-               0 < reply < 512)
-        # A huge prompt is trimmed so prompt+reply fits the 512 window.
-        big = "word " * 4000   # ~5000 tokens by chars/4
-        msgs2, reply2 = ce._clamp_messages_to_ctx(
-            [{"role": "system", "content": "be brief"},
-             {"role": "user", "content": big}], 300)
-        total = sum(ce.estimate_tokens(m["content"]) for m in msgs2)
-        _check("oversized prompt is trimmed under the window",
-               total + reply2 <= 512)
-        _check("trim marker is inserted",
-               any("trimmed to fit" in m["content"] for m in msgs2))
-        _check("short system message is preserved",
-               any(m["content"] == "be brief" for m in msgs2))
-        # Never raises on empty / weird input.
-        m3, r3 = ce._clamp_messages_to_ctx([], 100)
-        _check("empty messages handled", m3 == [] and r3 > 0)
+    # The window is passed as the serving instance's n_ctx: the clamp no
+    # longer reads COUNCIL_GGUF_N_CTX (user, 2026-10-23).
+    # A short prompt is returned unchanged with a sane reply budget.
+    msgs, reply = ce._clamp_messages_to_ctx(
+        [{"role": "user", "content": "hello there"}], 200, 512)
+    _check("short prompt is untouched",
+           msgs[0]["content"] == "hello there")
+    _check("reply budget is positive and within window",
+           0 < reply < 512)
+    # A huge prompt is trimmed so prompt+reply fits the 512 window.
+    big = "word " * 4000   # ~5000 tokens by chars/4
+    msgs2, reply2 = ce._clamp_messages_to_ctx(
+        [{"role": "system", "content": "be brief"},
+         {"role": "user", "content": big}], 300, 512)
+    total = sum(ce.estimate_tokens(m["content"]) for m in msgs2)
+    _check("oversized prompt is trimmed under the window",
+           total + reply2 <= 512)
+    _check("trim marker is inserted",
+           any("trimmed to fit" in m["content"] for m in msgs2))
+    _check("short system message is preserved",
+           any(m["content"] == "be brief" for m in msgs2))
+    # Never raises on empty / weird input.
+    m3, r3 = ce._clamp_messages_to_ctx([], 100, 512)
+    _check("empty messages handled", m3 == [] and r3 > 0)
 
-        # TERMINATION guard (regression): the trim loop must always return.
-        # The marker length has to be subtracted from the char target, else a
-        # trimmed block stays at (target + marker) forever and the loop spins.
-        # A tiny window + several huge messages is the worst case; if the
-        # implementation regressed, this test would hang, not fail.
-        os.environ["COUNCIL_GGUF_N_CTX"] = "128"
-        m4, r4 = ce._clamp_messages_to_ctx(
-            [{"role": "user", "content": "x" * 50000},
-             {"role": "user", "content": "y" * 50000},
-             {"role": "system", "content": "z" * 50000}], 400)
-        t4 = sum(ce.estimate_tokens(m["content"]) for m in m4)
-        _check("pathological huge prompt terminates and fits",
-               t4 + r4 <= 128 + 8)  # +8 slack for rounding of estimate_tokens
-        _check("clamp always returns a positive reply budget", r4 > 0)
-    finally:
-        if prev is None:
-            os.environ.pop("COUNCIL_GGUF_N_CTX", None)
-        else:
-            os.environ["COUNCIL_GGUF_N_CTX"] = prev
+    # TERMINATION guard (regression): the trim loop must always return.
+    # The marker length has to be subtracted from the char target, else a
+    # trimmed block stays at (target + marker) forever and the loop spins.
+    # A tiny window + several huge messages is the worst case; if the
+    # implementation regressed, this test would hang, not fail.
+    m4, r4 = ce._clamp_messages_to_ctx(
+        [{"role": "user", "content": "x" * 50000},
+         {"role": "user", "content": "y" * 50000},
+         {"role": "system", "content": "z" * 50000}], 400, 128)
+    t4 = sum(ce.estimate_tokens(m["content"]) for m in m4)
+    _check("pathological huge prompt terminates and fits",
+           t4 + r4 <= 128 + 8)  # +8 slack for rounding of estimate_tokens
+    _check("clamp always returns a positive reply budget", r4 > 0)
 
 
 def test_describe_nontext_routing() -> None:
@@ -8759,16 +8169,12 @@ def main() -> int:
          test_tfidf_idf_units)
     _run("field-name drift candidates (ranked, lexicon-free, field-agnostic)",
          test_field_name_drift_candidates)
-    _run("known field names harvest real vault labels (not 7 constants)",
-         test_known_field_names_harvests_real_labels)
     _run("field-value per-file rows + CSV export",
          test_field_value_file_rows_and_csv)
     _run("column name matches all styles (camel/snake/kebab/spaced)",
          test_column_name_matches_all_formats)
     _run("field-value aggregation ('how often does each X appear')",
          test_field_value_aggregation)
-    _run("an adjective does not break a field search ('listed point of contact')",
-         test_an_adjective_does_not_break_a_field_search)
     _run("vault index can find a numbered job (job 412 -> job 412)",
          test_vault_index_can_find_a_numbered_job)
     _run("vault search reads every file and counts only what it read",
@@ -8779,8 +8185,6 @@ def main() -> int:
          test_plain_english_is_not_a_file_path)
     _run("contour contours the z column, not the point density",
          test_contour_contours_the_z_column)
-    _run("UI pump survives a bad queue item",
-         test_ui_pump_survives_a_bad_item)
     _run("dependency check sees the chart libraries",
          test_dependency_check_sees_the_chart_libs)
     _run("feature detect counts thin features (cracks are not erased)",
@@ -8797,8 +8201,6 @@ def main() -> int:
          test_field_search_typo_tolerance)
     _run("RAG adaptive window (sizes itself to the data)",
          test_rag_adaptive_window)
-    _run("RAG recall + coverage (no arbitrary top-N slice)",
-         test_rag_recall_and_coverage)
     _run("search_value streams every row (no 5k blind spot)",
          test_search_value_searches_every_row)
     _run("field search returns EVERY match (all means all)",
@@ -8831,20 +8233,12 @@ def main() -> int:
          test_nx_hardening)
     _run("workflow chaining (pipeline 2 runs on pipeline 1's output)",
          test_workflow_chaining)
-    _run("no bare re.<attr> in the GUI (module imports re as _re)",
-         test_no_bare_re_in_gui)
-    _run("Dream3D convert-to-python routes to the deterministic transpiler",
-         test_dream3d_convert_to_python_routing)
-    _run("Dream3D tab wiring (Part B reachable from the app)",
-         test_dream3d_tab_wiring)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",
          test_plot_registry)
     _run("plot registry renders all types headlessly",
          test_plot_registry_renders_all)
-    _run("plots pane core (thumbnails, no pyplot leak)",
-         test_plots_pane_core)
     _run("route_message golden (routing unchanged)",
          test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",
@@ -8950,7 +8344,6 @@ def main() -> int:
     _run("DB — export write formats",             test_db_export_write_formats)
     _run("DB — export query cannot write",        test_db_export_query_cannot_write)
     _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
-    _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
     _run("MODELS — finder US filter + hardware fit", test_model_finder_us_filter_and_fit)

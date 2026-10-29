@@ -156,8 +156,12 @@ def mask_example(mask: str) -> str:
 #: model. Now a call gets the smallest of WINDOW_STEPS that holds its prompt
 #: and REPLY_ROOM for the answer - never more than the model's own - so a
 #: typical call stays on the GPU and a long document still gets a long window.
-#: A GGUF is loaded once: with GGUF_WINDOW at most (the council's own cap; its
-#: loader also sizes it to the card). Each reply may use whatever the prompt
+#: A GGUF is loaded once: with GGUF_WINDOW at most, sized to the card by the
+#: loader - never with the council's chat setting (COUNCIL_GGUF_N_CTX, the
+#: Models tab's n_ctx), which was 4K on the user's PC (user, 2026-10-23:
+#: "It is still using the council base token cap"). Council's own GGUF is
+#: loaded the same way: the Ledger lets go of the council's copy (sized for
+#: chat) and loads its own, so the file is not in memory twice. Each reply may use whatever the prompt
 #: leaves of the window (num_predict 0: council_engine sizes it on the
 #: model's own tokenizer, FILL). COUNCIL_LEDGER_NUM_CTX sets the window
 #: outright (never past the model's own); COUNCIL_LEDGER_NUM_PREDICT the
@@ -247,11 +251,15 @@ def council_chat(timeout: float = LEDGER_TIMEOUT,
     def chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
         try:
             import council_engine as ce
-            with ce.model_window(ledger_window(0, prompt)):
-                text = ce.local_chat([{"role": "user", "content": prompt}],
-                                     temperature=0.0, num_predict=fill_reply(),
-                                     json_schema=schema, timeout=int(max(5, timeout)),
-                                     should_stop=should_stop)
+            main = _main_gguf()
+            if main:                                       # its own window, not chat's
+                text = _gguf_reply(main, prompt, schema, should_stop)
+            else:
+                with ce.model_window(ledger_window(0, prompt)):
+                    text = ce.local_chat([{"role": "user", "content": prompt}],
+                                         temperature=0.0, num_predict=fill_reply(),
+                                         json_schema=schema, timeout=int(max(5, timeout)),
+                                         should_stop=should_stop)
             if text and text.strip():
                 return text, "Council's model"
         except Exception:                                  # noqa: BLE001
@@ -345,6 +353,8 @@ def _gguf_llm(path: str):
         if _GGUF["key"] == key and _GGUF["llm"] is not None:
             return _GGUF["llm"]
         _GGUF["key"] = _GGUF["llm"] = None
+        if _is_main_gguf(path):
+            _release_council_model()
         __import__("gc").collect()
         import source_extract as se
         try:
@@ -434,6 +444,33 @@ def _is_main_gguf(path: str) -> bool:
         os.path.normcase(os.path.realpath(path))
 
 
+def _main_gguf() -> str:
+    """Council's own GGUF (COUNCIL_GGUF_PATH) when it is a file and
+    llama-cpp-python is here to load it, else '' (Council's model is then
+    an Ollama one, asked through local_chat with the window the call needs)."""
+    import importlib.util
+    import os
+    main = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if not main or not os.path.isfile(main):
+        return ""
+    try:
+        return main if importlib.util.find_spec("llama_cpp") is not None else ""
+    except (ImportError, ValueError):
+        return ""
+
+
+def _release_council_model() -> None:
+    """Let go of the council's loaded copy of a GGUF the Ledger loads
+    itself (council_engine._release_slots: the next council answer loads it
+    again, as after a Models-tab change)."""
+    try:
+        import council_engine as ce
+        if ce._SLOT_INSTANCES:
+            ce._release_slots()
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
 def chat_for(model_id: str, timeout: float = LEDGER_TIMEOUT,
              should_stop: Optional[Callable[[], bool]] = None) -> Chat:
     """A Chat on the model the user picked: an Ollama model ('ollama:<name>')
@@ -472,43 +509,56 @@ def chat_for(model_id: str, timeout: float = LEDGER_TIMEOUT,
             return text, name
         return chat
 
+    # a GGUF - Council's own too - is loaded by the Ledger with its own
+    # window (_gguf_llm), not used at the council's chat window
     path = model_id
     label = __import__("os").path.basename(path)
-    if _is_main_gguf(path):
-        def main_chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
-            import council_engine as ce
-            try:
-                return ce.local_chat([{"role": "user", "content": prompt}],
-                                     temperature=0.0, num_predict=fill_reply(),
-                                     json_schema=schema, timeout=int(max(5, timeout)),
-                                     should_stop=should_stop), label
-            except Exception as exc:                       # noqa: BLE001
-                raise se.LedgerError(f"{label} did not answer: {exc}") from exc
-        return main_chat
 
     def gguf_chat(prompt: str, schema: Dict[str, Any]) -> Tuple[str, str]:
-        llm = _gguf_llm(path)
-        try:
-            window = int(llm.n_ctx())
-        except Exception:                                  # noqa: BLE001
-            window = 0
-        try:                                               # its own tokenizer's count
-            used = len(llm.tokenize(prompt.encode("utf-8", errors="ignore"))) + 64
-        except Exception:                                  # noqa: BLE001
-            used = len(prompt) // 3 + 64
-        fixed = _env_int("COUNCIL_LEDGER_NUM_PREDICT")
-        kw = dict(messages=[{"role": "user", "content": prompt}], temperature=0.0,
-                  max_tokens=fixed or (max(REPLY_FLOOR, window - used - REPLY_MARGIN)
-                                       if window else REPLY_FLOOR * 8))
-        with _GGUF_LOCK:
-            try:
-                out = llm.create_chat_completion(
-                    response_format={"type": "json_object", "schema": schema}, **kw)
-            except TypeError:                              # an older llama-cpp-python
-                out = llm.create_chat_completion(**kw)
-        _gpu_ok()
-        return out["choices"][0]["message"]["content"] or "", label
+        return _gguf_reply(path, prompt, schema, should_stop), label
     return gguf_chat
+
+
+def _gguf_reply(path: str, prompt: str, schema: Dict[str, Any],
+                should_stop: Optional[Callable[[], bool]] = None) -> str:
+    """One answer from the GGUF at ``path``, loaded by the Ledger
+    (_gguf_llm); the reply gets all the window the prompt leaves. Streamed,
+    so Cancel stops it between tokens."""
+    llm = _gguf_llm(path)
+    try:
+        window = int(llm.n_ctx())
+    except Exception:                                      # noqa: BLE001
+        window = 0
+    try:                                                   # its own tokenizer's count
+        used = len(llm.tokenize(prompt.encode("utf-8", errors="ignore"))) + 64
+    except Exception:                                      # noqa: BLE001
+        used = len(prompt) // 3 + 64
+    fixed = _env_int("COUNCIL_LEDGER_NUM_PREDICT")
+    kw = dict(messages=[{"role": "user", "content": prompt}], temperature=0.0,
+              max_tokens=fixed or (max(REPLY_FLOOR, window - used - REPLY_MARGIN)
+                                   if window else REPLY_FLOOR * 8))
+    if should_stop is not None:
+        kw["stream"] = True
+    from council_core import structured_output as so
+    with _GGUF_LOCK:
+        try:                    # grammar_safe: labels with quote marks (2026-10-23)
+            out = llm.create_chat_completion(
+                response_format={"type": "json_object",
+                                 "schema": so.grammar_safe(schema)}, **kw)
+        except TypeError:                                  # an older llama-cpp-python
+            out = llm.create_chat_completion(**kw)
+        if isinstance(out, dict):
+            text = out["choices"][0]["message"]["content"] or ""
+        else:
+            parts = []
+            for chunk in out:
+                if should_stop is not None and should_stop():
+                    raise RuntimeError("stopped by the caller")
+                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                parts.append(delta.get("content") or "")
+            text = "".join(parts)
+    _gpu_ok()
+    return text
 
 
 def _json(text: str) -> Any:
@@ -830,7 +880,8 @@ def map_labels(labels: Sequence[str], fields: Sequence[str], chat: Chat,
 
 
 def place_labels(run, schema, chat: Chat, report: AssistReport,
-                 examples: Optional[Sequence[LabelExample]] = None) -> None:
+                 examples: Optional[Sequence[LabelExample]] = None,
+                 guide: str = "") -> None:
     """Values under labels no rule placed: ask which field each label is and
     add those values as suggested rows (via 'model'), in place of their
     'Labels to map' rows - except a value with no item for a field kept
@@ -854,7 +905,10 @@ def place_labels(run, schema, chat: Chat, report: AssistReport,
         mapping, report.model = map_labels(
             labels, fields, chat, examples=pick_examples(examples or (), labels),
             # what the user's documents say these labels mean (docs_open)
-            notes=docs_open.notes_text(getattr(run, "explanations", None) or [], labels))
+            notes=docs_open.notes_text(getattr(run, "explanations", None) or [], labels)
+            # the Ledger's filled example: what each field holds
+            # (ledger_examples.filled_example_text, user 2026-10-23)
+            + (guide or ""))
     except ModelUnavailable:
         report.labels_failed = True
         return                                             # said once, by one_shot

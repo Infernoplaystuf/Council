@@ -210,6 +210,17 @@ def test_a_field_written_as_a_wikilink_reads_as_the_plain_field(tmp_path, linked
                      ("PROJECT", "Atlas Pump Retrofit")],
                     [("Atlas Pump Retrofit", "USES_PART", "PN-1002", "seeded"),
                      ("Priya Raman", "OWNS", "PN-1002", "seeded")])
+    # A table is its own node since tables became nodes (2026-10-27): it sits
+    # in b.md and LISTS the entities its cells name. Those are the field's
+    # entities too, so set the table aside and the rest must match.
+    tables = {n for t, n in got[0] if t == "TABLE"}
+    assert tables == ({"b.md"} if linked.startswith("|") else set())
+    table_rels = [r for r in got[1] if r[0] in tables]
+    assert {(p, o) for _s, p, o, _st in table_rels} <= {
+        ("IN_DOCUMENT", "b.md"), ("LISTS", "PN-1002"), ("LISTS", "Priya Raman"),
+        ("LISTS", "Atlas Pump Retrofit")}
+    got = ([e for e in got[0] if e[0] != "TABLE"],
+           [r for r in got[1] if r[0] not in tables])
     # One PART PN-1002, one person named 'Priya Raman', the same links.
     assert got == want
     assert people == ["Priya Raman"]

@@ -181,3 +181,20 @@ def test_extract_and_apply_report_progress_in_the_terminal(books, capsys):
     assert "[ledger apply] reading workbooks: 3/3 workbooks (100%)" in err
     assert "[ledger apply] filling templates: 2/2 parts (100%)" in err
     assert "[ledger apply] done in" in err
+
+
+def test_a_new_review_never_takes_an_existing_name(tmp_path, monkeypatch):
+    """Two runs in one second (Re-run with my answers) wrote the same name."""
+    from datetime import datetime as real
+
+    class Frozen(real):
+        @classmethod
+        def now(cls, tz=None):
+            return real(2026, 10, 23, 12, 0, 0)
+    monkeypatch.setattr(ledger_ingest, "datetime", Frozen)
+    csv = tmp_path / "l.csv"
+    first = ledger_ingest.default_review_for(csv)
+    first.write_bytes(b"")
+    second = ledger_ingest.default_review_for(csv)
+    assert (first.name, second.name) == ("review_20261023_120000.xlsx",
+                                         "review_20261023_120000_2.xlsx")
