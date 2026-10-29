@@ -37,6 +37,8 @@ from . import project as pj
 from . import token_budget
 
 DIR_NAME = ".council_agents"
+#: The example Qt apps (gui_reference) the "Qt app builder" reads.
+QT_EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "qt_apps"
 OUTPUTS = ("patch", "report")
 
 ALL_TOOLS = ("list_files", "read_file", "find_symbol", "search_code",
@@ -71,6 +73,17 @@ BUILT_INS: List[AgentProfile] = [
         "first): an Actions class the widget calls, work on threads via "
         "_to_ui, no tkinter. Every new widget gets a test that builds it "
         "offscreen, and gui_check must pass.", built_in=True),
+    AgentProfile(
+        "qt-app-builder", "Qt app builder",
+        "You build standalone PySide6 apps and tools. The example app that "
+        "best matches the task is in your context (QT EXAMPLE APPS); follow "
+        "its structure, and use search_references to find how the other "
+        "examples do a pattern before writing one yourself: long work on a "
+        "QThread or QThreadPool reporting through Signals, model/view for "
+        "tables, settings as JSON (never QSettings), QtCore/QtGui/QtWidgets "
+        "only. Give the app a make_window() and a test that builds it "
+        "offscreen; gui_check must pass.",
+        references=[str(QT_EXAMPLES)], built_in=True),
     AgentProfile(
         "test-writer", "Test writer",
         "You write tests only: pytest, one behaviour per test, named for "

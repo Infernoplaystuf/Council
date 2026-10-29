@@ -152,3 +152,8 @@ same list.
   between documents and tables related by meaning (a local embedding model,
   suggested), and a model reading each table to propose column rules:
   `docs/handoff/kg_tables_related_2026-10-27.md`.
+- The example Qt apps the models read when they write Qt code (ten at most;
+  each passes the generated-app gate; the Code tab's "Qt app builder" gets
+  the best match whole): `examples/qt_apps/README.md`, read by
+  `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
+  (`gui_examples.py`).
