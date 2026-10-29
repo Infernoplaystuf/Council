@@ -651,7 +651,9 @@ class CouncilActions:
             # verdict id — which is what keeps the verdict bar honest (A3).
             # It gets the vault context: the default build is this path, and
             # without it the default build was a chatbot.
-            return self._direct(sent, models, on_event=on_event)
+            return self._direct(
+                sent, models, on_event=on_event,
+                on_token=on_token if getattr(options, "stream", True) else None)
 
         enable_tools = bool(getattr(options, "tools", False))
         return council_turn.run_turn(
@@ -876,8 +878,13 @@ class CouncilActions:
         from council_core import vault_context
         return vault_context.build(question, self.vault_dir)
 
-    def _direct(self, typed_text: str, models, *, on_event=None):
-        """One personality answering directly, with no council."""
+    def _direct(self, typed_text: str, models, *, on_event=None,
+                on_token=None):
+        """One personality answering directly, with no council.
+
+        ``on_token(who, token)`` streams the Writer's answer as the council's
+        members stream theirs. It was never passed here, so with one Writer
+        the Stream tokens box did nothing and the answer came all at once."""
         from council_core import council_turn
         from council_core.deliberation import AgentEvent
 
@@ -890,7 +897,12 @@ class CouncilActions:
             # waits ("▶ Writer"). A thought: progress, never a transcript line.
             on_event(AgentEvent("Writer", "thought", "Answering…"))
         try:
-            answer = writer.respond(typed_text)
+            if on_token is not None:
+                answer = writer.respond(
+                    typed_text,
+                    token_callback=lambda token: on_token("Writer", token))
+            else:
+                answer = writer.respond(typed_text)
         except Exception as exc:                          # noqa: BLE001
             return council_turn.TurnResult(
                 False, message=f"The answer failed: {exc!r}", error=exc)
@@ -2220,5 +2232,8 @@ EXAMPLES = """Things you can ask:
 def build_council(window) -> QWidget:
     """Factory for the tab registry."""
     import branding
+    # The tab's demo_mode means "one Writer, no panel": the single-model
+    # chat (COUNCIL_CHAT_MODE=single), no longer the DEMO_MODE build.
     return CouncilTab(window,
-                      demo_mode=bool(getattr(branding, "DEMO_MODE", False)))
+                      demo_mode=bool(getattr(branding, "SINGLE_MODEL_COUNCIL",
+                                             False)))

@@ -8,8 +8,8 @@ Council sent only the typed question; a planted fact reached 0 of 13 prompts
 with deliberation on and 0 of 1 in the default build, while Tk put it in the
 Writer's prompt, used it, and showed a file chip. Here the Qt Council, built
 the way the app builds it (council_qt.tabs.council.build_council, which reads
-branding.DEMO_MODE): the default build (one Writer) and the full panel
-(DI_DEMO_MODE=0), against a FakeOllama that records every prompt and answers
+branding.SINGLE_MODEL_COUNCIL): the single-model chat (one Writer,
+COUNCIL_CHAT_MODE=single) and the full panel (the default), against a FakeOllama that records every prompt and answers
 the Writer from what it was given. The question names no file: the value
 search has to find it.
 
@@ -133,14 +133,14 @@ def engine(tmp_path, monkeypatch):
 # ============================================================
 
 def _qt_ask(qapp, monkeypatch, demo_mode: bool):
-    """Build the Council tab as the app does, for DI_DEMO_MODE on or off,
+    """Build the Council tab as the app does, one Writer (COUNCIL_CHAT_MODE=single) or the panel,
     ask QUESTION, and return what the tab and its conversation hold."""
     import branding
     from council_qt.tabs.council import build_council
     from council_qt.window import CouncilWindow
 
-    monkeypatch.setenv("DI_DEMO_MODE", "1" if demo_mode else "0")
-    monkeypatch.setattr(branding, "DEMO_MODE", demo_mode)
+    monkeypatch.setenv("COUNCIL_CHAT_MODE", "single" if demo_mode else "council")
+    monkeypatch.setattr(branding, "SINGLE_MODEL_COUNCIL", demo_mode)
     window = CouncilWindow()
     view = build_council(window)
     shown = []
@@ -175,10 +175,10 @@ def _answer_sources(rows):
     return [Path(p).name for p in answers[-1]["provenance"]["sources"]]
 
 
-def test_qt_default_build_gives_the_writer_the_fact_and_cites_it(
+def test_qt_single_model_chat_gives_the_writer_the_fact_and_cites_it(
         qapp, engine, monkeypatch):
     got = _qt_ask(qapp, monkeypatch, demo_mode=True)
-    assert got.route == "direct", "the default build is one Writer"
+    assert got.route == "direct", "the single-model chat is one Writer"
     prompts = _writer_prompts(engine.fake)
     assert len(prompts) == 1, prompts
     assert FACT in prompts[0], prompts[0]
@@ -191,7 +191,7 @@ def test_qt_default_build_gives_the_writer_the_fact_and_cites_it(
 
 def test_qt_full_panel_gives_the_writer_the_fact_and_cites_it(
         qapp, engine, monkeypatch):
-    """DI_DEMO_MODE=0: deliberation is on by default and the panel runs."""
+    """The default chat: deliberation is on by default and the panel runs."""
     got = _qt_ask(qapp, monkeypatch, demo_mode=False)
     assert got.route not in (None, "direct", "data"), got.route
     prompts = _writer_prompts(engine.fake)
@@ -219,7 +219,7 @@ def test_qt_follow_up_gets_this_conversation_and_the_vault_together(
     older.write_text(json.dumps({"who": "User", "text":
                                  "the old pump is called WALNUT"}) + "\n",
                      encoding="utf-8")
-    monkeypatch.setattr(branding, "DEMO_MODE", True)
+    monkeypatch.setattr(branding, "SINGLE_MODEL_COUNCIL", True)
     window = CouncilWindow()
     view = build_council(window)
     view.open_source = view.reveal_source = (lambda _p: None)

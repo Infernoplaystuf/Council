@@ -245,7 +245,10 @@ def test_with_no_room_left_the_passages_are_left_out_and_said(tmp_path,
     from council_core import council_options
     from council_qt.tabs.council import CouncilActions
     import council_engine as ce
-    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 4096)
+    # 3072, not 4096: at 4096 the room was only used up by the bundled
+    # sample data's value matches, which no longer reach a prompt
+    # (data_index.search_roots).
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 3072)
     actions = CouncilActions(vault_dir=tmp_path)
     models = _models()
     models.judge = EvidenceJudge()

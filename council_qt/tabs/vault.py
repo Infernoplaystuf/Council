@@ -133,8 +133,7 @@ class VaultActions:
             try:
                 import data_index
                 self._index = data_index.DataIndex(
-                    search_roots=[data_index.input_dir(self.vault_dir),
-                                  data_index.bundled_samples_dir()],
+                    search_roots=data_index.search_roots(self.vault_dir),
                     write_root=data_index.output_dir(self.vault_dir))
             except Exception:                             # noqa: BLE001
                 return None

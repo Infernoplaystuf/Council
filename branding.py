@@ -24,6 +24,13 @@ from typing import Dict
 # the commercial channel, set DI_DEMO_MODE=0.
 DEMO_MODE = os.environ.get("DI_DEMO_MODE", "1").lower() not in ("0", "false", "no")
 
+# How the Council tab answers: the whole council (the Judge routes, members
+# draft and rebut, a verdict; the Deliberation switch can turn it off per
+# question), or with COUNCIL_CHAT_MODE=single one Writer for every question and
+# no panel. It used to follow DEMO_MODE, so the home build was never a council.
+SINGLE_MODEL_COUNCIL = (os.environ.get("COUNCIL_CHAT_MODE", "council")
+                        .strip().lower() == "single")
+
 
 # ---- Identity ----------------------------------------------------------------
 
