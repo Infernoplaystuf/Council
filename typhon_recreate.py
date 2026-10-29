@@ -1213,6 +1213,8 @@ def run_tests(tests: Sequence[Path], work: Path, *,
     }
     argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
             "-p", "council_swap_plugin", f"--junitxml={junit}",
+            # xunit1 adds each case's file, for when classname comes out empty
+            "-o", "junit_family=xunit1",
             "--tb=short", *[str(t) for t in tests]]
     ran = child_proc.run(argv, cwd=str(HERE),
                          env=child_proc.child_env(env_extra),
@@ -1230,7 +1232,11 @@ def run_tests(tests: Sequence[Path], work: Path, *,
                                         [-400:])
         return out
     for case in ET.parse(junit).getroot().iter("testcase"):
-        tid = f"{case.get('classname', '')}::{case.get('name', '')}"
+        # A suite on another drive than the app (a temp folder on C:, the
+        # app on D:) has no relative path, and pytest leaves classname empty.
+        mod = case.get("classname", "") or re.split(
+            r"[\\/]", case.get("file", ""))[-1].rsplit(".py", 1)[0]
+        tid = f"{mod}::{case.get('name', '')}"
         state = "passed"
         for child in case:
             if child.tag in ("failure", "error"):
