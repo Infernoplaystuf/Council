@@ -936,6 +936,34 @@ def test_naming_one_of_the_app_s_files_is_said_and_not_read(vault_env):
                for _w, text, _k in said), said
 
 
+def test_an_app_file_s_path_is_not_searched_for(vault_env, monkeypatch):
+    """CI, 2026-10-26: the app's own file was named and not read, then the
+    vault was searched with the words of its path - on Windows the temp
+    folder's 'pytest-12' matched pumps.csv's 12.5, which came back in its
+    place. (A path with forward slashes is read as search syntax and finds
+    nothing, so on Linux it hid.) The path is taken out of what is searched;
+    the rest of the question still is."""
+    import vault_index
+    searched = []
+    real = vault_index.VaultIndex.search
+
+    def search(self, query, *a, **k):
+        searched.append(query)
+        return real(self, query, *a, **k)
+    monkeypatch.setattr(vault_index.VaultIndex, "search", search)
+    vault, _fake = vault_env
+    (vault / "conversation_logs").mkdir()
+    named = vault / "conversation_logs" / "orchid_pressure.md"
+    named.write_text("Q: which pump? A: WALNUTLOG\n", encoding="utf-8")
+    prepared, said, _ = _prepare(vault, f"compare {named} with bay 4")
+    assert "WALNUTLOG" not in prepared.text
+    assert searched and not any(str(named) in q or "orchid_pressure" in q
+                                for q in searched), searched
+    assert any("bay 4" in q for q in searched), searched
+    assert any("orchid_pressure.md" in text and "app's own" in text
+               for _w, text, _k in said), said
+
+
 def test_a_url_is_not_a_missing_file(vault_env):
     """Found in review: "summarize https://example.invalid/reports/data.csv"
     became the explicit path 's://example.invalid/…' (the drive-letter

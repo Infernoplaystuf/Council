@@ -70,6 +70,7 @@ import io
 import json
 import math
 import os
+import stat
 import re
 import urllib.request
 from collections import Counter, defaultdict
@@ -1170,7 +1171,13 @@ _SYSTEM_DIRS = {"$recycle.bin", "system volume information", "recycler"}
 def _is_link_dir(path: str) -> bool:
     try:
         isj = getattr(os.path, "isjunction", None)
-        return os.path.islink(path) or bool(isj and isj(path))
+        if os.path.islink(path) or bool(isj and isj(path)):
+            return True
+        # Python 3.11 has no os.path.isjunction: read the reparse tag
+        # (a junction is a mount point). Only that tag - OneDrive's
+        # cloud folders are reparse points too, and are real folders.
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+        return bool(tag) and tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1)
     except OSError:
         return True
 

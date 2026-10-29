@@ -623,8 +623,11 @@ def _busy_clipboard(monkeypatch) -> list:
     monkeypatch.setattr(excel_open, "_copy_picture", busy)
     monkeypatch.setattr(excel_open, "_clip_text", lambda: None)
     monkeypatch.setattr(excel_open, "_clip_restore", lambda text: None)   # the real one stays
+    # nor is the real clipboard read: on Windows a snapshot of it was taken
+    # and clipboard_safe asked with keeps=True (CI, 2026-10-26)
+    monkeypatch.setattr(excel_open, "_clip_snapshot", lambda *a, **k: None)
     # the fake Excel saves no copy: the clipboard, carefully, is the fallback
-    monkeypatch.setattr(excel_open, "clipboard_safe", lambda: (True, ""))
+    monkeypatch.setattr(excel_open, "clipboard_safe", lambda keeps=False: (True, ""))
     monkeypatch.setattr(excel_open, "_clip_seq", lambda: 1)
     return tried
 
@@ -2109,7 +2112,8 @@ def test_no_copy_means_the_careful_clipboard_and_never_over_what_you_copied(tmp_
     something besides text."""
     tried = _busy_clipboard(monkeypatch)
     monkeypatch.setattr(excel_open, "clipboard_safe",
-                        lambda: (False, "the clipboard holds something besides plain text"))
+                        lambda keeps=False: (False, "the clipboard holds something besides "
+                                                    "plain text"))
     app = _picture_app(1)
 
     def refuse(path, fmt):

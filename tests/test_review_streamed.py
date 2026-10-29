@@ -51,7 +51,8 @@ def test_it_looks_as_it_always_has(review):
     assert readme.column_dimensions["A"].width == 120
     values = wb["Values"]
     assert values.freeze_panes == "A2" and all(c.font.b for c in values[1])
-    assert values.auto_filter.ref == f"A1:M{values.max_row}"
+    # M was the last column until "Held back because" joined it (2026-10-27)
+    assert values.auto_filter.ref == f"A1:N{values.max_row}"
     assert values.column_dimensions["D"].width == 48
     lists = {str(dv.sqref): dv.formula1 for dv in values.data_validations.dataValidation}
     n = values.max_row
