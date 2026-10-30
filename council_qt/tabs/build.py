@@ -6,8 +6,18 @@ left, the editor in the middle with the output under it, the chat on the
 right (council_qt.widgets.build_chat). In Edit mode the chat's accepted edits
 come back here (apply_edits): into the editor, and in a session (a git
 branch of its own, council_core.build_session) committed one turn at a
-time, with Undo turn, the grouped review and Merge. Sandboxed Run and Test
-come in step 4.
+time, with Undo turn, the grouped review and Merge.
+
+    Run / Test     the open file, or the folder's pytest tests, in council_
+                   core.build_sandbox's sandbox: offline, the process tree
+                   killed by Stop or the time limit, a memory cap.
+    Fix this       after a failure: the chat in Edit mode with the output.
+                   After a failed TEST run, applying the fix runs the tests
+                   again by themselves, at most three rounds, and stops when
+                   the same failure comes back; the model is then asked what
+                   is in the way instead of for another fix.
+    Preview        the open file's Qt widget built offscreen (gui_check): a
+                   picture and its widget tree, or the error for Fix this.
 
     Open folder…   any folder becomes the workspace; it is remembered.
     Scratch        the vault's workspace folder (the IDE tab's), for code
@@ -18,9 +28,10 @@ come in step 4.
                    line numbers, find and replace (Ctrl+F), Ctrl+S saves.
                    A tab with unsaved changes shows a dot.
     Run            saves the current file and runs it with "Run with"'s
-                   Python in the file's own folder, streaming its output.
-                   Stop ends it. council_core.ide_trust asks first when the
-                   file does something that can affect the machine.
+                   Python in the file's own folder, in the sandbox,
+                   streaming its output. Stop ends it. council_core.ide_trust
+                   asks first when the file does something that can affect
+                   the machine.
 
 NOTHING IS LOST
   * Save goes through build_files.save_text: atomic, the file's own encoding
@@ -44,13 +55,14 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPlainTextEdit,
                                QSplitter, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from council_core import build_edits as be
+from council_core import build_sandbox as sb
 from council_core import build_session as bs
 from council_core import worktree as wt
 
@@ -85,7 +97,8 @@ class BuildActions:
                  confirm: Optional[Callable[[str, str], bool]] = None,
                  ask_name: Optional[Callable[[str, str], Optional[str]]] = None,
                  chat: Optional[Callable[..., str]] = None,
-                 review: Optional[Callable[[str], tuple]] = None):
+                 review: Optional[Callable[[str], tuple]] = None,
+                 show_preview: Optional[Callable[[str, str], None]] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -95,6 +108,7 @@ class BuildActions:
         self.ask_name = ask_name or self._ask_name
         self.chat = chat or self._chat
         self.review = review or self._review
+        self.show_preview = show_preview or self._show_preview
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -168,6 +182,32 @@ class BuildActions:
         dlg.exec()
         return chosen["answer"]
 
+    @staticmethod
+    def _show_preview(png: str, summary: str) -> None:
+        """The widget as it was built offscreen, and what was found."""
+        if _no_dialogs():
+            return
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import (QDialog, QLabel as _L, QPlainTextEdit as _T,
+                                       QScrollArea, QVBoxLayout as _V)
+        dlg = QDialog()
+        dlg.setWindowTitle("Preview (built offscreen)")
+        dlg.resize(900, 700)
+        col = _V(dlg)
+        pic = _L()
+        pix = QPixmap(png) if png else QPixmap()
+        if not pix.isNull():
+            pic.setPixmap(pix)
+        else:
+            pic.setText("No picture was made.")
+        area = QScrollArea()
+        area.setWidget(pic)
+        col.addWidget(area, 3)
+        text = _T(summary)
+        text.setReadOnly(True)
+        col.addWidget(text, 1)
+        dlg.exec()
+
     # -- the workspace -----------------------------------------------------
     def scratch_dir(self) -> Path:
         return paths.ensure(self.vault_dir / "workspace")
@@ -238,6 +278,8 @@ class BuildTab(ViewHelpers, QWidget):
         self._stop: Optional[threading.Event] = None
         self._running = False
         self._run_lines: List[str] = []       # the last run's output, for the chat
+        self._last: Optional[dict] = None     # the last run or test: kind, failed, output
+        self._fix: Optional[dict] = None      # the fix-and-test rounds under way
         self._build()
         state = self.actions.load_state()
         self.python_box.setCurrentText(envs.display(state.get("python", "")))
@@ -278,6 +320,10 @@ class BuildTab(ViewHelpers, QWidget):
         self.run_btn = self._button(row, amp("▶ Run"), self.on_run)
         self.stop_btn = self._button(row, amp("■ Stop"), self.on_stop)
         self.stop_btn.setEnabled(False)
+        self.test_btn = self._button(row, "Test", self.on_test)
+        self.fix_btn = self._button(row, "Fix this", self.on_fix)
+        self.fix_btn.setEnabled(False)
+        self.preview_btn = self._button(row, "Preview", self.on_preview)
         row.addStretch(1)
         outer.addLayout(row)
 
@@ -560,6 +606,13 @@ class BuildTab(ViewHelpers, QWidget):
     def python_spec(self) -> str:
         return envs.spec_from_choice(self.python_box.currentText())
 
+    def _python(self) -> Optional[str]:
+        res = envs.resolve(self.python_spec())
+        if res.error or not res.python:
+            self.append(f"[Cannot run: {res.error or 'no Python chosen'}]")
+            return None
+        return res.python
+
     def on_run(self) -> None:
         if self._running:
             self.say("A run is already going.")
@@ -580,18 +633,49 @@ class BuildTab(ViewHelpers, QWidget):
                 self.append("[Cancelled]")
                 return
             self.trust.trust(code)
-        res = envs.resolve(self.python_spec())
-        if res.error or not res.python:
-            self.append(f"[Cannot run: {res.error or 'no Python chosen'}]")
-            return
-        self._start_run(res.python, doc.path)
+        python = self._python()
+        if python:
+            self._start_run(python, doc.path)
 
     def _start_run(self, python: str, path: Path) -> None:
+        self._start(lambda line_out, stop: bf.run_file(python, path, line_out, stop),
+                    f"[Running {path.name} with {python}, offline in the sandbox]",
+                    path.name, "run")
+
+    def on_test(self, auto: bool = False) -> bool:
+        """Run the folder's tests (pytest) in the sandbox. ``auto``: a round
+        the model started after a fix."""
+        if self._running:
+            self.say("A run is already going.")
+            return False
+        if self.root is None or not sb.has_tests(self.root):
+            self.say("No tests found here: put test_*.py files in the folder or in "
+                     "tests/ (pytest).")
+            return False
+        if not self.save_all():
+            return False
+        python = self._python()
+        if not python:
+            return False
+        root, argv = Path(self.root), sb.test_argv(python)
+        env = sb.sandbox_env({"QT_QPA_PLATFORM": "offscreen", "COUNCIL_NO_DIALOGS": "1",
+                              "PYTHONDONTWRITEBYTECODE": "1"})
+        label = (f"[Running the tests, round {self._fix['runs']} of {sb.MAX_ROUNDS} "
+                 "(the model started it after its fix)]" if auto and self._fix
+                 else f"[Running the tests in {root.name} with {python}, offline in the sandbox]")
+        self._start(lambda line_out, stop: sb.run(argv, root, line_out, stop,
+                                                  timeout=sb.TEST_TIMEOUT_S,
+                                                  memory_mb=sb.TEST_MEMORY_MB, env=env),
+                    label, "The tests", "test")
+        return True
+
+    def _start(self, job, label: str, name: str, kind: str) -> None:
         self._running = True
         self._stop = threading.Event()
-        self.run_btn.setEnabled(False)
+        for b in (self.run_btn, self.test_btn, self.fix_btn, self.preview_btn):
+            b.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.append(f"[Running {path.name} with {python}]")
+        self.append(label)
         stop = self._stop
         self._run_lines = []
 
@@ -599,20 +683,155 @@ class BuildTab(ViewHelpers, QWidget):
             self._to_ui(self._run_line, line)
 
         def work() -> None:
-            outcome = bf.run_file(python, path, line_out, stop)
-            self._to_ui(self._finished, outcome, path.name)
+            outcome = job(line_out, stop)
+            self._to_ui(self._finished, outcome, name, kind)
 
         threading.Thread(target=work, name="build-run", daemon=True).start()
 
-    def _finished(self, outcome: bf.RunOutcome, name: str) -> None:
+    def _finished(self, outcome: sb.Outcome, name: str, kind: str = "run") -> None:
         self._running = False
-        self.run_btn.setEnabled(True)
+        for b in (self.run_btn, self.test_btn, self.preview_btn):
+            b.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.append(outcome.summary(name))
+        output = "\n".join(self._run_lines)
+        tests = sb.TestOutcome(outcome, output) if kind == "test" else None
+        if tests is not None and tests.missing_pytest():
+            self.append("[pytest is not installed in this Python: pick another under "
+                        "\"Run with\", or install it there (pip install pytest)]")
+        self.append(outcome.summary(name) if tests is None else
+                    f"[{'Tests passed' if tests.passed else 'Tests failed'}: {tests.headline()}]")
         self.say("")
+        self._last = {"kind": kind, "name": name, "failed": outcome.failed,
+                      "output": output,
+                      "headline": tests.headline() if tests else outcome.summary(name)}
+        self.fix_btn.setEnabled(outcome.failed)
         # a failed run is usually what the next question is about
-        self.chat_panel.use_output.setChecked(
-            outcome.returncode not in (0, None) and not outcome.stopped)
+        self.chat_panel.use_output.setChecked(outcome.failed)
+        if tests is not None:
+            self._round_done(tests)
+
+    # -- Fix this, and the rounds the model runs the tests in -------------------
+    def on_fix(self) -> None:
+        """Send the last failure to the chat in Edit mode. A failed TEST run
+        starts the rounds: after each fix is applied the tests run again by
+        themselves, at most MAX_ROUNDS times, and stop when the same failure
+        comes back (council_core.build_sandbox.stuck)."""
+        last = self._last
+        if not last or not last["failed"] or self.chat_panel.is_busy():
+            return
+        if self.chat_panel.proposal is not None:
+            self.say("Apply or reject the proposed edits first.")
+            return
+        what = "The tests" if last["kind"] == "test" else last["name"]
+        text = (f"Fix this: {what} failed ({last['headline']}). The output is shown "
+                "above; find the cause and fix it.")
+        self._fix = ({"runs": 0, "signatures": [sb.signature(last["output"])],
+                      "request": text} if last["kind"] == "test" else None)
+        self._ask_fix(text)
+
+    def _ask_fix(self, text: str) -> None:
+        p = self.chat_panel
+        p.set_mode("edit")
+        p.use_file.setChecked(True)
+        p.use_output.setChecked(True)
+        if self._fix is not None:
+            self._fix["request"] = text
+        p.send(text, kind="fix")
+
+    def _fix_applied(self, request: str) -> None:
+        """After Apply: in the rounds, the tests run again by themselves."""
+        fx = self._fix
+        if fx is None or request != fx.get("request"):
+            self._fix = None
+            return
+        fx["runs"] += 1
+        fx["auto"] = True
+        if not self.on_test(auto=True):
+            self._fix = None
+
+    def _round_done(self, tests: sb.TestOutcome) -> None:
+        fx = self._fix
+        if fx is None or not fx.pop("auto", False):
+            return
+        n = fx["runs"]
+        if tests.outcome.stopped:
+            self._fix = None
+            self.chat_panel.note("The test rounds are stopped.",
+                                 [{"kind": "test", "state": "no",
+                                   "text": f"Round {n}: the tests were stopped by you"}])
+            return
+        step = {"kind": "test", "state": "ok" if tests.passed else "no",
+                "text": f"Ran the tests (round {n} of {sb.MAX_ROUNDS}): {tests.headline()}"}
+        if tests.passed:
+            self._fix = None
+            self.chat_panel.note(f"The tests pass after round {n}.", [step])
+            return
+        fx["signatures"].append(tests.signature())
+        if sb.stuck(fx["signatures"]):
+            self._fix = None
+            self.chat_panel.note("Stopped: the same failure came back after the fix.",
+                                 [step, {"kind": "stuck", "state": "no",
+                                         "text": "Stopped: the same failure came back"}])
+            self.chat_panel.ask_blocker("the same failure came back after your fix")
+            return
+        if n >= sb.MAX_ROUNDS:
+            self._fix = None
+            self.chat_panel.note(f"Stopped after {n} rounds: the tests still fail.",
+                                 [step, {"kind": "stuck", "state": "no",
+                                         "text": f"Stopped after {n} rounds"}])
+            self.chat_panel.ask_blocker(f"the tests still fail after {n} rounds of fixes")
+            return
+        self.chat_panel.note(f"Round {n}: the tests still fail; asking for another fix.", [step])
+        self._ask_fix(f"The tests still fail after your fix (round {n} of {sb.MAX_ROUNDS}): "
+                      f"{tests.headline()}. The new output is shown above; fix it.")
+
+    # -- Preview -------------------------------------------------------------
+    def on_preview(self) -> None:
+        """Build the open file's widget offscreen (council_core.gui_check)
+        and show what it looks like, with any error."""
+        doc = self.current()
+        if self._running or doc is None or not doc.editor.is_python():
+            self.say("Open a Python file with a Qt widget to preview it.")
+            return
+        classes = sb.widget_classes(doc.editor.toPlainText())
+        module = sb.module_name(self.edit_root(), doc.path)
+        if not classes or module is None:
+            self.say(f"No Qt widget class to preview in {doc.path.name}." if not classes
+                     else f"{doc.path.name} is outside the folder; open its folder first.")
+            return
+        if doc.modified() and not self.save(doc):
+            return
+        cls, root = classes[0], self.edit_root()
+        out = self.actions.vault_dir / ".council_build" / "preview" / time.strftime(
+            "%Y%m%d-%H%M%S")
+        self.append(f"[Preview: building {module}.{cls} offscreen]")
+        self._running = True
+        for b in (self.run_btn, self.test_btn, self.fix_btn, self.preview_btn):
+            b.setEnabled(False)
+
+        def work() -> None:
+            from council_core import gui_check
+            res = gui_check.check(root, module, cls, out_dir=out)
+            self._to_ui(self._preview_done, res)
+
+        threading.Thread(target=work, name="build-preview", daemon=True).start()
+
+    def _preview_done(self, res) -> None:
+        self._running = False
+        for b in (self.run_btn, self.test_btn, self.preview_btn):
+            b.setEnabled(True)
+        summary = res.summary(2000)
+        for line in summary.split("\n")[:40]:
+            self.append(line)
+        self._last = {"kind": "preview", "name": f"The preview of {res.cls}",
+                      "failed": not res.ok, "output": summary,
+                      "headline": (res.errors[0].strip().splitlines()[-1][:160]
+                                   if res.errors else "it did not build")}
+        self._run_lines = summary.split("\n")
+        self.fix_btn.setEnabled(not res.ok)
+        self.chat_panel.use_output.setChecked(not res.ok)
+        if res.ok or res.screenshot:
+            self.actions.show_preview(res.screenshot, summary)
 
     def _run_line(self, line: str) -> None:
         self._run_lines.append(line)
@@ -748,6 +967,7 @@ class BuildTab(ViewHelpers, QWidget):
         committed as one turn. (steps for the chat, a message)."""
         changes = prop.accepted_changes()
         if not changes:
+            self._fix = None
             return ([{"kind": "apply", "state": "no", "text": "No edit was accepted"}],
                     "Nothing applied: no edit was accepted.")
         if self.session is not None:
@@ -790,6 +1010,7 @@ class BuildTab(ViewHelpers, QWidget):
                           "text": "In the editor, not saved yet: Save writes them"})
             message = "Applied in the editor, not saved yet. Save writes them; Undo turn takes them back."
         self._show_session()
+        QTimer.singleShot(0, lambda r=request: self._fix_applied(r))
         return steps, message
 
     # -- sessions ----------------------------------------------------------------

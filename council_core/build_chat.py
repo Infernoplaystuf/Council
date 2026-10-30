@@ -66,6 +66,16 @@ SYSTEM = (
     "need to see.")
 
 
+#: Asked when the fix rounds stop (the same failure twice, too many rounds,
+#: or an edit that could not be matched twice): the model writes what is in
+#: the way instead of trying again.
+STUCK = ("Stop trying to fix it now: {why}. Do not write edit blocks or a "
+         "plan. Write a short note for the user under three headings: What I "
+         "tried (one line per change so far), The error (the failure as it "
+         "stands now), What I need from you (the information, file or decision "
+         "that would unblock it).")
+
+
 @dataclass
 class Context:
     """What the editor shows when the user asks."""

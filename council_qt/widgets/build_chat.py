@@ -14,6 +14,12 @@ A request that needs several files gets a PLAN card first, marked green,
 amber or red with Council's reasons and the model's questions; nothing is
 edited until the user answers or presses Go.
 
+STOP WHEN STUCK
+When an edit still does not match after the second request, or the tab's
+test rounds stop (the same failure twice, or three rounds), ask_blocker asks
+the model in Ask mode what it tried, the error, and what it needs from the
+user; its answer is shown as "Council · stuck".
+
 THE STEP LIST
 Under each Edit-mode reply, a folded "▸ N steps": what the model was shown,
 each edit it proposed and what became of it, the second request for the
@@ -276,12 +282,19 @@ class ChatPanel(ViewHelpers, QWidget):
                     parts.append("*Council asked the model again for the edits that "
                                  "did not match.*")
                     continue
+                if t.kind == "blocker":
+                    why = t.content.split(": ", 1)[1].split(". Do not", 1)[0] \
+                        if ": " in t.content else ""
+                    parts.append(f"*Council stopped the fix ({why}) and asked the "
+                                 "model what is in the way.*")
+                    continue
                 where = f" · {Path(t.file).name}" if t.file else ""
                 mode = " · edit" if t.mode == EDIT else ""
                 parts.append(f"**You**{where}{mode}\n\n{t.content}")
                 continue
             text = be.prose(t.content) if t.mode == EDIT else t.content
-            block = [f"**Council**\n\n{text}" if text else "**Council**"]
+            who = "**Council · stuck**" if i and turns[i - 1].kind == "blocker" else "**Council**"
+            block = [f"{who}\n\n{text}" if text else who]
             plan = self._plan_md(i, t)
             if plan:
                 block.append(plan)
@@ -347,14 +360,17 @@ class ChatPanel(ViewHelpers, QWidget):
         self.render()
 
     # -- asking ----------------------------------------------------------------
-    def send(self, question: Optional[str] = None, kind: str = "") -> None:
+    def send(self, question: Optional[str] = None, kind: str = "",
+             mode: Optional[str] = None) -> None:
+        """Ask. ``kind`` marks a turn the Council started: "go" (a plan's Go),
+        "fix" (Fix this, or a test round), "blocker" (the rounds stopped)."""
         question = (question if question is not None else self.input.toPlainText()).strip()
         if not question or self._busy or self.conversation is None:
             return
-        if self.proposal is not None:
+        if self.proposal is not None and kind != "blocker":
             self.status.setText("Apply or reject the proposed edits first.")
             return
-        mode = self.mode()
+        mode = mode or self.mode()
         ctx = self.get_context(self.use_file.isChecked(), self.use_output.isChecked())
         plan_files: List[str] = []
         if mode == EDIT and self.host is not None:
@@ -363,9 +379,10 @@ class ChatPanel(ViewHelpers, QWidget):
             if kind == "go":
                 plan_files = self._open_plan_files()
             ctx.others = self.host.other_files(ctx.path, plan_files)
-        if kind != "go":
+        if not kind:
             self.input.clear()
-        self.proposal = None
+        if kind != "blocker":
+            self.proposal = None
         self._busy = True
         self._streamed = []
         self._stop = threading.Event()
@@ -376,7 +393,8 @@ class ChatPanel(ViewHelpers, QWidget):
         self.status.setText("Answering…" if mode == ASK else "Working on the change…")
         conv, stop, host = self.conversation, self._stop, self.host
         self._pending = question
-        self._request = question if kind != "go" else self._plan_request()
+        if kind != "blocker":                # a pending proposal keeps its request
+            self._request = question if kind != "go" else self._plan_request()
 
         def token(piece: str) -> None:
             self._to_ui(self._token, piece)
@@ -391,7 +409,7 @@ class ChatPanel(ViewHelpers, QWidget):
                              mode=EDIT, kind=kind)
                 else:
                     conv.ask(question, ctx, self.chat, on_token=token,
-                             should_stop=stop.is_set)
+                             should_stop=stop.is_set, kind=kind)
             except Exception as exc:                      # noqa: BLE001
                 error = ("Stopped." if type(exc).__name__ == "GenerationCancelled"
                          else f"The model did not answer: {exc}")
@@ -474,8 +492,15 @@ class ChatPanel(ViewHelpers, QWidget):
         for fc, e in prop.edits():
             reply.steps.append(self._edit_step(fc, e))
         self.conversation.save()
-        self._finish("" if not prop.refused() else
-                      f"{len(prop.refused())} edit(s) could not be applied; see why above.")
+        still = prop.refused()
+        self._finish("" if not still else
+                     f"{len(still)} edit(s) could not be applied; see why above.")
+        if still and retried:
+            # refused twice: stop asking for it again, ask what is in the way
+            reply.steps.append({"kind": "stuck", "state": "no",
+                                "text": f"Stopped: {len(still)} edit(s) did not match twice"})
+            self.ask_blocker(f"{len(still)} of your edits could not be matched to the "
+                             "file twice")
 
     def _reader(self):
         host = self.host
@@ -618,6 +643,13 @@ class ChatPanel(ViewHelpers, QWidget):
             self.conversation.save()
         self.status.setText(message)
         self.render()
+
+    def ask_blocker(self, why: str) -> None:
+        """The fix stops here: ask the model, in Ask mode, what is in the way
+        (council_core.build_chat.STUCK)."""
+        if self._busy or self.conversation is None:
+            return
+        self.send(bc.STUCK.format(why=why), kind="blocker", mode=ASK)
 
     def go(self) -> None:
         turns = self.turns()
