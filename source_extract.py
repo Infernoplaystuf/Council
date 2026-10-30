@@ -5083,6 +5083,13 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             data["read"] = idx
     if run.model_parts:                   # and the parts the model gave them
         data["model_parts"] = {k: list(v) for k, v in run.model_parts.items()}
+    if run.filled_copies:
+        # the sheets laid out like the template, and their parts: what the
+        # Ledger's questions ask about (council_core.ledger_questions)
+        data["filled_copies"] = [
+            {"where": where, "parts": sorted({str(r.get(schema.id_field) or "")
+                                              for r in rows} - {""})}
+            for rows, where in run.filled_copies]
     meta.append([json.dumps(data)], text=False)
     meta.ws.sheet_state = "hidden"
     meta.finish()

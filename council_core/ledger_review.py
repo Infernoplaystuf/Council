@@ -84,6 +84,9 @@ class Review:
     csv: str
     sources: List[str]
     items: List[Item]
+    #: the sheets the run found laid out like the template, and their parts:
+    #: [{'where': 'file › sheet', 'parts': [...]}] (ledger_questions)
+    filled_copies: List[Dict[str, Any]] = field(default_factory=list)
 
     def source_path(self, name: str) -> str:
         """The full path of a source given by name in the review."""
@@ -147,7 +150,8 @@ def load(path) -> Review:
             raise LedgerError(f"{path.name} is not a Ledger review (no Values or Records sheet)")
     finally:
         wb.close()
-    review = Review(str(path), kind, csv, sources, items)
+    review = Review(str(path), kind, csv, sources, items,
+                    [c for c in meta.get("filled_copies") or [] if isinstance(c, dict)])
     if not csv:
         review.csv = _csv_from_readme(path)
     return review
@@ -332,9 +336,10 @@ def record_row_cells(view, item: Item) -> List[Cell]:
 def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
     """Write the answers into the review workbook: {(sheet, row):
     {'accept': 'Y'|'N'|'', 'value': str, 'value_col': int, 'field': str,
-    'item': str}} - 'field' and 'item' put a value of the Values sheet in
-    another template cell (a right-click on it: Apply takes a row's Field
-    and Item as typed). Every other cell, fill, list and hidden sheet stays.
+    'item': str, 'part': str}} - 'field' and 'item' put a value of the
+    Values sheet in another template cell (a right-click on it: Apply takes
+    a row's Field and Item as typed); 'part' types another part over it (a
+    question's answer, ledger_questions). Every other cell, fill, list and hidden sheet stays.
     Atomic: a temporary file, then a replace. Returns how many rows
     changed."""
     import openpyxl
@@ -358,6 +363,8 @@ def save(path, answers: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
             if sheet == "Values" and "field" in a:
                 ws.cell(row=row, column=V_FIELD).value = a["field"]
                 ws.cell(row=row, column=V_ITEM).value = a.get("item") or None
+            if sheet == "Values" and a.get("part"):
+                ws.cell(row=row, column=V_PART).value = a["part"]
             changed += 1
         tmp = path.with_name(path.stem + ".saving.xlsx")
         try:
