@@ -88,6 +88,58 @@ def test_a_1000_row_sheet_is_read_in_seconds_not_minutes(tmp_path, ledger):
     assert took < 30, f"took {took:.1f}s"
 
 
+def _long_log_extractor(tmp_path, schema, rows=12000):
+    grids, _images = se.load_workbook_grids(_log_book(tmp_path / "long.xlsx", rows))
+    return se._Extractor(grids[0], se.Matcher(schema), se.ItemCodes(schema.items), "")
+
+
+def test_a_long_log_is_no_index_workbook_and_says_so_at_once(tmp_path, ledger):
+    """Every part number of a long log ('PN-1000') matches the Part Number
+    field; the index-workbook check walked the rows under each of them - a
+    12,000-row log took 89 s instead of 1.7 s on the test PC (2026-10-29)."""
+    _csv, schema = ledger
+    ex = _long_log_extractor(tmp_path, schema)
+    t0 = time.perf_counter()
+    assert ex.files_named() == {}
+    assert time.perf_counter() - t0 < 2
+
+
+def test_a_long_log_with_file_names_is_read_in_one_pass(tmp_path, ledger):
+    _csv, schema = ledger
+    ex = _long_log_extractor(tmp_path, schema)
+    for r in range(2, 12002):
+        ex.g.cells[(r, 21)] = f"scan_{r}.xlsx"
+    t0 = time.perf_counter()
+    got = ex.files_named()
+    assert time.perf_counter() - t0 < 5
+    assert got["scan_2.xlsx"] == ("PN-1000", 2) and got["scan_12001.xlsx"][0] == "PN-1239"
+
+
+def test_each_row_of_a_long_log_tried_as_a_header_is_not_a_walk_to_the_end(tmp_path, ledger):
+    """No row cap (a 12,000-row EC log, 2026-10-27), and every row of a log
+    is tried as a header: walked again from each, the rows under them took
+    30 s of a 12,000-row log (2026-10-30)."""
+    _csv, schema = ledger
+    ex = _long_log_extractor(tmp_path, schema)
+    cols = list(range(1, 21))
+    t0 = time.perf_counter()
+    n = sum(len(ex._data_rows(r, cols, 2)) for r in range(1, 12002))
+    assert time.perf_counter() - t0 < 5
+    assert n == 12000 * 12001 // 2
+    assert ex._data_rows(1, cols, 2) == list(range(2, 12002))
+
+
+def test_a_csv_too_big_is_not_read(tmp_path, monkeypatch):
+    big = tmp_path / "export.csv"
+    big.write_text("Part Number,Power (W)\n" + "2041,255\n" * 200_000)
+    monkeypatch.setenv("COUNCIL_LEDGER_CSV_LIMIT_MB", "1")
+    with pytest.raises(se.LedgerError, match="more than the 1 MB"):
+        se.load_workbook_grids(big)
+    monkeypatch.setenv("COUNCIL_LEDGER_CSV_LIMIT_MB", "0")       # no limit
+    grids, _images = se.load_workbook_grids(big)
+    assert len(grids[0].cells) == 400_002
+
+
 def test_one_far_away_formatted_cell_does_not_fill_the_sheet(tmp_path):
     from openpyxl.styles import Font
     wb = openpyxl.Workbook()

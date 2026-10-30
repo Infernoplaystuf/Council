@@ -18,6 +18,9 @@ time, with Undo turn, the grouped review and Merge.
                    is in the way instead of for another fix.
     Preview        the open file's Qt widget built offscreen (gui_check): a
                    picture and its widget tree, or the error for Fix this.
+    Agent mode     the chat plans a change, the user approves it, and an
+                   agent makes it on a branch of its own (council_qt.
+                   widgets.build_agent); Review and merge brings it here.
 
     Open folder…   any folder becomes the workspace; it is remembered.
     Scratch        the vault's workspace folder (the IDE tab's), for code
@@ -61,6 +64,7 @@ from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPlainTextEdit,
                                QSplitter, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from council_core import build_agent as ba
 from council_core import build_edits as be
 from council_core import build_sandbox as sb
 from council_core import build_session as bs
@@ -98,7 +102,8 @@ class BuildActions:
                  ask_name: Optional[Callable[[str, str], Optional[str]]] = None,
                  chat: Optional[Callable[..., str]] = None,
                  review: Optional[Callable[[str], tuple]] = None,
-                 show_preview: Optional[Callable[[str, str], None]] = None):
+                 show_preview: Optional[Callable[[str, str], None]] = None,
+                 agent=None, models_source: Optional[Callable] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -109,6 +114,9 @@ class BuildActions:
         self.chat = chat or self._chat
         self.review = review or self._review
         self.show_preview = show_preview or self._show_preview
+        # Agent mode (council_core.build_agent) and the Model box's source
+        self.agent = agent or ba.Agent(self.vault_dir)
+        self.models_source = models_source
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -373,7 +381,9 @@ class BuildTab(ViewHelpers, QWidget):
         right.setSizes([520, 180])
         split.addWidget(right)
         self.chat_panel = ChatPanel(self.actions.vault_dir, self.actions.chat,
-                                    self.chat_context, bridge=self.bridge, host=self)
+                                    self.chat_context, bridge=self.bridge, host=self,
+                                    agent=self.actions.agent,
+                                    models_source=self.actions.models_source)
         split.addWidget(self.chat_panel)
         split.setSizes([220, 700, 420])
         outer.addWidget(split, 1)
@@ -1146,6 +1156,22 @@ class BuildTab(ViewHelpers, QWidget):
                              [{"kind": "undo", "state": "ok",
                                "text": "Undid the last turn's edits in the editor"}])
         self._show_session()
+
+    # -- Agent mode (council_qt.widgets.build_agent) ---------------------------
+    def agent_folder(self) -> Path:
+        """The folder the agent works on: the user's, never a session copy."""
+        return self.project or self.root or self.actions.scratch_dir()
+
+    def agent_python(self) -> str:
+        return self._python() or ""
+
+    def unsaved(self) -> bool:
+        return any(d.modified() for d in self.docs)
+
+    def after_merge(self) -> None:
+        """A job was merged into the folder: show the files as they are now."""
+        self._reload_docs()
+        self.refresh_tree()
 
     def _reload_docs(self) -> None:
         """Every open file read again from disk (after a revert), and a tab
