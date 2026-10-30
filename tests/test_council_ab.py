@@ -80,16 +80,25 @@ def test_the_report_compares_the_sides(tmp_path):
         with (tmp_path / f"chat-{side}.jsonl").open("w") as fh:
             for r in recs:
                 fh.write(json.dumps(r) + "\n")
-    (tmp_path / "ledger-before.json").write_text(json.dumps(
+    (tmp_path / "ledger-pre48.json").write_text(json.dumps(
         [{"rows": 2000, "seconds": 0.5, "values": 1996}]))
-    (tmp_path / "ledger-after.json").write_text(json.dumps(
-        [{"rows": 2000, "timed_out": True, "seconds": 300}]))
+    (tmp_path / "ledger-pre56.json").write_text(json.dumps(
+        {"long_log": [{"rows": 2000, "timed_out": True, "seconds": 300}],
+         "batch": {"batch": 44, "seconds": 90.0, "values": 5020,
+                   "pre_accepted": 2596}}))
+    (tmp_path / "ledger-now.json").write_text(json.dumps(
+        {"long_log": [{"rows": 2000, "seconds": 0.6, "values": 2000}],
+         "batch": {"batch": 44, "seconds": 30.5, "values": 5020,
+                   "pre_accepted": 2596}}))
     md = ab.report(tmp_path, ["before-app", "after-app"], {})
     s = ab.summarise(ab.read_jsonl(tmp_path / "chat-after-app.jsonl"))
     assert s["right"] == 2 and s["handed_on"] == 1 and s["routing_ok"] == 2
     assert "| Right answers | 1/2 (50%) | 2/2 (100%) (better) |" in md
     assert "| Answers with demo sample data | 1 | 0 (better) |" in md
-    assert "over 300 s (stopped)" in md
+    assert "| Long log, 2000 rows | 0.5 s, 1996 values | over 300 s " \
+        "(stopped) | 0.6 s, 2000 values |" in md
+    assert "| Extract, 44 workbooks | - | 90.0 s: 5020 values, 2596 " \
+        "pre-accepted | 30.5 s: 5020 values, 2596 pre-accepted |" in md
     assert (tmp_path / "report.html").read_text().count("<details>") == 4
 
 
@@ -127,7 +136,7 @@ def test_every_step_has_an_id_a_command_and_a_limit(tmp_path):
     steps = ft.steps(_args(), tmp_path, tmp_path / "vault")
     ids = [s["id"] for s in steps]
     assert len(ids) == len(set(ids))
-    assert {"suite", "ab", "ledger", "connections", "llm"} <= set(ids)
+    assert {"suite", "ab", "ledger", "connections", "build", "llm"} <= set(ids)
     assert all(s["cmd"] and s["limit"] > 0 for s in steps)
     assert {s["id"] for s in steps if s.get("long")} == {
         "typhon", "code", "council"}
@@ -145,7 +154,7 @@ def test_a_gguf_goes_only_to_the_steps_that_take_one(tmp_path):
 
 def test_the_stand_in_template_reads_as_a_template(tmp_path):
     from sample_ledger import read_template
-    schema = read_template(ft.make_lmm_template(tmp_path / "t.xlsx"))
+    schema = read_template(ab.make_lmm_template(tmp_path / "t.xlsx"))
     labels = " ".join(str(getattr(f, "label", f)) for f in schema.fields)
     assert "Part Number" in labels and "Eddy Current" in labels
 
@@ -165,3 +174,38 @@ def test_the_full_report_lists_every_step(tmp_path):
         {"when": "now", "model": "", "build": "abc"})
     assert "| suite | ok | 1.0 |" in text and "12 passed" in text
     assert (tmp_path / "report.html").is_file()
+
+
+# ------------------------------------------- tools/council_build_bench.py
+import council_build_bench as bb  # noqa: E402
+
+_MEDIAN_FIX = """Why: average the two middle values for an even count
+stats.py
+<<<<<<< SEARCH
+    return ordered[len(ordered) // 2]
+=======
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+>>>>>>> REPLACE
+"""
+
+
+def test_every_build_task_starts_with_failing_tests(tmp_path):
+    for task in bb.TASKS:
+        root = bb.make_task(tmp_path / task["id"], task)
+        assert (root / task["open"]).is_file()
+        assert not bb.run_tests(root).passed, task["id"]
+
+
+def test_a_right_edit_solves_the_task_in_one_round(tmp_path):
+    rec = bb.run_task(bb.TASKS[0], tmp_path, tmp_path / "vault",
+                      lambda messages, **kw: _MEDIAN_FIX)
+    assert rec["solved"] and rec["rounds"] == 1 and rec["calls"] == 1
+    assert rec["applied"] == 1 and rec["refused"] == 0
+
+
+def test_a_model_that_does_nothing_stops_when_stuck(tmp_path):
+    rec = bb.run_task(bb.TASKS[2], tmp_path, tmp_path / "vault",
+                      lambda messages, **kw: "I am not sure.")
+    assert not rec["solved"] and rec["stuck"] and rec["rounds"] == 2

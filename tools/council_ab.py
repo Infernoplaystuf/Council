@@ -20,9 +20,14 @@ report:
   kg       Connections: council_core.kg_bench (30 labelled sentences) before
            PR #50 and now. Needs an Ollama model (--kg-model, or --model
            ollama:NAME).
-  ledger   Ledger speed on long eddy-current logs (2,000 / 4,000 / 12,000
-           rows) before PR #48 and now, each read with a time limit, so a
-           stall shows as "over N s" instead of hanging the run.
+  ledger   Ledger speed at four builds: before PR #48, before PR #56 (the
+           long-log stall), now with one process, and now as the app runs
+           (several helper processes since PR #57). Two measures, each with
+           a time limit so a stall shows as "over N s" instead of hanging
+           the run: one long eddy-current log (2,000 / 4,000 / 12,000 rows),
+           and a batch of 44 workbooks through the Ledger tab's own Extract
+           (ledger_ingest.run_extract), with what it found, so a faster
+           build that finds less shows.
 
 The "before" builds are git worktrees of this repository made in the output
 folder (no network: the commits only have to be in this clone). Nothing is
@@ -30,7 +35,7 @@ written to your vault or your data; the output folder holds everything:
 
     <out>/report.html, report.md     the scored comparison
     <out>/chat-<side>.jsonl          one line per question asked
-    <out>/kg-<side>.json, ledger-<side>.json
+    <out>/kg-<side>.json, ledger-<build>.json
     <out>/vault-<side>/              each side's synthetic vault
     <out>/code-<ref>/                the worktrees (removed at the end unless
                                      --keep-worktrees)
@@ -83,12 +88,25 @@ BEFORE = {
     "ledger": "35a2ba7e51712018f462112b98df97356b9deb81",  # before PR #48
 }
 
+#: The Ledger's builds, oldest first: (file key, column title, ref, extra
+#: environment). "" is this checkout. COUNCIL_LEDGER_WORKERS=1 turns PR
+#: #57's helper processes off (a build without them ignores it).
+LEDGER_BUILDS = (
+    ("pre48", "before #48", BEFORE["ledger"], {}),
+    ("pre56", "before #56 (stall)",
+     "8561178279d7ee8da45971db7e36c8ed6be0084d", {}),
+    ("now1", "now, one process", "", {"COUNCIL_LEDGER_WORKERS": "1"}),
+    ("now", "now", "", {}),
+)
+
 #: Words only the bundled sample data (assets/sample_data) has: one in an
 #: answer means the demo purchase orders / inventory reached it.
 SAMPLE_MARKERS = ("TradeWorks", "Hilltop Ind", "Acme Supply", "BoltCo",
                   "Northbridge", "Power Strip", "acmesupply.example")
 
 LEDGER_ROWS = (2000, 4000, 12000)
+#: The batch: ledger_bench's eleven workbooks, this many copies of each.
+BATCH_COPIES = 4
 
 
 # ============================================================
@@ -444,30 +462,157 @@ def ledger_one(code: Path, folder: Path, rows: int) -> int:
     return 0
 
 
+def make_lmm_template(path: Path) -> Path:
+    """The stand-in LMM template (the real one stays on your PC): the
+    sections and field names ledger_bench writes for."""
+    import openpyxl
+    from openpyxl.styles import Font
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "LMM"
+    big = Font(size=16, bold=True)
+
+    def head(cell, text):
+        ws[cell] = text
+        ws[cell].font = big
+
+    def grid(top, rows, extras=()):
+        r = top
+        for b in "ABC":
+            ws.cell(r, 2, "Flaw #")
+            for i in range(10):
+                ws.cell(r, 3 + i, f"{i + 1}{b}")
+            for j, e in enumerate(extras):
+                ws.cell(r, 13 + j, e)
+            for k, label in enumerate(rows):
+                ws.cell(r + 1 + k, 2, label.format(b=b))
+            r += len(rows) + 2
+        return r
+
+    head("A1", "Part Attributes")
+    for col, label in enumerate(
+            ["Part Number", "Frequency (kHz)", "%pec", "Power (W)",
+             "Scan Speed (mm/s)", "Jump Speed (mm/s)", "Beam Expander",
+             "Spot Size (mm)", "Date", "Roughness"], start=1):
+        ws.cell(2, col, label)
+    head("A5", "Flaw Attributes")
+    head("R5", "Tables for Presentation")
+    end = grid(6, ["Laser Team FOD {b} (um)", "Flaw Orientation (deg)",
+                   "Flaw Length (in)"])
+    for rr in range(6, end):
+        ws.cell(rr, 19, f"=C{rr}")
+        ws.cell(rr, 20, f"=AVERAGE(C{rr}:L{rr})")
+    head(f"A{end + 1}", "NDE Inspection")
+    end = grid(end + 2, ["Eddy Current Response Pre-Conceal",
+                         "Eddy Current Response Mid-Conceal",
+                         "Eddy Current Response Post-Conceal", "FPI"],
+               extras=["Inspector Initials", "Date"])
+    head(f"A{end + 1}", "Concealment")
+    for col, label in enumerate(["Media", "Media Run Time", "Media Size",
+                                 "Tub Status", "Amplitude", "Amount", "Notes"],
+                                start=2):
+        ws.cell(end + 2, col, label)
+    vis = end + 10
+    head(f"A{vis}", "Visual Inspection")
+    grid(vis + 1, ["Inspector 1", "Inspector 2", "Inspector 3"],
+         extras=["Inspector Initials"])
+    wb.save(path)
+    return path
+
+
+def make_batch(folder: Path, copies: int = BATCH_COPIES) -> Path:
+    """ledger_bench's eleven workbooks (this checkout's generator, so every
+    build reads the same files), ``copies`` of each under their own names."""
+    src = folder / "batch"
+    if (src / "done").is_file():
+        return src
+    if src.exists():
+        shutil.rmtree(src)
+    gen = folder / "batch-gen"
+    if gen.exists():
+        shutil.rmtree(gen)
+    tpl = make_lmm_template(folder / "LMM_standin_template.xlsx")
+    subprocess.run([sys.executable, str(REPO / "ledger_bench.py"), "make",
+                    str(tpl), str(gen)], cwd=REPO, check=True,
+                   capture_output=True, text=True)
+    src.mkdir(parents=True)
+    for k in range(copies):
+        for f in sorted(gen.glob("*.xlsx")):
+            shutil.copy2(f, src / f"c{k + 1}_{f.name}")
+    (src / "done").write_text("", encoding="utf-8")
+    return src
+
+
+def ledger_batch(code: Path, folder: Path) -> int:
+    """The Ledger tab's Extract over the batch at this build; prints a JSON
+    line: seconds and what it found."""
+    src = folder / "batch"
+    tpl = folder / "LMM_standin_template.xlsx"
+    work = folder / f"run-{os.getpid()}"
+    work.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(code))
+    os.chdir(code)
+    from council_core import ledger_ingest as li
+    csv_path = work / "LMM_parent.csv"
+    li.create_parent(str(tpl), csv_path)
+    t0 = time.monotonic()
+    es = li.run_extract(csv_path, [src], review_path=work / "review.xlsx",
+                        use_images=False)
+    secs = time.monotonic() - t0
+    rec = {"batch": len([p for p in src.iterdir() if p.suffix == ".xlsx"]),
+           "seconds": round(secs, 1)}
+    for k in ("files", "values", "pre_accepted", "to_review"):
+        v = getattr(es, k, None)
+        rec[k] = len(v) if isinstance(v, (list, tuple, set, dict)) else v
+    print(json.dumps(rec, default=str), flush=True)
+    shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+def _timed_child(args: List[str], limit_s: int, env: Dict[str, str],
+                 key: str, value: Any) -> Dict[str, Any]:
+    cmd = [sys.executable, str(Path(__file__).resolve())] + args
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=limit_s, env=env)
+        line = [x for x in p.stdout.splitlines() if x.startswith("{")]
+        rec = json.loads(line[-1]) if line else {
+            key: value, "error": (p.stderr or "no output")[-600:]}
+    except subprocess.TimeoutExpired:
+        rec = {key: value, "timed_out": True, "seconds": limit_s}
+    rec["wall_s"] = round(time.monotonic() - t0, 1)
+    return rec
+
+
+def _said(rec: Dict[str, Any], limit_s: int) -> str:
+    if rec.get("timed_out"):
+        return f"over {limit_s} s (stopped)"
+    return f"{rec['seconds']} s" if "seconds" in rec else "failed"
+
+
 def ledger_side(code: Path, folder: Path, out: Path, rows: Sequence[int],
-                limit_s: int) -> int:
-    results = []
+                limit_s: int, env: Optional[Dict[str, str]] = None,
+                batch: bool = True, batch_limit_s: int = 1800) -> int:
+    env = dict(os.environ if env is None else env)
+    results: Dict[str, Any] = {"long_log": [], "batch": None}
     for n in rows:
         make_ledger_files(folder, n)
-        cmd = [sys.executable, str(Path(__file__).resolve()), "_ledger-one",
-               "--code", str(code), "--work", str(folder), "--rows", str(n)]
-        t0 = time.monotonic()
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=limit_s)
-            line = [x for x in p.stdout.splitlines() if x.startswith("{")]
-            rec = json.loads(line[-1]) if line else {
-                "rows": n, "error": (p.stderr or "no output")[-600:]}
-        except subprocess.TimeoutExpired:
-            rec = {"rows": n, "timed_out": True, "seconds": limit_s}
-        rec["wall_s"] = round(time.monotonic() - t0, 1)
-        results.append(rec)
-        print(f"  {n} rows: " + (f"over {limit_s} s (stopped)"
-                                 if rec.get("timed_out") else
-                                 f"{rec.get('seconds', '?')} s"
-                                 if "seconds" in rec else "failed"),
-              flush=True)
-    out.write_text(json.dumps(results, indent=1), encoding="utf-8")
+        rec = _timed_child(["_ledger-one", "--code", str(code), "--work",
+                            str(folder), "--rows", str(n)], limit_s, env,
+                           "rows", n)
+        results["long_log"].append(rec)
+        print(f"  long log, {n} rows: {_said(rec, limit_s)}", flush=True)
+    if batch:
+        make_batch(folder)
+        rec = _timed_child(["_ledger-batch", "--code", str(code), "--work",
+                            str(folder)], batch_limit_s, env, "batch", 0)
+        results["batch"] = rec
+        print(f"  batch of {rec.get('batch', '?')} workbooks: "
+              f"{_said(rec, batch_limit_s)}, {rec.get('values', '?')} values"
+              f", {rec.get('pre_accepted', '?')} pre-accepted", flush=True)
+    out.write_text(json.dumps(results, indent=1, default=str),
+                   encoding="utf-8")
     return 0
 
 
@@ -731,29 +876,47 @@ def report(out: Path, sides: List[str], meta: Dict[str, Any]) -> str:
                 f"<td>{c}</td>" for c in cells) + "</tr>")
         h.append("</table>")
     # Ledger
-    led = {s: out / f"ledger-{s}.json" for s in ("before", "after")}
-    led = {s: json.loads(p.read_text(encoding="utf-8"))
-           for s, p in led.items() if p.is_file()}
+    led = {}
+    for key, title, _ref, _env in LEDGER_BUILDS:
+        p = out / f"ledger-{key}.json"
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):           # a run before the batch
+                data = {"long_log": data, "batch": None}
+            led[title] = data
     if led:
-        md += ["", "## Ledger: one long eddy-current log", "",
-               "| rows | " + " | ".join(led) + " |",
-               "|---|" + "---|" * len(led)]
-        h.append("<h2>Ledger: one long eddy-current log</h2><table><tr><th>"
-                 "rows</th>" + "".join(f"<th>{s}</th>" for s in led) +
-                 "</tr>")
-        rows = sorted({r["rows"] for v in led.values() for r in v})
-        for n in rows:
-            cells = []
-            for v in led.values():
-                r = next((x for x in v if x["rows"] == n), None)
-                cells.append("-" if r is None else
-                             f"over {r['seconds']} s (stopped)"
-                             if r.get("timed_out") else
-                             f"{r['seconds']} s, {r.get('values', '?')} values"
-                             if "seconds" in r else "failed")
-            md.append(f"| {n} | " + " | ".join(cells) + " |")
-            h.append(f"<tr><td>{n}</td>" + "".join(
-                f"<td>{c}</td>" for c in cells) + "</tr>")
+        md += ["", "## Ledger speed", "",
+               "| | " + " | ".join(led) + " |", "|---|" + "---|" * len(led)]
+        h.append("<h2>Ledger speed</h2><table><tr><th></th>" + "".join(
+            f"<th>{html.escape(s)}</th>" for s in led) + "</tr>")
+
+        def cell(r: Optional[Dict[str, Any]], batch: bool) -> str:
+            if r is None:
+                return "-"
+            if r.get("timed_out"):
+                return f"over {r['seconds']} s (stopped)"
+            if "seconds" not in r:
+                return "failed"
+            if batch:
+                return (f"{r['seconds']} s: {r.get('values', '?')} values, "
+                        f"{r.get('pre_accepted', '?')} pre-accepted")
+            return f"{r['seconds']} s, {r.get('values', '?')} values"
+
+        rows = sorted({r["rows"] for v in led.values()
+                       for r in v.get("long_log") or [] if "rows" in r})
+        lines = [(f"Long log, {n} rows",
+                  [cell(next((x for x in v.get("long_log") or []
+                              if x.get("rows") == n), None), False)
+                   for v in led.values()]) for n in rows]
+        if any(v.get("batch") for v in led.values()):
+            n = next(v["batch"].get("batch") for v in led.values()
+                     if v.get("batch"))
+            lines.append((f"Extract, {n} workbooks",
+                          [cell(v.get("batch"), True) for v in led.values()]))
+        for label, cells in lines:
+            md.append(f"| {label} | " + " | ".join(cells) + " |")
+            h.append(f"<tr><td>{html.escape(label)}</td>" + "".join(
+                f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
         h.append("</table>")
     text = "\n".join(md) + "\n"
     (out / "report.md").write_text(text, encoding="utf-8")
@@ -779,6 +942,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     k.add_argument("--code", required=True)
     k.add_argument("--model", required=True)
     k.add_argument("--out", required=True)
+    lb = sub.add_parser("_ledger-batch")
+    lb.add_argument("--code", required=True)
+    lb.add_argument("--work", required=True)
     lo = sub.add_parser("_ledger-one")
     lo.add_argument("--code", required=True)
     lo.add_argument("--work", required=True)
@@ -809,6 +975,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--ledger-rows", default=",".join(
             map(str, LEDGER_ROWS)))
         p.add_argument("--ledger-limit", type=int, default=300)
+        p.add_argument("--ledger-builds", default=",".join(
+            k for k, *_ in LEDGER_BUILDS),
+            help="which Ledger builds: " + ", ".join(
+                f"{k} ({t})" for k, t, *_ in LEDGER_BUILDS))
+        p.add_argument("--no-batch", action="store_true",
+                       help="ledger: only the long logs")
         p.add_argument("--keep-worktrees", action="store_true")
     a = ap.parse_args(argv)
 
@@ -821,6 +993,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          a.side, qs, a.repeat)
     if a.cmd == "_kg-side":
         return kg_side(Path(a.code), a.model, Path(a.out))
+    if a.cmd == "_ledger-batch":
+        return ledger_batch(Path(a.code), Path(a.work))
     if a.cmd == "_ledger-one":
         return ledger_one(Path(a.code), Path(a.work), a.rows)
     if a.cmd == "report":
@@ -876,15 +1050,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            kg_model, "--out", str(target)], env)
         if "ledger" in tests:
             rows = [int(x) for x in a.ledger_rows.split(",") if x]
-            for side, ref in (("before", BEFORE["ledger"]), ("after", "")):
+            want = set(a.ledger_builds.split(","))
+            for key, title, ref, extra in LEDGER_BUILDS:
+                if key not in want:
+                    continue
                 code = worktree(ref, out)
-                meta["builds"][f"ledger {side}"] = build_name(code)
-                target = out / f"ledger-{side}.json"
+                meta["builds"][f"ledger {title}"] = build_name(code)
+                target = out / f"ledger-{key}.json"
                 if target.exists():
                     continue
-                print(f"== ledger {side} ({code})", flush=True)
-                ledger_side(code, out / "ledger-files", target, rows,
-                            a.ledger_limit)
+                print(f"== ledger {title} ({code})", flush=True)
+                # One process changes nothing for a single file: the long
+                # logs are timed once for this checkout.
+                ledger_side(code, out / "ledger-files", target,
+                            [] if key == "now1" else rows, a.ledger_limit,
+                            env=dict(env, **extra), batch=not a.no_batch)
     finally:
         if not a.keep_worktrees:
             remove_worktrees(out)

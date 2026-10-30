@@ -24,18 +24,24 @@ STEPS (id: what it covers; [model] = needs one; [long] = only with --long)
                before/after #48 [model]
   ledger       Ledger accuracy: ledger_bench's eleven synthetic workbooks
                (stacked, side by side, by sheet, long log, pictures, messy)
-               read and scored against their answer key
+               read and scored against their answer key; then the same files
+               through the tab's Extract and Apply, and the Analyze window's
+               analysis and export of the result (PR #59, once merged)
   connections  Connections end to end on the synthetic Ironbridge vault:
                build the graph (timed), then the model reads the sentences
                and tables; links scored against the answer key [model]
+  build        Build tab, Edit mode: four small projects with failing tests
+               fixed through the chat, the sandboxed Test and "Fix this"
+               rounds (tools/council_build_bench.py) [model]
   llm          council_core.llm_bench: GUI Designer layouts, code, docs
-               answers, as the Code and Designer tabs make them [model]
+               answers, as the Build and Designer tabs make them [model]
   describe     Designer "Describe it": wireframe, generate, run [model]
   codebehind   Designer "Write it with the model…" [model]
   docs         Docs tab: answers from an invented package's docs [model]
   typhon       Rebuild the Typhon app: layout, wiring, widgets [model][long]
-  code         Code tab agent redoes 3 small past commits of this repo
-               until their tests pass [model][long]
+  code         Build tab, Agent mode (its plan-and-run pipeline) redoes 3
+               small past commits of this repo until their tests pass
+               [model][long]
   council      the whole council (Deliberation on) on council_bench's 20
                questions [model][long]
 
@@ -100,67 +106,9 @@ def env_report(out: Path) -> int:
     return 0
 
 
-def make_lmm_template(path: Path) -> Path:
-    """The stand-in LMM template (the real one stays on your PC): the
-    sections and field names ledger_bench writes for."""
-    import openpyxl
-    from openpyxl.styles import Font
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "LMM"
-    big = Font(size=16, bold=True)
-
-    def head(cell, text):
-        ws[cell] = text
-        ws[cell].font = big
-
-    def grid(top, rows, extras=()):
-        r = top
-        for b in "ABC":
-            ws.cell(r, 2, "Flaw #")
-            for i in range(10):
-                ws.cell(r, 3 + i, f"{i + 1}{b}")
-            for j, e in enumerate(extras):
-                ws.cell(r, 13 + j, e)
-            for k, label in enumerate(rows):
-                ws.cell(r + 1 + k, 2, label.format(b=b))
-            r += len(rows) + 2
-        return r
-
-    head("A1", "Part Attributes")
-    for col, label in enumerate(
-            ["Part Number", "Frequency (kHz)", "%pec", "Power (W)",
-             "Scan Speed (mm/s)", "Jump Speed (mm/s)", "Beam Expander",
-             "Spot Size (mm)", "Date", "Roughness"], start=1):
-        ws.cell(2, col, label)
-    head("A5", "Flaw Attributes")
-    head("R5", "Tables for Presentation")
-    end = grid(6, ["Laser Team FOD {b} (um)", "Flaw Orientation (deg)",
-                   "Flaw Length (in)"])
-    for rr in range(6, end):
-        ws.cell(rr, 19, f"=C{rr}")
-        ws.cell(rr, 20, f"=AVERAGE(C{rr}:L{rr})")
-    head(f"A{end + 1}", "NDE Inspection")
-    end = grid(end + 2, ["Eddy Current Response Pre-Conceal",
-                         "Eddy Current Response Mid-Conceal",
-                         "Eddy Current Response Post-Conceal", "FPI"],
-               extras=["Inspector Initials", "Date"])
-    head(f"A{end + 1}", "Concealment")
-    for col, label in enumerate(["Media", "Media Run Time", "Media Size",
-                                 "Tub Status", "Amplitude", "Amount", "Notes"],
-                                start=2):
-        ws.cell(end + 2, col, label)
-    vis = end + 10
-    head(f"A{vis}", "Visual Inspection")
-    grid(vis + 1, ["Inspector 1", "Inspector 2", "Inspector 3"],
-         extras=["Inspector Initials"])
-    wb.save(path)
-    return path
-
-
 def ledger_accuracy(work: Path, images: bool) -> int:
     work.mkdir(parents=True, exist_ok=True)
-    tpl = make_lmm_template(work / "LMM_standin_template.xlsx")
+    tpl = ab.make_lmm_template(work / "LMM_standin_template.xlsx")
     src = work / "sources"
     if src.exists():
         shutil.rmtree(src)
@@ -173,6 +121,65 @@ def ledger_accuracy(work: Path, images: bool) -> int:
               flush=True)
         if code:
             return code
+    return ledger_tab_and_analysis(work, tpl, src, images)
+
+
+def ledger_tab_and_analysis(work: Path, tpl: Path, src: Path,
+                            images: bool) -> int:
+    """The same workbooks through the Ledger tab's own path (Extract, then
+    Apply into the parent CSV), then the Analyze window's analysis of that
+    CSV (council_core.ledger_analytics, PR #59) when this build has it."""
+    sys.path.insert(0, str(REPO))
+    os.chdir(REPO)
+    from council_core import ledger_ingest as li
+    # The workbooks only: ledger_bench's score leaves its notes beside them.
+    tab_src = work / "tab_sources"
+    if tab_src.exists():
+        shutil.rmtree(tab_src)
+    tab_src.mkdir()
+    for f in src.glob("*.xlsx"):
+        shutil.copy2(f, tab_src / f.name)
+    src = tab_src
+    csv_path = work / "LMM_parent.csv"
+    for p in (csv_path, work / "review.xlsx"):
+        if p.exists():
+            p.unlink()
+    li.create_parent(str(tpl), csv_path)
+    t0 = time.monotonic()
+    es = li.run_extract(csv_path, [src], review_path=work / "review.xlsx",
+                        use_images=images)
+    print(f"  Extract (the tab's path): {time.monotonic() - t0:.1f} s", flush=True)
+    print("  " + str(es.describe()).replace("\n", "\n  "), flush=True)
+    t0 = time.monotonic()
+    ap = li.run_apply(work / "review.xlsx")
+    print(f"  Apply: {time.monotonic() - t0:.1f} s", flush=True)
+    print("  " + str(ap.describe() if hasattr(ap, "describe") else ap
+                     ).replace("\n", "\n  "), flush=True)
+    try:
+        from council_core import ledger_analytics as la
+    except ImportError:
+        print("  Analyze: not in this build (PR #59 not merged yet)",
+              flush=True)
+        return 0
+    t0 = time.monotonic()
+    data = la.load(csv_path)
+    cov = la.coverage(data)
+    summ = la.summary(data)
+    corr = la.correlation(data)
+    outl = la.outliers(data)
+    secs = time.monotonic() - t0
+    print(f"  Analyze: {secs:.1f} s; coverage {len(cov)} fields, summary "
+          f"{len(summ)} fields, outliers {len(outl)}", flush=True)
+    pairs = corr.pairs()
+    sure = int((pairs["Sure"] == "yes").sum()) if len(pairs) else 0
+    print(f"  correlation ({corr.method}): {len(corr.fields)} number fields, "
+          f"{len(pairs)} pairs, {sure} sure", flush=True)
+    if len(pairs):
+        print("  " + pairs.head(5).to_string(index=False).replace(
+            "\n", "\n  "), flush=True)
+    t0 = time.monotonic()
+    path = la.export(data, work / "LMM_parent_analysis.xlsx")
+    print(f"  Export: {time.monotonic() - t0:.1f} s -> {path}", flush=True)
     return 0
 
 
@@ -285,6 +292,9 @@ def steps(a, out: Path, vault: Path) -> List[Dict[str, Any]]:
                                       str(out), "--kg-model",
                                       a.kg_model or ollama],
          "limit": 3 * 3600},
+        {"id": "build", "cmd": [PY, "-u", str(HERE / "council_build_bench.py"),
+                                "--out", str(out / "build")],
+         "limit": 2 * 3600, "model": True},
         {"id": "llm", "cmd": [PY, "-u", "-m", "council_core.llm_bench",
                               "--suites", "gui,code,docs", "--pipeline",
                               "new", "--vault", str(out / "llm-vault"),
