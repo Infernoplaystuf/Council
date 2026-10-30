@@ -9,6 +9,7 @@ by **you** (the operator) to manage the business side of the product.
 | `license_server.py`   | Activation server the desktop app talks to once per device. |
 | `council_ab.py`       | Before/after test of the Council chat, Connections links and Ledger speed, on this PC with real models. |
 | `council_fulltest.py` | The whole app on this PC with real models: the test suite, every bench, one report. |
+| `council_build_bench.py` | The Build tab's Edit mode fixing four small projects with failing tests (a step of the full test). |
 
 ---
 
