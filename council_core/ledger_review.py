@@ -168,15 +168,20 @@ def _csv_from_readme(path: Path) -> str:
     return ""
 
 
-def _find(sources: Sequence[str], name: str) -> str:
+def _by_name(sources: Sequence[str]) -> Dict[str, str]:
+    """Each source by its file name, the first of a name kept (as a scan of
+    the list finds it). Built once per review: looked up once per value, the
+    scan built every Path again and was 40% of loading a review of 16,000
+    values (2026-10-30)."""
+    names: Dict[str, str] = {}
     for s in sources:
-        if Path(s).name == name:
-            return s
-    return ""
+        names.setdefault(Path(s).name, s)
+    return names
 
 
 def _values_items(wb, sources: Sequence[str]) -> List[Item]:
     out: List[Item] = []
+    by_name = _by_name(sources)
     rows = list(wb["Values"].iter_rows(min_row=2, values_only=True))
     for i, row in enumerate(rows, start=2):
         row = list(row) + [None] * (14 - len(row))
@@ -214,7 +219,7 @@ def _values_items(wb, sources: Sequence[str]) -> List[Item]:
             title=" · ".join(x for x in (value, fname, " ".join(y for y in (part, item) if y))
                              if x) or where,
             detail="\n".join(x for x in lines if x),
-            source_file=_find(sources, file), source_sheet=sheet,
+            source_file=by_name.get(file, ""), source_sheet=sheet,
             source_cells=[cell] if cell else [], fields=[fname] if fname else [],
             value=value, value_col=V_VALUE, where=where, item=item, part=part,
             score=_score(row[V_SCORE - 1]), label=label,
@@ -232,6 +237,7 @@ def _score(v: Any) -> float:
 
 def _records_items(wb, sources: Sequence[str]) -> List[Item]:
     out: List[Item] = []
+    by_name = _by_name(sources)
     for name in wb.sheetnames:
         if not (name == "Records" or name.startswith("Records ")):
             continue
@@ -266,7 +272,7 @@ def _records_items(wb, sources: Sequence[str]) -> List[Item]:
             out.append(Item(
                 sheet=name, row=i, accept=acc, needs=acc != "Y" or bool(checks), clash=clash,
                 title=shown or f"{file} row {srow}", detail="\n".join(lines),
-                source_file=_find(sources, _text(file)), source_sheet=_text(sheet),
+                source_file=by_name.get(_text(file), ""), source_sheet=_text(sheet),
                 source_cells=cells, fields=list(values), values=values,
                 where=f"{file} › {sheet}!{table}"))
     return out
