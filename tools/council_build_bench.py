@@ -126,10 +126,16 @@ def make_task(root: Path, task: Dict[str, Any]) -> Path:
 def run_tests(root: Path):
     from council_core import build_sandbox as bs
     lines: List[str] = []
+    # pytest's tmp_path under the bench's own folder: in the shared
+    # pytest-of-<user> folder its clean-up races with any other pytest
+    # running at the time (the suite runs four at once).
+    temp = root.parent / "_pytest_tmp"
+    temp.mkdir(parents=True, exist_ok=True)
     out = bs.run(bs.test_argv(sys.executable), root, lines.append,
                  timeout=bs.TEST_TIMEOUT_S, memory_mb=bs.TEST_MEMORY_MB,
                  env=bs.sandbox_env({"QT_QPA_PLATFORM": "offscreen",
-                                     "COUNCIL_NO_DIALOGS": "1"}))
+                                     "COUNCIL_NO_DIALOGS": "1",
+                                     "PYTEST_DEBUG_TEMPROOT": str(temp)}))
     return bs.TestOutcome(out, "\n".join(lines))
 
 
