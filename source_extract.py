@@ -2217,6 +2217,9 @@ class _Extractor:
         left blank: nothing to check - the whole sheet went amber (review,
         2026-10-20)."""
         labels, self.part_labels = self.part_labels, []
+        self._part_grid = False
+        if self._part_grid_blocks(labels):
+            return
         labels = [x for x in labels if x[2] or self._readings_after(x[0], labels)]
         if len({p for _r, _c, p in labels}) < 2:
             return                             # one part, typed once or again
@@ -2236,6 +2239,60 @@ class _Extractor:
                        + ("" if p else ", no part yet") if i or not p else self.part_how)
              + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
             for i, (r, c, p) in enumerate(blocks)]
+
+    def _part_grid_blocks(self, labels) -> bool:
+        """Parts' tables side by side as well as one under the other, each
+        under its own Part Number (user, 2026-10-30: "many tables ... on the
+        same sheet that belong to different parts"; every value of such a
+        sheet went to review). A label's block is the columns from it to the
+        next label's column to the right, and the rows from it down to the
+        next label in those columns. Sure - pre-accepted like a sheet of one
+        part - when every block that holds readings names its part, and a
+        label's row holds nothing but the labels and their parts. False when
+        no two labels of different parts share a row (_part_blocks then)."""
+        rows: Dict[int, set] = defaultdict(set)
+        for r, _c, p in labels:
+            rows[r].add(p)
+        if not any(len(ps) > 1 for ps in rows.values()):
+            return False
+        cols = sorted({c for _r, c, _p in labels})
+        last = max(self.rows, default=0) + 1
+        unclear, kept = False, []
+        for r, c, p in labels:
+            right = next((x for x in cols if x > c), 10 ** 6)
+            bottom = min((r2 for r2, c2, _p in labels if r2 > r and c <= c2 < right),
+                         default=last)
+            readings = self._readings_in(r, bottom, c, right)
+            if not p:
+                if readings:
+                    unclear = True             # 'TBD' over readings: whose are they?
+                continue
+            kept.append((r, c, p))
+        for r, c, p in kept:
+            # the label's row, in its own columns: nothing but it and its
+            # part (another block's readings may sit beside it)
+            right = next((x for x in cols if x > c), 10 ** 6)
+            for c2, x in self.row(r):
+                if c2 == c or not c <= c2 < right or isinstance(x, _Merged) or x is None:
+                    continue
+                if _text(x).strip() != p and str(x).strip():
+                    unclear = True             # a row of other titles or labels
+        from openpyxl.utils import get_column_letter
+        self._part_grid = True
+        self.part_labels = [
+            (r, c, p, f"{self.m.schema.id_field} at {self.g.sheet}!{get_column_letter(c)}{r}"
+             + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
+            for r, c, p in kept]
+        return True
+
+    def _readings_in(self, r1, r2, c1, c2) -> bool:
+        """A number or a flaw code in rows r1+1..r2-1, columns c1..c2-1."""
+        for rr in range(r1 + 1, r2):
+            for c, v in self.row(rr):
+                if c1 <= c < c2 and (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                     or self.codes.canon(v)):
+                    return True
+        return False
 
     def _readings_after(self, r, labels) -> bool:
         """Readings in the block of the part label at row r, down to the
@@ -2270,6 +2327,14 @@ class _Extractor:
         is '' on a sheet of one part (its part_how says)."""
         if not self.part_labels:
             return self.part, ""
+        if getattr(self, "_part_grid", False):
+            # side by side (_part_grid_blocks): the nearest label column at or
+            # left of it, then the nearest label above in that column
+            left = [x for x in self.part_labels if x[1] <= c and x[0] <= r]
+            if left:
+                band = max(x[1] for x in left)
+                pick = max((x for x in left if x[1] == band), key=lambda x: x[0])
+                return pick[2], pick[3]
         above = [x for x in self.part_labels if x[0] <= r]
         if not above:
             # above the first part label: the sheet's part, as before - but

@@ -1179,9 +1179,12 @@ def test_a_second_part_label_lower_down_starts_that_parts_block(ledger, tmp_path
 @pytest.mark.parametrize("layout", ["listed", "same_row", "tbd"])
 def test_two_part_labels_without_clear_blocks_are_never_pre_accepted(ledger, tmp_path,
                                                                       layout):
-    """Two part labels one under the other over one table, side by side on
-    one row, or a lower one naming no part yet ('TBD'): which values are
-    whose is not clear, so none is pre-accepted, and the Part from says so."""
+    """Two part labels one under the other over one table, or a lower one
+    naming no part yet ('TBD'): which values are whose is not clear, so none
+    is pre-accepted, and the Part from says so. Side by side on one row, each
+    over its own table, is clear since 2026-10-30 (user: "yes" to accepting
+    values directly under their own Part Number; test_ledger_part_grid.py):
+    each value is its own table's part and pre-accepted."""
     schema, _ = ledger
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1197,10 +1200,15 @@ def test_two_part_labels_without_clear_blocks_are_never_pre_accepted(ledger, tmp
         ws["A8"] = "Part Number: TBD"
         _grid(ws, 9, 2, ["1A", "2A", "3A"], "EC Pre-Conceal", [80, 81, 82])
     _, dec = _decided(schema, wb, tmp_path / f"parts_{layout}.xlsx")
-    assert dec and not any(d.accept for d in dec)
-    if layout == "same_row":                               # each its own, to check
+    if layout == "same_row":                               # each its own, accepted
         assert {d.obs.part for d in dec if d.obs.where.endswith(("!I5", "!J5", "!K5"))} \
             == {"LMM3EF305"}
+        assert {d.obs.part for d in dec if d.obs.where.endswith(("!C5", "!D5", "!E5"))} \
+            == {"LMM3EF304"}
+        assert dec and all(d.accept for d in dec)
+        assert not any(se.SHEET_PARTS_HOW in d.obs.part_how for d in dec)
+        return
+    assert dec and not any(d.accept for d in dec)
     if layout == "tbd":                                    # never the first part's
         assert {d.obs.part for d in dec if d.obs.where.endswith("10")} == {""}
     assert all(se.SHEET_PARTS_HOW in d.obs.part_how for d in dec)
