@@ -99,3 +99,30 @@ file it waited for read its pictures.
   ("book.xlsx: picture 3 of 40").
 
 Tests: `tests/test_ledger_picture_time.py`.
+
+## The clipboard copy of a protected workbook's pictures stalled (2026-10-30)
+
+Andy, after #62: "grabclipboard still appears to be a problem and causing
+stalls". When Excel will not save a copy of the workbook, its pictures go
+through the clipboard (`read_with_excel`). If pywin32 gave no bitmap, PIL's
+`ImageGrab.grabclipboard()` was asked instead. It waits on Excel rendering
+the picture while holding the GIL, with no time limit, so the whole app froze
+while Excel took its time, and stayed frozen for good when Excel never
+finished.
+
+- `ImageGrab` is gone. `_clipboard_dib` reads, through pywin32 (which lets
+  other threads run while Windows waits), a bitmap (CF_DIB), else its V5 form,
+  else a PNG that Excel put there. A format Excel fails to render is skipped.
+- Every sheet's cells, charts and text boxes are read first. The pictures are
+  copied after that, in one pass (`to_copy`), each into the slot it was
+  listed in.
+- Each picture has `PICTURE_STALL_S` (30 s; one normally takes well under a
+  second). Past that, `_picture_guard` (the open's `_watchdog`, by this read's
+  PID, never another Excel) ends this read's Excel. The waiting call returns,
+  the rest of the pictures are listed with no data, and a note says that
+  Excel was ended and that the cells were already read. The user's clipboard
+  is put back when the dead Excel owned it.
+- All of a workbook's pictures together have `picture_copy_budget_s()`: 120 s,
+  or `COUNCIL_LEDGER_PICTURE_BUDGET_S` (0 = no limit), the same setting as
+  the time they may take to be read. The rest are listed, not copied, with
+  one note.
