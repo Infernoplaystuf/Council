@@ -3652,11 +3652,23 @@ def extract(schema: TemplateSchema, sources: Sequence, aliases=None, ignore=(),
     try:
         # a Cancel (kill_active_excels) at any time from here stops this
         # run's Excel reads, also one pressed before a read began
+        # several files at once in helper processes (council_core.ledger_
+        # workers), from what the Matcher is made of; not for Teach's own
+        # sheet reader, nor a picture reader of the caller's
+        helpers = None
+        if reader_cls is None and readers is None and image_reader is None:
+            from council_core import ledger_workers
+            try:
+                helpers = ledger_workers.config_json(
+                    schema, aliases, ignore, taught, run.explanations, pattern_mask, part,
+                    pattern_strict, image_dir, "default" if reader is not None else "none")
+            except (TypeError, ValueError):
+                helpers = None                  # not a template's schema: read here
         with excel_open.cancel_scope():
             _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                          m, codes, mask_re, part, schema, _time, part_finder, labels,
                          reader_cls=reader_cls, readers=readers,
-                         mask_strict=pattern_strict)
+                         mask_strict=pattern_strict, helpers=helpers)
     finally:
         try:
             _wd_cm.__exit__(None, None, None)
@@ -3742,30 +3754,82 @@ def source_labels(sources: Sequence) -> Dict[str, str]:
 
 def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, part_finder=None,
-                 labels=None, reader_cls=None, readers=None, mask_strict=True) -> None:
+                 labels=None, reader_cls=None, readers=None, mask_strict=True,
+                 helpers: Optional[Dict[str, Any]] = None) -> None:
+    """Every source in order, into ``run``. ``helpers``: what helper
+    processes need to read and match files the same way
+    (ledger_workers.config_json); the files they can take are read ahead,
+    several at once, and put into the run in their turn."""
     labels = labels or source_labels(sources)
-    for src in sources:
-        if cancel is not None and cancel.is_set():
-            run.cancelled = True
-            run.problems.append("Cancelled by user before "
-                                f"{Path(src).name!r}.")
-            break
-        kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
-        label = labels.get(str(src)) or labels.get(str(Path(src))) or Path(src).name
-        try:
-            _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
-                         reader, m, codes, mask_re, part, schema, _time,
-                         label, part_finder, reader_cls=reader_cls, readers=readers,
-                         mask_strict=mask_strict)
-        except _Cancelled:
-            # half a workbook is not offered for review: what it gave goes
-            del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
-            del run.problems[kept[3]:]
-            run.model_parts.pop(label, None)
-            run.cancelled = True
-            run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
-                                "the workbooks before it are in this review.")
-            break
+
+    def label_of(src) -> str:
+        return labels.get(str(src)) or labels.get(str(Path(src))) or Path(src).name
+    pool, index = None, {}
+    if helpers is not None:
+        from council_core import ledger_workers
+        pool, index = ledger_workers.start(
+            helpers, [(str(s), label_of(s)) for s in sources],
+            asks_model=part_finder is not None and not part)
+        if pool is not None:
+            prog.update(f"reading {len(index)} files {len(pool.helpers)} at a time",
+                        force=True)
+    try:
+        for src in sources:
+            if cancel is not None and cancel.is_set():
+                run.cancelled = True
+                run.problems.append("Cancelled by user before "
+                                    f"{Path(src).name!r}.")
+                break
+            label = label_of(src)
+            if pool is not None and str(src) in index:
+                try:
+                    part_json = pool.result(
+                        index[str(src)], beat=_wd.beat,
+                        should_stop=(cancel.is_set if cancel is not None
+                                     else (lambda: False)))
+                except ledger_workers.Stopped:
+                    run.model_parts.pop(label, None)
+                    run.cancelled = True
+                    run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
+                                        "the workbooks before it are in this review.")
+                    break
+                if part_json is not None:
+                    ledger_workers.put(run, part_json)
+                    for what in pool.steps.pop(index[str(src)], []):
+                        prog.advance(what=what)
+                    _wd.beat()
+                    continue
+                # Excel's, Council's model's, or its helper stopped: read here
+            if not _extract_here(src, label, run, prog, _wd, tick, here, cancel, image_dir,
+                                 reader, m, codes, mask_re, part, schema, _time,
+                                 part_finder, reader_cls, readers, mask_strict):
+                break
+    finally:
+        if pool is not None:
+            pool.close()
+
+
+def _extract_here(src, label, run, prog, _wd, tick, here, cancel, image_dir, reader,
+                  m, codes, mask_re, part, schema, _time, part_finder, reader_cls,
+                  readers, mask_strict) -> bool:
+    """One source read in this process. False: cancelled while reading it
+    (what it gave is dropped)."""
+    kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
+    try:
+        _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
+                     reader, m, codes, mask_re, part, schema, _time,
+                     label, part_finder, reader_cls=reader_cls, readers=readers,
+                     mask_strict=mask_strict)
+    except _Cancelled:
+        # half a workbook is not offered for review: what it gave goes
+        del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
+        del run.problems[kept[3]:]
+        run.model_parts.pop(label, None)
+        run.cancelled = True
+        run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
+                            "the workbooks before it are in this review.")
+        return False
+    return True
 
 
 def _excel_down_line(problems: List[str], msg: str, name: str) -> None:

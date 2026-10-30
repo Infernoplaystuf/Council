@@ -22,6 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def main() -> int:
+    # A helper of the Ledger's Extract in the built app (the same exe, started
+    # by council_core.ledger_workers): no window, no Qt, only the reading
+    if len(sys.argv) > 1 and sys.argv[1] == "--ledger-worker":
+        from council_core.ledger_workers import main as ledger_worker
+        return ledger_worker()
     # The memory scope as the user started the app, FIRST: the retired Tk
     # module sets COUNCIL_DEMO_SILO=1 when it is imported, and an import of
     # it anywhere in this process would otherwise turn the Qt app's memory

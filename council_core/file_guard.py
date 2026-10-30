@@ -38,6 +38,7 @@ state.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import contextvars
 import json
 import os
@@ -64,11 +65,64 @@ _ZIPPED = (".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".potx", ".docx", ".dotx
 
 SKIP_NAME = "skipped_files.json"
 READING_NAME = "reading_now.json"
+LOCK_NAME = "file_guard.lock"
 
 #: this process, in the notes of what is being read
 SESSION = uuid.uuid4().hex
 
 _lock = threading.RLock()
+
+#: how deep this process holds the lock file (_locked is re-entered: recover
+#: calls add)
+_held = [0]
+
+
+@contextlib.contextmanager
+def _locked():
+    """This process's lock, and the lock file's: the Ledger's helper
+    processes (council_core.ledger_workers) write the same two JSON files,
+    and a read-modify-write of one by two processes at once lost the other's
+    entry. Best effort: a lock file that cannot be taken in ~10 s is gone
+    on without."""
+    with _lock:
+        if _held[0]:                    # taken already, further up this thread
+            _held[0] += 1
+            try:
+                yield
+            finally:
+                _held[0] -= 1
+            return
+        fh = None
+        try:
+            d = _state_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            fh = open(d / LOCK_NAME, "a+b")
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except (OSError, ImportError):
+            pass
+        _held[0] = 1
+        try:
+            yield
+        finally:
+            _held[0] = 0
+            if fh is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except (OSError, ImportError):
+                    pass
+                fh.close()
 _recovered = False
 
 #: threading.local()s a read needs from the thread that asked for it - the
@@ -211,11 +265,21 @@ def _stamp(path) -> tuple:
 
 # ── the two JSON files ──────────────────────────────────────────────────
 def _load(path: Path) -> Dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    for wait in _RETRY:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except PermissionError:
+            # Windows, while another process replaces it (the Ledger's
+            # helpers): read again in a moment, never taken as empty at once
+            time.sleep(wait)
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+#: the waits between tries of a file another process holds for a moment
+_RETRY = (0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4)
 
 
 def _save(path: Path, data: Dict[str, Any]) -> None:
@@ -224,7 +288,14 @@ def _save(path: Path, data: Dict[str, Any]) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        for wait in _RETRY:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                time.sleep(wait)        # Windows: another process is reading it
+        else:
+            os.replace(tmp, path)
         _cache["stamp"] = None                 # a coarse clock could hide the change
     finally:
         if tmp.exists():
@@ -281,7 +352,7 @@ def add(path, reason: str, tab: str = "") -> Entry:
     """Put ``path`` on the skip list, as it is now."""
     size, mtime = _stamp(path)
     e = Entry(_key(path), reason, tab, time.time(), size, mtime)
-    with _lock:
+    with _locked():
         data = _load(skip_file())
         data[e.path] = {k: v for k, v in e.as_dict().items() if k != "path"}
         _save(skip_file(), data)
@@ -290,7 +361,7 @@ def add(path, reason: str, tab: str = "") -> Entry:
 
 def clear(paths=None) -> int:
     """Take ``paths`` (all, when None) off the skip list. How many went."""
-    with _lock:
+    with _locked():
         data = _load(skip_file())
         if paths is None:
             gone = len(data)
@@ -304,7 +375,7 @@ def clear(paths=None) -> int:
 
 # ── what is being read now ──────────────────────────────────────────────
 def _note(token: str, path, tab: str) -> None:
-    with _lock:
+    with _locked():
         data = _load(reading_file())
         data[token] = {"path": _key(path), "tab": tab, "session": SESSION,
                        "pid": os.getpid(), "started": time.time()}
@@ -312,7 +383,7 @@ def _note(token: str, path, tab: str) -> None:
 
 
 def _unnote(token: str) -> None:
-    with _lock:
+    with _locked():
         data = _load(reading_file())
         if data.pop(token, None) is not None:
             _save(reading_file(), data)
@@ -321,7 +392,7 @@ def _unnote(token: str) -> None:
 def _forget_session() -> None:
     """A normal exit: what this session was reading did not stall it."""
     try:
-        with _lock:
+        with _locked():
             data = _load(reading_file())
             mine = [k for k, v in data.items()
                     if isinstance(v, dict) and v.get("session") == SESSION]
@@ -334,6 +405,24 @@ def _forget_session() -> None:
 
 
 atexit.register(_forget_session)
+
+
+def forget_pid(pid: int) -> None:
+    """Cross out what process ``pid`` was reading: a helper process the
+    Ledger stopped itself (Cancel), whose reads did not stall anything
+    (council_core.ledger_workers). Left in, the next read would put each of
+    its files on the skip list."""
+    try:
+        with _locked():
+            data = _load(reading_file())
+            gone = [k for k, v in data.items()
+                    if isinstance(v, dict) and v.get("pid") == pid]
+            if gone:
+                for k in gone:
+                    data.pop(k, None)
+                _save(reading_file(), data)
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 def _alive(pid) -> bool:
@@ -372,6 +461,9 @@ def recover() -> List[Entry]:
     or crashed - put on the skip list (once per process; read() calls it)."""
     global _recovered
     with _lock:
+        if _recovered:
+            return []
+    with _locked():
         if _recovered:
             return []
         _recovered = True
