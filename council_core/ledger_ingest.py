@@ -268,6 +268,9 @@ class ExtractSummary:
     unrelated: List[str] = field(default_factory=list)
     #: templates the Ledger filled that someone saved since: read as sources
     read_again: List[str] = field(default_factory=list)
+    #: what the Ledger asks the user about this review (ledger_questions,
+    #: user 2026-10-30): Question.to_dict()s, the kept answers left out
+    questions: List[Dict[str, Any]] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.records >= 0:
@@ -647,6 +650,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                  pattern_hint=pattern_saved, prefer=prefer)
     filled: List[str] = []
     filled_book = ""
+    questions: List[Dict[str, Any]] = []
+    dec_note: List[str] = []
+    counts: List[int] = []          # (Y, N) once answers changed the review
     if not run.cancelled:
         prog.stage("filling in the template for each part")
         from council_core import ledger_review
@@ -657,6 +663,23 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             review = ledger_review.load(out)
         except Exception as e:                              # noqa: BLE001
             why = str(e)
+        if review is not None:
+            # the answers the user gave this Ledger's questions, again; then
+            # what is still to ask (ledger_questions, user 2026-10-30)
+            from council_core import ledger_questions
+            try:
+                review, answered = ledger_questions.apply_saved(review, csv_path)
+                if answered.rows:
+                    dec_note.append("Your earlier answers to the Ledger's questions: "
+                                    + answered.describe())
+                    vals = [i for i in review.items if i.sheet == "Values"]
+                    counts[:] = [sum(i.accept == "Y" for i in vals),
+                                 sum(i.accept == "N" for i in vals)]
+                asked = ledger_questions.open_questions(
+                    review, ledger_questions.load_answers(csv_path))
+                questions[:] = [q.to_dict() for q in asked]
+            except Exception as e:                          # noqa: BLE001
+                run.problems.append(f"the Ledger's questions were not worked out: {e}")
         try:
             if review is None:
                 raise LedgerError(why)
@@ -670,9 +693,9 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             filled_book = ledger_review.write_full_filled(review, say) or ""
         except Exception as e:                              # noqa: BLE001
             run.problems.append(f"the filled workbook was not written: {e}")
-    ok = sum(d.accept for d in dec)
-    aside = sum(bool(d.alternate) for d in dec)
-    return ExtractSummary(str(out), len(files), len(dec), ok, len(dec) - ok - aside,
+    ok = counts[0] if counts else sum(d.accept for d in dec)
+    aside = counts[1] if counts else sum(bool(d.alternate) for d in dec)
+    return ExtractSummary(str(out), len(files), len(dec), ok, max(0, len(dec) - ok - aside),
                           len(run.unmatched), len(run.images), _images_read(run.images),
                           list(run.problems), list(run.open_failures),
                           list(run.timings), bool(run.cancelled), read_all=read_all,
@@ -689,7 +712,8 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
                                    if example else [])
                           + list(getattr(run, "learned", []) or [])
                           + ([f"{untracked} value(s) of fields their part's groups do not "
-                              "track were left out (Groups…)"] if untracked else []),
+                              "track were left out (Groups…)"] if untracked else []) + dec_note,
+                          questions=questions,
                           review_reasons=summarize_review_reasons(dec, ledger.schema),
                           filled=str(Path(filled[0]).parent) if filled else "",
                           filled_count=len(filled), filled_book=filled_book,

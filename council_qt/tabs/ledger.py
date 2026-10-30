@@ -170,7 +170,19 @@ class LedgerActions:
                     ledger_review.write_full_filled(ledger_review.load(new), progress)
                 except LedgerError as e:
                     progress(f"the filled workbook was not written: {e}")
+                # what the carried answers settled is not asked
+                from council_core import ledger_questions
+                extracted.questions = [q.to_dict() for q in ledger_questions.open_questions(
+                    ledger_review.load(new), ledger_questions.load_answers(csv))]
         return applied, extracted, carried
+
+    def recheck(self, review, csv, progress=None):
+        """The Ledger's questions answered: the review re-checked with every
+        kept answer, and its filled templates written again
+        (ledger_questions.recheck). Reads no source workbook."""
+        from council_core import ledger_questions
+        say = (lambda m: progress(m)) if progress is not None else None
+        return ledger_questions.recheck(review, csv, say)
 
     def update(self, csv, progress, use_images, vision_model: Optional[str] = None,
                cancel=None, assist=False, prefer=()):
@@ -742,6 +754,12 @@ class LedgerTab(ViewHelpers, QWidget):
         row.addStretch(1)
         grid3.addLayout(row, 1, 1)
         outer.addWidget(g3)
+
+        # the Ledger's questions, as a chat (user, 2026-10-30): shown only
+        # when it has something to ask after an Extract, Update or Re-run
+        from .ledger_questions_pane import LedgerQuestionsPane
+        self.questions = LedgerQuestionsPane(self.on_questions_recheck, self._read_reply)
+        outer.addWidget(self.questions)
 
         g4 = QGroupBox("4 · Apply the saved review")
         grid4 = QGridLayout(g4)
@@ -1515,6 +1533,7 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "\"Ask Council's model about the rest\" to run without one.")
                 return
             more = {"assist": model_id}
+            self._last_model = model_id
         from source_extract import parse_prefer
         prefer = parse_prefer(self.prefer_operator.text())
         if prefer:                         # only then, as with the model
@@ -1534,8 +1553,9 @@ class LedgerTab(ViewHelpers, QWidget):
             self._said_saved(saved)
         self._run("Extracting", step, done, cancellable=True)
 
-    def _show_extract(self, s) -> None:
-        """An Extract's summary in the stats, the status line and the log."""
+    def _show_extract(self, s, csv: str = "") -> None:
+        """An Extract's summary in the stats, the status line and the log;
+        then the Ledger's questions about it, if it has any."""
         self.review.setText(s.review)
         self.stat["values"].setText(str(s.values))
         self.stat["pre_accepted"].setText(str(s.pre_accepted))
@@ -1564,6 +1584,63 @@ class LedgerTab(ViewHelpers, QWidget):
                 "Review written. Open it, check the amber and red rows, "
                 "map the leftover labels, save it, then Apply.")
         self._say(s.describe())
+        self._ask_questions(s, csv or self.csv.text().strip())
+
+    # ── the Ledger's questions (council_core.ledger_questions) ───────────
+    def _ask_questions(self, s, csv: str) -> None:
+        if getattr(s, "cancelled", False) or not getattr(s, "review", ""):
+            return
+        from council_core import ledger_questions as lq
+        qs = [lq.Question.from_dict(d) for d in getattr(s, "questions", None) or []]
+        self.questions.start(csv, s.review, qs)
+        if qs:
+            self._say(f"The Ledger has {len(qs)} question(s) for you: see Ledger questions "
+                      "under step 3.")
+
+    def on_questions_recheck(self) -> None:
+        """A round of questions answered: the review re-checked with every
+        kept answer (LedgerActions.recheck) - no workbook read again - and
+        the next round asked."""
+        pane = self.questions
+        review, csv = pane.review, pane.csv
+        if self.busy:
+            pane.recheck_failed("another step is running; your answers are kept and are "
+                                "used by the next run")
+            return
+
+        def step(p):
+            return self.actions.recheck(review, csv, p)
+
+        def done(rnd) -> None:
+            pane.next_round(rnd)
+            line = f"Re-checked with your answers: {rnd.outcome.describe()}."
+            self._say(line)
+            self.status.setText(line)
+
+        def after(err) -> None:
+            if err:
+                pane.recheck_failed(err)
+        self._run("Re-checking with your answers", step, done, after=after)
+
+    def _read_reply(self, q, text: str, done: Callable) -> None:
+        """A typed reply to a question: the plain-words rules, then the model
+        picked for this Ledger's runs (when "Ask Council's model" is ticked),
+        on a thread; ``done`` on the GUI thread."""
+        from council_core import ledger_questions as lq
+        got = lq.interpret(q, text)
+        model_id = getattr(self, "_last_model", "")
+        if got is not None or not (self.ask_model.isChecked() and model_id):
+            done(got)
+            return
+
+        def work() -> None:
+            try:
+                from council_core import ledger_llm
+                res = lq.interpret(q, text, ledger_llm.chat_for(model_id))
+            except Exception:                             # noqa: BLE001
+                res = None
+            self._to_ui(done, res)
+        threading.Thread(target=work, name="ledger-reply", daemon=True).start()
 
     # ── saved Ledgers (council_core.ledger_saved) ────────────────────────
     def _settings(self) -> dict:
@@ -1738,6 +1815,7 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "model about the rest\" to run without one.")
                 return
             more["assist"] = model_id
+            self._last_model = model_id
         from source_extract import parse_prefer
         prefer = parse_prefer(self.prefer_operator.text())
         if prefer:
@@ -2019,6 +2097,7 @@ class LedgerTab(ViewHelpers, QWidget):
                                     "model about the rest\" to run without one.")
                 return False
             more["assist"] = model_id
+            self._last_model = model_id
         from source_extract import parse_prefer
         prefer = parse_prefer(self.prefer_operator.text())
         if prefer:                         # typed here: these, else the review's
@@ -2044,7 +2123,7 @@ class LedgerTab(ViewHelpers, QWidget):
                 self.status.setText(f"{applied.accepted} values accepted into the parent "
                                     "CSV; cancelled before Extract ran again.")
                 return
-            self._show_extract(extracted)
+            self._show_extract(extracted, csv)
             if not getattr(extracted, "cancelled", False):
                 line = (f"Re-run with your answers: {applied.accepted} values accepted into "
                         f"the parent CSV; the new review pre-accepts {extracted.pre_accepted} "
