@@ -64,6 +64,7 @@ says so. Values read from images are never pre-accepted.
 from __future__ import annotations
 
 import base64
+import bisect
 import difflib
 import errno
 import io
@@ -1385,10 +1386,31 @@ def load_workbook_grids(path, notes: Optional[List[str]] = None,
     return grids, images
 
 
+#: MB a .csv / .tsv source may be, unless COUNCIL_LEDGER_CSV_LIMIT_MB says
+#: otherwise (0 = no limit): each cell is kept and matched, so a big export
+#: costs many times its size in memory and minutes of reading
+DEFAULT_CSV_LIMIT_MB = 50
+
+
+def csv_limit_mb() -> int:
+    raw = os.environ.get("COUNCIL_LEDGER_CSV_LIMIT_MB", "").strip()
+    try:
+        return max(0, int(float(raw))) if raw else DEFAULT_CSV_LIMIT_MB
+    except ValueError:
+        return DEFAULT_CSV_LIMIT_MB
+
+
 def _grid_from_csv(path: Path) -> Grid:
     """A .csv / .tsv export as one sheet named after the file: numbers as
     numbers, as a workbook gives them."""
     import csv as _csv
+    cap = csv_limit_mb()
+    size = path.stat().st_size / 1e6
+    if cap and size > cap:
+        # every cell of it held and matched: a big export ate the app's
+        # memory and time (2026-10-29)
+        raise LedgerError(f"{path.name} is {size:,.0f} MB, more than the {cap:,} MB a "
+                          "CSV source may be (COUNCIL_LEDGER_CSV_LIMIT_MB) - not read")
     raw = path.read_bytes()
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
@@ -1824,28 +1846,42 @@ class _Extractor:
         the same row, a file's name ('B_settings_1.xlsx'). {file name in
         lower case: (part, row)}. Data workbooks that say no part at all
         were given none, though the index beside them said which was which
-        (synthetic test, 2026-10-27)."""
+        (synthetic test, 2026-10-27).
+
+        One pass, and only on a sheet that names a file at all: every part
+        number of a long log ('PN-1000') matches the Part Number field too,
+        and walking the rows under each of them took a 12,000-row log from
+        1.7 s to 89 s on the test PC (2026-10-29)."""
         out: Dict[str, Tuple[str, int]] = {}
-        heads = []
+        files: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
         for (r, c), v in self.g.cells.items():
-            if isinstance(v, str) and len(v) <= 40 and not isinstance(v, _Merged):
-                mt = self.m.match(v)
-                if mt.target is not None and mt.target.is_id and mt.score >= ACCEPT_AT:
-                    heads.append((r, c))
-        if not heads:
+            t = v.strip() if isinstance(v, str) and not isinstance(v, _Merged) else ""
+            if t and _FILE_NAME.fullmatch(t):
+                files[r].append((c, re.split(r"[\\/]", t)[-1].lower()))
+        if not files:
             return out
-        rows: Dict[int, List[Tuple[int, Any]]] = defaultdict(list)
+        # the topmost Part Number header of each column, above a named file
+        last = max(files)
+        seen: Dict[str, bool] = {}
+        head_at: Dict[int, int] = {}
         for (r, c), v in self.g.cells.items():
-            rows[r].append((c, v))
-        for hr, hc in heads:
-            for r in sorted(x for x in rows if x > hr):
+            if r >= last or r in files or (c in head_at and head_at[c] <= r) \
+                    or not isinstance(v, str) or len(v) > 40 or isinstance(v, _Merged):
+                continue
+            if v not in seen:
+                mt = self.m.match(v)
+                seen[v] = mt.target is not None and mt.target.is_id and mt.score >= ACCEPT_AT
+            if seen[v]:
+                head_at[c] = r
+        if not head_at:
+            return out
+        for r in sorted(files):
+            for hc in sorted(c for c, hr in head_at.items() if hr < r):
                 part = _text(self.g.cells.get((r, hc)))
                 if not part or len(part) > 40:
                     continue
-                for c, v in rows[r]:
-                    t = v.strip() if isinstance(v, str) else ""
-                    if c != hc and _FILE_NAME.fullmatch(t):
-                        name = re.split(r"[\\/]", t)[-1].lower()
+                for c, name in files[r]:
+                    if c != hc:
                         out.setdefault(name, (part, r))
         return out
 
@@ -2803,19 +2839,45 @@ class _Extractor:
         row is stepped over when the row after it has a flaw code (a gap left
         while typing), never into a different table. No row cap: a 500-row
         cap cut a 12,000-row EC log, and past it the Stage column was read as
-        the value with no part (synthetic test, 2026-10-27)."""
-        rows: List[int] = []
-        rr = r + 1
-        while True:
-            if any((rr, c) in self.g.cells for c in cols):
-                rows.append(rr)
-            elif rows and item_col is not None \
+        the value with no part (synthetic test, 2026-10-27).
+
+        Every row of a long log is tried as a header too, so the walk is
+        kept per set of columns (_rows_walk): walked again from each row it
+        took a 12,000-row log 30 s (2026-10-30)."""
+        rows, ok, stops = self._rows_walk(tuple(cols), item_col)
+        start = r + 1
+        if start not in ok:
+            return []
+        rr, path = start + 1, []
+        while rr not in stops:
+            if rr in ok or item_col is not None \
                     and self.codes.canon(self.g.cells.get((rr + 1, item_col))):
-                pass
+                path.append(rr)
+                rr += 1
             else:
-                break
-            rr += 1
-        return rows
+                stops[rr] = rr
+        end = stops[rr]
+        for x in path:
+            stops[x] = end
+        return rows[bisect.bisect_left(rows, start):bisect.bisect_left(rows, end)]
+
+    def _rows_walk(self, cols: Tuple[int, ...], item_col):
+        """For _data_rows: the rows with something in these columns (sorted,
+        and as a set), and where a walk from a row stops {row: stop}."""
+        memo = getattr(self, "_walks", None)
+        if memo is None:
+            memo = self._walks = {}
+            by_col: Dict[int, List[int]] = defaultdict(list)
+            for (r, c) in self.g.cells:
+                by_col[c].append(r)
+            self._col_rows = by_col
+        got = memo.get((cols, item_col))
+        if got is None:
+            ok = set()
+            for c in cols:
+                ok.update(self._col_rows.get(c, ()))
+            got = memo[(cols, item_col)] = (sorted(ok), ok, {})
+        return got
 
     def _stage_col(self, heads, data_rows, ctx) -> Optional[int]:
         """A LONG LOG: one row per reading, a column naming what was measured
