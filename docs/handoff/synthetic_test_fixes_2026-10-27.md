@@ -82,3 +82,25 @@ fixes 1-9. The corpus, its answer key and the scripts are in the project files
 Rerun, batch 2 (as the tab reads the folder, the index workbook included):
 6,587 of 6,591 right (94% → 99.9%), 0 wrong (was 240), 0 wrong values
 pre-accepted. Batch 1 unchanged (11,809 of 11,883).
+
+## Follow-up: the stall on long logs (2026-10-30)
+
+User, 2026-10-29: "The ledger on the disconnected test machine is now stalling
+out again." Two of the fixes above made a long log slow with the square of
+its rows (the test PC: a 12,000-row log 89 s, 1.7 s before them). Not the
+network: nothing on the Ledger's path goes online.
+
+- **`files_named`** (fix 4): every part number of a log ('PN-1000') matches
+  the Part Number field, so each counted as an index header and the rows
+  under each were walked. Now a sheet that names no file returns at once,
+  only the topmost Part Number header of a column counts, each distinct text
+  is matched once, and the rows are gone through once.
+- **`_data_rows`** (no 500-row cap): every row of a log is tried as a table
+  header, and each walked to the end of the sheet. The walk is now kept per
+  set of columns (`_rows_walk`); same rows as before.
+- **CSV sources** (fix 5 of the first list): a .csv / .tsv over 50 MB is not
+  read (`COUNCIL_LEDGER_CSV_LIMIT_MB`, 0 = no limit); every cell was held and
+  matched.
+
+Tests: `tests/test_ledger_stall_fixes.py` (`test_a_long_log_*`,
+`test_each_row_of_a_long_log_tried_as_a_header_*`, `test_a_csv_too_big_*`).
