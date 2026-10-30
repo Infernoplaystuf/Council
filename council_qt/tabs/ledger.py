@@ -718,6 +718,12 @@ class LedgerTab(ViewHelpers, QWidget):
             "Slice the Ledger's parts into groups - by part name, date or source folder - "
             "each with its own fields (tracked, not tracked, or Yes/No) and a workbook of its "
             "own beside the full one: a filled-template sheet per part.")
+        # analysis of what the Ledger holds (user, 2026-10-30)
+        self.analyze_btn = self._step_button(row, "Analyze…", self.on_analyze_window)
+        self.analyze_btn.setToolTip(
+            "Analyse the parent CSV, for all parts or one group: what is filled and what is "
+            "missing, each field's numbers, trends with control limits, and outliers to "
+            "check. Export writes an analysis workbook beside the Ledger.")
         self.open_btn = self._step_button(row, "Open review in Excel", self.on_open_review)
         # files skipped as too slow, or that stalled the app before
         # (council_core.file_guard): read again on the next run
@@ -966,6 +972,8 @@ class LedgerTab(ViewHelpers, QWidget):
         has_review = bool(self.review.text().strip())
         if hasattr(self, "groups_btn"):
             self.groups_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
+        if hasattr(self, "analyze_btn"):
+            self.analyze_btn.setEnabled(bool(csv) and self._schema_known != (csv, False))
         self.open_btn.setEnabled(has_review)
         if hasattr(self, "review_btn"):
             self.review_btn.setEnabled(has_review)
@@ -1829,6 +1837,33 @@ class LedgerTab(ViewHelpers, QWidget):
             return
         self.groups_dialog = dlg
         dlg.show()
+
+    def on_analyze_window(self) -> None:
+        """The Analyze window (ledger_analytics_dialog) over the parent CSV
+        shown; read on a worker. Double-clicking a part there opens it in the
+        Filled template window when there is a review."""
+        csv = self.csv.text().strip()
+        if not csv or not Path(csv).is_file():
+            self.status.setText("No parent CSV yet: create it first (step 1).")
+            return
+        from council_core import ledger_analytics
+
+        def done(data) -> None:
+            from .ledger_analytics_dialog import AnalyticsDialog
+            dlg = AnalyticsDialog(data, parent=self, log=self._say,
+                                  on_part=self._analyzed_part, opener=self.actions.open,
+                                  runner=self._run)
+            self.analytics_dialog = dlg
+            self._say(f"── Analyze ({Path(csv).name}): {len(data.parts)} part(s)")
+            dlg.show()
+        self._run("Reading the Ledger", lambda _p: ledger_analytics.load(csv), done)
+
+    def _analyzed_part(self, part: str) -> None:
+        if self.review.text().strip():
+            self.on_filled_window(part)
+        else:
+            self.status.setText(f"{part}: no review workbook to show its sources; run "
+                                "Extract first.")
 
     def on_write_workbooks(self) -> None:
         csv = self.csv.text().strip()
