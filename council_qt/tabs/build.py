@@ -21,6 +21,10 @@ time, with Undo turn, the grouped review and Merge.
     Agent mode     the chat plans a change, the user approves it, and an
                    agent makes it on a branch of its own (council_qt.
                    widgets.build_agent); Review and merge brings it here.
+    Snapshot to vault   a copy of the open file in the vault (the Librarian),
+                   reported in the Council transcript.
+
+It replaced the Code and IDE tabs (retired 2026-10-30).
 
     Open folder…   any folder becomes the workspace; it is remembered.
     Scratch        the vault's workspace folder (the IDE tab's), for code
@@ -103,7 +107,8 @@ class BuildActions:
                  chat: Optional[Callable[..., str]] = None,
                  review: Optional[Callable[[str], tuple]] = None,
                  show_preview: Optional[Callable[[str, str], None]] = None,
-                 agent=None, models_source: Optional[Callable] = None):
+                 agent=None, models_source: Optional[Callable] = None,
+                 snapshot: Optional[Callable[[str], object]] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -117,6 +122,7 @@ class BuildActions:
         # Agent mode (council_core.build_agent) and the Model box's source
         self.agent = agent or ba.Agent(self.vault_dir)
         self.models_source = models_source
+        self.snapshot = snapshot or self._snapshot
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -189,6 +195,15 @@ class BuildActions:
         col.addWidget(buttons)
         dlg.exec()
         return chosen["answer"]
+
+    def _snapshot(self, code: str):
+        """The text saved into the vault by the engine's Librarian (as the
+        IDE tab did): an ide_jobs.RunResult with the path or the error."""
+        import council_engine
+        from council_core import ide_jobs
+        lib = council_engine.Librarian(self.vault_dir,
+                                       self.vault_dir / "logs" / "council.log")
+        return ide_jobs.snapshot(lib, code)
 
     @staticmethod
     def _show_preview(png: str, summary: str) -> None:
@@ -332,6 +347,9 @@ class BuildTab(ViewHelpers, QWidget):
         self.fix_btn = self._button(row, "Fix this", self.on_fix)
         self.fix_btn.setEnabled(False)
         self.preview_btn = self._button(row, "Preview", self.on_preview)
+        self.snapshot_btn = self._button(row, "Snapshot to vault", self.on_snapshot)
+        self.snapshot_btn.setToolTip("A copy of the open file in the vault, where "
+                                     "the Council's search finds it.")
         row.addStretch(1)
         outer.addLayout(row)
 
@@ -1156,6 +1174,37 @@ class BuildTab(ViewHelpers, QWidget):
                              [{"kind": "undo", "state": "ok",
                                "text": "Undid the last turn's edits in the editor"}])
         self._show_session()
+
+    # -- Snapshot to vault (as the IDE tab's) -----------------------------------
+    def on_snapshot(self) -> None:
+        doc = self.current()
+        code = doc.editor.toPlainText() if doc is not None else ""
+        if not code.strip():
+            self.say("Nothing to snapshot.")
+            return
+
+        def work() -> None:
+            try:
+                result = self.actions.snapshot(code)
+            except Exception as exc:                      # noqa: BLE001
+                from council_core import ide_jobs
+                result = ide_jobs.RunResult(error=repr(exc))
+            self._to_ui(self._snapshot_done, result)
+
+        threading.Thread(target=work, name="build-snapshot", daemon=True).start()
+
+    def _snapshot_done(self, result) -> None:
+        line = (f"snapshot failed: {result.error}" if result.error
+                else f"snapshot saved: {result.path}")
+        self.append(f"[{line}]")
+        self.say(line[0].upper() + line[1:] + ".")
+        append = getattr(self.window, "append_transcript", None)
+        if append is not None:
+            try:
+                append("Librarian", line.replace("snapshot saved: ", "snapshot: "),
+                       "final", source="Build")
+            except Exception:                             # noqa: BLE001
+                pass
 
     # -- Agent mode (council_qt.widgets.build_agent) ---------------------------
     def agent_folder(self) -> Path:

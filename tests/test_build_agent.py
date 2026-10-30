@@ -378,3 +378,91 @@ def test_a_quoted_python_path_runs_on_windows_too():
     assert split_command(ba.test_command("/usr/bin/python3"), windows=False)[:3] == [
         "/usr/bin/python3", "-m", "pytest"]
     assert split_command('python -m pytest -k "a and b"', windows=True)[-1] == "a and b"
+
+
+# ── what the Code tab had besides (it was retired into Build, 2026-10-30) ──
+def test_the_project_dialog_reads_checks_and_references(qapp):
+    from council_qt.widgets.code_dialogs import ProjectDialog
+    d = ProjectDialog(None, pj.Project("x", "/r", gui_checks=[
+        pj.GuiCheck("pkg.tab", "Tab")], references=["/docs"]))
+    d.gui.setPlainText("pkg.tab:Tab\nother.mod:Win\nnonsense")
+    p = d.project()
+    assert [(g.module, g.cls) for g in p.gui_checks] == [
+        ("pkg.tab", "Tab"), ("other.mod", "Win")]
+    assert p.references == ["/docs"]
+
+
+def test_past_jobs_are_listed_and_can_still_be_merged(qapp, tmp_path, repo):
+    tab = make_tab(tmp_path, repo, Models())
+    panel = plan_for(qapp, tab)
+    panel.go()
+    settle(qapp, tab)
+    job_id = next(s["job"] for s in panel.turns()[-1].steps if s.get("kind") == "agent-job")
+    panel.set_folder(repo)                    # as after a restart
+    panel.agent_mode.list_jobs()
+    listing = panel.turns()[-1]
+    assert listing.kind == "agent-jobs"
+    md = panel.markdown()
+    assert "**Jobs on cam** (1)" in md and "Add Camera.reset · done" in md
+    assert f"[Review and merge](review:{job_id})" in md
+    panel.follow(f"review:{job_id}")
+    assert "def reset" in (repo / "camera.py").read_text()
+    # both the job's own reply and the list now say it was merged
+    assert all(s["status"] == "merged" for t in panel.turns() for s in t.steps
+               if s.get("kind") == "agent-job" and s.get("job") == job_id)
+    assert "Add Camera.reset · merged" in panel.markdown()
+    tab.deleteLater()
+
+
+def test_the_history_benchmark_runs_from_the_chat(qapp, tmp_path, repo):
+    tab = make_tab(tmp_path, repo, Models())
+    panel = tab.chat_panel
+    panel.set_mode(AGENT)
+    calls = {}
+
+    def bench(project, count, say, should_stop):
+        say("[1/1] abc Add reset")
+        calls["count"] = count
+        calls["project"] = project.root
+        return {"solved": 1, "valid": 1, "tasks": 1, "mean_calls": 4,
+                "mean_seconds": 9.5, "file": "code-history-x.jsonl"}
+    panel.agent_mode.agent.bench = bench
+    panel.agent_mode.bench()
+    settle(qapp, tab)
+    assert calls == {"count": 5, "project": str(repo)}
+    turn = panel.turns()[-1]
+    assert turn.kind == "agent-bench" and "Solved 1 of 1" in turn.content
+    assert any("[1/1] abc Add reset" in s.get("text", "") for s in turn.steps)
+    tab.deleteLater()
+
+
+def test_the_brief_is_opened_for_the_folders_project(qapp, tmp_path, repo):
+    tab = make_tab(tmp_path, repo, Models())
+    panel = tab.chat_panel
+    panel.set_mode(AGENT)
+    panel.on_brief()
+    assert pj.load(tmp_path / "vault", "cam") is not None     # saved to have a brief
+    assert panel._dialog.project.root == str(repo)
+    panel._dialog.close()
+    tab.deleteLater()
+
+
+def test_snapshot_to_vault_saves_the_open_file(qapp, tmp_path, repo):
+    saved = []
+
+    class Result:
+        error, path = "", tmp_path / "vault" / "council_code_1.py"
+    tab = make_tab(tmp_path, repo, Models())
+    tab.actions.snapshot = lambda code: saved.append(code) or Result()
+    tab.on_snapshot()
+    assert "Nothing to snapshot" in tab.status.text()
+    tab.open_file(repo / "camera.py")
+    tab.on_snapshot()
+    deadline = time.time() + 20
+    while not saved or "Snapshot saved" not in tab.status.text():
+        qapp.processEvents()
+        time.sleep(0.01)
+        assert time.time() < deadline
+    assert saved == ["class Camera:\n    exposure = 100\n"]
+    assert "[snapshot saved:" in tab.output.toPlainText()
+    tab.deleteLater()

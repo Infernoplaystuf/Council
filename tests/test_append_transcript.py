@@ -14,7 +14,7 @@ was dropped without a word. The Tk shell writes all of them into the Council
 transcript.
 
 These tests drive the real window, the real Council tab and, for the end-to-
-end case, the real IDE tab saving a real snapshot into a temp vault.
+end case, the real Build tab saving a real snapshot into a temp vault.
 """
 from __future__ import annotations
 
@@ -100,23 +100,32 @@ def test_the_window_has_the_method_the_tabs_look_for(qapp):
         win.request_close()
 
 
-def test_an_ide_snapshot_is_reported_in_the_council_transcript(
-        qapp, window, vault):
-    """End to end, all real: the IDE tab saves the buffer through the
-    engine's Librarian into the temp vault, and its report lands in the
-    Council transcript, labelled as coming from the IDE."""
-    from council_qt.tabs.ide import IdeActions, IdeTab
+def test_a_build_snapshot_is_reported_in_the_council_transcript(
+        qapp, window, vault, tmp_path):
+    """End to end, all real: the Build tab saves the open file through the
+    engine's Librarian into the temp vault (as the retired IDE tab did), and
+    its report lands in the Council transcript, labelled as coming from the
+    Build tab."""
+    from council_qt.tabs.build import BuildActions, BuildTab
 
-    ide = IdeTab(window, actions=IdeActions(vault_dir=vault))
-    ide.code.setPlainText("print('hello from the snapshot')\n")
-    ide.on_snapshot()
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    (folder / "hello.py").write_text("print('hello from the snapshot')\n",
+                                     encoding="utf-8")
+    actions = BuildActions(vault_dir=vault, state_file=tmp_path / "state.json",
+                           unsaved_dir=tmp_path / "unsaved",
+                           models_source=lambda: ([], None, None))
+    actions.save_state({"folder": str(folder)})
+    build = BuildTab(window, actions)
+    build.open_file(folder / "hello.py")
+    build.on_snapshot()
     assert _pump(qapp, lambda: "snapshot" in _transcript(window), 20.0), (
-        "the IDE's report never reached the Council transcript")
+        "the snapshot's report never reached the Council transcript")
     text = _transcript(window)
     saved = list(vault.glob("council_code_*.py"))
     assert saved, "the snapshot was not written"
     assert str(saved[0]) in text
-    assert "IDE" in text, f"the notice does not say where it came from:\n{text}"
+    assert "Build" in text, f"the notice does not say where it came from:\n{text}"
 
 
 def test_a_report_from_a_worker_thread_lands_on_the_gui_thread(qapp, window):

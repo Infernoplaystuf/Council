@@ -128,6 +128,13 @@ RETIRED = {
     "test_an_adjective_does_not_break_a_field_search":
         "CouncilConsole._resolve_proposed_field, likewise.",
     "test_rag_recall_and_coverage": "council_gui_engine.RAG_PER_ANGLE.",
+    # Retired with the Code and IDE tabs (2026-10-30), which the Build tab
+    # replaced.
+    "test_build_tab.py::test_the_tab_is_registered_beside_code":
+        "the Code tab is gone; now test_the_tab_replaces_the_code_and_ide_tabs.",
+    "test_append_transcript.py::test_an_ide_snapshot_is_reported_in_the_council_transcript":
+        "the IDE tab is gone; now "
+        "test_a_build_snapshot_is_reported_in_the_council_transcript.",
 }
 
 
@@ -135,7 +142,17 @@ RETIRED = {
 RETIRED_FILES = {
     "test_gui_canvas.py": "the Tk designer canvas; needed tkinter.",
     "test_gui_tab.py": "the Tk GUI Designer tab in council_gui_engine.py.",
+    # The Code and IDE tabs, retired into the Build tab (2026-10-30). Their
+    # checks live on in test_build_agent.py (plan, run, merge, refused merge,
+    # report agents, the project dialog, the history benchmark) and
+    # test_ide_jobs.py (the trust gate, the run and snapshot helpers).
+    "test_code_tab.py": "the Code tab (council_qt/tabs/code.py).",
+    "test_ide.py": "the IDE tab (council_qt/tabs/ide.py); its core half is "
+                   "test_ide_jobs.py.",
 }
+
+#: The Code and IDE tabs, replaced by the Build tab (2026-10-30).
+RETIRED_TABS = ("council_qt/tabs/code.py", "council_qt/tabs/ide.py")
 
 #: The Tk shell's own files, deleted 2026-10-23. A merge from an older branch
 #: can bring them back, and with them tests that need them.
@@ -173,3 +190,11 @@ def test_the_tk_shell_has_not_come_back():
     assert not back, (
         "the retired Tk shell is back, probably from a merge — delete it "
         "again (see CLAUDE.md, 'The Tk shell is retired'): " + ", ".join(back))
+
+
+def test_the_code_and_ide_tabs_have_not_come_back():
+    root = TESTS.parent
+    back = [name for name in RETIRED_TABS if (root / name).exists()]
+    assert not back, (
+        "a tab the Build tab replaced is back, probably from a merge — delete "
+        "it again (see CLAUDE.md, 'Retired tests'): " + ", ".join(back))

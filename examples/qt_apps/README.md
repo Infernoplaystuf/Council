@@ -38,7 +38,7 @@ the chatbot's Ollama backend needs `pip install ollama` and its GGUF backend
 matches a request (`select`, `for_prompt`) from each file's docstring and a
 short list of everyday words per example.
 
-In the Code tab, the built-in **Qt app builder** agent has this folder as a
+In the Build tab's Agent mode, the built-in **Qt app builder** agent has this folder as a
 reference: the best-matching example goes into its context whole, and its
 `search_references` tool finds passages from the others.
 

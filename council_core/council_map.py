@@ -285,12 +285,12 @@ _NODES: Tuple[Node, ...] = (
          "(.council_usage/verdicts-*.jsonl). The weekly review reads it.",
          "council_core/verdict_log.py"),
     Node("code_jobs", "Code jobs", "agent",
-         "The Code tab: a project's brief, code map and references; a plan "
+         "The Build tab's Agent mode: a project's brief, code map and references; a plan "
          "you approve; steps done with read / find / edit-by-replacement / "
          "test / GUI-check tools on a git branch of its own, each checked "
          "by the app and committed; then you merge or discard.",
          "council_core/code_agent.py; council_core/project_tools.py; "
-         "council_qt/tabs/code.py"),
+         "council_core/build_agent.py; council_qt/widgets/build_agent.py"),
     Node("bench", "Benchmark", "agent",
          "Asks a fixed set of questions through the council and measures "
          "calls, seconds per step, model loads and right answers, to "

@@ -94,6 +94,16 @@ same list.
     `test_an_adjective_does_not_break_a_field_search`,
     `test_rag_recall_and_coverage`. `test_plain_english_is_not_a_file_path`
     now checks `council_core.turn_context`, where that code moved.
+- Retired with the Code and IDE tabs (2026-10-30; the Build tab replaced
+  both, and `council_qt/tabs/code.py` and `ide.py` are gone):
+  - whole files `tests/test_code_tab.py` (its checks are in
+    `test_build_agent.py`) and `tests/test_ide.py` (its core half is
+    `test_ide_jobs.py`);
+  - `test_the_tab_is_registered_beside_code` (`test_build_tab.py`, now
+    `test_the_tab_replaces_the_code_and_ide_tabs`) and
+    `test_an_ide_snapshot_is_reported_in_the_council_transcript`
+    (`test_append_transcript.py`, now
+    `test_a_build_snapshot_is_reported_in_the_council_transcript`).
 
 ## Standing rules (all branches)
 
@@ -141,7 +151,8 @@ same list.
   kept and put back, whose copy it is told by its owner):
   `docs/handoff/ledger_pictures_2026-10-26.md`.
 - The Build tab (files, editor, and the chat beside the code being built in five
-  steps; the agreed design and what each step does): `docs/handoff/build_tab_2026-10-29.md`.
+  steps; the agreed design and what each step does; it replaced the Code and
+  IDE tabs): `docs/handoff/build_tab_2026-10-29.md`.
 - The Connections tab's Contents layer (every value of every spreadsheet, text
   document, PDF, Word and JSON file under its header or label, whatever the field rules; search over it; the Contents tab):
   `docs/handoff/kg_contents_2026-10-26.md`.
@@ -155,7 +166,7 @@ same list.
   suggested), and a model reading each table to propose column rules:
   `docs/handoff/kg_tables_related_2026-10-27.md`.
 - The example Qt apps the models read when they write Qt code (ten at most;
-  each passes the generated-app gate; the Code tab's "Qt app builder" gets
+  each passes the generated-app gate; the Build tab's Agent mode "Qt app builder" gets
   the best match whole): `examples/qt_apps/README.md`, read by
   `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
   (`gui_examples.py`).

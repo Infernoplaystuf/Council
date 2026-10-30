@@ -16,6 +16,12 @@ AGENT MODE (council_core.build_agent; the Code tab's pipeline, in the chat)
      and "Discard".
   The folder must be a git folder, and Agent mode waits while an Edit-mode
   session is open (both work on a branch of their own).
+  "More" holds the rest of what the Code tab had: the project (test command,
+  GUI checks, reference documents), its brief (what every job starts from,
+  and the council's proposed addition after a job), the folder's past jobs
+  (each still open one with Review and merge and Discard), and the
+  benchmark on history (the council redoes recent commits; the folder is
+  not touched).
 
 THE MODEL (council_core.build_models)
   The "Model:" box beside the mode is the coder role's model, which Ask,
@@ -122,14 +128,31 @@ class AgentMode:
                 out.append("[Go](go:) runs the kept steps on a branch of their own; "
                            "your folder is not touched until you merge. Or say "
                            "what to change and the plan is made again.")
+        if t.kind == "agent-jobs":
+            jobs = [s for s in t.steps if s.get("kind") == "agent-job"]
+            lines = [f"- {self._job_line(j)}" for j in jobs] or ["No jobs yet."]
+            return "\n\n".join(out + ["\n".join(lines)])
         job = self.job(t)
-        if job is not None and job.get("job") and job.get("status") not in (
-                "merged", "discarded", "running"):
-            out.append(f"[Review and merge](review:{job['job']}) · "
-                       f"[Discard](discard:{job['job']})")
-        elif job is not None and job.get("status") in ("merged", "discarded"):
-            out.append(f"*The job was {job['status']}.*")
+        if job is not None:
+            line = self._job_links(job)
+            if line:
+                out.append(line)
         return "\n\n".join(out)
+
+    @staticmethod
+    def _job_links(job: dict) -> str:
+        status = job.get("status")
+        if job.get("job") and status not in ("merged", "discarded", "running"):
+            return (f"[Review and merge](review:{job['job']}) · "
+                    f"[Discard](discard:{job['job']})")
+        if status in ("merged", "discarded"):
+            return f"*The job was {status}.*"
+        return ""
+
+    def _job_line(self, job: dict) -> str:
+        line = f"{job.get('task', '')} · {job.get('status', '')}"
+        links = self._job_links(job)
+        return f"{line} · {links}" if links and not links.startswith("*") else line
 
     # -- asking ---------------------------------------------------------------
     def _refused(self) -> str:
@@ -303,11 +326,87 @@ class AgentMode:
 
     # -- a finished job -------------------------------------------------------
     def _job_for(self, job_id: str):
+        """(a turn, its step) for the job, or (None, None); _mark updates
+        every turn that shows it (the job's own reply and a jobs list)."""
         for t in self.panel.turns():
-            j = self.job(t)
-            if j is not None and j.get("job") == job_id:
-                return t, j
+            for j in t.steps:
+                if j.get("kind") == "agent-job" and j.get("job") == job_id:
+                    return t, j
         return None, None
+
+    def _mark(self, job_id: str, status: str) -> None:
+        for t in self.panel.turns():
+            for j in t.steps:
+                if j.get("kind") == "agent-job" and j.get("job") == job_id:
+                    j["status"] = status
+        self._save()
+
+    # -- the folder's jobs, the brief, the benchmark ---------------------------
+    def list_jobs(self) -> None:
+        """A reply listing the folder's jobs, each with what can still be done."""
+        panel = self.panel
+        if panel.is_busy() or panel.conversation is None or self.agent is None \
+                or panel.host is None:
+            return
+        project = self.project()
+        try:
+            recs = self.agent.jobs(project) if self.agent.is_saved(project) else []
+        except OSError as exc:
+            panel.status.setText(f"The jobs could not be read: {exc}")
+            return
+        steps = [{"kind": "agent-job", "job": r.id, "status": r.status,
+                  "task": r.task.splitlines()[0][:80] if r.task else r.id}
+                 for r in reversed(recs)]
+        panel.conversation.turns.append(bc.Turn(
+            "assistant", f"**Jobs on {project.name}** ({len(recs)})", mode=AGENT,
+            kind="agent-jobs", steps=steps))
+        self._save()
+        panel.render()
+
+    def bench(self, count: int = 5) -> None:
+        """The council redoes recent commits of the folder (code_bench); the
+        result is a reply. The folder is not touched."""
+        panel = self.panel
+        why = self._refused()
+        if why:
+            panel.status.setText(why)
+        if why or panel.is_busy() or panel.conversation is None:
+            return
+        project = self.project()
+        turn = bc.Turn("assistant", f"Benchmarking on {count} past commits: the "
+                       f"council redoes each one and its tests decide.",
+                       mode=AGENT, kind="agent-bench")
+        panel.conversation.turns.append(turn)
+        panel._open_steps.add(len(panel.conversation.turns) - 1)
+        self._start(f"Benchmarking on {count} past commits; this runs the council "
+                    f"{count} times.")
+
+        def say(line: str) -> None:
+            panel._to_ui(self._event, turn, "phase", line)
+
+        def work() -> None:
+            error, res = "", None
+            try:
+                res = self.agent.bench(project, count, say, self._stop.is_set)
+            except Exception as exc:                      # noqa: BLE001
+                error = f"The benchmark stopped: {type(exc).__name__}: {exc}"
+            panel._to_ui(self._benched, turn, error, res)
+
+        threading.Thread(target=work, name="build-agent-bench", daemon=True).start()
+        panel.render()
+
+    def _benched(self, turn: bc.Turn, error: str, res) -> None:
+        for s in turn.steps:
+            if s.get("state") == "wait":
+                s["state"] = "ok"
+        if res is not None:
+            turn.content = (f"Solved {res['solved']} of {res['valid']} usable task(s) "
+                            f"({res['tasks']} tried); {res['mean_calls']} calls and "
+                            f"{res['mean_seconds']} s per task. Saved as {res['file']}.")
+        else:
+            turn.content = error
+        self._save()
+        self.panel._finish(error)
 
     def review(self, job_id: str) -> None:
         host, panel = self.panel.host, self.panel
@@ -340,8 +439,7 @@ class AgentMode:
         except wt.WorktreeError as exc:
             panel.status.setText(str(exc))
             return
-        j["status"] = "merged"
-        self._save()
+        self._mark(job_id, "merged")
         host.after_merge()
         panel.status.setText(f"Merged into your folder ({line}).")
         panel.render()
@@ -362,8 +460,7 @@ class AgentMode:
         except wt.WorktreeError as exc:
             panel.status.setText(str(exc))
             return
-        j["status"] = "discarded"
-        self._save()
+        self._mark(job_id, "discarded")
         panel.status.setText("The job's branch and worktree are gone.")
         panel.render()
 

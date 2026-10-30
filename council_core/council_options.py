@@ -93,7 +93,7 @@ SWITCHES: Tuple[Switch, ...] = (
                 "has its own short list (see Council Map ▸ Role specs). "
                 "Slower: each tool use is another model call."),
     Switch("fill_ide", "Fill IDE", True, available=False,
-           unavailable_why="Code in an answer is not copied to the IDE tab "
+           unavailable_why="Code in an answer is not copied to the Build tab "
                            "yet."),
     Switch("stream", "Stream tokens", True),
     # Its old tooltip promised "Unchecking skips it on the next message". In

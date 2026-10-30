@@ -46,8 +46,8 @@ from urllib.parse import quote, unquote
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel,
-                               QPlainTextEdit, QTextBrowser, QVBoxLayout,
-                               QWidget)
+                               QMenu, QPlainTextEdit, QTextBrowser, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from council_core import build_chat as bc
 from council_core import build_edits as be
@@ -142,7 +142,16 @@ class ChatPanel(ViewHelpers, QWidget):
         self.profile_box = QComboBox()
         arow.addWidget(self.profile_box, 1)
         self.agents_btn = self._button(arow, "Agents…", self.on_agents)
-        self.project_btn = self._button(arow, "Project…", self.on_project)
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More")
+        self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more = QMenu(self.more_btn)
+        more.addAction("Project…", self.on_project)
+        more.addAction("Brief…", self.on_brief)
+        more.addAction("Past jobs", self.agent_mode.list_jobs)
+        more.addAction("Benchmark on history", self.agent_mode.bench)
+        self.more_btn.setMenu(more)
+        arow.addWidget(self.more_btn)
         col.addWidget(self.agent_row)
 
         self.view = QTextBrowser()
@@ -750,6 +759,22 @@ class ChatPanel(ViewHelpers, QWidget):
                     (i for i, p in enumerate(self.agent_mode._profiles)
                      if p.name == saved.name), 0)))
         dlg.finished.connect(done)
+        dlg.open()
+        self._dialog = dlg
+
+    def on_brief(self) -> None:
+        from .code_dialogs import BriefDialog
+        project = self.agent_mode.project()
+        if project is None:
+            return
+        agent = self.agent_mode.agent
+        try:
+            if not agent.is_saved(project):
+                agent.save_project(project)
+        except OSError as exc:
+            self.status.setText(f"The project could not be saved: {exc}")
+            return
+        dlg = BriefDialog(self, agent.vault_dir, project)
         dlg.open()
         self._dialog = dlg
 

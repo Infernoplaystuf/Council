@@ -13,7 +13,7 @@ QUICK (seconds, no model call):
 LIVE (a minute or two; one short call per distinct model):
     the model answers at all, and how fast; it follows a JSON schema (the
     Judge's ranking and the Peasant's questions depend on it); the coder
-    calls a tool when it should (the Code tab depends on it).
+    calls a tool when it should (the Build tab's Agent mode depends on it).
 
 Nothing is downloaded or installed; a missing model is named with the
 command for the user to run themselves.
@@ -205,7 +205,7 @@ def _live(say: Callable[[str], None]) -> List[Check]:
                          f"called {calls[0]['name']}({calls[0].get('arguments')})"
                          if calls else f"no tool call; said "
                                        f"{str(r.get('content'))[:80]!r}",
-                         "" if ok else "The Code tab needs a coder that "
+                         "" if ok else "The Build tab's Agent mode needs a coder that "
                          "calls tools: try llama3.1:8b or gpt-oss:20b."))
     except Exception as exc:                              # noqa: BLE001
         out.append(Check("coder tool call", "FAIL", repr(exc)[:300]))
