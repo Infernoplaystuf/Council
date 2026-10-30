@@ -647,14 +647,25 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
     filled_book = ""
     if not run.cancelled:
         prog.stage("filling in the template for each part")
+        from council_core import ledger_review
+        # read back once for both: loading the review was 8.7 s of a 57 s
+        # run of 83 workbooks, and it was loaded twice (2026-10-30)
+        review, why = None, ""
         try:
-            from council_core import ledger_review
-            filled = ledger_review.write_all_filled(ledger_review.load(out), say)
+            review = ledger_review.load(out)
+        except Exception as e:                              # noqa: BLE001
+            why = str(e)
+        try:
+            if review is None:
+                raise LedgerError(why)
+            filled = ledger_review.write_all_filled(review, say)
         except Exception as e:                              # noqa: BLE001
             run.problems.append(f"the filled templates were not written: {e}")
         try:
             # every part in one workbook, a sheet each (user, 2026-10-26)
-            filled_book = ledger_review.write_full_filled(ledger_review.load(out), say) or ""
+            if review is None:
+                raise LedgerError(why)
+            filled_book = ledger_review.write_full_filled(review, say) or ""
         except Exception as e:                              # noqa: BLE001
             run.problems.append(f"the filled workbook was not written: {e}")
     ok = sum(d.accept for d in dec)

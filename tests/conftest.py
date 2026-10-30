@@ -30,6 +30,13 @@ from tests.sandbox_vault import sandbox_env  # noqa: E402,F401
 # a plugin, so inferno_local/tests can share the same fixture the same way.
 from tests.desktop_guard import desktop_openers  # noqa: E402,F401
 
+# The Ledger's Extract reads in helper processes (council_core.ledger_
+# workers) only in the tests that ask for it: a test that monkeypatches
+# source_extract or Path would not reach a helper's copy of them.
+# tests/test_ledger_workers.py sets COUNCIL_LEDGER_WORKERS itself.
+import os as _os  # noqa: E402
+_os.environ.setdefault("COUNCIL_LEDGER_WORKERS", "0")
+
 # No Tk window, in this process or any python child — installed on import,
 # before a test module is collected. See tests/no_tk_guard.py.
 from tests.no_tk_guard import no_tk_windows  # noqa: E402,F401

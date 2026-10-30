@@ -150,6 +150,10 @@ same list.
   clipboard a protected workbook's pictures go through (what the user had is
   kept and put back, whose copy it is told by its owner):
   `docs/handoff/ledger_pictures_2026-10-26.md`.
+- The Ledger's Extract reading and matching several files at once in helper
+  processes (JSON over a local pipe, half the cores up to 4, Excel's files
+  and the model's question in the Ledger's own process; the skip list's lock
+  file; COUNCIL_LEDGER_WORKERS): `docs/handoff/ledger_workers_2026-10-30.md`.
 - The Build tab (files, editor, and the chat beside the code being built in five
   steps; the agreed design and what each step does; it replaced the Code and
   IDE tabs): `docs/handoff/build_tab_2026-10-29.md`.

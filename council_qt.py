@@ -29,6 +29,11 @@ def main() -> int:
     # (council_core.memory_scope.pin_launch_environment).
     from council_core import memory_scope
     memory_scope.pin_launch_environment()
+    # A helper of the Ledger's Extract in the built app (the same exe, started
+    # by council_core.ledger_workers): no window, no Qt, only the reading
+    if len(sys.argv) > 1 and sys.argv[1] == "--ledger-worker":
+        from council_core.ledger_workers import main as ledger_worker
+        return ledger_worker()
 
     # The main model, before anything can import council_engine. The run-*
     # launchers export the FIRST *.gguf they find when COUNCIL_GGUF_PATH is
