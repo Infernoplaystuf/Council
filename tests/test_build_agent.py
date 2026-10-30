@@ -365,3 +365,16 @@ def test_the_model_box_ranks_installed_us_models_and_switches_the_coder(
     cfg = model_slots.load(tmp_path / "vault")
     assert cfg.slots[cfg.slot_for("coder")].path == "ollama:phi4:14b"
     tab.deleteLater()
+
+
+def test_a_quoted_python_path_runs_on_windows_too():
+    """The project's test command quotes "Run with"'s Python. Windows splits
+    it with posix=False, which used to leave the quotes on the program name
+    (a job's every test check then failed to start)."""
+    from council_core.project_tools import split_command
+    cmd = ba.test_command("C:\\Program Files\\py\\python.exe")
+    assert split_command(cmd, windows=True)[:3] == [
+        "C:\\Program Files\\py\\python.exe", "-m", "pytest"]
+    assert split_command(ba.test_command("/usr/bin/python3"), windows=False)[:3] == [
+        "/usr/bin/python3", "-m", "pytest"]
+    assert split_command('python -m pytest -k "a and b"', windows=True)[-1] == "a and b"
