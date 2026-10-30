@@ -38,7 +38,6 @@ _FACTORIES: Dict[str, str] = {
     "build_apothecary": "apothecary",
     "build_capture": "capture",
     "build_connections": "connections",
-    "build_code": "code",
     "build_build": "build",
     "build_council": "council",
     "build_council_map": "council_map",
@@ -50,7 +49,6 @@ _FACTORIES: Dict[str, str] = {
     "build_librarian": "librarian",
     "build_nodes": "nodes",
     "build_quant_duel": "quant_duel",
-    "build_ide": "ide",
     "build_vault_health": "vault_health",
     "build_changelog": "changelog",
     "build_forge": "forge",
@@ -83,7 +81,6 @@ _REGISTRY: List[Tuple[str, str, bool]] = [
     ("🇺🇸 Models", "build_models", False),
     ("🕸 Council Map", "build_council_map", False),
     ("🧱 Build", "build_build", False),
-    ("💻 Code", "build_code", False),
     ("🧩 Fan-out", "build_fanout", False),
     # Eager: its 15-minute timer runs due jobs without the tab being opened
     # (only when the user turned the duel and its schedule on).
@@ -98,13 +95,13 @@ _REGISTRY: List[Tuple[str, str, bool]] = [
 ]
 
 #: The advanced tabs, gated exactly as the Tk shell gates them: either
-#: COUNCIL_ADVANCED=1 or --advanced. Six tabs live here — Librarian, Nodes,
-#: Agents, Vault Health, Apothecary and the IDE — and every one of them
+#: COUNCIL_ADVANCED=1 or --advanced. Five tabs live here — Librarian, Nodes,
+#: Agents, Vault Health and Apothecary (the IDE was retired into the Build tab
+#: on 2026-10-30) — and every one of them
 #: commits the whole vault to git, SSHes into a Raspberry Pi, or rewrites the
 #: model registry. Registering them unconditionally would not be a port; it
 #: would put those operations in front of users who never asked for them.
 _ADVANCED_REGISTRY: List[Tuple[str, str, bool]] = [
-    ("💻 IDE / Runner", "build_ide", False),
     ("📚 Librarian", "build_librarian", False),
     ("🖧 Nodes", "build_nodes", False),
     ("🤖 Agents", "build_agents", False),
@@ -149,8 +146,8 @@ def registry(advanced: bool = False):
 __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_agent_creator",
            "build_agents",
            "build_apothecary",
-           "build_capture", "build_build", "build_code", "build_connections",
-           "build_changelog", "build_council", "build_council_map", "build_fanout", "build_librarian", "build_ide", "build_nodes", "build_vault_health", "build_var_graph",
+           "build_capture", "build_build", "build_connections",
+           "build_changelog", "build_council", "build_council_map", "build_fanout", "build_librarian", "build_nodes", "build_vault_health", "build_var_graph",
            "build_designer", "build_diagnostics", "build_docs", "build_dream3d", "build_forge", "build_grapher",
            "build_jobs", "build_quant_duel",
            "build_lens", "build_models", "build_sessions",

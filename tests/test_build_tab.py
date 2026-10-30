@@ -235,12 +235,19 @@ def tree_names(item):
     return [item.child(i).text(0) for i in range(item.childCount())]
 
 
-def test_the_tab_is_registered_beside_code():
+def test_the_tab_replaces_the_code_and_ide_tabs():
+    """Build replaced the Code and IDE tabs (2026-10-30): neither is
+    registered, in the advanced set or not, and their modules are gone."""
     from council_qt import tabs
-    titles = [t for t, _f, _e in tabs.registry()]
+    titles = [t for t, _f, _e in tabs.registry(advanced=True)]
     assert "🧱 Build" in titles
-    assert titles.index("🧱 Build") + 1 == titles.index("💻 Code")
+    assert not any("Code" == t.split(" ", 1)[-1] or "IDE" in t for t in titles), titles
     assert tabs.build_build is build_build
+    for name in ("build_code", "build_ide"):
+        with pytest.raises(AttributeError):
+            getattr(tabs, name)
+    root = Path(__file__).resolve().parent.parent / "council_qt" / "tabs"
+    assert not (root / "code.py").exists() and not (root / "ide.py").exists()
 
 
 def test_it_opens_the_scratch_folder_then_remembers_a_chosen_one(qapp, tmp_path, project):

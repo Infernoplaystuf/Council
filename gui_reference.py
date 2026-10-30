@@ -28,7 +28,7 @@ the set is meant to be read). Each one:
     SHOWS is what select() matches a request against.
 
 HOW THE COUNCIL FINDS THEM
-  * The Code tab's built-in "Qt app builder" agent (council_core.
+  * The Build tab's Agent mode: the built-in "Qt app builder" agent (council_core.
     code_profiles) has the folder as a reference. Its search_references
     tool then finds passages from the examples, and code_agent.context()
     adds the ONE example that best matches the task, whole (for_prompt).

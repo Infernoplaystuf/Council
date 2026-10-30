@@ -235,7 +235,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     vault = Path(args.vault) if args.vault else paths.vault_dir()
     project = pj.load(vault, args.project)
     if project is None:
-        print(f"No project named {args.project!r} (make it in the Code tab).")
+        print(f"No project named {args.project!r} (open its folder in the Build tab's Agent mode).")
         return 2
     print(json.dumps(run(vault, project, label=args.label, count=args.count),
                      indent=2))

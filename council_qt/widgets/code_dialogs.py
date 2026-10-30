@@ -1,5 +1,6 @@
 """
-council_qt.widgets.code_dialogs — the Code tab's dialogs: a project
+council_qt.widgets.code_dialogs — Agent mode's dialogs (the Build tab; they
+were the retired Code tab's): a project
 (folder, test command, GUI checks, references), an agent profile, and the
 project brief with the council's proposed additions.
 """
