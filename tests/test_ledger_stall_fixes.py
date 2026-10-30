@@ -478,15 +478,17 @@ def test_a_picture_is_read_through_pywin32_not_imagegrab(monkeypatch):
     assert img.size == (9, 5) and img.convert("RGB").getpixel((0, 0)) == (200, 30, 90)
 
 
-def test_imagegrab_is_still_the_fallback(monkeypatch):
+def test_imagegrab_is_never_the_fallback(monkeypatch):
+    """It held the GIL while Excel rendered the picture, with no time limit:
+    the whole app stalled in grabclipboard (user, 2026-10-30)."""
     import excel_open
     from PIL import Image, ImageGrab
 
     def broken(timeout=5.0):
         raise OSError("no pywin32 clipboard")
     monkeypatch.setattr(excel_open, "_clipboard_dib", broken)
-    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: Image.new("RGB", (4, 4)))
-    assert excel_open._copy_picture(_Shape())
+    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: pytest.fail("ImageGrab used"))
+    assert excel_open._copy_picture(_Shape()) is None
 
 
 # ---------------------------------------------- what a folder scan reads

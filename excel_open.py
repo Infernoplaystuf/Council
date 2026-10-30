@@ -53,6 +53,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1850,6 +1851,8 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         if seq is None:
             clip_why = "the clipboard could not be checked"
     locked = used_clip = False
+    to_copy: list = []              # (slot in out.pictures, sheet, anchor, shape)
+    stalled = False                 # this read ended its Excel over a picture
     watchdog = None
     stopped = []
     pid: Optional[int] = None
@@ -2039,44 +2042,74 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
                 elif (typ in (MSO_PICTURE, MSO_LINKED_PICTURE) or
                       typ == MSO_GROUP and _holds_picture(sh)) and want_pictures \
                         and copied is None:
-                    # a group holding a picture is copied out whole
-                    if not locked and not clip_why:
-                        # careful does not wait: the other reading changes
-                        # the clipboard anyway, and its pictures wait
-                        locked = _CLIPBOARD_LOCK.acquire(blocking=not careful)
-                        if not locked:
-                            clip_why = "another reading was using the clipboard"
-                        elif not careful:
-                            clip = _clip_text() if com is not None else None
-                    if careful and not clip_why and _user_copied(pid, seq, used_clip):
-                        clip_why = "the clipboard changed while the workbook was being read"
-                    if clip_why:
-                        if not any(n.endswith(clip_why) for n in out.notes):
-                            out.notes.append(f"{path.name} › {name}: picture(s) not copied: "
-                                             f"{clip_why}")
-                        out.pictures.append(Picture(name, anchor, b""))
-                        continue
-                    _COPY_WHY.why = ""
-                    data_png = _copy_picture(sh)
-                    used_clip = True
-                    if careful:
-                        seq = _clip_seq()
-                    if data_png:
-                        out.pictures.append(Picture(name, anchor, data_png))
-                    elif getattr(_COPY_WHY, "why", "") == "busy":
-                        # Listed with no data, so it is counted as not read
-                        # (and read again later): it left the count and the
-                        # Images sheet, and the note blamed the workbook
-                        # (review, 2026-10-19). The rest are not tried: each
-                        # would wait for the clipboard again.
-                        clip_why = ("the clipboard was busy (another program held it "
-                                    "open); read the workbook again later")
-                        out.pictures.append(Picture(name, anchor, b""))
-                        out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
-                                         f"be copied out: {clip_why}")
-                    else:
-                        out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
-                                         "be copied out (the workbook may forbid copying)")
+                    # a group holding a picture is copied out whole - after
+                    # every sheet's cells are read (below), so a picture
+                    # Excel stalls on costs only the pictures
+                    to_copy.append((len(out.pictures), name, anchor, sh))
+                    out.pictures.append(Picture(name, anchor, b""))
+        sh = None
+        # Through the clipboard, one at a time. Each picture has
+        # PICTURE_STALL_S: Excel rendering a picture it never finished held
+        # the read - and, through PIL's ImageGrab, holding the GIL, the whole
+        # app - for good (user, 2026-10-30: "grabclipboard still appears to be
+        # a problem and causing stalls"). Past it this read's Excel is ended
+        # and the rest are listed, not copied; the cells are already read.
+        # All of them together have picture_copy_budget_s().
+        budget = picture_copy_budget_s()
+        began = time.monotonic()
+        for at, (slot, name, anchor, sh) in enumerate(to_copy):
+            if not clip_why and budget and time.monotonic() - began > budget:
+                clip_why = (f"the workbook's pictures took longer than {budget:g} s to "
+                            f"copy out ({len(to_copy) - at} of {len(to_copy)} not copied; "
+                            "COUNCIL_LEDGER_PICTURE_BUDGET_S)")
+            if not locked and not clip_why:
+                # careful does not wait: the other reading changes
+                # the clipboard anyway, and its pictures wait
+                locked = _CLIPBOARD_LOCK.acquire(blocking=not careful)
+                if not locked:
+                    clip_why = "another reading was using the clipboard"
+                elif not careful:
+                    clip = _clip_text() if com is not None else None
+            if careful and not clip_why and _user_copied(pid, seq, used_clip):
+                clip_why = "the clipboard changed while the workbook was being read"
+            if clip_why:
+                if not any(n.endswith(clip_why) for n in out.notes):
+                    out.notes.append(f"{path.name} › {name}: picture(s) not copied: "
+                                     f"{clip_why}")
+                continue
+            _COPY_WHY.why = ""
+            ended: list = []
+            guard = _picture_guard(app, pid, ended, real=com is not None)
+            try:
+                data_png = _copy_picture(sh)
+            finally:
+                if guard is not None:
+                    guard.cancel()
+            used_clip = True
+            if ended:
+                stalled = True
+                clip_why = (f"Excel took longer than {PICTURE_STALL_S:.0f} s to copy one "
+                            "out, so it was ended (the cells were already read)")
+                out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not be "
+                                 f"copied out: {clip_why}")
+                continue
+            if careful:
+                seq = _clip_seq()
+            if data_png:
+                out.pictures[slot] = Picture(name, anchor, data_png)
+            elif getattr(_COPY_WHY, "why", "") == "busy":
+                # Listed with no data, so it is counted as not read
+                # (and read again later): it left the count and the
+                # Images sheet, and the note blamed the workbook
+                # (review, 2026-10-19). The rest are not tried: each
+                # would wait for the clipboard again.
+                clip_why = ("the clipboard was busy (another program held it "
+                            "open); read the workbook again later")
+                out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
+                                 f"be copied out: {clip_why}")
+            else:
+                out.notes.append(f"{path.name} › {name}!{anchor}: a picture could not "
+                                 "be copied out (the workbook may forbid copying)")
         # the copy's pictures no picture shape took: in a group, placed in a
         # cell (no shape at all), or at a fixed position (zip_pictures)
         for (sheet, at), rest in (copied or {}).items():
@@ -2112,7 +2145,9 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
             # now, before it closes - closing, Excel puts its copy there once
             # more, the counter moved, and the copy was left there for good
             # (user, 2026-10-26: "the clip board isn't actually clearing")
-            if used_clip and _clip_is(pid):
+            # Ended over a picture, Excel owns nothing now: no one else
+            # put anything there either, so the user's is put back too.
+            if used_clip and (_clip_is(pid) or stalled and _clip_owner_pid() is None):
                 _clip_restore(clip)
                 put_back = True
         except Exception:                                   # noqa: BLE001
@@ -2131,6 +2166,7 @@ def read_with_excel(path, want_pictures: bool = True, app_factory=None,
         # every Excel object let go before CoUninitialize, not only the
         # workbook and Excel itself (see _drop_frames)
         book = app = books = ws = used = shapes = sh = ch = ax = sc = item = None
+        to_copy.clear()             # the picture shapes waiting to be copied
         if held is not None:
             # Quit refused ('Call was rejected by callee': its license
             # agreement waiting), or an Excel that never answered: ended,
@@ -2464,14 +2500,45 @@ def _watchdog(app, timeout: float, stopped: list, pid: Optional[int] = None):
     return t
 
 
+#: How long one picture may take to copy out through the clipboard (Excel's
+#: CopyPicture and its rendering of the bitmap) before this read's Excel is
+#: ended: a picture takes well under a second.
+PICTURE_STALL_S = 30.0
+
+#: How long all of a workbook's pictures may take to copy out, unless
+#: COUNCIL_LEDGER_PICTURE_BUDGET_S says otherwise (0 = no limit) - the same
+#: setting as the time they may take to be read (source_extract).
+PICTURE_COPY_BUDGET_S = 120.0
+
+
+def picture_copy_budget_s() -> float:
+    raw = os.environ.get("COUNCIL_LEDGER_PICTURE_BUDGET_S", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else PICTURE_COPY_BUDGET_S
+    except ValueError:
+        return PICTURE_COPY_BUDGET_S
+
+
+def _picture_guard(app, pid: Optional[int], ended: list, real: bool = True):
+    """A timer ending this read's Excel (`pid`, never another) when one
+    picture's copy takes longer than PICTURE_STALL_S: the call waiting on it
+    returns then, the clipboard is let go, and `ended` says why. None when
+    there is no real Excel to end."""
+    if not real or not pid:
+        return None
+    return _watchdog(app, PICTURE_STALL_S, ended, pid)
+
+
 def _clipboard_dib(timeout: float = 5.0) -> Optional[bytes]:
-    """The clipboard's bitmap (CF_DIB) through pywin32, which lets other
-    threads run while Windows waits. PIL's ImageGrab holds the GIL through
-    its own 0.5 s retry and Excel's rendering of the bitmap - the whole app
-    froze meanwhile (review, 2026-10-19). The clipboard busy (another app,
-    Win+V history) is retried for ``timeout`` seconds, sleeping between
-    tries; None when it never opens or holds no bitmap."""
-    import time
+    """The clipboard's picture through pywin32, which lets other threads run
+    while Windows waits (on Excel rendering it). PIL's ImageGrab holds the
+    GIL through its own retry and that rendering - the whole app froze
+    meanwhile (review, 2026-10-19), and with no time limit for good when
+    Excel never finished (user, 2026-10-30) - so it is never used. A bitmap
+    (CF_DIB), else its V5 form, else a PNG Excel put there; the PNG's bytes
+    start with its signature, a DIB's do not. The clipboard busy (another
+    app, Win+V history) is retried for ``timeout`` seconds, sleeping between
+    tries; None when it never opens or holds no picture."""
     import win32clipboard
     import win32con
     end = time.monotonic() + timeout
@@ -2485,9 +2552,21 @@ def _clipboard_dib(timeout: float = 5.0) -> Optional[bytes]:
                 return None
             time.sleep(0.05)
     try:
-        if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
-            return None
-        return win32clipboard.GetClipboardData(win32con.CF_DIB)
+        formats = [win32con.CF_DIB, getattr(win32con, "CF_DIBV5", 17)]
+        try:
+            formats.append(win32clipboard.RegisterClipboardFormat("PNG"))
+        except Exception:                                   # noqa: BLE001
+            pass
+        for fmt in formats:
+            if not win32clipboard.IsClipboardFormatAvailable(fmt):
+                continue
+            try:
+                data = win32clipboard.GetClipboardData(fmt)
+            except Exception:                               # noqa: BLE001
+                continue                    # Excel could not render it so
+            if data:
+                return bytes(data)
+        return None
     finally:
         win32clipboard.CloseClipboard()
 
@@ -2521,7 +2600,7 @@ def _clipboard_busy(timeout: float = 0.5) -> bool:
 def _copy_picture(shape) -> Optional[bytes]:
     _COPY_WHY.why = ""
     try:
-        from PIL import Image, ImageGrab
+        from PIL import Image
         try:
             shape.CopyPicture(Appearance=1, Format=2)     # as shown, bitmap
         except Exception:
@@ -2532,19 +2611,16 @@ def _copy_picture(shape) -> Optional[bytes]:
             return None
         img = None
         try:
-            dib = _clipboard_dib()
-            if dib:
+            got = _clipboard_dib()
+            if got and got.startswith(b"\x89PNG"):
+                img = Image.open(io.BytesIO(got))
+            elif got:
                 from PIL import BmpImagePlugin
-                img = BmpImagePlugin.DibImageFile(io.BytesIO(dib))
+                img = BmpImagePlugin.DibImageFile(io.BytesIO(got))
         except Exception:
             img = None
-        if img is None and getattr(_COPY_WHY, "why", "") == "busy":
-            # the clipboard never opened in 5 s: ImageGrab's own retry could
-            # not do better, and it holds the GIL while it tries - the whole
-            # app froze once more per workbook (review, 2026-10-19)
-            return None
-        if img is None:
-            img = ImageGrab.grabclipboard()
+        # No ImageGrab.grabclipboard() when it gave nothing: it held the GIL
+        # while Excel rendered, with no time limit (_clipboard_dib)
         if isinstance(img, Image.Image):
             buf = io.BytesIO()
             img.convert("RGB").save(buf, "PNG")

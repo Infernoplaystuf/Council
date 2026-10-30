@@ -711,9 +711,103 @@ def test_a_busy_clipboard_is_not_tried_again_through_imagegrab(monkeypatch):
     monkeypatch.setattr(excel_open, "_clipboard_dib", never_opens)
     assert excel_open._copy_picture(Copied()) is None
     assert excel_open._COPY_WHY.why == "busy" and grabbed == []
-    # it opened but held no bitmap: ImageGrab is still asked, as before
+    # it opened but held no bitmap: ImageGrab is not asked either - it held
+    # the GIL while Excel rendered, with no time limit (user, 2026-10-30)
     monkeypatch.setattr(excel_open, "_clipboard_dib", lambda timeout=5.0: None)
-    assert excel_open._copy_picture(Copied()) is None and grabbed == [1]
+    assert excel_open._copy_picture(Copied()) is None and grabbed == []
+
+
+def _copying(monkeypatch, copy):
+    """The clipboard free, and each picture copied by `copy(shape)`."""
+    _busy_clipboard(monkeypatch)
+    monkeypatch.setattr(excel_open, "_copy_picture", copy)
+
+
+def test_a_picture_excel_stalls_on_ends_its_excel_and_keeps_the_cells(tmp_path, monkeypatch):
+    """Excel never finished rendering a picture: the read waited on it - in
+    ImageGrab, holding the GIL, the whole app - for good (user, 2026-10-30:
+    "grabclipboard still appears to be a problem and causing stalls"). Now
+    the picture's guard ends this read's Excel; the call returns, every
+    sheet's cells were read first, the rest of the pictures are listed and
+    not tried, and the note says what happened."""
+    tried, guards = [], []
+
+    class Guard:
+        def __init__(self, ended):
+            self.ended, self.cancelled = ended, False
+
+        def cancel(self):
+            self.cancelled = True
+
+    def guard(app, pid, ended, real=True):
+        guards.append(Guard(ended))
+        return guards[-1]
+
+    def stalls(shape):
+        tried.append(shape)
+        guards[-1].ended.append(4242)       # the guard fired: Excel was ended
+        return None
+    _copying(monkeypatch, stalls)
+    monkeypatch.setattr(excel_open, "_picture_guard", guard)
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    app = _picture_app(3)
+    later = _Sheet()
+    later.Name = "Later"
+    app._book.Worksheets = app._book.Worksheets + [later]
+    book = read_with_excel(f, app_factory=lambda: app)
+    assert [name for name, _cells in book.sheets] == ["EC", "Later"]     # cells first
+    assert [(p.sheet, p.anchor, p.data) for p in book.pictures] == [("EC", "E2", b"")] * 3
+    assert len(tried) == 1 and guards[0].cancelled
+    stalled = [n for n in book.notes if "took longer than" in n]
+    assert stalled == ["pics.xls › EC!E2: a picture could not be copied out: Excel took "
+                       "longer than 30 s to copy one out, so it was ended (the cells were "
+                       "already read)"]
+
+
+def test_the_pictures_of_a_workbook_have_a_time_budget(tmp_path, monkeypatch):
+    import types
+    tried, clock = [], [0.0]
+
+    def slow(shape):
+        tried.append(shape)
+        clock[0] += 100.0                   # each copy takes 100 s
+        return b"\x89PNG fake"
+    _copying(monkeypatch, slow)
+    monkeypatch.setattr(excel_open, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setenv("COUNCIL_LEDGER_PICTURE_BUDGET_S", "150")
+    f = tmp_path / "pics.xls"
+    f.write_bytes(OLE_MAGIC)
+    book = read_with_excel(f, app_factory=lambda: _picture_app(6))
+    assert len(book.pictures) == 6 and len(tried) == 2
+    assert [bool(p.data) for p in book.pictures] == [True, True] + [False] * 4
+    assert [n for n in book.notes if "COUNCIL_LEDGER_PICTURE_BUDGET_S" in n] == [
+        "pics.xls › EC: picture(s) not copied: the workbook's pictures took longer than "
+        "150 s to copy out (4 of 6 not copied; COUNCIL_LEDGER_PICTURE_BUDGET_S)"]
+    monkeypatch.setenv("COUNCIL_LEDGER_PICTURE_BUDGET_S", "0")      # no limit
+    tried.clear()
+    book = read_with_excel(f, app_factory=lambda: _picture_app(3))
+    assert len(tried) == 3 and all(p.data for p in book.pictures)
+
+
+def test_the_guard_is_only_for_a_real_excel():
+    assert excel_open._picture_guard(object(), 4242, [], real=False) is None
+    assert excel_open._picture_guard(object(), None, [], real=True) is None
+
+
+def test_a_png_on_the_clipboard_is_read_too(monkeypatch):
+    import io
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (7, 3), (10, 200, 30)).save(b, "PNG")
+
+    class Copied:
+        def CopyPicture(self, **kw):
+            pass
+    monkeypatch.setattr(excel_open, "_clipboard_dib", lambda timeout=5.0: b.getvalue())
+    png = excel_open._copy_picture(Copied())
+    img = Image.open(io.BytesIO(png))
+    assert img.size == (7, 3) and img.convert("RGB").getpixel((0, 0)) == (10, 200, 30)
 
 
 def test_a_clipboard_that_never_opens_is_busy(monkeypatch):
