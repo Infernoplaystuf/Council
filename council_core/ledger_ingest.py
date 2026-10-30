@@ -399,7 +399,7 @@ def summarize_slowest(timings, top: int = 5) -> str:
 
 def _images_read(notes) -> int:
     return sum(1 for n in notes if n.reader not in ("", "none installed")
-               and not n.text.startswith(("reader failed", "(no text found)")))
+               and not n.text.startswith(("reader failed", "(no text found)", "not read")))
 
 
 def _images_blank(notes) -> int:
@@ -415,12 +415,14 @@ def _images_unread(notes) -> str:
     why: Counter = Counter()
     for n in notes:
         if n.text.startswith("(no text found)") or (
-                n.reader not in ("", "none installed") and not n.text.startswith("reader")):
+                n.reader not in ("", "none installed")
+                and not n.text.startswith(("reader", "not read"))):
             continue
         why["the reader failed" if n.text.startswith("reader failed") else
             "no image reader installed" if n.reader == "none installed" else
             "Excel could not copy them out" if "Excel could not copy" in n.text else
             "EMF/WMF drawings (Windows only)" if "drawing, which" in n.text else
+            "over the time a file's pictures may take" if "pictures took longer" in n.text else
             "other"] += 1
     return ", ".join(f"{k} {w}" for w, k in why.most_common())
 

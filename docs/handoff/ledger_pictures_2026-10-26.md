@@ -70,3 +70,32 @@ Tests: `tests/test_ledger_pictures.py`, and in `tests/test_excel_open.py`
 `test_the_user_copying_meanwhile_stops_the_copies_and_keeps_theirs`,
 `test_what_a_clipboard_snapshot_can_keep`,
 `test_pictures_no_shape_takes_still_come_from_the_copy`.
+
+## A workbook of many pictures held the Extract (2026-10-30)
+
+User: "the ledger still has a stall in the extract -> review workbook", "an
+excel file with many images in it ... at least 10 minutes", "the issue is
+image grab and multi thread". The pictures of a file were read one by one
+after the file was opened, outside file_guard's time limit, with no limit of
+their own (Tesseract up to 60 s each, a vision model up to 300 s). With the
+helpers (`ledger_workers`), four Tesseracts each started a thread per core,
+and the Ledger's progress stood on "reading N files 4 at a time" while the
+file it waited for read its pictures.
+
+- **A time budget per file** (`source_extract.PICTURE_BUDGET_S`, 120 s;
+  `COUNCIL_LEDGER_PICTURE_BUDGET_S`, 0 = none). Past it the rest are saved
+  and listed on the review's Images sheet as `not read: the file's pictures
+  took longer than …`, and the file has one problem line.
+- **Photos are not given to the reader** (`looks_like_photo`: no shade
+  holds more than 22% of a small copy's pixels, and at least 640×480). A
+  page, scan, screenshot, chart or photographed page has a plain background
+  and is read. They count as "no text found". `COUNCIL_LEDGER_READ_PHOTOS=1`
+  reads every picture.
+- **Camera-size pictures are shrunk** to `OCR_MAX_SIDE` (2,600 px) before
+  Tesseract.
+- **Helpers:** `OMP_THREAD_LIMIT=1` in each helper's environment (its
+  Tesseract keeps to one core); a helper sends what it is doing each time it
+  changes, and `Pool.result(say=…)` shows the waited-for file's line
+  ("book.xlsx: picture 3 of 40").
+
+Tests: `tests/test_ledger_picture_time.py`.

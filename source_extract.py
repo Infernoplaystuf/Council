@@ -3334,6 +3334,66 @@ def word_confidences(tsv: str) -> Dict[str, float]:
     return out
 
 
+#: a picture longer than this on a side is made this size for the reader
+OCR_MAX_SIDE = 2600
+
+#: seconds the pictures of one file may take to read, unless
+#: COUNCIL_LEDGER_PICTURE_BUDGET_S says otherwise (0 = no limit). Past it the
+#: rest are saved and listed on the review's Images sheet, not read: a
+#: workbook of photos held the Extract for over 10 minutes (2026-10-30)
+PICTURE_BUDGET_S = 120.0
+#: what an unread picture's note starts with when the budget ran out
+PICTURES_OUT_OF_TIME = "not read: the file's pictures took longer than"
+#: what a photo with nothing like a page in it says (counted as no text)
+PHOTO_NO_TEXT = ("(no text found) - a photo with no plain page or screen in it, "
+                 "not given to the reader")
+
+
+def picture_budget_s() -> float:
+    raw = os.environ.get("COUNCIL_LEDGER_PICTURE_BUDGET_S", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else PICTURE_BUDGET_S
+    except ValueError:
+        return PICTURE_BUDGET_S
+
+
+def read_photos() -> bool:
+    """COUNCIL_LEDGER_READ_PHOTOS=1: every picture goes to the reader, photos
+    too (looks_like_photo)."""
+    return os.environ.get("COUNCIL_LEDGER_READ_PHOTOS", "").strip() in ("1", "yes", "on")
+
+
+def looks_like_photo(data: bytes) -> bool:
+    """A photo of a part, a room, a person: no plain background a text sits
+    on. A page, a scan, a screenshot or a chart has one - most of its
+    pixels are one shade (paper, a window) - and is read. Told from a small
+    copy in a few milliseconds, where the reader took seconds to say there
+    was no text. When unsure (an odd file), not a photo: it is read."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if im.width * im.height < PHOTO_MIN_PIXELS:
+                return False                 # an icon, a crop of a label: read
+            im.draft("L", (256, 256))        # a JPEG decodes small, fast
+            small = im.convert("L")
+            small.thumbnail((256, 256))
+            hist = small.histogram()
+    except Exception:                                       # noqa: BLE001
+        return False
+    total = float(sum(hist)) or 1.0
+    # the share of the most common shade, in 16 bands of 16
+    bands = [sum(hist[i:i + 16]) for i in range(0, 256, 16)]
+    top = max(bands) / total
+    near = max(bands[i] + (bands[i + 1] if i + 1 < 16 else 0) for i in range(16)) / total
+    return top < PHOTO_MAX_BAND and near < PHOTO_MAX_BAND * 1.6
+
+
+#: a picture smaller than this (pixels) is always read
+PHOTO_MIN_PIXELS = 640 * 480
+#: a page's background holds more than this share of its pixels in one band
+PHOTO_MAX_BAND = 0.22
+
+
 def _for_ocr(data: bytes) -> bytes:
     """Greyscale, and small screenshots enlarged: Tesseract wants text about
     20-30 px high and misreads the 10-12 px of a pasted screenshot."""
@@ -3345,6 +3405,12 @@ def _for_ocr(data: bytes) -> bytes:
     if max(img.size) < 1600:
         k = 3 if max(img.size) < 800 else 2
         img = img.resize((img.width * k, img.height * k), Image.LANCZOS)
+    elif max(img.size) > OCR_MAX_SIDE:
+        # a camera's 12-megapixel photo: Tesseract took tens of seconds on
+        # each, and its text is no smaller at this size (2026-10-30)
+        k = OCR_MAX_SIDE / max(img.size)
+        img = img.resize((max(1, int(img.width * k)), max(1, int(img.height * k))),
+                         Image.LANCZOS)
     img = _strip_table_lines(img)
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -3848,7 +3914,8 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                     part_json = pool.result(
                         index[str(src)], beat=_wd.beat,
                         should_stop=(cancel.is_set if cancel is not None
-                                     else (lambda: False)))
+                                     else (lambda: False)),
+                        say=prog.update)
                 except ledger_workers.Stopped:
                     run.model_parts.pop(label, None)
                     run.cancelled = True
@@ -3966,6 +4033,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         skip = {id(g) for g in unrelated}
         grids = [g for g in grids if id(g) not in skip]
         run.unrelated.extend(f"{g.file} › {g.sheet}" for g in unrelated)
+    budget = picture_budget_s() if reader is not None else 0.0
+    pictures_from = _time.monotonic()
+    out_of_time = 0
     for i, img in enumerate(images):
         if cancel is not None and cancel.is_set():
             raise _Cancelled()
@@ -4016,7 +4086,17 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             note.text = f"not read: {vector}"
             run.images.append(note)
             continue
-        if reader is not None:
+        if reader is not None and budget and _time.monotonic() - pictures_from > budget:
+            # the rest are saved and listed, not read: one workbook of
+            # photos held the whole Extract (2026-10-30)
+            note.reader = getattr(reader, "name", "image reader")
+            note.text = (f"{PICTURES_OUT_OF_TIME} {budget:.0f} s to read; this one is saved, "
+                         "not read (Diagnose a file… reads the file alone)")
+            out_of_time += 1
+        elif reader is not None and not read_photos() and looks_like_photo(img.data):
+            note.reader = getattr(reader, "name", "image reader")
+            note.text = PHOTO_NO_TEXT
+        elif reader is not None:
             note.reader = getattr(reader, "name", "image reader")
             try:
                 rows = reader(img.data)
@@ -4033,6 +4113,11 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             note.text = ("not read: install Tesseract (local OCR) to read images - Models tab, "
                          "Install Tesseract")
         run.images.append(note)
+    if out_of_time:
+        run.problems.append(
+            f"{src.name}: {out_of_time} of {len(images)} pictures not read - its pictures "
+            f"took longer than {budget:.0f} s (COUNCIL_LEDGER_PICTURE_BUDGET_S); they are "
+            "saved and listed on the review's Images sheet")
 
     layout = getattr(m, "layout", None)
     if layout:
