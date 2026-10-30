@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -195,13 +196,17 @@ def test_every_build_task_starts_with_failing_tests(tmp_path):
     for task in bb.TASKS:
         root = bb.make_task(tmp_path / task["id"], task)
         assert (root / task["open"]).is_file()
-        assert not bb.run_tests(root).passed, task["id"]
+        result = bb.run_tests(root)
+        # failing because a test failed, not because pytest could not start
+        # (the run's environment once lacked what Windows needs to start it)
+        assert not result.passed, task["id"]
+        assert re.search(r"\d+ (failed|errors?)\b", result.output), (task["id"], result.output[-800:])
 
 
 def test_a_right_edit_solves_the_task_in_one_round(tmp_path):
     rec = bb.run_task(bb.TASKS[0], tmp_path, tmp_path / "vault",
                       lambda messages, **kw: _MEDIAN_FIX)
-    assert rec["solved"] and rec["rounds"] == 1 and rec["calls"] == 1
+    assert rec["solved"] and rec["rounds"] == 1 and rec["calls"] == 1, rec
     assert rec["applied"] == 1 and rec["refused"] == 0
 
 

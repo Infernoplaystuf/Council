@@ -128,7 +128,8 @@ def run_tests(root: Path):
     lines: List[str] = []
     out = bs.run(bs.test_argv(sys.executable), root, lines.append,
                  timeout=bs.TEST_TIMEOUT_S, memory_mb=bs.TEST_MEMORY_MB,
-                 env={"QT_QPA_PLATFORM": "offscreen", "COUNCIL_NO_DIALOGS": "1"})
+                 env=bs.sandbox_env({"QT_QPA_PLATFORM": "offscreen",
+                                     "COUNCIL_NO_DIALOGS": "1"}))
     return bs.TestOutcome(out, "\n".join(lines))
 
 
