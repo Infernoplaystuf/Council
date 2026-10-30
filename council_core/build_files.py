@@ -28,18 +28,16 @@ LISTING
 
 RUNNING
   run_file starts ``python -u file`` in the file's own folder, so its imports
-  and relative paths work as they do from a terminal, and streams each output
-  line to a callback. Stop kills it. It runs with the user's own permissions,
-  as the IDE tab's Run does: the tab puts council_core.ide_trust's check in
-  front of it. The sandbox comes with the Build tab's Run and Test step.
+  work, in council_core.build_sandbox's sandbox (offline, a Job Object with a
+  memory cap, a time limit), and hands each line of its output to a
+  callback. Stop kills the whole process tree. It is not confined on disk:
+  the tab puts council_core.ide_trust's check in front of it.
 """
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Union
@@ -234,59 +232,16 @@ def new_file(folder: PathLike, name: str) -> Path:
     return target
 
 
-@dataclass
-class RunOutcome:
-    returncode: Optional[int]
-    seconds: float
-    stopped: bool = False
-    error: str = ""
-
-    def summary(self, name: str) -> str:
-        if self.error:
-            return f"[{name} did not start: {self.error}]"
-        if self.stopped:
-            return f"[{name} stopped after {self.seconds:.1f} s]"
-        return f"[{name} exited with code {self.returncode} after {self.seconds:.1f} s]"
-
-
 def run_file(python: str, path: PathLike, on_line: Callable[[str], None],
              stop: Optional[threading.Event] = None,
-             args: Optional[List[str]] = None) -> RunOutcome:
-    """Run ``python -u path`` in the file's folder, calling ``on_line`` with
-    each line of its output (stdout and stderr together, in order). Returns
-    when it exits or ``stop`` is set (it is then killed)."""
+             args: Optional[List[str]] = None):
+    """Run ``python -u path`` in the file's folder IN THE SANDBOX
+    (council_core.build_sandbox: offline, a Job Object, a time limit),
+    calling ``on_line`` with each line of its output (stdout and stderr
+    together, in order). Returns a build_sandbox.Outcome when it exits or
+    ``stop`` is set (the whole process tree is then killed)."""
+    from . import build_sandbox
     path = Path(path)
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    started = time.monotonic()
-    try:
-        proc = subprocess.Popen(
-            [python, "-u", str(path), *(args or [])], cwd=str(path.parent),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", env=env, creationflags=flags)
-    except OSError as exc:
-        return RunOutcome(None, 0.0, error=str(exc.strerror or exc))
-
-    def drain() -> None:
-        for line in proc.stdout:
-            try:
-                on_line(line.rstrip("\n"))
-            except Exception:                             # noqa: BLE001
-                pass
-        proc.stdout.close()
-
-    reader = threading.Thread(target=drain, name="build-run-out", daemon=True)
-    reader.start()
-    stopped = False
-    while proc.poll() is None:
-        if stop is not None and stop.wait(0.1):
-            stopped = True
-            proc.kill()
-            break
-        if stop is None:
-            time.sleep(0.1)
-    proc.wait()
-    reader.join(timeout=5)
-    return RunOutcome(proc.returncode, time.monotonic() - started, stopped)
+    return build_sandbox.run([python, "-u", str(path), *(args or [])], path.parent,
+                             on_line, stop)
 

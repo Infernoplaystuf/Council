@@ -159,6 +159,10 @@ datas = [
     # The example Qt apps gui_reference reads as TEXT into a coding agent's
     # prompt (the Code tab's "Qt app builder"); never imported by the app.
     ("examples/qt_apps",          "examples/qt_apps"),
+    # The Build tab's sandbox hook: a sitecustomize put on the PYTHONPATH of
+    # the user's own Python when the Build tab runs code (council_core.
+    # build_sandbox), so it must be .py files on disk, not frozen modules.
+    ("council_core/_build_sandbox", "council_core/_build_sandbox"),
     # ── Scripts run by ANOTHER interpreter (the DREAM3D-NX env), so they
     #    must be .py files beside the app, not modules frozen into it:
     #    workflow_runner launches every simplnx and every model-written
