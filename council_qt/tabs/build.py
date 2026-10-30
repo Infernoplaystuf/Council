@@ -1,10 +1,13 @@
 """
 council_qt.tabs.build — the Build tab: a folder's files, an editor, and Run.
 
-This is the first step of the coding workspace (the plan in the project
-thread, 2026-10-29): files on the left, the editor in the middle, the output
-under it. The chat beside the editor, edits shown as diffs to accept, and
-sandboxed Run and Test come in the next steps, on top of this.
+The coding workspace (docs/handoff/build_tab_2026-10-29.md): files on the
+left, the editor in the middle with the output under it, the chat on the
+right (council_qt.widgets.build_chat). In Edit mode the chat's accepted edits
+come back here (apply_edits): into the editor, and in a session (a git
+branch of its own, council_core.build_session) committed one turn at a
+time, with Undo turn, the grouped review and Merge. Sandboxed Run and Test
+come in step 4.
 
     Open folder…   any folder becomes the workspace; it is remembered.
     Scratch        the vault's workspace folder (the IDE tab's), for code
@@ -47,6 +50,10 @@ from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPlainTextEdit,
                                QSplitter, QTabWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from council_core import build_edits as be
+from council_core import build_session as bs
+from council_core import worktree as wt
+
 import python_envs as envs
 from council_core import build_chat as bc
 from council_core import build_files as bf
@@ -77,7 +84,8 @@ class BuildActions:
                  ask_folder: Optional[Callable[[str], str]] = None,
                  confirm: Optional[Callable[[str, str], bool]] = None,
                  ask_name: Optional[Callable[[str, str], Optional[str]]] = None,
-                 chat: Optional[Callable[..., str]] = None):
+                 chat: Optional[Callable[..., str]] = None,
+                 review: Optional[Callable[[str], tuple]] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -86,6 +94,7 @@ class BuildActions:
         self.confirm = confirm or self._confirm
         self.ask_name = ask_name or self._ask_name
         self.chat = chat or self._chat
+        self.review = review or self._review
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -121,6 +130,43 @@ class BuildActions:
             messages, role="coder", temperature=0.2,
             num_predict=token_budget.reply("long", 1500), timeout=180,
             token_callback=on_token, should_stop=should_stop)
+
+    @staticmethod
+    def _review(markdown: str) -> tuple:
+        """The grouped review before Merge: ("merge", None), ("ask", n) for
+        a group to ask the chat about, or ("cancel", None)."""
+        if _no_dialogs():
+            return ("cancel", None)
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QTextBrowser,
+                                       QVBoxLayout as _V)
+        dlg = QDialog()
+        dlg.setWindowTitle("Review the session before merging")
+        dlg.resize(820, 640)
+        col = _V(dlg)
+        view = QTextBrowser()
+        view.setOpenLinks(False)
+        view.setMarkdown(markdown)
+        col.addWidget(view)
+        chosen = {"answer": ("cancel", None)}
+
+        def link(url) -> None:
+            kind, _, rest = url.toString().partition(":")
+            if kind == "ask" and rest.isdigit():
+                chosen["answer"] = ("ask", int(rest))
+                dlg.accept()
+        view.anchorClicked.connect(link)
+        buttons = QDialogButtonBox()
+        merge = buttons.addButton("Merge into the project", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+
+        def merged() -> None:
+            chosen["answer"] = ("merge", None)
+            dlg.accept()
+        merge.clicked.connect(merged)
+        buttons.rejected.connect(dlg.reject)
+        col.addWidget(buttons)
+        dlg.exec()
+        return chosen["answer"]
 
     # -- the workspace -----------------------------------------------------
     def scratch_dir(self) -> Path:
@@ -184,6 +230,10 @@ class BuildTab(ViewHelpers, QWidget):
         self.actions = actions or BuildActions()
         self.trust = ide_trust.TrustStore()
         self.root: Optional[Path] = None
+        self.project: Optional[Path] = None   # the folder the user opened
+        self.session: Optional[bs.Session] = None
+        self._turns: List[dict] = []         # Undo turn outside a session
+        self._extra = ""                     # a review group, for the next question
         self.docs: List[_Doc] = []
         self._stop: Optional[threading.Event] = None
         self._running = False
@@ -192,8 +242,14 @@ class BuildTab(ViewHelpers, QWidget):
         state = self.actions.load_state()
         self.python_box.setCurrentText(envs.display(state.get("python", "")))
         folder = Path(state.get("folder") or "")
-        self.open_folder(folder if state.get("folder") and folder.is_dir()
-                         else self.actions.scratch_dir())
+        session = bs.Session.load(self.actions.vault_dir, state["session"]) \
+            if state.get("session") else None
+        if session is not None:
+            self.session = session
+            self.open_folder(session.tree_folder(), project=Path(session.folder))
+        else:
+            self.open_folder(folder if state.get("folder") and folder.is_dir()
+                             else self.actions.scratch_dir())
         kept = self.actions.unsaved_kept()
         if kept:
             self.say(f"Unsaved edits from an earlier session are kept in "
@@ -229,6 +285,16 @@ class BuildTab(ViewHelpers, QWidget):
         self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         outer.addWidget(self.folder_label)
 
+        srow = QHBoxLayout()
+        self.session_label = QLabel("")
+        self.session_label.setWordWrap(True)
+        srow.addWidget(self.session_label, 1)
+        self.session_btn = self._button(srow, "Start session", self.start_session)
+        self.undo_btn = self._button(srow, "Undo turn", self.undo_turn)
+        self.review_btn = self._button(srow, "Review and merge…", self.review_and_merge)
+        self.end_btn = self._button(srow, "End session", self.end_session)
+        outer.addLayout(srow)
+
         split = QSplitter(Qt.Orientation.Horizontal)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -261,7 +327,7 @@ class BuildTab(ViewHelpers, QWidget):
         right.setSizes([520, 180])
         split.addWidget(right)
         self.chat_panel = ChatPanel(self.actions.vault_dir, self.actions.chat,
-                                    self.chat_context, bridge=self.bridge)
+                                    self.chat_context, bridge=self.bridge, host=self)
         split.addWidget(self.chat_panel)
         split.setSizes([220, 700, 420])
         outer.addWidget(split, 1)
@@ -284,25 +350,64 @@ class BuildTab(ViewHelpers, QWidget):
             bar.setValue(bar.maximum())
 
     def _remember(self, *_a) -> None:
-        self.actions.save_state({"folder": str(self.root or ""),
-                                 "python": self.python_spec()})
+        self.actions.save_state({"folder": str(self.project or self.root or ""),
+                                 "python": self.python_spec(),
+                                 "session": self.session.id if self.session else ""})
 
     # -- the folder and its tree ---------------------------------------------
-    def open_folder(self, folder: Path) -> None:
+    def open_folder(self, folder: Path, project: Optional[Path] = None) -> None:
+        """Show ``folder``. In a session it is the session's worktree and
+        ``project`` the user's folder (the chat is the project's)."""
         folder = Path(folder)
         self.root = folder
-        self.folder_label.setText(str(folder))
+        self.project = Path(project) if project else folder
         self.tree.clear()
         self._fill_into(self.tree.invisibleRootItem(), folder)
-        self.chat_panel.set_folder(folder)
+        self.chat_panel.set_folder(self.project)
+        self._turns = []
+        self._show_session()
         self._remember()
 
+    def _show_session(self) -> None:
+        s = self.session
+        if s is not None:
+            live = [t for t in s.turns if not t.undone]
+            self.folder_label.setText(f"{self.project}  (session copy: {self.root})")
+            self.session_label.setText(
+                f"Session on branch {s.branch}: {len(live)} turn(s). Accepted edits "
+                "are committed here; your folder changes only when you merge.")
+        else:
+            self.folder_label.setText(str(self.root or ""))
+            repo = self.root is not None and bs.is_repo(self.root)
+            self.session_label.setText(
+                "Edit mode puts accepted edits into the editor, not saved: Save "
+                "writes them. " + ("Start session to work on a branch of its own, "
+                                   "one commit per turn." if repo else
+                                   "A session (a branch of its own, one commit per "
+                                   "turn) needs the folder to be a git repository."))
+            self.session_btn.setEnabled(bool(repo))
+        on = s is not None
+        self.session_btn.setVisible(not on)
+        self.review_btn.setVisible(on)
+        self.end_btn.setVisible(on)
+        self.undo_btn.setEnabled(bool(s.last_turn()) if on else bool(self._turns))
+
+    def _leave_session_check(self) -> bool:
+        if self.session is None:
+            return True
+        self.say("End the session or merge it first.")
+        return False
+
     def on_open_folder(self) -> None:
-        chosen = self.actions.ask_folder(str(self.root or ""))
+        if not self._leave_session_check():
+            return
+        chosen = self.actions.ask_folder(str(self.project or ""))
         if chosen:
             self.open_folder(Path(chosen))
 
     def on_scratch(self) -> None:
+        if not self._leave_session_check():
+            return
         self.open_folder(self.actions.scratch_dir())
 
     def _fill_into(self, parent: QTreeWidgetItem, folder: Path) -> None:
@@ -519,7 +624,9 @@ class BuildTab(ViewHelpers, QWidget):
     def chat_context(self, use_file: bool, use_output: bool) -> bc.Context:
         """What the chat's model is shown: the open file as edited, the
         selected lines (or the cursor's), and the last run's output."""
-        ctx = bc.Context(folder=str(self.root or ""))
+        ctx = bc.Context(folder=str(self.project or self.root or ""),
+                         root=str(self.root or ""))
+        ctx.extra, self._extra = self._extra, ""
         doc = self.current() if use_file else None
         if doc is not None:
             ed = doc.editor
@@ -548,6 +655,294 @@ class BuildTab(ViewHelpers, QWidget):
 
     def is_running(self) -> bool:
         return self._running
+
+
+    # -- Edit mode: what the chat's edits need (the chat's host) ----------------
+    def edit_root(self) -> Path:
+        return Path(self.root or ".")
+
+    def _path(self, rel: str) -> Path:
+        return Path(self.root) / rel
+
+    def read_for_edit(self, rel: str) -> Optional[str]:
+        """The file's text now: the editor's buffer when it is open, else the
+        disk; None when it does not exist (an edit may create it)."""
+        path = self._path(rel)
+        doc = self.doc_for(path)
+        if doc is not None:
+            return doc.editor.toPlainText()
+        if not path.exists():
+            return None
+        return bf.open_text(path).text
+
+    def other_files(self, current: str, extra: List[str]) -> List[tuple]:
+        """The other open files (as edited) and ``extra`` (a plan's files),
+        for an Edit-mode prompt."""
+        out, seen = [], {str(Path(current).resolve())} if current else set()
+        for d in self.docs:
+            key = str(d.path.resolve())
+            if key not in seen:
+                seen.add(key)
+                out.append((str(d.path), d.editor.toPlainText()))
+        for rel in extra:
+            safe = be.safe_rel(self.edit_root(), rel)
+            if safe is None:
+                continue
+            path = self._path(safe)
+            key = str(path.resolve())
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            try:
+                out.append((str(path), bf.open_text(path).text))
+            except bf.FileProblem:
+                continue
+        return out
+
+    def code_map(self, focus: str):
+        """The folder's outline for the prompt, and the map that checks a
+        plan's names (called from the chat's worker thread: disk only)."""
+        cache = self.actions.vault_dir / ".council_build" / "maps"
+        return bc.code_map_for(self.edit_root(), focus, cache)
+
+    def open_location(self, rel: str, line: int) -> None:
+        safe = be.safe_rel(self.edit_root(), rel)
+        if safe is None:
+            return
+        doc = self.open_file(self._path(safe))
+        if doc is None:
+            return
+        block = doc.editor.document().findBlockByNumber(max(0, line - 1))
+        cur = doc.editor.textCursor()
+        cur.setPosition(block.position())
+        doc.editor.setTextCursor(cur)
+        doc.editor.centerCursor()
+        doc.editor.setFocus()
+
+    @staticmethod
+    def _set_text(doc: _Doc, text: str) -> None:
+        """Replace the buffer as ONE undo step (Ctrl+Z takes the edit back)."""
+        cur = QTextCursor(doc.editor.document())
+        cur.beginEditBlock()
+        cur.select(QTextCursor.SelectionType.Document)
+        cur.insertText(text)
+        cur.endEditBlock()
+
+    def _doc_for_edit(self, rel: str, exists: bool) -> Optional[_Doc]:
+        path = self._path(rel)
+        doc = self.doc_for(path)
+        if doc is not None:
+            return doc
+        if not exists:
+            try:
+                bf.new_file(self.edit_root(), rel)
+            except bf.FileProblem as exc:
+                self.say(str(exc))
+                return None
+            self.refresh_tree()
+        return self.open_file(path)
+
+    def apply_edits(self, prop: be.Proposal, request: str):
+        """Put the accepted edits into the files: into each file's editor as
+        one undo step; in a session also saved into the session's copy and
+        committed as one turn. (steps for the chat, a message)."""
+        changes = prop.accepted_changes()
+        if not changes:
+            return ([{"kind": "apply", "state": "no", "text": "No edit was accepted"}],
+                    "Nothing applied: no edit was accepted.")
+        if self.session is not None:
+            if not self.save_all():
+                raise RuntimeError("an open file could not be saved")
+            self.session.commit_own_edits()
+        before: Dict[str, Optional[str]] = {}
+        records: List[bs.EditRecord] = []
+        done: List[str] = []
+        for fc in changes:
+            doc = self._doc_for_edit(fc.path, fc.exists)
+            if doc is None:
+                continue
+            before[str(doc.path)] = doc.editor.toPlainText() if fc.exists else ""
+            after = fc.after()
+            self._set_text(doc, after)
+            if self.session is not None:
+                self.save(doc)
+            shift = 0
+            for e in sorted((e for e in fc.edits if e.ok and e.accepted), key=lambda e: e.start):
+                old = fc.before[e.start:e.end]
+                line = fc.first_line(e) + shift
+                records.append(bs.edit_record(fc.path, after, line, e.new, old, e.block.reason))
+                shift += e.new.count("\n") - old.count("\n")
+            done.append(fc.path)
+        n = sum(1 for fc in changes for e in fc.edits if e.ok and e.accepted)
+        steps = [{"kind": "apply", "state": "ok",
+                  "text": f"Applied {n} edit(s) to {', '.join(done)}"}]
+        if self.session is not None:
+            turn = self.session.commit_turn(request, records)
+            if turn is not None:
+                steps.append({"kind": "commit", "state": "ok",
+                              "text": f"Committed as turn {turn.number} ({turn.commit[:7]}) "
+                                      f"on {self.session.branch}"})
+            message = (f"Applied and committed as turn {turn.number}. Undo turn takes it back."
+                       if turn else "Applied; nothing changed.")
+        else:
+            self._turns.append({"request": request, "before": before})
+            steps.append({"kind": "apply", "state": "ok",
+                          "text": "In the editor, not saved yet: Save writes them"})
+            message = "Applied in the editor, not saved yet. Save writes them; Undo turn takes them back."
+        self._show_session()
+        return steps, message
+
+    # -- sessions ----------------------------------------------------------------
+    def _carry_docs(self, old_root: Path, new_root: Path) -> None:
+        """Close every open file under ``old_root`` and open its counterpart
+        under ``new_root``, keeping unsaved edits as unsaved edits."""
+        carried = []
+        for d in list(self.docs):
+            try:
+                rel = d.path.resolve().relative_to(old_root.resolve())
+            except ValueError:
+                continue
+            carried.append((rel, d.editor.toPlainText() if d.modified() else None))
+            self.docs.remove(d)
+            i = self.editors.indexOf(d.editor)
+            if i >= 0:
+                self.editors.removeTab(i)
+            d.editor.deleteLater()
+        for rel, text in carried:
+            path = new_root / rel
+            if not path.is_file():
+                continue
+            doc = self.open_file(path)
+            if doc is not None and text is not None:
+                self._set_text(doc, text)
+
+    def start_session(self) -> None:
+        if self.session is not None or self.root is None:
+            return
+        if self.chat_panel.is_busy():
+            self.say("Wait for the chat to finish first.")
+            return
+        try:
+            session = bs.Session.start(self.actions.vault_dir, self.root)
+        except wt.WorktreeError as exc:
+            self.say(str(exc))
+            return
+        old = self.root
+        self.session = session
+        self.open_folder(session.tree_folder(), project=old)
+        self._carry_docs(old, self.root)
+        self.say(f"Session started on branch {session.branch}. Your folder is not "
+                 "changed until you merge.")
+
+    def _close_session(self, message: str) -> None:
+        project, tree = self.project, self.root
+        self.session = None
+        self.open_folder(project)
+        self._carry_docs(tree, project)
+        self.say(message)
+
+    def end_session(self) -> None:
+        s = self.session
+        if s is None:
+            return
+        live = [t for t in s.turns if not t.undone]
+        if not self.actions.confirm(
+                "End the session",
+                f"End the session without merging? Its {len(live)} turn(s) on "
+                f"{s.branch} are thrown away. Your project folder is not changed."):
+            return
+        for d in list(self.docs):
+            d.editor.document().setModified(False)     # the session's copies
+        s.end()
+        self.session = None
+        project = Path(s.folder)
+        tree = self.root
+        self.open_folder(project)
+        self._carry_docs(tree, project)
+        self.say("Session ended; nothing was merged.")
+
+    def review_and_merge(self) -> None:
+        s = self.session
+        if s is None:
+            return
+        if not self.save_all():
+            return
+        try:
+            groups = s.review()
+        except wt.WorktreeError as exc:
+            self.say(str(exc))
+            return
+        if not groups:
+            self.say("The session has no changes to merge.")
+            return
+        answer, n = self.actions.review(bs.review_markdown(groups))
+        if answer == "ask" and n is not None and 0 <= n < len(groups):
+            g = groups[n]
+            self._extra = (f"The user is asking about this change in the session "
+                           f"({g.title()}):\n```diff\n{g.diff}\n```")
+            self.chat_panel.set_mode("ask")
+            self.chat_panel.input.setPlainText(f"About {g.title()}: ")
+            self.chat_panel.input.setFocus()
+            self.say("Ask the chat about it, then Review and merge again.")
+            return
+        if answer != "merge":
+            return
+        try:
+            line = s.merge()
+        except wt.WorktreeError as exc:
+            self.say(str(exc))
+            return
+        self._close_session(f"Merged into {s.folder}: {line}")
+
+    def undo_turn(self) -> None:
+        """Take the newest applied turn back."""
+        if self.chat_panel.is_busy():
+            return
+        s = self.session
+        if s is not None:
+            if not self.save_all():
+                return
+            try:
+                turn = s.undo_turn()
+            except wt.WorktreeError as exc:
+                self.say(str(exc))
+                return
+            self._reload_docs()
+            self.refresh_tree()
+            self.chat_panel.note(f"Turn {turn.number} undone.",
+                                 [{"kind": "undo", "state": "ok",
+                                   "text": f"Undid turn {turn.number} (a revert commit)"}])
+            self._show_session()
+            return
+        if not self._turns:
+            return
+        last = self._turns.pop()
+        for path, text in last["before"].items():
+            doc = self.doc_for(Path(path)) or self.open_file(Path(path))
+            if doc is not None and text is not None:
+                self._set_text(doc, text)
+        self.chat_panel.note("The last turn's edits are taken back (in the editor).",
+                             [{"kind": "undo", "state": "ok",
+                               "text": "Undid the last turn's edits in the editor"}])
+        self._show_session()
+
+    def _reload_docs(self) -> None:
+        """Every open file read again from disk (after a revert), and a tab
+        whose file the revert removed closed."""
+        for d in list(self.docs):
+            if not d.path.is_file():
+                self.docs.remove(d)
+                i = self.editors.indexOf(d.editor)
+                if i >= 0:
+                    self.editors.removeTab(i)
+                d.editor.deleteLater()
+                continue
+            try:
+                d.opened = bf.open_text(d.path)
+            except bf.FileProblem:
+                continue
+            self._set_text(d, d.opened.text)
+            d.editor.document().setModified(False)
 
 
 def build_build(window) -> QWidget:
