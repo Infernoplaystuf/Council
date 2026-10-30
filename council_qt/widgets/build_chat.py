@@ -30,6 +30,8 @@ The reply streams in as it is written; Stop ends it where it is. Enter sends,
 Shift+Enter starts a new line. "Copy code" copies the last reply's last code
 block. Each folder keeps its own conversation; New chat starts it again.
 
+AGENT mode and the Model box: council_qt.widgets.build_agent.
+
 The panel knows nothing of the editor: ``get_context`` (from the tab) says
 what is open, ``chat`` calls the model, and ``host`` (the tab) reads and
 applies edits, so the tests give it fakes.
@@ -51,6 +53,7 @@ from council_core import build_chat as bc
 from council_core import build_edits as be
 
 from ..view import ViewHelpers
+from .build_agent import AGENT, AgentMode, ModelPicker
 
 #: How often a streaming reply is redrawn.
 REDRAW_MS = 120
@@ -82,7 +85,8 @@ class ChatPanel(ViewHelpers, QWidget):
 
     def __init__(self, vault_dir: Path, chat: Callable[..., str],
                  get_context: Callable[[bool, bool], bc.Context],
-                 parent: Optional[QWidget] = None, bridge=None, host=None):
+                 parent: Optional[QWidget] = None, bridge=None, host=None,
+                 agent=None, models_source=None):
         super().__init__(parent)
         self.bridge = bridge
         self.host = host
@@ -103,6 +107,8 @@ class ChatPanel(ViewHelpers, QWidget):
         self._redraw.setSingleShot(True)
         self._redraw.setInterval(REDRAW_MS)
         self._redraw.timeout.connect(self.render)
+        self.agent_mode = AgentMode(self, agent)
+        self.models = ModelPicker(self, self.vault_dir, models_source)
         self._build()
 
     def _build(self) -> None:
@@ -113,12 +119,31 @@ class ChatPanel(ViewHelpers, QWidget):
         self.mode_box = QComboBox()
         self.mode_box.addItem("Ask: answers only", ASK)
         self.mode_box.addItem("Edit: proposes changes", EDIT)
+        self.mode_box.addItem("Agent: plans, then works on a branch", AGENT)
         self.mode_box.currentIndexChanged.connect(self._mode_changed)
         head.addWidget(self.mode_box)
         head.addStretch(1)
         self.copy_btn = self._button(head, "Copy code", self.copy_code)
         self.new_btn = self._button(head, "New chat", self.new_chat)
         col.addLayout(head)
+
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Model:"))
+        self.model_box = QComboBox()
+        self.model_box.addItem("Main model (as the Council)", "")
+        self.model_box.activated.connect(self.models.chosen)
+        mrow.addWidget(self.model_box, 1)
+        col.addLayout(mrow)
+
+        self.agent_row = QWidget()
+        arow = QHBoxLayout(self.agent_row)
+        arow.setContentsMargins(0, 0, 0, 0)
+        arow.addWidget(QLabel("Agent:"))
+        self.profile_box = QComboBox()
+        arow.addWidget(self.profile_box, 1)
+        self.agents_btn = self._button(arow, "Agents…", self.on_agents)
+        self.project_btn = self._button(arow, "Project…", self.on_project)
+        col.addWidget(self.agent_row)
 
         self.view = QTextBrowser()
         self.view.setOpenLinks(False)
@@ -163,10 +188,20 @@ class ChatPanel(ViewHelpers, QWidget):
         return self.mode_box.currentData() or ASK
 
     def set_mode(self, mode: str) -> None:
-        self.mode_box.setCurrentIndex(1 if mode == EDIT else 0)
+        self.mode_box.setCurrentIndex(max(0, self.mode_box.findData(mode)))
 
     def _mode_changed(self, *_a) -> None:
-        if self.mode() == EDIT:
+        agent = self.mode() == AGENT
+        self.agent_row.setVisible(agent)
+        if agent:
+            self.agent_mode.fill_profiles()
+            self.view.setPlaceholderText(
+                "Describe a change to the folder: the council plans it, you "
+                "approve the plan, and an agent makes it on a branch of its own, "
+                "checking and committing each step. Your folder is not touched "
+                "until you merge. The folder must be a git folder.")
+            self.input.setPlaceholderText("Describe the change… (Enter sends)")
+        elif self.mode() == EDIT:
             self.view.setPlaceholderText(
                 "Ask for a change: \"add a --verbose flag\", \"fix the error in "
                 "the output\". The model proposes edits; you accept or reject "
@@ -207,7 +242,8 @@ class ChatPanel(ViewHelpers, QWidget):
 
     # -- drawing -------------------------------------------------------------
     def _steps_md(self, i: int, t: bc.Turn) -> str:
-        steps = [s for s in t.steps if s.get("kind") != "plan"]
+        steps = [s for s in t.steps
+                 if s.get("kind") not in ("plan", "agent-plan", "agent-job")]
         if not steps:
             return ""
         arrow = "▾" if i in self._open_steps else "▸"
@@ -289,11 +325,16 @@ class ChatPanel(ViewHelpers, QWidget):
                                  "model what is in the way.*")
                     continue
                 where = f" · {Path(t.file).name}" if t.file else ""
-                mode = " · edit" if t.mode == EDIT else ""
+                mode = {EDIT: " · edit", AGENT: " · agent"}.get(t.mode, "")
                 parts.append(f"**You**{where}{mode}\n\n{t.content}")
                 continue
-            text = be.prose(t.content) if t.mode == EDIT else t.content
+            if t.mode == AGENT:
+                text = self.agent_mode.markdown(i, t)
+            else:
+                text = be.prose(t.content) if t.mode == EDIT else t.content
             who = "**Council · stuck**" if i and turns[i - 1].kind == "blocker" else "**Council**"
+            if t.mode == AGENT:
+                who = "**Council · agent**"
             block = [f"{who}\n\n{text}" if text else who]
             plan = self._plan_md(i, t)
             if plan:
@@ -329,7 +370,8 @@ class ChatPanel(ViewHelpers, QWidget):
         self.apply_btn.setVisible(prop is not None)
         self.apply_btn.setEnabled(accepted and not self._busy)
         turns = self.turns()
-        plan_open = bool(turns) and self._plan_is_open(len(turns) - 1)
+        plan_open = bool(turns) and (self._plan_is_open(len(turns) - 1)
+                                     or self.agent_mode.plan_is_open())
         self.go_btn.setVisible(plan_open)
         self.go_btn.setEnabled(plan_open)
 
@@ -353,6 +395,15 @@ class ChatPanel(ViewHelpers, QWidget):
         elif kind == "go":
             self.go()
             return
+        elif kind == "use" and rest.isdigit():
+            self.agent_mode.toggle(int(rest))
+            return
+        elif kind == "review":
+            self.agent_mode.review(rest)
+            return
+        elif kind == "discard":
+            self.agent_mode.discard(rest)
+            return
         elif kind == "open" and self.host is not None:
             path, _, line = rest.rpartition(":")
             self.host.open_location(unquote(path), int(line or 1))
@@ -371,6 +422,9 @@ class ChatPanel(ViewHelpers, QWidget):
             self.status.setText("Apply or reject the proposed edits first.")
             return
         mode = mode or self.mode()
+        if mode == AGENT:
+            self.agent_mode.send(question)
+            return
         ctx = self.get_context(self.use_file.isChecked(), self.use_output.isChecked())
         plan_files: List[str] = []
         if mode == EDIT and self.host is not None:
@@ -445,6 +499,7 @@ class ChatPanel(ViewHelpers, QWidget):
         self.stop_btn.setEnabled(False)
         self.new_btn.setEnabled(True)
         self.mode_box.setEnabled(True)
+        self.profile_box.setEnabled(True)
         self.status.setText(error)
         self.render()
 
@@ -652,6 +707,9 @@ class ChatPanel(ViewHelpers, QWidget):
         self.send(bc.STUCK.format(why=why), kind="blocker", mode=ASK)
 
     def go(self) -> None:
+        if self.agent_mode.plan_is_open():
+            self.agent_mode.go()
+            return
         turns = self.turns()
         if turns and self._plan_is_open(len(turns) - 1):
             self.set_mode(EDIT)
@@ -674,6 +732,45 @@ class ChatPanel(ViewHelpers, QWidget):
     def stop(self) -> None:
         if self._stop is not None:
             self._stop.set()
+
+    def showEvent(self, event) -> None:                    # noqa: N802
+        super().showEvent(event)
+        self.models.ensure()
+
+    # -- Agent mode's agents and project ----------------------------------------
+    def on_agents(self) -> None:
+        from .code_dialogs import ProfileDialog
+        dlg = ProfileDialog(self, self.agent_mode.profile())
+
+        def done(code) -> None:
+            if code and self.agent_mode.agent is not None:
+                saved = self.agent_mode.agent.save_profile(dlg.profile())
+                self.agent_mode.fill_profiles()
+                self.profile_box.setCurrentIndex(max(0, next(
+                    (i for i, p in enumerate(self.agent_mode._profiles)
+                     if p.name == saved.name), 0)))
+        dlg.finished.connect(done)
+        dlg.open()
+        self._dialog = dlg
+
+    def on_project(self) -> None:
+        from .code_dialogs import ProjectDialog
+        project = self.agent_mode.project()
+        if project is None:
+            return
+        dlg = ProjectDialog(self, project)
+
+        def done(code) -> None:
+            if code:
+                p = dlg.project()
+                p.root = project.root           # the project is the open folder's
+                if self.agent_mode.agent.is_saved(project):
+                    p.name = project.name       # one project per folder
+                self.agent_mode.agent.save_project(p)
+                self.status.setText(f"Saved the project {p.name}.")
+        dlg.finished.connect(done)
+        dlg.open()
+        self._dialog = dlg
 
     def is_busy(self) -> bool:
         return self._busy

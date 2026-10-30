@@ -66,6 +66,19 @@ PARAMS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def split_command(command: str, windows: Optional[bool] = None) -> List[str]:
+    """A test command split like a shell would. On Windows backslashes are
+    kept (posix=False), and a quoted path ("C:/Program Files/py/python.exe")
+    loses its quotes there too: posix=False leaves them on the word, and a
+    program name with quotes in it cannot be started."""
+    windows = sys.platform == "win32" if windows is None else windows
+    argv = shlex.split(command, posix=not windows)
+    if windows:
+        argv = [a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'"
+                else a for a in argv]
+    return argv
+
+
 class Workspace:
     """The worktree a job edits, and what it may do there."""
 
@@ -314,8 +327,7 @@ class Workspace:
         if not self.test_command and not target:
             return False, "This project has no test command set."
         from . import child_proc
-        argv = shlex.split(self.test_command or "python -m pytest -q",
-                           posix=(sys.platform != "win32"))
+        argv = split_command(self.test_command or "python -m pytest -q")
         if argv and argv[0] in ("python", "python3", "py"):
             argv[0] = sys.executable
         if target:
