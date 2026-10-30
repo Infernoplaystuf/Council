@@ -2217,6 +2217,9 @@ class _Extractor:
         left blank: nothing to check - the whole sheet went amber (review,
         2026-10-20)."""
         labels, self.part_labels = self.part_labels, []
+        self._part_grid = False
+        if self._part_grid_blocks(labels):
+            return
         labels = [x for x in labels if x[2] or self._readings_after(x[0], labels)]
         if len({p for _r, _c, p in labels}) < 2:
             return                             # one part, typed once or again
@@ -2236,6 +2239,60 @@ class _Extractor:
                        + ("" if p else ", no part yet") if i or not p else self.part_how)
              + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
             for i, (r, c, p) in enumerate(blocks)]
+
+    def _part_grid_blocks(self, labels) -> bool:
+        """Parts' tables side by side as well as one under the other, each
+        under its own Part Number (user, 2026-10-30: "many tables ... on the
+        same sheet that belong to different parts"; every value of such a
+        sheet went to review). A label's block is the columns from it to the
+        next label's column to the right, and the rows from it down to the
+        next label in those columns. Sure - pre-accepted like a sheet of one
+        part - when every block that holds readings names its part, and a
+        label's row holds nothing but the labels and their parts. False when
+        no two labels of different parts share a row (_part_blocks then)."""
+        rows: Dict[int, set] = defaultdict(set)
+        for r, _c, p in labels:
+            rows[r].add(p)
+        if not any(len(ps) > 1 for ps in rows.values()):
+            return False
+        cols = sorted({c for _r, c, _p in labels})
+        last = max(self.rows, default=0) + 1
+        unclear, kept = False, []
+        for r, c, p in labels:
+            right = next((x for x in cols if x > c), 10 ** 6)
+            bottom = min((r2 for r2, c2, _p in labels if r2 > r and c <= c2 < right),
+                         default=last)
+            readings = self._readings_in(r, bottom, c, right)
+            if not p:
+                if readings:
+                    unclear = True             # 'TBD' over readings: whose are they?
+                continue
+            kept.append((r, c, p))
+        for r, c, p in kept:
+            # the label's row, in its own columns: nothing but it and its
+            # part (another block's readings may sit beside it)
+            right = next((x for x in cols if x > c), 10 ** 6)
+            for c2, x in self.row(r):
+                if c2 == c or not c <= c2 < right or isinstance(x, _Merged) or x is None:
+                    continue
+                if _text(x).strip() != p and str(x).strip():
+                    unclear = True             # a row of other titles or labels
+        from openpyxl.utils import get_column_letter
+        self._part_grid = True
+        self.part_labels = [
+            (r, c, p, f"{self.m.schema.id_field} at {self.g.sheet}!{get_column_letter(c)}{r}"
+             + (f" — {SHEET_PARTS_HOW}: check it" if unclear else ""))
+            for r, c, p in kept]
+        return True
+
+    def _readings_in(self, r1, r2, c1, c2) -> bool:
+        """A number or a flaw code in rows r1+1..r2-1, columns c1..c2-1."""
+        for rr in range(r1 + 1, r2):
+            for c, v in self.row(rr):
+                if c1 <= c < c2 and (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                     or self.codes.canon(v)):
+                    return True
+        return False
 
     def _readings_after(self, r, labels) -> bool:
         """Readings in the block of the part label at row r, down to the
@@ -2270,6 +2327,14 @@ class _Extractor:
         is '' on a sheet of one part (its part_how says)."""
         if not self.part_labels:
             return self.part, ""
+        if getattr(self, "_part_grid", False):
+            # side by side (_part_grid_blocks): the nearest label column at or
+            # left of it, then the nearest label above in that column
+            left = [x for x in self.part_labels if x[1] <= c and x[0] <= r]
+            if left:
+                band = max(x[1] for x in left)
+                pick = max((x for x in left if x[1] == band), key=lambda x: x[0])
+                return pick[2], pick[3]
         above = [x for x in self.part_labels if x[0] <= r]
         if not above:
             # above the first part label: the sheet's part, as before - but
@@ -3334,6 +3399,66 @@ def word_confidences(tsv: str) -> Dict[str, float]:
     return out
 
 
+#: a picture longer than this on a side is made this size for the reader
+OCR_MAX_SIDE = 2600
+
+#: seconds the pictures of one file may take to read, unless
+#: COUNCIL_LEDGER_PICTURE_BUDGET_S says otherwise (0 = no limit). Past it the
+#: rest are saved and listed on the review's Images sheet, not read: a
+#: workbook of photos held the Extract for over 10 minutes (2026-10-30)
+PICTURE_BUDGET_S = 120.0
+#: what an unread picture's note starts with when the budget ran out
+PICTURES_OUT_OF_TIME = "not read: the file's pictures took longer than"
+#: what a photo with nothing like a page in it says (counted as no text)
+PHOTO_NO_TEXT = ("(no text found) - a photo with no plain page or screen in it, "
+                 "not given to the reader")
+
+
+def picture_budget_s() -> float:
+    raw = os.environ.get("COUNCIL_LEDGER_PICTURE_BUDGET_S", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else PICTURE_BUDGET_S
+    except ValueError:
+        return PICTURE_BUDGET_S
+
+
+def read_photos() -> bool:
+    """COUNCIL_LEDGER_READ_PHOTOS=1: every picture goes to the reader, photos
+    too (looks_like_photo)."""
+    return os.environ.get("COUNCIL_LEDGER_READ_PHOTOS", "").strip() in ("1", "yes", "on")
+
+
+def looks_like_photo(data: bytes) -> bool:
+    """A photo of a part, a room, a person: no plain background a text sits
+    on. A page, a scan, a screenshot or a chart has one - most of its
+    pixels are one shade (paper, a window) - and is read. Told from a small
+    copy in a few milliseconds, where the reader took seconds to say there
+    was no text. When unsure (an odd file), not a photo: it is read."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if im.width * im.height < PHOTO_MIN_PIXELS:
+                return False                 # an icon, a crop of a label: read
+            im.draft("L", (256, 256))        # a JPEG decodes small, fast
+            small = im.convert("L")
+            small.thumbnail((256, 256))
+            hist = small.histogram()
+    except Exception:                                       # noqa: BLE001
+        return False
+    total = float(sum(hist)) or 1.0
+    # the share of the most common shade, in 16 bands of 16
+    bands = [sum(hist[i:i + 16]) for i in range(0, 256, 16)]
+    top = max(bands) / total
+    near = max(bands[i] + (bands[i + 1] if i + 1 < 16 else 0) for i in range(16)) / total
+    return top < PHOTO_MAX_BAND and near < PHOTO_MAX_BAND * 1.6
+
+
+#: a picture smaller than this (pixels) is always read
+PHOTO_MIN_PIXELS = 640 * 480
+#: a page's background holds more than this share of its pixels in one band
+PHOTO_MAX_BAND = 0.22
+
+
 def _for_ocr(data: bytes) -> bytes:
     """Greyscale, and small screenshots enlarged: Tesseract wants text about
     20-30 px high and misreads the 10-12 px of a pasted screenshot."""
@@ -3345,6 +3470,12 @@ def _for_ocr(data: bytes) -> bytes:
     if max(img.size) < 1600:
         k = 3 if max(img.size) < 800 else 2
         img = img.resize((img.width * k, img.height * k), Image.LANCZOS)
+    elif max(img.size) > OCR_MAX_SIDE:
+        # a camera's 12-megapixel photo: Tesseract took tens of seconds on
+        # each, and its text is no smaller at this size (2026-10-30)
+        k = OCR_MAX_SIDE / max(img.size)
+        img = img.resize((max(1, int(img.width * k)), max(1, int(img.height * k))),
+                         Image.LANCZOS)
     img = _strip_table_lines(img)
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -3848,7 +3979,8 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                     part_json = pool.result(
                         index[str(src)], beat=_wd.beat,
                         should_stop=(cancel.is_set if cancel is not None
-                                     else (lambda: False)))
+                                     else (lambda: False)),
+                        say=prog.update)
                 except ledger_workers.Stopped:
                     run.model_parts.pop(label, None)
                     run.cancelled = True
@@ -3966,6 +4098,9 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         skip = {id(g) for g in unrelated}
         grids = [g for g in grids if id(g) not in skip]
         run.unrelated.extend(f"{g.file} › {g.sheet}" for g in unrelated)
+    budget = picture_budget_s() if reader is not None else 0.0
+    pictures_from = _time.monotonic()
+    out_of_time = 0
     for i, img in enumerate(images):
         if cancel is not None and cancel.is_set():
             raise _Cancelled()
@@ -4016,7 +4151,17 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             note.text = f"not read: {vector}"
             run.images.append(note)
             continue
-        if reader is not None:
+        if reader is not None and budget and _time.monotonic() - pictures_from > budget:
+            # the rest are saved and listed, not read: one workbook of
+            # photos held the whole Extract (2026-10-30)
+            note.reader = getattr(reader, "name", "image reader")
+            note.text = (f"{PICTURES_OUT_OF_TIME} {budget:.0f} s to read; this one is saved, "
+                         "not read (Diagnose a file… reads the file alone)")
+            out_of_time += 1
+        elif reader is not None and not read_photos() and looks_like_photo(img.data):
+            note.reader = getattr(reader, "name", "image reader")
+            note.text = PHOTO_NO_TEXT
+        elif reader is not None:
             note.reader = getattr(reader, "name", "image reader")
             try:
                 rows = reader(img.data)
@@ -4033,6 +4178,11 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
             note.text = ("not read: install Tesseract (local OCR) to read images - Models tab, "
                          "Install Tesseract")
         run.images.append(note)
+    if out_of_time:
+        run.problems.append(
+            f"{src.name}: {out_of_time} of {len(images)} pictures not read - its pictures "
+            f"took longer than {budget:.0f} s (COUNCIL_LEDGER_PICTURE_BUDGET_S); they are "
+            "saved and listed on the review's Images sheet")
 
     layout = getattr(m, "layout", None)
     if layout:

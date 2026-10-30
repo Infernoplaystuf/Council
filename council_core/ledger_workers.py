@@ -196,15 +196,17 @@ class _Steps:
     """The progress a file's read reports: what it advanced, said again by
     the Ledger as the file's result is put in."""
 
-    def __init__(self, beat: Callable[[], None]):
+    def __init__(self, beat: Callable[..., None]):
         self.done: List[str] = []
         self._beat = beat
 
     def stage(self, *a, **k) -> None:
         self._beat()
 
-    def update(self, *a, **k) -> None:
-        self._beat()
+    def update(self, what: str = "", *a, **k) -> None:
+        # what it is doing now ('book.xlsx: picture 3 of 40'), for the
+        # Ledger to show while it waits for this file (Pool.result)
+        self._beat(what)
 
     def advance(self, n: int = 1, what: str = "") -> None:
         self.done.append(what)
@@ -219,10 +221,16 @@ def _job(setup: _Setup, src: str, label: str, send: Callable[[Dict[str, Any]], N
          job: int) -> Dict[str, Any]:
     import source_extract as se
     last = [0.0]
+    said = [""]
 
-    def beat() -> None:
+    def beat(what: str = "") -> None:
+        # a beat a second, and what it is doing each time that changes
+        # ('picture 3 of 40'): a plain beat just before must not swallow it
         now = time.monotonic()
-        if now - last[0] >= 1.0:
+        if what and what != said[0]:
+            last[0], said[0] = now, what
+            send({"beat": job, "what": what})
+        elif now - last[0] >= 1.0:
             last[0] = now
             send({"beat": job})
     steps = _Steps(beat)
@@ -378,6 +386,10 @@ class Pool:
         env["COUNCIL_LEDGER_WORKER_ADDRESS"] = str(self._listener.address)
         env["COUNCIL_LEDGER_WORKER_KEY"] = self._key.hex()
         env.pop("COUNCIL_LEDGER_WORKERS", None)
+        # one core for each helper's Tesseract: four of them, each starting a
+        # thread per core, read a workbook of photos slower than one did
+        # (2026-10-30)
+        env.setdefault("OMP_THREAD_LIMIT", "1")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             proc = subprocess.Popen(start_command(), env=env, stdin=subprocess.DEVNULL,
@@ -475,9 +487,12 @@ class Pool:
             self._start_one()
 
     def result(self, i: int, beat: Callable[[], None] = lambda: None,
-               should_stop: Callable[[], bool] = lambda: False) -> Optional[Dict[str, Any]]:
+               should_stop: Callable[[], bool] = lambda: False,
+               say: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
         """Job i's result (None: the Ledger reads it). Raises ``Stopped``
-        when ``should_stop()`` says so while it waits."""
+        when ``should_stop()`` says so while it waits. ``say``: what job i's
+        helper is doing meanwhile ('picture 3 of 40'): the Ledger's progress
+        stood on one line while a workbook of photos was read (2026-10-30)."""
         self._want = i
         self._dispatch()
         while i not in self.results:
@@ -499,6 +514,8 @@ class Pool:
                 continue
             beat()
             if "beat" in msg or "ready" in msg:
+                if say is not None and msg.get("what") and msg.get("beat") == i:
+                    say(msg["what"])
                 continue
             j = msg.get("done", msg.get("ledger"))
             if j is None:

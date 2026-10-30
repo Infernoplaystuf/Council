@@ -104,3 +104,19 @@ network: nothing on the Ledger's path goes online.
 
 Tests: `tests/test_ledger_stall_fixes.py` (`test_a_long_log_*`,
 `test_each_row_of_a_long_log_tried_as_a_header_*`, `test_a_csv_too_big_*`).
+
+## Follow-up: parts' tables side by side (2026-10-30)
+
+User: "many tables being in the file on the same sheet that belong to
+different parts", then "yes" to accepting values directly under their own
+Part Number. A sheet whose part labels shared a row sent every value to
+review ("more than one part on the sheet": 160 tables, 5,920 of 5,920).
+
+`_Extractor._part_grid_blocks` (from `_part_blocks`, when two labels of
+different parts share a row): a label's block is the columns from it to the
+next label column on the right, and the rows down to the next label in those
+columns; `part_at` takes the nearest label column at or left of a value,
+then the nearest label above in it. The blocks are sure, and pre-accepted,
+unless a 'TBD' block holds readings or a label's row holds other text in its
+own columns (a title). `test_ledger_real_layouts.py`'s `same_row` case now
+expects acceptance. Tests: `tests/test_ledger_part_grid.py`.
