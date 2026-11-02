@@ -5,7 +5,7 @@ THE THING THIS TAB IS NOT
 It does not change the PINS. `personality_backends.json` maps a role to a
 backend key, and nothing in the Models tab writes it. What this tab changes is
 the GGUF PATH — the one file behind every backend key — through
-`onboarding.save_gguf_path` plus `council_engine.refresh_backend_config`.
+`backend_settings.save_gguf_path` plus `council_engine.refresh_backend_config`.
 
 Those are different operations with different live-reload behaviour, and
 conflating them is easy: a path change takes effect on the next chat call,
@@ -549,8 +549,8 @@ def download_and_switch(row: ModelRow, vault_dir: Any, *,
         return SwitchResult(False, "The download did not produce a file.")
 
     try:
-        import onboarding
-        not_saved = onboarding.save_gguf_path(vault_dir, str(path))
+        from . import backend_settings
+        not_saved = backend_settings.save_gguf_path(vault_dir, str(path))
         import council_engine
         council_engine.refresh_backend_config()
     except Exception as exc:                              # noqa: BLE001

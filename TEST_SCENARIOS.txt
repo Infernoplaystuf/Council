@@ -164,7 +164,7 @@ J. USABILITY FEATURES (2026-06-30 batch)                                    [D]
 [ ] J42  [D] After a data answer, "Sources (click to preview)" chips appear;
          clicking one opens a schema + first-rows PREVIEW (no model); the
          preview's "Open containing folder" reveals the file.
-[ ] J43  [D] Force an error (e.g. tiny COUNCIL_GGUF_N_CTX so a query overflows)
+[ ] J43  [D] Force an error (e.g. a query too long for the model's window)
          → friendly guidance + a one-click fix chip (Open Engine settings /
          Switch to CPU / Open Models), NOT a raw traceback.
 [ ] J44  [D] Vault tab → "🔍 Find files" → type a name or a value → results list;

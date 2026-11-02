@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QApplication
 
 from council_core import paths, startup
 
-from . import theme
+from . import gui_gc, theme
 from .splash import NoSplash, show_splash
 from .window import CouncilWindow
 
@@ -64,6 +64,9 @@ def build(argv: Optional[list] = None, *,
     _apply_engine_settings(vault)
 
     app = QApplication.instance() or QApplication(list(argv or sys.argv))
+    # Before the first worker: garbage (a widget among it) collected on a
+    # worker thread hung the launch - see gui_gc.
+    gui_gc.install(app)
     theme.apply(app, "dark")
 
     # NOTHING SLOW BEFORE THE FIRST PIXEL. The readiness check can ask a
@@ -226,11 +229,8 @@ def _show(window) -> None:
 def _schedule_onboarding(window, vault, decided) -> None:
     """After the window, because it opens a modal and a modal needs a parent.
 
-    THE WIZARD ITSELF IS NOT PORTED YET. `onboarding.run_if_needed` takes a
-    tk.Tk parent, so calling it with a QMainWindow would raise into an except
-    and report "skipped" — which reads as a decision rather than as a gap.
-
-    So until a Qt wizard exists, this SAYS what is unconfigured and where to
+    THERE IS NO SETUP WIZARD. The Tk one was retired with the Tk shell and
+    never ported. So until a Qt wizard exists, this SAYS what is unconfigured and where to
     fix it. A user left silently without a model gets an app whose every
     answer is "no judge model is loaded", and no idea why.
 

@@ -455,14 +455,41 @@ BUILDERS = [build_record, ec_stacked, ec_side_by_side, ec_by_sheet, ec_long_log,
 
 # ── workbooks only Excel makes (and only Excel opens): .xls, .xlsb, a text
 #    box, a chart, a password. Built when Excel automation is available. ──
+def _excel_pid(app, tries: int = 40) -> Optional[int]:
+    """The process id of the Excel behind `app`, from its window - asked
+    again for a moment while Excel refuses calls (a dialog of its own up)."""
+    import time
+    try:
+        import win32process
+    except ImportError:
+        return None
+    for _ in range(tries):
+        try:
+            return int(win32process.GetWindowThreadProcessId(int(app.Hwnd))[1]) or None
+        except Exception:                                   # noqa: BLE001
+            time.sleep(0.05)
+    return None
+
+
 def _excel_save(src: Path, out: Path, fmt: int, password: str = "", edit=None):
     """Open an openpyxl-made workbook in a hidden Excel, optionally edit it
     (add a text box / chart), and save it as `fmt` (56 xls, 50 xlsb, 52 xlsm,
-    51 xlsx)."""
+    51 xlsx).
+
+    Its Excel dies with this process (excel_open.tie_to_this_process) and is
+    ended by its process id when it will not Quit: an Excel refusing every
+    call ('Call was rejected by callee' - its license agreement waiting, a
+    VISIBLE dialog) stayed running after a test, one per workbook, each
+    showing that dialog on the user's desktop (review, 2026-10-19)."""
+    import subprocess
     import pythoncom
     from win32com.client import DispatchEx
+    import excel_open
     pythoncom.CoInitialize()
     app = DispatchEx("Excel.Application")
+    pid = _excel_pid(app)
+    if pid:
+        excel_open.tie_to_this_process(pid)
     try:
         app.Visible = False
         app.DisplayAlerts = False
@@ -478,7 +505,13 @@ def _excel_save(src: Path, out: Path, fmt: int, password: str = "", edit=None):
             wb.SaveAs(str(out.resolve()), FileFormat=fmt)
         wb.Close(SaveChanges=False)
     finally:
-        app.Quit()
+        try:
+            app.Quit()
+        except Exception:                                   # noqa: BLE001
+            if pid:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               capture_output=True, check=False, timeout=10)
+        app = None
         pythoncom.CoUninitialize()
     src.unlink()
 

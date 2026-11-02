@@ -53,6 +53,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import token_budget
 from .confidence import HIGH as _cf_HIGH, LOW as _cf_LOW, \
     VERY_LOW as _cf_VERY_LOW
 
@@ -1060,7 +1061,8 @@ class DeliberationOrchestrator:
                         "Produce your rebuttal now.",
                         extra_context=_rebuttal_context(key),
                         token_callback=self.agents[key]._make_token_cb(),
-                        max_tokens=600,  # rebuttals must be concise bullets, not essays
+                        # concise bullets, not essays: a short reply, grown on a big model
+                        max_tokens=token_budget.reply("short", 600),
                         think=THINK["rebuttal"],
                     )
 
@@ -1159,7 +1161,7 @@ class DeliberationOrchestrator:
                             "Post your cross-fire message now.",
                             extra_context=_cf_context(turn),
                             token_callback=self.agents[key]._make_token_cb(),
-                            max_tokens=400,  # cross-fire must be tight
+                            max_tokens=token_budget.reply("short", 400),  # tight
                             think=THINK["cross_fire"],
                         )
 
@@ -1324,7 +1326,8 @@ class DeliberationOrchestrator:
                             self.agents["peasant"].model,
                             "State your adversarial challenge now.",
                             extra_context=_adv_ctx,
-                            max_tokens=300, think=THINK["adversarial"],
+                            max_tokens=token_budget.reply("short", 300),
+                            think=THINK["adversarial"],
                         )
                         ctx.shared["adversarial_challenge"] = _adversarial_challenge
                         ctx.shared["adversarial_target"] = _winner_role

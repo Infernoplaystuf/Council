@@ -287,6 +287,48 @@ def bounded(schema: Dict[str, Any], *, max_items: int = 64,
     return out
 
 
+def _literal_safe(x: Any) -> bool:
+    """True when ``x`` can be a literal in llama-cpp-python's grammar: its
+    JSON text has no backslash. The converter (SchemaConverter._format_literal,
+    0.3.36) escapes quote marks but not backslashes, so a value holding a
+    quote mark, a backslash or a control character becomes a literal llama.cpp
+    cannot parse ("expecting newline or end"; Ledger labels such as '"Vw'
+    and '.100"', 2026-10-23)."""
+    return "\\" not in json.dumps(x, ensure_ascii=False)
+
+
+def grammar_safe(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of ``schema`` the grammar converter can compile: an enum or
+    const with a value it would write wrongly (_literal_safe) is dropped, so
+    that value is a plain string/number in the grammar. The reply is still
+    checked against the full schema afterwards (validate), and callers read
+    such answers leniently; a schema with nothing to drop comes back equal."""
+    out = copy.deepcopy(schema)
+
+    def walk(s: Any) -> None:
+        if isinstance(s, list):
+            for x in s:
+                walk(x)
+            return
+        if not isinstance(s, dict):
+            return
+        if "enum" in s and not all(_literal_safe(x) for x in s["enum"]):
+            del s["enum"]
+        if "const" in s and not _literal_safe(s["const"]):
+            del s["const"]
+        for key in ("properties", "$defs", "definitions"):
+            if isinstance(s.get(key), dict):
+                for sub in s[key].values():
+                    walk(sub)
+        for key in ("items", "additionalProperties", "anyOf", "oneOf",
+                    "allOf", "prefixItems"):
+            if key in s:
+                walk(s[key])
+
+    walk(out)
+    return out
+
+
 def worst_case_chars(schema: Any, _depth: int = 0) -> Optional[int]:
     """Characters of the longest minified value ``schema`` allows, or None
     when something in it is unbounded (an array without maxItems, a string

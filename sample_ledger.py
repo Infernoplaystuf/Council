@@ -194,9 +194,21 @@ class TemplateSchema:
 
 
 def normalize_label(text: str) -> str:
-    """'Laser Power (W):' -> 'laser power'. Used to match source labels."""
-    text = _UNIT_RE.sub(r"\1", str(text).strip()) or str(text)
-    text = re.sub(r"[:#*]+$", "", text.strip())
+    """'Laser Power (W):' -> 'laser power'. Used to match source labels.
+
+    Runs of whitespace are collapsed BEFORE the unit pattern: its lazy
+    '(.*?)' then '\\s*' backtracked over every space, so a cell padded to
+    Excel's 32,767 characters held the GIL for 2.5-3.8 s per call and froze
+    the app for 10-14 s (end-to-end test, 2026-10-19). The result is the
+    same: the last step folds every non-alphanumeric run anyway. The marks
+    at the end are stripped, not matched: '[:#*]+$' rescanned a cell of
+    32,000 ':' or '*' from each of them for 2 s (review, 2026-10-20)."""
+    text = " ".join(str(text).split())
+    # the unit is the last 26 characters at most (one space each side of its
+    # brackets): read there, not tried from every bracket of a long cell
+    head, tail = text[:-40], text[-40:]
+    text = (head + _UNIT_RE.sub(r"\1", tail)) or text
+    text = text.strip().rstrip(":#*")
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
@@ -205,6 +217,7 @@ def _clean(label: str) -> str:
 
 
 def _split_unit(label: str) -> Tuple[str, str]:
+    label = " ".join(str(label).split())          # see normalize_label
     m = _UNIT_RE.match(label)
     return (m.group(1).strip(), m.group(2).strip()) if m and m.group(1) else (label, "")
 
@@ -212,6 +225,22 @@ def _split_unit(label: str) -> Tuple[str, str]:
 def _looks_like_id(label: str) -> bool:
     low = label.lower()
     return any(re.search(p, low) for p in _ID_PATTERNS)
+
+
+#: What a workbook cell cannot hold (openpyxl's ILLEGAL_CHARACTERS_RE):
+#: control characters other than tab and line breaks.
+_ILLEGAL_XL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+")
+
+
+def xl_text(v):
+    """`v` with the control characters a workbook cell cannot hold put as
+    a space (and trimmed): text pasted from another system ('Remark' +
+    CHAR(1)) read through Excel made openpyxl raise IllegalCharacterError,
+    and the whole extract wrote no review (review, 2026-10-20). Anything
+    that is not text is returned as it is."""
+    if not isinstance(v, str) or not _ILLEGAL_XL.search(v):
+        return v
+    return _ILLEGAL_XL.sub(" ", v).strip()
 
 
 def _text(v) -> str:
@@ -302,14 +331,19 @@ class _SheetReader:
         self.vals: Dict[Tuple[int, int], object] = {}
         self.text: Dict[Tuple[int, int], str] = {}
         sizes: Counter = Counter()
-        for row in ws.iter_rows():
-            for c in row:
-                if c.value in (None, ""):
-                    continue
-                self.vals[(c.row, c.column)] = c.value
-                if isinstance(c.value, str) and not c.value.startswith("="):
-                    self.text[(c.row, c.column)] = c.value.strip()
-                    sizes[c.font.sz or 11] += 1
+        # the cells the sheet has, not every position in its dimension: one
+        # formatted cell at the sheet's far corner made millions (review,
+        # 2026-10-19)
+        store = getattr(ws, "_cells", None)
+        existing = ([cell for _rc, cell in sorted(store.items())] if isinstance(store, dict)
+                    else [c for row in ws.iter_rows() for c in row])
+        for c in existing:
+            if c.value in (None, ""):
+                continue
+            self.vals[(c.row, c.column)] = c.value
+            if isinstance(c.value, str) and not c.value.startswith("="):
+                self.text[(c.row, c.column)] = c.value.strip()
+                sizes[c.font.sz or 11] += 1
         body = sizes.most_common(1)[0][0] if sizes else 11
         self.headings = sorted(
             (rc for rc, v in self.text.items()
@@ -608,6 +642,7 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
     written: Dict[Tuple[str, str], str] = {}
 
     def put(f: TemplateField, item: str, value) -> None:
+        value = xl_text(value)          # a parent CSV may hold CHAR(1)
         if value in (None, ""):
             return
         ws = wb[f.sheet] if f.sheet in wb.sheetnames else wb.worksheets[0]
@@ -627,8 +662,105 @@ def fill_template(schema: TemplateSchema, rows: List[Dict[str, str]], out_path,
         for f in schema.fields:
             if f.per_item and item in f.cells:
                 put(f, item, row.get(f.name))
+    # so a recursive source scan knows this is the Ledger's own output, not
+    # an inspection workbook (review, 2026-10-19)
+    # No last-saved-by: Excel writes one when a person saves the copy, and a
+    # copy someone kept typing into is read again (is_filled_template).
+    mark_filled(wb)
     wb.save(out_path)
     return warnings
+
+
+#: The keyword a filled template carries in its document properties.
+FILLED_MARK = "council-ledger-filled-template"
+#: After the mark: a fingerprint of every cell the workbook held when the
+#: Ledger saved it ('council-ledger-filled-template cells:1f3a…').
+_FP_KEY = "cells:"
+
+
+def _fp_value(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))                 # 285.0 and 285: one value
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def cells_fingerprint(wb) -> str:
+    """Every non-empty cell of every sheet - its sheet, place and value -
+    hashed. The same for a workbook loaded normally or read-only."""
+    import hashlib
+    h = hashlib.sha256()
+    for ws in wb.worksheets:
+        h.update(f"\x00{ws.title}\x00".encode("utf-8"))
+        for row in ws.iter_rows():
+            for c in row:
+                v = getattr(c, "value", None)
+                if v is None or v == "" or not hasattr(c, "row"):
+                    continue
+                h.update(f"{c.row},{c.column}={_fp_value(v)}\n".encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def mark_filled(wb) -> None:
+    """Mark a workbook the Ledger wrote, just before it is saved: the mark,
+    a fingerprint of its cells, and no last-saved-by. A scan leaves it out
+    while its cells are the Ledger's; once anyone has typed into it - in
+    Excel, LibreOffice, a script, anything - its cells differ and it is
+    read again (_filled_state). Only Excel's last-saved-by told before, so
+    a copy edited elsewhere was left out (synthetic test, 2026-10-27)."""
+    try:
+        wb.properties.keywords = f"{FILLED_MARK} {_FP_KEY}{cells_fingerprint(wb)}"
+        wb.properties.lastModifiedBy = None
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _filled_state(p) -> str:
+    """'' (not filled by the Ledger), 'filled', or 'edited': filled, then
+    changed by someone: Excel's last-saved-by is set (the Ledger leaves it
+    out), or - whatever program saved it - its cells are no longer the
+    ones fingerprinted when the Ledger wrote it (mark_filled)."""
+    import zipfile
+    p = Path(p)
+    if p.suffix.lower() not in (".xlsx", ".xlsm"):
+        return ""
+    try:
+        with zipfile.ZipFile(p) as z:
+            core = z.read("docProps/core.xml")
+    except Exception:
+        return ""
+    if FILLED_MARK.encode() not in core:
+        return ""
+    m = re.search(rb"<cp:lastModifiedBy>([^<]*)</cp:lastModifiedBy>", core)
+    if m and m.group(1).strip():
+        return "edited"                      # Excel says someone saved it
+    fp = re.search(rb"%s([0-9a-f]{8,64})" % _FP_KEY.encode(), core)
+    if fp:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(p, read_only=True)
+            try:
+                now = cells_fingerprint(wb)
+            finally:
+                wb.close()
+        except Exception:                                   # noqa: BLE001
+            return "edited"                  # cannot tell: read it, never skip it
+        return "filled" if now == fp.group(1).decode() else "edited"
+    return "filled"
+
+
+def is_filled_template(p) -> bool:
+    """A template the Ledger filled (fill_template) and nobody saved since,
+    told from its document properties without opening the workbook. One a
+    person kept typing into is a source again (synthetic test, 2026-10-27:
+    such copies were left out of a folder scan)."""
+    return _filled_state(p) == "filled"
+
+
+def is_edited_filled_template(p) -> bool:
+    """A template the Ledger filled that someone saved since (read again)."""
+    return _filled_state(p) == "edited"
 
 
 def _typed(v):
@@ -755,7 +887,9 @@ class ParentCSV:
         """Merge rows in by key, then save in sample order.
 
         Row keys may be the CSV header or any spelling that normalizes the
-        same ('laser power' for 'Laser Power (W)')."""
+        same ('laser power' for 'Laser Power (W)'). A row's own source_file,
+        when it has one, is written for it instead of `source` (the
+        workbooks its values came from - source_extract.rows_from)."""
         res = AddResult()
         # a fuzzy spelling finds a template column, never one person's copy of it
         by_name = {normalize_label(c): c for c in self.columns
@@ -766,6 +900,7 @@ class ParentCSV:
 
         for incoming in rows:
             mapped: Dict[str, str] = {}
+            src = xl_text(_text(incoming.get(SOURCE_COL))) or source
             for k, v in incoming.items():
                 if self.schema and self.schema.inspector_base(str(k)):
                     # exact only: normalize_label reads "[JB]" as a unit and
@@ -780,8 +915,9 @@ class ParentCSV:
                     if str(k) not in res.unknown_columns:
                         res.unknown_columns.append(str(k))
                     continue
-                if col not in META_COLS and _text(v) != "":
-                    mapped[col] = _text(v)
+                # as the review shows it: no control character (xl_text)
+                if col not in META_COLS and xl_text(_text(v)) != "":
+                    mapped[col] = xl_text(_text(v))
             key = self._key(mapped)
             label = " / ".join(mapped.get(k, "") for k in self.keys)
             if not all(key):
@@ -791,7 +927,7 @@ class ParentCSV:
             if existing is None:
                 row = {c: "" for c in self.columns}
                 row.update(mapped)
-                row[SOURCE_COL], row[UPDATED_COL] = source, now
+                row[SOURCE_COL], row[UPDATED_COL] = src, now
                 self.rows.append(row)
                 index[key] = row
                 res.added.append(label)
@@ -807,7 +943,7 @@ class ParentCSV:
                 else:
                     res.conflicts.append((label, col, old, val))
             if changed:
-                existing[SOURCE_COL], existing[UPDATED_COL] = source, now
+                existing[SOURCE_COL], existing[UPDATED_COL] = src, now
                 res.updated.append(label)
             else:
                 res.unchanged.append(label)

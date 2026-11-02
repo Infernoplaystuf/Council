@@ -1,9 +1,9 @@
 """
 The splash: the artwork, and the three behaviours it learned the hard way.
 
-The geometry is asserted against the Tk original point for point, because the
-whole claim of the extraction is that it is the SAME drawing and not a redraw
-that happens to look similar.
+The geometry was checked against the Tk original point for point while that
+existed; the Tk splash was retired with the Tk shell (2026-10-23), and the
+shape checks below stay.
 """
 from __future__ import annotations
 
@@ -32,22 +32,8 @@ def test_the_artwork_imports_no_toolkit():
 
 
 # ============================================================
-# It is the same drawing, not a redraw
+# The drawing
 # ============================================================
-
-def test_the_cog_is_point_for_point_the_tk_one():
-    import splash as tk_splash
-    for rotation in (0.0, 0.7, math.pi, 4.2):
-        assert art.cog_points(180, 180, 150, 130, 16, rotation) == \
-            tk_splash._cog_points(180, 180, 150, 130, 16, rotation)
-
-
-def test_the_flame_is_point_for_point_the_tk_one():
-    import splash as tk_splash
-    for jitter in (0.0, 1.5, -2.0):
-        assert art.flame_points(180, 210, 46, 80, jitter) == \
-            tk_splash._flame_points(180, 210, 46, 80, jitter)
-
 
 def test_a_tooth_is_four_points_not_a_star():
     """Two points a tooth gives a star. Four gives a gear, which is the whole

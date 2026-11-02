@@ -7,12 +7,11 @@
 #   • activates the council conda env
 #   • finds a .gguf model in ~/models, ~/Downloads, ./models
 #   • exports COUNCIL_BACKEND=gguf and sensible defaults
-#   • launches the Tkinter GUI
+#   • launches the app (council_qt.py)
 #   • falls back to CPU offload if the GPU launch SIGILLs
 #
 # Usage:
 #   ./run-linux.sh
-#   ./run-linux.sh --tk          # the classic Tk UI
 #   ./run-linux.sh --advanced    # any other argument goes to the app
 #   COUNCIL_GGUF_PATH=~/models/granite-3.1-8b.gguf ./run-linux.sh
 #   COUNCIL_GGUF_GPU_LAYERS=0 ./run-linux.sh   # force CPU
@@ -98,10 +97,11 @@ cd "$SCRIPT_DIR"
 say "GPU layers: $COUNCIL_GGUF_GPU_LAYERS"
 [ -n "${COUNCIL_GGUF_PATH:-}" ] && say "model: $COUNCIL_GGUF_PATH"
 
-# Which UI: the Qt app by default; the classic Tk app with --tk or
-# COUNCIL_UI=tk, or automatically when PySide6 is not installed.
-# --tk is the launcher's own, wherever it is on the line; every OTHER argument
-# is the app's (--advanced, ...) and is passed on, in order, as typed. They
+# The UI is the Qt app (council_qt.py). The classic Tk app that --tk and
+# COUNCIL_UI=tk used to pick, and that started when PySide6 was missing, was
+# retired 2026-10-23. --tk is still the launcher's own, wherever it is on the
+# line, so an old shortcut still starts the app; it only says so. Every OTHER
+# argument is the app's (--advanced, ...) and is passed on, in order, as typed. They
 # used to be dropped: only $1 was looked at and the app was started with no
 # arguments, so `./run-linux.sh --advanced` opened the default build.
 APP_ARGS=()
@@ -112,11 +112,11 @@ for arg in "$@"; do
     esac
 done
 COUNCIL_ENTRY=council_qt.py
-[ "${COUNCIL_UI:-}" = "tk" ] && COUNCIL_ENTRY=council_gui_engine.py
-if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/null 2>&1; then
-    warn "PySide6 is not installed in this environment, so the classic Tk UI is starting."
-    warn "For the new UI:  python -m pip install PySide6"
-    COUNCIL_ENTRY=council_gui_engine.py
+if [ "${COUNCIL_UI:-}" = "tk" ]; then
+    warn "The classic Tk UI was retired; starting the Qt app."
+fi
+if ! python -c "import PySide6" >/dev/null 2>&1; then
+    die "PySide6 is not installed in this environment, and the app needs it. Install it:  python -m pip install PySide6"
 fi
 say "launching $COUNCIL_ENTRY ..."
 # ${APP_ARGS[@]+...}: under `set -u`, a bare "${APP_ARGS[@]}" of an EMPTY

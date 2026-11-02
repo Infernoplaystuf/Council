@@ -63,7 +63,7 @@ def test_ec_remains_a_valid_initial_pair():
 
 # -------------------------------------------- unit labels
 
-@pytest.mark.parametrize("raw", ["PSI", "KW", "MW", "HZ", "RPM", "IPM",
+@pytest.mark.parametrize("raw", ["PSI", "KHZ", "MHZ", "RPM", "IPM",
                                  "DEG", "SEC", "MIN", "MAX", "AVG",
                                  "STD", "PPM"])
 def test_unit_labels_are_not_initials(raw):
@@ -72,6 +72,13 @@ def test_unit_labels_are_not_initials(raw):
     initials. The user who turns up a vault with unit-only two-letter
     column headers can add them to the stop-list in a follow-up."""
     assert not is_initials(raw), raw
+
+
+@pytest.mark.parametrize("raw", ["MW", "KW", "HZ", "MM", "LB"])
+def test_two_letter_units_that_are_also_initials_stay_initials(raw):
+    """Mark Williams signs 'MW': listing it as a unit made him a person
+    called 'MW' and dropped him from 'JB/MW' (review, 2026-10-19)."""
+    assert is_initials(raw), raw
 
 
 # -------------------------------------------- outcome words still rejected

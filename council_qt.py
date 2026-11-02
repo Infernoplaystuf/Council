@@ -1,14 +1,12 @@
 """
-council_qt.py — the Qt entry point, and the app the run-* launchers start.
-The Tk one (council_gui_engine.py) is untouched and still runs: the launchers
-use it with --tk / COUNCIL_UI=tk, or when PySide6 is not installed, and the
-.exe build still packages it.
+council_qt.py — the Council's entry point: the app the run-* launchers start
+and the .exe build packages. (The Tk shell it replaced was retired 2026-10-23.)
 
     python council_qt.py
 
-Both entry points read the same vault and the same engine, so run ONE at a time.
-There is no single-instance guard in this project yet (there never was), and two
-copies would mean two chromadb clients on one store and two GGUF loads.
+Run ONE copy at a time. There is no single-instance guard in this project yet
+(there never was), and two copies would mean two chromadb clients on one store
+and two GGUF loads.
 
 The startup chain — crash hooks, splash, reveal, onboarding — lives in
 `council_qt.launch`, over the decisions in `council_core.startup`. It is out of
@@ -31,6 +29,11 @@ def main() -> int:
     # (council_core.memory_scope.pin_launch_environment).
     from council_core import memory_scope
     memory_scope.pin_launch_environment()
+    # A helper of the Ledger's Extract in the built app (the same exe, started
+    # by council_core.ledger_workers): no window, no Qt, only the reading
+    if len(sys.argv) > 1 and sys.argv[1] == "--ledger-worker":
+        from council_core.ledger_workers import main as ledger_worker
+        return ledger_worker()
 
     # The main model, before anything can import council_engine. The run-*
     # launchers export the FIRST *.gguf they find when COUNCIL_GGUF_PATH is
@@ -41,13 +44,13 @@ def main() -> int:
     # the rest of the startup chain: the app still opens on the guess (and the
     # Models tab can fix it) if this cannot run.
     try:
-        import onboarding
-        onboarding.apply_saved_gguf_path()
+        from council_core import backend_settings
+        backend_settings.apply_saved_gguf_path()
     except Exception as exc:                              # noqa: BLE001
         # apply_saved_gguf_path drops COUNCIL_GGUF_PATH_AUTO whatever it
-        # decides; this path is the one where it never ran (onboarding did
-        # not import). Dropped here too, by its literal name since onboarding
-        # may be what failed: left in os.environ, every child the app spawns
+        # decides; this path is the one where it never ran (backend_settings
+        # did not import). Dropped here too, by its literal name, since that
+        # import may be what failed: left in os.environ, every child the app spawns
         # inherits it, and a `python council_qt.py` started from that
         # environment treats the path it was handed as a launcher's guess
         # and swaps in the saved model.
@@ -104,23 +107,51 @@ def _register_tabs(window) -> None:
     # The grouped layout, if Council has delivered profiles.py. It is wired
     # BEFORE any tab registers so the first add_tab call can place its page
     # inside a group.
+    #
+    # Two gates are deliberate here:
+    # (1) ``load_or_migrate`` only runs when profiles.py is present. The flat
+    #     fallback must not write ``{"ui":{"profile":"full"}}`` to disk — the
+    #     next ``modes.advanced()`` call reads that back as True and turns on
+    #     six advanced tabs for every user who never asked (committing the
+    #     vault to git, SSHing into a Pi, rewriting the model registry).
+    # (2) The grouped-controller setup is wrapped in try/except: a broken
+    #     profiles.py contract takes the LAUNCH down otherwise.
     profiles_mod = group_tabs.try_import_profiles()
-    ui_section, notice = ui_settings.load_or_migrate()
+    ui_section = None
+    notice = None
     if profiles_mod is not None:
-        controller = group_tabs.GroupedTabsController(window, profiles_mod)
-        window.install_grouped_layout(controller)
-        controller.apply_profile_state(ui_section)
-        if notice:
-            controller.show_once_notice(notice)
+        try:
+            ui_section, notice = ui_settings.load_or_migrate()
+            controller = group_tabs.GroupedTabsController(window, profiles_mod)
+            window.install_grouped_layout(controller)
+            controller.apply_profile_state(ui_section)
+            if notice:
+                controller.show_once_notice(notice)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[council_qt] grouped layout setup failed, falling back "
+                  f"to the flat shell: {exc!r}", flush=True)
+            window.grouped = None
+            ui_section = None
 
     # Advanced mode ADDS tabs; it does not unlock a setting. The six behind it
     # commit the vault to git, SSH into a Pi, or rewrite the model registry.
-    for title, factory, eager in registry(advanced=modes.advanced()):
+    #
+    # With the grouped controller installed, we register them unconditionally
+    # and let the profile filter hide them — otherwise a runtime
+    # Demo → Developer switch cannot show them.
+    # In the flat fallback, we use the Tk-era env/CLI gate only; the profile
+    # file is deliberately not consulted here (see (1) above).
+    if window.grouped is not None:
+        show_advanced = True
+    else:
+        show_advanced = modes.advanced_env_or_cli()
+
+    for title, factory, eager in registry(advanced=show_advanced):
         tab_id = _tab_id_of(factory)
         window.add_tab(title, lambda f=factory, w=window: f(w),
                        eager=eager, tab_id=tab_id)
 
-    if window.grouped is not None:
+    if window.grouped is not None and ui_section is not None:
         # Re-apply once every tab has registered so empty groups auto-hide
         # with their real inner counts.
         window.grouped.apply_profile_state(ui_section)

@@ -34,8 +34,7 @@ from tests.test_saved_model_path import (ROOT, _NO_WINDOW, _prepare_bat,
 _ARGV_ENTRY = """\
 import json, os, sys
 argv = list(sys.argv)
-names = ("council_qt.py", "council_gui_engine.py")
-if os.path.basename(argv[0]) in names:
+if os.path.basename(argv[0]) == "council_qt.py":
     entry, args = os.path.basename(argv[0]), argv[1:]
 else:
     entry, args = os.path.basename(argv[1]), argv[2:]
@@ -66,14 +65,16 @@ def test_bat_passes_advanced_to_the_app(tmp_path):
 
 @win_only
 def test_bat_keeps_its_own_flags_and_passes_the_rest(tmp_path):
-    """--tk is the launcher's, wherever it is on the line; it picks the entry
-    and is not handed on. Everything else is, in order."""
+    """--tk is the launcher's, wherever it is on the line, and is not handed
+    on. It used to pick the Tk app; that was retired (2026-10-23), so the Qt
+    app starts and the launcher says why. Everything else is, in order."""
     proc, out = _run_bat(tmp_path, "--advanced", "--tk", "--verbose",
                          entry_src=_ARGV_ENTRY)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     got = _started(out)
-    assert got == {"entry": "council_gui_engine.py",
+    assert got == {"entry": "council_qt.py",
                    "args": ["--advanced", "--verbose"]}
+    assert "Tk UI was retired" in proc.stdout
 
 
 @win_only
@@ -145,7 +146,7 @@ def test_bat_finds_its_own_flags_past_an_empty_argument(tmp_path):
     proc, out = _run_bat_line(tmp_path, '--advanced "" --TK')
     assert proc.returncode == 0, proc.stdout + proc.stderr
     got = _started(out)
-    assert got["entry"] == "council_gui_engine.py", got
+    assert got["entry"] == "council_qt.py", got
     assert "--TK" not in got["args"] and "--tk" not in got["args"], got
     assert got["args"][0] == "--advanced", got
 
@@ -198,11 +199,14 @@ def test_sh_passes_advanced_to_the_app(tmp_path, name):
 
 @pytest.mark.parametrize("name", ["run-linux.sh", "run-wsl.sh"])
 def test_sh_keeps_tk_and_passes_the_rest(tmp_path, name):
+    """--tk is still taken off the line; the Tk app it picked was retired
+    (2026-10-23), so the Qt app starts and the launcher says why."""
     proc, out = _run_sh(tmp_path, name, entry_src=_ARGV_ENTRY,
                         args=("--advanced", "--tk", "two words"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _started(out) == {"entry": "council_gui_engine.py",
+    assert _started(out) == {"entry": "council_qt.py",
                              "args": ["--advanced", "two words"]}
+    assert "Tk UI was retired" in proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("name", ["run-linux.sh", "run-wsl.sh"])

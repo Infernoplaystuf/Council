@@ -11,13 +11,11 @@ REM        - honours an externally-set COUNCIL_GGUF_PATH
 REM        - else first .gguf in .\models\ or %USERPROFILE%\models\,
 REM          marked COUNCIL_GGUF_PATH_AUTO=1 so the model saved in the app wins
 REM    4. Exports sensible Windows defaults (GPU offload, n_ctx debug)
-REM    5. Launches the GUI — the Qt app (council_qt.py) by default; the
-REM       classic Tk app (council_gui_engine.py) with --tk or COUNCIL_UI=tk,
-REM       or automatically when PySide6 is not installed.
+REM    5. Launches the app (council_qt.py). The classic Tk app that --tk and
+REM       COUNCIL_UI=tk used to pick was retired 2026-10-23.
 REM
 REM  Usage:
 REM    run-windows.bat
-REM    run-windows.bat --tk                     :: the classic Tk UI
 REM    run-windows.bat --advanced               :: any other argument goes to the app
 REM    set COUNCIL_GGUF_PATH=C:\path\to\model.gguf && run-windows.bat
 REM    set COUNCIL_GGUF_GPU_LAYERS=0 && run-windows.bat   :: force CPU
@@ -30,8 +28,9 @@ setlocal enableextensions disabledelayedexpansion
 
 REM --check and --tk are the launcher's own, wherever they are on the line.
 REM `run-windows.bat --check` resolves the env + reports GPU readiness, then
-REM exits WITHOUT launching - a quick "did my setup work?" command; --tk starts
-REM the classic Tk UI. EVERYTHING ELSE on the line is the app's (--advanced,
+REM exits WITHOUT launching - a quick "did my setup work?" command; --tk is
+REM still taken off the line, so an old shortcut still starts the app (the Tk
+REM UI it picked was retired), and it only says so. EVERYTHING ELSE on the line is the app's (--advanced,
 REM ...) and goes on exactly as typed. It used to be dropped: only the first
 REM argument was looked at and the app was started with none, so
 REM `run-windows.bat --advanced` opened the default build.
@@ -169,16 +168,14 @@ echo [run-windows] GPU layers: %COUNCIL_GGUF_GPU_LAYERS%   backend: %COUNCIL_BAC
 REM Honest one-line GPU readiness heads-up (non-fatal; skip with COUNCIL_SKIP_GPU_CHECK=1)
 if not defined COUNCIL_SKIP_GPU_CHECK "!PYEXE!" gpu_check.py --quiet
 
-REM ── Which UI: Qt by default, Tk on request or when Qt is missing ──
+REM ── The UI is the Qt app; the classic Tk UI was retired 2026-10-23 ──
 set "COUNCIL_ENTRY=council_qt.py"
-if /i "%COUNCIL_UI%"=="tk" set "COUNCIL_ENTRY=council_gui_engine.py"
-if "!COUNCIL_ENTRY!"=="council_qt.py" (
-    "!PYEXE!" -c "import PySide6" >nul 2>&1
-    if errorlevel 1 (
-        echo [run-windows] PySide6 is not installed in this environment, so the classic Tk UI is starting.
-        echo [run-windows] For the new UI:  "!PYEXE!" -m pip install PySide6
-        set "COUNCIL_ENTRY=council_gui_engine.py"
-    )
+if /i "!COUNCIL_UI!"=="tk" echo [run-windows] The classic Tk UI was retired; starting the Qt app.
+"!PYEXE!" -c "import PySide6" >nul 2>&1
+if errorlevel 1 (
+    echo [run-windows] PySide6 is not installed in this environment, and the app needs it.
+    echo [run-windows] Install it:  "!PYEXE!" -m pip install PySide6
+    exit /b 1
 )
 echo [run-windows] launching !COUNCIL_ENTRY! !APP_ARGS! ...
 

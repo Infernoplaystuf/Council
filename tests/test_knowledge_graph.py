@@ -39,6 +39,9 @@ def _graph(v, *, confirm=True, poc=False):
     kg = kgm.KnowledgeGraph(v)
     if confirm:
         kg.confirm_all_rules()
+    else:
+        for r, _s in kg.field_rules():
+            kg.set_rule_status(r.label, "proposed")
     if poc:
         kg.add_label_synonym("POC", "Point of Contact")
     return kg
@@ -159,7 +162,44 @@ def test_inferred_name_link_stays_suggested(tmp_path):
     assert st[("PRJ-2", "CONTACT_FOR")] == "suggested"
 
 
-def test_proposed_rules_are_not_used_until_confirmed(tmp_path):
+def test_the_default_rules_start_ticked(tmp_path):
+    """User, 2026-10-21: needing the field rules ticked before anything was
+    read was a wrong assumption - a first build reads the labelled fields."""
+    v, key = _vault(tmp_path)
+    kg = kgm.KnowledgeGraph(v)
+    status = {r.label: s for r, s in kg.field_rules()}
+    assert {status[r.label] for r in kgm.DEFAULT_FIELD_RULES} == {"confirmed"}
+    # the people columns of rosters and logs are offered, not ticked
+    # (synthetic test, 2026-10-27)
+    assert {status[r.label] for r in kgm.PROPOSED_FIELD_RULES} == {"proposed"}
+    kg.seed()
+    labelled = _truth(key, evidence={"row", "record"}) - {
+        ("bob", "CONTACT_FOR", "northwind"), ("marcus", "CONTACT_FOR", "bands")}
+    assert labelled <= set(_found(kg, key))
+
+
+def test_an_older_store_gets_the_default_rules_ticked_unless_the_user_chose(tmp_path):
+    v, _key = _vault(tmp_path)
+    for name, user_chose in (("untouched", False), ("chosen", True)):
+        store = tmp_path / name
+        store.mkdir()
+        kg = kgm.KnowledgeGraph(store)
+        if user_chose:
+            kg.set_rule_status("Owner", "confirmed")
+        # as an earlier Council left it: every rule proposed, no marker
+        with kg.db:
+            kg.db.execute("UPDATE field_rules SET status='proposed'")
+            kg.db.execute("DELETE FROM meta WHERE key='rules_on_by_default'")
+        kg.close()
+        kg = kgm.KnowledgeGraph(store)
+        defaults = {r.label for r in kgm.DEFAULT_FIELD_RULES}
+        got = {s for r, s in kg.field_rules() if r.label in defaults}
+        assert got == ({"proposed"} if user_chose else {"confirmed"}), name
+        assert {s for r, s in kg.field_rules() if r.label not in defaults} == {"proposed"}
+        kg.close()
+
+
+def test_unticked_rules_are_not_read(tmp_path):
     v, _key = _vault(tmp_path)
     kg = _graph(v, confirm=False)
     assert {s for _r, s in kg.field_rules()} == {"proposed"}
@@ -378,6 +418,81 @@ def test_search_is_accent_and_order_insensitive(tmp_path):
     assert kg.search("tomas")[0]["name"] == "Tomás Echeverría"
     assert kg.search("Lee, Carol")[0]["name"] == "Carol Lee"
     assert kg.search("pn-1234", "PART")[0]["name"].startswith("PN-1234/")
+
+
+def test_search_matches_word_starts_and_initials_not_mid_word(tmp_path):
+    """'AK' found 'Jordan Blake' (blAKe) in the Connections search (review,
+    2026-10-19). Names match where a word starts; initials find the people
+    whose initials they are; a code still matches on any piece of it."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Jordan Blake", "Alex Kim", "Dana Whitfield", "Kim Lee"):
+            kg.add_person(name)
+        with kg.db:
+            kg._entity("PART", "ABC1DE234")
+
+        def names(text, etype=None):
+            return [h["name"] for h in kg.search(text, etype)]
+        assert names("AK") == ["Alex Kim"]                   # not Jordan blAKe
+        assert names("lake") == [] and names("ordan") == []
+        assert names("blake") == ["Jordan Blake"]           # a later word's start
+        assert names("jor") == ["Jordan Blake"]
+        assert names("JB") == ["Jordan Blake"] == names("j.b.") == names("jb")
+        assert names("JB", "PART") == []
+        assert names("D. Whitfield") == ["Dana Whitfield"]
+        # a name that starts so first, then one with a later word that does
+        assert names("kim") == ["Kim Lee", "Alex Kim"]
+        assert names("234") == ["ABC1DE234"] == names("1de2", "PART")
+        assert names("de") == []                             # letters: word starts only
+
+
+def test_lower_case_letters_search_as_a_name_before_initials(tmp_path):
+    """The search box searches on every keystroke: 'al' listed Anna Lopez
+    (A.L.) in among Alex Kim and David Allen Nash at the same rank (review,
+    2026-10-19). Lower-case letters are a piece of a name first; the people
+    whose initials they spell come after every name hit. Typed as initials
+    ('AL', 'a.l.') they rank with a later word's start, as before."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Alex Kim", "Anna Lopez", "David Allen Nash", "Zed Allard",
+                     "Dana Whitfield", "Jordan Blake"):
+            kg.add_person(name)
+
+        def names(text):
+            return [h["name"] for h in kg.search(text)]
+        assert names("al") == ["Alex Kim", "David Allen Nash", "Zed Allard",
+                               "Anna Lopez"]
+        assert names("dan") == ["Dana Whitfield", "David Allen Nash"]
+        assert names("AL") == ["Alex Kim", "Anna Lopez", "David Allen Nash",
+                               "Zed Allard"]
+        assert names("a.l.") == ["Anna Lopez"]
+        assert names("jb") == ["Jordan Blake"]             # still found, nothing ahead
+        assert names("Dan") == ["Dana Whitfield"]          # a capitalised word is a name
+
+
+def test_an_exact_search_gives_only_the_entry_of_that_name(tmp_path):
+    """The 'Same as…' merge needs the one entry the user named: 'JB' (an
+    initials-only person) also brings in Jordan Blake and Jill Brown by their
+    initials, and 'D. Whitfield' the Whitfields it fits (review, 2026-10-19)."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        for name in ("Jordan Blake", "Jill Brown", "Dana Whitfield", "Dan Whitfield"):
+            kg.add_person(name)
+        with kg.db:
+            kg._entity("PERSON", "JB", alias_source="user")
+            kg._entity("PERSON", "D. Whitfield", alias_source="user")
+
+        def names(text, exact=False):
+            return [h["name"] for h in kg.search(text, "PERSON", exact=exact)]
+        assert names("JB") == ["JB", "Jill Brown", "Jordan Blake"]
+        assert names("JB", exact=True) == ["JB"] == names("jb", exact=True)
+        assert len(names("D. Whitfield")) == 3
+        assert names("D. Whitfield", exact=True) == ["D. Whitfield"]
+        assert names("Whitfield, Dana", exact=True) == ["Dana Whitfield"]
+        assert names("Whit", exact=True) == []
 
 
 def test_gazetteer_finds_unlabelled_mentions(tmp_path):
@@ -648,7 +763,13 @@ def _full_snapshot(kg):
                 " JOIN entities e ON e.id=m.entity_id WHERE m.method != 'collection'")),
             sorted((r[0], r[1], r[2]) for r in q(
                 "SELECT relation_id, locator, method FROM evidence"
-                " WHERE method != 'collection'")),
+                " WHERE method NOT IN ('collection', 'table')")),
+            # a table's links name its document, whose id is the vault's own
+            # (kg_tables, 2026-10-27): compared by name
+            sorted((r[0], r[1], r[2], r[3]) for r in q(
+                "SELECT s.name, r.predicate, o.name, e.locator FROM evidence e"
+                " JOIN relations r ON r.id=e.relation_id JOIN entities s ON s.id=r.subject_id"
+                " JOIN entities o ON o.id=r.object_id WHERE e.method='table'")),
             sorted((r[0], r[1]) for r in q("SELECT kind, surface FROM review"
                                            " WHERE status='open'")))
 

@@ -252,3 +252,54 @@ def test_the_kv_estimate_uses_the_headers_head_size():
     meta.pop("gptoss.attention.key_length")
     meta.pop("gptoss.attention.value_length")
     assert ce._estimate_kv_cache_bytes(meta, 1) == 2 * 24 * 8 * 45 * 2
+
+
+# ============================================================
+# One GPU: the discrete card, not an integrated one beside it
+# ============================================================
+
+INTEL = {"name": "Vulkan0", "description": "Intel(R) UHD Graphics", "total": 16 * GB}
+NVIDIA = {"name": "Vulkan1", "description": "NVIDIA GeForce RTX 4070 Laptop GPU",
+          "total": 8 * GB}
+
+
+def test_the_model_goes_on_the_nvidia_card_not_the_intel_gpu(loader, monkeypatch):
+    """llama.cpp splits a model's layers over every GPU it finds, by free
+    memory: an Intel GPU beside the NVIDIA one - its 'free memory' the
+    system's RAM - took most of them (user, 2026-10-22)."""
+    monkeypatch.delenv("COUNCIL_GGUF_MAIN_GPU", raising=False)
+    monkeypatch.setattr(loader.ce, "_gguf_gpu_devices", lambda: [INTEL, NVIDIA])
+    llm = _load(loader)
+    assert llm.kw["split_mode"] == 0 and llm.kw["main_gpu"] == 1
+
+
+def test_one_gpu_or_no_telling_them_apart_is_left_alone(loader, monkeypatch):
+    ce = loader.ce
+    monkeypatch.delenv("COUNCIL_GGUF_MAIN_GPU", raising=False)
+    assert ce._pick_gguf_gpu([NVIDIA]) is None
+    assert ce._pick_gguf_gpu([NVIDIA, dict(NVIDIA, total=24 * GB)]) == 1   # the larger
+    two_unknown = [{"description": "GPU A", "total": GB}, {"description": "GPU B", "total": GB}]
+    assert ce._pick_gguf_gpu(two_unknown) is None
+    amd = {"description": "AMD Radeon RX 7600M", "total": 8 * GB}
+    assert ce._pick_gguf_gpu([INTEL, amd]) == 1
+    monkeypatch.setattr(ce, "_gguf_gpu_devices", lambda: [NVIDIA])
+    llm = _load(loader)
+    assert "split_mode" not in llm.kw and "main_gpu" not in llm.kw
+    assert ce._one_gpu(0) == {}                          # a CPU load: nothing to pick
+
+
+def test_the_user_can_choose_the_gpu_or_the_split(loader, monkeypatch):
+    ce = loader.ce
+    monkeypatch.setattr(ce, "_gguf_gpu_devices", lambda: [INTEL, NVIDIA])
+    monkeypatch.setenv("COUNCIL_GGUF_MAIN_GPU", "all")
+    assert ce._one_gpu(-1) == {}
+    monkeypatch.setenv("COUNCIL_GGUF_MAIN_GPU", "0")
+    assert ce._one_gpu(-1) == {"split_mode": 0, "main_gpu": 0}
+
+
+def test_a_build_that_refuses_the_choice_still_loads(loader, monkeypatch):
+    monkeypatch.delenv("COUNCIL_GGUF_MAIN_GPU", raising=False)
+    monkeypatch.setattr(loader.ce, "_gguf_gpu_devices", lambda: [INTEL, NVIDIA])
+    FakeLlama.refuse = {"main_gpu"}
+    llm = _load(loader)
+    assert "main_gpu" not in llm.kw

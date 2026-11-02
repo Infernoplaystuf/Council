@@ -209,8 +209,10 @@ def roomy(monkeypatch):
     passages go into what the Writer's call has left after the turn
     context's blocks (CouncilActions._fit_brief), and the test default —
     4,096 tokens, the Writer's ~1,700-token instructions and 2,400-token
-    reply — leaves none."""
-    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "16384")
+    reply — leaves none. (It was COUNCIL_GGUF_N_CTX=16384; that variable is
+    no longer read, the window is the model's.)"""
+    import council_engine as ce
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 16384)
 
 
 def test_send_gives_the_vault_to_the_turn_and_takes_it_back(tmp_path,
@@ -224,7 +226,7 @@ def test_send_gives_the_vault_to_the_turn_and_takes_it_back(tmp_path,
         "VAULT CONTEXT:\n[1] notes/pumps.md\nP-200: 40 l/min",
         ["notes/pumps.md"], "keyword")
     events = []
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"          # the debate itself is under test
     result = actions.send("pump size?", options, on_event=events.append)
     assert result.ok, result.message
@@ -242,7 +244,11 @@ def test_with_no_room_left_the_passages_are_left_out_and_said(tmp_path,
     the transcript says why. The Judge still gets them as evidence."""
     from council_core import council_options
     from council_qt.tabs.council import CouncilActions
-    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "4096")
+    import council_engine as ce
+    # 3072, not 4096: at 4096 the room was only used up by the bundled
+    # sample data's value matches, which no longer reach a prompt
+    # (data_index.search_roots).
+    monkeypatch.setattr(ce, "effective_n_ctx", lambda *_a, **_k: 3072)
     actions = CouncilActions(vault_dir=tmp_path)
     models = _models()
     models.judge = EvidenceJudge()
@@ -250,7 +256,7 @@ def test_with_no_room_left_the_passages_are_left_out_and_said(tmp_path,
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
     events = []
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"
     assert actions.send("pump size?", options, on_event=events.append).ok
     assert not any("P-200" in s for s in models.writer.seen)
@@ -282,7 +288,7 @@ def test_a_passage_from_a_file_already_in_front_is_not_repeated(tmp_path,
     actions.prepare = prepare
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"
     result = actions.send("pump size?", options)
     assert result.ok, result.message
@@ -326,7 +332,7 @@ def test_the_turn_context_is_sized_with_the_blocks_set_before_it(
         at_prepare.append((kw["writer"].extra_context, kw.get("think")))
         return real(*a, **kw)
     actions.prepare = prepare
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.deliberate = deliberate
     options.depth = "deep"
     result = actions.send("which pump for 40 litres per minute?", options)
@@ -346,7 +352,7 @@ def test_the_vault_switch_turns_it_off(tmp_path):
     actions._models = _models()
     asked = []
     actions.vault_brief = lambda q: asked.append(q) or vc.Brief()
-    options = council_options.CouncilOptions.defaults()
+    options = council_options.CouncilOptions(deliberate=True)
     options.depth = "deep"          # the debate itself is under test
     options.vault = False
     events = []
@@ -402,7 +408,7 @@ def test_the_judge_ranks_and_critiques_with_the_evidence(tmp_path):
     actions._models = models
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     opts.depth = "deep"
     result = actions.send("pump size?", opts)
     assert result.ok, result.message
@@ -425,8 +431,8 @@ def test_no_vault_no_evidence_and_old_judges_still_work(tmp_path):
     models.judge = FakeJudge()             # rank_candidates(user, cands)
     actions._models = models
     actions.vault_brief = lambda q: vc.Brief()
-    result = actions.send("pump size?", council_options.CouncilOptions
-                          .defaults())
+    result = actions.send("pump size?", council_options.CouncilOptions(
+                              deliberate=True))
     assert result.ok, result.message
 
 
@@ -460,7 +466,7 @@ def test_only_the_sage_reads_its_knowledge_for_the_turn(tmp_path):
     actions.vault_brief = lambda q: vc.Brief()
     events = []
     result = actions.send("which pump for 40 litres per minute?",
-                          council_options.CouncilOptions.defaults(),
+                          council_options.CouncilOptions(deliberate=True),
                           on_event=events.append)
     assert result.ok and "sage" in result.panel, result.message
     assert any("Sage: 2 item(s)" in e.text for e in events)
@@ -496,7 +502,7 @@ def test_the_sage_s_knowledge_follows_the_memory_scope(tmp_path, monkeypatch,
     actions.memo_llm = None
     events = []
     result = actions.send("which pump for 40 litres per minute?",
-                          council_options.CouncilOptions.defaults(),
+                          council_options.CouncilOptions(deliberate=True),
                           on_event=events.append)
     assert result.ok and "sage" in result.panel, result.message
     assert models.sage.seen

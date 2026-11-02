@@ -16,12 +16,15 @@ runs on the user's machine against ``http://localhost:11434``.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, List, Optional
 
-OLLAMA = "http://localhost:11434"
+#: 127.0.0.1, not localhost: Windows tries IPv6 ::1 first and the probe
+#: (on the GUI thread, each time the dropdown opens) waited ~2 s
+OLLAMA = "http://127.0.0.1:11434"
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,28 @@ def installed_models() -> List[str]:
     except OllamaUnavailable:
         return []
     return [t["name"] for t in tags if isinstance(t, dict) and t.get("name")]
+
+
+def vision_models() -> List[str]:
+    """The installed US-origin models that can read a picture: Ollama's own
+    'vision' capability. The reader dropdown listed every Granite / Llama /
+    Gemma model, and a text-only one answered HTTP 400 to every image
+    (review, 2026-10-19). An Ollama too old to report capabilities: the
+    name decides ('vision', 'llava')."""
+    try:
+        from council_core import local_models
+        entries = local_models.list_local_models(include_gguf=False)
+    except Exception:                                      # noqa: BLE001
+        return []
+    out = []
+    for e in entries:
+        if e.get("origin") == "non-US":
+            continue
+        caps = e.get("capabilities") or []
+        name = str(e.get("name") or "")
+        if "vision" in caps or (not caps and re.search(r"vision|llava", name, re.I)):
+            out.append(name)
+    return out
 
 
 def is_installed(name: str, installed: Optional[Iterable[str]] = None) -> bool:

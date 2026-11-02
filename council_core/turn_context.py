@@ -32,7 +32,7 @@ THE EDITS THE MOVE MADE (everything else was byte-for-byte):
   * `_inject_file_contents` takes `extra_blocks` (default None: no change),
     placed at a new priority band PRIO_EXTRA between the folder listings
     and the vault search — where prepare_turn hands in the knowledge graph's
-    block (KG4; `knowledge_graph_block`, not built yet).
+    block (KG4; `knowledge_graph_block`).
 These edits are marked "[turn_context]" in the code, apart from the
 `_vault()` reads (search for `_vault()`).
 """
@@ -48,6 +48,7 @@ import council_engine as ce
 import data_index
 
 from . import paths as _paths
+from . import token_budget
 
 # ============================================================
 # The vault, and the session a turn is prepared for
@@ -1580,6 +1581,16 @@ def _named_app_files(text):
             if _named_path_is_app_file(p)]
 
 
+def _without_app_file_paths(text):
+    """``text`` less the app's own files it names, for the vault search: the
+    words of a path that was not read found other files in its place (on
+    Windows a temp folder's 'pytest-12' matched a CSV's 12.5; CI,
+    2026-10-26). The rest of the question is still searched."""
+    for p in _named_app_files(text):
+        text = text.replace(p, " ")
+    return text
+
+
 # ── Session "recently referenced files" registry ────────────────────────────
 # When a command lists files to the user (e.g. "files associated with job 456"),
 # the console records their ABSOLUTE paths here, keyed by lowercase basename. A
@@ -2131,7 +2142,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 import council_engine as _ce_tim
                 with _ce_tim._TimingScope("vault.search"):
                     all_hits, fuzzy_matches = idx.search(
-                        user_text, k=k + TAIL_K, folder=folder_scope,
+                        _without_app_file_paths(user_text), k=k + TAIL_K,
+                        folder=folder_scope,
                         llm_call=_semantic_llm_call,
                     )
                 # Drop any hit that's already explicit (won't happen
@@ -2717,10 +2729,7 @@ def _get_data_index():
     try:
         import data_index as _di
         _DATA_INDEX_INSTANCE = _di.DataIndex(
-            search_roots=[
-                _di.input_dir(_vault()),
-                _di.bundled_samples_dir(),
-            ],
+            search_roots=_di.search_roots(_vault()),
             write_root=_di.output_dir(_vault()),
         )
     except Exception as _e:
@@ -2786,8 +2795,14 @@ _FILE_COUNT_TRIGGERS = (
     "how many json", "number of files", "count of files",
     "count the files", "file count", "total files", "how many files are",
 )
-# Intents that need per-file work, not a census: "how many rows in the files".
-_FILE_COUNT_EXCLUSIONS = ("row", "record", "column", "value", "cell")
+# Intents that need per-file work, not a census: "how many rows in the files",
+# and "how many files mention Project Cobalt" — a search of what the files
+# SAY. That one was answered "data_in contains 0 file(s)", labelled exact
+# (found 2026-10-29 on a corpus Connections had read).
+_FILE_COUNT_EXCLUSIONS = ("row", "record", "column", "value", "cell",
+                          "mention", "contain", "refer", "include",
+                          "talk about", " about ", " that ", " which ",
+                          " where ", " with ", " say ", " says ")
 
 
 def looks_like_file_count(query) -> bool:
@@ -2806,7 +2821,7 @@ def looks_like_file_count(query) -> bool:
     when a real field is named, so a generic 'how many files' still falls
     through" - it just had no way to test for it. This is that test.
     """
-    q = str(query or "").lower()
+    q = " " + " ".join(str(query or "").lower().split()) + " "
     return (any(t in q for t in _FILE_COUNT_TRIGGERS)
             and not any(x in q for x in _FILE_COUNT_EXCLUSIONS))
 
@@ -3015,7 +3030,11 @@ def _run_analyst_step_impl(query):
             print('[analyst] folder_file_counts failed: ' + repr(_ce_exc),
                   file=_sys_dbg.stderr)
             counts = None
-        if counts is not None:
+        # An empty input folder is no answer to "how many files": the user's
+        # files may be in the folders Connections reads instead, so the
+        # question goes on to the model with that context rather than an
+        # instant "0 file(s)" presented as exact.
+        if counts is not None and counts.get("total", 0):
             by_ext = counts.get("by_ext", {})
             breakdown = ", ".join(
                 f"{n} {ext}" for ext, n in
@@ -3317,7 +3336,7 @@ def _run_analyst_step_impl(query):
                     messages=[{'role': 'user', 'content': prompt + feedback}],
                     role="coder",
                     temperature=0.0,
-                    num_predict=700,
+                    num_predict=token_budget.reply("answer", 700),
                     timeout=120,
                 )
         except Exception as _e:
@@ -3604,14 +3623,13 @@ class TurnState:
         return self.vault_index
 
     def get_data_index(self):
-        """This conversation's data index (data_in/ + the bundled samples),
+        """This conversation's data index (data_in/, data_index.search_roots),
         built on first use and kept warm."""
         if self.data_index is None:
             try:
                 import data_index as _di
                 self.data_index = _di.DataIndex(
-                    search_roots=[_di.input_dir(self.vault_dir),
-                                  _di.bundled_samples_dir()],
+                    search_roots=_di.search_roots(self.vault_dir),
                     write_root=_di.output_dir(self.vault_dir))
             except Exception as exc:                      # noqa: BLE001
                 import sys as _sys_dbg
@@ -3705,18 +3723,22 @@ class ContextBlock:
 
 def knowledge_graph_block(question: str,
                           state: TurnState) -> Optional[ContextBlock]:
-    """KG4 — NOT BUILT. The knowledge graph's cited neighbourhood for a
-    question that names a known person, part or project
-    (docs/handoff/knowledge_graph_desktop.md, KG4): the linked items and,
-    for each link, where it was found (file, row or line).
+    """KG4 - the knowledge graph's cited neighbourhood for a question that
+    names something a graph knows (council_core.kg_query.block): the
+    entities named, their links two hops out, the chain between two named
+    ones, each fact with its file, row or line and quote. Every graph the
+    user marked "use in answers" (Connections; council_core.kg_graphs) is
+    read; one never built is skipped and none is created.
 
-    Returns None: no block. When KG4 lands, this reads the graph
-    (council_core.knowledge_graph, the store in ``state.vault_dir``) and
-    returns a ContextBlock; prepare_turn already puts it in front of the
-    question with the vault blocks, inside the same window budget, and cites
-    its files under the answer. It must not raise for an ordinary reason (a
-    missing or locked store is "no block"); prepare_turn catches what does."""
-    return None
+    None: no block (nothing named, no graph, or a store busy with a
+    rebuild). It must not raise for an ordinary reason; prepare_turn
+    catches what does."""
+    from council_core import kg_query
+    got = kg_query.block(state.vault_dir, question)
+    if got is None:
+        return None
+    text, sources = got
+    return ContextBlock(text=text, sources=list(sources))
 
 
 _FORGET_RE = _re.compile(r"^\s*forget\s+(.+?)\s*$", _re.IGNORECASE)
@@ -3902,11 +3924,13 @@ def writer_budget(augmented: str, room: Dict[str, Any]) -> Dict[str, Any]:
             "model_max_ctx": most, "tokenizer": "estimate"}
 
 
-def window_setting() -> str:
+def window_setting() -> Optional[str]:
     """The setting that sizes the main model's window, as the engine reads
     it (council_engine._ollama_num_ctx / effective_n_ctx): when Ollama serves
     the main model, the main slot's own "n_ctx" in model_slots.json if it has
-    one, else COUNCIL_OLLAMA_NUM_CTX; otherwise COUNCIL_GGUF_N_CTX. Never
+    one, else COUNCIL_OLLAMA_NUM_CTX. None for a GGUF: its window is already
+    the largest that fits this PC (the loader's ladder), with no setting to
+    raise — COUNCIL_GGUF_N_CTX is no longer read (user, 2026-10-23). Never
     loads a model."""
     try:
         if ce._ollama_will_serve("main"):
@@ -3919,7 +3943,7 @@ def window_setting() -> str:
             return "COUNCIL_OLLAMA_NUM_CTX"
     except Exception:                                     # noqa: BLE001
         pass
-    return "COUNCIL_GGUF_N_CTX"
+    return None
 
 
 def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
@@ -3939,7 +3963,10 @@ def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
     kept = f", and keeps {answer:,} of them for the answer" if answer else ""
     if budget.get("over_window") or used > room:
         most = int(budget.get("model_max_ctx") or 0)
-        if most and most > ctx:
+        if setting is None:
+            hint = (" The model already has the largest window that fits "
+                    "this PC; to fit it, ask about fewer files at once.")
+        elif most and most > ctx:
             hint = (f" This model can read up to {most:,}: start the app "
                     f"with {setting} set to "
                     f"{min(max(16384, ctx * 4), most)} and it will fit.")
@@ -3957,9 +3984,9 @@ def context_window_notice(budget: Dict[str, Any]) -> Optional[str]:
                 f"fills what the model can read at once: about {used:,} "
                 f"tokens, {pct:.0f}% of the {room:,} it has for a question "
                 f"(it reads {ctx:,}{kept}). If the model counts a little "
-                f"more than this estimate, part of it will be cut out. "
-                f"Starting the app with {setting} set higher gives it more "
-                f"room.")
+                f"more than this estimate, part of it will be cut out."
+                + (f" Starting the app with {setting} set higher gives it "
+                   f"more room." if setting else ""))
     return None
 
 
@@ -3995,10 +4022,12 @@ def left_out_notice(dropped, n_ctx: int) -> str:
     for label, cost in dropped:
         lines.append(f"  • {_plain_label(label)}  (about {int(cost):,} "
                      f"tokens)")
+    setting = window_setting()
     lines.append(f"A computed answer, the task memo and a \"file not found\" "
                  f"note are never left out; files you named and folder lists "
-                 f"can be. Starting the app with {window_setting()} set "
-                 f"higher keeps more.")
+                 f"can be."
+                 + (f" Starting the app with {setting} set higher keeps more."
+                    if setting else ""))
     return "\n".join(lines)
 
 
@@ -4181,7 +4210,7 @@ def _prepare(question, state, prepared, say, *, n_ctx, pinned_files,
               f"{exc!r}")
         room = None
     pins = state.current_pins() if pinned_files is None else pinned_files
-    # The knowledge graph's block (KG4; None until it is built) goes into
+    # The knowledge graph's block (KG4; None when no graph knows the question) goes into
     # the same assembly as the vault blocks.
     try:
         graph = knowledge_graph_block(question, state)

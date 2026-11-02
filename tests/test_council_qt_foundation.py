@@ -762,10 +762,11 @@ def window(qapp, tmp_path, monkeypatch):
 # violation roughly one run in three, blamed on whichever test was running.
 # `test_the_drain_list_covers_every_worker_a_tab_starts` keeps it honest.
 TAB_WORKERS = (
-    "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog",
-    "code-", "collection-", "council-command", "council-map-", "council-turn",
+    "agent-creator", "agents-", "apoth-", "build-", "camera-", "capture",
+    "changelog",
+    "collection-", "council-command", "council-map-", "council-turn",
     "designer-", "diagnostics", "docs-", "dream3d-", "fanout-", "forge",
-    "grapher-", "ide-", "jobs-", "keyword-index", "kg-", "ledger-",
+    "grapher-", "jobs-", "keyword-index", "kg-", "ledger-",
     "lens-",
     "librarian-", "model-", "mongo-convert", "nodes-", "pi-setup", "quant-",
     "sessions-", "tts-", "var-graph", "vault-",
@@ -1491,11 +1492,10 @@ def test_the_qt_build_runs_the_close_work_at_all(qapp, tmp_path, monkeypatch):
     assert "_shutdown" in names
 
 
-def test_the_close_work_is_shared_with_the_tk_shell():
+def test_the_qt_entry_does_the_close_work():
     root = Path(__file__).resolve().parent.parent
-    for name in ("council_qt.py", "council_gui_engine.py"):
-        source = (root / name).read_text(encoding="utf-8")
-        assert "close_session(" in source, f"{name} does not use it"
+    source = (root / "council_qt.py").read_text(encoding="utf-8")
+    assert "close_session(" in source, "council_qt.py does not use it"
 
 
 # ============================================================

@@ -185,7 +185,9 @@ def test_the_qt_default_is_this_conversation_only():
 # '1') (its e0b7a3c code, which is not edited any more). Batches 1-2 guarded
 # this with memory_scope.set_tk_default; the merge removed it with the Tk
 # edits, and nothing covered the case (found in review). The Qt entry point
-# now pins the user's settings first.
+# now pins the user's settings first. (The Tk module itself was deleted
+# 2026-10-23; the pin stays, so the scope is still the one the user started
+# the app with whatever a later import sets.)
 
 @pytest.fixture
 def unpinned(monkeypatch):
@@ -233,31 +235,6 @@ def test_council_qt_pins_it_before_anything_else(unpinned):
     first = [ast.unparse(n) for n in main.body[:2]]
     assert first == ["from council_core import memory_scope",
                      "memory_scope.pin_launch_environment()"], first
-
-
-def test_importing_the_tk_module_after_the_pin_keeps_qt_memory(tmp_path):
-    """The real thing, in a child process (the import is not undone): pin as
-    council_qt.py does, import the Tk module, and the Qt scope is still
-    "This conversation only"."""
-    import os
-    import subprocess
-    code = ("import os, sys\n"
-            f"sys.path.insert(0, {str(ROOT)!r})\n"
-            "from council_core import memory_scope\n"
-            "memory_scope.pin_launch_environment()\n"
-            "import council_gui_engine\n"
-            "print(os.environ.get('COUNCIL_DEMO_SILO'), "
-            "memory_scope.for_qt())\n")
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("COUNCIL_MEMORY_SCOPE", "COUNCIL_DEMO_SILO")}
-    env["COUNCIL_VAULT_ROOT"] = str(tmp_path / "vault")
-    out = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path),
-                         env=env, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", timeout=300)
-    assert out.returncode == 0, out.stderr[-2000:]
-    silo, scope = out.stdout.strip().splitlines()[-1].split()
-    assert silo == "1", "the Tk module no longer sets SILO: update this test"
-    assert scope == "conversation"
 
 
 def test_the_qt_app_imports_neither_tk_module(tmp_path):

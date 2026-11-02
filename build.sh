@@ -46,7 +46,7 @@ python -m PyInstaller --version
 echo
 echo "=== Verifying critical runtime deps are importable ==="
 fail=0
-for mod in llama_cpp pandas numpy openpyxl tkinter yaml requests; do
+for mod in llama_cpp pandas numpy openpyxl PySide6 yaml requests; do
     if ! python -c "import $mod" >/dev/null 2>&1; then
         echo "  missing: $mod"
         fail=1

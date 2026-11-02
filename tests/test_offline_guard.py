@@ -639,8 +639,11 @@ def _inner_pytest(tmp_path, name, tests, conftest_extra="",
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("COUNCIL_OLLAMA_HOST", None)
     env.update(env_extra or {})
+    # -rN: no short summary. Its lines repeat each refusal or not depending
+    # on the terminal's width (cut at 80 columns, whole on a wide Windows
+    # console), and the tests below count them.
     r = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        [sys.executable, "-m", "pytest", "-q", "-rN", "-p", "no:cacheprovider",
          str(tmp_path / name)],
         capture_output=True, text=True, timeout=300, cwd=str(tmp_path),
         env=env)

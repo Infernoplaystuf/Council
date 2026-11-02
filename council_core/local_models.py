@@ -21,7 +21,8 @@ non-US model is LISTED — the user installed it and may want to measure it —
 but marked, and never recommended or picked by default. Origin is read from
 the model FAMILY (Ollama's details.family / the GGUF architecture) and the
 name, non-US fragments first: a US repacker or a llama-architecture distill of
-a DeepSeek model is still DeepSeek's.
+a DeepSeek model is still DeepSeek's. Only the NAME can make a model US: the
+family is the architecture, and "llama" is also every Mistral fine-tune.
 
 NOTHING HERE STARTS A GENERATION
 Only Ollama's metadata endpoints are called (/api/version, /api/tags,
@@ -313,30 +314,46 @@ NON_US_MAKERS: Tuple[Tuple[str, str], ...] = (
     ("llama-pro", "Tencent ARC (China)"), ("hunyuan", "Tencent (China)"),
     ("ernie", "Baidu (China)"), ("minicpm", "OpenBMB (China)"),
     ("jais", "G42 (UAE)"),
+    # LLaVA 1.6 34B is built on Nous-Hermes-2-Yi-34B (01.AI); the name
+    # does not say so and its family reads "llama"
+    ("llava:34b", "01.AI (Yi base)"),
 )
 #: Fragments matched as a whole word, not a substring: "yi" is 01.AI's
-#: ("yi:6b", "yi-coder:9b") but also the inside of unrelated names.
-_WORD_FRAGMENTS = frozenset({"yi"})
+#: ("yi:6b", "yi-coder:9b") but also the inside of unrelated names; "phi" is
+#: Microsoft's ("phi3", "dolphin-phi") but also inside "tinydolphin"
+#: (TinyLlama, Singapore); "llava" is not "bakllava" (Mistral base).
+_WORD_FRAGMENTS = frozenset({"yi", "phi", "llava"})
+#: US origin is read from the NAME only: the family Ollama reports is the
+#: architecture, and "llama" is every Llama- or Mistral-architecture model -
+#: zephyr, openhermes, neural-chat, starling-lm, vicuna, orca-mini ... came
+#: out ('Meta', 'US') and Suggest links ran on them (review, 2026-10-19).
+#: The family still REJECTS (a renamed qwen2 is Alibaba's).
 US_MAKERS: Tuple[Tuple[str, str], ...] = (
     ("gpt-oss", "OpenAI"), ("gptoss", "OpenAI"),
     ("phi", "Microsoft"), ("llama", "Meta"), ("gemma", "Google"),
     ("granite", "IBM"), ("olmo", "AllenAI"), ("nemotron", "NVIDIA"),
     ("dolly", "Databricks"), ("dbrx", "Databricks"),
+    ("llava", "LLaVA (UW-Madison, Microsoft)"),
 )
+
+
+def _has_fragment(frag: str, hay: str) -> bool:
+    if frag in _WORD_FRAGMENTS:
+        return re.search(rf"(?<![a-z0-9]){re.escape(frag)}(?![a-z])", hay) is not None
+    return frag in hay
 
 
 def maker_and_origin(name: str, family: str = "",
                      families: Iterable[str] = ()) -> Tuple[str, str]:
-    """(maker, origin) with origin 'US' | 'non-US' | 'unknown'."""
+    """(maker, origin) with origin 'US' | 'non-US' | 'unknown'. Name, family
+    and families can each say non-US; only the name says US."""
     hay = " ".join([name or "", family or ""] + list(families or ())).lower()
     for frag, maker in NON_US_MAKERS:
-        if frag in _WORD_FRAGMENTS:
-            if re.search(rf"(?<![a-z0-9]){re.escape(frag)}(?![a-z])", hay):
-                return maker, "non-US"
-        elif frag in hay:
+        if _has_fragment(frag, hay):
             return maker, "non-US"
+    own = (name or "").lower()
     for frag, maker in US_MAKERS:
-        if frag in hay:
+        if _has_fragment(frag, own):
             return maker, "US"
     return "unknown", "unknown"
 

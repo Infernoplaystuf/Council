@@ -145,14 +145,14 @@ def test_an_unsupported_type_still_returns_none(renderer):
     assert "MPL_SUPPORTED" in dir(ge)
 
 
-# -- both front ends ----------------------------------------------------------
+# -- callers outside council_core -----------------------------------------------
 
-#: Every module that calls MatplotlibRenderer.save. Found by searching rather
-#: than remembered — the first version of this file had a section headed "both
-#: front ends" that only ever read council_gui_engine.py, and missed that
-#: grapher_app.py has the identical bare save(). Making save() refuse turned a
-#: lie into an uncaught exception there, in a module nobody had checked.
-EXPORT_CALLERS = ("council_gui_engine.py", "grapher_app.py")
+#: Every root module that calls MatplotlibRenderer.save. Found by searching
+#: rather than remembered. The two there were (council_gui_engine.py and
+#: grapher_app.py, each checked for catching ExportRefused before printing its
+#: tick) were deleted with the Tk shell on 2026-10-23, so there are none now;
+#: a new one must catch the refusal and get a test here for it.
+EXPORT_CALLERS = ()
 
 
 def test_every_module_that_saves_a_figure_is_known_to_this_file():
@@ -172,29 +172,3 @@ def test_every_module_that_saves_a_figure_is_known_to_this_file():
     unknown = sorted(set(found) - set(EXPORT_CALLERS))
     assert not unknown, (
         f"these save a figure and are not covered here: {unknown}")
-
-
-@pytest.mark.parametrize("module", EXPORT_CALLERS)
-def test_every_export_call_site_handles_the_refusal(module):
-    """Tk is being deprecated, but until it is, a caller must not meet a raised
-    refusal with nothing — an uncaught exception in a button handler is a worse
-    outcome than the original wrong tick."""
-    source = (ROOT / module).read_text(encoding="utf-8")
-    assert "ExportRefused" in source, f"{module} does not know about it"
-    index = source.index("mpl_r.save(fig, Path(path_str))")
-    window = source[index - 300:index + 500]
-    assert "except ge.ExportRefused" in window, (
-        f"{module} saves without catching the refusal")
-    assert "Export failed" in window
-
-
-@pytest.mark.parametrize("module", EXPORT_CALLERS)
-def test_the_tick_is_guarded_by_the_refusal_handler(module):
-    """Ordering is the whole bug. A tick printed regardless of the write is a
-    tick that means nothing."""
-    source = (ROOT / module).read_text(encoding="utf-8")
-    save_at = source.index("mpl_r.save(fig, Path(path_str))")
-    tick_at = source.index("Exported: {saved}", save_at)
-    refusal_at = source.index("except ge.ExportRefused", save_at - 300)
-    assert save_at < refusal_at < tick_at, (
-        f"{module}'s success line is not guarded by the refusal handler")

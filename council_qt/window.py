@@ -185,15 +185,50 @@ class CouncilWindow(QMainWindow):
         self._maybe_build_inner(group_page, index, title)
 
     def _maybe_build_inner(self, group_page, index: int, title: str) -> None:
+        """Swap a placeholder for its real widget inside a group's inner bar.
+
+        Two subtleties, both measured defects:
+        - ``removeTab(index)`` fires ``currentChanged`` for whichever tab Qt
+          lands on next (Qt advances past the removed index to the next
+          visible one), and so does ``insertTab`` and ``setCurrentIndex``.
+          Without a guard, each fires ``_on_inner_tab_changed`` → straight
+          back here → the whole group's tabs build in a cascade. Guard with
+          the ``_swapping`` flag AND block the inner-widget's signals around
+          the three calls, since the top-level ``_swapping`` flag alone does
+          not stop _on_inner_tab_changed being reentered via the slot queue.
+        - A newly ``insertTab``'d tab defaults to visible, which un-hides a
+          profile-hidden tab the controller just put out of the way. Record
+          the inner tab's own visibility before the swap and restore it
+          after.
+        """
         if title in self._built or title not in self._factories:
+            return
+        if self._swapping:
             return
         current = group_page.inner.widget(index)
         if not current.property("council_placeholder"):
             return
-        page = self._build(title)
-        group_page.inner.removeTab(index)
-        group_page.inner.insertTab(index, page, title)
-        group_page.inner.setCurrentIndex(index)
+        inner = group_page.inner
+        bar = inner.tabBar()
+        was_visible = True
+        try:
+            was_visible = bar.isTabVisible(index)
+        except Exception:                                        # noqa: BLE001
+            was_visible = True
+        self._swapping = True
+        inner.blockSignals(True)
+        try:
+            page = self._build(title)
+            inner.removeTab(index)
+            inner.insertTab(index, page, title)
+            try:
+                bar.setTabVisible(index, was_visible)
+            except Exception:                                    # noqa: BLE001
+                pass
+            inner.setCurrentIndex(index)
+        finally:
+            inner.blockSignals(False)
+            self._swapping = False
         # No mapping update needed: the group's tab-id order is stable
         # since nothing is reordered — removeTab/insertTab at the same
         # index keeps every id at the same position.

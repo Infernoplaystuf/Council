@@ -214,6 +214,12 @@ sys.path.insert(0, project)
 os.chdir(project)
 errors = []
 sys.excepthook = lambda *exc: errors.append("".join(traceback.format_exception(*exc)))
+# An App that raises while it is BUILT never reaches the report at the end,
+# and the hook above swallowed the traceback: say it on the way out instead
+# of exiting 1 with nothing on stderr.
+import atexit
+reported = []
+atexit.register(lambda: reported or [print(e, file=sys.stderr) for e in errors])
 from PySide6.QtWidgets import (QApplication, QAbstractButton, QCheckBox,
                                QComboBox, QMenuBar, QRadioButton, QSlider,
                                QSpinBox, QTabBar)
@@ -269,6 +275,7 @@ for _ in range(5):
 print(f"BUILT poked={poked} slot_errors={len(errors)}")
 for e in errors:
     print(e, file=sys.stderr)
+reported.append(True)
 getattr(w, "request_close", w.close)()
 qapp.processEvents()
 '''
@@ -279,8 +286,14 @@ qapp.processEvents()
 RUNTIME_MEMORY_MB = 4096
 
 
-def run_generated(pdir: Path, python: str = sys.executable) -> Dict[str, Any]:
+def run_generated(pdir: Path, python: str = sys.executable,
+                  prelude: str = "") -> Dict[str, Any]:
     """Construct the generated App offscreen, in its own process.
+
+    ``prelude`` is Python run before the probe in the same process — how
+    typhon_recreate puts the Council on sys.path for a LINKED project (its
+    main.py does that, and the probe imports app directly) and loads a
+    rebuilt widget module in place of the original.
 
     Through council_core.child_proc: the app and anything it starts live in
     a Job Object (killed together on the timeout), the machine's commit
@@ -292,7 +305,8 @@ def run_generated(pdir: Path, python: str = sys.executable) -> Dict[str, Any]:
     env = child_proc.child_env({"QT_QPA_PLATFORM": "offscreen",
                                 "COUNCIL_NO_DIALOGS": "1"})
     ran = child_proc.run(
-        [python, "-c", RUNTIME_PROBE, str(pdir), str(RUNTIME_TIMEOUT - 10)],
+        [python, "-c", prelude + RUNTIME_PROBE, str(pdir),
+         str(RUNTIME_TIMEOUT - 10)],
         cwd=str(pdir), env=env, timeout=RUNTIME_TIMEOUT,
         memory_limit_mb=RUNTIME_MEMORY_MB)
     if ran.infra:
