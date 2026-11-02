@@ -1151,6 +1151,29 @@ Still API 0.3 (0.x allows additions). New features, by `has()` name:
 Both hooks run on the UI thread under the watchdog's 2 s: long work starts
 from the panel, never inside the call.
 
+## Trigger-source plugins and record runs (2 November 2026)
+
+Still API 0.3. New features, by `has()` name:
+
+- `kind.source`, `hook.sources`, `hook.make_source`, `type.SourcePlugin`: a
+  plugin whose manifest's kind is "source" is no longer refused. `sources()`
+  names what it offers (listed under Trigger from after Software and Timer;
+  a camera's or Typhon's own names are left out); `make_source(name)` gives
+  a TriggerSource for one run, which the host wraps (`GuardedSource`) so its
+  start and stop are guarded. Its `fire` queues a trigger on the run's books
+  (`TriggerRun.fire_from`); Typhon fires the camera from there, as for a
+  Capture now press.
+- `context.trigger_sources()`, `context.make_source(name)`: what the
+  triggering plugin uses; a run from a source no plugin offers is refused
+  at Start.
+- `mode.record` (`api.MODE_RECORD`, "Triggered: record") and the set-up's
+  `record_s` (`capture.record_s`, "Record for"): every frame from a trigger
+  for that long, or with 0 from one trigger until the next.
+
+The Triggering panel is shown from the plugin toolbar (`WINDOW_KEEPS` is
+empty); the Basic tab no longer has the trigger boxes in a plugins project.
+Details: `docs/handoff/typhon_triggering_2026-11-02.md`.
+
 ## What is wired, and what comes when
 
 Today's Typhon never calls the host, so it behaves exactly as before, and a

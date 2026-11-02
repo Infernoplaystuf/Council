@@ -68,8 +68,9 @@ def test_the_classifier_left_the_main_window():
     new_ids = {s["id"] for s in new["shapes"]}
     assert CLASSIFIER_SHAPES <= old_ids
     assert not (CLASSIFIER_SHAPES & new_ids)
-    assert new_ids - old_ids == {"s93", "s94", "s95"}
-    assert old_ids - new_ids == CLASSIFIER_SHAPES
+    assert new_ids - old_ids == {"s93", "s94", "s95", "s96"}
+    triggers = {f"s{i}" for i in range(84, 92)}
+    assert old_ids - new_ids == CLASSIFIER_SHAPES | triggers
     assert "sklearn" in old["requires"] and "sklearn" not in new["requires"]
     modules = {s["script"].get("module") for s in new["shapes"]
                if s.get("script")}
@@ -218,14 +219,12 @@ def strip_texts(ui):
 
 def test_the_strip_has_classification_then_plugins(ui):
     strip = ui._plugin_strip
-    assert list(strip.buttons) == [CLASSIFY]
+    assert list(strip.buttons) == ["typhon.trigger", CLASSIFY]
     toolbar = ui.ports.plugin_toolbar.widget
     box = toolbar.layout()
     order = [box.itemAt(i).widget().text() for i in range(box.count())
              if box.itemAt(i).widget() is not None]
-    assert order == ["Classification", "Plugins…"]
-    assert "typhon.trigger" not in strip.buttons, \
-        "the trigger boxes are still on the Basic tab"
+    assert order == ["Triggering", "Classification", "Plugins…"]
     sheet = strip.buttons[CLASSIFY].styleSheet()
     assert "#045f80" in sheet, "dressed as the window's own buttons"
 

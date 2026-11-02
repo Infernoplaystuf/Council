@@ -178,6 +178,15 @@ FEATURES: FrozenSet[str] = frozenset({
     "context.datasets", "context.dataset", "context.show_panel",
     "context.image_folder",
     "type.Dataset", "type.DatasetFrame",
+    # trigger-source plugins (2 November 2026): a plugin of kind "source"
+    # offers named sources (`sources()`) and makes one per run
+    # (`make_source(name)`: a TriggerSource); the triggering plugin lists
+    # them beside Software and Timer and fires the run from them. A
+    # Triggered: record run saves every frame from a trigger for "Record
+    # for" seconds, or until the next trigger.
+    "kind.source", "hook.sources", "hook.make_source",
+    "context.trigger_sources", "context.make_source",
+    "type.SourcePlugin", "mode.record",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -543,6 +552,14 @@ class PluginContext(Protocol):
         """Open (or bring forward) this plugin's pop-out window; False when
         the window has none to show (P4)."""
 
+    def trigger_sources(self) -> List[str]:
+        """The names of the sources the project's trigger-source plugins
+        offer now, beside Typhon's own Software and Timer."""
+
+    def make_source(self, name: str) -> Optional[TriggerSource]:
+        """A new TriggerSource for one run, made by the plugin that offers
+        source `name` (its start and stop guarded), or None."""
+
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (a CaptureSetup: trigger
         mode, source, frames per trigger, timer, edge, delay, debounce,
@@ -551,6 +568,28 @@ class PluginContext(Protocol):
         camera. Read in place: the camera's set-up is the storage while the
         code stays where it is (design 2.5); a change goes through the
         camera's settings (its "capture.*" keys), never through this copy."""
+
+
+@runtime_checkable
+class SourcePlugin(Protocol):
+    """A trigger-source plugin (manifest kind "source"): something outside
+    Typhon that says "capture now" — a serial or USB box, another program,
+    a sensor. `sources()` names what it offers now (shown under Trigger
+    from; not "Software" or "Timer", and not a camera's own: no name
+    starting Line, CC, CxpTrigger, Counter, Timer, Software,
+    PeriodicSignal or Action). `make_source(name)` returns a new
+    TriggerSource for one run: its `start(fire)` tells `fire` each trigger
+    (a TriggerEvent; any thread but Typhon's own; it returns at once) and
+    `stop()` ends it within a moment. Typhon fires the cameras: in an
+    exact run their software trigger, in a snapshot or record run the
+    frames it saves. Both calls are guarded: a fault switches the plugin
+    off and the run goes on from Capture now."""
+
+    def activate(self, ctx: "PluginContext") -> None: ...
+
+    def sources(self) -> List[str]: ...
+
+    def make_source(self, name: str) -> TriggerSource: ...
 
 
 @runtime_checkable
@@ -895,9 +934,9 @@ class TriggerSource(Protocol):
     second start while it runs starts nothing more, a second stop returns
     at once, and a start after stop starts nothing — a source belongs to
     one run, and a run makes new ones. The contract suite holds every
-    source to this (tests/contracts/test_trigger_sources.py). Typhon's own
-    two are the only sources a run uses before stage P6: a plugin whose
-    manifest's kind is "source" is refused until then."""
+    source to this (tests/contracts/test_trigger_sources.py). Beside
+    Typhon's own two, a trigger-source plugin (SourcePlugin, manifest kind
+    "source") makes one for each run that picks it."""
 
     name: str
     camera_line: bool
@@ -969,6 +1008,7 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "MODE_CONTINUOUS": ("council_core.triggered", "MODE_CONTINUOUS"),
     "MODE_EXACT": ("council_core.triggered", "MODE_EXACT"),
     "MODE_SNAPSHOT": ("council_core.triggered", "MODE_SNAPSHOT"),
+    "MODE_RECORD": ("council_core.triggered", "MODE_RECORD"),
     "MODES": ("council_core.triggered", "MODES"),
     "SOFTWARE": ("council_core.triggered", "SOFTWARE"),
     "TIMER": ("council_core.triggered", "TIMER"),
@@ -977,7 +1017,8 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
-                  "FeaturePlugin", "CameraPlugin", "CameraSetup",
+                  "FeaturePlugin", "SourcePlugin", "CameraPlugin",
+                  "CameraSetup",
                   "CategoryHints", "ReviewSource", "RunCamera", "RunPlan",
                   "RunInfo", "SoftwareTrigger", "HardwareTrigger", "Binning",
                   "FACETS", "TriggerEvent", "TriggerSource", "Action",

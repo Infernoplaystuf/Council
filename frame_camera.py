@@ -1285,6 +1285,11 @@ def _capture_now_idle(setup: Any) -> str:
         return (f"Not capturing — Start first: it arms the trigger "
                 f"({setup.short()}); then Capture now ({CAPTURE_KEY}) takes "
                 f"each picture.")
+    if setup.triggered and getattr(setup, "record", False):
+        return (f"Not capturing — Start first ({setup.short()}); then "
+                f"Capture now ({CAPTURE_KEY}) starts a recording"
+                + ("." if setup.record_s > 0 else
+                   " and the next press stops it."))
     if setup.triggered:
         # A snapshot run arms nothing: the live view runs, and each press
         # saves the next frame(s).
@@ -1589,6 +1594,9 @@ def _mode_word(setup: Any) -> str:
     if setup is not None and getattr(setup, "mode", "") == \
             triggered.MODE_SNAPSHOT:
         return "a snapshot run"
+    if setup is not None and getattr(setup, "mode", "") == \
+            triggered.MODE_RECORD:
+        return "a record run"
     return "a Continuous run"
 
 
@@ -1951,6 +1959,9 @@ def _trigger_start_words(setup: Any, armed: Any) -> str:
     elif setup.snapshot:
         said += (f" Snapshot ({setup.source_words()}) — the live view runs "
                  f"and only the frames each trigger asks for are saved.")
+    elif getattr(setup, "record", False):
+        said += (f" Record ({setup.source_words()}) — the live view runs "
+                 f"and every frame is saved while a trigger records.")
     return said
 
 
@@ -5251,3 +5262,19 @@ def _can(capability: str) -> bool:
     design 2.4 item 4). Its camera slot answers: what the camera's plugin
     confirmed when it opened it, else what the camera says of itself."""
     return capability in _RIG.active.capabilities
+
+
+def _plugin_trigger_sources() -> Optional[List[str]]:
+    """The trigger-source plugins' sources of a "Typhon (plugins)" project
+    (its host's trigger_sources) — or None for today's Typhon, whose
+    capture rows stay as they were (council_core.triggered.plugin_sources)."""
+    host = _plugin_host()
+    return list(host.trigger_sources()) if host is not None else None
+
+
+def _offer_plugin_sources() -> None:
+    from council_core import triggered as _tg
+    _tg.plugin_sources = _plugin_trigger_sources
+
+
+_offer_plugin_sources()

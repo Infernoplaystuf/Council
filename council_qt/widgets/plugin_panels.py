@@ -10,9 +10,8 @@ The wireframe's `toolbar` shape (port `plugin_toolbar`) at the top of the
 window. PluginStrip puts in it, left to right, one button per plugin this
 project runs that has a panel (its manifest's name: "Classification"), then
 "Plugins…". A plugin that is switched off, faulted or missing a package has
-no button. Plugins whose controls the main window still has (WINDOW_KEEPS:
-the triggering plugin, whose boxes stay on the Basic tab until its own step)
-get none yet, so nothing is offered twice.
+no button. Plugins whose controls the main window still has (WINDOW_KEEPS,
+empty since the Triggering window) get none, so nothing is offered twice.
 
 THE WINDOWS
 Typhon creates each plugin's window, titles it ("Classification — Typhon
@@ -46,8 +45,10 @@ from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
 
 #: The project's remembered window places, beside its plugin list.
 WINDOWS_FILE = "typhon_windows.json"
-#: Plugins with a panel whose controls the main window still has.
-WINDOW_KEEPS = frozenset({"typhon.trigger"})
+#: Plugins with a panel whose controls the main window still has: none
+#: since the Triggering window (2 November 2026) — the trigger boxes left
+#: the Basic tab; Capture now (F9) stays beside Start and Stop.
+WINDOW_KEEPS: frozenset = frozenset()
 #: The strip's last button.
 PLUGINS_BUTTON = "Plugins…"
 #: How long after the last move or resize a place is written.

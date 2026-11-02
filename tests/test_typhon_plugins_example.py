@@ -63,7 +63,10 @@ def test_it_is_typhons_wireframe_under_the_new_name():
     2026), less the classifier, which is a plugin's pop-out now, with the
     plugin strip and the dataset buttons in, and the freed width given to
     the live view and the rows under it
-    (tests/test_typhon_plugins_classify_panel.py checks those)."""
+    (tests/test_typhon_plugins_classify_panel.py checks those); and less
+    the Basic tab's trigger boxes, which are the Triggering window's now,
+    with a line saying so in their place
+    (tests/test_typhon_plugins_trigger_window.py)."""
     old, new = gspec("typhon"), gspec(NAME)
     assert new["project"] == NAME and new["window"]["title"] == TITLE
     assert {k: v for k, v in new["window"].items() if k != "title"} == \
@@ -75,10 +78,13 @@ def test_it_is_typhons_wireframe_under_the_new_name():
     assert new["requires"] == [r for r in old["requires"] if r != "sklearn"]
     classifier = {f"s{i:02d}" for i in list(range(24, 41))
                   + list(range(64, 79))}
-    kept = [s for s in old["shapes"] if s["id"] not in classifier]
+    triggers = {f"s{i}" for i in range(84, 92)}
+    kept = [s for s in old["shapes"]
+            if s["id"] not in classifier | triggers]
     olds = {s["id"]: s for s in kept}
     news = {s["id"]: s for s in new["shapes"]}
-    assert set(news) - set(olds) == {"s93", "s94", "s95"}
+    assert not triggers & set(news)
+    assert set(news) - set(olds) == {"s93", "s94", "s95", "s96"}
     assert set(olds) <= set(news)
     widened = {"s10", "s20", "s22", "s23", "s48", "s49", "s50", "s51",
                "s59", "s60", "s61", "s62", "s63"}

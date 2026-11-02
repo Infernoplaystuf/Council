@@ -248,6 +248,9 @@ class RunTriggers:
         self.armed: Any = None
         self.books: Any = None
         self.sources: List[TyphonSource] = []
+        #: The run's trigger-source plugin's source (a GuardedSource), when
+        #: it fires from one: started with the books, stopped first.
+        self.outside: Any = None
         #: From the moment its source started until Stop began: what
         #: Capture now fires and the status segment says (frame_camera's
         #: "capturing, with a triggered run").
@@ -314,6 +317,19 @@ class RunTriggers:
         books = self.books
         if books is None:
             return
+        name = str(getattr(self.setup, "source", "") or "")
+        if books.typhon_fires and name not in (api.SOFTWARE, api.TIMER):
+            # A trigger-source plugin's source: the books' worker fires
+            # each trigger it tells (and Capture now presses, as ever).
+            self.outside = (self.plugin.ctx.make_source(name)
+                            if self.plugin.ctx is not None else None)
+            books.start()
+            if self.outside is not None:
+                self.outside.start(
+                    lambda event, n=name: books.fire_from(
+                        getattr(event, "source", "") or n))
+            self.live = True
+            return
         source = self.source()
         if source is not None:
             source.start(lambda event: None)
@@ -336,6 +352,7 @@ class RunTriggers:
         """A Start that failed after arming: the triggers CSV closed (it
         stays, header only), the camera put back."""
         self.live = False
+        self._stop_outside()
         books = self.books
         if books is not None:
             try:
@@ -352,6 +369,7 @@ class RunTriggers:
         and — an exact run from a camera line — end the edge count before
         the stream stops and let the frames already exposed land."""
         self.live = False
+        self._stop_outside()
         books = self.books
         if books is None:
             return
@@ -369,6 +387,11 @@ class RunTriggers:
                 pass
             if isinstance(armed, dict) and armed.get("counter"):
                 builtin.let_frames_land(_Grabbed(grabbed), camera, books)
+
+    def _stop_outside(self) -> None:
+        outside, self.outside = self.outside, None
+        if outside is not None:
+            outside.stop()
 
     def close(self) -> None:
         """The books closed before the recording ends, so its end record
@@ -389,6 +412,7 @@ class RunTriggers:
         """Disconnect in the middle of the run: the books stopped, the
         camera's triggers put back (as today's Disconnect does)."""
         self.live = False
+        self._stop_outside()
         for source in self.sources:
             source.stop()
         if self.books is not None:
@@ -480,12 +504,12 @@ class TriggerPlugin:
             SOFTWARE_TRIGGER if line else HARDWARE_TRIGGER)
         if facet is not None:
             why = str(facet.problem(setup) or "")
-        elif setup.snapshot and line:
+        elif setup.frames_only and line:
             why = (f"Snapshot takes its trigger from Software (Capture now) "
                    f"or the Timer; {setup.source} is the camera's own input, "
                    f"which only an exact run waits for — choose Triggered: "
                    f"exact, or Software / Timer")
-        elif setup.snapshot:
+        elif setup.frames_only:
             why = ""                      # frames only: nothing is armed
         elif needed not in caps:
             why = (f"this camera has no {needed.replace('_', ' ')} Typhon can "
@@ -497,6 +521,14 @@ class TriggerPlugin:
             why = ""
         if not why and setup.source == api.TIMER and setup.every_s <= 0:
             why = "the timer's interval must be more than 0 s"
+        if not why and not line and setup.source not in (api.SOFTWARE,
+                                                         api.TIMER):
+            offered = (self.ctx.trigger_sources()
+                       if self.ctx is not None else [])
+            if setup.source not in offered:
+                why = (f"no trigger-source plugin offers {setup.source!r} "
+                       f"now — switch its plugin on (Plugins…), or choose "
+                       f"Trigger from: Software or Timer")
         return why
 
     def check_start(self, plan: Any) -> str:
@@ -589,8 +621,10 @@ class TriggerPlugin:
                 options = hardware.inputs()
             except Exception:                             # noqa: BLE001
                 options = None
+        extra = self.ctx.trigger_sources() if self.ctx is not None else []
         return builtin.trigger_settings(setup, options or
-                                        api.CaptureOptions())
+                                        api.CaptureOptions(), extra,
+                                        plugins=True)
 
     def write_setting(self, key: str, value: Any) -> Dict[str, Any]:
         """One of the set-up's "capture.*" keys written in place, as the

@@ -1305,6 +1305,50 @@ class PluginHost:
         return said or (f"'{dataset.name}' ({len(dataset.frames)} frames) "
                         f"sent to {self._name(pid)}.")
 
+    # -- trigger-source plugins (2 November 2026) ----------------------------
+    def source_plugins(self) -> List[str]:
+        """The trigger-source plugins (manifest kind "source") this project
+        runs that can run now."""
+        out = []
+        for pid in self.runs():
+            m = self.manifest(pid)
+            if m is not None and m.kind == "source" and \
+                    self.state(pid)[0] in (ON, ACTIVE):
+                out.append(pid)
+        return out
+
+    def trigger_sources(self) -> Dict[str, str]:
+        """Each source the trigger-source plugins offer now, by name, with
+        the plugin that offers it. A name Typhon or a camera owns
+        (Software, Timer, Line1 …: triggered.camera_source), or one a
+        plugin before it offers, is left out."""
+        from council_core import triggered
+
+        out: Dict[str, str] = {}
+        for pid in self.source_plugins():
+            names = self.call(pid, "sources", default=())
+            if isinstance(names, str):
+                names = [names]
+            for name in names or ():
+                name = " ".join(str(name).split())
+                if not name or name in triggered.TYPHON_SOURCES or \
+                        triggered.camera_source(name) or name in out:
+                    continue
+                out[name] = pid
+        return out
+
+    def make_source(self, name: str) -> Optional["GuardedSource"]:
+        """A new source `name` for one run, from the plugin that offers it
+        (its make_source(name)), guarded — or None when no plugin offers it
+        now, or making it failed (the plugin is switched off)."""
+        pid = self.trigger_sources().get(str(name))
+        if pid is None:
+            return None
+        made = self.call(pid, "make_source", str(name))
+        if made is None or not callable(getattr(made, "start", None)):
+            return None
+        return GuardedSource(self, pid, str(name), made)
+
     def check_start(self, plan: Any) -> List[str]:
         """Every run-hook plugin's check_start(plan): the reasons Start is
         refused (design 3.6, 3.10). A plugin whose check FAILS refuses this
@@ -3141,6 +3185,14 @@ class Context:
             return False
         return self._host.show_panel(self.plugin_id)
 
+    def trigger_sources(self) -> List[str]:
+        return list(self._host.trigger_sources())
+
+    def make_source(self, name: str) -> Any:
+        if self._off():
+            return None
+        return self._host.make_source(name)
+
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (device.capture, the
         storage today's code reads, design 2.5), or None."""
@@ -3152,6 +3204,39 @@ class Context:
 
     def __repr__(self) -> str:
         return f"<plugin context {self.plugin_id}>"
+
+
+class GuardedSource:
+    """A trigger-source plugin's source for one run (host.make_source):
+    its start and stop called guarded — a fault switches the plugin off
+    and stops nothing else; the run goes on, fired from Capture now."""
+
+    camera_line = False
+
+    def __init__(self, host: "PluginHost", pid: str, name: str,
+                 made: Any) -> None:
+        self.host = host
+        self.plugin_id = pid
+        self.name = name
+        self._made = made
+
+    def needs(self, mode: str = "Triggered: snapshot") -> frozenset:
+        """Typhon fires the cameras from it: an exact run needs their
+        software trigger; a snapshot or record run frames only."""
+        if str(mode) == "Triggered: exact":
+            return frozenset({"frames", "software_trigger"})
+        return frozenset({"frames"})
+
+    def start(self, fire: Callable[[Any], Any]) -> None:
+        made = self._made
+        self.host._guard(self.plugin_id, "source.start", made.start,
+                         (fire,), {}, None)
+
+    def stop(self) -> None:
+        stop = getattr(self._made, "stop", None)
+        if callable(stop):
+            self.host._guard(self.plugin_id, "source.stop", stop, (), {},
+                             None)
 
 
 # ======================================================================

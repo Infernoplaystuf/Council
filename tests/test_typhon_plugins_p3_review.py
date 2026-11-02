@@ -878,18 +878,20 @@ def test_frame_saved_is_not_offered_until_the_window_feeds_frames():
 # ======================================================================
 # Trigger sources
 # ======================================================================
-def test_a_trigger_source_plugin_is_refused_until_it_is_wired():
+def test_a_trigger_source_plugin_is_accepted_now_it_is_wired():
     """A "source" plugin was found, made active and never used: no run
-    could pick it, and its fire() caused no trigger."""
+    could pick it, and its fire() caused no trigger — so it was refused
+    until it was wired. Since 2 November 2026 the triggering plugin lists
+    its sources and a run fires from one
+    (tests/test_typhon_plugins_trigger_sources.py), so it is accepted."""
     doc = {"schema": 1, "id": "acme.box", "short": "box", "name": "Box A",
            "version": "1.0.0", "api": pm.API_VERSION, "kind": "source",
            "entry": "plugin:P", "author": "A", "description": "A box.",
            "licence": "MIT"}
-    with pytest.raises(pm.ManifestError, match="not wired") as caught:
-        pm.check(doc, builtin=False)
-    assert caught.value.field == "kind"
-    with pytest.raises(pm.ManifestError, match="not wired"):
-        pm.check(dict(doc, id="typhon.box"), builtin=True)
+    assert pm.check(doc, builtin=False).kind == "source"
+    assert pm.check(dict(doc, id="typhon.box"), builtin=True).kind == \
+        "source"
+    assert api.has("kind.source")
 
 
 # ======================================================================

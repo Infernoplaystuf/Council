@@ -707,7 +707,8 @@ def test_its_rows_are_the_trigger_set_up_read_in_place(plugin_project):
     set_up(mode=tg.MODE_SNAPSHOT, source=tg.TIMER, per=2, every="0.5")
     rows = {r.key: r for r in plugin.settings_rows()}
     assert set(rows) == {tg.MODE_KEY, tg.SOURCE_KEY, tg.PER_KEY,
-                         tg.EVERY_KEY}, "no Downsample: it is the core's"
+                         tg.EVERY_KEY, tg.RECORD_KEY}, \
+        "no Downsample: it is the core's"
     assert rows[tg.MODE_KEY].value == tg.MODE_SNAPSHOT
     assert rows[tg.EVERY_KEY].value == 0.5 and rows[tg.PER_KEY].value == 2
     said = plugin.write_setting(tg.PER_KEY, 4)
