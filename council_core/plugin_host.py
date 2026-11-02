@@ -752,6 +752,10 @@ def capabilities_of(device: Any, info: Any) -> frozenset:
 # ======================================================================
 # The host
 # ======================================================================
+#: send_dataset: the plugin gave no answer at all.
+_NO_ANSWER = object()
+
+
 class PluginHost:
     """The rig's plugin host. Cheap to make: it reads nothing until asked."""
 
@@ -809,6 +813,12 @@ class PluginHost:
         self.current_frame_fn: Optional[Callable[[], Optional[Path]]] = None
         self.crop_box_fn: Optional[Callable[[Optional[str]],
                                             Optional[api.CropBox]]] = None
+        #: Set by the window (P4): open plugin `pid`'s pop-out window;
+        #: True when it did.
+        self.show_panel_fn: Optional[Callable[[str], bool]] = None
+        #: Set by the window (P4): the folder the main window's slider
+        #: shows (its Image folder), or None.
+        self.image_folder_fn: Optional[Callable[[], Optional[Path]]] = None
         self.ui_thread = threading.main_thread().ident
         #: Runs from their name's reservation to their end record (stage
         #: P3; council_core.plugin_runs.ActiveRun), and each camera's own.
@@ -1246,6 +1256,54 @@ class PluginHost:
             if m is not None and contribution in m.contributes:
                 out.append(pid)
         return out
+
+    # -- the screen and datasets (P4) ----------------------------------------
+    def panel_plugins(self) -> List[str]:
+        """The plugins this project runs that have a pop-out panel and can
+        run now (not off, faulted or missing a requirement)."""
+        return [pid for pid in self.with_hook("panel")
+                if self.state(pid)[0] in (ON, ACTIVE)]
+
+    def dataset_plugins(self) -> List[str]:
+        """The plugins this project runs that take datasets and can run."""
+        return [pid for pid in self.with_hook("datasets")
+                if self.state(pid)[0] in (ON, ACTIVE)]
+
+    def build_panel(self, pid: str, parent: Any = None) -> Any:
+        """Plugin `pid`'s panel widget, built now (guarded: None when it
+        has none, cannot run, or fails, which switches it off)."""
+        if pid not in self.with_hook("panel"):
+            return None
+        return self.call(pid, "panel", parent)
+
+    def show_panel(self, pid: str) -> bool:
+        """Ask the window to open plugin `pid`'s pop-out."""
+        fn = self.show_panel_fn
+        if fn is None or pid not in self.with_hook("panel"):
+            return False
+        return bool(fn(pid))
+
+    def send_dataset(self, pid: str, name: str) -> str:
+        """Hand dataset `name` (as it is now) to plugin `pid`. What the
+        plugin says back, or why it could not take it."""
+        from council_core import datasets as ds
+
+        if pid not in self.with_hook("datasets"):
+            return f"{self._name(pid)} does not take datasets"
+        doc = ds.load(name)
+        dataset = api.dataset_from(doc.get("name") or name,
+                                   ds.frames(name))
+        if self.instance(pid) is None:
+            return (f"{self._name(pid)} cannot run now: "
+                    f"{self.state(pid)[1] or 'switched off'}")
+        out = self.call(pid, "take_dataset", dataset, default=_NO_ANSWER)
+        if out is _NO_ANSWER:
+            if pid in self.faults:
+                return f"{self._name(pid)}: {self.faults[pid].reason}"
+            return f"{self._name(pid)} has no take_dataset"
+        said = str(out or "").strip()
+        return said or (f"'{dataset.name}' ({len(dataset.frames)} frames) "
+                        f"sent to {self._name(pid)}.")
 
     def check_start(self, plan: Any) -> List[str]:
         """Every run-hook plugin's check_start(plan): the reasons Start is
@@ -3064,6 +3122,24 @@ class Context:
     def data_dir(self) -> Path:
         self._open()
         return self._host.data_dir(self.plugin_id)
+
+    def image_folder(self) -> Optional[Path]:
+        fn = self._host.image_folder_fn
+        return fn() if fn is not None else None
+
+    def datasets(self) -> List[str]:
+        from council_core import datasets as ds
+        return ds.names()
+
+    def dataset(self, name: str) -> api.Dataset:
+        from council_core import datasets as ds
+        doc = ds.load(name)
+        return api.dataset_from(doc.get("name") or name, ds.frames(name))
+
+    def show_panel(self) -> bool:
+        if self._off():
+            return False
+        return self._host.show_panel(self.plugin_id)
 
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (device.capture, the

@@ -1120,6 +1120,37 @@ cannot add anything there, and the 1 ms switch interval is what the core
 now sets while a run records ("What is wired"); a minimized window and the
 bench PC are still to measure.
 
+## The classifier's window and datasets (P4, 2 November 2026)
+
+Still API 0.3 (0.x allows additions). New features, by `has()` name:
+
+- `hook.panel`: with "panel" in contributes, `panel(parent) -> QWidget` is
+  the inner widget of the plugin's pop-out window. Typhon makes the window
+  (council_qt/widgets/plugin_panels.py), titles it, builds the panel on
+  first open through `host.build_panel` (guarded), hides it on close and
+  remembers its place in the project's `typhon_windows.json`. The toolbar
+  strip (port `plugin_toolbar`) has a button per plugin with a panel that
+  can run now, then "Plugins…", where a project switches its feature
+  plugins on and off. `WINDOW_KEEPS` (the triggering plugin) gets no button
+  while the main window still has its controls.
+- `hook.take_dataset`: with "datasets" in contributes (a new contribution
+  point), `take_dataset(dataset) -> str | None`. `host.send_dataset(pid,
+  name)` reads the dataset, hands it over guarded, and returns what the
+  plugin said (or a sentence of its own when it said nothing).
+- `type.Dataset`, `type.DatasetFrame`: a frozen snapshot of a dataset
+  (council_core/datasets.py): its name and frames, each a reference to a
+  saved picture (path, name, run, frame number, folder, camera, crop box,
+  and whether the file was there). `api.dataset_from` builds one.
+- `context.datasets()`, `context.dataset(name)`, `context.show_panel()`
+  (opens the plugin's own window), `context.image_folder()` (the folder the
+  main window's slider shows; `capture_folder` stays the camera's run
+  folder). `context.current_frame()` now answers in a plugins project:
+  `frame_camera` sets `host.current_frame_fn`, `image_folder_fn` and emits
+  `frames_reloaded` when the slider lists its folder again.
+
+Both hooks run on the UI thread under the watchdog's 2 s: long work starts
+from the panel, never inside the call.
+
 ## What is wired, and what comes when
 
 Today's Typhon never calls the host, so it behaves exactly as before, and a

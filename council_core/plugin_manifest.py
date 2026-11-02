@@ -102,10 +102,11 @@ NETWORK = ("none", "camera-link", "internet")
 #: The places a plugin may attach to (design 3.7, 3.8, 3.11). "presets"
 #: (stage P3 row 4): values of its own in each camera's presets, as
 #: "<id>/<key>" (design 3.9) — asked with preset_values, given back with
-#: apply_preset_values.
+#: apply_preset_values. "datasets" (P4, 2 November 2026): the plugin
+#: takes a dataset sent from the Datasets window (take_dataset).
 CONTRIBUTIONS = ("panel", "toolbar", "status", "run_hooks", "analyse",
                  "review_source", "setup", "overlay", "record_gate",
-                 "frame_stage", "presets")
+                 "frame_stage", "presets", "datasets")
 #: Inside the data-safety rules: built-in plugins only (design 3.11).
 BUILTIN_ONLY = frozenset({"record_gate", "frame_stage"})
 #: Camera plugins only: how the slider shows one of its run files; and a

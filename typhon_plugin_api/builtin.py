@@ -80,7 +80,25 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "basler_scan": ("council_core.basler_scan", "scan"),
 }
 
-__all__ = sorted(_REEXPORTS)
+__all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
+
+
+def classifier_library() -> Any:
+    """frame_classes, the classifier library (design 2.3: it stays a
+    library, its file formats unchanged): the typhon.classify adapter's
+    panel calls its functions exactly as today's script links did."""
+    import importlib
+
+    return importlib.import_module("frame_classes")
+
+
+def classifier_picker() -> Any:
+    """council_qt.widgets.classifier_picker: today's model dropdown, its
+    filter, the "classified with" line and Delete's second press, which the
+    classification pop-out reuses (design 6.3)."""
+    import importlib
+
+    return importlib.import_module("council_qt.widgets.classifier_picker")
 
 
 def __getattr__(name: str) -> Any:

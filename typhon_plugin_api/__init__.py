@@ -170,6 +170,14 @@ FEATURES: FrozenSet[str] = frozenset({
     # P3 row 6: a built-in plugin's frame stage for a run, which Start asks
     # (after the core's Downsample, guarded on the recording path)
     "hook.frame_stage",
+    # P4, the classifier's pop-out and datasets (2 November 2026): a
+    # plugin's panel in its own Typhon-owned window, opened from the
+    # toolbar strip; the vault's datasets, read through the context; and a
+    # dataset sent to a plugin whose manifest contributes "datasets"
+    "hook.panel", "hook.take_dataset",
+    "context.datasets", "context.dataset", "context.show_panel",
+    "context.image_folder",
+    "type.Dataset", "type.DatasetFrame",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -189,6 +197,56 @@ def has(name: str) -> bool:
 # ======================================================================
 # What a plugin is handed
 # ======================================================================
+@dataclass(frozen=True)
+class DatasetFrame:
+    """One frame of a dataset: a REFERENCE to a saved picture where it was
+    recorded (council_core.datasets). `run` and `frame` come from the name
+    Typhon gives every frame ("" and None for another file); `exists` is
+    whether the file was there when the dataset was read."""
+    path: Path
+    name: str = ""
+    run: str = ""
+    frame: Optional[int] = None
+    folder: Optional[Path] = None
+    camera: str = ""
+    crop: Optional[Tuple[int, int, int, int]] = None
+    exists: bool = True
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """A dataset as it was when it was read: its name and its frames, in
+    the order they were added. Read-only: a plugin changes nothing in it."""
+    name: str
+    frames: Tuple[DatasetFrame, ...] = ()
+
+    @property
+    def paths(self) -> Tuple[Path, ...]:
+        """The frames still on disk."""
+        return tuple(f.path for f in self.frames if f.exists)
+
+    @property
+    def missing(self) -> int:
+        return sum(1 for f in self.frames if not f.exists)
+
+
+def dataset_from(doc_name: str, entries: Sequence[Mapping[str, Any]]
+                 ) -> Dataset:
+    """A Dataset from council_core.datasets' entries (each with "exists")."""
+    frames = []
+    for e in entries:
+        crop = e.get("crop")
+        frames.append(DatasetFrame(
+            path=Path(str(e["path"])), name=str(e.get("name") or ""),
+            run=str(e.get("run") or ""),
+            frame=e.get("frame") if isinstance(e.get("frame"), int) else None,
+            folder=Path(str(e["folder"])) if e.get("folder") else None,
+            camera=str(e.get("camera") or ""),
+            crop=tuple(int(v) for v in crop) if crop else None,
+            exists=bool(e.get("exists", True))))
+    return Dataset(name=str(doc_name), frames=tuple(frames))
+
+
 @dataclass(frozen=True)
 class CameraHandle:
     """One camera of the rig, as a feature plugin sees it (design 3.4): its
@@ -470,6 +528,21 @@ class PluginContext(Protocol):
         `<project>/plugin_data/<id>/`, made on first ask; files go in it
         through write_new (design 4.1)."""
 
+    def image_folder(self) -> Optional[Path]:
+        """The folder the main window's slider shows — its Image folder —
+        or None (P4). Not always capture_folder(): the user may be looking
+        at an older folder of frames."""
+
+    def datasets(self) -> List[str]:
+        """The names of the vault's datasets (P4)."""
+
+    def dataset(self, name: str) -> Dataset:
+        """Dataset `name` as it is now (P4); raises when there is none."""
+
+    def show_panel(self) -> bool:
+        """Open (or bring forward) this plugin's pop-out window; False when
+        the window has none to show (P4)."""
+
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (a CaptureSetup: trigger
         mode, source, frames per trigger, timer, edge, delay, debounce,
@@ -492,7 +565,16 @@ class FeaturePlugin(Protocol):
     values)`; with "frame_stage" (built-in plugins only), `frame_stage(
     camera)` -> `stage(image, meta) -> picture` for the run about to
     start, or None — run after the core's Downsample, handed a read-only
-    picture and meta. The screen points come at stage P4.
+    picture and meta.
+
+    THE SCREEN (P4). With "panel" in contributes, `panel(parent) ->
+    QWidget`: the inner widget of the plugin's pop-out window, which Typhon
+    creates, titles and remembers the place of, opened from the plugin's
+    button on the toolbar strip and built on first open. With "datasets",
+    `take_dataset(dataset) -> str | None`: a Dataset the user sent it from
+    the Datasets window; what it returns is said in the status line. Both
+    are called on the UI thread and must return quickly (the watchdog's
+    2 s): long work is started from the panel, never inside the call.
 
     THE FAULT RULE (design 3.10). Every call is guarded: whatever it
     raises switches the plugin off for the session, said and logged. The
@@ -899,7 +981,8 @@ __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CategoryHints", "ReviewSource", "RunCamera", "RunPlan",
                   "RunInfo", "SoftwareTrigger", "HardwareTrigger", "Binning",
                   "FACETS", "TriggerEvent", "TriggerSource", "Action",
-                  "TYPHON_DOWNSAMPLE", "CAMERA_DOWNSAMPLE", *_REEXPORTS])
+                  "TYPHON_DOWNSAMPLE", "CAMERA_DOWNSAMPLE", "Dataset",
+                  "DatasetFrame", "dataset_from", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:

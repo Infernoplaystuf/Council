@@ -246,9 +246,10 @@ def test_its_manifest_says_what_it_contributes():
 
 def test_the_api_names_what_typhon_now_calls_of_it():
     for name in ("hook.trigger_slot", "hook.capture_now", "type.TriggerSource",
-                 "type.TriggerEvent", "type.Action", "context.capture_setup"):
+                 "type.TriggerEvent", "type.Action", "context.capture_setup",
+                 "hook.panel"):
         assert api.has(name), name
-    for later in ("hook.status", "hook.panel", "hook.toolbar",
+    for later in ("hook.status", "hook.toolbar",
                   "hook.settings_rows"):
         assert not api.has(later), f"{later}: the window asks it from P4"
 

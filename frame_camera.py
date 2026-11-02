@@ -2573,6 +2573,7 @@ def attach(app: Any, view: str = "live_view",
         # New frames in the folder (a capture's last frame on disk): the
         # line says which runs are not classified yet.
         reviewer.on_reload(models_picker.line_soon)
+    _attach_plugin_screen(app, reviewer, folder, say)
     settings_tabs = _tabs_for(app, tabs, tabs_note)
     if _LIVE.tabs is not None and _LIVE.tabs is not settings_tabs:
         _LIVE.tabs.close()             # an earlier window's, now replaced
@@ -2584,6 +2585,156 @@ def attach(app: Any, view: str = "live_view",
         # to sit over.
         QTimer.singleShot(0, lambda: (wizard or _first_run)(app))
     return timer
+
+
+# ======================================================================
+# "Typhon (plugins)": the toolbar strip, the plugins' windows, datasets
+# ======================================================================
+#: The window's plugin strip and Datasets window (stage P4; Andy, 2
+#: November 2026), and the app they belong to.
+_SCREEN: Dict[str, Any] = {"app": None, "strip": None, "datasets": None}
+
+#: The wireframe port of the toolbar strip plugins put their buttons in.
+PLUGIN_TOOLBAR = "plugin_toolbar"
+
+
+def _shown_frame() -> Optional[Path]:
+    """The saved frame the slider shows, as a full path, or None (live, the
+    raw view, or no folder)."""
+    reviewer = _LIVE.reviewer
+    if reviewer is None or reviewer.current is None:
+        return None
+    try:
+        rel = str(reviewer.current.get() or "").strip()
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not rel:
+        return None
+    p = Path(rel)
+    if not p.is_absolute():
+        p = Path(reviewer.root or ".") / p
+    return p if p.is_file() else None
+
+
+def _image_folder() -> Optional[Path]:
+    reviewer = _LIVE.reviewer
+    folder = getattr(reviewer, "folder", None) if reviewer is not None \
+        else None
+    try:
+        text = str(folder.get() or "").strip().strip('"') if folder else ""
+    except Exception:                                     # noqa: BLE001
+        text = ""
+    return Path(text) if text else None
+
+
+def _attach_plugin_screen(app: Any, reviewer: Any, folder: str,
+                          say: Optional[Callable[[str], Any]]) -> None:
+    """A "Typhon (plugins)" window: the plugin host learns the frame on
+    screen and the image folder, hears the folder listed again, and the
+    toolbar strip gets a button per plugin with a pop-out (council_qt.
+    widgets.plugin_panels). Today's Typhon, and any app without the strip,
+    is left as it is."""
+    _SCREEN["app"] = app
+    host = _plugin_host()
+    if host is None:
+        return
+    host.current_frame_fn = _shown_frame
+    host.image_folder_fn = _image_folder
+    if reviewer is not None:
+        def reloaded() -> None:
+            try:
+                host.emit("frames_reloaded", folder=str(_image_folder() or ""))
+            except Exception:                             # noqa: BLE001
+                pass
+        reviewer.on_reload(reloaded)
+    ports = getattr(app, "ports", None)
+    toolbar = getattr(getattr(ports, PLUGIN_TOOLBAR, None), "widget", None)
+    if toolbar is None:
+        return
+    old = _SCREEN.get("strip")
+    if old is not None:
+        old.close()
+    from council_qt.widgets.plugin_panels import PluginStrip
+    try:
+        title = app.window().windowTitle() or "Typhon (plugins)"
+    except Exception:                                     # noqa: BLE001
+        title = "Typhon (plugins)"
+    strip = PluginStrip(app, host, toolbar, say=say, title=title)
+    _SCREEN["strip"] = strip
+    app._plugin_strip = strip
+
+
+def _run_frames(current: Optional[Path]) -> List[Path]:
+    """Every saved frame of the run `current` belongs to, in the slider's
+    order (the folder as the slider lists it)."""
+    reviewer = _LIVE.reviewer
+    if current is None or reviewer is None:
+        return []
+    from council_core import datasets as ds
+    run = ds.describe(current)["run"]
+    if not run:
+        return [current]
+    return [Path(f) for f in list(reviewer.files)
+            if ds.describe(f)["run"] == run]
+
+
+def add_to_dataset() -> Dict[str, Any]:
+    """Add the frame on screen — or a stretch of its run, or the whole run —
+    to a dataset (a dialog asks which). Script-linkable: the "Add to
+    dataset…" button beside PNG / Raw.
+
+    Keys: summary"""
+    from council_qt.widgets import datasets_window as dw
+
+    current = _shown_frame()
+    reviewer = _LIVE.reviewer
+    crop = None
+    roi = getattr(reviewer, "roi", None) if reviewer is not None else None
+    try:
+        crop = roi.get() if roi is not None else None
+    except Exception:                                     # noqa: BLE001
+        crop = None
+    camera = getattr(_RIG.active, "name", "") if _LIVE.device is not None \
+        else ""
+    said = dw.add_to_dataset(_SCREEN.get("app"), current=current,
+                             run_frames=_run_frames(current), camera=camera,
+                             crop=crop)
+    window = _SCREEN.get("datasets")
+    if said and window is not None:
+        try:
+            window.refresh()
+        except RuntimeError:                  # its window was closed away
+            _SCREEN["datasets"] = None
+    return {"summary": said or "Nothing added."}
+
+
+def open_datasets() -> Dict[str, Any]:
+    """Open the Datasets window: every dataset, its pictures, Remove, Send to
+    a plugin, Merge, Rename, Delete. Script-linkable.
+
+    Keys: summary"""
+    from council_qt.widgets.datasets_window import DatasetsWindow
+
+    window = _SCREEN.get("datasets")
+    if window is not None:
+        try:
+            window.isVisible()
+        except RuntimeError:
+            window = None
+    if window is None:
+        host = _plugin_host()
+        say = None
+        app = _SCREEN.get("app")
+        if app is not None:
+            port = getattr(getattr(app, "ports", None), "capture_status", None)
+            say = getattr(port, "set", None)
+        window = DatasetsWindow(host, say=say)
+        _SCREEN["datasets"] = window
+    window.refresh()
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return {"summary": "Datasets opened."}
 
 
 def _reviewer_for(app: Any, canvas: Any, scrubber: str, folder: str,

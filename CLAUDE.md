@@ -184,6 +184,10 @@ same list.
   the best match whole): `examples/qt_apps/README.md`, read by
   `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
   (`gui_examples.py`).
+- The classifier as an optional pop-out plugin, the plugin toolbar strip
+  and "Plugins…", and datasets of picked frames (references, sent to
+  plugins; branch `typhon-plugins`):
+  `docs/handoff/typhon_classifier_datasets_2026-11-02.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

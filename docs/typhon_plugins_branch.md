@@ -42,8 +42,12 @@ other folders.
 4. Run it from that Designer, or double-click its `main.py`. Either way it
    runs the plugin checkout's code and uses its own classifier store.
 
-Until stage P4 it looks and behaves exactly like today's Typhon, under its
-new name.
+Until stage P4 it looked and behaved exactly like today's Typhon, under its
+new name. From 2 November 2026 (the first part of P4) the classifier is a
+plugin in a window of its own, and frames can be put into datasets and sent
+to plugins: `docs/handoff/typhon_classifier_datasets_2026-11-02.md`. A
+project made from the example before then gets the new window through
+`python run_example_gui.py typhon_plugins --project <name> --update`.
 
 ## The traps, and what guards each
 
