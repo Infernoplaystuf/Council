@@ -115,7 +115,17 @@ BATCH_COPIES = 4
 # ============================================================
 
 _NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
-_FENCE = re.compile(r"```(?:python|py)?[^\n]*\n(.*?)```", re.DOTALL)
+_FENCE = re.compile(r"```([^\n]*)\n(.*?)```", re.DOTALL)
+
+
+def python_blocks(text: str) -> List[str]:
+    """The fenced blocks to treat as Python: those tagged so. An untagged block
+    counts only when nothing is tagged, because answers often show a program's
+    output in an untagged or ```text fence after the code."""
+    fences = _FENCE.findall(text)
+    tagged = [b for tag, b in fences
+              if tag.strip().lower() in ("python", "python3", "py")]
+    return tagged or [b for tag, b in fences if not tag.strip()]
 
 
 def check(answer: str, checks: Sequence[Dict[str, Any]]) -> List[str]:
@@ -149,7 +159,7 @@ def check(answer: str, checks: Sequence[Dict[str, Any]]) -> List[str]:
             if not any(abs(n - want) <= tol for n in nums):
                 failed.append(f"no {want:g}")
         if c.get("python_parses"):
-            blocks = _FENCE.findall(text)
+            blocks = python_blocks(text)
             if not blocks:
                 failed.append("no Python block")
             for b in blocks:

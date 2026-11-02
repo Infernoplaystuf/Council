@@ -23,6 +23,16 @@ def test_checks_score_like_the_council_bench():
     assert ab.check("Buy from TradeWorks", [{"not_contains": ["tradeworks"]}])
 
 
+def test_output_blocks_are_not_read_as_python():
+    code = "```python\nprint(1)\n```\n"
+    for output in ("```text\nFound at index 3\n```", "```\nFound at index 3\n```"):
+        assert ab.check(code + output, [{"python_parses": True}]) == []
+    assert ab.check("```\nprint(1)\n```", [{"python_parses": True}]) == []
+    assert ab.check("```\ndef f(:\n```", [{"python_parses": True}])
+    assert ab.check("```text\nprint(1)\n```", [{"python_parses": True}]) == [
+        "no Python block"]
+
+
 def test_the_questions_load_and_have_checks():
     qs = ab.load_questions()
     assert len(qs) >= 20
