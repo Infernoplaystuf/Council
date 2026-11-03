@@ -2650,7 +2650,8 @@ def write_review(out, run: RecordRun, csv_path, sources: Sequence) -> Path:
     meta = {"mode": "records", "csv": str(csv_path), "sources": [str(s) for s in sources],
             "fields": names, "key_fields": run.key_fields,
             "made": f"{datetime.now():%Y-%m-%dT%H:%M:%S}"}
-    ws.append([json.dumps(meta)])
+    from source_extract import run_meta_cells
+    ws.append(run_meta_cells(meta))      # under Excel's cell limit (2026-11-03)
     wb.properties.keywords = REVIEW_MARK
     tmp = out.with_name(out.stem + ".tmp.xlsx")
     wb.save(tmp)
@@ -2720,8 +2721,8 @@ def apply_review(review, fill_dir=None, progress=None) -> ApplyResult:
     try:
         # read whole (list): a suspended read-only generator crashes lxml
         # when it is collected after the workbook closed
-        meta = json.loads(list(wb["_run"].iter_rows(max_row=1, max_col=1,
-                                                    values_only=True))[0][0])
+        from source_extract import read_run_meta
+        meta = read_run_meta(wb, review.name)
         if meta.get("mode") != "records":
             raise LedgerError(f"{review.name} is not a table Ledger's review")
         csv_path = Path(meta["csv"])
