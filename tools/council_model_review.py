@@ -511,6 +511,9 @@ def review(rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
     families: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         families.setdefault(r["family"], []).append(r)
+    sizes = meta.get("sizes") or {}
+    for members in families.values():
+        members.sort(key=lambda m: sizes.get(m["tag"]) or float("inf"))
     md += ["", "## Model by model", ""]
     for family, members in families.items():
         md += [f"### {family} ({members[0]['maker']}, "

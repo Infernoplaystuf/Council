@@ -147,3 +147,12 @@ def test_the_review_is_written_with_a_section_per_family(tmp_path):
 
 def test_no_results_yet_is_said_plainly():
     assert "No results yet." in mr.review([], {"planned": 15})
+
+
+def test_a_family_is_listed_smallest_first(tmp_path):
+    rows = [mr.collect(make_results(tmp_path / t), t)
+            for t in ("phi4:14b", "phi4-mini:latest")]
+    text = mr.review(rows, {"sizes": {"phi4:14b": 9.1,
+                                      "phi4-mini:latest": 2.5}})
+    assert "By size: phi4-mini:latest" in text
+    assert text.index("**phi4-mini:latest**") < text.index("**phi4:14b**")
