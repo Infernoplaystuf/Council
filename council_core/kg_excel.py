@@ -378,13 +378,13 @@ def _review_meta(p: Path) -> Optional[Dict[str, Any]]:
     try:
         if "_run" not in wb.sheetnames:
             return None
-        for row in wb["_run"].iter_rows(min_row=1, max_row=1, max_col=1, values_only=True):
-            return json.loads(row[0])
+        # the first row joined, else the Read me sheet's CSV and sources
+        # (source_extract.read_run_meta: a record cut at 32,767 characters, 2026-11-03)
+        return _se().read_run_meta(wb, p.name)
     except Exception:
         return None
     finally:
         wb.close()
-    return None
 
 
 def _reviews_of(csv_path: Path) -> List[Path]:
