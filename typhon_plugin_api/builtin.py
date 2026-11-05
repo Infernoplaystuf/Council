@@ -78,6 +78,10 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "setup_check": ("council_core.camera_setup", "check"),
     "setup_label": ("council_core.camera_setup", "label"),
     "basler_scan": ("council_core.basler_scan", "scan"),
+    # a camera's I/O lines watched (council_core/basler_lines.py, 5 November
+    # 2026): "Find my trigger line" and its words
+    "FIND_LINE_SECONDS": ("council_core.basler_lines", "FIND_S"),
+    "find_line_words": ("council_core.basler_lines", "find_words"),
 }
 
 __all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
@@ -199,6 +203,28 @@ class DeviceHardwareTrigger(_Arming):
 
     def count_to_now(self, armed: Any) -> None:
         self._device.count_to_now(armed)
+
+    # -- the lines watched (5 November 2026; a Basler's) --------------------
+    def lines(self) -> Any:
+        """The camera's input lines now (() when it cannot say)."""
+        fn = getattr(self._device, "input_lines", None)
+        return tuple(fn()) if callable(fn) else ()
+
+    def states(self, lines: Any = ()) -> Any:
+        """Each input line's level: True, False, or None."""
+        fn = getattr(self._device, "line_states", None)
+        return dict(fn(tuple(lines))) if callable(fn) else {}
+
+    def can_watch(self) -> bool:
+        return callable(getattr(self._device, "watch_lines", None))
+
+    def watch(self, lines: Any, fire: Any, edge: str = "RisingEdge") -> Any:
+        """Watch `lines` (a LineWatcher, started): `fire(line)` per edge,
+        until its stop()."""
+        fn = getattr(self._device, "watch_lines", None)
+        if not callable(fn):
+            raise RuntimeError("this camera's lines cannot be watched")
+        return fn(tuple(lines), fire, edge)
 
 
 class DeviceBinning(DeviceFacet):

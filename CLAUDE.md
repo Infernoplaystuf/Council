@@ -191,6 +191,10 @@ same list.
 - The Triggering window, trigger-source plugins (manifest kind "source")
   and Triggered: record runs (branch `typhon-plugins`):
   `docs/handoff/typhon_triggering_2026-11-02.md`.
+- A Basler's I/O cable as a trigger for snapshot and record runs (every
+  model: a counter on the line, else its level), the Triggering window's
+  line check and "Find my trigger line", `tools/basler_line_test.py`
+  (branch `typhon-plugins`): `docs/handoff/typhon_basler_lines_2026-11-05.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

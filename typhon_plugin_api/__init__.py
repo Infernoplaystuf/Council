@@ -187,6 +187,11 @@ FEATURES: FrozenSet[str] = frozenset({
     "kind.source", "hook.sources", "hook.make_source",
     "context.trigger_sources", "context.make_source",
     "type.SourcePlugin", "mode.record",
+    # a camera's I/O lines watched (5 November 2026): the hardware_trigger
+    # facet's lines(), states(lines), can_watch() and watch(lines, fire,
+    # edge) — a snapshot or record run from the camera's cable, the
+    # Triggering window's line check and "Find my trigger line".
+    "facet.hardware_trigger.watch",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -859,7 +864,13 @@ class HardwareTrigger(Protocol):
       count_from_now(armed)    start the count (the stream runs, the camera
                                ready)
       count_to_now(armed)      end it, before the stream stops; the camera
-                               takes no more hardware triggers"""
+                               takes no more hardware triggers
+
+    Optional, for a camera whose lines Typhon can watch (a Basler's; feature
+    "facet.hardware_trigger.watch"): lines() its input lines now, states(
+    lines) each one's level, can_watch(), and watch(lines, fire, edge) — a
+    started watcher calling fire(line) per edge until its stop(); a
+    snapshot or record run from the camera's cable uses it."""
 
     def inputs(self) -> Any: ...
 

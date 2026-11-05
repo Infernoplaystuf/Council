@@ -249,7 +249,9 @@ class RunTriggers:
         self.books: Any = None
         self.sources: List[TyphonSource] = []
         #: The run's trigger-source plugin's source (a GuardedSource), when
-        #: it fires from one: started with the books, stopped first.
+        #: it fires from one — or the camera's line watched (a LineWatcher)
+        #: for a snapshot or record run from its cable: started with the
+        #: books, stopped first.
         self.outside: Any = None
         #: From the moment its source started until Stop began: what
         #: Capture now fires and the status segment says (frame_camera's
@@ -318,6 +320,22 @@ class RunTriggers:
         if books is None:
             return
         name = str(getattr(self.setup, "source", "") or "")
+        if not books.typhon_fires and getattr(self.setup, "frames_only",
+                                              False):
+            # The camera's cable, for a snapshot or record run: the line is
+            # watched and each pulse is a trigger of the books.
+            books.start()
+            edge = str(getattr(self.setup, "edge", "") or "RisingEdge")
+            self.outside = self.hardware.watch(
+                [name], lambda line, n=name: books.fire_from(n), edge)
+            note = getattr(self.outside, "note", "")
+            if note and self.plugin.ctx is not None:
+                try:
+                    self.plugin.ctx.say(note)
+                except Exception:                         # noqa: BLE001
+                    pass
+            self.live = True
+            return
         if books.typhon_fires and name not in (api.SOFTWARE, api.TIMER):
             # A trigger-source plugin's source: the books' worker fires
             # each trigger it tells (and Capture now presses, as ever).
@@ -446,6 +464,8 @@ class TriggerPlugin:
 
     def __init__(self) -> None:
         self.ctx: Optional[api.PluginContext] = None
+        #: The cameras a run is capturing on (on_run_started .. finished).
+        self._capturing: set = set()
 
     def activate(self, ctx: api.PluginContext) -> None:
         self.ctx = ctx
@@ -499,6 +519,10 @@ class TriggerPlugin:
             facets = self._facets(camera)
         caps = frozenset(capabilities or ())
         line = not setup.typhon_fires
+        if line and setup.frames_only:
+            # Snapshot or record from the camera's cable: the camera runs
+            # live and Typhon watches the line (council_core.basler_lines).
+            return self._watch_problem(setup, facets.get(HARDWARE_TRIGGER))
         needed = HARDWARE_TRIGGER if line else SOFTWARE_TRIGGER
         facet = facets.get(needed) or facets.get(
             SOFTWARE_TRIGGER if line else HARDWARE_TRIGGER)
@@ -531,6 +555,29 @@ class TriggerPlugin:
                        f"Trigger from: Software or Timer")
         return why
 
+    @staticmethod
+    def _watch_problem(setup: Any, facet: Any) -> str:
+        """Why the camera's line cannot be watched for a snapshot or record
+        run, or ""."""
+        how = "Snapshot" if setup.snapshot else "Record"
+        if facet is None or not callable(getattr(facet, "can_watch", None)) \
+                or not facet.can_watch():
+            return (f"{how} takes its trigger from Software (Capture now), "
+                    f"the Timer or a trigger-source plugin here; "
+                    f"{setup.source} is the camera's own input, and this "
+                    f"camera's lines cannot be watched, so only an exact run "
+                    f"waits for it — choose Triggered: exact, or Software / "
+                    f"Timer")
+        try:
+            lines = tuple(facet.lines())
+        except Exception:                                 # noqa: BLE001
+            lines = ()
+        if setup.source not in lines:
+            return (f"{setup.source} is not an input of this camera now "
+                    f"(its inputs: {', '.join(lines) or 'none'}) — choose "
+                    f"one of those, or Software / Timer")
+        return ""
+
     def check_start(self, plan: Any) -> str:
         """Every camera of the run, asked what its mode and source need
         (design 3.6), before anything stops; a reason refuses Start."""
@@ -548,13 +595,24 @@ class TriggerPlugin:
         return "; ".join(reasons)
 
     def on_run_started(self, run: Any) -> None:
-        """Nothing of its own: the source starts at its own step, after
-        every plugin was told (design 3.6)."""
+        """The cameras capturing noted (the line finder waits for them);
+        the source starts at its own step, after every plugin was told
+        (design 3.6)."""
+        self._capturing.update(str(c) for c in dict(
+            getattr(run, "folders", {}) or {}))
 
     def on_run_finished(self, run: Any) -> None:
         """Nothing for the end record's "plugins": the run's capture block
         is format 1's own (design 3.9)."""
+        for camera in dict(getattr(run, "folders", {}) or {}):
+            self._capturing.discard(str(camera))
         return None
+
+    def capturing(self, camera: Optional[str] = None) -> bool:
+        """Whether `camera` (the active one) is capturing: a run of any
+        mode, continuous included, or a triggered run's books live."""
+        name = self._camera(camera)
+        return bool(name in self._capturing or self.status(camera))
 
     # -- the trigger slot (the core's order, design 3.6) ---------------------
     def trigger_slot(self, camera: str) -> RunTriggers:
@@ -625,6 +683,43 @@ class TriggerPlugin:
         return builtin.trigger_settings(setup, options or
                                         api.CaptureOptions(), extra,
                                         plugins=True)
+
+    # -- the camera's input lines (5 November 2026) ---------------------------
+    def _hardware(self, camera: Optional[str]) -> Any:
+        name = self._camera(camera)
+        return self._facets(name).get(HARDWARE_TRIGGER) if name else None
+
+    def line_levels(self, camera: Optional[str] = None) -> Dict[str, Any]:
+        """Each input line of the camera and its level now (True high,
+        False low, None when the camera cannot say); {} for a camera whose
+        lines cannot be read (no camera, or not a Basler)."""
+        hardware = self._hardware(camera)
+        if hardware is None or not callable(getattr(hardware, "states",
+                                                     None)):
+            return {}
+        try:
+            return dict(hardware.states())
+        except Exception:                                 # noqa: BLE001
+            return {}
+
+    def find_line(self, camera: Optional[str] = None) -> Any:
+        """"Find my trigger line": every input line of the camera watched
+        (a LineWatcher, started; the caller stops it and words it with
+        builtin.find_line_words). Refused while capturing — a run may be
+        using the line — and for a camera whose lines cannot be watched."""
+        if self.capturing(camera):
+            raise RuntimeError("Stop the capture first: Find my trigger line "
+                               "watches the camera's lines on its own.")
+        hardware = self._hardware(camera)
+        can_watch = getattr(hardware, "can_watch", None)
+        if not callable(can_watch) or not can_watch():
+            raise RuntimeError("This camera's I/O lines cannot be watched "
+                               "(connect a Basler camera).")
+        lines = tuple(hardware.lines())
+        if not lines:
+            raise RuntimeError("This camera has no input line Typhon can "
+                               "watch: every line is set to Output.")
+        return hardware.watch(lines, None, "RisingEdge")
 
     def write_setting(self, key: str, value: Any) -> Dict[str, Any]:
         """One of the set-up's "capture.*" keys written in place, as the

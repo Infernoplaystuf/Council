@@ -131,3 +131,90 @@ def test_a_record_run_from_the_window(camera, tmp_path):
         frame_camera.stop()
     panel.refresh()
     assert panel.rows[tg.MODE_KEY].isEnabled()
+
+
+# ======================================================================
+# The camera's lines (5 November 2026): the levels and "Find my trigger
+# line", on the fake Basler of test_typhon_plugins_basler_lines
+# ======================================================================
+@pytest.fixture
+def basler(ui, monkeypatch):
+    from tests.test_basler_trigger import FakePylon
+    from tests.test_typhon_plugins_basler_lines import LevelBasler
+    without_camera_sdks(monkeypatch)
+    monkeypatch.delenv("COUNCIL_SIM_CAMERAS", raising=False)
+    cam = LevelBasler(sources=("Software", "Line1", "Line2", "Line3"),
+                      line_modes={"Line1": "Input", "Line2": "Output",
+                                  "Line3": "Input"})
+    frame_camera._plugin_host().instance("typhon.basler").sdk = FakePylon(cam)
+    rows = frame_camera.list_cameras()["rows"]
+    first = frame_camera._RIG.slots[0]
+    kept = first.name
+    frame_camera.connect(next(r for r in rows if "Basler" in r or "boA" in r))
+    yield ui, cam
+    frame_camera.disconnect()
+    if first.name != kept:     # the Basler named its slot: the name put back
+        frame_camera._RIG.rename_slot(first.name, kept)
+
+
+def test_a_simulated_camera_shows_no_lines(camera):
+    panel = open_triggering(camera)
+    panel.refresh()
+    assert panel.lines_label.isHidden() and panel.find_button.isHidden()
+
+
+def test_the_lines_levels_are_shown(basler):
+    ui, cam = basler
+    panel = open_triggering(ui)
+    cam.levels["Line3"] = True
+    panel.refresh()
+    assert not panel.find_button.isHidden()
+    text = panel.lines_label.text()
+    assert "Line1 low" in text and "Line3 HIGH" in text, text
+    assert "Line2" not in text, "an output is not an input"
+
+
+def test_find_my_trigger_line_then_use_it(basler, monkeypatch):
+    import threading
+    import time
+    from typhon_plugins.trigger import panel as tp
+    ui, cam = basler
+    panel = open_triggering(ui)
+    panel.refresh()
+    panel.find_button.click()
+    assert panel.finding is not None and "Watching Line1, Line3" in \
+        panel.said.text()
+    assert panel.find_button.text() == "Stop looking"
+
+    def send():
+        for _ in range(3):
+            cam.pulse("Line3", 0.01)
+            time.sleep(0.03)
+    sender = threading.Thread(target=send)
+    sender.start()
+    assert pump(5.0, until=lambda: panel.finding.counts.get("Line3") == 3)
+    sender.join()
+    panel._find_until = 0.0                     # the time is up
+    assert pump(2.0, until=lambda: panel.finding is None)
+    assert panel.said.text().startswith("Your trigger cable is on Line3"), \
+        panel.said.text()
+    assert not panel.use_button.isHidden()
+    assert panel.use_button.text() == "Use Line3"
+    assert cam.value("CounterEventSource", "Counter2") == "Off", "put back"
+    panel.rows[tg.MODE_KEY].setCurrentText(tg.MODE_SNAPSHOT)
+    panel.use_button.click()
+    assert frame_camera._LIVE.device.capture.source == "Line3"
+    assert panel.use_button.isHidden()
+
+
+def test_the_finder_waits_while_capturing(basler, tmp_path):
+    ui, cam = basler
+    panel = open_triggering(ui)
+    frame_camera.start(str(tmp_path / "frames"))
+    try:
+        panel.refresh()
+        assert not panel.find_button.isEnabled()
+        with pytest.raises(RuntimeError, match="Stop the capture first"):
+            panel.plugin.find_line()
+    finally:
+        frame_camera.stop()

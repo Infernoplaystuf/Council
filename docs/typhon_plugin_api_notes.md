@@ -1174,6 +1174,20 @@ The Triggering panel is shown from the plugin toolbar (`WINDOW_KEEPS` is
 empty); the Basic tab no longer has the trigger boxes in a plugins project.
 Details: `docs/handoff/typhon_triggering_2026-11-02.md`.
 
+## A camera's cable as a trigger (5 November 2026)
+
+Still API 0.3. New feature `facet.hardware_trigger.watch`: the
+`hardware_trigger` facet may also have `lines()` (the camera's input lines
+now), `states(lines)` (each one's level), `can_watch()` and
+`watch(lines, fire, edge)` (a started watcher, `fire(line)` per edge, until
+`stop()`). The built-in Basler plugin has them on every model
+(`council_core/basler_lines.py`: a counter of the camera's on the line,
+else the line's level read every 2 ms). With them a Triggered: snapshot or
+record run may take its trigger from the camera's own line — the camera
+runs live, nothing is armed — and the Triggering window shows the lines'
+levels and "Find my trigger line". A camera without them keeps exact-only
+from a line. Details: `docs/handoff/typhon_basler_lines_2026-11-05.md`.
+
 ## What is wired, and what comes when
 
 Today's Typhon never calls the host, so it behaves exactly as before, and a
