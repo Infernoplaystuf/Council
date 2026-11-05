@@ -169,7 +169,19 @@ BUILTIN_PLUGINS: Tuple[Tuple[str, str], ...] = (
     ("typhon.classify", "classify"),
     ("typhon.timing", "timing"),
     ("typhon.crop", "crop"),
+    ("typhon.send_trigger", "send_trigger"),
 )
+#: Built-ins a new project does not run until ticked in Plugins… (a plugin
+#: home with no base set file): optional extras (Send trigger, 5 November
+#: 2026). A base set written by the user lists what it lists.
+OPTIONAL_BUILTINS: Tuple[str, ...] = ("typhon.send_trigger",)
+
+
+def default_plugins(builtins: Sequence[Tuple[str, str]] = BUILTIN_PLUGINS
+                    ) -> List[str]:
+    """The base set of a plugin home with none written: every built-in but
+    the optional ones."""
+    return [pid for pid, _name in builtins if pid not in OPTIONAL_BUILTINS]
 #: The package the built-ins are imported as.
 BUILTIN_PACKAGE = "typhon_plugins"
 BUILTIN_DIR = Path(__file__).resolve().parent.parent / BUILTIN_PACKAGE
@@ -888,8 +900,8 @@ class PluginHost:
         with self._lock:
             if self._base is None:
                 try:
-                    self._base = pl.read_base_set(self.home.path,
-                                                  self.builtin_ids())
+                    self._base = pl.read_base_set(
+                        self.home.path, default_plugins(self.builtins))
                 except pl.PluginListError as exc:
                     self.notes.append(f"{exc} — every built-in plugin is "
                                       f"used meanwhile")
@@ -3192,6 +3204,11 @@ class Context:
         if self._off():
             return None
         return self._host.make_source(name)
+
+    def capture_now(self, camera: Optional[str] = None) -> Optional[str]:
+        if self._off():
+            return None
+        return self._host.capture_now(camera)
 
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (device.capture, the

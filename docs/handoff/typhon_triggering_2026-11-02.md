@@ -65,3 +65,17 @@ after the classifier and datasets: `typhon_classifier_datasets_2026-11-02.md`).
 adopted by the host, record runs on a fake clock and on the simulated
 camera) and `tests/test_typhon_plugins_trigger_window.py` (the wireframe,
 the window in the built app, a record run started from it).
+
+## Send trigger (5 November 2026)
+
+Andy: "a button inside of Typhon to send a trigger to a camera selected from
+a drop down … a plugin so it can be optionally added". `typhon.send_trigger`
+(`typhon_plugins/send_trigger/`) is a built-in feature plugin that a new
+project does NOT run (`plugin_host.OPTIONAL_BUILTINS`; the default base set
+is `default_plugins()`): tick *Send trigger* in Plugins… and its button
+appears on the toolbar strip. Its window has a drop-down of the connected
+cameras and *Send trigger*: Capture now (F9) on the camera picked, whichever
+the main window shows — one trigger of the triggered run in progress there
+(`context.capture_now(camera)`, API feature `context.capture_now`), counted
+in the run's trigger file; with no run, the triggering plugin's words on
+what to set up. Tests: `tests/test_typhon_plugins_send_trigger.py`.

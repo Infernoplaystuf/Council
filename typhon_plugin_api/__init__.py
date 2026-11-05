@@ -192,6 +192,9 @@ FEATURES: FrozenSet[str] = frozenset({
     # edge) — a snapshot or record run from the camera's cable, the
     # Triggering window's line check and "Find my trigger line".
     "facet.hardware_trigger.watch",
+    # Capture now on any camera of the rig (5 November 2026; the Send
+    # trigger plugin's button).
+    "context.capture_now",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -564,6 +567,12 @@ class PluginContext(Protocol):
     def make_source(self, name: str) -> Optional[TriggerSource]:
         """A new TriggerSource for one run, made by the plugin that offers
         source `name` (its start and stop guarded), or None."""
+
+    def capture_now(self, camera: Optional[str] = None) -> Optional[str]:
+        """Capture now (F9) on `camera` (default: the active one): one
+        trigger of the triggered run in progress there, through the
+        triggering plugin; its words, or None when no triggering plugin
+        runs in this project."""
 
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (a CaptureSetup: trigger

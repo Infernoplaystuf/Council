@@ -1188,6 +1188,15 @@ runs live, nothing is armed — and the Triggering window shows the lines'
 levels and "Find my trigger line". A camera without them keeps exact-only
 from a line. Details: `docs/handoff/typhon_basler_lines_2026-11-05.md`.
 
+## Capture now on any camera (5 November 2026)
+
+Still API 0.3. `context.capture_now(camera=None)` (feature
+`context.capture_now`): Capture now (F9) on that camera — one trigger of its
+triggered run, through the triggering plugin — and its words, or None when no
+triggering plugin runs. The optional built-in `typhon.send_trigger` uses it:
+a drop-down of the cameras and a Send trigger button. It is in
+`OPTIONAL_BUILTINS`, so a new project runs it only once ticked in Plugins….
+
 ## What is wired, and what comes when
 
 Today's Typhon never calls the host, so it behaves exactly as before, and a
