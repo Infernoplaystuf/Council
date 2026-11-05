@@ -51,7 +51,7 @@ def panel_for(tmp_path, example, **actions) -> ModelPanel:
 
 
 def test_a_folder_that_isnt_a_model_shows_nothing(qapp, tmp_path):
-    panel = ModelPanel(None, PhysicsActions(), python=lambda: sys.executable,
+    panel = ModelPanel(None, PhysicsActions(ask_folder=lambda start: ""), python=lambda: sys.executable,
                        vault_dir=tmp_path)
     assert not panel.set_folder(tmp_path) and panel.folder is None
     panel.deleteLater()
