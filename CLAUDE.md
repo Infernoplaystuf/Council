@@ -174,6 +174,9 @@ same list.
   the best match whole): `examples/qt_apps/README.md`, read by
   `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
   (`gui_examples.py`).
+- Council's own plugins (plugin.json shared with Typhon, kind "tab", all off
+  until ticked in the Settings tab, guarded tab build, plugin data folder):
+  `docs/handoff/app_plugins_2026-11-05.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

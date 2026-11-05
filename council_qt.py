@@ -151,6 +151,11 @@ def _register_tabs(window) -> None:
         window.add_tab(title, lambda f=factory, w=window: f(w),
                        eager=eager, tab_id=tab_id)
 
+    # The plugins the user switched on in Settings (all start off), after the
+    # built-in tabs. Guarded: a broken plugin never stops the launch.
+    from council_qt import plugin_tabs
+    plugin_tabs.register(window)
+
     if window.grouped is not None and ui_section is not None:
         # Re-apply once every tab has registered so empty groups auto-hide
         # with their real inner counts.

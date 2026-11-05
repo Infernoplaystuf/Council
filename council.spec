@@ -163,6 +163,10 @@ datas = [
     # the user's own Python when the Build tab runs code (council_core.
     # build_sandbox), so it must be .py files on disk, not frozen modules.
     ("council_core/_build_sandbox", "council_core/_build_sandbox"),
+    # Council's built-in plugins: imported from their own folders by
+    # council_core.app_plugins.load_entry (spec_from_file_location), so they
+    # ship as .py files beside the app, like the sandbox hook above.
+    ("council_plugins",           "council_plugins"),
     # ── Scripts run by ANOTHER interpreter (the DREAM3D-NX env), so they
     #    must be .py files beside the app, not modules frozen into it:
     #    workflow_runner launches every simplnx and every model-written
