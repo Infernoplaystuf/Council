@@ -206,12 +206,19 @@ class DeviceHardwareTrigger(_Arming):
 
     # -- the lines watched (5 November 2026; a Basler's) --------------------
     def lines(self) -> Any:
-        """The camera's input lines now (() when it cannot say)."""
-        fn = getattr(self._device, "input_lines", None)
-        return tuple(fn()) if callable(fn) else ()
+        """What a cable's pulse can be watched on now: the camera's input
+        lines, then the triggers through a CoaXPress frame grabber
+        (CxpTrigger0 …) a counter of the camera can count; () when it
+        cannot say."""
+        for name in ("trigger_inputs", "input_lines"):
+            fn = getattr(self._device, name, None)
+            if callable(fn):
+                return tuple(fn())
+        return ()
 
     def states(self, lines: Any = ()) -> Any:
-        """Each input line's level: True, False, or None."""
+        """Each input line's level: True, False, or None (default: the
+        camera's input lines; a trigger through the grabber has none)."""
         fn = getattr(self._device, "line_states", None)
         return dict(fn(tuple(lines))) if callable(fn) else {}
 

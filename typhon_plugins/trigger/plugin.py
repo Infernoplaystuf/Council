@@ -572,6 +572,14 @@ class TriggerPlugin:
             lines = tuple(facet.lines())
         except Exception:                                 # noqa: BLE001
             lines = ()
+        if setup.source not in lines and not setup.source.startswith(
+                "Line"):
+            return (f"{how} cannot take its trigger from {setup.source}: it "
+                    f"comes through the frame grabber, and none of this "
+                    f"camera's free counters can count it, so only an exact "
+                    f"run waits for it — choose Triggered: exact, or plug "
+                    f"the cable into the camera's own I/O socket and choose "
+                    f"its line (Find my trigger line)")
         if setup.source not in lines:
             return (f"{setup.source} is not an input of this camera now "
                     f"(its inputs: {', '.join(lines) or 'none'}) — choose "

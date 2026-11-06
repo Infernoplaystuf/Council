@@ -27,6 +27,15 @@ model each does what it can:
     more over GigE) can fall between them: the watcher says so (`method`,
     `note`).
 
+A TRIGGER THROUGH THE FRAME GRABBER (6 November 2026). On a CoaXPress
+camera the cable may go into the frame grabber's I/O instead of the
+camera's: the card sends it down the CXP link and the camera sees it as
+CxpTrigger0 (a trigger source, not a line — it has no level to read). It is
+watched by a counter, where one of the camera's counters lists it among its
+event sources; else only an exact run takes it (trigger_inputs leaves it
+out, and the run says why). The grabber must be set, in its own software,
+to pass the trigger on: Typhon does not set the grabber.
+
 The camera's other settings are never changed: a line that is an Output is
 not watched (its LineMode is not touched); the LineSelector is put back
 after every read, under the device's trigger_lock (a settings view walks
@@ -51,6 +60,8 @@ FIND_S = 10.0
 
 COUNTER = "counter"
 STATUS = "line status"
+#: A trigger that is not a line and no free counter counts: not watched.
+UNWATCHED = "not watched"
 
 
 def _entries(node: Any) -> Tuple[str, ...]:
@@ -121,6 +132,51 @@ def input_lines(device: Any) -> Tuple[str, ...]:
             if before is not None:
                 _set(selector, before)
     return tuple(out)
+
+
+def is_line(source: str) -> bool:
+    """A camera line (Line1 …), whose level can be read; else a trigger
+    that arrives another way (CxpTrigger0 through the frame grabber)."""
+    return str(source).startswith("Line")
+
+
+def countable(device: Any, source: str) -> bool:
+    """Whether one of the camera's counters can count `source`'s edges
+    (it is among a counter's event sources). Read only; the selector put
+    back."""
+    node = getattr(device, "_node", None)
+    if not callable(node):
+        return False
+    sel, events = node("CounterSelector"), node("CounterEventSource")
+    if sel is None or events is None:
+        return False
+    counters = [c for c in COUNTERS if c in _entries(sel)]
+    with _lock(device):
+        before = _get(sel)
+        try:
+            for counter in counters:
+                if _set(sel, counter) and source in _entries(events):
+                    return True
+        finally:
+            if before is not None:
+                _set(sel, before)
+    return False
+
+
+def trigger_inputs(device: Any) -> Tuple[str, ...]:
+    """Every input a cable's pulse can reach the camera on that Typhon can
+    watch: its input lines, then the triggers that come another way
+    (CxpTrigger0 … through a CoaXPress frame grabber) that a counter can
+    count."""
+    lines = input_lines(device)
+    try:
+        offered = tuple(getattr(device.capture_options(), "hardware", ())
+                        or ())
+    except Exception:                                     # noqa: BLE001
+        offered = ()
+    others = tuple(s for s in offered if not is_line(s) and s not in lines
+                   and countable(device, s))
+    return lines + others
 
 
 def line_states(device: Any, lines: Sequence[str] = ()) -> Dict[str, Optional[bool]]:
@@ -270,19 +326,28 @@ class LineWatcher:
     @property
     def note(self) -> str:
         polled = [l for l, m in self.method.items() if m == STATUS]
+        lost = [l for l, m in self.method.items() if m == UNWATCHED]
+        out = []
+        if lost:
+            out.append(f"{', '.join(lost)} cannot be watched: no free "
+                       f"counter of the camera counts it — an exact run "
+                       f"takes it")
         if not polled:
-            return ""
-        return (f"{', '.join(polled)} watched by reading the line's level "
-                f"every {self.poll_s * 1000:g} ms (this camera has no "
-                f"counter that counts that line): a pulse shorter than a "
-                f"few ms can be missed — an exact run from the line never "
-                f"misses one")
+            return "; ".join(out)
+        out.append(f"{', '.join(polled)} watched by reading the line's "
+                   f"level every {self.poll_s * 1000:g} ms (this camera has "
+                   f"no counter that counts that line): a pulse shorter "
+                   f"than a few ms can be missed — an exact run from the "
+                   f"line never misses one")
+        return "; ".join(out)
 
     def start(self) -> "LineWatcher":
         if self._thread is not None:
             return self
         free = list(COUNTERS)
-        for line in self.lines:
+        # The grabber's triggers first: a line that gets no counter can
+        # still have its level read; a CxpTrigger cannot.
+        for line in sorted(self.lines, key=is_line):
             counted = None
             while free and counted is None:
                 trial = _Counted(self.device, line, free.pop(0), self.edge)
@@ -291,8 +356,10 @@ class LineWatcher:
             if counted is not None:
                 self._counted[line] = counted
                 self.method[line] = COUNTER
-            else:
+            elif is_line(line):
                 self.method[line] = STATUS
+            else:
+                self.method[line] = UNWATCHED
         polled = [l for l, m in self.method.items() if m == STATUS]
         if polled:
             self._levels = line_states(self.device, polled)
@@ -365,5 +432,7 @@ def find_words(watcher: LineWatcher) -> str:
     best = max(seen, key=seen.get)
     parts = ", ".join(f"{l}: {n} pulse{'' if n == 1 else 's'}"
                       for l, n in seen.items())
-    return (f"Your trigger cable is on {best} ({parts}). Choose Trigger "
+    where = (f"is on {best}" if is_line(best) else
+             f"comes through the frame grabber, as {best}")
+    return (f"Your trigger cable {where} ({parts}). Choose Trigger "
             f"from: {best}.")

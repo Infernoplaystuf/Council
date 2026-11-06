@@ -1048,6 +1048,12 @@ class BaslerDevice(Device):
         from . import basler_lines
         return basler_lines.input_lines(self)
 
+    def trigger_inputs(self) -> Tuple[str, ...]:
+        """The input lines, then CxpTrigger0 … (through a CoaXPress frame
+        grabber) where a counter can count them: what can be watched."""
+        from . import basler_lines
+        return basler_lines.trigger_inputs(self)
+
     def line_states(self, lines: Sequence[str] = ()) -> Dict[str, Any]:
         from . import basler_lines
         return basler_lines.line_states(self, lines)

@@ -48,6 +48,23 @@ exposes only on a pulse, so it never misses one. That is unchanged.
   project. Everything goes under one new folder (report.txt and the runs).
   `--fake` checks the script with the test suite's fake camera.
 
+## The cable into a CoaXPress frame grabber (6 November 2026)
+
+Andy: the cable may go into the camera's I/O socket or into the frame
+grabber, and users may switch. In the grabber, the card sends the pulse down
+the CXP link and the camera sees it as `CxpTrigger0` — a trigger source, not
+a line, with no level to read. `basler_lines.trigger_inputs` offers it
+beside the lines where one of the camera's counters lists it among its
+event sources (`countable`); the watcher gives such triggers a counter
+first (a line left without one still has its level). So Find my trigger
+line covers both places ("comes through the frame grabber, as
+CxpTrigger0"), and a snapshot or record run can take its trigger from
+`CxpTrigger0`. Where no counter counts it, only an exact run takes it and a
+snapshot or record run is refused with the reason. The grabber must be set
+in its own software to pass the trigger on; Typhon does not set the
+grabber. Whether a real boost's counters list `CxpTrigger0` is not known
+yet: `tools/basler_line_test.py` says so on the first line of its report.
+
 ## Tests
 
 `tests/test_typhon_plugins_basler_lines.py` (fake Basler with counters, and
@@ -60,5 +77,5 @@ here has run on a real camera yet: `tools/basler_line_test.py` is that step.
 
 - Real-camera numbers: which models fall back to line status, and the
   shortest pulse the fallback catches over USB and GigE.
-- A CoaXPress (boost) camera's CxpTrigger sources and a Camera Link CC line
-  are offered for exact runs as before; the watcher only reads LineN lines.
+- A Camera Link CC line is offered for exact runs as before; the watcher
+  does not read it.

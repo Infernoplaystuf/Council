@@ -9,7 +9,11 @@ WHAT IT DOES, IN ORDER
      short pulse can be missed).
   2. "Find my trigger line": watches every input of the first camera (or
      --serial's) for --seconds while you send a few pulses down the cable,
-     and says which line they came on.
+     and says which line they came on — a camera line when the cable is in
+     the camera's I/O socket, CxpTrigger0 when it is in a CoaXPress frame
+     grabber (where a counter of the camera can count it). With the cable
+     in the grabber, the grabber must be set (in its own software) to pass
+     the trigger to the camera; Typhon does not set the grabber.
   3. With --runs: three short runs from that line in "Typhon (plugins)" —
      Triggered: exact (the camera's own trigger), Triggered: snapshot and
      Triggered: record (the camera live, the line watched) — each for
@@ -116,15 +120,31 @@ def check_lines(sdk: Any, serial: str, seconds: float, edge: str,
     say(f"Camera: {chosen.label}")
     device = backend.open(chosen)
     try:
-        lines = device.input_lines()
+        own = device.input_lines()
+        lines = device.trigger_inputs()
+        if own:
+            levels = device.line_states(own)
+            words = {True: "HIGH", False: "low", None: "cannot be read"}
+            say("  Input lines now: " + ", ".join(
+                f"{l} {words[levels.get(l)]}" for l in own))
+        grabber = [l for l in lines if l not in own]
+        if grabber:
+            say("  Through the frame grabber (CoaXPress), countable: "
+                + ", ".join(grabber))
+        try:
+            offered = tuple(getattr(device.capture_options(), "hardware",
+                                    ()) or ())
+        except Exception:                                 # noqa: BLE001
+            offered = ()
+        lost = [s for s in offered if not s.startswith("Line")
+                and s not in lines]
+        if lost:
+            say("  Trigger sources an exact run can use but Typhon cannot "
+                "watch (no counter counts them): " + ", ".join(lost))
         if not lines:
-            say("  It has no input line (every line is set to Output, or it "
-                "has no LineSelector).")
+            say("  Nothing to watch: no input line (every line is set to "
+                "Output) and no countable grabber trigger.")
             return chosen, None
-        levels = device.line_states(lines)
-        words = {True: "HIGH", False: "low", None: "cannot be read"}
-        say("  Input lines now: " + ", ".join(
-            f"{l} {words[levels.get(l)]}" for l in lines))
         say("")
         say(f"Find my trigger line: watching {', '.join(lines)} for "
             f"{seconds:g} s — send a few pulses down the trigger cable now.")

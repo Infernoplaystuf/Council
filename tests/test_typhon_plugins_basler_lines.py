@@ -273,3 +273,74 @@ def test_the_hardware_script_runs_on_the_fake_camera(tmp_path):
         assert any(p.name.endswith("_frames.csv")
                    for p in (out / "runs" / mode).iterdir()), mode
     assert "Refused" not in report, report
+
+
+# ======================================================================
+# The cable into the frame grabber (6 November 2026): CxpTrigger0
+# ======================================================================
+class CxpBasler(LevelBasler):
+    """A boost whose counters can count CxpTrigger0 (the frame grabber's
+    trigger, sent down the CXP link) — or, with cxp_counted False, not."""
+
+    def __init__(self, cxp_counted=True, **kw):
+        super().__init__(**kw)
+        if cxp_counted:
+            node = self.nodes["CounterEventSource"]
+            node.choices = tuple(node.choices) + ("CxpTrigger0",)
+
+    def grabber_pulse(self):
+        self.raise_line("CxpTrigger0")
+
+
+def test_the_grabbers_trigger_is_offered_where_a_counter_counts_it():
+    dev = device(CxpBasler())
+    assert bl.trigger_inputs(dev) == ("Line1", "CxpTrigger0")
+    assert dev.input_lines() == ("Line1",), "a line, with a level"
+    assert bl.trigger_inputs(device(CxpBasler(cxp_counted=False))) == \
+        ("Line1",)
+
+
+def test_find_my_trigger_line_finds_the_grabber():
+    cam = CxpBasler(line_modes={"Line1": "Input", "Line2": "Input",
+                                "Line3": "Input"})
+    dev = device(cam)
+    watcher = dev.watch_lines(dev.trigger_inputs(), None)
+    try:
+        assert watcher.method["CxpTrigger0"] == bl.COUNTER, \
+            "the grabber's trigger gets a counter first"
+        for _ in range(3):
+            cam.grabber_pulse()
+        assert wait_for(lambda: watcher.counts.get("CxpTrigger0") == 3, 5)
+    finally:
+        watcher.stop()
+    said = bl.find_words(watcher)
+    assert said.startswith("Your trigger cable comes through the frame "
+                           "grabber, as CxpTrigger0"), said
+
+
+def test_a_snapshot_run_from_the_grabbers_trigger(plugin_project, tmp_path):
+    cam = CxpBasler()
+    connect_basler(cam)
+    set_up(mode=tg.MODE_SNAPSHOT, source="CxpTrigger0", per=1)
+    folder = tmp_path / "frames"
+    frame_camera.start(str(folder))
+    assert not cam.armed(), "the camera runs live"
+    session = frame_camera._LIVE.session
+    assert wait_for(lambda: session.stats().grabbed >= 3)
+    for _ in range(2):
+        cam.grabber_pulse()
+        time.sleep(0.08)
+    assert wait_for(lambda: session.stats().recorded >= 2)
+    frame_camera.stop()
+    frames = rows_of(folder / f"{last_run(folder)}_frames.csv")
+    assert {r["trigger_source"] for r in frames} == {"CxpTrigger0"}
+
+
+def test_an_uncounted_grabber_trigger_is_exact_only(plugin_project,
+                                                    tmp_path):
+    cam = CxpBasler(cxp_counted=False)
+    connect_basler(cam)
+    set_up(mode=tg.MODE_RECORD, source="CxpTrigger0")
+    with pytest.raises(RuntimeError, match="comes through the frame "
+                                           "grabber"):
+        frame_camera.start(str(tmp_path / "frames"))
