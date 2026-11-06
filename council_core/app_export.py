@@ -66,6 +66,8 @@ DATA_DIR = "data"
 EXPORT_FILE = "export.json"
 EXPORT_FORMAT = "council-app-export"
 COMMIT_FILE = "SOURCE_COMMIT"
+#: The exported folder's own setup check (check.bat / check.sh run it).
+CHECK_SCRIPT = "check_setup.py"
 
 #: Never copied out of a project folder.
 SKIP_NAMES = {"__pycache__", ".pytest_cache", ".git", "logs"}
@@ -391,13 +393,28 @@ def _write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+_FIND_PYTHON = [
+    "if defined PYTHON goto have_python",
+    "where python >nul 2>nul && set \"PYTHON=python\" && goto have_python",
+    "where py >nul 2>nul && set \"PYTHON=py\" && goto have_python",
+    "echo No Python found. Install Python 3.11 or newer (tick \"Add python.exe",
+    "echo to PATH\"), or set PYTHON to python.exe first, e.g.",
+    "echo     set PYTHON=C:\\Python311\\python.exe",
+    "echo See README.txt.",
+    "pause",
+    "exit /b 9009",
+    ":have_python",
+]
+
+
 def _bat(name: str) -> str:
     return "\r\n".join([
         "@echo off",
         f"REM {name}: exported from the Council. Runs with its own data",
         "REM folder (data\\ beside this file): vault, settings, plugin home",
         "REM and classifiers. Set PYTHON to the Python to use (one with the",
-        "REM packages in requirements.txt), else python on PATH is used.",
+        "REM packages in requirements.txt), else python on PATH, else the py",
+        "REM launcher, is used.",
         "setlocal",
         "set \"HERE=%~dp0\"",
         "set \"COUNCIL_VAULT_ROOT=%HERE%data\\vault\"",
@@ -405,10 +422,33 @@ def _bat(name: str) -> str:
         "set \"TYPHON_PLUGIN_HOME=%HERE%data\\plugin_home\"",
         "set \"FRAME_CLASSES_STORE=%HERE%data\\classifiers\"",
         "set \"COUNCIL_SKIP_PATH_MIGRATION=1\"",
-        "if not defined PYTHON set \"PYTHON=python\"",
+        *_FIND_PYTHON,
         "cd /d \"%HERE%\"",
         "\"%PYTHON%\" \"%HERE%main.py\" %*",
-        "exit /b %ERRORLEVEL%", ""])
+        "set \"CODE=%ERRORLEVEL%\"",
+        "if not \"%CODE%\"==\"0\" (",
+        "  echo.",
+        f"  echo {name} stopped with an error ^(code %CODE%^). Run",
+        "  echo check.bat to see what is missing; README.txt has the fixes.",
+        "  pause",
+        ")",
+        "exit /b %CODE%", ""])
+
+
+def _check_bat() -> str:
+    return "\r\n".join([
+        "@echo off",
+        "REM Checks this machine can run the app: Python, packages, the",
+        "REM Council files in _council, and which cameras are seen. Changes",
+        "REM nothing (a throw-away data folder is used).",
+        "setlocal",
+        "set \"HERE=%~dp0\"",
+        *_FIND_PYTHON,
+        "cd /d \"%HERE%\"",
+        f"\"%PYTHON%\" \"%HERE%{CHECK_SCRIPT}\" %*",
+        "set \"CODE=%ERRORLEVEL%\"",
+        "pause",
+        "exit /b %CODE%", ""])
 
 
 def _sh(name: str) -> str:
@@ -426,6 +466,15 @@ def _sh(name: str) -> str:
         "exec \"${PYTHON:-python3}\" \"$HERE/main.py\" \"$@\"", ""])
 
 
+def _check_sh() -> str:
+    return "\n".join([
+        "#!/bin/sh",
+        "# Checks this machine can run the app (changes nothing).",
+        "HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"",
+        "cd \"$HERE\"",
+        f"exec \"${{PYTHON:-python3}}\" \"$HERE/{CHECK_SCRIPT}\" \"$@\"", ""])
+
+
 def _requirements(required: Sequence[str], optional: Sequence[str]) -> str:
     lines = ["# pip install -r requirements.txt",
              "# (Python 3.11 or newer.)", "PySide6"]
@@ -438,26 +487,189 @@ def _requirements(required: Sequence[str], optional: Sequence[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+#: check_setup.py, written into every export: run on the other machine
+#: (check.bat), it says what is missing there. Standard library and the
+#: app's own files only; a throw-away data folder; nothing is changed.
+SETUP_CHECK = r"""
+'''Checks this machine can run the exported app (check.bat / check.sh).
+Changes nothing: a throw-away data folder is used.'''
+import atexit, importlib, json, os, shutil, sys, tempfile, traceback
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIB = os.path.join(HERE, "_council")
+problems = []
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+say(f"Python {sys.version.split()[0]} at {sys.executable}")
+if sys.version_info < (3, 11):
+    problems.append("Python is older than 3.11: install Python 3.11 or newer "
+                    "and point run.bat at it (set PYTHON=...).")
+try:
+    with open(os.path.join(HERE, "export.json"), encoding="utf-8") as f:
+        record = json.load(f)
+except (OSError, ValueError):
+    record = {}
+pip = {"PIL": "Pillow", "sklearn": "scikit-learn", "cv2": "opencv-python",
+       "yaml": "PyYAML", "skimage": "scikit-image"}
+say("")
+say("Packages:")
+for name in ["PySide6"] + list(record.get("requires", [])):
+    try:
+        importlib.import_module(name)
+        say(f"  {name}: ok")
+    except Exception as exc:
+        say(f"  {name}: MISSING ({type(exc).__name__}: {exc})")
+        problems.append(f"{pip.get(name, name)} is not installed: "
+                        f"python -m pip install -r requirements.txt")
+for name in record.get("optional", []):
+    try:
+        importlib.import_module(name)
+        say(f"  {name} (optional): ok")
+    except Exception:
+        say(f"  {name} (optional): not installed")
+if problems:
+    say("")
+    for line in problems:
+        say("PROBLEM: " + line)
+    sys.exit(1)
+
+scratch = tempfile.mkdtemp(prefix="app-check-")
+atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+os.environ.update(QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
+                  COUNCIL_SKIP_PATH_MIGRATION="1",
+                  COUNCIL_VAULT_ROOT=os.path.join(scratch, "vault"),
+                  COUNCIL_APP_DIR=os.path.join(scratch, "app"),
+                  TYPHON_PLUGIN_HOME=os.path.join(scratch, "plugin_home"),
+                  FRAME_CLASSES_STORE=os.path.join(scratch, "classifiers"))
+sys.path[:0] = [HERE, LIB]
+from PySide6.QtWidgets import QApplication
+qapp = QApplication.instance() or QApplication([])
+say("")
+names = []
+for base, dirs, files in os.walk(LIB):
+    dirs[:] = [d for d in dirs if d != "__pycache__"]
+    for f in files:
+        if f.endswith(".py"):
+            rel = os.path.relpath(os.path.join(base, f), LIB)[:-3]
+            parts = [p for p in rel.split(os.sep) if p != "__init__"]
+            if parts:
+                names.append(".".join(parts))
+bad = 0
+for name in sorted(names):
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        bad += 1
+        say(f"  cannot load {name}: {type(exc).__name__}: {exc}")
+        problems.append(f"{name} did not load (a package above, or a "
+                        f"damaged copy: copy the folder again)")
+say(f"Council files in _council: {len(names) - bad} of {len(names)} load")
+try:
+    import app
+    window = app.App()
+    qapp.processEvents()
+    window.close()
+    say("The app's window: builds")
+except Exception as exc:
+    problems.append(f"the app's window did not build: "
+                    f"{type(exc).__name__}: {exc}")
+    traceback.print_exc()
+if "frame_camera" in sys.modules or os.path.isfile(
+        os.path.join(LIB, "frame_camera.py")):
+    say("")
+    try:
+        from council_core import cameras
+        hint = cameras.BaslerBackend.install_hint
+        if cameras.BaslerBackend().available():
+            found = cameras.BaslerBackend().discover()
+            say(f"Basler (pylon): ready, {len(found)} camera(s) seen")
+            for info in found:
+                say(f"  {info.label}")
+            if not found:
+                say("  None seen: is the camera plugged in and powered, and "
+                    "does the pylon Viewer see it?")
+        else:
+            say(f"Basler (pylon): not available ({hint})")
+        import frame_camera
+        rows = frame_camera.list_cameras().get("rows", [])
+        say(f"The app's camera list: {len(rows)}")
+        for row in rows:
+            say(f"  {row}")
+    except Exception as exc:
+        say(f"Camera check stopped: {type(exc).__name__}: {exc}")
+say("")
+if problems:
+    for line in problems:
+        say("PROBLEM: " + line)
+    sys.exit(1)
+say("All set: run run.bat (run.sh on Linux) to start the app.")
+"""
+
+
 def _readme(name: str, required: Sequence[str],
             optional: Sequence[str], commit: str) -> str:
     return f"""{name} — exported from the Council
 
 RUN IT
-  Windows:  double-click run.bat (or set PYTHON=C:\\path\\to\\python.exe first)
+  Windows:  double-click run.bat
   Linux:    sh run.sh
+  First time on a new machine: do SET UP below, then run check.bat
+  (sh check.sh on Linux) — it says what is missing, if anything.
 
-  It needs Python 3.11 or newer with the packages in requirements.txt:
-      python -m pip install -r requirements.txt
-  Required: PySide6{''.join(', ' + PIP_NAMES.get(n, n) for n in required)}.
-  Optional (see requirements.txt): {', '.join(PIP_NAMES.get(n, n) for n in optional) or 'none'}.
-  A camera also needs its maker's software (Basler: pylon; CoaXPress
-  cameras also the pylon Software Suite's CXP support and the frame
-  grabber's driver).
+SET UP A NEW MACHINE
+  1. Python 3.11 or newer (python.org). On Windows tick "Add python.exe to
+     PATH" in the installer. run.bat uses, in order: PYTHON if it is set,
+     python on PATH, then the py launcher. To use one Python in
+     particular, open a Command Prompt here and
+         set PYTHON=C:\\Python311\\python.exe
+         run.bat
+  2. The packages, with the same Python:
+         python -m pip install -r requirements.txt
+     Required: PySide6{''.join(', ' + PIP_NAMES.get(n, n) for n in required)}.
+     Optional (lines starting with # in requirements.txt; install one
+     with pip install <name>): {', '.join(PIP_NAMES.get(n, n) for n in optional) or 'none'}.
+  3. Cameras need their maker's software as well: Basler needs the pylon
+     runtime (pylon Software Suite) and pip install pypylon; a CoaXPress
+     camera also needs the suite's CXP support and the frame grabber's
+     driver, and the grabber set (in its own software) to pass triggers.
+  4. Run check.bat. It changes nothing.
+
+NO INTERNET ON THAT MACHINE
+  On a PC with internet and the same Windows and Python version (3.11 ->
+  3.11), in this folder:
+      python -m pip download -r requirements.txt -d wheels
+      python -m pip download pypylon -d wheels      (Basler cameras)
+  Copy the whole folder (wheels\\ included) across, then on the machine:
+      python -m pip install --no-index --find-links wheels -r requirements.txt
+      python -m pip install --no-index --find-links wheels pypylon
+  The Python and pylon installers are copied across the same way.
+
+IF SOMETHING GOES WRONG
+  "No Python found"          Install Python (step 1) or set PYTHON.
+  "No module named ..."      Step 2 was missed or used another Python: run
+                             it with the Python run.bat uses (check.bat
+                             prints which one).
+  No camera in the list      check.bat says whether pylon is installed and
+                             which cameras it sees. If pylon sees none, open
+                             the pylon Viewer: if it does not see the camera
+                             either, it is the cable, power or driver.
+  The window closes at once  Start it from a Command Prompt (run.bat) to
+                             read the error, or run check.bat.
+  Moving to a new version    Export again from the Council into a new
+                             folder. Copy data\\ from the old folder to keep
+                             its settings, plugins and classifiers.
 
 WHAT IS IN THIS FOLDER
   main.py, app.py, ui/ ...  the app as it was built in the Council
   _council/                 the Council files the app uses (nothing else
                             of the Council: no models, no Ledger)
+  run.bat, run.sh           start the app
+  check.bat, check.sh       check this machine can run it
+  requirements.txt          the Python packages it uses
   data/                     made on first run: this copy's own vault,
                             settings, plugin home and classifiers
 
@@ -548,6 +760,9 @@ def export_app(project_dir: Path, dest_parent: Path, *,
                _requirements(required, optional))
         _write(staging / "run.bat", _bat(name))
         _write(staging / "run.sh", _sh(name))
+        _write(staging / "check.bat", _check_bat())
+        _write(staging / "check.sh", _check_sh())
+        _write(staging / CHECK_SCRIPT, SETUP_CHECK.lstrip("\n"))
         _write(staging / "README.txt",
                _readme(name, required, optional, commit))
         data = staging / DATA_DIR

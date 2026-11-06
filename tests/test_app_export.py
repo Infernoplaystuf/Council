@@ -176,3 +176,63 @@ def test_the_designer_exports_and_checks(typhon, tmp_path):
     finally:
         tab.deleteLater()
         qapp.processEvents()
+
+
+# ----------------------------------------------------------------------
+# The README sets up a new machine, and check.bat says what is missing
+# (Andy, 6 November 2026: the README should hold everything needed to
+# set up and launch Typhon).
+# ----------------------------------------------------------------------
+def test_the_readme_covers_setting_up_a_new_machine(exported):
+    readme = (exported.folder / "README.txt").read_text(encoding="utf-8")
+    for wanted in ("SET UP A NEW MACHINE", "Add python.exe to",
+                   "pip install -r requirements.txt",
+                   "NO INTERNET ON THAT MACHINE", "pip download",
+                   "--no-index --find-links wheels",
+                   "IF SOMETHING GOES WRONG", "pylon Viewer", "check.bat"):
+        assert wanted in readme, wanted
+    for name in ("check.bat", "check.sh", ae.CHECK_SCRIPT):
+        assert (exported.folder / name).is_file(), name
+
+
+def test_run_bat_finds_python_or_says_how_to_get_it(exported):
+    for name in ("run.bat", "check.bat"):
+        bat = (exported.folder / name).read_text(encoding="utf-8")
+        assert "where python" in bat and "where py " in bat, name
+        assert "No Python found" in bat and "pause" in bat, name
+    assert "check.bat" in (exported.folder / "run.bat").read_text(
+        encoding="utf-8"), "an error points at the check"
+
+
+def _setup_check(folder):
+    import subprocess
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("COUNCIL_", "TYPHON_", "FRAME_CLASSES"))}
+    return subprocess.run(
+        [sys.executable, "-I", "-B", str(folder / ae.CHECK_SCRIPT)],
+        cwd=str(folder), env=env, capture_output=True, text=True,
+        timeout=180)
+
+
+def test_the_setup_check_passes_and_changes_nothing(exported):
+    done = _setup_check(exported.folder)
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    assert "All set" in done.stdout
+    assert "The app's window: builds" in done.stdout
+    assert "The app's camera list: 2" in done.stdout
+    assert not any((exported.folder / ae.DATA_DIR).iterdir()), \
+        "the real data folder is untouched"
+    assert not list(exported.folder.rglob("__pycache__"))
+
+
+def test_the_setup_check_names_a_missing_package(exported, tmp_path):
+    import shutil
+    copy = tmp_path / "Typhon"
+    shutil.copytree(exported.folder, copy)
+    record = json.loads((copy / "export.json").read_text(encoding="utf-8"))
+    record["requires"].append("no_such_package_xyz")
+    (copy / "export.json").write_text(json.dumps(record), encoding="utf-8")
+    done = _setup_check(copy)
+    assert done.returncode == 1
+    assert "no_such_package_xyz: MISSING" in done.stdout
+    assert "PROBLEM: no_such_package_xyz is not installed" in done.stdout

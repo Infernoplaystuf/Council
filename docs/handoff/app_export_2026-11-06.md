@@ -28,9 +28,23 @@ export it to other machines."
   reads it where there is no .git, so a capture's run record still names it.
 - `run.bat` / `run.sh`: `COUNCIL_VAULT_ROOT`, `COUNCIL_APP_DIR`,
   `TYPHON_PLUGIN_HOME`, `FRAME_CLASSES_STORE` all under `data\` beside it;
-  `PYTHON` picks the Python.
+  `PYTHON` picks the Python, else `python` on PATH, else the `py`
+  launcher; none found, or the app stops with an error, it says so and
+  pauses (a double-clicked window does not vanish).
+- `check.bat` / `check.sh` run `check_setup.py` (standard library and the
+  folder's own files; a throw-away data folder; changes nothing) on the
+  other machine: Python version, required and optional packages, every
+  `_council` file loads, the window builds, whether pylon is there and
+  which cameras it and the app see; `PROBLEM:` lines say what to fix.
 - `requirements.txt` (PySide6, the project's declared packages; camera SDKs
-  and other optional ones as comments), `README.txt`, `export.json`.
+  and other optional ones as comments), `export.json`.
+- `README.txt` (Andy: it should hold everything needed to set up and
+  launch): run it; set up a new machine (Python with PATH, pip, pylon /
+  pypylon / CXP and the grabber, check.bat); no internet there (`pip
+  download -d wheels` on a connected PC with the same Python, then
+  `--no-index --find-links wheels`); if something goes wrong (no Python,
+  no module, no camera, window closes, moving to a new export keeping
+  `data\`); what is in the folder.
 
 ## Checked
 
