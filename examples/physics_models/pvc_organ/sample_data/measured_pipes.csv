@@ -1,0 +1,9 @@
+Pipe,Length (mm),Frequency (Hz),Notes
+P1,640,262.96,measured with a phone tuner app (sample data)
+P2,575,292.26,measured with a phone tuner app (sample data)
+P3,512,326.83,measured with a phone tuner app (sample data)
+P4,482,347.15,measured with a phone tuner app (sample data)
+P5,430,388.31,measured with a phone tuner app (sample data)
+P6,383,434.06,measured with a phone tuner app (sample data)
+P7,341,486.58,measured with a phone tuner app (sample data)
+P8,320,515.11,measured with a phone tuner app (sample data)

@@ -39,6 +39,9 @@ from . import token_budget
 DIR_NAME = ".council_agents"
 #: The example Qt apps (gui_reference) the "Qt app builder" reads.
 QT_EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "qt_apps"
+#: The worked physics models (council_core.physics_project) the "Physics
+#: modeller" reads.
+PHYSICS_EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "physics_models"
 OUTPUTS = ("patch", "report")
 
 ALL_TOOLS = ("list_files", "read_file", "find_symbol", "search_code",
@@ -85,6 +88,10 @@ BUILT_INS: List[AgentProfile] = [
         "offscreen; gui_check must pass.",
         references=[str(QT_EXAMPLES)], built_in=True),
     AgentProfile(
+        "physics-modeller", "Physics modeller",
+        "",  # filled below from council_core.physics_project.AGENT_INSTRUCTIONS
+        references=[str(PHYSICS_EXAMPLES)], max_turns=40, built_in=True),
+    AgentProfile(
         "test-writer", "Test writer",
         "You write tests only: pytest, one behaviour per test, named for "
         "what it proves. Change production code only to make it testable, "
@@ -101,6 +108,16 @@ BUILT_INS: List[AgentProfile] = [
         "each matters. You change nothing.",
         tools=list(READ_ONLY), output="report", role="judge", built_in=True),
 ]
+
+
+def _physics_instructions() -> str:
+    from . import physics_project
+    return physics_project.AGENT_INSTRUCTIONS
+
+
+for _p in BUILT_INS:
+    if _p.id == "physics-modeller":
+        _p.instructions = _physics_instructions()
 
 
 def _dir(vault_dir: Path) -> Path:
