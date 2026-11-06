@@ -17,12 +17,18 @@ last lines of its output, so one hang cannot hold the run. Logs go to
 every file that failed with the tail of its log. Exit status is 0 only when
 every file passed.
 
+Each file's pytest gets a temp root of its own (PYTEST_DEBUG_TEMPROOT),
+removed when it ends: in the shared pytest-of-<user> folder one file's
+clean-up unlinks the pytest-current link while another's is unlinking it,
+and that file fails at session end with FileNotFoundError (CI, PR #70).
+
 Standard library only, so it runs before anything else is installed.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,9 +55,19 @@ def test_files(roots: Sequence[str] = SUITES) -> List[Path]:
 
 def run_one(path: Path, logs: Path, timeout: int) -> Tuple[Path, str, float]:
     """(file, "passed" | "failed" | "timeout", seconds)."""
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1")
+    temproot = tempfile.mkdtemp(prefix="run_all-")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
+               PYTEST_DEBUG_TEMPROOT=temproot)
     log = logs / (path.relative_to(ROOT).as_posix().replace("/", "__") + ".log")
     start = time.monotonic()
+    try:
+        return _run_one(path, log, timeout, env, start)
+    finally:
+        shutil.rmtree(temproot, ignore_errors=True)
+
+
+def _run_one(path: Path, log: Path, timeout: int, env: dict,
+             start: float) -> Tuple[Path, str, float]:
     with open(log, "w", encoding="utf-8", errors="replace") as out:
         proc = subprocess.Popen(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
