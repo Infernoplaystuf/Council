@@ -195,6 +195,10 @@ same list.
   model: a counter on the line, else its level), the Triggering window's
   line check and "Find my trigger line", `tools/basler_line_test.py`
   (branch `typhon-plugins`): `docs/handoff/typhon_basler_lines_2026-11-05.md`.
+- Exporting a Designer-built app (Typhon …) to a folder of its own to run on
+  another machine without the Council (the GUI Designer's "Export app…",
+  `tools/export_app.py`, `council_core/app_export.py`, the check that it
+  stands alone): `docs/handoff/app_export_2026-11-06.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

@@ -3145,8 +3145,10 @@ class HandlerMixin:
 
 
 # A file that exists at the app root and nowhere else, used by a generated
-# main.py to recognise the app if it has been moved since generation.
-_ROOT_MARKER = "council_gui_engine.py"
+# main.py to recognise the app if it has been moved since generation. It was
+# council_gui_engine.py until the Tk shell was retired (2026-10-23): with that
+# file gone, a moved Council was never found again (6 November 2026).
+_ROOT_MARKER = "council_qt.py"
 
 LAUNCH_SHIM = '''"""Moved to main.py. Kept so existing shortcuts keep working."""
 from main import main
