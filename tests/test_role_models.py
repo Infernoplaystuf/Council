@@ -188,8 +188,9 @@ def test_balanced_with_the_files_present_just_saves(qapp, make, tmp_path):
 
 def test_save_writes_the_map_sets_main_and_reloads(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setitem(sys.modules, "onboarding", SimpleNamespace(
-        save_gguf_path=lambda v, p: calls.append(("main", p))))
+    from council_core import backend_settings
+    monkeypatch.setattr(backend_settings, "save_gguf_path",
+                        lambda v, p: calls.append(("main", p)))
     monkeypatch.setitem(sys.modules, "council_engine", SimpleNamespace(
         refresh_backend_config=lambda: calls.append(("refresh",))))
     big, small = tmp_path / "big.gguf", tmp_path / "small.gguf"
@@ -213,7 +214,7 @@ _UTF16 = json.dumps(_KEEP).encode("utf-16")
 
 def test_save_says_when_the_main_model_could_not_be_saved(tmp_path,
                                                           monkeypatch):
-    """MEASURED 2026-09-29: onboarding._merge_backend_settings, which Save
+    """MEASURED 2026-09-29: backend_settings._merge_backend_settings, which Save
     goes through, rewrote a settings file it could not read — UTF-16,
     truncated, cp1252 — with only the key it was saving (clip_path and
     role_models gone), and Save said "Saved" as if the next launch would

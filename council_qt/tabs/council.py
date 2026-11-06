@@ -438,7 +438,7 @@ class CouncilActions:
         asking = models is not None
         sage = getattr(models, "sage", None)
         writer = getattr(models, "writer", None)
-        deliberate = bool(getattr(options, "deliberate", True))
+        deliberate = bool(getattr(options, "deliberate", False))
 
         # 1. council-map's lookups, started side by side: the wait is the
         # slowest step, not the sum. Earlier conversations' decisions only
@@ -645,13 +645,28 @@ class CouncilActions:
         ``typed_text`` is what the Judge routes on and the depth is decided
         on (A5)."""
         from council_core import council_turn
-        if not getattr(options, "deliberate", True):
+        stream = on_token if getattr(options, "stream", True) else None
+        depth = str(getattr(options, "depth", "auto") or "auto")
+        if not getattr(options, "deliberate", False):
             # The fast path: one personality, no panel, no verdict. It is a
             # real answer and it is NOT a deliberation, so it produces no
             # verdict id — which is what keeps the verdict bar honest (A3).
-            # It gets the vault context: the default build is this path, and
-            # without it the default build was a chatbot.
-            return self._direct(sent, models, on_event=on_event)
+            # It gets the vault context: without it this path was a chatbot.
+            if self.demo_mode:
+                # The single-model chat: nothing to hand a question on to.
+                return self._direct(sent, models, on_event=on_event,
+                                    on_token=stream)
+            first = self._front_desk(sent, typed_text, models, options,
+                                     on_event=on_event, on_token=stream)
+            if first is not None:
+                return first
+            # Handed on. The council takes it at Standard at least: a Quick
+            # council would be the same one model answering again.
+            if depth == "auto":
+                from council_core.depth import QUICK, decide
+                route = self._route(models, typed_text)
+                if decide(typed_text, route).level == QUICK:
+                    depth = "standard"
 
         enable_tools = bool(getattr(options, "tools", False))
         return council_turn.run_turn(
@@ -659,12 +674,85 @@ class CouncilActions:
             enable_tools=enable_tools,
             tools=self.tools() if enable_tools else None,
             parallel_members=bool(getattr(options, "parallel", False)),
-            depth=str(getattr(options, "depth", "auto") or "auto"),
+            depth=depth,
             extra_ctx=({"judge_evidence": judge_evidence}
                        if judge_evidence else None),
             on_event=on_event,
-            on_token=on_token if getattr(options, "stream", True) else None,
+            on_token=stream,
             route_text=typed_text)
+
+    @staticmethod
+    def _route(models, typed_text: str) -> str:
+        """The Judge's keyword route for the typed question ("" without a
+        Judge, or when it fails)."""
+        judge = getattr(models, "judge", None)
+        try:
+            return (judge.route(typed_text) or "") if judge is not None else ""
+        except Exception:                                 # noqa: BLE001
+            return ""
+
+    def _front_desk(self, sent, typed_text, models, options, *,
+                    on_event=None, on_token=None):
+        """One model answers first (council_core.front_desk). Returns its
+        result, or None when the question goes to the council — said in the
+        transcript, with why. Without a Judge there is no council to hand
+        on to, so the Writer's answer stands."""
+        from council_core import council_turn, front_desk
+        from council_core.deliberation import AgentEvent
+
+        writer = getattr(models, "writer", None)
+        can_hand_on = getattr(models, "judge", None) is not None
+        # "Explain boids in Python" is answered as a short tutorial ending in
+        # a runnable program (front_desk.GUIDE): by the Coder when there is
+        # one, since its model is the one set for code.
+        guide = front_desk.guide_language(typed_text)
+        who = "Writer"
+        if guide and getattr(models, "coder", None) is not None:
+            writer, who = models.coder, "Coder"
+
+        def hand_on(why: str):
+            if on_event is not None:
+                on_event(AgentEvent("Council", "observation",
+                                    f"Handing this to the council: {why}."))
+            return None
+
+        if can_hand_on:
+            why = ("Tools are on, and only the council's members use them"
+                   if getattr(options, "tools", False)
+                   else front_desk.needs_council(
+                       typed_text, self._route(models, typed_text)))
+            if why:
+                return hand_on(why)
+        if writer is None:
+            return council_turn.TurnResult(
+                False, message="No writer model is loaded.")
+        if on_event is not None:
+            on_event(AgentEvent(who, "thought", "Answering…"))
+        gate = (front_desk.StreamGate(lambda token: on_token(who, token))
+                if on_token is not None else None)
+        kwargs = {"extra_context": front_desk.instruction(typed_text)}
+        if guide:
+            from council_core import token_budget
+            kwargs["max_tokens"] = token_budget.reply("long", 2400)
+        if gate is not None:
+            kwargs["token_callback"] = gate
+        try:
+            raw = writer.respond(sent, **kwargs)
+        except Exception as exc:                          # noqa: BLE001
+            return council_turn.TurnResult(
+                False, message=f"The answer failed: {exc!r}", error=exc)
+        answer, why, pct = front_desk.read_reply(raw)
+        if why and can_hand_on:
+            return hand_on(why)
+        if not answer:
+            return council_turn.TurnResult(
+                False, message="The Writer gave no answer.")
+        event = AgentEvent(who, "final", answer)
+        if on_event is not None:
+            on_event(event)
+        return council_turn.TurnResult(
+            True, answer=answer, route="direct", events=[event],
+            confidence=pct if pct is not None else 0)
 
     # -- the vault context ---------------------------------------------
     def turn_state(self):
@@ -876,8 +964,13 @@ class CouncilActions:
         from council_core import vault_context
         return vault_context.build(question, self.vault_dir)
 
-    def _direct(self, typed_text: str, models, *, on_event=None):
-        """One personality answering directly, with no council."""
+    def _direct(self, typed_text: str, models, *, on_event=None,
+                on_token=None):
+        """One personality answering directly, with no council.
+
+        ``on_token(who, token)`` streams the Writer's answer as the council's
+        members stream theirs. It was never passed here, so with one Writer
+        the Stream tokens box did nothing and the answer came all at once."""
         from council_core import council_turn
         from council_core.deliberation import AgentEvent
 
@@ -890,7 +983,12 @@ class CouncilActions:
             # waits ("▶ Writer"). A thought: progress, never a transcript line.
             on_event(AgentEvent("Writer", "thought", "Answering…"))
         try:
-            answer = writer.respond(typed_text)
+            if on_token is not None:
+                answer = writer.respond(
+                    typed_text,
+                    token_callback=lambda token: on_token("Writer", token))
+            else:
+                answer = writer.respond(typed_text)
         except Exception as exc:                          # noqa: BLE001
             return council_turn.TurnResult(
                 False, message=f"The answer failed: {exc!r}", error=exc)
@@ -2220,5 +2318,8 @@ EXAMPLES = """Things you can ask:
 def build_council(window) -> QWidget:
     """Factory for the tab registry."""
     import branding
+    # The tab's demo_mode means "one Writer, no panel": the single-model
+    # chat (COUNCIL_CHAT_MODE=single), no longer the DEMO_MODE build.
     return CouncilTab(window,
-                      demo_mode=bool(getattr(branding, "DEMO_MODE", False)))
+                      demo_mode=bool(getattr(branding, "SINGLE_MODEL_COUNCIL",
+                                             False)))

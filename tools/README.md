@@ -7,6 +7,9 @@ by **you** (the operator) to manage the business side of the product.
 |------|--------------|
 | `generate_license.py` | Mint a license blob to email a customer. |
 | `license_server.py`   | Activation server the desktop app talks to once per device. |
+| `council_ab.py`       | Before/after test of the Council chat, Connections links and Ledger speed, on this PC with real models. |
+| `council_fulltest.py` | The whole app on this PC with real models: the test suite, every bench, one report. |
+| `council_build_bench.py` | The Build tab's Edit mode fixing four small projects with failing tests (a step of the full test). |
 
 ---
 
@@ -178,3 +181,40 @@ a clean experience when they move machines. A determined attacker who
 extracts `DI_LICENSE_SECRET` from a binary can mint their own keys and
 their own activation tokens. Accepting that trade-off is what lets the
 app stay fully offline after first activation.
+
+---
+
+## Testing on your own PC: `council_fulltest.py` and `council_ab.py`
+
+```bat
+conda activate wizardCouncil
+cd C:\path\to\Council
+python tools\council_fulltest.py --model ollama:gemma3:12b          & rem everything but the slow steps
+python tools\council_fulltest.py --model ollama:gemma3:12b --long   & rem and Typhon, the Code agent, the full council
+python tools\council_ab.py --model ollama:gemma3:12b                & rem only the before/after comparison
+```
+
+Both write everything into one folder (`%USERPROFILE%\council_fulltest\<time>` or
+`%USERPROFILE%\council_ab\<time>`, or `--out`) and end with `report.html`.
+They run against a scratch vault of synthetic files, never your own vault.
+Run the same command with the same `--out` to carry on after a stop. No
+network is needed: the "before" builds are git worktrees of commits already in
+this clone. Each file's docstring lists its steps and options.
+
+---
+
+## A Basler's trigger cable: `basler_line_test.py`
+
+```bat
+conda activate pylon
+cd C:\path\to\Council
+python tools\basler_line_test.py                      & rem the cameras, their lines, and which line your pulses come on
+python tools\basler_line_test.py --runs               & rem and short exact, snapshot and record runs from that line
+python tools\basler_line_test.py --serial 40012345 --line Line1 --runs
+```
+
+Send a few pulses down the cable while it says "send a few pulses now". It
+writes `report.txt` and the runs' files into one new folder
+(`basler_line_test_<time>` here, or `--out`), with a throw-away project and
+vault: your own are not touched. `--fake` checks the script without a
+camera.

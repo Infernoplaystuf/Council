@@ -664,6 +664,18 @@ def gguf_eng(tmp_path, monkeypatch):
     ce.refresh_backend_config()
 
 
+def test_gguf_grammar_leaves_out_an_enum_with_quote_marks(gguf_eng):
+    """Labels with quote marks in the Ledger's label enum made a grammar
+    llama.cpp could not parse (2026-10-23); the enum is left out of the
+    grammar, and the answer is still read."""
+    ce = gguf_eng.ce
+    schema = {"type": "object", "properties": {
+        "label": {"type": "string", "enum": ['"', '\\"Vw', "Power"]}}}
+    ce.local_chat(MSGS, json_schema=schema)
+    kind, src = gguf_eng.state.grammars[-1]
+    assert kind == "schema" and "enum" not in json.loads(src)["properties"]["label"]
+
+
 def test_gguf_schema_becomes_a_grammar_and_seed_and_stop_pass_through(
         gguf_eng):
     ce = gguf_eng.ce

@@ -42,13 +42,16 @@ class StubActions(ConnectionsActions):
     def local_models(self):
         return ["llama3.1:8b", "granite3.3:8b"]
 
+    def gguf_models(self):
+        return []                        # never the real model folders
+
     def pi_workers(self):
         return []
 
-    def suggest(self, model, use_pis, on_progress, should_stop):
-        from tests.test_kg_suggest import oracle
+    def read_text(self, model, use_pis, on_progress, should_stop):
+        from tests.test_kg_suggest import open_oracle
         with self.open_graph() as kg:
-            return kg.suggest_from_text({f"this PC ({model})": oracle()},
+            return kg.extract_from_text({f"this PC ({model})": open_oracle()},
                                         model=model, on_progress=on_progress,
                                         should_stop=should_stop)
 
@@ -150,7 +153,16 @@ def test_factory_takes_a_window(qapp, monkeypatch):
         qapp.processEvents()
 
 
-def test_before_any_fields_nothing_is_read(qapp, tab):
+def test_a_first_build_reads_the_labelled_fields(qapp, tab):
+    """No set-up first (user, 2026-10-21): the default rules start ticked."""
+    tab.on_rebuild()
+    drive(qapp, tab)
+    assert "No field labels are ticked" not in tab.coverage.text()
+    assert tab.results.count() >= 15
+
+
+def test_with_every_rule_unticked_only_collections_are_read(qapp, tab):
+    tab.apply_fields({r.label: False for r, _s in tab._kg.field_rules()}, [])
     tab.on_rebuild()
     drive(qapp, tab)
     assert "No field labels are ticked" in tab.coverage.text()
@@ -191,6 +203,38 @@ def test_search_shows_links_with_evidence_and_preview(qapp, tab):
     assert tab.open_btn.isEnabled()
     tab.on_open_file()
     assert tab.actions.opened == ["ironbridge/trackers/parts_list.csv"]
+
+
+def test_the_rebuild_summary_is_not_hidden_by_the_open_item(qapp, tab):
+    """A rebuild with an item open: the view was refreshed after the
+    summary was set, and the item's header ('⚙ 101') replaced it at once
+    (review, 2026-10-19)."""
+    _rebuilt(qapp, tab)
+    tab.search.setText("Lee, Carol")
+    tab.results.setCurrentRow(0)
+    assert "Carol Lee" in tab.status.text()
+    tab.on_rebuild()
+    drive(qapp, tab)
+    assert tab.status.text().startswith("Rebuilt from"), tab.status.text()
+    assert tab._current and _items(tab.tree)               # the item is still shown
+
+
+def test_the_rebuild_summary_counts_links_as_the_coverage_line_does(qapp, tab):
+    """The summary said '36 links (1 of them suggested)' over a coverage
+    line saying '35 links, 1 waiting for you': two link counts on screen at
+    once (review, 2026-10-19). Both count the seeded and accepted links."""
+    import re
+    _rebuilt(qapp, tab)
+    _wait_threads(qapp)
+    tab.on_suggest()                        # some links only a model suggests
+    drive(qapp, tab)
+    tab.on_rebuild()
+    drive(qapp, tab)
+    links, waiting = re.search(r"(\d+) links, (\d+) waiting for you",
+                               tab.coverage.text()).groups()
+    assert int(waiting) > 0
+    assert f"; {links} links + {waiting} suggested" in tab.status.text(), (
+        tab.status.text(), tab.coverage.text())
 
 
 def test_text_evidence_preview_marks_the_line(qapp, tab):
@@ -296,22 +340,51 @@ def test_phrases_and_names():
     assert display_name(ent) == "PRJ-0915 — Helios Turbine Upgrade"
 
 
-def test_model_suggestions_arrive_as_suggested_links(qapp, tab):
-    _rebuilt(qapp, tab)
+def test_build_reads_the_documents_then_the_text_with_the_model(qapp, tab):
+    """⟳ Build graph (Morphik's create graph): the documents, then every
+    passage read by the chosen model; its links are in the graph at once."""
     _wait_threads(qapp)                    # the models are listed on a worker
     assert tab.model_box.currentData() == "llama3.1:8b"
+    assert tab.model_box.itemData(tab.model_box.count() - 1) == ""   # 'No model'
     assert not tab.pis_box.isEnabled()                     # no Pi nodes registered
+    tab.apply_fields({}, [("POC", "Point of Contact")])
+    tab.on_build()
+    drive(qapp, tab)
+    if tab._busy is False and "Built" not in tab.status.text():
+        drive(qapp, tab)
+    assert tab.status.text().startswith("Built: the model read"), tab.status.text()
+    assert "Text read by a model: 6 of 6" in tab.coverage.text()
+    tab.search.setText("BRG-7720")
+    tab.results.setCurrentRow(0)
+    used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
+    assert used_in.text(1) == "seeded"
+    ev = used_in.child(0)
+    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
+    tab.tree.setCurrentItem(used_in)
+    assert tab.reject_btn.isEnabled()                      # still the user's to reject
+    tab.reject_btn.click()
+    with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
+        st = {r["status"] for r in kg.all_relations(include_rejected=True)
+              if r["object"]["name"] == "BRG-7720" and r["subject"]["name"] == "PRJ-0915"}
+    assert st == {"rejected"}
+    tab.on_build()                                         # nothing new to read
+    drive(qapp, tab)
+    drive(qapp, tab)
+    assert tab.status.text() == "Built. The model had read every passage already."
+
+
+def test_a_graph_set_to_review_keeps_the_models_links_waiting(qapp, tab):
+    _wait_threads(qapp)
+    _rebuilt(qapp, tab)
+    tab._kg.set_model_links("review")
     tab.on_suggest()
     drive(qapp, tab)
-    assert "link(s) suggested" in tab.status.text()
+    assert "Its links wait for you" in tab.status.text()
     tab.search.setText("BRG-7720")
     tab.results.setCurrentRow(0)
     used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
     assert used_in.text(1) == "suggested"
-    ev = used_in.child(0)
-    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
     tab.tree.setCurrentItem(used_in)
-    assert tab.accept_btn.isEnabled()
     tab.accept_btn.click()
     with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
         st = {r["status"] for r in kg.all_relations()
@@ -323,13 +396,13 @@ def test_suggest_runs_off_the_gui_thread_and_can_stop(qapp, tab, monkeypatch):
     _rebuilt(qapp, tab)
     _wait_threads(qapp)
     seen = []
-    real = tab.actions.suggest
+    real = tab.actions.read_text
 
     def spy(model, use_pis, on_progress, should_stop):
         seen.append(threading.current_thread() is threading.main_thread())
         tab._stop.set()                     # as if Stop were pressed at once
         return real(model, use_pis, on_progress, should_stop)
-    monkeypatch.setattr(tab.actions, "suggest", spy)
+    monkeypatch.setattr(tab.actions, "read_text", spy)
     tab.on_suggest()
     drive(qapp, tab)
     assert seen == [False] and "Stopped" in tab.status.text()
@@ -365,6 +438,45 @@ def test_same_as_merges_after_confirming(qapp, vault):
         view.on_merge()
         assert asked and view._kg.resolve(view._kg.search("Caroline Lee")[0]["id"]) == carol
         assert view.split_btn.isEnabled()
+    finally:
+        _wait_threads(qapp)
+        view.close()
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_same_as_takes_the_entry_of_that_exact_name(qapp, tmp_path):
+    """'Keep JB as a person of their own' makes an entry whose whole name is
+    'JB'. Merging it into Jordan Blake while a Jill Brown exists said '2
+    entries match 'JB' - type more of the name' (the search also finds
+    people by their initials), and there was no more to type; so did 'D.
+    Whitfield' beside Dan Whitfield (review, 2026-10-19)."""
+    v = tmp_path / "v"
+    (v / "data_in").mkdir(parents=True)
+    with kgm.KnowledgeGraph(v, image_reader=None) as kg:
+        jordan = kg.add_person("Jordan Blake")
+        kg.add_person("Jill Brown")
+        dana = kg.add_person("Dana Whitfield")
+        kg.add_person("Dan Whitfield")
+        with kg.db:
+            jb = kg._entity("PERSON", "JB", alias_source="user")
+            dw = kg._entity("PERSON", "D. Whitfield", alias_source="user")
+    typed = []
+    view = ConnectionsTab(actions=StubActions(v),
+                          ask_string=lambda *a, **k: typed[-1],
+                          ask_yes_no=lambda *a, **k: True)
+    try:
+        for cur, text, other in ((jordan, "JB", jb), (dana, "D. Whitfield", dw)):
+            view._current = cur
+            typed.append(text)
+            view.on_merge()
+            assert view._kg.resolve(other) == cur, view.status.text()
+            assert f"also written: {text}" in view.status.text()   # the item's header
+        # what matches by initials alone is still a choice to narrow down
+        view._current = view._kg.search("Jill Brown")[0]["id"]
+        typed.append("DW")
+        view.on_merge()
+        assert "2 entries match 'DW'" in view.status.text()
     finally:
         _wait_threads(qapp)
         view.close()
@@ -408,12 +520,12 @@ def test_pi_workers_are_us_origin_only(qapp, vault, monkeypatch):
 
 def test_suggest_gives_each_worker_its_own_model_and_no_double_prefix(qapp, vault, monkeypatch):
     from council_core import kg_extract as kx
-    from tests.test_kg_suggest import oracle
+    from tests.test_kg_suggest import open_oracle
     made = []
 
     def fake_chat(model, host=None):
         made.append((model, host))
-        return oracle()
+        return open_oracle()
     monkeypatch.setattr(kx, "ollama_chat", fake_chat)
     monkeypatch.setenv("COUNCIL_REMOTE_NODES", "1")
     _registry(vault, [{"name": "NodePrimus", "host": "192.0.2.10", "model": "qwen2.5:3b"},
@@ -422,14 +534,14 @@ def test_suggest_gives_each_worker_its_own_model_and_no_double_prefix(qapp, vaul
     with acts.open_graph() as kg:
         kg.confirm_all_rules()
         kg.seed()
-    stats = acts.suggest("gemma3:12b", True, None, lambda: False)
+    stats = acts.read_text("gemma3:12b", True, None, lambda: False)
     assert made == [("gemma3:12b", None), ("llama3.2:3b", "http://192.0.2.12:11434")]
     assert stats["done"] == stats["chunks"] > 0
     with acts.open_graph() as kg:
-        kinds = [r[0] for r in kg.db.execute("SELECT kind FROM runs WHERE kind LIKE 'extract%'")]
+        kinds = [r[0] for r in kg.db.execute("SELECT kind FROM runs WHERE kind LIKE 'build%'")]
         models = {r[0] for r in kg.db.execute("SELECT model FROM extraction_done")}
-    assert kinds == ["extract:gemma3:12b"]
-    assert models <= {"gemma3:12b", "llama3.2:3b"}
+    assert kinds == ["build:gemma3:12b"]
+    assert models <= {"open|gemma3:12b", "open|llama3.2:3b"}
 
 
 def test_models_are_listed_off_the_gui_thread(qapp, vault):
@@ -442,7 +554,7 @@ def test_models_are_listed_off_the_gui_thread(qapp, vault):
     view = ConnectionsTab(actions=Spy(vault))
     try:
         _wait_threads(qapp)
-        assert seen == [False] and view.model_box.count() == 1
+        assert seen == [False] and view.model_box.count() == 2     # and 'No model'
     finally:
         view.close()
         view.deleteLater()

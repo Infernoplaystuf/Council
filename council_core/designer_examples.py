@@ -349,7 +349,7 @@ def make_plugin_list(project_dir: Any) -> Path:
     from council_core import plugin_lists as pl
 
     home = pl.resolve_home()
-    base = pl.read_base_set(home.path, [pid for pid, _ in ph.BUILTIN_PLUGINS])
+    base = pl.read_base_set(home.path, ph.default_plugins())
     return pl.make_project(project_dir, base, home.path).path
 
 

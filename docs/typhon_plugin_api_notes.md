@@ -1120,6 +1120,83 @@ cannot add anything there, and the 1 ms switch interval is what the core
 now sets while a run records ("What is wired"); a minimized window and the
 bench PC are still to measure.
 
+## The classifier's window and datasets (P4, 2 November 2026)
+
+Still API 0.3 (0.x allows additions). New features, by `has()` name:
+
+- `hook.panel`: with "panel" in contributes, `panel(parent) -> QWidget` is
+  the inner widget of the plugin's pop-out window. Typhon makes the window
+  (council_qt/widgets/plugin_panels.py), titles it, builds the panel on
+  first open through `host.build_panel` (guarded), hides it on close and
+  remembers its place in the project's `typhon_windows.json`. The toolbar
+  strip (port `plugin_toolbar`) has a button per plugin with a panel that
+  can run now, then "Plugins…", where a project switches its feature
+  plugins on and off. `WINDOW_KEEPS` (the triggering plugin) gets no button
+  while the main window still has its controls.
+- `hook.take_dataset`: with "datasets" in contributes (a new contribution
+  point), `take_dataset(dataset) -> str | None`. `host.send_dataset(pid,
+  name)` reads the dataset, hands it over guarded, and returns what the
+  plugin said (or a sentence of its own when it said nothing).
+- `type.Dataset`, `type.DatasetFrame`: a frozen snapshot of a dataset
+  (council_core/datasets.py): its name and frames, each a reference to a
+  saved picture (path, name, run, frame number, folder, camera, crop box,
+  and whether the file was there). `api.dataset_from` builds one.
+- `context.datasets()`, `context.dataset(name)`, `context.show_panel()`
+  (opens the plugin's own window), `context.image_folder()` (the folder the
+  main window's slider shows; `capture_folder` stays the camera's run
+  folder). `context.current_frame()` now answers in a plugins project:
+  `frame_camera` sets `host.current_frame_fn`, `image_folder_fn` and emits
+  `frames_reloaded` when the slider lists its folder again.
+
+Both hooks run on the UI thread under the watchdog's 2 s: long work starts
+from the panel, never inside the call.
+
+## Trigger-source plugins and record runs (2 November 2026)
+
+Still API 0.3. New features, by `has()` name:
+
+- `kind.source`, `hook.sources`, `hook.make_source`, `type.SourcePlugin`: a
+  plugin whose manifest's kind is "source" is no longer refused. `sources()`
+  names what it offers (listed under Trigger from after Software and Timer;
+  a camera's or Typhon's own names are left out); `make_source(name)` gives
+  a TriggerSource for one run, which the host wraps (`GuardedSource`) so its
+  start and stop are guarded. Its `fire` queues a trigger on the run's books
+  (`TriggerRun.fire_from`); Typhon fires the camera from there, as for a
+  Capture now press.
+- `context.trigger_sources()`, `context.make_source(name)`: what the
+  triggering plugin uses; a run from a source no plugin offers is refused
+  at Start.
+- `mode.record` (`api.MODE_RECORD`, "Triggered: record") and the set-up's
+  `record_s` (`capture.record_s`, "Record for"): every frame from a trigger
+  for that long, or with 0 from one trigger until the next.
+
+The Triggering panel is shown from the plugin toolbar (`WINDOW_KEEPS` is
+empty); the Basic tab no longer has the trigger boxes in a plugins project.
+Details: `docs/handoff/typhon_triggering_2026-11-02.md`.
+
+## A camera's cable as a trigger (5 November 2026)
+
+Still API 0.3. New feature `facet.hardware_trigger.watch`: the
+`hardware_trigger` facet may also have `lines()` (the camera's input lines
+now), `states(lines)` (each one's level), `can_watch()` and
+`watch(lines, fire, edge)` (a started watcher, `fire(line)` per edge, until
+`stop()`). The built-in Basler plugin has them on every model
+(`council_core/basler_lines.py`: a counter of the camera's on the line,
+else the line's level read every 2 ms). With them a Triggered: snapshot or
+record run may take its trigger from the camera's own line — the camera
+runs live, nothing is armed — and the Triggering window shows the lines'
+levels and "Find my trigger line". A camera without them keeps exact-only
+from a line. Details: `docs/handoff/typhon_basler_lines_2026-11-05.md`.
+
+## Capture now on any camera (5 November 2026)
+
+Still API 0.3. `context.capture_now(camera=None)` (feature
+`context.capture_now`): Capture now (F9) on that camera — one trigger of its
+triggered run, through the triggering plugin — and its words, or None when no
+triggering plugin runs. The optional built-in `typhon.send_trigger` uses it:
+a drop-down of the cameras and a Send trigger button. It is in
+`OPTIONAL_BUILTINS`, so a new project runs it only once ticked in Plugins….
+
 ## What is wired, and what comes when
 
 Today's Typhon never calls the host, so it behaves exactly as before, and a

@@ -170,6 +170,31 @@ FEATURES: FrozenSet[str] = frozenset({
     # P3 row 6: a built-in plugin's frame stage for a run, which Start asks
     # (after the core's Downsample, guarded on the recording path)
     "hook.frame_stage",
+    # P4, the classifier's pop-out and datasets (2 November 2026): a
+    # plugin's panel in its own Typhon-owned window, opened from the
+    # toolbar strip; the vault's datasets, read through the context; and a
+    # dataset sent to a plugin whose manifest contributes "datasets"
+    "hook.panel", "hook.take_dataset",
+    "context.datasets", "context.dataset", "context.show_panel",
+    "context.image_folder",
+    "type.Dataset", "type.DatasetFrame",
+    # trigger-source plugins (2 November 2026): a plugin of kind "source"
+    # offers named sources (`sources()`) and makes one per run
+    # (`make_source(name)`: a TriggerSource); the triggering plugin lists
+    # them beside Software and Timer and fires the run from them. A
+    # Triggered: record run saves every frame from a trigger for "Record
+    # for" seconds, or until the next trigger.
+    "kind.source", "hook.sources", "hook.make_source",
+    "context.trigger_sources", "context.make_source",
+    "type.SourcePlugin", "mode.record",
+    # a camera's I/O lines watched (5 November 2026): the hardware_trigger
+    # facet's lines(), states(lines), can_watch() and watch(lines, fire,
+    # edge) — a snapshot or record run from the camera's cable, the
+    # Triggering window's line check and "Find my trigger line".
+    "facet.hardware_trigger.watch",
+    # Capture now on any camera of the rig (5 November 2026; the Send
+    # trigger plugin's button).
+    "context.capture_now",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -189,6 +214,56 @@ def has(name: str) -> bool:
 # ======================================================================
 # What a plugin is handed
 # ======================================================================
+@dataclass(frozen=True)
+class DatasetFrame:
+    """One frame of a dataset: a REFERENCE to a saved picture where it was
+    recorded (council_core.datasets). `run` and `frame` come from the name
+    Typhon gives every frame ("" and None for another file); `exists` is
+    whether the file was there when the dataset was read."""
+    path: Path
+    name: str = ""
+    run: str = ""
+    frame: Optional[int] = None
+    folder: Optional[Path] = None
+    camera: str = ""
+    crop: Optional[Tuple[int, int, int, int]] = None
+    exists: bool = True
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """A dataset as it was when it was read: its name and its frames, in
+    the order they were added. Read-only: a plugin changes nothing in it."""
+    name: str
+    frames: Tuple[DatasetFrame, ...] = ()
+
+    @property
+    def paths(self) -> Tuple[Path, ...]:
+        """The frames still on disk."""
+        return tuple(f.path for f in self.frames if f.exists)
+
+    @property
+    def missing(self) -> int:
+        return sum(1 for f in self.frames if not f.exists)
+
+
+def dataset_from(doc_name: str, entries: Sequence[Mapping[str, Any]]
+                 ) -> Dataset:
+    """A Dataset from council_core.datasets' entries (each with "exists")."""
+    frames = []
+    for e in entries:
+        crop = e.get("crop")
+        frames.append(DatasetFrame(
+            path=Path(str(e["path"])), name=str(e.get("name") or ""),
+            run=str(e.get("run") or ""),
+            frame=e.get("frame") if isinstance(e.get("frame"), int) else None,
+            folder=Path(str(e["folder"])) if e.get("folder") else None,
+            camera=str(e.get("camera") or ""),
+            crop=tuple(int(v) for v in crop) if crop else None,
+            exists=bool(e.get("exists", True))))
+    return Dataset(name=str(doc_name), frames=tuple(frames))
+
+
 @dataclass(frozen=True)
 class CameraHandle:
     """One camera of the rig, as a feature plugin sees it (design 3.4): its
@@ -470,6 +545,35 @@ class PluginContext(Protocol):
         `<project>/plugin_data/<id>/`, made on first ask; files go in it
         through write_new (design 4.1)."""
 
+    def image_folder(self) -> Optional[Path]:
+        """The folder the main window's slider shows — its Image folder —
+        or None (P4). Not always capture_folder(): the user may be looking
+        at an older folder of frames."""
+
+    def datasets(self) -> List[str]:
+        """The names of the vault's datasets (P4)."""
+
+    def dataset(self, name: str) -> Dataset:
+        """Dataset `name` as it is now (P4); raises when there is none."""
+
+    def show_panel(self) -> bool:
+        """Open (or bring forward) this plugin's pop-out window; False when
+        the window has none to show (P4)."""
+
+    def trigger_sources(self) -> List[str]:
+        """The names of the sources the project's trigger-source plugins
+        offer now, beside Typhon's own Software and Timer."""
+
+    def make_source(self, name: str) -> Optional[TriggerSource]:
+        """A new TriggerSource for one run, made by the plugin that offers
+        source `name` (its start and stop guarded), or None."""
+
+    def capture_now(self, camera: Optional[str] = None) -> Optional[str]:
+        """Capture now (F9) on `camera` (default: the active one): one
+        trigger of the triggered run in progress there, through the
+        triggering plugin; its words, or None when no triggering plugin
+        runs in this project."""
+
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (a CaptureSetup: trigger
         mode, source, frames per trigger, timer, edge, delay, debounce,
@@ -478,6 +582,28 @@ class PluginContext(Protocol):
         camera. Read in place: the camera's set-up is the storage while the
         code stays where it is (design 2.5); a change goes through the
         camera's settings (its "capture.*" keys), never through this copy."""
+
+
+@runtime_checkable
+class SourcePlugin(Protocol):
+    """A trigger-source plugin (manifest kind "source"): something outside
+    Typhon that says "capture now" — a serial or USB box, another program,
+    a sensor. `sources()` names what it offers now (shown under Trigger
+    from; not "Software" or "Timer", and not a camera's own: no name
+    starting Line, CC, CxpTrigger, Counter, Timer, Software,
+    PeriodicSignal or Action). `make_source(name)` returns a new
+    TriggerSource for one run: its `start(fire)` tells `fire` each trigger
+    (a TriggerEvent; any thread but Typhon's own; it returns at once) and
+    `stop()` ends it within a moment. Typhon fires the cameras: in an
+    exact run their software trigger, in a snapshot or record run the
+    frames it saves. Both calls are guarded: a fault switches the plugin
+    off and the run goes on from Capture now."""
+
+    def activate(self, ctx: "PluginContext") -> None: ...
+
+    def sources(self) -> List[str]: ...
+
+    def make_source(self, name: str) -> TriggerSource: ...
 
 
 @runtime_checkable
@@ -492,7 +618,16 @@ class FeaturePlugin(Protocol):
     values)`; with "frame_stage" (built-in plugins only), `frame_stage(
     camera)` -> `stage(image, meta) -> picture` for the run about to
     start, or None — run after the core's Downsample, handed a read-only
-    picture and meta. The screen points come at stage P4.
+    picture and meta.
+
+    THE SCREEN (P4). With "panel" in contributes, `panel(parent) ->
+    QWidget`: the inner widget of the plugin's pop-out window, which Typhon
+    creates, titles and remembers the place of, opened from the plugin's
+    button on the toolbar strip and built on first open. With "datasets",
+    `take_dataset(dataset) -> str | None`: a Dataset the user sent it from
+    the Datasets window; what it returns is said in the status line. Both
+    are called on the UI thread and must return quickly (the watchdog's
+    2 s): long work is started from the panel, never inside the call.
 
     THE FAULT RULE (design 3.10). Every call is guarded: whatever it
     raises switches the plugin off for the session, said and logged. The
@@ -738,7 +873,13 @@ class HardwareTrigger(Protocol):
       count_from_now(armed)    start the count (the stream runs, the camera
                                ready)
       count_to_now(armed)      end it, before the stream stops; the camera
-                               takes no more hardware triggers"""
+                               takes no more hardware triggers
+
+    Optional, for a camera whose lines Typhon can watch (a Basler's; feature
+    "facet.hardware_trigger.watch"): lines() its input lines now, states(
+    lines) each one's level, can_watch(), and watch(lines, fire, edge) — a
+    started watcher calling fire(line) per edge until its stop(); a
+    snapshot or record run from the camera's cable uses it."""
 
     def inputs(self) -> Any: ...
 
@@ -813,9 +954,9 @@ class TriggerSource(Protocol):
     second start while it runs starts nothing more, a second stop returns
     at once, and a start after stop starts nothing — a source belongs to
     one run, and a run makes new ones. The contract suite holds every
-    source to this (tests/contracts/test_trigger_sources.py). Typhon's own
-    two are the only sources a run uses before stage P6: a plugin whose
-    manifest's kind is "source" is refused until then."""
+    source to this (tests/contracts/test_trigger_sources.py). Beside
+    Typhon's own two, a trigger-source plugin (SourcePlugin, manifest kind
+    "source") makes one for each run that picks it."""
 
     name: str
     camera_line: bool
@@ -887,6 +1028,7 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "MODE_CONTINUOUS": ("council_core.triggered", "MODE_CONTINUOUS"),
     "MODE_EXACT": ("council_core.triggered", "MODE_EXACT"),
     "MODE_SNAPSHOT": ("council_core.triggered", "MODE_SNAPSHOT"),
+    "MODE_RECORD": ("council_core.triggered", "MODE_RECORD"),
     "MODES": ("council_core.triggered", "MODES"),
     "SOFTWARE": ("council_core.triggered", "SOFTWARE"),
     "TIMER": ("council_core.triggered", "TIMER"),
@@ -895,11 +1037,13 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
 
 __all__ = sorted(["API_VERSION", "FEATURES", "EVENTS", "STATUS_MAX", "has",
                   "CameraHandle", "CropBox", "FrameView", "PluginContext",
-                  "FeaturePlugin", "CameraPlugin", "CameraSetup",
+                  "FeaturePlugin", "SourcePlugin", "CameraPlugin",
+                  "CameraSetup",
                   "CategoryHints", "ReviewSource", "RunCamera", "RunPlan",
                   "RunInfo", "SoftwareTrigger", "HardwareTrigger", "Binning",
                   "FACETS", "TriggerEvent", "TriggerSource", "Action",
-                  "TYPHON_DOWNSAMPLE", "CAMERA_DOWNSAMPLE", *_REEXPORTS])
+                  "TYPHON_DOWNSAMPLE", "CAMERA_DOWNSAMPLE", "Dataset",
+                  "DatasetFrame", "dataset_from", *_REEXPORTS])
 
 
 def __getattr__(name: str) -> Any:

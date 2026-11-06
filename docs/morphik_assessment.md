@@ -6,6 +6,12 @@ github.com/morphik-org/morphik-core (origin/main fc6dd938, 2026-10-05; the repo 
 no tags). Nothing in the Council repo was changed by the research. A reference like
 `@94e58e4:core/agent.py:244` means that file and line at that Morphik commit.
 
+> **2026-10-21:** the user decided the Connections tab should work very like Morphik
+> after all (any entity type, a model reading every passage, its links in the graph at
+> once, named graphs, the graph in answers). Recommendations 4 and the "suggested until
+> accepted" rule below are superseded: see `docs/handoff/kg_morphik_2026-10-21.md`. The
+> research itself (licences, what Morphik did, the measurements) stands.
+
 The user's goal for the graph: **connecting people, parts and projects across the
 vault documents**. Constraint: **local-only now** — a networked Council is only a
 possible future path (section 6 is a note, not work).

@@ -67,7 +67,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: What an event camera's accumulated image uses for "no event here".
 EVENT_MID = 128
@@ -1042,6 +1042,28 @@ class BaslerDevice(Device):
 
     def count_to_now(self, armed: Any) -> None:
         self.settings_provider().count_to_now(armed)
+
+    # -- its I/O lines, watched (council_core.basler_lines) ----------------
+    def input_lines(self) -> Tuple[str, ...]:
+        from . import basler_lines
+        return basler_lines.input_lines(self)
+
+    def trigger_inputs(self) -> Tuple[str, ...]:
+        """The input lines, then CxpTrigger0 … (through a CoaXPress frame
+        grabber) where a counter can count them: what can be watched."""
+        from . import basler_lines
+        return basler_lines.trigger_inputs(self)
+
+    def line_states(self, lines: Sequence[str] = ()) -> Dict[str, Any]:
+        from . import basler_lines
+        return basler_lines.line_states(self, lines)
+
+    def watch_lines(self, lines: Sequence[str],
+                    fire: Optional[Callable[[str], Any]] = None,
+                    edge: str = "RisingEdge") -> Any:
+        """A started LineWatcher on `lines`: fire(line) per edge."""
+        from . import basler_lines
+        return basler_lines.LineWatcher(self, lines, fire, edge).start()
 
     def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
         """Is the camera waiting for a frame trigger (FrameTriggerWait)?

@@ -315,3 +315,18 @@ Ledger's people list (asking about unknown ones once), reads folders outside the
 the user adds, and prints its progress in the terminal. It changed `knowledge_graph.py`,
 the Connections tab and three small seams in `source_extract.py`; the store schema is
 still v3. Merge `origin/qt-migration` first.
+
+## 11. Like Morphik (2026-10-21) — read before continuing
+
+`docs/handoff/kg_morphik_2026-10-21.md`: the user found four assumptions above wrong
+(fixed entity types, a model that may only link names labelled fields gave, field rules
+to tick first, one graph per vault) and decided a model's links go in the graph at once.
+It supersedes §2's "suggested until accepted" and "Entities: PERSON, PART, PROJECT".
+The store is schema v4. Merge `origin/qt-migration` first.
+
+## 12. The Contents layer (2026-10-26) — read before continuing
+
+`docs/handoff/kg_contents_2026-10-26.md`: the user found the graph too strict ("ALL
+of the input data should be in the knowledge graph"). Every cell of every CSV and
+workbook is now kept under its header or label, searchable, and shown in a Contents
+tab. The store is schema v5.

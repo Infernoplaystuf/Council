@@ -198,7 +198,7 @@ def test_a_gap_names_the_typed_question_not_the_text_in_front_of_it(
     actions.vault_brief = lambda q: vc.Brief()
     actions.docs_brief = lambda q, m: DocsBrief()
     actions.memo_llm = None
-    opts = council_options.CouncilOptions.defaults()
+    opts = council_options.CouncilOptions(deliberate=True)
     opts.depth = "deep"                 # the Judge ranks only past Quick
     typed = "How big is the pump\nin bay 4 (see pumps.csv)?"
     result = actions.send(typed, opts)

@@ -499,6 +499,36 @@ def test_a_second_launch_in_one_process_leaves_the_app_dressed(qapp,
     assert styles == [], f"the app was dressed again: {styles}"
 
 
+def test_garbage_is_collected_on_the_gui_thread_only(qapp):
+    """A collection on a worker destroyed a window an earlier build left in a
+    cycle, and ~QWidget waited for the GUI thread - which was joining that
+    worker: this file hung in its second build (council_qt.gui_gc)."""
+    import gc
+    import threading
+
+    build()
+    on_gui = []
+
+    def note(phase, _info):
+        if phase == "start":
+            on_gui.append(threading.current_thread() is threading.main_thread())
+    gc.callbacks.append(note)
+    try:
+        def churn():                     # far past the first threshold
+            for _ in range(50_000):
+                cycle = []
+                cycle.append(cycle)
+        worker = threading.Thread(target=churn)
+        worker.start()
+        worker.join()
+        assert False not in on_gui, "garbage was collected on a worker"
+        assert _pump_until(qapp, lambda: on_gui, seconds=5), (
+            "nothing collects the garbage")
+        assert all(on_gui)
+    finally:
+        gc.callbacks.remove(note)
+
+
 def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
     """A launch that resolves a vault path and then fails on every read because
     nothing made the directory is a worse first run than no vault at all."""
@@ -557,11 +587,10 @@ def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
 def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
                                                           monkeypatch):
     """The review's probe, as a test: a model saved the way the app saves one
-    (onboarding.save_gguf_path, model_slots.save), then a Qt launch. On the
+    (backend_settings.save_gguf_path, model_slots.save), then a Qt launch. On the
     base there was no data_in/ at all; with batch 0 both files were copied
     into it and the data index offered them as datasets."""
-    import onboarding
-    from council_core import model_slots
+    from council_core import backend_settings, model_slots
 
     # save_gguf_path also exports the choice; recorded so it is put back.
     monkeypatch.setenv("COUNCIL_GGUF_PATH", "placeholder")
@@ -571,7 +600,7 @@ def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
     model = tmp_path / "models" / "granite.gguf"
     model.parent.mkdir()
     model.write_bytes(b"GGUF" + b"\0" * 64)
-    assert onboarding.save_gguf_path(vault, str(model)) is None
+    assert backend_settings.save_gguf_path(vault, str(model)) is None
     model_slots.save(vault, model_slots.SlotConfig(slots={
         "main": model_slots.Slot("main", str(model)),
         "coding": model_slots.Slot("coding", "ollama:llama3.1:8b")}))
@@ -626,9 +655,11 @@ def test_the_engine_settings_saved_in_the_vault_are_applied(qapp, tmp_path,
     _engine_settings(tmp_path, n_ctx="16384", gpu_layers="20",
                      embed_device="cuda")
     build()
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "20"
     assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cuda"
+    # The saved context size is the Tk era's fixed window: the engine sizes
+    # the window to the model now (user, 2026-10-23), so it is not applied.
+    assert "COUNCIL_GGUF_N_CTX" not in os.environ
 
 
 def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
@@ -640,7 +671,6 @@ def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
     monkeypatch.setenv("COUNCIL_GGUF_GPU_LAYERS", "0")
     build()
     assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "0"
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
 
 
 def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):
@@ -650,38 +680,3 @@ def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):
     for var in ENGINE_VARS:
         assert var not in os.environ, var
 
-
-def test_the_tk_console_applies_them(tmp_path, engine_env, monkeypatch):
-    """Run, not read (found in review: the check below passed with Tk's
-    call disabled). _load_backend_settings is the console's own method; it
-    is called unbound, with only the settings path it asks its console for,
-    so no Tk window is built."""
-    import council_gui_engine as cge
-
-    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "placeholder")
-    monkeypatch.delenv("COUNCIL_GGUF_N_CTX")
-    _engine_settings(tmp_path, n_ctx="12288", gpu_layers="7",
-                     embed_device="cuda")
-    monkeypatch.setenv("COUNCIL_EMBED_DEVICE", "cpu")     # an export wins
-
-    class Console:
-        def _backend_settings_path(self):
-            return tmp_path / "vault" / "backend_settings.json"
-
-    data = cge.CouncilConsole._load_backend_settings(Console())
-    assert data["n_ctx"] == "12288"
-    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "12288"
-    assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "7"
-    assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cpu"
-
-
-def test_the_tk_console_applies_them_through_the_same_function():
-    """One rule for both front ends, so they cannot disagree about which
-    value wins."""
-    from tests.source_checks import code_of
-
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    body = code_of(source, "_load_backend_settings")
-    assert "engine_settings.apply(" in body
-    assert "COUNCIL_GGUF_N_CTX" not in body, (
-        "the Tk console still applies the knobs with its own loop")

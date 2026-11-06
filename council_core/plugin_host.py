@@ -169,7 +169,19 @@ BUILTIN_PLUGINS: Tuple[Tuple[str, str], ...] = (
     ("typhon.classify", "classify"),
     ("typhon.timing", "timing"),
     ("typhon.crop", "crop"),
+    ("typhon.send_trigger", "send_trigger"),
 )
+#: Built-ins a new project does not run until ticked in Plugins… (a plugin
+#: home with no base set file): optional extras (Send trigger, 5 November
+#: 2026). A base set written by the user lists what it lists.
+OPTIONAL_BUILTINS: Tuple[str, ...] = ("typhon.send_trigger",)
+
+
+def default_plugins(builtins: Sequence[Tuple[str, str]] = BUILTIN_PLUGINS
+                    ) -> List[str]:
+    """The base set of a plugin home with none written: every built-in but
+    the optional ones."""
+    return [pid for pid, _name in builtins if pid not in OPTIONAL_BUILTINS]
 #: The package the built-ins are imported as.
 BUILTIN_PACKAGE = "typhon_plugins"
 BUILTIN_DIR = Path(__file__).resolve().parent.parent / BUILTIN_PACKAGE
@@ -752,6 +764,10 @@ def capabilities_of(device: Any, info: Any) -> frozenset:
 # ======================================================================
 # The host
 # ======================================================================
+#: send_dataset: the plugin gave no answer at all.
+_NO_ANSWER = object()
+
+
 class PluginHost:
     """The rig's plugin host. Cheap to make: it reads nothing until asked."""
 
@@ -809,6 +825,12 @@ class PluginHost:
         self.current_frame_fn: Optional[Callable[[], Optional[Path]]] = None
         self.crop_box_fn: Optional[Callable[[Optional[str]],
                                             Optional[api.CropBox]]] = None
+        #: Set by the window (P4): open plugin `pid`'s pop-out window;
+        #: True when it did.
+        self.show_panel_fn: Optional[Callable[[str], bool]] = None
+        #: Set by the window (P4): the folder the main window's slider
+        #: shows (its Image folder), or None.
+        self.image_folder_fn: Optional[Callable[[], Optional[Path]]] = None
         self.ui_thread = threading.main_thread().ident
         #: Runs from their name's reservation to their end record (stage
         #: P3; council_core.plugin_runs.ActiveRun), and each camera's own.
@@ -878,8 +900,8 @@ class PluginHost:
         with self._lock:
             if self._base is None:
                 try:
-                    self._base = pl.read_base_set(self.home.path,
-                                                  self.builtin_ids())
+                    self._base = pl.read_base_set(
+                        self.home.path, default_plugins(self.builtins))
                 except pl.PluginListError as exc:
                     self.notes.append(f"{exc} — every built-in plugin is "
                                       f"used meanwhile")
@@ -1246,6 +1268,98 @@ class PluginHost:
             if m is not None and contribution in m.contributes:
                 out.append(pid)
         return out
+
+    # -- the screen and datasets (P4) ----------------------------------------
+    def panel_plugins(self) -> List[str]:
+        """The plugins this project runs that have a pop-out panel and can
+        run now (not off, faulted or missing a requirement)."""
+        return [pid for pid in self.with_hook("panel")
+                if self.state(pid)[0] in (ON, ACTIVE)]
+
+    def dataset_plugins(self) -> List[str]:
+        """The plugins this project runs that take datasets and can run."""
+        return [pid for pid in self.with_hook("datasets")
+                if self.state(pid)[0] in (ON, ACTIVE)]
+
+    def build_panel(self, pid: str, parent: Any = None) -> Any:
+        """Plugin `pid`'s panel widget, built now (guarded: None when it
+        has none, cannot run, or fails, which switches it off)."""
+        if pid not in self.with_hook("panel"):
+            return None
+        return self.call(pid, "panel", parent)
+
+    def show_panel(self, pid: str) -> bool:
+        """Ask the window to open plugin `pid`'s pop-out."""
+        fn = self.show_panel_fn
+        if fn is None or pid not in self.with_hook("panel"):
+            return False
+        return bool(fn(pid))
+
+    def send_dataset(self, pid: str, name: str) -> str:
+        """Hand dataset `name` (as it is now) to plugin `pid`. What the
+        plugin says back, or why it could not take it."""
+        from council_core import datasets as ds
+
+        if pid not in self.with_hook("datasets"):
+            return f"{self._name(pid)} does not take datasets"
+        doc = ds.load(name)
+        dataset = api.dataset_from(doc.get("name") or name,
+                                   ds.frames(name))
+        if self.instance(pid) is None:
+            return (f"{self._name(pid)} cannot run now: "
+                    f"{self.state(pid)[1] or 'switched off'}")
+        out = self.call(pid, "take_dataset", dataset, default=_NO_ANSWER)
+        if out is _NO_ANSWER:
+            if pid in self.faults:
+                return f"{self._name(pid)}: {self.faults[pid].reason}"
+            return f"{self._name(pid)} has no take_dataset"
+        said = str(out or "").strip()
+        return said or (f"'{dataset.name}' ({len(dataset.frames)} frames) "
+                        f"sent to {self._name(pid)}.")
+
+    # -- trigger-source plugins (2 November 2026) ----------------------------
+    def source_plugins(self) -> List[str]:
+        """The trigger-source plugins (manifest kind "source") this project
+        runs that can run now."""
+        out = []
+        for pid in self.runs():
+            m = self.manifest(pid)
+            if m is not None and m.kind == "source" and \
+                    self.state(pid)[0] in (ON, ACTIVE):
+                out.append(pid)
+        return out
+
+    def trigger_sources(self) -> Dict[str, str]:
+        """Each source the trigger-source plugins offer now, by name, with
+        the plugin that offers it. A name Typhon or a camera owns
+        (Software, Timer, Line1 …: triggered.camera_source), or one a
+        plugin before it offers, is left out."""
+        from council_core import triggered
+
+        out: Dict[str, str] = {}
+        for pid in self.source_plugins():
+            names = self.call(pid, "sources", default=())
+            if isinstance(names, str):
+                names = [names]
+            for name in names or ():
+                name = " ".join(str(name).split())
+                if not name or name in triggered.TYPHON_SOURCES or \
+                        triggered.camera_source(name) or name in out:
+                    continue
+                out[name] = pid
+        return out
+
+    def make_source(self, name: str) -> Optional["GuardedSource"]:
+        """A new source `name` for one run, from the plugin that offers it
+        (its make_source(name)), guarded — or None when no plugin offers it
+        now, or making it failed (the plugin is switched off)."""
+        pid = self.trigger_sources().get(str(name))
+        if pid is None:
+            return None
+        made = self.call(pid, "make_source", str(name))
+        if made is None or not callable(getattr(made, "start", None)):
+            return None
+        return GuardedSource(self, pid, str(name), made)
 
     def check_start(self, plan: Any) -> List[str]:
         """Every run-hook plugin's check_start(plan): the reasons Start is
@@ -3065,6 +3179,37 @@ class Context:
         self._open()
         return self._host.data_dir(self.plugin_id)
 
+    def image_folder(self) -> Optional[Path]:
+        fn = self._host.image_folder_fn
+        return fn() if fn is not None else None
+
+    def datasets(self) -> List[str]:
+        from council_core import datasets as ds
+        return ds.names()
+
+    def dataset(self, name: str) -> api.Dataset:
+        from council_core import datasets as ds
+        doc = ds.load(name)
+        return api.dataset_from(doc.get("name") or name, ds.frames(name))
+
+    def show_panel(self) -> bool:
+        if self._off():
+            return False
+        return self._host.show_panel(self.plugin_id)
+
+    def trigger_sources(self) -> List[str]:
+        return list(self._host.trigger_sources())
+
+    def make_source(self, name: str) -> Any:
+        if self._off():
+            return None
+        return self._host.make_source(name)
+
+    def capture_now(self, camera: Optional[str] = None) -> Optional[str]:
+        if self._off():
+            return None
+        return self._host.capture_now(camera)
+
     def capture_setup(self, camera: Optional[str] = None) -> Any:
         """A copy of the camera's capture set-up (device.capture, the
         storage today's code reads, design 2.5), or None."""
@@ -3076,6 +3221,39 @@ class Context:
 
     def __repr__(self) -> str:
         return f"<plugin context {self.plugin_id}>"
+
+
+class GuardedSource:
+    """A trigger-source plugin's source for one run (host.make_source):
+    its start and stop called guarded — a fault switches the plugin off
+    and stops nothing else; the run goes on, fired from Capture now."""
+
+    camera_line = False
+
+    def __init__(self, host: "PluginHost", pid: str, name: str,
+                 made: Any) -> None:
+        self.host = host
+        self.plugin_id = pid
+        self.name = name
+        self._made = made
+
+    def needs(self, mode: str = "Triggered: snapshot") -> frozenset:
+        """Typhon fires the cameras from it: an exact run needs their
+        software trigger; a snapshot or record run frames only."""
+        if str(mode) == "Triggered: exact":
+            return frozenset({"frames", "software_trigger"})
+        return frozenset({"frames"})
+
+    def start(self, fire: Callable[[Any], Any]) -> None:
+        made = self._made
+        self.host._guard(self.plugin_id, "source.start", made.start,
+                         (fire,), {}, None)
+
+    def stop(self) -> None:
+        stop = getattr(self._made, "stop", None)
+        if callable(stop):
+            self.host._guard(self.plugin_id, "source.stop", stop, (), {},
+                             None)
 
 
 # ======================================================================

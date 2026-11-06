@@ -111,6 +111,20 @@ def bundled_samples_dir() -> Path:
     return Path(__file__).parent / "assets" / "sample_data"
 
 
+def search_roots(vault_dir: Path) -> List[Path]:
+    """The folders a data index searches: the vault's input folder, and the
+    bundled samples only when COUNCIL_SAMPLE_DATA=1 (a demo with no data of
+    its own). The samples were always searched, so their made-up purchase
+    orders, inventory and suppliers turned up in answers about the user's own
+    files (found 2026-10-29: "which run had a power dip" was given a
+    "Power Strip" inventory row)."""
+    roots = [input_dir(vault_dir)]
+    if os.environ.get("COUNCIL_SAMPLE_DATA", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        roots.append(bundled_samples_dir())
+    return roots
+
+
 #: Where the data index keeps its own files (its column index and its
 #: warm-start cache): a hidden folder in the WRITE root, data_out/.index/.
 #: They were kept in data_in/, the folder the app promises never to write.
@@ -638,7 +652,8 @@ class DataIndex:
         ext = path.suffix.lower()
         prof = FileProfile(path=path, name=path.name, extension=ext,
                             indexed_at=time.time())
-        try:
+
+        def profile() -> FileProfile:
             if ext in (".csv", ".tsv"):
                 self._profile_delimited(path, prof, delim="," if ext == ".csv" else "\t")
             elif ext == ".json":
@@ -647,6 +662,18 @@ class DataIndex:
                 self._profile_excel(path, prof)
             else:
                 prof.error = f"Unsupported extension: {ext}"
+            return prof
+        try:
+            # too slow, or stalled the app before: skipped, the index goes on
+            # (council_core.file_guard). A profile of its own then - the read
+            # left behind may still be filling the other - asked again next
+            # refresh (indexed_at 0), when the skip list answers at once.
+            from council_core import file_guard
+            try:
+                return file_guard.read(path, profile, tab="Vault", note_after=2.0)
+            except file_guard.Skipped as e:
+                return FileProfile(path=path, name=path.name, extension=ext,
+                                   indexed_at=0.0, error=str(e))
         except Exception as e:
             prof.error = f"{type(e).__name__}: {e}"
         return prof

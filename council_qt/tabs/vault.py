@@ -133,8 +133,7 @@ class VaultActions:
             try:
                 import data_index
                 self._index = data_index.DataIndex(
-                    search_roots=[data_index.input_dir(self.vault_dir),
-                                  data_index.bundled_samples_dir()],
+                    search_roots=data_index.search_roots(self.vault_dir),
                     write_root=data_index.output_dir(self.vault_dir))
             except Exception:                             # noqa: BLE001
                 return None
@@ -498,6 +497,11 @@ class VaultTab(ViewHelpers, QWidget):
                                               self.on_descriptions)
         self._btn_embeddings = self._button(row, "3. Build Vector Embeddings",
                                             self.on_embeddings)
+        # files skipped as too slow, or that stalled the app before
+        # (council_core.file_guard): read again on the next run
+        from ..widgets.skipped_files import RetrySkippedButton
+        self.retry_skipped_btn = RetrySkippedButton(self.append)
+        row.addWidget(self.retry_skipped_btn)
         row.addStretch(1)
         layout.addLayout(row)
         return box
@@ -985,6 +989,8 @@ class VaultTab(ViewHelpers, QWidget):
         for button in (self._btn_keyword, self._btn_descriptions,
                        self._btn_embeddings):
             button.setEnabled(enabled)
+        if enabled:
+            self.retry_skipped_btn.refresh()
 
     def on_descriptions(self) -> None:
         from council_core import vault_ops

@@ -51,6 +51,39 @@ class MemoryHit:
     distance: float
 
 
+def _offline_embedding_function():
+    """A ChromaDB embedding function for records stored without a vector:
+    a fixed 8-number placeholder, computed here, never a download. Queries
+    without an embedder match by substring (LocalMemory.query), so the
+    placeholder is only there to satisfy Chroma. None when chromadb's
+    interface cannot be imported (the collection then gets Chroma's own,
+    as before)."""
+    try:
+        from chromadb.api.types import EmbeddingFunction
+    except Exception:
+        return None
+
+    class _Placeholder(EmbeddingFunction):
+        def __init__(self) -> None:
+            pass
+
+        def __call__(self, input):
+            return [[0.0] * 7 + [1.0] for _ in input]
+
+        @staticmethod
+        def name() -> str:
+            return "council-offline-placeholder"
+
+        def get_config(self) -> Dict[str, Any]:
+            return {}
+
+        @staticmethod
+        def build_from_config(config: Dict[str, Any]) -> "_Placeholder":
+            return _Placeholder()
+
+    return _Placeholder()
+
+
 class LocalMemory:
     """Persistent, telemetry-off vector store. Single-collection by default;
     multi-collection use is supported via ``collection`` constructor arg.
@@ -104,17 +137,13 @@ class LocalMemory:
             path=str(self.persist_dir),
             settings=settings,
         )
-        # Use a no-op embedding function and supply our own vectors.
-        # ChromaDB's default would try to download a sentence-transformer
-        # model on first use — exactly what §0 forbids.
-        try:
-            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-            ef = DefaultEmbeddingFunction()
-        except Exception:
-            ef = None
-        # We will pass embeddings directly on add/query, so the default
-        # function never runs. But we still need to supply *something* on
-        # collection-create for older Chroma versions.
+        # Our own embedding function, which never downloads anything.
+        # ChromaDB's default (DefaultEmbeddingFunction) fetches an ONNX
+        # model from the internet the first time a record is added without
+        # a vector - which is every add when no embedder is injected -
+        # exactly what §0 forbids. With an embedder the vectors are passed
+        # directly and this one is never asked.
+        ef = _offline_embedding_function()
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
             embedding_function=ef,

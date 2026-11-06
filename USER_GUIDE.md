@@ -214,7 +214,7 @@ Common patterns:
 
 ## Sessions
 
-Every conversation auto-saves (the question when you ask it, the answer when the turn ends). Newest-first, with the Tk app's sessions in the same list; type in the filter box to narrow it.
+Every conversation auto-saves (the question when you ask it, the answer when the turn ends). Newest-first, including sessions saved by the retired Tk app; type in the filter box to narrow it.
 
 **Memory is "This conversation only"** (the toolbar says so): a follow-up question sees this conversation's earlier turns and nothing older — not older sessions, not what the council learned about you or your projects, not your profile. To bring ONE older session in on purpose:
 
@@ -224,7 +224,7 @@ Every conversation auto-saves (the question when you ask it, the answer when the
 
 `COUNCIL_MEMORY_SCOPE=all` lets everything learned in (the old behaviour); `COUNCIL_MEMORY_SCOPE=none` (or `COUNCIL_DEMO_SILO=1`) answers every question on its own.
 
-**Crash recovery:** not in the Qt app yet — it keeps the question as soon as you ask it, but a session that ended in a crash is not offered back at the next launch (the Tk app's resume offer is not ported).
+**Crash recovery:** not in the Qt app yet — it keeps the question as soon as you ask it, but a session that ended in a crash is not offered back at the next launch (the retired Tk app's resume offer was never ported).
 
 ---
 

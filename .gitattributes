@@ -9,3 +9,8 @@ setup-wsl.sh   text eol=lf
 run-wsl.sh     text eol=lf
 setup-linux.sh text eol=lf
 run-linux.sh   text eol=lf
+
+# Windows batch files need CRLF: cmd.exe misreads labels and GOTOs in an LF
+# file. Stored as CRLF on every checkout, not only where git's autocrlf is on
+# (tests/test_launcher_args.py checks it).
+*.bat text eol=crlf

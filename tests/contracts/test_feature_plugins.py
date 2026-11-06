@@ -105,9 +105,10 @@ def plugin_object(folder):
 # ======================================================================
 # The manifest and the hooks it names
 # ======================================================================
-def test_the_built_in_feature_plugins_are_the_four():
+def test_the_built_in_feature_plugins_are_the_five():
     assert FEATURE_IDS == ["typhon.trigger", "typhon.classify",
-                           "typhon.timing", "typhon.crop"]
+                           "typhon.timing", "typhon.crop",
+                           "typhon.send_trigger"]
 
 
 def test_reading_their_manifests_imports_none_of_them():

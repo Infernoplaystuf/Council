@@ -120,6 +120,8 @@ TYPHON_FILES = (
     "tests/test_gui_describe_small.py",
     "tests/test_python_envs.py",
     "tests/test_project_workspace.py",
+    # the Council rebuilding Typhon grades against typhon.gspec
+    "tests/test_typhon_recreate.py",
     # a retired test must not come back in a merge
     "tests/test_retired_tests.py",
 )
@@ -139,6 +141,12 @@ NOT_GATED: Dict[str, str] = {
     "tests/test_var_graph.py":
         "uses frame_timing.py's name as a sample script's; tests the "
         "variable graph, not Typhon",
+    "tests/test_council_ab.py":
+        "names the full-test harness's 'typhon' step id; tests the harness, "
+        "not Typhon",
+    "tests/test_qt_app_examples.py":
+        "uses gui_reference's EXAMPLES_DIR (examples/qt_apps, the Qt apps "
+        "the models read), not Typhon's examples/gui",
 }
 
 #: Words that make a test file a Typhon test file (--check-list).

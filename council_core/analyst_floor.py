@@ -85,6 +85,7 @@ What it does not see:
 from __future__ import annotations
 
 import _thread
+import mimetypes
 import os
 import sys
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
@@ -387,12 +388,28 @@ def _arg(args: tuple, i: int) -> Any:
     return args[i] if len(args) > i else None
 
 
+#: Files libraries read only to probe the machine, and carry on without:
+#: pandas >= 3 reads the cgroup CPU quota on every read_csv (on Windows too,
+#: where the spelling is a drive-root path), and mimetypes reads the system's
+#: type tables. Each is answered "not there" - exactly what the library sees on
+#: a machine without the file - so nothing is read, and the run is not failed
+#: for a refusal its code never asked for. Exact spellings only.
+_PROBES = frozenset({
+    "/sys/fs/cgroup/cpu.max",
+    "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+    "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+    *mimetypes.knownfiles,
+})
+
+
 def _on_open(floor: Floor, args: tuple) -> None:
     path, mode, flags = (tuple(args) + (None, None, None))[:3]
     if isinstance(mode, str):
         writing = any(ch in mode for ch in "wax+")
     else:
         writing = bool((flags or 0) & _WRITE_FLAGS)
+    if not writing and isinstance(path, str) and path in _PROBES:
+        raise FileNotFoundError(2, "not available in the sandbox", path)
     floor.check(path, writing, "writing" if writing else "reading")
 
 

@@ -53,6 +53,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
+from . import token_budget
+
 APP_ROOT = Path(__file__).resolve().parent.parent
 TIME_LIMIT_S = 120
 #: Wall-clock grace added to the model's code budget so the sandbox child's
@@ -499,7 +501,8 @@ def run(question: str, vault_dir: Path, *,
     for _ in range(MAX_TRIES):
         try:
             raw = chat([{"role": "user", "content": prompt + feedback}],
-                       role="coder", temperature=0.0, num_predict=700,
+                       role="coder", temperature=0.0,
+                       num_predict=token_budget.reply("answer", 700),
                        timeout=120)
         except Exception as exc:                          # noqa: BLE001
             log = f"code generation failed: {exc}"

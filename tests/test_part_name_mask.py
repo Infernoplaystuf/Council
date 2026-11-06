@@ -22,12 +22,42 @@ from source_extract import (_part_from_filename, _part_from_name,     # noqa: E4
 
 # ------------------------------------------------------------- mask_to_regex
 
-def test_a_mask_of_letters_and_digits_matches_that_shape():
-    pat = mask_to_regex("@@@#@@###")
+def test_an_exact_mask_matches_that_shape_only():
+    pat = mask_to_regex("=@@@#@@###")
     assert pat.search("ABC1DE234") is not None
     assert pat.search("abc1de234") is not None                       # case-insensitive
     assert pat.search("AB1DE234") is None                            # one letter short
     assert pat.search("ABCX1DE234") is None                          # extra letter breaks the shape
+    assert pat.fullmatch("ABC1DE234-A") is None                      # no tail
+    assert mask_to_regex("@@@#@@###", exact=True).pattern == pat.pattern
+
+
+def test_a_loose_mask_takes_shorter_and_longer_runs_and_a_dash_tail():
+    """User, 2026-10-22: "the part name pattern is taken as way too strict.
+    For instance earlier samples have less letters or number in a row or say
+    have a -@ or -#"."""
+    pat = mask_to_regex("@@@#@@###")
+    for part in ("ABC1DE234", "AB1DE234", "ABC1DE23", "ABCX1DE234", "ABC1DE234-A",
+                 "ABC1DE234-2", "AB1DE23-R2"):
+        assert pat.fullmatch(part), part
+    for not_part in ("A1DE234", "ABC1DE2", "ABC1DE234-ABCD", "CH1CH2", "X1Y2"):
+        assert not pat.fullmatch(not_part), not_part
+    # a tail after an underscore is the file name's, not the part's
+    assert _part_from_filename("inspection_ABC1DE234_run3", pat) == "ABC1DE234"
+
+
+def test_a_digits_only_mask_keeps_its_length():
+    pat = mask_to_regex("#####")
+    assert pat.fullmatch("48213") and pat.fullmatch("48213-2")
+    assert not pat.fullmatch("2026") and not pat.fullmatch("482130")
+
+
+def test_several_shapes_are_any_of_them():
+    pat = mask_to_regex("=@@@#@@### | @@-####, P/N-###")
+    assert pat.fullmatch("ABC1DE234") and pat.fullmatch("XY-1234") and pat.fullmatch("P/N-101")
+    assert not pat.fullmatch("AB1DE234")
+    from source_extract import mask_shapes
+    assert mask_shapes("=@@@#@@### | @@-####, P/N-###") == ["@@@#@@###", "@@-####", "P/N-###"]
 
 
 def test_a_mask_with_literal_characters_requires_them():
@@ -47,7 +77,8 @@ def test_the_match_is_bounded_by_non_alphanumeric_characters():
 
 def test_a_mask_run_collapses_to_a_quantified_class():
     # Just a sanity check of the compiled form.
-    assert mask_to_regex("@@@").pattern.startswith("(?<![A-Za-z0-9])[A-Za-z]{3}")
+    assert mask_to_regex("=@@@").pattern.startswith("(?<![A-Za-z0-9])[A-Za-z]{3}")
+    assert mask_to_regex("@@@").pattern.startswith("(?<![A-Za-z0-9])[A-Za-z]{2,4}")
 
 
 # ------------------------------------------------------------- invalid masks

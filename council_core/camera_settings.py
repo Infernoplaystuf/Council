@@ -1747,7 +1747,7 @@ class BaslerSettings(Provider):
 
         if not setup.triggered:
             return ""
-        if setup.snapshot:
+        if setup.frames_only:
             if not setup.typhon_fires:
                 return (f"Snapshot takes its trigger from Software (Capture "
                         f"now) or the Timer; {setup.source} is the camera's "

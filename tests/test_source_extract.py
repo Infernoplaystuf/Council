@@ -136,6 +136,143 @@ def test_no_reader_means_images_are_saved_not_read(setup):
     assert not any(o.from_image for o in run.obs)
 
 
+def test_no_pictures_folder_is_made_for_a_workbook_without_pictures(setup):
+    schema, _, sources, tmp = setup
+    run = extract(schema, [sources[0]], image_dir=tmp / "imgs", use_images=False)
+    assert run.obs and not run.images
+    assert not (tmp / "imgs").exists()
+
+
+def test_a_pictures_folder_path_too_long_is_one_problem_not_a_failed_extract(
+        setup, monkeypatch):
+    """A review folder whose '<review>_images' path was 248+ characters
+    failed the whole Extract with a raw FileNotFoundError [WinError 206],
+    pictures ticked or not: the folder was made before anything else
+    (review, 2026-10-19). Now the pictures are not saved, once said, and
+    the values are all read."""
+    import errno
+    schema, _, sources, tmp = setup
+    nde2 = make_nde_book(tmp / "NDE again.xlsx")            # a second picture
+    real = Path.mkdir
+
+    def too_long(self, *a, **kw):
+        if self.name == "imgs":
+            raise OSError(errno.ENAMETOOLONG, "The filename or extension is too long")
+        return real(self, *a, **kw)
+    monkeypatch.setattr(Path, "mkdir", too_long)
+    for use_images in (False, True):
+        reader = fake_reader(CONCEALMENT_IMAGE_ROWS) if use_images else None
+        run = extract(schema, sources + [nde2], image_dir=tmp / "imgs", image_reader=reader,
+                      use_images=use_images)
+        said = [p for p in run.problems if "path too long" in p]
+        n = len(str((tmp / "imgs").absolute())) + 1
+        assert len(said) == 1, run.problems
+        assert said[0].startswith("pictures not saved: path too long (")
+        assert said[0].endswith(" characters) — enable Windows long paths or move the folder")
+        assert int(said[0].split("(")[1].split()[0]) > n
+        assert len(run.images) == 2 and not any(i.saved_as for i in run.images)
+        assert any(o.field == "Frequency (kHz)" for o in run.obs)
+        assert any(o.from_image for o in run.obs) == use_images     # still read
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_real_pictures_folder_path_too_long_does_not_fail_the_extract(tmp_path):
+    """The tester's repro: <review>_images of 248+ characters, Windows long
+    paths off."""
+    import os
+    from council_core import ledger_ingest as li
+    probe = tmp_path / ("p" * 120) / ("q" * 120)
+    try:
+        os.makedirs(probe)
+        pytest.skip("Windows long paths are on here")
+    except OSError:
+        pass
+    suffix = len("\\review_20261019_123456_images")
+    folder = tmp_path / ("d" * (250 - suffix - len(str(tmp_path)) - 1))
+    folder.mkdir()
+    review = folder / "review_20261019_123456.xlsx"
+    assert len(str(review.with_name(review.stem + "_images"))) == 250
+    tpl = make_template(folder / "t.xlsx")
+    csv = folder / "p.csv"
+    li.create_parent(str(tpl), str(csv))
+    src = make_nde_book(folder / "nde.xlsx")                  # has a picture
+    for use_images in (False, True):
+        s = li.run_extract(str(csv), [str(src)], str(review), use_images=use_images,
+                           image_reader=fake_reader(CONCEALMENT_IMAGE_ROWS))
+        assert Path(s.review).exists() and s.values
+        assert [p for p in s.problems if p.startswith("pictures not saved: path too long")]
+
+
+def _long_folder(tmp_path, review_len):
+    """A folder made past MAX_PATH (as another program can, long paths on or
+    off) and a review path in it of `review_len` characters."""
+    import os
+    import source_extract as se
+    name = "review_20261019_123456.xlsx"
+    folder = tmp_path / ("d" * (review_len - len(str(tmp_path)) - len(name) - 2))
+    os.makedirs(se._long_path(str(folder)))
+    review = folder / name
+    assert len(str(review)) == review_len
+    return folder, review
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_review_path_too_long_is_said_before_a_workbook_is_read(tmp_path, monkeypatch):
+    """A review path of 260+ characters (its pictures folder 262+) failed
+    the Extract with a raw FileNotFoundError [Errno 2] once every workbook
+    was read (review, 2026-10-19). Now a plain error, before any is read."""
+    import shutil
+    import source_extract as se
+    from council_core import ledger_ingest as li
+    from sample_ledger import LedgerError
+    # as on most PCs, whatever this one says
+    monkeypatch.setattr(se, "_long_paths_on", lambda: False, raising=False)
+    tpl = make_template(tmp_path / "t.xlsx")
+    csv = tmp_path / "p.csv"
+    li.create_parent(str(tpl), str(csv))
+    src = make_laser_log(tmp_path / "laser.xlsx")
+
+    def read(*a, **k):
+        raise AssertionError("a workbook was read")
+    monkeypatch.setattr(li, "extract", read)
+    folder, review = _long_folder(tmp_path, 265)
+    try:
+        with pytest.raises(LedgerError) as e:
+            li.run_extract(str(csv), [str(src)], str(review), use_images=False)
+        assert str(e.value) == ("review path too long (265 characters) — enable Windows "
+                                "long paths or pick a shorter folder")
+        # one Windows can write is not stopped
+        assert not se.too_long_to_write(tmp_path / "review.xlsx")
+        monkeypatch.setattr(se, "_long_paths_on", lambda: True)
+        assert not se.too_long_to_write(review)
+    finally:
+        shutil.rmtree(se._long_path(str(folder)), ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+def test_a_review_too_long_to_save_is_a_plain_error(setup):
+    """Whoever writes the review past MAX_PATH (long paths off) is told so,
+    not given FileNotFoundError [Errno 2]."""
+    import os
+    import shutil
+    import source_extract as se
+    from sample_ledger import LedgerError
+    schema, csv, sources, tmp = setup
+    try:
+        os.makedirs(tmp / ("p" * 130) / ("q" * 130))
+        pytest.skip("Windows long paths are on here")
+    except OSError:
+        pass
+    run = extract(schema, [sources[0]], use_images=False)
+    folder, review = _long_folder(tmp, 270)
+    try:
+        with pytest.raises(LedgerError, match=r"^could not write review_20261019_123456\.xlsx: "
+                                              r"review path too long \(270 characters\)"):
+            write_review(review, run, decide(run, schema), schema, str(csv))
+    finally:
+        shutil.rmtree(se._long_path(str(folder)), ignore_errors=True)
+
+
 def test_unknown_labels_and_problems(setup):
     schema, _, sources, tmp = setup
     run = _run(schema, sources, tmp)
@@ -156,15 +293,15 @@ def test_missing_part_number_is_reported(setup):
 
 
 # ── review -> apply ─────────────────────────────────────────────────────
-def _edit_review(path, accept=(), map_labels=None, ignore=()):
+def _edit_review(path, accept=(), map_labels=None, ignore=(), reject=()):
     wb = openpyxl.load_workbook(path)
     ws = wb["Values"]
     for row in ws.iter_rows(min_row=2):
         key = (str(row[1].value or ""), str(row[2].value or ""), row[3].value,
                str(row[4].value))
-        for want in accept:
+        for want, mark in [(w, "Y") for w in accept] + [(w, "N") for w in reject]:
             if all(w is None or w == k for w, k in zip(want, key)):
-                row[0].value = "Y"
+                row[0].value = mark
     lab = wb["Labels to map"]
     for row in lab.iter_rows(min_row=2):
         if map_labels and row[2].value in map_labels:
@@ -462,16 +599,22 @@ def test_each_inspectors_reading_is_kept_under_their_initials(setup):
     for who, vals in (("JB", ["60", "61", "62"]), ("MK", ["60", "66", "62"])):
         for it, v in zip(["1A", "2A", "3A"], vals):
             assert got[(it, f"{pre} [{who}]", v)].accept
-    # the template's one cell: agreed values in, a disagreement left to the reviewer
+    # the template's one cell: agreed values in; two readings of this one
+    # workbook that disagree - the first one is used (user, 2026-10-23:
+    # "prioritize the first reading or ... which operator"), the other set aside
     assert got[("1A", pre, "60")].accept and got[("1A", pre, "60")].obs.inspector == "JB/MK"
     jb, mk = got[("2A", pre, "61")], got[("2A", pre, "66")]
-    assert not jb.accept and not mk.accept
-    assert jb.conflict == "66 (MK)" and mk.conflict == "61 (JB)"
+    assert jb.accept and not jb.conflict and "the first reading" in jb.obs.note
+    assert not mk.accept and mk.alternate and not mk.conflict
     assert not any(d.obs.field.startswith("%pec") or d.obs.value in ("JB", "MK") for d in dec)
+    # an operator to prefer: theirs
+    mine = {(d.obs.item, d.obs.field, d.obs.value): d for d in decide(run, schema, ["mk"])}
+    assert mine[("2A", pre, "66")].accept and mine[("2A", pre, "61")].alternate
 
     review = tmp / "review.xlsx"
     write_review(review, run, dec, schema, str(csv))
-    _edit_review(review, accept=[("101", "2A", pre, "66")])     # MK's reading goes in
+    _edit_review(review, accept=[("101", "2A", pre, "66")],     # MK's reading goes in
+                 reject=[("101", "2A", pre, "61")])
     res = apply_review(review, fill_dir=tmp / "filled", use_images=False)
     ledger = ParentCSV(csv)
     cols = ledger.columns

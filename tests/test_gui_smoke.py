@@ -401,7 +401,8 @@ def f(text):
 @pytest.mark.parametrize("line, said", [
     ("first, last = text.split(' ')", "not enough values to unpack"),
     ("value = f'{\"name\": 1}'", "format specifier"),
-    ("value = max([n for n in [] if n])", "empty sequence"),
+    # "arg is an empty sequence" up to 3.11, "iterable argument is empty" from 3.12
+    ("value = max([n for n in [] if n])", "empty"),
 ])
 def test_a_value_error_a_builtin_raises_on_the_code_line_is_a_crash(line,
                                                                    said):

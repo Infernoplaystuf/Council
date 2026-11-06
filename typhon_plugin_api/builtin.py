@@ -78,9 +78,31 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "setup_check": ("council_core.camera_setup", "check"),
     "setup_label": ("council_core.camera_setup", "label"),
     "basler_scan": ("council_core.basler_scan", "scan"),
+    # a camera's I/O lines watched (council_core/basler_lines.py, 5 November
+    # 2026): "Find my trigger line" and its words
+    "FIND_LINE_SECONDS": ("council_core.basler_lines", "FIND_S"),
+    "find_line_words": ("council_core.basler_lines", "find_words"),
 }
 
-__all__ = sorted(_REEXPORTS)
+__all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
+
+
+def classifier_library() -> Any:
+    """frame_classes, the classifier library (design 2.3: it stays a
+    library, its file formats unchanged): the typhon.classify adapter's
+    panel calls its functions exactly as today's script links did."""
+    import importlib
+
+    return importlib.import_module("frame_classes")
+
+
+def classifier_picker() -> Any:
+    """council_qt.widgets.classifier_picker: today's model dropdown, its
+    filter, the "classified with" line and Delete's second press, which the
+    classification pop-out reuses (design 6.3)."""
+    import importlib
+
+    return importlib.import_module("council_qt.widgets.classifier_picker")
 
 
 def __getattr__(name: str) -> Any:
@@ -181,6 +203,35 @@ class DeviceHardwareTrigger(_Arming):
 
     def count_to_now(self, armed: Any) -> None:
         self._device.count_to_now(armed)
+
+    # -- the lines watched (5 November 2026; a Basler's) --------------------
+    def lines(self) -> Any:
+        """What a cable's pulse can be watched on now: the camera's input
+        lines, then the triggers through a CoaXPress frame grabber
+        (CxpTrigger0 …) a counter of the camera can count; () when it
+        cannot say."""
+        for name in ("trigger_inputs", "input_lines"):
+            fn = getattr(self._device, name, None)
+            if callable(fn):
+                return tuple(fn())
+        return ()
+
+    def states(self, lines: Any = ()) -> Any:
+        """Each input line's level: True, False, or None (default: the
+        camera's input lines; a trigger through the grabber has none)."""
+        fn = getattr(self._device, "line_states", None)
+        return dict(fn(tuple(lines))) if callable(fn) else {}
+
+    def can_watch(self) -> bool:
+        return callable(getattr(self._device, "watch_lines", None))
+
+    def watch(self, lines: Any, fire: Any, edge: str = "RisingEdge") -> Any:
+        """Watch `lines` (a LineWatcher, started): `fire(line)` per edge,
+        until its stop()."""
+        fn = getattr(self._device, "watch_lines", None)
+        if not callable(fn):
+            raise RuntimeError("this camera's lines cannot be watched")
+        return fn(tuple(lines), fire, edge)
 
 
 class DeviceBinning(DeviceFacet):

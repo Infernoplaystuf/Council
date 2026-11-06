@@ -497,11 +497,13 @@ def test_a_crash_sentinel_sizes_the_model_for_the_cpu(engine):
     assert llm.n_gpu_layers == 0 and llm._n_ctx == 8192     # was 32768
 
 
-def test_the_env_var_still_sizes_a_cpu_model(engine, monkeypatch):
+def test_the_old_env_var_no_longer_sizes_a_model(engine, monkeypatch):
+    """COUNCIL_GGUF_N_CTX, the Tk era's fixed window, is not read: the
+    ladder sizes the window to the model (user, 2026-10-23)."""
     monkeypatch.setenv("COUNCIL_GGUF_GPU_LAYERS", "0")
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "16384")
     llm = engine.ce._get_gguf_model()
-    assert llm.n_gpu_layers == 0 and llm._n_ctx == 16384
+    assert llm.n_gpu_layers == 0 and llm._n_ctx == 8192   # the CPU rung
 
 
 def test_a_model_on_the_gpu_is_still_sized_by_the_card(engine):

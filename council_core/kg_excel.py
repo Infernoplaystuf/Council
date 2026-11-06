@@ -59,7 +59,10 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 from council_core import knowledge_graph as kgm
 
-WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb")
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".xlsb",
+                     # slides: their tables laid out as sheets (pptx_open), as the
+                     # Ledger reads them (synthetic test, 2026-10-27)
+                     ".pptx", ".pptm")
 
 #: Above this many bytes of uncompressed sheet XML a workbook is STREAMED
 #: (openpyxl read-only, one row at a time) instead of loaded whole. MEASURED
@@ -159,8 +162,10 @@ def _col_letter(c: int) -> str:
 
 
 def _label_text(v) -> str:
-    """'Program Lead:' -> 'Program Lead'."""
-    return re.sub(r"[\s:]+$", "", " ".join(str(v).split()))
+    """'Program Lead:' -> 'Program Lead'. Not '[\\s:]+$': it rescanned a
+    run of colons from each of them, quadratic on a cell of ':' (review,
+    2026-10-20); the words have no other space to strip."""
+    return " ".join(str(v).split()).rstrip(" :")
 
 
 def _norm(v) -> str:
@@ -192,12 +197,14 @@ _NOT_INITIALS = {
     # a column header on their own ("MM", "KG"). As with the method
     # labels, we skip 2-letter units that could be initials ("MM" vs
     # Matt M., "LB" vs Lee B.) — only the ones that are overwhelmingly
-    # units.
-    "psi", "kw", "mw", "hz", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
+    # units. 'KW', 'MW', 'HZ' are real inspectors' initials (Mark Williams
+    # became a person called 'MW' - review, 2026-10-19): not listed.
+    "psi", "khz", "mhz", "rpm", "ipm", "fpm", "deg",
     "sec", "min", "max", "avg", "std", "ppm",
-}
-#: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?'.
-_NOBODY = re.compile(r"(?i)\s*(?:n\s*/\s*a|n\.?\s*a\.?|-+|\?+|tbd|tba|none|nil|unknown)\s*")
+} | _se().NOT_INITIALS        # the Ledger's: result codes 'NRI', 'IND', 'REJ' ...
+#: A cell that says nobody signed: 'N/A', 'n.a.', '-', '?', 'TBD'. The
+#: Ledger's list: one there is no part number either (review, 2026-10-19).
+_NOBODY = _se().PLACEHOLDER
 
 
 def is_initials(s: Any, loose: bool = False) -> bool:
@@ -244,6 +251,9 @@ def split_people(s: Any) -> List[str]:
     capitals ('jb' -> 'JB'); a name stays whole ('Lee, Carol'). Anything else
     ('seen', '63', a date) is nobody."""
     raw = " ".join(str(s or "").split())
+    # '(JB)', '[MK]': initials in brackets are someone's (the Ledger reads
+    # them so - source_extract._initials; review, 2026-10-20)
+    raw = re.sub(r"^[\(\[]\s*([^()\[\]]*?)\s*[\)\]]$", r"\1", raw)
     if not raw or _NOBODY.fullmatch(raw):
         return []
     parts = [p.strip() for p in re.split(r"\s*(?:/|&|;|\band\b)\s*", raw) if p.strip()]
@@ -260,10 +270,21 @@ def split_people(s: Any) -> List[str]:
     return out
 
 
-def _who_head(v) -> bool:
+def _who_head(v, taught: Any = None) -> bool:
     """A label the Ledger reads as 'who logged this' (Inspector, Initials,
-    Operator, Inspected by ...): source_extract's own pattern."""
-    return isinstance(v, str) and bool(_se()._WHO_HEAD.match(v))
+    Operator, Inspected by ...): source_extract's own pattern - and, for a
+    Ledger, the labels its Teach learned are an inspector's or are no one
+    (``taught``: source_extract.Taught; council_core.ledger_teach)."""
+    if not isinstance(v, str):
+        return False
+    if taught is not None and (taught.who or taught.not_who):
+        from sample_ledger import normalize_label
+        key = normalize_label(_label_text(v))
+        if key in {normalize_label(x) for x in taught.not_who}:
+            return False
+        if key in {normalize_label(x) for x in taught.who}:
+            return True
+    return bool(_se()._WHO_HEAD.match(v))
 
 
 def _who_inline(v) -> List[str]:
@@ -387,6 +408,13 @@ def ledger_fingerprint(csv_path: Path) -> bytes:
         out += schema_path(csv_path).read_bytes()
     except OSError:
         out += b"no schema"
+    # the labels Teach learned are an inspector's: a column of this Ledger
+    # reads as a person by them (read_ledger). Only when some are: a Ledger
+    # with none keeps the reading it has. Labels taught as no one's are not
+    # read here (read_ledger never lets them undo a template's own field).
+    taught = _se().load_taught(csv_path)
+    if taught.who:
+        out += ("\0who\0" + json.dumps(sorted(taught.who))).encode("utf-8")
     for x in _reviews_of(csv_path):
         st = x.stat()
         out += f"\0{x.name}\0{st.st_size}\0{st.st_mtime_ns}".encode("utf-8")
@@ -402,14 +430,18 @@ def _decode(raw: bytes) -> str:
     return raw.decode("latin-1", "replace")
 
 
-#: (the review's sources as the CSV's source_file says them, part, item,
-#: field, value) -> 'nde.xlsx › Part 101!C4'
-Provenance = Dict[Tuple[str, str, str, str, str], str]
+#: (the review's sources as the CSV's source_file says them - or one
+#: workbook of them, part, item, field, value) -> the cells found for it,
+#: newest review first: (0 for the cell the review shows, 1 for one its
+#: note says the value is 'also at'; when the review was made; the cell,
+#: 'nde.xlsx › Part 101!C4')
+Provenance = Dict[Tuple[str, str, str, str, str], List[Tuple[int, str, str]]]
 
 
 def _applied_as(meta: Dict[str, Any]) -> str:
-    """What apply_review writes in the CSV's source_file for this review's
-    rows: its sources' names, joined, cut at 200 characters."""
+    """What apply_review wrote in the CSV's source_file for this review's
+    rows until 2026-10-20: its sources' names, joined, cut at 200
+    characters. Since then each row names its own workbooks."""
     return ", ".join(Path(str(s)).name for s in meta.get("sources", []))[:200]
 
 
@@ -419,6 +451,9 @@ def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
     source_file column names them - so a row cites only the review that was
     APPLIED to it, never a newer one saved and not applied (review,
     2026-10-16: a resent workbook was cited for a value it did not give).
+    Keyed by one workbook too (a row now names its own), a newer review of
+    a workbook of the same name is found as well: read_ledger.where ranks a
+    review made after the row was written last.
     A review belongs to this CSV by its resolved path (by name only when that
     path is gone: the folder was moved). Only a place for a value already in
     the CSV is looked up here: nothing in a review is read as a fact."""
@@ -460,15 +495,42 @@ def _provenance(csv_path: Path) -> Tuple[Provenance, int, List[str]]:
         try:
             if "Values" not in wb.sheetnames:
                 continue
+            made = _made(wb)
+
+            def put(key, rank: int, cell: str) -> None:
+                got = index.setdefault(key, [])
+                if (rank, made, cell) not in got:
+                    got.append((rank, made, cell))
             for row in wb["Values"].iter_rows(min_row=2, values_only=True):
                 if len(row) < 9 or str(row[0] or "").strip().upper() != "Y" or not row[8]:
                     continue
-                key = (applied, _text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
-                       _text(row[4]))
-                index.setdefault(key, str(row[8]))
+                rest = (_text(row[1]).lower(), _text(row[2]), str(row[3] or ""),
+                        _text(row[4]))
+                put((applied,) + rest, 0, str(row[8]))
+                # Apply now names each row's own workbooks (source_extract.
+                # rows_from), not the whole run's (review, 2026-10-20): the
+                # value is also found by the workbook it was at - its cell,
+                # or a cell its note says it is 'also at' (ranked after the
+                # cell the review shows: read_ledger.where)
+                note = str(row[10] or "") if len(row) > 10 else ""
+                for rank, w in enumerate([str(row[8])] + [p[8:] for p in note.split("; ")
+                                                          if p.startswith("also at ")]):
+                    put((w.split(" › ", 1)[0],) + rest, min(rank, 1), w)
         finally:
             wb.close()
     return index, n, notes
+
+
+def _made(wb) -> str:
+    """When a review workbook was made ('Made: 2026-10-20T06:43:12' on its
+    Read me sheet, as the CSV's updated_at is written), or ''."""
+    if "Read me" not in wb.sheetnames:
+        return ""
+    for row in wb["Read me"].iter_rows(min_row=1, max_row=40, max_col=1, values_only=True):
+        t = str(row[0] or "")
+        if t.startswith("Made: "):
+            return t[6:].strip()
+    return ""
 
 
 def load_schema(csv_path: Path):
@@ -491,6 +553,12 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     schema = load_schema(p)
     by_norm = kgm._rule_index(rules)
     fields = {f.name: f for f in schema.fields}
+    # the labels this Ledger's Teach learned are an inspector's ('Tech Sig'):
+    # its person columns follow them (user, 2026-10-20). Never the labels
+    # taught as no one's: they are a workbook's labels, and one answer made
+    # the template's own 'Inspector Initials' fields no one's (review,
+    # 2026-10-20)
+    taught = _se().Taught(who=list(_se().load_taught(p).who))
     prov, n_reviews, notes = _provenance(p)
     sink = _Sink()
     try:
@@ -500,7 +568,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
     reader = csv.reader(io.StringIO(text, newline=""))
     header: Optional[List[str]] = None
     roles: Dict[int, Tuple[str, Any]] = {}
-    id_i = item_i = src_i = None
+    id_i = item_i = src_i = upd_i = None
     part_rule = kgm.LEDGER_PART
     parts, people = set(), set()
     n_rows = skipped = located = 0
@@ -528,6 +596,8 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                     item_i = i
                 elif col == sl.SOURCE_COL:
                     src_i = i
+                elif col == sl.UPDATED_COL:
+                    upd_i = i
                 elif col in sl.META_COLS:
                     continue
                 elif schema.inspector_base(col):
@@ -543,7 +613,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
                     if r is not None:
                         roles[i] = ("rule", r)
                         rule_cols.append(col)
-                    elif f is not None and _who_head(_label_text(f.label)):
+                    elif f is not None and _who_head(_label_text(f.label), taught):
                         roles[i] = ("person", None)
                         person_cols.append(col)
             if id_i is None:
@@ -563,6 +633,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
         parts.add(part)
         item = cell(item_i)
         sources = cell(src_i)
+        updated = cell(upd_i)
         base: Dict[str, Any] = {"row": n}
         if item:
             base["item"] = f"{schema.item_field} {item}"
@@ -575,9 +646,22 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
 
         def where(field: str, value: str) -> str:
             # a part-level value sits on every flaw row of its part, but the
-            # review lists it once, under no flaw
-            return (prov.get((sources, part.lower(), item, field, value))
-                    or prov.get((sources, part.lower(), "", field, value)) or "")
+            # review lists it once, under no flaw. The row's sources as one
+            # review's whole run first (an older Apply wrote that), then each
+            # workbook it names (_provenance). Of the cells found, one from a
+            # review made before this row was written (the one applied to
+            # it, not a newer one saved and not applied) first, then the
+            # cell the review shows before one it is 'also at' - which was
+            # cited when its workbook came first in source_file (review,
+            # 2026-10-20)
+            pl = part.lower()
+            hits = [h for s in [sources] + [b for b in sources.split(", ") if b and b != sources]
+                    for k in ((s, pl, item, field, value), (s, pl, "", field, value))
+                    for h in prov.get(k, ())]
+            if not hits:
+                return ""
+            return min(hits, key=lambda h: (bool(updated and h[1] and h[1] > updated),
+                                            h[0]))[2]
 
         def add_person(who: str, col: str, shown: str, src_key: Tuple[str, str]):
             nonlocal located
@@ -616,7 +700,7 @@ def read_ledger(p: Path, rel: str, rules: Sequence["kgm.FieldRule"]) -> Reading:
             else:
                 r = x
                 import field_search as fs
-                for one in (fs._split_values(v, r.label, r.type) or [v]):
+                for one in (fs._split_values(_unpadded(v), r.label, r.type) or [v]):
                     loc = {**base, "column": col}
                     w = where(col, v)
                     if w:
@@ -727,7 +811,10 @@ class _GridReader:
         if not isinstance(v, str) or self._merged(v):
             return None
         r = self.by_norm.get(_norm(v))
-        if r is not None:
+        # A ticked offered rule ('Inspector') does not take a 'who' label
+        # from the Ledger's own reading: the initials still go through the
+        # people list and the links stay suggested.
+        if r is not None and not (r in kgm.PROPOSED_FIELD_RULES and _who_head(v)):
             return r
         return kgm.INSPECTOR if _who_head(v) else None
 
@@ -1127,9 +1214,24 @@ def sheet_part(name: str) -> str:
     return _se()._part_from_name(n)
 
 
+#: A run of spaces, tabs or line breaks this long is padding, not a gap
+#: between values.
+_PADDING = re.compile(r"\s{32}")
+
+
+def _unpadded(raw: str) -> str:
+    """``raw`` for field_search's split: as typed, unless it holds padding
+    (_PADDING) - then its words, one space apart. The split's '\\s*;\\s*',
+    '\\s*,\\s*' and '\\s+and\\s+' rescan a run of spaces from each of its
+    characters: one cell of 'x', 32,000 spaces and 'y' held the GIL for 8 s,
+    an 'Inspector:' padded cell for 22 s (review, 2026-10-20)."""
+    return " ".join(raw.split()) if _PADDING.search(raw) else raw
+
+
 def _split(raw: str, rule) -> List[str]:
     import field_search as fs
-    return [x for x in (fs._split_values(raw, rule.label, rule.type) or [raw]) if x]
+    return [x for x in (fs._split_values(_unpadded(raw), rule.label, rule.type) or [raw])
+            if x]
 
 
 def plausible(rule, raw: str) -> bool:
@@ -1270,9 +1372,17 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
                          text_all=is_extra and "text box" in name, sheet=parent or name,
                          budget=budget, sure=sure)
         gr.sink = sink
+        # the graph's Contents layer: every cell, whatever the rules say
+        contents = kgm.contents_now()
+        cg = contents.grid(name, loc_sheet=parent or name, image=image) \
+            if contents is not None else None
         for r, cells in rows:
             gr.feed(r, cells)
+            if cg is not None:
+                cg.feed(r, cells)
         gr.close()
+        if cg is not None:
+            cg.close()
         readers.append((gr, parent or name.split(" › ")[0]))
         if image:
             return
@@ -1342,9 +1452,14 @@ def read_workbook(p: Path, rel: str, rules: Sequence["kgm.FieldRule"],
         except se.LedgerError as exc:
             # openpyxl refusing the bytes is for good, and so is a password;
             # Excel failing otherwise may not be (busy, asking to sign in),
-            # so that is tried again next time.
+            # so that is tried again next time. Not when Excel said these
+            # bytes are no workbook ('the file format or file extension is
+            # not valid') or the file is empty (ExcelOpenError.for_good): a
+            # hidden Excel was started for it on every rebuild, unchanged or
+            # not (review, 2026-10-20).
             raise Unreadable(str(exc), permanent=not via_excel or bool(
-                re.search(r"(?i)password", str(exc)))) from exc
+                re.search(r"(?i)password", str(exc))) or bool(
+                getattr(exc.__cause__, "for_good", False))) from exc
         except Exception as exc:
             if not via_excel:
                 raise

@@ -45,11 +45,24 @@ def advanced(argv: Optional[Sequence[str]] = None) -> bool:
     and keep working the way the existing tests exercise them; the third is
     the new source of truth for a normal launch.
     """
+    if advanced_env_or_cli(argv):
+        return True
+    return _advanced_from_profile()
+
+
+def advanced_env_or_cli(argv: Optional[Sequence[str]] = None) -> bool:
+    """Just the Tk-era overrides, without reading the profile file.
+
+    Used by the Qt entry point's FLAT fallback (no ``council_qt.profiles``
+    yet), where we deliberately do not migrate ``ui_settings.json``: a fresh
+    install would be promoted to Full and the six advanced tabs would appear
+    for every user who never opted in.
+    """
     if os.environ.get(ENV_VAR, "").strip().lower() in TRUE_VALUES:
         return True
     if FLAG in list(argv if argv is not None else sys.argv):
         return True
-    return _advanced_from_profile()
+    return False
 
 
 def _advanced_from_profile() -> bool:

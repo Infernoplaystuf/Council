@@ -5,11 +5,11 @@ launcher's first-found guess.
 MEASURED 2026-09-29: whatever main model the user picked in the Models tab,
 the next launch started on granite-3.1-8b from ~/models. run-windows.bat
 exports the first *.gguf it finds when COUNCIL_GGUF_PATH is unset, and
-onboarding.load_gguf_path let any env value beat the saved one — so the
+backend_settings.load_gguf_path let any env value beat the saved one — so the
 launcher's guess outranked the user's choice on every launch after the first.
 
 The launchers now mark their guess with COUNCIL_GGUF_PATH_AUTO=1, and the
-entry points (onboarding.apply_saved_gguf_path) let the saved model beat a
+entry points (backend_settings.apply_saved_gguf_path) let the saved model beat a
 MARKED guess while the saved file is on disk. A path the user exported still
 beats both.
 
@@ -35,9 +35,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import onboarding  # noqa: E402
+from council_core import backend_settings  # noqa: E402
 
-AUTO = onboarding.GGUF_AUTO_ENV
+AUTO = backend_settings.GGUF_AUTO_ENV
 
 
 @pytest.fixture
@@ -75,45 +75,45 @@ def _vault(tmp_path: Path, saved: str = None) -> Path:
 
 def test_an_exported_path_beats_the_saved_one(tmp_path):
     saved = _gguf(tmp_path / "saved.gguf")
-    assert onboarding.resolve_gguf_path("C:/mine.gguf", False, str(saved)) \
+    assert backend_settings.resolve_gguf_path("C:/mine.gguf", False, str(saved)) \
         == ("C:/mine.gguf", "env")
 
 
 def test_the_saved_path_beats_the_launchers_guess(tmp_path):
     saved = _gguf(tmp_path / "saved.gguf")
-    assert onboarding.resolve_gguf_path("C:/guess.gguf", True, str(saved)) \
+    assert backend_settings.resolve_gguf_path("C:/guess.gguf", True, str(saved)) \
         == (str(saved), "saved")
 
 
 def test_a_deleted_saved_file_falls_back_to_the_guess(tmp_path):
     gone = tmp_path / "deleted.gguf"
-    assert onboarding.resolve_gguf_path("C:/guess.gguf", True, str(gone)) \
+    assert backend_settings.resolve_gguf_path("C:/guess.gguf", True, str(gone)) \
         == ("C:/guess.gguf", "auto-saved-missing")
 
 
 def test_the_guess_stands_when_nothing_is_saved():
-    assert onboarding.resolve_gguf_path("C:/guess.gguf", True, "") \
+    assert backend_settings.resolve_gguf_path("C:/guess.gguf", True, "") \
         == ("C:/guess.gguf", "auto")
 
 
 def test_no_env_value_uses_the_saved_path(tmp_path):
     saved = _gguf(tmp_path / "saved.gguf")
-    assert onboarding.resolve_gguf_path("", False, str(saved)) \
+    assert backend_settings.resolve_gguf_path("", False, str(saved)) \
         == (str(saved), "saved")
     # The AUTO flag without a path is meaningless and changes nothing.
-    assert onboarding.resolve_gguf_path("", True, str(saved)) \
+    assert backend_settings.resolve_gguf_path("", True, str(saved)) \
         == (str(saved), "saved")
 
 
 def test_no_env_value_and_a_deleted_saved_file_still_names_it(tmp_path):
     gone = tmp_path / "deleted.gguf"
-    assert onboarding.resolve_gguf_path("", False, str(gone)) \
+    assert backend_settings.resolve_gguf_path("", False, str(gone)) \
         == (str(gone), "saved-missing")
 
 
 def test_nothing_anywhere():
-    assert onboarding.resolve_gguf_path("", False, "") == ("", "none")
-    assert onboarding.resolve_gguf_path("  ", True, "  ") == ("", "none")
+    assert backend_settings.resolve_gguf_path("", False, "") == ("", "none")
+    assert backend_settings.resolve_gguf_path("  ", True, "  ") == ("", "none")
 
 
 # ============================================================
@@ -125,7 +125,7 @@ def test_apply_replaces_the_guess_with_the_saved_model(tmp_path):
     guess = _gguf(tmp_path / "home" / "models" / "granite-3.1-8b.gguf")
     env = {"COUNCIL_GGUF_PATH": str(guess), AUTO: "1"}
     lines = []
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(saved)), environ=env, log=lines.append)
     assert source == "saved"
     assert env["COUNCIL_GGUF_PATH"] == str(saved)
@@ -141,7 +141,7 @@ def test_apply_keeps_the_guess_when_the_saved_file_is_gone(tmp_path):
     gone = tmp_path / "deleted.gguf"
     env = {"COUNCIL_GGUF_PATH": str(guess), AUTO: "1"}
     lines = []
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(gone)), environ=env, log=lines.append)
     assert source == "auto-saved-missing"
     # The guess stays — and is no longer marked as one (see
@@ -156,7 +156,7 @@ def test_apply_never_overrides_an_exported_path(tmp_path):
     saved = _gguf(tmp_path / "chosen.gguf")
     env = {"COUNCIL_GGUF_PATH": "D:/mine.gguf"}
     lines = []
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(saved)), environ=env, log=lines.append)
     assert source == "env"
     assert env == {"COUNCIL_GGUF_PATH": "D:/mine.gguf"}
@@ -168,7 +168,7 @@ def test_apply_sets_the_saved_model_when_nothing_is_exported(tmp_path):
     the saved path into the env, so the engine said "not set"."""
     saved = _gguf(tmp_path / "chosen.gguf")
     env = {}
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(saved)), environ=env, log=lambda _m: None)
     assert source == "saved"
     assert env == {"COUNCIL_GGUF_PATH": str(saved)}
@@ -178,7 +178,7 @@ def test_apply_does_not_point_the_env_at_a_missing_file(tmp_path):
     gone = tmp_path / "deleted.gguf"
     env = {}
     lines = []
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(gone)), environ=env, log=lines.append)
     assert source == "saved-missing"
     assert env == {}
@@ -189,7 +189,7 @@ def test_apply_is_quiet_when_the_guess_already_is_the_saved_model(tmp_path):
     saved = _gguf(tmp_path / "chosen.gguf")
     env = {"COUNCIL_GGUF_PATH": str(saved), AUTO: "1"}
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(saved)), environ=env, log=lines.append) == "saved"
     assert env == {"COUNCIL_GGUF_PATH": str(saved)}
     assert lines == []
@@ -198,7 +198,7 @@ def test_apply_is_quiet_when_the_guess_already_is_the_saved_model(tmp_path):
 def test_apply_with_nothing_saved_leaves_the_guess_alone(tmp_path):
     env = {"COUNCIL_GGUF_PATH": "C:/guess.gguf", AUTO: "1"}
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         _vault(tmp_path), environ=env, log=lines.append) == "auto"
     assert env == {"COUNCIL_GGUF_PATH": "C:/guess.gguf"}
     assert lines == [], "no settings file is a first run, not a problem"
@@ -242,7 +242,7 @@ def test_apply_drops_the_marker_whatever_it_decides(tmp_path, monkeypatch,
         _drop_vault_dir(monkeypatch)
     before = env.get("COUNCIL_GGUF_PATH")
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         vault, environ=env, log=lines.append) == expected
     assert AUTO not in env, f"{case}: the marker outlived the decision"
     if expected != "saved":
@@ -257,7 +257,7 @@ def test_apply_error_path_logs_and_drops_the_marker_on_os_environ(
     clean_env.setenv("COUNCIL_GGUF_PATH", "C:/guess.gguf")
     clean_env.setenv(AUTO, "1")
     lines = []
-    assert onboarding.apply_saved_gguf_path(log=lines.append) == "error"
+    assert backend_settings.apply_saved_gguf_path(log=lines.append) == "error"
     assert AUTO not in os.environ
     assert os.environ["COUNCIL_GGUF_PATH"] == "C:/guess.gguf"
     assert len(lines) == 1 and "no vault" in lines[0]
@@ -282,7 +282,7 @@ def test_apply_reads_a_settings_file_written_with_a_bom(tmp_path):
     _settings_bytes(vault, b"\xef\xbb\xbf"
                     + json.dumps({"gguf_path": str(saved)}).encode("utf-8"))
     env = {"COUNCIL_GGUF_PATH": "C:/guess.gguf", AUTO: "1"}
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         vault, environ=env, log=lambda _m: None) == "saved"
     assert env == {"COUNCIL_GGUF_PATH": str(saved)}
 
@@ -296,7 +296,7 @@ def test_a_merge_into_a_bom_file_keeps_the_other_keys(tmp_path, monkeypatch):
             "role_models": {"sage": "C:/sage.gguf"}}
     _settings_bytes(vault, b"\xef\xbb\xbf" + json.dumps(keep).encode("utf-8"))
     monkeypatch.setenv("COUNCIL_GGUF_CLIP_PATH", "x")
-    onboarding.save_clip_path(vault, "C:/new-mmproj.gguf")
+    backend_settings.save_clip_path(vault, "C:/new-mmproj.gguf")
     data = json.loads((vault / "backend_settings.json").read_text("utf-8-sig"))
     assert data == dict(keep, clip_path="C:/new-mmproj.gguf")
 
@@ -324,9 +324,9 @@ def test_a_merge_never_replaces_a_file_it_could_not_read(tmp_path, clean_env,
     clean_env.setenv("COUNCIL_GGUF_CLIP_PATH", "x")
     clean_env.delenv("COUNCIL_GGUF_CLIP_PATH")
     if which == "gguf":
-        why = onboarding.save_gguf_path(vault, "C:/new.gguf")
+        why = backend_settings.save_gguf_path(vault, "C:/new.gguf")
     else:
-        why = onboarding.save_clip_path(vault, "C:/new-mmproj.gguf")
+        why = backend_settings.save_clip_path(vault, "C:/new-mmproj.gguf")
     assert path.read_bytes() == content, "a file it could not read was replaced"
     assert why and str(path) in why and "left as it is" in why
     # Still the user's choice for THIS process; only the next launch misses it.
@@ -344,7 +344,7 @@ def test_a_merge_says_when_it_cannot_write(tmp_path, clean_env):
     path = vault / "backend_settings.json"
     os.chmod(path, stat.S_IREAD)                  # read-only on Windows too
     try:
-        why = onboarding.save_gguf_path(vault, "C:/new.gguf")
+        why = backend_settings.save_gguf_path(vault, "C:/new.gguf")
     finally:
         os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
     assert why and why.startswith(f"could not write {path}:")
@@ -359,7 +359,7 @@ def test_an_empty_settings_file_is_saved_over(tmp_path, clean_env, content):
     leave exactly that 0-byte file."""
     vault = _vault(tmp_path)
     path = _settings_bytes(vault, content)
-    assert onboarding.save_gguf_path(vault, "C:/new.gguf") is None
+    assert backend_settings.save_gguf_path(vault, "C:/new.gguf") is None
     assert json.loads(path.read_text("utf-8")) == {"gguf_path": "C:/new.gguf"}
 
 
@@ -374,8 +374,8 @@ def test_a_merge_swaps_the_file_in_whole(tmp_path, clean_env, monkeypatch):
     def fail(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(onboarding._os, "replace", fail)
-    why = onboarding.save_gguf_path(vault, "C:/new.gguf")
+    monkeypatch.setattr(backend_settings._os, "replace", fail)
+    why = backend_settings.save_gguf_path(vault, "C:/new.gguf")
     assert why and "disk full" in why
     assert path.read_bytes() == before
     assert not list(vault.glob("*.tmp"))
@@ -393,7 +393,7 @@ def test_apply_says_when_the_settings_file_cannot_be_read(tmp_path, content):
     path = _settings_bytes(vault, content)
     env = {"COUNCIL_GGUF_PATH": "C:/guess.gguf", AUTO: "1"}
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         vault, environ=env, log=lines.append) == "auto"
     assert env == {"COUNCIL_GGUF_PATH": "C:/guess.gguf"}
     assert lines == [f"[startup] main model: could not read {path}; "
@@ -404,7 +404,7 @@ def test_an_unreadable_settings_file_with_no_pick_says_so_too(tmp_path):
     vault = _vault(tmp_path)
     path = _settings_bytes(vault, b"{not json")
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         vault, environ={}, log=lines.append) == "none"
     assert len(lines) == 1
     assert lines[0].startswith(f"[startup] main model: could not read {path};")
@@ -417,7 +417,7 @@ def test_an_unreadable_settings_file_is_irrelevant_to_an_exported_path(
     _settings_bytes(vault, b"{not json")
     env = {"COUNCIL_GGUF_PATH": "D:/mine.gguf"}
     lines = []
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         vault, environ=env, log=lines.append) == "env"
     assert env == {"COUNCIL_GGUF_PATH": "D:/mine.gguf"} and lines == []
 
@@ -431,7 +431,7 @@ def test_a_saved_path_that_is_a_folder_is_not_called_deleted(tmp_path,
     folder.mkdir(parents=True)
     env = {"COUNCIL_GGUF_PATH": "C:/guess.gguf", AUTO: "1"} if with_guess else {}
     lines = []
-    source = onboarding.apply_saved_gguf_path(
+    source = backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(folder)), environ=env, log=lines.append)
     assert source == ("auto-saved-missing" if with_guess else "saved-missing")
     assert len(lines) == 1 and str(folder) in lines[0]
@@ -446,7 +446,7 @@ def test_apply_never_raises_even_when_logging_does(tmp_path):
     def broken_console(_message):
         raise UnicodeEncodeError("cp1252", "x", 0, 1, "no")
 
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         _vault(tmp_path, str(saved)), environ=env,
         log=broken_console) == "saved"
     assert env == {"COUNCIL_GGUF_PATH": str(saved)}
@@ -462,7 +462,7 @@ def test_apply_finds_the_vault_the_way_the_app_does(tmp_path, monkeypatch):
     from council_core import paths
     assert paths.vault_dir() == vault.resolve()
     env = {"COUNCIL_GGUF_PATH": "C:/guess.gguf", AUTO: "1"}
-    assert onboarding.apply_saved_gguf_path(
+    assert backend_settings.apply_saved_gguf_path(
         environ=env, log=lambda _m: None) == "saved"
     assert env["COUNCIL_GGUF_PATH"] == str(saved)
 
@@ -476,27 +476,27 @@ def test_load_prefers_the_saved_model_over_a_marked_guess(tmp_path, clean_env):
     vault = _vault(tmp_path, str(saved))
     clean_env.setenv("COUNCIL_GGUF_PATH", "C:/guess.gguf")
     clean_env.setenv(AUTO, "1")
-    assert onboarding.load_gguf_path(vault) == str(saved)
+    assert backend_settings.load_gguf_path(vault) == str(saved)
 
 
 def test_load_still_lets_an_exported_path_win(tmp_path, clean_env):
     saved = _gguf(tmp_path / "chosen.gguf")
     vault = _vault(tmp_path, str(saved))
     clean_env.setenv("COUNCIL_GGUF_PATH", "D:/mine.gguf")
-    assert onboarding.load_gguf_path(vault) == "D:/mine.gguf"
+    assert backend_settings.load_gguf_path(vault) == "D:/mine.gguf"
 
 
 def test_load_keeps_the_guess_when_the_saved_file_is_gone(tmp_path, clean_env):
     vault = _vault(tmp_path, str(tmp_path / "deleted.gguf"))
     clean_env.setenv("COUNCIL_GGUF_PATH", "C:/guess.gguf")
     clean_env.setenv(AUTO, "1")
-    assert onboarding.load_gguf_path(vault) == "C:/guess.gguf"
+    assert backend_settings.load_gguf_path(vault) == "C:/guess.gguf"
 
 
 def test_load_with_no_env_returns_the_saved_path(tmp_path, clean_env):
     gone = str(tmp_path / "deleted.gguf")
-    assert onboarding.load_gguf_path(_vault(tmp_path, gone)) == gone
-    assert onboarding.load_gguf_path(tmp_path / "empty-vault") == ""
+    assert backend_settings.load_gguf_path(_vault(tmp_path, gone)) == gone
+    assert backend_settings.load_gguf_path(tmp_path / "empty-vault") == ""
 
 
 def test_save_makes_the_env_value_the_users_choice(tmp_path, clean_env):
@@ -505,13 +505,13 @@ def test_save_makes_the_env_value_the_users_choice(tmp_path, clean_env):
     vault = _vault(tmp_path, "C:/old.gguf")
     clean_env.setenv("COUNCIL_GGUF_PATH", "C:/guess.gguf")
     clean_env.setenv(AUTO, "1")
-    assert onboarding.save_gguf_path(vault, "C:/picked.gguf") is None, (
+    assert backend_settings.save_gguf_path(vault, "C:/picked.gguf") is None, (
         "None means saved")
     assert os.environ["COUNCIL_GGUF_PATH"] == "C:/picked.gguf"
     assert AUTO not in os.environ
     data = json.loads((vault / "backend_settings.json").read_text("utf-8"))
     assert data == {"gguf_path": "C:/picked.gguf", "clip_path": "keep-me"}
-    onboarding.save_gguf_path(vault, "")
+    backend_settings.save_gguf_path(vault, "")
     assert "COUNCIL_GGUF_PATH" not in os.environ and AUTO not in os.environ
 
 
@@ -527,7 +527,7 @@ def test_the_qt_entry_applies_it_before_anything_else():
     source = (ROOT / "council_qt.py").read_text(encoding="utf-8")
     body = source[source.index("def main()"):source.index("def _shutdown")]
     code = "\n".join(_code_lines(body))
-    assert "onboarding.apply_saved_gguf_path()" in code
+    assert "backend_settings.apply_saved_gguf_path()" in code
     assert code.index("apply_saved_gguf_path") < code.index("council_qt.launch")
 
 
@@ -568,7 +568,7 @@ def test_the_qt_entry_hands_launch_the_saved_model(tmp_path, clean_env):
     assert _run_qt_main(clean_env) == {"path": str(saved), "auto": None}
 
 
-def test_the_qt_entry_drops_the_marker_when_onboarding_cannot_load(
+def test_the_qt_entry_drops_the_marker_when_the_settings_cannot_load(
         tmp_path, clean_env, capsys):
     """council_qt.py main()'s except path: apply_saved_gguf_path never ran,
     so nothing dropped COUNCIL_GGUF_PATH_AUTO and the app — and every child
@@ -577,23 +577,13 @@ def test_the_qt_entry_drops_the_marker_when_onboarding_cannot_load(
     clean_env.setenv("COUNCIL_VAULT_ROOT", str(_vault(tmp_path)))
     clean_env.setenv("COUNCIL_GGUF_PATH", "C:/guess.gguf")
     clean_env.setenv(AUTO, "1")
-    # None in sys.modules: `import onboarding` raises ImportError.
-    clean_env.setitem(sys.modules, "onboarding", None)
+    # None in sys.modules, and off the package: `from council_core import
+    # backend_settings` raises ImportError.
+    import council_core
+    clean_env.delattr(council_core, "backend_settings", raising=False)
+    clean_env.setitem(sys.modules, "council_core.backend_settings", None)
     assert _run_qt_main(clean_env) == {"path": "C:/guess.gguf", "auto": None}
     assert "[startup] saved main model not applied" in capsys.readouterr().out
-
-
-def test_the_tk_entry_applies_it_before_council_engine_is_imported():
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    code = _code_lines(source)
-    at_engine = code.index("import council_engine as ce")
-    apply_at = next(i for i, ln in enumerate(code)
-                    if "apply_saved_gguf_path()" in ln)
-    assert apply_at < at_engine
-    guard = next(i for i in range(apply_at, -1, -1)
-                 if code[i].startswith("if "))
-    assert code[guard].strip() == 'if __name__ == "__main__":', (
-        "importing council_gui_engine (tests do) must not rewrite the env")
 
 
 # ============================================================
@@ -692,8 +682,8 @@ _APPLY_ENTRY = _STUB_ENTRY.replace(
     "import json, os, sys, time\n",
     "import json, os, sys, time\n"
     "sys.path.insert(0, os.environ['STUB_REPO'])\n"
-    "import onboarding\n"
-    "onboarding.apply_saved_gguf_path()\n", 1)
+    "from council_core import backend_settings\n"
+    "backend_settings.apply_saved_gguf_path()\n", 1)
 assert _APPLY_ENTRY != _STUB_ENTRY
 _STUB_GPU_CHECK = """\
 import os
@@ -745,8 +735,7 @@ def _prepare_bat(tmp_path: Path, *args, entry_src: str = _STUB_ENTRY,
     # never goes looking for conda.
     (app / ".council_python").write_text(sys.executable + "\n",
                                          encoding="utf-8")
-    for entry in ("council_qt.py", "council_gui_engine.py"):
-        (app / entry).write_text(entry_src, encoding="utf-8")
+    (app / "council_qt.py").write_text(entry_src, encoding="utf-8")
     (app / "gpu_check.py").write_text(_STUB_GPU_CHECK, encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -1223,7 +1212,7 @@ def test_sh_never_marks_a_path_the_user_set(tmp_path, name):
 # ============================================================
 # The measured bug, replayed: a model saved in the app, a different .gguf in
 # the folder the launcher searches, and a fresh launch. The stub entry runs the
-# real onboarding.apply_saved_gguf_path against a tmp vault, then writes down
+# real backend_settings.apply_saved_gguf_path against a tmp vault, then writes down
 # the COUNCIL_GGUF_PATH the engine would have loaded.
 
 @win_only

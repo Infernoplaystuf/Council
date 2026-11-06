@@ -21,9 +21,9 @@ adds a case beside.
     stop starts nothing (a source belongs to one run: a run makes new
     ones).
 
-A plugin whose manifest's kind is "source" is refused until the triggering
-plugin can pick one for a run (stage P6); this suite is what it will be
-held to then.
+A plugin whose manifest's kind is "source" is held to this suite: since 2
+November 2026 the triggering plugin lists its sources and fires a run from
+one (tests/test_typhon_plugins_trigger_sources.py).
 
 Offscreen, no files: the books here keep no triggers CSV.
 """

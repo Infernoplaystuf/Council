@@ -220,7 +220,7 @@ def test_built_in_plugins_import_only_the_plugin_api():
     assert bad == []
 
 
-def test_the_real_built_ins_are_found_and_on(plugin_home):
+def test_the_real_built_ins_are_found_and_on_but_the_optional_ones(plugin_home):
     host = ph.PluginHost(camera_rig.Rig(Template))
     states = {pid: (state, why) for pid, state, why in host.states()}
     assert list(states) == [pid for pid, _ in ph.BUILTIN_PLUGINS]
@@ -229,6 +229,9 @@ def test_the_real_built_ins_are_found_and_on(plugin_home):
         if pid == "typhon.classify" and \
                 importlib.util.find_spec("sklearn") is None:
             assert state == ph.INCOMPATIBLE and "sklearn" in why
+        elif pid in ph.OPTIONAL_BUILTINS:
+            # found, not run until ticked in Plugins… (Send trigger)
+            assert state == ph.DISCOVERED, (pid, state, why)
         else:
             assert state == ph.ON, (pid, state, why)
     assert host.registry.refused == []
