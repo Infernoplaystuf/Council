@@ -58,6 +58,7 @@ _FACTORIES: Dict[str, str] = {
     "build_ledger": "ledger",
     "build_models": "models",
     "build_sessions": "sessions",
+    "build_settings": "settings",
     "build_specialists": "specialists",
     "build_speech": "speech",
     "build_var_graph": "var_graph",
@@ -91,6 +92,8 @@ _REGISTRY: List[Tuple[str, str, bool]] = [
     ("🧊 Dream3D", "build_dream3d", False),
     ("🎨 GUI Designer", "build_designer", False),
     ("🔗 Variable Map", "build_var_graph", False),
+    # Plugins are switched on here (all start off; council_core.app_plugins).
+    ("⚙ Settings", "build_settings", False),
     ("Diagnostics", "build_diagnostics", False),
 ]
 

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "council.finance",
+  "short": "finance",
+  "name": "Finance",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "tab",
+  "entry": "tab:build_tab",
+  "network": "none",
+  "author": "The Council",
+  "description": "Your pay after tax and deductions, check by check and for the year: federal, Social Security, Medicare, state, and Ohio city, JEDD and school district tax; insurance, HSA, FSA and 401(k). Kept on this PC."
+}
