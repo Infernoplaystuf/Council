@@ -92,7 +92,7 @@ FIELDS = frozenset(REQUIRED) | frozenset(OPTIONAL)
 
 #: The built-in plugins: folder names under council_plugins/. A plugin is
 #: built in because it is on this list, never because of where it sits.
-BUILTIN_PLUGINS: Sequence[str] = ()
+BUILTIN_PLUGINS: Sequence[str] = ("finance",)
 
 #: Where the built-in plugins ship (beside council_core in the source tree
 #: and in the bundle).

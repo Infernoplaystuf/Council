@@ -15,7 +15,7 @@ Council"):
 |---|---|
 | The manifest reader, shared with Typhon (typhon-plugins is merged into qt-migration) | `council_core/plugin_manifest.py` (Typhon's; Council does not change it) |
 | Council's manifest check, discovery, on/off, context, loader, fault log | `council_core/app_plugins.py` |
-| The built-in plugins' folder (empty list for now) | `council_plugins/` + `app_plugins.BUILTIN_PLUGINS` |
+| The built-in plugins' folder (Finance, from 2026-11-06) | `council_plugins/` + `app_plugins.BUILTIN_PLUGINS` |
 | A switched-on plugin's tab, guarded | `council_qt/plugin_tabs.py`, called from `council_qt.py` after the built-in tabs |
 | The Settings tab, Plugins section | `council_qt/tabs/settings.py` (registered as "⚙ Settings") |
 | Bundle | `council.spec` ships `council_plugins/` as files (they are imported from their folders) |
@@ -48,10 +48,9 @@ Council"):
 
 ## Next
 
-1. Finance plugin (`council_plugins/finance/`, id `council.finance`) step 1:
-   tax engine with 2025/2026 tables, paycheck breakdown, plan save/load. See
-   the Finance proposal (project thread). Waiting on Andy's state, filing
-   status and number of earners for the state tables.
+1. Finance plugin step 1 is built (2026-11-06):
+   `docs/handoff/finance_plugin_2026-11-06.md`. Its stock tracker needs a
+   plugin network exception (one named host, off by default).
 2. Services for `needs` (local model, Connections search), each opt-in.
 3. An approval step for third-party plugins (hash, then load), as in
    `docs/typhon_plugins_design.md` 4.5-4.6.

@@ -1,0 +1,48 @@
+{
+  "year": 2026,
+  "units": "rate is a fraction; 'over' is taxable income in dollars above which the rate applies; limits are dollars a year",
+  "sources": {
+    "brackets, standard deduction, child tax credit, health FSA": "IRS Rev. Proc. 2025-32 (https://www.irs.gov/pub/irs-drop/rp-25-32.pdf) and IR-2025-103",
+    "401(k), IRA": "IRS IR-2025-111 (https://www.irs.gov/newsroom/401k-limit-increases-to-24500-for-2026-ira-limit-increases-to-7500)",
+    "HSA": "IRS Rev. Proc. 2025-19 (https://www.irs.gov/pub/irs-drop/rp-25-19.pdf)",
+    "Social Security wage base and payroll rates": "SSA Contribution and Benefit Base (https://www.ssa.gov/oact/cola/cbb.html)",
+    "statutory": "Set by law and not indexed; not read from a 2026 IRS page: Additional Medicare Tax 0.9% and its thresholds (IRC 3101(b)(2), 1401(b)(2)), HSA age-55 catch-up $1,000 (IRC 223(b)(3)), other-dependent credit $500 and the child tax credit phase-out (IRC 24(b),(h)), dependent care FSA $7,500 (IRC 129 as amended in 2025)"
+  },
+  "brackets": {
+    "single": [
+      {"rate": 0.10, "over": 0}, {"rate": 0.12, "over": 12400},
+      {"rate": 0.22, "over": 50400}, {"rate": 0.24, "over": 105700},
+      {"rate": 0.32, "over": 201775}, {"rate": 0.35, "over": 256225},
+      {"rate": 0.37, "over": 640600}],
+    "married_joint": [
+      {"rate": 0.10, "over": 0}, {"rate": 0.12, "over": 24800},
+      {"rate": 0.22, "over": 100800}, {"rate": 0.24, "over": 211400},
+      {"rate": 0.32, "over": 403550}, {"rate": 0.35, "over": 512450},
+      {"rate": 0.37, "over": 768700}],
+    "head_of_household": [
+      {"rate": 0.10, "over": 0}, {"rate": 0.12, "over": 17700},
+      {"rate": 0.22, "over": 67450}, {"rate": 0.24, "over": 105700},
+      {"rate": 0.32, "over": 201750}, {"rate": 0.35, "over": 256200},
+      {"rate": 0.37, "over": 640600}]
+  },
+  "standard_deduction": {"single": 16100, "married_joint": 32200,
+                         "head_of_household": 24150},
+  "child_tax_credit": {"per_child": 2200, "refundable_per_child": 1700,
+                       "refundable_rate": 0.15, "refundable_earned_floor": 2500,
+                       "other_dependent": 500,
+                       "phaseout_start": {"single": 200000, "married_joint": 400000,
+                                          "head_of_household": 200000},
+                       "phaseout_per_1000": 50},
+  "social_security": {"rate": 0.062, "wage_base": 184500},
+  "medicare": {"rate": 0.0145, "additional_rate": 0.009,
+               "additional_over": {"single": 200000, "married_joint": 250000,
+                                   "head_of_household": 200000},
+               "withholding_over": 200000},
+  "limits": {
+    "k401_deferral": 24500, "k401_catchup_50": 8000, "k401_catchup_60_63": 11250,
+    "ira": 7500, "ira_catchup_50": 1100,
+    "hsa_self": 4400, "hsa_family": 8750, "hsa_catchup_55": 1000,
+    "health_fsa": 3400, "health_fsa_carryover": 680,
+    "dependent_care_fsa": 7500
+  }
+}
