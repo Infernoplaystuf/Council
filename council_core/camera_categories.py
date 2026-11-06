@@ -31,7 +31,8 @@ with more features gets more tabs, never fewer settings.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Tuple)
 
 #: Tabs that hold more than one group: (title, its groups in order, what its
 #: tooltip says). A group in none of these has a tab of its own.
@@ -123,22 +124,84 @@ class Tab:
         return tuple(s.group for s in self.sections)
 
 
-def tab_of(group: str) -> str:
+@dataclass(frozen=True)
+class Tables:
+    """The three tables a plan is made from: SHARED_TABS, TIPS and
+    MOST_USED, or the same merged from the camera plugins' hints
+    (`merge`)."""
+    shared_tabs: Tuple[Tuple[str, Tuple[str, ...], str], ...]
+    tips: Mapping[str, str]
+    most_used: Mapping[str, Tuple[str, ...]]
+
+
+def today() -> Tables:
+    """Today's tables, as one (read when asked)."""
+    return Tables(SHARED_TABS, TIPS, MOST_USED)
+
+
+def merge(hints: Iterable[Any]) -> Tables:
+    """One set of tables from every camera plugin's hints (typhon_plugin_
+    api.CategoryHints: shared_tabs, tips, most_used), in the order given
+    (plugin design 2.4 item 9: the tables take rows from each camera
+    plugin; `plan` stays here). A shared tab two plugins name holds the
+    groups of both, each plugin's own order kept (a group new to the tab
+    goes after the one it follows in that plugin's row); a tooltip or a
+    group's most-used keys come from the first plugin that gives them.
+    A group stays in the FIRST shared tab that names it: a later plugin
+    naming it in a tab of its own does not put it there too (before the
+    P2 review a third party's ("Thermal", ("Thermal", "Status")) put Status
+    in two tabs, and plan() showed its settings twice). A shared tab left
+    with no group of its own is dropped. The built-in camera plugins' hints
+    merge into today's tables."""
+    shared: Dict[str, List[str]] = {}
+    shared_tips: Dict[str, str] = {}
+    tips: Dict[str, str] = {}
+    most: Dict[str, Tuple[str, ...]] = {}
+    placed: Dict[str, str] = {}                 # group -> the tab it is in
+    for hint in hints:
+        for title, groups, tip in getattr(hint, "shared_tabs", ()) or ():
+            title = str(title)
+            row = shared.setdefault(title, [])
+            shared_tips.setdefault(title, str(tip))
+            before = -1
+            for group in groups:
+                group = str(group)
+                if group in row:
+                    before = row.index(group)
+                    continue
+                if placed.get(group, title) != title:
+                    continue                    # another tab has it already
+                row.insert(before + 1, group)
+                placed[group] = title
+                before += 1
+        for title, tip in dict(getattr(hint, "tips", {}) or {}).items():
+            tips.setdefault(str(title), str(tip))
+        for group, keys in dict(getattr(hint, "most_used", {}) or
+                                {}).items():
+            most.setdefault(str(group), tuple(str(k) for k in keys))
+    return Tables(tuple((t, tuple(g), shared_tips[t])
+                        for t, g in shared.items() if g), tips, most)
+
+
+def tab_of(group: str, tables: Optional[Tables] = None) -> str:
     """The title of the tab `group` goes in."""
-    for title, groups, _tip in SHARED_TABS:
+    for title, groups, _tip in (tables or today()).shared_tabs:
         if group in groups:
             return title
     return group
 
 
-def ordered(group: str, keys: Sequence[str]) -> List[str]:
+def ordered(group: str, keys: Sequence[str],
+            tables: Optional[Tables] = None) -> List[str]:
     """`keys` (one group's, in describe order) with the most-used first."""
-    first = [k for k in MOST_USED.get(group, ()) if k in keys]
+    first = [k for k in (tables or today()).most_used.get(group, ())
+             if k in keys]
     return first + [k for k in keys if k not in first]
 
 
 def plan(settings: Iterable[Mapping[str, Any]],
-         groups: Sequence[str] = ()) -> List[Tab]:
+         groups: Sequence[str] = (),
+         tables: Optional[Tables] = None) -> List[Tab]:
     """The tabs for these settings (settings_list()["settings"]), in the
     order their groups first appear (`groups`, the camera's own display
     order, then any group only a setting names).
@@ -147,7 +210,11 @@ def plan(settings: Iterable[Mapping[str, Any]],
     order a person reads them in (exposure before gain); the tabs follow
     the camera's order. The CAMERA_TAB is always last of the setting tabs,
     whether or not the camera has readings to put in it.
+
+    `tables`: the tables merged from the camera plugins' hints (`merge`),
+    or today's (None).
     """
+    tables = tables or today()
     rows = list(settings)
     by_group: Dict[str, List[str]] = {}
     for row in rows:
@@ -155,21 +222,25 @@ def plan(settings: Iterable[Mapping[str, Any]],
             str(row.get("key")))
     order = [g for g in dict.fromkeys(list(groups) + list(by_group))
              if by_group.get(g)]
-    titles = list(dict.fromkeys(tab_of(g) for g in order))
+    titles = list(dict.fromkeys(tab_of(g, tables) for g in order))
     if CAMERA_TAB in titles:
         titles.remove(CAMERA_TAB)
     titles.append(CAMERA_TAB)
     out: List[Tab] = []
     for title in titles:
-        shared = next((t for t in SHARED_TABS if t[0] == title), None)
-        members = ([g for g in shared[1] if g in by_group] if shared
-                   else [g for g in order if tab_of(g) == title])
+        shared = next((t for t in tables.shared_tabs if t[0] == title), None)
+        # A shared tab's sections in its own order — but only the groups
+        # whose tab it is (tab_of): tables that name a group in two tabs
+        # still put it in one (P2 review).
+        members = ([g for g in shared[1] if g in by_group
+                    and tab_of(g, tables) == title] if shared
+                   else [g for g in order if tab_of(g, tables) == title])
         limit = ROWS_ALONE if len(members) <= 1 else ROWS_SHARED
         sections = []
         for group in members:
-            keys = ordered(group, by_group[group])
+            keys = ordered(group, by_group[group], tables)
             sections.append(Section(group, tuple(keys[:limit]),
                                     tuple(keys[limit:])))
-        tip = shared[2] if shared else TIPS.get(title, title)
+        tip = shared[2] if shared else tables.tips.get(title, title)
         out.append(Tab(title, tip, tuple(sections)))
     return out

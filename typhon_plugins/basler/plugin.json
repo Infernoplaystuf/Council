@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "id": "typhon.basler",
+  "short": "basler",
+  "name": "Basler cameras",
+  "version": "0.2.0",
+  "api": "0.3",
+  "kind": "camera",
+  "entry": "plugin:BaslerPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [
+    "setup"
+  ],
+  "files": [],
+  "network": "camera-link",
+  "capabilities": [
+    "frames",
+    "restartable",
+    "grab_failures",
+    "software_trigger",
+    "hardware_trigger",
+    "binning"
+  ]
+}

@@ -42,6 +42,11 @@ same list.
   (`tests/test_council_qt_foundation.py`): compared the Qt `StandaloneHost` with
   the Tk one and needed tkinter. Its Qt-only checks are now
   `test_the_standalone_host_surface`.
+- `test_connect_accepts_a_listbox_selection` (`tests/test_barbie_v4.py`), retired on
+  branch `typhon-plugins`, where a failing Barbie test is retired rather than fixed
+  (`docs/typhon_plugins_design.md` 7.2): it hard-coded row 1 of the camera list as
+  the simulated event camera and failed whenever `PYLON_CAMEMU` lists pylon's
+  emulated Baslers first (the `pylon` env), on `qt-migration` too.
 - `test_the_tk_console_applies_them` and
   `test_the_tk_console_applies_them_through_the_same_function`
   (`tests/test_launch.py`): ran, and read the source of, the Tk console's
@@ -127,6 +132,11 @@ same list.
   progress; it was written for the desktop's `knowledge-graph` branch).
 - The graph's Excel / Ledger sources, inspector initials and outside folders:
   `docs/handoff/kg_excel_2026-10-16.md`.
+- The plugin Typhon on branch `typhon-plugins` (design: `docs/typhon_plugins_design.md`):
+  `docs/typhon_plugins_branch.md` says how "Typhon (plugins)" runs beside today's Typhon
+  (`run-typhon-plugins.bat`, its side vault), its traps, and the branch gate every commit
+  passes (`python tools/typhon_plugins_gate.py`). The plugin host and the plugin API as
+  they stand (0.x until P5): `docs/typhon_plugin_api_notes.md`.
 - The Ledger for table templates (one row per record, highlights, lookups, the
   model per header layout): `docs/handoff/ledger_records_2026-10-21.md`.
 - The Connections tab working like Morphik (any entity type, a model reading every
@@ -174,6 +184,17 @@ same list.
   the best match whole): `examples/qt_apps/README.md`, read by
   `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
   (`gui_examples.py`).
+- The classifier as an optional pop-out plugin, the plugin toolbar strip
+  and "Plugins…", and datasets of picked frames (references, sent to
+  plugins; branch `typhon-plugins`):
+  `docs/handoff/typhon_classifier_datasets_2026-11-02.md`.
+- The Triggering window, trigger-source plugins (manifest kind "source")
+  and Triggered: record runs (branch `typhon-plugins`):
+  `docs/handoff/typhon_triggering_2026-11-02.md`.
+- A Basler's I/O cable as a trigger for snapshot and record runs (every
+  model: a counter on the line, else its level), the Triggering window's
+  line check and "Find my trigger line", `tools/basler_line_test.py`
+  (branch `typhon-plugins`): `docs/handoff/typhon_basler_lines_2026-11-05.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

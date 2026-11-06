@@ -393,6 +393,33 @@ def trigger_warning(source: str) -> str:
 
 
 # ======================================================================
+# Downsample: the core's row in every frame camera's "Capture" group
+# ======================================================================
+def downsample_setting(factor: Any, options: Any = None) -> Setting:
+    """THE CORE'S DOWNSAMPLE ROW (docs/typhon_plugins_design.md 2.1, 2.5):
+    Downsample, "save.downsample" (Off, 2x, 3x, 4x), in the "Capture" group
+    of every frame camera with a capture set-up, chosen before a run and
+    fixed while capturing. Downsample is the core's, not the triggering
+    plugin's: this row is Typhon's whatever the camera, and the camera's
+    `options` (CaptureOptions) say only whether it can change while the
+    stream runs (camera binning needs it stopped) and how it is made there
+    (downsample_live, downsample_help).
+
+    The key, its choices and its words stay in council_core.triggered,
+    where today's set-up has them, until the files move at stage P7
+    (design 7.2); today's providers build their Capture group with this
+    row (triggered.capture_settings), so both Typhons describe it alike."""
+    from . import triggered
+
+    live = getattr(options, "downsample_live", True)
+    words = str(getattr(options, "downsample_help", "") or "")
+    return Setting(triggered.DOWNSAMPLE_KEY, "Downsample", triggered.GROUP,
+                   CHOICE, triggered.downsample_text(factor),
+                   choices=triggered.DOWNSAMPLES, live=bool(live),
+                   per_run=True, help=words or triggered.DOWNSAMPLE_HELP)
+
+
+# ======================================================================
 # Turning what was typed or saved into what the setting takes
 # ======================================================================
 _TRUE = {"1", "true", "yes", "on", "enabled"}
@@ -585,6 +612,17 @@ class Provider:
         hold them; [] when it reads them all, or there are none."""
         return []
 
+    # -- what else the stream is in the way of (plugin design 2.1) ---------
+    def extra_stops(self, values: Mapping[str, Any],
+                    described: Sequence[Setting]) -> List[str]:
+        """The keys of `values` — a set's keys that no row of `described`
+        (the camera's description) has — that the stream is in the way of
+        on THIS camera; [] by default. `stops_needed` checks the described
+        rows itself and asks this for the rest, so the generic check names
+        no camera: a Basler's other triggers ("TriggerMode[FrameBurstStart]",
+        trigger_key) are its own (BaslerSettings)."""
+        return []
+
     # ------------------------------------------------------------------
     def find(self, key: str) -> Setting:
         for setting in self.describe():
@@ -729,20 +767,45 @@ def stops_needed(device: Any, values: Mapping[str, Any],
     """
     if not getattr(device, "streaming", False):
         return []
+    provider = None
     if described is None:
-        described = device.settings_provider().describe()
+        provider = device.settings_provider()
+        described = provider.describe()
     by_key = {s.key: s for s in described}
     blocked = [key for key in values
                if key in by_key and not by_key[key].live
                and not by_key[key].read_only
                and _would_change(by_key[key], values[key])]
-    blocked += _triggers_in_the_way(device, values, by_key)
+    # The keys no row describes, asked of the camera's own provider (a
+    # Basler's other triggers: BaslerSettings.extra_stops).
+    blocked += _extra_stops(device, provider, {
+        key: value for key, value in values.items() if key not in by_key},
+        described)
     if (roi is not None and not getattr(device, "area_live", False)
             and _fits(device, roi) and not area_unchanged(device, roi)):
         # An area off the sensor is refused, not written (apply): no reason
         # to stop the stream for it.
         blocked.append("area")
     return blocked
+
+
+def _extra_stops(device: Any, provider: Any, values: Mapping[str, Any],
+                 described: Sequence[Setting]) -> List[str]:
+    """What the camera's provider says the stream is in the way of among
+    `values`, the keys no described row has (Provider.extra_stops) — a
+    provider only made for it when there are such keys. A provider without
+    the hook (a stand-in) adds nothing."""
+    if not values:
+        return []
+    if provider is None:
+        try:
+            provider = device.settings_provider()
+        except Exception:                                   # noqa: BLE001
+            return []
+    ask = getattr(provider, "extra_stops", None)
+    if not callable(ask):
+        return []
+    return list(ask(values, described))
 
 
 def _locked(setting: Optional[Setting]) -> bool:
@@ -1034,6 +1097,13 @@ class BaslerSettings(Provider):
 
     def __init__(self, device: Any):
         self.device = device
+
+    def extra_stops(self, values: Mapping[str, Any],
+                    described: Sequence[Setting]) -> List[str]:
+        """The other triggers' settings (trigger_key) the stream is in the
+        way of (Provider.extra_stops; _triggers_in_the_way)."""
+        return _triggers_in_the_way(self.device, values,
+                                    {s.key: s for s in described})
 
     # -- nodes -----------------------------------------------------------
     def _resolve(self, feature: _Feature) -> Optional[Tuple[str, Any]]:
@@ -1677,7 +1747,7 @@ class BaslerSettings(Provider):
 
         if not setup.triggered:
             return ""
-        if setup.snapshot:
+        if setup.frames_only:
             if not setup.typhon_fires:
                 return (f"Snapshot takes its trigger from Software (Capture "
                         f"now) or the Timer; {setup.source} is the camera's "
@@ -2879,11 +2949,13 @@ class SyntheticSettings(Provider):
         self.device = device
 
     def describe(self) -> List[Setting]:
+        from .camera_capabilities import EVENTS, has
+
         dev = self.device
         state = dev.state
         ranges = dev.RANGES
         out: List[Setting] = []
-        if dev.info.kind == "event":
+        if has(dev, EVENTS):
             for name in dev.BIASES:
                 # Like an EVK4 opened as Typhon opens one: the range it
                 # accepts (RANGES — the IMX636's recommended range, what
@@ -2992,7 +3064,9 @@ class SyntheticSettings(Provider):
         """The simulated frame camera has factory settings to load, as a
         Basler does; the simulated event camera has none, as an EVK4 has
         none."""
-        if self.device.info.kind == "event":
+        from .camera_capabilities import EVENTS, has
+
+        if has(self.device, EVENTS):
             return ""
         return "the simulated camera's defaults"
 

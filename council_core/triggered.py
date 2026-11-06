@@ -56,7 +56,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import (Any, Callable, Deque, Dict, List, Optional, Sequence,
+                    Tuple)
 
 # ======================================================================
 # The set-up
@@ -64,7 +65,16 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 MODE_CONTINUOUS = "Continuous"
 MODE_EXACT = "Triggered: exact"
 MODE_SNAPSHOT = "Triggered: snapshot"
+#: Record (typhon-plugins, 2 November 2026): like a snapshot the live view
+#: runs and Typhon decides which frames are saved — EVERY frame from the
+#: trigger for `record_s` seconds, or (record_s 0) from one trigger until
+#: the next, which ends the recording without starting another.
+MODE_RECORD = "Triggered: record"
+#: Today's Typhon's modes (its Basic tab lists these; unchanged).
 MODES: Tuple[str, ...] = (MODE_CONTINUOUS, MODE_EXACT, MODE_SNAPSHOT)
+#: A "Typhon (plugins)" window's: today's and record (its Triggering
+#: window).
+PLUGIN_MODES: Tuple[str, ...] = MODES + (MODE_RECORD,)
 
 #: The sources Typhon fires itself. Every other source is the camera's own
 #: (a line, a CoaXPress trigger), as the camera lists it.
@@ -86,10 +96,11 @@ EDGE_KEY = "capture.edge"
 DELAY_KEY = "capture.delay_us"
 DEBOUNCE_KEY = "capture.debounce_us"
 DOWNSAMPLE_KEY = "save.downsample"
+RECORD_KEY = "capture.record_s"
 
 #: Every key of the set-up, in the order a set writes them.
 KEYS: Tuple[str, ...] = (MODE_KEY, SOURCE_KEY, PER_KEY, EVERY_KEY, EDGE_KEY,
-                         DELAY_KEY, DEBOUNCE_KEY, DOWNSAMPLE_KEY)
+                         DELAY_KEY, DEBOUNCE_KEY, DOWNSAMPLE_KEY, RECORD_KEY)
 
 #: Frames one trigger may ask for (a short burst).
 MAX_PER_TRIGGER = 1000
@@ -97,11 +108,28 @@ MAX_PER_TRIGGER = 1000
 #: The timer's interval, seconds: 20 a second at most, one a day at least.
 EVERY_RANGE: Tuple[float, float] = (0.05, 86400.0)
 
+#: How long a record trigger records, seconds: 0 (until the next trigger)
+#: up to a day.
+RECORD_RANGE: Tuple[float, float] = (0.0, 86400.0)
+
 #: The camera's own trigger sources offered as hardware inputs: its input
 #: lines and the CoaXPress triggers a frame grabber forwards. A camera's
 #: internal signals (Counter*, Timer*, SoftwareSignal*, PeriodicSignal*,
 #: Action*) are not inputs a signal is wired to, so they are not offered.
 HARDWARE_PREFIXES: Tuple[str, ...] = ("Line", "CxpTrigger", "CC")
+#: The camera's internal signals (never offered, but a preset from another
+#: camera may name one): the camera's, not Typhon's, like the inputs.
+CAMERA_SIGNAL_PREFIXES: Tuple[str, ...] = ("Counter", "Timer", "Software",
+                                           "PeriodicSignal", "Action")
+
+
+def camera_source(name: Any) -> bool:
+    """Is `name` a source of the camera's own (an input, an internal
+    signal) rather than one Typhon fires — Software, Timer, or a
+    trigger-source plugin's source, which may not use these prefixes?"""
+    text = str(name or "")
+    return text not in TYPHON_SOURCES and text.startswith(
+        HARDWARE_PREFIXES + CAMERA_SIGNAL_PREFIXES)
 
 
 def is_capture_key(key: Any) -> bool:
@@ -156,10 +184,22 @@ class CaptureSetup:
     debounce_us: Optional[float] = None
     #: Downsample: 1 (Off), 2, 3 or 4.
     downsample: int = 1
+    #: Record: seconds each trigger records (0: until the next trigger).
+    record_s: float = 0.0
 
     @property
     def triggered(self) -> bool:
-        return self.mode in (MODE_EXACT, MODE_SNAPSHOT)
+        return self.mode in (MODE_EXACT, MODE_SNAPSHOT, MODE_RECORD)
+
+    @property
+    def record(self) -> bool:
+        return self.mode == MODE_RECORD
+
+    @property
+    def frames_only(self) -> bool:
+        """Snapshot or record: the camera free-runs and Typhon picks the
+        frames it saves; nothing is armed on the camera."""
+        return self.mode in (MODE_SNAPSHOT, MODE_RECORD)
 
     @property
     def exact(self) -> bool:
@@ -171,15 +211,17 @@ class CaptureSetup:
 
     @property
     def typhon_fires(self) -> bool:
-        """Typhon fires the trigger (Software, Timer); else the camera's
-        own input does."""
-        return self.source in TYPHON_SOURCES
+        """Typhon fires the trigger (Software, Timer, or a trigger-source
+        plugin's source); else the camera's own input does (a line, a
+        CoaXPress trigger: HARDWARE_PREFIXES)."""
+        return not camera_source(self.source)
 
     def short(self) -> str:
         """"exact, Line1", "snapshot, Timer every 2 s", "continuous"."""
         if not self.triggered:
             return "continuous"
-        how = "exact" if self.exact else "snapshot"
+        how = ("exact" if self.exact else "record" if self.record
+               else "snapshot")
         return f"{how}, {self.source_words()}"
 
     def source_words(self) -> str:
@@ -187,18 +229,26 @@ class CaptureSetup:
         source = self.source
         if source == TIMER:
             source = f"Timer every {show_seconds(self.every_s)}"
-        per = (f", {self.per_trigger} frames per trigger"
-               if self.per_trigger > 1 else "")
+        if self.record:
+            per = (f", {show_seconds(self.record_s)} per trigger"
+                   if self.record_s > 0 else ", until the next trigger")
+        else:
+            per = (f", {self.per_trigger} frames per trigger"
+                   if self.per_trigger > 1 else "")
         return f"{source}{per}"
 
     def as_record(self) -> Dict[str, Any]:
-        """The set-up as a run's records say it."""
-        return {"mode": self.mode, "source": self.source,
-                "per_trigger": int(self.per_trigger),
-                "every_s": float(self.every_s),
-                "edge": self.edge or None, "delay_us": self.delay_us,
-                "debounce_us": self.debounce_us,
-                "downsample": int(self.downsample)}
+        """The set-up as a run's records say it ("record_s" only for a
+        record run, so the records of every other run read as before)."""
+        out = {"mode": self.mode, "source": self.source,
+               "per_trigger": int(self.per_trigger),
+               "every_s": float(self.every_s),
+               "edge": self.edge or None, "delay_us": self.delay_us,
+               "debounce_us": self.debounce_us,
+               "downsample": int(self.downsample)}
+        if self.record:
+            out["record_s"] = float(self.record_s)
+        return out
 
 
 def show_seconds(seconds: float) -> str:
@@ -230,10 +280,13 @@ MODE_HELP = (
     "picture shows the last capture between triggers) — for the run it "
     "takes over the camera's own Trigger rows, and Stop puts them back. "
     "Triggered: snapshot keeps the live view and saves the next frames that "
-    "arrive after each trigger (up to one frame late). Fixed while "
-    "capturing.")
+    "arrive after each trigger (up to one frame late). Triggered: record "
+    "keeps the live view and saves EVERY frame from each trigger for the "
+    "Record for seconds — or, at 0, from one trigger until the next, which "
+    "stops the recording. Fixed while capturing.")
 SOURCE_HELP = (
     "Software: the Capture now button or F9. Timer: every so many seconds. "
+    "A trigger-source plugin's source: when that plugin says so. "
     "Line1 …: a hardware input the camera lists (exact only) — its edge, "
     "delay and debounce are in the Capture settings (the Exposure tab's "
     "Capture section; Pop out shows them all). Fixed while capturing.")
@@ -241,6 +294,9 @@ PER_HELP = ("Frames each trigger saves: 1, or more for a short burst. A "
             "hardware trigger with more than one needs a camera with burst "
             "triggers (AcquisitionBurstFrameCount).")
 EVERY_HELP = "The timer's interval, in seconds (source Timer only)."
+RECORD_HELP = ("Triggered: record only — how long each trigger records, in "
+               "seconds. 0: from one trigger until the next, which stops "
+               "the recording (the one after starts another).")
 EDGE_HELP = ("Which edge of the hardware signal triggers (TriggerActivation "
              "of the trigger Start arms).")
 DELAY_HELP = ("How long the camera waits after the hardware trigger before "
@@ -249,20 +305,72 @@ DEBOUNCE_HELP = ("Ignore pulses on the input line shorter than this (the "
                  "camera's line debouncer or input filter).")
 
 
+#: Asked each time the rows are drawn or a value is checked against them:
+#: None for today's Typhon — its rows stay exactly as they were — or, in a
+#: "Typhon (plugins)" project, the trigger-source plugins' sources (maybe
+#: none), which also offers Triggered: record and its Record for row. Set
+#: by frame_camera (_plugin_trigger_sources); None when unset.
+plugin_sources: Optional[Callable[[], Optional[Sequence[str]]]] = None
+
+
+def _plugin_window() -> Optional[Tuple[str, ...]]:
+    fn = plugin_sources
+    if fn is None:
+        return None
+    try:
+        got = fn()
+    except Exception:                                     # noqa: BLE001
+        return None
+    return None if got is None else tuple(str(s) for s in got)
+
+
+def offered_plugin_sources() -> Tuple[str, ...]:
+    """The trigger-source plugins' sources offered now ((): today's
+    Typhon, or none)."""
+    return _plugin_window() or ()
+
+
 def capture_settings(setup: CaptureSetup,
                      options: CaptureOptions) -> List[Any]:
     """The set-up as camera_settings.Setting rows, group GROUP: every one
-    is chosen before a run and fixed while capturing (per_run)."""
+    is chosen before a run and fixed while capturing (per_run). The
+    Downsample row is the core's (camera_settings.downsample_setting:
+    Downsample is Typhon's, not the triggering plugin's, typhon-plugins
+    design 2.5), in its place among them; the rest are the trigger rows
+    (trigger_settings)."""
+    from . import camera_settings
+
+    extra = _plugin_window()
+    out = trigger_settings(setup, options, extra or (),
+                           plugins=extra is not None)
+    out.insert(4, camera_settings.downsample_setting(setup.downsample,
+                                                     options))
+    return out
+
+
+def trigger_settings(setup: CaptureSetup, options: CaptureOptions,
+                     extra_sources: Sequence[str] = (),
+                     plugins: bool = False) -> List[Any]:
+    """The TRIGGER rows of the set-up — capture_settings less the core's
+    Downsample row, in the same order: the triggering plugin's rows
+    (typhon-plugins design 2.5: its pop-out shows them from stage P4).
+    `extra_sources`: the trigger-source plugins' sources, offered after
+    Typhon's own. `plugins` (a "Typhon (plugins)" window): Triggered:
+    record is offered too, with its Record for row last."""
     from .camera_settings import CHOICE, FLOAT, INT, Setting
 
-    sources = TYPHON_SOURCES + tuple(options.hardware)
+    sources = TYPHON_SOURCES + tuple(
+        s for s in extra_sources if s not in TYPHON_SOURCES) + tuple(
+        options.hardware)
     if setup.source not in sources:
         # A preset from another camera: shown as it is, and Start says why
         # it cannot be used here.
         sources = sources + (setup.source,)
+    plugins = plugins or setup.record
+    modes = PLUGIN_MODES if plugins else MODES
     out = [
         Setting(MODE_KEY, "Capture", GROUP, CHOICE, setup.mode,
-                choices=MODES, help=MODE_HELP, per_run=True),
+                choices=modes, help=MODE_HELP, per_run=True),
         Setting(SOURCE_KEY, "Trigger from", GROUP, CHOICE, setup.source,
                 choices=sources, help=SOURCE_HELP, per_run=True),
         Setting(PER_KEY, "Frames per trigger", GROUP, INT,
@@ -271,10 +379,6 @@ def capture_settings(setup: CaptureSetup,
         Setting(EVERY_KEY, "Timer every", GROUP, FLOAT, float(setup.every_s),
                 minimum=EVERY_RANGE[0], maximum=EVERY_RANGE[1], unit="s",
                 help=EVERY_HELP, per_run=True),
-        Setting(DOWNSAMPLE_KEY, "Downsample", GROUP, CHOICE,
-                downsample_text(setup.downsample), choices=DOWNSAMPLES,
-                live=options.downsample_live, per_run=True,
-                help=options.downsample_help or DOWNSAMPLE_HELP),
     ]
     if options.edges:
         edges = tuple(options.edges)
@@ -298,6 +402,11 @@ def capture_settings(setup: CaptureSetup,
                                         else setup.debounce_us),
                            minimum=low, maximum=high, unit="µs",
                            help=DEBOUNCE_HELP, per_run=True))
+    if plugins:
+        out.append(Setting(RECORD_KEY, "Record for", GROUP, FLOAT,
+                           float(setup.record_s), minimum=RECORD_RANGE[0],
+                           maximum=RECORD_RANGE[1], unit="s",
+                           help=RECORD_HELP, per_run=True))
     return out
 
 
@@ -337,6 +446,9 @@ def write_capture(setup: CaptureSetup, key: str, value: Any) -> None:
         setup.debounce_us = float(value)
     elif key == DOWNSAMPLE_KEY:
         setup.downsample = factor_of(value)
+    elif key == RECORD_KEY:
+        setup.record_s = max(RECORD_RANGE[0], min(RECORD_RANGE[1],
+                                                  float(value)))
     else:
         raise KeyError(key)
 
@@ -410,6 +522,10 @@ class _Trigger:
     #: Past its deadline with no frame, held a while longer for a LATE
     #: frame (TriggerRun._expire) — until this moment (monotonic).
     held_until: Optional[float] = None
+    #: Record: still recording (every frame is its), and until when
+    #: (monotonic; None: until the next trigger).
+    recording: bool = False
+    until: Optional[float] = None
 
     @property
     def done(self) -> bool:
@@ -462,9 +578,15 @@ class TriggerRun:
         self.per = max(1, int(self.setup.per_trigger))
         self.timer = self.setup.source == TIMER
         self.period = float(self.setup.every_s)
+        #: Record: every frame from a trigger for record_s seconds (0:
+        #: until the next trigger, which ends it and starts none).
+        self.record = self.setup.record
+        self.record_s = max(0.0, float(self.setup.record_s or 0.0))
         self._lock = threading.Lock()
         self._cond = threading.Condition()
-        self._requests = 0
+        #: Triggers asked of the worker, by source: Capture now presses
+        #: (Software) and a trigger-source plugin's (fire_from).
+        self._requests: Deque[str] = deque()
         self._stopping = False
         self._thread: Optional[threading.Thread] = None
         self._number = 0
@@ -501,14 +623,22 @@ class TriggerRun:
         self.edges_note = ""
         #: Between which moments the camera counted them, in words.
         self.edges_window = ""
+        #: Told each trigger Typhon's own sources make (Software, Timer) —
+        #: on_trigger(source, number, at: seconds since 1970) — missed ones
+        #: too; never on the grab thread. None (today's Typhon): nobody.
+        #: The typhon-plugins branch's TriggerSource tells its `fire`.
+        self.on_trigger: Optional[Callable[[str, int, float], Any]] = None
 
     # -- the triggers CSV ------------------------------------------------
-    def open(self) -> Optional[Path]:
+    def open(self, handle: Any = None) -> Optional[Path]:
         """Create the triggers CSV — EXCLUSIVELY (never over a file) — with
-        its header. Raises OSError when it cannot be made."""
-        if self.path is None:
-            return None
-        handle = open(self.path, "x", newline="", encoding="utf-8")
+        its header. Raises OSError when it cannot be made. `handle`: a text
+        file already created exclusively for it (the typhon-plugins
+        branch's file service, ctx.create_file), written through instead."""
+        if handle is None:
+            if self.path is None:
+                return None
+            handle = open(self.path, "x", newline="", encoding="utf-8")
         self._file = handle
         self._writer = csv.writer(handle)
         self._writer.writerow(TRIGGER_COLUMNS)
@@ -551,10 +681,32 @@ class TriggerRun:
         with self._cond:
             if self._stopping:
                 return "the run is stopping"
-            self._requests += 1
+            self._requests.append(SOFTWARE)
             self._cond.notify()
+        if self.record:
+            return self._record_words()
         return "trigger sent" if self.exact else "saving the next frame" + (
             "s" if self.per > 1 else "")
+
+    def _record_words(self) -> str:
+        with self._lock:
+            current = self._current
+            on = current is not None and current.recording
+        if self.record_s > 0:
+            return f"recording for {show_seconds(self.record_s)}"
+        return "recording stopped" if on else "recording"
+
+    def fire_from(self, source: str) -> bool:
+        """A trigger of a trigger-source plugin's source (its `fire`, on
+        any thread but the grab thread): queued for the worker, fired as a
+        Capture now press is, under the source's name. False once the run
+        is stopping (nothing is fired after Stop)."""
+        with self._cond:
+            if self._stopping:
+                return False
+            self._requests.append(str(source or SOFTWARE))
+            self._cond.notify()
+        return True
 
     def halt(self, timeout: float = 5.0) -> None:
         """Fire nothing more (the worker ends); triggers already fired keep
@@ -590,6 +742,7 @@ class TriggerRun:
                 waiting = any(t.firing or t.arrived < t.fired
                               for t in self._pending) or (
                     current is not None and not current.done
+                    and not current.recording
                     and current.arrived < current.asked)
             if not waiting:
                 return True
@@ -635,6 +788,8 @@ class TriggerRun:
                     continue
                 self._settle(trig, NO_FRAME if trig.arrived == 0
                              else self._partial(trig), note="the run stopped")
+            if self._current is not None and self._current.recording:
+                self._end_recording(self._current, "the run stopped")
             if self._current is not None and not self._current.done:
                 self._settle(self._current, NO_FRAME
                              if self._current.arrived == 0
@@ -666,11 +821,12 @@ class TriggerRun:
                     self._cond.wait(wait)
                 # A press made before Stop is FIRED, not dropped: it was
                 # answered "trigger sent" (and Stop waits for its frame).
-                presses, self._requests = self._requests, 0
+                presses = list(self._requests)
+                self._requests.clear()
                 stopping = self._stopping
             self._expire()
-            for _ in range(presses):
-                self._trigger(SOFTWARE)
+            for source in presses:
+                self._trigger(source)
             if stopping:
                 break
             if self.timer and self._clock() >= self._due():
@@ -693,6 +849,7 @@ class TriggerRun:
                 self._settle(trig, MISSED_BUSY,
                              note="the timer's tick came while the last was "
                                   "still being fired")
+            self._told(TIMER, number)
             self._tick += 1
         self._tick += 1
         self._trigger(TIMER)
@@ -702,6 +859,18 @@ class TriggerRun:
             self._number += 1
             self.counts["triggers"] += 1
             return self._number
+
+    def _told(self, source: str, number: int) -> None:
+        """Tell on_trigger of a trigger of Typhon's own source (the
+        worker's thread; never the grab thread). Its fault is not the
+        run's: the books go on."""
+        tell = self.on_trigger
+        if tell is None:
+            return
+        try:
+            tell(source, number, self._wall())
+        except Exception:                                 # noqa: BLE001
+            pass
 
     # -- firing ---------------------------------------------------------
     def _ready(self, timeout: float) -> Optional[bool]:
@@ -752,6 +921,10 @@ class TriggerRun:
     def _trigger(self, source: str) -> None:
         number = self._next_number()
         trig = _Trigger(number, source, self.per)
+        self._told(source, number)
+        if self.record:
+            self._record_trigger(trig)
+            return
         if not self.exact:
             now = self._clock()
             with self._lock:
@@ -822,6 +995,44 @@ class TriggerRun:
             trig.firing = False
             self._maybe_settle(trig)
 
+    def _record_trigger(self, trig: _Trigger) -> None:
+        """Record: the trigger starts a recording — every frame from now
+        for record_s, or until the next trigger. A recording still going
+        is ended by it; with record_s 0 that is all it does (it stops the
+        recording, and the one after starts the next)."""
+        now = self._clock()
+        with self._lock:
+            trig.fired_mono, trig.fired_wall = now, self._wall()
+            self.last_at = now
+            current = self._current
+            if current is not None and current.recording:
+                self._end_recording(current, f"trigger {trig.number} came")
+                if self.record_s <= 0:
+                    trig.asked = 0
+                    self._settle(trig, OK, note=f"stopped the recording of "
+                                                f"trigger {current.number}")
+                    return
+            trig.asked = 0
+            trig.recording = True
+            trig.until = now + self.record_s if self.record_s > 0 else None
+            self._current = trig
+
+    def _end_recording(self, trig: _Trigger, why: str = "") -> None:
+        """Record: no frame after now is the trigger's (the lock held). It
+        is settled once the frames it took are told saved: ok with every
+        frame it took, "no frame" with none."""
+        if not trig.recording:
+            return
+        trig.recording = False
+        trig.asked = trig.got
+        if why and not trig.note:
+            trig.note = f"recorded {trig.got} frame" + (
+                "" if trig.got == 1 else "s") + f" until {why}"
+        if trig.arrived == 0:
+            self._settle(trig, NO_FRAME, note=why)
+            return
+        self._maybe_settle(trig)
+
     def _expire(self) -> None:
         """Triggers past their deadline (exposure + DEADLINE_S) with frames
         still due are "no frame" — but an exact trigger of Typhon's that got
@@ -834,12 +1045,18 @@ class TriggerRun:
         (read once, then), a slow link, or frames queued in pylon."""
         now = self._clock()
         with self._lock:
+            current = self._current
+            if current is not None and current.recording and \
+                    current.until is not None and now > current.until:
+                self._end_recording(current, f"its "
+                                    f"{show_seconds(self.record_s)} ended")
             for trig in list(self._held):
                 if trig.held_until is not None and now > trig.held_until:
                     self._held.remove(trig)
                     self._settle(trig, NO_FRAME)
             waiting = list(self._pending)
-            if self._current is not None and not self._current.done:
+            if self._current is not None and not self._current.done and \
+                    not self._current.recording and not self.record:
                 waiting.append(self._current)
             for trig in waiting:
                 if trig.firing or trig.deadline is None or now <= trig.deadline:
@@ -860,8 +1077,8 @@ class TriggerRun:
         return f"{NO_FRAME}: {trig.arrived} of {trig.asked} frames"
 
     def _maybe_settle(self, trig: _Trigger) -> None:
-        if (trig.done or trig.firing or trig.arrived < trig.fired
-                or trig.waiting > 0):
+        if (trig.done or trig.firing or trig.recording
+                or trig.arrived < trig.fired or trig.waiting > 0):
             return
         if trig.failed:
             self._settle(trig, FAILED_GRAB)
@@ -1007,6 +1224,15 @@ class TriggerRun:
                 trig.got += 1
                 return self._took(trig, arrived_wall)
             trig = self._current
+            if self.record:
+                if (trig is None or not trig.recording
+                        or trig.fired_mono is None
+                        or arrived_mono <= trig.fired_mono
+                        or (trig.until is not None
+                            and arrived_mono > trig.until)):
+                    return None
+                trig.got += 1
+                return self._took(trig, arrived_wall)
             if (trig is None or trig.done or trig.arrived >= trig.asked
                     or trig.fired_mono is None
                     or arrived_mono <= trig.fired_mono):
@@ -1067,8 +1293,10 @@ class TriggerRun:
                 trig = self._hardware_frame(self._clock(), self._wall())
             else:
                 trig = self._current
-                if trig is not None and (trig.done or
-                                         trig.arrived >= trig.asked):
+                if trig is not None and self.record:
+                    trig = trig if trig.recording else None
+                elif trig is not None and (trig.done or
+                                           trig.arrived >= trig.asked):
                     trig = None
             if trig is None:
                 return
@@ -1139,6 +1367,12 @@ class TriggerRun:
         """Which frames a trigger saved, in words."""
         n = self.per
         frames = "frame" if n == 1 else f"{n} frames"
+        if self.record:
+            if self.record_s > 0:
+                return (f"every frame that reached Typhon for "
+                        f"{show_seconds(self.record_s)} after each trigger")
+            return ("every frame that reached Typhon from one trigger until "
+                    "the next, which stopped the recording")
         if not self.exact:
             return (f"the first {frames} that reached Typhon after the "
                     f"trigger; the first may have begun its exposure up to "
@@ -1167,12 +1401,22 @@ class TriggerRun:
             else:
                 edge = f" {setup.edge}" if setup.edge else ""
                 head = f"Armed — waiting for {setup.source}{edge}"
+        elif self.record:
+            with self._lock:
+                current = self._current
+                on = current is not None and current.recording
+            how = (f"{show_seconds(self.record_s)} per trigger"
+                   if self.record_s > 0 else "until the next trigger")
+            head = (f"Record — {'RECORDING' if on else 'live, waiting'} "
+                    f"({how}, from {setup.source})")
         else:
             if setup.source == TIMER:
                 head = (f"Snapshot — live, saving {per} every "
                         f"{show_seconds(self.period)}")
-            else:
+            elif setup.source == SOFTWARE:
                 head = f"Snapshot — live, saving {per} per Capture now (F9)"
+            else:
+                head = f"Snapshot — live, saving {per} per {setup.source} trigger"
         bits = [head, f"{c['triggers']} trigger"
                       f"{'' if c['triggers'] == 1 else 's'}", f"{c['ok']} ok"]
         missed = (c["missed_busy"] + c["no_frame"] + c["failed_grab"]
@@ -1186,7 +1430,7 @@ class TriggerRun:
             bits[-1] += " (camera busy)" if missed == c["missed_busy"] else ""
         elif c["not_saved"]:
             bits[-1] += " (NOT saved)" if missed == c["not_saved"] else ""
-        if not self.exact:
+        if not self.exact and not self.record:
             bits.append(f"{c['cut_short']} cut short")
         if c["untriggered"]:
             bits.append(f"{c['untriggered']} frames with no trigger")
@@ -1205,7 +1449,7 @@ class TriggerRun:
             bits.append(f"{missed} missed")
             if c["not_saved"]:
                 bits[-1] += f" ({c['not_saved']} NOT saved)"
-        if not self.exact:
+        if not self.exact and not self.record:
             bits.append(f"{c['cut_short']} cut short")
         if c["stopped"]:
             bits.append(f"{c['stopped']} cut short by Stop")

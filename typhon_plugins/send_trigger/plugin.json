@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "typhon.send_trigger",
+  "short": "sendtrig",
+  "name": "Send trigger",
+  "version": "0.1.0",
+  "api": "0.3",
+  "kind": "feature",
+  "scope": "rig",
+  "entry": "plugin:SendTriggerPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [
+    "panel"
+  ],
+  "files": [],
+  "network": "none"
+}

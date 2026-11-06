@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "id": "typhon.trigger",
+  "short": "trig",
+  "name": "Triggering",
+  "version": "0.2.0",
+  "api": "0.3",
+  "kind": "feature",
+  "scope": "rig",
+  "entry": "plugin:TriggerPlugin",
+  "needs": [
+    "frames"
+  ],
+  "python": [],
+  "contributes": [
+    "run_hooks",
+    "record_gate",
+    "panel",
+    "toolbar",
+    "status"
+  ],
+  "files": [
+    "_capture_triggers.csv"
+  ],
+  "network": "none"
+}
