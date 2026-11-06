@@ -145,6 +145,10 @@ NOT_GATED: Dict[str, str] = {
     "tests/test_council_ab.py":
         "names the full-test harness's 'typhon' step id; tests the harness, "
         "not Typhon",
+    "tests/test_app_plugins.py":
+        "checks that Council's plugins read plugin.json with Typhon's "
+        "reader (council_core.plugin_manifest), unchanged; tests Council's "
+        "plugin host, not Typhon",
     "tests/test_qt_app_examples.py":
         "uses gui_reference's EXAMPLES_DIR (examples/qt_apps, the Qt apps "
         "the models read), not Typhon's examples/gui",
