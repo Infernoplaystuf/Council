@@ -451,6 +451,17 @@ def guard_deletes(app: Any, picker: ClassifierPicker,
     return wrapped
 
 
+def ask_twice(picker: ClassifierPicker, run: Callable[..., Any],
+              button: Optional[QAbstractButton] = None) -> "_DeleteGuard":
+    """`run` (a Delete press) made to ask for a second press, as
+    guard_deletes does for a window's handler — for a panel whose buttons
+    are not generated handlers (the Classification pop-out of "Typhon
+    (plugins)"). Connect the button to the returned guard's press."""
+    guard = _DeleteGuard(picker, run, button, parent=picker)
+    picker.delete_guard = guard
+    return guard
+
+
 def _handlers_calling(app: Any, function: str) -> List[str]:
     """The names of `app`'s handlers (on_*) whose code calls `function` —
     read from their source, handlers.py, which the user may have edited."""

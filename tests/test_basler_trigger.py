@@ -511,11 +511,15 @@ def rows_of(path):
 
 
 def run_files(folder, run):
+    # Stop gives saving STOP_DRAIN_SECONDS and lets the rest finish in the
+    # background (frame_camera.stop): on a loaded machine the end record
+    # lands a moment after Stop returns (Windows CI, PR #71).
+    end = folder / f"{run}_run_end.json"
+    assert wait_for(end.exists), f"no end record: {end}"
     triggers = folder / f"{run}{tg.TRIGGERS_SUFFIX}"
     return {"frames": rows_of(folder / f"{run}_frames.csv"),
             "triggers": rows_of(triggers) if triggers.exists() else None,
-            "end": json.loads((folder / f"{run}_run_end.json").read_text(
-                encoding="utf-8")),
+            "end": json.loads(end.read_text(encoding="utf-8")),
             "record": json.loads((folder / f"{run}_camera.json").read_text(
                 encoding="utf-8"))}
 

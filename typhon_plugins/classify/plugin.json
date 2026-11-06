@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "id": "typhon.classify",
+  "short": "classify",
+  "name": "Classification",
+  "version": "0.2.0",
+  "api": "0.3",
+  "kind": "feature",
+  "scope": "rig",
+  "entry": "plugin:ClassifyPlugin",
+  "needs": [],
+  "python": [
+    "sklearn"
+  ],
+  "contributes": [
+    "panel",
+    "datasets"
+  ],
+  "files": [],
+  "network": "none"
+}

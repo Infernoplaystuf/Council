@@ -7,11 +7,10 @@ ONE FORMAT WITH TYPHON
 A Council plugin is a folder holding `plugin.json`, in the same schema-1
 format Typhon's plugins use, read by the same reader
 (council_core.plugin_manifest: its `load` refuses duplicate keys, NaN, a file
-over 64 KB, text that is not UTF-8). That module is a byte-for-byte copy of
-the one on the typhon-plugins branch, so the two merge cleanly; nothing here
-changes it. What differs is what a manifest may SAY, because Council's
-plugins add to an app, not to a camera rig, and that check is this module's
-(`check`):
+over 64 KB, text that is not UTF-8). That module is Typhon's own (it came
+with typhon-plugins); nothing here changes it. What differs is what a
+manifest may SAY, because Council's plugins add to an app, not to a camera
+rig, and that check is this module's (`check`):
 
     kind      "tab" — the plugin adds one tab (the only kind so far)
     id        reverse-domain; "council." is kept for the plugins that ship

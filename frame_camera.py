@@ -180,6 +180,11 @@ class _Live:
     it is an open device with a thread attached, and reopening it per call
     would be both slow and wrong. So the state is here, explicitly, with one
     instance and an explicit shutdown.
+
+    On the typhon-plugins branch this class DECLARES the fields, and no
+    instance of it is the state any more: what clear() resets lives on each
+    camera slot, the rest on the rig, and _LIVE is a view over them (see
+    _RIG below and council_core.camera_rig). Add a field here as before.
     """
 
     def __init__(self) -> None:
@@ -331,6 +336,11 @@ class _Live:
         self.capture_key: Any = None
         #: What Stop could not put back after an exact run, or "".
         self.disarm_note = ""
+        #: A "Typhon (plugins)" run's triggering slot (the plugin host's
+        #: TriggerSlot: the triggering plugin's part of Start and Stop,
+        #: plugin design 3.6) while the run lasts, else None. Today's
+        #: Typhon never has one.
+        self.trigger_slot: Any = None
 
     def clear(self) -> None:
         self.device = None
@@ -368,9 +378,26 @@ class _Live:
         self.armed = None
         self.shown_reduce = 1
         self.disarm_note = ""
+        self.trigger_slot = None
 
 
-_LIVE = _Live()
+#: Every camera this window runs (council_core.camera_rig): a slot per camera
+#: holding the fields _Live.clear() resets, and the rig holding the rest —
+#: the app's. _LIVE is the one-camera object of before as a VIEW over it:
+#: per-connection names go to the active slot, app-level names to the rig,
+#: so every function here and every caller runs unchanged. _Live above still
+#: declares every field; the split is read off it (camera_rig.split_fields).
+from council_core import camera_rig as _camera_rig  # noqa: E402
+# Downsample's and the trigger set-up's code, loaded with this module: until
+# stage P3 row 3 took them out of capture.py's imports they came with the
+# capture code, so today's Settings > Python Scripts list showed them loaded
+# from the start — and does again (P3 review). Both use the standard library
+# only; the functions here still import them where they use them.
+from council_core import reduce as _reduce  # noqa: E402,F401
+from council_core import triggered as _triggered  # noqa: E402,F401
+
+_RIG = _camera_rig.Rig(_Live)
+_LIVE = _camera_rig.LiveView(_RIG)
 _LOCK = threading.Lock()
 _STAMPS = itertools.count(1)
 
@@ -388,14 +415,25 @@ def list_cameras() -> Dict[str, Any]:
     """
     from council_core import cameras
 
-    found = cameras.discover(_backends_for(current_choice()))
+    host = _plugin_host()
+    if host is None:
+        found = cameras.discover(_backends_for(current_choice()))
+    else:
+        # A "Typhon (plugins)" project: the camera plugins it runs, less
+        # the families its set-up did not tick — the same scan, the same
+        # notes (plugin design 2.4 items 3 and 15).
+        found = host.discover_cameras()
     _LIVE.found = found
     rows = [_row(i, c) for i, c in enumerate(found.cameras)]
+    if host is not None:
+        rows = _in_use(rows, found.cameras)
     # A LIST, not a joined string. These go to a listbox port, whose
     # set() iterates what it is given -- a string becomes one row PER
     # CHARACTER, which is exactly what it did the first time this ran
     # against a real camera: the panel showed "p", "r", "o", ...
-    notes = list(found.notes) or ["Every backend was searched."]
+    notes = list(found.notes) + (list(host.notes) if host is not None
+                                 else [])
+    notes = notes or ["Every backend was searched."]
     if found.cameras:
         summary = f"{len(found.cameras)} camera(s) found."
     else:
@@ -418,6 +456,109 @@ def _backends_for(choice: Optional[str]):
     if choice == "prophesee":
         return [cameras.EvkBackend(), cameras.SyntheticBackend()]
     return None
+
+
+# ======================================================================
+# A "Typhon (plugins)" project (typhon-plugins branch, stage P2 rows 3-4)
+# ======================================================================
+#: A "Typhon (plugins)" project keeps its plugin list in this file beside
+#: camera_setup.json (council_core.plugin_lists.PROJECT_FILE; a test checks
+#: they agree). Named here, never imported: today's Typhon must not import
+#: the plugin system, nor list it among its Python Scripts.
+_PLUGIN_LIST_FILE = "typhon_plugins.json"
+
+
+def _plugin_project() -> Optional[Path]:
+    """The attached app's project folder when it is a "Typhon (plugins)"
+    project — one whose folder holds its plugin list — else None (today's
+    Typhon, and every app that never attached)."""
+    path = _LIVE.setup_path
+    if path is None:
+        return None
+    project = Path(path).parent
+    try:
+        return project if (project / _PLUGIN_LIST_FILE).is_file() else None
+    except OSError:
+        return None
+
+
+def _plugin_host() -> Any:
+    """The rig's plugin host with this app's project open, for a "Typhon
+    (plugins)" project: its cameras are scanned, opened and set up through
+    the camera plugins it runs (plugin design 2.4 items 3 and 15). None for
+    today's Typhon, which never makes the host."""
+    project = _plugin_project()
+    if project is None:
+        return None
+    host = _RIG.plugins
+    have = host.project_dir
+    if have is None or Path(have).resolve() != project.resolve():
+        host.open_project(project)
+    return host
+
+
+def _in_use(rows: List[str], infos: List[Any]) -> List[str]:
+    """The scan's rows, a camera this window has open marked "in use as
+    cam2" (multi-camera design 2.2) — once the rig has a second camera
+    slot. A one-camera window's rows read as they always have."""
+    if len(_RIG) < 2:
+        return rows
+    out = []
+    for row, info in zip(rows, infos):
+        slot = _RIG.holding(info)
+        out.append(f"{row} · in use as {slot.name}" if slot is not None
+                   else row)
+    return out
+
+
+def _name_in_rig(host: Any, info: Any) -> str:
+    """Give the camera just connected in the active slot its name in the
+    rig (the plugin host's name_camera); "" when all went well, else what
+    to say. Never in the way of the camera: whatever goes wrong is said."""
+    try:
+        return host.name_camera(_RIG.active.name, info)[1]
+    except Exception as exc:                              # noqa: BLE001
+        return f"the camera keeps the name {_RIG.active.name} — " \
+               f"{type(exc).__name__}: {exc}"
+
+
+def _held_names() -> Dict[str, str]:
+    """Every camera this window has open, by the key it was found by: its
+    name in the rig (the families wizard's scans: "in use as cam2")."""
+    return {slot.info.key: slot.name for slot in _RIG
+            if getattr(slot, "info", None) is not None}
+
+
+def _current_families() -> Optional[List[str]]:
+    """The camera families this app is set up for (camera_setup.json:
+    a "Typhon (plugins)" project's ticked families, or the one camera of a
+    single-choice file), or None when it was never set up.
+
+    Private on purpose: the Designer offers a linked button every public
+    function of this module, and this one, used by the plugins path only,
+    made today's Typhon's link list one longer (P2 review)."""
+    from council_core import camera_setup
+
+    path = _LIVE.setup_path
+    return camera_setup.load_families(path) if path is not None else None
+
+
+def _needs_setup() -> bool:
+    """Whether the attached app has never been set up: a "Typhon (plugins)"
+    project asks for its families, today's Typhon for its one camera. A
+    project set up with today's single choice is set up for both. A
+    "Typhon (plugins)" project whose camera plugins with a set-up are all
+    switched off has nothing to tick (only the simulated cameras, which
+    need none), so it is not asked at every start."""
+    if _plugin_project() is not None:
+        if _current_families() is not None:
+            return False
+        try:
+            host = _plugin_host()
+            return host is None or bool(host.family_plugins())
+        except Exception:                                 # noqa: BLE001
+            return True              # cannot tell: ask, as a new app is
+    return current_choice() is None
 
 
 def _picked(selection: Any) -> str:
@@ -477,11 +618,26 @@ def connect(which: Any) -> Dict[str, Any]:
     # An app that never attached (no live view, a script) warms here; one
     # that did is warm already, and this costs nothing.
     capture.warm_in_background()
+    host = _plugin_host()
+    named = ""
     with _LOCK:
         if _LIVE.device is not None:
             raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
-        device = cameras.open_camera(info)
+        if host is None:
+            device = cameras.open_camera(info)
+        else:
+            # A "Typhon (plugins)" project opens through the camera plugin
+            # of the camera's family, which confirms onto the slot what the
+            # camera can do (plugin design 3.4). A camera another slot of
+            # this window holds is refused before anything opens: a second
+            # open fails on real hardware (the emulator allows it).
+            slot = _RIG.active
+            other = _RIG.holding(info)
+            if other is not None and other is not slot:
+                raise RuntimeError(f"that camera is in use as {other.name} — "
+                                   f"disconnect it there first")
+            device = host.open_camera(info, camera=slot.name)
         # What the camera says it is once open (an event camera's sensor is
         # read then, never at discovery — cameras.identify): the identity
         # presets and the run's camera record use.
@@ -492,6 +648,11 @@ def connect(which: Any) -> Dict[str, Any]:
         _LIVE.info = info
         _LIVE.session = capture.CaptureSession(device)
         _LIVE.reported = True
+    if host is not None:
+        # Its name in the rig (camera_rig.json): the same camera gets the
+        # same name next time (multi-camera design 2.2). Outside the lock:
+        # another window may hold the file's for a moment.
+        named = _name_in_rig(host, info)
 
     limits = device.limits()
     area = device.roi()
@@ -516,6 +677,10 @@ def connect(which: Any) -> Dict[str, Any]:
         # earlier session left) sends smaller frames with Downsample Off:
         # said here, where the user looks first, not found in the files.
         said += f" Note: {binned}."
+    if named:
+        # Its name in the rig could not be kept (camera_rig.json damaged,
+        # or not writable): said, never in the way of the camera.
+        said += f" Note: {named}."
     return {
         "summary": said,
         "area": _area_text(area),
@@ -531,10 +696,16 @@ def connect(which: Any) -> Dict[str, Any]:
 
 def disconnect() -> Dict[str, Any]:
     """Stop grabbing, release the camera, forget it."""
+    host = _plugin_host() if _LIVE.capturing else None
+    if host is not None:
+        # Disconnected in the middle of a "Typhon (plugins)" run: it is
+        # over for its plugins, before its recording ends (see stop).
+        host.run_stopped(camera=_RIG.active.name)
     with _LOCK:
         session = _LIVE.session
         job = _LIVE.job
         trig, armed = _LIVE.trigger_run, _LIVE.armed
+        plug = _LIVE.trigger_slot
         _LIVE.clear()
     if job is not None:
         # A change still stopping or restarting the stream owns it until it
@@ -542,6 +713,11 @@ def disconnect() -> Dict[str, Any]:
         # so it does not start a stream that is about to be closed.
         job.cancelled = True
         job.done.wait(JOB_JOIN_SECONDS)
+    if plug is not None:
+        # A "Typhon (plugins)" run: its triggering plugin stops the books
+        # and puts the camera's triggers back, before the camera closes.
+        plug.abort()
+        trig = armed = None
     if trig is not None:
         # Its thread fires the camera: stopped before the camera closes.
         trig.stop()
@@ -663,9 +839,28 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     if out.exists() and not out.is_dir():
         raise RuntimeError(f"{out} is a file, not a folder")
     setup = _capture_setup(session.device)
-    problem = _capture_problem(session.device, setup)
+    # A "Typhon (plugins)" project (plugin design 3.6): the trigger set-up
+    # is its triggering plugin's to check (its start check, below); the
+    # core checks Downsample, its own. Today's Typhon makes no host.
+    host = _plugin_host()
+    problem = (_capture_problem(session.device, setup) if host is None
+               else _downsample_problem(session.device, setup))
     if problem:
         raise RuntimeError(problem)
+    # Every run-hook plugin's check_start, before anything is changed,
+    # stopped or reserved — a reason refuses this Start.
+    base = time.strftime("%Y%m%d_%H%M%S")
+    if host is not None:
+        host.register_run_files()
+        if setup.triggered and host.trigger_plugin() is None:
+            raise RuntimeError(f"Start refused — {_a_run(setup)} needs the "
+                               f"Triggering plugin (typhon.trigger), which "
+                               f"this project does not run now — switch it "
+                               f"on, or choose Capture: Continuous")
+        refused = host.check_start(_run_plan(host, base, out, session.device,
+                                             setup))
+        if refused:
+            raise RuntimeError("Start refused — " + "; ".join(refused))
     waits_for = _waits_for_trigger(session.device, setup)
 
     for box, value in (("exposure", exposure), ("gain", gain),
@@ -707,13 +902,39 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # again, a program that briefly took the new file without sharing made
     # Start fail after the live view had stopped (measured).
     try:
-        run, claim = _claim_run(out)
+        run, claim = (_claim_run(out) if host is None else
+                      _claim_run(out, base))
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
     recorder = capture.run_recorder(out, run, claim)
     armed = None
     trig = None
+    active = None
+    plug = None
+    plugin_notes: List[str] = []
+    if host is not None:
+        # The run in progress, as its plugins see it: its end record
+        # carries their blocks and faults (plugin design 3.9, 3.10).
+        active = host.begin_run(run, {_RIG.active.name: out})
+        recorder.end_blocks = host.end_blocks(active, _RIG.active.name)
     try:
+        if host is not None and getattr(device, "capture", None) is not None:
+            # The triggering plugin's part of this run (plugin design 3.6):
+            # each trigger step below is its, in the core's order —
+            # TriggerRun's books driven by the rig, the camera reached
+            # through its facets.
+            plug = host.trigger_slot(_RIG.active.name)
+            if plug is None and setup.triggered:
+                raise RuntimeError(f"Start refused — {_a_run(setup)} needs "
+                                   f"the Triggering plugin (typhon.trigger), "
+                                   f"which could not be had now")
+        if host is not None:
+            # A built-in plugin's frame stage, after the core's Downsample,
+            # guarded on the recording path (plugin design 3.8): asked
+            # before anything stops; a stage that cannot be had refuses.
+            staged = host.frame_stages(_RIG.active.name, session)
+            if staged is not None:
+                recorder.frame_stage = staged
         recorder.open()
         if session.running and restartable:
             _stop_preview(session)
@@ -722,7 +943,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # Downsample made by the camera's binning, checked against the
         # binning the camera has now (BaslerDevice.check_downsample): a run
         # is never recorded as binned while the camera sends full frames.
-        downsample_note = _check_downsample(device)
+        # A "Typhon (plugins)" project asks the camera's Binning facet.
+        downsample_note = (_check_downsample(device) if host is None
+                           else _check_binning(host, device))
         if downsample_note:
             setup.downsample = int(getattr(getattr(device, "capture", None),
                                            "downsample", 1) or 1)
@@ -740,17 +963,30 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # changed".
         listing = _camera_listing(device)
         if setup.exact:
-            armed = _arm(device, setup)
+            armed = _arm(device, setup) if plug is None else plug.arm(setup)
             # An armed camera sends nothing between triggers: the grab loop
             # waits in short reads, so Stop is not held up to a second by
             # one (it notices Stop between reads).
             session.timeout_ms = ARMED_READ_MS
+        made_by = None
+        if host is not None:
+            # What made the run: the camera record's "plugins" block.
+            made_by, said_of = host.record_plugins(_RIG.active.name, device)
+            plugin_notes.extend(said_of)
         content, record_note = _camera_record(
             run, device, listing,
             setup if getattr(device, "capture", None) is not None else None,
-            armed)
+            armed, plugins=made_by,
+            capture=(plug.record(run, setup, armed) if plug is not None
+                     else None))
         if setup.triggered:
-            trig = _trigger_run(setup, device, out, run, listing, rate)
+            if plug is None:
+                trig = _trigger_run(setup, device, out, run, listing, rate)
+            else:
+                # The record gate: the plugin's books, guarded on the
+                # recording path (plugin design 3.10).
+                trig = plug.make_gate(run, out, setup,
+                                      _listed_values(listing), rate, session)
             recorder.capture_info = trig.summary
         recorder.downsample_info = _downsample_record(device)
         # reset: this run's numbers only — frames the preview showed were
@@ -761,8 +997,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         # Refused before the recording began: let go of the reservation's
         # CSV (it stays, header only, and keeps the name taken), and put
         # an armed trigger back.
-        _undo_arming(device, trig, armed)
+        _undo_start(device, plug, trig, armed)
         recorder.close()
+        if active is not None:
+            host.abandon_run(active)
         if isinstance(exc, OSError):
             raise RuntimeError(
                 f"cannot save frames into {out}: {exc}") from exc
@@ -774,7 +1012,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
             raw = device.start_raw(out / f"{run}_events.raw")
         except Exception as exc:                          # noqa: BLE001
             session.record_to(None)
-            _undo_arming(device, trig, armed)
+            _undo_start(device, plug, trig, armed)
+            if active is not None:
+                host.abandon_run(active)
             raise RuntimeError(f"cannot record the raw file: {exc}") from exc
     _LIVE.folder = out
     _LIVE.run = run
@@ -792,21 +1032,36 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                 except Exception:                         # noqa: BLE001
                     pass
             session.record_to(None)
-            _undo_arming(device, trig, armed)
+            _undo_start(device, plug, trig, armed)
+            if active is not None:
+                host.abandon_run(active)
             raise
         _started_stream(session)
-    if trig is not None and armed is not None and not trig.typhon_fires:
+    if plug is not None:
+        # The triggering plugin's step: the camera's edge count once it can
+        # take a trigger (on the recording path: a fault ends the run).
+        plugin_notes.extend(plug.ready())
+    elif trig is not None and armed is not None and not trig.typhon_fires:
         # The camera's edge count starts once it can take a trigger: the
         # edges before that (arming, the record read, the stream starting)
         # triggered nothing.
         _count_from_ready(device, armed)
+    if active is not None:
+        # The recording has begun: each run-hook plugin's on_run_started,
+        # best effort — a fault is said below, the capture carries on
+        # (plugin design 3.6, 3.10) — before the trigger source starts.
+        plugin_notes.extend(host.run_started(active))
     if trig is not None:
         # After the stream: the first trigger waits for the camera to say
         # it is ready (a trigger fired before that is lost — measured).
-        trig.start()
+        if plug is None:
+            trig.start()
+        else:
+            plugin_notes.extend(plug.start())
     _LIVE.trigger_run = trig
     _LIVE.last_trigger_run = trig
     _LIVE.armed = armed
+    _LIVE.trigger_slot = plug
     _LIVE.capturing = True
     _LIVE.previewing = False
     # The run's own silence, if any, is asked about afresh: a reason left
@@ -819,7 +1074,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     _LIVE.record_path = record
 
     said = f"Capturing into {out}."
-    said += _capture_words(setup, armed, device)
+    if plug is None:
+        said += _capture_words(setup, armed, device)
+    else:
+        said += plug.words(setup, armed) + _downsample_start_words(device)
     if downsample_note:
         said += f" {downsample_note[0].upper()}{downsample_note[1:]}."
     if raw is not None:
@@ -836,6 +1094,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "skipped.")
     if waits_for:
         said += f" The camera waits for {waits_for} before each frame."
+    if plugin_notes:
+        said += " " + " ".join(note if note.endswith(".") else note + "."
+                               for note in plugin_notes)
     _capture_button_state()
     # A settings window greys out what a capture refuses (the area, a
     # preset, a setting the stream is in the way of) from this.
@@ -867,9 +1128,16 @@ def stop() -> Dict[str, Any]:
     _LIVE.idle = "stopped"
     device = session.device
     trig, armed = _LIVE.trigger_run, _LIVE.armed
+    plug = _LIVE.trigger_slot
     _LIVE.trigger_run = None
     _LIVE.armed = None
-    if trig is not None:
+    _LIVE.trigger_slot = None
+    if plug is not None:
+        # A "Typhon (plugins)" run: its triggering plugin's step — the
+        # source stopped, the last frames given their moment, an input
+        # line's count ended before the stream (plugin design 3.6).
+        plug.halt(lambda: session.stats().grabbed)
+    elif trig is not None:
         # Fire nothing more, and give a trigger fired a moment ago its
         # frame before the stream ends (a Timer tick at the press of Stop
         # was "no frame" otherwise).
@@ -885,16 +1153,31 @@ def stop() -> Dict[str, Any]:
                 pass
             if isinstance(armed, dict) and armed.get("counter"):
                 _let_frames_land(session, device, trig)
-    if getattr(device, "restartable", True):
+    host = _plugin_host()
+    restartable = getattr(device, "restartable", True)
+    if host is not None and not restartable:
+        # The run is over for its plugins (plugin design 3.6): no new
+        # streamed file in it, and "run_stopped" told — before its
+        # recording ends, so before each one's on_run_finished, which
+        # comes with the run's end record once its last frame is on disk.
+        # An event camera's stream runs on, so they hear of it now.
+        host.run_stopped(camera=_RIG.active.name)
+    if restartable:
         ended = session.stop()
+        if host is not None:
+            # As above, once a frame camera's stream has stopped: a
+            # listener that hangs (bounded, plugin_host._tell) holds Stop
+            # no longer than its limit and adds no frame to the run (P3
+            # review: one that slept 6 s let the run record 6 s more).
+            host.run_stopped(camera=_RIG.active.name)
         session.timeout_ms = FREE_READ_MS
         # The run's books closed before its recording ends, so its end
         # record (written as the last frame lands) has every trigger.
-        _end_triggers(device, trig, armed)
+        _close_books(device, plug, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
     else:
         ended = True
-        _end_triggers(device, trig, armed)
+        _close_books(device, plug, trig, armed)
         session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
         finish = getattr(device, "finish_raw", None)
         if callable(finish):
@@ -904,7 +1187,11 @@ def stop() -> Dict[str, Any]:
                 _LIVE.idle = (f"Stopped, but the raw file did not close "
                               f"cleanly: {exc}")
     _LIVE.disarm_note = ""
-    if armed is not None:
+    if plug is not None:
+        # The plugin's step: every trigger back as before Start (served out
+        # even after a fault of its elsewhere, plugin design 3.10).
+        _LIVE.disarm_note = plug.disarm()
+    elif armed is not None:
         # Every trigger back as it was before Start: the live view runs
         # free again. What could not be put back is said with the result.
         _LIVE.disarm_note = _disarm(device, armed)
@@ -933,6 +1220,15 @@ def stop() -> Dict[str, Any]:
 RUN_NOTE_SECONDS = 10.0
 
 
+def _close_books(device: Any, plug: Any, trig: Any, armed: Any) -> None:
+    """A triggered run's books closed before its recording ends: today's
+    (_end_triggers), or a "Typhon (plugins)" run's triggering plugin's."""
+    if plug is not None:
+        plug.close()
+    else:
+        _end_triggers(device, trig, armed)
+
+
 # ======================================================================
 # Capture now, and the Basic tab's capture boxes
 # ======================================================================
@@ -955,31 +1251,56 @@ def capture_now() -> Dict[str, Any]:
     if session is None:
         return {"summary": "Connect a camera first — Capture now fires the "
                            "trigger of a triggered capture."}
+    host = _plugin_host()
+    if host is not None:
+        # A "Typhon (plugins)" project: Capture now is the triggering
+        # plugin's (its toolbar button and F9, plugin design 3.7) — the run
+        # in progress's slot serves its run out.
+        said = host.capture_now(_RIG.active.name)
+        if said is None:
+            return {"summary": _NEEDS_TRIGGERING}
+        return {"summary": said}
     trig = _LIVE.trigger_run
     if not _LIVE.capturing or trig is None:
-        setup = getattr(session.device, "capture", None)
-        if setup is None:
-            return {"summary": "An event camera is not triggered here — "
-                               "its .raw keeps every event."}
-        if setup.triggered and setup.exact:
-            return {"summary": f"Not capturing — Start first: it arms the "
-                               f"trigger ({setup.short()}); then Capture "
-                               f"now ({CAPTURE_KEY}) takes each picture."}
-        if setup.triggered:
-            # A snapshot run arms nothing: the live view runs, and each
-            # press saves the next frame(s).
-            frames = ("frame" if setup.per_trigger <= 1
-                      else f"{setup.per_trigger} frames")
-            return {"summary": f"Not capturing — Start first ("
-                               f"{setup.short()}); then Capture now "
-                               f"({CAPTURE_KEY}) saves the next {frames}."}
-        # Not "Basic tab": every app with a camera hears F9 — the capture
-        # set-up is in its camera's Capture settings wherever it shows them.
-        return {"summary": "Capture now is for a triggered capture — choose "
-                           "Capture: Triggered: exact or Triggered: "
-                           "snapshot, then Start."}
+        return {"summary": _capture_now_idle(getattr(session.device,
+                                                     "capture", None))}
     said = trig.capture_now()
     return {"summary": f"Capture now: {said}."}
+
+
+#: What a "Typhon (plugins)" project says of a triggered capture, and of
+#: Capture now, when its triggering plugin does not run there.
+_NEEDS_TRIGGERING = ("Triggered capture and Capture now need the Triggering "
+                     "plugin (typhon.trigger), which this project does not "
+                     "run now — switch it on, or choose Capture: Continuous")
+
+
+def _capture_now_idle(setup: Any) -> str:
+    """What Capture now says while no triggered run is in progress, for a
+    camera with the capture set-up `setup` (None: an event camera)."""
+    if setup is None:
+        return ("An event camera is not triggered here — its .raw keeps "
+                "every event.")
+    if setup.triggered and setup.exact:
+        return (f"Not capturing — Start first: it arms the trigger "
+                f"({setup.short()}); then Capture now ({CAPTURE_KEY}) takes "
+                f"each picture.")
+    if setup.triggered and getattr(setup, "record", False):
+        return (f"Not capturing — Start first ({setup.short()}); then "
+                f"Capture now ({CAPTURE_KEY}) starts a recording"
+                + ("." if setup.record_s > 0 else
+                   " and the next press stops it."))
+    if setup.triggered:
+        # A snapshot run arms nothing: the live view runs, and each press
+        # saves the next frame(s).
+        frames = ("frame" if setup.per_trigger <= 1
+                  else f"{setup.per_trigger} frames")
+        return (f"Not capturing — Start first ({setup.short()}); then "
+                f"Capture now ({CAPTURE_KEY}) saves the next {frames}.")
+    # Not "Basic tab": every app with a camera hears F9 — the capture set-up
+    # is in its camera's Capture settings wherever it shows them.
+    return ("Capture now is for a triggered capture — choose Capture: "
+            "Triggered: exact or Triggered: snapshot, then Start.")
 
 
 def _set_capture(key: str, value: Any) -> Dict[str, Any]:
@@ -1273,7 +1594,17 @@ def _mode_word(setup: Any) -> str:
     if setup is not None and getattr(setup, "mode", "") == \
             triggered.MODE_SNAPSHOT:
         return "a snapshot run"
+    if setup is not None and getattr(setup, "mode", "") == \
+            triggered.MODE_RECORD:
+        return "a record run"
     return "a Continuous run"
+
+
+def _a_run(setup: Any) -> str:
+    """"an exact, Software run", "a snapshot, Timer run": the set-up's run,
+    with its article (a "Typhon (plugins)" refusal's words, P3 review)."""
+    words = f"{setup.short()} run"
+    return f"{'an' if words[:1].lower() in 'aeiou' else 'a'} {words}"
 
 
 # ======================================================================
@@ -1294,8 +1625,6 @@ def _capture_setup(device: Any) -> Any:
 def _capture_problem(device: Any, setup: Any) -> str:
     """Why this run's capture set-up cannot run on this camera, in words —
     "" when it can. Asked at Start BEFORE anything stops."""
-    from council_core import reduce
-
     if setup.triggered:
         try:
             problem = device.trigger_problem(setup)
@@ -1306,6 +1635,15 @@ def _capture_problem(device: Any, setup: Any) -> str:
             return f"cannot start a {setup.short()} run: {problem}"
         if setup.source == "Timer" and setup.every_s <= 0:
             return "the timer's interval must be more than 0 s"
+    return _downsample_problem(device, setup)
+
+
+def _downsample_problem(device: Any, setup: Any) -> str:
+    """Why this run's Downsample cannot be made on this camera — the
+    core's part of _capture_problem (a "Typhon (plugins)" run's triggers
+    are its triggering plugin's start check): "" when it can."""
+    from council_core import reduce
+
     if int(getattr(setup, "downsample", 1) or 1) > 1:
         info = _downsample_state(device)
         if info.get("method") in ("", reduce.TYPHON_MEAN):
@@ -1370,6 +1708,37 @@ def _disarm(device: Any, armed: Any) -> str:
         return f"the camera's triggers were NOT put back: {_said(exc)}"
     failed = [line for line in said if "NOT" in line]
     return "; ".join(failed)
+
+
+def _check_binning(host: Any, device: Any) -> str:
+    """_check_downsample through the camera's Binning facet, in a "Typhon
+    (plugins)" project (plugin design 2.1: binning is a camera facet,
+    Downsample the core's): "" for a camera with none — as today's check
+    says of a camera that cannot bin."""
+    try:
+        facet = host.camera_facet(_RIG.active.name, "binning")
+    except Exception:                                     # noqa: BLE001
+        facet = None
+    if facet is None:
+        return ""
+    try:
+        return str(facet.check(False) or "")
+    except Exception as exc:                              # noqa: BLE001
+        return f"Downsample could not be checked: {_said(exc)}"
+
+
+def _undo_start(device: Any, plug: Any, trig: Any, armed: Any) -> None:
+    """A Start that failed after the run's name was reserved: today's
+    undo (_undo_arming), or — a "Typhon (plugins)" run — its triggering
+    plugin's (its slot's undo: the triggers CSV closed, the camera put
+    back), with the grab loop's reads as long as before."""
+    if plug is None:
+        _undo_arming(device, trig, armed)
+        return
+    session = _LIVE.session
+    if session is not None:
+        session.timeout_ms = FREE_READ_MS
+    plug.undo()
 
 
 def _undo_arming(device: Any, trig: Any, armed: Any) -> None:
@@ -1473,8 +1842,25 @@ def _trigger_run(setup: Any, device: Any, out: Path, run: str,
     a file)."""
     from council_core import triggered
 
-    values = {str(r.get("key")): r.get("value")
-              for r in listing.get("listed") or []}
+    exposure_s, period_s = _trigger_timing(_listed_values(listing), rate)
+    trig = triggered.TriggerRun(
+        setup, device, out / f"{run}{triggered.TRIGGERS_SUFFIX}",
+        exposure_s=exposure_s, frame_period_s=period_s)
+    trig.open()
+    return trig
+
+
+def _listed_values(listing: Dict[str, Any]) -> Dict[str, Any]:
+    """Every setting's value as the camera had it at Start, by key."""
+    return {str(r.get("key")): r.get("value")
+            for r in listing.get("listed") or []}
+
+
+def _trigger_timing(values: Mapping[str, Any], rate: float) -> tuple:
+    """(exposure in seconds, frame period in seconds — 0 when not known) of
+    a run's books, from the camera's settings at Start and the live view's
+    measured `rate` (the rate the camera says it runs at when no live view
+    measured one)."""
     try:
         exposure_s = float(values.get("ExposureTime") or 0.0) / 1e6
     except (TypeError, ValueError):
@@ -1488,12 +1874,7 @@ def _trigger_run(setup: Any, device: Any, out: Path, run: str,
                 rate = 0.0
             if rate > 0:
                 break
-    trig = triggered.TriggerRun(
-        setup, device, out / f"{run}{triggered.TRIGGERS_SUFFIX}",
-        exposure_s=exposure_s,
-        frame_period_s=(1.0 / rate) if rate > 0 else 0.0)
-    trig.open()
-    return trig
+    return exposure_s, (1.0 / rate) if rate > 0 else 0.0
 
 
 def _downsample_record(device: Any, area: Any = None) -> Optional[Dict[str,
@@ -1551,6 +1932,14 @@ def _downsample_words(device: Any) -> str:
 def _capture_words(setup: Any, armed: Any, device: Any) -> str:
     """What Start says of the capture set-up: " Armed: exact, Line1 — the
     camera waits for it." "" for a Continuous run at full size."""
+    return _trigger_start_words(setup, armed) + _downsample_start_words(
+        device)
+
+
+def _trigger_start_words(setup: Any, armed: Any) -> str:
+    """What Start says of the TRIGGER set-up (_capture_words' first part;
+    a "Typhon (plugins)" run's triggering plugin says it): "" for a
+    Continuous run."""
     from council_core import triggered
 
     said = ""
@@ -1570,6 +1959,16 @@ def _capture_words(setup: Any, armed: Any, device: Any) -> str:
     elif setup.snapshot:
         said += (f" Snapshot ({setup.source_words()}) — the live view runs "
                  f"and only the frames each trigger asks for are saved.")
+    elif getattr(setup, "record", False):
+        said += (f" Record ({setup.source_words()}) — the live view runs "
+                 f"and every frame is saved while a trigger records.")
+    return said
+
+
+def _downsample_start_words(device: Any) -> str:
+    """What Start says of Downsample (_capture_words' second part: the
+    core's in both Typhons): "" at full size."""
+    said = ""
     info = _downsample_state(device)
     factor = int(info.get("factor") or 1)
     if factor > 1:
@@ -1704,7 +2103,7 @@ def _preview_line(session: Any, stats: Any, frame: Any) -> str:
     else:
         line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}
-    if meta.get("kind") == "event" and not quiet:
+    if frame is not None and _can("events") and not quiet:
         line += f" · {meta.get('events', 0)} events/window"
     setup = getattr(session.device, "capture", None)
     if setup is not None and setup.triggered:
@@ -1772,14 +2171,25 @@ def _watch_capture() -> None:
     except Exception:                                     # noqa: BLE001
         pass
     trig, armed = _LIVE.trigger_run, _LIVE.armed
+    plug = _LIVE.trigger_slot
     _LIVE.trigger_run = None
     _LIVE.armed = None
+    _LIVE.trigger_slot = None
+    host = _plugin_host()
+    if host is not None:
+        # Over for its plugins too (plugin design 3.6), as at Stop.
+        try:
+            host.run_stopped(camera=_RIG.active.name)
+        except Exception:                                 # noqa: BLE001
+            pass
     try:
-        _end_triggers(session.device, trig, armed)
+        _close_books(session.device, plug, trig, armed)
     except Exception:                                     # noqa: BLE001
         pass
     session.record_to(None, drain_timeout=0)
-    if armed is not None:
+    if plug is not None:
+        _LIVE.disarm_note = plug.disarm()
+    elif armed is not None:
         _LIVE.disarm_note = _disarm(session.device, armed)
     if not getattr(session.device, "restartable", True):
         reason += " — Disconnect and Connect again"
@@ -2174,17 +2584,168 @@ def attach(app: Any, view: str = "live_view",
         # New frames in the folder (a capture's last frame on disk): the
         # line says which runs are not classified yet.
         reviewer.on_reload(models_picker.line_soon)
+    _attach_plugin_screen(app, reviewer, folder, say)
     settings_tabs = _tabs_for(app, tabs, tabs_note)
     if _LIVE.tabs is not None and _LIVE.tabs is not settings_tabs:
         _LIVE.tabs.close()             # an earlier window's, now replaced
     _LIVE.tabs = settings_tabs
     app._settings_tabs = settings_tabs
-    if first_run and current_choice() is None and not _dialogs_disabled():
+    if first_run and _needs_setup() and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
         # to sit over.
         QTimer.singleShot(0, lambda: (wizard or _first_run)(app))
     return timer
+
+
+# ======================================================================
+# "Typhon (plugins)": the toolbar strip, the plugins' windows, datasets
+# ======================================================================
+#: The window's plugin strip and Datasets window (stage P4; Andy, 2
+#: November 2026), and the app they belong to.
+_SCREEN: Dict[str, Any] = {"app": None, "strip": None, "datasets": None}
+
+#: The wireframe port of the toolbar strip plugins put their buttons in.
+PLUGIN_TOOLBAR = "plugin_toolbar"
+
+
+def _shown_frame() -> Optional[Path]:
+    """The saved frame the slider shows, as a full path, or None (live, the
+    raw view, or no folder)."""
+    reviewer = _LIVE.reviewer
+    if reviewer is None or reviewer.current is None:
+        return None
+    try:
+        rel = str(reviewer.current.get() or "").strip()
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not rel:
+        return None
+    p = Path(rel)
+    if not p.is_absolute():
+        p = Path(reviewer.root or ".") / p
+    return p if p.is_file() else None
+
+
+def _image_folder() -> Optional[Path]:
+    reviewer = _LIVE.reviewer
+    folder = getattr(reviewer, "folder", None) if reviewer is not None \
+        else None
+    try:
+        text = str(folder.get() or "").strip().strip('"') if folder else ""
+    except Exception:                                     # noqa: BLE001
+        text = ""
+    return Path(text) if text else None
+
+
+def _attach_plugin_screen(app: Any, reviewer: Any, folder: str,
+                          say: Optional[Callable[[str], Any]]) -> None:
+    """A "Typhon (plugins)" window: the plugin host learns the frame on
+    screen and the image folder, hears the folder listed again, and the
+    toolbar strip gets a button per plugin with a pop-out (council_qt.
+    widgets.plugin_panels). Today's Typhon, and any app without the strip,
+    is left as it is."""
+    _SCREEN["app"] = app
+    host = _plugin_host()
+    if host is None:
+        return
+    host.current_frame_fn = _shown_frame
+    host.image_folder_fn = _image_folder
+    if reviewer is not None:
+        def reloaded() -> None:
+            try:
+                host.emit("frames_reloaded", folder=str(_image_folder() or ""))
+            except Exception:                             # noqa: BLE001
+                pass
+        reviewer.on_reload(reloaded)
+    ports = getattr(app, "ports", None)
+    toolbar = getattr(getattr(ports, PLUGIN_TOOLBAR, None), "widget", None)
+    if toolbar is None:
+        return
+    old = _SCREEN.get("strip")
+    if old is not None:
+        old.close()
+    from council_qt.widgets.plugin_panels import PluginStrip
+    try:
+        title = app.window().windowTitle() or "Typhon (plugins)"
+    except Exception:                                     # noqa: BLE001
+        title = "Typhon (plugins)"
+    strip = PluginStrip(app, host, toolbar, say=say, title=title)
+    _SCREEN["strip"] = strip
+    app._plugin_strip = strip
+
+
+def _run_frames(current: Optional[Path]) -> List[Path]:
+    """Every saved frame of the run `current` belongs to, in the slider's
+    order (the folder as the slider lists it)."""
+    reviewer = _LIVE.reviewer
+    if current is None or reviewer is None:
+        return []
+    from council_core import datasets as ds
+    run = ds.describe(current)["run"]
+    if not run:
+        return [current]
+    return [Path(f) for f in list(reviewer.files)
+            if ds.describe(f)["run"] == run]
+
+
+def add_to_dataset() -> Dict[str, Any]:
+    """Add the frame on screen — or a stretch of its run, or the whole run —
+    to a dataset (a dialog asks which). Script-linkable: the "Add to
+    dataset…" button beside PNG / Raw.
+
+    Keys: summary"""
+    from council_qt.widgets import datasets_window as dw
+
+    current = _shown_frame()
+    reviewer = _LIVE.reviewer
+    crop = None
+    roi = getattr(reviewer, "roi", None) if reviewer is not None else None
+    try:
+        crop = roi.get() if roi is not None else None
+    except Exception:                                     # noqa: BLE001
+        crop = None
+    camera = getattr(_RIG.active, "name", "") if _LIVE.device is not None \
+        else ""
+    said = dw.add_to_dataset(_SCREEN.get("app"), current=current,
+                             run_frames=_run_frames(current), camera=camera,
+                             crop=crop)
+    window = _SCREEN.get("datasets")
+    if said and window is not None:
+        try:
+            window.refresh()
+        except RuntimeError:                  # its window was closed away
+            _SCREEN["datasets"] = None
+    return {"summary": said or "Nothing added."}
+
+
+def open_datasets() -> Dict[str, Any]:
+    """Open the Datasets window: every dataset, its pictures, Remove, Send to
+    a plugin, Merge, Rename, Delete. Script-linkable.
+
+    Keys: summary"""
+    from council_qt.widgets.datasets_window import DatasetsWindow
+
+    window = _SCREEN.get("datasets")
+    if window is not None:
+        try:
+            window.isVisible()
+        except RuntimeError:
+            window = None
+    if window is None:
+        host = _plugin_host()
+        say = None
+        app = _SCREEN.get("app")
+        if app is not None:
+            port = getattr(getattr(app, "ports", None), "capture_status", None)
+            say = getattr(port, "set", None)
+        window = DatasetsWindow(host, say=say)
+        _SCREEN["datasets"] = window
+    window.refresh()
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return {"summary": "Datasets opened."}
 
 
 def _reviewer_for(app: Any, canvas: Any, scrubber: str, folder: str,
@@ -2512,13 +3073,38 @@ def _unique_run(out: Path) -> str:
     return capture.reserve_run(out, time.strftime("%Y%m%d_%H%M%S"))
 
 
-def _claim_run(out: Path) -> tuple:
+def _claim_run(out: Path, base: Optional[str] = None) -> tuple:
     """_unique_run, with the reserved CSV still OPEN: (the run's name, the
     handle), for capture.run_recorder — never closed and opened again, so
-    no other program can take the file in between (capture.claim_run)."""
+    no other program can take the file in between (capture.claim_run).
+    `base`: the name to start from (a "Typhon (plugins)" Start's, the one
+    its plugins' start check was told); the time now otherwise."""
     from council_core import capture
 
-    return capture.claim_run(out, time.strftime("%Y%m%d_%H%M%S"))
+    return capture.claim_run(out, base or time.strftime("%Y%m%d_%H%M%S"))
+
+
+def _run_plan(host: Any, base: str, out: Path, device: Any,
+              setup: Any) -> Any:
+    """The run Start is about to make, for its plugins' start check (the
+    plugin host's RunPlan; plugin design 3.6, 3.11): the active camera
+    with its folder, area, Downsample and capture set-up. Read only."""
+    slot = _RIG.active
+    info = _LIVE.info
+    try:
+        area = tuple(device.roi().as_tuple())
+    except Exception:                                     # noqa: BLE001
+        area = (0, 0, 0, 0)
+    factor = int(getattr(setup, "downsample", 1) or 1)
+    method = (str(_downsample_state(device).get("method") or "")
+              if factor > 1 else "")
+    return host.plan_run(base, {slot.name: {
+        "kind": str(getattr(info, "kind", "") or ""), "info": info,
+        "capabilities": slot.capabilities, "folder": out, "area": area,
+        "downsample": factor, "downsample_method": method,
+        "capture": (dict(setup.as_record())
+                    if getattr(device, "capture", None) is not None
+                    else {})}})
 
 
 def _on_network_share(path: Path) -> bool:
@@ -2568,7 +3154,9 @@ def _camera_listing(device: Any) -> Dict[str, Any]:
 
 def _camera_record(run: str, device: Any,
                    listing: Optional[Dict[str, Any]] = None,
-                   setup: Any = None, armed: Any = None
+                   setup: Any = None, armed: Any = None,
+                   plugins: Optional[Dict[str, Any]] = None,
+                   capture: Optional[Dict[str, Any]] = None
                    ) -> "tuple[Optional[Dict[str, Any]], str]":
     """The run's camera record as it is now; (the record, "") or (None, why
     it could not be made).
@@ -2582,7 +3170,11 @@ def _camera_record(run: str, device: Any,
     `listing` is _camera_listing's, read before an exact run armed the
     trigger; the Trigger rows are read AGAIN after arming, so the record
     shows the trigger as the run had it. The capture set-up and Downsample
-    are their own blocks (`capture`, `downsample`)."""
+    are their own blocks (`capture`, `downsample`); `plugins`, for a
+    "Typhon (plugins)" run, what made it (the plugin host's
+    record_plugins), its `plugins` block; `capture`, for such a run, the
+    capture block its triggering plugin made (the same block: today's
+    _capture_record, plugin design 2.4 item 8), else it is made here."""
     from council_core import camera_record
 
     if listing is None:
@@ -2608,8 +3200,10 @@ def _camera_record(run: str, device: Any,
             preset=str(listing.get("preset") or ""),
             preset_changed=listing.get("changed"), app=_app_identity(),
             software=_software(), host=_host_name(),
-            capture=_capture_record(run, setup, armed),
-            downsample=_downsample_record(device, area)), ""
+            capture=(capture if capture is not None
+                     else _capture_record(run, setup, armed)),
+            downsample=_downsample_record(device, area),
+            plugins=plugins), ""
     except Exception as exc:                              # noqa: BLE001
         return None, _not_recorded(run, exc)
 
@@ -2838,28 +3432,50 @@ def setup(parent: Any = None) -> Dict[str, Any]:
 
         window = parent or QApplication.activeWindow()
         title = window.windowTitle() if window is not None else ""
+        host = _plugin_host()
         try:
-            chosen = camera_wizard.run_wizard(window, path, app_name=title)
+            if host is None:
+                chosen = camera_wizard.run_wizard(window, path,
+                                                  app_name=title)
+            else:
+                # A "Typhon (plugins)" project ticks camera families: one
+                # check box per camera plugin with a set-up, each bringing
+                # its guide, checks and scan (plugin design 2.4 item 15).
+                families = host.camera_families()
+                ticked = camera_wizard.run_families_wizard(
+                    window, path, families, app_name=title,
+                    held=_held_names)
         except getattr(camera_wizard, "NoQtApplication", ()) as exc:
             chosen = None
             said = f"Camera setup skipped — {exc}."
         else:
-            said = (f"Set up for {camera_setup.label(chosen)}." if chosen
-                    else "Camera setup cancelled — nothing changed.")
+            if host is None:
+                said = (f"Set up for {camera_setup.label(chosen)}." if chosen
+                        else "Camera setup cancelled — nothing changed.")
+            else:
+                said = (f"Set up for "
+                        f"{camera_setup.families_label(ticked, families)}."
+                        if ticked else
+                        "Camera setup cancelled — nothing changed.")
     listed = list_cameras()
     listed["summary"] = f"{said} {listed['summary']}"
     return listed
 
 
 def _tell_the_scan_what_is_open() -> None:
-    """The wizard's Basler scan must not open the camera this app already has
-    open: a second open fails on real hardware (the emulator allows it)."""
+    """The wizard's Basler scan must not open a camera this app already has
+    open: a second open fails on real hardware (the emulator allows it). It
+    is told about every camera slot (multi-camera design 2.2) — with one
+    camera, the one camera as before — and, for a "Typhon (plugins)"
+    project's scans, the name each goes by in the rig."""
     try:
         from council_qt.widgets import camera_wizard
     except Exception:                                     # noqa: BLE001
         return
     camera_wizard.held_keys = (
-        lambda: [_LIVE.info.key] if _LIVE.info is not None else [])
+        lambda: [slot.info.key for slot in _RIG
+                 if getattr(slot, "info", None) is not None])
+    camera_wizard.held_names = _held_names
 
 
 def _first_run(app: Any) -> None:
@@ -2928,7 +3544,7 @@ def _status_line(stats: Any, frame: Any) -> str:
         head, sep, rest = line.partition(" · ")
         line = f"{head}{note}{sep}{rest}"
     meta = getattr(frame, "meta", None) or {}
-    if meta.get("kind") == "event":
+    if frame is not None and _can("events"):
         # An event camera has no frame rate. What the number above counts is
         # accumulation windows; the event rate is the sensor's own measure.
         line += f" · {meta.get('events', 0)} events/window"
@@ -3654,8 +4270,8 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                name: str, live_ok: bool = False,
-               triggers: Optional[Dict[str, Any]] = None
-               ) -> Dict[str, Any]:
+               triggers: Optional[Dict[str, Any]] = None,
+               plugins: Any = None) -> Dict[str, Any]:
     """Write a set. `live_ok`: allowed while capturing when nothing in it
     needs the stream stopped and it holds no area — a category's settings
     put back as connected are then the same as changing each live, which
@@ -3670,6 +4286,11 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     the worker with it, when the stream is stopped for it — a change among
     them that the stream is in the way of stops it too), and what that
     changed is said one line per trigger — a reset's.
+
+    `plugins`, a "Typhon (plugins)" preset's split by owner (the plugin
+    host's split_preset; `values` is its camera part): once the set is
+    applied, each running plugin is handed its own values, and the keys
+    kept for plugins not running are said.
 
     Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
@@ -3761,6 +4382,14 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                      f"{'it' if len(restarted) == 1 else 'them'}).")
         elif getattr(device, "streaming", False):
             said += " Applied live."
+        host = _plugin_host() if plugins is not None else None
+        if host is not None:
+            words = host.apply_preset_values(_RIG.active.name,
+                                             plugins.plugins)
+            words.append(host.kept_words(plugins.kept))
+            words = [w if w.endswith(".") else w + "." for w in words if w]
+            if words:
+                said += " " + " ".join(words)
         return {"applied": applied.as_dict(), "ok": applied.ok,
                 "area": _area_text(device.roi()),
                 "crop": "" if moved else _current_crop(),
@@ -4003,16 +4632,27 @@ def save_preset(name: Any, include_roi: Any = True,
     camera = _identity()
     with_area = _truthy(include_roi)
     store = _preset_store()
+    host = _plugin_host()
+    plugin_notes: List[str] = []
     try:
         settings, roi = camera_presets.capture(device, with_area)
         settings = _as_before_arming(settings)
+        in_use = settings
+        if host is not None:
+            # A "Typhon (plugins)" project (plugin design 3.9): each
+            # running plugin's own values as "<id>/<key>", and the keys of
+            # a plugin not running kept from the preset this replaces.
+            settings, plugin_notes = _plugin_preset(host, store, camera,
+                                                    _picked(name), settings)
+            in_use = host.split_preset(settings).camera
         preset, replaced, moved = store.save(
             camera, _picked(name), settings, roi, note=str(note or ""),
             repair=True)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
-    # Saved FROM the camera as it is: the camera is that preset now.
-    _preset_now_in_use(preset.name, settings, roi)
+    # Saved FROM the camera as it is: the camera is that preset now — as
+    # far as the camera's own keys go (a plugin's are not the camera's).
+    _preset_now_in_use(preset.name, in_use, roi)
     said = (f"{'Replaced' if replaced else 'Saved'} preset {preset.name!r}: "
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
@@ -4033,7 +4673,24 @@ def save_preset(name: Any, include_roi: Any = True,
     elif moved is not None:
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
+    if plugin_notes:
+        said += " " + " ".join(plugin_notes)
     return _presets_changed(preset.name, said)
+
+
+def _plugin_preset(host: Any, store: Any, camera: Any, name: str,
+                   settings: Dict[str, Any]) -> tuple:
+    """The preset a "Typhon (plugins)" project saves as `name` (the plugin
+    host's preset_settings): (settings, words to say). The preset it
+    replaces, if any, is read first: the keys of a plugin not running are
+    kept from it exactly as they were."""
+    from council_core import camera_presets
+
+    try:
+        old = dict(store.get(camera, name).settings)
+    except camera_presets.PresetError:
+        old = {}
+    return host.preset_settings(_RIG.active.name, settings, old)
 
 
 def _as_before_arming(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -4112,9 +4769,18 @@ def apply_preset(name: Any) -> Dict[str, Any]:
         preset = _preset_store().get(_identity(), chosen)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
-    return _apply_set(_with_capture_defaults(preset.settings), preset.roi,
+    values = _with_capture_defaults(preset.settings)
+    host = _plugin_host()
+    split = None
+    if host is not None:
+        # A "Typhon (plugins)" project (plugin design 3.9): the camera is
+        # given its own keys; a running plugin its own, once the set is
+        # applied; a plugin's that is not running are kept, and said.
+        split = host.split_preset(values, given=preset.settings)
+        values = split.camera
+    return _apply_set(values, preset.roi,
                       f"Applying preset {preset.name!r}", "preset",
-                      preset.name)
+                      preset.name, plugins=split)
 
 
 def _with_capture_defaults(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -4416,7 +5082,7 @@ def set_frame_rate(value: Any) -> Dict[str, Any]:
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"frame rate: {exc}") from exc
     said = f"{got:.1f} fps" if got else "the camera's own rate"
-    if getattr(getattr(device, "info", None), "kind", "") == "event" and got:
+    if _can("events") and got:
         said += f" ({1000.0 / got:.1f} ms windows)"
     return _box_written("frame_rate", {"frame_rate": f"{got:.1f}",
                                        "summary": f"Frame rate: {said}."})
@@ -4487,7 +5153,7 @@ def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"frame rate: {exc}") from exc
 
-    event = getattr(getattr(device, "info", None), "kind", "") == "event"
+    event = _can("events")
     if fps <= 0:
         # No number: a camera whose cap was just lifted may still report the
         # old setpoint as its rate (the emulator does), and "own rate (25)"
@@ -4587,3 +5253,28 @@ def _require_session() -> Any:
     if session is None:
         raise RuntimeError("connect a camera first")
     return session
+
+
+def _can(capability: str) -> bool:
+    """Whether the active camera can do `capability` ("events", "frames",
+    "restartable", ...; council_core.camera_capabilities) — the question
+    asked where this module once asked "is it an event camera?" (plugin
+    design 2.4 item 4). Its camera slot answers: what the camera's plugin
+    confirmed when it opened it, else what the camera says of itself."""
+    return capability in _RIG.active.capabilities
+
+
+def _plugin_trigger_sources() -> Optional[List[str]]:
+    """The trigger-source plugins' sources of a "Typhon (plugins)" project
+    (its host's trigger_sources) — or None for today's Typhon, whose
+    capture rows stay as they were (council_core.triggered.plugin_sources)."""
+    host = _plugin_host()
+    return list(host.trigger_sources()) if host is not None else None
+
+
+def _offer_plugin_sources() -> None:
+    from council_core import triggered as _tg
+    _tg.plugin_sources = _plugin_trigger_sources
+
+
+_offer_plugin_sources()

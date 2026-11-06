@@ -28,19 +28,31 @@ frames into a closing window is the standard way to get a crash on exit.
 NOTHING HERE IMPORTS A TOOLKIT
 The session hands frames to a callback. Who marshals them onto a UI thread is
 the view's problem, not this module's.
+
+NOR ANY FEATURE (docs/typhon_plugins_design.md 2.4 item 6; typhon-plugins
+branch, stage P3)
+The recording knows the camera layer and nothing above it: what a frame
+becomes before it is saved is the core's ONE FRAME STAGE, Downsample
+(cameras.frame_stage, or a recorder's own `frame_stage`); which frames a
+triggered run keeps is the RECORD GATE handed in with the recorder
+(record_to's `gate`); the end record's capture block is the recorder's
+`capture_info`; and the run files of the features are run markers by name
+(RUN_MARKERS, run_markers). So council_core.reduce and council_core.
+triggered are not imported here.
 """
 from __future__ import annotations
 
 import collections
 import csv
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from . import cameras, reduce, triggered
+from . import cameras
 
 #: How long a stop() waits for the grab loop before reporting failure.
 STOP_TIMEOUT = 3.0
@@ -370,8 +382,10 @@ INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
 #: reserves the run's name (reserve_run).
 INDEX_SUFFIX = "_frames.csv"
 
-#: A triggered run's "<run>_capture_triggers.csv" (council_core.triggered).
-TRIGGERS_SUFFIX = triggered.TRIGGERS_SUFFIX
+#: A triggered run's "<run>_capture_triggers.csv" (council_core.triggered's
+#: TRIGGERS_SUFFIX, written by its books): a run marker by name, so the
+#: recording imports no feature (a test holds the two names together).
+TRIGGERS_SUFFIX = "_capture_triggers.csv"
 
 #: A run's end record, "<run>_run_end.json": what only the end of a
 #: recording knows (Recorder.finish) — above all the failed grabs, which
@@ -380,22 +394,95 @@ TRIGGERS_SUFFIX = triggered.TRIGGERS_SUFFIX
 RUN_END_SUFFIX = "_run_end.json"
 RUN_END_FORMAT = "typhon-run-end"
 RUN_END_VERSION = 1
+#: The only keys a plugin host adds to an end record (Recorder.end_blocks):
+#: each plugin's block, by id, and which plugins faulted during the run.
+#: Never one of the record's own keys (docs/typhon_plugins_design.md 3.9).
+END_BLOCK_KEYS = ("plugins", "plugin_faults")
 
 #: The endings that put a run's name on a file in a capture folder. A run
 #: with any file of these there is taken, and so is a FOLDER of the run's
 #: name (a run of several cameras is a folder; the multi-camera design 2.6).
+#: Today's Typhon's own list, whatever plugins are on: the raw file and the
+#: triggers CSV among them, which the plugin Typhon's built-in Prophesee and
+#: triggering plugins also declare (register_run_files).
 RUN_MARKERS = ("_frame_", "_events.raw", INDEX_SUFFIX, "_camera.json",
                RUN_END_SUFFIX, TRIGGERS_SUFFIX)
 
 #: How many names reserve_run tries (base, base_2, ...) before giving up.
 RESERVE_TRIES = 1000
 
+#: THE RUN-FILE SUFFIX REGISTRY (docs/typhon_plugins_design.md 2.4 item 7,
+#: 3.9): run files a plugin writes beside a run's own ("_therm_tracks.csv"),
+#: by who registered them. Each marks a run's name as taken, as RUN_MARKERS
+#: do, so a new run never takes the name of a run whose only file left is a
+#: plugin's. Additive: it only ever makes MORE names taken. Creating the
+#: run's frames CSV exclusively stays the real reservation (claim_run).
+_REGISTERED: Dict[Any, Tuple[str, ...]] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def register_run_files(owner: Any, suffixes: Any) -> None:
+    """Mark run files ending in each of `suffixes` as a run's (the plugin
+    host registers every plugin's manifest `files`); `owner` is whatever
+    registers them, and registering again replaces its suffixes. A suffix
+    is a run-file ending: it starts with "_" and names no folder."""
+    kept: List[str] = []
+    for suffix in suffixes:
+        text = str(suffix)
+        if (not text.startswith("_") or len(text) < 2 or "/" in text
+                or "\\" in text or ":" in text):
+            raise ValueError(f"{text!r} is not a run-file ending like "
+                             f"\"_therm_tracks.csv\"")
+        if text not in kept:
+            kept.append(text)
+    with _REGISTRY_LOCK:
+        _REGISTERED[owner] = tuple(kept)
+
+
+def unregister_run_files(owner: Any) -> None:
+    """Forget what `owner` registered (nothing when it registered none)."""
+    with _REGISTRY_LOCK:
+        _REGISTERED.pop(owner, None)
+
+
+def run_markers() -> Tuple[str, ...]:
+    """Every ending that marks a run's name as taken: RUN_MARKERS, then each
+    registered run file, each once."""
+    with _REGISTRY_LOCK:
+        registered = [s for suffixes in _REGISTERED.values()
+                      for s in suffixes]
+    return tuple(dict.fromkeys(RUN_MARKERS + tuple(registered)))
+
+
+def _reruns() -> List[Any]:
+    """For each registered run file "<stem><ext>", the pattern of its
+    numbered forms "<run><stem>_2<ext>", "_3" ... — what a plugin's whole
+    file written again beside the same run is named (plugin_runs.numbered;
+    typhon-plugins P3 review: a run whose only file left was such a one
+    was not counted as taken). Today's RUN_MARKERS have none: nothing
+    writes them twice."""
+    with _REGISTRY_LOCK:
+        registered = [s for suffixes in _REGISTERED.values()
+                      for s in suffixes]
+    out = []
+    for suffix in dict.fromkeys(registered):
+        stem, dot, ext = suffix.rpartition(".")
+        if not dot or not stem:
+            continue
+        out.append(re.compile(rf"^(?P<run>.+?){re.escape(stem)}_[0-9]+"
+                              rf"{re.escape(dot + ext)}\Z"))
+    return out
+
 
 def taken_runs(folder: Any) -> set:
     """The run names already used in `folder`: every name a file of a run
-    starts with (RUN_MARKERS), and every sub-folder's name. Empty for a
-    folder that does not exist or cannot be listed."""
+    starts with (run_markers: today's RUN_MARKERS and every registered run
+    file, and a registered run file's numbered rerun forms), and every
+    sub-folder's name. Empty for a folder that does not exist or cannot be
+    listed."""
     names: set = set()
+    markers = run_markers()
+    reruns = _reruns()
     try:
         with os.scandir(str(folder)) as found:
             for entry in found:
@@ -404,10 +491,14 @@ def taken_runs(folder: Any) -> set:
                         names.add(entry.name)
                 except OSError:
                     pass
-                for marker in RUN_MARKERS:
+                for marker in markers:
                     head, hit, _ = entry.name.partition(marker)
                     if hit:
                         names.add(head)
+                for pattern in reruns:
+                    match = pattern.match(entry.name)
+                    if match:
+                        names.add(match.group("run"))
     except OSError:
         pass
     return names
@@ -529,6 +620,19 @@ class Recorder:
         self.capture_info: Optional[Callable[[], Dict[str, Any]]] = None
         #: The run's Downsample block for the end record, or None for Off.
         self.downsample_info: Optional[Dict[str, Any]] = None
+        #: THE FRAME STAGE (docs/typhon_plugins_design.md 2.1, 3.8, 3.10):
+        #: the one step that changes a picture before it is saved,
+        #: `stage(image, meta) -> image`, on the writer threads — None for
+        #: the core's own, Downsample (cameras.frame_stage: Typhon averages
+        #: the blocks a frame's meta asks for). A stage that raises is a
+        #: failed write: that frame and those queued behind it are not
+        #: saved, and the recording ends with its reason.
+        self.frame_stage: Optional[Callable[[Any, Any], Any]] = None
+        #: The plugins' part of the end record (typhon-plugins branch): a
+        #: function of the record so far, asked once when the recording
+        #: ends, giving its END_BLOCK_KEYS — or None (today's Typhon).
+        self.end_blocks: Optional[Callable[[Dict[str, Any]],
+                                           Mapping[str, Any]]] = None
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -567,10 +671,15 @@ class Recorder:
         once: it touches nothing but its own file.
 
         DOWNSAMPLED HERE, on the writer threads, when the camera that took
-        it says Typhon reduces it (Frame.meta "reduce";
-        council_core.reduce.prepared) — never on the grab thread, whose
-        budget at 150 fps is 6.7 ms against 22-34 ms for a full frame."""
-        self._writer(reduce.prepared(frame.image, frame.meta), path)
+        it says Typhon reduces it (Frame.meta "reduce"; the core's frame
+        stage, cameras.frame_stage) — never on the grab thread, whose
+        budget at 150 fps is 6.7 ms against 22-34 ms for a full frame.
+        A frame stage set on the recorder (`frame_stage`) takes Downsample's
+        place there."""
+        stage = self.frame_stage
+        if stage is None:
+            stage = cameras.frame_stage
+        self._writer(stage(frame.image, frame.meta), path)
 
     def log(self, frame: cameras.Frame, path: Path) -> None:
         """Count a saved frame and give it its index row. NOT thread-safe:
@@ -666,10 +775,19 @@ class Recorder:
                               (council_core.reduce), the picture's size, and
                               the right and bottom pixels a block could not
                               hold.
+            plugins           A "TYPHON (PLUGINS)" RUN ONLY (added in version
+                              1): each plugin's own block from its
+                              on_run_finished, by plugin id, cleaned and
+                              size-checked (typhon-plugins branch,
+                              council_core.plugin_host; design 3.9)
+            plugin_faults     likewise, only when a plugin faulted during the
+                              run: plugin id -> why (design 3.10)
 
         NEVER OVER ANYTHING: written whole to a temporary name and renamed
         into a name that must not exist (camera_record.write_once). A record
         that cannot be written is kept in `end_note`; the frames come first.
+        A plugins' block that cannot be written leaves the record written
+        without it, saying why in plugin_faults.
         """
         if self.end_path is None or self._finished:
             return None
@@ -700,15 +818,55 @@ class Recorder:
             doc["stream_ended"] = str(totals["stream_ended"])
         info = self.capture_info
         if callable(info):
+            # BaseException (typhon-plugins P3 review): a run's books may be
+            # a plugin's (its guarded record gate), and this is the writer
+            # thread that writes the end record — nothing raised here may
+            # cost the run its end record.
             try:
                 doc["capture"] = dict(info())
-            except Exception as exc:                        # noqa: BLE001
+            except BaseException as exc:                    # noqa: BLE001
                 doc["capture"] = {"error": f"{type(exc).__name__}: {exc}"}
             doc["capture"]["frames_between_triggers"] = int(
                 totals.get("passed", 0) or 0)
         if self.downsample_info:
             doc["downsample"] = dict(self.downsample_info)
+        extra = self.end_blocks
+        if callable(extra):
+            # The plugin host's part (its plugins' on_run_finished, bounded
+            # and guarded there), asked with the record so far — its
+            # counts — and allowed to add END_BLOCK_KEYS only. BaseException
+            # likewise: the end record is written whatever it raises.
+            try:
+                more = dict(extra(dict(doc)) or {})
+            except BaseException as exc:                    # noqa: BLE001
+                more = {"plugin_faults": {
+                    "": f"the plugins' end of the run failed — "
+                        f"{type(exc).__name__}: {exc}"}}
+            for key in END_BLOCK_KEYS:
+                if more.get(key):
+                    doc[key] = more[key]
         from . import camera_record
+        try:
+            return camera_record.write_once(self.end_path, doc)
+        except (ValueError, TypeError) as exc:
+            # Not JSON: only the plugins' part and the books' capture block
+            # can be (the record's own fields are plain), so the record is
+            # written without the plugins' blocks and with the capture block
+            # made plain (a NaN as null).
+            if "plugins" not in doc and "capture" not in doc:
+                self.end_note = f"{type(exc).__name__}: {exc}"
+                return None
+            if "plugins" in doc:
+                doc.pop("plugins")
+                faults = dict(doc.get("plugin_faults") or {})
+                faults[""] = (f"the plugins' blocks could not be written — "
+                              f"{type(exc).__name__}: {exc}")
+                doc["plugin_faults"] = faults
+            if "capture" in doc:
+                doc["capture"] = camera_record._plain_tree(doc["capture"])
+        except Exception as exc:                            # noqa: BLE001
+            self.end_note = f"{type(exc).__name__}: {exc}"
+            return None
         try:
             return camera_record.write_once(self.end_path, doc)
         except Exception as exc:                            # noqa: BLE001
@@ -859,6 +1017,10 @@ class FrameWriter:
         self.offered = 0
         self.first_index: Optional[int] = None
         self.last_index: Optional[int] = None
+        #: (frame, reason) from end_recording: that frame is the last one
+        #: this recording takes, and the recording ends with it; None
+        #: otherwise.
+        self._end_after: Optional[Tuple[Any, str]] = None
         #: Every file written, in GRAB order — append-only, so a viewer can
         #: pick up new frames without rescanning a folder of thousands.
         self.paths: List[Path] = []
@@ -909,6 +1071,12 @@ class FrameWriter:
         with self._cond:
             if self._closing:
                 return False
+            last = self._end_after is not None and \
+                frame is self._end_after[0]
+            if self._end_after is not None and not last:
+                # end_recording named a last frame that never came: the
+                # recording ends before this one.
+                self._end_now()
             self.offered += 1
             self._saw_index(frame.index)
             if self.failed:
@@ -920,10 +1088,16 @@ class FrameWriter:
             # save anything at all.
             if self._queue and self._queued_bytes + size > self.budget:
                 self.skipped += 1
+                if last:
+                    self._end_now()
                 return False
             self._queue.append((self._submitted, frame))
             self._submitted += 1
             self._queued_bytes += size
+            if last:
+                # Queued first, so a writer still takes it: the recording
+                # ends WITH this frame (end_recording).
+                self._end_now()
             self._cond.notify()
         return True
 
@@ -946,6 +1120,43 @@ class FrameWriter:
         with self._cond:
             if not self.stream_ended:
                 self.stream_ended = str(why or "") or "the stream ended"
+
+    def end_recording(self, reason: str, frame: Any = None) -> bool:
+        """END THIS RECORDING, for `reason`, as the first failed write
+        does: nothing offered after it is taken, the session stops the
+        recording at its next frame, and `reason` is the end record's
+        recording_failed — "the write that stopped it", here a plugin's
+        fault on the recording path (docs/typhon_plugins_design.md 3.10:
+        carrying on would leave half a run tagged and half not).
+
+        `frame`, the frame being handled when it happened (a record gate
+        that raised on it), is the LAST frame taken: its own submit a moment
+        later still queues it, and the recording ends with it — so it is
+        saved, marked by the tags the gate's guard gave it, as a gate that
+        raises has always been (design 3.6). Without a frame, it ends now.
+        Unlike a failed write, frames already queued still land: they were
+        whole before the fault.
+
+        Returns False, changing nothing, when the recording has already
+        failed, been ended, or is closing."""
+        with self._cond:
+            if self.failed or self._closing or self._end_after is not None:
+                return False
+            reason = str(reason or "") or "the recording was ended"
+            if frame is not None:
+                self._end_after = (frame, reason)
+            else:
+                self.failed = reason
+                self._cond.notify_all()
+        return True
+
+    def _end_now(self) -> None:
+        """The end end_recording set for after a frame, now. Lock held."""
+        if self._end_after is not None:
+            if not self.failed:
+                self.failed = self._end_after[1]
+            self._end_after = None
+            self._cond.notify_all()
 
     def _saw_index(self, index: Any) -> None:
         """Called with the lock held."""
@@ -1085,19 +1296,25 @@ class FrameWriter:
 
     def _close_recorder(self) -> None:
         """The last writer out: every frame is published (or the first
-        failed write ended the recording). The end record, then the index."""
+        failed write ended the recording). The end record, then the index —
+        the index closed whatever the end record raised, BaseException
+        included: a plugin's code may run there (typhon-plugins P3 review:
+        a SystemExit in a plugin's block left the frames CSV open), and
+        this is a writer thread, never the main one (no Ctrl+C lands
+        here)."""
         finish = getattr(self.recorder, "finish", None)
-        if callable(finish):
-            try:
+        try:
+            if callable(finish):
                 finish(self.totals())
-            except Exception:                               # noqa: BLE001
-                pass
-        closer = getattr(self.recorder, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:                               # noqa: BLE001
-                pass
+        except BaseException:                               # noqa: BLE001
+            pass
+        finally:
+            closer = getattr(self.recorder, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except BaseException:                       # noqa: BLE001
+                    pass
 
     def wait_empty(self, timeout: Optional[float] = None) -> bool:
         """Block until everything queued is on disk. False on timeout."""
@@ -1119,6 +1336,7 @@ class FrameWriter:
         caller should say so rather than claim the run is saved.
         """
         with self._cond:
+            self._end_now()     # an end_recording whose frame never came
             self._closing = True
             self._cond.notify_all()
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -1305,6 +1523,12 @@ class CaptureSession:
             old = self.writer
             broken, self._broken = self._broken, None
             self.gate = gate if writer is not None else None
+            bind = getattr(self.gate, "bind_writer", None)
+            if writer is not None and callable(bind):
+                # A plugin's guarded gate (typhon-plugins branch,
+                # council_core.plugin_host) ends ITS run's writer on a
+                # fault, never a later run's: it is told which, first.
+                bind(writer)
             confirm = getattr(self.gate, "confirm_saves", None)
             told = getattr(self.gate, "saved", None)
             if writer is not None and callable(confirm) and callable(told):

@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 EXAMPLES_DIR = Path(__file__).resolve().parent / "examples" / "gui"
 
@@ -134,6 +134,19 @@ NOTES: Dict[str, str] = {
         "(`--target qt`); an older Typhon catches up with the Designer's "
         "Update from example."
     ),
+    "typhon_plugins": (
+        "Typhon (plugins): the Typhon of the typhon-plugins branch, where "
+        "camera families, triggering, classification, the timing scan and "
+        "cropped export become plugins (docs/typhon_plugins_design.md). "
+        "Built from that branch's own checkout and vault, beside today's "
+        "Typhon (docs/typhon_plugins_branch.md). For now typhon's wireframe "
+        "under this name, so it looks and behaves exactly like today's "
+        "Typhon. Its projects keep their classifiers in a store of their "
+        "own in the vault they were built in (classifier_store.json beside "
+        "the app), and the list of plugins they run (typhon_plugins.json), "
+        "copied from the app-wide base set when the project is made. "
+        "Generate it for Qt (`--target qt`)."
+    ),
 }
 
 # The toolkit each example is MEANT to be generated into, where that is known.
@@ -148,12 +161,46 @@ INTENDED_TOOLKIT: Dict[str, str] = {
     "barbie_capture_v4": "qt",
     "barbie_capture_v5": "qt",
     "typhon": "qt",
+    "typhon_plugins": "qt",
 }
 
 
 def intended_toolkit(name: str) -> str:
     """"qt" / "tk" for an example meant for one toolkit, else ""."""
     return INTENDED_TOOLKIT.get(name, "")
+
+
+# Examples whose projects keep their classifiers in a store of their OWN:
+# building one writes classifier_store.json beside the app, naming
+# <vault>/classifiers of the vault it was built in, so the app finds the same
+# store whether the Council started it (COUNCIL_VAULT_ROOT inherited) or it
+# was double-clicked (no variable: it would otherwise fall back to
+# ~/.council/vault, the user's real library). "Typhon (plugins)" runs beside
+# today's Typhon from a side vault, and its library starts empty there
+# (docs/typhon_plugins_design.md 7.1, question 10; how to copy a library in:
+# docs/typhon_plugins_branch.md). council_core.designer_examples.
+# build_project writes the file.
+OWN_CLASSIFIER_STORE: Tuple[str, ...] = ("typhon_plugins",)
+
+
+def own_classifier_store(name: str) -> bool:
+    """Whether a project built from example `name` pins a store of its own."""
+    return name in OWN_CLASSIFIER_STORE
+
+
+# Examples whose projects keep a Typhon PLUGIN LIST: building one writes
+# typhon_plugins.json beside the app — the app-wide base set COPIED as it is
+# when the project is made (question 1: a plugin added to the base set later
+# reaches only projects made after it), the plugin home it was made with,
+# and room for the project's own additions, switch-offs and setting
+# overrides (docs/typhon_plugins_design.md 4.2; council_core.plugin_lists).
+# council_core.designer_examples.build_project writes the file.
+PLUGIN_LIST: Tuple[str, ...] = ("typhon_plugins",)
+
+
+def keeps_plugin_list(name: str) -> bool:
+    """Whether a project built from example `name` keeps a plugin list."""
+    return name in PLUGIN_LIST
 
 
 # The examples sent to a model when none is named. The newest version teaches

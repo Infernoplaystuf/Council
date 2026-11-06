@@ -67,7 +67,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: What an event camera's accumulated image uses for "no event here".
 EVENT_MID = 128
@@ -265,6 +265,22 @@ def downsample_meta(setup: Any, method: str) -> Dict[str, Any]:
         return {"downsample": factor, "downsample_method": method}
     return {"downsample": factor, "downsample_method": red.TYPHON_MEAN,
             "reduce": factor}
+
+
+def frame_stage(image: Any, meta: Optional[Dict[str, Any]],
+                pool: Any = None) -> Any:
+    """THE CORE'S ONE FRAME STAGE (docs/typhon_plugins_design.md 2.1, 3.8):
+    a frame's picture as it is saved — Downsample by Typhon, averaging the
+    blocks its meta asks for ("reduce", downsample_meta;
+    council_core.reduce.prepared), else the picture as it came.
+
+    What capture.Recorder saves through when it has no stage of its own:
+    the recording asks the camera layer, whose frames carry the request,
+    and knows no feature itself. On the writer threads only, never the
+    grab thread."""
+    from . import reduce as red
+
+    return red.prepared(image, meta, pool=pool)
 
 
 # ======================================================================
@@ -1026,6 +1042,28 @@ class BaslerDevice(Device):
 
     def count_to_now(self, armed: Any) -> None:
         self.settings_provider().count_to_now(armed)
+
+    # -- its I/O lines, watched (council_core.basler_lines) ----------------
+    def input_lines(self) -> Tuple[str, ...]:
+        from . import basler_lines
+        return basler_lines.input_lines(self)
+
+    def trigger_inputs(self) -> Tuple[str, ...]:
+        """The input lines, then CxpTrigger0 … (through a CoaXPress frame
+        grabber) where a counter can count them: what can be watched."""
+        from . import basler_lines
+        return basler_lines.trigger_inputs(self)
+
+    def line_states(self, lines: Sequence[str] = ()) -> Dict[str, Any]:
+        from . import basler_lines
+        return basler_lines.line_states(self, lines)
+
+    def watch_lines(self, lines: Sequence[str],
+                    fire: Optional[Callable[[str], Any]] = None,
+                    edge: str = "RisingEdge") -> Any:
+        """A started LineWatcher on `lines`: fire(line) per edge."""
+        from . import basler_lines
+        return basler_lines.LineWatcher(self, lines, fire, edge).start()
 
     def trigger_ready(self, timeout_s: float = 0.0) -> Optional[bool]:
         """Is the camera waiting for a frame trigger (FrameTriggerWait)?

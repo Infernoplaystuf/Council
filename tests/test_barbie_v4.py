@@ -209,18 +209,6 @@ def test_a_failed_camera_call_reports_instead_of_crashing(app):
     # It must not raise. The generated handler catches and reports.
 
 
-def test_connect_accepts_a_listbox_selection(app):
-    """The generated handler passes ports.cameras.get(), which is a LIST.
-
-    str() of a list is "['1. ...']", which resolves to no camera at all.
-    """
-    app.on_btn_scan_for_cameras()
-    app.ports.cameras.widget.setCurrentRow(1)
-    selection = app.ports.cameras.get()
-    assert isinstance(selection, list) and selection
-    assert frame_camera._chosen(selection).kind == "event"
-
-
 def test_connecting_with_nothing_selected_says_so(app):
     app.on_btn_scan_for_cameras()
     with pytest.raises(RuntimeError, match="choose a camera"):

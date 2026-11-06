@@ -200,3 +200,37 @@ They run against a scratch vault of synthetic files, never your own vault.
 Run the same command with the same `--out` to carry on after a stop. No
 network is needed: the "before" builds are git worktrees of commits already in
 this clone. Each file's docstring lists its steps and options.
+
+---
+
+## A Basler's trigger cable: `basler_line_test.py`
+
+```bat
+conda activate pylon
+cd C:\path\to\Council
+python tools\basler_line_test.py                      & rem the cameras, their lines, and which line your pulses come on
+python tools\basler_line_test.py --runs               & rem and short exact, snapshot and record runs from that line
+python tools\basler_line_test.py --serial 40012345 --line Line1 --runs
+```
+
+Send a few pulses down the cable while it says "send a few pulses now". It
+writes `report.txt` and the runs' files into one new folder
+(`basler_line_test_<time>` here, or `--out`), with a throw-away project and
+vault: your own are not touched. `--fake` checks the script without a
+camera.
+
+---
+
+## Export an app to another machine: `export_app.py`
+
+```bat
+python tools\export_app.py example_typhon D:\exports
+python tools\export_app.py example_typhon D:\exports --name Typhon --with-classifiers
+```
+
+Copies the app built in the GUI Designer, plus only the Council files it
+uses, into a new folder (`D:\exports\Typhon`) with `run.bat`,
+`requirements.txt` and a `data\` folder of its own, then checks that it
+starts with no Council present. Copy that folder to the other machine,
+`pip install -r requirements.txt`, and run `run.bat`. The GUI Designer's
+"Export app…" button does the same.

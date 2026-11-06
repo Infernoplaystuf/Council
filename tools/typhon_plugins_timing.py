@@ -1,0 +1,597 @@
+"""
+tools/typhon_plugins_timing.py — frame timing inside the real Qt Typhon with
+a deliberately slow plugin, at Windows' default timer and at a 1 ms timer
+(docs/typhon_plugins_design.md 10.2; stage P1 row 3).
+
+WHY
+A plugin on its own thread still shares Python's lock (the GIL) with the
+camera's grab thread. The design's research measured that in a benchmark
+process: a plugin holding the lock 20 ms per call made 313-340 of about 575
+frames of a 150 fps camera late, mostly because of Windows' 15.6 ms timer
+tick — and 0 with the process timer at 1 ms (timeBeginPeriod(1)) and
+Python's switch interval at 1 ms. Inside a running Qt event loop the same
+plugin made 113-125 late, so the design asked for the numbers again INSIDE
+THE REAL TYPHON before choosing whether the core sets the finer timer while
+it records (stage P3 row 5). This takes them.
+
+WHAT ONE RUN IS
+A child process builds nothing: it imports the "Typhon (plugins)" app the
+parent built (examples/gui/typhon_plugins.gspec, generated for Qt) and makes
+its window offscreen — the same window, live-view timer, slider and capture
+code as the real app; never shown. It connects the simulated frame camera,
+paced on a FIXED schedule (frame i is due at t0 + i/fps, as a real camera's
+sensor clock is; a grab thread that falls behind gets the waiting frames at
+once, as from a camera's buffer), starts a capture into a temporary folder
+through the app's own Start button, runs Qt's event loop for `seconds`, and
+stops through the Stop button. A plugin from the rig's plugin host
+(frame_camera._RIG.plugins) gets every live frame through a LiveFeed —
+on_frame on its own thread — and busies Python for `slow_ms` per frame
+(pure Python, holding the lock), optionally capped to 25 % of the time.
+
+  late      a frame reached the end of the grab thread's step (handed to
+            the writers and the live view) more than one frame period
+            after it was due
+  read_late the same, measured when read() returned it
+
+"1ms" runs ask Windows for a 1 ms timer (winmm timeBeginPeriod(1), and
+SetProcessInformation so Windows 11 honours it even with no visible window)
+and set Python's switch interval to 1 ms (default 5 ms); "switch" and
+"period" each of the two alone. Each run is its own process: the timer and
+the switch interval are per process. `event_wait_1ms` records how long a
+1 ms Event.wait really took (median of 50) once the window is up, which
+shows the timer in force; `event_wait_1ms_bare` the same at the child's
+start, before Qt (a running Qt timer of 20 ms or less gives the process
+Windows' 1 ms timer by itself: measured, 15.5-15.8 ms bare, 1.1-1.4 ms
+with a 15 ms QTimer running, 15.7 ms with a 40 ms one).
+
+STAGE P3 ROW 5. The plugin Typhon now holds Python's switch interval at
+1 ms itself while a run records (council_core.plugin_host.
+RECORDING_SWITCH_S). So that every row above still means what it says,
+the bench switches that off for them ("default" is today's settings), and
+"typhon" is the plugin Typhon as it is: the bench sets nothing, and its own
+hold is in force while it records. `switch_interval_ms_recording` is the
+interval read during the capture.
+
+`--window minimized` shows the window, minimized, instead of offscreen:
+Windows 11 may not honour a minimized window's process's timer requests
+(design 10.2), which an offscreen window cannot tell. It puts a window on
+the screen; for the bench PC, run by hand.
+
+THE PC'S LOAD IS PART OF EVERY RESULT. The P1 review re-ran this on the
+same laptop and found a 5 ms plugin at today's settings making 0 of 600
+frames late where the first runs had 512-544: other work on the PC moves
+these numbers a great deal. So each run records how busy the whole PC was
+during its capture (`cpu_busy_pct`, from GetSystemTimes), the logical CPU
+count, how many processes ran, and the busiest other programs then
+(`busiest`, through psutil where it is installed). Compare runs only with
+their load beside them.
+
+    python tools/typhon_plugins_timing.py                       # the matrix
+    python tools/typhon_plugins_timing.py --repeats 1 --seconds 2
+    python tools/typhon_plugins_timing.py --out results.json
+
+Everything in temporary folders (vault, app folder, plugin home, the capture
+folder), removed afterwards. Offscreen; no window is shown; nothing leaves
+the PC.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+TREE = Path(__file__).resolve().parents[1]
+
+#: The plugins measured: (name, busy ms per frame, duty cap or None).
+PLUGINS = {
+    "none": (0.0, None),
+    "noop": (0.0, None),
+    "slow5": (5.0, None),
+    "slow20": (20.0, None),
+    "slow20cap": (20.0, 0.25),
+}
+#: default: as today. 1ms: Python's switch interval AND Windows' timer at
+#: 1 ms. switch / period: each of the two alone, to tell which one
+#: matters. typhon: what the plugin Typhon sets by itself while it records
+#: (P3 row 5: the switch interval; the bench sets nothing).
+TIMERS = ("default", "1ms", "switch", "period", "typhon")
+#: Where the window is: offscreen (never shown), or shown minimized.
+WINDOWS = ("offscreen", "minimized")
+
+
+# ======================================================================
+# One run, in its own process
+# ======================================================================
+def _set_fine_timer(switch: bool = True, period: bool = True
+                    ) -> Dict[str, Any]:
+    """1 ms switch interval and/or process timer; what Windows says after."""
+    out: Dict[str, Any] = {}
+    if switch:
+        sys.setswitchinterval(0.001)
+    if os.name != "nt" or not period:
+        return out
+    import ctypes
+    from ctypes import wintypes
+
+    class _Throttle(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG),
+                    ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    # ProcessPowerThrottling (4); PROCESS_POWER_THROTTLING_IGNORE_TIMER_
+    # RESOLUTION (4) in ControlMask with it clear in StateMask: "always
+    # honour this process's timer resolution requests" (Windows 11).
+    state = _Throttle(1, 4, 0)
+    kernel.SetProcessInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    out["honour_timer"] = bool(kernel.SetProcessInformation(
+        kernel.GetCurrentProcess(), 4, ctypes.byref(state),
+        ctypes.sizeof(state)))
+    out["timeBeginPeriod"] = int(ctypes.WinDLL("winmm").timeBeginPeriod(1))
+    return out
+
+
+def _timer_resolution_ms() -> Optional[float]:
+    """Windows' current timer resolution (NtQueryTimerResolution), ms."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    low, high, now = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_ulong()
+    try:
+        ctypes.WinDLL("ntdll").NtQueryTimerResolution(
+            ctypes.byref(low), ctypes.byref(high), ctypes.byref(now))
+    except (OSError, AttributeError):
+        return None
+    return now.value / 10000.0
+
+
+def _event_wait_ms(n: int = 50) -> float:
+    """Median time a 1 ms threading.Event.wait takes: the timer in force."""
+    import threading
+
+    event = threading.Event()
+    took = []
+    for _ in range(n):
+        started = time.perf_counter()
+        event.wait(0.001)
+        took.append((time.perf_counter() - started) * 1000.0)
+    return round(statistics.median(took), 3)
+
+
+def _system_times() -> Optional[tuple]:
+    """(idle, kernel, user) CPU time of the whole PC so far, in 100 ns
+    units (GetSystemTimes; kernel includes idle), or None off Windows."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    idle, kernel, user = (wintypes.FILETIME(), wintypes.FILETIME(),
+                          wintypes.FILETIME())
+    try:
+        ok = ctypes.WinDLL("kernel32").GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+    except (OSError, AttributeError):
+        return None
+    if not ok:
+        return None
+
+    def value(t: Any) -> int:
+        return (int(t.dwHighDateTime) << 32) | int(t.dwLowDateTime)
+    return value(idle), value(kernel), value(user)
+
+
+def cpu_busy_pct(before: Optional[tuple], after: Optional[tuple]
+                 ) -> Optional[float]:
+    """How busy the whole PC was between two _system_times(), in %."""
+    if not before or not after:
+        return None
+    idle = after[0] - before[0]
+    total = (after[1] - before[1]) + (after[2] - before[2])
+    if total <= 0:
+        return None
+    return round(100.0 * (1.0 - idle / total), 1)
+
+
+class Load:
+    """The PC's load over a capture: whole-PC CPU busy share, and the
+    busiest other programs (psutil, where installed: per-process CPU % over
+    the same window, 100 % = one logical CPU)."""
+
+    def __init__(self) -> None:
+        self._times: Optional[tuple] = None
+        self._procs: List[Any] = []
+        try:
+            import psutil                             # noqa: F401
+            self._psutil: Any = psutil
+        except ImportError:
+            self._psutil = None
+
+    def begin(self) -> None:
+        if self._psutil is not None:
+            self._procs = []
+            for proc in self._psutil.process_iter(["name"]):
+                try:
+                    proc.cpu_percent(None)            # primes its counter
+                    self._procs.append(proc)
+                except Exception:                     # noqa: BLE001
+                    pass
+        self._times = _system_times()
+
+    def end(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "cpu_busy_pct": cpu_busy_pct(self._times, _system_times()),
+            "logical_cpus": os.cpu_count()}
+        if self._psutil is None:
+            return out
+        me = os.getpid()
+        busy = []
+        for proc in self._procs:
+            try:
+                share = proc.cpu_percent(None)
+                # pid 0 is Windows' "System Idle Process": idle time.
+                if proc.pid not in (0, me) and share >= 5.0:
+                    busy.append((round(share, 1), proc.info.get("name")
+                                 or str(proc.pid)))
+            except Exception:                         # noqa: BLE001
+                pass
+        busy.sort(reverse=True)
+        out["processes"] = len(self._procs)
+        out["busiest"] = [f"{name} {share:g}%" for share, name in busy[:6]]
+        return out
+
+
+def _percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    k = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return ordered[k]
+
+
+def child(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """One measured capture; returns the numbers."""
+    window_place = spec.get("window", "offscreen")
+    if window_place == "offscreen":
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
+    timer = spec["timer"]
+    slow_ms, duty = PLUGINS[spec["plugin"]]
+    fps = float(spec["fps"])
+    period = 1.0 / fps
+    out: Dict[str, Any] = {"timer": timer, "plugin": spec["plugin"],
+                           "fps": fps, "seconds": spec["seconds"],
+                           "window": window_place,
+                           "switch_interval_ms_before":
+                               sys.getswitchinterval() * 1000.0,
+                           "event_wait_1ms_bare": _event_wait_ms()}
+    if timer not in ("default", "typhon"):
+        out.update(_set_fine_timer(switch=timer in ("1ms", "switch"),
+                                   period=timer in ("1ms", "period")))
+    pdir = Path(spec["project"])
+    sys.path.insert(0, str(TREE))
+    sys.path.insert(0, str(pdir))
+
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    import frame_camera
+    from council_core import cameras, capture
+    from council_core import plugin_host as ph
+    from council_core import plugin_manifest as pm
+
+    if timer != "typhon":
+        # Every other row means what it always meant: the plugin Typhon's
+        # own finer switch interval while recording (P3 row 5) held off.
+        ph.RECORDING_SWITCH_S = None
+
+    np = cameras._numpy()
+
+    class FixedScheduleCamera(cameras.SyntheticDevice):
+        """The simulated frame camera on a sensor clock: frame i is due at
+        t0 + i * period whatever the grab thread does; a late grab gets
+        the waiting frames at once, as from a camera's buffer."""
+
+        def start(self) -> None:
+            super().start()
+            self._t0 = time.perf_counter()
+            self._n = 0
+
+        def read(self, timeout_ms: int = 1000) -> Any:
+            if self._armed:
+                return super().read(timeout_ms)
+            step = self._interval()
+            due = self._t0 + (self._n + 1) * step
+            wait = due - time.perf_counter()
+            if wait > timeout_ms / 1000.0:
+                time.sleep(timeout_ms / 1000.0)
+                return None
+            if wait > 0:
+                time.sleep(wait)
+            self._n += 1
+            got = time.perf_counter()
+            made = self._with_downsample(self._picture(np))
+            made.meta["bench_due"] = due
+            made.meta["bench_read"] = got
+            return made
+
+    real_open = cameras.SyntheticBackend.open
+
+    def bench_open(self: Any, info: Any) -> Any:
+        if info.kind == "frame":
+            return FixedScheduleCamera(info)
+        return real_open(self, info)
+    cameras.SyntheticBackend.open = bench_open
+
+    qapp = QApplication.instance() or QApplication([])
+    capture.warm_imports()
+    import app as generated
+
+    window = generated.App()
+    window.resize(1504, 1016)
+    if window_place == "minimized":
+        window.showMinimized()          # a real window, on the screen
+        qapp.processEvents()
+    window.on_btn_scan_for_cameras()
+    rows = window.ports.cameras.items()
+    index = next(i for i, r in enumerate(rows)
+                 if "Simulated" in str(r) and str(r).endswith("frame"))
+    window.ports.cameras.widget.setCurrentRow(index)
+    window.on_btn_connect()
+    slot = frame_camera._RIG.active
+    # The FPS box beside Start, as a user sets it: Start applies it.
+    window.ports.frame_rate.set(str(int(fps) if fps == int(fps) else fps))
+    frame_camera.apply_frame_rate(fps)
+    out["timer_resolution_ms"] = _timer_resolution_ms()
+    out["event_wait_1ms"] = _event_wait_ms()
+    out["switch_interval_ms"] = sys.getswitchinterval() * 1000.0
+
+    host = frame_camera._RIG.plugins
+    feed = None
+    if spec["plugin"] != "none":
+        doc = {"schema": 1, "id": "typhon.bench", "short": "bench",
+               "name": "Slow bench plugin", "version": "0.1.0",
+               "api": pm.API_VERSION, "kind": "feature", "scope": "camera",
+               "entry": "plugin:Bench", "budget_ms": 5}
+
+        class Bench:
+            def activate(self, ctx: Any) -> None:
+                self.ctx = ctx
+
+            def on_frame(self, view: Any) -> None:
+                if slow_ms <= 0:
+                    return
+                until = time.perf_counter() + slow_ms / 1000.0
+                while time.perf_counter() < until:     # pure Python: the GIL
+                    sum(range(200))
+        host.adopt(pm.check(doc, builtin=True), Bench)
+        feed = host.feed("typhon.bench", duty=duty)
+
+    late: List[float] = []
+    read_late: List[float] = []
+    recording = {"on": False}
+
+    def on_frame(shot: Any) -> None:
+        now = time.perf_counter()
+        meta = shot.meta or {}
+        due = meta.get("bench_due")
+        if recording["on"] and due is not None:
+            late.append(now - due)
+            read_late.append(meta["bench_read"] - due)
+        if feed is not None:
+            feed.offer(shot)
+
+    folder = Path(spec["folder"])
+    window.ports.capture_folder.set(str(folder))
+    load = Load()
+
+    def begin() -> None:
+        load.begin()
+        slot.session.on_frame = on_frame
+        window.on_btn_start_capture()
+        recording["on"] = True
+        QTimer.singleShot(int(float(spec["seconds"]) * 1000), finish)
+
+    held: Dict[str, Any] = {}
+
+    def finish() -> None:
+        recording["on"] = False
+        held["load"] = load.end()
+        held["switch_rec"] = sys.getswitchinterval() * 1000.0
+        held["wait_rec"] = _event_wait_ms(20)
+        held["session"] = slot.session
+        window.on_btn_stop_capture()
+        deadline = time.monotonic() + 30
+        while slot.session is not None and slot.session.saving and \
+                time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.02)
+        held["stats"] = slot.session.run_stats()
+        qapp.quit()
+
+    QTimer.singleShot(500, begin)        # the live view runs first, as in use
+    qapp.exec()
+    stats = held["stats"]
+    if feed is not None:
+        out["feed"] = feed.stats()
+        feed.stop()
+    frame_camera.disconnect()
+    host.close()
+
+    lateness = [x * 1000.0 for x in late]
+    out.update({
+        "frames": len(lateness),
+        "late": sum(1 for x in late if x > period),
+        "late_2": sum(1 for x in late if x > 2 * period),
+        "median_ms": round(statistics.median(lateness), 3)
+        if lateness else 0.0,
+        "p99_ms": round(_percentile(lateness, 0.99), 3),
+        "max_ms": round(max(lateness), 3) if lateness else 0.0,
+        "read_late": sum(1 for x in read_late if x > period),
+        "read_p99_ms": round(_percentile([x * 1000.0 for x in read_late],
+                                         0.99), 3),
+        "grabbed": stats.grabbed, "saved": stats.recorded,
+        "not_saved_storage": stats.skipped,
+        "faults": sorted(host.faults),
+        "switch_interval_ms_recording": round(held.get("switch_rec", 0.0),
+                                              3),
+        "event_wait_1ms_recording": held.get("wait_rec"),
+    })
+    out.update(held.get("load") or {})
+    try:
+        import PySide6
+
+        out["pyside6"] = PySide6.__version__
+    except Exception:                                     # noqa: BLE001
+        pass
+    out["python"] = sys.version.split()[0]
+    return out
+
+
+# ======================================================================
+# The matrix
+# ======================================================================
+def build_app(where: Path) -> Path:
+    """Build "Typhon (plugins)" for Qt into a temporary vault."""
+    sys.path.insert(0, str(TREE))
+    import run_example_gui as rex
+
+    return rex.build("typhon_plugins", project="timing",
+                     vault_dir=where / "vault", target="qt")
+
+
+def sandbox_env(where: Path, window: str = "offscreen") -> Dict[str, str]:
+    env = dict(os.environ)
+    env.update({
+        "QT_QPA_PLATFORM": "offscreen", "COUNCIL_NO_DIALOGS": "1",
+        "COUNCIL_VAULT_ROOT": str(where / "vault"),
+        "COUNCIL_APP_DIR": str(where),
+        "TYPHON_PLUGIN_HOME": str(where / "typhon"),
+        "COUNCIL_SKIP_PATH_MIGRATION": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    if window != "offscreen":
+        env.pop("QT_QPA_PLATFORM", None)        # a real window (--window)
+    env.pop("FRAME_CLASSES_STORE", None)
+    return env
+
+
+def _say(text: str) -> None:
+    print(text, flush=True)
+
+
+def run_matrix(plugins: List[str], timers: List[str], repeats: int,
+               seconds: float, fps: float, python: str,
+               keep: bool = False, say=_say, window: str = "offscreen"
+               ) -> List[Dict[str, Any]]:
+    where = Path(tempfile.mkdtemp(prefix="tptiming_"))
+    results: List[Dict[str, Any]] = []
+    try:
+        env = sandbox_env(where, window)
+        os.environ.update({k: env[k] for k in (
+            "COUNCIL_VAULT_ROOT", "COUNCIL_APP_DIR", "TYPHON_PLUGIN_HOME",
+            "COUNCIL_SKIP_PATH_MIGRATION")})
+        pdir = build_app(where)
+        for rep in range(repeats):
+            for timer in timers:
+                for plugin in plugins:
+                    folder = where / f"runs_{rep}_{timer}_{plugin}"
+                    spec = {"timer": timer, "plugin": plugin,
+                            "seconds": seconds, "fps": fps,
+                            "project": str(pdir), "folder": str(folder),
+                            "window": window}
+                    proc = subprocess.run(
+                        [python, str(Path(__file__).resolve()), "--child",
+                         json.dumps(spec)], capture_output=True, text=True,
+                        timeout=180 + seconds * 4, env=env, cwd=str(TREE),
+                        encoding="utf-8")
+                    line = next((l for l in reversed(proc.stdout.splitlines())
+                                 if l.startswith("{")), "")
+                    if proc.returncode != 0 or not line:
+                        result = {"timer": timer, "plugin": plugin,
+                                  "error": (proc.stderr or proc.stdout)[-800:]}
+                    else:
+                        result = json.loads(line)
+                    result["repeat"] = rep + 1
+                    results.append(result)
+                    say(row(result))
+                    shutil.rmtree(folder, ignore_errors=True)
+    finally:
+        if not keep:
+            shutil.rmtree(where, ignore_errors=True)
+    return results
+
+
+def row(r: Dict[str, Any]) -> str:
+    if "error" in r:
+        return f"{r['timer']:>7} {r['plugin']:>10}  ERROR {r['error'][-300:]}"
+    feed = r.get("feed") or {}
+    return (f"{r['timer']:>7} {r['plugin']:>10}  late {r['late']:>3}/"
+            f"{r['frames']:<4} (>2 periods {r['late_2']:>3})  median "
+            f"{r['median_ms']:6.2f} ms  p99 {r['p99_ms']:6.2f} ms  max "
+            f"{r['max_ms']:6.1f} ms  read-late {r['read_late']:>3}  saved "
+            f"{r['saved']}/{r['grabbed']}  timer {r['timer_resolution_ms']}"
+            f" ms, 1ms-wait {r['event_wait_1ms']:.2f} ms (bare "
+            f"{r.get('event_wait_1ms_bare', 0) or 0:.2f})  switch while "
+            f"recording {r.get('switch_interval_ms_recording', '?')} ms  "
+            f"plugin "
+            f"{feed.get('delivered', '-')} calls, "
+            f"{feed.get('dropped', '-')} dropped  PC busy "
+            f"{r.get('cpu_busy_pct', '?')}%"
+            + (f" ({', '.join(r['busiest'][:3])})" if r.get("busiest")
+               else ""))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--child", help=argparse.SUPPRESS)
+    ap.add_argument("--plugins", default="none,noop,slow5,slow20,slow20cap")
+    ap.add_argument("--timers", default="default,1ms")
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--seconds", type=float, default=4.0)
+    ap.add_argument("--fps", type=float, default=150.0)
+    ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--out", help="write every run's numbers here (JSON)")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep the temporary folders")
+    ap.add_argument("--window", choices=WINDOWS, default="offscreen",
+                    help="offscreen (never shown), or minimized: a real "
+                         "window on the screen, minimized (Windows 11 may "
+                         "not honour a minimized window's timer requests)")
+    args = ap.parse_args(argv)
+    if args.child:
+        print(json.dumps(child(json.loads(args.child))))
+        return 0
+    plugins = [p for p in args.plugins.split(",") if p]
+    timers = [t for t in args.timers.split(",") if t]
+    for p in plugins:
+        if p not in PLUGINS:
+            ap.error(f"unknown plugin {p!r}: {', '.join(PLUGINS)}")
+    for t in timers:
+        if t not in TIMERS:
+            ap.error(f"unknown timer {t!r}: {', '.join(TIMERS)}")
+    if args.window != "offscreen":
+        _say("Each run shows the app's window, minimized, on this screen.")
+    started = time.time()
+    results = run_matrix(plugins, timers, args.repeats, args.seconds,
+                         args.fps, args.python, keep=args.keep,
+                         window=args.window)
+    print(f"{len(results)} runs in {time.time() - started:.0f} s")
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=2) + "\n",
+                                  encoding="utf-8")
+    return 0 if all("error" not in r for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

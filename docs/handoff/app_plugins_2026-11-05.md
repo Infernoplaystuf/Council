@@ -13,7 +13,7 @@ Council"):
 
 | Piece | Where |
 |---|---|
-| The manifest reader, a byte-for-byte copy of typhon-plugins' | `council_core/plugin_manifest.py` (do not edit here; change it on typhon-plugins so the two stay identical) |
+| The manifest reader, shared with Typhon (typhon-plugins is merged into qt-migration) | `council_core/plugin_manifest.py` (Typhon's; Council does not change it) |
 | Council's manifest check, discovery, on/off, context, loader, fault log | `council_core/app_plugins.py` |
 | The built-in plugins' folder (empty list for now) | `council_plugins/` + `app_plugins.BUILTIN_PLUGINS` |
 | A switched-on plugin's tab, guarded | `council_qt/plugin_tabs.py`, called from `council_qt.py` after the built-in tabs |

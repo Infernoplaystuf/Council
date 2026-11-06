@@ -2237,6 +2237,93 @@ def mark_frame(name: Any, folder: Any, frame: Any,
                        f"Marked so far: {_counts_text(data)}."}
 
 
+def mark_dataset(name: Any, frames: Any, selection: Any) -> Dict[str, Any]:
+    """A whole dataset's pictures marked as one class, under one lock
+    and one save (each as mark_frame would). `frames` are full paths; one that is not a file, or sits
+    inside the store, refuses the whole call (nothing is marked).
+
+    Keys: summary, marked, changed"""
+    d = store_dir(name)
+    cls = _picked(selection)
+    if not cls:
+        raise RuntimeError("pick a class in the Classes list first")
+    paths = []
+    for frame in frames or ():
+        p = _frame_path("", frame)
+        if _inside(d, p.parent):
+            raise RuntimeError(_capture_refusal(d, p.parent, "marked"))
+        paths.append(p)
+    if not paths:
+        raise RuntimeError("no frames to mark: the dataset has none on disk")
+    _check_owner(d, "marked")
+    changed = 0
+    with _locked(d):
+        data = _load_dir(d)
+        if cls not in data["classes"]:
+            raise RuntimeError(f"'{cls}' is not a class of '{d.name}' — "
+                               f"Open it again to refresh the list")
+        imported = data.get("imported_labels")
+        imported_set = set(imported) if isinstance(imported, list) else set()
+        for p in paths:
+            was = data["labels"].get(str(p))
+            if was and was != cls:
+                changed += 1
+            data["labels"][str(p)] = cls
+            imported_set.discard(str(p))
+        if isinstance(imported, list):
+            data["imported_labels"] = [x for x in imported
+                                       if x in imported_set]
+        _save_dir(d, data)
+    change = f" ({changed} had another class before)" if changed else ""
+    return {"summary": f"{len(paths)} frames marked '{cls}'{change}. "
+                       f"Marked so far: {_counts_text(data)}.",
+            "marked": len(paths), "changed": changed}
+
+
+def classify_dataset(name: Any, frames: Any) -> Dict[str, Any]:
+    """A dataset's pictures sorted by the classifier, in the order
+    given (classify_folder for a list): each with its likely class (its share when below 80%). Nothing
+    is recorded in runs.jsonl: that history is of capture folders.
+
+    Keys: rows, counts, version, summary"""
+    d = store_dir(name)
+    n = d.name
+    paths = [_frame_path("", f) for f in (frames or ())]
+    if not paths:
+        raise RuntimeError("no frames to classify: the dataset has none on "
+                           "disk")
+    with _using(d):
+        forest, _X, classes, _paths, meta, notes = _load_model(n)
+        import numpy as np
+        feats, names, unreadable = [], [], 0
+        for p in paths:
+            try:
+                feats.append(features(p))
+            except RuntimeError:
+                raise
+            except Exception:
+                unreadable += 1
+                continue
+            names.append(p.name)
+        rows, tally = [], {c: 0 for c in classes}
+        if feats:
+            probas = forest.predict_proba(np.stack(feats))
+            for nm, pr in zip(names, probas):
+                best, share = _share_text(pr)
+                cls = classes[int(forest.classes_[best])]
+                tally[cls] += 1
+                rows.append(f"{nm}   {cls}" + ("" if pr[best] >= 0.8
+                                               else f"  ({share})"))
+    vid = _vid(n, meta)
+    summary = (f"{len(rows)} frames: "
+               + ", ".join(f"{c} {k}" for c, k in tally.items())
+               + (f"; {unreadable} unreadable" if unreadable else "")
+               + f" — classified with {vid}."
+               + ((" " + " ".join(notes)) if notes else ""))
+    return {"rows": rows, "counts": tally, "version": vid,
+            "summary": summary}
+
+
 def _first_sentence(exc: Exception) -> str:
     return str(exc).split(". ")[0]
 
