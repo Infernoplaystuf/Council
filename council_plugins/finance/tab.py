@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QCompleter,
                                QVBoxLayout, QWidget)
 
 from .engine import paycheck, tables
+from .projection_view import ProjectionPage
 
 PLAN_FILE = "plan.json"
 SAVE_DELAY_MS = 500
@@ -28,6 +29,7 @@ SAVE_DELAY_MS = 500
 EARNER_FIELDS: Tuple[Tuple[str, str, str, Any], ...] = (
     ("name", "Name", "text", None),
     ("age", "Age (end of year)", "int", (16, 100)),
+    ("retire_age", "Retires at age", "int", (16, 100)),
     ("salary", "Salary (a year)", "money", None),
     ("bonus", "Bonus (a year)", "money", None),
     ("pay_periods", "Checks a year", "int", (1, 52)),
@@ -192,12 +194,18 @@ class FinanceTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
         intro = QLabel("Your pay after tax and deductions, check by check "
-                       "and for the year. A planner, not tax filing: it is "
+                       "and for the year, and what your accounts grow to "
+                       "over the years. A planner, not tax filing: it is "
                        "kept on this PC only.")
         intro.setWordWrap(True)
         outer.addWidget(intro)
+        self.pages = QTabWidget()
+        self.pages.setObjectName("FinancePages")
+        outer.addWidget(self.pages, 1)
         split = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(split, 1)
+        self.pages.addTab(split, "Paycheck")
+        self.projection = ProjectionPage(self.changed)
+        self.pages.addTab(self.projection, "Projection")
 
         left = QWidget()
         lv = QVBoxLayout(left)
@@ -311,7 +319,8 @@ class FinanceTab(QWidget):
             "school_district": _code(self.school),
             "children_under_17": self.kids.value(),
             "other_dependents": self.others.value(),
-            "earners": [f.value() for f in self._forms()]})
+            "earners": [f.value() for f in self._forms()],
+            "projection": self.projection.settings()})
 
     def show_plan(self, plan: Dict[str, Any]) -> None:
         plan = paycheck.normalized(plan)
@@ -331,6 +340,7 @@ class FinanceTab(QWidget):
                 w.deleteLater()
             for earner in plan["earners"]:
                 self._add_form(earner)
+            self.projection.show_plan(plan)
         finally:
             self._loading = False
         self.recalculate()
@@ -379,14 +389,16 @@ class FinanceTab(QWidget):
 
     # -- the result -------------------------------------------------------
     def recalculate(self) -> None:
+        plan = self.plan()
         try:
-            self.result = paycheck.compute(self.plan())
+            self.result = paycheck.compute(plan)
         except Exception as exc:                          # noqa: BLE001
             self.result = None
             self.table.clear()
             self.notes.setText(f"Could not work it out: {exc}")
-            return
-        self._fill(self.result)
+        else:
+            self._fill(self.result)
+        self.projection.refresh(plan)
 
     def _fill(self, result: paycheck.Result) -> None:
         self.table.clear()

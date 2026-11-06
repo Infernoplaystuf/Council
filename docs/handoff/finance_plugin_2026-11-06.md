@@ -1,4 +1,4 @@
-# Finance plugin, step 1: paycheck and taxes (2026-11-06)
+# Finance plugin: paycheck, taxes and projection (2026-11-06)
 
 Council's first plugin: `council_plugins/finance/` (id `council.finance`,
 kind `tab`, network `none`). Like every plugin it is off until ticked in
@@ -33,6 +33,35 @@ by line, and the household's year when there is more than one earner.
 A planner, not tax software: no itemizing, AMT, self-employment or
 investment income. Household taxes are shared to earners by pay.
 
+## Projection (step 2)
+
+The tab's second page, Projection, carries the plan forward a year at a
+time (`engine/projection.py`, `project(plan)`; settings saved in plan.json
+under "projection"):
+
+- Assumptions: years to show, raises, inflation, default growth.
+- Accounts: name, kind (401(k), Roth 401(k), HSA, traditional or Roth IRA,
+  brokerage, savings), whose (an earner or the household), balance now,
+  its own growth (else the default), extra put in a year from take-home.
+- Pay goes in by itself: traditional 401(k) and the employer match to the
+  earner's first 401(k) account, Roth 401(k) to their Roth 401(k), HSA
+  (theirs and the employer's) to their HSA. An account is added when pay
+  feeds a kind with none listed.
+- Each year is worked in today's dollars (pay grows by raise over
+  inflation, every other dollar amount stays) with the current tables,
+  then scaled back up: the same as brackets and limits indexed to
+  inflation.
+- Growth: the balance a full year, the year's money half a year.
+- Each earner's pay, payroll money and own extras stop at their
+  retirement age (a new earner field, default 65); household extras go on.
+- Shown: a line chart of each account and the total (painted with
+  QPainter, no QtCharts), a table a row a year (ages, gross, taxes,
+  take-home, put in by you / employer / extras, left to spend, growth,
+  each balance, total), "today's dollars" switch, and notes (IRA over its
+  limit, extras over take-home, retirements).
+- Not yet: withdrawals in retirement, Social Security benefits, RMDs, tax
+  on brokerage gains, family expenses.
+
 ## Where things are
 
 - `engine/paycheck.py`: `compute(plan) -> Result`; the plan format is in
@@ -46,6 +75,7 @@ investment income. Household taxes are shared to earners by pay.
 - `data/state_income_tax_{2025,2026}.json` (Tax Foundation),
   `ohio_municipal_income_tax.json`, `ohio_school_district_income_tax.json`,
   `ohio_jedd_income_tax.json` (Ohio Finder tables Andy downloaded).
+- `projection_view.py`: the Projection page and its chart.
 - `tab.py`: the tab; the plan is saved as
   `<app dir>/plugin_data/council.finance/plan.json`.
 - Tests: `tests/test_finance_plugin.py` (hand-worked examples and the tab
@@ -53,8 +83,8 @@ investment income. Household taxes are shared to earners by pay.
 
 ## Next steps (agreed order)
 
-2. Projection over years: raises, expenses with inflation, account
-   balances. Later years' federal tables indexed by inflation.
+2. (Built.) Still to add to it: family expenses, retirement withdrawals
+   and Social Security income.
 3. Scenarios and more warnings; Excel export.
 4. Stock tracker: broker CSV holdings; opt-in online price refresh (Andy
    chose it 2026-11-06) needs the plugin system to allow one named host,

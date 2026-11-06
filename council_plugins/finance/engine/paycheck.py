@@ -15,7 +15,8 @@ A plan:
     school_district   Ohio school district number ("4704"), or ""
     children_under_17, other_dependents
     earners           list of:
-        name, age, salary (a year), bonus (a year), pay_periods (24)
+        name, age, retire_age (the projection stops pay at it),
+        salary (a year), bonus (a year), pay_periods (24)
         work_city (FIPS) or work_jedd (JEDD code), or neither
         medical, dental, vision, other_pretax     per check, Section 125
         hsa_employee      per check (payroll, Section 125)
@@ -127,7 +128,7 @@ def default_earner(name: str = "Me") -> Dict[str, Any]:
             "other_pretax": 0.0, "hsa_employee": 0.0, "hsa_employer": 0.0,
             "hsa_coverage": "none", "health_fsa": 0.0, "dc_fsa": 0.0,
             "k401_percent": 0.0, "roth_percent": 0.0, "match_rate": 0.0,
-            "match_up_to": 0.0, "after_tax": 0.0}
+            "match_up_to": 0.0, "after_tax": 0.0, "retire_age": 65}
 
 
 def default_plan() -> Dict[str, Any]:
@@ -153,6 +154,10 @@ def normalized(plan: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
                 if isinstance(e, Mapping):
                     one.update({k: e[k] for k in one if k in e})
                 base["earners"].append(one)
+        # The projection's settings ride along untouched; the projection
+        # engine makes them whole (engine/projection.py).
+        if isinstance(plan.get("projection"), Mapping):
+            base["projection"] = dict(plan["projection"])
     if base["filing_status"] not in STATUSES:
         base["filing_status"] = "single"
     base["year"] = int(num(base["year"], 2026))
@@ -164,9 +169,10 @@ def normalized(plan: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     for e in base["earners"]:
         e["pay_periods"] = max(int(num(e["pay_periods"], 24)), 1)
         e["age"] = int(num(e["age"], 35))
+        e["retire_age"] = int(num(e["retire_age"], 65))
         for key, value in list(e.items()):
             if key not in ("name", "work_city", "work_jedd", "hsa_coverage",
-                           "pay_periods", "age"):
+                           "pay_periods", "age", "retire_age"):
                 e[key] = max(num(value), 0.0)
         e["name"] = str(e["name"] or "Earner")
         e["work_city"] = str(e["work_city"] or "")

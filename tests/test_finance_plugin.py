@@ -8,6 +8,10 @@ The Finance plugin (council_plugins/finance, id council.finance):
     Tax, the state's brackets and exemptions, and Ohio city, JEDD and
     school district tax with the home city's credit;
   * it says when a limit is passed or a match is left unclaimed;
+  * its projection carries the plan forward year by year: pay into the
+    401(k), Roth 401(k) and HSA by itself (with the employer's money),
+    extras from take-home into any account, raises, inflation (taxes
+    indexed), growth, retirement stopping pay;
   * its tab builds offscreen from the plugin folder, and what is typed is
     saved in the plugin's own data folder and read back next time.
 """
@@ -27,7 +31,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
 
 from council_core import app_plugins as ap  # noqa: E402
-from council_plugins.finance.engine import paycheck, tables  # noqa: E402
+from council_plugins.finance.engine import (paycheck, projection,  # noqa: E402
+                                           tables)
 
 COLUMBUS, DUBLIN = "18000", "22694"
 
@@ -286,3 +291,144 @@ def test_a_second_earner_switches_to_joint_and_shows_the_household(qapp):
     assert tops[-1] == "Household"
     tab.on_remove_earner()
     assert tab.earners.count() == 1
+
+
+# ------------------------------------------------------------- projection
+def flat(**over):
+    """Projection settings with no raise, inflation or growth unless said."""
+    out = {"years": 3, "raise_percent": 0, "inflation_percent": 0,
+           "return_percent": 0, "accounts": []}
+    out.update(over)
+    return out
+
+
+def test_pay_goes_into_its_accounts_by_itself():
+    p = plan(earner(name="A", salary=100000, k401_percent=6, roth_percent=2,
+                    match_rate=50, match_up_to=6, hsa_coverage="self",
+                    hsa_employee=100, hsa_employer=500))
+    p["projection"] = flat(years=1)
+    r = projection.project(p)
+    kinds = {a["kind"]: i for i, a in enumerate(r.accounts)}
+    assert set(kinds) == {"k401", "roth401k", "hsa"}
+    row = r.rows[0]
+    # Match is on 8% put in, capped at 6% of pay: half of 6,000.
+    assert row.put_in[kinds["k401"]] == pytest.approx(6000 + 3000)
+    assert row.put_in[kinds["roth401k"]] == pytest.approx(2000)
+    assert row.put_in[kinds["hsa"]] == pytest.approx(2400 + 500)
+    assert row.from_pay == pytest.approx(6000 + 2000 + 2400)
+    assert row.employer == pytest.approx(3500)
+    assert row.total == pytest.approx(13900)            # no growth
+
+
+def test_growth_by_hand():
+    p = plan(earner(salary=100000, k401_percent=6))
+    p["projection"] = flat(years=2, return_percent=10)
+    r = projection.project(p)
+    first = 6000 * 1.1 ** 0.5                     # half a year's growth
+    assert r.rows[0].total == pytest.approx(first)
+    assert r.rows[1].total == pytest.approx(first * 1.1 + first)
+    assert r.rows[1].growth == pytest.approx(r.rows[1].total - first - 6000)
+
+
+def test_an_account_of_its_own_with_a_balance_and_extras():
+    p = plan(earner(salary=60000))
+    p["projection"] = flat(years=2, return_percent=5, accounts=[
+        {"name": "Roth IRA", "kind": "roth_ira", "owner": 0,
+         "balance": 10000, "return_percent": 8, "extra_per_year": 6000}])
+    r = projection.project(p)
+    year1 = 10000 * 1.08 + 6000 * 1.08 ** 0.5
+    assert r.rows[0].balances == [pytest.approx(year1)]
+    assert r.rows[1].balances == [pytest.approx(year1 * 1.08
+                                                + 6000 * 1.08 ** 0.5)]
+    assert r.rows[0].left == pytest.approx(r.rows[0].take_home - 6000)
+
+
+def test_raises_and_inflation_index_the_taxes():
+    p = plan(earner(salary=100000, medical=100))
+    p["projection"] = flat(years=2, raise_percent=3, inflation_percent=3)
+    r = projection.project(p)
+    assert r.rows[1].gross == pytest.approx(103000)
+    # Pay rising with prices: every line, taxes too, rises 3%.
+    assert r.rows[1].taxes == pytest.approx(r.rows[0].taxes * 1.03)
+    assert r.rows[1].take_home == pytest.approx(r.rows[0].take_home * 1.03)
+
+
+def test_inflation_and_todays_dollars():
+    p = plan(earner(salary=50000))
+    p["projection"] = flat(years=3, inflation_percent=2.5, accounts=[
+        {"kind": "savings", "owner": -1, "balance": 1000}])
+    r = projection.project(p)
+    assert r.rows[2].total == pytest.approx(1000)
+    assert r.rows[2].total_today == pytest.approx(1000 / 1.025 ** 2)
+
+
+def test_retirement_stops_pay_and_that_earners_extras():
+    p = plan(earner(name="A", salary=80000, k401_percent=10, age=64,
+                    retire_age=65),
+             earner(name="B", salary=50000, age=40),
+             filing_status="married_joint")
+    p["projection"] = flat(years=3, accounts=[
+        {"name": "A's IRA", "kind": "ira", "owner": 0,
+         "extra_per_year": 1000},
+        {"name": "Joint", "kind": "brokerage", "owner": -1,
+         "extra_per_year": 500}])
+    r = projection.project(p)
+    assert r.rows[0].working == [True, True]
+    assert r.rows[1].working == [False, True]
+    assert r.rows[1].gross == pytest.approx(50000)
+    assert r.rows[1].from_pay == 0
+    assert r.rows[1].extra == pytest.approx(500)        # joint goes on
+    assert any("A retires at 65 in 2027" in n for n in r.notes)
+
+
+def test_an_ira_over_its_limit_is_noted():
+    p = plan(earner(salary=90000, age=52))
+    p["projection"] = flat(accounts=[
+        {"name": "Roth IRA", "kind": "roth_ira", "owner": 0,
+         "extra_per_year": 9000}])
+    notes = "\n".join(projection.project(p).notes)
+    assert "over the $8,600 IRA limit" in notes
+
+
+def test_bad_projection_settings_are_made_whole():
+    p = plan(earner(salary=1000))
+    p["projection"] = {"years": 500, "raise_percent": "x",
+                       "accounts": [{"kind": "gold", "owner": 9}, "junk"]}
+    s = projection.settings_of(paycheck.normalized(p))
+    assert s["years"] == projection.MAX_YEARS
+    assert s["raise_percent"] == 3.0
+    assert s["accounts"] == [dict(projection.default_account("savings", -1),
+                                  name="Savings / cash")]
+
+
+def test_the_projection_page_shows_saves_and_reads_back(qapp, app_dir):
+    from council_qt import plugin_tabs
+
+    tab = plugin_tabs.build_page(_finance())
+    fields = tab.earners.widget(0).fields
+    fields["salary"][0].setValue(100000)
+    fields["k401_percent"][0].setValue(6)
+    page = tab.projection
+    assert page.accounts.rowCount() == 1                # 401(k), by itself
+    page.years.setValue(10)
+    page.on_add_account()
+    r = page.accounts.rowCount() - 1
+    page.accounts.cellWidget(r, 3).setValue(20000)
+    assert page.table.rowCount() == 10
+    heads = [page.table.horizontalHeaderItem(c).text()
+             for c in range(page.table.columnCount())]
+    assert heads[-1] == "Total" and "Savings" in heads
+    total = page.table.item(9, len(heads) - 1).text()
+    page.today.setChecked(True)
+    assert page.table.item(9, len(heads) - 1).text() != total
+    assert "By the end of 2035" in page.summary.text()
+    assert len(page.chart.series) == 3                  # two and the total
+    tab.save()
+    saved = json.loads((app_dir / "plugin_data" / "council.finance"
+                        / "plan.json").read_text(encoding="utf-8"))
+    assert saved["projection"]["years"] == 10
+    assert saved["projection"]["accounts"][1]["balance"] == 20000
+    again = plugin_tabs.build_page(_finance())
+    assert again.projection.accounts.rowCount() == 2
+    assert again.projection.years.value() == 10
+    page.chart.grab()                                   # paints offscreen

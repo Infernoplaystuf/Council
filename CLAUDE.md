@@ -189,7 +189,8 @@ same list.
   `docs/handoff/app_plugins_2026-11-05.md`.
 - The Finance plugin (`council_plugins/finance`: paycheck after federal,
   FICA, state and Ohio city / JEDD / school district tax; the tax tables it
-  ships; what is not modeled; next steps):
+  ships; the projection of accounts over the years; what is not modeled;
+  next steps):
   `docs/handoff/finance_plugin_2026-11-06.md`.
 - The classifier as an optional pop-out plugin, the plugin toolbar strip
   and "Plugins…", and datasets of picked frames (references, sent to
