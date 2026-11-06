@@ -218,3 +218,19 @@ writes `report.txt` and the runs' files into one new folder
 (`basler_line_test_<time>` here, or `--out`), with a throw-away project and
 vault: your own are not touched. `--fake` checks the script without a
 camera.
+
+---
+
+## Export an app to another machine: `export_app.py`
+
+```bat
+python tools\export_app.py example_typhon D:\exports
+python tools\export_app.py example_typhon D:\exports --name Typhon --with-classifiers
+```
+
+Copies the app built in the GUI Designer, plus only the Council files it
+uses, into a new folder (`D:\exports\Typhon`) with `run.bat`,
+`requirements.txt` and a `data\` folder of its own, then checks that it
+starts with no Council present. Copy that folder to the other machine,
+`pip install -r requirements.txt`, and run `run.bat`. The GUI Designer's
+"Export app…" button does the same.

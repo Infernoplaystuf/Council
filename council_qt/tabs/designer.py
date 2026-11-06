@@ -188,6 +188,15 @@ class DesignerActions:
     def export_gspec(self, name: str, shapes: Sequence[Any], dest):
         return dx.export_gspec(name, shapes, self.vault_dir, dest)
 
+    def export_app(self, name: str, dest, *, with_classifiers=False):
+        """The generated app, into a new folder of its own under `dest`,
+        then checked to start with no Council (council_core.app_export).
+        Blocking; a worker calls it. (ExportResult, CheckResult or None)."""
+        from council_core import app_export as ae
+        result = ae.export_app(self.project_dir(name), Path(dest),
+                               with_classifiers=with_classifiers)
+        return result, ae.check(result.folder)
+
     def stop(self, name: str) -> bool:
         import gui_runner
         directory = self.project_dir(name)
@@ -272,6 +281,8 @@ class DesignerTab(ViewHelpers, QWidget):
         self.ask_example = ask_example or (lambda *a, **k: None)
         #: (title, folder, file name) -> a path, or "" for cancelled.
         self.ask_save_path = ask_save_path or (lambda *a, **k: "")
+        #: (title, start folder) -> a folder, or "" for cancelled.
+        self.ask_folder = lambda *a, **k: ""
         #: designer_codebehind.Review -> True to write it. The default is
         #: "not accepted": model-written code nobody looked at is never
         #: written, by a test or by a host that forgot to supply a dialog.
@@ -309,6 +320,7 @@ class DesignerTab(ViewHelpers, QWidget):
                               ("Open", self.on_open),
                               ("Save", self.on_save),
                               ("Export .gspec…", self.on_export),
+                              ("Export app…", self.on_export_app),
                               ("⚙ Generate", self.on_generate),
                               ("▶ Run", self.on_run), ("■ Stop", self.on_stop),
                               ("Review with Council", self.on_review),
@@ -1027,6 +1039,51 @@ class DesignerTab(ViewHelpers, QWidget):
                      "itself still has unsaved changes; Save keeps them "
                      "there too.")
 
+    def on_export_app(self) -> None:
+        """Export app…: the generated app into a new folder of its own, with
+        the Council files it uses, to copy to another machine and run there
+        (council_core.app_export). Asks for the folder to put it in; never
+        replaces a folder; Generates first when the canvas has unsaved
+        changes is the user's call — what is exported is the project as
+        generated. Then checks that it starts with no Council."""
+        if not self.project:
+            self.log("No project open.")
+            return
+        project = self.actions.project_dir(self.project)
+        if project is None or not (Path(project) / "main.py").is_file():
+            self.log("Generate the app first — Export app copies the "
+                     "generated app.")
+            return
+        dest = self.ask_folder("Export app — choose the folder to put it in",
+                               str(Path.home()))
+        if not dest:
+            return
+        if getattr(self.canvas.scene, "dirty", False):
+            self.log("note: the canvas has unsaved changes — the export is "
+                     "the app as last generated; Save and Generate first to "
+                     "include them.")
+        with_classifiers = bool(self.confirm(
+            "Export app",
+            "Copy this PC's classifiers into the exported app too?\n\n"
+            "No: it starts with none of its own."))
+        name = self.project
+
+        def work() -> None:
+            try:
+                result, checked = self.actions.export_app(
+                    name, dest, with_classifiers=with_classifiers)
+                words = [result.message, checked.message]
+            except Exception as exc:                      # noqa: BLE001
+                words = [f"Not exported: {exc}"]
+
+            def done() -> None:
+                self._busy = False
+                self._refresh_status()
+                for line in words:
+                    self.log(line)
+            self._to_ui(done)
+        self._start("exporting…", work, name="designer-export-app")
+
     def on_wizard(self) -> None:
         """Guided start.
 
@@ -1402,6 +1459,10 @@ def build_designer(window) -> QWidget:
                                           vault_dir=tab.actions.vault_dir)
     tab.ask_save_path = lambda title, folder, filename: ask_export_path(
         tab, title, folder, filename)
+    tab.ask_folder = lambda title, folder: (
+        "" if dialogs.disabled() else
+        dialogs.askdirectory(title=title, initialdir=folder, parent=tab)
+        or "")
     # The code writer's review. "No" under COUNCIL_NO_DIALOGS, like the two
     # above: unattended, nothing a model wrote is ever accepted.
     from ..widgets.wiring import ask_accept

@@ -540,6 +540,12 @@ def source_commit(root: Any) -> str:
         elif dot.is_dir():
             gitdir = dot
         else:
+            # An exported app (council_core.app_export): the commit it was
+            # exported from, written beside its Council files.
+            stamp = base / "SOURCE_COMMIT"
+            if stamp.is_file():
+                text = stamp.read_text(encoding="utf-8").strip()
+                return text if _is_sha(text) else ""
             return ""
         common = gitdir
         pointer = gitdir / "commondir"
