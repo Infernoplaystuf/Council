@@ -172,9 +172,14 @@ def morning(chat: Chat, system: str, packet: str, answer: Answer, *,
             messages.append({"role": "user",
                              "content": "\n\n".join(replies) + "\n\n" + tail})
             continue
-        messages.append({"role": "user", "content":
-                         "Decide now: reply with a trade or hold JSON "
-                         "object only."})
+        if last_turn:
+            nudge = "Decide now: reply with a trade or hold JSON object only."
+        else:
+            nudge = ('Not understood: "action" must be "request", "trade" '
+                     'or "hold". To ask for data reply e.g. {"action": '
+                     '"request", "requests": [{"tool": "history", "ticker": '
+                     '"NVDA", "days": 30}]}. Otherwise trade or hold.')
+        messages.append({"role": "user", "content": nudge})
     return {"action": "error", "reason": "no decision after "
             f"{max_rounds} turns", "requests": log}, messages
 
