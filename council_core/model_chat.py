@@ -94,7 +94,11 @@ def catalog_matches(query: str, models: Optional[List[Any]] = None) -> List[Any]
         return exact
     # Whole words, so "3" does not match every model with a 3 in it.
     hay = [(m, set(f"{_norm(m.id)} {_norm(m.name)}".split())) for m in models]
-    return [m for m, tokens in hay if all(w in tokens for w in words)]
+    hits = [m for m, tokens in hay if all(w in tokens for w in words)]
+    # A current model wins over the older (legacy) entries it replaced:
+    # "granite 8b" is Granite 4.2 8B, not also Granite 3.0 / 3.1.
+    current = [m for m in hits if not getattr(m, "legacy", False)]
+    return current or hits
 
 
 def origin(repo: str, filename: str) -> str:
@@ -171,8 +175,12 @@ class ModelChat:
         if size:
             bits.append(f"{size:g} GB")
         bits.append(where)
-        if role and role != "general":
-            bits.append(f"good for {role}")
+        good = [role] if role and role not in ("general", "tiny") else []
+        good += [r for r in (raw.get("good_for") or ()) if r not in good]
+        if good:
+            bits.append("good for " + ", ".join(good))
+        if raw.get("ollama"):
+            bits.append(f"ollama pull {raw['ollama']}")
         return " — ".join(bits) + f"   [{row.model_id}]"
 
     # -- downloading -------------------------------------------------------
@@ -184,6 +192,12 @@ class ModelChat:
                      "ids in brackets.", "final")
             return
         m = hits[0]
+        if not (m.hf_repo and m.hf_file):
+            # Offered through Ollama only (model_catalog says why).
+            self.say("Writer", f"{m.name} is offered through Ollama only. "
+                     f"Open a terminal and run:\n  ollama pull {m.ollama}\n"
+                     "then press Rescan in the Models tab.", "final")
+            return
         self.download(Target(m.hf_repo, m.hf_file, name=m.name,
                              size_gb=m.size_gb, verified=True))
 

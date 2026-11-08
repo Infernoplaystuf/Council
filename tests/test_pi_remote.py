@@ -358,7 +358,7 @@ def test_only_us_models(model, us):
 def test_every_recommendation_is_us_origin():
     for ram in (2, 4, 8, 16):
         assert all(pi_models.is_us_origin(m) for m in pi_models.for_ram(ram))
-    assert pi_models.for_ram(3.7)[0] == "llama3.2:3b"        # a "4 GB" Pi
+    assert pi_models.for_ram(3.7)[0] == "granite4.2:3b"      # a "4 GB" Pi
 
 
 # ── the user's decisions of 2026-10-07 ────────────────────────────────────

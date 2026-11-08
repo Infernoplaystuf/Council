@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QLineEdit, QPlainTextEdit, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from council_core import model_jobs
 from council_core import paths
@@ -177,7 +177,18 @@ class ModelsTab(ViewHelpers, QWidget):
                                       for _key, heading in model_jobs.COLUMNS])
         self.results.setRootIsDecorated(False)
         self.results.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.results.currentItemChanged.connect(self._show_steps)
         outer.addWidget(self.results, 1)
+
+        # How to get the selected model: its `ollama pull` command and its
+        # Hugging Face file (model_catalog.download_steps). Selectable, so a
+        # command can be copied straight out of it.
+        self.steps = QPlainTextEdit()
+        self.steps.setReadOnly(True)
+        self.steps.setPlaceholderText(
+            "Select a model to see how to download it.")
+        self.steps.setMaximumHeight(170)
+        outer.addWidget(self.steps)
 
         actions = QHBoxLayout()
         self.download_btn = self._button(actions, "⬇ Download & install",
@@ -298,6 +309,9 @@ class ModelsTab(ViewHelpers, QWidget):
         self.status.setText(amp(f"The Ledger and the Connections graph read pictures with "
                                 f"{exe} now."))
 
+    def _show_steps(self, *_args) -> None:
+        self.steps.setPlainText(model_jobs.copy_text(self.selected_row()))
+
     def selected_row(self) -> Optional[model_jobs.ModelRow]:
         index = self.results.indexOfTopLevelItem(self.results.currentItem())
         return self._rows[index] if 0 <= index < len(self._rows) else None
@@ -394,6 +408,13 @@ class ModelsTab(ViewHelpers, QWidget):
         self._download(row)
 
     def _download(self, row: model_jobs.ModelRow) -> None:
+        if not row.repo:
+            tag = row.raw.get("ollama")
+            self.status.setText(
+                f"{row.cells[0]} is offered through Ollama only: run "
+                f"`ollama pull {tag}` in a terminal, then Rescan."
+                if tag else "That model has no download source listed.")
+            return
         size = row.raw.get("size_gb")
         dest = self.actions.models_dir()
         # The folder the file lands in, not the vault — they can be on
@@ -441,7 +462,7 @@ class ModelsTab(ViewHelpers, QWidget):
             return
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(model_jobs.copy_text(row))
-        self.status.setText("Copied the repo and file name.")
+        self.status.setText("Copied the download steps.")
 
 
 def build_models(window) -> QWidget:

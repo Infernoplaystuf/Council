@@ -613,7 +613,8 @@ def _catalog_pick(vram_gb: float) -> str:
     if fitting:
         names = [m.name for m in fitting[:2]]
         return names[0] + (f"  (or {names[1]})" if len(names) > 1 else "")
-    small = sorted((m for m in mc.MODELS if m.role == "general"),
+    small = sorted((m for m in getattr(mc, "CURRENT", mc.MODELS)
+                    if m.role == "general"),
                    key=lambda m: m.size_gb)
     return (small[0].name + "  (CPU inference)") if small else \
         "Llama 3.2 3B Instruct Q4_K_M  (CPU inference)"

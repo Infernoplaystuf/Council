@@ -53,9 +53,10 @@ CATALOG_NOTE = (
     "Curated US-made GGUF models ranked by fit for this machine. Models that "
     "fit your VRAM run on GPU; \"partial\" ones split between GPU and RAM "
     "(slower); the rest run on CPU.\n"
-    "Nothing downloads automatically — pick one and fetch it from the listed "
-    "repo, or `ollama pull` its tag. US-origin is verified for the catalog; "
-    "online results are a name heuristic.")
+    "Nothing downloads automatically. Select a model to see how to get it "
+    "(the `ollama pull` command, or the Hugging Face file for llama-cpp). "
+    "US-origin is verified for the catalog; online results are a name "
+    "heuristic.")
 
 
 @dataclass
@@ -596,9 +597,29 @@ def copy_text(row: ModelRow) -> str:
     """
     if not row:
         return ""
+    steps = download_steps(row)
+    if steps:
+        return steps
     lines = [row.cells[0]]
     if row.repo:
         lines.append(f"repo: {row.repo}")
     if row.filename:
         lines.append(f"file: {row.filename}")
+    if row.repo and row.filename:
+        lines.append(f"    hf download {row.repo} {row.filename} "
+                     "--local-dir ./models")
     return "\n".join(lines)
+
+
+def download_steps(row: Optional[ModelRow]) -> str:
+    """How to get a catalog row's model (model_catalog.download_steps: the
+    Ollama command, the Hugging Face command, the picture reader, the pages),
+    or "" for a row the catalog does not know (an online result)."""
+    if not row:
+        return ""
+    try:
+        import model_catalog
+        spec = model_catalog.by_id(row.model_id)
+        return model_catalog.download_steps(spec) if spec else ""
+    except Exception:                                     # noqa: BLE001
+        return ""

@@ -1,8 +1,8 @@
 """Which model a Pi should run — US-origin only.
 
-The Apothecary's PI_MODEL_RECOMMENDATIONS (apothecary_engine.py) lists
-qwen2.5 first for every Pi and its DEFAULT_MODEL is qwen2.5:3b; the Council
-recommends only US-origin models (Llama, Phi, Gemma, Granite, OLMo,
+The Apothecary's PI_MODEL_RECOMMENDATIONS (apothecary_engine.py) listed
+qwen2.5 first for every Pi until 2026-11-08 (now the same US picks as here);
+the Council recommends only US-origin models (Llama, Phi, Gemma, Granite, OLMo,
 gpt-oss). This table is what the Pi setup offers. Sizes are the Ollama q4
 downloads; a Pi needs roughly the model size plus ~1 GB free, so each entry
 fits the RAM it is listed under. The KG0 benchmark decides which of these is
@@ -20,9 +20,9 @@ from typing import List, Optional
 
 #: RAM (GB) -> models, best first.
 BY_RAM = {
-    16: ["llama3.1:8b", "granite3.3:8b", "gemma3:12b"],
-    8: ["llama3.1:8b", "granite3.3:8b", "gemma3:4b"],
-    4: ["llama3.2:3b", "granite3.3:2b", "gemma3:1b"],
+    16: ["granite4.2:8b", "gemma4:12b", "llama3.1:8b"],
+    8: ["granite4.2:8b", "granite4.2:3b", "phi4-mini:3.8b"],
+    4: ["granite4.2:3b", "phi4-mini:3.8b", "llama3.2:3b"],
     2: ["llama3.2:1b", "gemma3:1b"],
 }
 US_FAMILIES = ("llama", "phi", "gemma", "granite", "olmo", "gpt-oss")
@@ -37,6 +37,11 @@ MAKERS = {"llama": "Meta", "phi": "Microsoft", "gemma": "Google", "granite": "IB
 #: measured on a Pi). llama3.1:8b is exact: this PC's /api/tags reports
 #: 4,920,753,328 bytes (tests/fake_ollama.DEFAULT_TAGS). Shown as "about".
 DOWNLOAD_BYTES = {
+    # Added 2026-11-08, as ollama.com/library lists them.
+    "granite4.2:8b": 5_300_000_000,
+    "granite4.2:3b": 2_200_000_000,
+    "gemma4:12b": 7_700_000_000,
+    "phi4-mini:3.8b": 2_500_000_000,
     "llama3.1:8b": 4_920_753_328,
     "llama3.2:3b": 2_000_000_000,
     "llama3.2:1b": 1_300_000_000,

@@ -1953,7 +1953,7 @@ def test_model_finder_us_filter_and_fit() -> None:
     _check("upgrade headroom is positive", (up["headroom_gb"] or 0) > 0)
 
     top = mf.assess_upgrade(hardware={"vram_gb": 24.0, "ram_gb": 64.0},
-                            current_model="phi-4-14b-Q4_K_M.gguf",
+                            current_model="gemma-4-31B-it-Q4_K_M.gguf",
                             role="general")
     _check("already running top model => no upgrade",
            top["can_upgrade"] is False and top["upgrades"] == [])

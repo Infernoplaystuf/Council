@@ -94,7 +94,7 @@ def test_the_list_names_hardware_fit_and_how_to_download(chat):
     text = run(chat, "what models can I download?")
     assert "GPU: RTX 5080" in text
     assert "fits your GPU" in text and "runs on CPU" in text
-    assert "[granite-3.1-8b-q4]" in text
+    assert "[granite-4.2-8b]" in text
     assert 'say "download <name>"' in text
     assert "good for code" in text
 
@@ -113,12 +113,24 @@ def test_download_by_name_words(chat):
 
 
 def test_an_ambiguous_name_lists_the_choices(chat):
-    text = run(chat, "download granite 8b")
+    text = run(chat, "download phi 4")       # Phi-4-reasoning and Phi-4-mini
     assert "matches 2 models" in text and chat.jobs.downloads == []
 
 
+def test_a_current_model_wins_over_the_older_ones_it_replaced(chat):
+    run(chat, "download granite 8b")
+    assert chat.jobs.downloads == [("ibm-granite/granite-4.2-8b-GGUF",
+                                    "granite-4.2-8b-Q4_K_M.gguf")]
+
+
+def test_an_ollama_only_model_says_to_pull_it(chat):
+    text = run(chat, "download muse glimmer")
+    assert "ollama pull muse-glimmer:30b" in text
+    assert chat.jobs.downloads == []
+
+
 def test_progress_is_reported_every_ten_percent_not_every_chunk(chat):
-    run(chat, "download phi 4")
+    run(chat, "download phi 4 reasoning")
     progress = [t for w, t, k in chat.said if w == "Workflow"]
     assert len(progress) == 3 and "(100%)" in progress[-1]
 
@@ -140,7 +152,7 @@ def test_no_room_is_said_before_downloading(tmp_path):
     c = model_chat.ModelChat(lambda w, t, k: said.append(t),
                              jobs=Jobs(tmp_path, space_problem="Not enough "
                                        "room: 9 GB needed"))
-    c.plan("download phi 4")()
+    c.plan("download phi 4 reasoning")()
     assert said[-1].startswith("Not enough room")
     assert c.jobs.downloads == []
 
@@ -148,7 +160,7 @@ def test_no_room_is_said_before_downloading(tmp_path):
 def test_one_download_at_a_time(chat):
     model_chat.ModelChat._download_lock.acquire()
     try:
-        assert "already running" in run(chat, "download phi 4")
+        assert "already running" in run(chat, "download phi 4 reasoning")
     finally:
         model_chat.ModelChat._download_lock.release()
     assert chat.jobs.downloads == []
@@ -158,15 +170,19 @@ def test_a_failed_download_says_so(chat):
     def boom(*a, **k):
         raise RuntimeError("HTTP 404")
     chat.jobs.download = boom
-    assert run(chat, "download phi 4") == "Download failed: HTTP 404"
+    assert run(chat, "download phi 4 reasoning") == \
+        "Download failed: HTTP 404"
 
 
 def test_catalog_matching_is_whole_words():
     assert model_chat.catalog_matches("gem") == []       # not a substring
-    # Every Gemma in the catalog (Gemma 3 4B / 12B joined it for the 8 GB
-    # tier), and nothing that merely contains the letters.
+    # Every current Gemma in the catalog (the older Gemma 2 / 3 entries give
+    # way to Gemma 4), and nothing that merely contains the letters.
     assert sorted(m.id for m in model_chat.catalog_matches("gemma")) == \
-        ["gemma-2-9b-q4", "gemma-3-12b-q4", "gemma-3-4b-q4"]
+        ["gemma-4-12b", "gemma-4-26b-a4b", "gemma-4-31b", "gemma-4-e2b",
+         "gemma-4-e4b"]
+    assert [m.id for m in model_chat.catalog_matches("gemma 3 12b")] == \
+        ["gemma-3-12b-q4"]                   # an older one, asked for by name
 
 
 # ============================================================

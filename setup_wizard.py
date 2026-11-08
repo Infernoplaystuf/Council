@@ -432,18 +432,22 @@ def step6_pick_model(py: Path, args) -> "Optional[object]":
     # zero models to anyone with a low-VRAM GPU, dead-ending the wizard
     # at "Choose 1-0 or s".
     _, vram_gb, _ = detect_gpu()
+    # Current models with a GGUF file (this wizard downloads the file);
+    # --all adds the older ones. An Ollama-only entry has no file.
+    offered = [m for m in getattr(mc, "CURRENT", mc.MODELS)
+               if getattr(m, "has_hf_file", True)]
     if vram_gb:
         suitable = sorted(
-            (m for m in mc.MODELS
+            (m for m in offered
              if m.role in ("general", "tiny") and mc.fits(m, vram_gb)),
             key=lambda m: (not m.is_default, -m.params_b),
         )
         print(f"  Showing models that fit comfortably in {vram_gb} GB VRAM. "
               "Add --all to see everything.")
     else:
-        suitable = [m for m in mc.MODELS if m.role in ("general", "tiny")]
+        suitable = [m for m in offered if m.role in ("general", "tiny")]
     if args.all:
-        suitable = list(mc.MODELS)
+        suitable = [m for m in mc.MODELS if getattr(m, "has_hf_file", True)]
 
     if args.model:
         chosen = mc.by_id(args.model)
@@ -461,7 +465,7 @@ def step6_pick_model(py: Path, args) -> "Optional[object]":
             f"  No catalogued model fits a {vram_gb} GB budget "
             "comfortably. Showing the full catalog — the smallest "
             "option may still run if you accept slow CPU offload."))
-        suitable = [m for m in mc.MODELS if m.role in ("general", "tiny")]
+        suitable = [m for m in offered if m.role in ("general", "tiny")]
 
     print()
     for i, m in enumerate(suitable, 1):
