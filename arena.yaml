@@ -1,4 +1,4 @@
-# The Model Arena: one local model per family trades its own paper book.
+﻿# The Model Arena: one local model per family trades its own paper book.
 # Pretend money only: nothing here can place a real order.
 # Prices and the stock list come from config.yaml (universe, data); the
 # price cache is shared with the A/B duel (data/shared/prices).
@@ -29,8 +29,6 @@ contestants:            # middle size of each family installed on this PC
   - {name: Llama,   model: "llama3.2:latest"}
   - {name: Phi,     model: "phi4:14b"}
   - {name: Granite, model: "granite3.3:8b"}
-  - {name: Qwen,    model: "qwen2.5:14b-instruct-q4_K_M"}
-  - {name: Mistral, model: "mistral:7b"}
   - {name: GPT-OSS, model: "gpt-oss:20b", json_format: false, think: low,
      reply_tokens: 4000}
   - {name: OLMo,    model: "olmo2:13b", num_ctx: 4096,  # its window is 4k
