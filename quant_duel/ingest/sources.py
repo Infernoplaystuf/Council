@@ -38,8 +38,47 @@ def _empty() -> pd.DataFrame:
     return pd.DataFrame(columns=COLUMNS, index=pd.Index([], name="date"))
 
 
+def system_ca_bundle():
+    """A PEM of the operating system's trusted roots plus certifi's.
+
+    yfinance talks through curl_cffi, which trusts only certifi's bundle.
+    Where antivirus scans HTTPS with its own root (Norton, Avast...), that
+    root is in the OS store but not in certifi, so every download fails.
+    Python's ``ssl`` loads the OS store on Windows; export it once."""
+    import ssl
+    import tempfile
+    from pathlib import Path
+    try:
+        ctx = ssl.create_default_context()
+        pems = [ssl.DER_cert_to_PEM_cert(d)
+                for d in ctx.get_ca_certs(binary_form=True)]
+        try:
+            import certifi
+            pems.append(Path(certifi.where()).read_text(encoding="ascii"))
+        except Exception:                                 # noqa: BLE001
+            pass
+        path = Path(tempfile.gettempdir()) / "quant_duel_ca.pem"
+        path.write_text("".join(pems), encoding="ascii")
+        return str(path)
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
 class YFinanceSource(DataSource):
     name = "yfinance"
+
+    def __init__(self):
+        self._session = None
+
+    def session(self):
+        if self._session is None:
+            try:
+                from curl_cffi import requests as creq
+                self._session = creq.Session(
+                    impersonate="chrome", verify=system_ca_bundle() or True)
+            except ImportError:
+                self._session = False
+        return self._session or None
 
     def fetch(self, ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
         try:
@@ -51,7 +90,7 @@ class YFinanceSource(DataSource):
             raw = yf.download(ticker, start=start.isoformat(),
                               end=(end + dt.timedelta(days=1)).isoformat(),
                               auto_adjust=False, progress=False,
-                              threads=False)
+                              threads=False, session=self.session())
         except Exception as exc:                          # noqa: BLE001
             raise DataSourceError(f"yfinance failed for {ticker}: {exc}") from exc
         if raw is None or raw.empty:

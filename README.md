@@ -227,3 +227,22 @@ identical). Splits are time-ordered with a one-day embargo; scalers live
 inside the fitted model. A feature equal to the future target is refused;
 a shuffled target scores ~50%. Results above ~55% accuracy, or a Sharpe far
 above buy-and-hold, are flagged as suspicious, not reported as wins.
+
+## The Model Arena (model vs model)
+
+A separate game on the same data: one local model per family (see
+`arena.yaml`) trades its own pretend $10,000. Every trading morning at 2am
+each model gets the previous close and key stats for every stock, recent
+headlines, its own book and the leaderboard; it may ask for up to 5 extra
+pieces of data, then names its holdings as percents. Orders fill at that
+day's open with a 5 bp cost. Most money at the close on `end` wins.
+Paper trading only.
+
+```
+python -m quant_duel.arena run       # the daily job (deploy/run_arena.ps1, Task Scheduler 2am)
+python -m quant_duel.arena status
+python -m quant_duel.arena report    # leaderboard: reports/arena/latest.html (also written every Sunday)
+```
+
+Books: `data/arena/books/*.json`; each model's morning conversation:
+`data/arena/logs/<day>/<name>.json`; job logs: `logs/arena/`.

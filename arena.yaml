@@ -1,0 +1,37 @@
+# The Model Arena: one local model per family trades its own paper book.
+# Pretend money only: nothing here can place a real order.
+# Prices and the stock list come from config.yaml (universe, data); the
+# price cache is shared with the A/B duel (data/shared/prices).
+
+start: "2026-11-09"     # first trading day; its open is the first fill
+end: "2027-02-09"       # last trading day; standings at its close are final
+start_cash: 10000
+cost_bps: 5             # charged on every dollar traded
+benchmark: SPY          # a buy-and-hold book of this runs alongside
+
+ollama: http://localhost:11434
+temperature: 0.2
+num_ctx: 8192           # per-contestant override below
+max_requests: 5         # extra data requests per model per morning
+max_rounds: 4           # model turns per morning (requests + the decision)
+reply_tokens: 1200
+timeout_s: 600
+
+headlines_per_ticker: 2 # in the morning packet, newest first
+max_headlines: 40
+headline_hours: 72      # how far back the packet looks for headlines
+
+dir: data/arena
+reports: reports/arena
+
+contestants:            # middle size of each family installed on this PC
+  - {name: Gemma,   model: "gemma3:12b"}
+  - {name: Llama,   model: "llama3.2:latest"}
+  - {name: Phi,     model: "phi4:14b"}
+  - {name: Granite, model: "granite3.3:8b"}
+  - {name: Qwen,    model: "qwen2.5:14b-instruct-q4_K_M"}
+  - {name: Mistral, model: "mistral:7b"}
+  - {name: GPT-OSS, model: "gpt-oss:20b", json_format: false, think: low,
+     reply_tokens: 4000}
+  - {name: OLMo,    model: "olmo2:13b", num_ctx: 4096,  # its window is 4k
+     max_requests: 2}
