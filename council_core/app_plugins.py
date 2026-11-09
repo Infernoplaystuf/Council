@@ -16,8 +16,9 @@ rig, and that check is this module's (`check`):
     id        reverse-domain; "council." is kept for the plugins that ship
               with Council
     network   "none" only: Council is offline by design
-    needs     services the plugin asks Council for; none are offered yet,
-              so a plugin that names one is listed with that reason
+    needs     services the plugin asks Council for (council_core.
+              plugin_services: "sources", "models"); a plugin naming one
+              Council does not offer is listed with that reason
 
 WHERE PLUGINS ARE (`discover`)
   * Built in: the folders of `council_plugins/` that BUILTIN_PLUGINS names.
@@ -37,7 +38,8 @@ A switched-on plugin's entry ("module:object", inside its own folder) is
 imported from its folder as a package of its own, without touching
 sys.path, and called with a PluginContext: the plugin's own data folder
 (`<app dir>/plugin_data/<id>/`, made on first use), atomic JSON save and
-load inside it, and the window. A plugin reaches nothing else of Council
+load inside it, the window, and the services its manifest names in `needs`
+(`service`, made on first use). A plugin reaches nothing else of Council
 through it.
 
 FAULTS (`record_fault`)
@@ -78,9 +80,10 @@ KINDS = ("tab",)
 BUILTIN_PREFIX = "council."
 #: The only network a Council plugin may say it uses.
 NETWORK = ("none",)
-#: Services a plugin may ask for in `needs`. None are offered yet; the
-#: local model and Connections search are the first planned.
-SERVICES: frozenset = frozenset()
+#: Services a plugin may ask for in `needs` (council_core.plugin_services:
+#: "sources" = the user's documents as Connections reads them, "models" =
+#: the US-origin local models). Named here so listing imports nothing.
+SERVICES: frozenset = frozenset({"sources", "models"})
 
 #: The fields a Council manifest may hold.
 REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",
@@ -92,7 +95,7 @@ FIELDS = frozenset(REQUIRED) | frozenset(OPTIONAL)
 
 #: The built-in plugins: folder names under council_plugins/. A plugin is
 #: built in because it is on this list, never because of where it sits.
-BUILTIN_PLUGINS: Sequence[str] = ("finance",)
+BUILTIN_PLUGINS: Sequence[str] = ("finance", "study")
 
 #: Where the built-in plugins ship (beside council_core in the source tree
 #: and in the bundle).
@@ -406,11 +409,26 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,120}$")
 @dataclass
 class PluginContext:
     """What Council hands a plugin: its own data folder, atomic JSON in it,
-    and the window. Nothing else of Council is reachable through it."""
+    the window, and the services its manifest asked for. Nothing else of
+    Council is reachable through it."""
     manifest: pm.Manifest
     window: Any = None
     root: Optional[Path] = None
     _logged: List[str] = field(default_factory=list, repr=False)
+    #: name -> the service, for tests (Council makes them on first use)
+    services: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def service(self, name: str) -> Any:
+        """The service ``name`` (council_core.plugin_services), made the
+        first time it is asked for. Only a service the manifest's `needs`
+        names: anything else is PermissionError."""
+        if name not in self.manifest.needs:
+            raise PermissionError(f"{self.manifest.id} did not ask for the "
+                                  f"{name!r} service in its manifest")
+        if name not in self.services:
+            from council_core import plugin_services
+            self.services[name] = plugin_services.make(name)
+        return self.services[name]
 
     @property
     def id(self) -> str:

@@ -4479,6 +4479,42 @@ class KnowledgeGraph:
                     break
         return out
 
+    def text_passages(self, max_lines: int = 30, overlap: int = 4
+                      ) -> List[Dict[str, Any]]:
+        """Every passage of free text the graph's documents hold, whatever
+        it names: a PDF page or ~``max_lines`` lines, cut per page with a
+        small overlap, blank lines dropped. For reading the documents as
+        text (the Study plugin's notebooks, through council_core.
+        plugin_services); ``text_chunks`` is the model's links pass and
+        keeps only passages naming known entities. Read-only: lines come
+        from doc_cache when it holds the document's version, else from the
+        file. ``[]`` for a document that cannot be read now."""
+        out: List[Dict[str, Any]] = []
+        step = max(1, max_lines - max(0, overlap))
+        for d in self._text_documents():
+            lines = self._doc_lines(d)
+            if not lines:
+                continue
+            groups: Dict[Any, List[Tuple[int, str]]] = {}
+            for page, line, text in lines:
+                if str(text).strip():
+                    groups.setdefault(page, []).append((int(line), str(text)))
+            n = 0
+            for page, plines in groups.items():
+                for start in range(0, len(plines), step):
+                    window = plines[start:start + max_lines]
+                    if not window:
+                        break
+                    out.append({"document_id": d["id"], "path": d["path"],
+                                "display": self.display_path(d["path"]),
+                                "content_hash": d["content_hash"], "chunk": n,
+                                "page": page, "line_nos": [ln for ln, _t in window],
+                                "text": "\n".join(t for _l, t in window)})
+                    n += 1
+                    if start + max_lines >= len(plines):
+                        break
+        return out
+
     def text_chunks(self, max_lines: int = 40, overlap: int = 5
                     ) -> List[Dict[str, Any]]:
         """Every text chunk worth a model call: a PDF page, or ~40 lines with
