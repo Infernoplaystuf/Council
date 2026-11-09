@@ -235,6 +235,11 @@ class ModelsTab(ViewHelpers, QWidget):
             def show() -> None:
                 self._hardware = hardware
                 self.hardware.setText(hardware.summary)
+                # Not once the window is closing: a worker started now would
+                # still be running while QApplication is torn down (a
+                # 'model-find' straggler, CI on Windows, PR #72).
+                if getattr(self.window, "_closing", False):
+                    return
                 self.on_find()          # the first ranking, now that we can
                 self.on_suggest()
 
