@@ -362,3 +362,116 @@ def test_the_review_page_writes_saves_and_shows_a_citation(qapp, built, app_dir)
     assert pump(qapp, lambda: "stroma" in page.cited.toPlainText())
     again = tab_for(src, FakeModels(fake_writer))
     assert again.review_page.review is not None
+
+
+# ------------------------------------------------------------- study documents
+from council_plugins.study.engine import study_docs as sd  # noqa: E402
+import json as _json  # noqa: E402
+import re as _re  # noqa: E402
+
+
+def _num(prompt: str, file: str) -> int:
+    return int(_re.search(r"^\[(\d+)\] notes/" + file, prompt, _re.M).group(1))
+
+
+def fake_teacher(messages, schema):
+    """The review's replies, then for each study kind one good item, one
+    the source does not back, and one citing a source never shown."""
+    if schema == rv.OUTLINE_SCHEMA:
+        return OUTLINE
+    if schema is None:
+        return fake_writer(messages, schema)
+    prompt = messages[-1]["content"]
+    photo = "Section: Photosynthesis" in prompt or "— Photosynthesis" in prompt
+    n = _num(prompt, "photo" if photo else "resp")
+    if schema == sd.SCHEMAS["cards"]:
+        good = ({"front": "Where does the Calvin cycle occur?", "back": "In the stroma"}
+                if photo else {"front": "Where is the Krebs cycle?",
+                               "back": "The mitochondrial matrix"})
+        return _json.dumps({"cards": [dict(good, source=n),
+                                      {"front": "Who found it?", "back": "Melvin Calvin in 1950",
+                                       "source": n},
+                                      dict(good, source=99)]})
+    if schema == sd.SCHEMAS["quiz"]:
+        q = {"kind": "choice", "question": "Where does the Calvin cycle occur?",
+             "choices": ["Stroma", "Thylakoid", "Nucleus", "Cytoplasm"],
+             "answer": "stroma", "explanation": "It occurs in the stroma.", "source": n}
+        bad = dict(q, choices=["Stroma", "Stroma", "Nucleus", "Cytoplasm"],
+                   question="Twice?")
+        short = {"kind": "short", "question": "What does glycolysis yield?",
+                 "answer": "Two ATP per glucose", "source": n}
+        return _json.dumps({"questions": [q, bad] if photo else [short]})
+    if schema == sd.SCHEMAS["guide"]:
+        text = ("Chlorophyll a absorbs red and blue light." if photo
+                else "The electron transport chain makes most of the ATP.")
+        return _json.dumps({"points": [{"text": text, "source": n}]})
+    if schema == sd.SCHEMAS["glossary"]:
+        return _json.dumps({"terms": [
+            {"term": "Stroma" if photo else "Glycolysis",
+             "definition": ("where the Calvin cycle occurs and fixes carbon dioxide"
+                            if photo else "happens in the cytoplasm and yields two ATP"),
+             "source": n},
+            {"term": "Rubisco", "definition": "an enzyme", "source": n}]})
+    raise AssertionError(schema)
+
+
+@pytest.fixture
+def review(built):
+    src, nb = built
+    return rv.write_review(FakeModels(fake_teacher).chat("m"), src, nb.id)
+
+
+def test_study_documents_keep_only_items_their_source_backs(review):
+    st = sd.make_study_set(FakeModels(fake_teacher).chat("m"), review)
+    assert [c["front"] for c in st.cards] == ["Where does the Calvin cycle occur?",
+                                              "Where is the Krebs cycle?"]
+    assert st.cards[0]["back"] == "In the stroma"
+    assert [q["question"] for q in st.quiz] == ["Where does the Calvin cycle occur?",
+                                                "What does glycolysis yield?"]
+    assert st.quiz[0]["answer"] == "Stroma"           # the choice, as written
+    assert [g["heading"] for g in st.guide] == ["Photosynthesis", "Respiration"]
+    assert sorted(t["term"] for t in st.glossary) == ["Glycolysis", "Stroma"]
+    assert st.dropped == {"cites no passage this section was shown": 2,
+                          "not in the passage it cites": 4,
+                          "not four different choices": 1}
+    for n in st.cited("cards") + st.cited("quiz") + st.cited("glossary"):
+        assert st.sources[n].text
+
+
+def test_a_study_set_round_trips_and_renders(review):
+    st = sd.make_study_set(FakeModels(fake_teacher).chat("m"), review)
+    again = sd.StudySet.from_dict(_json.loads(_json.dumps(st.to_dict())))
+    assert again.to_dict() == st.to_dict()
+    html = again.to_html("quiz", lambda t: t)
+    assert "Answer key" in html and "A. Stroma" in html
+    assert "Answer key" not in again.to_html("quiz", lambda t: t, answers=False)
+    assert "Chlorophyll a absorbs" in again.to_html("guide", lambda t: t)
+
+
+def test_only_the_kinds_asked_for_are_made(review):
+    st = sd.make_study_set(FakeModels(fake_teacher).chat("m"), review, ["cards"])
+    assert st.cards and not st.quiz and not st.guide and not st.glossary
+    with pytest.raises(ValueError):
+        sd.make_study_set(FakeModels(fake_teacher).chat("m"), review, [])
+
+
+def test_a_reply_that_is_not_json_is_counted_not_crashed(review):
+    st = sd.make_study_set(FakeModels("sorry, I cannot").chat("m"), review, ["cards"])
+    assert not st.cards
+    assert st.dropped == {"the model's reply was not the JSON asked for": 2}
+
+
+def test_the_study_page_makes_from_the_review_and_saves(qapp, built, app_dir):
+    src, nb = built
+    tab = tab_for(src, FakeModels(fake_teacher))
+    assert pump(qapp, lambda: tab.model.currentData() == "granite3.3:8b")
+    tab.docs_page.make()
+    assert "Write the review first" in tab.status.text()
+    tab.review_page.write()
+    assert pump(qapp, lambda: tab.review_page.review is not None)
+    tab.docs_page.make()
+    assert pump(qapp, lambda: tab.docs_page.set is not None)
+    assert "Where does the Calvin cycle occur?" in tab.docs_page.view.text.toPlainText()
+    assert (app_dir / "plugin_data" / "council.study" / f"{nb.id}.study.json").exists()
+    tab.docs_page.show_kind.setCurrentIndex(sd.KINDS.index("glossary"))
+    assert "Glycolysis" in tab.docs_page.view.text.toPlainText()

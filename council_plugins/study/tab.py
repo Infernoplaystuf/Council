@@ -16,6 +16,9 @@ Pages (right):
             citation shows that passage, and what the model wrote but could
             not back with a citation is listed apart. Saved per notebook
             (<notebook>.review.json).
+  Study documents  flash cards, a quiz with its answer key, a study guide
+            and a glossary made from the review (engine.study_docs), each item
+            checked against the passage it cites. <notebook>.study.json.
 
 Work that reads files or asks a model runs on a worker thread; its result
 comes back to the GUI thread through a queued signal (``_Ui``). What the
@@ -29,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QMessageBox, QPushButton, QSpinBox, QSplitter,
@@ -37,6 +40,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
 
 from .engine import common as cm
 from .engine import review as rv
+from .engine import study_docs as sd
 
 SETTINGS_FILE = "settings.json"
 SEARCH_RESULTS = 25
@@ -179,6 +183,57 @@ class SourcesPage(QWidget):
             self.tab.open_file(self._current)
 
 
+class CitedView(QWidget):
+    """A document whose citations are links ``cite:<n>``, beside the cited
+    passage: click a citation to read it, Open file to open it."""
+
+    def __init__(self, tab: "StudyTab", name: str, sources: Callable[[], Dict[int, Any]]):
+        super().__init__()
+        self.tab = tab
+        self._sources = sources
+        self._source = None
+        self.text = QTextBrowser()
+        self.text.setObjectName(name)
+        self.text.setOpenLinks(False)
+        self.text.anchorClicked.connect(self.cite_clicked)
+        self.cited = QTextBrowser()
+        self.cited.setObjectName(name + "_source")
+        self.open_btn = QPushButton("Open file")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(lambda: self._source and self.tab.open_file(self._source))
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.addWidget(QLabel("Cited passage (click a [number])"))
+        sl.addWidget(self.cited, 1)
+        sl.addWidget(self.open_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self.text)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(split)
+
+    def set_html(self, html: str) -> None:
+        self.text.setHtml(html)
+        self.cited.clear()
+        self.open_btn.setEnabled(False)
+        self._source = None
+
+    def cite_clicked(self, url) -> None:
+        text = url.toString()
+        if not text.startswith("cite:"):
+            return
+        src = (self._sources() or {}).get(int(text[5:]))
+        if src is None:
+            return
+        self._source = src
+        self.open_btn.setEnabled(True)
+        self.tab.show_passage(self.cited, src)
+
+
 class ReviewPage(QWidget):
     """Write the notebook's literature review; click a citation to read it."""
 
@@ -209,30 +264,12 @@ class ReviewPage(QWidget):
         top.addWidget(self.write_btn)
         top.addWidget(self.stop_btn)
         top.addWidget(self.save_btn)
-        self.text = QTextBrowser()
-        self.text.setObjectName("study_review")
-        self.text.setOpenLinks(False)
-        self.text.anchorClicked.connect(self.cite_clicked)
-        self.cited = QTextBrowser()
-        self.cited.setObjectName("study_review_source")
-        self.open_btn = QPushButton("Open file")
-        self.open_btn.setEnabled(False)
-        self.open_btn.clicked.connect(lambda: self._source and self.tab.open_file(self._source))
-        self._source: Optional[rv.Source] = None
-        side = QWidget()
-        sl = QVBoxLayout(side)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.addWidget(QLabel("Cited passage"))
-        sl.addWidget(self.cited, 1)
-        sl.addWidget(self.open_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.text)
-        split.addWidget(side)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
+        self.view = CitedView(tab, "study_review",
+                              lambda: self.review.sources if self.review else {})
+        self.text, self.cited = self.view.text, self.view.cited
         lay = QVBoxLayout(self)
         lay.addLayout(top)
-        lay.addWidget(split, 1)
+        lay.addWidget(self.view, 1)
 
     def file_name(self, nid: str) -> str:
         return f"{nid}.review.json"
@@ -244,27 +281,20 @@ class ReviewPage(QWidget):
     def set_review(self, review: Optional[rv.Review]) -> None:
         self.review = review
         self.save_btn.setEnabled(review is not None)
-        self.cited.clear()
-        self.open_btn.setEnabled(False)
         if review is None:
-            self.text.setHtml("<p style='color:#888'>No review yet. Press Write "
+            self.view.set_html("<p style='color:#888'>No review yet. Press Write "
                               "review: the model plans sections, writes each from "
                               "the notebook's passages, and every sentence it "
                               "cannot back with a citation is left out.</p>")
         else:
-            self.text.setHtml(review.to_html(esc))
+            self.view.set_html(review.to_html(esc))
 
     def write(self) -> None:
-        nid, model = self.tab.notebook_id(), self.tab.model_id()
+        nid = self.tab.notebook_id()
         if not nid:
             return
-        if not model:
-            self.tab.status.setText("Choose a model first (a US-made model on this PC).")
-            return
-        try:
-            chat = self.tab.models.chat(model)
-        except ValueError as exc:
-            self.tab.status.setText(str(exc))
+        chat = self.tab.chat()
+        if chat is None:
             return
         self._stop.clear()
         self.write_btn.setEnabled(False)
@@ -295,15 +325,7 @@ class ReviewPage(QWidget):
         self.stop_btn.setEnabled(False)
 
     def cite_clicked(self, url) -> None:
-        text = url.toString()
-        if not text.startswith("cite:") or self.review is None:
-            return
-        src = self.review.sources.get(int(text[5:]))
-        if src is None:
-            return
-        self._source = src
-        self.open_btn.setEnabled(True)
-        self.tab.show_passage(self.cited, src)
+        self.view.cite_clicked(url)
 
     def save_markdown(self) -> None:
         if self.review is None:
@@ -315,6 +337,124 @@ class ReviewPage(QWidget):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(self.review.to_markdown())
             self.tab.status.setText(f"Saved {path}")
+
+
+class StudyDocsPage(QWidget):
+    """Flash cards, a quiz, a study guide and a glossary made from the
+    review, each item citing its passage."""
+
+    def __init__(self, tab: "StudyTab"):
+        super().__init__()
+        self.tab = tab
+        self.set: Optional[sd.StudySet] = None
+        self._stop = threading.Event()
+        self.kinds: Dict[str, QCheckBox] = {}
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Make:"))
+        for kind in sd.KINDS:
+            box = QCheckBox(sd.KIND_NAMES[kind])
+            box.setChecked(True)
+            box.setObjectName(f"study_make_{kind}")
+            self.kinds[kind] = box
+            top.addWidget(box)
+        self.make_btn = QPushButton("Make from the review")
+        self.make_btn.setObjectName("study_make")
+        self.make_btn.clicked.connect(self.make)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop.set)
+        top.addStretch(1)
+        top.addWidget(self.make_btn)
+        top.addWidget(self.stop_btn)
+        show = QHBoxLayout()
+        show.addWidget(QLabel("Show:"))
+        self.show_kind = QComboBox()
+        self.show_kind.setObjectName("study_show_kind")
+        for kind in sd.KINDS:
+            self.show_kind.addItem(sd.KIND_NAMES[kind], kind)
+        self.show_kind.currentIndexChanged.connect(lambda *_a: self.render())
+        self.answers = QCheckBox("Show the quiz's answer key")
+        self.answers.setChecked(True)
+        self.answers.toggled.connect(lambda *_a: self.render())
+        show.addWidget(self.show_kind)
+        show.addWidget(self.answers)
+        show.addStretch(1)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        show.addWidget(self.summary)
+        self.view = CitedView(tab, "study_docs",
+                              lambda: self.set.sources if self.set else {})
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addLayout(show)
+        lay.addWidget(self.view, 1)
+
+    @staticmethod
+    def file_name(nid: str) -> str:
+        return f"{nid}.study.json"
+
+    def notebook_changed(self, nid: str) -> None:
+        saved = self.tab.load(self.file_name(nid)) if nid else None
+        self.set_set(sd.StudySet.from_dict(saved) if saved else None)
+
+    def set_set(self, st: Optional[sd.StudySet]) -> None:
+        self.set = st
+        if st is None:
+            self.summary.setText("")
+        else:
+            c = st.counts()
+            self.summary.setText(
+                f"{c['cards']} cards, {c['quiz']} questions, {c['guide']} key "
+                f"points, {c['glossary']} terms; {c['dropped']} item(s) dropped "
+                f"as not backed by their source.")
+            if st.dropped:
+                self.summary.setToolTip("\n".join(f"{n} × {why}" for why, n in
+                                                   sorted(st.dropped.items())))
+        self.render()
+
+    def render(self) -> None:
+        if self.set is None:
+            self.view.set_html("<p style='color:#888'>Nothing made yet. Write the "
+                               "review first, then press Make from the review.</p>")
+            return
+        kind = str(self.show_kind.currentData())
+        self.view.set_html(self.set.to_html(kind, esc, answers=self.answers.isChecked()))
+
+    def make(self) -> None:
+        nid = self.tab.notebook_id()
+        review = self.tab.review_page.review
+        if not nid:
+            return
+        if review is None:
+            self.tab.status.setText("Write the review first: study documents are made from it.")
+            return
+        chat = self.tab.chat()
+        if chat is None:
+            return
+        kinds = [k for k, box in self.kinds.items() if box.isChecked()]
+        label = self.tab.model.currentText()
+        self._stop.clear()
+        self.make_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        def work():
+            return sd.make_study_set(chat, review, kinds, model=label,
+                                     on_progress=self.tab.say,
+                                     should_stop=self._stop.is_set)
+
+        def done(st):
+            self._idle()
+            self.tab.save(self.file_name(nid), st.to_dict())
+            if nid == self.tab.notebook_id():
+                self.set_set(st)
+                self.tab.status.setText("Study documents made: " + self.summary.text())
+            self.tab.study_changed(nid)
+
+        self.tab.run(work, done, "making study documents", on_fail=self._idle)
+
+    def _idle(self, *_a) -> None:
+        self.make_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
 
 class StudyTab(QWidget):
@@ -416,6 +556,8 @@ class StudyTab(QWidget):
         self.pages.addTab(self.sources_page, "Sources")
         self.review_page = ReviewPage(self)
         self.pages.addTab(self.review_page, "Review")
+        self.docs_page = StudyDocsPage(self)
+        self.pages.addTab(self.docs_page, "Study documents")
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(left)
@@ -440,6 +582,25 @@ class StudyTab(QWidget):
 
     def load(self, name: str) -> Any:
         return self.ctx.load_json(name, None) if self.ctx is not None else None
+
+    def study_changed(self, nid: str) -> None:
+        """New study documents were made: practice may want to know."""
+        for i in range(self.pages.count()):
+            page = self.pages.widget(i)
+            if hasattr(page, "study_changed"):
+                page.study_changed(nid)
+
+    def chat(self):
+        """The chosen model's chat function, or None (said in the status line)."""
+        model = self.model_id()
+        if not model:
+            self.status.setText("Choose a model first (a US-made model on this PC).")
+            return None
+        try:
+            return self.models.chat(model)
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return None
 
     def review_changed(self, nid: str) -> None:
         """A new review was written: pages made from it may want to know."""
