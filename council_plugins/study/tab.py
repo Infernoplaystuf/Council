@@ -11,6 +11,11 @@ here leaves it out of the Council's own answers.
 Pages (right):
   Sources   search the notebook's passages; click one to read the cited
             lines here, or open the file.
+  Review    a literature review of the notebook, or of a topic in it
+            (engine.review): every sentence cites its passages, a click on a
+            citation shows that passage, and what the model wrote but could
+            not back with a citation is listed apart. Saved per notebook
+            (<notebook>.review.json).
 
 Work that reads files or asks a model runs on a worker thread; its result
 comes back to the GUI thread through a queued signal (``_Ui``). What the
@@ -27,8 +32,11 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
-                               QMessageBox, QPushButton, QSplitter,
+                               QMessageBox, QPushButton, QSpinBox, QSplitter,
                                QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+
+from .engine import common as cm
+from .engine import review as rv
 
 SETTINGS_FILE = "settings.json"
 SEARCH_RESULTS = 25
@@ -171,6 +179,144 @@ class SourcesPage(QWidget):
             self.tab.open_file(self._current)
 
 
+class ReviewPage(QWidget):
+    """Write the notebook's literature review; click a citation to read it."""
+
+    def __init__(self, tab: "StudyTab"):
+        super().__init__()
+        self.tab = tab
+        self.review: Optional[rv.Review] = None
+        self._stop = threading.Event()
+        self.topic = QLineEdit()
+        self.topic.setObjectName("study_topic")
+        self.topic.setPlaceholderText("Topic or question (blank: the documents as a whole)")
+        self.sections = QSpinBox()
+        self.sections.setRange(2, 8)
+        self.sections.setValue(rv.SECTIONS)
+        self.sections.setSuffix(" sections")
+        self.write_btn = QPushButton("Write review")
+        self.write_btn.setObjectName("study_write_review")
+        self.write_btn.clicked.connect(self.write)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop.set)
+        self.save_btn = QPushButton("Save as Markdown…")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self.save_markdown)
+        top = QHBoxLayout()
+        top.addWidget(self.topic, 1)
+        top.addWidget(self.sections)
+        top.addWidget(self.write_btn)
+        top.addWidget(self.stop_btn)
+        top.addWidget(self.save_btn)
+        self.text = QTextBrowser()
+        self.text.setObjectName("study_review")
+        self.text.setOpenLinks(False)
+        self.text.anchorClicked.connect(self.cite_clicked)
+        self.cited = QTextBrowser()
+        self.cited.setObjectName("study_review_source")
+        self.open_btn = QPushButton("Open file")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(lambda: self._source and self.tab.open_file(self._source))
+        self._source: Optional[rv.Source] = None
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.addWidget(QLabel("Cited passage"))
+        sl.addWidget(self.cited, 1)
+        sl.addWidget(self.open_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self.text)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(split, 1)
+
+    def file_name(self, nid: str) -> str:
+        return f"{nid}.review.json"
+
+    def notebook_changed(self, nid: str) -> None:
+        saved = self.tab.load(self.file_name(nid)) if nid else None
+        self.set_review(rv.Review.from_dict(saved) if saved else None)
+
+    def set_review(self, review: Optional[rv.Review]) -> None:
+        self.review = review
+        self.save_btn.setEnabled(review is not None)
+        self.cited.clear()
+        self.open_btn.setEnabled(False)
+        if review is None:
+            self.text.setHtml("<p style='color:#888'>No review yet. Press Write "
+                              "review: the model plans sections, writes each from "
+                              "the notebook's passages, and every sentence it "
+                              "cannot back with a citation is left out.</p>")
+        else:
+            self.text.setHtml(review.to_html(esc))
+
+    def write(self) -> None:
+        nid, model = self.tab.notebook_id(), self.tab.model_id()
+        if not nid:
+            return
+        if not model:
+            self.tab.status.setText("Choose a model first (a US-made model on this PC).")
+            return
+        try:
+            chat = self.tab.models.chat(model)
+        except ValueError as exc:
+            self.tab.status.setText(str(exc))
+            return
+        self._stop.clear()
+        self.write_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        sources, topic, n = self.tab.sources, self.topic.text().strip(), self.sections.value()
+        label = self.tab.model.currentText()
+
+        def work():
+            return rv.write_review(chat, sources, nid, topic=topic, model=label,
+                                   sections=n, on_progress=self.tab.say,
+                                   should_stop=self._stop.is_set)
+
+        def done(review):
+            self._idle()
+            self.tab.save(self.file_name(nid), review.to_dict())
+            if nid == self.tab.notebook_id():
+                self.set_review(review)
+                c = review.counts()
+                self.tab.status.setText(
+                    f"Review written: {c['sentences']} cited sentences, "
+                    f"{c['left_out']} left out as unsupported.")
+            self.tab.review_changed(nid)
+
+        self.tab.run(work, done, "writing the review", on_fail=self._idle)
+
+    def _idle(self, *_a) -> None:
+        self.write_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def cite_clicked(self, url) -> None:
+        text = url.toString()
+        if not text.startswith("cite:") or self.review is None:
+            return
+        src = self.review.sources.get(int(text[5:]))
+        if src is None:
+            return
+        self._source = src
+        self.open_btn.setEnabled(True)
+        self.tab.show_passage(self.cited, src)
+
+    def save_markdown(self) -> None:
+        if self.review is None:
+            return
+        path, _f = QFileDialog.getSaveFileName(self, "Save the review",
+                                               f"{self.review.title}.md",
+                                               "Markdown (*.md)")
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.review.to_markdown())
+            self.tab.status.setText(f"Saved {path}")
+
+
 class StudyTab(QWidget):
     def __init__(self, ctx=None, *, sources=None, models=None):
         super().__init__()
@@ -186,9 +332,11 @@ class StudyTab(QWidget):
 
     # -- the worker seam ---------------------------------------------------
     def run(self, work: Callable[[], Any], done: Callable[[Any], None],
-            what: str = "") -> threading.Thread:
+            what: str = "", on_fail: Optional[Callable[[str], None]] = None
+            ) -> threading.Thread:
         """``work()`` on a worker thread, then ``done(result)`` on the GUI
-        thread; an exception is shown in the status line instead."""
+        thread; an exception is shown in the status line instead (and
+        ``on_fail(reason)`` called). Stop is an exception too."""
         self._busy += 1
         if what:
             self.status.setText(what[:1].upper() + what[1:] + "…")
@@ -200,11 +348,16 @@ class StudyTab(QWidget):
                     self.status.setText("")
                 done(value)
             else:
-                self.status.setText(f"Stopped {what or 'working'}: {value}")
+                self.status.setText(value if value == "Stopped." else
+                                    f"Stopped {what or 'working'}: {value}")
+                if on_fail is not None:
+                    on_fail(value)
 
         def body():
             try:
                 value, ok = work(), True
+            except cm.Stopped:
+                value, ok = "Stopped.", False
             except Exception as exc:                         # noqa: BLE001
                 value, ok = f"{type(exc).__name__}: {exc}"[:300], False
             self._ui.call.emit(lambda: finish(ok, value))
@@ -261,6 +414,8 @@ class StudyTab(QWidget):
         self.pages.setObjectName("study_pages")
         self.sources_page = SourcesPage(self)
         self.pages.addTab(self.sources_page, "Sources")
+        self.review_page = ReviewPage(self)
+        self.pages.addTab(self.review_page, "Review")
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(left)
@@ -272,10 +427,26 @@ class StudyTab(QWidget):
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
 
-    # -- settings ----------------------------------------------------------
+    # -- settings and saved work --------------------------------------------
     def save_settings(self) -> None:
         if self.ctx is not None:
             self.ctx.save_json(SETTINGS_FILE, self.settings)
+
+    def save(self, name: str, data: Any) -> None:
+        """A notebook's saved work (review, study documents, practice) in the
+        plugin's data folder."""
+        if self.ctx is not None:
+            self.ctx.save_json(name, data)
+
+    def load(self, name: str) -> Any:
+        return self.ctx.load_json(name, None) if self.ctx is not None else None
+
+    def review_changed(self, nid: str) -> None:
+        """A new review was written: pages made from it may want to know."""
+        for i in range(self.pages.count()):
+            page = self.pages.widget(i)
+            if hasattr(page, "review_changed"):
+                page.review_changed(nid)
 
     # -- models ------------------------------------------------------------
     def refresh_models(self) -> None:

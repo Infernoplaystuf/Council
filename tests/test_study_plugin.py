@@ -262,3 +262,103 @@ def test_the_tab_lists_notebooks_and_searches(qapp, built):
                 page.results.item(0).text().startswith("notes/photosynthesis.md"))
     page.results.setCurrentRow(0)
     assert pump(qapp, lambda: "thylakoid" in page.preview.toPlainText())
+
+
+# ------------------------------------------------------------- the review
+from council_plugins.study.engine import common as cm  # noqa: E402
+from council_plugins.study.engine import review as rv  # noqa: E402
+
+OUTLINE = ('{"title": "Energy in cells", "sections": ['
+           '{"heading": "Photosynthesis", "question": "Where do the Calvin cycle and light reactions happen?"},'
+           '{"heading": "Respiration", "question": "Where are the Krebs cycle and glycolysis?"}]}')
+
+
+def fake_writer(messages, schema):
+    """An outline for the planning call; for a section, one supported
+    sentence citing the first source it was shown, one invented, one with
+    no citation."""
+    if schema is not None:
+        return OUTLINE
+    import re
+    prompt = messages[-1]["content"]
+    if "Section: Photosynthesis" in prompt:
+        good, file = "The Calvin cycle occurs in the stroma and fixes carbon dioxide", "photo"
+    else:
+        good, file = "The Krebs cycle occurs in the mitochondrial matrix", "resp"
+    first = int(re.search(r"^\[(\d+)\] notes/" + file, prompt, re.M).group(1))
+    return (f"{good} [{first}]. Zebras migrate across savannas every winter [{first}]. "
+            f"Scientists agree this matters greatly.")
+
+
+def test_a_review_keeps_only_supported_cited_sentences(built):
+    src, nb = built
+    models = FakeModels(fake_writer)
+    review = rv.write_review(models.chat("granite3.3:8b"), src, nb.id, model="granite")
+    assert review.title == "Energy in cells"
+    assert [s.heading for s in review.sections] == ["Photosynthesis", "Respiration"]
+    photo, resp = review.sections
+    assert [s.text for s in photo.sentences] == [
+        "The Calvin cycle occurs in the stroma and fixes carbon dioxide."]
+    assert review.sources[photo.sentences[0].cites[0]].display == "notes/photosynthesis.md"
+    assert resp.sentences[0].text.startswith("The Krebs cycle")
+    whys = sorted(x.why for x in photo.left_out)
+    assert whys == ["cites nothing", "not in what it cites"]
+    c = review.counts()
+    assert (c["sentences"], c["left_out"]) == (2, 4)
+
+
+def test_a_review_round_trips_and_renders_its_citations(built):
+    src, nb = built
+    review = rv.write_review(FakeModels(fake_writer).chat("m"), src, nb.id)
+    again = rv.Review.from_dict(review.to_dict())
+    assert again.to_dict() == review.to_dict()
+    html = again.to_html(lambda t: t)
+    n = again.sections[0].sentences[0].cites[0]
+    assert f"href='cite:{n}'" in html and "Left out as unsupported" in html
+    md = again.to_markdown()
+    assert md.startswith("# Energy in cells") and "## Sources" in md
+
+
+def test_a_sentence_citing_a_passage_it_was_not_shown_is_left_out():
+    sources = {1: rv.Source(1, "d", "p", "p", None, [1], "The sky is blue.")}
+    sec = rv.Section("h", "q", shown=[1])
+    rv.check_section(sec, "The sky is blue [1]. The sky is blue [4]. "
+                          "The sources do not cover clouds.", sources)
+    assert [s.text for s in sec.sentences] == ["The sky is blue.",
+                                               "The sources do not cover clouds."]
+    assert sec.sentences[1].gap
+    assert sec.left_out[0].why.startswith("cites [4]")
+
+
+def test_stop_ends_a_review(built):
+    src, nb = built
+    with pytest.raises(cm.Stopped):
+        rv.write_review(FakeModels(fake_writer).chat("m"), src, nb.id,
+                        should_stop=lambda: True)
+
+
+def test_an_empty_notebook_cannot_be_reviewed(tmp_path, notes):
+    vault = tmp_path / "vault"
+    (vault / "data_in").mkdir(parents=True)
+    src = ps.Sources(vault=vault)
+    nb = src.create_notebook("Empty", [notes])
+    with pytest.raises(ValueError, match="build it first"):
+        rv.write_review(FakeModels(fake_writer).chat("m"), src, nb.id)
+
+
+def test_the_review_page_writes_saves_and_shows_a_citation(qapp, built, app_dir):
+    src, nb = built
+    tab = tab_for(src, FakeModels(fake_writer))
+    assert pump(qapp, lambda: tab.model.currentData() == "granite3.3:8b")
+    page = tab.review_page
+    page.write()
+    assert pump(qapp, lambda: page.review is not None)
+    assert "Calvin cycle occurs in the stroma" in page.text.toPlainText()
+    saved = app_dir / "plugin_data" / "council.study" / f"{nb.id}.review.json"
+    assert saved.exists()
+    from PySide6.QtCore import QUrl
+    n = page.review.sections[0].sentences[0].cites[0]
+    page.cite_clicked(QUrl(f"cite:{n}"))
+    assert pump(qapp, lambda: "stroma" in page.cited.toPlainText())
+    again = tab_for(src, FakeModels(fake_writer))
+    assert again.review_page.review is not None
