@@ -46,6 +46,28 @@ class VisionModel:
 #: US-origin vision models recommended for the Council's 4080 / 16 GB target.
 #: Granite is the user's preferred family (see memory [[us-models-only]]).
 CATALOG: List[VisionModel] = [
+    # Added 2026-11-08: Gemma 4 reads scanned pages and charts best among the
+    # US models that fit a 16 GB card (ollama.com/library/gemma4).
+    VisionModel(
+        name="gemma4:12b",
+        label="Google Gemma 4 (12B)",
+        family="gemma",
+        approx_vram_gb=9.5,
+        download_gb=7.7,
+        description="Best picture and scanned-page reader for 12-16 GB "
+                    "cards; also a strong text model, 256K context.",
+        recommended=False,
+    ),
+    VisionModel(
+        name="gemma4:e4b",
+        label="Google Gemma 4 (E4B)",
+        family="gemma",
+        approx_vram_gb=6.0,
+        download_gb=6.6,
+        description="Reads pictures, charts and scanned forms on an 8 GB "
+                    "card.",
+        recommended=False,
+    ),
     VisionModel(
         name="granite3.2-vision:2b",
         label="IBM Granite Vision 3.2 (2B)",

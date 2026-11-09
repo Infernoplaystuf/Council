@@ -118,7 +118,8 @@ same list.
 - Never delete or overwrite user data; never modify existing vault files. Test against
   temporary vaults (`COUNCIL_VAULT_ROOT`) or copies.
 - No pickle. Atomic writes. Python 3.11+ compatible.
-- Only US-origin models may be recommended (Llama, Phi, Gemma, Granite, OLMo, gpt-oss).
+- Only US-origin models may be recommended (Llama, Muse, Phi, Gemma, Granite, OLMo, gpt-oss);
+  a US fine-tune of a foreign base model (Qwen, DeepSeek, Mistral...) does not count.
   The Council never downloads models itself.
 - Verify offscreen (`QT_QPA_PLATFORM=offscreen`, `COUNCIL_NO_DIALOGS=1`); don't open
   windows on the user's screen unless asked.

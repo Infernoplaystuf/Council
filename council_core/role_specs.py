@@ -75,11 +75,9 @@ SPECS: Tuple[RoleSpec, ...] = (
         "candidate, argument and the Judge's ranking.",
         1, "1 per round, with the longest prompt of the turn",
         "Long context (it reads the whole debate) and good prose.",
-        Tier("llama3.1:8b", "128k context; the smallest that synthesises "
-             "a long debate reliably"),
-        Tier("gemma3:12b", "tagged for writing, 128k context"),
-        Tier("gpt-oss:20b", "the strongest US model in the catalog; an MoE, "
-             "so it runs well even when part of it spills to RAM"),
+        Tier("granite4.2:8b", "128k context, built for summarising"),
+        Tier("gemma4:12b", "256k context and polished prose; reads pictures too"),
+        Tier("gemma4:31b", "the strongest US model for long documents; one 24 GB card"),
         ("Every answer you see is the Writer's: this is the role where a "
          "better model shows most.",
          "Give it a large context window (n_ctx) in model_slots.json — its "
@@ -92,10 +90,9 @@ SPECS: Tuple[RoleSpec, ...] = (
         "final one — and, as controller, reviews placement weekly.",
         1, "2 per round (rank, critique); short replies, strict JSON",
         "Reliable structured (JSON) output and careful reasoning.",
-        Tier("llama3.1:8b", "native tool calling and dependable JSON"),
-        Tier("phi4:14b", "tagged for reasoning; fits a 12 GB card"),
-        Tier("gpt-oss:20b", "reasoning + tools; the best verdicts in the "
-             "catalog"),
+        Tier("granite4.2:8b", "native tool calling and dependable JSON"),
+        Tier("phi4-reasoning:14b", "thinks step by step; fits a 12 GB card"),
+        Tier("gpt-oss:20b", "reasoning + tools; the best verdicts in the catalog"),
         ("A weak judge picks the wrong winner and passes weak answers: "
          "quality here matters more than speed.",
          "Keep it on a different model from the members if you can, so it "
@@ -107,13 +104,13 @@ SPECS: Tuple[RoleSpec, ...] = (
         "and searches the vault mid-answer.",
         2, "≈5 per round, plus 1–3 more per tool use",
         "Code ability, tool calling, and 8k+ context.",
-        Tier("llama3.1:8b", "tools, 128k context; good enough for scripts"),
-        Tier("phi4:14b", "tagged for code and reasoning"),
+        Tier("granite4.2:8b", "code, fill-in-the-middle and tools; 128k"),
         Tier("gpt-oss:20b", "code, docs and tools in one model"),
+        Tier("gemma4:31b", "the strongest US coder that fits one 24 GB card"),
         ("If you use the council mostly for code, move the Coder up to "
          "Highest.",
-         "granite3-dense:8b is a code-specialised alternative at the same "
-         "size as Llama 3.1 8B."),
+         "gpt-oss:20b is an MoE: on a 16 GB card it is the fastest strong "
+         "coder in the catalog."),
         "Already used by the 🧩 Fan-out tab: several Coder workers run at "
         "once on different parts of a bigger change, one per machine. More "
         "machines with the Coder's model (Machines & roles) means more units "
@@ -125,10 +122,9 @@ SPECS: Tuple[RoleSpec, ...] = (
         "and writes code from what it read.",
         2, "Several per question, each a tool call",
         "Tool calling is required (local_models.TOOL_ROLES).",
-        Tier("llama3.1:8b", "the smallest catalog model with native tool "
-             "calling"),
+        Tier("granite4.2:8b", "the smallest current catalog model with native tool calling"),
         Tier("gpt-oss:20b", "tools + code + docs"),
-        Tier("gpt-oss:20b", "same — nothing larger in the catalog"),
+        Tier("gpt-oss:20b", "same; the most dependable tool caller in the catalog"),
         ("A model without tool support cannot do this role at all.",),
         "Not on the council panel; a duplicate only helps if you ask the "
         "Docs tab two things at once."),
@@ -136,8 +132,8 @@ SPECS: Tuple[RoleSpec, ...] = (
         "strategist", "Strategist", "Plans: steps, order, trade-offs.",
         3, "≈5 per round",
         "Reasoning over several steps.",
-        Tier("llama3.1:8b", "solid general model"),
-        Tier("phi4:14b", "tagged for reasoning"),
+        Tier("granite4.2:8b", "solid general model"),
+        Tier("phi4-reasoning:14b", "thinks step by step"),
         Tier("gpt-oss:20b", "reasoning"),
         ("Shares a model with the Judge happily: different job, same "
          "strength.",),
@@ -146,17 +142,17 @@ SPECS: Tuple[RoleSpec, ...] = (
         "sage", "Sage", "Long-view answers: context, history, consequences.",
         3, "≈5 per round",
         "Breadth of knowledge; a larger model knows more.",
-        Tier("llama3.1:8b", "solid general model"),
-        Tier("gemma3:12b", "larger, tagged for writing"),
-        Tier("gpt-oss:20b", "broadest knowledge in the catalog"),
+        Tier("granite4.2:8b", "solid general model"),
+        Tier("gemma4:12b", "larger, broad knowledge, 256k context"),
+        Tier("gemma4:31b", "broadest knowledge in the catalog"),
         (), "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "skeptic", "Skeptic", "Attacks the question and the answers.",
         3, "≈5 per round, short replies",
         "Short critical replies; no vault, no history.",
-        Tier("llama3.2:3b", "short replies are fine from a small model"),
-        Tier("llama3.1:8b", "sharper objections"),
-        Tier("phi4:14b", "reasoning: finds the real flaws"),
+        Tier("granite4.2:3b", "short replies are fine from a small model"),
+        Tier("granite4.2:8b", "sharper objections"),
+        Tier("phi4-reasoning:14b", "reasoning: finds the real flaws"),
         ("A different model from the Writer gives genuinely different "
          "objections.",),
         "Helps with Parallel members on, when it has its own machine."),
@@ -164,18 +160,18 @@ SPECS: Tuple[RoleSpec, ...] = (
         "artist", "Artist", "Creative answers and alternatives.",
         4, "≈5 per round",
         "Fluent, varied writing.",
-        Tier("llama3.2:3b", "fast and fluent"),
-        Tier("gemma3:12b", "tagged for writing"),
-        Tier("gemma3:12b", "same"),
+        Tier("gemma4:e4b", "fast and fluent"),
+        Tier("gemma4:12b", "polished, varied writing"),
+        Tier("gemma4:26b", "larger, still quick as an MoE"),
         (), "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "intern", "Intern", "Fast first drafts; with Tools on, can run code "
         "and search the vault.",
         4, "≈5 per round, plus tool calls",
         "Speed over depth.",
-        Tier("llama3.2:3b", "fast; the role is meant to be quick"),
-        Tier("llama3.1:8b", "better drafts, still fast on a GPU"),
-        Tier("llama3.1:8b", "more is wasted on first drafts"),
+        Tier("granite4.2:3b", "fast; the role is meant to be quick"),
+        Tier("granite4.2:8b", "better drafts, still fast on a GPU"),
+        Tier("granite4.2:8b", "more is wasted on first drafts"),
         ("A good role for a small, fast model — or a second machine once "
          "roles can be pinned to one.",),
         "Helps with Parallel members on, when it has its own machine."),
@@ -184,9 +180,9 @@ SPECS: Tuple[RoleSpec, ...] = (
         4, "1–2 per candidate, plus cross-fire questions — the most calls of "
         "any role",
         "Speed: it is called the most, with short prompts and replies.",
-        Tier("llama3.2:1b", "plain questions need little; runs anywhere"),
-        Tier("llama3.2:3b", "better questions, still very fast"),
-        Tier("llama3.2:3b", "a bigger model mostly adds waiting"),
+        Tier("granite4.2:3b", "plain questions need little; runs on a CPU"),
+        Tier("phi4-mini:3.8b", "sharper questions, still very fast"),
+        Tier("phi4-mini:3.8b", "a bigger model mostly adds waiting"),
         ("The cheapest way to speed up a whole turn: give the Peasant a "
          "small model of its own so it never waits behind the big one.",),
         "The best candidate for a duplicate once calls can overlap: it is "

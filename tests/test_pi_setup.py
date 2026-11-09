@@ -116,7 +116,7 @@ def test_setup_existing_asks_about_the_key_then_completes(env, pi):
     out = su.setup_existing(env["vault"], host="127.0.0.1", username="council",
                             password=pi.password, name="pi-a", port=pi.port,
                             key_dir=env["keys"], approved_fingerprint=exc.value.fingerprint)
-    assert out.ok and out.model == "llama3.1:8b"              # 7.7 GB Pi 5
+    assert out.ok and out.model == "granite4.2:8b"            # 7.7 GB Pi 5
     assert pi.logins.count("password") == 1
 
 
@@ -158,15 +158,15 @@ def test_setup_leaves_the_model_for_the_users_click(env, pi):
                             approved_fingerprint=remote.fingerprint(pi.host_key))
     assert out.ok and out.model_pending and out.username == "council"
     assert not any("ollama pull" in c for c in pi.commands)
-    assert "llama3.1:8b (Meta, US) — about 4.9 GB" in out.message
+    assert "granite4.2:8b (IBM, US) — about 5.3 GB" in out.message
     assert "Download on the Pi" in out.message
     got = su.download_model(host="127.0.0.1", username="council", model=out.model,
                             port=pi.port, key_dir=env["keys"])
-    assert got.ok and pi.commands[-1] == "ollama pull llama3.1:8b"
+    assert got.ok and pi.commands[-1] == "ollama pull granite4.2:8b"
     refused = su.download_model(host="127.0.0.1", username="council", model="qwen2.5:3b",
                                 port=pi.port, key_dir=env["keys"])
     assert not refused.ok and "US-origin" in refused.message
-    assert pi.commands[-1] == "ollama pull llama3.1:8b"
+    assert pi.commands[-1] == "ollama pull granite4.2:8b"
 
 
 def test_setup_turns_password_login_off_and_says_how_to_undo_it(env, pi):

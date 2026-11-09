@@ -33,6 +33,7 @@ US_ORG_FRAGMENTS = (
     "meta-llama", "llama", "microsoft", "phi-", "phi3", "phi4",
     "ibm", "granite", "google", "gemma", "allenai", "olmo",
     "openai", "gpt-oss", "nvidia", "nemotron", "databricks", "dolly",
+    "muse-glimmer", "muse-spark",   # Meta's Muse open models (2026)
     "stabilityai",   # US-based (Stability AI Inc.)
 )
 
@@ -143,8 +144,10 @@ def recommend_from_catalog(vram_gb: Optional[float] = None,
     `good_for` list, so "code" finds Llama 3.1 8B and gpt-oss-20b, not only
     the one entry labelled code."""
     role = catalog_role(role)
-    role_models = ([m for m in _cat.MODELS if _cat.serves(m, role)]
-                   or list(_cat.MODELS))
+    current = list(getattr(_cat, "CURRENT", _cat.MODELS))
+    role_models = ([m for m in current if _cat.serves(m, role)]
+                   or current)
+    rank = getattr(_cat, "pick_rank", lambda m, v, r="general": 0)
     budget = vram_gb if vram_gb else (ram_gb * 0.5 if ram_gb else 0)
 
     def _fits(m) -> bool:
@@ -152,13 +155,16 @@ def recommend_from_catalog(vram_gb: Optional[float] = None,
 
     fitting = [m for m in role_models if _fits(m)]
     if fitting:
-        # biggest model that fits first (better quality within budget),
-        # defaults nudged up.
-        ranked = sorted(fitting, key=lambda m: (not m.is_default,
+        # this card's tier picks first (model_catalog.TIER_PICKS), then the
+        # biggest model that fits (better quality within budget), defaults
+        # nudged up.
+        ranked = sorted(fitting, key=lambda m: (rank(m, vram_gb, role),
+                                                not m.is_default,
                                                 -m.effective_params_b))
         partial = [m for m in role_models if m not in fitting and
                    _cat.fit_kind(m, vram_gb, ram_gb) == "partial"]
         ranked += sorted(partial, key=lambda m: (not m.is_moe,
+                                                 rank(m, vram_gb, role),
                                                  -m.effective_params_b))
     else:
         # nothing fits VRAM — smallest first (CPU fallback).
@@ -170,6 +176,7 @@ def recommend_from_catalog(vram_gb: Optional[float] = None,
             "params_b": m.params_b, "quant": m.quant, "size_gb": m.size_gb,
             "context_k": m.context_k, "vram_gb_q4": m.vram_gb_q4,
             "hf_repo": m.hf_repo, "hf_file": m.hf_file,
+            "hf_mmproj": m.hf_mmproj,
             "license": m.license, "blurb": m.blurb,
             "origin": "us", "origin_verified": True,
             "fits_vram": bool(vram_gb and (m.vram_gb_q4 + 1.5) <= vram_gb),
@@ -345,8 +352,14 @@ def assess_upgrade(hardware: Optional[Dict[str, Any]] = None,
     else:
         upgrades = fitting        # unknown current size — just show fits
 
-    upgrades = sorted(upgrades, key=lambda m: -m.get(
-        "effective_params_b", m["params_b"]))[:limit]
+    # This card's tier picks first (model_catalog.TIER_PICKS), then size:
+    # the best pick for a 24 GB card is Gemma 4 31B, not whichever model is
+    # a few hundred million parameters bigger.
+    picks = [m.id for m in getattr(_cat, "tier_picks",
+                                   lambda *a, **k: [])(vram or 0, "general")]
+    upgrades = sorted(upgrades, key=lambda m: (
+        picks.index(m["id"]) if m["id"] in picks else len(picks),
+        -m.get("effective_params_b", m["params_b"])))[:limit]
     can_upgrade = bool(upgrades) and bool(cur_params)
 
     if not budget:
@@ -356,7 +369,7 @@ def assess_upgrade(hardware: Optional[Dict[str, Any]] = None,
         big = upgrades[0]
         reason = (f"Your hardware has room (~{headroom} GB free over the "
                   f"current ~{cur_params:g}B model) — it can run a stronger "
-                  f"model, up to {big['name']} ({big['params_b']:g}B).")
+                  f"model: best pick {big['name']} ({big['params_b']:g}B).")
     elif cur_params and not upgrades:
         reason = (f"You're already running a model (~{cur_params:g}B) at or "
                   "above the best fit for your hardware — no stronger model "

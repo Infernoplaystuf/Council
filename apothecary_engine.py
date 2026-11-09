@@ -77,15 +77,17 @@ class TaskStep:
     warn_only: bool = False
 
 
+# US-made models only (the Council's rule); the same picks as
+# council_core/pi_setup/pi_models.BY_RAM. Updated 2026-11-08.
 PI_MODEL_RECOMMENDATIONS = {
-    "Pi 5 (16GB)":          ["qwen2.5:14b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M", "phi4"],
-    "Pi 5 (16GB) + AI HAT+":["qwen2.5:14b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M", "phi4"],
-    "Pi 5 (8GB)":           ["phi4", "qwen2.5:7b-instruct-q4_K_M", "qwen2.5:3b"],
-    "Pi 5 (8GB) + AI HAT+": ["phi4", "qwen2.5:7b-instruct-q4_K_M", "qwen2.5:3b"],
-    "Pi 5 (4GB)":           ["qwen2.5:1.5b", "phi3.5:3.8b-mini"],
-    "Pi 4 (8GB)":           ["qwen2.5:1.5b", "llama3.2:1b"],
-    "Pi 4 (4GB)":           ["qwen2.5:0.5b", "llama3.2:1b"],
-    "Other / 2GB":          ["qwen2.5:0.5b"],
+    "Pi 5 (16GB)":          ["granite4.2:8b", "gemma4:12b", "phi4"],
+    "Pi 5 (16GB) + AI HAT+":["granite4.2:8b", "gemma4:12b", "phi4"],
+    "Pi 5 (8GB)":           ["granite4.2:8b", "granite4.2:3b", "phi4-mini:3.8b"],
+    "Pi 5 (8GB) + AI HAT+": ["granite4.2:8b", "granite4.2:3b", "phi4-mini:3.8b"],
+    "Pi 5 (4GB)":           ["granite4.2:3b", "phi4-mini:3.8b"],
+    "Pi 4 (8GB)":           ["granite4.2:3b", "llama3.2:1b"],
+    "Pi 4 (4GB)":           ["llama3.2:1b", "gemma3:1b"],
+    "Other / 2GB":          ["gemma3:1b"],
 }
 
 # Council role assignment by Pi model

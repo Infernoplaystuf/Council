@@ -3,7 +3,7 @@ Role specs: each role's minimum / recommended / best model, against a PC.
 
 Pinned: every tier names a US model that is in the catalog; a model the spec
 names gets that tier whatever its size (gpt-oss-20b is an MoE smaller than a
-dense 12B by effective size, yet it is the Writer's best); an upgrade is
+dense 14B by effective size, yet it is the Judge's best); an upgrade is
 called easy only when it fits the graphics card; non-US models are flagged.
 """
 from __future__ import annotations
@@ -35,18 +35,20 @@ def test_every_role_has_a_spec_and_every_tier_is_a_us_catalog_model():
 
 
 def test_named_tiers_win_over_size():
-    a = rs.assess({"writer": "gpt-oss:20b", "judge": "phi4:14b"})
+    a = rs.assess({"judge": "gpt-oss:20b", "strategist": "phi4-reasoning:14b",
+                   "writer": "gemma4:31b"})
+    assert _a(a, "judge").model_verdict == "Best"
+    assert _a(a, "strategist").model_verdict == "Recommended"
     assert _a(a, "writer").model_verdict == "Best"
-    assert _a(a, "judge").model_verdict == "Recommended"
 
 
 def test_verdicts_by_size_and_origin():
     a = rs.assess({"skeptic": "llama3.2:1b", "artist": "qwen2.5:7b",
                    "sage": "olmo2:13b", "intern": "my-own-model"})
     assert _a(a, "skeptic").model_verdict == "Below minimum"
-    assert "llama3.2:3b" in _a(a, "skeptic").notes[0]
+    assert "granite4.2:3b" in _a(a, "skeptic").notes[0]
     assert _a(a, "artist").model_verdict == "Not US-made"
-    assert _a(a, "sage").model_verdict == "Recommended"   # 13.7B ≥ 12.2B
+    assert _a(a, "sage").model_verdict == "Recommended"   # 13.7B ≥ 12B
     assert _a(a, "intern").model_verdict == "Not in catalog"
 
 

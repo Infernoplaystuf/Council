@@ -112,10 +112,11 @@ dist/DatasInferno/
 1. Copy the entire `dist/DatasInferno/` folder anywhere (e.g.
    `C:\Programs\DatasInferno\`). Make sure the user has write
    permission to `%USERPROFILE%\.council\` (default on Windows).
-2. Download a GGUF model. Recommended for the typical workload:
-   * **Phi-4 14B Q4_K_M** (~9 GB) — best reasoning at 16 GB VRAM
-   * **Llama 3.1 8B Q5_K_M** (~6 GB) — longest context (128K)
-   * **Granite 3.1 8B** — IBM, the current baseline
+2. Download a model (US-made; the README's "Pick a model" has the full
+   list by graphics-card size and the download commands):
+   * **IBM Granite 4.2 8B** (~5.3 GB) — the default; 8 GB cards and up
+   * **Google Gemma 4 12B** (~7.1 GB) — 12-16 GB cards; reads pictures too
+   * **Google Gemma 4 26B-A4B** (~17 GB, Ollama) — best on a 16 GB card
 3. Run `DatasInferno.exe`. On first launch the app:
    * creates `~/.council/vault/` and its `data_in/`, `logs/`,
      `workspace/`, etc. subfolders

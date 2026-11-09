@@ -43,6 +43,51 @@ def test_every_catalog_model_is_us_made_and_has_an_ollama_tag():
         assert m.ollama, f"{m.id} has no Ollama tag"
 
 
+def test_every_current_model_says_how_to_download_it():
+    """User, 2026-11-08: update the model lists "and include their download
+    instructions". Every current model names its Ollama command; the ones
+    with a GGUF file name the Hugging Face command too, and a picture
+    reader names its mmproj file."""
+    assert mc.CURRENT and all(not m.legacy for m in mc.CURRENT)
+    for m in mc.CURRENT:
+        steps = mc.download_steps(m)
+        assert f"ollama pull {m.ollama}" in steps, m.id
+        assert "https://ollama.com/library/" in steps, m.id
+        if m.has_hf_file:
+            assert f"hf download {m.hf_repo} {m.hf_file}" in steps, m.id
+            assert m.hf_file.endswith(".gguf"), m.id
+        else:
+            assert "use Ollama" in steps, m.id
+        if m.hf_mmproj:
+            assert m.reads_pictures and m.hf_mmproj in steps, m.id
+
+
+def test_the_default_is_current_and_legacy_models_are_not_picks():
+    assert mc.DEFAULT_MODEL_ID == "granite-4.2-8b"
+    for vram in (0, 4, 8, 12, 16, 24, 48):
+        assert all(not m.legacy for m in mc.for_vram(vram))
+        assert all(not m.legacy for m in mc.tier_picks(vram))
+        ids = {r["id"] for r in mf.recommend_from_catalog(vram, 32, limit=50)}
+        assert not ids & {m.id for m in mc.MODELS if m.legacy}
+    # still resolvable for saved settings and installed files
+    assert mc.by_id("granite-3.1-8b-q4").legacy
+
+
+@pytest.mark.parametrize("vram, first", [
+    (0, "granite-4.2-3b"), (8, "granite-4.2-8b"), (12, "gemma-4-12b"),
+    (16, "gemma-4-26b-a4b"), (24, "gemma-4-31b")])
+def test_the_best_pick_for_each_card_size(vram, first):
+    assert mc.tier_picks(vram)[0].id == first
+    assert mc.tier_picks(vram + 1)[0].id == first      # up to the next tier
+
+
+def test_a_16gb_card_ranks_the_picks_that_fit_first():
+    ranked = [r["id"] for r in mf.recommend_from_catalog(16.0, 64.0,
+                                                         limit=8)]
+    assert ranked[:2] == ["gemma-4-12b", "gpt-oss-20b"]
+    assert mc.for_vram(16.0)[0].id == "gemma-4-12b"
+
+
 def test_the_granite_code_entry_is_no_longer_a_made_up_model():
     """It was "IBM Granite 3.0 8B Code Instruct" — no such model — pointing
     at granite-3.0-8b-instruct, a general instruct model."""
@@ -55,17 +100,24 @@ def test_the_granite_code_entry_is_no_longer_a_made_up_model():
 def test_an_8gb_card_gets_us_candidates_including_partial_offload():
     ranked = mf.recommend_from_catalog(8.0, 31.7, role="general", limit=8)
     fits = {r["id"]: r["fit"] for r in ranked}
-    assert fits["llama-3.1-8b-q4"] == "gpu"
+    assert ranked[0]["id"] == "granite-4.2-8b"
+    assert fits["granite-4.2-8b"] == "gpu"
     assert fits.get("gpt-oss-20b") == "partial"
-    assert fits.get("phi-4-q4") == "partial"
+    assert fits.get("gemma-4-26b-a4b") == "partial"
     full = [r for r in ranked if r["fit"] == "gpu"]
     assert ranked[:len(full)] == full                  # full fits first
 
 
 def test_an_moe_is_not_an_upgrade_over_a_dense_14b_by_its_total():
-    up = mf.assess_upgrade(hardware={"vram_gb": 24.0, "ram_gb": 64.0},
+    up = mf.assess_upgrade(hardware={"vram_gb": 16.0, "ram_gb": 64.0},
                            current_model="phi-4-14b-Q4_K_M.gguf")
     assert up["can_upgrade"] is False and up["upgrades"] == []
+
+
+def test_an_upgrade_offers_the_cards_best_pick_first():
+    up = mf.assess_upgrade(hardware={"vram_gb": 24.0, "ram_gb": 64.0},
+                           current_model="phi-4-14b-Q4_K_M.gguf")
+    assert up["can_upgrade"] and up["upgrades"][0]["id"] == "gemma-4-31b"
 
 
 # ============================================================
@@ -85,7 +137,7 @@ def test_the_task_box_picks_the_role(task, role):
 def test_the_coder_role_is_offered_real_coders():
     ids = [r["id"] for r in mf.recommend_from_catalog(8.0, 31.7,
                                                       role="coder", limit=8)]
-    assert "llama-3.1-8b-q4" in ids
+    assert "granite-4.2-8b" in ids
     assert "gpt-oss-20b" in ids
 
 
@@ -105,14 +157,14 @@ def test_find_passes_the_role_from_the_task(monkeypatch):
 def test_rows_already_on_this_pc_say_so(monkeypatch):
     from council_core import local_models
     monkeypatch.setattr(local_models, "list_local_models", lambda **k: [
-        {"id": "ollama:llama3.1:8b", "backend": "ollama"},
-        {"id": "C:/m/phi-4-Q4_K_M.gguf", "backend": "gguf",
-         "file": "phi-4-Q4_K_M.gguf"}])
+        {"id": "ollama:granite4.2:8b", "backend": "ollama"},
+        {"id": "C:/m/Olmo-3-7B-Instruct-Q4_K_M.gguf", "backend": "gguf",
+         "file": "Olmo-3-7B-Instruct-Q4_K_M.gguf"}])
     result = mj.find(mj.Hardware(vram_gb=8.0, ram_gb=31.7, raw=dict(LAPTOP)))
     on_pc = {r.model_id: r.cells[-1] for r in result.rows}
-    assert on_pc["llama-3.1-8b-q4"] == "Ollama"
-    assert on_pc["phi-4-q4"] == "GGUF"
-    assert on_pc["granite-3.1-8b-q4"] == "no"
+    assert on_pc["granite-4.2-8b"] == "Ollama"
+    assert on_pc["olmo-3-7b"] == "GGUF"
+    assert on_pc["gemma-4-e4b"] == "no"
     assert len(mj.COLUMNS) == len(result.rows[0].cells)
 
 
@@ -172,6 +224,27 @@ def test_the_wizard_pick_is_one_the_catalog_says_fits(vram):
     spec = next(m for m in mc.MODELS if m.name == first)
     assert mc.fits(spec, vram) or not mc.for_vram(vram)
     assert "Gemma 2 9B" not in rec["model_pick"] or vram >= 9
+
+
+def test_the_models_tab_shows_and_copies_the_download_steps():
+    rows = mj.find(mj.Hardware(vram_gb=16.0, ram_gb=64.0,
+                               raw={"vram_gb": 16.0, "ram_gb": 64.0})).rows
+    row = next(r for r in rows if r.model_id == "gemma-4-12b")
+    text = mj.copy_text(row)
+    assert "ollama pull gemma4:12b" in text
+    assert "hf download unsloth/gemma-4-12b-it-GGUF" in text
+    assert "mmproj-F16.gguf" in text
+    online = mj.ModelRow("x/y", ("Y",), repo="x/y-GGUF", filename="y.gguf")
+    assert "hf download x/y-GGUF y.gguf" in mj.copy_text(online)
+
+
+def test_an_ollama_only_model_is_not_downloaded_from_hugging_face(tmp_path):
+    spec = mc.by_id("muse-glimmer-30b")
+    assert not spec.has_hf_file
+    row = mj.to_row({**vars(spec), "origin_verified": True})
+    result = mj.download_and_switch(row, tmp_path)
+    assert not result.ok and "no download source" in result.message
+    assert "ollama pull muse-glimmer:30b" in mj.copy_text(row)
 
 
 def test_the_hardware_line_names_free_vram_and_the_core_split():

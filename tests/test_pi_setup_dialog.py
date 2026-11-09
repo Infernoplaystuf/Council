@@ -164,7 +164,7 @@ def test_write_then_find_the_pi(qapp, dlg):
     acts = dlg.actions
     assert acts.prepared["typed_confirm"] == acts.list_disks()[2].confirm_code
     assert acts.prepared["init_format"] == "cloudinit-rpi"
-    assert acts.prepared["model"] in ("llama3.1:8b",)
+    assert acts.prepared["model"] in ("granite4.2:8b",)   # pi_models.BY_RAM
     assert acts.started is not None
     assert dlg.s_pass.text() == "" and dlg.s_wpass.text() == ""
     acts.status = {"phase": "writing", "done": 500, "total": 1000, "message": "Writing"}

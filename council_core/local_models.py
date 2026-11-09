@@ -332,6 +332,7 @@ US_MAKERS: Tuple[Tuple[str, str], ...] = (
     ("gpt-oss", "OpenAI"), ("gptoss", "OpenAI"),
     ("phi", "Microsoft"), ("llama", "Meta"), ("gemma", "Google"),
     ("granite", "IBM"), ("olmo", "AllenAI"), ("nemotron", "NVIDIA"),
+    ("muse-glimmer", "Meta"), ("muse-spark", "Meta"),
     ("dolly", "Databricks"), ("dbrx", "Databricks"),
     ("llava", "LLaVA (UW-Madison, Microsoft)"),
 )

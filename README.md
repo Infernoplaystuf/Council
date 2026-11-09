@@ -662,43 +662,79 @@ You can edit them in the 🎓 Specialists tab. Each one is just config: name, ic
 
 ## Pick a model
 
-Council ships with a curated catalog of US-origin GGUF models — Anthropic
-isn't open-weight, so the runtime defaults to other US labs (IBM, Meta,
-Microsoft, Google, AllenAI). The catalog is the single source of truth used
-by `setup_wizard.py`, the in-GUI onboarding wizard, and these docs.
+Council ships with a curated catalog of US-made models (`model_catalog.py`,
+updated 2026-11-08): IBM, Google, Meta, OpenAI, Microsoft and Ai2. A US
+company's fine-tune of a foreign base model (Qwen, DeepSeek, Mistral...) does
+not count. The catalog is the single source of truth used by the Models tab,
+`setup_wizard.py` and these docs. The Models tab ranks it for your graphics
+card and shows how to download the model you select.
+
+**Best picks by graphics-card memory** (for analysis, summaries and
+Connections / Ledger questions):
+
+| Card memory | Main model, best first | For pictures and scans |
+|---|---|---|
+| No GPU, or under 8 GB | IBM Granite 4.2 3B, Google Gemma 4 E2B, Microsoft Phi-4-mini 3.8B | Google Gemma 4 E2B |
+| 8 GB | IBM Granite 4.2 8B, Google Gemma 4 E4B, Ai2 OLMo 3 7B | Google Gemma 4 E4B |
+| 12 GB | Google Gemma 4 12B, IBM Granite 4.2 8B | Google Gemma 4 12B |
+| 16 GB (RTX 4080 / 5080) | Google Gemma 4 26B-A4B, Google Gemma 4 12B, OpenAI gpt-oss-20b | Google Gemma 4 26B-A4B, Google Gemma 4 12B |
+| 24 GB or more | Google Gemma 4 31B, Meta Muse Glimmer 30B, IBM Granite 4.2 30B, Google Gemma 4 26B-A4B | Google Gemma 4 31B, Meta Muse Glimmer 30B |
+
+Gemma 4 26B-A4B is a mixture of experts (about 4B parameters work on each
+word), so on a 16 GB card it stays fast with part of it in system RAM.
 
 | ID | Name | Org | Size | Ctx | VRAM (Q4) | License | Notes |
 |---|---|---|---|---|---|---|---|
-| `granite-3.1-8b-q4` | IBM Granite 3.1 8B Instruct (Q4_K_M) | IBM | 4.9 GB | 128K | 6.5 GB | Apache-2.0 | **Default.** Solid general baseline. Conservative refusals; good with tabular data. |
-| `llama-3.1-8b-q5` | Meta Llama 3.1 8B Instruct (Q5_K_M) | Meta | 5.7 GB | 128K | 7.0 GB | Llama 3.1 Community License | Long-context generalist. Best for big folder dumps / multi-CSV context. |
-| `llama-3.2-3b-q5` | Meta Llama 3.2 3B Instruct (Q5_K_M) | Meta | 2.4 GB | 128K | 3.2 GB | Llama 3.2 Community License | Fast, fits 8 GB cards comfortably. Good for routing / classification. |
-| `llama-3.2-1b-q8` | Meta Llama 3.2 1B Instruct (Q8_0) | Meta | 1.3 GB | 128K | 1.8 GB | Llama 3.2 Community License | Tiny. CPU-friendly. Use for quick demos or constrained boxes. |
-| `phi-4-q4` | Microsoft Phi-4 14B (Q4_K_M) | Microsoft | 8.9 GB | 16K | 11.0 GB | MIT | Best reasoning at this VRAM tier. Pick for analyst Q&A on dense data. |
-| `phi-3.5-mini-q5` | Microsoft Phi-3.5-mini Instruct (Q5_K_M) | Microsoft | 2.8 GB | 128K | 3.6 GB | MIT | Compact, strong reasoning. Great middle-ground for 8 GB VRAM. |
-| `gemma-2-9b-q4` | Google Gemma 2 9B Instruct (Q4_K_M) | Google | 5.8 GB | 8K | 7.5 GB | Gemma Terms of Use | Polished prose; helpful for write-ups. Short native context. |
-| `granite-3.1-8b-code-q4` | IBM Granite 3.1 8B Code Instruct (Q4_K_M) | IBM | 4.9 GB | 128K | 6.5 GB | Apache-2.0 | Code-specialised IBM model. Wire into the Coder role if you have RAM headroom. |
-| `olmo-2-13b-q4` | AllenAI OLMo 2 13B Instruct (Q4_K_M) | AllenAI | 8.4 GB | 4K | 10.5 GB | Apache-2.0 | Fully open weights + training data (Allen Institute). Pick for transparency. |
+| `granite-4.2-8b` | IBM Granite 4.2 8B Instruct (Q4_K_M) | IBM | 5.3 GB | 128K | 6.5 GB | Apache-2.0 | **Default.** Default. Built for summarising, pulling facts out of documents and answering from your own files; tool calling and a thinking mode. The 8 GB-card pick. |
+| `granite-4.2-3b` | IBM Granite 4.2 3B Instruct (Q4_K_M) | IBM | 2.2 GB | 128K | 3.2 GB | Apache-2.0 | Small Granite: the same summarising and extraction skills for small cards, laptops without a GPU and Raspberry Pis. |
+| `granite-4.2-30b` | IBM Granite 4.2 30B Instruct (Q4_K_M) | IBM | 17.7 GB | 128K | 19.5 GB | Apache-2.0 | Largest Granite. Careful summaries and extraction on 24 GB cards. A dense model, so it is slow when it spills to RAM. |
+| `gemma-4-e2b` | Google Gemma 4 E2B Instruct (Q4_K_M) | Google | 3.1 GB | 128K | 4.0 GB | Apache-2.0 | Tiny Gemma that also reads pictures and scanned pages. For cards under 6 GB or no GPU. |
+| `gemma-4-e4b` | Google Gemma 4 E4B Instruct (Q4_K_M) | Google | 5.0 GB | 128K | 6.0 GB | Apache-2.0 | Reads pictures, charts and scanned forms on an 8 GB card. Pair it with Granite 4.2 8B for text. |
+| `gemma-4-12b` | Google Gemma 4 12B Instruct (Q4_K_M) | Google | 7.1 GB | 256K | 9.5 GB | Apache-2.0 | The 12 GB-card pick: text and pictures in one model, 256K context for long documents. On 16 GB it leaves room for a very long window. |
+| `gemma-4-26b-a4b` | Google Gemma 4 26B-A4B Instruct (Q4_K_M) | Google | 17.0 GB | 256K | 18.5 GB | Apache-2.0 | The 16 GB-card pick in Ollama: a mixture of experts with ~4B parameters active per word, so it stays fast when part of it spills to RAM. Strong on documents and pictures. |
+| `gemma-4-31b` | Google Gemma 4 31B Instruct (Q4_K_M) | Google | 18.3 GB | 256K | 20.5 GB | Apache-2.0 | Strongest US model that fits one 24 GB card: best at long documents and scanned pages. |
+| `muse-glimmer-30b` | Meta Muse Glimmer 30B | Meta | 18.0 GB | 128K | 19.5 GB | Apache-2.0 | Reads documents, charts and screenshots beside text; built for tool use. A 24 GB-card pick. Ollama only. |
+| `gpt-oss-20b` | OpenAI gpt-oss-20b (MXFP4) | OpenAI | 12.1 GB | 128K | 14.0 GB | Apache-2.0 | Mixture of experts: ~3.6B parameters active per token, so with the experts in RAM it runs on an 8 GB card + 32 GB RAM (Ollama places them; llama-cpp-python 0.3.35 offloads whole layers only). Best at step-by-step number work, code and tool calling. |
+| `phi-4-reasoning` | Microsoft Phi-4-reasoning 14B (Q4_K_M) | Microsoft | 9.1 GB | 32K | 11.0 GB | MIT | Thinks step by step before answering: good for maths and careful analysis questions. Slower replies; 32K context. |
+| `phi-4-mini` | Microsoft Phi-4-mini Instruct 3.8B (Q4_K_M) | Microsoft | 2.5 GB | 128K | 3.6 GB | MIT | Small and quick with good reasoning for its size; runs on a CPU. |
+| `olmo-3-7b` | Ai2 OLMo 3 7B Instruct (Q4_K_M) | AllenAI | 4.5 GB | 64K | 5.8 GB | Apache-2.0 | Fully open weights and training data (Allen Institute). Pick for transparency. |
+| `olmo-3-32b-think` | Ai2 OLMo 3 32B Think (Q4_K_M) | AllenAI | 19.5 GB | 64K | 21.5 GB | Apache-2.0 | Largest fully open model; thinks step by step. A 24 GB-card option for transparency. |
 
-VRAM column is approximate at the listed quant + 4K context with ~1.5 GB
-headroom for the CUDA driver and the Tkinter UI. On a 16 GB card (RTX
-4080 / 5080) any of these run comfortably; on an 8 GB card stick to the
-Llama-3.2-3B, Phi-3.5-mini, or the Llama-3.2-1B (CPU-fine too).
+VRAM is approximate at the listed quant with a 4K window; leave about
+1.5 GB for the driver and the app, more for a long context window. Older
+entries (Granite 3, Llama 3.x, Phi-3.5 / Phi-4, Gemma 2 / 3, OLMo 2) stay in
+the catalog so existing setups keep working, but are no longer suggested.
 
-Pick one via the wizard:
+### Downloading a model
+
+**With Ollama (easiest):** install Ollama from ollama.com, then for example
 
 ```bash
-python setup_wizard.py --model phi-4-q4   # preselect by id, or omit to choose
+ollama pull granite4.2:8b      # the default
+ollama pull gemma4:12b         # 12-16 GB cards; reads pictures too
 ```
 
-…or download manually then point Council at the file:
+and press Rescan in the Models tab.
+
+**As a GGUF file for llama-cpp:** the Models tab's "Download & install"
+fetches the file and switches to it, or download it by hand:
 
 ```bash
-python -c "from huggingface_hub import hf_hub_download as h; h(repo_id='bartowski/phi-4-GGUF', filename='phi-4-Q4_K_M.gguf', local_dir='./models')"
-export COUNCIL_GGUF_PATH=./models/phi-4-Q4_K_M.gguf
+hf download ibm-granite/granite-4.2-8b-GGUF granite-4.2-8b-Q4_K_M.gguf --local-dir ./models
+export COUNCIL_GGUF_PATH=./models/granite-4.2-8b-Q4_K_M.gguf
 ```
 
-The same catalog renders in the in-GUI onboarding wizard with **Open**
-(goes to Hugging Face) and **⬇ Auto-download** buttons per row.
+Select any model in the Models tab (or press "Copy download info") for its
+exact commands, including the picture-reader file (`mmproj`) a vision model
+needs with llama-cpp. Gemma 4 and Granite 4.2 GGUF files need a recent
+llama.cpp; Ollama runs them once it is updated. Meta Muse Glimmer is offered
+through Ollama only.
+
+Or pick one via the wizard:
+
+```bash
+python setup_wizard.py --model granite-4.2-8b   # preselect by id, or omit to choose
+```
 
 ---
 

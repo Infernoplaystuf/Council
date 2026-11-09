@@ -259,13 +259,63 @@ def test_a_model_that_never_delivers_is_reported_and_repaired(
 
     rep = tr.rebuild_widget("pop_out", tmp_path / "w", model_call=bad,
                             repairs=1)
-    assert rep["passed"] == 0 and rep["counted"] == 1
+    # If a child run was spoiled by the machine, say how (it is not the
+    # code's failure, and the assertions below would only hide that).
+    why = {"baseline": rep["baseline"],
+           "rounds": [{k: r.get(k) for k in ("infra", "outcomes", "stderr")}
+                      for r in rep["rounds"]]}
+    assert rep["passed"] == 0 and rep["counted"] == 1, why
     assert rep["pieces"]["pop_out"]["problems"] == ["does not define pop_out"]
-    assert len(calls) == 2                     # the write, then one repair
+    assert len(calls) == 2, why                # the write, then one repair
     assert "these failed" in calls[1]
     found = tr.widget_findings(rep)
     assert any("never delivered" in f for f in found)
     assert any("0 of 1" in f for f in found)
+
+
+def test_a_spoiled_run_is_run_again(tmp_path, monkeypatch):
+    runs = []
+
+    def once(tests, work, *, swap=None, tag="run"):
+        runs.append(tag)
+        if len(runs) == 1:
+            return {"outcomes": {}, "failures": {}, "seconds": 1,
+                    "infra": "pytest wrote no report: "}
+        return {"outcomes": {"t::a": "passed"}, "failures": {}, "seconds": 1,
+                "infra": ""}
+
+    monkeypatch.setattr(tr, "_run_tests_once", once)
+    out = tr.run_tests([], tmp_path, tag="round0")
+    assert runs == ["round0", "round0"] and out["infra"] == ""
+    assert out["outcomes"] == {"t::a": "passed"}
+    assert out["infra_retried"] == ["pytest wrote no report: "]
+
+
+def test_a_timeout_is_not_run_again(tmp_path, monkeypatch):
+    runs = []
+
+    def once(tests, work, *, swap=None, tag="run"):
+        runs.append(tag)
+        return {"outcomes": {}, "failures": {}, "seconds": 900,
+                "infra": "timed out after 900s", "timed_out": True}
+
+    monkeypatch.setattr(tr, "_run_tests_once", once)
+    assert tr.run_tests([], tmp_path)["infra"] == "timed out after 900s"
+    assert len(runs) == 1
+
+
+def test_a_spoiled_baseline_counts_no_test(tmp_path, monkeypatch, small_suite):
+    """Measured on CI (PR #72): the empty module's run wrote no report, so
+    every test the original passed was counted, and a model that delivered
+    nothing scored 1 of 1 on the placeholder."""
+    def fake(tests, work, *, swap=None, tag="run"):
+        if tag == "empty":
+            return {"outcomes": {}, "failures": {}, "infra": "no report"}
+        return {"outcomes": {"m::t": "passed"}, "failures": {}, "infra": ""}
+
+    monkeypatch.setattr(tr, "run_tests", fake)
+    base = tr.widget_baseline("pop_out", tmp_path, "", [small_suite])
+    assert base["counted"] == [] and base["infra"] == "no report"
 
 
 # ============================================================

@@ -50,7 +50,7 @@ PI_MODELS: Tuple[str, ...] = tuple(PI_MODEL_RECOMMENDATIONS)
 COUNCIL_ROLES = ("heavy", "fast", "unassigned")
 AUTH_METHODS = ("password", "key")
 AI_HAT_TOPS = 26.0
-DEFAULT_MODEL = "qwen2.5:3b"
+DEFAULT_MODEL = "granite4.2:3b"   # US-made (was qwen2.5:3b)
 
 #: status -> theme token. The Tk console hard-coded Catppuccin hex values.
 STATUS_TOKEN = {"online": "success", "offline": "error",

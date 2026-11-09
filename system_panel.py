@@ -31,7 +31,7 @@ def snapshot() -> Dict[str, Any]:
     hw = cookbook.describe()
     vram = cookbook.primary_vram_gb()
     fits = []
-    for spec in model_catalog.MODELS:
+    for spec in model_catalog.CURRENT:
         fits.append({
             "model_id": spec.id,
             "name":     spec.name,
