@@ -475,3 +475,127 @@ def test_the_study_page_makes_from_the_review_and_saves(qapp, built, app_dir):
     assert (app_dir / "plugin_data" / "council.study" / f"{nb.id}.study.json").exists()
     tab.docs_page.show_kind.setCurrentIndex(sd.KINDS.index("glossary"))
     assert "Glycolysis" in tab.docs_page.view.text.toPlainText()
+
+
+# ------------------------------------------------------------- practice and export
+from council_plugins.study.engine import export as ex  # noqa: E402
+from council_plugins.study.engine import practice as pr  # noqa: E402
+
+CARDS = [{"front": "A?", "back": "a", "source": 1},
+         {"front": "B?", "back": "b", "source": 1}]
+
+
+def test_cards_move_up_a_box_when_right_and_back_to_one_when_wrong():
+    deck = pr.Deck()
+    now = 1_000_000.0
+    assert deck.due(CARDS, now) == CARDS                    # new cards are due
+    deck.answer(CARDS[0], True, now)
+    assert deck.state(CARDS[0])["box"] == 2
+    assert deck.due(CARDS, now) == [CARDS[1]]
+    assert deck.due(CARDS, now + pr.DAY + 1) == [CARDS[1], CARDS[0]]
+    deck.answer(CARDS[0], False, now)
+    assert deck.state(CARDS[0])["box"] == 1
+    assert deck.box_counts(CARDS) == {1: 2, 2: 0, 3: 0, 4: 0, 5: 0}
+    again = pr.Deck(_json.loads(_json.dumps(deck.to_dict())))
+    assert again.state(CARDS[0]) == deck.state(CARDS[0])
+
+
+def test_a_missed_card_comes_round_again_until_it_is_right():
+    deck = pr.Deck()
+    s = pr.Session.start(deck, CARDS, now=0)
+    s.answer(deck, False, now=0)                 # A missed
+    s.answer(deck, True, now=0)                  # B right
+    assert s.current() == CARDS[0] and [c["front"] for c in s.missed] == ["A?"]
+    s.answer(deck, True, now=0)
+    assert s.current() is None and s.missed == []
+    assert (s.done, s.right) == (3, 2)
+
+
+def test_a_quiz_marks_choices_scores_and_retakes_the_missed():
+    qs = [{"question": "Where?", "choices": ["Stroma", "Nucleus", "Cytoplasm", "Matrix"],
+           "answer": "Stroma", "source": 1},
+          {"question": "Yield?", "answer": "two ATP per glucose", "source": 1}]
+    run = pr.QuizRun.start(qs)
+    assert run.submit("Nucleus") is False
+    run.next()
+    assert run.submit("it yields two ATP for each glucose") is True    # the guess
+    run.remark(False)
+    run.next()
+    assert run.finished and run.score() == {"right": 0, "total": 2}
+    assert [q["question"] for q in run.missed()] == ["Where?", "Yield?"]
+    shuffled = pr.QuizRun.start(qs, shuffle=True, seed=3)
+    assert sorted(shuffled.questions[0]["choices"] if shuffled.questions[0].get("choices")
+                  else shuffled.questions[1]["choices"]) == sorted(qs[0]["choices"])
+    assert not pr.suggest("", "anything")
+
+
+def test_export_writes_word_html_and_anki(review, tmp_path):
+    st = sd.make_study_set(FakeModels(fake_teacher).chat("m"), review)
+    html = ex.to_html(review, st)
+    assert "Literature review" in html and "Answer key" in html and "Sources" in html
+    path = ex.to_docx(tmp_path / "pack.docx", review, st)
+    import docx
+    text = "\n".join(p.text for p in docx.Document(str(path)).paragraphs)
+    assert "Answer key" in text and "Calvin cycle occurs in the stroma" in text
+    anki = ex.anki_text(st)
+    lines = anki.splitlines()
+    assert lines[0] == "#separator:tab"
+    assert lines[3].split("\t")[:2] == ["Where does the Calvin cycle occur?", "In the stroma"]
+    assert lines[3].split("\t")[2].startswith("notes/photosynthesis.md")
+
+
+def _tab_with_study(qapp, built):
+    src, nb = built
+    tab = tab_for(src, FakeModels(fake_teacher))
+    assert pump(qapp, lambda: tab.model.currentData() == "granite3.3:8b")
+    tab.review_page.write()
+    assert pump(qapp, lambda: tab.review_page.review is not None)
+    tab.docs_page.make()
+    assert pump(qapp, lambda: tab.docs_page.set is not None)
+    return tab, nb
+
+
+def test_the_practice_page_runs_cards_and_a_quiz(qapp, built, app_dir):
+    tab, nb = _tab_with_study(qapp, built)
+    page = tab.practice_page
+    assert "2 cards, 2 due now" in page.boxes.text()
+    page.start_cards(False)
+    first = page.front.text()
+    page.flip()
+    assert page.back.text()
+    page.mark_card(False)
+    page.flip()
+    page.mark_card(True)
+    assert page.front.text() == first                 # the missed one again
+    page.flip()
+    page.mark_card(True)
+    assert page.front.text().startswith("Done: 2 right of 3")
+    saved = _json.loads((app_dir / "plugin_data" / "council.study"
+                         / f"{nb.id}.practice.json").read_text(encoding="utf-8"))
+    assert len(saved["cards"]) == 2
+
+    page.start_quiz(False)
+    for _ in range(2):
+        q = page.run.current()
+        if q.get("choices"):
+            wrong = [rb for rb in page.choices if rb.text() != q["answer"]][0]
+            wrong.setChecked(True)
+        else:
+            page.short.setText(q["answer"])
+        page.submit()
+        page.next_question()
+    assert page.quiz_result.text().startswith("Score: 1 of 2.")
+    assert page.retake_btn.isEnabled()
+    page.start_quiz(True)
+    assert len(page.run.questions) == 1
+
+
+def test_the_study_page_exports(qapp, built, tmp_path):
+    tab, _nb = _tab_with_study(qapp, built)
+    page = tab.docs_page
+    assert all(b.isEnabled() for b in page.export_btns)
+    pdf = page.export_pdf(str(tmp_path / "pack.pdf"))
+    assert Path(pdf).read_bytes()[:5] == b"%PDF-"
+    assert Path(page.export_docx(str(tmp_path / "pack.docx"))).stat().st_size > 1000
+    assert "Where is the Krebs cycle?" in Path(
+        page.export_anki(str(tmp_path / "cards.txt"))).read_text(encoding="utf-8")

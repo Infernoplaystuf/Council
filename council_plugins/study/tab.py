@@ -19,6 +19,10 @@ Pages (right):
   Study documents  flash cards, a quiz with its answer key, a study guide
             and a glossary made from the review (engine.study_docs), each item
             checked against the passage it cites. <notebook>.study.json.
+            Exported as Word, PDF (Qt's own writer) or an Anki import file.
+  Practice  the flash cards in Leitner boxes (due cards, the missed ones
+            again) and the quiz, marked and scored (engine.practice).
+            <notebook>.practice.json.
 
 Work that reads files or asks a model runs on a worker thread; its result
 comes back to the GUI thread through a queued signal (``_Ui``). What the
@@ -31,15 +35,17 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtGui import QDesktopServices, QPageSize, QPdfWriter, QTextDocument
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
-                               QMessageBox, QPushButton, QSpinBox, QSplitter,
+                               QMessageBox, QPushButton, QRadioButton, QSpinBox, QSplitter,
                                QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
 from .engine import common as cm
 from .engine import review as rv
+from .engine import export as ex
+from .engine import practice as pr
 from .engine import study_docs as sd
 
 SETTINGS_FILE = "settings.json"
@@ -379,6 +385,17 @@ class StudyDocsPage(QWidget):
         show.addWidget(self.show_kind)
         show.addWidget(self.answers)
         show.addStretch(1)
+        self.export_btns = []
+        for text, slot in (("Word…", self.export_docx), ("PDF…", self.export_pdf),
+                           ("Anki…", self.export_anki)):
+            b = QPushButton(text)
+            b.setToolTip({"Word…": "The review and every study document as a Word file",
+                          "PDF…": "The review and every study document as a PDF",
+                          "Anki…": "The flash cards as a file Anki imports"}[text])
+            b.clicked.connect(slot)
+            b.setEnabled(False)
+            show.addWidget(b)
+            self.export_btns.append(b)
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
         show.addWidget(self.summary)
@@ -399,6 +416,8 @@ class StudyDocsPage(QWidget):
 
     def set_set(self, st: Optional[sd.StudySet]) -> None:
         self.set = st
+        for b in self.export_btns:
+            b.setEnabled(st is not None)
         if st is None:
             self.summary.setText("")
         else:
@@ -455,6 +474,368 @@ class StudyDocsPage(QWidget):
     def _idle(self, *_a) -> None:
         self.make_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+
+    # -- export --
+    def _ask_path(self, what: str, suffix: str, filt: str) -> str:
+        title = ex.title_of(self.tab.review_page.review, self.set)
+        path, _f = QFileDialog.getSaveFileName(self, f"Export {what}",
+                                               f"{title}{suffix}", filt)
+        return path
+
+    def export_docx(self, path: str = "") -> str:
+        path = path or self._ask_path("as Word", ".docx", "Word (*.docx)")
+        if path:
+            ex.to_docx(path, self.tab.review_page.review, self.set)
+            self.tab.status.setText(f"Saved {path}")
+        return path
+
+    def export_pdf(self, path: str = "") -> str:
+        path = path or self._ask_path("as PDF", ".pdf", "PDF (*.pdf)")
+        if path:
+            doc = QTextDocument()
+            doc.setHtml(ex.to_html(self.tab.review_page.review, self.set))
+            writer = QPdfWriter(path)
+            writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
+            doc.print_(writer)
+            del writer
+            self.tab.status.setText(f"Saved {path}")
+        return path
+
+    def export_anki(self, path: str = "") -> str:
+        if self.set is None or not self.set.cards:
+            self.tab.status.setText("There are no flash cards to export.")
+            return ""
+        path = path or self._ask_path("flash cards for Anki", ".txt", "Text (*.txt)")
+        if path:
+            ex.to_anki(path, self.set)
+            self.tab.status.setText(f"Saved {path}: in Anki, File > Import.")
+        return path
+
+
+class PracticePage(QWidget):
+    """Flash cards in Leitner boxes, and the quiz taken and scored."""
+
+    def __init__(self, tab: "StudyTab"):
+        super().__init__()
+        self.tab = tab
+        self.deck = pr.Deck()
+        self.session: Optional[pr.Session] = None
+        self.run: Optional[pr.QuizRun] = None
+        inner = QTabWidget()
+        inner.addTab(self._cards_ui(), "Flash cards")
+        inner.addTab(self._quiz_ui(), "Quiz")
+        lay = QVBoxLayout(self)
+        lay.addWidget(inner)
+
+    # -- layout --
+    def _cards_ui(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.boxes = QLabel("")
+        self.boxes.setObjectName("study_boxes")
+        row = QHBoxLayout()
+        self.due_btn = QPushButton("Practise the cards due")
+        self.due_btn.setObjectName("study_practise_due")
+        self.due_btn.clicked.connect(lambda: self.start_cards(False))
+        self.all_btn = QPushButton("Practise every card")
+        self.all_btn.clicked.connect(lambda: self.start_cards(True))
+        row.addWidget(self.due_btn)
+        row.addWidget(self.all_btn)
+        row.addStretch(1)
+        self.front = QLabel("")
+        self.front.setObjectName("study_card_front")
+        self.front.setWordWrap(True)
+        self.front.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.front.setStyleSheet("font-size: 18pt; padding: 18px;")
+        self.back = QLabel("")
+        self.back.setObjectName("study_card_back")
+        self.back.setWordWrap(True)
+        self.back.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.back.setStyleSheet("font-size: 14pt; padding: 12px;")
+        answer_row = QHBoxLayout()
+        self.flip_btn = QPushButton("Show answer")
+        self.flip_btn.clicked.connect(self.flip)
+        self.right_btn = QPushButton("I knew it")
+        self.right_btn.clicked.connect(lambda: self.mark_card(True))
+        self.wrong_btn = QPushButton("I missed it")
+        self.wrong_btn.clicked.connect(lambda: self.mark_card(False))
+        for b in (self.flip_btn, self.right_btn, self.wrong_btn):
+            answer_row.addWidget(b)
+        self.card_progress = QLabel("")
+        lay.addWidget(self.boxes)
+        lay.addLayout(row)
+        lay.addWidget(self.front, 2)
+        lay.addWidget(self.back, 1)
+        lay.addLayout(answer_row)
+        lay.addWidget(self.card_progress)
+        self._card_buttons(False, False)
+        return w
+
+    def _quiz_ui(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        row = QHBoxLayout()
+        self.quiz_btn = QPushButton("Start the quiz")
+        self.quiz_btn.setObjectName("study_start_quiz")
+        self.quiz_btn.clicked.connect(lambda: self.start_quiz(False))
+        self.retake_btn = QPushButton("Retake the ones I missed")
+        self.retake_btn.setEnabled(False)
+        self.retake_btn.clicked.connect(lambda: self.start_quiz(True))
+        row.addWidget(self.quiz_btn)
+        row.addWidget(self.retake_btn)
+        row.addStretch(1)
+        self.question = QLabel("")
+        self.question.setObjectName("study_question")
+        self.question.setWordWrap(True)
+        self.question.setStyleSheet("font-size: 14pt; padding: 8px;")
+        self.choice_group = QButtonGroup(self)
+        self.choices: List[QRadioButton] = []
+        choice_box = QVBoxLayout()
+        for _i in range(4):
+            rb = QRadioButton("")
+            self.choice_group.addButton(rb)
+            self.choices.append(rb)
+            choice_box.addWidget(rb)
+        self.short = QLineEdit()
+        self.short.setObjectName("study_short_answer")
+        self.short.setPlaceholderText("Your answer")
+        self.short.returnPressed.connect(self.submit)
+        sub = QHBoxLayout()
+        self.submit_btn = QPushButton("Check")
+        self.submit_btn.clicked.connect(self.submit)
+        self.mark_right = QPushButton("Count it right")
+        self.mark_right.clicked.connect(lambda: self.remark(True))
+        self.mark_wrong = QPushButton("Count it wrong")
+        self.mark_wrong.clicked.connect(lambda: self.remark(False))
+        self.next_btn = QPushButton("Next")
+        self.next_btn.clicked.connect(self.next_question)
+        for b in (self.submit_btn, self.mark_right, self.mark_wrong, self.next_btn):
+            sub.addWidget(b)
+        sub.addStretch(1)
+        self.feedback = QTextBrowser()
+        self.feedback.setObjectName("study_feedback")
+        self.feedback.setOpenLinks(False)
+        self.feedback.anchorClicked.connect(self._feedback_cite)
+        self.feedback.setMaximumHeight(160)
+        self.quiz_result = QLabel("")
+        self.quiz_result.setObjectName("study_quiz_result")
+        self.quiz_result.setWordWrap(True)
+        lay.addLayout(row)
+        lay.addWidget(self.question)
+        lay.addLayout(choice_box)
+        lay.addWidget(self.short)
+        lay.addLayout(sub)
+        lay.addWidget(self.feedback)
+        lay.addWidget(self.quiz_result)
+        lay.addStretch(1)
+        self._quiz_controls(None)
+        return w
+
+    # -- state --
+    @staticmethod
+    def file_name(nid: str) -> str:
+        return f"{nid}.practice.json"
+
+    def study(self) -> Optional[sd.StudySet]:
+        return self.tab.docs_page.set
+
+    def notebook_changed(self, nid: str) -> None:
+        self.deck = pr.Deck(self.tab.load(self.file_name(nid)) if nid else None)
+        self.session = None
+        self.run = None
+        self._show_card()
+        self._quiz_controls(None)
+        self.question.setText("")
+        self.feedback.clear()
+        self.quiz_result.setText(self._history())
+        self.retake_btn.setEnabled(False)
+        self._boxes()
+
+    def study_changed(self, nid: str) -> None:
+        if nid == self.tab.notebook_id():
+            self.notebook_changed(nid)
+
+    def _save(self) -> None:
+        nid = self.tab.notebook_id()
+        if nid:
+            self.tab.save(self.file_name(nid), self.deck.to_dict())
+
+    def _boxes(self) -> None:
+        st = self.study()
+        if st is None or not st.cards:
+            self.boxes.setText("No flash cards yet: make them on the Study documents page.")
+            self.due_btn.setEnabled(False)
+            self.all_btn.setEnabled(False)
+            return
+        counts = self.deck.box_counts(st.cards)
+        due = len(self.deck.due(st.cards))
+        self.boxes.setText(f"{len(st.cards)} cards, {due} due now. By box: " + ", ".join(
+            f"{b}: {n}" for b, n in counts.items()) + " (box 5 = known well).")
+        self.due_btn.setEnabled(due > 0)
+        self.all_btn.setEnabled(True)
+
+    # -- flash cards --
+    def _card_buttons(self, flip: bool, mark: bool) -> None:
+        self.flip_btn.setEnabled(flip)
+        self.right_btn.setEnabled(mark)
+        self.wrong_btn.setEnabled(mark)
+
+    def start_cards(self, everything: bool) -> None:
+        st = self.study()
+        if st is None or not st.cards:
+            return
+        self.session = pr.Session.start(self.deck, st.cards, everything=everything)
+        self._show_card()
+
+    def _show_card(self) -> None:
+        card = self.session.current() if self.session else None
+        self.back.setText("")
+        if card is None:
+            if self.session is not None:
+                s = self.session
+                self.front.setText(f"Done: {s.right} right of {s.done} answers.")
+            else:
+                self.front.setText("")
+            self.card_progress.setText("")
+            self._card_buttons(False, False)
+            self.session = None
+            self._boxes()
+            return
+        self.front.setText(card["front"])
+        self.card_progress.setText(f"{self.session.left} to go"
+                                   + (f", {len(self.session.missed)} missed so far"
+                                      if self.session.missed else ""))
+        self._card_buttons(True, False)
+
+    def flip(self) -> None:
+        card = self.session.current() if self.session else None
+        if card is None:
+            return
+        src = self.study().sources.get(card["source"])
+        self.back.setText(card["back"] + (f"\n\n[{card['source']}] {src.cite()}" if src else ""))
+        self._card_buttons(False, True)
+
+    def mark_card(self, right: bool) -> None:
+        if self.session is None or self.session.current() is None:
+            return
+        self.session.answer(self.deck, right)
+        self._save()
+        self._show_card()
+
+    # -- the quiz --
+    def _quiz_controls(self, q: Optional[Dict[str, Any]], answered: bool = False) -> None:
+        choice = bool(q and q.get("choices"))
+        for i, rb in enumerate(self.choices):
+            rb.setVisible(choice)
+            rb.setEnabled(choice and not answered)
+            if choice:
+                rb.setText(q["choices"][i] if i < len(q["choices"]) else "")
+        self.short.setVisible(bool(q) and not choice)
+        self.short.setEnabled(bool(q) and not answered)
+        self.submit_btn.setEnabled(bool(q) and not answered)
+        self.next_btn.setEnabled(bool(q) and answered)
+        self.mark_right.setVisible(bool(q) and not choice and answered)
+        self.mark_wrong.setVisible(bool(q) and not choice and answered)
+
+    def start_quiz(self, missed_only: bool) -> None:
+        st = self.study()
+        if missed_only and self.run is not None:
+            qs = self.run.missed()
+        else:
+            qs = st.quiz if st is not None else []
+        if not qs:
+            self.quiz_result.setText("No quiz questions yet: make them on the Study "
+                                     "documents page.")
+            return
+        self.run = pr.QuizRun.start(qs, shuffle=True)
+        self._retake = missed_only
+        self.retake_btn.setEnabled(False)
+        self.quiz_result.setText("")
+        self._ask()
+
+    def _ask(self) -> None:
+        q = self.run.current() if self.run else None
+        self.feedback.clear()
+        self.short.clear()
+        self.choice_group.setExclusive(False)
+        for rb in self.choices:
+            rb.setChecked(False)
+        self.choice_group.setExclusive(True)
+        if q is None:
+            self._finish()
+            return
+        self.question.setText(f"{self.run.at + 1} of {len(self.run.questions)}. "
+                              f"{q['question']}")
+        self._quiz_controls(q)
+
+    def submit(self) -> None:
+        q = self.run.current() if self.run else None
+        if q is None or not self.submit_btn.isEnabled():
+            return
+        if q.get("choices"):
+            picked = [rb.text() for rb in self.choices if rb.isChecked()]
+            if not picked:
+                return
+            given = picked[0]
+        else:
+            given = self.short.text().strip()
+        right = self.run.submit(given)
+        self._feedback(q, right)
+        self._quiz_controls(q, answered=True)
+
+    def _feedback(self, q: Dict[str, Any], right: bool) -> None:
+        st = self.study()
+        src = st.sources.get(q["source"]) if st else None
+        cite = (f" <a href='cite:{q['source']}'>[{q['source']}] {esc(src.cite())}</a>"
+                if src else "")
+        verdict = ("<b style='color:#2a2'>Right.</b>" if right else
+                   "<b style='color:#c33'>Not quite.</b>")
+        hint = ("" if q.get("choices") else
+                " <i>Council's guess for a typed answer: use Count it right or "
+                "Count it wrong if it guessed wrong.</i>")
+        why = f" {esc(q['explanation'])}" if q.get("explanation") else ""
+        self.feedback.setHtml(f"{verdict} The answer: <b>{esc(q['answer'])}</b>.{why}"
+                              f"{cite}{hint}")
+
+    def remark(self, right: bool) -> None:
+        q = self.run.current() if self.run else None
+        if q is None:
+            return
+        self.run.remark(right)
+        self._feedback(q, right)
+
+    def next_question(self) -> None:
+        if self.run is None:
+            return
+        self.run.next()
+        self._ask()
+
+    def _finish(self) -> None:
+        score = self.run.score()
+        if not getattr(self, "_retake", False):
+            self.deck.add_quiz(score["right"], score["total"])
+            self._save()
+        self.question.setText("")
+        self._quiz_controls(None)
+        missed = len(self.run.missed())
+        self.retake_btn.setEnabled(missed > 0)
+        self.quiz_result.setText(f"Score: {score['right']} of {score['total']}."
+                                 + (f" {missed} to go over again." if missed else "")
+                                 + "\n" + self._history())
+
+    def _history(self) -> str:
+        if not self.deck.quizzes:
+            return ""
+        last = self.deck.quizzes[-5:]
+        return "Past scores: " + ", ".join(f"{q['right']}/{q['total']}" for q in last)
+
+    def _feedback_cite(self, url) -> None:
+        st = self.study()
+        text = url.toString()
+        if st and text.startswith("cite:"):
+            src = st.sources.get(int(text[5:]))
+            if src is not None:
+                self.tab.open_file(src)
 
 
 class StudyTab(QWidget):
@@ -558,6 +939,8 @@ class StudyTab(QWidget):
         self.pages.addTab(self.review_page, "Review")
         self.docs_page = StudyDocsPage(self)
         self.pages.addTab(self.docs_page, "Study documents")
+        self.practice_page = PracticePage(self)
+        self.pages.addTab(self.practice_page, "Practice")
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(left)
