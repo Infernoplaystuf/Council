@@ -769,6 +769,7 @@ TAB_WORKERS = (
     "grapher-", "jobs-", "keyword-index", "kg-", "ledger-",
     "lens-",
     "librarian-", "model-", "mongo-convert", "nodes-", "pi-setup", "quant-",
+    "research-",
     "sessions-", "tts-", "var-graph", "vault-",
     # capture.warm_in_background: Pillow's plugins imported off the UI
     # thread before a camera's picture starts. It touches no widget, but it

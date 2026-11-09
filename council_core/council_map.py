@@ -228,8 +228,11 @@ _NODES: Tuple[Node, ...] = (
          "the Artist. Repeat calls in one question come from a cache.",
          "council_core/council_tools.py; council_core/tool_kit.py"),
     Node("web", "Web research", "supplier",
-         "crawl4ai page research (intern_agent.py). Not part of the turn.",
-         "intern_agent.py"),
+         "The Research tab (council_core/web_research.py) searches and reads "
+         "pages only while Settings › Online is on (council_core/web.py, the "
+         "one door). Its runs are saved in data_in/research, which "
+         "Connections reads. Not part of the turn.",
+         "council_core/web_research.py; council_core/web.py"),
     Node("sage_kb", "Sage knowledge", "supplier",
          "The sage_knowledge base SageAgent.respond injects.",
          "sage_agent.py:320-332"),

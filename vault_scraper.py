@@ -328,8 +328,15 @@ _HEADERS = {
 _ROBOTS_CACHE: Dict[str, urllib.robotparser.RobotFileParser] = {}
 
 
+def _require_online() -> None:
+    """Council's Online switch (council_core.web): off, nothing is fetched."""
+    from council_core import web
+    web.require_online()
+
+
 def _can_fetch(url: str) -> bool:
     """Check robots.txt. Returns True if allowed or robots.txt unreachable."""
+    _require_online()
     parsed = urllib.parse.urlparse(url)
     if not parsed.scheme or not parsed.netloc:
         return False  # malformed URL
@@ -357,6 +364,7 @@ def _can_fetch(url: str) -> bool:
 
 def _fetch(url: str, timeout: int = 15) -> Optional[str]:
     """Fetch URL, return HTML string or None on failure."""
+    _require_online()
     import ssl as _ssl
     # Create a context that works on Windows without system cert issues
     ctx = _ssl.create_default_context()
@@ -386,6 +394,7 @@ def _fetch(url: str, timeout: int = 15) -> Optional[str]:
 
 def _fetch_raw(url: str, timeout: int = 15) -> Optional[str]:
     """Fetch raw text (for markdown/rst files)."""
+    _require_online()
     import ssl as _ssl
     ctx = _ssl.create_default_context()
     ctx.check_hostname = False
