@@ -706,3 +706,101 @@ def set_base_plugins(home: Any, default_plugins: Sequence[str],
     def change(b: BaseSet) -> None:
         b.plugins = wanted
     return change_base_set(home, default_plugins, change)
+
+
+# ======================================================================
+# Approvals (stage P5; design 4.6, question 7): one per plugin id, never
+# asked again
+# ======================================================================
+APPROVALS_FORMAT = "typhon-approvals"
+
+
+@dataclass
+class Approval:
+    """One plugin's approval: its id, the version and every file's sha256
+    as they were when it was approved (for information only: a later
+    version runs without a question, design 4.6), when, and whether it may
+    use the internet (the standing offline rule's opt-in, step 4)."""
+    id: str
+    version: str = ""
+    approved: str = ""
+    files: Dict[str, str] = field(default_factory=dict)
+    internet: bool = False
+
+    def as_doc(self) -> Dict[str, Any]:
+        return {"version": self.version, "approved": self.approved,
+                "files": dict(self.files), "internet": bool(self.internet)}
+
+
+def approvals_path(home: Any) -> Path:
+    return Path(home) / APPROVALS_FILE
+
+
+def read_approvals(home: Any) -> Dict[str, Approval]:
+    """Every approval kept in `home`'s approvals.json, by plugin id ({}
+    with no file). A damaged file is a PluginListError: nothing is
+    approved meanwhile, and the file is left as it is."""
+    path = approvals_path(home)
+    doc = _read_doc(path, APPROVALS_FORMAT)
+    if doc is None:
+        return {}
+    block = doc.get("plugins")
+    if not isinstance(block, dict):
+        raise PluginListError(f"{path} has no \"plugins\" block; it is left "
+                              f"as it is", path)
+    out: Dict[str, Approval] = {}
+    for pid, entry in block.items():
+        if not isinstance(pid, str) or not isinstance(entry, dict):
+            continue
+        files = entry.get("files") if isinstance(entry.get("files"),
+                                                 dict) else {}
+        out[pid] = Approval(
+            id=pid, version=str(entry.get("version") or ""),
+            approved=str(entry.get("approved") or ""),
+            files={str(k): str(v) for k, v in files.items()},
+            internet=entry.get("internet") is True)
+    return out
+
+
+def change_approvals(home: Any,
+                     change: Callable[[Dict[str, Approval]], None]
+                     ) -> Dict[str, Approval]:
+    """Re-read approvals.json under the lock, let `change` alter it, write
+    it whole (renamed into place). A damaged or newer file is refused and
+    left as it is; so is one under ~/.council beside today's Typhon."""
+    path = approvals_path(home)
+    problem = side_problem(path, "the plugin approvals")
+    if problem:
+        raise PluginListError(problem, path)
+    with _locked(path):
+        approvals = read_approvals(home)
+        change(approvals)
+        _write_whole(path, {
+            "format": APPROVALS_FORMAT, "format_version": FORMAT_VERSION,
+            "plugins": {pid: a.as_doc()
+                        for pid, a in sorted(approvals.items())}})
+        return approvals
+
+
+def approve(home: Any, pid: str, version: str, files: Mapping[str, str],
+            internet: bool = False) -> Approval:
+    """Approve plugin `pid` once (question 7): kept by its id, never asked
+    for again — not for a later version, a changed file or a folder dragged
+    in over it. `internet` is the opt-in a plugin whose manifest declares
+    the internet needs (design 4.6 step 4)."""
+    made = Approval(id=pid, version=str(version),
+                    approved=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    files=dict(files), internet=bool(internet))
+
+    def change(approvals: Dict[str, Approval]) -> None:
+        approvals[pid] = made
+
+    change_approvals(home, change)
+    return made
+
+
+def withdraw(home: Any, pid: str) -> None:
+    """Take plugin `pid`'s approval back (the Plugins window's "Withdraw
+    approval"): it, and any later folder with its id, needs approval
+    again."""
+    change_approvals(home, lambda approvals: approvals.pop(pid, None))

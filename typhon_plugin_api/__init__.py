@@ -1,6 +1,8 @@
 """
-typhon_plugin_api — the one Typhon module a plugin imports: plugin API 0.3,
-the working version of the API that is frozen as 1.0 at stage P5.
+typhon_plugin_api — the one Typhon module a plugin imports: plugin API 1.0
+(frozen at stage P5, 9 November 2026). The author's guide is
+docs/typhon_camera_plugins.md; `python -m typhon_plugin_api.check <folder>`
+checks a plugin's folder.
 
 WHAT THIS IS (docs/typhon_plugins_design.md 3.2, 3.5, 3.11)
 A plugin — built in or written by someone else — imports Typhon only through
@@ -12,15 +14,12 @@ may use (Device, Frame, Provider, Setting, ...) are re-exported from where
 they live, so their code stays where it is while the branch lives (design
 7.2) and a fix to them on qt-migration lands in the same lines.
 
-0.x: ANY CHANGE IS ALLOWED, FOR NOW
-On the typhon-plugins branch the API is numbered 0.x while the built-in
-plugins shape it; no camera plugin, run hook or UI point has been used for
-real yet. A plugin names the exact 0.x it was written for (its manifest's
-"api"). At stage P5 it is frozen as 1.0, and from then on an addition
-raises the minor number and a removal or change raises the major (design
-3.2). What 0.1 has, and what each later stage adds, is in
-docs/typhon_plugin_api_notes.md — the working notes until the author's guide
-of 1.0.
+1.0: FROZEN
+The API was numbered 0.x (0.1 to 0.3) while the built-in plugins shaped
+it. At stage P5 it was frozen as 1.0: from now on an addition raises the
+minor number and a removal or change raises the major (design 3.2). A
+plugin names the lowest API it needs (its manifest's "api"). What each
+stage added is in docs/typhon_plugin_api_notes.md.
 
 ASK, DO NOT COMPARE VERSIONS
 `has("name")` says whether this Typhon offers a feature of the API; a plugin
@@ -107,10 +106,10 @@ from types import MappingProxyType
 from typing import (Any, Callable, Dict, FrozenSet, List, Mapping, Optional,
                     Protocol, Sequence, Tuple, runtime_checkable)
 
-#: This API's version: 0.x until it is frozen as 1.0 at stage P5 — 0.1 at
-#: stage P1, 0.2 at P2 (the camera plugins), 0.3 at P3 (runs, presets, the
-#: facets, triggering).
-API_VERSION = "0.3"
+#: This API's version: 0.1 at stage P1, 0.2 at P2 (the camera plugins), 0.3
+#: at P3 (runs, presets, the facets, triggering), frozen as 1.0 at P5
+#: (plugins from someone else, read_data, the author's kit).
+API_VERSION = "1.0"
 
 #: The features of this API version, by name, for `has` (design 3.11). A
 #: hook is here only once Typhon calls it: activate and deactivate (the
@@ -195,6 +194,11 @@ FEATURES: FrozenSet[str] = frozenset({
     # Capture now on any camera of the rig (5 November 2026; the Send
     # trigger plugin's button).
     "context.capture_now",
+    # API 1.0 (stage P5, 9 November 2026): plugins from someone else load
+    # once approved, from the bytes read at start-up; their data files are
+    # read through the context, checked against those bytes; the author's
+    # kit (python -m typhon_plugin_api.check).
+    "thirdparty.load", "context.read_data", "kit.check",
 })
 
 #: What `ctx.on(event, fn)` may listen for; `fn` gets one read-only mapping.
@@ -539,6 +543,15 @@ class PluginContext(Protocol):
         holds the run `name` belongs to (`name` is "<run><ending>", an
         ending the manifest declares), past runs included, or is this
         plugin's data_dir(), where any plain file name but code goes."""
+
+    def read_data(self, name: str) -> bytes:
+        """A data file of the plugin's own folder (a model, a table, JSON),
+        by its name relative to the folder ("models/net.onnx"). A plugin
+        from someone else gets it checked against the sha256 taken when
+        Typhon started: a file changed or added since is refused
+        (FileNotFoundError) and used from the next start (design 4.5).
+        Read data files this way, never with open()."""
+        ...
 
     def data_dir(self) -> Path:
         """This plugin's own data folder in this project,

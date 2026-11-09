@@ -13,9 +13,10 @@ STAGE P1: THE HOST, AND NO PLUGIN WIRED TO A FEATURE YET
 Today's Typhon behaves exactly as before: nothing in frame_camera calls the
 host yet. The camera plugins are wired at stage P2, the run hooks and the
 triggering plugin at P3, the screen points at P4. Third-party plugins are
-FOUND and listed now — one folder each, copied into the plugin home's
-plugins folder (question 7) — but never loaded before stage P5 brings
-approval and the hash-then-compile loader (design 4.5, 4.6).
+FOUND and listed — one folder each, copied into the plugin home's plugins
+folder (question 7) — and, from stage P5 (9 November 2026), loaded once
+the user approves them, from the bytes read and hashed at start-up
+(council_core.plugin_loader; design 4.5, 4.6).
 
 STAGE P2: THE CAMERA-PLUGIN REGISTRY (design 2.4 items 3 and 9, 3.3, 3.4)
 The camera plugins this project runs are scanned and opened through the
@@ -50,9 +51,20 @@ FINDING PLUGINS READS MANIFESTS ONLY (design 4.1, 4.4)
 Built-in plugins are the folders of typhon_plugins/ that BUILTIN_PLUGINS
 names. A plugin is built in because it is on that list, never because of
 the folder it sits in: any other folder there is refused, not loaded.
-Third-party plugins are folders under <plugin home>/plugins/, each named
-after its id with the dots turned into underscores. Nothing of a plugin is
-imported to list it.
+Third-party plugins are folders under <plugin home>/plugins/, any folder
+name (the package name comes from the id). Nothing of a plugin is imported
+to list it.
+
+STAGE P5: PLUGINS FROM SOMEONE ELSE (design 4.1, 4.5, 4.6; the author's
+guide docs/typhon_camera_plugins.md)
+Discovery reads and hashes every file of a third-party plugin and holds its
+code (plugin_loader.HeldPlugin). One approval per id, kept in the plugin
+home's approvals.json (plugin_lists.approve), never asked again; a plugin
+whose manifest says "internet" also needs the user's opt-in. Loading
+compiles the held bytes as typhon_thirdparty.<id> (plugin_loader), arms the
+network tripwire for its package, and a run's camera record carries its
+sha256. `approve`, `withdraw`, `rescan`, `review` and `risks` serve the
+Plugins window.
 
 LAZY LOADING (design 4.4)
 A plugin's code is imported when it is first needed — `instance()`, or a
@@ -474,6 +486,11 @@ class PluginRecord:
     approval: str = ""
     #: Made in this process (tests, the timing bench): never from disk.
     factory: Optional[Callable[[], Any]] = None
+    #: A third-party plugin's folder as read and hashed at start-up
+    #: (plugin_loader.HeldPlugin): the bytes that run (design 4.5).
+    held: Any = None
+    #: Its approval, once given (plugin_lists.Approval), else None.
+    approved: Any = None
 
     @property
     def name(self) -> str:
@@ -503,9 +520,15 @@ class _Loading:
 
 
 def _third_party_wait() -> str:
-    return ("a plugin from someone else: it is listed, and it loads once "
-            "you have approved it — approval comes with stage P5 of the "
-            "plugin work; until then it does not run")
+    return ("a plugin from someone else: look at it in the Plugins window "
+            "(its files, what it asks for, the lines worth a look) and "
+            "approve it once; until then it does not run")
+
+
+def _internet_wait() -> str:
+    return ("it asks to use the internet, and nothing leaves this PC unless "
+            "you choose it: tick \"Allow internet\" for it in the Plugins "
+            "window, or ask its author for a version that needs none")
 
 
 def _compiled_files(folder: Path) -> Tuple[List[str], bool]:
@@ -554,11 +577,20 @@ def ending_clash(files: Iterable[str], taken: Mapping[str, str]) -> str:
 
 def discover(home: Any, *, builtin_dir: Any = None,
              builtins: Sequence[Tuple[str, str]] = BUILTIN_PLUGINS,
-             api_version: str = pm.API_VERSION) -> Registry:
+             api_version: str = pm.API_VERSION,
+             approvals: Optional[Mapping[str, Any]] = None) -> Registry:
     """Read every manifest — the built-ins named in `builtins`, inside
     `builtin_dir`, and the third-party folders under <home>/plugins/ —
     importing nothing. Never raises for a plugin: each is a record, with
-    its problem if it has one; folders that are no plugin go to `refused`."""
+    its problem if it has one; folders that are no plugin go to `refused`.
+
+    STAGE P5: every file of a third-party plugin that can run is read and
+    hashed here, and its code held (plugin_loader.read_folder): what runs
+    is what was read now. `approvals` (plugin_lists.read_approvals) says
+    which ids the user approved; the others wait for approval."""
+    from . import plugin_loader
+
+    approvals = dict(approvals or {})
     home = Path(home)
     builtin_dir = Path(builtin_dir) if builtin_dir is not None else BUILTIN_DIR
     reg = Registry(home=home)
@@ -623,13 +655,29 @@ def discover(home: Any, *, builtin_dir: Any = None,
             continue
         record = PluginRecord(id=m.id, folder=entry, builtin=False,
                               manifest=m, approval=_third_party_wait())
-        want = m.id.replace(".", "_")
+        given = approvals.get(m.id)
+        if given is not None:
+            record.approved = given
+            record.approval = ("" if m.network != plugin_loader.
+                               NETWORK_INTERNET or given.internet
+                               else _internet_wait())
         problem = ""
-        if entry.name != want:
-            problem = (f"its folder is {entry.name!r}; a plugin with the id "
-                       f"{m.id!r} lives in a folder named {want!r}")
-        elif m.id in reg.records:
-            problem = f"another plugin already has the id {m.id!r}"
+        # Any folder name will do (a folder dragged in as it was unzipped):
+        # the package name comes from the id (design 3.11, 4.5). Two
+        # folders with one id are both refused until one is taken out.
+        if m.id in reg.records:
+            problem = (f"another folder ({reg.records[m.id].folder.name}) "
+                       f"holds a plugin with the id {m.id!r} too — take one "
+                       f"of them out of the plugins folder")
+            other = reg.records[m.id]
+            if not other.builtin and not other.problem:
+                other.problem = (f"another folder ({entry.name}) holds a "
+                                 f"plugin with the id {m.id!r} too — take "
+                                 f"one of them out of the plugins folder")
+        elif "_" in m.id:
+            problem = (f"its id {m.id!r} holds an underscore; a plugin's id "
+                       f"is lower-case letters and digits between dots, so "
+                       f"that each id gives a package name of its own")
         elif m.short in shorts:
             problem = (f"its short name {m.short!r} is {shorts[m.short]}'s "
                        f"already")
@@ -647,6 +695,11 @@ def discover(home: Any, *, builtin_dir: Any = None,
                 problem = (f"it holds more than {MAX_FILES} files; a "
                            f"plugin's folder is checked file by file before "
                            f"it may run, so it holds at most {MAX_FILES}")
+        if not problem:
+            try:
+                record.held = plugin_loader.read_folder(entry, m.id)
+            except plugin_loader.LoaderError as exc:
+                problem = f"its folder could not be read: {exc}"
         record.problem = problem
         if m.id in reg.records:
             reg.refused.append((entry, problem))
@@ -942,11 +995,174 @@ class PluginHost:
             if made:
                 self._registry = discover(self.home.path,
                                           builtin_dir=self.builtin_dir,
-                                          builtins=self.builtins)
+                                          builtins=self.builtins,
+                                          approvals=self._approvals())
             found = self._registry
         if made:
             self._register_files(only_if_loaded=True)
         return found
+
+    def _approvals(self) -> Dict[str, Any]:
+        """The plugin home's approvals (stage P5); a damaged file is a note
+        and nothing approved meanwhile."""
+        try:
+            return pl.read_approvals(self.home.path)
+        except pl.PluginListError as exc:
+            self.notes.append(f"{exc} — no plugin from someone else runs "
+                              f"until it is mended")
+            return {}
+
+    # -- plugins from someone else (stage P5; design 4.1, 4.5, 4.6) -------
+    def plugins_folder(self) -> Path:
+        """The folder a plugin's folder is dragged into."""
+        return pl.plugins_folder(self.home.path)
+
+    def rescan(self) -> List[str]:
+        """Find the plugins again (the Plugins window's Rescan): a folder
+        dragged in since start-up is read and hashed now. A plugin already
+        loaded keeps the code it loaded with until the next start. Returns
+        the ids found that were not found before."""
+        with self._lock:
+            before = set(self._registry.records) if self._registry else set()
+            loaded = {pid for pid, _slot in self._instances}
+            old = self._registry
+            self._registry = None
+        found = self.registry
+        if old is not None:
+            # What is loaded keeps the bytes it was loaded from (design
+            # 4.5: a change takes effect at the next start).
+            for pid in loaded:
+                if pid in old.records and pid in found.records:
+                    found.records[pid] = old.records[pid]
+        return [pid for pid in found.records if pid not in before]
+
+    def approve(self, pid: str, internet: bool = False) -> None:
+        """Approve third-party plugin `pid` once (question 7), as its
+        folder was read at start-up: kept in the plugin home's
+        approvals.json and never asked again. `internet`: the user's
+        opt-in for a plugin whose manifest declares the internet. Turning
+        it on in a project is the project's list's business (switch_on)."""
+        rec = self.record(pid)
+        if rec is None or rec.builtin:
+            raise ValueError(f"{pid} is not a plugin from someone else "
+                             f"found on this PC")
+        if rec.problem:
+            raise ValueError(f"{pid} cannot run here: {rec.problem}")
+        files = rec.held.hashes() if rec.held is not None else {}
+        made = pl.approve(self.home.path, pid, rec.manifest.version, files,
+                          internet=internet)
+        with self._lock:
+            rec.approved = made
+            rec.approval = ("" if rec.manifest.network != "internet" or
+                            internet else _internet_wait())
+
+    def withdraw(self, pid: str) -> None:
+        """Take plugin `pid`'s approval back: it is switched off now and
+        needs approval again (and so does any later folder with its id)."""
+        pl.withdraw(self.home.path, pid)
+        rec = self.record(pid)
+        if rec is not None and not rec.builtin:
+            with self._lock:
+                rec.approved = None
+                rec.approval = _third_party_wait()
+        self._deactivate(lambda key: key[0] == pid)
+
+    def risks(self, pid: str) -> List[Any]:
+        """The risky-pattern scan of plugin `pid`'s code (plugin_loader.
+        scan): lines worth a look before approving. [] for a built-in."""
+        from . import plugin_loader
+
+        rec = self.record(pid)
+        if rec is None or rec.held is None:
+            return []
+        return plugin_loader.scan(rec.held)
+
+    def review(self, pid: str) -> List[str]:
+        """What the Plugins window shows before plugin `pid` is approved
+        (design 4.6 step 2), as lines: its manifest (author, version, what
+        it attaches to, files it writes, network use), the Python packages
+        it needs and whether this interpreter has them, every file with its
+        size and sha256, and the lines worth a look."""
+        rec = self.record(pid)
+        if rec is None or rec.manifest is None:
+            return [f"{pid} is not on this PC."]
+        m = rec.manifest
+        out = [f"{m.name} {m.version} ({m.id})",
+               f"Author: {m.author or '(not given)'}",
+               f"Licence: {m.licence or '(not given)'}"]
+        if m.description:
+            out.append(f"What it says it does: {m.description}")
+        out.append(f"Kind: {m.kind}" + (f", one per {m.scope}"
+                                        if m.kind == "feature" else ""))
+        if m.contributes:
+            out.append("Attaches to: " + ", ".join(m.contributes))
+        if m.files:
+            out.append("Run files it writes: " + ", ".join(m.files))
+        out.append(f"Network: {m.network}" + {
+            "none": " (it should never connect anywhere)",
+            "camera-link": " (cameras on this PC's local network only)",
+            "internet": " (it asks for the internet: refused unless you "
+                        "tick Allow internet)"}.get(m.network, ""))
+        if m.python:
+            problem = self._python_problem(rec)
+            out.append("Python packages: " + ", ".join(m.python)
+                       + (f" — {problem}" if problem else
+                          " — all found in this Python"))
+        out.append(f"Folder: {rec.folder}")
+        if rec.held is not None:
+            out.append(f"Files ({len(rec.held.files)}, "
+                       f"{rec.held.total_bytes():,} bytes, as read when "
+                       f"Typhon started — these exact bytes are what runs):")
+            for rel, f in sorted(rec.held.files.items()):
+                out.append(f"  {rel}  {f.size:,} bytes  sha256 {f.sha256}")
+            risks = self.risks(pid)
+            if risks:
+                out.append(f"Lines worth a look before you approve "
+                           f"({len(risks)}):")
+                for r in risks[:40]:
+                    out.append(f"  {r.file}:{r.line}  {r.label}:  "
+                               f"{r.snippet}")
+                if len(risks) > 40:
+                    out.append(f"  ...and {len(risks) - 40} more")
+            else:
+                out.append("Lines worth a look: none of the patterns Typhon "
+                           "looks for.")
+        out.append("")
+        out.append("An approved plugin is ordinary Python running with "
+                   "Typhon's rights: it can read, change and delete your "
+                   "files and reach the network whatever its manifest says. "
+                   "The checks above catch mistakes; they do not fence a "
+                   "plugin written to do harm. Approve only plugins whose "
+                   "author you trust. You approve each plugin once: a later "
+                   "version dragged in over it runs at the next start "
+                   "without asking.")
+        return out
+
+    def read_data(self, pid: str, name: str) -> bytes:
+        """Data file `name` of plugin `pid`'s folder (ctx.read_data): a
+        third party's checked against the sha256 taken at start-up."""
+        from . import plugin_loader
+
+        rec = self.record(pid)
+        if rec is None:
+            raise FileNotFoundError(f"{pid} is not on this PC")
+        if rec.held is not None:
+            try:
+                return plugin_loader.read_data(rec.held, name)
+            except plugin_loader.LoaderError as exc:
+                raise FileNotFoundError(str(exc)) from None
+        rel = Path(str(name))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise FileNotFoundError(f"{name!r} is outside the plugin's folder")
+        return (rec.folder / rel).read_bytes()
+
+    def _network_refused(self, package: str, address: Any, why: str) -> None:
+        """The tripwire refused a connection: say so, by the plugin's name."""
+        for pid, rec in list(self.registry.records.items()):
+            if rec.held is not None and rec.held.package == package:
+                self.say(pid, f"refused a network connection to "
+                              f"{address!r}: its manifest does not allow it")
+                return
 
     # -- the run-file suffix registry (stage P3; design 2.4 item 7, 3.9) --
     def _register_files(self, only_if_loaded: bool = False) -> None:
@@ -1233,13 +1449,30 @@ class PluginHost:
             if rec.factory is not None:
                 return rec.factory()
             if not rec.builtin:
-                raise RuntimeError("third-party plugins load from stage P5")
+                return self._load_third_party(rec)()
             folder = dict((pid, name) for pid, name in self.builtins)[rec.id]
             module = importlib.import_module(
                 f"{self.package}.{folder}.{rec.manifest.module}")
             factory = getattr(module, rec.manifest.attribute)
             return factory()
         return self._guard(rec.id, "loading", make, (), {}, None, kind=LOAD)
+
+    def _load_third_party(self, rec: PluginRecord) -> Callable[[], Any]:
+        """A third-party plugin's entry, compiled from the bytes read at
+        start-up (plugin_loader; design 4.5), its network policy armed."""
+        from . import plugin_loader
+
+        if rec.held is None or rec.approved is None or rec.approval:
+            raise RuntimeError(f"{rec.id} has not been approved")
+        m = rec.manifest
+        network = m.network or plugin_loader.NETWORK_NONE
+        if network == plugin_loader.NETWORK_INTERNET and \
+                not getattr(rec.approved, "internet", False):
+            network = plugin_loader.NETWORK_CAMERA
+        plugin_loader.install_tripwire()
+        plugin_loader.on_refused = self._network_refused
+        plugin_loader.allow_network(rec.held.package, network)
+        return plugin_loader.import_entry(rec.held, m.module, m.attribute)
 
     def loaded(self) -> List[str]:
         """The plugins whose code has been loaded, in order."""
@@ -1746,6 +1979,12 @@ class PluginHost:
                                      "short": m.short, "kind": m.kind}
             if state == FAULTED:
                 entry["faulted"] = cut(why)
+            rec = self.record(pid)
+            held = getattr(rec, "held", None)
+            if held is not None:
+                # What ran, by its bytes (design 4.2, 4.5): one sha256 over
+                # every file's, as read at start-up.
+                entry["sha256"] = held.digest()
             if pid == source and device is not None:
                 fields, note = self._record_fields(pid, device)
                 if fields:
@@ -3178,6 +3417,9 @@ class Context:
     def data_dir(self) -> Path:
         self._open()
         return self._host.data_dir(self.plugin_id)
+
+    def read_data(self, name: str) -> bytes:
+        return self._host.read_data(self.plugin_id, name)
 
     def image_folder(self) -> Optional[Path]:
         fn = self._host.image_folder_fn

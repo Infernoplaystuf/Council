@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "example.webcam",
+  "short": "webcam",
+  "name": "USB webcams (example)",
+  "version": "1.0.0",
+  "api": "1.0",
+  "kind": "camera",
+  "entry": "plugin:WebcamPlugin",
+  "author": "The Council examples",
+  "description": "Any webcam OpenCV can open, as a Typhon camera: the worked example of docs/typhon_camera_plugins.md.",
+  "licence": "MIT",
+  "network": "none",
+  "capabilities": [
+    "frames",
+    "restartable"
+  ]
+}
