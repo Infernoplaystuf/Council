@@ -1,4 +1,28 @@
-# Typhon plugin API 0.x: working notes
+# Typhon plugin API: working notes
+
+> **Stage P5 (9 November 2026): the API is frozen as 1.0, and plugins
+> written by someone else load once approved.** The author's guide is
+> `docs/typhon_camera_plugins.md`, with the worked example
+> `examples/typhon_plugins/example_webcam/` and the check command
+> `python -m typhon_plugin_api.check <folder>`. What P5 added:
+> `council_core/plugin_loader.py` (every file of a third-party plugin read
+> and hashed at start-up, the code compiled from those held bytes as
+> `typhon_thirdparty.<id>` with no bytecode, `read_data` checked against
+> the start-up sha256, the risky-pattern scan, the network tripwire);
+> `plugin_lists` approvals (`approvals.json`, one per id, never asked
+> again; `withdraw`); the host's `approve`, `withdraw`, `rescan`,
+> `review`, `risks`, `read_data`, `plugins_folder`, and each run's camera
+> record carrying a third-party plugin's sha256; any folder name (the
+> package name comes from the id), ids without underscores, two folders
+> with one id both refused; the Plugins window listing every third-party
+> plugin (any kind) with "Review and approve…", "Withdraw approval",
+> "Open plugins folder" and "Rescan"; `has()` names `thirdparty.load`,
+> `context.read_data` and `kit.check`. The fake host loads a folder
+> through the same loader. **Keep the guide and the example current with
+> any change to this code** (Andy, 9 November 2026).
+>
+> The notes below are the record of 0.1 to 0.3 as they were written; where
+> they say "never loaded before stage P5" or "0.x", P5 has since happened.
 
 These notes describe the plugin API as it stands on branch `typhon-plugins`.
 The design is `docs/typhon_plugins_design.md` (sections 3, 4 and 10). The

@@ -29,9 +29,9 @@ someone else (the third-party rules: no record gate or frame stage, a run
 file named `_<short>_<what>`, a short name and run files of its own) and
 imports its code from the folder's own files — without writing
 `__pycache__` into it, which would get the folder refused (design 4.5).
-Typhon itself loads plugins from someone else only from stage P5, after
-your approval; the fake host loads the one you name because you are
-already running your own code. `adopt(manifest, plugin)` takes a plugin
+Typhon loads a plugin from someone else only after your approval (stage
+P5); the fake host loads the one you name because you are already running
+your own code — through the same loader, from the bytes it read. `adopt(manifest, plugin)` takes a plugin
 made in the test's own process instead.
 
 Only the simulated cameras are scanned unless `real_cameras=True`: the
@@ -44,9 +44,9 @@ put back at close, and so are COUNCIL_SIM_CAMERAS, the camera module's own
 state and the modules `load` imported. One FakeHost at a time in a process:
 the camera module has one window's state.
 
-AT STAGE P5 it ships with the author's kit (design 3.11: python -m
-typhon_plugin_api.check, the contract suites of tests/contracts/ against
-the plugin's folder). Until then it is the branch's, used by those suites.
+It ships with the author's kit (stage P5, design 3.11): `python -m
+typhon_plugin_api.check <plugin folder>` loads the folder here, runs its
+kind's contract checks and then its own tests/.
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ SIMULATED = "Simulated"
 #: are scanned.
 SIMULATED_PLUGIN = "typhon.simulated"
 #: The package a plugin `load` imports from its folder is put under.
-PACKAGE = "typhon_fakehost"
+PACKAGE = "typhon_thirdparty"
 
 
 class FakeHostError(RuntimeError):
@@ -249,6 +249,7 @@ class FakeHost:
         else:
             os.environ["COUNCIL_SIM_CAMERAS"] = str(sim_cameras)
         self._modules: List[str] = []
+        self._packages: List[str] = []
         self._feeds: List[Any] = []
         self._closed = False
         ids = [pid for pid, _name in plugin_host.BUILTIN_PLUGINS]
@@ -371,40 +372,23 @@ class FakeHost:
                 problem = ph.ending_clash(m.files, endings)
         if problem:
             raise FakeHostError(f"{m.id} would be refused: {problem}")
-        package = f"{PACKAGE}.{m.id.replace('.', '_')}"
-        module = self._import(where, package, m.module)
-        factory = getattr(module, m.attribute, None)
-        if not callable(factory):
-            raise FakeHostError(f"{m.id}: its entry {m.module}:{m.attribute} "
-                                f"names nothing callable")
-        host.adopt(m, factory)
-        return m
+        # Imported exactly as Typhon imports an approved plugin (stage P5;
+        # council_core.plugin_loader): every file read and hashed now, the
+        # code compiled from those bytes, no bytecode, nothing written into
+        # the folder.
+        from council_core import plugin_loader
 
-    def _import(self, folder: Path, package: str, module: str) -> Any:
-        """`<package>.<module>` from `folder`, a package of its own, with no
-        bytecode written into the folder."""
-        root = sys.modules.get(PACKAGE)
-        if root is None:
-            root = types.ModuleType(PACKAGE)
-            root.__path__ = []                      # a namespace of its own
-            sys.modules[PACKAGE] = root
-            self._modules.append(PACKAGE)
-        if package not in sys.modules:
-            made = types.ModuleType(package)
-            made.__path__ = [str(folder)]
-            made.__file__ = str(folder / "__init__.py")
-            sys.modules[package] = made
-            self._modules.append(package)
-        before = set(sys.modules)
-        kept = sys.dont_write_bytecode
-        sys.dont_write_bytecode = True
         try:
-            imported = importlib.import_module(f"{package}.{module}")
-        finally:
-            sys.dont_write_bytecode = kept
-            self._modules += [n for n in set(sys.modules) - before
-                              if n.startswith(package)]
-        return imported
+            held = plugin_loader.read_folder(where, m.id)
+            factory = plugin_loader.import_entry(held, m.module, m.attribute)
+        except plugin_loader.LoaderError as exc:
+            raise FakeHostError(f"{m.id}: {exc}") from None
+        self._packages.append(held.package)
+        plugin_loader.allow_network(held.package, m.network)
+        plugin_loader.install_tripwire()
+        host.adopt(m, factory)
+        host.record(m.id).held = held
+        return m
 
     def instance(self, pid: str) -> Any:
         return self.host.instance(pid)
@@ -506,6 +490,10 @@ class FakeHost:
                     slot.plugin_state.clear()
                 for name in reversed(self._modules):
                     sys.modules.pop(name, None)
+                from council_core import plugin_loader
+                for package in self._packages:
+                    plugin_loader.uninstall(package)
+                    plugin_loader.forget_network(package)
                 for name, value in self._env.items():
                     if value is None:
                         os.environ.pop(name, None)

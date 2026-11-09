@@ -26,8 +26,11 @@ THE PLUGINS WINDOW
 Each feature plugin with a tick box (ticked = this project runs it) and its
 state and reason (host.states()). Unticking switches it off in this project
 now (host.switch_off: its instance is deactivated, its window closed, its
-button gone); ticking switches it on. Camera plugins are not listed: the
-set-up wizard chooses the camera families.
+button gone); ticking switches it on. Built-in camera plugins are not
+listed: the set-up wizard chooses the camera families. Every plugin from
+someone else is listed, any kind, with "Review and approve…" while it waits
+for approval and "Withdraw approval" once approved; "Open plugins folder"
+and "Rescan" find one dragged in (stage P5, 9 November 2026).
 """
 from __future__ import annotations
 
@@ -40,7 +43,8 @@ from typing import Any, Callable, Dict, List, Optional
 from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
-                               QLabel, QPushButton, QScrollArea, QVBoxLayout,
+                               QHBoxLayout, QLabel, QPlainTextEdit,
+                               QPushButton, QScrollArea, QVBoxLayout,
                                QWidget)
 
 #: The project's remembered window places, beside its plugin list.
@@ -312,7 +316,13 @@ class PluginStrip:
 
 
 class PluginsDialog(QDialog):
-    """Which feature plugins this project runs, with each one's state."""
+    """Which plugins this project runs, with each one's state: every
+    feature plugin, and every plugin from someone else (any kind — a camera
+    plugin's cameras are listed at the next camera scan). A plugin from
+    someone else waits for approval: "Review and approve…" shows what it
+    is before it may run (stage P5; design 4.6). "Open plugins folder" is
+    where such a plugin's folder is dragged; "Rescan" finds one dragged in
+    since Typhon started."""
 
     def __init__(self, strip: PluginStrip, parent: Any = None) -> None:
         super().__init__(parent)
@@ -320,46 +330,104 @@ class PluginsDialog(QDialog):
         self.setWindowTitle("Plugins")
         self.boxes: Dict[str, QCheckBox] = {}
         self.notes: Dict[str, QLabel] = {}
+        self.approve_buttons: Dict[str, QPushButton] = {}
+        self.withdraw_buttons: Dict[str, QPushButton] = {}
+        #: The folder "Open plugins folder" last opened (tests).
+        self.opened: Optional[Path] = None
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "Tick the plugins this project runs. A plugin that is off has "
-            "no button and loads nothing.", self))
-        area = QScrollArea(self)
-        area.setWidgetResizable(True)
-        inner = QWidget(area)
-        rows = QVBoxLayout(inner)
-        host = strip.host
-        for pid in self.feature_plugins():
-            box = QCheckBox(strip._name(pid), inner)
-            box.setObjectName(f"tick_{pid.replace('.', '_')}")
-            box.setChecked(pid in host.runs())
-            box.toggled.connect(lambda on, p=pid: self._toggled(p, on))
-            note = QLabel("", inner)
-            note.setWordWrap(True)
-            note.setIndent(24)
-            rows.addWidget(box)
-            rows.addWidget(note)
-            self.boxes[pid] = box
-            self.notes[pid] = note
-        rows.addStretch(1)
-        area.setWidget(inner)
-        layout.addWidget(area, 1)
+            "no button and loads nothing. A plugin from someone else runs "
+            "only once you have approved it.", self))
+        self.area = QScrollArea(self)
+        self.area.setWidgetResizable(True)
+        layout.addWidget(self.area, 1)
+        row = QHBoxLayout()
+        self.open_folder_button = QPushButton("Open plugins folder", self)
+        self.open_folder_button.setObjectName("open_plugins_folder")
+        self.open_folder_button.setToolTip(
+            "Drag a plugin's folder into this folder, then press Rescan.")
+        self.open_folder_button.clicked.connect(self.open_plugins_folder)
+        self.rescan_button = QPushButton("Rescan", self)
+        self.rescan_button.setObjectName("rescan_plugins")
+        self.rescan_button.setToolTip(
+            "Find plugins dragged into the plugins folder since Typhon "
+            "started.")
+        self.rescan_button.clicked.connect(self.rescan)
+        row.addWidget(self.open_folder_button)
+        row.addWidget(self.rescan_button)
+        row.addStretch(1)
+        layout.addLayout(row)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close,
                                    self)
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
-        self.resize(460, 360)
-        self.show_states()
+        self.resize(560, 420)
+        self.build_rows()
 
-    def feature_plugins(self) -> List[str]:
+    # -- the rows ----------------------------------------------------------
+    def listed_plugins(self) -> List[str]:
+        """Every feature plugin, then every plugin from someone else."""
         host = self.strip.host
         out = []
         for pid, _state, _why in host.states():
             m = host.manifest(pid)
-            if m is not None and m.kind == "feature":
+            rec = host.record(pid)
+            if m is None:
+                continue
+            if m.kind == "feature" or (rec is not None and not rec.builtin
+                                       and rec.factory is None):
                 out.append(pid)
         return out
+
+    def feature_plugins(self) -> List[str]:
+        host = self.strip.host
+        return [pid for pid in self.listed_plugins()
+                if getattr(host.manifest(pid), "kind", "") == "feature"]
+
+    def build_rows(self) -> None:
+        host = self.strip.host
+        self.boxes.clear()
+        self.notes.clear()
+        self.approve_buttons.clear()
+        self.withdraw_buttons.clear()
+        inner = QWidget(self.area)
+        rows = QVBoxLayout(inner)
+        for pid in self.listed_plugins():
+            rec = host.record(pid)
+            third = rec is not None and not rec.builtin
+            line = QHBoxLayout()
+            box = QCheckBox(self.strip._name(pid), inner)
+            box.setObjectName(f"tick_{pid.replace('.', '_')}")
+            box.setChecked(pid in host.runs())
+            box.toggled.connect(lambda on, p=pid: self._toggled(p, on))
+            line.addWidget(box, 1)
+            if third:
+                review = QPushButton("Review and approve…", inner)
+                review.setObjectName(f"approve_{pid.replace('.', '_')}")
+                review.clicked.connect(lambda _=False, p=pid:
+                                       self.review(p))
+                line.addWidget(review)
+                self.approve_buttons[pid] = review
+                withdraw = QPushButton("Withdraw approval", inner)
+                withdraw.setObjectName(f"withdraw_{pid.replace('.', '_')}")
+                withdraw.clicked.connect(lambda _=False, p=pid:
+                                         self.withdraw(p))
+                line.addWidget(withdraw)
+                self.withdraw_buttons[pid] = withdraw
+            note = QLabel("", inner)
+            note.setWordWrap(True)
+            note.setIndent(24)
+            rows.addLayout(line)
+            rows.addWidget(note)
+            self.boxes[pid] = box
+            self.notes[pid] = note
+        if not self.boxes:
+            rows.addWidget(QLabel("No plugins to switch here.", inner))
+        rows.addStretch(1)
+        self.area.setWidget(inner)
+        self.show_states()
 
     def show_states(self) -> None:
         host = self.strip.host
@@ -367,9 +435,129 @@ class PluginsDialog(QDialog):
             state, why = host.state(pid)
             m = host.manifest(pid)
             version = getattr(m, "version", "")
+            kind = getattr(m, "kind", "")
+            extra = ""
+            if kind == "camera" and state in ("on", "active"):
+                extra = (" Its cameras are listed at the next camera scan "
+                         "(Connect).")
             note.setText(f"{pid} {version} — {state}"
-                         + (f": {why}" if why else ""))
+                         + (f": {why}" if why else "") + "." + extra)
+            rec = host.record(pid)
+            waiting = state == "needs approval"
+            if pid in self.approve_buttons:
+                self.approve_buttons[pid].setVisible(waiting)
+                self.withdraw_buttons[pid].setVisible(
+                    rec is not None and rec.approved is not None)
 
     def _toggled(self, pid: str, on: bool) -> None:
         self.strip.switch(pid, on)
         self.show_states()
+
+    # -- approval (design 4.6) -------------------------------------------
+    def review(self, pid: str) -> Optional["ApprovalDialog"]:
+        """Show plugin `pid` as it was read at start-up, and approve it
+        there; an approved plugin is switched on in this project."""
+        dlg = ApprovalDialog(self.strip.host, pid, self)
+        if os.environ.get("COUNCIL_NO_DIALOGS"):
+            return dlg                     # built, never waited on (tests)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.approve(pid, internet=dlg.internet())
+        return dlg
+
+    def approve(self, pid: str, internet: bool = False) -> str:
+        host = self.strip.host
+        try:
+            host.approve(pid, internet=internet)
+        except Exception as exc:                          # noqa: BLE001
+            said = f"{self.strip._name(pid)} was not approved: {exc}"
+            self.strip._say(said)
+            self.show_states()
+            return said
+        said = f"{self.strip._name(pid)} is approved."
+        if pid not in host.runs():
+            said = self.strip.switch(pid, True)
+            box = self.boxes.get(pid)
+            if box is not None:
+                box.blockSignals(True)
+                box.setChecked(True)
+                box.blockSignals(False)
+        self.strip.refresh()
+        self.show_states()
+        return said
+
+    def withdraw(self, pid: str) -> str:
+        host = self.strip.host
+        try:
+            self.strip.close_window(pid)
+            host.withdraw(pid)
+        except Exception as exc:                          # noqa: BLE001
+            return f"{self.strip._name(pid)}: {exc}"
+        self.strip.refresh()
+        self.show_states()
+        said = (f"{self.strip._name(pid)}'s approval was withdrawn: it does "
+                f"not run until you approve it again.")
+        self.strip._say(said)
+        return said
+
+    # -- the plugins folder ------------------------------------------------
+    def open_plugins_folder(self) -> Path:
+        folder = self.strip.host.plugins_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self.opened = folder
+        if not os.environ.get("COUNCIL_NO_DIALOGS"):
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        return folder
+
+    def rescan(self) -> List[str]:
+        found = self.strip.host.rescan()
+        self.build_rows()
+        if found:
+            self.strip._say("Found: " + ", ".join(
+                self.strip._name(p) for p in found))
+        return found
+
+
+class ApprovalDialog(QDialog):
+    """One plugin from someone else, as Typhon read it at start-up (host.
+    review: its manifest, packages, every file's sha256, the lines worth a
+    look) with Approve and Cancel, and "Allow internet" for a plugin whose
+    manifest asks for it."""
+
+    def __init__(self, host: Any, pid: str, parent: Any = None) -> None:
+        super().__init__(parent)
+        self.host = host
+        self.pid = pid
+        m = host.manifest(pid)
+        self.setWindowTitle(f"Approve {getattr(m, 'name', pid)}?")
+        layout = QVBoxLayout(self)
+        self.text = QPlainTextEdit(self)
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.text.setPlainText("\n".join(host.review(pid)))
+        layout.addWidget(self.text, 1)
+        self.allow_internet = QCheckBox(
+            "Allow internet (it asks to connect beyond this PC)", self)
+        self.allow_internet.setVisible(getattr(m, "network", "") ==
+                                       "internet")
+        layout.addWidget(self.allow_internet)
+        buttons = QDialogButtonBox(self)
+        self.approve_button = buttons.addButton(
+            "Approve", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        rec = host.record(pid)
+        self.approve_button.setEnabled(rec is not None and not rec.problem)
+        self.resize(720, 520)
+
+    def internet(self) -> bool:
+        """The user's opt-in, for a plugin that asks for the internet."""
+        m = self.host.manifest(self.pid)
+        return getattr(m, "network", "") == "internet" and \
+            self.allow_internet.isChecked()
