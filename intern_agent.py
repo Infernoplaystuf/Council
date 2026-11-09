@@ -117,35 +117,14 @@ Write a concise working draft.
 
 def _ddg_search(query: str, max_results: int = 5) -> List[str]:
     """
-    Lightweight DuckDuckGo search using their HTML endpoint.
-    Returns a list of URLs. No API key required.
+    Web search through Council's one door to the internet (council_core.web):
+    nothing is sent while the Online switch in Settings is off.
+    Returns a list of URLs.
     """
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+    from council_core import web
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        # Extract result URLs from DDG HTML
-        urls = re.findall(r'href="(https?://[^"&]+)"', html)
-        # Filter out DDG internal links
-        filtered = [u for u in urls if "duckduckgo" not in u and "duck.com" not in u]
-        # Deduplicate while preserving order
-        seen: set = set()
-        unique: List[str] = []
-        for u in filtered:
-            if u not in seen:
-                seen.add(u)
-                unique.append(u)
-        return unique[:max_results]
-    except Exception as e:
+        return [h.url for h in web.search(query, max_results)]
+    except (web.Offline, web.WebError):
         return []
 
 
@@ -155,6 +134,9 @@ def _ddg_search(query: str, max_results: int = 5) -> List[str]:
 
 def _scrape_url_crawl4ai(url: str, timeout: int = 15) -> Tuple[bool, str]:
     """Scrape a URL and return clean markdown using Crawl4AI."""
+    from council_core import web
+    if not web.is_online():
+        return False, web.why_offline()
     if not _CRAWL4AI_OK:
         return False, "crawl4ai not installed"
     # Deferred heavy import — see the find_spec probe at module top.
@@ -198,23 +180,14 @@ def _scrape_url_crawl4ai(url: str, timeout: int = 15) -> Tuple[bool, str]:
 
 def _scrape_url_stdlib(url: str) -> Tuple[bool, str]:
     """
-    Minimal HTML scraper using only stdlib.
-    Strips tags, returns plain text. Used when crawl4ai is unavailable.
+    Read a page through Council's one door to the internet
+    (council_core.web), as plain text. Used when crawl4ai is unavailable.
     """
+    from council_core import web
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; CouncilBot/1.0)"}
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        # Strip scripts and styles
-        html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-        # Strip tags
-        text = re.sub(r"<[^>]+>", " ", html)
-        # Clean whitespace
-        text = re.sub(r"\s{3,}", "\n\n", text)
-        text = text.strip()
-        return True, text[:6000]
-    except Exception as e:
+        art = web.read_page(web.fetch(url, robots=web.Robots()))
+        return True, art.text[:6000]
+    except (web.Offline, web.WebError) as e:
         return False, str(e)
 
 
@@ -223,6 +196,10 @@ def _do_research(query: str, max_pages: int = 3) -> ResearchResult:
     Search DuckDuckGo for query, scrape top results, return combined markdown.
     """
     result = ResearchResult(query=query)
+    from council_core import web
+    if not web.is_online():
+        result.error = web.why_offline()
+        return result
 
     urls = _ddg_search(query, max_results=max_pages + 2)
     if not urls:

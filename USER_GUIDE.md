@@ -302,6 +302,30 @@ lives in its own folder (a checkout of the `quant-duel` branch, with its own
 
 The duel's own `deploy/README_PI.md` covers running a node directly on a Pi.
 
+## Research (web)
+
+Council is offline unless you say otherwise. To let it look things up on the
+internet, open **⚙ Settings** and tick **Online**. Untick it and nothing in
+Council reaches the internet again. (An administrator can set
+`COUNCIL_OFFLINE=1` to keep a PC offline whatever the box says.)
+
+In the **🌐 Research** tab, type a question ("how do I paint flamethrower
+effects on Warhammer models?"), pick a model and press **Research**. Council
+splits the question into a few searches, reads the best pages (honouring each
+site's robots.txt, with no cookies or logins) and writes a short report. Every
+claim has a number like [2] that points at a source listed at the end. Pages
+are read as information only; instructions written in a page are ignored.
+
+- **Sources**: untick a page you don't trust and press **Write again with ticked
+  sources**. Nothing is downloaded again, so this works offline too.
+- **Where it's kept**: each run is a folder in your vault's
+  `data_in/research/`, with `report.md` and every page as text (each starts
+  with a `Source:` line giving its web address). The Connections "All
+  documents" graph reads it at its next build; **Make a Connections graph**
+  gives the run a graph of its own, which a Study notebook can use too.
+- **Search engine**: DuckDuckGo needs no account. In Settings you can switch to
+  Brave Search (your own API key) or your own SearXNG server.
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
