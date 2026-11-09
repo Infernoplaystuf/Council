@@ -1185,6 +1185,7 @@ for item in filter(None, os.environ.get("COUNCIL_SWAP", "").split(os.pathsep)):
     except Exception as exc:          # the tests will say what is missing
         print(f"COUNCIL_SWAP: {name} failed to import: {exc!r}",
               file=sys.stderr)
+    print(f"COUNCIL_SWAP: {name} from {path}", file=sys.stderr)
 '''
 
 #: One widget's test files may take this long, collection included.
@@ -1231,8 +1232,15 @@ def _run_tests_once(tests: Sequence[Path], work: Path, *,
     junit = work / f"{tag}.xml"
     if junit.exists():
         junit.unlink()
+    # No compiled copies of the swapped modules: a round rewrites the same
+    # file, and a cached .pyc is checked only by the source's size and its
+    # modification time in whole seconds, so a stale one could be run in
+    # place of the new source. Read from source every time.
+    import shutil
+    shutil.rmtree(work / "__pycache__", ignore_errors=True)
     env_extra = {
         "QT_QPA_PLATFORM": "offscreen", "COUNCIL_NO_DIALOGS": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join([str(work), str(HERE),
                                        os.environ.get("PYTHONPATH", "")]),
         "COUNCIL_SWAP": os.pathsep.join(
@@ -1247,7 +1255,8 @@ def _run_tests_once(tests: Sequence[Path], work: Path, *,
                          env=child_proc.child_env(env_extra),
                          timeout=TEST_TIMEOUT, memory_limit_mb=4096)
     out: Dict[str, Any] = {"outcomes": {}, "failures": {}, "infra": "",
-                           "seconds": getattr(ran, "seconds", None)}
+                           "seconds": getattr(ran, "seconds", None),
+                           "stderr": (getattr(ran, "stderr", "") or "")[-600:]}
     if ran.infra:
         out["infra"] = ran.infra
         return out
@@ -1382,7 +1391,9 @@ def rebuild_widget(name: str, work: Path, *, model_call: ModelCall,
                    for t in counted if t not in passed}
         report["rounds"].append({"passed": len(passed),
                                  "counted": len(counted),
-                                 "infra": result["infra"]})
+                                 "infra": result["infra"],
+                                 "outcomes": dict(result["outcomes"]),
+                                 "stderr": result.get("stderr", "")})
         if not failing or rnd == repairs or result["infra"]:
             break
         blamed = blame(failing, spans, module_file, plist)

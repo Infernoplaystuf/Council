@@ -261,8 +261,9 @@ def test_a_model_that_never_delivers_is_reported_and_repaired(
                             repairs=1)
     # If a child run was spoiled by the machine, say how (it is not the
     # code's failure, and the assertions below would only hide that).
-    why = {"baseline": rep["baseline"]["infra"],
-           "rounds": [r["infra"] for r in rep["rounds"]]}
+    why = {"baseline": rep["baseline"],
+           "rounds": [{k: r.get(k) for k in ("infra", "outcomes", "stderr")}
+                      for r in rep["rounds"]]}
     assert rep["passed"] == 0 and rep["counted"] == 1, why
     assert rep["pieces"]["pop_out"]["problems"] == ["does not define pop_out"]
     assert len(calls) == 2, why                # the write, then one repair
