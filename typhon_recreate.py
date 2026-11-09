@@ -1191,12 +1191,39 @@ for item in filter(None, os.environ.get("COUNCIL_SWAP", "").split(os.pathsep)):
 TEST_TIMEOUT = 900
 
 
+#: A run the machine spoiled (no report, the child could not start) is run
+#: this many more times before it counts as an infrastructure failure.
+INFRA_RETRIES = 1
+
+
 def run_tests(tests: Sequence[Path], work: Path, *,
               swap: Optional[Dict[str, Path]] = None,
               tag: str = "run") -> Dict[str, Any]:
     """Run ``tests`` in a child pytest, optionally with modules swapped;
     {"outcomes": {test id: passed|failed|error|skipped}, "failures":
-    {test id: message}, "infra": why the run itself failed or ""}."""
+    {test id: message}, "infra": why the run itself failed or ""}.
+
+    A run that fails for the MACHINE's reason (the child pytest wrote no
+    report, or could not start) is run again, up to INFRA_RETRIES times:
+    on the Windows CI runner, with four test files at once, one such run in
+    a few dozen happened (2026-11-08, PR #72), and a single spoiled run
+    used to end the repair loop early or, in the baseline, count a test
+    that the empty module would have passed. A timeout is not retried."""
+    out: Dict[str, Any] = {}
+    tries: List[str] = []
+    for _attempt in range(INFRA_RETRIES + 1):
+        out = _run_tests_once(tests, work, swap=swap, tag=tag)
+        if not out["infra"] or out.get("timed_out"):
+            break
+        tries.append(out["infra"])
+    if tries and not out["infra"]:
+        out["infra_retried"] = tries
+    return out
+
+
+def _run_tests_once(tests: Sequence[Path], work: Path, *,
+                    swap: Optional[Dict[str, Path]] = None,
+                    tag: str = "run") -> Dict[str, Any]:
     from council_core import child_proc
     work.mkdir(parents=True, exist_ok=True)
     (work / "council_swap_plugin.py").write_text(SWAP_PLUGIN,
@@ -1226,6 +1253,7 @@ def run_tests(tests: Sequence[Path], work: Path, *,
         return out
     if ran.timed_out:
         out["infra"] = f"timed out after {TEST_TIMEOUT}s"
+        out["timed_out"] = True
     if not junit.exists():
         out["infra"] = out["infra"] or ("pytest wrote no report: "
                                         + (ran.stderr or ran.stdout or "")
@@ -1404,11 +1432,16 @@ def widget_baseline(name: str, wdir: Path, header: str,
                           encoding="utf-8")
     empty = run_tests(tests, wdir, swap={widget_module(name): empty_file},
                       tag="empty")
-    counted = counted_tests(original["outcomes"], empty["outcomes"])
+    # A spoiled run says nothing about which tests measure the widget: with
+    # the empty run's outcomes missing, every test the original passed would
+    # count, and a model that delivered nothing would score on them.
+    infra = original["infra"] or empty["infra"]
+    counted = [] if infra else counted_tests(original["outcomes"],
+                                             empty["outcomes"])
     return {"counted": counted,
             "original_fail": sorted(t for t, s in original["outcomes"].items()
                                     if s in ("failed", "error")),
-            "infra": original["infra"] or empty["infra"]}
+            "infra": infra}
 
 
 def widget_findings(rep: Dict[str, Any]) -> List[str]:
