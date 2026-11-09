@@ -323,13 +323,13 @@ def third_party(home, folder, doc, code=None):
 def test_a_third_party_plugin_is_listed_as_needing_approval_never_loaded(
         builtins_pkg, plugin_home, tmp_path):
     """Question 7: a plugin is its own folder, dragged into the plugins
-    folder, approved once — approval and loading come at stage P5. Until
-    then it is listed and never runs, even in a project that adds it."""
+    folder, approved once (stage P5). Until it is approved it is listed and
+    never runs, even in a project that adds it."""
     third_party(plugin_home, "acme_thermal",
                 manifest_doc("acme.thermal", "therm", builtin=False))
     host = make_host(builtins_pkg, [])
     state, why = host.state("acme.thermal")
-    assert state == ph.NEEDS_APPROVAL and "P5" in why
+    assert state == ph.NEEDS_APPROVAL and "approve it once" in why
     proj = tmp_path / "proj"
     proj.mkdir()
     host.open_project(proj, create=True)
@@ -342,7 +342,7 @@ def test_a_third_party_plugin_is_listed_as_needing_approval_never_loaded(
 
 
 @pytest.mark.parametrize("folder, over, extra, words", [
-    ("thermal", {}, None, "lives in a folder named 'acme_thermal'"),
+    ("thermal", {}, None, ""),       # any folder name (P5): id gives it
     ("acme_thermal", {"short": "sim2", "files": ["_sim2_x.csv"]},
      None, ""),                                       # fine
     ("acme_thermal", {"short": "good"}, None, "is typhon.good's already"),

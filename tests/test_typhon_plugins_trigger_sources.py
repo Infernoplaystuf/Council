@@ -108,7 +108,7 @@ class BoxPlugin:
 def manifest():
     return pm.check({"schema": 1, "id": "acme.box", "short": "box",
                      "name": "Acme trigger box", "version": "0.1.0",
-                     "api": "0.3", "kind": "source", "entry": "plugin:Box",
+                     "api": "1.0", "kind": "source", "entry": "plugin:Box",
                      "needs": [], "python": [], "contributes": [],
                      "files": [], "network": "none", "author": "Acme",
                      "description": "A trigger box on a serial port.",

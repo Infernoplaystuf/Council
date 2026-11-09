@@ -282,10 +282,11 @@ def test_the_api_version_rule(wanted, have, ok):
         assert wanted in said and have in said, "both numbers named"
 
 
-def test_this_typhons_api_is_0_x_until_p5_and_matches_the_package():
+def test_this_typhons_api_is_1_x_from_p5_and_matches_the_package():
+    """0.x while the built-ins shaped it; frozen as 1.0 at stage P5."""
     import typhon_plugin_api as api
     assert pm.API_VERSION == api.API_VERSION
-    assert pm.API_VERSION.startswith("0.")
+    assert pm.API_VERSION.startswith("1.")
 
 
 # ======================================================================

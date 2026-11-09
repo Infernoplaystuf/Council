@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "council.study",
+  "short": "study",
+  "name": "Study",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "tab",
+  "entry": "tab:build_tab",
+  "needs": ["sources", "models"],
+  "network": "none",
+  "author": "The Council",
+  "description": "Notebooks over the documents you pick: search them, get a literature review where every claim cites its source, then make flash cards, quizzes, a study guide and a glossary from it, and practise with them. Runs on your local US-made model; nothing leaves the PC."
+}

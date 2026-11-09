@@ -137,7 +137,13 @@ same list.
   `docs/typhon_plugins_branch.md` says how "Typhon (plugins)" runs beside today's Typhon
   (`run-typhon-plugins.bat`, its side vault), its traps, and the branch gate every commit
   passes (`python tools/typhon_plugins_gate.py`). The plugin host and the plugin API as
-  they stand (0.x until P5): `docs/typhon_plugin_api_notes.md`.
+  they stand: `docs/typhon_plugin_api_notes.md` (API 1.0 since stage P5).
+- Writing a Typhon plugin, above all a camera plugin (plugin API 1.0; plugins from
+  others load once approved; the webcam example; `python -m typhon_plugin_api.check`):
+  `docs/typhon_camera_plugins.md`. **Any change to Typhon's camera or plugin code
+  (typhon_plugin_api/, typhon_plugins/, council_core/plugin_*.py, cameras.py's Device,
+  camera_settings.py's Provider/Setting, the Plugins window) updates that guide and
+  `examples/typhon_plugins/example_webcam/` in the same change** (Andy, 2026-11-09).
 - The Ledger for table templates (one row per record, highlights, lookups, the
   model per header layout): `docs/handoff/ledger_records_2026-10-21.md`.
 - The Connections tab working like Morphik (any entity type, a model reading every

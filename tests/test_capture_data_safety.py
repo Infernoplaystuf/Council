@@ -626,7 +626,11 @@ def test_typhon_says_a_stopped_recording_until_stop_and_at_stop(
     out = typhon.start(str(tmp_path))
     session = typhon._LIVE.session
     at, clash = clash_ahead(tmp_path, out["run"], session)
-    wait_for(lambda: session.stats().grabbed > at + 4, 15)
+    # Until the writer reaches the clash: grabbing runs ahead of saving
+    # (CI on Windows: "33 saved · 7 waiting to save" when frame `at` was
+    # grabbed 4 frames ago), so a grab count alone was a race.
+    wait_for(lambda: session.stats().grabbed > at + 4 and
+             bool(session.stats().recording_failed), 15)
     said = []
     typhon.pump(lambda image: None, said.append)
     live = said[-1]
