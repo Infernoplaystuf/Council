@@ -218,7 +218,7 @@ def page_header(src: Source, question: str) -> str:
     if src.published:
         lines.append(f"Published: {src.published}")
     lines += [f"Fetched: {src.fetched}",
-              f"Found researching: {question}", ""]
+              f"Found researching: {src.found_by or question}", ""]
     return "\n".join(lines)
 
 
@@ -282,7 +282,9 @@ def passages(text: str, size: int = PASSAGE_CHARS) -> List[str]:
 def rank(query: str, items: Sequence[Tuple[int, str]], limit: int,
          per_source: int = 2) -> List[Tuple[int, str]]:
     """The passages (source n, text) that best match ``query`` (BM25-like),
-    at most ``per_source`` from one source."""
+    at most ``per_source`` from one source. Each source's best passage is
+    taken before any source's second, so one long page (often the most
+    keyword-stuffed) cannot fill a section on its own."""
     q = set(terms(query))
     if not q or not items:
         return list(items[:limit])
@@ -301,15 +303,18 @@ def rank(query: str, items: Sequence[Tuple[int, str]], limit: int,
                 s += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / avg))
         scored.append((s, i))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    out, per = [], Counter()
-    for s, i in scored:
-        if s <= 0 or len(out) >= limit:
-            break
-        src = items[i][0]
-        if per[src] >= per_source:
-            continue
-        per[src] += 1
-        out.append(items[i])
+    scored = [(s, i) for s, i in scored if s > 0]
+    out, taken, per = [], set(), Counter()
+    for cap in range(1, max(1, per_source) + 1):
+        for _s, i in scored:
+            if len(out) >= limit:
+                return out
+            src = items[i][0]
+            if i in taken or per[src] >= cap:
+                continue
+            per[src] += 1
+            taken.add(i)
+            out.append(items[i])
     return out
 
 
@@ -329,7 +334,9 @@ SECTION_SYSTEM = ("You write one section of a short research report for the "
                   "user, from the numbered web sources given, and from nothing "
                   "else. " + UNTRUSTED + " Write plain, practical prose or a short "
                   "step list. Put the source number in square brackets after "
-                  "each claim, like [2] or [1][4]. Use only the numbers given. "
+                  "each claim, like [2] or [1][4]: the number of the source whose "
+                  "text says it. Use only the numbers given, and use every "
+                  "source that has something useful, not just one. "
                   "If the sources do not answer this part, say so in one "
                   "sentence. Do not write a heading.")
 
@@ -411,10 +418,19 @@ def write_sections(run: Run, chat: Optional[ChatFn], *,
         for p in passages(read_source_text(run, src)):
             items.append((src.n, p))
     run.sections = []
+    used: set = set()
     for i, sq in enumerate(run.sub_questions, 1):
         if should_stop and should_stop():
             break
-        chosen = rank(f"{sq} {run.question}", items, PASSAGES_PER_SECTION)
+        # the sub-question alone (the whole question added to each one gave
+        # every section the same passages); passages an earlier section had
+        # are used again only when nothing fresh matches
+        fresh = [it for it in items if it not in used]
+        chosen = rank(sq, fresh, PASSAGES_PER_SECTION)
+        if len(chosen) < PASSAGES_PER_SECTION // 2:
+            chosen = rank(sq, items, PASSAGES_PER_SECTION) or rank(
+                f"{sq} {run.question}", items, PASSAGES_PER_SECTION)
+        used.update(chosen)
         sec = Section(heading=sq)
         if not chosen:
             sec.note = "No page read for this run says anything about this."
@@ -477,6 +493,16 @@ def report_markdown(run: Run) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _discard(folder: Path) -> None:
+    """Take away a run folder that read nothing (its run file, the empty
+    pages folder, the folder): only those, never anything else in it."""
+    for path in (folder / RUN_FILE, folder / PAGES_DIR, folder):
+        try:
+            path.unlink() if path.is_file() else path.rmdir()
+        except OSError:
+            pass
+
+
 def finish(run: Run) -> None:
     run.written = web.now_iso()
     _write_text(run.path / REPORT_FILE, report_markdown(run))
@@ -502,14 +528,14 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
 
     say("Planning the searches…")
     subs = plan(question, chat, sub_questions)
-    folder = new_folder(vault, question)
-    run = Run(question=question, folder=str(folder), sub_questions=subs,
-              model=model, engine=settings.search, started=web.now_iso())
-    save_run(run)
+    started = web.now_iso()
 
-    # search: the question itself first, then each sub-question
+    # search: the question itself first, then each sub-question. The run's
+    # folder is made only once a search has found something, so a run that
+    # finds nothing leaves no empty folder behind in the run list.
     queries = [question] + [q for q in subs if q.lower() != question.lower()]
     lists: List[Tuple[str, List[web.Hit]]] = []
+    errors: List[str] = []
     for i, q in enumerate(queries):
         if stop():
             break
@@ -517,13 +543,24 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         try:
             lists.append((q, web.search(q, results_per_search)))
         except web.WebError as exc:
-            run.skipped.append(f"search {q!r}: {exc}")
+            errors.append(str(exc))
         web.pause()
     if not any(hits for _, hits in lists):
-        run.skipped.append("no search found any page")
-        save_run(run)
-        reason = run.skipped[0] if run.skipped else "no results"
-        raise ResearchError(f"the search found nothing to read ({reason})")
+        reason = errors[0] if errors else "no results for any search"
+        raise ResearchError(f"the search found nothing to read: {reason}")
+
+    engines = {h.engine for _, hits in lists for h in hits if h.engine}
+    engine = settings.search
+    folder = new_folder(vault, question)
+    run = Run(question=question, folder=str(folder), sub_questions=subs,
+              model=model, engine=engine, started=started)
+    if engines and engine not in engines:
+        run.engine = sorted(engines)[0]
+        run.skipped.append(
+            f"{web.ENGINE_NAMES.get(engine, engine)} could not be reached, so "
+            f"{web.ENGINE_NAMES.get(run.engine, run.engine)} searched instead")
+    run.skipped += [f"a search failed: {e}" for e in dict.fromkeys(errors)]
+    save_run(run)
 
     # take the results in turns, so every sub-question gets its best pages
     order: List[Tuple[str, web.Hit]] = []
@@ -564,7 +601,7 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         run.sources.append(src)
         save_run(run)
     if not run.sources:
-        save_run(run)
+        _discard(folder)
         raise ResearchError("none of the pages found could be read: "
                             + "; ".join(run.skipped[:4]))
 

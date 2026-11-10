@@ -356,3 +356,96 @@ def test_the_research_tab_is_registered():
     assert "🌐 Research" in titles
     assert titles.index("🌐 Research") == titles.index("🕸 Connections") + 1
     assert tabs.build_research is build_research
+
+
+# -- search engines (2026-11-10: DuckDuckGo answered with its bot check) ----------
+DDG_BOT_CHECK = """<html><body><form id="challenge-form">
+<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+<input type="checkbox" class="anomaly-modal__check" name="image-check_1">
+</form></body></html>"""
+
+
+def test_searxng_is_the_default_engine():
+    assert web.Settings().search == "searxng" == web.load().search
+    assert web.ENGINES[0] == "searxng"
+
+
+def test_duckduckgos_bot_check_is_reported_as_such(monkeypatch):
+    web.save(web.Settings(online=True, search="duckduckgo"))
+    monkeypatch.setattr(web, "_open", lambda *_a, **_k: (None, DDG_BOT_CHECK.encode(), False))
+    assert web.duckduckgo_blocked(DDG_BOT_CHECK)
+    with pytest.raises(web.WebError, match="bot check"):
+        web.search("paint flamers")
+
+
+def test_a_searxng_server_that_is_not_there_falls_back_to_duckduckgo(server, monkeypatch):
+    # port 9 on loopback: nothing listens there
+    web.save(web.Settings(online=True, search="searxng", searxng_url="http://127.0.0.1:9"))
+    monkeypatch.setattr(web, "_search_duckduckgo",
+                        lambda q: [web.Hit("https://paint.example/flamer", "Flamer")])
+    hits = web.search("paint flamers")
+    assert [(h.url, h.engine) for h in hits] == [("https://paint.example/flamer", "duckduckgo")]
+
+
+def test_both_engines_failing_says_why(server, monkeypatch):
+    web.save(web.Settings(online=True, search="searxng", searxng_url="http://127.0.0.1:9"))
+
+    def blocked(_q):
+        raise web.WebError(web.DDG_BLOCKED)
+    monkeypatch.setattr(web, "_search_duckduckgo", blocked)
+    with pytest.raises(web.WebError, match=r"SearXNG: .*DuckDuckGo: .*bot check"):
+        web.search("paint flamers")
+
+
+def test_a_run_whose_searches_fail_says_why_and_leaves_no_folder(server, tmp_path, monkeypatch):
+    web.save(web.Settings(online=True, search="duckduckgo"))
+
+    def blocked(*_a, **_k):
+        raise web.WebError(web.DDG_BLOCKED)
+    monkeypatch.setattr(web, "search", blocked)
+    with pytest.raises(wr.ResearchError, match="bot check"):
+        wr.research("how to paint flamers", tmp_path / "v", fake_chat)
+    assert not list((tmp_path / "v" / "data_in" / "research").glob("*"))
+
+
+def test_a_run_records_the_engine_that_searched(online, tmp_path, monkeypatch):
+    real = web.search
+
+    def via_duckduckgo(q, limit=6):
+        hits = real(q, limit)
+        for h in hits:
+            h.engine = "duckduckgo"
+        return hits
+    monkeypatch.setattr(web, "search", via_duckduckgo)
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat)
+    assert run.engine == "duckduckgo"
+    assert any("could not be reached" in x for x in run.skipped)
+
+
+def test_a_page_says_which_search_found_it(online, tmp_path):
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat)
+    for src in run.sources:
+        page = (run.path / src.file).read_text(encoding="utf-8")
+        assert f"Found researching: {src.found_by}\n" in page
+
+
+# -- passages ----------------------------------------------------------------------
+def test_each_sources_best_passage_comes_before_any_second():
+    items = ([(1, "flame flame flame yellow glaze %d" % i) for i in range(5)]
+             + [(2, "flame glaze tips"), (3, "yellow flame smoke")])
+    chosen = wr.rank("flame yellow glaze", items, 4)
+    assert sorted({n for n, _ in chosen[:3]}) == [1, 2, 3]
+    assert [n for n, _ in chosen].count(1) == 2
+
+
+def test_sections_do_not_all_get_the_same_passages(online, tmp_path):
+    given = []
+
+    def chat(messages, num_predict=None, schema=None):
+        if messages[0]["content"].startswith("You plan web research"):
+            return json.dumps({"questions": ["flame colours yellow red",
+                                             "soot on the barrel"]})
+        given.append(messages[1]["content"].split("The user's question")[0])
+        return "Glaze it [1]."
+    wr.research("How do I paint flamethrower effects", tmp_path / "v", chat)
+    assert len(given) == 2 and given[0] != given[1]

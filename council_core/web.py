@@ -31,9 +31,15 @@ WHAT GOES OUT
     Markdown, JSON) are read.
 
 Search engines (``search``):
-  * "duckduckgo" (default): DuckDuckGo's HTML page, no key or account;
-  * "brave": the Brave Search API with the user's own key;
-  * "searxng": the user's own SearXNG server (its JSON output).
+  * "searxng" (default): a SearXNG server, no key or account - by default
+    the one Settings › Online › "Set up SearXNG" runs in Docker on this PC
+    (council_core.searxng, http://127.0.0.1:8888). It asks several engines
+    and merges their results, so one engine refusing does not stop a search.
+    If it cannot be reached, DuckDuckGo is tried instead;
+  * "duckduckgo": DuckDuckGo's HTML page, no key or account. DuckDuckGo
+    often answers a program with its bot check instead of results (seen
+    2026-11-10); that is reported as such, never got round;
+  * "brave": the Brave Search API with the user's own key.
 
 What a page SAYS is data. Nothing here interprets it; council_core.
 web_research tells the model to ignore instructions written in pages.
@@ -61,10 +67,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from council_core import paths
 
 SETTINGS_FILE = "online.json"
-ENGINES = ("duckduckgo", "brave", "searxng")
-ENGINE_NAMES = {"duckduckgo": "DuckDuckGo (no account)",
-                "brave": "Brave Search (your API key)",
-                "searxng": "Your own SearXNG server"}
+ENGINES = ("searxng", "duckduckgo", "brave")
+DEFAULT_ENGINE = "searxng"
+ENGINE_NAMES = {"searxng": "SearXNG (no account; on this PC or your server)",
+                "duckduckgo": "DuckDuckGo (no account)",
+                "brave": "Brave Search (your API key)"}
+#: where "Set up SearXNG" runs it, and the address used when none is saved
+DEFAULT_SEARXNG = "http://127.0.0.1:8888"
+#: DuckDuckGo's bot-check page instead of results
+DDG_BLOCKED = ("DuckDuckGo showed its bot check instead of results, so it is "
+               "not answering Council's searches. Use SearXNG instead "
+               "(Settings › Online › Set up SearXNG).")
 USER_AGENT = "CouncilResearch/1.0 (+offline-first desktop app; one page at a time)"
 #: a page is read up to this many bytes, then cut
 MAX_BYTES = 2_000_000
@@ -91,7 +104,7 @@ class WebError(RuntimeError):
 @dataclass
 class Settings:
     online: bool = False
-    search: str = "duckduckgo"
+    search: str = DEFAULT_ENGINE
     searxng_url: str = ""
     brave_key: str = ""
 
@@ -118,7 +131,7 @@ def load() -> Settings:
         return Settings()
     if not isinstance(doc, dict):
         return Settings()
-    engine = doc.get("search") if doc.get("search") in ENGINES else "duckduckgo"
+    engine = doc.get("search") if doc.get("search") in ENGINES else DEFAULT_ENGINE
     return Settings(online=doc.get("online") is True, search=engine,
                     searxng_url=str(doc.get("searxng_url") or "").strip(),
                     brave_key=str(doc.get("brave_key") or "").strip())
@@ -399,6 +412,7 @@ class Hit:
     url: str
     title: str = ""
     snippet: str = ""
+    engine: str = ""             # the engine that found it
 
 
 def _ddg_url(href: str) -> str:
@@ -441,47 +455,76 @@ def parse_duckduckgo(page_html: str) -> List[Hit]:
     return hits
 
 
+def _search_brave(q: str, limit: int, key: str) -> List[Hit]:
+    if not key:
+        raise WebError("Brave Search needs your API key (Settings › Online)")
+    _, body, _ = _open(f"https://api.search.brave.com/res/v1/web/search?q={q}"
+                       f"&count={max(1, min(limit, 20))}",
+                       headers={"Accept": "application/json",
+                                "X-Subscription-Token": key})
+    doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
+    rows = ((doc.get("web") or {}).get("results") or [])
+    return [Hit(url=r.get("url", ""), title=r.get("title", ""),
+                snippet=re.sub(r"<[^>]+>", "", r.get("description", "")))
+            for r in rows if str(r.get("url", "")).startswith("http")]
+
+
+def _search_searxng(q: str, base: str) -> List[Hit]:
+    base = (base or DEFAULT_SEARXNG).rstrip("/")
+    _check_url(base)
+    _, body, _ = _open(f"{base}/search?q={q}&format=json",
+                       headers={"Accept": "application/json"})
+    try:
+        doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
+    except ValueError:
+        raise WebError("the SearXNG server did not answer in JSON - switch on "
+                       "the json format in its settings.yml") from None
+    return [Hit(url=r.get("url", ""), title=r.get("title", ""),
+                snippet=r.get("content", ""))
+            for r in doc.get("results") or [] if str(r.get("url", "")).startswith("http")]
+
+
+def _search_duckduckgo(q: str) -> List[Hit]:
+    _, body, _ = _open(f"https://html.duckduckgo.com/html/?q={q}")
+    page = body.decode("utf-8", errors="replace")
+    hits = parse_duckduckgo(page)
+    if not hits and duckduckgo_blocked(page):
+        raise WebError(DDG_BLOCKED)
+    return hits
+
+
+def duckduckgo_blocked(page_html: str) -> bool:
+    """DuckDuckGo's bot check (its "anomaly" picture challenge) instead of
+    results. Council says so; it never tries to answer the check."""
+    return "anomaly-modal" in page_html or 'id="challenge-form"' in page_html
+
+
 def search(query: str, limit: int = 6) -> List[Hit]:
-    """Web results for ``query`` from the engine chosen in Settings."""
+    """Web results for ``query`` from the engine chosen in Settings; a
+    SearXNG server that cannot be reached falls back to DuckDuckGo. Each
+    Hit says which engine found it."""
     s = require_online()
     query = " ".join(str(query or "").split())[:300]
     if not query:
         return []
     q = urllib.parse.quote_plus(query)
     if s.search == "brave":
-        if not s.brave_key:
-            raise WebError("Brave Search needs your API key (Settings › Online)")
-        _, body, _ = _open(f"https://api.search.brave.com/res/v1/web/search?q={q}"
-                           f"&count={max(1, min(limit, 20))}",
-                           headers={"Accept": "application/json",
-                                    "X-Subscription-Token": s.brave_key})
-        doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
-        rows = ((doc.get("web") or {}).get("results") or [])
-        hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
-                    snippet=re.sub(r"<[^>]+>", "", r.get("description", "")))
-                for r in rows if str(r.get("url", "")).startswith("http")]
+        hits, engine = _search_brave(q, limit, s.brave_key), "brave"
     elif s.search == "searxng":
-        if not s.searxng_url:
-            raise WebError("set your SearXNG server's address (Settings › Online)")
-        base = s.searxng_url.rstrip("/")
-        _check_url(base)
-        _, body, _ = _open(f"{base}/search?q={q}&format=json",
-                           headers={"Accept": "application/json"})
         try:
-            doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
-        except ValueError:
-            raise WebError("the SearXNG server did not answer in JSON - switch on "
-                           "the json format in its settings.yml") from None
-        hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
-                    snippet=r.get("content", ""))
-                for r in doc.get("results") or [] if str(r.get("url", "")).startswith("http")]
+            hits, engine = _search_searxng(q, s.searxng_url), "searxng"
+        except WebError as exc:
+            try:
+                hits, engine = _search_duckduckgo(q), "duckduckgo"
+            except WebError as exc2:
+                raise WebError(f"SearXNG: {exc}; DuckDuckGo: {exc2}") from None
     else:
-        _, body, _ = _open(f"https://html.duckduckgo.com/html/?q={q}")
-        hits = parse_duckduckgo(body.decode("utf-8", errors="replace"))
+        hits, engine = _search_duckduckgo(q), "duckduckgo"
     out, seen = [], set()
     for h in hits:
         if h.url not in seen:
             seen.add(h.url)
+            h.engine = engine
             out.append(h)
     return out[:limit]
 

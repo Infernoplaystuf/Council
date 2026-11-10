@@ -323,8 +323,12 @@ are read as information only; instructions written in a page are ignored.
   with a `Source:` line giving its web address). The Connections "All
   documents" graph reads it at its next build; **Make a Connections graph**
   gives the run a graph of its own, which a Study notebook can use too.
-- **Search engine**: DuckDuckGo needs no account. In Settings you can switch to
-  Brave Search (your own API key) or your own SearXNG server.
+- **Search engine**: SearXNG, which needs no account or key. With Docker Desktop
+  running, press **Set up SearXNG on this PC** in Settings › Online and Council
+  starts it for you (only this PC can reach it). If it is not running, Council
+  tries DuckDuckGo instead, but DuckDuckGo often answers programs with a bot
+  check, and Council then says so. Brave Search (your own API key) and your own
+  SearXNG server elsewhere are the other choices.
 
 ## Keyboard shortcuts
 
